@@ -14,6 +14,8 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+static int kmsg = -1;
+
 static uint32_t rd(void *base, unsigned offset)
 {
 	uint32_t value = *(volatile uint32_t *)((char *)base + offset);
@@ -34,6 +36,8 @@ static void checkpoint(const char *message)
 		perror("fsync");
 		exit(2);
 	}
+	if (dprintf(kmsg, "<6>NEO_PMGR_ADMISSION: %s\n", message) < 0)
+		exit(2);
 	usleep(500000);
 }
 
@@ -45,14 +49,19 @@ int main(int argc, char **argv)
 	int fd, log;
 	uint32_t value;
 	void *pmgr, *asc;
-	int manual, matched;
+	int manual, matched, readback_first;
 
 	if (argc != 3 || (strcmp(argv[1], "--same-value") &&
+			  strcmp(argv[1], "--same-value-readback") &&
 			  strcmp(argv[1], "--manual-active"))) {
-		fprintf(stderr, "usage: %s --same-value|--manual-active NEW_LOG\n", argv[0]);
+		fprintf(stderr, "usage: %s --same-value|--same-value-readback|--manual-active NEW_LOG\n", argv[0]);
 		return 2;
 	}
 	manual = !strcmp(argv[1], "--manual-active");
+	readback_first = !strcmp(argv[1], "--same-value-readback");
+	kmsg = open("/dev/kmsg", O_WRONLY);
+	if (kmsg < 0)
+		return 2;
 	log = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_DSYNC, 0600);
 	if (log < 0 || dup2(log, STDOUT_FILENO) < 0) {
 		perror("open log");
@@ -94,9 +103,23 @@ int main(int argc, char **argv)
 	value = manual ? 0x0f0000ff : 0x1f0000ff;
 	printf("requested=%08x\n", value);
 	checkpoint("before PMGR write");
-	wr(pmgr, 0x10000, value);
-	checkpoint("PMGR write/barrier returned; before readback");
-	value = rd(pmgr, 0x10000);
+	if (readback_first) {
+		/* ApplePMGR emits a plain STR, then a status read. This isolated
+		 * same-value probe distinguishes that ordering from the explicit
+		 * post-write DSB in wr(). It never changes ownership or PS target.
+		 * It is not a general recommendation to omit MMIO barriers.
+		 */
+		*(volatile uint32_t *)((char *)pmgr + 0x10000) = value;
+		value = rd(pmgr, 0x10000);
+		printf("immediate-readback=%08x\n", value);
+		checkpoint("PMGR store/read returned; before explicit write barrier");
+		__asm__ volatile("dsb oshst" ::: "memory");
+		checkpoint("PMGR write barrier returned after readback");
+	} else {
+		wr(pmgr, 0x10000, value);
+		checkpoint("PMGR write/barrier returned; before readback");
+		value = rd(pmgr, 0x10000);
+	}
 	printf("readback=%08x\n", value);
 	matched = value == (manual ? 0x0f0000ff : 0x1f0000ff);
 	if (manual) {
