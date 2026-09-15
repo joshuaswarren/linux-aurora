@@ -126,6 +126,8 @@ int main(int argc, char **argv)
 		if (!ret)
 			ret = read_pmu(0xf800, 1);
 		if (!ret)
+			ret = read_pmu(0xf808, 4);
+		if (!ret)
 			ret = read_pmu(0xf80c, 1);
 		if (!ret)
 			ret = read_pmu(0xf80e, 1);
