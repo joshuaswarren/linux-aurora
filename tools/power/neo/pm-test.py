@@ -75,6 +75,7 @@ def snapshot():
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/s2idle/usage",
                     "/sys/module/neo_display_sleep/parameters/*",
                     "/sys/module/neo_dcp_retained/parameters/*",
+                    "/sys/module/neo_media_sleep/parameters/*",
                     "/sys/module/mt7932_fullmac/parameters/*",
                     "/sys/bus/platform/devices/macsmc-input/power/wakeup"):
         paths.extend(str(p) for p in Path('/').glob(pattern.lstrip('/')) if p.is_file())
@@ -86,6 +87,9 @@ def snapshot():
 
 
 def check_firmware_health(capture):
+    media = '/sys/module/neo_media_sleep/parameters/'
+    if capture['files'].get(media + 'failed', 'N') != 'N' or capture['files'].get(media + 'pending', '0') != '0':
+        raise RuntimeError('media sleep transition failed or was not fully restored')
     for name, path in (
         ('PMP', '/sys/kernel/debug/apple-pmp-v2/status'),
         ('DCP', '/sys/bus/platform/devices/412e00000.neo-dcp-retained/status'),
