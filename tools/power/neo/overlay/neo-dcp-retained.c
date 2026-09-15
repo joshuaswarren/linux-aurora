@@ -47,6 +47,8 @@ struct neo_dcp {
 	bool oslog_started;
 	u32 sleeps, wakes;
 	struct regmap *pmgr;
+	void __iomem *retention;
+	bool retention_prepared;
 	bool stopped;
 	bool transport_paused;
 	u32 saved_control, saved_clocks[3];
@@ -72,6 +74,46 @@ static void trace_step(struct neo_dcp *d, const char *step)
 		return;
 	dev_info(d->dev, "DCP awake step: %s\n", step);
 	msleep(200);
+}
+
+/* AppleT8140PMGR::_setPwrGateRetentionWorkaround, table at
+ * 0xfffffe000c455710: DISP_CPU uses map 0x65, ADT reg[22].
+ * Prepare before lowering the manual target; restore only after ACTIVE
+ * and BUSY clear, before restoring AUTO. This is not an MMIO access unlock.
+ */
+static int retention_controls(struct neo_dcp *d, bool prepare)
+{
+	static const u32 offsets[] = { 0xc8c, 0xcd0 };
+	static const u32 active[] = { 0, 1 }, retained[] = { 3, 0 };
+	const u32 *values = prepare ? retained : active;
+	unsigned int i;
+	u32 value;
+
+	if (!d->retention)
+		return -ENODEV;
+	if (prepare) {
+		if (d->retention_prepared)
+			return -EBUSY;
+		for (i = 0; i < ARRAY_SIZE(offsets); i++)
+			if (readl(d->retention + offsets[i]) != active[i])
+				return -EBUSY;
+		/* Also retain ownership of a partially written sequence. */
+		d->retention_prepared = true;
+	} else if (!d->retention_prepared) {
+		return 0;
+	}
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		trace_step(d, prepare ? "prepare retention control" : "restore retention control");
+		writel(values[i], d->retention + offsets[i]);
+		value = readl(d->retention + offsets[i]);
+		dev_info(d->dev, "DCP retention offset=%#x expected=%#x actual=%#x\n",
+			 offsets[i], values[i], value);
+		if (value != values[i])
+			return -EIO;
+	}
+	if (!prepare)
+		d->retention_prepared = false;
+	return 0;
 }
 
 static int set_clock(struct neo_dcp *d, unsigned int i, bool on)
@@ -106,6 +148,11 @@ static int set_clock(struct neo_dcp *d, unsigned int i, bool on)
 		if (ret)
 			return ret;
 	}
+	if (!on && i == 0) {
+		ret = retention_controls(d, true);
+		if (ret)
+			return ret;
+	}
 	value &= ~(15 | BIT(28) | BIT(11) | BIT(9) | BIT(8));
 	dev_info(d->dev, "DCP manual target offset=%#x write=%#x\n",
 		 clock_offsets[i], value | target);
@@ -115,6 +162,8 @@ static int set_clock(struct neo_dcp *d, unsigned int i, bool on)
 	if (!ret)
 		ret = regmap_read_poll_timeout(d->pmgr, clock_offsets[i], value,
 			((value >> 4) & 15) == target && !(value & BIT(11)), 10, 10000);
+	if (!ret && on && i == 0)
+		ret = retention_controls(d, false);
 	if (!ret && on && (d->saved_clocks[i] & BIT(28)))
 		ret = regmap_write(d->pmgr, clock_offsets[i],
 			(value & ~(BIT(11) | BIT(9) | BIT(8))) | BIT(28));
@@ -508,6 +557,19 @@ static int dcp_suspend(struct device *dev)
 		return -EAGAIN;
 	if (depth > 3 || (depth && !stop) || (ap && (depth || stop)))
 		return -EINVAL;
+	/* Map only for an explicitly requested gate trial. This window lies
+	 * outside the main PMGR syscon. No mapping or control writes for the
+	 * already qualified AP-only sleep path.
+	 */
+	if (depth && !d->retention) {
+		d->retention = devm_ioremap(dev, 0x300724000ULL, SZ_4K);
+		if (!d->retention)
+			return -ENOMEM;
+	}
+	if (depth && (d->retention_prepared ||
+		      readl(d->retention + 0xc8c) != 0 ||
+		      readl(d->retention + 0xcd0) != 1))
+		return -EBUSY;
 	for (i = 0; i < depth; i++) {
 		ret = regmap_read(d->pmgr, clock_offsets[i], &d->saved_clocks[i]);
 		if (ret || (d->saved_clocks[i] & 0xff) != 0xff ||

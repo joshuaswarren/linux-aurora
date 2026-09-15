@@ -656,3 +656,15 @@ voter/boost/DVMR/BWR/cluster-rail operations. ADT boost, DVMR and BWR tables
 include DISP_SYS (device 0x3a), not DISP_CPU (0x84). These calls are not yet
 identified as a CPU-register access unlock. Avoid attributing the fault to
 an ownership or security policy without further evidence.
+
+The experimental DCP module now implements the decoded retention-control
+sequence around DISP_CPU manual target changes. It maps the separate control
+window only when clock_depth is explicitly nonzero, admits the observed
+awake values 0/1 before firmware idle, writes 3/0 before lowering, and restores
+0/1 only after actual ACTIVE with BUSY clear. A partial control write remains
+tracked for recovery. AUTO is restored afterward. AP-only sleep does not map
+or touch these controls. The overlay modules build successfully; target
+changes and retention-control writes are **not hardware-qualified**. In
+particular this sequence does not remove the captured CPU write access fault.
+The build is retained as `dcp-pmgr-native/retention-build.log`, with module
+SHA256 `f6d50a5ed324980c843c97f5bc1ddbe9c09a2bbc99595812f53c8aabb4988e9d`.
