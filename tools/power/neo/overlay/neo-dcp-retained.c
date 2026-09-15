@@ -339,6 +339,11 @@ static ssize_t wake_store(struct device *dev, struct device_attribute *a, const 
 	guard(mutex)(&d->lock);
 	if (atomic_read(&d->failed))
 		return -EIO;
+	/* Unlike a PM wake after IDLE, a second awake-adoption request repeats
+	 * AP ON. This firmware asserts on an unchanged AP power state.
+	 */
+	if (d->wakes && !d->touched)
+		return -EALREADY;
 	ret = wake_dcp(d);
 	return ret ? ret : count;
 }

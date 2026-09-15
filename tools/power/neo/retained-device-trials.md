@@ -358,3 +358,14 @@ DATA-page digest, client string and original mode 1 before an aligned store
 of 2 and readback. This mirrors the native setter without altering TEXT,
 DART tables or CPU control. The module remains pinned until reboot; no reset
 of a failed epoch is attempted. Hardware qualification is pending.
+
+
+The first mode-2 probe selected the guarded DATA value successfully, then
+erroneously sent AP ON again while DCP was already awake. The retained CLHE
+explicitly reports `Invalid AP power: 33`; this is a probe defect, not a
+failed sleep/wake qualification of mode 2. Crash SHA256
+`d98b33805ccefaf01794ea06522aa2f8d5ce9f72543868083ac54a2ad1a7c964`;
+`dcp-returning-mode/crash-sections.json`. The diagnostic now rejects duplicate
+awake-adoption writes with -EALREADY. PM wake after a touched IDLE transition
+continues to use a fresh AP acknowledgement. Reboot is required after this
+assertion; no in-place recovery is claimed.
