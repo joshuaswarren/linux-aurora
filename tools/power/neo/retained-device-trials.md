@@ -458,3 +458,43 @@ steps and logs exact register values before writes. It preserves the existing
 BUSY/status-write exclusions. Qualification is pending; this is a sequencing
 correction, not a claimed cure or a measured saving. Native retention-table
 handling and the J700 retention-workaround property still need further study.
+
+The separated manual-ACTIVE trial still lost connectivity. The synchronized
+`dcp-manual-active/` capture (module source `1c3e075e7`, SHA256
+`2471d8cdbdb74d53f77e4c2257e79551761f01f824a132651c7fc8608b9a2022`)
+ends at `disable AUTO at ACTIVE write`, value `0x0f0000ff`. Target 4 was
+never requested. This rules out combining the two requests as the sole
+problem; it does not establish that the register write completed. One reset
+returned the normal #6 kernel. A separate awake AUTO-only admission uses
+persistent userspace checkpoints to distinguish the PMGR access from DCP's
+sleep/transport sequence; its result must be retrieved after recovery.
+
+## T8140-specific DCP retention controls
+
+The chip-specific AppleT8140PMGR binary, SHA256
+`bc900d4fc10b3783890b51c68fd28ef78c2e4662a71e1a3b00458d183b7989fd`,
+adds a workaround absent from the common ApplePMGR implementation. Binary,
+kernelcache provenance and captures remain under `artifacts/` in the parent
+workspace; `dcp-pmgr-native/retention-profile.json` records the decoded table.
+The J700 ADT enables `pwrgateretention-workaround` (native feature 0x5d).
+
+`AppleT8140PMGR::writeReg32` at 0xfffffe000982ff38 calls the check at
+0xfffffe0009830288 and setter at 0xfffffe0009830388. The two 24-byte table
+rows at 0xfffffe000c455710 select RegMap 0, PS offset 0x10000 (DISP_CPU).
+They write RegMap 0x65 offsets 0xc8c and 0xcd0. `initRegMaps`, at
+0xfffffe000982b358, maps native RegMap 0x65 to ADT reg[22], giving physical
+addresses 0x300724c8c and 0x300724cd0 on this machine.
+
+Before lowering the manual PS target, native code writes 3 then 0 to these
+controls. After increasing the target, it waits for actual ACTIVE and BUSY
+clear, then writes 0 and 1. These are full aligned 32-bit writes. A bounded
+read-only probe on normal #6 observed awake values 0 and 1. This observation
+was printed by the SSH tool; the attempted redirected awake-retention.log is
+empty and is not a retained register capture.
+
+The check compares manual target nibbles: a same-target AUTO-only change does
+**not** invoke the workaround. Therefore the missing workaround is relevant
+to future lowering tests but does not explain our current AUTO-only boundary
+by itself. No implementation or successful sleep qualification is claimed.
+Native AXI2AF handling has a separate table: it includes DISP_SYS (0x280),
+but not DISP_CPU. Do not apply the SYS workaround to the CPU register.
