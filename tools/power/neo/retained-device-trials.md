@@ -498,3 +498,33 @@ to future lowering tests but does not explain our current AUTO-only boundary
 by itself. No implementation or successful sleep qualification is claimed.
 Native AXI2AF handling has a separate table: it includes DISP_SYS (0x280),
 but not DISP_CPU. Do not apply the SYS workaround to the CPU register.
+
+## Awake PMGR write admission
+
+The durable AUTO-only capture `dcp-pmgr-native/manual-awake-v2.log` ends
+before the write of 0x0f0000ff with DCP awake on normal #6. The subsequent
+same-value probe wrote the inherited 0x1f0000ff, without changing AUTO or
+the manual target. It also lost connectivity; its log ends before the
+write/barrier returned (boot be046269-c18f-4e7f-ac6e-0d096f6476bd). No DCP
+adoption, sleep, transport pause or RUN stop preceded either test. This
+isolates a write/access issue from the full firmware sleep sequence, but
+does not distinguish a stalled bus from an asynchronous fatal exception.
+Native RegMap 0 was checked through initRegMaps/initRegMap/getRegMap and
+does map ADT reg[0], the same physical base 0x300700000.
+
+`dcp-pmgr-admission.c` retains the bounded same-value and manual-ACTIVE
+experiments, with kernel and boot identities, exact initial values, and
+O_DSYNC checkpoints before each MMIO operation. Cross-build with
+`aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Werror`. Run under a transient
+systemd service with a new log path. These writes have failed on hardware;
+do not treat either mode as safe production power management.
+
+Neither /sys/fs/pstore nor the systemd archive contained a fault report.
+The next diagnostic build applies `crash-capture.config` and boots with
+`reserve_mem=2M:16384:neo_crash ramoops.mem_name=neo_crash`
+`ramoops.record_size=1048576 ramoops.console_size=1048576`. This explicitly
+reserves RAM before allocation, rather than borrowing firmware or allocated
+memory. Keep the same kernel and command line on capture and recovery boots,
+check the recorded physical address, and qualify persistence across reset
+before relying on it. Firmware may erase RAM during reboot; configuration
+alone does not prove that crash logs will survive.
