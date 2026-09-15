@@ -108,3 +108,20 @@ clock-gate consumer nodes in the saved board ADT. This absence is a screening
 criterion, not proof that a firmware consumer cannot exist. SPI3 is the panel
 SPI node, UART4/5 are radio debug ports, QSPI owns NOR/NVRAM, and I2C0 owns the
 audio codec: don't lump those together as anonymous unused leaves.
+
+## Sleep-only media hook candidate
+
+`overlay/neo-media-sleep.c` gates only PRORES and MSR in suspend_noirq and
+restores them in resume_noirq. Default enabled=N. It rejects DT-described
+providers for these offsets, unsafe initial words and non-s2idle requests;
+it retains partially touched state and verifies ACTIVE/original policy during
+restoration. No parent, virtual descriptor, CPU, firmware buffer or display
+mapping is changed. The ordinary awake state is preserved after a successful
+cycle. Do not operate the userspace gate helper on those domains while this
+hook is enabled. Its parameters expose pending/failed and cycle counters;
+PM snapshots and health validation check unresolved transitions.
+
+The module builds against #40; hardware qualification is pending. This is a
+board-specific experimental sidecar, not a replacement for eventual consumer
+drivers and genpd ownership. A failed restoration requires recovery rather
+than treating a module unload or successful PM write as a healthy machine.
