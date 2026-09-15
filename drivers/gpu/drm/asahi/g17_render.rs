@@ -613,6 +613,31 @@ impl RenderDescriptorMetadata {
     }
 }
 
+/// Native's TA/3D register-list producer couples the command-buffer state tag
+/// to the descriptor's allocated application-GART context. The physical QID,
+/// QoS HardwareBufferID, descriptor-array slot and 36-entry state-ring index
+/// are independent namespaces and must not be substituted here.
+const fn render_work_key(context_id: u32, command_buffer_state_word: u32) -> u64 {
+    ((context_id as u64) << 8) | ((command_buffer_state_word & 0x3f) as u64)
+}
+
+/// The completion record must name the same generation as the rendered writes.
+/// Native nextCommandBufferState stores the allocated word at EventControl +8;
+/// generate3DRegisterList uses its low six bits in 0x10211/0x10420. B1 uses those
+/// same bits in the cache-maintenance request before publishing the stamp.
+/// Keep the full word here: physical slot ordinals and ring indices are not
+/// substitutes for the command-buffer allocator's generation.
+pub(crate) fn set_render_event_control_generation(
+    event_control: &mut [u8],
+    command_buffer_state_word: u32,
+) -> Result<(), RenderBuildError> {
+    let generation = event_control
+        .get_mut(8..12)
+        .ok_or(RenderBuildError::BufferTooSmall)?;
+    generation.copy_from_slice(&command_buffer_state_word.to_le_bytes());
+    Ok(())
+}
+
 fn descriptor_work_ordinal(ordinal: u32) -> u32 {
     ordinal + ordinal / 2
 }
@@ -1527,8 +1552,205 @@ mod tests {
     }
 
     #[test]
-    fn retained_descriptor_refresh_keeps_canonical_self_pointers_and_advances_item_two() {
+    fn cold_opening_ta_couples_the_hardware_buffer_id_without_clobbering_registers() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.ta_hardware_buffer_id = 5;
+        let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
+        build_cold_opening_ta_descriptor(
+            &parameters,
+            objects(),
+            1,
+            0,
+            parameters.ta_hardware_buffer_id,
+            &mut tiling,
+        )
+        .unwrap();
+
+        assert_eq!(get_u32(&tiling, 0x18), 5);
+        // +0x300 is register 0x1c830 and +0x304 is its value word.
+        assert_eq!(get_u32(&tiling, 0x300), 0x1c830);
+        assert_eq!(get_u64(&tiling, 0x304), 5);
+    }
+
+    #[test]
+    fn shared_usc_flist_id_drives_both_stage_registers_independently_of_pm_id() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.ta_hardware_buffer_id = 7;
+        parameters.usc_flist_hardware_buffer_id = 5;
+        // Every diagnostic bit set must not recouple the retired bit-16
+        // capture literals to these source-owned registers.
+        parameters.native_ta_registers = u32::MAX;
+
+        let tiling = build_ta_registers(&parameters).unwrap();
+        let fragment = build_fragment_registers(&parameters).unwrap();
+        assert_eq!(
+            tiling.iter().find(|write| write.number == 0x1c830).unwrap().value,
+            7
+        );
+        assert_eq!(
+            tiling.iter().find(|write| write.number == 0x14308).unwrap().value,
+            5
+        );
+        assert_eq!(
+            fragment.iter().find(|write| write.number == 0x14048).unwrap().value,
+            5
+        );
+        assert_eq!(
+            fragment.iter().find(|write| write.number == 0x1c838).unwrap().value,
+            7
+        );
+    }
+
+    #[test]
+    fn descriptor_context_and_state_word_drive_every_native_work_key() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.ta_hardware_buffer_id = 5;
+        parameters.gpc_perf_state_map = 7;
+        let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
+        let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+        let tiling_metadata = RenderDescriptorMetadata {
+            context_id: 9,
+            submission_ordinal: 4,
+            command_buffer_state_word: 0x40,
+            ta_hardware_buffer_id: parameters.ta_hardware_buffer_id,
+            submit_sequence: 7,
+        };
+        let fragment_metadata = RenderDescriptorMetadata {
+            command_buffer_state_word: 0x41,
+            ..tiling_metadata
+        };
+
+        build_ta_descriptor(&parameters, objects(), tiling_metadata, &mut tiling).unwrap();
+        build_fragment_descriptor(&parameters, objects(), fragment_metadata, &mut fragment)
+            .unwrap();
+
+        for (raw, offset, register, value) in [
+            (&tiling[..], 0x300, 0x1c830, 5u64),
+            (&tiling[..], 0x36c, 0x10209, 0x900),
+            (&tiling[..], 0x378, 0x1c9f0, 0x900),
+            (&tiling[..], 0x384, 0x14320, 0x900),
+            (&fragment[..], 0x454, 0x1c838, 5u64),
+            (&fragment[..], 0x46c, 0x10211, 0x901),
+            (&fragment[..], 0x478, 0x10420, 0x901),
+        ] {
+            assert_eq!(get_u32(raw, offset), register);
+            assert_eq!(get_u64(raw, offset + 4), value);
+        }
+        assert_eq!(get_u32(&tiling, 0x0c), 9);
+        assert_eq!(get_u32(&fragment, 0x0c), 9);
+    }
+
+    #[test]
+    fn completion_generation_matches_render_tags_across_reuse_and_wrap() {
         let parameters = G17pRenderParameters::source_rsrc8();
+        // Include a second client's cold submission and generations beyond the
+        // six-bit hardware tag wrap. The slot ordinal is intentionally unrelated.
+        for generation in [0, 1, 2, 62, 64, 65, 128, 0x12345678, u32::MAX - 1] {
+            for context_id in [1, 7] {
+                let metadata = RenderDescriptorMetadata {
+                    context_id,
+                    submission_ordinal: 2,
+                    command_buffer_state_word: generation,
+                    ..RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment)
+                };
+                let mut ta = [0u8; TA_DESCRIPTOR_SIZE];
+                let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+                let mut event_control = [0xa5; 0x100];
+                build_ta_descriptor(&parameters, objects(), metadata, &mut ta).unwrap();
+                build_fragment_descriptor(&parameters, objects(), metadata, &mut fragment)
+                    .unwrap();
+                set_render_event_control_generation(&mut event_control, generation).unwrap();
+                assert_eq!(get_u32(&event_control, 8), generation);
+                assert_eq!(&event_control[..8], &[0xa5; 8]);
+                assert!(event_control[12..].iter().all(|&v| v == 0xa5));
+                let maintenance_key = ((context_id as u64) << 8)
+                    | (get_u32(&event_control, 8) & 63) as u64;
+                for (raw, offset) in [(&ta[..], 0x36c), (&ta[..], 0x378),
+                                      (&ta[..], 0x384), (&fragment[..], 0x46c),
+                                      (&fragment[..], 0x478)] {
+                    assert_eq!(get_u64(raw, offset + 4), maintenance_key);
+                }
+            }
+        }
+        assert_eq!(
+            set_render_event_control_generation(&mut [0; 11], 0),
+            Err(RenderBuildError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn fragment_parameter_buffer_owner_is_independent_of_perf_map_and_tail() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.native_ta_registers = u32::MAX;
+
+        for (control, low, map, id) in [(0, 7, 3, 0), (1, 3, 7, 5), (1, 0, 1, 3)] {
+            parameters.ta_hardware_buffer_id = id;
+            parameters.gpc_perf_state_control = control;
+            parameters.gpc_perf_state_map_low = low;
+            parameters.gpc_perf_state_map = map;
+            let fragment = build_fragment_registers(&parameters).unwrap();
+            let write = fragment
+                .iter()
+                .find(|write| write.number == 0x1c838)
+                .unwrap();
+            assert_eq!(write.value, id as u64);
+
+            let mut descriptor = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+            build_fragment_descriptor(
+                &parameters,
+                objects(),
+                RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+                &mut descriptor,
+            )
+            .unwrap();
+            assert_eq!(get_u32(&descriptor, 0x2104), control);
+            assert_eq!(get_u32(&descriptor, 0x210c), low);
+            assert_eq!(get_u32(&descriptor, 0x2110), u32::MAX);
+            assert_eq!(get_u32(&descriptor, 0x2124), 1);
+            assert_eq!(get_u32(&descriptor, 0x2128), 1);
+            assert_eq!(get_u32(&descriptor, 0x212c), 0);
+            assert_eq!(get_u32(&descriptor, 0x2130), 0);
+        }
+    }
+
+    #[test]
+    fn priority_zero_ta_force_stamp_is_independent_of_physical_qid() {
+        for (queue_id, ordinal, cold, expected) in [
+            (0, 0, true, 1),
+            (0, 1, false, 1),
+            (0, 2, false, 1),
+            (2, 0, true, 1),
+            (2, 1, false, 1),
+            (5, 0, true, 1),
+            (5, 1, false, 1),
+        ] {
+            let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
+            apply_g17p_retained_descriptor_fields(
+                RenderDescriptorKind::Tiling,
+                0x70_0001_8000,
+                0xffff_fc20_c082_8000,
+                queue_id,
+                queue_id + 1,
+                ordinal,
+                cold,
+                true,
+                &mut tiling,
+            )
+            .unwrap();
+            assert_eq!(get_u32(&tiling, 0x8c2), expected);
+            assert_eq!(get_u32(&tiling, 0x8be), 0);
+            assert_eq!(
+                get_u64(&tiling, 0x8c6),
+                ((ordinal + 1) as u64) << 40 | (ordinal + 1) as u64
+            );
+        }
+    }
+
+    #[test]
+    fn retained_descriptor_refresh_stages_native_external_rce_and_advances_item_two() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.lifecycle = 0x1122_3344_5566_7788;
+        parameters.fragment_lifecycle = 0x99aa_bbcc_ddee_ff00;
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
         let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
         let tiling_va = 0x70_0001_8000;

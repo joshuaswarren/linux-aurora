@@ -2985,7 +2985,12 @@ impl G17PUserRenderStorage {
                 &mut raw[G17P_RENDER_POOL_A
                     ..G17P_RENDER_POOL_A + g17_submission::G17P_COLD_OPENING_RECORD_POOL_A_SIZE],
             )
-            .map_err(|_| EINVAL)?;
+            .map_err(|_| render_build_fail(11))?;
+            g17_render::set_render_event_control_generation(
+                &mut raw[G17P_RENDER_POOL_A + pool_a_record_index * 0x100..],
+                command_buffer_state_words[0],
+            )
+            .map_err(|_| render_build_fail(11))?;
             g17_submission::apply_g17p_cold_opening_record_pool_b(
                 graph_addresses,
                 &mut raw[G17P_RENDER_POOL_B
@@ -3935,41 +3940,81 @@ impl G17PUserRenderStorage {
             apply_g17p_generic_descriptor_tail(tiling, fragment).ok_or(EINVAL)
         })?;
 
-        let source = next_descriptors.object.vmap()?;
-        let destination = self.descriptors.object.vmap()?;
-        let support = self.support.object.vmap()?;
-        let source = unsafe {
-            core::slice::from_raw_parts(source.as_ptr(), G17P_RENDER_DESCRIPTOR_STORAGE_SIZE)
-        };
-        let destination = unsafe {
-            core::slice::from_raw_parts_mut(
-                destination.as_mut_ptr(),
-                G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+        // Confine the staging map to this block. The `VMapRef` borrows
+        // `next_descriptors` mutably for as long as it lives, and the retained
+        // staging image is handed back to `self` after the copy.
+        {
+            let source = next_descriptors.object.vmap()?;
+            let destination = self.descriptors.object.vmap()?;
+            let support = self.support.object.vmap()?;
+            let source = unsafe {
+                core::slice::from_raw_parts(source.as_ptr(), G17P_RENDER_DESCRIPTOR_IMAGE_SIZE)
+            };
+            let destination = unsafe {
+                core::slice::from_raw_parts_mut(
+                    destination.as_mut_ptr(),
+                    G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+                )
+            };
+            let support = unsafe {
+                core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
+            };
+            let pool_a_kick = match G17PEventControlKick::prepare_reuse(
+                support,
+                support_va,
+                record_a_index,
+            ) {
+                Some(kick) => kick,
+                None => {
+                    // The record was reusable when it was selected above and the
+                    // manager lock is held throughout, so this can only mean
+                    // firmware relinked it underneath us. Report the exact fields.
+                    if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
+                        G17PEventControlKick::reuse_fields(support, support_va, record_a_index)
+                    {
+                        dev_err!(
+                            dev.as_ref(),
+                            "G17P render restage: selected pool-A record {} became unusable ordinal={} slot_va={:#x} expected={:#x} completed={} expected={} membership={:#x}\n",
+                            record_a_index,
+                            submission_ordinal,
+                            slot_va,
+                            want_slot_va,
+                            completed,
+                            want_completed,
+                            membership,
+                        );
+                    }
+                    return Err(EBUSY);
+                }
+            };
+            let ta_offset = g17p_render_ta_descriptor_offset(submission_ordinal);
+            let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
+            destination
+                .get_mut(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?
+                .copy_from_slice(&source[..g17_render::TA_DESCRIPTOR_SIZE]);
+            destination
+                .get_mut(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?
+                .copy_from_slice(
+                    &source[0x4000..0x4000 + g17_render::FRAGMENT_DESCRIPTOR_SIZE],
+                );
+            let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
+            g17_render::set_render_event_control_generation(
+                &mut support[record_a..],
+                command_buffer_state_words[0],
             )
-        };
-        let support = unsafe {
-            core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
-        };
-        destination.copy_from_slice(source);
-        let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
-        put_u32(
-            support,
-            record_a + 0x08,
-            submission_ordinal + submission_ordinal / 2,
-        );
-        put_u32(support, record_a + 0x10, 0x50);
-        put_u32(
-            support,
-            G17P_RENDER_POOL_A_SLOTS + 4 + record_a_index * 4,
-            1,
-        );
-        put_u32(
-            support,
-            G17P_RENDER_SHARED_CONTROL_INNER,
-            submission_ordinal * 2 + 1,
-        );
-        put_u32(support, G17P_RENDER_FLAG, submission_ordinal + 1);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            .map_err(|_| EINVAL)?;
+            put_u32(support, record_a + 0x10, 0x50);
+            pool_a_kick.apply(support);
+            put_u32(
+                support,
+                G17P_RENDER_SHARED_CONTROL_INNER,
+                submission_ordinal * 2 + 1,
+            );
+            put_u32(support, G17P_RENDER_FLAG, submission_ordinal + 1);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
 
         // The fixed status addresses are phase-stable while their backing is
         // replaced after an idle retained submission. Release the old aliases
