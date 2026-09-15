@@ -5,6 +5,7 @@
  * Pins itself after adoption: remove the trial by reboot, not forced unload.
  */
 #include <linux/console.h>
+#include <linux/delay.h>
 #include <crypto/sha2.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
@@ -16,6 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
+#include <linux/suspend.h>
 #include <linux/vmalloc.h>
 #include <linux/soc/apple/rtkit.h>
 
@@ -46,6 +48,7 @@ struct neo_dcp {
 	u32 sleeps, wakes;
 	struct regmap *pmgr;
 	bool stopped;
+	bool transport_paused;
 	u32 saved_control, saved_clocks[3];
 	unsigned int clocks_touched;
 	u64 requested_iova;
@@ -56,18 +59,35 @@ struct neo_dcp {
 	size_t log_size;
 	atomic_t log_flushes;
 	u32 firmware_idle_mode;
+	bool awake_trace;
 };
 static const unsigned int clock_offsets[] = { 0x10000, 0x318, 0x280 };
+
+/* Only the explicit awake diagnostic delays here. Its userspace /dev/kmsg
+ * collector stays runnable and fsyncs each marker before the next MMIO step.
+ */
+static void trace_step(struct neo_dcp *d, const char *step)
+{
+	if (!d->awake_trace)
+		return;
+	dev_info(d->dev, "DCP awake step: %s\n", step);
+	msleep(200);
+}
 
 static int set_clock(struct neo_dcp *d, unsigned int i, bool on)
 {
 	u32 value, target = on ? d->saved_clocks[i] & 15 : 4;
-	int ret = regmap_read(d->pmgr, clock_offsets[i], &value);
+	int ret;
+
+	trace_step(d, on ? "clock-on read" : "clock-off read");
+	ret = regmap_read(d->pmgr, clock_offsets[i], &value);
 
 	if (ret)
 		return ret;
 	value &= ~(15 | BIT(28) | BIT(11) | BIT(9) | BIT(8));
+	trace_step(d, on ? "clock-on write" : "clock-off write");
 	ret = regmap_write(d->pmgr, clock_offsets[i], value | target);
+	trace_step(d, on ? "clock-on poll" : "clock-off poll");
 	if (!ret)
 		ret = regmap_read_poll_timeout(d->pmgr, clock_offsets[i], value,
 			((value >> 4) & 15) == target && !(value & BIT(11)), 10, 10000);
@@ -278,6 +298,7 @@ static int wake_dcp(struct neo_dcp *d)
 		d->clocks_touched--;
 	}
 	if (d->stopped) {
+		trace_step(d, "restore RUN");
 		writel(d->saved_control, d->control + 0x44);
 		if (readl(d->control + 0x44) != d->saved_control) {
 			atomic_set(&d->failed, 1);
@@ -285,6 +306,16 @@ static int wake_dcp(struct neo_dcp *d)
 		}
 		d->stopped = false;
 	}
+	if (d->transport_paused) {
+		trace_step(d, "resume mailbox");
+		ret = apple_rtkit_resume_idle_transport(d->rtk);
+		if (ret) {
+			atomic_set(&d->failed, 1);
+			return ret;
+		}
+		d->transport_paused = false;
+	}
+	trace_step(d, "AP wake");
 	ret = apple_rtkit_unidle(d->rtk);
 
 	dev_info(d->dev, "DCP retained wake result=%d control=%#x status=%#x\n", ret,
@@ -417,9 +448,12 @@ static DEVICE_ATTR_RO(status);
 static DEVICE_ATTR_WO(wake);
 static DEVICE_ATTR_WO(start_oslog);
 static DEVICE_ATTR_WO(returning_idle);
+static ssize_t awake_cycle_store(struct device *dev, struct device_attribute *a,
+				const char *buf, size_t count);
+static DEVICE_ATTR_WO(awake_cycle);
 static struct attribute *neo_dcp_attrs[] = {
 	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr,
-	&dev_attr_returning_idle.attr, NULL
+	&dev_attr_returning_idle.attr, &dev_attr_awake_cycle.attr, NULL
 };
 static const struct bin_attribute *const neo_dcp_bin_attrs[] = {
 	&bin_attr_oslog_snapshot, NULL
@@ -460,17 +494,27 @@ static int dcp_suspend(struct device *dev)
 	if (!(d->saved_control & BIT(4)))
 		return -EBUSY;
 	d->touched = true;
+	trace_step(d, "firmware idle request");
 	ret = ap ? apple_rtkit_idle_ap(d->rtk) : apple_rtkit_idle(d->rtk);
 	dev_info(dev, "DCP retained idle ap_only=%u result=%d control=%#x status=%#x\n", ap, ret,
 		 readl(d->control + 0x44), readl(d->control + 0x48));
 	if (!ret && atomic_read(&d->failed))
 		ret = -EIO;
 	if (!ret && stop) {
+		d->transport_paused = true;
+		trace_step(d, "pause mailbox");
+		ret = apple_rtkit_pause_idle_transport(d->rtk);
+		dev_info(dev, "DCP retained transport pause after idle-gated: %d\n", ret);
+		if (!ret && atomic_read(&d->failed))
+			ret = -EIO;
+	}
+	if (!ret && stop) {
 		ret = readl_poll_timeout(d->control + 0x48, value, value & 3, 10, 10000);
 		dev_info(dev, "DCP firmware idle before ASC stop: status=%#x result=%d\n", value, ret);
 	}
 	if (!ret && stop) {
 		d->stopped = true;
+		trace_step(d, "stop RUN");
 		writel(d->saved_control & ~BIT(4), d->control + 0x44);
 		value = readl(d->control + 0x44);
 		writel(value & ~BIT(5), d->control + 0x44);
@@ -493,6 +537,78 @@ static int dcp_resume(struct device *dev)
 
 	guard(mutex)(&d->lock);
 	return d->touched ? wake_dcp(d) : 0;
+}
+
+/* Diagnostic only: keep the host awake so a userspace log collector can
+ * persist the gate boundary. It is not a suspend/power measurement. The
+ * built-in VT and retained early dockchannel consoles have static lifetime;
+ * do not generalize this pointer handling to removable consoles.
+ * The caller must stop display clients and run the qualified panel-off helper.
+ */
+static ssize_t awake_cycle_store(struct device *dev, struct device_attribute *a,
+				const char *buf, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	struct console *con, *consoles[2] = {};
+	unsigned int flags;
+	int cookie, i, slot, ret = -EBUSY;
+
+	if (!IS_BUILTIN(CONFIG_VT) || !sysfs_streq(buf, "1"))
+		return -EINVAL;
+	flags = lock_system_sleep();
+	mutex_lock(&d->lock);
+	if (READ_ONCE(sleep_enabled) || !READ_ONCE(stop_cpu) ||
+	    READ_ONCE(ap_only) || READ_ONCE(clock_depth) != 1 ||
+	    atomic_read(&d->failed) || d->touched || d->sleeps ||
+	    d->wakes != 1 || d->firmware_idle_mode != 2 || d->awake_trace)
+		goto unlock;
+	cookie = console_srcu_read_lock();
+	for_each_console_srcu(con) {
+		short state = console_srcu_read_flags(con);
+
+		if (!(state & CON_ENABLED))
+			continue;
+		slot = -1;
+		if (!strcmp(con->name, "tty") && con->index == 0 &&
+		    !(state & CON_BOOT))
+			slot = 0;
+		else if (!strcmp(con->name, "dockchannel") && con->index == 0 &&
+			 (state & CON_BOOT))
+			slot = 1;
+		if (slot < 0 || (state & CON_SUSPENDED) || consoles[slot]) {
+			consoles[0] = NULL;
+			break;
+		}
+		consoles[slot] = con;
+	}
+	console_srcu_read_unlock(cookie);
+	if (!consoles[0])
+		goto unlock;
+	d->awake_trace = true;
+	mutex_unlock(&d->lock);
+	for (i = 0; i < ARRAY_SIZE(consoles); i++)
+		if (consoles[i])
+			console_suspend(consoles[i]);
+	WRITE_ONCE(sleep_enabled, true);
+	ret = dcp_suspend(dev);
+	WRITE_ONCE(sleep_enabled, false);
+	if (!ret) {
+		trace_step(d, "clock gated; one-second awake hold");
+		msleep(1000);
+		ret = dcp_resume(dev);
+	}
+	trace_step(d, "cycle returned");
+	mutex_lock(&d->lock);
+	d->awake_trace = false;
+	/* Do not start framebuffer console activity after a failed gate restore. */
+	if (!d->clocks_touched)
+		for (i = 0; i < ARRAY_SIZE(consoles); i++)
+			if (consoles[i])
+				console_resume(consoles[i]);
+unlock:
+	mutex_unlock(&d->lock);
+	unlock_system_sleep(flags);
+	return ret ? ret : count;
 }
 static const struct dev_pm_ops pm = {
 	.suspend_late = dcp_suspend,

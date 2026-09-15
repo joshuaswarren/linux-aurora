@@ -386,3 +386,56 @@ to aligned 32-bit reads with unbuffered output; no repeat is scheduled. One
 DebugUSB reset returned Neo to normal #6, followed by a one-shot #35 reboot.
 The next bounded trial adds ASC RUN stop/start to returning-mode idle, leaving
 all display clocks active.
+
+
+Returning mode with ASC RUN stop/start also failed AP wake
+(`dcp-returning-stop/`). The native expert's `require-force-wakeup` property
+selects PA 0x308008000, values off=0/on=0x10. One aligned 32-bit read found
+it already asserted. An explicitly guarded 0 -> 0x10 pulse after the failed
+mode-2 sleep left CPU_STATUS 0x4e; it did not recover the epoch
+(`dcp-force-wake/pulse.log`). This is not proof that force-wake sequencing is
+irrelevant during a complete power transition.
+
+An aligned 32-bit read of ASC +0x40/+0x44/+0x48 passed while awake:
+0x000a0401/0x10/0x6d. The subsequent mode-2, stop-CPU, clock-depth-1 trial lost
+connectivity. Its platform result was still running, so no successful clock
+transition, wake or wattage is claimed. One DebugUSB reset returned to #6.
+
+The follow-up addresses transport ordering before a CPU-domain gate. Native
+RTBuddy waits for management type 0x0c (idle gated), then disables mailbox
+interrupts before provider power changes. The previous Linux diagnostic kept
+its mailbox RX IRQ and workers active during clock removal: an IRQ could
+access a gated register window. This is an identified admission gap, not yet
+a proven cause of the hang. New retained-transport APIs wait for a fresh 0x0c,
+drain work, stop/synchronize RX, and drain the final work while clocks are
+still active. They preserve endpoints, mappings and the firmware epoch.
+The DCP trial restores clocks and RUN before restarting the transport and
+requesting AP wake. This ordering still needs hardware qualification.
+
+## Retained transport qualification (#37)
+
+Kernel source `1a0ca0ee2`, Image SHA256
+`16ab05ddea2ed974dad97006eba510ff27c70b0e87e1ff65d1da26c6aebde8da`.
+The mode-2/stop-CPU/no-clock trial acknowledged idle-gated and paused its
+transport successfully, but AP wake still timed out with CPU_STATUS 0x4e.
+`dcp-transport-gate/platform/` records failure, not sleep power. A fresh boot's
+clock-depth-1 trial again lost host connectivity (`dcp-transport-clock/`).
+A single Fedora Left-back reset returned Neo to normal #6. Stopping RX closes
+an ordering gap but has not fixed or localized the clock-trial hang.
+
+An explicit `awake_cycle=1` diagnostic now exercises the same DCP path while
+leaving host storage and networking available to persist stage markers. It
+admits only a fresh healthy mode-2 epoch, stop-CPU with clock depth 1, and a
+built-in tty0 and optional retained dockchannel boot consoles. It serializes
+against system sleep, suspends those static consoles, and restores them only
+after all touched clocks
+have been restored. Display clients must be stopped and the qualified panel
+helper must hold LCD-enable low. Markers around clock read/write/poll are
+separated by 200 ms only in this diagnostic. The userspace collector must
+poll /dev/kmsg and fsync records; this awake test is not a wattage experiment.
+Hardware qualification of this diagnostic is pending.
+
+The first awake diagnostic rejected the additional dockchannel console before
+any PM operation (EBUSY, sleeps=0, failed=0). Its console admission now handles
+that retained static boot console as well as tty0; all other active consoles
+remain rejected. Capture: `dcp-awake-trace/`.
