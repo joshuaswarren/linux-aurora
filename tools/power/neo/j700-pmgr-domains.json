@@ -4,72 +4,80 @@
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 131072,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 1
+  "adt_index": 1,
+  "device_id": 1
  },
  {
   "name": "ECPU_1",
   "base": "0x300700000",
   "offset": 8,
   "parents": [],
-  "flags": 131072,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 2
+  "adt_index": 2,
+  "device_id": 2
  },
  {
   "name": "ECPU_2",
   "base": "0x300700000",
   "offset": 16,
   "parents": [],
-  "flags": 131072,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 3
+  "adt_index": 3,
+  "device_id": 3
  },
  {
   "name": "ECPU_3",
   "base": "0x300700000",
   "offset": 24,
   "parents": [],
-  "flags": 131072,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 4
+  "adt_index": 4,
+  "device_id": 4
  },
  {
   "name": "PCPU_0",
   "base": "0x300700000",
   "offset": 48,
   "parents": [],
-  "flags": 327680,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 5
+  "adt_index": 5,
+  "device_id": 5
  },
  {
   "name": "PCPU_1",
   "base": "0x300700000",
   "offset": 56,
   "parents": [],
-  "flags": 327680,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 6
+  "adt_index": 6,
+  "device_id": 6
  },
  {
   "name": "ECPM",
   "base": "0x300700000",
   "offset": 80,
   "parents": [],
-  "flags": 50462720,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 7
+  "adt_index": 7,
+  "device_id": 7
  },
  {
   "name": "PCPM",
   "base": "0x300700000",
   "offset": 88,
   "parents": [],
-  "flags": 67436544,
+  "flags": 0,
   "virtual": false,
-  "adt_index": 8
+  "adt_index": 8,
+  "device_id": 8
  },
  {
   "name": "SEP_AON",
@@ -78,7 +86,8 @@
   "parents": [],
   "flags": 0,
   "virtual": false,
-  "adt_index": 9
+  "adt_index": 9,
+  "device_id": 9
  },
  {
   "name": "SBR",
@@ -86,8 +95,9 @@
   "offset": 256,
   "parents": [],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 10
+  "virtual": true,
+  "adt_index": 10,
+  "device_id": 10
  },
  {
   "name": "MSG",
@@ -96,7 +106,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 11
+  "adt_index": 11,
+  "device_id": 11
  },
  {
   "name": "AIC",
@@ -105,7 +116,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 12
+  "adt_index": 12,
+  "device_id": 12
  },
  {
   "name": "DWI",
@@ -114,7 +126,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 13
+  "adt_index": 13,
+  "device_id": 13
  },
  {
   "name": "GPIO",
@@ -123,7 +136,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 14
+  "adt_index": 14,
+  "device_id": 14
  },
  {
   "name": "PMS_BUSIF",
@@ -131,8 +145,9 @@
   "offset": 296,
   "parents": [],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 15
+  "virtual": true,
+  "adt_index": 15,
+  "device_id": 15
  },
  {
   "name": "PMS",
@@ -140,8 +155,9 @@
   "offset": 304,
   "parents": [],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 16
+  "virtual": true,
+  "adt_index": 16,
+  "device_id": 16
  },
  {
   "name": "PMC",
@@ -150,7 +166,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 17
+  "adt_index": 17,
+  "device_id": 17
  },
  {
   "name": "PMS_FPWM0",
@@ -159,7 +176,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 18
+  "adt_index": 18,
+  "device_id": 18
  },
  {
   "name": "PMS_FPWM1",
@@ -168,7 +186,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 19
+  "adt_index": 19,
+  "device_id": 19
  },
  {
   "name": "PMS_FPWM2",
@@ -177,7 +196,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 20
+  "adt_index": 20,
+  "device_id": 20
  },
  {
   "name": "PMS_FPWM3",
@@ -186,7 +206,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 21
+  "adt_index": 21,
+  "device_id": 21
  },
  {
   "name": "PMS_FPWM4",
@@ -195,7 +216,8 @@
   "parents": [],
   "flags": 1,
   "virtual": false,
-  "adt_index": 22
+  "adt_index": 22,
+  "device_id": 22
  },
  {
   "name": "PMS_C1PPT",
@@ -204,7 +226,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 23
+  "adt_index": 23,
+  "device_id": 23
  },
  {
   "name": "SOC_RC",
@@ -213,7 +236,8 @@
   "parents": [],
   "flags": 0,
   "virtual": false,
-  "adt_index": 24
+  "adt_index": 24,
+  "device_id": 24
  },
  {
   "name": "SOC_DPE",
@@ -222,7 +246,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 25
+  "adt_index": 25,
+  "device_id": 25
  },
  {
   "name": "PMGR_SOC_OCLA",
@@ -231,7 +256,8 @@
   "parents": [],
   "flags": 0,
   "virtual": false,
-  "adt_index": 26
+  "adt_index": 26,
+  "device_id": 26
  },
  {
   "name": "ISPSENS0",
@@ -240,7 +266,8 @@
   "parents": [],
   "flags": 0,
   "virtual": false,
-  "adt_index": 27
+  "adt_index": 27,
+  "device_id": 27
  },
  {
   "name": "ISPSENS1",
@@ -249,7 +276,8 @@
   "parents": [],
   "flags": 0,
   "virtual": false,
-  "adt_index": 28
+  "adt_index": 28,
+  "device_id": 28
  },
  {
   "name": "AFIMCCNI0",
@@ -257,8 +285,9 @@
   "offset": 408,
   "parents": [],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 29
+  "virtual": true,
+  "adt_index": 29,
+  "device_id": 29
  },
  {
   "name": "AP_TMM",
@@ -267,7 +296,8 @@
   "parents": [],
   "flags": 0,
   "virtual": false,
-  "adt_index": 30
+  "adt_index": 30,
+  "device_id": 30
  },
  {
   "name": "PIOGW",
@@ -275,8 +305,9 @@
   "offset": 424,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 31
+  "virtual": true,
+  "adt_index": 31,
+  "device_id": 31
  },
  {
   "name": "AFIAFT",
@@ -284,8 +315,9 @@
   "offset": 432,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 32
+  "virtual": true,
+  "adt_index": 32,
+  "device_id": 32
  },
  {
   "name": "AFGGFXNI0",
@@ -294,7 +326,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 33
+  "adt_index": 33,
+  "device_id": 33
  },
  {
   "name": "AFCMCCNI0",
@@ -302,8 +335,9 @@
   "offset": 448,
   "parents": [],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 34
+  "virtual": true,
+  "adt_index": 34,
+  "device_id": 34
  },
  {
   "name": "AMCC0_P0",
@@ -314,8 +348,9 @@
    "PIOGW"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 35
+  "virtual": true,
+  "adt_index": 35,
+  "device_id": 35
  },
  {
   "name": "AMCC0_P1",
@@ -326,8 +361,9 @@
    "PIOGW"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 36
+  "virtual": true,
+  "adt_index": 36,
+  "device_id": 36
  },
  {
   "name": "AMCC0_P2",
@@ -338,8 +374,9 @@
    "PIOGW"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 37
+  "virtual": true,
+  "adt_index": 37,
+  "device_id": 37
  },
  {
   "name": "AMCC0_P3",
@@ -350,8 +387,9 @@
    "PIOGW"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 38
+  "virtual": true,
+  "adt_index": 38,
+  "device_id": 38
  },
  {
   "name": "AFINS0",
@@ -362,8 +400,9 @@
    "PIOGW"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 39
+  "virtual": true,
+  "adt_index": 39,
+  "device_id": 39
  },
  {
   "name": "GFX",
@@ -373,9 +412,10 @@
    "AFIMCCNI0",
    "PIOGW"
   ],
-  "flags": 83886210,
+  "flags": 130,
   "virtual": false,
-  "adt_index": 40
+  "adt_index": 40,
+  "device_id": 40
  },
  {
   "name": "DCS0",
@@ -385,8 +425,9 @@
    "AMCC0_P0"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 41
+  "virtual": true,
+  "adt_index": 41,
+  "device_id": 41
  },
  {
   "name": "DCS1",
@@ -396,8 +437,9 @@
    "AMCC0_P1"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 42
+  "virtual": true,
+  "adt_index": 42,
+  "device_id": 42
  },
  {
   "name": "DCS2",
@@ -407,8 +449,9 @@
    "AMCC0_P2"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 43
+  "virtual": true,
+  "adt_index": 43,
+  "device_id": 43
  },
  {
   "name": "DCS3",
@@ -418,8 +461,9 @@
    "AMCC0_P3"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 44
+  "virtual": true,
+  "adt_index": 44,
+  "device_id": 44
  },
  {
   "name": "AFISOCNI0",
@@ -430,8 +474,9 @@
    "PIOGW"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 45
+  "virtual": true,
+  "adt_index": 45,
+  "device_id": 45
  },
  {
   "name": "AFISOCNI1",
@@ -442,8 +487,9 @@
    "PIOGW"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 46
+  "virtual": true,
+  "adt_index": 46,
+  "device_id": 46
  },
  {
   "name": "AFISOCNI2",
@@ -454,8 +500,9 @@
    "PIOGW"
   ],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 47
+  "virtual": true,
+  "adt_index": 47,
+  "device_id": 47
  },
  {
   "name": "JPG",
@@ -464,9 +511,10 @@
   "parents": [
    "AFISOCNI0"
   ],
-  "flags": 234881026,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 48
+  "adt_index": 48,
+  "device_id": 48
  },
  {
   "name": "MSR",
@@ -475,31 +523,36 @@
   "parents": [
    "AFISOCNI0"
   ],
-  "flags": 218103810,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 49
+  "adt_index": 49,
+  "device_id": 49
  },
  {
   "name": "VENC0_SYS",
   "base": "0x300700000",
   "offset": 576,
   "parents": [
-   "AFISOCNI0"
+   "AFISOCNI0",
+   "VENC-CLSTR-V"
   ],
-  "flags": 167772178,
-  "virtual": false,
-  "adt_index": 50
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 50,
+  "device_id": 50
  },
  {
   "name": "VENC1_SYS",
   "base": "0x300700000",
   "offset": 584,
   "parents": [
-   "AFISOCNI0"
+   "AFISOCNI0",
+   "VENC-CLSTR-V"
   ],
-  "flags": 184549378,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 51
+  "adt_index": 51,
+  "device_id": 51
  },
  {
   "name": "PRORES",
@@ -508,9 +561,10 @@
   "parents": [
    "AFISOCNI0"
   ],
-  "flags": 251658242,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 52
+  "adt_index": 52,
+  "device_id": 52
  },
  {
   "name": "APCIE_GP",
@@ -521,7 +575,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 53
+  "adt_index": 53,
+  "device_id": 53
  },
  {
   "name": "SIO",
@@ -531,8 +586,9 @@
    "AFISOCNI1"
   ],
   "flags": 17,
-  "virtual": false,
-  "adt_index": 54
+  "virtual": true,
+  "adt_index": 54,
+  "device_id": 54
  },
  {
   "name": "ISP_SYS",
@@ -541,9 +597,10 @@
   "parents": [
    "AFISOCNI1"
   ],
-  "flags": 117440514,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 55
+  "adt_index": 55,
+  "device_id": 55
  },
  {
   "name": "AVD_SYS",
@@ -552,9 +609,10 @@
   "parents": [
    "AFISOCNI1"
   ],
-  "flags": 201326594,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 56
+  "adt_index": 56,
+  "device_id": 56
  },
  {
   "name": "ANS",
@@ -565,7 +623,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 57
+  "adt_index": 57,
+  "device_id": 57
  },
  {
   "name": "DISP_SYS",
@@ -574,9 +633,10 @@
   "parents": [
    "AFISOCNI2"
   ],
-  "flags": 134217730,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 58
+  "adt_index": 58,
+  "device_id": 58
  },
  {
   "name": "DISPEXT0_SYS",
@@ -585,9 +645,10 @@
   "parents": [
    "AFISOCNI2"
   ],
-  "flags": 150994946,
+  "flags": 2,
   "virtual": false,
-  "adt_index": 59
+  "adt_index": 59,
+  "device_id": 59
  },
  {
   "name": "ANE_SYS",
@@ -598,7 +659,8 @@
   ],
   "flags": 128,
   "virtual": false,
-  "adt_index": 60
+  "adt_index": 60,
+  "device_id": 60
  },
  {
   "name": "MSR_ASE_CORE",
@@ -609,7 +671,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 61
+  "adt_index": 61,
+  "device_id": 61
  },
  {
   "name": "APCIE_SYS_GP",
@@ -620,7 +683,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 62
+  "adt_index": 62,
+  "device_id": 62
  },
  {
   "name": "SIO_CPU",
@@ -631,7 +695,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 63
+  "adt_index": 63,
+  "device_id": 63
  },
  {
   "name": "FPWM0",
@@ -642,7 +707,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 64
+  "adt_index": 64,
+  "device_id": 64
  },
  {
   "name": "FPWM1",
@@ -653,7 +719,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 65
+  "adt_index": 65,
+  "device_id": 65
  },
  {
   "name": "FPWM2",
@@ -664,7 +731,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 66
+  "adt_index": 66,
+  "device_id": 66
  },
  {
   "name": "I2C0",
@@ -675,7 +743,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 67
+  "adt_index": 67,
+  "device_id": 67
  },
  {
   "name": "I2C1",
@@ -686,7 +755,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 68
+  "adt_index": 68,
+  "device_id": 68
  },
  {
   "name": "I2C2",
@@ -697,7 +767,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 69
+  "adt_index": 69,
+  "device_id": 69
  },
  {
   "name": "I2C3",
@@ -708,7 +779,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 70
+  "adt_index": 70,
+  "device_id": 70
  },
  {
   "name": "I2C4",
@@ -719,7 +791,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 71
+  "adt_index": 71,
+  "device_id": 71
  },
  {
   "name": "SPI_P",
@@ -730,7 +803,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 72
+  "adt_index": 72,
+  "device_id": 72
  },
  {
   "name": "UART_P",
@@ -741,7 +815,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 73
+  "adt_index": 73,
+  "device_id": 73
  },
  {
   "name": "DPA_P",
@@ -752,7 +827,8 @@
   ],
   "flags": 9,
   "virtual": false,
-  "adt_index": 74
+  "adt_index": 74,
+  "device_id": 74
  },
  {
   "name": "AES",
@@ -763,7 +839,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 75
+  "adt_index": 75,
+  "device_id": 75
  },
  {
   "name": "APCIE_ST",
@@ -774,7 +851,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 76
+  "adt_index": 76,
+  "device_id": 76
  },
  {
   "name": "DISP_FE",
@@ -785,7 +863,8 @@
   ],
   "flags": 4,
   "virtual": false,
-  "adt_index": 77
+  "adt_index": 77,
+  "device_id": 77
  },
  {
   "name": "DISPEXT0_FE",
@@ -796,7 +875,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 78
+  "adt_index": 78,
+  "device_id": 78
  },
  {
   "name": "DISPEXT0_CPU",
@@ -807,7 +887,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 79
+  "adt_index": 79,
+  "device_id": 79
  },
  {
   "name": "SPI0",
@@ -818,7 +899,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 80
+  "adt_index": 80,
+  "device_id": 80
  },
  {
   "name": "SPI1",
@@ -829,7 +911,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 81
+  "adt_index": 81,
+  "device_id": 81
  },
  {
   "name": "SPI2",
@@ -840,7 +923,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 82
+  "adt_index": 82,
+  "device_id": 82
  },
  {
   "name": "SPI3",
@@ -851,7 +935,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 83
+  "adt_index": 83,
+  "device_id": 83
  },
  {
   "name": "QSPI",
@@ -862,7 +947,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 84
+  "adt_index": 84,
+  "device_id": 84
  },
  {
   "name": "UART_N",
@@ -873,7 +959,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 85
+  "adt_index": 85,
+  "device_id": 85
  },
  {
   "name": "UART0",
@@ -884,7 +971,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 86
+  "adt_index": 86,
+  "device_id": 86
  },
  {
   "name": "UART1",
@@ -895,7 +983,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 87
+  "adt_index": 87,
+  "device_id": 87
  },
  {
   "name": "UART2",
@@ -906,7 +995,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 88
+  "adt_index": 88,
+  "device_id": 88
  },
  {
   "name": "UART3",
@@ -917,7 +1007,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 89
+  "adt_index": 89,
+  "device_id": 89
  },
  {
   "name": "UART4",
@@ -928,7 +1019,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 90
+  "adt_index": 90,
+  "device_id": 90
  },
  {
   "name": "UART5",
@@ -939,7 +1031,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 91
+  "adt_index": 91,
+  "device_id": 91
  },
  {
   "name": "DPA0",
@@ -950,7 +1043,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 92
+  "adt_index": 92,
+  "device_id": 92
  },
  {
   "name": "DPA1",
@@ -961,7 +1055,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 93
+  "adt_index": 93,
+  "device_id": 93
  },
  {
   "name": "APCIE_SYS_ST",
@@ -973,7 +1068,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 94
+  "adt_index": 94,
+  "device_id": 94
  },
  {
   "name": "DISPEXT0_DBE",
@@ -983,8 +1079,9 @@
    "DISPEXT0_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 95
+  "virtual": true,
+  "adt_index": 95,
+  "device_id": 95
  },
  {
   "name": "DPEXT0",
@@ -994,8 +1091,9 @@
    "DISPEXT0_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 96
+  "virtual": true,
+  "adt_index": 96,
+  "device_id": 96
  },
  {
   "name": "DISPEXT0_GPPP",
@@ -1005,8 +1103,9 @@
    "DISPEXT0_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 97
+  "virtual": true,
+  "adt_index": 97,
+  "device_id": 97
  },
  {
   "name": "APCIE_PHY_SW",
@@ -1018,7 +1117,8 @@
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 98
+  "adt_index": 98,
+  "device_id": 98
  },
  {
   "name": "DPTX_PHY",
@@ -1026,8 +1126,9 @@
   "offset": 968,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 99
+  "virtual": true,
+  "adt_index": 99,
+  "device_id": 99
  },
  {
   "name": "PMP",
@@ -1036,7 +1137,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 100
+  "adt_index": 100,
+  "device_id": 100
  },
  {
   "name": "PMS_SRAM",
@@ -1045,7 +1147,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 101
+  "adt_index": 101,
+  "device_id": 101
  },
  {
   "name": "ATC0_USB_AON",
@@ -1054,7 +1157,8 @@
   "parents": [],
   "flags": 0,
   "virtual": false,
-  "adt_index": 102
+  "adt_index": 102,
+  "device_id": 102
  },
  {
   "name": "ATC0_COMMON",
@@ -1066,7 +1170,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 103
+  "adt_index": 103,
+  "device_id": 103
  },
  {
   "name": "ATC0_USB",
@@ -1077,7 +1182,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 104
+  "adt_index": 104,
+  "device_id": 104
  },
  {
   "name": "SEP",
@@ -1088,7 +1194,8 @@
   ],
   "flags": 9,
   "virtual": false,
-  "adt_index": 105
+  "adt_index": 105,
+  "device_id": 105
  },
  {
   "name": "ISP_CPU",
@@ -1098,8 +1205,9 @@
    "ISP_SYS"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 106
+  "virtual": true,
+  "adt_index": 106,
+  "device_id": 106
  },
  {
   "name": "ISP_CPU_CORE0",
@@ -1109,8 +1217,9 @@
    "ISP_CPU"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 107
+  "virtual": true,
+  "adt_index": 107,
+  "device_id": 107
  },
  {
   "name": "ISP_CPU_CORE1",
@@ -1120,8 +1229,9 @@
    "ISP_CPU"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 108
+  "virtual": true,
+  "adt_index": 108,
+  "device_id": 108
  },
  {
   "name": "ISP_FE",
@@ -1131,8 +1241,9 @@
    "ISP_SYS"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 109
+  "virtual": true,
+  "adt_index": 109,
+  "device_id": 109
  },
  {
   "name": "DPRX",
@@ -1142,8 +1253,9 @@
    "ISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 110
+  "virtual": true,
+  "adt_index": 110,
+  "device_id": 110
  },
  {
   "name": "ISP_SECURE",
@@ -1153,8 +1265,9 @@
    "ISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 111
+  "virtual": true,
+  "adt_index": 111,
+  "device_id": 111
  },
  {
   "name": "ISP_STS0",
@@ -1164,8 +1277,9 @@
    "ISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 112
+  "virtual": true,
+  "adt_index": 112,
+  "device_id": 112
  },
  {
   "name": "ISP_STS1",
@@ -1175,8 +1289,9 @@
    "ISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 113
+  "virtual": true,
+  "adt_index": 113,
+  "device_id": 113
  },
  {
   "name": "ISP_PEARL",
@@ -1186,8 +1301,9 @@
    "ISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 114
+  "virtual": true,
+  "adt_index": 114,
+  "device_id": 114
  },
  {
   "name": "ISP_BE",
@@ -1197,8 +1313,9 @@
    "ISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 115
+  "virtual": true,
+  "adt_index": 115,
+  "device_id": 115
  },
  {
   "name": "ISP_CLR",
@@ -1208,8 +1325,9 @@
    "ISP_BE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 116
+  "virtual": true,
+  "adt_index": 116,
+  "device_id": 116
  },
  {
   "name": "ISP_CVD",
@@ -1219,8 +1337,9 @@
    "ISP_BE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 117
+  "virtual": true,
+  "adt_index": 117,
+  "device_id": 117
  },
  {
   "name": "ISP_CVM",
@@ -1230,8 +1349,9 @@
    "ISP_CVD"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 118
+  "virtual": true,
+  "adt_index": 118,
+  "device_id": 118
  },
  {
   "name": "VENC0_DMA",
@@ -1241,8 +1361,9 @@
    "VENC0_SYS"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 119
+  "virtual": true,
+  "adt_index": 119,
+  "device_id": 119
  },
  {
   "name": "VENC0_PIPE4",
@@ -1252,8 +1373,9 @@
    "VENC0_DMA"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 120
+  "virtual": true,
+  "adt_index": 120,
+  "device_id": 120
  },
  {
   "name": "VENC0_PIPE5",
@@ -1263,8 +1385,9 @@
    "VENC0_DMA"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 121
+  "virtual": true,
+  "adt_index": 121,
+  "device_id": 121
  },
  {
   "name": "VENC0_ME0",
@@ -1274,8 +1397,9 @@
    "VENC0_DMA"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 122
+  "virtual": true,
+  "adt_index": 122,
+  "device_id": 122
  },
  {
   "name": "VENC0_ME1",
@@ -1285,8 +1409,9 @@
    "VENC0_ME0"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 123
+  "virtual": true,
+  "adt_index": 123,
+  "device_id": 123
  },
  {
   "name": "VENC1_DMA",
@@ -1297,7 +1422,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 124
+  "adt_index": 124,
+  "device_id": 124
  },
  {
   "name": "VENC1_PIPE4",
@@ -1308,7 +1434,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 125
+  "adt_index": 125,
+  "device_id": 125
  },
  {
   "name": "VENC1_PIPE5",
@@ -1319,7 +1446,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 126
+  "adt_index": 126,
+  "device_id": 126
  },
  {
   "name": "VENC1_ME0",
@@ -1330,7 +1458,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 127
+  "adt_index": 127,
+  "device_id": 127
  },
  {
   "name": "VENC1_ME1",
@@ -1341,7 +1470,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 128
+  "adt_index": 128,
+  "device_id": 128
  },
  {
   "name": "ANE_CPU",
@@ -1351,8 +1481,9 @@
    "ANE_SYS"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 129
+  "virtual": true,
+  "adt_index": 129,
+  "device_id": 129
  },
  {
   "name": "DISP_CPU",
@@ -1363,7 +1494,8 @@
   ],
   "flags": 0,
   "virtual": false,
-  "adt_index": 130
+  "adt_index": 130,
+  "device_id": 132
  },
  {
   "name": "DISP_GP0",
@@ -1373,8 +1505,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 131
+  "virtual": true,
+  "adt_index": 131,
+  "device_id": 133
  },
  {
   "name": "DISP_GP1",
@@ -1384,8 +1517,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 132
+  "virtual": true,
+  "adt_index": 132,
+  "device_id": 134
  },
  {
   "name": "DISP_CMB",
@@ -1395,8 +1529,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 133
+  "virtual": true,
+  "adt_index": 133,
+  "device_id": 135
  },
  {
   "name": "DISP_PPP",
@@ -1406,8 +1541,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 134
+  "virtual": true,
+  "adt_index": 134,
+  "device_id": 136
  },
  {
   "name": "DISP_HILO",
@@ -1417,8 +1553,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 135
+  "virtual": true,
+  "adt_index": 135,
+  "device_id": 137
  },
  {
   "name": "DISP_DBE",
@@ -1428,8 +1565,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 136
+  "virtual": true,
+  "adt_index": 136,
+  "device_id": 138
  },
  {
   "name": "DP",
@@ -1439,8 +1577,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 137
+  "virtual": true,
+  "adt_index": 137,
+  "device_id": 139
  },
  {
   "name": "MIPI_DSI",
@@ -1450,8 +1589,9 @@
    "DISP_FE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 138
+  "virtual": true,
+  "adt_index": 138,
+  "device_id": 140
  },
  {
   "name": "DEBUG_GATED",
@@ -1460,7 +1600,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 139
+  "adt_index": 139,
+  "device_id": 141
  },
  {
   "name": "NUB_SPMI0",
@@ -1469,7 +1610,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 140
+  "adt_index": 140,
+  "device_id": 142
  },
  {
   "name": "NUB_SPMI1",
@@ -1478,7 +1620,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 141
+  "adt_index": 141,
+  "device_id": 143
  },
  {
   "name": "NUB_SPMI_A0",
@@ -1487,7 +1630,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 142
+  "adt_index": 142,
+  "device_id": 144
  },
  {
   "name": "NUB_AON",
@@ -1495,8 +1639,9 @@
   "offset": 112,
   "parents": [],
   "flags": 25,
-  "virtual": false,
-  "adt_index": 143
+  "virtual": true,
+  "adt_index": 143,
+  "device_id": 145
  },
  {
   "name": "NUB_AON_NOGATE",
@@ -1505,7 +1650,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 144
+  "adt_index": 144,
+  "device_id": 146
  },
  {
   "name": "NUB_OCLA",
@@ -1514,7 +1660,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 145
+  "adt_index": 145,
+  "device_id": 147
  },
  {
   "name": "NUB_GPIO",
@@ -1523,7 +1670,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 146
+  "adt_index": 146,
+  "device_id": 148
  },
  {
   "name": "DSG",
@@ -1531,8 +1679,9 @@
   "offset": 144,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 147
+  "virtual": true,
+  "adt_index": 147,
+  "device_id": 149
  },
  {
   "name": "HPD",
@@ -1540,8 +1689,9 @@
   "offset": 152,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 148
+  "virtual": true,
+  "adt_index": 148,
+  "device_id": 150
  },
  {
   "name": "NUB_FABRIC",
@@ -1550,7 +1700,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 149
+  "adt_index": 149,
+  "device_id": 151
  },
  {
   "name": "NUB_SRAM",
@@ -1559,7 +1710,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 150
+  "adt_index": 150,
+  "device_id": 152
  },
  {
   "name": "DEBUG_SWITCH",
@@ -1568,7 +1720,8 @@
   "parents": [],
   "flags": 9,
   "virtual": false,
-  "adt_index": 151
+  "adt_index": 151,
+  "device_id": 153
  },
  {
   "name": "AOP_FILTER",
@@ -1576,520 +1729,567 @@
   "offset": 16384,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 152
+  "virtual": true,
+  "adt_index": 152,
+  "device_id": 154
  },
  {
   "name": "AOP_GPIO",
   "base": "0x308280000",
   "offset": 16392,
   "parents": [
-   "AOP_BASE"
+   "AOP_FILTER"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 153
+  "virtual": true,
+  "adt_index": 153,
+  "device_id": 155
  },
  {
   "name": "AOP_BASE",
   "base": "0x308280000",
   "offset": 16400,
   "parents": [
-   "AOP_BASE"
+   "AOP_FILTER"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 154
+  "virtual": true,
+  "adt_index": 154,
+  "device_id": 156
  },
  {
   "name": "AOP_FR",
   "base": "0x308280000",
   "offset": 16408,
   "parents": [
-   "AOP_BASE"
+   "AOP_FILTER"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 155
+  "virtual": true,
+  "adt_index": 155,
+  "device_id": 157
  },
  {
   "name": "AUDIO_A",
   "base": "0x308280000",
   "offset": 16416,
   "parents": [
-   "AOP_BASE"
+   "AOP_FILTER"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 156
+  "virtual": true,
+  "adt_index": 156,
+  "device_id": 158
  },
  {
   "name": "AOP_SHIM",
   "base": "0x308280000",
   "offset": 16424,
   "parents": [
-   "AUDIO_A"
+   "AOP_BASE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 157
+  "virtual": true,
+  "adt_index": 157,
+  "device_id": 159
  },
  {
   "name": "AOP_PIODMA",
   "base": "0x308280000",
   "offset": 16432,
   "parents": [
-   "AUDIO_A"
+   "AOP_BASE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 158
+  "virtual": true,
+  "adt_index": 158,
+  "device_id": 160
  },
  {
   "name": "AOP2_PIODMA",
   "base": "0x308280000",
   "offset": 16440,
   "parents": [
-   "AUDIO_A"
+   "AOP_BASE"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 159
+  "virtual": true,
+  "adt_index": 159,
+  "device_id": 161
  },
  {
   "name": "AOP_I2CM0",
   "base": "0x308280000",
   "offset": 16448,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 160
+  "virtual": true,
+  "adt_index": 160,
+  "device_id": 162
  },
  {
   "name": "AOP_I2CM1",
   "base": "0x308280000",
   "offset": 16456,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 161
+  "virtual": true,
+  "adt_index": 161,
+  "device_id": 163
  },
  {
   "name": "AOP_I2CM2",
   "base": "0x308280000",
   "offset": 16464,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 162
+  "virtual": true,
+  "adt_index": 162,
+  "device_id": 164
  },
  {
   "name": "AOP_I2CM3",
   "base": "0x308280000",
   "offset": 16472,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 163
+  "virtual": true,
+  "adt_index": 163,
+  "device_id": 165
  },
  {
   "name": "AOP_SCM",
   "base": "0x308280000",
   "offset": 16480,
   "parents": [
-   "AUDIO_A",
-   "AOP_SHIM"
+   "AOP_BASE",
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 164
+  "virtual": true,
+  "adt_index": 164,
+  "device_id": 166
  },
  {
   "name": "AOP_SPI0",
   "base": "0x308280000",
   "offset": 16488,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 165
+  "virtual": true,
+  "adt_index": 165,
+  "device_id": 167
  },
  {
   "name": "AOP_SPI1",
   "base": "0x308280000",
   "offset": 16496,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 166
+  "virtual": true,
+  "adt_index": 166,
+  "device_id": 168
  },
  {
   "name": "AOP_SPMI0",
   "base": "0x308280000",
   "offset": 16504,
   "parents": [
-   "AOP_BASE",
-   "AOP_SHIM"
+   "AOP_FILTER",
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 167
+  "virtual": true,
+  "adt_index": 167,
+  "device_id": 169
  },
  {
   "name": "AOP_SPMI1",
   "base": "0x308280000",
   "offset": 16512,
   "parents": [
-   "AOP_BASE",
-   "AOP_SHIM"
+   "AOP_FILTER",
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 168
+  "virtual": true,
+  "adt_index": 168,
+  "device_id": 170
  },
  {
   "name": "AOP_HE_NRCS0",
   "base": "0x308280000",
   "offset": 16520,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 169
+  "virtual": true,
+  "adt_index": 169,
+  "device_id": 171
  },
  {
   "name": "AOP_HE_NRCS1",
   "base": "0x308280000",
   "offset": 16528,
   "parents": [
-   "AOP_SHIM"
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 170
+  "virtual": true,
+  "adt_index": 170,
+  "device_id": 172
  },
  {
   "name": "AOP_CPU",
   "base": "0x308280000",
   "offset": 16536,
   "parents": [
-   "AUDIO_A",
-   "AOP_SHIM"
+   "AOP_BASE",
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 171
+  "virtual": true,
+  "adt_index": 171,
+  "device_id": 173
  },
  {
   "name": "AOP2_CPU",
   "base": "0x308280000",
   "offset": 16544,
   "parents": [
-   "AUDIO_A",
-   "AOP_SHIM"
+   "AOP_BASE",
+   "AOP_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 172
+  "virtual": true,
+  "adt_index": 172,
+  "device_id": 174
  },
  {
   "name": "AUDIO_FR",
   "base": "0x308280000",
   "offset": 16552,
   "parents": [
-   "AOP_PIODMA"
+   "AUDIO_A"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 173
+  "virtual": true,
+  "adt_index": 173,
+  "device_id": 175
  },
  {
   "name": "AOP_UART0",
   "base": "0x308280000",
   "offset": 16560,
   "parents": [
-   "AOP2_PIODMA"
+   "AOP_SHIM"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 174
+  "virtual": true,
+  "adt_index": 174,
+  "device_id": 176
  },
  {
   "name": "AOP_UART1",
   "base": "0x308280000",
   "offset": 16568,
   "parents": [
-   "AOP2_PIODMA"
+   "AOP_SHIM"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 175
+  "virtual": true,
+  "adt_index": 175,
+  "device_id": 177
  },
  {
   "name": "AOP_UART2",
   "base": "0x308280000",
   "offset": 16576,
   "parents": [
-   "AOP2_PIODMA"
+   "AOP_SHIM"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 176
+  "virtual": true,
+  "adt_index": 176,
+  "device_id": 178
  },
  {
   "name": "AOP_SRAM",
   "base": "0x308280000",
   "offset": 16584,
   "parents": [
-   "AOP_SPI1",
-   "AUDIO_FR"
+   "AOP_SCM",
+   "AOP_CPU"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 177
+  "virtual": true,
+  "adt_index": 177,
+  "device_id": 179
  },
  {
   "name": "AUDIO_P",
   "base": "0x308280000",
   "offset": 16592,
   "parents": [
-   "AOP_UART1"
+   "AUDIO_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 178
+  "virtual": true,
+  "adt_index": 178,
+  "device_id": 180
  },
  {
   "name": "AUDIO_LEAP_A",
   "base": "0x308280000",
   "offset": 16600,
   "parents": [
-   "AOP_UART1"
+   "AUDIO_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 179
+  "virtual": true,
+  "adt_index": 179,
+  "device_id": 181
  },
  {
   "name": "AUDIO_SENSE_PDMC",
   "base": "0x308280000",
   "offset": 16608,
   "parents": [
-   "AOP_UART1"
+   "AUDIO_FR"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 180
+  "virtual": true,
+  "adt_index": 180,
+  "device_id": 182
  },
  {
   "name": "AUDIO_BASE_S_A",
   "base": "0x308280000",
   "offset": 16616,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 181
+  "virtual": true,
+  "adt_index": 181,
+  "device_id": 183
  },
  {
   "name": "AUDIO_BASE_NS_A",
   "base": "0x308280000",
   "offset": 16624,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 182
+  "virtual": true,
+  "adt_index": 182,
+  "device_id": 184
  },
  {
   "name": "AUDIO_LEAP_MCA",
   "base": "0x308280000",
   "offset": 16632,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 183
+  "virtual": true,
+  "adt_index": 183,
+  "device_id": 185
  },
  {
   "name": "AUDIO_MCA0_M",
   "base": "0x308280000",
   "offset": 16640,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 184
+  "virtual": true,
+  "adt_index": 184,
+  "device_id": 186
  },
  {
   "name": "AUDIO_MCA1_M",
   "base": "0x308280000",
   "offset": 16648,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 185
+  "virtual": true,
+  "adt_index": 185,
+  "device_id": 187
  },
  {
   "name": "AUDIO_MCA2_M",
   "base": "0x308280000",
   "offset": 16656,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 186
+  "virtual": true,
+  "adt_index": 186,
+  "device_id": 188
  },
  {
   "name": "AUDIO_MCA3_M",
   "base": "0x308280000",
   "offset": 16664,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 187
+  "virtual": true,
+  "adt_index": 187,
+  "device_id": 189
  },
  {
   "name": "AUDIO_MCA4_M",
   "base": "0x308280000",
   "offset": 16672,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 188
+  "virtual": true,
+  "adt_index": 188,
+  "device_id": 190
  },
  {
   "name": "AUDIO_MCA5_M",
   "base": "0x308280000",
   "offset": 16680,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 189
+  "virtual": true,
+  "adt_index": 189,
+  "device_id": 191
  },
  {
   "name": "AUDIO_LEAP_C",
   "base": "0x308280000",
   "offset": 16688,
   "parents": [
-   "AUDIO_BASE_S_A"
+   "AUDIO_LEAP_A"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 190
+  "virtual": true,
+  "adt_index": 190,
+  "device_id": 192
  },
  {
   "name": "AUDIO_LEAP_S_A",
   "base": "0x308280000",
   "offset": 16696,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 191
+  "virtual": true,
+  "adt_index": 191,
+  "device_id": 193
  },
  {
   "name": "AUDIO_LEAP_NS_A",
   "base": "0x308280000",
   "offset": 16704,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 192
+  "virtual": true,
+  "adt_index": 192,
+  "device_id": 194
  },
  {
   "name": "AUDIO_LEAP_RX0",
   "base": "0x308280000",
   "offset": 16712,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 193
+  "virtual": true,
+  "adt_index": 193,
+  "device_id": 195
  },
  {
   "name": "AUDIO_LEAP_RX1",
   "base": "0x308280000",
   "offset": 16720,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 194
+  "virtual": true,
+  "adt_index": 194,
+  "device_id": 196
  },
  {
   "name": "AUDIO_LEAP_RX2",
   "base": "0x308280000",
   "offset": 16728,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 195
+  "virtual": true,
+  "adt_index": 195,
+  "device_id": 197
  },
  {
   "name": "AUDIO_LEAP_RX3",
   "base": "0x308280000",
   "offset": 16736,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 196
+  "virtual": true,
+  "adt_index": 196,
+  "device_id": 198
  },
  {
   "name": "AUDIO_LEAP_RX4",
   "base": "0x308280000",
   "offset": 16744,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 197
+  "virtual": true,
+  "adt_index": 197,
+  "device_id": 199
  },
  {
   "name": "AUDIO_LEAP_TX0",
   "base": "0x308280000",
   "offset": 16752,
   "parents": [
-   "AUDIO_LEAP_NS_A"
+   "AUDIO_LEAP_C"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 198
+  "virtual": true,
+  "adt_index": 198,
+  "device_id": 200
  },
  {
   "name": "PDM0_AUDIO_REF",
@@ -2097,8 +2297,9 @@
   "offset": 16760,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 199
+  "virtual": true,
+  "adt_index": 199,
+  "device_id": 201
  },
  {
   "name": "PDM1_AUDIO_REF",
@@ -2106,8 +2307,9 @@
   "offset": 16768,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 200
+  "virtual": true,
+  "adt_index": 200,
+  "device_id": 202
  },
  {
   "name": "SMC_FABRIC",
@@ -2115,298 +2317,325 @@
   "offset": 32768,
   "parents": [],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 201
+  "virtual": true,
+  "adt_index": 201,
+  "device_id": 203
  },
  {
   "name": "SMC_GPIO",
   "base": "0x308280000",
   "offset": 32776,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 202
+  "virtual": true,
+  "adt_index": 202,
+  "device_id": 204
  },
  {
   "name": "SMC_AON",
   "base": "0x308280000",
   "offset": 32784,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 203
+  "virtual": true,
+  "adt_index": 203,
+  "device_id": 205
  },
  {
   "name": "SMC_UART0",
   "base": "0x308280000",
   "offset": 32792,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 204
+  "virtual": true,
+  "adt_index": 204,
+  "device_id": 206
  },
  {
   "name": "SMC_UART1",
   "base": "0x308280000",
   "offset": 32800,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 205
+  "virtual": true,
+  "adt_index": 205,
+  "device_id": 207
  },
  {
   "name": "SMC_I2CM0",
   "base": "0x308280000",
   "offset": 32808,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 206
+  "adt_index": 206,
+  "device_id": 208
  },
  {
   "name": "SMC_I2CM1",
   "base": "0x308280000",
   "offset": 32816,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 207
+  "adt_index": 207,
+  "device_id": 209
  },
  {
   "name": "SMC_I2CM2",
   "base": "0x308280000",
   "offset": 32824,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 1,
   "virtual": false,
-  "adt_index": 208
+  "adt_index": 208,
+  "device_id": 210
  },
  {
   "name": "SMC_FPWM0",
   "base": "0x308280000",
   "offset": 32832,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 209
+  "virtual": true,
+  "adt_index": 209,
+  "device_id": 211
  },
  {
   "name": "SMC_FPWM1",
   "base": "0x308280000",
   "offset": 32840,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 210
+  "virtual": true,
+  "adt_index": 210,
+  "device_id": 212
  },
  {
   "name": "SMC_FPWM2",
   "base": "0x308280000",
   "offset": 32848,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 211
+  "virtual": true,
+  "adt_index": 211,
+  "device_id": 213
  },
  {
   "name": "SMC_FPWM3",
   "base": "0x308280000",
   "offset": 32856,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 212
+  "virtual": true,
+  "adt_index": 212,
+  "device_id": 214
  },
  {
   "name": "SMC_PTD",
   "base": "0x308280000",
   "offset": 32864,
   "parents": [
-   "SMC_AON",
-   "NUB_OCLA"
+   "SMC_FABRIC",
+   "NUB_AON"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 213
+  "virtual": true,
+  "adt_index": 213,
+  "device_id": 215
  },
  {
   "name": "SMC_CPU",
   "base": "0x308280000",
   "offset": 32872,
   "parents": [
-   "SMC_AON"
+   "SMC_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 214
+  "virtual": true,
+  "adt_index": 214,
+  "device_id": 216
  },
  {
   "name": "NUB_HE_NRCS0",
   "base": "0x308280000",
   "offset": 32880,
   "parents": [
-   "NUB_HE_NRCS0",
-   "NUB_SPMI_A0"
+   "SMC_PTD",
+   "NUB_SPMI0"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 215
+  "virtual": true,
+  "adt_index": 215,
+  "device_id": 217
  },
  {
   "name": "NUB_HE_NRCS1",
   "base": "0x308280000",
   "offset": 32888,
   "parents": [
-   "NUB_HE_NRCS0",
-   "NUB_AON"
+   "SMC_PTD",
+   "NUB_SPMI1"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 216
+  "virtual": true,
+  "adt_index": 216,
+  "device_id": 218
  },
  {
   "name": "MTP_FABRIC",
   "base": "0x308280000",
   "offset": 49152,
   "parents": [
-   "DEBUG_SWITCH"
+   "NUB_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 217
+  "virtual": true,
+  "adt_index": 217,
+  "device_id": 219
  },
  {
   "name": "MTP_GPIO",
   "base": "0x308280000",
   "offset": 49160,
   "parents": [
-   "MTP_BASE"
+   "MTP_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 218
+  "virtual": true,
+  "adt_index": 218,
+  "device_id": 220
  },
  {
   "name": "MTP_BASE",
   "base": "0x308280000",
   "offset": 49168,
   "parents": [
-   "MTP_BASE"
+   "MTP_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 219
+  "virtual": true,
+  "adt_index": 219,
+  "device_id": 221
  },
  {
   "name": "MTP_PERIPH",
   "base": "0x308280000",
   "offset": 49176,
   "parents": [
-   "MTP_BASE"
+   "MTP_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 220
+  "virtual": true,
+  "adt_index": 220,
+  "device_id": 222
  },
  {
   "name": "MTP_UART0",
   "base": "0x308280000",
   "offset": 49184,
   "parents": [
-   "MTP_BASE"
+   "MTP_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 221
+  "virtual": true,
+  "adt_index": 221,
+  "device_id": 223
  },
  {
   "name": "MTP_CPU",
   "base": "0x308280000",
   "offset": 49192,
   "parents": [
-   "MTP_BASE"
+   "MTP_FABRIC"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 222
+  "virtual": true,
+  "adt_index": 222,
+  "device_id": 224
  },
  {
   "name": "MTP_SCM_FABRIC",
   "base": "0x308280000",
   "offset": 49200,
   "parents": [
-   "MTP_CPU"
+   "MTP_PERIPH"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 223
+  "virtual": true,
+  "adt_index": 223,
+  "device_id": 225
  },
  {
   "name": "MTP_SPI0",
   "base": "0x308280000",
   "offset": 49208,
   "parents": [
-   "MTP_CPU"
+   "MTP_PERIPH"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 224
+  "virtual": true,
+  "adt_index": 224,
+  "device_id": 226
  },
  {
   "name": "MTP_I2CM0",
   "base": "0x308280000",
   "offset": 49216,
   "parents": [
-   "MTP_CPU"
+   "MTP_PERIPH"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 225
+  "virtual": true,
+  "adt_index": 225,
+  "device_id": 227
  },
  {
   "name": "MTP_SRAM",
   "base": "0x308280000",
   "offset": 49224,
   "parents": [
-   "MTP_I2CM0",
-   "MTP_SPI0"
+   "MTP_SCM_FABRIC",
+   "MTP_CPU"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 226
+  "virtual": true,
+  "adt_index": 226,
+  "device_id": 228
  },
  {
   "name": "MTP_DMA",
   "base": "0x308280000",
   "offset": 49232,
   "parents": [
-   "CPU-BUSY"
+   "MTP_SRAM"
   ],
   "flags": 16,
-  "virtual": false,
-  "adt_index": 227
+  "virtual": true,
+  "adt_index": 227,
+  "device_id": 229
  },
  {
   "name": "CPU-BUSY",
@@ -2415,25 +2644,28 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 228
+  "adt_index": 228,
+  "device_id": 230
  },
  {
   "name": "ECPU_NRG",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 131088,
+  "flags": 16,
   "virtual": true,
-  "adt_index": 229
+  "adt_index": 229,
+  "device_id": 231
  },
  {
   "name": "PCPU_NRG",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 327696,
+  "flags": 16,
   "virtual": true,
-  "adt_index": 230
+  "adt_index": 230,
+  "device_id": 232
  },
  {
   "name": "ECPU_SRAM",
@@ -2442,7 +2674,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 231
+  "adt_index": 231,
+  "device_id": 233
  },
  {
   "name": "PCPU_SRAM",
@@ -2451,7 +2684,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 232
+  "adt_index": 232,
+  "device_id": 234
  },
  {
   "name": "GFX-SGX",
@@ -2462,7 +2696,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 233
+  "adt_index": 233,
+  "device_id": 235
  },
  {
   "name": "GFX-BUSY",
@@ -2471,7 +2706,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 234
+  "adt_index": 234,
+  "device_id": 236
  },
  {
   "name": "GFX-ASC",
@@ -2482,7 +2718,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 235
+  "adt_index": 235,
+  "device_id": 237
  },
  {
   "name": "GFX-ASC1",
@@ -2493,7 +2730,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 236
+  "adt_index": 236,
+  "device_id": 321
  },
  {
   "name": "ECPU0_SRAM",
@@ -2502,7 +2740,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 237
+  "adt_index": 237,
+  "device_id": 238
  },
  {
   "name": "ECPU1_SRAM",
@@ -2511,7 +2750,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 238
+  "adt_index": 238,
+  "device_id": 239
  },
  {
   "name": "ECPU2_SRAM",
@@ -2520,7 +2760,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 239
+  "adt_index": 239,
+  "device_id": 240
  },
  {
   "name": "ECPU3_SRAM",
@@ -2529,7 +2770,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 240
+  "adt_index": 240,
+  "device_id": 241
  },
  {
   "name": "PCPU0_SRAM",
@@ -2538,7 +2780,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 241
+  "adt_index": 241,
+  "device_id": 242
  },
  {
   "name": "PCPU1_SRAM",
@@ -2547,16 +2790,18 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 242
+  "adt_index": 242,
+  "device_id": 243
  },
  {
   "name": "VENC0-AVE-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 167772434,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 243
+  "adt_index": 243,
+  "device_id": 247
  },
  {
   "name": "VENC0-MEM-FAST",
@@ -2565,151 +2810,168 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 244
+  "adt_index": 244,
+  "device_id": 248
  },
  {
   "name": "VENC0-AVE-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 167772690,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 245
+  "adt_index": 245,
+  "device_id": 249
  },
  {
   "name": "AVD-SOC-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 201326866,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 246
+  "adt_index": 246,
+  "device_id": 250
  },
  {
   "name": "AVD-SOC-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 201327122,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 247
+  "adt_index": 247,
+  "device_id": 251
  },
  {
   "name": "JPG-SOC-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 234881298,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 248
+  "adt_index": 248,
+  "device_id": 252
  },
  {
   "name": "JPG-SOC-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 234881554,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 249
+  "adt_index": 249,
+  "device_id": 253
  },
  {
   "name": "ISP-SOC-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 117440786,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 250
+  "adt_index": 250,
+  "device_id": 254
  },
  {
   "name": "ISP-SOC-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 117441042,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 251
+  "adt_index": 251,
+  "device_id": 255
  },
  {
   "name": "CLPC-SOC-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 272,
+  "flags": 16,
   "virtual": true,
-  "adt_index": 252
+  "adt_index": 252,
+  "device_id": 256
  },
  {
   "name": "CLPC-SOC-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 528,
+  "flags": 16,
   "virtual": true,
-  "adt_index": 253
+  "adt_index": 253,
+  "device_id": 257
  },
  {
   "name": "CLPC-DCS-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 272,
+  "flags": 16,
   "virtual": true,
-  "adt_index": 254
+  "adt_index": 254,
+  "device_id": 258
  },
  {
   "name": "CLPC-DCS-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 528,
+  "flags": 16,
   "virtual": true,
-  "adt_index": 255
+  "adt_index": 255,
+  "device_id": 259
  },
  {
   "name": "PRORES-SOC-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 251658514,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 256
+  "adt_index": 256,
+  "device_id": 260
  },
  {
   "name": "PRORES-SOC-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 251658770,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 257
+  "adt_index": 257,
+  "device_id": 261
  },
  {
   "name": "MSR-SOC-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 218104082,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 258
+  "adt_index": 258,
+  "device_id": 262
  },
  {
   "name": "MSR-SOC-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 218104338,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 259
+  "adt_index": 259,
+  "device_id": 263
  },
  {
   "name": "VENC1-AVE-VNOM",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 184549650,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 260
+  "adt_index": 260,
+  "device_id": 264
  },
  {
   "name": "VENC1-MEM-FAST",
@@ -2718,16 +2980,18 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 261
+  "adt_index": 261,
+  "device_id": 265
  },
  {
   "name": "VENC1-AVE-VMAX",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 184549906,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 262
+  "adt_index": 262,
+  "device_id": 266
  },
  {
   "name": "SIO-CPU-V",
@@ -2738,7 +3002,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 263
+  "adt_index": 263,
+  "device_id": 288
  },
  {
   "name": "USB-AUDIO-V",
@@ -2747,7 +3012,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 264
+  "adt_index": 264,
+  "device_id": 289
  },
  {
   "name": "VENC0-SYS-V",
@@ -2758,7 +3024,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 265
+  "adt_index": 265,
+  "device_id": 306
  },
  {
   "name": "VENC1-SYS-V",
@@ -2769,7 +3036,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 266
+  "adt_index": 266,
+  "device_id": 307
  },
  {
   "name": "AVD-SYS-V",
@@ -2780,7 +3048,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 267
+  "adt_index": 267,
+  "device_id": 290
  },
  {
   "name": "ANE-SYS-V",
@@ -2791,7 +3060,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 268
+  "adt_index": 268,
+  "device_id": 291
  },
  {
   "name": "JPG0-V",
@@ -2802,7 +3072,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 269
+  "adt_index": 269,
+  "device_id": 292
  },
  {
   "name": "JPG1-V",
@@ -2813,7 +3084,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 270
+  "adt_index": 270,
+  "device_id": 293
  },
  {
   "name": "MSR-V",
@@ -2824,7 +3096,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 271
+  "adt_index": 271,
+  "device_id": 294
  },
  {
   "name": "ISP-SYS-V",
@@ -2835,7 +3108,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 272
+  "adt_index": 272,
+  "device_id": 295
  },
  {
   "name": "ISP-CORE-V",
@@ -2847,38 +3121,42 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 273
+  "adt_index": 273,
+  "device_id": 309
  },
  {
   "name": "SEP-PEARL-V",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 469762066,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 274
+  "adt_index": 274,
+  "device_id": 296
  },
  {
   "name": "AUDIO-P-V",
   "base": "0x300700000",
   "offset": 0,
   "parents": [
-   "AUDIO_SENSE_PDMC"
+   "AUDIO_P"
   ],
   "flags": 17,
   "virtual": true,
-  "adt_index": 275
+  "adt_index": 275,
+  "device_id": 297
  },
  {
   "name": "ATC0-USB-AUD-V",
   "base": "0x300700000",
   "offset": 0,
   "parents": [
-   "DISP_INT_M3"
+   "USB-AUDIO-V"
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 276
+  "adt_index": 276,
+  "device_id": 298
  },
  {
   "name": "AUDIO-LLT-V",
@@ -2887,7 +3165,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 277
+  "adt_index": 277,
+  "device_id": 299
  },
  {
   "name": "AUSB0_AONUSB-V",
@@ -2898,7 +3177,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 278
+  "adt_index": 278,
+  "device_id": 300
  },
  {
   "name": "USB_SLP_DDR-V",
@@ -2907,7 +3187,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 279
+  "adt_index": 279,
+  "device_id": 305
  },
  {
   "name": "DISP-MIE-DPB",
@@ -2916,7 +3197,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 280
+  "adt_index": 280,
+  "device_id": 244
  },
  {
   "name": "DISP-FB-ACTIVE",
@@ -2925,7 +3207,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 281
+  "adt_index": 281,
+  "device_id": 245
  },
  {
   "name": "DISP-CARVE-OUT",
@@ -2934,18 +3217,20 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 282
+  "adt_index": 282,
+  "device_id": 246
  },
  {
   "name": "DCP0-V",
   "base": "0x300700000",
   "offset": 0,
   "parents": [
-   "DISP_GP1"
+   "DISP_CPU"
   ],
   "flags": 17,
   "virtual": true,
-  "adt_index": 283
+  "adt_index": 283,
+  "device_id": 301
  },
  {
   "name": "DCPEXT0-V",
@@ -2956,7 +3241,8 @@
   ],
   "flags": 17,
   "virtual": true,
-  "adt_index": 284
+  "adt_index": 284,
+  "device_id": 302
  },
  {
   "name": "FR_SCALING-V",
@@ -2965,7 +3251,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 285
+  "adt_index": 285,
+  "device_id": 304
  },
  {
   "name": "APCIE_SYS_ST-V",
@@ -2976,7 +3263,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 286
+  "adt_index": 286,
+  "device_id": 308
  },
  {
   "name": "ATC0-USB-DART",
@@ -2987,7 +3275,8 @@
   ],
   "flags": 16,
   "virtual": true,
-  "adt_index": 287
+  "adt_index": 287,
+  "device_id": 320
  },
  {
   "name": "VENC-CLSTR-V",
@@ -2996,7 +3285,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 288
+  "adt_index": 288,
+  "device_id": 322
  },
  {
   "name": "DISP_INT_M3",
@@ -3005,7 +3295,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 289
+  "adt_index": 289,
+  "device_id": 336
  },
  {
   "name": "DISP_EXT0_M3",
@@ -3014,16 +3305,18 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 290
+  "adt_index": 290,
+  "device_id": 337
  },
  {
   "name": "ANE-SYS-V-PMP",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 101187602,
+  "flags": 18,
   "virtual": true,
-  "adt_index": 291
+  "adt_index": 291,
+  "device_id": 338
  },
  {
   "name": "ATC0-DCS-F1",
@@ -3032,16 +3325,18 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 292
+  "adt_index": 292,
+  "device_id": 339
  },
  {
   "name": "ATC0-DCS-F2",
   "base": "0x300700000",
   "offset": 0,
   "parents": [],
-  "flags": 272,
+  "flags": 16,
   "virtual": true,
-  "adt_index": 293
+  "adt_index": 293,
+  "device_id": 340
  },
  {
   "name": "ATC0-DCS-F3",
@@ -3050,7 +3345,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 294
+  "adt_index": 294,
+  "device_id": 341
  },
  {
   "name": "ATC0-DCS-F4",
@@ -3059,7 +3355,8 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 295
+  "adt_index": 295,
+  "device_id": 342
  },
  {
   "name": "ATC0-DCS-F5",
@@ -3068,6 +3365,7 @@
   "parents": [],
   "flags": 16,
   "virtual": true,
-  "adt_index": 296
+  "adt_index": 296,
+  "device_id": 343
  }
 ]
