@@ -182,6 +182,10 @@ def main():
             pm.check_firmware_health(result['after'])
         except RuntimeError as error:
             result.update(status='error', firmware_error=str(error))
+        try:
+            result['suspend_stats_check'] = pm.check_suspend_stats(result['before'], result['after'])
+        except RuntimeError as error:
+            result.update(status='error', suspend_stats_error=str(error))
         if args.display_off:
             try:
                 result['display_after'] = display_snapshot()

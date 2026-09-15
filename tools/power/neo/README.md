@@ -242,3 +242,16 @@ blocks automatic logind lid/power/sleep actions; direct test requests still work
 Stop that unit when controlled testing is finished.
 
 The first actual sleep/wake results are recorded in `rtc-alarm.md`.
+
+`pm-test.py` and `sleep-test.py` compare `/sys/power/suspend_stats` failure
+counters (`fail`, `failed_freeze`, `failed_prepare`, `failed_suspend*`,
+`failed_resume*`) between the before and after snapshots. A write to
+`/sys/power/state` returns success even when a device resume callback fails, so
+a run whose counters increased is marked `status=error` with
+`suspend_stats_error` naming the counter, delta and `last_failed_dev`,
+`last_failed_errno`, `last_failed_step`; the deltas are saved as
+`suspend_stats_check`. `validate-result.py RESULT_JSON...` reapplies that check
+and the firmware health check to saved results offline (descending through
+`sleep_result`), printing PASS/FAIL per file. `test-validate-result.py` is its
+regression test against the `nvme-phy/platform` artifact, whose returned
+platform run had `failed_resume` 0 -> 1 on `0000:01:00.0`.
