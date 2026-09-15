@@ -588,3 +588,23 @@ immediately by a status read before the explicit post-write DSB, matching
 the ordering visible in native ApplePMGR. It neither lowers the target nor
 changes AUTO. This is an isolated ordering experiment, not a general change
 to Linux MMIO barriers or evidence that Apple's mapping attributes match ours.
+
+With panic=0, the readback-first userspace probe produced a complete remote
+panic capture: `SError Interrupt on CPU3, code 0x00000000be000000`, followed
+by `Kernel panic - not syncing: Asynchronous SError Interrupt`. Boot
+437c5e5a-1810-4f39-892c-6d80ed517f0d ran #39; admission binary SHA256
+`dbf511b0191d81702b044845b7a39bd4d7d1c81bf6ff4b002d6c8adb5d291087`.
+`dcp-netconsole/readback-panic.txt`, `readback-capture.jsonl` and
+`pmgr-readback-first.log` retain the result. Initial DISP_CPU was 0x1f0000ff,
+ASC control/status 0x10/0x6d; the requested value was unchanged. The final
+durable marker precedes the write. Asynchronous delivery means the saved
+EL0 PC does not identify the offending instruction. Immediate readback did
+not make the userspace sequence succeed. Panic-time network delivery is now
+qualified for this awake test, with Wi-Fi running.
+
+The next admission isolates a different access path: `neo-pmgr-admission`
+uses the existing kernel syscon regmap with fully awake DCP, first as a
+five-second read-only control and then with `same_value=1` for one unchanged
+write. No firmware adoption, lower power target, RUN stop, AUTO change or
+retention-control write occurs. This distinguishes the tested kernel path
+from /dev/mem; privilege and mapping attributes are not independently varied.
