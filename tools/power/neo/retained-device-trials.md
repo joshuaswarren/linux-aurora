@@ -321,3 +321,40 @@ comparisons, DCP counter deltas and ring snapshots are retained under
 `dcp-oslog-flush/`. The measurement script disabled DCP sleep afterward;
 Neo remains awake on #35. PMP firmware idle, DCP CPU stop and display clock
 gating remain disabled. No upstream fetch or push occurred.
+
+
+## DCP returning-mode investigation
+
+Full IOP IDLE on #35, with OSLOG draining working, still timed out on AP wake:
+`dcp-oslog-flush/full-idle-platform/`. It reached AP/IOP 0x201 and management
+notification 0x0c, CPU_STATUS 0x4e, RUN set. The OSLOG fix does not resolve this
+separate full-processor wake path. A normal one-shot reboot restored #35.
+
+The original `dcp.bin` includes a separate low-level monitor in its first
+64 KiB. It has a non-returning WFI loop at offset 0x38a0, ordinary scheduler
+WFI at 0xb530, and a context-saving WFI/restore path at 0x2bb4. Do not look only
+for WFI instructions in the extracted client Mach-O.
+
+In client code, state 8 at 0x4030810 selects 0x401db04 when the power context
+word at +0x64 is 2; otherwise it follows 0x401d9f8. The existing setter
+0x402fac0 performs one aligned store of 2 to VA 0x445d90c. No direct caller
+was found. The management PowerNap request changes a keep-awake counter;
+it is not this mode setter.
+
+A read-only capture of the ADT's boot memory region 50 (PA 0x101ea7d4000,
+size 0xcbc000) located the original DATA page at capture offset 0x13000.
+The first 1 KiB exactly matches the original Mach-O page at VA 0x445d000
+(SHA256 0a93751f089999a9b94145988a4e6a5b4e4168ec40d5adcc715debaca54a5885).
+Its client string at +0x87c matches AppleDCP-1041.120.7~1815-t8140dcp.RELEASE.
+The live mode at PA 0x101ea7e790c was 1. This is a 4 KiB client page within
+the retained boot allocation; assuming a 16 KiB CPU-page offset missed it.
+Capture SHA256: cc9e99ea75dc7dbaf73f60c03d9502e085e2a9bcc52489c43b7d9ebbc6c91dac.
+Artifacts and bounded read-only helpers: `dcp-monitor/`.
+
+The diagnostic adds an explicit `returning_idle=2` sysfs write. It requires
+J700 adoption, one fresh AP-ON acknowledgement, no prior sleep, no failure,
+sleep disabled, RUN set and all display gates active. It checks that exact
+DATA-page digest, client string and original mode 1 before an aligned store
+of 2 and readback. This mirrors the native setter without altering TEXT,
+DART tables or CPU control. The module remains pinned until reboot; no reset
+of a failed epoch is attempted. Hardware qualification is pending.
