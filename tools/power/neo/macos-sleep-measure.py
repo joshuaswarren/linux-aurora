@@ -42,6 +42,7 @@ def main():
     a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     r={'status':'preparing', 'requested_seconds':a.seconds, 'pre':[], 'post':[],
        'os':run('sw_vers'), 'boot':run('sysctl','-n','kern.boottime'),
+       'boot_uuid':run('sysctl','-n','kern.bootsessionuuid'),
        'scheduled_before':run('pmset','-g','sched')}
     def save():
         tmp=a.output/'result.tmp';tmp.write_text(json.dumps(r,indent=2)+'\n');tmp.replace(a.output/'result.json')
@@ -97,6 +98,8 @@ def main():
         r['pmset_log']=run('pmset','-g','log')
         r['scheduled_end']=run('pmset','-g','sched')
         r['boot_end']=run('sysctl','-n','kern.boottime')
+        r['boot_uuid_end']=run('sysctl','-n','kern.bootsessionuuid')
+        assert r['boot_uuid']==r['boot_uuid_end']
         r['status']='captured'
     except BaseException as e:
         r['status']='error';r['error']=repr(e);raise
