@@ -7390,6 +7390,11 @@ impl G17PUserRenderStorage {
                     ..G17P_RENDER_POOL_A + g17_submission::G17P_COLD_OPENING_RECORD_POOL_A_SIZE],
             )
             .map_err(|_| render_build_fail(11))?;
+            g17_render::set_render_event_control_generation(
+                &mut raw[G17P_RENDER_POOL_A + pool_a_record_index * 0x100..],
+                command_buffer_state_words[0],
+            )
+            .map_err(|_| render_build_fail(11))?;
             g17_submission::apply_g17p_cold_opening_record_pool_b(
                 graph_addresses,
                 &mut raw[G17P_RENDER_POOL_B
@@ -8814,11 +8819,11 @@ impl G17PUserRenderStorage {
                     &source[0x4000..0x4000 + g17_render::FRAGMENT_DESCRIPTOR_SIZE],
                 );
             let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
-            put_u32(
-                support,
-                record_a + 0x08,
-                submission_ordinal + submission_ordinal / 2,
-            );
+            g17_render::set_render_event_control_generation(
+                &mut support[record_a..],
+                command_buffer_state_words[0],
+            )
+            .map_err(|_| EINVAL)?;
             put_u32(support, record_a + 0x10, 0x50);
             pool_a_kick.apply(support);
             put_u32(
