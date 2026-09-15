@@ -15486,6 +15486,30 @@ impl G17ResourceOwner {
         }
     }
 
+    /// Read the selected physical 3D queue's post-maintenance completion stamp.
+    ///
+    /// B1's timestamp queue unlinks EventControl at 0x16b48, performs GPU
+    /// cache maintenance, then writes the first pointer from fragment stamp
+    /// info (+0x2140) at 0x16ea0. Page B is firmware-private bookkeeping;
+    /// page A is the host-visible completion witness, as on M1/M2.
+    pub(crate) fn render_fragment_completion_stamp(
+        &mut self,
+        pair: G17PRenderQueuePair,
+    ) -> Result<u32> {
+        let offset = usize::from(pair.fragment) * core::mem::size_of::<u32>();
+        self.resources.bootstrap_descriptor_zero_a.with_bytes_mut(|bytes| {
+            let word = bytes.get(offset..offset + 4).ok_or(ERANGE)?;
+            // SAFETY: this WC-mapped allocation is page aligned, each QID's
+            // lane is u32 aligned, and the checked slice covers that lane.
+            // Firmware updates it with one aligned u32 store. The acquire
+            // load orders subsequent CPU reads after the completion witness.
+            let stamp = unsafe {
+                &*word.as_ptr().cast::<core::sync::atomic::AtomicU32>()
+            };
+            Ok(u32::from_le(stamp.load(core::sync::atomic::Ordering::Acquire)))
+        })
+    }
+
     /// Sample the first four per-queue stamp lanes of the shared "descriptor
     /// zero" pages -- A (GPU and firmware) and B (firmware-private) -- that the
     /// TA/3D records point at by their own QID. DRAM only, safe after a
