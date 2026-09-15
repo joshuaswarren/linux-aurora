@@ -17,6 +17,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -146,7 +147,10 @@ def main():
         return powered
 
     if args.command == 'gate':
-        bad = [n for n in args.names if denied(n)]
+        summary = Path('/sys/kernel/debug/pm_genpd/pm_genpd_summary').read_text()
+        managed = {m.group(1).upper() for m in
+                   re.finditer(r'^(\S+)\s+(?:on|off)\b', summary, re.MULTILINE)}
+        bad = [n for n in args.names if denied(n) or n.upper() in managed]
         if bad:
             ap.error('refusing to gate infrastructure/managed domains: %s' % ' '.join(bad))
         target = int(args.target, 0)
