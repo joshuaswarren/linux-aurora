@@ -668,3 +668,36 @@ changes and retention-control writes are **not hardware-qualified**. In
 particular this sequence does not remove the captured CPU write access fault.
 The build is retained as `dcp-pmgr-native/retention-build.log`, with module
 SHA256 `f6d50a5ed324980c843c97f5bc1ddbe9c09a2bbc99595812f53c8aabb4988e9d`.
+
+The non-posted CPU-write reset did not return to Linux. The user observed
+1TR and booted Omarchy manually; recovered #39 boot
+50a2e9df-9eb8-474f-818d-62c1e0a7a23c. Awake retention controls still read
+0/1. The retained parent-admission binary SHA256 is
+`0e0f6cfc49c5c2aa8bfb248029d0e340a6e4099c466619c0216874f27bcd7081`.
+Further CPU-write repetitions are not scheduled.
+
+## Releasing the inherited force-wake assertion
+
+`neo-dcp-force-wake` tests a separate native control: dcp0-expert selects
+PA 0x308008000, off=0 and on=0x10. It releases the assertion in suspend_noirq
+and restores it in resume_noirq, before ordinary device resume. It leaves
+PMGR targets, ASC RUN, firmware data and RTKit messaging untouched. Releasing
+an awake assertion alone is not proof that the firmware actually idles or
+that a power domain collapses. The helper defaults disabled and checks the
+awake control value, console-suspend setting and its own restoration state.
+
+The recovery boot initially had an armed PMU alarm: control 0x41, target
+19458284 raw seconds, current counter 19458266.98. It was allowed to fire;
+subsequent control 0x03 and event 1 confirmed expiry, after which the RTC
+driver bound normally. No live alarm was overwritten. Read-only captures
+are in `dcp-force-idle/inherited-alarm{,-after}.log`.
+
+On that boot the force-wake helper passed a platform-stage check and two
+10-second RTC sleeps. All six CPUs entered s2idle, every panel cycle restored,
+and force-wake counters reached suspends=3/resumes=3 with failed=0/released=0.
+Module SHA256 `8964c51ee48b65ab5d10119f09789a8c0d8b546a341518100c90340d7d147c42`,
+source b461ffe9f. Power qualification runs four 120-second intervals in ABBA
+order, following a fresh 60-second awake counter calibration. These measurements
+use the inherited DCP without adoption; they differ from the earlier adopted
+DCP AP-only comparison. No power-saving result is claimed until the paired
+measurements finish.
