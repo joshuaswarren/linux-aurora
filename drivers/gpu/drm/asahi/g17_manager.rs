@@ -8034,17 +8034,15 @@ impl G17PManagerConstruction {
                 // maintenance (25G83 B1 0x16ea0); queue/list retirement alone
                 // therefore cannot authorize a userspace-visible fence.
                 // The physical slot retains its ordinal across VM switches,
-                // has one in-flight pair. The event value wraps as on M1/M2;
-                // the previous completed value differs even across zero.
+                // has one in-flight pair, and refuses 24-bit stamp overflow.
                 // Require this exact generation, never a stale nonzero stamp.
                 let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
-                let expected_stamp = ordinal
+                let expected_stamp = self.render_submission_ordinal
                     .checked_add(1)
-                    .map(|value| (value as u32).wrapping_shl(8))
+                    .and_then(|value| value.checked_mul(0x100))
                     .ok_or(EOVERFLOW)?;
                 let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
-                let stamp_delta = fragment_stamp.wrapping_sub(expected_stamp);
-                if stamp_delta & 0xff != 0 || stamp_delta >= 0x8000_0000 {
+                if fragment_stamp != expected_stamp {
                     if crate::util::g17p_verbose() {
                         dev_info!(
                             self.resources.dev().as_ref(),
