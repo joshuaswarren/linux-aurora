@@ -52,6 +52,7 @@ struct apple_pmgr_ps {
 	bool force_disable;
 	bool force_reset;
 	bool externally_clocked;
+	bool neo_nvme_phy;
 };
 
 /*
@@ -74,6 +75,9 @@ static unsigned int apple_pmgr_suppress_write_mask;
 static bool retain_s2idle;
 module_param(retain_s2idle, bool, 0644);
 MODULE_PARM_DESC(retain_s2idle, "Keep T8140 domains powered during s2idle qualification");
+static bool nvme_phy_s2idle;
+module_param(nvme_phy_s2idle, bool, 0644);
+MODULE_PARM_DESC(nvme_phy_s2idle, "Allow only J700's NVMe PHY domain to gate during retained s2idle qualification");
 
 #define APPLE_PMGR_T8140_DISP_SYS       BIT(0)
 #define APPLE_PMGR_T8140_DISPEXT0_SYS   BIT(1)
@@ -606,9 +610,22 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 {
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
+	int ret;
 
 	if (READ_ONCE(retain_s2idle) && pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
 	    of_device_is_compatible(ps->dev->of_node, "apple,t8140-pmgr-pwrstate")) {
+		/*
+		 * ANS already drains NVMe, shuts down RTKit and stops its CPU in
+		 * the normal device suspend callback. Qualify only its PHY leaf;
+		 * retain the parent domains and all unrelated device domains.
+		 * genpd still requires every consumer to have suspended first.
+		 */
+		if (ps->neo_nvme_phy && READ_ONCE(nvme_phy_s2idle)) {
+			ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
+			dev_info(ps->dev, "J700 NVMe PHY sleep gate: result=%d min_state=%u\n",
+				 ret, ps->min_state);
+			return ret;
+		}
 		/* genpd keeps its state ON when the provider rejects power-off.
 		 * Driver suspend callbacks still run; runtime PM outside system
 		 * suspend retains its normal behaviour.
@@ -714,6 +731,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	struct apple_pmgr_ps *ps;
 	struct regmap *regmap;
 	struct of_phandle_iterator it;
+	struct resource parent;
 	int ret;
 	const char *name;
 	bool active;
@@ -740,6 +758,11 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		dev_err(dev, "missing reg property\n");
 		return ret;
 	}
+	ps->neo_nvme_phy = of_machine_is_compatible("apple,j700") &&
+		of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate") &&
+		ps->offset == 0x3c0 &&
+		!of_address_to_resource(node->parent, 0, &parent) &&
+		parent.start == 0x300700000ULL;
 
 	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	ps->genpd.name = name;
