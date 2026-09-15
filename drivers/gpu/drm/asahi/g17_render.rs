@@ -755,8 +755,8 @@ pub(crate) fn set_render_event_control_generation(
     Ok(())
 }
 
-fn descriptor_work_ordinal(ordinal: u64) -> u32 {
-    (ordinal as u32).wrapping_add((ordinal / 2) as u32)
+fn descriptor_work_ordinal(ordinal: u32) -> u32 {
+    ordinal + ordinal / 2
 }
 
 fn write_common_descriptor(
