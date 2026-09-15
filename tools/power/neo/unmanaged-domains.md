@@ -60,3 +60,18 @@ stage. Kernel #40 itself remains unchanged; nvme_phy_s2idle stays disabled.
 Initial tooling and inventory: Claude Fable 5.1; restoration and validation
 corrections: Codex. Original scripts/feedback were retained under workspace
 `artifacts/neo-suspend/domain-gate-review/` before modification.
+
+## First corrected hardware qualification
+
+On unchanged kernel #40, boot 9e018be2-2a9d-4f7a-b66a-6e91b2be4e60,
+the fresh 20s baseline's first post-wake PSTR was 0.774208 W. PRORES+MSR
+gave 0.758828 W; awake PSTR fell 3.518191 -> 3.502073 W, then returned to
+3.531646 W. These remain screening samples, not a confirmed sleep average.
+
+Actual restoration now passed: PRORES 0x000003ff -> 0x00000300 -> 0x000003ff,
+MSR 0x0f0023ff -> 0x0f002300 -> 0x0f0023ff. State records retained both
+readbacks with restore_complete=true. RTC, panel, six CPUs, storage, Wi-Fi
+association/gateway and PM failure-counter checks passed. Raw captures are
+`domain-gate-review/{base-20,g1-20}/` locally and `domain-gate-v2/` on Neo.
+The helper also now refuses domains enumerated in the live genpd summary,
+in addition to its static exclusions.
