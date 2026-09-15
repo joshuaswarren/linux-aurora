@@ -8,11 +8,38 @@
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/panic_notifier.h>
+#include <asm/sysreg.h>
 #include <linux/regmap.h>
 
 static bool same_value;
+static bool panic_registered;
 module_param(same_value, bool, 0400);
 MODULE_PARM_DESC(same_value, "Explicitly admit one unchanged DISP_CPU PS write while awake");
+
+/* Read-only Apple L2 error registers, as named by m1n1 cpu_regs.h.
+ * Keep the error latched: this probe never writes or clears these registers.
+ */
+static void report_bus_error(const char *stage)
+{
+	u64 status = read_sysreg_s(sys_reg(3, 3, 15, 8, 0));
+	u64 address = read_sysreg_s(sys_reg(3, 3, 15, 9, 0));
+	u64 info = read_sysreg_s(sys_reg(3, 3, 15, 10, 0));
+
+	pr_emerg("NEO_PMGR_EL1: %s L2 status=%#llx address=%#llx info=%#llx\n",
+		 stage, status, address, info);
+}
+
+static int admission_panic(struct notifier_block *nb, unsigned long event,
+			   void *data)
+{
+	report_bus_error("panic");
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block admission_notifier = {
+	.notifier_call = admission_panic,
+};
 
 static int __init neo_pmgr_admission(void)
 {
@@ -50,6 +77,7 @@ static int __init neo_pmgr_admission(void)
 	pr_info("NEO_PMGR_EL1: control=%#x status=%#x\n", control, status);
 	if (control != 0x10 || status != 0x6d)
 		return -EBUSY;
+	report_bus_error("awake");
 	if (!same_value) {
 		msleep(5000);
 		pr_info("NEO_PMGR_EL1: read-only admission complete\n");
@@ -57,20 +85,33 @@ static int __init neo_pmgr_admission(void)
 	}
 	pr_info("NEO_PMGR_EL1: before same-value regmap write 0x1f0000ff\n");
 	msleep(500);
-	ret = regmap_write(pmgr, 0x10000, 0x1f0000ff);
-	pr_info("NEO_PMGR_EL1: write returned %d\n", ret);
+	ret = atomic_notifier_chain_register(&panic_notifier_list, &admission_notifier);
 	if (ret)
 		return ret;
+	panic_registered = true;
+	ret = regmap_write(pmgr, 0x10000, 0x1f0000ff);
+	dsb(sy);
+	pr_info("NEO_PMGR_EL1: write returned %d\n", ret);
+	if (ret)
+		goto remove_observer;
 	ret = regmap_read(pmgr, 0x10000, &value);
 	pr_info("NEO_PMGR_EL1: readback=%#x ret=%d\n", value, ret);
-	if (ret || value != 0x1f0000ff)
-		return ret ?: -EIO;
+	if (ret || value != 0x1f0000ff) {
+		ret = ret ?: -EIO;
+		goto remove_observer;
+	}
 	msleep(500);
 	pr_info("NEO_PMGR_EL1: admission complete\n");
 	return 0;
+remove_observer:
+	atomic_notifier_chain_unregister(&panic_notifier_list, &admission_notifier);
+	panic_registered = false;
+	return ret;
 }
 static void __exit neo_pmgr_admission_exit(void)
 {
+	if (panic_registered)
+		atomic_notifier_chain_unregister(&panic_notifier_list, &admission_notifier);
 	/* All mappings are released during init; no persistent state changed. */
 }
 module_init(neo_pmgr_admission);
