@@ -9,7 +9,7 @@ reproducible.
 
 ## DIAGNOSIS
 
-On jwm1, an M1 (t8103, MacBookPro17,1, kernel 7.1.6-1-1-ARCH),
+On the M1 host (t8103, MacBookPro17,1, kernel 7.1.6-1-1-ARCH),
 a GRUB entry ran `devicetree /@/boot/ane.dtb`. That command
 replaces the complete m1n1-patched device tree with one static
 snapshot captured 2026-08-25. m1n1 writes per-boot values into
@@ -98,7 +98,7 @@ copied from `eiln/linux` commit `6027c18`, not re-derived
 from this machine's ADT. The static tree the original commit
 message claimed these windows matched is itself built from
 that commit, so the match is circular. Re-deriving them from
-the ADT on jwm1 is open work.
+the ADT on M1 hardware is open work.
 
 ## CONCRETE DEFECT IN THE EXISTING OUT-OF-TREE ARTIFACT
 
@@ -135,7 +135,7 @@ automatic load of `joshuaswarren/omarchy-ane`.
 | Fork | `joshuaswarren/linux` |
 | Upstream | `AsahiLinux/linux` |
 | Branch | `ane-dt-t8103` |
-| Base tag | `asahi-7.1.6-1` (= `e2e1930a9595bffafad92cec2b5504525efb9cd4`, the source of Arch `linux-asahi` `7.1.6-1-1-ARCH` on jwm1) |
+| Base tag | `asahi-7.1.6-1` (= `e2e1930a9595bffafad92cec2b5504525efb9cd4`, the source of Arch `linux-asahi` `7.1.6-1-1-ARCH` on the M1 host) |
 | Commits | `326d6033` (node + pmgr + binding disagreement), `b1cb024a` (DART dual-ownership hardening, claims corrected), and the in-tree cover commit that adds this file |
 | Driver pointer | `joshuaswarren/omarchy-ane` (not vendored) |
 | Docs pointer | `joshuaswarren/mlx-omarchy` → `docs/boot-and-kernel.md` and `docs/forks.md` |
