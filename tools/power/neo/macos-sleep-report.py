@@ -25,7 +25,11 @@ def main():
     ds=b['PowerTelemetryData']['AccumulatedSystemLoad']-a['PowerTelemetryData']['AccumulatedSystemLoad']
     np=b['PowerTelemetryData']['SystemLoadAccumulatorCount']-a['PowerTelemetryData']['SystemLoadAccumulatorCount']
     if min(dt,dq,nc,ds,np)<=0:raise RuntimeError('invalid or reset counters')
-    if r['boot']!=r['boot_end']:raise RuntimeError('boot changed')
+    # Wall-clock boot timestamps can be adjusted by time synchronization.
+    if r.get('boot_uuid') is not None:
+        if r['boot_uuid']!=r.get('boot_uuid_end'):raise RuntimeError('boot UUID changed')
+    elif r['boot']!=r['boot_end']:
+        raise RuntimeError('legacy capture boot timestamp changed; manual review required')
     if a['ExternalConnected'] or b['ExternalConnected'] or a['IsCharging'] or b['IsCharging']:
         raise RuntimeError('external power/charging endpoint')
     v=(a['Voltage']+b['Voltage'])/2000
