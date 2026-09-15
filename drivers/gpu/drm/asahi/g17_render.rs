@@ -1057,6 +1057,23 @@ const fn render_work_key(context_id: u32, command_buffer_state_word: u32) -> u64
     ((context_id as u64) << 8) | ((command_buffer_state_word & 0x3f) as u64)
 }
 
+/// The completion record must name the same generation as the rendered writes.
+/// Native nextCommandBufferState stores the allocated word at EventControl +8;
+/// generate3DRegisterList uses its low six bits in 0x10211/0x10420. B1 uses those
+/// same bits in the cache-maintenance request before publishing the stamp.
+/// Keep the full word here: physical slot ordinals and ring indices are not
+/// substitutes for the command-buffer allocator's generation.
+pub(crate) fn set_render_event_control_generation(
+    event_control: &mut [u8],
+    command_buffer_state_word: u32,
+) -> Result<(), RenderBuildError> {
+    let generation = event_control
+        .get_mut(8..12)
+        .ok_or(RenderBuildError::BufferTooSmall)?;
+    generation.copy_from_slice(&command_buffer_state_word.to_le_bytes());
+    Ok(())
+}
+
 fn descriptor_work_ordinal(ordinal: u32) -> u32 {
     ordinal + ordinal / 2
 }
@@ -2293,6 +2310,44 @@ mod tests {
         }
         assert_eq!(get_u32(&tiling, 0x0c), 9);
         assert_eq!(get_u32(&fragment, 0x0c), 9);
+    }
+
+    #[test]
+    fn completion_generation_matches_render_tags_across_reuse_and_wrap() {
+        let parameters = G17pRenderParameters::source_rsrc8();
+        // Include a second client's cold submission and generations beyond the
+        // six-bit hardware tag wrap. The slot ordinal is intentionally unrelated.
+        for generation in [0, 1, 2, 62, 64, 65, 128, 0x12345678, u32::MAX - 1] {
+            for context_id in [1, 7] {
+                let metadata = RenderDescriptorMetadata {
+                    context_id,
+                    submission_ordinal: 2,
+                    command_buffer_state_word: generation,
+                    ..RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment)
+                };
+                let mut ta = [0u8; TA_DESCRIPTOR_SIZE];
+                let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+                let mut event_control = [0xa5; 0x100];
+                build_ta_descriptor(&parameters, objects(), metadata, &mut ta).unwrap();
+                build_fragment_descriptor(&parameters, objects(), metadata, &mut fragment)
+                    .unwrap();
+                set_render_event_control_generation(&mut event_control, generation).unwrap();
+                assert_eq!(get_u32(&event_control, 8), generation);
+                assert_eq!(&event_control[..8], &[0xa5; 8]);
+                assert!(event_control[12..].iter().all(|&v| v == 0xa5));
+                let maintenance_key = ((context_id as u64) << 8)
+                    | (get_u32(&event_control, 8) & 63) as u64;
+                for (raw, offset) in [(&ta[..], 0x36c), (&ta[..], 0x378),
+                                      (&ta[..], 0x384), (&fragment[..], 0x46c),
+                                      (&fragment[..], 0x478)] {
+                    assert_eq!(get_u64(raw, offset + 4), maintenance_key);
+                }
+            }
+        }
+        assert_eq!(
+            set_render_event_control_generation(&mut [0; 11], 0),
+            Err(RenderBuildError::BufferTooSmall)
+        );
     }
 
     #[test]
