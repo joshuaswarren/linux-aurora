@@ -572,3 +572,19 @@ with no missing IDs, and the network console reported zero transmit errors.
 10.129.154.39, receiver Fedora 10.129.154.47:6666, boot
 39eb27dd-429b-46aa-8b77-be8ef1e59e37. Awake delivery is qualified; panic-time
 delivery and the next unchanged-value PMGR probe remain unqualified.
+
+The network-captured unchanged-value probe again stopped at the first write
+(`dcp-netconsole/pmgr-same-value.log`), with no panic text received. This is
+not proof of a bus stall: a controlled SysRq crash also delivered only its
+pre-crash message. Inspection found that this kernel's netconsole is marked
+CON_NBCON_ATOMIC_UNSAFE; vpanic calls nbcon_atomic_flush_unsafe only after
+the emergency_restart path. Capture trials must use `kernel.panic=0` and
+DebugUSB recovery, rather than the earlier panic=15 timeout. Panic-time
+delivery still requires qualification with that correction.
+
+The admission helper now duplicates durable stage markers to /dev/kmsg for
+remote capture. Its same-value-readback mode tests a plain write followed
+immediately by a status read before the explicit post-write DSB, matching
+the ordering visible in native ApplePMGR. It neither lowers the target nor
+changes AUTO. This is an isolated ordering experiment, not a general change
+to Linux MMIO barriers or evidence that Apple's mapping attributes match ours.
