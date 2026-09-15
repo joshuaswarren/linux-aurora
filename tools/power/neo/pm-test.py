@@ -65,6 +65,10 @@ def snapshot():
     paths.extend('/sys/module/pmp_v2/parameters/' + name for name in
                  ('rtkit_idle_s2idle', 'rtkit_stop_s2idle'))
     for pattern in ("/sys/power/suspend_stats/*", "/sys/power/suspend_stats/last_hw_sleep",
+                    "/sys/class/typec/port*/data_role", "/sys/class/typec/port*/power_role",
+                    "/sys/class/typec/port*/power_operation_mode",
+                    "/sys/class/power_supply/macsmc-ac/online",
+                    "/sys/class/power_supply/macsmc-battery/status",
                     "/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq",
                     "/sys/class/thermal/thermal_zone*/mode",
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/usage",
@@ -74,9 +78,11 @@ def snapshot():
                     "/sys/module/mt7932_fullmac/parameters/*",
                     "/sys/bus/platform/devices/macsmc-input/power/wakeup"):
         paths.extend(str(p) for p in Path('/').glob(pattern.lstrip('/')) if p.is_file())
-    return {"files": {p: read(p) for p in paths},
+    capture = {"files": {p: read(p) for p in paths},
             "kernel_notes_sha256": hashlib.sha256(Path('/sys/kernel/notes').read_bytes()).hexdigest(),
             "dmesg": command(['dmesg']), "input": read('/proc/bus/input/devices')}
+    capture['typec_partners'] = sorted(p.name for p in Path('/sys/class/typec').glob('*-partner'))
+    return capture
 
 
 def check_firmware_health(capture):
