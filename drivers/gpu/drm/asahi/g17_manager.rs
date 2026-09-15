@@ -1058,9 +1058,216 @@ impl G17PManagerConstruction {
                     job_list_empty: state.job_list_empty,
                     tiling_timestamps: state.tiling_timestamps,
                     fragment_timestamps: state.fragment_timestamps,
-                },
-            )
-            .map_err(|_| EINVAL)?;
+                }
+            };
+            let observe = |state: &g17_resources::G17PUserRenderQueueState| {
+                g17_completion::observe_paired_render_window(
+                    window,
+                    tiling_previous,
+                    state.tiling,
+                    fragment_previous,
+                    state.fragment,
+                    execution(state),
+                )
+            };
+            let completion = match observe(&state) {
+                Ok(completion) => completion,
+                Err(first_error) => {
+                    // The six producer/consumer words are firmware-owned and
+                    // sampled separately.  An event edge can therefore catch
+                    // one cache line before the paired line becomes visible.
+                    // Retry one immediate DRAM snapshot; this is bounded edge
+                    // handling, not a completion poll or a steady-state timer.
+                    fence(Ordering::Acquire);
+                    let retry = self
+                        .render_storage
+                        .as_mut()
+                        .ok_or(ENODEV)?
+                        .snapshot()?;
+                    match observe(&retry) {
+                        Ok(completion) => {
+                            state = retry;
+                            completion
+                        }
+                        Err(second_error) => {
+                            dev_err!(
+                                self.resources.dev().as_ref(),
+                                "G17P render completion: ordinal {} target {} rejected two snapshots ({:?}/{:?}); previous TA {}/{}/{} 3D {}/{}/{} first TA {}/{}/{} 3D {}/{}/{} retry TA {}/{}/{} 3D {}/{}/{}\n",
+                                self.render_submission_ordinal,
+                                window.target(),
+                                first_error,
+                                second_error,
+                                tiling_previous.done,
+                                tiling_previous.read,
+                                tiling_previous.write,
+                                fragment_previous.done,
+                                fragment_previous.read,
+                                fragment_previous.write,
+                                state.tiling.done,
+                                state.tiling.read,
+                                state.tiling.write,
+                                state.fragment.done,
+                                state.fragment.read,
+                                state.fragment.write,
+                                retry.tiling.done,
+                                retry.tiling.read,
+                                retry.tiling.write,
+                                retry.fragment.done,
+                                retry.fragment.read,
+                                retry.fragment.write,
+                            );
+                            return Ok(G17PRenderPollOutcome::Retry);
+                        }
+                    }
+                }
+            };
+            let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
+            if completion.complete {
+                // Queue retirement can become visible before the TA command's
+                // EventControl has reached its own submitted target and been
+                // unlinked. Releasing the fence at that intermediate state
+                // lets the next command consume another Pool-A record until
+                // all 35 appear busy. The matching type-1 edge is the wake;
+                // this is its single ordered host-DRAM validation.
+                let event_control = self
+                    .render_storage
+                    .as_mut()
+                    .ok_or(ENODEV)?
+                    .render_event_control_state()?;
+                if !event_control.unlinked() {
+                    if crate::util::g17p_verbose() {
+                        dev_info!(
+                            self.resources.dev().as_ref(),
+                            "G17P render completion: EventControl {} pending submitted={} completed={} membership={:#x}\n",
+                            event_control.record_index,
+                            event_control.submitted,
+                            event_control.completed,
+                            event_control.membership,
+                        );
+                    }
+                    return Ok(G17PRenderPollOutcome::Pending);
+                }
+                // B1 clears EventControl membership BEFORE GPU cache
+                // maintenance. Its fragment stamp A write follows that
+                // maintenance (25G83 B1 0x16ea0); queue/list retirement alone
+                // therefore cannot authorize a userspace-visible fence.
+                // The physical slot retains its ordinal across VM switches,
+                // has one in-flight pair, and refuses 24-bit stamp overflow.
+                // Require this exact generation, never a stale nonzero stamp.
+                let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
+                let expected_stamp = self.render_submission_ordinal
+                    .checked_add(1)
+                    .and_then(|value| value.checked_mul(0x100))
+                    .ok_or(EOVERFLOW)?;
+                let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
+                if fragment_stamp != expected_stamp {
+                    if crate::util::g17p_verbose() {
+                        dev_info!(
+                            self.resources.dev().as_ref(),
+                            "G17P render completion: fragment stamp pending qid={} observed={:#x} expected={:#x}\n",
+                            pair.fragment,
+                            fragment_stamp,
+                            expected_stamp,
+                        );
+                    }
+                    // The post-stamp type-1 notification wakes this job.
+                    // Keep its ownership and fence pending without polling.
+                    return Ok(G17PRenderPollOutcome::Pending);
+                }
+                // Publish the exact GPU-written pass envelope while the completed job's
+                // VM binding, ordinal and QIDs are still owned.  This is
+                // observation only: it neither gates completion nor changes
+                // queue state.  Invalid retirement-only pairs are omitted.
+                if let Some(interval) =
+                    g17_completion::render_gpu_interval(
+                        g17_completion::RenderExecutionState {
+                            job_list_empty: state.job_list_empty,
+                            tiling_timestamps: state.tiling_timestamps,
+                            fragment_timestamps: state.fragment_timestamps,
+                        },
+                    )
+                {
+                    let (vm_id, root) = self.render_bind.as_ref()
+                        .map_or((0, 0), |binding| (binding.vm_id(), binding.root()));
+                    let fallback_pair = self.render_storage
+                        .as_ref()
+                        .map(g17_resources::G17PUserRenderStorage::queue_pair)
+                        .unwrap_or(g17_resources::G17PRenderQueuePair::for_slot(
+                            self.active_render_slot,
+                        ).ok_or(EINVAL)?);
+                    let (tiling_qid, fragment_qid) = self.render_sksm.as_ref()
+                        .map_or((fallback_pair.tiling, fallback_pair.fragment), |queues| (
+                            u16::from(queues.tiling.queue_id),
+                            u16::from(queues.fragment.queue_id),
+                        ));
+                    if crate::util::g17p_verbose() {
+                        dev_info!(
+                            self.resources.dev().as_ref(),
+                            "G17P render: GPU-INTERVAL ordinal={} vm={} root={:#x} ta-qid={} fragment-qid={} start={} end={}\n",
+                            self.render_submission_ordinal,
+                            vm_id,
+                            root,
+                            tiling_qid,
+                            fragment_qid,
+                            interval[0],
+                            interval[1],
+                        );
+                    }
+                }
+                // Validate and commit the context-retirement epoch before the
+                // ordinary occupancy transaction starts mutating allocator
+                // state. Every fallible retirement precondition is therefore
+                // checked before an HWPB lease or queue producer is changed.
+                self.complete_render_context_update_retirement()?;
+                // Native TA/3D complete subtract completed kicks from queue
+                // +44. Prepare both results before mutating either queue;
+                // timestamps and previous-stamp history must never reset.
+                let retired_sksm = self.render_sksm.as_ref().map(|queues| {
+                    let ta = g17_submission::complete_g17p_cl_kicks(queues.tiling.producer, 1)?;
+                    let fragment = g17_submission::complete_g17p_cl_kicks(queues.fragment.producer, 1)?;
+                    Ok::<_, g17_submission::SubmissionError>((ta, fragment))
+                }).transpose().map_err(|_| EIO)?;
+                let next_ordinal = self.render_submission_ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+                let hardware_buffer_id = self.render_hardware_buffer_id.ok_or(EIO)?;
+                self.render_hardware_buffer_ids
+                    .release(hardware_buffer_id)
+                    .map_err(|_| EIO)?;
+                self.release_active_render_command_buffer_states()?;
+                if let (Some(queues), Some((ta, fragment))) = (self.render_sksm.as_mut(), retired_sksm) {
+                    queues.tiling.producer = ta;
+                    queues.fragment.producer = fragment;
+                }
+                self.render_hardware_buffer_id = None;
+                self.render_tracker = None;
+                self.render_hardware_buffer_published = false;
+                self.render_auxiliary_timestamp = 0;
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.resources.dev().as_ref(),
+                        "G17P render: released TA HardwareBufferID {} at paired completion\n",
+                        hardware_buffer_id,
+                    );
+                }
+                self.render_submission_ordinal = next_ordinal;
+                // One control sample per boot, from a render that DID complete.
+                //
+                // Every field of the `context/qos` line captured at a wedge --
+                // slot=255 ctx=255 prio=0 class=0 state=2 bound-slot=255 and an
+                // all-zero qid bitmap -- is byte-for-byte what
+                // `apply_g17p_cold_opening_channel_control` writes at cold
+                // opening (`0x0000_0100_0000_ffff` at +0x00, `0x0002_..` at
+                // +0x20, `0x0000_0000_ff00_0000` at +0x30, `fill(0)` elsewhere).
+                // So that line proves only that the record is UNTOUCHED, which
+                // is a different claim from "the context was lost", and without
+                // a healthy sample the two are indistinguishable. If this
+                // control prints the same constants, the firmware never writes
+                // this record and the diagnostic -- and the comment above it
+                // claiming it is "the exact host-safe witness" -- is wrong.
+                if !RENDER_CONTEXT_WITNESS_LOGGED.swap(true, Ordering::Relaxed) {
+                    self.log_render_context_witness("healthy-paired-completion");
+                }
+                return Ok(G17PRenderPollOutcome::Complete(completion));
+            }
             tracker.tiling_previous = state.tiling;
             tracker.fragment_previous = state.fragment;
             if completion.complete {

@@ -771,6 +771,11 @@ pub(crate) fn build_fragment_descriptor(
 
     put_u64(raw, 0x40, parameters.tilemap);
     put_u64(raw, 0x48, parameters.multisample_control);
+    // Native copies the render target's sample count through host +0x8c8
+    // into every fragment descriptor at +0x50 (25G83: 0x8839d80,
+    // 0x8837af8..0x8837b08). It is not first-work metadata. The UAPI has
+    // already encoded log2(samples) in UTILE_CONFIG bits [1:0].
+    put_u32(raw, 0x50, 1u32 << (parameters.utile_config & 3));
     put_u32(raw, 0x54, geometry.macro_size as u32);
     put_u32(raw, 0x68, parameters.merge_upper_x_bits);
     put_u32(raw, 0x6c, parameters.merge_upper_y_bits);
@@ -840,13 +845,10 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     objects: RenderDescriptorObjects,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
-    build_fragment_descriptor(
-        parameters,
-        objects,
-        RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
-        raw,
-    )?;
-    put_u32(raw, 0x50, 1);
+    let mut metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment);
+    metadata.context_id = context_id;
+    metadata.command_buffer_state_word = command_buffer_state_word;
+    build_fragment_descriptor(parameters, objects, metadata, raw)?;
     put_u16(raw, 0x80, 0x56);
     put_u16(raw, 0x82, 0x57);
     put_u16(raw, 0x84, 0x57);
@@ -1313,6 +1315,191 @@ mod tests {
         assert_eq!(get_u64(&fragment, 0x1e80), G17P_SOURCE_BG_PIPELINE);
         assert_eq!(get_u32(&fragment, 0x1f78), 0x8);
         assert_eq!(get_u64(&fragment, 0x1f7c), G17P_SOURCE_EOT_PIPELINE);
+    }
+
+    #[test]
+    fn pool_a_record_one_changes_only_the_two_stage_pointer_fields() {
+        let parameters = G17pRenderParameters::source_rsrc8();
+        let baseline_objects = objects();
+        let record_one_objects = baseline_objects.with_pool_a_record_index(1).unwrap();
+        let mut baseline_ta = [0u8; TA_DESCRIPTOR_SIZE];
+        let mut record_one_ta = [0u8; TA_DESCRIPTOR_SIZE];
+        let mut baseline_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+        let mut record_one_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+        build_ta_descriptor(
+            &parameters,
+            baseline_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
+            &mut baseline_ta,
+        )
+        .unwrap();
+        build_ta_descriptor(
+            &parameters,
+            record_one_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
+            &mut record_one_ta,
+        )
+        .unwrap();
+        build_fragment_descriptor(
+            &parameters,
+            baseline_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+            &mut baseline_3d,
+        )
+        .unwrap();
+        build_fragment_descriptor(
+            &parameters,
+            record_one_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+            &mut record_one_3d,
+        )
+        .unwrap();
+
+        assert_eq!(record_one_objects.record_a, baseline_objects.record_a + 0x100);
+        assert_eq!(get_u64(&baseline_ta, 0x10), baseline_objects.record_a);
+        assert_eq!(get_u64(&record_one_ta, 0x10), record_one_objects.record_a);
+        assert_eq!(get_u64(&baseline_3d, 0x20), baseline_objects.record_a);
+        assert_eq!(get_u64(&record_one_3d, 0x20), record_one_objects.record_a);
+        for (offset, (before, after)) in baseline_ta.iter().zip(record_one_ta.iter()).enumerate() {
+            if !(0x10..0x18).contains(&offset) {
+                assert_eq!(before, after, "unexpected TA descriptor change at {offset:#x}");
+            }
+        }
+        for (offset, (before, after)) in baseline_3d.iter().zip(record_one_3d.iter()).enumerate() {
+            if !(0x20..0x28).contains(&offset) {
+                assert_eq!(before, after, "unexpected 3D descriptor change at {offset:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn pool_a_record_index_checks_overflow() {
+        let objects = RenderDescriptorObjects {
+            record_a: u64::MAX - 0xff,
+            ..objects()
+        };
+        assert_eq!(
+            objects.with_pool_a_record_index(1),
+            Err(RenderBuildError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn fragment_hwpb_split_changes_only_fragment_plus_0x28() {
+        let parameters = G17pRenderParameters::source_rsrc8();
+        let baseline_objects = objects();
+        let hwpb = 0xffff_fc20_c099_8000;
+        let fragment_objects = baseline_objects.with_shared(hwpb);
+        let mut baseline_ta = [0u8; TA_DESCRIPTOR_SIZE];
+        let mut split_ta = [0u8; TA_DESCRIPTOR_SIZE];
+        let mut baseline_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+        let mut split_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+
+        build_ta_descriptor(
+            &parameters,
+            baseline_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
+            &mut baseline_ta,
+        )
+        .unwrap();
+        build_ta_descriptor(
+            &parameters,
+            baseline_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
+            &mut split_ta,
+        )
+        .unwrap();
+        build_fragment_descriptor(
+            &parameters,
+            baseline_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+            &mut baseline_3d,
+        )
+        .unwrap();
+        build_fragment_descriptor(
+            &parameters,
+            fragment_objects,
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+            &mut split_3d,
+        )
+        .unwrap();
+
+        assert_eq!(baseline_ta, split_ta);
+        assert_eq!(get_u64(&baseline_3d, 0x20), baseline_objects.record_a);
+        assert_eq!(get_u64(&split_3d, 0x20), baseline_objects.record_a);
+        assert_eq!(get_u64(&baseline_3d, 0x28), baseline_objects.shared);
+        assert_eq!(get_u64(&split_3d, 0x28), hwpb);
+        assert_eq!(get_u64(&baseline_3d, 0x30), baseline_objects.record_b);
+        assert_eq!(get_u64(&split_3d, 0x30), baseline_objects.record_b);
+        assert_eq!(get_u64(&baseline_3d, 0x38), baseline_objects.zero);
+        assert_eq!(get_u64(&split_3d, 0x38), baseline_objects.zero);
+        for (offset, (before, after)) in baseline_3d.iter().zip(split_3d.iter()).enumerate() {
+            if !(0x28..0x30).contains(&offset) {
+                assert_eq!(
+                    before, after,
+                    "unexpected 3D descriptor change at {offset:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memory_backed_render_policy_is_independent_of_tib_size() {
+        for tib_blocks in [4, 8, 9, 12, 16] {
+            for process_empty_tiles in [false, true] {
+                let mut parameters = G17pRenderParameters::source_rsrc8();
+                parameters.tib_blocks = tib_blocks;
+                parameters.process_empty_tiles = process_empty_tiles;
+                parameters.tile_config = 0x280
+                    | if process_empty_tiles { 0x1_0000 } else { 0 };
+                let mut fragment = [0xa5u8; FRAGMENT_DESCRIPTOR_SIZE];
+                build_cold_opening_fragment_descriptor(
+                    &parameters, objects(), 1, 1, &mut fragment,
+                )
+                .unwrap();
+                assert_eq!(fragment[0x2100], 0);
+                assert_eq!(get_u64(&fragment, 0x1f38), tib_blocks);
+                assert_eq!(get_u64(&fragment, 0x1f58), parameters.tile_config);
+                // Keep real memory-backed partial phase programs, not the
+                // native memoryless count-two reset-only phase variant.
+                for (at, count) in [(0xec8, 16), (0x15e8, 23), (0x1d08, 10)] {
+                    assert_eq!(get_u32(&fragment, at) & 0xffff, count);
+                }
+                apply_g17p_retained_descriptor_fields(
+                    RenderDescriptorKind::Fragment, 0x7000098000, 0,
+                    1, 1, 1, false, false, &mut fragment,
+                )
+                .unwrap();
+                assert_eq!(fragment[0x2100], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn fragment_sample_count_matches_tile_configuration_on_every_submission() {
+        for (sample_log2, samples) in [(0, 1), (1, 2), (2, 4)] {
+            let mut parameters = G17pRenderParameters::source_rsrc8();
+            parameters.utile_config = 0xa000 | sample_log2;
+            let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+
+            build_fragment_descriptor(
+                &parameters,
+                objects(),
+                RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+                &mut fragment,
+            )
+            .unwrap();
+            assert_eq!(get_u32(&fragment, 0x50), samples, "retained {samples}x");
+            assert_eq!(get_u32(&fragment, 0xac), 0x10009);
+            assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
+
+            build_cold_opening_fragment_descriptor(
+                &parameters, objects(), 1, 1, &mut fragment,
+            )
+            .unwrap();
+            assert_eq!(get_u32(&fragment, 0x50), samples, "first {samples}x");
+            assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
+        }
     }
 
     #[test]

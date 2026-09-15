@@ -6314,6 +6314,400 @@ impl G17ResourceOwner {
         Ok(())
     }
 
+    pub(crate) fn stage_render_parameter_buffer_descriptor(
+        &mut self,
+        descriptor: Option<(u32, u64, u32)>,
+    ) -> Result<Option<(u32, [u32; 4])>> {
+        let Some((index, page_list_address, page_count)) = descriptor else {
+            return Ok(None);
+        };
+        let offset = g17_submission::g17p_pbdesc_offset(index);
+        let mut previous = [0u32; 4];
+        let mut published = [0u32; 4];
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let end = offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EINVAL)?;
+            if end > bytes.len() {
+                return Err(EINVAL);
+            }
+            for (word, value) in previous.iter_mut().enumerate() {
+                let at = offset + word * 4;
+                *value = u32::from_le_bytes(bytes[at..at + 4].try_into().map_err(|_| EINVAL)?);
+            }
+            let encoded = g17_submission::encode_g17p_pbdesc(
+                previous,
+                page_list_address,
+                page_count,
+                g17_submission::G17PPbDescRingState::default(),
+            );
+            published = encoded;
+            for (word, value) in encoded.iter().enumerate() {
+                let at = offset + word * 4;
+                bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P render PM: PBDesc index={} page-list-address={:#x} pages={} raw={:08x?} reconstructed={:#x} published-table=[{:#x},{:#x}]\n",
+                index,
+                page_list_address,
+                page_count,
+                published,
+                g17_submission::g17p_pbdesc_reconstructed_address(page_list_address),
+                self.resources.pb_descriptor_table_low.iova(),
+                self.resources.pb_descriptor_table.iova(),
+            );
+        }
+        Ok(Some((index, previous)))
+    }
+
+    fn restore_render_parameter_buffer_descriptor(
+        &mut self,
+        staged: Option<(u32, [u32; 4])>,
+    ) -> Result {
+        let Some((index, previous)) = staged else {
+            return Ok(());
+        };
+        let offset = g17_submission::g17p_pbdesc_offset(index);
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let end = offset
+                .checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE)
+                .ok_or(EINVAL)?;
+            if end > bytes.len() {
+                return Err(EINVAL);
+            }
+            for (word, value) in previous.into_iter().enumerate() {
+                let at = offset + word * 4;
+                bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Snapshot the retained PBDesc entry and the two primary-main-config
+    /// pointers through which B1 discovers that table.  All reads are from
+    /// host-owned DRAM and remain safe at recovery/timeout checkpoints.
+    pub(crate) fn log_render_parameter_buffer_descriptor(
+        &mut self,
+        label: &str,
+        index: u32,
+    ) {
+        if !crate::util::g17p_verbose() {
+            return;
+        }
+        let offset = g17_submission::g17p_pbdesc_offset(index);
+        let mut entry = [0u32; 4];
+        let entry_read = self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            for (word, value) in entry.iter_mut().enumerate() {
+                let at = offset.checked_add(word * 4).ok_or(EOVERFLOW)?;
+                *value = u32::from_le_bytes(
+                    bytes
+                        .get(at..at + 4)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| ERANGE)?,
+                );
+            }
+            Ok(())
+        });
+
+        let shared_base = self.resources.shared_cluster.iova();
+        let main_offset: Result<usize> = self
+            .handoff
+            .primary
+            .instance
+            .main_config
+            .checked_sub(shared_base)
+            .ok_or(ERANGE)
+            .and_then(|value| value.try_into().map_err(|_| ERANGE));
+        let mut main_views = [0u64; 2];
+        let main_read = main_offset.and_then(|main_offset| {
+            self.resources.shared_cluster.with_bytes_mut(|bytes| {
+                for (slot, relative) in [0x2d8usize, 0x2e0].into_iter().enumerate() {
+                    let at = main_offset.checked_add(relative).ok_or(EOVERFLOW)?;
+                    main_views[slot] = u64::from_le_bytes(
+                        bytes
+                            .get(at..at + 8)
+                            .ok_or(ERANGE)?
+                            .try_into()
+                            .map_err(|_| ERANGE)?,
+                    );
+                }
+                Ok(())
+            })
+        });
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
+        match (entry_read, main_read) {
+            (Ok(()), Ok(())) => dev_info!(
+                self.dev().as_ref(),
+                "G17P render PBDesc[{}]: index={} entry={:08x?} main-config(+2d8,+2e0)=[{:#x},{:#x}] expected-table=[{:#x},{:#x}]\n",
+                label,
+                index,
+                entry,
+                main_views[0],
+                main_views[1],
+                self.resources.pb_descriptor_table_low.iova(),
+                self.resources.pb_descriptor_table.iova(),
+            ),
+            (entry_result, main_result) => dev_warn!(
+                self.dev().as_ref(),
+                "G17P render PBDesc[{}]: snapshot failed entry={:?} main-config={:?}\n",
+                label,
+                entry_result.err(),
+                main_result.err(),
+            ),
+        }
+    }
+
+    /// Read the selected physical 3D queue's post-maintenance completion stamp.
+    ///
+    /// B1's timestamp queue unlinks EventControl at 0x16b48, performs GPU
+    /// cache maintenance, then writes the first pointer from fragment stamp
+    /// info (+0x2140) at 0x16ea0. Page B is firmware-private bookkeeping;
+    /// page A is the host-visible completion witness, as on M1/M2.
+    pub(crate) fn render_fragment_completion_stamp(
+        &mut self,
+        pair: G17PRenderQueuePair,
+    ) -> Result<u32> {
+        let offset = usize::from(pair.fragment) * core::mem::size_of::<u32>();
+        self.resources.bootstrap_descriptor_zero_a.with_bytes_mut(|bytes| {
+            let word = bytes.get(offset..offset + 4).ok_or(ERANGE)?;
+            // SAFETY: this WC-mapped allocation is page aligned, each QID's
+            // lane is u32 aligned, and the checked slice covers that lane.
+            // Firmware updates it with one aligned u32 store. The acquire
+            // load orders subsequent CPU reads after the completion witness.
+            let stamp = unsafe {
+                &*word.as_ptr().cast::<core::sync::atomic::AtomicU32>()
+            };
+            Ok(u32::from_le(stamp.load(core::sync::atomic::Ordering::Acquire)))
+        })
+    }
+
+    /// Sample the first four per-queue stamp lanes of the shared "descriptor
+    /// zero" pages -- A (GPU and firmware) and B (firmware-private) -- that the
+    /// TA/3D records point at by their own QID. DRAM only, safe after a
+    /// timeout; QIDs 0/1 belong to render pair 0 and 2/3 to pair 1.
+    pub(crate) fn render_stamp_lanes(&mut self) -> Result<[[u32; 4]; 2]> {
+        let mut lanes = [[0u32; 4]; 2];
+        for (page, object) in [
+            &mut self.resources.bootstrap_descriptor_zero_a,
+            &mut self.resources.bootstrap_descriptor_zero_b,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            object.with_bytes_mut(|bytes| {
+                for (qid, lane) in lanes[page].iter_mut().enumerate() {
+                    *lane = u32::from_le_bytes(
+                        bytes
+                            .get(qid * 4..qid * 4 + 4)
+                            .ok_or(ERANGE)?
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(lanes)
+    }
+
+    /// Validate a retained storage's indexed PBDesc entry on owner switches.
+    /// The table has one entry per HardwareBufferID, not a single current
+    /// descriptor to retarget. Firmware owns the live allocation cursors and
+    /// flags: running the cold initializer here destroys halStorePBDesc state.
+    pub(crate) fn stage_render_parameter_buffer_view(
+        &mut self,
+        storage: &mut G17PUserRenderStorage,
+    ) -> Result {
+        self.stage_render_parameter_buffer_page_list(storage)?;
+        let Some((index, page_list_address, page_count)) =
+            storage.parameter_buffer_descriptor()? else { return Ok(()); };
+        let offset = g17_submission::g17p_pbdesc_offset(index);
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let end = offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE)
+                .ok_or(EINVAL)?;
+            if end > bytes.len() { return Err(EINVAL); }
+            let mut previous = [0u32; 4];
+            for (word, value) in previous.iter_mut().enumerate() {
+                let at = offset + word * 4;
+                *value = u32::from_le_bytes(bytes[at..at + 4].try_into().map_err(|_| EINVAL)?);
+            }
+            let expected = g17_submission::encode_g17p_pbdesc(
+                previous, page_list_address, page_count,
+                g17_submission::decode_g17p_pbdesc(previous),
+            );
+            // A different address/count means the retained identity was lost.
+            // Do not repair it while firmware may retain that other owner.
+            if previous != expected { return Err(EIO); }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn stage_render_parameter_buffer_page_list(
+        &mut self,
+        storage: &mut G17PUserRenderStorage,
+    ) -> Result {
+        let pm = storage.parameter_management.as_mut().ok_or(EINVAL)?;
+        let page_list_offset = pm.layout.page_list;
+        let page_list_vas = pm.page_list_vas;
+        let mut first = [0u32; 8];
+        pm.backing.with_bytes_mut(|bytes| {
+            for (index, value) in first.iter_mut().enumerate() {
+                let offset = page_list_offset + index * 4;
+                *value = u32::from_le_bytes(
+                    bytes
+                        .get(offset..offset + 4)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| EINVAL)?,
+                );
+            }
+            Ok(())
+        })?;
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P render PM: staged native PB page-list aliases=[{:#x},{:#x}] first={:x?}\n",
+                page_list_vas[0],
+                page_list_vas[1],
+                first,
+            );
+        }
+        Ok(())
+    }
+
+    /// Publish the Linux-owned USC private-memory FList into the global UMA
+    /// descriptor table exactly as `AGXAcceleratorG16::halLoadUMADesc` does.
+    pub(crate) fn stage_render_uma_page_pool_descriptor(&mut self) -> Result {
+        let hardware_buffer_id =
+            g17_initdata::PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID;
+        let offset = g17_submission::g17p_umadesc_offset(hardware_buffer_id).ok_or(EINVAL)?;
+        let mut state = g17_submission::G17PUmaPagePoolState::default();
+        self.resources
+            .control_shared
+            .with_bytes_mut(|bytes| {
+                let read_u32 = |at: usize| -> Result<u32> {
+                    Ok(u32::from_le_bytes(
+                        bytes.get(at..at + 4).ok_or(EINVAL)?.try_into().map_err(|_| EINVAL)?,
+                    ))
+                };
+                let read_u64 = |at: usize| -> Result<u64> {
+                    Ok(u64::from_le_bytes(
+                        bytes.get(at..at + 8).ok_or(EINVAL)?.try_into().map_err(|_| EINVAL)?,
+                    ))
+                };
+                state = g17_submission::G17PUmaPagePoolState {
+                    page_list: read_u64(0x14)?,
+                    unit_pages: read_u32(0x1c)?,
+                    counter_a: read_u32(0x20)?,
+                    counter_b: read_u32(0x24)?,
+                    empty: read_u32(0x28)?,
+                    total_pages: read_u32(0x2c)?,
+                };
+                Ok(())
+            })?;
+        let mut encoded = [0u64; 4];
+        self.resources
+            .uma_page_pool_descriptor_table
+            .with_bytes_mut(|bytes| {
+                let end = offset
+                    .checked_add(g17_submission::G17P_UMA_DESC_ENTRY_SIZE)
+                    .ok_or(EINVAL)?;
+                if end > bytes.len() {
+                    return Err(EINVAL);
+                }
+                let mut previous = [0u64; 4];
+                for (word, value) in previous.iter_mut().enumerate() {
+                    let at = offset + word * 8;
+                    *value = u64::from_le_bytes(
+                        bytes[at..at + 8].try_into().map_err(|_| EINVAL)?,
+                    );
+                }
+                encoded = g17_submission::encode_g17p_umadesc(previous, state);
+                for (word, value) in encoded.iter().enumerate() {
+                    let at = offset + word * 8;
+                    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                Ok(())
+            })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        dev_info!(
+            self.dev().as_ref(),
+            "G17P render UMA: ID={} state=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] descriptor=[{:#x},{:#x},{:#x},{:#x}] table=[{:#x},{:#x}]\n",
+            hardware_buffer_id,
+            state.page_list,
+            state.unit_pages,
+            state.counter_a,
+            state.counter_b,
+            state.empty,
+            state.total_pages,
+            encoded[0],
+            encoded[1],
+            encoded[2],
+            encoded[3],
+            self.resources.uma_page_pool_descriptor_table_low.iova(),
+            self.resources.uma_page_pool_descriptor_table.iova(),
+        );
+        Ok(())
+    }
+
+    /// Diagnose the firmware mutation expected after a successful opcode-0x20
+    /// grow. Native appends five 1-MiB blocks after the 0x1100 initial pages.
+    pub(crate) fn log_render_uma_growth(&mut self, checkpoint: &str) {
+        let mut state = [0u32; 7];
+        let state_result = self
+            .resources
+            .control_shared
+            .with_bytes_mut(|bytes| {
+                for (index, offset) in [0x20usize, 0x24, 0x28, 0x2c, 0x40, 0x44, 0x48]
+                    .into_iter()
+                    .enumerate()
+                {
+                    state[index] = u32::from_le_bytes(
+                        bytes.get(offset..offset + 4).ok_or(EINVAL)?
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                }
+                Ok(())
+            });
+        let mut appended = [0u64; 5];
+        let page_result = self.resources.control_operand_page_lists.with_bytes_mut(|bytes| {
+            let start = 0x1100usize * 8;
+            for (index, value) in appended.iter_mut().enumerate() {
+                let offset = start + index * 8;
+                *value = u64::from_le_bytes(
+                    bytes.get(offset..offset + 8).ok_or(EINVAL)?
+                        .try_into()
+                        .map_err(|_| EINVAL)?,
+                );
+            }
+            Ok(())
+        });
+        match (state_result, page_result) {
+            (Ok(()), Ok(())) => dev_info!(
+                self.dev().as_ref(),
+                "G17P render UMA growth[{}]: state(+20,+24,+28,+2c,+40,+44,+48)={:x?} page-list[0x1100..]={:x?}\n",
+                checkpoint,
+                state,
+                appended,
+            ),
+            (state_error, page_error) => dev_warn!(
+                self.dev().as_ref(),
+                "G17P render UMA growth[{}]: snapshot failed state={:?} pages={:?}\n",
+                checkpoint,
+                state_error,
+                page_error,
+            ),
+        }
+    }
+
     pub(crate) fn new_user_render_storage(
         &mut self,
         dev: &AsahiDevice,
