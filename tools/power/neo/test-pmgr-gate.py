@@ -3,6 +3,7 @@
 """Offline restoration regression cases: no hardware access."""
 import importlib.util
 from pathlib import Path
+import json
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('gate', Path(__file__).with_name('pmgr-gate.py'))
@@ -41,4 +42,10 @@ with patch.object(gate, 'helper', side_effect=RuntimeError('MMIO failure')), \
 for name in ('SIO_CPU', 'DISPEXT0_CPU', 'AOP_CPU', 'DISP_CPU', 'PMP', 'APCIE_PHY_SW'):
     assert gate.denied(name), name
 assert not gate.denied('PRORES') and not gate.denied('MSR')
+table = {d['name']: d for d in json.loads(gate.TABLE.read_text())}
+assert table['AOP_BASE']['parents'] == ['AOP_FILTER']
+assert table['AOP_CPU']['device_id'] != table['AOP_CPU']['adt_index']
+assert table['DPTX_PHY']['virtual'] and table['DISPEXT0_GPPP']['virtual']
+assert 'VENC-CLSTR-V' in table['VENC0_SYS']['parents']
+assert not table['PRORES']['virtual'] and not table['MSR']['virtual']
 print('ok: explicit hex target, ACTIVE/policy readback, failure propagation, CPU exclusions')
