@@ -621,3 +621,16 @@ any sleep handshake or lower power request. This rules out userspace-only
 access and a stopped-DCP prerequisite as sufficient explanations, but does
 not establish the underlying interconnect error cause. One DebugUSB reset
 returned Neo to #39, boot fdb9ad2b-2d95-4333-9c4f-0c315974c0fa.
+
+The next probe added a read-only panic observer for Apple's L2 error registers
+(named in m1n1 cpu_regs.h). A five-second control read them as zero and
+completed successfully. The unchanged write then captured L2 status 0x80
+(access-fault bit), address 0x6280000300710000, info 0x1500000002. The low
+physical-address bits match DISP_CPU 0x300710000. No decoding of the upper
+address metadata or info fields is claimed. Boot
+fdb9ad2b-2d95-4333-9c4f-0c315974c0fa, module SHA256
+`56da27140668e08116f36e3c2602ec7927bdd6bbf8ef6f7e30f556414adb7249`,
+source d86b21fe2; capture `dcp-netconsole/el1-l2-capture.jsonl` and
+`el1-l2-panic.txt`. No error-status register was cleared or modified. One
+DebugUSB reset recovered the machine. Retention controls remain unmodified;
+the native caller/ownership path must be resolved before retrying CPU gating.
