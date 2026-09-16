@@ -99,3 +99,17 @@ handler. Since the device mask was already enabled, restoring that same mask
 did not ensure a fresh edge. #47 masks the device, drains and acknowledges
 pending causes after ownership and DMA verification, then enables Linux IRQ.
 This is the next candidate fix, not a passing network result yet.
+
+## #47 rearm correction passes short network checks
+
+Boot e18d0253-14f1-4cb2-a911-c4e690f0dd59, Image SHA256
+e7e51e2ed35c9a804fe002ab17aaeb773fdf487f795f7114fc6560d5d87c58c9.
+The timer-only 100 ms control and four MSI-enabled holds passed ownership,
+geometry, carrier and all fifteen post-trial pings. The MSI holds ended in
+15.0, 49.8, 77.5 and 3.9 ms, with ownership word4 observed before reclaim.
+This fixes the observed receive stall. It does not identify which packet or
+background event generated each MSI, nor prove continuous idle residency.
+Capture: wifi-ownirq-qualify47/. A duplicate service launch refused to reuse
+its existing output directory before any hardware access; the first run's
+passing JSON and full kernel log remain the evidence, not that service's
+later failed status. A bracketed power experiment follows separately.
