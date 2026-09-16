@@ -7275,7 +7275,9 @@ impl G17ResourceOwner {
             Ok(())
         })?;
         self.resources.compute_operand_page_lists.as_mut().ok_or(EIO)?
-            .with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_flist_page_list(bytes).map_err(|_| EINVAL)
+            })?;
         self.resources.compute_operand_table.as_mut().ok_or(EIO)?
             .with_bytes_mut(|bytes| {
                 if encode_g17p_compute_flist_runs(bytes) { Ok(()) } else { Err(EINVAL) }
@@ -8078,6 +8080,417 @@ mod tests {
         );
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
         assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
+
+    #[test]
+    fn g17p_normal_cl_completion_storage_matches_inline_descriptor_abi() {
+        assert_eq!(g17_submission::G17P_NORMAL_CL_COMPLETION_ORDINAL, 0);
+        assert_eq!(g17_submission::G17P_KSM_COMPLETION_PRESENT_ORDINALS, [0, 2]);
+        assert_eq!(g17_initdata::G17P_KSM_COMPLETION_PRESENT_ORDINALS, [0, 2]);
+        assert_eq!(g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE, 0x20000);
+        assert_eq!(
+            g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE,
+            g17_submission::G17P_KSM_COMPLETION_BACKING_SIZE
+        );
+        let aliases = [
+            g17_initdata::G17PKsmCompletionAliases {
+                low: g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[0],
+                high: g17_initdata::NATIVE_SHARED_CLUSTER_GPU_VA
+                    + g17_initdata::G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[0] as u64,
+            },
+            g17_initdata::G17PKsmCompletionAliases {
+                low: g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[1],
+                high: g17_initdata::NATIVE_SHARED_CLUSTER_GPU_VA
+                    + g17_initdata::G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[1] as u64,
+            },
+        ];
+        let extent = g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE as u64;
+        assert!(aliases[0].low + extent <= aliases[1].low);
+        assert!(aliases[0].high + extent <= aliases[1].high);
+
+        let mut hw = vec![0xa5; g17_initdata::HW_DATA_SIZE];
+        g17_initdata::encode_hw_data(
+            &[],
+            &[],
+            aliases,
+            g17_initdata::NATIVE_SHARED_CLUSTER_GPU_VA
+                + g17_initdata::NATIVE_SHARED_CLUSTER_SIZE as u64
+                + 0x8000,
+            g17_initdata::NATIVE_SHARED_CLUSTER_GPU_VA
+                + g17_initdata::NATIVE_SHARED_CLUSTER_SIZE as u64
+                + 0x4000,
+            &mut hw,
+        )
+        .unwrap();
+        for ordinal in [1usize, 3] {
+            let base = g17_initdata::G17P_KSM_COMPLETION_TABLE_OFFSET
+                + ordinal * g17_initdata::G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+            assert_eq!(&hw[base..base + 0x20], &[0; 0x20]);
+        }
+        for (pair, ordinal) in aliases
+            .iter()
+            .zip(g17_submission::G17P_KSM_COMPLETION_PRESENT_ORDINALS)
+        {
+            let expected = g17_submission::encode_g17p_ksm_completion_descriptor(
+                g17_submission::G17ChannelAbiTarget::A18ProG17P,
+                ordinal,
+                pair.low,
+                pair.high,
+                g17_submission::G17P_KSM_COMPLETION_CAPACITY,
+            )
+            .unwrap();
+            let base = g17_initdata::G17P_KSM_COMPLETION_TABLE_OFFSET
+                + ordinal as usize * g17_initdata::G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+            assert_eq!(&hw[base..base + expected.len()], &expected);
+        }
+    }
+
+    #[test]
+    fn class3_readiness_reuses_only_the_retired_primary_index_page() {
+        let owner = g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA;
+        let owner_size = g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE;
+        let class3 = g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS;
+        assert_eq!(G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET, 0x8000);
+        assert_eq!(class3, owner + 0x8000);
+        assert!(G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET
+            + g17_initdata::COMPUTE_READINESS_PAGE_SIZE
+            <= owner_size);
+
+        let mut storage = vec![0u8; owner_size];
+        g17_submission::apply_g17p_partial_opening_primary_index_page(
+            &mut storage[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE],
+        )
+        .unwrap();
+        let opening_page = storage[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE].to_vec();
+        let start = G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET;
+        let end = start + g17_initdata::COMPUTE_READINESS_PAGE_SIZE;
+        g17_initdata::encode_compute_readiness_class3_support(&mut storage[start..end]).unwrap();
+        let mut expected = vec![0u8; g17_initdata::COMPUTE_READINESS_PAGE_SIZE];
+        g17_initdata::encode_compute_readiness_class3_support(&mut expected).unwrap();
+        assert_eq!(&storage[start..end], expected);
+        assert_eq!(
+            &storage[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE],
+            opening_page,
+        );
+
+        let owner_end = owner + owner_size as u64;
+        for (address, size) in [
+            (
+                g17_initdata::COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS,
+                g17_initdata::COMPUTE_READINESS_PAGE_SIZE as u64,
+            ),
+            (
+                g17_initdata::COMPUTE_READINESS_CLASS1_STATE_ADDRESS,
+                g17_initdata::COMPUTE_READINESS_PAGE_SIZE as u64,
+            ),
+            (
+                g17_initdata::COMPUTE_READINESS_CLASS3_STATE_ADDRESS,
+                g17_initdata::COMPUTE_READINESS_PAGE_SIZE as u64,
+            ),
+        ] {
+            assert!(address >= owner_end || address + size <= owner);
+        }
+    }
+
+    #[test]
+    fn dynamic_cl_range_excludes_the_complete_fixed_low_arena() {
+        let dynamic = G17P_CL_DYNAMIC_LOW_VA_START..G17P_CL_LOW_VA_END;
+        assert_eq!(dynamic.start, 0x70_0400_0000);
+        assert!(G17P_CL_LOW_VA_START < dynamic.start && dynamic.start < dynamic.end);
+        let table = G17P_CONTROL_OPERAND_TABLE_VA
+            ..G17P_CONTROL_OPERAND_TABLE_VA
+                + g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64;
+        assert!(table.end <= dynamic.start);
+
+        for index in 0..G17P_CONTROL_OPERAND_BUFFER_COUNT {
+            let start = g17p_control_operand_buffer_va(index).unwrap();
+            let end = start + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+            assert!(end <= dynamic.start);
+        }
+        let fixed_end = g17p_control_operand_buffer_va(G17P_CONTROL_OPERAND_BUFFER_COUNT - 1)
+            .unwrap()
+            + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        assert_eq!(fixed_end, 0x70_01ef_8000);
+        assert_eq!(dynamic.start - fixed_end, 0x210_8000);
+
+        for (start, size) in [
+            (G17P_CONTROL_DIRECTORY_VA, G17P_CONTROL_DIRECTORY_SIZE),
+            (
+                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+                G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
+            ),
+            (
+                G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA,
+                G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
+            ),
+            (G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA, G17P_BOOTSTRAP_CONTEXT_PEER_SIZE),
+            (G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA, G17P_BOOTSTRAP_CONTEXT_PEER_SIZE),
+            (
+                g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
+                g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE,
+            ),
+            (
+                g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_ADDRESS,
+                g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_SIZE,
+            ),
+        ] {
+            assert!(start >= G17P_CL_LOW_VA_START);
+            assert!(start + size as u64 <= dynamic.start);
+        }
+        assert!(g17_initdata::REGION_VIEW_LOW_ADDRS
+            .into_iter()
+            .all(|address| address < dynamic.start));
+    }
+
+    #[test]
+    fn compute_readiness_activation_record_is_distinct_from_the_cl_record() {
+        let mut shared = [0u8; G17P_CL_SHARED_SUPPORT_SIZE];
+        let mut support = [0u8; G17P_CL_SUPPORT_STATE_SIZE];
+        let mut scheduler = [0u8; G17P_CL_SUPPORT_STATE_SIZE];
+        let mut channel = [0u8; G17P_CL_CHANNEL_CONTROL_SIZE];
+        g17_submission::apply_g17p_cl_retained_static_state(
+            &mut shared,
+            &mut support,
+            &mut scheduler,
+            &mut channel,
+            g17_initdata::COMPUTE_FLIST_PAGE_LIST_ADDRESS,
+            0x70_0020_8000,
+            0xffff_fc20_0164_8000,
+            0xffff_fc20_0165_0000,
+        )
+        .unwrap();
+        let cl_before = channel[..g17_initdata::CONTROL_RECORD_SIZE].to_vec();
+        let activation = g17_initdata::COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET;
+        assert!(channel[activation..activation + g17_initdata::CONTROL_RECORD_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
+        g17_initdata::encode_compute_readiness_activation_record(
+            &mut channel[activation..activation + g17_initdata::CONTROL_RECORD_SIZE],
+        )
+        .unwrap();
+        assert_eq!(&channel[..g17_initdata::CONTROL_RECORD_SIZE], cl_before);
+        assert!(channel[g17_initdata::CONTROL_RECORD_SIZE..activation]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(get_u64(&channel, activation), 0x0000_0100_0000_ffff);
+        assert_eq!(get_u64(&channel, activation + 0x20), 0x0002_0000_0000_0000);
+        assert_eq!(get_u64(&channel, activation + 0x30), 0x0000_0000_ff00_0000);
+    }
+
+    /// The item ring must WRAP, and the publisher must take the wrapped
+    /// producer the transition computed.
+    ///
+    /// This is the 320-submission wall in one assertion. The ring is `0x500`
+    /// entries and a submission publishes four records, so submission 320's
+    /// last record -- the tag-16 EntrySignal -- lands on the final slot. The
+    /// transition correctly returns 0; the publisher used to compare that
+    /// against a locally computed `expected_producer + 1` and refuse with
+    /// EBUSY on a ring that was almost entirely free.
+    #[test]
+    fn item_ring_command_pointer_wraps_to_zero_on_the_last_slot() {
+        const RECORD: u64 = 0xffff_fc20_c035_8000;
+        let count = g17_compute::compute_item_ring_entries();
+        let pointers = g17_compute::COMPUTE_QUEUE_POINTERS;
+        let mut graph = vec![0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
+        put_u32(&mut graph, pointers + 0x60, count);
+        // Consumer far behind the producer, so the ring is nowhere near full
+        // and the only thing under test is the wrap itself.
+        put_u32(&mut graph, pointers, count / 2);
+        put_u32(&mut graph, pointers + 0x40, count - 1);
+
+        assert_eq!(
+            apply_g17p_initial_command_pointer(&mut graph, count - 1, RECORD),
+            Some(0),
+            "the last slot's transition must report producer 0, not count"
+        );
+        assert_eq!(
+            get_u32(&graph, pointers + 0x40),
+            0,
+            "the graph's producer must wrap to 0"
+        );
+        assert_eq!(
+            get_u64(
+                &graph,
+                g17_compute::COMPUTE_ITEM_RING + (count as usize - 1) * 8
+            ),
+            RECORD
+        );
+
+        // And the lap after the wrap publishes at slot 0 as usual.
+        assert_eq!(
+            apply_g17p_initial_command_pointer(&mut graph, 0, RECORD),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn g17p_first_bind_tag15_reuses_the_admitted_optional_builder() {
+        const TAG15: &[u8; 0x86] =
+            include_bytes!("fixtures/g17p_first_submit/tag15-config-update-first.bin");
+        const RELOCATION_MASK: &[u8; 0x86] = include_bytes!(
+            "fixtures/g17p_first_submit/tag15-config-update-relocation-mask.bin"
+        );
+        const BEFORE_TAG15: &[u8; 0x80] =
+            include_bytes!("fixtures/g17p_first_submit/channel-state-before-tag15.bin");
+        const AFTER_TAG15: &[u8; 0x80] =
+            include_bytes!("fixtures/g17p_first_submit/channel-state-after-tag15.bin");
+        const AFTER_TAG16: &[u8; 0x80] =
+            include_bytes!("fixtures/g17p_first_submit/channel-state-after-tag16.bin");
+        const QUEUE: u64 = 0xffff_fc20_c000_0300;
+        const DESCRIPTOR: u64 = 0xffff_fc20_c035_8000;
+        const ENTRY_LOW: u64 = 0x70_004d_8000;
+        const ENTRY_HIGH: u64 = 0xffff_fc20_0027_8000;
+        const SHARED_SUPPORT: u64 = 0xffff_fc20_c087_0000;
+        const CHANNEL_CONTROL: u64 = 0xffff_fc20_c07b_8040;
+        const GEOMETRY: g17_submission::G17SksmQueueGeometry =
+            g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+
+        let mut graph = [0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
+        g17_compute::build_compute_queue_graph(QUEUE, CHANNEL_CONTROL, &mut graph).unwrap();
+        let mut context = vec![0u8; g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT];
+        let sksm_entries = g17_compute::ComputeSksmEntryAliases::new(
+            ENTRY_LOW,
+            ENTRY_HIGH,
+            GEOMETRY.backing_size(),
+            GEOMETRY.allocation_alignment(),
+        )
+        .unwrap();
+        g17_compute::build_initial_compute_channel_group(
+            QUEUE,
+            DESCRIPTOR,
+            sksm_entries,
+            SHARED_SUPPORT,
+            CHANNEL_CONTROL,
+            4,
+            &mut graph,
+            &mut context,
+            true,
+            None,
+        )
+        .unwrap();
+        let actual = &graph
+            [g17_compute::COMPUTE_OPTIONAL..g17_compute::COMPUTE_OPTIONAL + TAG15.len()];
+        assert_eq!(actual, *TAG15);
+        assert_eq!(get_u64(actual, 0x08), sksm_entries.low());
+        assert_eq!(get_u64(actual, 0x10), sksm_entries.high());
+        assert_eq!(sksm_entries.extent(), GEOMETRY.backing_size());
+        assert_eq!(
+            sksm_entries.range_at(0x200, 0x200).unwrap(),
+            [ENTRY_LOW + 0x200, ENTRY_HIGH + 0x200]
+        );
+        assert!(RELOCATION_MASK.iter().any(|byte| *byte != 0));
+        for index in 0..TAG15.len() {
+            assert_eq!(
+                actual[index] & !RELOCATION_MASK[index],
+                TAG15[index] & !RELOCATION_MASK[index]
+            );
+        }
+
+        // Moving the two mappings of the same backing changes only the two
+        // address qwords selected by the admitted relocation mask.
+        let relocated = g17_compute::ComputeSksmEntryAliases::new(
+            ENTRY_LOW + 0x4000,
+            ENTRY_HIGH + 0x8000,
+            GEOMETRY.backing_size(),
+            GEOMETRY.allocation_alignment(),
+        )
+        .unwrap();
+        let mut relocated_graph = [0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
+        g17_compute::build_compute_queue_graph(
+            QUEUE,
+            CHANNEL_CONTROL,
+            &mut relocated_graph,
+        )
+        .unwrap();
+        let mut relocated_context = vec![0u8; g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT];
+        g17_compute::build_initial_compute_channel_group(
+            QUEUE,
+            DESCRIPTOR,
+            relocated,
+            SHARED_SUPPORT,
+            CHANNEL_CONTROL,
+            4,
+            &mut relocated_graph,
+            &mut relocated_context,
+            true,
+            None,
+        )
+        .unwrap();
+        let relocated_actual = &relocated_graph
+            [g17_compute::COMPUTE_OPTIONAL..g17_compute::COMPUTE_OPTIONAL + TAG15.len()];
+        assert_eq!(get_u64(relocated_actual, 0x08), relocated.low());
+        assert_eq!(get_u64(relocated_actual, 0x10), relocated.high());
+        assert_eq!(relocated_context, context);
+        for index in 0..TAG15.len() {
+            assert_eq!(
+                relocated_actual[index] & !RELOCATION_MASK[index],
+                actual[index] & !RELOCATION_MASK[index]
+            );
+        }
+
+        graph[g17_compute::COMPUTE_EVENT
+            ..g17_compute::COMPUTE_EVENT + g17_compute::COMPUTE_EVENT_SIZE]
+            .fill(0);
+        put_u64(&mut graph, g17_compute::COMPUTE_ITEM_RING + 0x08, 0);
+        put_u64(&mut graph, g17_compute::COMPUTE_ITEM_RING + 0x10, 0);
+        put_u32(&mut graph, g17_compute::COMPUTE_QUEUE_POINTERS + 0x40, 1);
+        assert_eq!(
+            &graph[g17_compute::COMPUTE_QUEUE_POINTERS
+                ..g17_compute::COMPUTE_QUEUE_POINTERS + 0x80],
+            *BEFORE_TAG15
+        );
+
+        assert_eq!(
+            apply_g17p_initial_command_pointer(
+                &mut graph,
+                1,
+                QUEUE + g17_compute::COMPUTE_OPTIONAL as u64,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            &graph[g17_compute::COMPUTE_QUEUE_POINTERS
+                ..g17_compute::COMPUTE_QUEUE_POINTERS + 0x80],
+            *AFTER_TAG15
+        );
+
+        let mut entry_signal = [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        g17_submission::encode_g17p_compute_optional_event(
+            g17_submission::G17PComputeOptionalEvent {
+                queue_id: 4,
+                old_timestamp: 1,
+            },
+            &mut entry_signal,
+        )
+        .unwrap();
+        graph[g17_compute::COMPUTE_EVENT
+            ..g17_compute::COMPUTE_EVENT + entry_signal.len()]
+            .copy_from_slice(&entry_signal);
+        assert_eq!(
+            apply_g17p_initial_command_pointer(
+                &mut graph,
+                2,
+                QUEUE + g17_compute::COMPUTE_EVENT as u64,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            &graph[g17_compute::COMPUTE_QUEUE_POINTERS
+                ..g17_compute::COMPUTE_QUEUE_POINTERS + 0x80],
+            *AFTER_TAG16
+        );
+        assert_eq!(
+            get_u64(&graph, g17_compute::COMPUTE_ITEM_RING + 0x08),
+            QUEUE + g17_compute::COMPUTE_OPTIONAL as u64
+        );
+        assert_eq!(
+            get_u64(&graph, g17_compute::COMPUTE_ITEM_RING + 0x10),
+            QUEUE + g17_compute::COMPUTE_EVENT as u64
+        );
+        assert!(
+            g17_compute::COMPUTE_ITEM_RING + g17_compute::COMPUTE_ITEM_RING_SIZE
+                <= g17_compute::COMPUTE_OPTIONAL
+        );
     }
 
     #[test]

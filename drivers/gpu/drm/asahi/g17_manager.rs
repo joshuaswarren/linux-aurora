@@ -2014,6 +2014,7 @@ impl G17PManagerConstruction {
                     support_state,
                     scheduler_state,
                     channel_control,
+                    g17_initdata::COMPUTE_FLIST_PAGE_LIST_ADDRESS,
                     operand_table_gpu_va,
                     support_state_gpu_va,
                     scheduler_state_gpu_va,
