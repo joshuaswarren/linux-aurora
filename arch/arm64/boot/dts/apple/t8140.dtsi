@@ -808,7 +808,9 @@
 			 * vm-size-9); no ADMAC.
 			 */
 			aop_audio: audio {
-				compatible = "apple,t8140-aop-audio", "apple,aop-audio";
+				/* no apple,aop-audio fallback: the t8140 capture path
+				 * (setup-port source ring, 16 kHz) is its own driver */
+				compatible = "apple,t8140-aop-audio";
 				iommus = <&aop_dart 9>;
 				apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
 			};
