@@ -74,7 +74,15 @@ def main():
     ap.add_argument('--kind', choices=['pmgr', 'mailbox'], required=True)
     ap.add_argument('--registry-id', type=lambda s: int(s, 0), required=True)
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--watch-seconds', type=int, default=0,
+                    help='mailbox only: retain repeated snapshots for 1..60 seconds')
+    ap.add_argument('--interval', type=float, default=.02,
+                    help='watch polling interval in seconds, .02..1')
     a = ap.parse_args()
+    if not 0 <= a.watch_seconds <= 60 or not .02 <= a.interval <= 1:
+        ap.error('watch seconds must be 0..60 and interval .02..1')
+    if a.watch_seconds and a.kind != 'mailbox':
+        ap.error('watch requires mailbox kind')
     os.umask(0o077)
     if history.command('sysctl', '-n', 'hw.model') != 'Mac17,5' or history.command('sw_vers', '-buildVersion') != '25F84':
         ap.error('requires reviewed J700 / 25F84')
@@ -223,11 +231,70 @@ def main():
             if any(b['ticks'] < a['ticks'] for a, b in zip(rows, rows[1:])):
                 raise RuntimeError('mailbox timestamps out of order')
             result.update(buffer=hex(buf), words=words, position=pos, role=hex(role), records=rows)
+            if a.watch_seconds:
+                # Native wake traffic can overwrite 128 records before a
+                # later one-shot capture. Observe the existing RAM log,
+                # without changing mailbox registers or installing hooks.
+                result.update(status='watching', watch_seconds=a.watch_seconds,
+                              interval=a.interval, frame_bytes=8 + 64 + words * 16,
+                              watch_frames=0, stable_frames=0, unstable_frames=0,
+                              watch_records=[])
+                save()  # A controller may now trigger a managed display wake.
+                seen = {(r['ticks'], r['continuous_ticks'], r['event'],
+                         r['msg0'], r['msg1']) for r in rows}
+                until = time.monotonic() + a.watch_seconds
+                with (a.output / 'watch-frames.bin').open('xb') as frames:
+                    while time.monotonic() < until:
+                        stamp = time.monotonic_ns()
+                        h = dev.read(addr + 0x90, 0x20)
+                        b, w, _, index, payload, current_role = struct.unpack_from('<Q5I', h)
+                        if (b, w, payload, current_role) != (buf, words, payload_words, role) or index >= words or index % stride:
+                            raise RuntimeError('mailbox layout changed during watch')
+                        first = dev.read(buf, words * 8)
+                        second = dev.read(buf, words * 8)
+                        t = dev.read(addr + 0x90, 0x20)
+                        # Fixed-size frames retain rejected/racing reads too:
+                        # monotonic_ns, header, copy1, copy2, trailing header.
+                        frames.write(struct.pack('<Q', stamp) + h + first + second + t)
+                        frames.flush()
+                        result['watch_frames'] += 1
+                        if h != t or first != second:
+                            result['unstable_frames'] += 1
+                        else:
+                            captured = []
+                            for slot in [*range(index // stride, 128), *range(index // stride)]:
+                                ticks, continuous, event, msg0, msg1 = struct.unpack_from('<5Q', second, slot * stride * 8)
+                                if not ticks:
+                                    continue
+                                row = dict(slot=slot, ticks=ticks, continuous_ticks=continuous,
+                                           event=event, msg0=hex(msg0), msg1=hex(msg1),
+                                           sample_monotonic_ns=stamp)
+                                if event in (0, 2):
+                                    row.update(endpoint=msg1 & 0xff, management_type=(msg0 >> 52) & 0xfff)
+                                captured.append(row)
+                            if any(y['ticks'] < x['ticks'] for x, y in zip(captured, captured[1:])):
+                                result['unstable_frames'] += 1
+                            else:
+                                result['stable_frames'] += 1
+                                for row in captured:
+                                    key = (row['ticks'], row['continuous_ticks'], row['event'], row['msg0'], row['msg1'])
+                                    if key not in seen:
+                                        seen.add(key)
+                                        result['watch_records'].append(row)
+                        if result['watch_frames'] % 50 == 0:
+                            os.fsync(frames.fileno())
+                            save()
+                        time.sleep(a.interval)
+                    os.fsync(frames.fileno())
+                if not result['stable_frames']:
+                    raise RuntimeError('no stable watch samples')
+                result['watch_coverage'] = 'observed records only; ring overflow between samples is possible'
+
         if history.command('sysctl', '-n', 'kern.bootsessionuuid') != result['boot_uuid']:
             raise RuntimeError('boot changed')
         result['status'] = 'captured'
         save()
-        print(json.dumps({k:v for k,v in result.items() if k not in ('records', 'mappings')}))
+        print(json.dumps({k:v for k,v in result.items() if k not in ('records', 'mappings', 'watch_records')}))
     except BaseException as e:
         result.update(status='error', error=repr(e))
         save()
