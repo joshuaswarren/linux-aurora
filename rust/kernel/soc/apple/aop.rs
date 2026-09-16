@@ -2,7 +2,12 @@
 
 //! Common code for AOP endpoint drivers
 
-use kernel::{prelude::*, sync::Arc};
+use kernel::{
+    device::{Bound, Device},
+    dma::Coherent,
+    prelude::*,
+    sync::Arc,
+};
 
 /// Representation of an "EPIC" service.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,6 +30,24 @@ pub trait FakehidListener {
 pub trait ReportListener {
     /// Process the report payload (everything after the EPIC headers).
     fn process_report(&self, subtype: u16, data: &[u8]) -> Result<()>;
+}
+
+/// T8140: the low-power microphone source ring.  The firmware accepts one
+/// binding for its lifetime (a second bind on the same boot answers
+/// 0x2000000000000009), so the AOP driver owns the allocation and hands the
+/// same ring to every audio driver probe.
+pub struct SourceRing {
+    /// The ring, mapped through the audio child's IOMMU stream.
+    pub buf: Coherent<[u8]>,
+    /// IOVA the firmware produces into.
+    pub iova: u64,
+}
+
+impl SourceRing {
+    /// Size of the ring in bytes.
+    pub fn size(&self) -> usize {
+        self.buf.size()
+    }
 }
 
 /// AOP communications manager.
@@ -57,10 +80,11 @@ pub trait AOP: Send + Sync {
     ) -> Result<()>;
     /// Remove the report listener for the specified service and subtype
     fn remove_report_listener(&self, svc: &EPICService, subtype: u16) -> bool;
-    /// T8140: bind the low-power microphone source ring (IOVA through the
-    /// AOP's audio stream, size in bytes) over the setup port.  Returns
-    /// ENODEV on other generations.
-    fn bind_source_buffer(&self, iova: u64, size: u64) -> Result<()>;
+    /// T8140: the low-power microphone source ring, `size` bytes mapped
+    /// through `dev` (the audio child).  Allocated and bound to the firmware
+    /// over the setup port on first use, then shared for the AOP's lifetime.
+    /// Returns ENODEV on other generations.
+    fn source_ring(&self, dev: &Device<Bound>, size: usize) -> Result<Arc<SourceRing>>;
     /// Internal method to detach the device.
     fn remove(&self);
 }
