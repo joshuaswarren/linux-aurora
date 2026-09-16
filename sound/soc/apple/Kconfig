@@ -12,15 +12,18 @@ config SND_SOC_APPLE_AOP_AUDIO
 	  co-processor on ARM Macs. This includes the built-in microphone on those
 	  machines.
 
-config SND_SOC_APPLE_J700_LPMIC
-	tristate "J700 (T8140) AOP low-power microphone"
+config SND_SOC_APPLE_T8140_AOP_AUDIO
+	tristate "T8140 (J700) AOP audio: low-power microphone, jack and speaker paths"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on RUST
 	select APPLE_AOP
 	help
-	  Capture-only driver for the MacBook Neo's low-power microphone: the
-	  AOP firmware's lpai service fills a host ring bound over the AOP
-	  setup port (16 kHz, 2 channels, S32_LE).
+	  The MacBook Neo's AOP-owned audio paths: the low-power microphone
+	  (the lpai service fills a host ring bound over the AOP setup port,
+	  16 kHz, 2 channels, S32_LE) as an ALSA card, and an ASoC component
+	  whose back-end DAIs drive the AOP output services (cout for the
+	  CS42L83 jack, spkr for the internal speaker) with the ADMAC-fed
+	  serializers, linked by the macaudio J700 variant.
 
 config SND_SOC_APPLE_MCA
 	tristate "Apple Silicon MCA driver"
