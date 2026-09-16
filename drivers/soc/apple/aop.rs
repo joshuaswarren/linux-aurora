@@ -23,7 +23,7 @@ use kernel::{
         Device,
         DmaMask, //
     },
-    error::from_err_ptr,
+    error::{from_err_ptr, to_result},
     io::{
         mem::IoMem,
         Io,
@@ -42,14 +42,18 @@ use kernel::{
         FakehidListener,
         AOP, //
     },
+    soc::apple::mailbox,
     soc::apple::rtkit,
     sync::{
         aref::ARef,
         Arc,
         ArcBorrow,
         CondVar,
-        Mutex, //
+        Mutex,
+        SpinLock, //
     },
+    new_spinlock,
+    time::msecs_to_jiffies,
     types::ForeignOwnable,
     workqueue::{
         self,
@@ -96,6 +100,29 @@ const EPIC_SUBTYPE_STRING: u16 = 0x8a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
 
+// T8140 (J700) AOP "setup port": the second mailbox the firmware boots
+// through.  Everything below was measured by the native m1n1 microphone host
+// (m1n1-aurora proxyclient/m1n1/fw/aop/j700_lpmic_native.py, RESULTS in
+// artifacts/j700-native-lpmic-20260906).
+const SETUP_PAGE: usize = 0x4000;
+const SETUP_ARENA_PAGES: usize = 13;
+const SETUP_MGMT_EP: u8 = 0;
+const SETUP_TYPE_HELLO: u64 = 1;
+const SETUP_TYPE_HELLO_REPLY: u64 = 2;
+const SETUP_TYPE_UNK3: u64 = 3;
+const SETUP_TYPE_UNK3_REPLY: u64 = 4;
+const SETUP_TYPE_PWR_ACK: u64 = 7;
+const SETUP_TYPE_EPMAP: u64 = 8;
+const SETUP_TYPE_AP_PWR: u64 = 0xb;
+const SETUP_HELLO_VERSION: u64 = 0xc000c;
+const SETUP_EPMAP_LAST: u64 = 1 << 51;
+const SETUP_AP_PWR_INIT: u64 = 0x220;
+const SETUP_AP_PWR_ON: u64 = 0x20;
+const SETUP_BUFFER_REQUEST: u64 = 0x12;
+const SETUP_BUFFER_REQUEST_ACK: u64 = 0x1200000000000000;
+const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
+const SETUP_BOOT_TIMEOUT_MS: i64 = 15000;
+
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
@@ -133,6 +160,50 @@ struct EPICHeader {
     _unk1: u16,
     _pad1: u64,
     inline_len: u32,
+}
+
+/// EPIC v4 (t8140): the sub-header carries a timestamp before the tag.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct EPICHeaderV4 {
+    version: u8,
+    seq: u16,
+    _pad0: u8,
+    _unk0: u32,
+    timestamp: u64,
+    // Subheader
+    length: u32,
+    sub_version: u8,
+    category: u8,
+    subtype: u16,
+    sub_timestamp: u64,
+    tag: u16,
+    _unk1: u16,
+    inline_len: u32,
+}
+
+/// The fields handle_ipc needs, decoded from either sub-header layout.
+struct EPICDecoded {
+    category: u8,
+    subtype: u16,
+    tag: u16,
+}
+
+fn epic_decode(hdr_bytes: &[u8]) -> EPICDecoded {
+    let sub = &hdr_bytes[16..];
+    let sub_version = sub[4];
+    let category = sub[5];
+    let subtype = u16::from_le_bytes([sub[6], sub[7]]);
+    let tag = if sub_version >= 4 {
+        u16::from_le_bytes([sub[16], sub[17]])
+    } else {
+        u16::from_le_bytes([sub[8], sub[9]])
+    };
+    EPICDecoded {
+        category,
+        subtype,
+        tag,
+    }
 }
 
 #[repr(C, packed)]
@@ -406,9 +477,13 @@ impl AFKEndpoint {
             }
             msg_buf.resize(qeh.size as usize, 0, GFP_KERNEL)?;
             self.memcpy_from_iomem(base + rptr + QEH_SIZE, &mut msg_buf)?;
+            if msg_buf.len() < mem::size_of::<EPICHeader>() {
+                dev_err!(client.dev, "Short EPIC message on ep {}", self.index);
+                return Err(EIO);
+            }
             let (hdr_bytes, msg) = msg_buf.split_at(mem::size_of::<EPICHeader>());
-            let header = unsafe { &*(hdr_bytes.as_ptr() as *const EPICHeader) };
-            self.handle_ipc(client, qeh, header, msg)?;
+            let header = epic_decode(hdr_bytes);
+            self.handle_ipc(client, qeh, &header, msg)?;
             rptr = align_up(rptr + QEH_SIZE + qeh.size as usize, block_size) % buf_size;
             mem_sync();
             self.iomem_write32(buf_offset + block_size, rptr as u32)?;
@@ -421,7 +496,7 @@ impl AFKEndpoint {
         &mut self,
         client: ArcBorrow<'_, AopData>,
         qhdr: &QEHeader,
-        ehdr: &EPICHeader,
+        ehdr: &EPICDecoded,
         data: &[u8],
     ) -> Result<()> {
         let subtype = ehdr.subtype;
@@ -586,7 +661,7 @@ impl AFKEndpoint {
             return Err(EIO);
         }
         let call = Arc::pin_init(FutureValue::pin_init(), GFP_KERNEL)?;
-        let hdr = EPICHeader {
+        let hdr_v2 = EPICHeader {
             version: 2,
             seq: self.seq,
             length: data.len() as u32,
@@ -596,20 +671,33 @@ impl AFKEndpoint {
             tag: tag as u16,
             ..EPICHeader::default()
         };
+        let hdr_v4 = EPICHeaderV4 {
+            version: 2,
+            seq: self.seq,
+            length: data.len() as u32,
+            sub_version: 4,
+            category: EPIC_CATEGORY_NOTIFY,
+            subtype,
+            tag: tag as u16,
+            ..EPICHeaderV4::default()
+        };
         self.call_returns[tag - 1] = ret;
-        self.send_rb(
-            client,
-            rtkit,
-            channel,
-            EPIC_TYPE_NOTIFY,
+        let hdr_bytes = if client.epic_v4 {
             unsafe {
                 slice::from_raw_parts(
-                    &hdr as *const EPICHeader as *const u8,
+                    &hdr_v4 as *const EPICHeaderV4 as *const u8,
+                    mem::size_of::<EPICHeaderV4>(),
+                )
+            }
+        } else {
+            unsafe {
+                slice::from_raw_parts(
+                    &hdr_v2 as *const EPICHeader as *const u8,
                     mem::size_of::<EPICHeader>(),
                 )
-            },
-            data,
-        )?;
+            }
+        };
+        self.send_rb(client, rtkit, channel, EPIC_TYPE_NOTIFY, hdr_bytes, data)?;
         self.seq = self.seq.wrapping_add(1);
         self.calls[tag - 1] = Some(call.clone());
         Ok(call)
@@ -623,9 +711,105 @@ struct ListenerEntry {
 
 unsafe impl Send for ListenerEntry {}
 
+/// One of the five setup-port endpoints: a host-to-AOP message page and an
+/// AOP-to-host reply window, both in the setup arena (dart-aop stream 1).
+#[derive(Clone, Copy, Default)]
+struct SetupEndpoint {
+    ep: u8,
+    tx_iova: u64,
+    rx_iova: u64,
+    rx_pages: usize,
+}
+
+struct SetupState {
+    mbox: Option<mailbox::Mailbox<SetupPortCallback>>,
+    arena: Option<Coherent<[u8]>>,
+    next_page: usize,
+    endpoints: [Option<SetupEndpoint>; SETUP_ENDPOINTS.len()],
+    map_done: bool,
+    ap_ready: bool,
+    power_sent: bool,
+    failed: bool,
+}
+
+impl SetupState {
+    fn new() -> SetupState {
+        SetupState {
+            mbox: None,
+            arena: None,
+            next_page: 0,
+            endpoints: [None; SETUP_ENDPOINTS.len()],
+            map_done: false,
+            ap_ready: false,
+            power_sent: false,
+            failed: false,
+        }
+    }
+
+    fn arena_iova(&self) -> u64 {
+        self.arena.as_ref().map(|a| a.dma_handle() as u64).unwrap_or(0)
+    }
+
+    fn endpoint_count(&self) -> usize {
+        self.endpoints.iter().filter(|e| e.is_some()).count()
+    }
+
+    fn ready(&self) -> bool {
+        self.ap_ready && self.endpoint_count() == SETUP_ENDPOINTS.len()
+    }
+
+    fn send(&self, ep: u8, word: u64) -> Result<()> {
+        let mbox = self.mbox.as_ref().ok_or(ENXIO)?;
+        mbox.send(
+            mailbox::Message {
+                msg0: word,
+                msg1: ep as u32,
+            },
+            true,
+        )
+    }
+
+    /// (5 << 60) | (host_to_aop << 54) | (pages << 48) | (iova >> 4)
+    fn shared_descriptor(iova: u64, pages: usize, host_to_aop: bool) -> u64 {
+        (5u64 << 60) | ((host_to_aop as u64) << 54) | ((pages as u64) << 48) | (iova >> 4)
+    }
+}
+
+unsafe impl Send for SetupState {}
+
+struct SetupPortCallback;
+
+impl mailbox::MailCallback for SetupPortCallback {
+    type Data = Arc<AopData>;
+
+    fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, msg: mailbox::Message) {
+        let ep = (msg.msg1 & 0xff) as u8;
+        let word = msg.msg0;
+        let mut st = data.setup.lock();
+        let res = data.setup_handle(&mut st, ep, word);
+        if let Err(e) = res {
+            dev_err!(
+                data.dev,
+                "setup port: unhandled message ep {:#x} word {:#x}: {:?}",
+                ep,
+                word,
+                e
+            );
+            st.failed = true;
+        }
+        drop(st);
+        data.setup_cv.notify_all();
+    }
+}
+
 #[pin_data]
 struct AopData {
     dev: ARef<device::Device>,
+    epic_v4: bool,
+    #[pin]
+    setup: SpinLock<SetupState>,
+    #[pin]
+    setup_cv: CondVar,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<AopData>>>,
     #[pin]
@@ -714,11 +898,14 @@ impl WorkItem for AopServiceRegisterWork {
 }
 
 impl AopData {
-    fn new(dev: &platform::Device<Core>) -> Result<Arc<AopData>> {
+    fn new(dev: &platform::Device<Core>, epic_v4: bool) -> Result<Arc<AopData>> {
         Arc::pin_init(
             pin_init!(
                 AopData {
                     dev: dev.as_ref().into(),
+                    epic_v4,
+                    setup <- new_spinlock!(SetupState::new()),
+                    setup_cv <- new_condvar!(),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
@@ -737,6 +924,9 @@ impl AopData {
             let mut rtk = guard.as_mut().as_pin_mut().unwrap();
             rtk.as_mut().wake()?;
         }
+        self.start_afk()
+    }
+    fn start_afk(&self) -> Result<()> {
         for ep in 0..AFK_ENDPOINT_COUNT {
             let rtk_ep_num = AFK_ENDPOINT_START + ep;
             let mut guard = self.rtkit.lock();
@@ -831,6 +1021,118 @@ impl AopData {
             idx += size;
         }
         aop_mmio.try_memcpy_toio(offset, &arg_bytes)
+    }
+
+    /// One setup-port message, in interrupt context (the native host's
+    /// boot_step() and endpoint_request()).
+    fn setup_handle(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
+        if ep == SETUP_MGMT_EP {
+            let ty = (word >> 52) & 0xff;
+            match ty {
+                SETUP_TYPE_HELLO => {
+                    if word & 0xffffffff != SETUP_HELLO_VERSION {
+                        dev_warn!(self.dev, "setup port: HELLO version {:#x}", word & 0xffffffff);
+                    }
+                    st.send(SETUP_MGMT_EP, (SETUP_TYPE_HELLO_REPLY << 52) | SETUP_HELLO_VERSION)
+                }
+                SETUP_TYPE_EPMAP => {
+                    st.send(SETUP_MGMT_EP, word)?;
+                    if word & SETUP_EPMAP_LAST != 0 {
+                        st.map_done = true;
+                    }
+                    Ok(())
+                }
+                SETUP_TYPE_AP_PWR => {
+                    st.ap_ready = (word & 0xffff) == SETUP_AP_PWR_ON;
+                    Ok(())
+                }
+                SETUP_TYPE_UNK3 => st.send(SETUP_MGMT_EP, SETUP_TYPE_UNK3_REPLY << 52),
+                SETUP_TYPE_PWR_ACK => Ok(()),
+                _ => Err(EIO),
+            }
+        } else if word >> 56 == SETUP_BUFFER_REQUEST {
+            self.setup_endpoint_request(st, ep, word)
+        } else {
+            Err(EIO)
+        }
+    }
+
+    /// Endpoint buffer request: one host-to-AOP page and a reply window of
+    /// requested * 16 bytes, both handed out from the pre-mapped arena.
+    fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
+        let requested = (word & 0xffffffff) as usize;
+        let slot = SETUP_ENDPOINTS.iter().position(|e| *e == ep).ok_or(EIO)?;
+        if st.endpoints[slot].is_some() || (requested != 0x400 && requested != 0x1000) {
+            return Err(EIO);
+        }
+        let rx_pages = (requested * 16).div_ceil(SETUP_PAGE);
+        if st.next_page + 1 + rx_pages > SETUP_ARENA_PAGES {
+            return Err(ENOMEM);
+        }
+        let base = st.arena_iova();
+        let tx_iova = base + (st.next_page * SETUP_PAGE) as u64;
+        st.next_page += 1;
+        let rx_iova = base + (st.next_page * SETUP_PAGE) as u64;
+        st.next_page += rx_pages;
+        st.send(ep, SETUP_BUFFER_REQUEST_ACK)?;
+        st.send(ep, SetupState::shared_descriptor(tx_iova, 1, true))?;
+        st.send(ep, SetupState::shared_descriptor(rx_iova, rx_pages, false))?;
+        st.endpoints[slot] = Some(SetupEndpoint {
+            ep,
+            tx_iova,
+            rx_iova,
+            rx_pages,
+        });
+        dev_info!(
+            self.dev,
+            "setup port: endpoint {:#x} tx {:#x} rx {:#x} ({} pages)\n",
+            ep,
+            tx_iova,
+            rx_iova,
+            rx_pages
+        );
+        Ok(())
+    }
+
+    /// After the primary port reports AP power ON: request the setup port's
+    /// AP power state and wait for its ack and the five endpoint buffers.
+    fn setup_finish_boot(&self) -> Result<()> {
+        let mut st = self.setup.lock();
+        if !st.map_done {
+            dev_warn!(self.dev, "setup port: EPMAP not complete before AP power request\n");
+        }
+        if !st.power_sent {
+            st.send(SETUP_MGMT_EP, (SETUP_TYPE_AP_PWR << 52) | SETUP_AP_PWR_INIT)?;
+            st.power_sent = true;
+        }
+        let mut waited = 0i64;
+        while !st.ready() && !st.failed {
+            let _ = self
+                .setup_cv
+                .wait_interruptible_timeout(&mut st, msecs_to_jiffies(100));
+            waited += 100;
+            if waited >= SETUP_BOOT_TIMEOUT_MS {
+                break;
+            }
+        }
+        let ready = st.ready();
+        let count = st.endpoint_count();
+        let ap_ready = st.ap_ready;
+        let failed = st.failed;
+        drop(st);
+        if !ready {
+            dev_err!(
+                self.dev,
+                "setup port: boot incomplete (ap_ready {} endpoints {}/{} failed {})\n",
+                ap_ready,
+                count,
+                SETUP_ENDPOINTS.len(),
+                failed
+            );
+            return Err(ETIMEDOUT);
+        }
+        dev_info!(self.dev, "setup port: dual-mailbox boot complete\n");
+        Ok(())
     }
 
     fn start_cpu(&self, asc_mmio: &RelaxedMmio<ASC_MMIO_SIZE>) -> Result<()> {
@@ -946,27 +1248,40 @@ struct AopHwConfig {
     ec0p: u64,
     alig: u64,
     aopt: u64,
+    /// t8140: no bootarg patching, a second "setup" mailbox to boot through,
+    /// EPIC v4 on the AFK endpoints.
+    t8140: bool,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 1,
     alig: 128,
+    t8140: false,
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 128,
+    t8140: false,
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 64,
+    t8140: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
     aopt: 0,
     alig: 64,
+    t8140: false,
+};
+const HW_CFG_T8140: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    aopt: 0,
+    alig: 0,
+    t8140: true,
 };
 
 kernel::of_device_table!(
@@ -978,6 +1293,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t8112-aop")), &HW_CFG_T8112),
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
+        (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
     ]
 );
 
@@ -996,22 +1312,70 @@ impl platform::Driver for AopDriver {
         let aop_mmio = KBox::pin_init(aop_req.iomap_sized::<AOP_MMIO_SIZE>(), GFP_KERNEL)?;
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = KBox::pin_init(asc_req.iomap_sized::<ASC_MMIO_SIZE>(), GFP_KERNEL)?;
-        let data = AopData::new(pdev)?;
+        let data = AopData::new(pdev, cfg.t8140)?;
         let aop_mmio = aop_mmio.access(pdev.as_ref())?;
-        data.patch_bootargs(
-            aop_mmio,
-            &[
-                (from_fourcc(b"EC0p"), cfg.ec0p),
-                (from_fourcc(b"nCal"), 0x0),
-                (from_fourcc(b"alig"), cfg.alig),
-                (from_fourcc(b"AOPt"), cfg.aopt),
-            ],
-        )?;
+        if !cfg.t8140 {
+            data.patch_bootargs(
+                aop_mmio,
+                &[
+                    (from_fourcc(b"EC0p"), cfg.ec0p),
+                    (from_fourcc(b"nCal"), 0x0),
+                    (from_fourcc(b"alig"), cfg.alig),
+                    (from_fourcc(b"AOPt"), cfg.aopt),
+                ],
+            )?;
+        }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
         *data.rtkit.lock() = Some(rtkit);
+        if cfg.t8140 {
+            // The setup port must be answered from the first HELLO on, so it
+            // is opened (and its 13-page arena mapped through dart-aop stream
+            // 1, the setup mailbox's own IOMMU stream) before the CPU runs.
+            let setup_mbox = mailbox::Mailbox::<SetupPortCallback>::new_byname(
+                pdev.as_ref(),
+                c_str!("setup"),
+                data.clone(),
+            )?;
+            let setup_dev = setup_mbox.device();
+            // SAFETY: no DMA through the setup mailbox device is in flight yet.
+            unsafe {
+                to_result(bindings::dma_set_mask_and_coherent(
+                    setup_dev.as_raw(),
+                    DmaMask::new::<42>().value(),
+                ))?;
+            }
+            // SAFETY: the mailbox provider is bound for as long as we hold the
+            // mailbox client.
+            let bound = unsafe { setup_dev.as_bound() };
+            let arena = Coherent::<u8>::zeroed_slice(bound, SETUP_ARENA_PAGES * SETUP_PAGE, GFP_KERNEL)?;
+            dev_info!(
+                pdev.as_ref(),
+                "setup port: arena {} pages at iova {:#x}\n",
+                SETUP_ARENA_PAGES,
+                arena.dma_handle() as u64
+            );
+            let mut st = data.setup.lock();
+            st.arena = Some(arena);
+            st.mbox = Some(setup_mbox);
+            drop(st);
+        }
         let asc_mmio = asc_mmio.access(pdev.as_ref())?.relaxed();
         let _ = data.start_cpu(asc_mmio);
-        data.start()?;
+        if cfg.t8140 {
+            // Primary port RTKit v12 handshake to AP power ON, with the setup
+            // port answered from interrupt context meanwhile; then the setup
+            // port's own AP power state and endpoint buffers.
+            {
+                let mut guard = data.rtkit.lock();
+                let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+                rtk.as_mut().wake()?;
+            }
+            data.setup_finish_boot()?;
+            dev_info!(pdev.as_ref(), "t8140 AOP: both ports up, starting AFK endpoints\n");
+            data.start_afk()?;
+        } else {
+            data.start()?;
+        }
         let data = data as Arc<dyn AOP>;
         Ok(Self(data))
     }
