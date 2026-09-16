@@ -157,3 +157,49 @@ device descriptors and PS groups**, not just mapped region bases. This is
 needed to verify the actual DCP CPU register selected by getDevicePSRegOffset;
 matching region bases alone does not prove the device lookup is unchanged.
 That extension has passed syntax/code review but is not yet Mac-qualified.
+
+## Fresh native boot: device lookup and Wi-Fi software state
+
+Boot `34CB72A9-4E8A-49ED-982C-2A528D19A6B2` remained healthy during these
+read-only captures. Automatic system sleep remains disabled. Artifacts are
+`macos-live-20260916/boot34CB/` in the parent workspace.
+
+The device lookup extension is now Mac-qualified. Its initial check rejected
+the packed DeviceData pointer's four-byte alignment before reading it; the
+reader now distinguishes that from eight-byte object alignment. It validates
+the native ID round trip and mapping bounds as well. All five live devices
+match our archived addresses: DISP_SYS 0x300700280, SIO_CPU 0x3007002a8,
+DISP_FE 0x300700318, DISPEXT0_CPU 0x300700328, DISP_CPU 0x300710000.
+There is no different device/group lookup explaining Linux's DISP_CPU fault.
+
+Both generic `_setPwrGateRetentionV2` lookup indices are -1 for all five
+devices. Therefore that generic helper has no retention record to execute
+for them on this boot. This does not remove the separate T8140-specific
+DISP_CPU retention workaround. Fresh DCP trace/mailbox histories and five
+domain status words were retained. No corresponding panic report from the
+previous incorrect-address read was found in the normal report directories.
+
+`macos-wifi-state.py` uses task_for_pid and Mach read-only copies to inspect
+the running DriverKit process without suspending it. The installed arm64e
+binary differs from the earlier archived binary: SHA256
+`990d66919bdb39d3a2ec30a0cd441c1a5c2f171d337baf02369d03061cbb653d`, UUID
+`CDE06805-403D-32ED-AE4F-1E1DE57F9A2C`. Existing ownership field offsets match
+the reviewed current disassembly; calls/string locations differ. Do not
+silently apply old whole-binary identity claims to this build.
+
+Live ownership/accessor instruction comparisons passed. The global
+g_prAdapter is NULL; the actual adapter comes from gprWdev -> wiphy ->
+wiphy+0x842a8, matching wlanGetWiphy and AppleSunriseWLAN::getAdapter.
+The reader follows that chain afresh for every sample and fails if it changes.
+At adapter+0x123aa the software firmware-own flag was 1 in **294/574 samples**
+over 120.052 seconds at approximately 5 Hz. The IPC ownership selection flag
+at +0x197941 was 1 throughout. This is sampled software state, not a hardware
+residency counter or a power measurement; observation and SSH traffic can
+affect it. No MMIO or firmware commands were issued by the reader.
+
+The native cached BSS0 power profile at adapter+0x32248 is `[0,2,0,0]`, with
+the cached vote word zero. Thus native FAST PS agrees with Linux's current
+setting; a different profile value is not the missing awake-power fix.
+The earlier 10-second exploratory capture called +0x123bc a reference count;
+the retained helper now labels it own_enable_word to avoid asserting an
+unverified field name. All state remains read-only.
