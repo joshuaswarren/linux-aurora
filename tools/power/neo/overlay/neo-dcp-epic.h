@@ -100,7 +100,7 @@ static bool neo_prop_string(const u8 *p, u32 len, const char *expected)
 		len--;
 	return len == strlen(expected) && !memcmp(p, expected, len);
 }
-static int neo_epic_identify(struct neo_epic *e, const u8 *payload, u32 length)
+static int neo_epic_identify(u32 channel, const u8 *payload, u32 length)
 {
 	struct neo_prop_cursor c;
 	const u8 *key, *value;
@@ -136,7 +136,7 @@ static int neo_epic_identify(struct neo_epic *e, const u8 *payload, u32 length)
 		} else if (neo_prop_string(key, key_size, "interface-id")) {
 			if (iboot_interface || ((tag >> 24) & 31) != 4 ||
 			    (tag & 0xffffff) != 64 || neo_prop_take(&c, 8, &value) ||
-			    get_unaligned_le32(value) != 3 || get_unaligned_le32(value + 4))
+			    (!channel || get_unaligned_le32(value) != channel) || get_unaligned_le32(value + 4))
 				return -EINVAL;
 			iboot_interface = true;
 		} else if (neo_prop_value(&c, tag, 0)) {
@@ -145,7 +145,8 @@ static int neo_epic_identify(struct neo_epic *e, const u8 *payload, u32 length)
 	}
 	/* Native iBoot uses name + a 36-byte interface-id dictionary. The
 	 * upstream AFK matcher likewise uses the name for properties <=36
-	 * bytes; here additionally require the captured interface id 3.
+	 * bytes; here additionally require interface-id to match the channel.
+	 * Firmware assigns a new channel when this endpoint is restarted.
 	 */
 	return found || (iboot_interface && pairs == 1 && length == 68 &&
 			strnlen(payload, 32) == strlen("disp0-service") &&
@@ -240,7 +241,7 @@ static int neo_epic_receive(struct neo_epic *e)
 				return -EEXIST;
 			memcpy(e->announcement, q, size + 16);
 			e->announcement_size = size + 16;
-			if (!neo_epic_identify(e, sub + 24, get_unaligned_le32(sub))) {
+			if (!neo_epic_identify(channel, sub + 24, get_unaligned_le32(sub))) {
 				e->service = true;
 				e->channel = channel;
 			}
