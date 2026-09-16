@@ -12,3 +12,4 @@ obj-m += neo-netconsole-prep.o
 obj-m += neo-pmgr-admission.o
 obj-m += neo-dcp-force-wake.o
 obj-m += neo-media-sleep.o
+obj-m += neo-auto-idle.o
