@@ -7,6 +7,8 @@
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
 #include <linux/scatterlist.h>
+#include <asm/barrier.h>
+#include <asm/sysreg.h>
 
 #define NEO_DCP_POOL_SIZE SZ_1M
 #define NEO_DCP_SID 23
@@ -16,13 +18,28 @@ struct neo_dcp_owned {
 	void __iomem *dart;
 	u64 *root, *before, *leaf;
 	void *pool;
-	dma_addr_t root_dma, leaf_dma, pool_dma;
+	dma_addr_t leaf_dma, pool_dma;
 	phys_addr_t root_pa, leaf_pa, pool_pa;
 	u64 iova, entry;
 	u32 ttbr;
-	unsigned int slot;
-	bool mapped, root_dma_valid, published, advertised, failed;
+	unsigned int slot, cache_line;
+	bool mapped, published, advertised, failed;
 };
+
+/* The bootloader root is reserved NOMAP RAM, not a DMA-API allocation or
+ * linear-map address. Clean the one modified cache line through its WB
+ * memremap alias. This is the DC CVAC + barrier operation used by arm64's
+ * dcache_clean_poc (arch/arm64/mm/cache.S, ARM Ltd., GPL-2.0-only), narrowed
+ * to one aligned u64 and this explicitly admitted J700 experiment.
+ */
+static void neo_dcp_dma_root_write(struct neo_dcp_owned *o, u64 entry)
+{
+	unsigned long line = (unsigned long)&o->root[o->slot] & ~(o->cache_line - 1UL);
+
+	WRITE_ONCE(o->root[o->slot], entry);
+	asm volatile("dc cvac, %0" : : "r" (line) : "memory");
+	dsb(sy);
+}
 
 static int neo_dcp_dma_physical(struct device *dev, void *cpu, dma_addr_t dma,
 			      size_t size, phys_addr_t *physical)
@@ -82,9 +99,7 @@ static int neo_dcp_dma_release(struct neo_dcp_owned *o)
 		ret = neo_dcp_dma_preserved(o);
 		if (ret)
 			goto fail;
-		dma_sync_single_for_cpu(o->dev, o->root_dma, SZ_16K, DMA_TO_DEVICE);
-		WRITE_ONCE(o->root[o->slot], 0);
-		dma_sync_single_for_device(o->dev, o->root_dma, SZ_16K, DMA_TO_DEVICE);
+		neo_dcp_dma_root_write(o, 0);
 		o->published = false;
 		ret = neo_dcp_dma_flush(o);
 		if (ret)
@@ -97,8 +112,6 @@ static int neo_dcp_dma_release(struct neo_dcp_owned *o)
 		dma_free_coherent(o->dev, NEO_DCP_POOL_SIZE, o->pool, o->pool_dma);
 	if (o->leaf)
 		dma_free_coherent(o->dev, SZ_16K, o->leaf, o->leaf_dma);
-	if (o->root_dma_valid)
-		dma_unmap_single(o->dev, o->root_dma, SZ_16K, DMA_TO_DEVICE);
 	if (o->root)
 		memunmap(o->root);
 	kfree(o->before);
@@ -138,8 +151,13 @@ static int neo_dcp_dma_prepare(struct neo_dcp_owned *o, struct device *dev,
 		return ret;
 	o->dev = dev;
 	o->dart = dart;
+	o->cache_line = 4U << ((read_sysreg(ctr_el0) >> 16) & 15);
+	if (o->cache_line < 16 || o->cache_line > 2048) {
+		ret = -EINVAL;
+		goto fail;
+	}
 	o->root = memremap(o->root_pa, SZ_16K, MEMREMAP_WB);
-	if (!o->root || !virt_addr_valid(o->root)) {
+	if (!o->root) {
 		ret = -ERANGE;
 		goto fail;
 	}
@@ -174,19 +192,11 @@ static int neo_dcp_dma_prepare(struct neo_dcp_owned *o, struct device *dev,
 	for (i = 0; i < NEO_DCP_POOL_SIZE / SZ_16K; i++)
 		o->leaf[i] = ((o->pool_pa + i*SZ_16K) >> 4) | 3 | (0xfffULL << 40);
 	o->entry = (o->leaf_pa >> 4) | 1;
-	o->root_dma = dma_map_single(dev, o->root, SZ_16K, DMA_TO_DEVICE);
-	if (dma_mapping_error(dev, o->root_dma)) {
-		ret = -EIO;
-		goto fail;
-	}
-	o->root_dma_valid = true;
 	ret = neo_dcp_dma_preserved(o);
 	if (ret)
 		goto fail;
-	dma_sync_single_for_cpu(dev, o->root_dma, SZ_16K, DMA_TO_DEVICE);
 	dma_wmb();
-	WRITE_ONCE(o->root[o->slot], o->entry);
-	dma_sync_single_for_device(dev, o->root_dma, SZ_16K, DMA_TO_DEVICE);
+	neo_dcp_dma_root_write(o, o->entry);
 	o->published = true;
 	ret = neo_dcp_dma_flush(o);
 	if (!ret)
