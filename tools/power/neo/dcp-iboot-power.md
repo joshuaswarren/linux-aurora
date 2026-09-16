@@ -157,3 +157,20 @@ Status includes separate AP idle/wake results; failed transitions latch the
 trial failed. This combines two previously qualified operations, but the
 combined path still requires its own short-cycle and power qualification.
 It does not claim DCP processor sleep or enable system suspend with AFK active.
+
+The complete panel-only / native shutdown / panel-only comparison on that
+boot measured 1.10541 / 1.13764 / 1.10256 W from the accumulated counter
+(previous scale 3.600772452250379 raw units/uAh). Independently sampled power
+gave 1.10594 / 1.13753 / 1.10294 W. Each interval lasted 120 seconds, with
+Wi-Fi associated and panel supply low; native restoration and subsequent HPD
+passed. No saving is resolved: the native-off interval consumed about 34 mW
+more than the bracketing mean. These are awake measurements, not deep sleep.
+Retained evidence is power-compare2/reference and power-compare3 under
+artifacts/neo-suspend/dcp-owned-dma/. The failed duplicate panel-owner trial
+is retained separately and contributes no candidate power result.
+
+`dcp-epic-trial.py --directory /root/dirtyroom-gpu/neo-suspend --output NEWDIR
+--seconds 120 [--ap-idle]` reproduces the native interval. It checks a short
+cycle and asynchronous HPD restoration first, verifies LCD supply low across
+measurement, waits for independent kernel restoration, then checks HPD, LCD
+power and gateway reachability. No separate GPIO/backlight cycle is used.
