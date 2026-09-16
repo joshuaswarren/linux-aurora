@@ -457,10 +457,8 @@ static int macaudio_parse_of_be_dai_link(struct macaudio_snd_data *ma,
 	int ret, i;
 
 	link->no_pcm = 1;
-	if (ma->cfg->dai_fmt)
-		link->dai_fmt = ma->cfg->dai_fmt;
 
-	link->dai_fmt = MACAUDIO_DAI_FMT;
+	link->dai_fmt = ma->cfg->dai_fmt ?: MACAUDIO_DAI_FMT;
 
 	link->num_codecs = ncodecs_per_be;
 	link->codecs = devm_kcalloc(dev, ncodecs_per_be,
@@ -1586,7 +1584,8 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.stereo = true,
 	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
 	.primary_bclk_ratio = 125,
-	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_NB_NF,
+	/* 125-SCLK frame pulse, two 32-bit slots back to back, 24-bit samples */
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_NB_NF,
 };
 
 struct macaudio_platform_cfg macaudio_j314_cfg = {
