@@ -757,8 +757,13 @@
 			interrupts = <AIC_IRQ 394 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 397 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "send-empty", "recv-not-empty";
-			/* Setup messages are exchanged through dart-aop stream 1. */
+			/*
+			 * Setup messages are exchanged through dart-aop stream 1,
+			 * whose inherited root has its 64 GiB slot at the ADT
+			 * vm-base-1 (0x20000000000) free for the host arena.
+			 */
 			iommus = <&aop_dart 1>;
+			apple,dma-range = <0x200 0x0 0x10 0x0>;
 			#mbox-cells = <0>;
 			status = "disabled";
 		};
@@ -786,17 +791,26 @@
 			mboxes = <&aop_mbox>, <&aop_setup_mbox>;
 			mbox-names = "mbox", "setup";
 			iommus = <&aop_dart 0>;
+			/*
+			 * Stream 0's inherited root owns the 64 GiB slot at
+			 * 0x10000000000 (the firmware's own mappings); the host's
+			 * AFK buffers go into the next free slot of the ADT
+			 * vm-base-0/vm-size-0 window.
+			 */
+			apple,dma-range = <0x110 0x0 0x10 0x0>;
 			power-domains = <&ps_aop_cpu>;
 			status = "disabled";
 
 			/*
 			 * Low-power microphone: the AOP firmware produces 16 kHz
 			 * stereo S32 frames into a 512 KiB host ring bound through
-			 * dart-aop stream 9 (mapper-admac-base-s); no ADMAC.
+			 * dart-aop stream 9 (mapper-admac-base-s, ADT vm-base-9 /
+			 * vm-size-9); no ADMAC.
 			 */
 			aop_audio: audio {
 				compatible = "apple,t8140-aop-audio", "apple,aop-audio";
 				iommus = <&aop_dart 9>;
+				apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
 			};
 		};
 
