@@ -16244,7 +16244,9 @@ impl G17ResourceOwner {
             Ok(())
         })?;
         self.resources.compute_operand_page_lists.as_mut().ok_or(EIO)?
-            .with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_flist_page_list(bytes).map_err(|_| EINVAL)
+            })?;
         self.resources.compute_operand_table.as_mut().ok_or(EIO)?
             .with_bytes_mut(|bytes| {
                 if encode_g17p_compute_flist_runs(bytes) { Ok(()) } else { Err(EINVAL) }
@@ -18099,6 +18101,7 @@ mod tests {
             &mut support,
             &mut scheduler,
             &mut channel,
+            g17_initdata::COMPUTE_FLIST_PAGE_LIST_ADDRESS,
             0x70_0020_8000,
             0xffff_fc20_0164_8000,
             0xffff_fc20_0165_0000,

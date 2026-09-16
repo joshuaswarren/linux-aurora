@@ -3602,6 +3602,7 @@ pub(crate) fn apply_g17p_cl_retained_static_state(
     support_state: &mut [u8],
     scheduler_state: &mut [u8],
     channel_control: &mut [u8],
+    page_list_gpu_va: u64,
     operand_table_gpu_va: u64,
     support_state_gpu_va: u64,
     scheduler_state_gpu_va: u64,
@@ -3622,7 +3623,10 @@ pub(crate) fn apply_g17p_cl_retained_static_state(
     put_u64_le(shared_support, 0x00, 2);
     put_u64_le(shared_support, 0x08, 1);
     put_u64_le(shared_support, 0x10, 2);
-    put_u64_le(shared_support, 0x18, 0x0004_0000_0000_0070);
+    // _AGFIUMAPagePoolState stores the full VA at unaligned +0x14.
+    // Copying the native +0x18 qword leaves compute naming render's pool.
+    put_u64_le(shared_support, 0x14, page_list_gpu_va);
+    put_u32_le(shared_support, 0x1c, 0x4_0000);
     put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
     put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
     put_u64_le(shared_support, 0x30, operand_table_gpu_va);
