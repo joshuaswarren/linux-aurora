@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #![recursion_limit = "2048"]
 
-//! Apple J700 (T8140) low-power microphone capture
+//! Apple T8140 (J700, MacBook Neo) AOP audio
 //!
-//! The AOP firmware's `lpai` service produces 16 kHz stereo S32 frames (24
-//! meaningful bits) into a 512 KiB host ring mapped through dart-aop stream 9
-//! and reports its cursor every 3,200 frames.  There is no DMA engine on the
-//! host side: the ring is bound to the firmware over the AOP setup port and
-//! the driver copies each reported span into the ALSA buffer.  Everything
-//! here follows the native m1n1 host that proved the path
-//! (m1n1-aurora proxyclient/m1n1/fw/aop/lpmic_probe.py).
+//! The AOP firmware owns the audio fabric on this SoC, so the paths the AP
+//! sees are its services:
+//!
+//! * `lpai`, the low-power microphone: 16 kHz stereo S32 frames (24
+//!   meaningful bits) produced into a 512 KiB host ring mapped through
+//!   dart-aop stream 9, with a cursor report every 3,200 frames.  There is
+//!   no DMA engine on the host side: the ring is bound to the firmware over
+//!   the AOP setup port (the AOP driver owns it, the firmware binds it once
+//!   per boot) and the driver copies each reported span into the ALSA
+//!   buffer of the NeoMic card.  This follows the native m1n1 host that
+//!   proved the path (m1n1-aurora proxyclient/m1n1/fw/aop/lpmic_probe.py).
+//! * `cout` (the CS42L83 jack on MCA1, fed by base-ns ADMAC TX2) and `spkr`
+//!   (the MAX98360 speaker on LEAP TX0, fed by leap-ns ADMAC TX0): ASoC
+//!   back-end DAIs that attach the service, request its power states
+//!   (`pw0 ` idle, `pwrd` running, the firmware then runs the serializer
+//!   clocks) and power the AP-side PMGR leaves, with DPCM front-end PCMs on
+//!   the ADMAC channels.  The macaudio J700 variant links them to the
+//!   codecs.  The speaker path additionally carries the bench proofs
+//!   (zero-DMA, bounded tone) used to establish its sample format.
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
@@ -1770,8 +1782,8 @@ impl platform::Driver for LpmicDriver {
 
 module_platform_driver! {
     type: LpmicDriver,
-    name: "snd_soc_j700_lpmic",
-    description: "Apple J700 AOP low-power microphone capture driver",
+    name: "snd_soc_t8140_aop_audio",
+    description: "Apple T8140 (J700) AOP audio: low-power microphone, jack and speaker paths",
     license: "Dual MIT/GPL",
     params: {
         spkr_test: u8 {

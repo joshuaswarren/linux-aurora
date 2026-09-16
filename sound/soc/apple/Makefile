@@ -3,8 +3,8 @@
 snd-soc-aop-y		:= aop_audio.o
 obj-$(CONFIG_SND_SOC_APPLE_AOP_AUDIO)	+= snd-soc-aop.o
 
-snd-soc-j700-lpmic-y	:= j700_lpmic.o
-obj-$(CONFIG_SND_SOC_APPLE_J700_LPMIC)	+= snd-soc-j700-lpmic.o
+snd-soc-t8140-aop-audio-y	:= t8140_aop_audio.o
+obj-$(CONFIG_SND_SOC_APPLE_T8140_AOP_AUDIO)	+= snd-soc-t8140-aop-audio.o
 
 snd-soc-apple-mca-y	:= mca.o
 
