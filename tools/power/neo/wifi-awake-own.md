@@ -113,3 +113,47 @@ Capture: wifi-ownirq-qualify47/. A duplicate service launch refused to reuse
 its existing output directory before any hardware access; the first run's
 passing JSON and full kernel log remain the evidence, not that service's
 later failed status. A bracketed power experiment follows separately.
+
+## #47 bracketed battery result: no resolved saving
+
+On the same boot, three 120-second awake LCD/backlight-off FAST PS intervals
+measured 1.150433 W (reference), 1.156354 W (repeated ownership), and
+1.153835 W (restored). Raw accumulated battery counter drops were 33,464,
+33,618 and 33,559 respectively, corroborating the lack of improvement without
+assuming those raw units are microamp-hours. These are whole-machine watts,
+not an isolated radio-rail allocation. The target remains unmet.
+
+The bounded controller completed 608 trials in 132.182 seconds, no busy
+admission retries or recovery failures. 606 ended on MSI, two on the deadline;
+all final ownership observations were 4 before recovery. Mean recorded hold
+was 200.669 ms, median 73.793 ms, range 0.317..1027.837 ms. Those intervals
+include handoff overhead and are not a measured firmware sleep residency.
+An incoming SSH command succeeded during the loop, taking 2.137 seconds and
+reading carrier 1 and healthy status at trial 169. Outgoing traffic can still
+wait for an interrupt or the bounded deadline; this is not a production
+latency qualification. Post-stage gateway probes all passed without loss.
+
+Captures: wifi-own-power47/ and own47-incoming-ssh.json. The proven controller
+is retained as wifi-own-loop.py (remote original own-idle-loop.py), requiring
+explicit PS and awake_own_irq selection and a bounded duration. It changes
+neither policy automatically. Do not overlap it with another ownership,
+suspend, display or power-policy controller. The display trial used its
+separate bounded supply/backlight restoration.
+
+Final state: #47 booted, regular FAST PS on, awake_own_irq=N,
+station_ps_max=N, thermal idle_poll_ms=0, ownership active/quiesced=0,
+613 total successful ownership trials, LCD supply restored. The unused
+recovery timer was stopped. Normal #6 remains the GRUB default. Changes and
+results are committed locally on eryk_neo_deepsleep; no upstream operations.
+
+The next useful native capture must resolve the remaining policy gap rather
+than repeat acknowledged ownership writes: live DCP/SIO shutdown coordination,
+ApplePMGR's actual register mappings/access prerequisites, and the Wi-Fi DMA
+clock policy during native associated idle. Linux's active WFDMA word includes
+bit30 (CLK_GAT_DIS in the MT792x register definitions). The decoded native
+ownership callback only writes the always-on ownership register; that does
+not establish when it is safe to change DMA clock policy. Keep native
+runtime observations distinct from startup constants or bit names. The
+existing DCP traces show successful native OFF state but omit the full
+firmware exchange and cannot explain Linux's prior CPU-domain write faults.
+A further macOS session is needed before reproducing those missing sequences.
