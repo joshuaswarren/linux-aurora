@@ -1101,7 +1101,9 @@ static int macaudio_probe(struct snd_soc_card *card)
 	dev_dbg(card->dev, "%s!\n", __func__);
 
 	ret = snd_soc_card_jack_new_pins(card, "Headphone Jack",
-			SND_JACK_HEADSET | SND_JACK_HEADPHONE,
+			SND_JACK_HEADSET | SND_JACK_HEADPHONE |
+			SND_JACK_BTN_0 | SND_JACK_BTN_1 |
+			SND_JACK_BTN_2 | SND_JACK_BTN_3,
 			&ma->jack, macaudio_jack_pins,
 			ARRAY_SIZE(macaudio_jack_pins));
 	if (ret < 0) {
@@ -1109,7 +1111,16 @@ static int macaudio_probe(struct snd_soc_card *card)
 		return ret;
 	}
 
-	return ret;
+	/*
+	 * Map the codec's four headset button functions to media keys.
+	 * Apple remote volume buttons also require codec protocol support.
+	 */
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
+
+	return 0;
 }
 
 static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_soc_dai *dai,
