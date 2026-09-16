@@ -24,6 +24,7 @@
 
 static bool retained_ram(u64 pa, size_t size);
 #include "neo-dcp-owned.h"
+#include "neo-dcp-epic.h"
 
 static bool sleep_enabled;
 module_param(sleep_enabled, bool, 0644);
@@ -42,6 +43,7 @@ static struct platform_device *adopted;
 
 struct neo_dcp {
 	struct neo_dcp_owned owned;
+	struct neo_epic epic;
 	struct device *dev;
 	void __iomem *control;
 	void __iomem *dart;
@@ -285,6 +287,11 @@ static void application_message(void *cookie, u8 ep, u64 word)
 {
 	struct neo_dcp *d = cookie;
 
+	if (ep == 0x23 && READ_ONCE(d->epic.active)) {
+		if (neo_epic_message(&d->epic, word))
+			atomic_set(&d->failed, 1);
+		return;
+	}
 	if (!atomic_xchg(&d->failed, 1))
 		dev_err(d->dev, "Unexpected application activity ep=%#x word=%#llx\n", ep, word);
 }
@@ -556,6 +563,67 @@ static ssize_t scratch_dma_store(struct device *dev, struct device_attribute *a,
 	return ret ?: restore ?: count;
 }
 static DEVICE_ATTR_WO(scratch_dma);
+static ssize_t epic_start_store(struct device *dev, struct device_attribute *a,
+			       const char *buf, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	struct neo_epic *e = &d->epic;
+	int ret;
+
+	if (!sysfs_streq(buf, "1"))
+		return -EINVAL;
+	guard(mutex)(&d->lock);
+	if (atomic_read(&d->failed) || d->touched || !d->wakes ||
+	    READ_ONCE(sleep_enabled) || e->active)
+		return -EBUSY;
+	ret = neo_dcp_dma_prepare(&d->owned, dev, d->dart);
+	if (ret)
+		return ret;
+	e->dev = dev;
+	e->rtk = d->rtk;
+	e->owned = &d->owned;
+	WRITE_ONCE(e->active, true);
+	ret = apple_rtkit_start_ep(d->rtk, 0x23);
+	if (!ret)
+		ret = neo_epic_send(e, 0x80ULL << 48);
+	if (!ret && !wait_for_completion_timeout(&e->ready, msecs_to_jiffies(15000)))
+		ret = -ETIMEDOUT;
+	mutex_lock(&e->lock);
+	ret = ret ?: e->error;
+	if (ret)
+		e->error = ret;
+	mutex_unlock(&e->lock);
+	if (ret)
+		atomic_set(&d->failed, 1);
+	dev_info(dev, "DCP EPIC start result=%d; buffers pinned, no display command sent\n", ret);
+	return ret ?: count;
+}
+static ssize_t epic_status_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	struct neo_epic *e = &d->epic;
+
+	guard(mutex)(&e->lock);
+	return sysfs_emit(buf, "active=%u started=%u error=%d last=%#llx ring_size=%u announcement_size=%u advertised=%u iova=%#llx\n",
+		e->active, e->started, e->error, e->last_message, e->ring_size,
+		e->announcement_size, d->owned.advertised, d->owned.iova);
+}
+static ssize_t epic_announcement_read(struct file *file, struct kobject *kobj,
+	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(kobj_to_dev(kobj));
+	struct neo_epic *e = &d->epic;
+
+	guard(mutex)(&e->lock);
+	if (off >= e->announcement_size)
+		return 0;
+	count = min_t(size_t, count, e->announcement_size - off);
+	memcpy(buf, e->announcement + off, count);
+	return count;
+}
+static DEVICE_ATTR_WO(epic_start);
+static DEVICE_ATTR_RO(epic_status);
+static BIN_ATTR_ADMIN_RO(epic_announcement, 4096);
 static DEVICE_ATTR_RO(status);
 static DEVICE_ATTR_WO(wake);
 static DEVICE_ATTR_WO(start_oslog);
@@ -566,10 +634,10 @@ static DEVICE_ATTR_WO(awake_cycle);
 static struct attribute *neo_dcp_attrs[] = {
 	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr,
 	&dev_attr_returning_idle.attr, &dev_attr_awake_cycle.attr,
-	&dev_attr_scratch_dma.attr, NULL
+	&dev_attr_scratch_dma.attr, &dev_attr_epic_start.attr, &dev_attr_epic_status.attr, NULL
 };
 static const struct bin_attribute *const neo_dcp_bin_attrs[] = {
-	&bin_attr_oslog_snapshot, NULL
+	&bin_attr_oslog_snapshot, &bin_attr_epic_announcement, NULL
 };
 static const struct attribute_group neo_dcp_group = {
 	.attrs = neo_dcp_attrs,
@@ -587,6 +655,8 @@ static int dcp_suspend(struct device *dev)
 	int ret;
 
 	guard(mutex)(&d->lock);
+	if (d->epic.active)
+		return -EBUSY; /* Awake AFK experiment has no system-sleep lifecycle. */
 	if (!READ_ONCE(sleep_enabled))
 		return 0;
 	if (!READ_ONCE(console_suspend_enabled))
@@ -774,6 +844,8 @@ static int probe(struct platform_device *pdev)
 	d->pmgr = pmgr;
 	mutex_init(&d->lock);
 	mutex_init(&d->log_lock);
+	mutex_init(&d->epic.lock);
+	init_completion(&d->epic.ready);
 	d->control = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(d->control))
 		return PTR_ERR(d->control);
