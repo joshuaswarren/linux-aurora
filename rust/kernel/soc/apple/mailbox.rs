@@ -85,6 +85,13 @@ impl<T: MailCallback> Mailbox<T> {
             _p: PhantomData,
         })
     }
+    /// The mailbox provider's device (DMA through its own IOMMU stream).
+    pub fn device(&self) -> &device::Device {
+        // SAFETY: `mbox` is a valid pointer for the life of `self` and its
+        // `dev` is the provider's device, which outlives the client.
+        unsafe { device::Device::from_raw((*self.mbox).dev) }
+    }
+
     /// Sends the specified message
     pub fn send(&self, msg: Message, atomic: bool) -> Result<()> {
         // SAFETY: Calling the c function, `mbox` is a valid pointer
