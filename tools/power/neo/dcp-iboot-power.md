@@ -43,3 +43,46 @@ mapping, but extrapolating that linear mapping into heap addresses yielded
 zeros for the display-service object. This is not proof that the object is
 absent. Resolve the firmware VA through its actual mappings before further
 object inspection.
+
+## Owned-buffer integration, 2026-09-16
+
+The opt-in retained helper now has an explicit DMA trial. `scratch_dma=cycle`
+reserves one **empty entire L1 branch**, allocates its own coherent leaf table
+and 1 MiB pool, publishes only that branch, flushes SID23, verifies every new
+translation, and removes it again. All 2048 inherited root entries and the
+original TTBR/TCR must match on restoration. It claims the DART MMIO resource
+and rejects another Linux owner/shared root. It never frees an advertised
+buffer; failed flush/restore leaves backing RAM pinned until reboot.
+
+The bootloader root at 0x101ffed8000 is reserved NOMAP RAM (pfn_valid=1,
+virt_addr_valid=0). The first candidate correctly rejected using DMA API
+linear-map cache maintenance on it, before any PTE write. The revised helper
+cleans the modified cache line through its WB memremap address using DC CVAC
+and DSB, following arm64's dcache_clean_poc operation. New DMA allocations
+still use the normal coherent DMA API and physical addresses from sg_table.
+
+On #47 boot `10ebbaec-e3f8-4135-bbe5-341e08c0389f`, two scratch cycles passed:
+slot128 / IOVA0x100000000, 64 new pages verified, original root restored,
+all six gateway pings returned. Module SHA256
+`473159405601a07ffc4cdc604a612ad7fd203f13abcba15411357d4ece439ee2`.
+This proves map/restore mechanics, **not firmware DMA or display sleep**.
+
+The subsequent endpoint start returned -EINVAL before sending a packet:
+RTKit adoption originally marks only the system endpoints known. Kernel #48
+adds `apple_rtkit_start_adopted_ep`, requiring an adopted, running session and
+explicit client responsibility for firmware/endpoint ABI validation. The DCP
+client checks the pinned 25F84 DATA hash/version before using endpoint0x23.
+
+The AFK helper captures a bounded service announcement, structurally validates
+EPICProviderClass=disp0-service, and exposes a read-only HPD query. Display
+power cycling remains gated on a valid query response and an explicit 1..300s
+request, with an unconditional power-on attempt after the hold. Protocol
+errors/timeouts poison the command session, and buffers stay pinned. System
+sleep is refused while the AFK experiment is active.
+
+The extracted announcement parser passed a valid-class/truncation/wrong-class
+check and 9,031,553 libFuzzer runs with ASan+UBSan in 11 seconds. These are
+parser checks, not a substitute for the pending native endpoint and power
+qualification. Captures/build/controller files are in the parent workspace's
+`artifacts/neo-suspend/dcp-owned-dma/`, including kernel48's exact manifest and
+isolated initramfs installation record. No DCP power register write is added.
