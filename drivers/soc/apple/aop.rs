@@ -17,7 +17,7 @@ use kernel::{
     bindings,
     c_str,
     device,
-    device::Core,
+    device::{Bound, Core},
     dma::{
         Coherent,
         Device,
@@ -41,6 +41,7 @@ use kernel::{
         EPICService,
         FakehidListener,
         ReportListener,
+        SourceRing,
         AOP, //
     },
     soc::apple::mailbox,
@@ -129,6 +130,10 @@ const SETUP_REQUEST_TYPE: u64 = 3 << 60;
 const SETUP_REQUEST_DONE: u64 = 4 << 60;
 const SETUP_REPLY_READY: u64 = 0x2000000000000001;
 const SETUP_REPLY_TIMEOUT_MS: i64 = 5000;
+/// Bound on an EPIC call: the firmware can stop answering (e.g. a power
+/// request against a fabric the AP turned off), and the caller must not be
+/// wedged in D state forever.
+const EPIC_CALL_TIMEOUT_MS: i64 = 5000;
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
@@ -251,6 +256,21 @@ impl<T> FutureValue<T> {
             self.completion.wait(&mut ret_guard);
         }
         ret_guard.take().unwrap()
+    }
+    /// Waits at most `timeout_ms`; `None` when the value never arrived.
+    fn wait_timeout(&self, timeout_ms: i64) -> Option<T> {
+        let mut ret_guard = self.val.lock();
+        let mut waited = 0i64;
+        while ret_guard.is_none() {
+            let _ = self
+                .completion
+                .wait_interruptible_timeout(&mut ret_guard, msecs_to_jiffies(100));
+            waited += 100;
+            if waited >= timeout_ms && ret_guard.is_none() {
+                return None;
+            }
+        }
+        ret_guard.take()
     }
     fn reset(&self) {
         *self.val.lock() = None;
@@ -728,6 +748,18 @@ impl AFKEndpoint {
         self.calls[tag - 1] = Some(call.clone());
         Ok(call)
     }
+    /// Drops a call that will never be waited on again (timed out).
+    fn cancel_call(&mut self, call: &Arc<FutureValue<CallResult>>) {
+        for i in 0..self.calls.len() {
+            if let Some(c) = &self.calls[i] {
+                if Arc::ptr_eq(c, call) {
+                    self.calls[i] = None;
+                    self.call_returns[i] = None;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 struct ListenerEntry {
@@ -872,6 +904,8 @@ struct AopData {
     report_listeners: Mutex<KVec<ReportListenerEntry>>,
     #[pin]
     subdevices: Mutex<KVec<*mut bindings::platform_device>>,
+    #[pin]
+    source_ring: Mutex<Option<Arc<SourceRing>>>,
 }
 
 unsafe impl Send for AopData {}
@@ -966,6 +1000,7 @@ impl AopData {
                     hid_listeners <- new_mutex!(KVec::new()),
                     report_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
+                    source_ring <- new_mutex!(None),
                 }
             ),
             GFP_KERNEL,
@@ -1266,6 +1301,34 @@ impl AopData {
     }
 }
 
+impl AopData {
+    /// Waits for a call's reply with a bound; on timeout the call slot is
+    /// released so a late reply is dropped instead of completing a later call.
+    fn wait_call(
+        &self,
+        ep_idx: u8,
+        svc: &EPICService,
+        subtype: u16,
+        call: Arc<FutureValue<CallResult>>,
+    ) -> Result<CallResult> {
+        match call.wait_timeout(EPIC_CALL_TIMEOUT_MS) {
+            Some(res) => Ok(res),
+            None => {
+                let mut ep_guard = self.endpoints[ep_idx as usize].lock();
+                ep_guard.cancel_call(&call);
+                dev_err!(
+                    self.dev,
+                    "EPIC call {:#x} on channel {} timed out after {} ms\n",
+                    subtype,
+                    svc.channel,
+                    EPIC_CALL_TIMEOUT_MS
+                );
+                Err(ETIMEDOUT)
+            }
+        }
+    }
+}
+
 impl AOP for AopData {
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
         let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
@@ -1275,7 +1338,7 @@ impl AOP for AopData {
             let mut ep_guard = self.endpoints[ep_idx as usize].lock();
             ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, None)?
         };
-        Ok(call.wait().retcode)
+        Ok(self.wait_call(ep_idx, svc, subtype, call)?.retcode)
     }
     fn epic_call_ret(
         &self,
@@ -1300,7 +1363,7 @@ impl AOP for AopData {
                 Some(ret_buf),
             )?
         };
-        let res = call.wait();
+        let res = self.wait_call(ep_idx, svc, subtype, call)?;
         Ok((res.retcode, res.extra_data.unwrap()))
     }
     fn add_fakehid_listener(
@@ -1347,11 +1410,24 @@ impl AOP for AopData {
         }
         false
     }
-    fn bind_source_buffer(&self, iova: u64, size: u64) -> Result<()> {
+    fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
         if !self.epic_v4 {
             return Err(ENODEV);
         }
-        self.setup_bind_source(iova, size)
+        let mut guard = self.source_ring.lock();
+        if let Some(ring) = guard.as_ref() {
+            if ring.size() < size {
+                dev_err!(self.dev, "source ring already bound with {} bytes\n", ring.size());
+                return Err(EBUSY);
+            }
+            return Ok(ring.clone());
+        }
+        let buf = Coherent::<u8>::zeroed_slice(dev, size, GFP_KERNEL)?;
+        let iova = buf.dma_handle() as u64;
+        self.setup_bind_source(iova, size as u64)?;
+        let ring = Arc::new(SourceRing { buf, iova }, GFP_KERNEL)?;
+        *guard = Some(ring.clone());
+        Ok(ring)
     }
     fn remove(&self) {
         if let Err(e) = self.stop() {
