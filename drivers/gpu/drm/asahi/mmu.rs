@@ -1275,6 +1275,19 @@ impl Drop for KernelMapping {
             );
             mem::sync();
         }
+
+        // On T8140 the bind slot is not the only context that publishes this
+        // root. kernel_lower_vm is installed directly in contexts 0/1 and has
+        // no slot at all, and client roots are also leased to application-GART
+        // contexts. A translation any of them still caches outlives the leaf
+        // removed above, and this range returns to the VA allocator when the
+        // node is released after this function: the next mapping placed there
+        // would otherwise be read through the stale entry from the previous
+        // owner's freed backing. Invalidate every context naming the root
+        // before the address can be reused, as GPUVM unmap already does.
+        if owner.uat_inner.t8140 {
+            owner.tlbi_live_contexts(self.iova(), self.size() as u64);
+        }
     }
 }
 
@@ -1307,6 +1320,25 @@ unsafe impl Send for UatShared {}
 #[pin_data]
 struct UatInner {
     firmware_cache_flush_ready: AtomicBool,
+    /// `Vm::id` of the VM whose root is currently published at the G17P
+    /// compute contexts (`T8140_COMPUTE_CTXS`), or 0 for none.
+    ///
+    /// `VmInner::drop` used to decide whether to retract those entries by
+    /// comparing the stored TTB0 against its own root *value*.  A VM's root is
+    /// one page from the page allocator, so the page a dying VM frees can be
+    /// handed straight back to the next VM created -- at which point the old
+    /// VM's drop matches on the new VM's identical root and retracts the
+    /// aliases the new VM just published.  Keying on the VM id instead makes
+    /// that impossible.
+    t8140_alias_owner: AtomicU64,
+    /// Allocation bitmap for native-style application-GART context leases.
+    /// Reserved and fixed contexts are permanently marked; bits 5..63 are
+    /// claimed before their TTBAT roots become visible and released only
+    /// after lease teardown invalidates the corresponding ASID.
+    t8140_app_contexts: AtomicU64,
+    /// T8140 publishes one page-table root in contexts other than a VM's bind
+    /// slot, so unmapping must invalidate every context naming that root.
+    t8140: bool,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
@@ -3194,7 +3226,11 @@ impl Uat {
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
-    fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode) -> Result<Arc<UatInner>> {
+    fn make_inner(
+        dev: &driver::AsahiDevice,
+        cfg: UatConfig,
+        handoff_mode: HandoffMode,
+    ) -> Result<Arc<UatInner>> {
         let handoff_rgn = Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, true)?;
         let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, true)?;
 
@@ -3208,6 +3244,16 @@ impl Uat {
             try_pin_init!(UatInner {
                 firmware_cache_flush_ready: AtomicBool::new(
                     handoff_mode == HandoffMode::FirmwareDekker
+                ),
+                t8140_alias_owner: AtomicU64::new(0),
+                t8140: cfg == UatConfig::T8140,
+                // Contexts 0..4 have fixed architectural meaning, and the
+                // bind band belongs to `Uat::bind`. Reserving the band here as
+                // well means the two allocators cannot collide even if the
+                // masks in `g17_queue_limits` are ever edited apart.
+                t8140_app_contexts: AtomicU64::new(
+                    T8140_APP_CONTEXT_RESERVED_MASK
+                        | crate::g17_queue_limits::BIND_CONTEXT_MASK,
                 ),
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
@@ -3420,7 +3466,7 @@ impl Uat {
             return Err(ENODEV);
         }
 
-        let inner = Self::make_inner(dev)?;
+        let inner = Self::make_inner(dev, cfg, handoff_mode)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
