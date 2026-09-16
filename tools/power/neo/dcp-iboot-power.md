@@ -122,3 +122,20 @@ outer types; the helper now does too, retaining all outstanding-command,
 channel, subtype and owned-RX-buffer checks. No power command was sent on
 this boot. A root-only, read-only owned-pool attribute replaces ad-hoc
 private-layout probes for subsequent captures.
+
+## Zero-payload power replies
+
+On boot 7e38d0fb-31bb-42a4-bdaf-35f4912d5484, HPD passed with the expected
+20-byte response, HPD=1 and one timing/color mode. SET_POWER then caused
+`ASSERT!AFKEPCommandContext.cpp:204`; Linux/Wi-Fi stayed alive. No power
+measurement or successful off/on cycle is claimed for that boot. The crash
+and owned buffers are retained under dcp-owned-dma/power-compare48.
+
+Desliding the client stack by 0x321000 locates the assert at 0x404c224:
+the reply context attempts to copy a zero-length response into the supplied
+RX buffer and asserts when the copy routine returns zero. The power handler
+0x42e16d8 explicitly sets response length to zero, including on success.
+Unlike HPD, SET_POWER must advertise RX address/length zero. The helper now
+requests only its EPIC status reply for power commands. This fixes the reply
+contract rather than modifying firmware assertions or guessing a longer
+request. The captured request's operation=2 and length=17 matched dispatch.
