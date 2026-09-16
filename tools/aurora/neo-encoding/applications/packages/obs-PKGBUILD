@@ -1,0 +1,17 @@
+pkgname=obs-studio-j700
+pkgver=32.2.2
+pkgrel=1
+pkgdesc='Native ARM64 OBS Studio for the J700 application test suite'
+arch=('aarch64')
+url='https://obsproject.com/'
+license=('GPL-2.0-or-later')
+depends=('ffmpeg' 'qt6-base' 'qt6-svg' 'qt6-imageformats' 'libdatachannel' 'librist'
+         'mbedtls3' 'x264' 'rnnoise' 'jansson' 'luajit' 'libpulse' 'pipewire'
+         'vlc' 'v4l-utils' 'libxcomposite' 'libxinerama' 'libxrandr' 'python'
+         'qrcodegencpp-cmake' 'curl' 'speexdsp')
+provides=('obs-studio')
+conflicts=('obs-studio')
+options=('!strip' '!debug')
+package() {
+  cp -a /build/obs-installed/. "$pkgdir/"
+}

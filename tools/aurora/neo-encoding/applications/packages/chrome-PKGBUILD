@@ -1,0 +1,31 @@
+# Native ARM64 package repacked from Google's unmodified official Debian payload.
+pkgname=google-chrome-stable
+pkgver=153.0.8010.36
+pkgrel=1
+pkgdesc='Google Chrome browser, official native Linux ARM64 binaries'
+arch=('aarch64')
+url='https://www.google.com/chrome/'
+license=('custom:Google-Chrome')
+depends=('alsa-lib' 'at-spi2-core' 'ca-certificates' 'cairo' 'cups' 'curl' 'dbus'
+         'expat' 'glib2' 'glibc' 'gtk3' 'libdrm' 'libx11' 'libxcb' 'libxcomposite'
+         'libxdamage' 'libxext' 'libxfixes' 'libxkbcommon' 'libxrandr' 'mesa' 'nspr'
+         'nss' 'pango' 'ttf-liberation' 'vulkan-icd-loader' 'wget' 'xdg-utils')
+options=('!strip' '!debug')
+source=('google-chrome-stable_current_arm64.deb')
+sha256sums=('1fcf6ec51a9d52e26ff1ad807225f725be55069ad2b68c5d69361a2746665188')
+noextract=('google-chrome-stable_current_arm64.deb')
+
+package() {
+  bsdtar -xf "$srcdir/google-chrome-stable_current_arm64.deb" -C "$srcdir"
+  mkdir -p "$srcdir/payload"
+  bsdtar -xf "$srcdir/data.tar.xz" -C "$srcdir/payload"
+  install -d "$pkgdir/opt/google" "$pkgdir/usr/bin" "$pkgdir/usr/share"
+  cp -a "$srcdir/payload/opt/google/chrome" "$pkgdir/opt/google/"
+  for item in applications icons man; do
+    [[ ! -d "$srcdir/payload/usr/share/$item" ]] || cp -a "$srcdir/payload/usr/share/$item" "$pkgdir/usr/share/"
+  done
+  ln -s /opt/google/chrome/google-chrome "$pkgdir/usr/bin/google-chrome-stable"
+  ln -s google-chrome-stable "$pkgdir/usr/bin/google-chrome"
+  chmod 4755 "$pkgdir/opt/google/chrome/chrome-sandbox"
+  # Debian's cron/APT integration is intentionally not installed on Arch.
+}
