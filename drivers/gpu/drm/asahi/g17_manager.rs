@@ -1042,8 +1042,488 @@ impl G17PManagerConstruction {
             {
                 self.render_storage
                     .as_mut()
-                    .ok_or(ENODEV)?
-                    .quiesce_completed_job_list(state)?;
+                    .map(|s| s.read_pool_a_record(&mut pa).is_ok())
+                    .unwrap_or(false)
+                {
+                    // The TA descriptor's +0x10 selects WHICH Pool-A record the
+                    // firmware gates on, and it is record 1 by default -- read
+                    // both. `FUN_16f7c` sets +0x94 = 1 after linking the job, so
+                    // a 1 proves the classic TA enqueue ran and the job is
+                    // sitting in the list; a 0 proves it never ran at all.
+                    let r0 = u32::from_le_bytes([pa[0x94], pa[0x95], pa[0x96], pa[0x97]]);
+                    let r1 = u32::from_le_bytes([
+                        pa[0x194], pa[0x195], pa[0x196], pa[0x197],
+                    ]);
+                    let v1 = if r1 != 0 {
+                        "rec1 QUEUED (FUN_16f7c ran, job linked, nothing dequeues DM0)"
+                    } else {
+                        "rec1 NOT queued (FUN_16f7c never ran)"
+                    };
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P pool-a[{}] rec0(+0x00={:02x?} +0x10={:02x?} +0x94={:#010x}) rec1(+0x00={:02x?} +0x10={:02x?} +0x94={:#010x} link={:02x?}) {}\n",
+                        label,
+                        &pa[0x00..0x08],
+                        &pa[0x10..0x14],
+                        r0,
+                        &pa[0x100..0x108],
+                        &pa[0x110..0x114],
+                        r1,
+                        &pa[0x198..0x1a8],
+                        v1,
+                    );
+                }
+            }
+            let mut cc = [0u8; 0x40];
+            let ok = self
+                .render_storage
+                .as_mut()
+                .map(|s| s.read_channel_control(&mut cc).is_ok())
+                .unwrap_or(false);
+            if ok {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render channel-control[{}]: pid={:#04x} idx={:#04x} f2={:#04x} prio={:#04x} class={:#04x} qidmask={:02x?} hwbuf={:#04x}\n",
+                    label,
+                    cc[0],
+                    cc[1],
+                    cc[2],
+                    cc[3],
+                    cc[4],
+                    &cc[0x12..0x1a],
+                    cc[0x33],
+                );
+            }
+        }
+
+        self.resources.dump_render_qos_regions(label);
+        if *crate::module_parameters::g17p_dump_state.value() != 0
+            && !G17P_STATE_DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            let kib = *crate::module_parameters::g17p_dump_state.value() as usize;
+            if kib == 1 {
+                self.resources.checksum_primary_state(label);
+            } else {
+                self.resources.dump_primary_state(label, kib * 1024);
+            }
+        }
+        if *crate::module_parameters::g17p_dump_hwdata.value() != 0
+            && !G17P_HW_DATA_DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            self.resources.dump_hw_data(label);
+        }
+        self.resources.log_render_parameter_buffer_descriptor(
+            label,
+            self.render_hardware_buffer_id.unwrap_or(0),
+        );
+        let selected_metric = self
+            .render_storage
+            .as_ref()
+            .ok_or(ENODEV)
+            .and_then(|storage| storage.selected_scene_index())
+            .and_then(|scene| self.resources.selected_parameter_metric(scene));
+        let dev = self.resources.dev().clone();
+        match selected_metric {
+            Ok(value) => dev_info!(
+                dev.as_ref(),
+                "G17P render PM[{}]: actual-selected-metric={:#x}\n",
+                label,
+                value,
+            ),
+            Err(error) => dev_warn!(
+                dev.as_ref(),
+                "G17P render PM[{}]: actual selected metric read failed ({:?})\n",
+                label,
+                error,
+            ),
+        }
+        if let Some(storage) = self.render_storage.as_mut() {
+            match storage.render_activation_coordinates() {
+                Ok((ta_qid, ta_stamp, sku_reserved, sku_pointer, sku_header)) => dev_info!(
+                    dev.as_ref(),
+                    "G17P render activation[{}]: TA-link qid={} stamp={:#x} predecessor={:#x}; 3D-SKU reserved={:#x} stream={:#x} header={:#x}\n",
+                    label,
+                    ta_qid,
+                    ta_stamp,
+                    ta_stamp.wrapping_sub(1) & ((1u64 << 40) - 1),
+                    sku_reserved,
+                    sku_pointer,
+                    sku_header,
+                ),
+                Err(error) => dev_warn!(
+                    dev.as_ref(),
+                    "G17P render activation[{}]: descriptor coordinates unreadable ({:?})\n",
+                    label,
+                    error,
+                ),
+            }
+            match storage.render_activation_gate_words() {
+                Ok(gate) => dev_info!(
+                    dev.as_ref(),
+                    "G17P render activation gate[{}]: TA(+7a4,+866,+892,+8ba,+8cb)={:x?}\n",
+                    label,
+                    gate,
+                ),
+                Err(error) => dev_warn!(
+                    dev.as_ref(),
+                    "G17P render activation gate[{}]: descriptor inputs unreadable ({:?})\n",
+                    label,
+                    error,
+                ),
+            }
+            storage.log_status_pages(&dev, label);
+            storage.log_parameter_management(&dev, label);
+        }
+    }
+
+    /// Snapshot every host-DRAM render progress marker while firmware is
+    /// halted at recovery state 1, before the host acknowledges the restart.
+    /// The recovery path retires both queue graphs and writes a synthetic 3D
+    /// completion record, so the ordinary timeout dump is too late to tell a
+    /// launch failure from recovery cleanup.
+    /// Locate a reported MMU fault address inside the render VM's own tables.
+    ///
+    /// The G14X fault-address register is documented as VA >> 6, but that
+    /// reading and the raw one cannot be told apart from a fault inside the
+    /// first page. The GMMU report's VM slot is the descriptor/application
+    /// context, not the ordinary VM bind slot. Resolve the retained storage by
+    /// that exact context before walking its owner. Then report whether the
+    /// selected VM maps the page and every mapped run within +/-1 MiB of it. A
+    /// candidate that abuts or falls just outside a live run is the real
+    /// address; one that lands in empty space at every scale is not.
+    fn render_bind_for_descriptor_context(
+        &self,
+        descriptor_context_id: u8,
+    ) -> Option<(&G17PRenderRootOwner, &'static str)> {
+        let matches = |storage: &g17_resources::G17PUserRenderStorage| {
+            storage.descriptor_context_id() == u16::from(descriptor_context_id)
+        };
+        if self.render_storage.as_ref().is_some_and(matches) {
+            if let Some(bind) = self.render_bind.as_ref() {
+                return Some((bind, "active"));
+            }
+        }
+        if let Some(retirement) = self.render_context_retirement.as_ref().filter(|retirement| {
+            retirement.bind.root_slot().ok() == Some(descriptor_context_id)
+        }) {
+            return Some((&retirement.bind, "active-context-retirement"));
+        }
+        if let Some(graph) = self
+            .retired_render_handoff_graph
+            .as_ref()
+            .filter(|graph| matches(&graph.storage))
+        {
+            return Some((&graph.bind, "active-quarantine"));
+        }
+        if let Some(graph) = self
+            .retired_render_handoff_graphs
+            .iter()
+            .find(|graph| matches(&graph.storage))
+        {
+            return Some((&graph.bind, "completion-quarantine"));
+        }
+        for state in self.parked_render_slots.iter().flatten() {
+            if state.storage.as_ref().is_some_and(matches) {
+                if let Some(bind) = state.bind.as_ref() {
+                    return Some((bind, "parked"));
+                }
+            }
+            if let Some(graph) = state
+                .retired_handoff_graph
+                .as_ref()
+                .filter(|graph| matches(&graph.storage))
+            {
+                return Some((&graph.bind, "parked-quarantine"));
+            }
+            if let Some(retirement) = state.context_retirement.as_ref().filter(|retirement| {
+                retirement.bind.root_slot().ok() == Some(descriptor_context_id)
+            }) {
+                return Some((&retirement.bind, "parked-context-retirement"));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn log_fault_address_candidates(
+        &self,
+        label: &'static str,
+        addr_word: u64,
+        fault_vm_slot: u8,
+    ) -> bool {
+        let Some((bind, owner)) = self.render_bind_for_descriptor_context(fault_vm_slot) else {
+            return false;
+        };
+        self.log_fault_address_candidates_for_vm(
+            label,
+            addr_word,
+            fault_vm_slot,
+            bind.vm(),
+            bind.vm_id(),
+            bind.root(),
+            owner,
+        );
+        true
+    }
+
+    pub(crate) fn log_compute_fault_address_candidates(
+        &self,
+        label: &'static str,
+        addr_word: u64,
+        fault_vm_slot: u8,
+        context: &mmu::T8140ComputeExecutionContext,
+        owner: &'static str,
+    ) {
+        self.log_fault_address_candidates_for_vm(
+            label,
+            addr_word,
+            fault_vm_slot,
+            context.vm(),
+            context.vm_id(),
+            context.root(),
+            owner,
+        );
+    }
+
+    fn log_fault_address_candidates_for_vm(
+        &self,
+        label: &'static str,
+        addr_word: u64,
+        fault_vm_slot: u8,
+        vm: &mmu::Vm,
+        vm_id: u64,
+        root: u64,
+        owner: &'static str,
+    ) {
+        let dev = self.resources.dev().clone();
+        dev_info!(
+            dev.as_ref(),
+            "G17P fault address[{}]: walking {} owner vm={} root={:#x} vm-slot={}\n",
+            label,
+            owner,
+            vm_id,
+            root,
+            fault_vm_slot,
+        );
+        let candidates = [
+            ("raw", addr_word),
+            ("shift6", (addr_word & ((1u64 << 42) - 1)) << 6),
+            ("shift6-masked", (addr_word << 6) & ((1u64 << 42) - 1)),
+        ];
+        for (name, candidate) in candidates {
+            let page = candidate & !(mmu::UAT_PGSZ as u64 - 1);
+            let mapped = vm.covers_range(page, mmu::UAT_PGSZ as u64, true, false);
+            let translation = vm.translate_iova(candidate);
+            dev_info!(
+                dev.as_ref(),
+                "G17P fault address[{}]: {} candidate {:#x} page {:#x} mapped={} translate={:?}\n",
+                label,
+                name,
+                candidate,
+                page,
+                mapped,
+                translation,
+            );
+            let window_start = page.saturating_sub(0x10_0000);
+            let window_end = match page.checked_add(0x10_0000) {
+                Some(end) => end,
+                None => continue,
+            };
+            let mut ranges = [pgtable::MappedRange::default(); 16];
+            match vm.mapped_ranges(window_start..window_end, &mut ranges) {
+                Ok((count, truncated)) => {
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P fault address[{}]: {} neighbourhood {:#x}..{:#x} has {} run(s){}\n",
+                        label,
+                        name,
+                        window_start,
+                        window_end,
+                        count,
+                        if truncated { " TRUNCATED" } else { "" },
+                    );
+                    for run in ranges.iter().take(count) {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17P fault address[{}]:   {:#x}..{:#x} pte={:#x}\n",
+                            label,
+                            run.start,
+                            run.end,
+                            run.pte,
+                        );
+                    }
+                }
+                Err(error) => dev_info!(
+                    dev.as_ref(),
+                    "G17P fault address[{}]: {} neighbourhood walk failed ({:?})\n",
+                    label,
+                    name,
+                    error,
+                ),
+            }
+        }
+
+        // One fault-only discriminator for Honeykrisp's sparse buffer layout:
+        // a mapped lower peer with an unmapped upper address means the shadow
+        // bind disappeared, while two unmapped peers point to a stale or
+        // malformed address. Keep this to one line; it is not submit logging.
+        let decoded = (addr_word << 6) & ((1u64 << 42) - 1);
+        if let Some(candidate) = g17p_fault_sparse_ro_lower(decoded) {
+            let page = candidate & !(mmu::UAT_PGSZ as u64 - 1);
+            let mapped = vm.covers_range(page, mmu::UAT_PGSZ as u64, true, false);
+            let translation = vm.translate_iova(candidate);
+            dev_info!(
+                dev.as_ref(),
+                "G17P fault address[{}]: Honeykrisp sparse-RO lower peer {:#x} page {:#x} mapped={} translate={:?}\n",
+                label,
+                candidate,
+                page,
+                mapped,
+                translation,
+            );
+        }
+
+        // The whole client root, so any decode of the address register can be
+        // tested against the real layout instead of one window at a time.
+        let mut all = [pgtable::MappedRange::default(); 96];
+        // The full 42-bit low half, from the client null view up to the
+        // unknown page, so no decode of the address register is excluded by
+        // the window rather than by the tables.
+        let user_range = 0u64..(1u64 << 42);
+        match vm.mapped_ranges(user_range.clone(), &mut all) {
+            Ok((count, truncated)) => {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P fault address[{}]: client root {:#x}..{:#x} holds {} run(s){}\n",
+                    label,
+                    user_range.start,
+                    user_range.end,
+                    count,
+                    if truncated { " TRUNCATED" } else { "" },
+                );
+                for run in all.iter().take(count) {
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P fault address[{}]: run {:#x}..{:#x} ({:#x}) pte={:#x}\n",
+                        label,
+                        run.start,
+                        run.end,
+                        run.end - run.start,
+                        run.pte,
+                    );
+                }
+            }
+            Err(error) => dev_info!(
+                dev.as_ref(),
+                "G17P fault address[{}]: client root walk failed ({:?})\n",
+                label,
+                error,
+            ),
+        }
+    }
+
+    pub(crate) fn log_render_recovery_pre_ack(&mut self, label: &'static str) {
+        let render_qids = self.render_sksm.as_ref().map(|queues| {
+            [
+                queues.tiling.queue_id as usize,
+                queues.fragment.queue_id as usize,
+            ]
+        });
+        if let Some([tiling_qid, fragment_qid]) = render_qids {
+            let tiling_last = self.g17p_last_submitted_hw_timestamp(tiling_qid);
+            let fragment_last = self.g17p_last_submitted_hw_timestamp(fragment_qid);
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P render recovery pre-ack[{}]: last-submitted TA(qid {})={:?} 3D(qid {})={:?}\n",
+                label,
+                tiling_qid,
+                tiling_last,
+                fragment_qid,
+                fragment_last,
+            );
+        }
+        {
+            let dev = self.resources.dev().clone();
+            if let Some(storage) = self.render_storage.as_mut() {
+                match storage.snapshot() {
+                    Ok(state) => dev_info!(
+                        dev.as_ref(),
+                        "G17P render recovery pre-ack[{}]: tiling done/read/write {}/{}/{} fragment {}/{}/{} job-list-empty {} tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]\n",
+                        label,
+                        state.tiling.done,
+                        state.tiling.read,
+                        state.tiling.write,
+                        state.fragment.done,
+                        state.fragment.read,
+                        state.fragment.write,
+                        state.job_list_empty,
+                        state.tiling_timestamps[0],
+                        state.tiling_timestamps[1],
+                        state.fragment_timestamps[0],
+                        state.fragment_timestamps[1],
+                    ),
+                    Err(error) => dev_warn!(
+                        dev.as_ref(),
+                        "G17P render recovery pre-ack[{}]: queue snapshot failed ({:?})\n",
+                        label,
+                        error
+                    ),
+                }
+            }
+        }
+        self.log_render_status_pages(label);
+        self.log_render_sksm_entries(label);
+        if g17p_native_fragment_first_mode(
+            *crate::module_parameters::g17p_render_native_doorbells.value(),
+        ) {
+            self.log_render_outer_channels(label);
+        }
+        if let Err(error) = self.dump_completion_records(label) {
+            let dev = self.resources.dev().clone();
+            dev_warn!(
+                dev.as_ref(),
+                "G17P render recovery pre-ack[{}]: completion dump failed ({:?})\n",
+                label,
+                error
+            );
+        }
+    }
+
+    /// DRAM-only TA/3D outer-channel state. The current slot record pointer and
+    /// queue-id byte prove whether firmware consumed the Fragment slot after
+    /// its dedicated doorbell without touching the SGX MMIO aperture.
+    pub(crate) fn log_render_outer_channels(&mut self, label: &'static str) {
+        let snapshots = match self.resources.snapshot_all_primary_work_channels() {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                dev_warn!(
+                    self.resources.dev().as_ref(),
+                    "G17P render outer[{}]: snapshot failed ({:?})\n",
+                    label,
+                    error
+                );
+                return;
+            }
+        };
+        // Log EVERY work channel, not the first two. The userspace render's
+        // tables are TA_2/3D_2 (indices 6/7) and compute publishes on CL_2 (8).
+        // Native's distinct system bring-up queues occupy TA_0/3D_0.
+        for snapshot in snapshots.into_iter() {
+            let name = if snapshot.table_index
+                == g17_submission::G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX
+            {
+                "TA"
+            } else if snapshot.table_index
+                == g17_submission::G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX
+            {
+                "3D"
+            } else if snapshot.table_index
+                == g17_submission::G17P_COMPUTE_CHANNEL_TABLE_INDEX
+            {
+                "CL"
+            } else {
+                "--"
+            };
+            if snapshot.cursors == [0, 0, 0] && snapshot.current_slot_queue == 0 {
                 continue;
             }
             let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
@@ -1549,9 +2029,438 @@ impl G17PManagerConstruction {
             .map_err(|_| EINVAL)
         })?;
 
-        let group = queue.compute.stage_initial_channel_group(
-            descriptor_high,
-            user_layout.queue_context,
+        let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
+            descriptor_low,
+            queue.submission_ordinal,
+        )
+        .map_err(|_| EINVAL)?;
+        let prepared_entry = g17_submission::prepare_g17p_cl_kick_entry(
+            queue.producer,
+            g17_submission::G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 1,
+                barriers: &[],
+                mcache: None,
+                payload: [descriptor_high, queue.compute.queue_record_gpu_va()],
+                event_mask: command_state.event_mask,
+                rce_kind: 0,
+                rce_bindings: command_state.rce_bindings,
+                auxiliary: context.auxiliary,
+            },
+        )
+        .map_err(|_| EINVAL)?;
+        if prepared_entry.entry_index != 1
+            || prepared_entry.entry_offset != queue.producer.geometry.entry_stride()
+            || prepared_entry.current_timestamp != queue.producer.geometry.timestamp_seed()
+        {
+            return Err(EINVAL);
+        }
+        let backend = g17_submission::T8140_G17P_CL_BACKEND;
+        if !g17_submission::g17p_first_bind_tag15_required(true)
+            || !g17_submission::g17p_first_bind_tag16_required(backend, true)
+        {
+            return Err(EINVAL);
+        }
+        let mut entry_signal =
+            [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        // Tag 16 names the last retired entry. A newly installed queue has no
+        // predecessor, so the protocol value is zero.
+        let first_bind_old_timestamp = prepared_entry.current_timestamp.saturating_sub(1);
+        g17_submission::encode_g17p_compute_optional_event(
+            g17_submission::G17PComputeOptionalEvent {
+                queue_id: u16::from(queue.queue_id),
+                old_timestamp: first_bind_old_timestamp,
+            },
+            &mut entry_signal,
+        )
+        .map_err(|_| EINVAL)?;
+        if let Ok(window) = queue.compute.g17p_preempt_argument_window() {
+            // +0x1480 is where 0x1a4d0..0x1a4e8 point; +0x14a0 (this dump's
+            // +0x20) is the add3 operand table. Populated for the proof path,
+            // untouched for a Honeykrisp dispatch.
+            self.log_record("preempt+0x1480", &window);
+        }
+        self.log_record("cl-kick-entry", &prepared_entry.entry);
+        self.log_record("tag16-entry-signal", &entry_signal);
+
+        let sksm_entry_aliases = queue.storage.entry_aliases()?;
+        // Tag 15 installs a queue exactly once. This path is reachable only for
+        // the prepared first bind; retained submissions use the repeat encoder
+        // with the install flag clear.
+        let install_queue = matches!(
+            queue.hardware_state,
+            G17PSksmQueueHardwareState::PreparedMemory
+        );
+        // The single most diagnostic line for a client handoff. The tag-15
+        // queue-install flag must be published exactly once for each fresh QID.
+        // Reusing an installed QID with another context would ask firmware to
+        // reprogram a live KSMFE queue and strand one of the two routes.
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17PMARK tag15-install i={} z={} r={} h={} qid={} flag={} (first-bind chronology; a second install on the SAME qid in one boot is the second-client bug)\n",
+            {
+                let n = G17P_MARK_TAG15_INSTALLS.fetch_add(1, Ordering::Relaxed) + 1;
+                n
+            },
+            G17P_MARK_ZERO_DURATION.load(Ordering::Relaxed),
+            G17P_MARK_GATE_REBUILDS.load(Ordering::Relaxed),
+            G17P_MARK_RETAINED_HANDOFFS.load(Ordering::Relaxed),
+            queue.queue_id,
+            install_queue as u32,
+        );
+        let mut group = queue
+            .compute
+            .stage_initial_channel_group_without_fallback_event(
+                descriptor_high,
+                sksm_entry_aliases,
+                shared_control,
+                queue.storage.channel_control_gpu_va(),
+                queue.queue_id,
+                install_queue,
+                binding.declared_context_id(),
+            )?;
+        // Purely precompute the host-only sequence token and notification
+        // predicates. Retained state is not committed until after the SKSM
+        // producer transition, matching the native correlation chronology.
+        let lifecycle = g17_submission::prepare_g17p_direct_cl_lifecycle(
+            queue.direct_lifecycle,
+            group.queue,
+            true,
+            backend,
+        )
+        .map_err(|_| EINVAL)?;
+        if !lifecycle.publish_config_update
+            || !lifecycle.publish_entry_signal
+            || lifecycle.correlation_token == 0
+        {
+            return Err(EINVAL);
+        }
+        if *module_parameters::g17p_fault_report.value() != 0 {
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P rec tag15: install_queue={} descriptor_high={:#x} shared_control={:#x} channel_control={:#x} group(queue={:#x} optional={:#x} event={:#x} write_index={})\n",
+                install_queue,
+                descriptor_high,
+                shared_control,
+                queue.storage.channel_control_gpu_va(),
+                group.queue,
+                group.optional,
+                group.event,
+                group.write_index,
+            );
+        }
+        self.arm_compute_completion(queue, descriptor_high)?;
+        self.publish_compute_b2_once(queue)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_B2, Ordering::Release);
+        queue
+            .compute
+            .publish_initial_config_update_pointer(group)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_TAG15, Ordering::Release);
+        // Tag 15 carries the firmware-visible queue-install request. Prepare
+        // every mapping before the remainder of that group is published; no
+        // AP-side SKSM MMIO is valid on J700.
+        self.prepare_compute_firmware_install(queue)?;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P submitBuffer: tag15 firmware install published; writing first SKSM entry\n"
+        );
+        if g17p_compute_sksm_entry_enabled() {
+            queue.storage.write_entry(
+                prepared_entry.entry_offset as usize,
+                prepared_entry.zero_length as usize,
+                &prepared_entry.entry,
+            )?;
+        }
+        fence(Ordering::SeqCst);
+        queue.producer = prepared_entry.producer_after;
+        submission_phase.store(G17P_SUBMIT_PHASE_SKSM_ENTRY, Ordering::Release);
+        let descriptor_generation =
+            g17_submission::advance_g17p_compute_descriptor_generation(0, 0)
+                .map_err(|_| EINVAL)?;
+        queue.direct_lifecycle = lifecycle.next;
+        // Native's publication order is tag 15 -> 14 -> 16; ours has been
+        // 15 -> 16 -> 14. Selectable so both can be tested from one build.
+        let native_order = *module_parameters::g17p_native_order.value() != 0;
+        let add_kicks = g17_submission::prepare_g17p_ksm_add_kicks_command(
+            g17_submission::G17PKsmAddKicksCommand {
+                queue_id: queue.queue_id,
+                add_count: descriptor_generation,
+                queue_priority: queue.producer.completion_selector,
+                entry_stamp: prepared_entry.current_timestamp,
+            },
+        )
+        .map_err(|_| EINVAL)?;
+        self.log_record("tag14-add-kicks", &add_kicks.bytes);
+
+        let skip = *module_parameters::g17p_skip.value();
+        if native_order {
+            // Native's firmware-transport order is tag 3 -> 15 -> 14 -> 16.
+            // Tag 16's handler ends with a broadcast MMIO[0x210e0]/[0x210d8]
+            // = -1 "go" poke, so it must follow AddKicks, not precede it.
+            // publish_initial_config_update_pointer leaves the ring producer
+            // at 2. group.write_index is staged as 3 for the default order,
+            // where tag 16 advances 2 -> 3 first; in native order tag 14 takes
+            // slot 2 itself.
+            let defer_kicks = *module_parameters::g17p_defer_add_kicks.value() != 0;
+            let after_kicks = if skip & 1 != 0 {
+                dev_info!(self.resources.dev().as_ref(), "G17P bisect: tag-14 AddKicks SKIPPED\n");
+                2
+            } else if defer_kicks {
+                // Native defers the AddKicks poke (host flag accel[0x662]) and
+                // replays it from an IOP power-state callback. It must not be
+                // published while a recovery is open: the unhalt's 128-queue
+                // restore rewrites 0x21010/0x21018/0x21020 for every queue from
+                // the halt-time snapshot and erases it.
+                self.pending_add_kicks = Some(add_kicks.bytes);
+                dev_info!(
+                    self.resources.dev().as_ref(),
+                    "G17P compute: tag-14 AddKicks deferred until recovery closes\n"
+                );
+                2
+            } else {
+                queue
+                    .compute
+                    .publish_add_kicks_command(2, &add_kicks.bytes)?
+            };
+            queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
+            fence(Ordering::SeqCst);
+            submission_phase.store(G17P_SUBMIT_PHASE_ADD_KICKS, Ordering::Release);
+            group.write_index = if skip & 2 != 0 {
+                dev_info!(self.resources.dev().as_ref(), "G17P bisect: tag-16 EntrySignal SKIPPED\n");
+                after_kicks
+            } else {
+                queue
+                    .compute
+                    .publish_initial_entry_signal_at(after_kicks, &entry_signal)?
+            };
+            submission_phase.store(G17P_SUBMIT_PHASE_TAG16, Ordering::Release);
+        } else {
+            queue
+                .compute
+                .publish_initial_entry_signal(&entry_signal)?;
+            submission_phase.store(G17P_SUBMIT_PHASE_TAG16, Ordering::Release);
+            group.write_index = queue
+                .compute
+                .publish_add_kicks_command(group.write_index, &add_kicks.bytes)?;
+            queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
+            fence(Ordering::SeqCst);
+            submission_phase.store(G17P_SUBMIT_PHASE_ADD_KICKS, Ordering::Release);
+        }
+        let prepared = self
+            .resources
+            .publish_compute_channel(group.queue, group.write_index, queue.queue_id, false)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
+        // The complete install group is now visible to firmware. From this
+        // point a retry must use the retained route; publishing another
+        // install for the same QID could reprogram a live queue.
+        queue.hardware_state = G17PSksmQueueHardwareState::HardwareRegistered;
+        if lifecycle.notifications.activation != Some(prepared.doorbell) {
+            return Err(EINVAL);
+        }
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P compute: native-direct-first-v2 qid {} entry_offset {:#x} entry_low {:#x} entry_high {:#x} timestamp {:#x} descriptor_generation {} tag15_producer 2 tag16_producer 3 tag14_producer {} addkicks-via-channel-command=true correlation_token {}\n",
+            queue.queue_id,
+            prepared_entry.entry_offset,
+            sksm_entry_aliases.low(),
+            sksm_entry_aliases.high(),
+            prepared_entry.current_timestamp,
+            descriptor_generation,
+            group.write_index,
+            lifecycle.correlation_token
+        );
+        queue.submission_ordinal = 1;
+        self.log_compute_ring_state(queue, "first-post-cl2");
+        self.log_compute_outer_channel("first-post-cl2");
+        Ok(lifecycle.notifications)
+    }
+
+    /// The steady-state (second and later) submission on an already-installed
+    /// queue.
+    ///
+    /// Everything the first bind does exactly once is skipped here: the QID
+    /// configure transaction, the B2 activation, the queue-install flag in
+    /// tag 15, and above all the first-bind graph builder, which rewrites the
+    /// queue header and RESETS the item-ring producer to 1. Re-running that
+    /// builder for a repeat is what made the firmware's consumer cursor and
+    /// our producer disagree, so the record was published and never consumed.
+    ///
+    /// What DOES repeat, in native's transport order:
+    ///
+    ///   tag 3 (a new descriptor slot) -> tag 15 -> tag 14 -> tag 16 -> CL_2
+    ///
+    /// appended at the live ring producer rather than at slots 0..3. macOS
+    /// republishes tag 15 on every submission -- both live captures are of
+    /// already-installed queues and both carry one -- with `+0x1a` clear.
+    fn submit_translated_repeat_channel(
+        &mut self,
+        registers: &regs::Resources,
+        queue: &mut G17PSksmQueue,
+        submission_phase: &AtomicU32,
+        binding: &G17PComputeUserBinding,
+        command: &g17_uapi::TranslatedComputeCommand,
+        context: G17PComputeSubmissionContext<'_>,
+        add3_buffers: Option<[u64; 3]>,
+    ) -> Result<g17_submission::PreparedG17PDirectClNotifications> {
+        if queue.hardware_state != G17PSksmQueueHardwareState::HardwareRegistered
+            || queue.submission_ordinal == 0
+        {
+            return Err(EINVAL);
+        }
+        let _ = registers;
+        // The add3 operand table lives in the retained preempt object and is
+        // unchanged by a completed submission, but the probe may have staged
+        // new buffers, so honour the flag exactly as the first bind does.
+        if let Some(buffers) = add3_buffers {
+            queue.compute.write_g17p_add3_resource_table(buffers)?;
+        }
+
+        let ordinal = queue.submission_ordinal;
+        let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+        // Descriptor ordinals, split into the two fields that behave
+        // differently. Hardware has ruled on the extremes: advancing everything
+        // (mode 1) fails on the very first repeat, pinning everything (mode 0)
+        // gets exactly two consecutive submissions. Mode 2 separates them.
+        //
+        // `sequence_ordinal` feeds submit_sequence / queue_submission /
+        // queue_ordinal / submission_index -- pure per-submission counters, and
+        // macOS's CL command record advances its +0x04 sequence once per
+        // published record.
+        //
+        // `work_ordinal` is different in kind: it is folded into the register
+        // program as `context_word = (context_id << 8) | work_ordinal`, which
+        // m1n1's proven add3 left at 0x200. Mode 1 was sending 0x201, which is
+        // the most likely reason it failed immediately.
+        // The output-positive 100-submit run keeps both descriptor ordinals at
+        // their first-bind values. The item-ring producer and entry timestamp
+        // provide the forward progress for repeat commands.
+        let sequence_ordinal: u32 = 0;
+        let work_ordinal = 0;
+        let queue_submission = sequence_ordinal.checked_add(1).ok_or(EINVAL)?;
+        let stamp = g17_submission::decode_kick_timestamp(queue.producer.current_timestamp)
+            .map_err(|_| EINVAL)?;
+        let descriptor_slot = stamp.stamp_index;
+        let (descriptor_high, _) = queue.compute.descriptor_gpu_vas(descriptor_slot);
+        let descriptor_low = binding.mappings.descriptor_gpu_va(descriptor_slot);
+        let user_layout = binding.mappings.layout();
+        let shared_control = queue.storage.shared_support_gpu_va();
+        let objects = g17_compute::ComputeDescriptorObjects {
+            scheduler_record: queue.compute.scheduler_record_gpu_va(),
+            descriptor_low_alias: descriptor_low,
+            dispatch_a: queue.compute.dispatch_a_gpu_va(),
+            dispatch_b: queue.compute.dispatch_b_gpu_va(),
+            status_a: queue.compute.status_a_gpu_va(),
+            status_b: queue.compute.status_b_gpu_va(),
+            shared_control,
+            zero_page: queue.compute.zero_page_gpu_va(),
+        };
+        queue.compute.with_descriptor_mut(descriptor_slot, |raw| {
+            g17_uapi::build_compute_descriptor(
+                command,
+                g17_uapi::ComputeInternalState {
+                    preempt_base: user_layout.preempt,
+                    dispatch_identity: context.dispatch_identity,
+                    context_id: context.context_id,
+                    work_ordinal,
+                    robustness: user_layout.robustness,
+                    operand_state_base: user_layout.operand_state,
+                    execution_gate: context.execution_gate,
+                },
+                objects,
+                g17_compute::ComputeDescriptorMetadata {
+                    submit_sequence: sequence_ordinal as u64,
+                    context_id: context.context_id,
+                    grid_index: u32::from(queue.queue_id),
+                    work_ordinal,
+                    queue_submission,
+                    queue_ordinal: sequence_ordinal,
+                    submission_index: queue_submission,
+                    support_control: 0xe0a0_0001,
+                    support_flags: 0,
+                },
+                context.timestamps,
+                raw,
+            )
+            .map_err(|_| EINVAL)
+        })?;
+
+        // Ordinal 0 deliberately: the entry's event mask is a set of event
+        // SLOT indices, not a counter. macOS's captured kick entries carry the
+        // same constant mask value on every submission of a queue (0x22 for
+        // CL), and the CL command record's own event quartet is likewise
+        // identical across all twelve captured submissions. Only the RCE
+        // bindings, which this call also derives, legitimately move -- they
+        // follow the descriptor slot.
+        let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
+            descriptor_low,
+            0,
+        )
+        .map_err(|_| EINVAL)?;
+        let prepared_entry = g17_submission::prepare_g17p_cl_kick_entry(
+            queue.producer,
+            g17_submission::G17PClKickEntryOperands {
+                descriptor_flag_4c: context.descriptor_flag_4c,
+                descriptor_flag_5c8: context.descriptor_flag_5c8,
+                converted_command_timestamp: context.converted_command_timestamp,
+                barriers: context.barriers,
+                mcache: context.mcache,
+                payload: [descriptor_high, queue.compute.queue_record_gpu_va()],
+                event_mask: command_state.event_mask,
+                rce_kind: context.rce_kind,
+                rce_bindings: command_state.rce_bindings,
+                auxiliary: context.auxiliary,
+            },
+        )
+        .map_err(|_| EINVAL)?;
+        self.log_record("repeat-cl-kick-entry", &prepared_entry.entry);
+        if prepared_entry.entry_index != descriptor_slot {
+            return Err(EINVAL);
+        }
+        let backend = g17_submission::T8140_G17P_CL_BACKEND;
+        let mut entry_signal = [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        // Tag 16 names the last retired entry, never the kick being published.
+        let entry_old_timestamp = queue.producer.previous_timestamp;
+        g17_submission::encode_g17p_compute_optional_event(
+            g17_submission::G17PComputeOptionalEvent {
+                queue_id: u16::from(queue.queue_id),
+                old_timestamp: entry_old_timestamp,
+            },
+            &mut entry_signal,
+        )
+        .map_err(|_| EINVAL)?;
+        let sksm_entry_aliases = queue.storage.entry_aliases()?;
+        // Reclaim everything the firmware has finished with, so slots come back
+        // round instead of the ring being single-use.
+        let trace = Self::compute_trace_enabled(ordinal);
+        match queue.compute.recycle_consumed_ring_slots() {
+            Ok(_) if !trace => {}
+            Ok(0) => {}
+            Ok(reclaimed) => dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P compute: reclaimed {} consumed item-ring slots\n",
+                reclaimed
+            ),
+            Err(error) => dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P compute: item-ring reclaim failed ({:?}); publishing without it\n",
+                error
+            ),
+        }
+        match *module_parameters::g17p_repeat_context.value() {
+            0 => {}
+            2 => queue
+                .compute
+                .write_repeat_queue_context_item(
+                    descriptor_slot,
+                    descriptor_high,
+                    queue.queue_id,
+                )?,
+            _ => queue.compute.refresh_repeat_queue_context(descriptor_high)?,
+        }
+        let rewind = *module_parameters::g17p_repeat_ring.value() == 0;
+        let group = queue.compute.stage_repeat_config_update(
+            sksm_entry_aliases,
             shared_control,
             queue.storage.channel_control_gpu_va(),
         )?;
@@ -1559,9 +2468,37 @@ impl G17PManagerConstruction {
         fence(Ordering::SeqCst);
         let prepared = self
             .resources
-            .publish_compute_channel(group.queue, group.write_index)?;
-        queue.submission_ordinal = 1;
-        Ok(prepared.doorbell)
+            .publish_compute_channel(group.queue, reported_write_index, queue.queue_id, true)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
+        let _ = prepared;
+        queue.direct_lifecycle = lifecycle.next;
+        queue.submission_ordinal = next_ordinal;
+        // Optional settle. The 319-deep build padded every submission with
+        // several console writes here; this makes that padding explicit and
+        // measurable instead of an accident of log verbosity.
+        let settle = *module_parameters::g17p_repeat_settle_us.value();
+        if settle != 0 {
+            fsleep(Delta::from_micros(settle as i64));
+        }
+        self.log_compute_ring_state(queue, "repeat-post-cl2");
+        if !trace {
+            return Ok(lifecycle.notifications);
+        }
+        self.log_compute_outer_channel("repeat-post-cl2");
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P compute: repeat submission {} qid {} descriptor-slot {} descriptor {:#x} stamp {:#x} ring {} -> {} activation {:?} kick {:?}\n",
+            ordinal,
+            queue.queue_id,
+            descriptor_slot,
+            descriptor_high,
+            prepared_entry.current_timestamp,
+            producer_before,
+            write_index,
+            lifecycle.notifications.activation,
+            lifecycle.notifications.direct_kick
+        );
+        Ok(lifecycle.notifications)
     }
 
     /// Build and publish one complete userspace compute command.
