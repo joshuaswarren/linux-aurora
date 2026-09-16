@@ -602,7 +602,7 @@ static ssize_t epic_start_store(struct device *dev, struct device_attribute *a,
 	WRITE_ONCE(e->active, true);
 	ret = apple_rtkit_start_adopted_ep(d->rtk, 0x23);
 	if (!ret)
-		ret = neo_epic_send(e, 0x80ULL << 48);
+		ret = neo_epic_send(e, (0x80ULL << 48) | 8);
 	if (!ret && !wait_for_completion_timeout(&e->ready, msecs_to_jiffies(15000)))
 		ret = -ETIMEDOUT;
 	mutex_lock(&e->lock);

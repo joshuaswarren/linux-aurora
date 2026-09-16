@@ -7,11 +7,11 @@
 #include <linux/completion.h>
 #include <linux/unaligned.h>
 
-/* Pinned 25F84 INIT mode 0 selects config {128,128,0} at 0x4373775.
- * Firmware 0x403f234 reserves three 128-byte blocks; packet alignment is
- * also 128 (0x404137c). Mailbox size/offset units remain 64 bytes.
+/* Pinned 25F84 INIT mode 8 selects compatibility config {64,64,0}
+ * at 0x4373747 (selection 0x404198c). Mode 0 instead uses {128,128,0}
+ * and newer compact messages. Mailbox size/offset units remain 64 bytes.
  */
-#define NEO_EPIC_BLOCK 128
+#define NEO_EPIC_BLOCK 64
 #define NEO_EPIC_HEADER (3 * NEO_EPIC_BLOCK)
 
 struct neo_epic_ring {
