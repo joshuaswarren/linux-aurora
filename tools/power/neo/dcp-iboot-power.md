@@ -212,3 +212,15 @@ The userspace controller's --endpoint-cycle option qualifies HPD and records
 separate stop/restart results, and may then measure a bounded interval.
 Build qualification passed against the #48 exported-symbol manifest;
 hardware lifecycle qualification is pending.
+
+First hardware trial, #48 boot 00c44a36, acknowledged SHUTDOWN and
+re-established both rings after INIT. The service re-announced on channel 5
+with interface-id=5; initial announcement had channel/interface-id=3. The
+old parser's fixed interface-id=3 incorrectly rejected this valid restart,
+so power-on did not execute. Linux/Wi-Fi stayed available; recover via reboot.
+The parser now checks interface-id against the announcement's channel,
+retaining its exact service-name and dictionary checks. Captured initial
+and restarted announcements passed ASan/UBSan replay, mismatched/zero channel,
+truncation and wrong-name rejection. Artifacts: dcp-owned-dma/endpoint-cycle.
+This fixes the diagnostic guard; complete hardware restoration remains to
+be qualified with the changed parser.
