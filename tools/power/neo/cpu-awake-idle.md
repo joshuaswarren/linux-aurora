@@ -41,6 +41,10 @@ This is evidence of an asymmetry between the boot performance core and
 secondaries, not evidence that CPU0 is busy-spinning. It could prevent a
 deeper P-cluster state, but no wattage has yet been assigned to it.
 
+A further busy sample with `neo_cpu_pm=N` also kept P0 ACTIVE in all
+200,000 observations; the parameter was restored to Y. This excludes the
+optional CPU PM notifications as a simple explanation for this boot.
+
 Prior macOS `macos-pmgr/idle-01` reads P0 OFF (0x100) and P1 ACTIVE;
 `idle-02` reads P0 ACTIVE and P1 OFF. Thus native P0 can reach the reported
 OFF state. These snapshots are not a matched native residency measurement.
@@ -71,3 +75,34 @@ path maintains core/cluster bookkeeping and updates performance state.
 Next investigate boot-core initialization, native cluster policy, and
 interrupt routing. A reduction in watts requires a controlled before/after
 measurement with the real panel off and Wi-Fi associated.
+
+## Next native comparison
+
+`cpu-awake-config.py` uses the existing read-only client commands on either
+OS to collect the same six core words, AIC configuration, SMC/NVMe IRQ_CFG,
+and the two native CPM gating-enable words. It does not read IACK or issue
+register writes. Native MMIO access requires the already installed DevMem
+ABI 7 client. Example on macOS:
+
+```
+python3 cpu-awake-config.py --client /usr/local/bin/devmem-v12 --output NEW_DIRECTORY
+```
+
+Linux backend qualification (`config-linux/`) completed 64 rounds:
+P0 ACTIVE in all 64; P1 OFF in all 64. AIC version/config were
+0xa/0xe0000001, SMC RX IRQ584 and NVMe IRQ1039 configuration words both zero.
+PMGR SOCPwrGate regmap 0x65 maps to 0x300724000 on this binary/ADT.
+The native enableCPMPowerDomainGating method sets bit31 at offsets 0x60 and
+0x68; Linux already reads 0x80000000 at both. No toggle was attempted.
+
+Native AppleInterruptControllerV3 startup also preserves its configuration
+and sets ENABLE. Its optional `aic-ext-intr-cfg` property supplies per-IRQ
+low-byte overrides, but the retained J700 IORegistry has no such property.
+The last-core PMP doorbell in generic ApplePMGR::_cpuIdle is gated on PMP
+**v1**, so it is not evidence for a missing T8140 PMP v2 notification.
+Do not copy this command based solely on finding it in generic code.
+
+The saved macOS powermetrics capture reports P-cluster idle residency of
+99.51% and 99.71%, E-cluster 97.35% and 96.51%, and CPU power 3 mW in each
+5-second interval. Those are the native tool's reported estimates, not
+whole-machine battery watts or a controlled comparison with this Linux boot.
