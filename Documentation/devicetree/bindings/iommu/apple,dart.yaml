@@ -64,6 +64,18 @@ properties:
       aperture bits may be a firmware-visible alias which the DART driver
       removes before programming a narrower hardware page table.
 
+  apple,remap-streams:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: source stream id
+        - description: target stream id
+    description:
+      t8110 DARTs can fold a stream onto another one so that it is translated,
+      filtered and TLB-tracked exactly as the target (the ADT "remap" list).
+      Each pair remaps the source stream onto the target stream; the source
+      keeps no translation table of its own.
+
 required:
   - compatible
   - reg
