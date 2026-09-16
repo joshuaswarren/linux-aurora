@@ -36,6 +36,7 @@ assert "retire_after_context_epoch: u64" in pending
 
 drop = function(drm, "impl Drop for G17PQueue")
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
+retarget = function(manager, "fn retarget_retained_render_context(")
 poll = function(manager, "pub(crate) fn poll_translated_render_completion(")
 complete = function(manager, "fn complete_render_context_update_retirement(")
 reclaimable = function(manager, "fn retired_render_graph_reclaimable(")
@@ -45,10 +46,10 @@ abandoned = function(manager, "pub(crate) fn retire_abandoned_render_if_firmware
 stop = function(manager, "pub(crate) fn release_runtime_objects_after_processor_stop(")
 
 assert "release_render_owner" in drop
-assert handoff.index(".retarget_command_context(vm, execution_context.clone())") < handoff.index(
+assert retarget.index(".retarget_command_context(vm, execution_context.clone())") < retarget.index(
     ".render_bind\n                .replace"
 )
-assert "render_context_retirement = Some(G17PRenderContextRetirement" in handoff
+assert "render_context_retirement = Some(G17PRenderContextRetirement" in retarget
 assert "self.next_render_context_epoch(self.active_render_slot)?" in handoff
 assert poll.index("if !event_control.unlinked()") < poll.index(
     "self.complete_render_context_update_retirement()?"
