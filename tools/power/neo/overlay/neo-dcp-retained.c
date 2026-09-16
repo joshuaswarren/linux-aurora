@@ -470,8 +470,7 @@ static ssize_t wake_store(struct device *dev, struct device_attribute *a, const 
  * 2 to 0x445d90c; state 8 then selects the returning idle path. No TEXT edit,
  * CPU reset, page-table change or new firmware allocation is involved.
  */
-static ssize_t returning_idle_store(struct device *dev,
-	struct device_attribute *a, const char *buf, size_t count)
+static void *firmware_data_page(void)
 {
 	static const u8 expected_hash[SHA256_DIGEST_SIZE] = {
 		0x0a, 0x93, 0x75, 0x1f, 0x08, 0x99, 0x99, 0xa9,
@@ -480,8 +479,24 @@ static ssize_t returning_idle_store(struct device *dev,
 		0x71, 0x5d, 0xeb, 0xac, 0xa5, 0x4a, 0x58, 0x85,
 	};
 	static const char version[] = "AppleDCP-1041.120.7~1815-t8140dcp.RELEASE";
-	struct neo_dcp *d = dev_get_drvdata(dev);
 	u8 hash[SHA256_DIGEST_SIZE];
+	void *page = memremap(0x101ea7e7000ULL, SZ_4K, MEMREMAP_WB);
+
+	if (!page)
+		return ERR_PTR(-ENOMEM);
+	sha256(page, 0x400, hash);
+	if (memcmp(hash, expected_hash, sizeof(hash)) ||
+	    memcmp(page + 0x87c, version, sizeof(version))) {
+		memunmap(page);
+		return ERR_PTR(-ESTALE);
+	}
+	return page;
+}
+
+static ssize_t returning_idle_store(struct device *dev,
+	struct device_attribute *a, const char *buf, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
 	void *page;
 	u32 state;
 	int i, ret = -ESTALE;
@@ -500,13 +515,10 @@ static ssize_t returning_idle_store(struct device *dev,
 	}
 	if (readl(d->control + 0x44) != BIT(4))
 		return -EBUSY;
-	page = memremap(0x101ea7e7000ULL, SZ_4K, MEMREMAP_WB);
-	if (!page)
-		return -ENOMEM;
-	sha256(page, 0x400, hash);
-	if (memcmp(hash, expected_hash, sizeof(hash)) ||
-	    memcmp(page + 0x87c, version, sizeof(version)) ||
-	    READ_ONCE(*(u32 *)(page + 0x90c)) != 1)
+	page = firmware_data_page();
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+	if (READ_ONCE(*(u32 *)(page + 0x90c)) != 1)
 		goto out;
 	if (atomic_read(&d->failed)) {
 		ret = -EIO;
@@ -568,6 +580,7 @@ static ssize_t epic_start_store(struct device *dev, struct device_attribute *a,
 {
 	struct neo_dcp *d = dev_get_drvdata(dev);
 	struct neo_epic *e = &d->epic;
+	void *page;
 	int ret;
 
 	if (!sysfs_streq(buf, "1"))
@@ -576,6 +589,10 @@ static ssize_t epic_start_store(struct device *dev, struct device_attribute *a,
 	if (atomic_read(&d->failed) || d->touched || !d->wakes ||
 	    READ_ONCE(sleep_enabled) || e->active)
 		return -EBUSY;
+	page = firmware_data_page();
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+	memunmap(page);
 	ret = neo_dcp_dma_prepare(&d->owned, dev, d->dart);
 	if (ret)
 		return ret;
@@ -583,7 +600,7 @@ static ssize_t epic_start_store(struct device *dev, struct device_attribute *a,
 	e->rtk = d->rtk;
 	e->owned = &d->owned;
 	WRITE_ONCE(e->active, true);
-	ret = apple_rtkit_start_ep(d->rtk, 0x23);
+	ret = apple_rtkit_start_adopted_ep(d->rtk, 0x23);
 	if (!ret)
 		ret = neo_epic_send(e, 0x80ULL << 48);
 	if (!ret && !wait_for_completion_timeout(&e->ready, msecs_to_jiffies(15000)))
@@ -604,10 +621,90 @@ static ssize_t epic_status_show(struct device *dev, struct device_attribute *a, 
 	struct neo_epic *e = &d->epic;
 
 	guard(mutex)(&e->lock);
-	return sysfs_emit(buf, "active=%u started=%u error=%d last=%#llx ring_size=%u announcement_size=%u advertised=%u iova=%#llx\n",
+	return sysfs_emit(buf, "active=%u started=%u error=%d last=%#llx ring_size=%u announcement_size=%u advertised=%u iova=%#llx service=%u channel=%u queried=%u response_size=%u retcode=%#x power_stage=%u cycles=%u off_result=%d on_result=%d\n",
 		e->active, e->started, e->error, e->last_message, e->ring_size,
-		e->announcement_size, d->owned.advertised, d->owned.iova);
+		e->announcement_size, d->owned.advertised, d->owned.iova,
+		e->service, e->channel, e->queried, e->response_size, e->retcode,
+		e->power_stage, e->power_cycles, e->power_off_result, e->power_on_result);
 }
+static ssize_t epic_query_store(struct device *dev, struct device_attribute *a,
+			       const char *buf, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	struct neo_epic *e = &d->epic;
+	int ret;
+
+	if (!sysfs_streq(buf, "hpd"))
+		return -EINVAL;
+	guard(mutex)(&d->lock);
+	if (atomic_read(&d->failed) || !e->active || !e->service)
+		return -EBUSY;
+	ret = neo_epic_command(e, 3, false);
+	if (ret)
+		return ret;
+	guard(mutex)(&e->lock);
+	if (e->response_size < 20 || get_unaligned_le32(e->response) != 3 ||
+	    get_unaligned_le32(e->response + 4) < 20 ||
+	    get_unaligned_le32(e->response + 4) > e->response_size ||
+	    e->response[8] > 1)
+		return -EPROTO;
+	e->queried = true;
+	dev_info(dev, "DCP iBoot HPD=%u timing modes=%u color modes=%u\n", e->response[8],
+		 get_unaligned_le32(e->response + 12), get_unaligned_le32(e->response + 16));
+	return count;
+}
+static ssize_t epic_power_cycle_store(struct device *dev, struct device_attribute *a,
+				     const char *buf, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	struct neo_epic *e = &d->epic;
+	u32 seconds;
+	int off, on;
+
+	if (kstrtou32(buf, 0, &seconds) || !seconds || seconds > 300)
+		return -EINVAL;
+	guard(mutex)(&d->lock);
+	if (atomic_read(&d->failed) || !e->queried || e->error ||
+	    READ_ONCE(sleep_enabled) || d->touched)
+		return -EBUSY;
+	WRITE_ONCE(e->power_stage, 1);
+	off = neo_epic_command(e, 2, false);
+	WRITE_ONCE(e->power_off_result, off);
+	dev_info(dev, "DCP iBoot power-off result=%d hold=%us\n", off, seconds);
+	if (!off) {
+		WRITE_ONCE(e->power_stage, 2);
+		/* Always return to the power-on attempt, even if the userspace
+		 * writer receives a signal or closes its SSH session.
+		 */
+		msleep(seconds * 1000);
+	}
+	WRITE_ONCE(e->power_stage, 3);
+	on = neo_epic_command(e, 2, true);
+	WRITE_ONCE(e->power_on_result, on);
+	WRITE_ONCE(e->power_stage, on ? 5 : 4);
+	if (!off && !on)
+		e->power_cycles++;
+	else
+		atomic_set(&d->failed, 1);
+	dev_info(dev, "DCP iBoot power-on result=%d completed cycles=%u\n", on, e->power_cycles);
+	return off ?: on ?: count;
+}
+static ssize_t epic_response_read(struct file *file, struct kobject *kobj,
+	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(kobj_to_dev(kobj));
+	struct neo_epic *e = &d->epic;
+
+	guard(mutex)(&e->lock);
+	if (off >= e->response_size)
+		return 0;
+	count = min_t(size_t, count, e->response_size - off);
+	memcpy(buf, e->response + off, count);
+	return count;
+}
+static DEVICE_ATTR_WO(epic_query);
+static DEVICE_ATTR_WO(epic_power_cycle);
+static BIN_ATTR_ADMIN_RO(epic_response, 128);
 static ssize_t epic_announcement_read(struct file *file, struct kobject *kobj,
 	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
 {
@@ -634,10 +731,11 @@ static DEVICE_ATTR_WO(awake_cycle);
 static struct attribute *neo_dcp_attrs[] = {
 	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr,
 	&dev_attr_returning_idle.attr, &dev_attr_awake_cycle.attr,
-	&dev_attr_scratch_dma.attr, &dev_attr_epic_start.attr, &dev_attr_epic_status.attr, NULL
+	&dev_attr_scratch_dma.attr, &dev_attr_epic_start.attr, &dev_attr_epic_status.attr,
+	&dev_attr_epic_query.attr, &dev_attr_epic_power_cycle.attr, NULL
 };
 static const struct bin_attribute *const neo_dcp_bin_attrs[] = {
-	&bin_attr_oslog_snapshot, &bin_attr_epic_announcement, NULL
+	&bin_attr_oslog_snapshot, &bin_attr_epic_announcement, &bin_attr_epic_response, NULL
 };
 static const struct attribute_group neo_dcp_group = {
 	.attrs = neo_dcp_attrs,
@@ -846,6 +944,7 @@ static int probe(struct platform_device *pdev)
 	mutex_init(&d->log_lock);
 	mutex_init(&d->epic.lock);
 	init_completion(&d->epic.ready);
+	init_completion(&d->epic.reply);
 	d->control = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(d->control))
 		return PTR_ERR(d->control);
