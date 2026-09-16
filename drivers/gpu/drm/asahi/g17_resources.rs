@@ -339,7 +339,7 @@ const G17P_QOS_QUEUE_COUNT: usize = 0x80;
 /// Linux's old 0x14 made the QID resource disagree with its own queue class.
 /// Kext RE confirms the five-byte table is selected through accelerator policy
 /// fields, not by directly indexing it with the outer doorbell priority.
-const G17P_DEFAULT_RENDER_QOS_CLASS: u8 = 0x0f;
+const G17P_DEFAULT_QOS_CLASS: u8 = 0x0f;
 /// Native's normalized per-HardwareBufferID share, read out of the same
 /// capture's `+0xc00` index row:
 ///
@@ -349,7 +349,7 @@ const G17P_DEFAULT_RENDER_QOS_CLASS: u8 = 0x0f;
 /// i.e. the whole normalization base for a single registered queue. The old
 /// `class << 13` form produced 0x28000, which overshoots that base by 20x --
 /// it cannot be a normalized share at all.
-const G17P_SINGLE_RENDER_QOS_SHARE: u32 = 0x2000;
+const G17P_SINGLE_QUEUE_QOS_SHARE: u32 = 0x2000;
 /// `AGXArmFirmware::initFirmwareSharedData` publishes this allocation through
 /// primary main-config `+0x274`, the fifth pointer in the packed bundle-view
 /// array.  The native CPU mapping is `AGXFirmware + 0x2f0`, its firmware GPU
@@ -4470,6 +4470,7 @@ impl G17PComputeDescriptorStorage {
         shared_control: u64,
         channel_control: u64,
         queue_id: u8,
+        hardware_buffer_id: u8,
         install_queue: bool,
         context_id: Option<u16>,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
@@ -4494,6 +4495,7 @@ impl G17PComputeDescriptorStorage {
             shared_control,
             channel_control,
             queue_id,
+            hardware_buffer_id,
             graph,
             queue_context,
             install_queue,
@@ -4736,6 +4738,7 @@ impl G17PComputeDescriptorStorage {
         shared_control: u64,
         channel_control: u64,
         queue_id: u8,
+        hardware_buffer_id: u8,
         rewind: bool,
         context_id: Option<u16>,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
@@ -4753,6 +4756,7 @@ impl G17PComputeDescriptorStorage {
                 shared_control,
                 channel_control,
                 queue_id,
+                hardware_buffer_id,
                 // A repeat is by definition not a first bind, so the install
                 // flag is clear -- which is also what every captured macOS
                 // steady-state submission sends.
@@ -12360,29 +12364,33 @@ impl G17ResourceOwner {
     /// data-master slot at `+0xe08 + dm*8`, and increments the matching count
     /// at `+0xe20 + dm*8`. The remaining six queue-record bytes belong to other
     /// runtime state and must not be reset on a retained submission.
-    pub(crate) fn publish_render_qos_queue_record(
+    fn publish_qos_queue_record(
         &mut self,
-        header: G17PRenderConfigUpdateHeader,
+        queue_id: u8,
+        hardware_buffer_id: u8,
+        qos_class: u8,
+        scheduler_state: u64,
+        data_master: u8,
+        share: u32,
     ) -> Result<[u8; 8]> {
-        if header.queue_id >= G17P_QOS_QUEUE_COUNT as u16
-            || header.field_56 >= G17P_QOS_QUEUE_COUNT as u16
-        {
+        if usize::from(queue_id) >= G17P_QOS_QUEUE_COUNT
+            || usize::from(hardware_buffer_id) >= G17P_QOS_QUEUE_COUNT {
             return Err(EINVAL);
         }
-        if header.scheduler_state == 0 {
+        if scheduler_state == 0 {
             return Err(EINVAL);
         }
-        let offset = usize::from(header.queue_id)
+        let offset = usize::from(queue_id)
             .checked_mul(8)
             .ok_or(EINVAL)?;
-        let hardware_buffer_id = usize::from(header.field_56);
+        let hardware_buffer_id = usize::from(hardware_buffer_id);
         let scheduler_state_offset = 0x800usize
             .checked_add(hardware_buffer_id.checked_mul(8).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
         let share_offset = 0xc00usize
             .checked_add(hardware_buffer_id.checked_mul(4).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
-        let data_master = usize::from(header.data_master);
+        let data_master = usize::from(data_master);
         let data_master_time_offset = 0xe08usize
             .checked_add(data_master.checked_mul(8).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
@@ -12405,18 +12413,18 @@ impl G17ResourceOwner {
         let mut published = [0u8; 8];
         self.resources.qos_resource.with_bytes_mut(|bytes| {
             let record = bytes.get_mut(offset..offset + 8).ok_or(EINVAL)?;
-            record[0] = header.field_56 as u8;
-            record[1] = G17P_DEFAULT_RENDER_QOS_CLASS;
+            record[0] = hardware_buffer_id as u8;
+            record[1] = qos_class;
             published.copy_from_slice(record);
             bytes
                 .get_mut(scheduler_state_offset..scheduler_state_offset + 8)
                 .ok_or(EINVAL)?
-                .copy_from_slice(&header.scheduler_state.to_le_bytes());
+                .copy_from_slice(&scheduler_state.to_le_bytes());
             bytes
                 .get_mut(share_offset..share_offset + 4)
                 .ok_or(EINVAL)?
-                .copy_from_slice(&G17P_SINGLE_RENDER_QOS_SHARE.to_le_bytes());
-            // `AGXQOSQueue::willSubmit(qid, dm)` @ 0xfffffe0008a80fa8 also
+                .copy_from_slice(&share.to_le_bytes());
+            // `AGXQOSQueue::willSubmit(qid, dm)` @ 0xfffffe0008b7a248 also
             // updates its monotonic accounting in this object. Decoded from
             // the kext and checked against the valid cold native capture:
             //
@@ -12436,7 +12444,7 @@ impl G17ResourceOwner {
             // 0xffffffff and something outside init assigns. Writing it on a
             // guessed index would scribble on the object, so it stays open.
             let submit_counter_offset = 0x400usize
-                .checked_add(usize::from(header.queue_id).checked_mul(4).ok_or(EINVAL)?)
+                .checked_add(usize::from(queue_id).checked_mul(4).ok_or(EINVAL)?)
                 .ok_or(EINVAL)?;
             let counter = bytes
                 .get_mut(submit_counter_offset..submit_counter_offset + 4)
@@ -12478,6 +12486,41 @@ impl G17ResourceOwner {
         // corresponding tag-15 record to firmware.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(published)
+    }
+
+    pub(crate) fn publish_render_qos_queue_record(
+        &mut self,
+        header: G17PRenderConfigUpdateHeader,
+    ) -> Result<[u8; 8]> {
+        self.publish_qos_queue_record(
+            u8::try_from(header.queue_id).map_err(|_| EINVAL)?,
+            u8::try_from(header.field_56).map_err(|_| EINVAL)?,
+            G17P_DEFAULT_QOS_CLASS,
+            header.scheduler_state,
+            u8::try_from(header.data_master).map_err(|_| EINVAL)?,
+            G17P_SINGLE_QUEUE_QOS_SHARE,
+        )
+    }
+
+    /// Publish the same `AGXQOSQueue::willSubmit` state that native writes
+    /// immediately before exposing a compute ConfigUpdate. The kext supplies
+    /// data master 2 here; Linux uses the already hardware-validated default
+    /// class/share. The queue-specific HardwareBufferID is directly observed
+    /// in native CL captures and keeps their scheduler-state slots distinct.
+    pub(crate) fn publish_compute_qos_queue_record(
+        &mut self,
+        queue_id: u8,
+        hardware_buffer_id: u8,
+        scheduler_state: u64,
+    ) -> Result<[u8; 8]> {
+        self.publish_qos_queue_record(
+            queue_id,
+            hardware_buffer_id,
+            G17P_DEFAULT_QOS_CLASS,
+            scheduler_state,
+            2,
+            G17P_SINGLE_QUEUE_QOS_SHARE,
+        )
     }
 
     /// Dump the QOS resource regions `AGXQOSQueue::willSubmit` touches.
@@ -17453,7 +17496,7 @@ mod tests {
     #[test]
     fn initial_render_qos_row_matches_valid_qid0_qid1_profile() {
         assert_eq!(g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY, 0);
-        assert_eq!(G17P_DEFAULT_RENDER_QOS_CLASS, 0x0f);
+        assert_eq!(G17P_DEFAULT_QOS_CLASS, 0x0f);
     }
 
     #[test]
@@ -18210,6 +18253,7 @@ mod tests {
             SHARED_SUPPORT,
             CHANNEL_CONTROL,
             4,
+            1,
             &mut graph,
             &mut context,
             true,
@@ -18258,6 +18302,7 @@ mod tests {
             SHARED_SUPPORT,
             CHANNEL_CONTROL,
             4,
+            1,
             &mut relocated_graph,
             &mut relocated_context,
             true,

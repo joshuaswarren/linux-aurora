@@ -391,6 +391,24 @@ impl G17PHardwareBufferIdAllocator {
         Ok(id)
     }
 
+    /// Allocate a retained compute owner from the same HardwareBufferID
+    /// namespace as render. ID zero belongs to the bootstrap/render owner;
+    /// native's captured retained CL queues then receive 1, 2 and 3 in
+    /// creation order. A compute owner keeps its ID until the firmware session
+    /// is stopped because its tag-15 record and QoS scheduler-state slot both
+    /// retain that identity.
+    fn allocate_compute(&mut self) -> core::result::Result<u32, G17PHardwareBufferIdError> {
+        for id in 1..G17P_TA_HARDWARE_BUFFER_ID_COUNT as u32 {
+            if self.is_free(id) && !self.is_reserved(id) {
+                let index = id as usize;
+                self.free[index / 64] &= !(1u64 << (index % 64));
+                self.remove_from_stack(id);
+                return Ok(id);
+            }
+        }
+        Err(G17PHardwareBufferIdError::Exhausted)
+    }
+
     /// Mark `id` as owned by a live retained storage. Usually called while the
     /// storage's first submission still holds the ID; tolerated at any time.
     fn reserve(&mut self, id: u32) -> core::result::Result<(), G17PHardwareBufferIdError> {
@@ -1561,6 +1579,9 @@ const _: () = assert!(G17P_COMPUTE_QUEUE_ID_LAST <= 127);
 #[cfg(not(test))]
 pub(crate) struct G17PSksmQueue {
     queue_id: u8,
+    /// Queue-lifetime AGXQOSQueue/HardwareBufferID identity. Native copies it
+    /// into ConfigUpdate +0x56 and indexes the QoS scheduler-state table by it.
+    hardware_buffer_id: u8,
     scratch: G17SksmScratchGeometry,
     uat_owner: u64,
     configure_pair: g17_submission::G17SksmOrderedWritePair,
@@ -3348,6 +3369,10 @@ impl G17PManagerConstruction {
         self.render_command_buffer_states = G17PCommandBufferStateAllocator::new();
         self.render_command_buffer_state_pairs = [None, None];
         self.active_render_slot = 0;
+        // Both processors are stopped and every retained compute/render graph
+        // is gone, so queue-lifetime HardwareBufferIDs can be allocated from
+        // the native cold-session order again (render/bootstrap 0, compute 1+).
+        self.render_hardware_buffer_ids = G17PHardwareBufferIdAllocator::new();
         // Every compute graph and the boot graph have been dropped after both
         // processors stopped. Their QIDs are no longer installed in firmware,
         // so the replacement session owns a fresh namespace. Leaving this at
@@ -7766,6 +7791,13 @@ impl G17PManagerConstruction {
         dev: &AsahiDevice,
     ) -> Result<G17PSksmQueue> {
         let queue_id = self.allocate_compute_queue_id()?;
+        let hardware_buffer_id = match self.render_hardware_buffer_ids.allocate_compute() {
+            Ok(id) => u8::try_from(id).map_err(|_| ERANGE)?,
+            Err(_) => {
+                self.next_compute_queue_id = Some(queue_id);
+                return Err(ENOSPC);
+            }
+        };
         let result = (|| {
         const COMPLETION_SELECTOR: u8 = 2;
 
@@ -7807,6 +7839,7 @@ impl G17PManagerConstruction {
 
         Ok(G17PSksmQueue {
             queue_id: routing.queue_id,
+            hardware_buffer_id,
             scratch: self.sksm_scratch(),
             uat_owner: self.uat().ttb_base(),
             configure_pair: config.write_pair(),
@@ -7843,7 +7876,12 @@ impl G17PManagerConstruction {
         })();
         // No firmware publication occurs in this constructor. A failed host
         // allocation must not consume the finite QID namespace permanently.
-        if result.is_err() { self.next_compute_queue_id = Some(queue_id); }
+        if result.is_err() {
+            self.next_compute_queue_id = Some(queue_id);
+            self.render_hardware_buffer_ids
+                .release(u32::from(hardware_buffer_id))
+                .map_err(|_| EIO)?;
+        }
         result
     }
 
@@ -8154,6 +8192,7 @@ impl G17PManagerConstruction {
                 shared_control,
                 queue.storage.channel_control_gpu_va(),
                 queue.queue_id,
+                queue.hardware_buffer_id,
                 install_queue,
                 binding.declared_context_id(),
             )?;
@@ -8190,6 +8229,11 @@ impl G17PManagerConstruction {
         self.arm_compute_completion(queue, descriptor_high)?;
         self.publish_compute_b2_once(queue)?;
         submission_phase.store(G17P_SUBMIT_PHASE_B2, Ordering::Release);
+        self.resources.publish_compute_qos_queue_record(
+            queue.queue_id,
+            queue.hardware_buffer_id,
+            queue.storage.channel_control_gpu_va(),
+        )?;
         queue
             .compute
             .publish_initial_config_update_pointer(group)?;
@@ -8501,6 +8545,7 @@ impl G17PManagerConstruction {
             shared_control,
             queue.storage.channel_control_gpu_va(),
             queue.queue_id,
+            queue.hardware_buffer_id,
             rewind,
             binding.declared_context_id(),
         )?;
@@ -8547,6 +8592,11 @@ impl G17PManagerConstruction {
             G17PRepeatRecord::Pointer(descriptor_high),
         )?;
         submission_phase.store(G17P_SUBMIT_PHASE_B2, Ordering::Release);
+        self.resources.publish_compute_qos_queue_record(
+            queue.queue_id,
+            queue.hardware_buffer_id,
+            queue.storage.channel_control_gpu_va(),
+        )?;
         let after_config = self.publish_repeat_record(
             queue,
             "the tag-15 ConfigUpdate pointer",

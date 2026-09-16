@@ -359,6 +359,7 @@ pub(crate) fn encode_compute_config_update(
     shared_control: u64,
     channel_control: u64,
     queue_id: u8,
+    hardware_buffer_id: u8,
     install_queue: bool,
     context_id: Option<u16>,
 ) -> Result<(), ComputeBuildError> {
@@ -423,7 +424,12 @@ pub(crate) fn encode_compute_config_update(
         (0x3e, flushid_slot),
         (0x46, flushid_index),
         (0x52, 1),
-        (0x56, 1),
+        // AGXCLChannelSKSM::submitBuffer copies AGXQOSQueue +0x10 here.
+        // Native retained CL queues receive distinct HardwareBufferIDs in
+        // allocation order (1, 2, 3 in the captured QID 4/5/7 sequence).
+        // This field is therefore queue identity, not the literal 1 from the
+        // first output-positive queue.
+        (0x56, u16::from(hardware_buffer_id)),
         (0x5a, 0x170),
         (0x5e, 2),
         (0x62, 1),
@@ -493,6 +499,7 @@ pub(crate) fn build_initial_compute_channel_group(
     shared_control: u64,
     channel_control: u64,
     queue_id: u8,
+    hardware_buffer_id: u8,
     graph: &mut [u8],
     queue_context: &mut [u8],
     install_queue: bool,
@@ -537,6 +544,7 @@ pub(crate) fn build_initial_compute_channel_group(
         shared_control,
         channel_control,
         queue_id,
+        hardware_buffer_id,
         install_queue,
         context_id,
     )?;
@@ -885,6 +893,7 @@ mod tests {
             0xffff_fc20_c400_0000,
             0xffff_fc20_c500_0000,
             4,
+            1,
             &mut graph,
             &mut context,
             true,
