@@ -2246,15 +2246,17 @@ fn prepare_g17p_partial_opening_outer_slot(
 pub(crate) fn prepare_g17p_compute_channel_work(
     state: G17PPartialOpeningOuterChannelState,
     queue_id: u8,
+    channel_started: bool,
 ) -> Result<PreparedG17PComputeChannelWork, SubmissionError> {
-    // Compute is left byte-for-byte as proven by 2000 consecutive passing
-    // submissions; only the render stages are moved onto the measured value.
+    // Match AGXArmFirmware::encodeAcceleratorRingCommand for every pipe:
+    // +0x17 is !AGXChannel[0x3c], so it is one only for the first publication
+    // of a physical channel and zero after that channel has started.
     let outer = prepare_g17p_partial_opening_outer_slot(
         state,
         G17P_COMPUTE_CHANNEL_TABLE_INDEX,
         queue_id,
         PipeType::Compute as u32,
-        false,
+        channel_started,
     )?;
     Ok(PreparedG17PComputeChannelWork {
         outer,
@@ -5804,6 +5806,8 @@ mod tests {
                 queue_gpu_va: 0xffff_fc20_c100_0000,
                 queue_write_index: 3,
             },
+            4,
+            false,
         )
         .unwrap();
         assert_eq!(compute.outer.channel_table_index, 8);
@@ -5822,6 +5826,26 @@ mod tests {
             0x0104_0003
         );
         assert_eq!(compute.doorbell, 0x0083_0000_0000_000a);
+
+        let compute_repeat = prepare_g17p_compute_channel_work(
+            G17PPartialOpeningOuterChannelState {
+                consumers: [1, 1],
+                producer: 1,
+                queue_gpu_va: 0xffff_fc20_c100_0000,
+                queue_write_index: 7,
+            },
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                compute_repeat.outer.slot[0x14..0x18]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x0004_0007
+        );
 
         let full = G17PPartialOpeningOuterChannelState {
             consumers: [0, 7],

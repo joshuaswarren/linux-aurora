@@ -16774,6 +16774,7 @@ impl G17ResourceOwner {
         queue_gpu_va: u64,
         queue_write_index: u32,
         queue_id: u8,
+        channel_started: bool,
     ) -> Result<g17_submission::PreparedG17PComputeChannelWork> {
         let channels = g17_initdata::derive_channel_table(
             InstanceRole::Primary,
@@ -16794,8 +16795,12 @@ impl G17ResourceOwner {
             queue_gpu_va,
             queue_write_index,
         };
-        let prepared = g17_submission::prepare_g17p_compute_channel_work(state, queue_id)
-            .map_err(|_| EINVAL)?;
+        let prepared = g17_submission::prepare_g17p_compute_channel_work(
+            state,
+            queue_id,
+            channel_started,
+        )
+        .map_err(|_| EINVAL)?;
         let slot_gpu_va = channel
             .ring
             .checked_add(prepared.outer.slot_byte_offset as u64)

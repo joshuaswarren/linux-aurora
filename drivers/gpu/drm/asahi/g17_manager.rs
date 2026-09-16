@@ -6223,25 +6223,59 @@ impl G17PManagerConstruction {
         label: &'static str,
         addr_word: u64,
         fault_vm_slot: u8,
-    ) {
+    ) -> bool {
         let Some((bind, owner)) = self.render_bind_for_descriptor_context(fault_vm_slot) else {
-            dev_info!(
-                self.resources.dev().as_ref(),
-                "G17P fault address[{}]: no retained render bind for descriptor context {}\n",
-                label,
-                fault_vm_slot,
-            );
-            return;
+            return false;
         };
-        let vm = bind.vm();
+        self.log_fault_address_candidates_for_vm(
+            label,
+            addr_word,
+            fault_vm_slot,
+            bind.vm(),
+            bind.vm_id(),
+            bind.root(),
+            owner,
+        );
+        true
+    }
+
+    pub(crate) fn log_compute_fault_address_candidates(
+        &self,
+        label: &'static str,
+        addr_word: u64,
+        fault_vm_slot: u8,
+        context: &mmu::T8140ComputeExecutionContext,
+        owner: &'static str,
+    ) {
+        self.log_fault_address_candidates_for_vm(
+            label,
+            addr_word,
+            fault_vm_slot,
+            context.vm(),
+            context.vm_id(),
+            context.root(),
+            owner,
+        );
+    }
+
+    fn log_fault_address_candidates_for_vm(
+        &self,
+        label: &'static str,
+        addr_word: u64,
+        fault_vm_slot: u8,
+        vm: &mmu::Vm,
+        vm_id: u64,
+        root: u64,
+        owner: &'static str,
+    ) {
         let dev = self.resources.dev().clone();
         dev_info!(
             dev.as_ref(),
             "G17P fault address[{}]: walking {} owner vm={} root={:#x} vm-slot={}\n",
             label,
             owner,
-            bind.vm_id(),
-            bind.root(),
+            vm_id,
+            root,
             fault_vm_slot,
         );
         let candidates = [
@@ -8265,7 +8299,7 @@ impl G17PManagerConstruction {
         }
         let prepared = self
             .resources
-            .publish_compute_channel(group.queue, group.write_index, queue.queue_id)?;
+            .publish_compute_channel(group.queue, group.write_index, queue.queue_id, false)?;
         submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
         // The complete install group is now visible to firmware. From this
         // point a retry must use the retained route; publishing another
@@ -8600,7 +8634,7 @@ impl G17PManagerConstruction {
         };
         let prepared = self
             .resources
-            .publish_compute_channel(group.queue, reported_write_index, queue.queue_id)?;
+            .publish_compute_channel(group.queue, reported_write_index, queue.queue_id, true)?;
         submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
         let _ = prepared;
         queue.direct_lifecycle = lifecycle.next;

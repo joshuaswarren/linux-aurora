@@ -1036,9 +1036,55 @@ fn log_g17p_halted_slot0(
 
 /// Preserve the fault selected by B1's reason-3 classifier before ACK. This
 /// does not use Status-B's copied slot mask as a GMMU-fault predicate.
+fn log_g17p_fault_address_candidates(
+    dev: &kernel::device::Device,
+    manager: &g17_manager::G17PManagerConstruction,
+    async_compute_queues: &KVec<G17PAsyncComputeQueue>,
+    label: &'static str,
+    address_word: u64,
+    vm_slot: u8,
+) {
+    if manager.log_fault_address_candidates(label, address_word, vm_slot) {
+        return;
+    }
+
+    let matching_context = async_compute_queues
+        .iter()
+        .find_map(|queue| {
+            let context = queue.context.as_deref()?;
+            (queue.active.is_some() && context.context_id() == u32::from(vm_slot))
+                .then_some((context, "active-compute"))
+        })
+        .or_else(|| {
+            async_compute_queues.iter().find_map(|queue| {
+                let context = queue.context.as_deref()?;
+                (context.context_id() == u32::from(vm_slot))
+                    .then_some((context, "retained-compute"))
+            })
+        });
+    if let Some((context, owner)) = matching_context {
+        manager.log_compute_fault_address_candidates(
+            label,
+            address_word,
+            vm_slot,
+            context,
+            owner,
+        );
+        return;
+    }
+
+    dev_info!(
+        dev,
+        "G17P fault address[{}]: no retained render or compute owner for descriptor context {}\n",
+        label,
+        vm_slot,
+    );
+}
+
 fn log_g17p_halted_gmmu(
     dev: &kernel::device::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
+    async_compute_queues: &KVec<G17PAsyncComputeQueue>,
     registers: Option<&regs::Resources>,
     expected_epoch: u64,
 ) {
@@ -1072,7 +1118,10 @@ fn log_g17p_halted_gmmu(
                     (snapshot.info_before >> 9) & 0xff,
                     (snapshot.info_before >> 17) & 0x3f,
                 );
-                manager.log_fault_address_candidates(
+                log_g17p_fault_address_candidates(
+                    dev,
+                    manager,
+                    async_compute_queues,
                     "halted-reason3",
                     address_word,
                     ((snapshot.info_before >> 17) & 0x3f) as u8,
@@ -1396,6 +1445,7 @@ fn drain_primary_firmware_event_batch(
 fn complete_primary_real_recovery(
     pdev: &platform::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
+    async_compute_queues: &KVec<G17PAsyncComputeQueue>,
     registers: Option<&regs::Resources>,
     state: &G17PRoleRtkitState,
     generation: u64,
@@ -1465,7 +1515,13 @@ fn complete_primary_real_recovery(
     log_g17p_fault_report(pdev.as_ref(), manager, "recovery-blamed-cause");
     probe_g17p_recovery_report_history(pdev.as_ref(), manager);
     log_g17p_halted_slot0(pdev.as_ref(), manager, registers, handshake.epoch);
-    log_g17p_halted_gmmu(pdev.as_ref(), manager, registers, handshake.epoch);
+    log_g17p_halted_gmmu(
+        pdev.as_ref(),
+        manager,
+        async_compute_queues,
+        registers,
+        handshake.epoch,
+    );
     let cause = manager.primary_firmware_recovery_cause_snapshot()?;
     let slot_mask_population = cause.slot_mask.count_ones();
     let lowest_blamed_slot = match cause.slot_mask {
@@ -1542,7 +1598,14 @@ fn complete_primary_real_recovery(
             }
         }
         if let Some((addr_word, vm_slot)) = faulting_address {
-            manager.log_fault_address_candidates("recovery-state-1", addr_word, vm_slot);
+            log_g17p_fault_address_candidates(
+                pdev.as_ref(),
+                manager,
+                async_compute_queues,
+                "recovery-state-1",
+                addr_word,
+                vm_slot,
+            );
         }
     }
     if scheduler_active {
@@ -3721,6 +3784,7 @@ impl G17PLiveRuntime {
         // DRAM only -- see `log_compute_recovery_alignment`.
         self.log_recovery_alignment("pre-recovery");
         let registers = self.registers.as_ref();
+        let async_compute_queues = &self.async_compute_queues;
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         let Some((generation, records, blamed_stamp)) = manager.pending_primary_recovery() else {
             return Ok(());
@@ -3728,6 +3792,7 @@ impl G17PLiveRuntime {
         let result = complete_primary_real_recovery(
             &pdev,
             manager,
+            async_compute_queues,
             registers,
             &state,
             generation,
