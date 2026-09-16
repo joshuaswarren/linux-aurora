@@ -661,7 +661,10 @@
 	 * left to the ISP driver, which sequences them in the ADT parent-first
 	 * order (ISP_SYS -> ISP_CPU -> cores, ISP_SYS -> ISP_FE -> ...).  The
 	 * unnamed slot at 0x4020 is the ISP_DPRX domain that the macOS 25G83
-	 * power trace enables between ISP_FE and ISP_SECURE.
+	 * power trace enables between ISP_FE and ISP_SECURE.  Plain power
+	 * gating only: a local domain parked with DEV_DISABLE (the t8112
+	 * apple,force-disable pattern) never reached ACTIVE again on J700
+	 * (isp_cpu_core0 stuck at ACTUAL=0 on the second firmware boot).
 	 */
 	ps_isp_cpu: power-controller@4000 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -669,7 +672,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu";
-		apple,force-disable;
 	};
 
 	ps_isp_cpu_core0: power-controller@4008 {
@@ -678,7 +680,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu_core0";
-		apple,force-disable;
 	};
 
 	ps_isp_cpu_core1: power-controller@4010 {
@@ -687,7 +688,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu_core1";
-		apple,force-disable;
 	};
 
 	ps_isp_fe: power-controller@4018 {
@@ -696,7 +696,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_fe";
-		apple,force-disable;
 	};
 
 	ps_isp_dprx: power-controller@4020 {
@@ -705,7 +704,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_dprx";
-		apple,force-disable;
 	};
 
 	ps_isp_secure: power-controller@4028 {
@@ -714,7 +712,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_secure";
-		apple,force-disable;
 	};
 
 	ps_isp_sts0: power-controller@4030 {
@@ -723,7 +720,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sts0";
-		apple,force-disable;
 	};
 
 	ps_isp_sts1: power-controller@4038 {
@@ -732,7 +728,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sts1";
-		apple,force-disable;
 	};
 
 	ps_isp_pearl: power-controller@4040 {
@@ -741,7 +736,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_pearl";
-		apple,force-disable;
 	};
 
 	ps_isp_be: power-controller@4048 {
@@ -750,7 +744,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_be";
-		apple,force-disable;
 	};
 
 	ps_isp_clr: power-controller@4050 {
@@ -759,7 +752,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_clr";
-		apple,force-disable;
 	};
 
 	ps_isp_cvd: power-controller@4058 {
@@ -768,7 +760,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cvd";
-		apple,force-disable;
 	};
 
 	ps_isp_cvm: power-controller@4060 {
@@ -777,7 +768,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cvm";
-		apple,force-disable;
 	};
 };
 

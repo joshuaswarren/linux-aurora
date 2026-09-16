@@ -865,6 +865,16 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_isp_sys>;
+			/*
+			 * 3-level tables (ias <= 36) as iBoot and the native host
+			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
+			 * walk ignores the high bits; 32 GiB keeps the DAPF MMIO
+			 * identity windows (up to 0x401660000) inside the aperture.
+			 */
+			apple,dma-range = <0x0 0x0 0x8 0x0>;
+			/* ADT "remap": streams 1 2 6 7 10 11 are stream 0 */
+			apple,remap-streams = <1 0>, <2 0>, <6 0>, <7 0>,
+					      <10 0>, <11 0>;
 			status = "disabled";
 		};
 
@@ -875,6 +885,16 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_isp_sys>;
+			/*
+			 * 3-level tables (ias <= 36) as iBoot and the native host
+			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
+			 * walk ignores the high bits; 32 GiB keeps the DAPF MMIO
+			 * identity windows (up to 0x401660000) inside the aperture.
+			 */
+			apple,dma-range = <0x0 0x0 0x8 0x0>;
+			/* ADT "remap": streams 1 2 6 7 10 11 are stream 0 */
+			apple,remap-streams = <1 0>, <2 0>, <6 0>, <7 0>,
+					      <10 0>, <11 0>;
 			status = "disabled";
 		};
 
@@ -885,18 +905,37 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_isp_sys>;
+			/*
+			 * 3-level tables (ias <= 36) as iBoot and the native host
+			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
+			 * walk ignores the high bits; 32 GiB keeps the DAPF MMIO
+			 * identity windows (up to 0x401660000) inside the aperture.
+			 */
+			apple,dma-range = <0x0 0x0 0x8 0x0>;
+			/* ADT "remap": streams 1 2 6 7 10 11 are stream 0 */
+			apple,remap-streams = <1 0>, <2 0>, <6 0>, <7 0>,
+					      <10 0>, <11 0>;
 			status = "disabled";
 		};
 
+		/*
+		 * ISP17a.  The ADT window is 0x320000000+0x3fe8000; "coproc"
+		 * stops short of the secure route table at +0x1804000 (a read
+		 * takes a sticky SError) and of the IRQ block (+0x2920000,
+		 * "mbox": interrupt/enable words, doorbell/ack at +0x410) and
+		 * the GPIO words (+0x2921000).  "wdt" is the EIC's mmio-wd-isp
+		 * window the host kicks at 30 Hz while streaming.
+		 */
 		isp: isp@320000000 {
 			compatible = "apple,t8140-isp", "apple,isp";
 			iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
 			reg-names = "coproc", "mbox", "gpio", "wdt";
-			reg = <0x3 0x20000000 0x0 0x3fe8000>,
+			reg = <0x3 0x20000000 0x0 0x1801000>,
 			      <0x3 0x22920000 0x0 0x1000>,
 			      <0x3 0x22921000 0x0 0x100>,
 			      <0x3 0x63b50000 0x0 0x8000>;
 			interrupt-parent = <&aic>;
+			/* ADT [323 324 325 326 336]; 323 carries the IPC mailbox */
 			interrupts = <AIC_IRQ 323 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
 					<&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>,

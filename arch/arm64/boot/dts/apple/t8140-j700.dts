@@ -512,3 +512,15 @@
 		apple,keyboard-layout-id = <5>;
 	};
 };
+
+/*
+ * FaceTime HD camera: IMX558 behind the ISP17a.  The platform id is the ADT
+ * sensor-type (0x70) the macOS 25G83 init passes in the H16 boot descriptor;
+ * the newer IMX558 machines run the temporal filter at strength 1.
+ */
+#include "isp-imx558.dtsi"
+
+&isp {
+	apple,platform-id = <0x70>;
+	apple,temporal-filter = <1>;
+};
