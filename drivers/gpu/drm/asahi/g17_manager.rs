@@ -4159,66 +4159,10 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    fn reactivate_recycled_render_graph(
-        &mut self,
-        mut cached: G17PRetiredRenderGraph,
-        vm: &mmu::Vm,
-        execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
-    ) -> Result {
-        let cached_vm = cached.bind.vm_id();
-        let mut stage = "retarget-command-context";
-        let prepared = (|| -> Result {
-            // The old root remains owned by cached.bind through the entire
-            // transaction. Retargeting first additionally retains the new
-            // root if a later alias allocation fails.
-            cached.storage.retarget_command_context(vm, execution_context.clone())?;
-            cached.bind.vm().clear_render_pool_mappings(cached.storage.queue_pair().slot());
-            drop(cached.context_aliases.take());
-            stage = "queue-backing";
-            let backing = self.render_sksm.as_mut()
-                .and_then(|queues| queues.backing.as_mut()).ok_or(EIO)?;
-            stage = "client-vm-aliases";
-            self.resources.rebind_cached_render_vm(&mut cached.storage, vm, backing)?;
-            stage = "reactivate-rings";
-            cached.storage.prepare_cached_reactivation(self.render_submission_ordinal)?;
-            stage = "claim-queue-backing";
-            cached.storage.claim_sksm_backing(
-                &mut self.render_sksm.as_mut().ok_or(EIO)?.backing,
-            )?;
-            Ok(())
-        })();
-        if let Err(error) = prepared {
-            // This graph has already been firmware-visible. A failed alias
-            // transaction must not drop its descriptors, support or PM data.
-            // Its old bind and new command context retain both roots.
-            if let Err(full) = self.retired_render_handoff_graphs.push_within_capacity(cached) {
-                core::mem::forget(full.0);
-            }
-            dev_err!(
-                self.resources.dev().as_ref(),
-                "G17P graph rebind failed from vm={} to vm={} stage={} ({:?}); retaining complete graph\n",
-                cached_vm, vm.id(), stage, error,
-            );
-            return Err(error);
-        }
-        drop(cached.bind);
-        self.render_bind = Some(G17PRenderRootOwner::Job { context: execution_context });
-        self.render_context_aliases = None;
-        self.render_storage = Some(cached.storage);
-        if crate::util::g17p_verbose() {
-            dev_info!(
-                self.resources.dev().as_ref(),
-                "G17P render VM handoff: rebound complete cached graph from vm={} to vm={} on pair {} at ordinal {}\n",
-                cached_vm, vm.id(), self.active_render_slot, self.render_submission_ordinal,
-            );
-        }
-        Ok(())
-    }
-
     fn retarget_retained_render_context(
         &mut self,
         vm: &mmu::Vm,
-        execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
     ) -> Result<bool> {
         let descriptor_context_id =
             u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
@@ -4287,18 +4231,11 @@ impl G17PManagerConstruction {
     pub(crate) fn handoff_retained_render_vm(
         &mut self,
         vm: &mmu::Vm,
-        execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
     ) -> Result {
-        if !execution_context.matches(vm) || !execution_context.is_current() {
-            return Err(EFAULT);
-        }
-        self.retain_logical_channel_control(&execution_context.channel_control)
-            .map_err(|error| Self::render_stage_fail("handoff-retain-channel-control", error))?;
         let descriptor_context_id =
             u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
-        if self.retarget_retained_render_context(vm, execution_context.clone())
-            .map_err(|error| Self::render_stage_fail("handoff-retarget-current", error))?
-        {
+        if self.retarget_retained_render_context(vm, execution_context.clone())? {
             return Ok(());
         }
         // A pre-publication failure can leave this slot with no selected graph
@@ -4308,8 +4245,21 @@ impl G17PManagerConstruction {
         // ownership collision and deterministically returns ENOSPC.
         if self.render_storage.is_none() {
             let pair_slot = self.active_render_slot;
-            let (cached_immediate, cached_index) =
-                self.select_cached_render_graph(vm, descriptor_context_id);
+            let cached_immediate = self
+                .retired_render_handoff_graph
+                .as_ref()
+                .is_some_and(|graph| {
+                    Self::retained_graph_matches_vm(graph, vm)
+                        && graph.storage.queue_pair().slot() == pair_slot
+                });
+            let cached_index = if cached_immediate {
+                None
+            } else {
+                self.retired_render_handoff_graphs.iter().position(|graph| {
+                    Self::retained_graph_matches_vm(graph, vm)
+                        && graph.storage.queue_pair().slot() == pair_slot
+                })
+            };
             if !cached_immediate && cached_index.is_none() {
                 return Ok(());
             }
@@ -4361,10 +4311,8 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
-            self.retarget_retained_render_context(vm, execution_context)
-                .map_err(|error| Self::render_stage_fail("handoff-retarget-restored-cache", error))?;
-            self.prune_unreferenced_retired_render_graphs()
-                .map_err(|error| Self::render_stage_fail("handoff-prune-restored-cache", error))?;
+            self.retarget_retained_render_context(vm, execution_context)?;
+            self.prune_unreferenced_retired_render_graphs()?;
             dev_info!(
                 self.resources.dev().as_ref(),
                 "G17P render VM handoff: restored cached graph vm={} into empty slot {} at ordinal {}\n",
@@ -4398,8 +4346,19 @@ impl G17PManagerConstruction {
             .filter(|_| cached_immediate)
             .or_else(|| cached_index.and_then(|index| self.retired_render_handoff_graphs.get(index)))
             .is_some_and(|graph| {
-                !Self::retained_graph_matches_vm(graph, vm)
+                Self::retained_graph_matches_vm(graph, vm)
+                    && graph.storage.queue_pair().slot() == self.active_render_slot
             });
+        let cached_index = if cached_immediate {
+            None
+        } else {
+            self.retired_render_handoff_graphs
+                .iter()
+                .position(|graph| {
+                    Self::retained_graph_matches_vm(graph, vm)
+                        && graph.storage.queue_pair().slot() == self.active_render_slot
+                })
+        };
         if cached_immediate {
             let cached = self.retired_render_handoff_graph.as_mut().ok_or(EIO)?;
             if !cached.storage.sksm_backing_detached() {
@@ -4430,6 +4389,14 @@ impl G17PManagerConstruction {
         let mut cached = if cached_immediate {
             self.retired_render_handoff_graph.take()
         } else if cached_index.is_some() {
+            let index = self
+                .retired_render_handoff_graphs
+                .iter()
+                .position(|graph| {
+                    Self::retained_graph_matches_vm(graph, vm)
+                        && graph.storage.queue_pair().slot() == self.active_render_slot
+                })
+                .ok_or(EIO)?;
             Some(
                 self.retired_render_handoff_graphs
                     .remove(cached_index.ok_or(EIO)?)
@@ -4460,10 +4427,8 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
-            self.retarget_retained_render_context(vm, execution_context)
-                .map_err(|error| Self::render_stage_fail("handoff-retarget-replacement", error))?;
-            self.prune_unreferenced_retired_render_graphs()
-                .map_err(|error| Self::render_stage_fail("handoff-prune-replacement", error))?;
+            self.retarget_retained_render_context(vm, execution_context)?;
+            self.prune_unreferenced_retired_render_graphs()?;
             if crate::util::g17p_verbose() {
                 dev_info!(self.resources.dev().as_ref(),
                     "G17P render VM handoff: reactivated retained graph vm={} at ordinal {} without clearing its render-pool mappings\n",

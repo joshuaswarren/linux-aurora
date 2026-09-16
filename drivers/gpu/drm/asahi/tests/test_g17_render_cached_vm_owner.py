@@ -6,7 +6,7 @@ import tempfile
 
 source = (Path(__file__).resolve().parents[1] / "g17_manager.rs").read_text()
 start = source.index("    fn retained_graph_matches_vm(")
-end = source.index("\n    }\n", start) + len("\n    }")
+end = source.index("    /// The retained graph and global aliases", start)
 predicate = source[start:end]
 
 code = r'''

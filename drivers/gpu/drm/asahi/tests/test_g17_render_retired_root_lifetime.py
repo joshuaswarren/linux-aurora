@@ -50,8 +50,7 @@ assert retarget.index(".retarget_command_context(vm, execution_context.clone())"
     ".render_bind\n                .replace"
 )
 assert "render_context_retirement = Some(G17PRenderContextRetirement" in retarget
-assert ".next_render_context_epoch(self.active_render_slot)" in handoff
-assert '"handoff-next-context-epoch"' in handoff
+assert "self.next_render_context_epoch(self.active_render_slot)?" in handoff
 assert poll.index("if !event_control.unlinked()") < poll.index(
     "self.complete_render_context_update_retirement(true)?"
 )

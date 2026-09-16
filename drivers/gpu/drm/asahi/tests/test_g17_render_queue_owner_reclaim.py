@@ -50,8 +50,7 @@ assert "same_vm_different_context" in retarget
 assert ".retarget_command_context(vm, execution_context.clone())" in retarget
 assert "render_context_retirement = Some(G17PRenderContextRetirement" in retarget
 assert handoff.count("self.retarget_retained_render_context(") == 3
-selection = function(manager, "fn select_cached_render_graph(")
-assert "Self::retired_render_graph_reclaimable(" in selection
+assert "Self::retired_render_graph_reclaimable(" in preserve
 assert "manager.release_render_context_owner(context)" in runtime_release
 complete = function(manager, "fn complete_render_context_update_retirement(")
 assert complete.index("complete_context_update()") < complete.index(
