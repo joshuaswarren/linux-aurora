@@ -103,3 +103,66 @@ Sampling itself runs CPUs and touches storage. These sequential reads cannot
 be used as a CPU or memory-fabric residency measurement. Full IORegistry
 serialization may also invoke driver code; record snapshots separately from
 uninterrupted battery measurements.
+
+## Existing DCP history retrieved without new tracing hooks
+
+`macos-dcp-history.py` retrieves AppleDCPExpert's existing inline trace ring
+through DevMem kernel-VA reads. The matching AppleDCP binary SHA256 is
+`ff6c9228d92d2d09752ad570ae031fac122ce2563960b76ee4fae3becab9ac5a`, extracted
+from kernelcache SHA256
+`c4de7d65a016ff68f6ac2a335517da82c9be966175c80afd8a738dd00faa1c61`.
+The tool verifies the full live `_enterTrace` function and object-size
+declaration against that binary, checks the registry class and vtable address,
+and retains the object through one DevMem connection until all reads finish.
+It does not dereference guessed object pointers or install kernel hooks.
+
+Layout confirmed from native code:
+
+- `_enterTrace`: unslid 0xfffffe0008d1f498, length 0xb8.
+- Object size: 0x2cb8; next ring index at +0x4b0.
+- Ring: +0x4b8, 256 records of 40 bytes.
+- Record: mach_absolute_time u64, event u32, padding u32, three u64 args.
+- Event 1: power assertion enabled/disabled, client pointer, zero.
+- Event 2: old DCP state, requested DCP state, returned status.
+
+The state-change argument mapping is established by `_changeDCPPowerStateInternal`
+at 0xfffffe0008d1f6e8 and its call to `_enterTrace` at 0xfffffe0008d1f984.
+Do not interpret the large count of event-2 `(4,4,0)` records as repeated
+hardware shutdowns; these are successful same-state requests.
+
+Both internal DCP (`0x10000049c`) and DCPEXT (`0x10000048c`) yielded full,
+stable 256-record rings. Final entries in each are assertion releases followed
+by `(old=4, requested=0, result=0)`. Corresponding current IORegistry properties:
+`DCPPowerState=0`, `DCPPowerAssertionCount=0`, `DCPPowerRetained=false`.
+PMGR independently shows CPU/SYS/FE OFF. The ring plus register observations
+establish a successful native off transition, but **do not contain the full
+firmware mailbox exchange or individual PMGR writes**.
+
+An initial DCPEXT capture stopped at its vtable check without reading the
+object: PAC bit 47 differed from the canonical address. The qualified helper
+compares the low 47 address bits only, without using that masked value as a
+pointer. Full-function/build/class checks remain required. Final captures
+`dcp-history-03` and `dcpext-history-03` passed all checks, double-copy ring
+stability, and timestamp ordering. Earlier raw captures remain retained.
+
+Commands below use IDs from this boot's IORegistry; discover fresh IDs after
+reboot instead of carrying them forward:
+
+```
+python3 macos-dcp-history.py --registry-id 0x10000049c --output NEW_DCP_DIRECTORY
+python3 macos-dcp-history.py --registry-id 0x10000048c --output NEW_DCPEXT_DIRECTORY
+```
+
+This gives the next Linux DCP investigation a native transition history and
+an independently checked final hardware state. It does not resolve Linux's
+earlier CPU-domain write access fault; reproduce the owning driver's protocol
+and access prerequisites before attempting a gate.
+
+## Additional native residency check
+
+Two 5-second powermetrics samples while system sleep remained disabled showed
+GPU idle residency 100%, estimated GPU/ANE power 0 mW, and estimated CPU power
+3 mW. E-cluster idle residency was 97.35% / 96.51%; P-cluster 99.51% / 99.71%.
+Raw output is `powermetrics-idle.txt`. These are Apple's subsystem estimates,
+not whole-machine power or measurements of DCP/SIO/PMP consumption. They
+support a quiet CPU/GPU reference but cannot allocate the missing Linux watts.
