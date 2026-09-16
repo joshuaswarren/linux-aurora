@@ -86,3 +86,18 @@ parser checks, not a substitute for the pending native endpoint and power
 qualification. Captures/build/controller files are in the parent workspace's
 `artifacts/neo-suspend/dcp-owned-dma/`, including kernel48's exact manifest and
 isolated initramfs installation record. No DCP power register write is added.
+
+## Native ring layout qualification
+
+On #48 boot 750129b6-517e-4195-bdf7-9dbfcabd0f51, firmware accepted the
+owned IOVA and wrote both ring headers. The old 192-byte layout guard stopped
+at INIT_TX, before START or display commands. Read-only coherent-pool capture
+showed size 0x1e80 and format word 0x00070006 for each 0x2000 extent.
+
+Firmware 0x404198c selects config bytes {128,128,0} at 0x4373775 for INIT
+mode 0. The constructor 0x403f234 reserves three alignment blocks, puts the
+read/write pointers at +128/+256 and payload at +384. Packet alignment uses
+the second config byte (0x404137c), also 128. Mailbox sizes stay in 64-byte
+units. The helper now requires this pinned format and layout, rather than
+accepting arbitrary size differences. Pool/DART captures and constructor
+disassembly are retained in artifacts/neo-suspend/dcp-owned-dma/.

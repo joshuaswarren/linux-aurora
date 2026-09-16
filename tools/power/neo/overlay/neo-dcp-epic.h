@@ -7,6 +7,13 @@
 #include <linux/completion.h>
 #include <linux/unaligned.h>
 
+/* Pinned 25F84 INIT mode 0 selects config {128,128,0} at 0x4373775.
+ * Firmware 0x403f234 reserves three 128-byte blocks; packet alignment is
+ * also 128 (0x404137c). Mailbox size/offset units remain 64 bytes.
+ */
+#define NEO_EPIC_BLOCK 128
+#define NEO_EPIC_HEADER (3 * NEO_EPIC_BLOCK)
+
 struct neo_epic_ring {
 	u8 *header, *data;
 	u32 size, offset, extent;
@@ -141,7 +148,7 @@ static int neo_epic_ring_init(struct neo_epic *e, struct neo_epic_ring *r,
 	u8 *header;
 
 	if (r->header || (word & 0xffff) != e->tag || !e->ring_size ||
-	    size <= 192 || off > e->ring_size || size > e->ring_size - off)
+	    size <= NEO_EPIC_HEADER || off > e->ring_size || size > e->ring_size - off)
 		return -EPROTO;
 	if (other->header && off < other->offset + other->extent &&
 	    other->offset < off + size)
@@ -149,14 +156,15 @@ static int neo_epic_ring_init(struct neo_epic *e, struct neo_epic_ring *r,
 	header = e->owned->pool + off;
 	dma_rmb();
 	bufsz = READ_ONCE(*(u32 *)header);
-	if (bufsz != size - 192 || !IS_ALIGNED(bufsz, 64) ||
-	    READ_ONCE(*(u32 *)(header + 64)) >= bufsz ||
-	    READ_ONCE(*(u32 *)(header + 128)) >= bufsz ||
-	    !IS_ALIGNED(READ_ONCE(*(u32 *)(header + 64)) |
-			READ_ONCE(*(u32 *)(header + 128)), 64))
+	if (get_unaligned_le32(header + 4) != 0x00070006 ||
+	    bufsz != size - NEO_EPIC_HEADER || !IS_ALIGNED(bufsz, NEO_EPIC_BLOCK) ||
+	    READ_ONCE(*(u32 *)(header + NEO_EPIC_BLOCK)) >= bufsz ||
+	    READ_ONCE(*(u32 *)(header + 2 * NEO_EPIC_BLOCK)) >= bufsz ||
+	    !IS_ALIGNED(READ_ONCE(*(u32 *)(header + NEO_EPIC_BLOCK)) |
+			READ_ONCE(*(u32 *)(header + 2 * NEO_EPIC_BLOCK)), NEO_EPIC_BLOCK))
 		return -EPROTO;
 	r->header = header;
-	r->data = header + 192;
+	r->data = header + NEO_EPIC_HEADER;
 	r->offset = off;
 	r->extent = size;
 	r->size = bufsz;
@@ -178,9 +186,9 @@ static int neo_epic_receive(struct neo_epic *e)
 		return -EPROTO;
 	for (n = 0; n < 64; n++) {
 		dma_rmb();
-		rp = READ_ONCE(*(u32 *)(r->header + 64));
-		wp = READ_ONCE(*(u32 *)(r->header + 128));
-		if (rp >= r->size || wp >= r->size || !IS_ALIGNED(rp | wp, 64))
+		rp = READ_ONCE(*(u32 *)(r->header + NEO_EPIC_BLOCK));
+		wp = READ_ONCE(*(u32 *)(r->header + 2 * NEO_EPIC_BLOCK));
+		if (rp >= r->size || wp >= r->size || !IS_ALIGNED(rp | wp, NEO_EPIC_BLOCK))
 			return -EPROTO;
 		if (rp == wp)
 			return 0;
@@ -199,7 +207,7 @@ static int neo_epic_receive(struct neo_epic *e)
 			    get_unaligned_le32(q + 4) != size)
 				return -EPROTO;
 		}
-		next = ALIGN(rp + 16 + size, 64);
+		next = ALIGN(rp + 16 + size, NEO_EPIC_BLOCK);
 		if (next > r->size || (rp < wp && next > wp))
 			return -EPROTO;
 		type = get_unaligned_le32(q + 12);
@@ -241,7 +249,7 @@ static int neo_epic_receive(struct neo_epic *e)
 			return -EOPNOTSUPP;
 		}
 		dma_mb();
-		WRITE_ONCE(*(u32 *)(r->header + 64), next == r->size ? 0 : next);
+		WRITE_ONCE(*(u32 *)(r->header + NEO_EPIC_BLOCK), next == r->size ? 0 : next);
 		if (e->started && e->announcement_size)
 			complete_all(&e->ready);
 	}
@@ -327,9 +335,9 @@ static int neo_epic_command(struct neo_epic *e, u32 op, bool power)
 		goto unlock;
 	}
 	dma_rmb();
-	rp = READ_ONCE(*(u32 *)(r->header + 64));
-	wp = READ_ONCE(*(u32 *)(r->header + 128));
-	if (rp >= r->size || wp >= r->size || !IS_ALIGNED(rp | wp, 64)) {
+	rp = READ_ONCE(*(u32 *)(r->header + NEO_EPIC_BLOCK));
+	wp = READ_ONCE(*(u32 *)(r->header + 2 * NEO_EPIC_BLOCK));
+	if (rp >= r->size || wp >= r->size || !IS_ALIGNED(rp | wp, NEO_EPIC_BLOCK)) {
 		ret = -EPROTO;
 		goto unlock;
 	}
@@ -363,7 +371,7 @@ static int neo_epic_command(struct neo_epic *e, u32 op, bool power)
 		wp = 0;
 	}
 	memcpy(r->data + wp, message, sizeof(message));
-	next = ALIGN(wp + sizeof(message), 64);
+	next = ALIGN(wp + sizeof(message), NEO_EPIC_BLOCK);
 	if (next == r->size)
 		next = 0;
 	reinit_completion(&e->reply);
@@ -371,7 +379,7 @@ static int neo_epic_command(struct neo_epic *e, u32 op, bool power)
 	e->retcode = 0;
 	e->waiting = true;
 	dma_wmb();
-	WRITE_ONCE(*(u32 *)(r->header + 128), next);
+	WRITE_ONCE(*(u32 *)(r->header + 2 * NEO_EPIC_BLOCK), next);
 	ret = neo_epic_send(e, (0xa2ULL << 48) | next);
 	if (ret)
 		e->error = ret;
