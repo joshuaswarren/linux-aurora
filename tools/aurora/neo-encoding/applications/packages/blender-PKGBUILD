@@ -1,0 +1,21 @@
+pkgname=blender-j700
+pkgver=5.2.1
+pkgrel=4
+pkgdesc='Native ARM64 Blender for the J700 application test suite'
+arch=('aarch64')
+url='https://www.blender.org/'
+license=('GPL-3.0-or-later')
+depends=('python' 'python-numpy' 'python-cattrs' 'python-requests' 'openimageio' 'opencolorio' 'openexr' 'openvdb'
+         'opensubdiv' 'alembic' 'ffmpeg' 'fftw' 'openal' 'libsndfile' 'libspnav'
+         'libdecor' 'libepoxy' 'libharu' 'potrace' 'onetbb' 'fmt' 'gmp' 'manifold'
+         'libx11' 'libxi' 'libxfixes' 'libxrender' 'libxxf86vm' 'vulkan-icd-loader' 'google-glog')
+provides=('blender')
+conflicts=('blender')
+options=('!strip' '!debug')
+package() {
+  cp -a /build/blender-installed/. "$pkgdir/"
+  install -d "$pkgdir/usr/bin" "$pkgdir/usr/share/applications" "$pkgdir/usr/share/icons/hicolor/scalable/apps"
+  ln -s /opt/neo-blender/blender "$pkgdir/usr/bin/blender"
+  install -m 644 "$pkgdir/opt/neo-blender/blender.desktop" "$pkgdir/usr/share/applications/blender.desktop"
+  install -m 644 "$pkgdir/opt/neo-blender/blender.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/blender.svg"
+}
