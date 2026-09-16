@@ -115,3 +115,34 @@ already-measured series and unloaded the restored module. The second series
 waited for actual `pending=N` with a bounded deadline and completed. Preserve
 the first series's incomplete JSON alongside the final kernel log rather than
 rewriting it as a fully passed run.
+
+## CPU PM and reconnect checks
+
+The uncontaminated #43 120-second CPU-PM comparison measured **1.1802 W**
+with station FAST PS and all six `WFI-test` states enabled. All CPUs recorded
+entries and about 128–130 seconds residency over the surrounding test span;
+the driver was then unbound and all previous parameters restored. The nearby
+unbound reference was 1.1664 W, so no reduction is demonstrated. Capture:
+`wifi-cpupm43/`. This does not introduce a new CPU power-down state.
+
+A reconnect with the original NetworkManager profile succeeded, but NM
+selected CAM during activation; it therefore did not test FAST PS retention.
+The retained `wifi-reconnect43/result.json` has `ps=off`; its misleadingly
+named `ping_ps` field must not be interpreted as a PS-on test.
+
+A second reconnect temporarily set the existing NM profile's powersave
+setting to enabled (3). It succeeded, `iw` read back PS on, and the driver
+resubmitted profile 2 before `WPA2_AUTHORIZED`. Ten gateway pings immediately
+after reconnect had no loss, mean 3.507 ms, max 7.140 ms. After selecting CAM,
+ten more had no loss, mean 3.165 ms. The profile was restored to its previous
+(default=0) setting without changing persistent credentials, and PS was left
+off. Capture: `wifi-reconnect43b/`. External SSH also returned after both
+reconnections. This qualifies one requested-policy reconnect, not sustained
+throughput or long-idle latency: earlier PS-on probes reached 519–821 ms.
+
+The CPU and AFG experiments are restored, LCD/backlight restored, original
+PCIe policy restored. Kernel #43 stays in the one-shot experimental slot;
+normal #6 remains the GRUB default. No upstream synchronization occurred.
+The achieved awake display-off result is about **1.16 W**, not 0.2 W. See
+[dcp-iboot-power.md](dcp-iboot-power.md) for the firmware display-power path
+and the unresolved transport/mapping work needed before testing it.
