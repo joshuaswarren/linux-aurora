@@ -14,9 +14,10 @@ The delayed return runs in the same sysfs operation independently of SSH.
 Ownership and ring geometry must recover before IRQs/host traffic resume.
 A failed recovery leaves admission closed for reboot recovery.
 
-This is deliberately a bounded transport experiment: traffic waits during
-the interval, and no packet-triggered wake or automatic runtime PM is
-implemented. A final ownership register sample is not a residency integral.
+This is deliberately a bounded transport experiment: traffic may wait during
+the interval, and automatic runtime PM is not implemented. The optional
+`awake_own_irq` mode described below still requires hardware qualification.
+A final ownership register sample is not a residency integral.
 No DMA memory is freed, no DART table is changed, and no PCI D3 is requested.
 
 `station_ps_max` separately selects native MAX PS (1) instead of FAST PS (2)
@@ -46,3 +47,39 @@ loss and kernel association history; retain wifi-own-qualify45 as incomplete.
 A separate shutdown guard now avoids WFDMA accesses if an actual failed
 ownership recovery has left transport quiesced. It is not in #45 and was
 not needed for this successful ownership round trip.
+
+## Associated round-trip qualification completed on #45
+
+Boot 5df69e17-6e70-4a2f-8ee5-5e6f36d939e6: 1 ms, 100 ms and two 1000 ms
+trials passed ownership/DMA recovery, carrier and NM connected checks, and
+all twenty post-trial gateway pings. No disconnect/reassociation was logged.
+FAST PS latency is still variable (one probe 904 ms); these bounded holds
+do not yet qualify continuous packet-triggered wake or a power saving.
+Capture: wifi-own-qualify45b/.
+
+## MSI wake candidate
+
+`awake_own_irq=Y` preserves the normal device interrupt mask during a bounded
+ownership trial and enables Linux MSI after ownership has been acknowledged.
+The guarded hard handler does no WFDMA access; it takes exactly one disable
+reference and signals completion. The controlling task synchronizes the
+handler, balances that reference, recovers driver ownership, checks DMA and
+finally restores the normal IRQ path. A timeout follows the same recovery.
+Legacy INTx is refused. An IRQ may be a stale cause or background event: early
+completion alone is not proof that a particular packet woke the interface.
+Test quiet controls and timestamped external probes separately.
+
+The real IRQ-handler regression checks zero WFDMA accesses during ownership,
+only one mask reference for repeated MSI delivery, and ordinary dispatch
+after restoring the guard. Built kernel #46; hardware checks pending.
+
+## Station profile comparison on #45
+
+Same boot as the completed ownership qualification, all ownership probes
+finished before measurement. Three 120-second LCD/backlight-off intervals:
+FAST PS 1.152648 W, MAX PS 1.331233 W, restored FAST PS 1.150693 W. All
+post-interval three-packet gateway probes had zero loss. MAX PS therefore
+provides no saving with this firmware/AP configuration; its draw resembles
+CAM. This is an observed outcome, not proof of how firmware interprets or
+honors that profile. The selector and original PS setting were restored.
+Capture: wifi-maxps-series45/.
