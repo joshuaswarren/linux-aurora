@@ -787,6 +787,75 @@ struct G17PQueue {
     id: u64,
 }
 
+impl Drop for G17PQueue {
+    fn drop(&mut self) {
+        // Entity teardown handles pending scheduler jobs before the frontend
+        // reference goes away. Active hardware packets are retained by runtime.
+        //
+        // Do not leave async ownership release to G17PAsyncQueueBackend::drop:
+        // DRM scheduler teardown may retain that Arc past the file/queue close
+        // boundary.  An idle queue would then pin its QID and execution context
+        // even though no DRM file still owns the render node, forcing the next
+        // client onto a needlessly fresh hardware queue.  Release explicitly
+        // after the entity is torn down; the backend's later Drop is idempotent.
+        drop(self.render_scheduler.take());
+        drop(self.async_scheduler.take());
+        self.runtime
+            .mutex()
+            .lock()
+            .release_render_owner(self.id, self.context.context_id() as u16);
+        self.runtime
+            .mutex()
+            .lock()
+            .release_async_compute_queue(self.id);
+        drop(self.async_backend.take());
+        self.runtime.release_compute_owner(self.id);
+        self.registry.release_queue();
+    }
+}
+
+pub(crate) struct G17PRenderWatchBackend {
+    runtime: G17PRuntimeRef,
+}
+
+/// Scheduler teardown is not evidence that a published GPU job failed.
+/// Keep its owner alive and let the RTKit worker retire the hardware fence.
+/// This runs only at queue destruction, with no runtime mutex held, and is
+/// uninterruptible because the exiting task already has a fatal signal.
+/// Use the same finite bound as the render scheduler's watchdog; a genuinely
+/// stuck job still reaches the existing final-observation/quarantine path.
+fn wait_for_render_teardown(fence: &Fence) -> bool {
+    // SAFETY: The retained Fence reference lives across the entire wait.
+    unsafe {
+        bindings::dma_fence_wait_timeout(
+            fence.raw(),
+            false,
+            kernel::time::msecs_to_jiffies(2000) as _,
+        ) > 0
+    }
+}
+
+impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
+    fn timed_out(
+        &self,
+        packet: Arc<g17_job::G17PRenderWatchPacket>,
+    ) -> kernel::drm::sched::Status {
+        self.runtime.mutex().lock().timeout_deferred_render(
+            packet.render_slot(), packet.submission_id(), packet.completion(), ETIMEDOUT,
+        );
+        kernel::drm::sched::Status::Nominal
+    }
+
+    fn cancel(&self, packet: Arc<g17_job::G17PRenderWatchPacket>) {
+        if wait_for_render_teardown(&packet.fence()) {
+            return;
+        }
+        self.runtime.mutex().lock().timeout_deferred_render(
+            packet.render_slot(), packet.submission_id(), packet.completion(), ETIMEDOUT,
+        );
+    }
+}
+
 enum G17PPendingCommand {
     Render(g17_uapi::TranslatedRenderCommand),
     Compute(g17_uapi::TranslatedComputeCommand),
@@ -1059,19 +1128,19 @@ impl queue::Queue for G17PQueue {
                 sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
                 if let Err(error) = submit {
                     self.runtime.mutex().lock().timeout_deferred_render(
-                        render_slot, submission_id, error,
+                        render_slot, submission_id, &completion, error,
                     );
                     return Err(Self::stage_fail(
                         submission_id, "submit-translated-render", error,
                     ));
                 }
                 let packet = match g17_job::G17PRenderWatchPacket::new(
-                    submission_id, render_slot, completion,
+                    submission_id, render_slot, completion.clone(),
                 ) {
                     Ok(packet) => packet,
                     Err(error) => {
                         self.runtime.mutex().lock().timeout_deferred_render(
-                            render_slot, submission_id, error,
+                            render_slot, submission_id, &completion, error,
                         );
                         return Err(Self::stage_fail(
                             submission_id, "allocate-render-watch", error,
@@ -1082,7 +1151,7 @@ impl queue::Queue for G17PQueue {
                     Ok(fence) => fence,
                     Err(error) => {
                         self.runtime.mutex().lock().timeout_deferred_render(
-                            render_slot, submission_id, error,
+                            render_slot, submission_id, &completion, error,
                         );
                         return Err(Self::stage_fail(
                             submission_id, "schedule-render-watch", error,

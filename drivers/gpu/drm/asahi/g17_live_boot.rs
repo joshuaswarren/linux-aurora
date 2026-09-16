@@ -3442,6 +3442,679 @@ impl G17PLiveRuntime {
 
     /// Build, publish, notify, and synchronously retire one translated user
     /// render through the Linux-owned G17P queue graph.
+    /// Wait for the render to complete, servicing firmware events between
+    /// polls when `g17p_render_service_events` is set.
+    ///
+    /// WHY THIS EXISTS. The render submit runs under the runtime mutex --
+    /// `g17_drm.rs` calls `submit_translated_render` on a locked guard and the
+    /// wait happens inside that call -- so the workqueue item that would drain
+    /// the firmware event ring blocks on `mutex().lock()` for the whole wait.
+    /// Measured consequence: the firmware halts, posts a type-4
+    /// `kAGFIFirmwareEventTypeGPURestart` naming stamp slot 0, raises the RTKit
+    /// notification (four seen, role=GFX1) -- and the ring still reads
+    /// `producer=1 consumer=0 pending=1` when the wait gives up. The firmware
+    /// spins until the host writes 2 into `status_b[0x4900]`; never answering
+    /// leaves KSM halted forever.
+    ///
+    /// The fix mirrors `submit_translated_compute`, which polls with the mutex
+    /// held and therefore calls `service_firmware_events_inline` from inside
+    /// its own loop rather than relying on the worker. That is deliberately NOT
+    /// the same as releasing the lock: no locking changes here, so compute and
+    /// the DRM-level wait are untouched, and `service_firmware_events_inline`
+    /// already does the `queue_primary_recovery(generation, ..)` bookkeeping
+    /// that a bare drain would skip.
+    ///
+    /// SCOPE: this makes a render halt RECOVERABLE. It does not make a render
+    /// succeed. The completion records were read directly from the KSM rings
+    /// and were genuinely empty, so nothing about this makes the work run.
+    fn wait_render_completion_servicing_events(
+        &mut self,
+    ) -> Result<g17_completion::PairedRenderCompletion> {
+        if *module_parameters::g17p_render_service_events.value() == 0 {
+            let completion = self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .wait_translated_render_completion()?;
+            if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                finish_g17p_render_trace(pdev.as_ref(), manager,
+                    crate::g17_trace_capture::Phase::AfterPairRetirement);
+            }
+            let release = self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .retire_render_usc_freelist_at_completion()?;
+            if let Some(release) = release {
+                self.service_render_usc_freelist_release(release)?;
+            }
+            return Ok(completion);
+        }
+        let mut serviced = 0u32;
+        let mut service_failures = 0u32;
+        // Same schedule as the DRM-level wait: start at 20us so a short pass
+        // is observed promptly, settle at the 1ms interval this loop always
+        // used. The stuck-firmware bound is a wall-clock deadline instead of a
+        // poll count, so it no longer moves with the poll interval.
+        let mut schedule =
+            crate::g17_perf::PollSchedule::new(*module_parameters::g17p_render_poll_us.value());
+        let deadline_ns =
+            i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
+        let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
+        loop {
+            match self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .poll_translated_render_completion()?
+            {
+                g17_manager::G17PRenderPollOutcome::Complete(completion) => {
+                    // Drain pending firmware notifications BEFORE retiring the
+                    // USC FList references. The lifecycle holds three: the
+                    // async-grow request, the TA and the 3D. The firmware's
+                    // type-13 async-grow completion retires the first (3 -> 2)
+                    // and only then may this paired completion retire the other
+                    // two. Returning straight out of the poll skipped that, so
+                    // the retire saw references=3 and refused with WrongPhase,
+                    // which the caller reported as a bare EIO -- AFTER the GPU
+                    // had finished the whole render. Ordering only: nothing is
+                    // retired here that was not already complete.
+                    match self.service_firmware_events_inline() {
+                        Ok(count) => serviced += count,
+                        Err(error) => {
+                            if let Some(pdev) = self.pdev.as_ref() {
+                                dev_warn!(
+                                    pdev.as_ref(),
+                                    "G17P render: event service at completion failed ({:?})\n",
+                                    error
+                                );
+                            }
+                        }
+                    }
+                    if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                        finish_g17p_render_trace(pdev.as_ref(), manager,
+                            crate::g17_trace_capture::Phase::AfterPairRetirement);
+                    }
+                    let release = self
+                        .manager
+                        .as_mut()
+                        .ok_or(ENODEV)?
+                        .retire_render_usc_freelist_at_completion()?;
+                    if let Some(release) = release {
+                        self.service_render_usc_freelist_release(release)?;
+                    }
+                    if serviced != 0 {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_info!(
+                                pdev.as_ref(),
+                                "G17P render: completed after servicing {} firmware event notifications\n",
+                                serviced
+                            );
+                        }
+                    }
+                    return Ok(completion);
+                }
+                // "A completed job list was quiesced; re-poll immediately,
+                // do not sleep." The deadline still applies: with a poll count
+                // gone, an outcome that never advances would otherwise spin
+                // this loop forever inside the kernel.
+                g17_manager::G17PRenderPollOutcome::Retry => {
+                    if started.elapsed().as_nanos() >= deadline_ns {
+                        break;
+                    }
+                    continue;
+                }
+                g17_manager::G17PRenderPollOutcome::Pending => {}
+            }
+            match self.service_firmware_events_inline() {
+                Ok(count) => serviced += count,
+                Err(error) => {
+                    if service_failures == 0 {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_warn!(
+                                pdev.as_ref(),
+                                "G17P render: inline event service failed ({:?})\n",
+                                error
+                            );
+                        }
+                    }
+                    service_failures += 1;
+                }
+            }
+            if started.elapsed().as_nanos() >= deadline_ns {
+                break;
+            }
+            fsleep(Delta::from_micros(i64::from(schedule.next_delay_us())));
+        }
+        if let Some(pdev) = self.pdev.as_ref() {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P render: wait timed out; serviced {} notifications, {} service failures\n",
+                serviced,
+                service_failures
+            );
+        }
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .report_render_wait_timeout("event-serviced-wait-expired");
+        Err(ETIMEDOUT)
+    }
+
+    /// Poll one independently owned render slot while holding the runtime
+    /// mutex only for this bounded observation/service transaction.  The DRM
+    /// caller sleeps with the mutex released, allowing the other slot to
+    /// publish and allowing asynchronous compute retirement to proceed.
+    pub(crate) fn poll_deferred_render_completion(
+        &mut self,
+        render_slot: u8,
+    ) -> Result<Option<g17_completion::PairedRenderCompletion>> {
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .select_render_slot(render_slot)?;
+        let outcome = self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .poll_translated_render_completion()?;
+        match outcome {
+            g17_manager::G17PRenderPollOutcome::Complete(completion) => {
+                if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                    finish_g17p_render_trace(
+                        pdev.as_ref(),
+                        manager,
+                        crate::g17_trace_capture::Phase::AfterPairRetirement,
+                    );
+                }
+                if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                    log_g17p_status_a(pdev.as_ref(), manager, "render-post-wait");
+                    probe_g17p_ktrace(pdev.as_ref(), manager, "render-post-wait");
+                    dump_g17p_firmware_log(pdev.as_ref(), manager, "render-post-wait");
+                    manager.log_render_status_pages("post-completion");
+                }
+                Ok(Some(completion))
+            }
+            g17_manager::G17PRenderPollOutcome::Retry => Ok(None),
+            g17_manager::G17PRenderPollOutcome::Pending => Ok(None),
+        }
+    }
+
+    /// Publish the exact render fence before fallible device-global cleanup.
+    ///
+    /// `poll_translated_render_completion` has already committed the paired
+    /// queue retirement: it clears the manager tracker, returns the HWPB ID,
+    /// advances the ordinal, and proves EventControl unlinked.  A subsequent
+    /// FList release error therefore cannot be retried as a render completion.
+    /// Keeping the fence armed until after that cleanup made a GPU-successful
+    /// job wait for the two-second scheduler watchdog and then fail as EIO.
+    /// FList storage is driver-owned and remains retained by the manager, so
+    /// signal the truthful completion first; if cleanup fails, stop both
+    /// processors and rebuild before another submission can reuse that state.
+    fn settle_deferred_render_completion(
+        &mut self,
+        render_slot: u8,
+        observed: g17_completion::PairedRenderCompletion,
+    ) -> Result<bool> {
+        let index = usize::from(render_slot);
+        if self.pending_render.get(index).and_then(Option::as_ref).is_none() {
+            return Err(EIO);
+        }
+        if !self.render_fence_state.settle(render_slot) {
+            return Ok(false);
+        }
+        self.render_event_masks[index] = [0; 2];
+        let signal = self.pending_render[index].take().ok_or(EIO)?;
+        signal.complete(Ok(observed));
+
+        let cleanup = (|| -> Result {
+            let release = self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .retire_render_usc_freelist_at_completion()?;
+            if let Some(release) = release {
+                self.service_render_usc_freelist_release(release)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = cleanup {
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P render: paired completion signalled, but retained FList cleanup failed ({:?}); rebuilding before reuse\n",
+                    error,
+                );
+            }
+            g17_lifecycle::recover_persistent_runtime(self)?;
+        }
+        Ok(true)
+    }
+
+    /// Retire any render whose firmware record became visible on this RTKit
+    /// event edge. Both slots are inspected so a later submission completing
+    /// first cannot strand the earlier slot, and taking the pending Arc makes
+    /// duplicate notifications idempotent.
+    fn service_async_render_completions(&mut self, new_masks: [u64; 2]) -> Result {
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            if !self.render_fence_state.pending(slot) {
+                continue;
+            }
+            let observed = &mut self.render_event_masks[slot as usize];
+            observed[0] |= new_masks[0];
+            observed[1] |= new_masks[1];
+            let expected = {
+                let manager = self.manager.as_mut().ok_or(ENODEV)?;
+                manager.select_render_slot(slot)?;
+                manager.render_completion_masks()?
+            };
+            if !g17_completion::g17p_render_type1_complete(*observed, expected) {
+                continue;
+            }
+            let mut completion = None;
+            // A completed firmware list can require one immediate quiesce
+            // pass before the paired retirement becomes observable.
+            for _ in 0..2 {
+                match self.poll_deferred_render_completion(slot)? {
+                    Some(observed) => {
+                        completion = Some(observed);
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            if let Some(observed) = completion {
+                self.settle_deferred_render_completion(slot, observed)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn install_render_completion(
+        &mut self,
+        render_slot: u8,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+    ) -> Result {
+        let pending = self.pending_render
+            .get_mut(render_slot as usize)
+            .ok_or(EINVAL)?;
+        if pending.is_some() || !self.render_fence_state.arm(render_slot) {
+            return Err(EBUSY);
+        }
+        self.render_event_masks[render_slot as usize] = [0; 2];
+        *pending = Some(completion);
+        Ok(())
+    }
+
+    /// Release error-fence owners only after both processors are stopped.
+    /// Scheduler packets may retain their completion Arcs after the fence was
+    /// signalled, so clearing this vector alone is not an ownership boundary.
+    fn release_quarantined_render_after_processor_stop(&mut self) {
+        for completion in &self.quarantined_render_completions {
+            completion.release_after_processor_stop();
+        }
+        self.quarantined_render_completions.clear();
+    }
+
+    /// Bounded watchdog/cancel settlement. This is never the normal
+    /// completion path: ordinary retirement is driven by the RTKit event
+    /// worker above. An unresolved completion quarantines its own physical
+    /// slot before signalling the error fence, so no later caller can race a
+    /// session rebuild by publishing that bit late.
+    pub(crate) fn timeout_deferred_render(
+        &mut self,
+        render_slot: u8,
+        submission_id: u64,
+        completion: &Arc<crate::g17_drm::G17PRenderCompletion>,
+        error: Error,
+    ) {
+        // A scheduler can retain a completed watch after its physical slot
+        // has been reused by another queue. Cancel/timeout belongs to this
+        // exact completion, not whoever now occupies the slot. The logged
+        // submission ID was previously used for diagnostics only.
+        let Some(current) = self.pending_render
+            .get(usize::from(render_slot)).and_then(Option::as_ref) else {
+                return;
+            };
+        if !Arc::ptr_eq(current, completion) {
+            return;
+        }
+        self.settle_failed_deferred_render(
+            render_slot,
+            Some(submission_id),
+            None,
+            error,
+        );
+    }
+
+    /// Settle the render named by a firmware type-4 recovery record.
+    ///
+    /// Type-1 event masks and type-4 `stamp_index` use the same 128-bit
+    /// EventMachine QID namespace. A recovery naming TA/3D QID 0/1 therefore
+    /// belongs only to physical render slot 0, while QID 2/3 belongs only to
+    /// slot 1. Do this after the firmware reaches state 0: at that point a
+    /// final DRAM observation can either salvage an actual completion or
+    /// classify the rejected group without waiting for the scheduler's
+    /// unrelated two-second watchdog.
+    fn settle_render_blamed_by_recovery(&mut self, stamp: u8, error: Error) {
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            let Some(pair) = g17_resources::G17PRenderQueuePair::for_slot(slot) else {
+                continue;
+            };
+            if stamp != pair.tiling as u8 && stamp != pair.fragment as u8 {
+                continue;
+            }
+            if !self.render_fence_state.pending(slot) {
+                return;
+            }
+            self.settle_failed_deferred_render(slot, None, Some(stamp), error);
+            return;
+        }
+    }
+
+    /// Exact-once settlement shared by the watchdog and a firmware-blamed
+    /// recovery. The optional identities affect diagnostics only; ownership,
+    /// final completion observation, VM status, and fence order are identical.
+    fn settle_failed_deferred_render(
+        &mut self,
+        render_slot: u8,
+        submission_id: Option<u64>,
+        blamed_stamp: Option<u8>,
+        error: Error,
+    ) {
+        // Construction and direct-registration failures happen before a
+        // completion owner is installed. They have no published work to
+        // observe or abandon; probing the selected slot here manufactured an
+        // ENODEV "final watchdog" warning and obscured the original EAGAIN or
+        // EBUSY. Only an armed fence denotes a deferred render transaction.
+        //
+        // This is also the path the scheduler watchdog takes after a
+        // firmware-blamed recovery has already settled the same slot. It
+        // returned silently, so the only externally visible timeout in the
+        // driver could fire and leave nothing at all in the log. Say so.
+        if !self.render_fence_state.pending(render_slot) {
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P render: settle skipped for submission {:?} recovery-stamp {:?} slot {} ({:?}); slot already settled\n",
+                    submission_id,
+                    blamed_stamp,
+                    render_slot,
+                    error,
+                );
+            }
+            return;
+        }
+        // A firmware event can precede visibility of the final paired queue
+        // cache lines. Recheck once at the scheduler's existing watchdog
+        // boundary before declaring the device lost. This is not a polling
+        // completion path: ordinary retirement remains event-driven, and the
+        // watchdog supplies the sole bounded lost-event fallback.
+        match self.poll_deferred_render_completion(render_slot) {
+            Ok(Some(observed)) => {
+                match self.settle_deferred_render_completion(render_slot, observed) {
+                    Ok(true) => {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            if let Some(submission_id) = submission_id {
+                                dev_warn!(
+                                    pdev.as_ref(),
+                                    "G17P render: watchdog recovered completed submission {} slot {} after an early firmware event\n",
+                                    submission_id,
+                                    render_slot,
+                                );
+                            } else {
+                                dev_warn!(
+                                    pdev.as_ref(),
+                                    "G17P render: recovery stamp {:?} raced a completed slot {}\n",
+                                    blamed_stamp,
+                                    render_slot,
+                                );
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(cleanup_error) => {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P render: completed submission {:?} slot {} could not settle retained cleanup ({:?})\n",
+                                submission_id,
+                                render_slot,
+                                cleanup_error,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(observe_error) => {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "G17P render: final failure observation for submission {:?} recovery-stamp {:?} slot {} failed ({:?})\n",
+                        submission_id,
+                        blamed_stamp,
+                        render_slot,
+                        observe_error,
+                    );
+                }
+            }
+        }
+        if self.render_fence_state.settle(render_slot) {
+            self.render_event_masks[render_slot as usize] = [0; 2];
+            let Some(signal) = self.pending_render
+                .get_mut(render_slot as usize)
+                .and_then(Option::take) else { return; };
+            let retired = self
+                .retire_failed_deferred_render(render_slot, submission_id.is_some())
+                .unwrap_or(false);
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P render: settled lost submission {:?} recovery-stamp {:?} slot {} ({:?}, firmware-retired={})\n",
+                    submission_id,
+                    blamed_stamp,
+                    render_slot,
+                    error,
+                    retired,
+                );
+            }
+            let status = signal.vm_status();
+            if retired {
+                signal.complete(Err(EIO));
+            } else {
+                // The output fence is about to wake a client which may close
+                // every mapping this live group names. Quarantine retains the
+                // graph; this flag makes the required processor-stop boundary
+                // reachable from the next device query/submission instead of
+                // leaving the remaining clients permanently capacity-poisoned.
+                if *module_parameters::g17p_quarantine_scope.value() & 2 == 0 {
+                    note_session_recovery_pending(
+                        &mut self.session_recovery_pending,
+                        self.pdev.as_ref(),
+                        "render-submission-lost",
+                    );
+                } else if let Some(pdev) = self.pdev.as_ref() {
+                    dev_err!(
+                        pdev.as_ref(),
+                        "G17PMARK quarantine-scoped render slot {} -- the losing client's VM is still poisoned and the slot is retired, but the session stays up for every other client; render capacity is now reduced for the rest of this boot\n",
+                        render_slot,
+                    );
+                }
+                signal.fail_while_owned(error);
+                if let Err(error) = self
+                    .quarantined_render_completions
+                    .push_within_capacity(signal)
+                {
+                    // There can be at most one unresolved owner per
+                    // quarantined physical slot. If that invariant is ever
+                    // violated, intentionally leak rather than unmap memory
+                    // firmware may still dereference.
+                    core::mem::forget(error.0);
+                    pr_err!(
+                        "G17P render: completion quarantine exhausted; retaining VM mappings permanently\n"
+                    );
+                }
+            }
+            self.fail_outstanding_jobs_for_vm(&status, error);
+        }
+    }
+
+    /// Release a timed-out render.
+    ///
+    /// Returns `true` when the firmware had already retired the group without
+    /// executing it: the slot's host state has then been settled exactly as a
+    /// completion settles it and the slot stays usable. `false` means the
+    /// firmware may still own the group, which is left pinned as before.
+    pub(crate) fn abandon_deferred_render(
+        &mut self,
+        render_slot: u8,
+    ) -> Result<bool> {
+        self.retire_failed_deferred_render(render_slot, true)
+    }
+
+    fn retire_failed_deferred_render(
+        &mut self,
+        render_slot: u8,
+        timed_out: bool,
+    ) -> Result<bool> {
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .select_render_slot(render_slot)?;
+        // Run the classifier on BOTH settle paths.
+        //
+        // It was gated on `timed_out`, which is `submission_id.is_some()`, and
+        // the recovery-blamed path passes `None` -- so the one route that
+        // actually kills the desktop was the one route that produced no
+        // explanation at all. Measured on the 236s soak wedge: `settled lost
+        // submission None recovery-stamp Some(0) ... firmware-retired=false`
+        // with no render state logged anywhere in the boot. The body is a plain
+        // read of driver-allocated DRAM plus one line, and it makes no claim
+        // about why the settle happened, so it is correct on either path.
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .report_render_wait_timeout(if timed_out {
+                "inline-wait-expired"
+            } else {
+                "recovery-blamed"
+            });
+        let retired = match self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            // Only the recovery-blamed path may accept an executed group, and
+            // only under the probe. An inline wait that simply expired proves
+            // nothing about firmware ownership, so it keeps the strict rule.
+            .retire_abandoned_render_if_firmware_retired(
+                !timed_out
+                    && *module_parameters::g17p_render_recovery_retire.value() != 0,
+            )
+        {
+            Ok(retired) => retired,
+            Err(error) => {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "G17P render: could not classify the timed-out group ({:?}); treating it as still owned by firmware\n",
+                        error
+                    );
+                }
+                false
+            }
+        };
+        if retired {
+            // The firmware is finished with the group: drain its notifications
+            // and retire the FList references the way a completion does, so the
+            // device-global FList refcount does not leak two references per
+            // abandoned render. Neither failure changes the slot's state.
+            let _ = self.service_firmware_events_inline();
+            match self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .retire_render_usc_freelist_at_completion()
+            {
+                Ok(Some(release)) => {
+                    if let Err(error) = self.service_render_usc_freelist_release(release) {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_warn!(
+                                pdev.as_ref(),
+                                "G17P render: FList release after a firmware-retired group failed ({:?})\n",
+                                error
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_warn!(
+                            pdev.as_ref(),
+                            "G17P render: FList retire after a firmware-retired group failed ({:?})\n",
+                            error
+                        );
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if timed_out {
+            self.abandon_render_submission_after_timeout();
+        }
+        Ok(false)
+    }
+
+    /// Wait only for the two TA-owned timestamps used by the split-launch
+    /// diagnostic. The sample path is retained DRAM; it performs no SGX MMIO,
+    /// completion acknowledgement, recovery service, or fragment publication.
+    /// The bound is deliberately below the measured ~84ms fragment recovery,
+    /// so a failed TA phase cannot leave firmware halted at recovery state 1
+    /// while this diagnostic keeps polling.
+    /// Release a timed-out render without tearing down the runtime.
+    ///
+    /// Drops this submission's retained render state so the next submission
+    /// builds its own, and leaves the session accepting work.
+    fn abandon_render_submission_after_timeout(&mut self) {
+        if let Some(pdev) = self.pdev.as_ref() {
+            dev_warn!(
+                pdev.as_ref(),
+                "G17P render: abandoning the timed-out submission; runtime stays up\n"
+            );
+        }
+        // Deliberately release nothing here. The firmware may still hold
+        // references to this submission's graph, and freeing it under a live
+        // pair of firmware CPUs is how you turn a stalled render into a DMA
+        // fault. The next submission reuses or rebuilds through the retained
+        // paths it already has; the only thing this path must guarantee is
+        // that the session keeps accepting work.
+    }
+
+    fn wait_split_render_tiling_completion(&mut self) -> Result<[u64; 2]> {
+        const POLLS: usize = 50;
+        for _ in 0..POLLS {
+            if let Some(timestamps) = self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .split_render_tiling_completion()?
+            {
+                return Ok(timestamps);
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        if let Some(pdev) = self.pdev.as_ref() {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P render split-launch: TA did not complete within {} DRAM polls; 3D remains unpublished\n",
+                POLLS
+            );
+        }
+        Err(ETIMEDOUT)
+    }
+
     pub(crate) fn submit_translated_render(
         &mut self,
         vm: &mmu::Vm,

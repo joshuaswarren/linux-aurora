@@ -278,6 +278,9 @@ impl G17PRenderWatchPacket {
 
     pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
     pub(crate) fn render_slot(&self) -> u8 { self.render_slot }
+    pub(crate) fn completion(&self) -> &Arc<crate::g17_drm::G17PRenderCompletion> {
+        &self.completion
+    }
     pub(crate) fn fence(&self) -> Fence { self.completion.fence() }
 }
 
