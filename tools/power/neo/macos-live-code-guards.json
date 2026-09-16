@@ -40,5 +40,29 @@
     "address": "0xfffffe000891ea18",
     "size": 1048,
     "sha256": "61d055d8470552181b81c3fd011c8989c33b846e8819c0dd5ef05ba3cd775b18"
+  },
+  {
+    "name": "deviceOffset",
+    "address": "0xfffffe00094546c0",
+    "size": 360,
+    "sha256": "dd2c3718eb681b60c283bfdf63312fb483098fa48b531fd3098488c9c85bdf6d"
+  },
+  {
+    "name": "deviceMap",
+    "address": "0xfffffe0009454828",
+    "size": 132,
+    "sha256": "968e48b1a51977076061d92e20f339eaa858e5409fa9bc0e217c1e2f5f07712a"
+  },
+  {
+    "name": "deviceGroup",
+    "address": "0xfffffe000944ad38",
+    "size": 84,
+    "sha256": "c906c24582a94cb573263819d8a3010133e6c005e40da9ed6147d0962006ec77"
+  },
+  {
+    "name": "deviceIndex",
+    "address": "0xfffffe000944ad8c",
+    "size": 92,
+    "sha256": "97dc32521b463a5e26f0fbc03c620dac9a35e62a6c2e0818bd4e2ce6adb26cd4"
   }
 ]

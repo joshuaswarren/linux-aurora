@@ -84,7 +84,9 @@ After the successful RAM captures, an attempted separate MMIO read at the
 incorrect 0x375e00040 made macOS unreachable, with no returned bytes. The
 following three queued reads and PMGR snapshot produced no output. This
 is not a captured SIO register value or proof of a fault at the correctly
-translated SIO resource. Recovery/panic evidence is pending. Future register
+translated SIO resource. Neo automatically returned to normal Linux #6,
+boot `b18d501c-90b9-4c3b-87c5-17c32d1a332e`; no DebugUSB reset was sent.
+The macOS panic report has not been retrieved. Future register
 tools must derive and validate the physical resources from live IORegistry,
 including the complete parent translation, before reading.
 
@@ -92,3 +94,66 @@ SIO's native ADT `asio-ascwrap-tunables` contains two 24-byte entries:
 offset 0x40 / width 4 / mask 0xff00 / value 0x400; offset 0x80c /
 width 4 / mask 0x60000001 / value 0x60000001. These are a configuration
 lead to compare with Linux, not yet sampled register values or a power result.
+
+## Linux SIO clock-gate isolation
+
+Correctly addressed read-only #6 admission returned:
+
+| Register | Value |
+| --- | --- |
+| SIO_CPU PMGR | 0x0f0000ff |
+| ASC configuration +0x40 | 0x000a0000 |
+| ASC CPU control +0x44 | 0 |
+| ASC CPU status +0x48 | 0x6a |
+| ASC +0x80c | 0 |
+
+Thus the inherited SIO CPU is **stopped**, not an adopted running RTKit
+instance. Native SIO's startup history cannot be assumed to describe Linux's
+firmware state. No SIO firmware or DMA mapping was started for this experiment.
+
+One-shot experimental kernel #47 boot
+`eee02c00-3ca6-4a36-a191-c205f7127e30` repeated the admission. The new
+`overlay/neo-sio-idle.c` rejects a DT owner, changed inherited configuration,
+running CPU and unsafe PMGR state. It defaults to read-only and restores on
+a bounded delayed work item or unload. It never requests power-off.
+
+Two 15-second AUTO/minimum-CLKGATE trials, with and without the native ASC
+masks, retained actual ACTIVE at every delayed PMGR read. Both restored all
+original policy/configuration and passed gateway pings. The first qualification
+captured only the cached immediate `during` parameter; the repeated
+`qualify47b` adds live PMGR observations and is the residency evidence.
+
+A separate manual target-4 trial, with no ASC tunable writes, **did reach
+CLKGATE** (0x0f000244), stayed there at all interval samples and restored
+ACTIVE (0x0f0002ff). Sticky history accounts for the differing 0x200 bit.
+This is confined to the admitted stopped SIO CPU, not general permission to
+gate running coprocessors or the still-faulting DCP CPU register.
+
+The following awake, associated, LCD/backlight-off battery comparison used
+120 seconds per interval, FAST PS, no Wi-Fi ownership loop:
+
+| State | Whole-machine W |
+| --- | ---: |
+| Original SIO active clock | 1.148368 |
+| SIO clock-gated | 1.149309 |
+| Original policy restored | 1.157872 |
+
+All nine gateway probes passed with no loss. Both gated endpoint checks
+confirmed actual4, and unload restored actual15. This resolves **no useful
+SIO clock saving** and does not reach the <1 W awake Wi-Fi target.
+Module SHA256 `ff6a3ddec145cd1cbf8c82c330e69546fcd0311082b869f68413dab58e9a2169`.
+Full traces/controller/raw battery samples: `sio-native-compare/`.
+
+Final cleanup left SIO at its original policy with the module unloaded,
+display restored, station FAST PS on, ownership IRQ experiment off, battery
+74% discharging. Automatic lid/system sleep remains inhibited. Normal #6
+is still GRUB's default; #47 was selected only for this boot. The installed
+asahi-bless cannot select macOS: its NVRAM device is absent, there are no
+nvmem devices, and EFI runtime services are disabled. No boot-volume change
+was made by those failed read-only list/get attempts.
+
+The next native capture extends the PMGR RAM reader to decode the **live
+device descriptors and PS groups**, not just mapped region bases. This is
+needed to verify the actual DCP CPU register selected by getDevicePSRegOffset;
+matching region bases alone does not prove the device lookup is unchanged.
+That extension has passed syntax/code review but is not yet Mac-qualified.
