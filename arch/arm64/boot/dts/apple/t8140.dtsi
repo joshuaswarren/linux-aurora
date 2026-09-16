@@ -813,6 +813,16 @@
 				compatible = "apple,t8140-aop-audio";
 				iommus = <&aop_dart 9>;
 				apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
+				/*
+				 * Internal speaker: LEAP TX0 (admac-leap-ns channel 0,
+				 * dart-aop stream 10) fed while the AOP spkr service is
+				 * in pwrd; the LEAP power chain is brought up parent-
+				 * first from tx0 and leap_mca.
+				 */
+				dmas = <&admac_leap_ns 0>;
+				dma-names = "spkr";
+				power-domains = <&ps_audio_leap_tx0>, <&ps_audio_leap_mca>;
+				power-domain-names = "tx0", "mca";
 			};
 		};
 
@@ -847,8 +857,13 @@
 					      <0>, <0>, <0>;
 			#dma-cells = <1>;
 			iommus = <&aop_dart 10>;
+			/* stream 10's inherited root is empty; use the generic window */
+			apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
 			power-domains = <&ps_audio_leap_ns_a>;
-			resets = <&ps_audio_leap_ns_a>;
+			/*
+			 * No resets: the AOP firmware owns the LEAP fabric and a
+			 * second reset pulse (driver reload) wedged the block.
+			 */
 			status = "disabled";
 		};
 

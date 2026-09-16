@@ -85,6 +85,7 @@
 #include "poll.c"
 #include "processor.c"
 #include "property.c"
+#include "pm_domain.c"
 #include "pwm.c"
 #include "rbtree.c"
 #include "rcu.c"

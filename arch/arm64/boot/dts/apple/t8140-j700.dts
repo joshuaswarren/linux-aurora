@@ -191,23 +191,6 @@
 
 &pinctrl_ap {
 	status = "okay";
-
-	/*
-	 * Fail-closed speaker amplifier gate.  Exact J700 ADT
-	 * /arm-io/iop-audio-controller/audio-speaker function-reset is
-	 * GPIO pin 105 with descriptor 0x00010001.  In 25G76,
-	 * AppleMAX98360Amp::SetMuteControl(1) reaches
-	 * AppleARMGPIOFunction::callFunction(), which drives this pin low;
-	 * unmute drives it high.  Reserve it as a physical-low hog so Linux
-	 * cannot emit speaker output while AOP/LSM/CPMS protection is absent.
-	 * This node intentionally provides no runtime unmute interface.
-	 */
-	j700_speaker_amp_enable_hog: speaker-amp-enable-hog {
-		gpio-hog;
-		gpios = <105 GPIO_ACTIVE_HIGH>;
-		output-low;
-		line-name = "j700-speaker-amp-enable";
-	};
 };
 
 /*
@@ -234,10 +217,13 @@
 
 /*
  * Internal speaker amplifier (ADT audio-speaker audio-control,max98360,
- * function-reset GPIO 105 = the SD_MODE enable).  Kept disabled while the
- * fail-closed hog below owns pin 105: the MAX98360 has no current/voltage
- * sense, so speakersafetyd does not apply and the amp only leaves reset
- * under a timer-bounded, gain-capped bring-up contract.
+ * function-reset GPIO 105 = the SD_MODE enable; in 25G76
+ * AppleMAX98360Amp::SetMuteControl(1) drives it low, unmute high).  The
+ * pin is iBoot's output-low at Linux boot and nothing raises it until a
+ * driver takes sdmode-gpios: the codec driver from DAPM, or the bench
+ * bounded-tone step (hrtimer-guarded, -50 dBFS ceiling).  The MAX98360
+ * has no current/voltage sense, so speakersafetyd does not apply and the
+ * digital ceiling lives in the machine driver.
  */
 / {
 	speaker_amp: audio-amplifier {
@@ -245,7 +231,6 @@
 		sdmode-gpios = <&pinctrl_ap 105 GPIO_ACTIVE_HIGH>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Speaker";
-		status = "disabled";
 	};
 };
 
@@ -527,5 +512,9 @@
 };
 
 &aop {
+	status = "okay";
+};
+
+&admac_leap_ns {
 	status = "okay";
 };
