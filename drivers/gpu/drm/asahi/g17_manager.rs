@@ -3385,13 +3385,14 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    fn retained_graph_matches_owner(
+    fn retained_graph_matches_vm(
         graph: &G17PRetiredRenderGraph,
         vm: &mmu::Vm,
-        descriptor_context_id: u16,
     ) -> bool {
+        // Fixed RT/TPC mappings belong to the VM and physical pair, not the
+        // logical queue's descriptor context. A cached graph may therefore
+        // need a context retarget before it can execute the incoming queue.
         graph.bind.matches(vm)
-            && graph.storage.descriptor_context_id() == descriptor_context_id
             && vm.render_pool_mappings_match(
                 graph.storage.queue_pair().slot(),
                 graph.storage.render_pool_id(),
@@ -3495,11 +3496,11 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    pub(crate) fn handoff_retained_render_vm(
+    fn retarget_retained_render_context(
         &mut self,
         vm: &mmu::Vm,
         execution_context: Arc<mmu::T8140ComputeExecutionContext>,
-    ) -> Result {
+    ) -> Result<bool> {
         let descriptor_context_id =
             u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
         // Logical queues in one DRM VM receive independent descriptor
@@ -3559,6 +3560,19 @@ impl G17PManagerConstruction {
                 descriptor_context_id,
                 retire_after_context_epoch,
             );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn handoff_retained_render_vm(
+        &mut self,
+        vm: &mmu::Vm,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result {
+        let descriptor_context_id =
+            u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
+        if self.retarget_retained_render_context(vm, execution_context.clone())? {
             return Ok(());
         }
         // A pre-publication failure can leave this slot with no selected graph
@@ -3572,14 +3586,14 @@ impl G17PManagerConstruction {
                 .retired_render_handoff_graph
                 .as_ref()
                 .is_some_and(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == pair_slot
                 });
             let cached_index = if cached_immediate {
                 None
             } else {
                 self.retired_render_handoff_graphs.iter().position(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == pair_slot
                 })
             };
@@ -3617,6 +3631,7 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
+            self.retarget_retained_render_context(vm, execution_context)?;
             self.prune_unreferenced_retired_render_graphs()?;
             dev_info!(
                 self.resources.dev().as_ref(),
@@ -3647,7 +3662,7 @@ impl G17PManagerConstruction {
             .retired_render_handoff_graph
             .as_ref()
             .is_some_and(|graph| {
-                Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                Self::retained_graph_matches_vm(graph, vm)
                     && graph.storage.queue_pair().slot() == self.active_render_slot
             });
         let cached_index = if cached_immediate {
@@ -3656,7 +3671,7 @@ impl G17PManagerConstruction {
             self.retired_render_handoff_graphs
                 .iter()
                 .position(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == self.active_render_slot
                 })
         };
@@ -3689,7 +3704,7 @@ impl G17PManagerConstruction {
                 .retired_render_handoff_graphs
                 .iter()
                 .position(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == self.active_render_slot
                 })
                 .ok_or(EIO)?;
@@ -3718,6 +3733,7 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
+            self.retarget_retained_render_context(vm, execution_context)?;
             self.prune_unreferenced_retired_render_graphs()?;
             if crate::util::g17p_verbose() {
                 dev_info!(self.resources.dev().as_ref(),
