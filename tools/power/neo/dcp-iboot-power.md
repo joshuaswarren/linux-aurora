@@ -101,3 +101,14 @@ the second config byte (0x404137c), also 128. Mailbox sizes stay in 64-byte
 units. The helper now requires this pinned format and layout, rather than
 accepting arbitrary size differences. Pool/DART captures and constructor
 disassembly are retained in artifacts/neo-suspend/dcp-owned-dma/.
+
+The next boot (a92fd6c5-6860-4b5d-a590-915da6dbddf2) completed both rings
+and START, then captured the new compact announcement: QE payload begins
+`0d 00 03 00 54 00 00 00`, with `disp0-service` and interface-id 3.
+This is not the older EPIC v2 header. Firmware selection 0x404198c explicitly
+recognizes INIT low16=8, sets endpoint flag bit2 and selects {64,64,0}.
+The message paths test that flag and translate compact/legacy headers
+(e.g. 0x4040154 and 0x4040a84). The helper now explicitly requests mode 8
+and checks its 192-byte/64-byte layout and legacy header before commands.
+The successful 128-byte capture is retained; it is not silently interpreted
+as the older protocol.
