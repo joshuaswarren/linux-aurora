@@ -819,10 +819,17 @@
 				 * in pwrd; the LEAP power chain is brought up parent-
 				 * first from tx0 and leap_mca.
 				 */
-				dmas = <&admac_leap_ns 0>;
-				dma-names = "spkr";
-				power-domains = <&ps_audio_leap_tx0>, <&ps_audio_leap_mca>;
-				power-domain-names = "tx0", "mca";
+				dmas = <&admac_leap_ns 0>, <&admac_base_ns 4>;
+				dma-names = "spkr", "cout";
+				/*
+				 * 3.5 mm jack: base-ns TX2 (channel 4, dart-aop stream 8)
+				 * into MCA1 while the AOP cout service is in pwrd; the
+				 * serializer domain audio_mca1_m is the AP's to power.
+				 */
+				power-domains = <&ps_audio_leap_tx0>, <&ps_audio_leap_mca>,
+						<&ps_audio_mca1_m>;
+				power-domain-names = "tx0", "mca", "mca1";
+				#sound-dai-cells = <1>;
 			};
 		};
 
@@ -844,8 +851,15 @@
 					      <0>, <0>, <0>;
 			#dma-cells = <1>;
 			iommus = <&aop_dart 8>;
+			/*
+			 * Stream 8's inherited root has its slot 16 (IOVA 1 TiB..
+			 * 1 TiB + 64 GiB) owned by the firmware, and the locked
+			 * publish path never writes into a firmware-owned slot, so
+			 * the AP's window sits in the free slot 17.
+			 */
+			apple,dma-range = <0x110 0x00000000 0x0 0x10000000>;
 			power-domains = <&ps_audio_base_ns_a>;
-			resets = <&ps_audio_base_ns_a>;
+			/* no resets: the AOP owns the audio fabric (see admac_leap_ns) */
 			status = "disabled";
 		};
 

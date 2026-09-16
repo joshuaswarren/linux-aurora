@@ -518,3 +518,31 @@
 &admac_leap_ns {
 	status = "okay";
 };
+
+&admac_base_ns {
+	status = "okay";
+};
+
+/*
+ * The sound card (macaudio's J700 variant).  One back-end so far: the
+ * 3.5 mm jack, AOP cout service on the audio child's DAI 0 with the
+ * CS42L83.  The internal speaker link is added once its LEAP sample
+ * path is calibrated.
+ */
+/ {
+	sound {
+		compatible = "apple,j700-macaudio", "apple,macaudio";
+		model = "MacBook Neo J700";
+
+		dai-link@0 {
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};

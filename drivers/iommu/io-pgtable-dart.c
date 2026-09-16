@@ -553,6 +553,29 @@ int io_pgtable_apple_dart_import(struct io_pgtable_ops *ops,
 	if (!src)
 		return -ENOMEM;
 
+	/*
+	 * Report which root slots the firmware owns: the locked publish path
+	 * never touches those, so a consumer's apple,dma-range must sit in
+	 * a slot listed as free here (T8140 dart-aop bring-up, 2026-09-16).
+	 */
+	{
+		unsigned int i, n = 0;
+		char buf[128];
+		size_t off = 0;
+
+		for (i = 0; i < DART_PTES_PER_TABLE(data); i++) {
+			if (!(READ_ONCE(src[i]) & APPLE_DART_PTE_VALID))
+				continue;
+			n++;
+			if (off < sizeof(buf) - 8)
+				off += scnprintf(buf + off, sizeof(buf) - off, " %u", i);
+		}
+		buf[off] = 0;
+		dev_info(data->iop.cfg.iommu_dev,
+			 "locked ttbr[%u] root %pa: %u of %u slots owned by firmware:%s\n",
+			 ttbr, &paddr, n, DART_PTES_PER_TABLE(data), buf);
+	}
+
 	ret = apple_dart_clone_pgtable(data, data->pgd[ttbr], src,
 				       data->levels - 1);
 	memunmap(src);

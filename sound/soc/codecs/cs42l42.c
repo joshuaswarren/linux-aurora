@@ -789,8 +789,13 @@ static int cs42l42_asp_config(struct snd_soc_component *component,
 {
 	u32 fsync = sclk / sample_rate;
 
-	/* Set up the LRCLK */
-	if (((fsync * sample_rate) != sclk) || ((fsync % 2) != 0)) {
+	/*
+	 * Set up the LRCLK.  An odd number of SCLKs per frame is accepted:
+	 * the T8140 AOP runs the CS42L83 jack link at 125 SCLKs per 48 kHz
+	 * frame (6 MHz), with the pulse width rounded down to 62 SCLKs as
+	 * the native driver programs it.
+	 */
+	if ((fsync * sample_rate) != sclk) {
 		dev_err(component->dev,
 			"Unsupported sclk %d/sample rate %d\n",
 			sclk,
