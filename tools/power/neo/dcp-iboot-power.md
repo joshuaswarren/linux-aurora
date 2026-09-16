@@ -191,3 +191,24 @@ The 120-second AP-IDLE interval measured 1.08557 W and the subsequent
 pipeline-off/AP-ON reference 1.09702 W (sampled power). This single pair
 suggests only 11 mW; it does not establish a repeatable saving or <1 W.
 Captures and module/source identities are in dcp-owned-dma/ap-cycle/.
+
+
+## Explicit endpoint lifecycle qualification
+
+`epic_endpoint_cycle` is an opt-in native-panel-off / AFK SHUTDOWN (0xc0) /
+ACK (0xc1) / bounded hold / INIT(8) / announcement / panel-on experiment.
+This is the teardown protocol implemented by Asahi's AFK and m1n1, **not**
+a decode of native macOS pre-idle notifications: those are ring messages
+(0x85), and their payloads were not captured. No IOP idle, CPU stop, clock
+or PMGR change is made in this qualification. Do not conflate endpoint
+shutdown acknowledgement with firmware or physical power-down.
+
+The device lifecycle mutex serializes the complete trial. Only acknowledged
+shutdown permits clearing the old ring layout before INIT; allocations and
+DART mappings remain pinned throughout. Timeouts poison the session and
+require reboot. Incoming shutdown ACK must correspond to an outstanding
+request. Re-announcement must identify disp0-service before sending power-on.
+The userspace controller's --endpoint-cycle option qualifies HPD and records
+separate stop/restart results, and may then measure a bounded interval.
+Build qualification passed against the #48 exported-symbol manifest;
+hardware lifecycle qualification is pending.

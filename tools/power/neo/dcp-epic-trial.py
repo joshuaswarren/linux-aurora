@@ -49,7 +49,10 @@ def main():
     p.add_argument('--directory', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--seconds', type=int, default=120)
-    p.add_argument('--ap-idle', action='store_true')
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--ap-idle', action='store_true')
+    mode.add_argument('--endpoint-cycle', action='store_true',
+                      help='shut down and restart AFK, without IOP idle')
     p.add_argument('--cpu-energy-client', type=Path,
                    help='optional read-only cpu-energy-read binary')
     p.add_argument('--cpu-state-client', type=Path,
@@ -72,7 +75,7 @@ def main():
     if Path('/sys/class/power_supply/macsmc-battery/status').read_text().strip() != 'Discharging':
         raise RuntimeError('requires battery discharge')
     out.mkdir(parents=True, exist_ok=False)
-    result = dict(status='running', ap_idle=a.ap_idle, seconds=a.seconds,
+    result = dict(status='running', ap_idle=a.ap_idle, endpoint_cycle=a.endpoint_cycle, seconds=a.seconds,
                   boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                   kernel=Path('/proc/version').read_text().strip(),
                   cmdline=Path('/proc/cmdline').read_text().strip(),
@@ -98,7 +101,8 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     child = None
     energy_child = None
-    attr = 'epic_ap_cycle' if a.ap_idle else 'epic_power_cycle'
+    attr = ('epic_endpoint_cycle' if a.endpoint_cycle else
+            'epic_ap_cycle' if a.ap_idle else 'epic_power_cycle')
     try:
         save()
         write(attr, 2)
@@ -122,6 +126,9 @@ def main():
         if a.ap_idle and (result['off_before']['ap_cycle'] != '1' or
                           result['off_before']['ap_idle_result'] != '0'):
             raise RuntimeError('AP IDLE was not acknowledged')
+        if a.endpoint_cycle and (result['off_before']['started'] != '0' or
+                                 result['off_before']['endpoint_stop_result'] != '0'):
+            raise RuntimeError('endpoint shutdown was not acknowledged')
         result['gpio_off_before'] = gpio()
         if 'inherited=0\n' not in result['gpio_off_before']:
             raise RuntimeError('native display shutdown did not lower LCD power')
@@ -161,6 +168,9 @@ def main():
             raise RuntimeError('native power restore failed')
         if a.ap_idle and result['after']['ap_wake_result'] != '0':
             raise RuntimeError('AP wake failed')
+        if a.endpoint_cycle and (result['after']['endpoint_start_result'] != '0' or
+                                 result['after']['started'] != '1'):
+            raise RuntimeError('endpoint restart failed')
         result['hpd_after'] = wait_hpd()
         result['gpio_after'] = gpio()
         if 'inherited=1\n' not in result['gpio_after']:
