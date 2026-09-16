@@ -232,3 +232,14 @@ powering the panel; each result is retained. This changes two preconditions
 from older failed full-idle trials (native pipeline shutdown and acknowledged
 endpoint teardown). It still does not reproduce the complete macOS sequence
 or write any CPU power domain. Build passed; hardware qualification pending.
+
+With the dynamic-channel check fixed, boot 1fbdf4bc completed the short and
+180-second endpoint cycles, followed by a panel-only reference. Firmware
+assigned channels 3 -> 5 -> 7. Both paths restored LCD GPIO, HPD and gateway
+reachability without a boot change. The 120-second battery sampled means
+were 1.081541 W (endpoint stopped) and 1.080382 W (endpoint running, panel
+off). This pair resolves no useful saving. Both clusters were capped at
+minimum frequency, experimental cpuidle enabled on all CPUs with CPU PM,
+Wi-Fi station PS enabled, multi-user target, battery discharging. Evidence:
+`dcp-owned-dma/endpoint-cycle-v2/{measurement,reference}`. The old failed
+channel-3 guard trial remains separate and contributes no power result.
