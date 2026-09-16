@@ -1,0 +1,60 @@
+diff --git a/src/gallium/drivers/asahi/agx_pipe.c b/src/gallium/drivers/asahi/agx_pipe.c
+index c7aa499b07c..7ef7c519882 100644
+--- a/src/gallium/drivers/asahi/agx_pipe.c
++++ b/src/gallium/drivers/asahi/agx_pipe.c
+@@ -961,6 +961,37 @@ agx_blit_to_staging(struct pipe_context *pctx, struct agx_transfer *trans)
+    agx_blit(pctx, &blit);
+ }
+ 
++/* Temporary A/B diagnostic, not a production synchronization policy. Build
++ * with flags 0 and 5 to compare ordering-only and cache-maintenance records
++ * using identical queue submission, BO retention and fence-wait paths. A pass
++ * in both variants is consistent with timing masking and is not a fix. */
++#define AGX_HOST_READ_EXPERIMENT_FLAGS 0
++
++static void
++agx_debug_host_read_cdm(struct agx_context *ctx, struct agx_resource *rsrc)
++{
++   struct agx_device *dev = agx_device(ctx->base.screen);
++   if (dev->chip != AGX_CHIP_G17P)
++      return;
++
++   struct agx_batch *batch = agx_get_compute_batch(ctx);
++   if (batch->cdm.current != (uint8_t *)agx_bo_map(batch->cdm.bo))
++      UNREACHABLE("host-read experiment requires an isolated CDM batch");
++
++   const struct agx3_cdm_barrier_info info = {
++      .chip = dev->chip,
++      .flags = AGX_HOST_READ_EXPERIMENT_FLAGS,
++   };
++   uint8_t packed[AGX3_CDM_BARRIER_SIZE];
++   if (!agx3_cdm_barrier_pack(&info, packed))
++      UNREACHABLE("host-read experiment requires a grounded native record");
++
++   agx_batch_add_bo(batch, rsrc->bo);
++   memcpy(batch->cdm.current, packed, sizeof(packed));
++   batch->cdm.current += sizeof(packed);
++   agx_sync_batch(ctx, batch);
++}
++
+ static void *
+ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
+                  unsigned level,
+@@ -987,6 +1018,9 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
+ 
+    agx_prepare_for_map(ctx, rsrc, level, usage, box, staging_blit);
+ 
++   if ((usage & PIPE_MAP_READ) && !staging_blit)
++      agx_debug_host_read_cdm(ctx, rsrc);
++
+    /* Track the written buffer range */
+    if (resource->target == PIPE_BUFFER) {
+       /* Note the ordering: DISCARD|WRITE is valid, so clear before adding. */
+@@ -1031,6 +1065,7 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
+       if ((usage & PIPE_MAP_READ) && agx_resource_valid(rsrc, level)) {
+          agx_blit_to_staging(pctx, transfer);
+          agx_sync_writer(ctx, staging, "GPU read staging blit");
++         agx_debug_host_read_cdm(ctx, staging);
+       }
+ 
+       return agx_bo_map(staging->bo);

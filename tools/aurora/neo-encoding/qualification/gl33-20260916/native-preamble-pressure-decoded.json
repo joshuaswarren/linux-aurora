@@ -1,0 +1,94 @@
+{
+  "scope": "Existing offline compiler captures, not a runtime or performance result.",
+  "compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "schemas_verified": 4,
+  "captures": [
+    {
+      "directory": "native-preamble-pressure-host27/vertex-128",
+      "words": 128,
+      "workload": "vertex-128",
+      "native_sha256": "e2204b8e609b5a9dcd1b1c0db948e70e506767ef94099d1078d4d28e63db9ee7",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 71,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 2688,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 2826
+    },
+    {
+      "directory": "native-preamble-pressure-host27/vertex-256",
+      "words": 256,
+      "workload": "vertex-256",
+      "native_sha256": "0a1fa8489bae8ab6688a4b00ac5de510828821647e5522d4032346155017095c",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 71,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 5440,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 5578
+    },
+    {
+      "directory": "native-preamble-pressure-host27/vertex-512",
+      "words": 512,
+      "workload": "vertex-512",
+      "native_sha256": "030ff5c99e1f59b36b47dfa51937ba041be6815dc2a543256ab29177f82879c4",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 71,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 10880,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 11018
+    }
+  ]
+}

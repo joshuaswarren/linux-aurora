@@ -1,0 +1,131 @@
+diff --git a/drivers/gpu/drm/asahi/g17_manager.rs b/drivers/gpu/drm/asahi/g17_manager.rs
+index e8e5bc0dfecc..ce83bce7efe6 100644
+--- a/drivers/gpu/drm/asahi/g17_manager.rs
++++ b/drivers/gpu/drm/asahi/g17_manager.rs
+@@ -6927,6 +6927,33 @@ pub(crate) fn poll_translated_render_completion(
+                     }
+                     return Ok(G17PRenderPollOutcome::Pending);
+                 }
++                // B1 clears EventControl membership BEFORE GPU cache
++                // maintenance. Its fragment stamp A write follows that
++                // maintenance (25G83 B1 0x16ea0); queue/list retirement alone
++                // therefore cannot authorize a userspace-visible fence.
++                // The physical slot retains its ordinal across VM switches,
++                // has one in-flight pair, and refuses 24-bit stamp overflow.
++                // Require this exact generation, never a stale nonzero stamp.
++                let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
++                let expected_stamp = self.render_submission_ordinal
++                    .checked_add(1)
++                    .and_then(|value| value.checked_mul(0x100))
++                    .ok_or(EOVERFLOW)?;
++                let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
++                if fragment_stamp != expected_stamp {
++                    if crate::util::g17p_verbose() {
++                        dev_info!(
++                            self.resources.dev().as_ref(),
++                            "G17P render completion: fragment stamp pending qid={} observed={:#x} expected={:#x}\n",
++                            pair.fragment,
++                            fragment_stamp,
++                            expected_stamp,
++                        );
++                    }
++                    // The post-stamp type-1 notification wakes this job.
++                    // Keep its ownership and fence pending without polling.
++                    return Ok(G17PRenderPollOutcome::Pending);
++                }
+                 // Publish the exact GPU-written pass envelope while the completed job's
+                 // VM binding, ordinal and QIDs are still owned.  This is
+                 // observation only: it neither gates completion nor changes
+diff --git a/drivers/gpu/drm/asahi/g17_render.rs b/drivers/gpu/drm/asahi/g17_render.rs
+index 54d34aaaee5b..c840f50ec58d 100644
+--- a/drivers/gpu/drm/asahi/g17_render.rs
++++ b/drivers/gpu/drm/asahi/g17_render.rs
+@@ -1221,6 +1221,11 @@ pub(crate) fn build_fragment_descriptor(
+ 
+     put_u64(raw, 0x40, parameters.tilemap);
+     put_u64(raw, 0x48, parameters.multisample_control);
++    // Native copies the render target's sample count through host +0x8c8
++    // into every fragment descriptor at +0x50 (25G83: 0x8839d80,
++    // 0x8837af8..0x8837b08). It is not first-work metadata. The UAPI has
++    // already encoded log2(samples) in UTILE_CONFIG bits [1:0].
++    put_u32(raw, 0x50, 1u32 << (parameters.utile_config & 3));
+     put_u32(raw, 0x54, geometry.macro_size as u32);
+     put_u32(raw, 0x68, parameters.merge_upper_x_bits);
+     put_u32(raw, 0x6c, parameters.merge_upper_y_bits);
+@@ -1358,7 +1363,6 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
+     metadata.context_id = context_id;
+     metadata.command_buffer_state_word = command_buffer_state_word;
+     build_fragment_descriptor(parameters, objects, metadata, raw)?;
+-    put_u32(raw, 0x50, 1);
+     put_u16(raw, 0x80, 0x56);
+     put_u16(raw, 0x82, 0x57);
+     put_u16(raw, 0x84, 0x57);
+@@ -2139,6 +2143,33 @@ fn memory_backed_render_policy_is_independent_of_tib_size() {
+         }
+     }
+ 
++    #[test]
++    fn fragment_sample_count_matches_tile_configuration_on_every_submission() {
++        for (sample_log2, samples) in [(0, 1), (1, 2), (2, 4)] {
++            let mut parameters = G17pRenderParameters::source_rsrc8();
++            parameters.utile_config = 0xa000 | sample_log2;
++            let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
++
++            build_fragment_descriptor(
++                &parameters,
++                objects(),
++                RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
++                &mut fragment,
++            )
++            .unwrap();
++            assert_eq!(get_u32(&fragment, 0x50), samples, "retained {samples}x");
++            assert_eq!(get_u32(&fragment, 0xac), 0x10009);
++            assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
++
++            build_cold_opening_fragment_descriptor(
++                &parameters, objects(), 1, 1, &mut fragment,
++            )
++            .unwrap();
++            assert_eq!(get_u32(&fragment, 0x50), samples, "first {samples}x");
++            assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
++        }
++    }
++
+     #[test]
+     fn cold_opening_descriptors_apply_only_the_native_first_work_overrides() {
+         let parameters = G17pRenderParameters::source_rsrc8();
+diff --git a/drivers/gpu/drm/asahi/g17_resources.rs b/drivers/gpu/drm/asahi/g17_resources.rs
+index 4795ecd1b26d..c67b26481ee5 100644
+--- a/drivers/gpu/drm/asahi/g17_resources.rs
++++ b/drivers/gpu/drm/asahi/g17_resources.rs
+@@ -15486,6 +15486,30 @@ pub(crate) fn log_render_parameter_buffer_descriptor(
+         }
+     }
+ 
++    /// Read the selected physical 3D queue's post-maintenance completion stamp.
++    ///
++    /// B1's timestamp queue unlinks EventControl at 0x16b48, performs GPU
++    /// cache maintenance, then writes the first pointer from fragment stamp
++    /// info (+0x2140) at 0x16ea0. Page B is firmware-private bookkeeping;
++    /// page A is the host-visible completion witness, as on M1/M2.
++    pub(crate) fn render_fragment_completion_stamp(
++        &mut self,
++        pair: G17PRenderQueuePair,
++    ) -> Result<u32> {
++        let offset = usize::from(pair.fragment) * core::mem::size_of::<u32>();
++        self.resources.bootstrap_descriptor_zero_a.with_bytes_mut(|bytes| {
++            let word = bytes.get(offset..offset + 4).ok_or(ERANGE)?;
++            // SAFETY: this WC-mapped allocation is page aligned, each QID's
++            // lane is u32 aligned, and the checked slice covers that lane.
++            // Firmware updates it with one aligned u32 store. The acquire
++            // load orders subsequent CPU reads after the completion witness.
++            let stamp = unsafe {
++                &*word.as_ptr().cast::<core::sync::atomic::AtomicU32>()
++            };
++            Ok(u32::from_le(stamp.load(core::sync::atomic::Ordering::Acquire)))
++        })
++    }
++
+     /// Sample the first four per-queue stamp lanes of the shared "descriptor
+     /// zero" pages -- A (GPU and firmware) and B (firmware-private) -- that the
+     /// TA/3D records point at by their own QID. DRAM only, safe after a

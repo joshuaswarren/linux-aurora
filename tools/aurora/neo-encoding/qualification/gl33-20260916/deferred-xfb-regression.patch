@@ -1,0 +1,172 @@
+diff --git a/src/gallium/drivers/asahi/meson.build b/src/gallium/drivers/asahi/meson.build
+index 6ed32984ef3..8bb3e9f277f 100644
+--- a/src/gallium/drivers/asahi/meson.build
++++ b/src/gallium/drivers/asahi/meson.build
+@@ -77,6 +77,23 @@ if with_tests and with_tools.contains('drm-shim')
+ 
+   # The shim has to be preloaded before libc's open(), so the test runs the
+   # binary through a wrapper that sets LD_PRELOAD and the chip selector.
++  foreach chip : ['g13g', 'g17p']
++    test(
++      'asahi-' + chip + '-gallium-xfb-program',
++      prog_python,
++      args : [
++        files('tests/run-shim.py'),
++        libasahi_noop_drm_shim,
++        asahi_g17p_blit_test,
++      ],
++      env : [
++        'ASAHI_SHIM_CHIP=' + chip,
++        'AGX_TEST_XFB_COPY_PROGRAM=1',
++      ],
++      suite : ['asahi'],
++    )
++  endforeach
++
+   test(
+     'asahi-g17p-gallium-blit',
+     prog_python,
+diff --git a/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c b/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c
+index 1449bba4ae0..f930fb92d0b 100644
+--- a/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c
++++ b/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c
+@@ -49,6 +49,7 @@
+ #include "asahi/compiler/agx_compile.h"
+ #include "asahi/genxml/agx_pack.h"
+ #include "compiler/nir/nir_builder.h"
++#include "compiler/nir/nir_xfb_info.h"
+ 
+ #include "agx_public.h"
+ #include "agx_state.h"
+@@ -652,6 +653,117 @@ check_staged_resolve_shapes(void)
+    return true;
+ }
+ 
++/* The official clip-distance coverage test captures gl_MaxClipDistances through
++ * transform feedback. This follows the same software-VS/GS-copy path without a
++ * GPU. Check command construction, not the buffer contents: the shim does not
++ * execute shaders. */
++static bool
++check_xfb_copy_program(struct pipe_context *pctx)
++{
++   struct pipe_screen *screen = pctx->screen;
++   nir_builder vs = nir_builder_init_simple_shader(
++      MESA_SHADER_VERTEX, &agx_nir_options, "transform feedback constant eight");
++   nir_store_output(&vs, nir_imm_vec4(&vs, 0, 0, 0, 1),
++                    nir_imm_int(&vs, 0), .base = 0, .write_mask = 0xf,
++                    .io_semantics.location = VARYING_SLOT_POS);
++   nir_store_output(&vs, nir_imm_int(&vs, 8), nir_imm_int(&vs, 0),
++                    .base = 1, .write_mask = 1,
++                    .io_semantics.location = VARYING_SLOT_VAR0,
++                    .io_xfb.out[0].num_components = 1);
++   vs.shader->info.xfb_stride[0] = 1;
++   nir_gather_xfb_info_from_intrinsics(vs.shader);
++   nir_shader_gather_info(vs.shader, nir_shader_get_entrypoint(vs.shader));
++   struct pipe_shader_state vs_state = {
++      .type = PIPE_SHADER_IR_NIR,
++      .ir.nir = vs.shader,
++   };
++   void *vs_cso = pctx->create_vs_state(pctx, &vs_state);
++
++   nir_builder fs = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &agx_nir_options, "transform feedback fragment");
++   nir_store_output(&fs, nir_imm_vec4(&fs, 1, 0, 0, 1),
++                    nir_imm_int(&fs, 0), .base = 0, .write_mask = 0xf,
++                    .io_semantics.location = FRAG_RESULT_DATA0);
++   nir_shader_gather_info(fs.shader, nir_shader_get_entrypoint(fs.shader));
++   struct pipe_shader_state fs_state = {
++      .type = PIPE_SHADER_IR_NIR,
++      .ir.nir = fs.shader,
++   };
++   void *fs_cso = pctx->create_fs_state(pctx, &fs_state);
++   struct pipe_rasterizer_state rast = {
++      .rasterizer_discard = true,
++      .depth_clip_near = true,
++      .depth_clip_far = true,
++      .point_size = 1,
++      .line_width = 1,
++   };
++   struct pipe_blend_state blend = {.rt[0].colormask = 0xf};
++   struct pipe_depth_stencil_alpha_state depth = {0};
++   void *rast_cso = pctx->create_rasterizer_state(pctx, &rast);
++   void *blend_cso = pctx->create_blend_state(pctx, &blend);
++   void *depth_cso = pctx->create_depth_stencil_alpha_state(pctx, &depth);
++   void *ve_cso = pctx->create_vertex_elements_state(pctx, 0, NULL);
++   if (!vs_cso || !fs_cso || !rast_cso || !blend_cso || !depth_cso || !ve_cso)
++      return false;
++
++   struct pipe_framebuffer_state fb = {.width = 16, .height = 16, .layers = 1};
++   struct pipe_viewport_state viewport = {
++      .scale = {8, 8, 0.5}, .translate = {8, 8, 0.5},
++   };
++   pctx->set_framebuffer_state(pctx, &fb);
++   pctx->set_viewport_states(pctx, 0, 1, &viewport);
++   pctx->set_sample_mask(pctx, ~0u);
++   pctx->bind_vs_state(pctx, vs_cso);
++   pctx->bind_fs_state(pctx, fs_cso);
++   pctx->bind_rasterizer_state(pctx, rast_cso);
++   pctx->bind_blend_state(pctx, blend_cso);
++   pctx->bind_depth_stencil_alpha_state(pctx, depth_cso);
++   pctx->bind_vertex_elements_state(pctx, ve_cso);
++
++   struct pipe_resource *buffer = make_buffer(screen, 256);
++   if (!buffer)
++      return false;
++   struct pipe_stream_output_target *target =
++      pctx->create_stream_output_target(pctx, buffer, 0, 256);
++   if (!target)
++      return false;
++   unsigned offset = 0;
++   pctx->set_stream_output_targets(pctx, 1, &target, &offset, MESA_PRIM_POINTS);
++   const struct pipe_draw_info info = {
++      .mode = MESA_PRIM_POINTS, .instance_count = 1,
++   };
++   const struct pipe_draw_start_count_bias draw = {.count = 1};
++   struct agx_context *ctx = agx_context(pctx);
++   bool ok = true;
++   for (unsigned i = 0; i < 2; ++i) {
++      pctx->draw_vbo(pctx, &info, 0, NULL, &draw, 1);
++      ok &= ctx->gs && ctx->gs->gs_copy && !ctx->gs->gs_copy->failed &&
++            ctx->skipped_no_program == 0 && ctx->batch && ctx->batch->draws;
++   }
++   if (!ok)
++      fprintf(stderr, "XFB copy program: skipped=%u draws=%u\n",
++              ctx->skipped_no_program, ctx->batch ? ctx->batch->draws : 0);
++   else
++      printf("two transform-feedback draws built without a missing program\n");
++
++   pctx->set_stream_output_targets(pctx, 0, NULL, NULL, MESA_PRIM_POINTS);
++   pipe_so_target_reference(&target, NULL);
++   pipe_resource_reference(&buffer, NULL);
++   pctx->bind_vs_state(pctx, NULL);
++   pctx->bind_fs_state(pctx, NULL);
++   pctx->bind_rasterizer_state(pctx, NULL);
++   pctx->bind_blend_state(pctx, NULL);
++   pctx->bind_depth_stencil_alpha_state(pctx, NULL);
++   pctx->bind_vertex_elements_state(pctx, NULL);
++   pctx->delete_vs_state(pctx, vs_cso);
++   pctx->delete_fs_state(pctx, fs_cso);
++   pctx->delete_rasterizer_state(pctx, rast_cso);
++   pctx->delete_blend_state(pctx, blend_cso);
++   pctx->delete_depth_stencil_alpha_state(pctx, depth_cso);
++   pctx->delete_vertex_elements_state(pctx, ve_cso);
++   return ok;
++}
++
+ int
+ main(void)
+ {
+@@ -687,6 +799,14 @@ main(void)
+       return 1;
+    }
+ 
++   if (getenv("AGX_TEST_XFB_COPY_PROGRAM")) {
++      const bool ok = check_xfb_copy_program(pctx);
++      pctx->destroy(pctx);
++      screen->destroy(screen);
++      close(fd);
++      return ok ? 0 : 1;
++   }
++
+    if (!check_g17p_sampler_bias_record())
+       return 1;

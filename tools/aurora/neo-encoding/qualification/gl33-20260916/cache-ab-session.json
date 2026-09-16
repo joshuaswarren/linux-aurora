@@ -1,0 +1,4 @@
+{
+  "kind": "test",
+  "command": "--deqp-caselist-file=gl_cts/data/mustpass/gl/khronos_mustpass/main/gl33-main.txt --deqp-screen-rotation=unspecified --deqp-surface-width=64 --deqp-surface-height=64 --deqp-watchdog=disable --deqp-base-seed=1 --deqp-surface-type=window --deqp-gl-config-id=1 --deqp-gl-context-type=egl"
+}

@@ -1,0 +1,45 @@
+diff --git a/drivers/gpu/drm/asahi/g17_manager.rs b/drivers/gpu/drm/asahi/g17_manager.rs
+index 758157016bb8..a39273190ea2 100644
+--- a/drivers/gpu/drm/asahi/g17_manager.rs
++++ b/drivers/gpu/drm/asahi/g17_manager.rs
+@@ -6930,7 +6930,8 @@ pub(crate) fn poll_translated_render_completion(
+                 let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
+                 let expected_stamp = self.render_submission_ordinal
+                     .checked_add(1)
+-                    .map(|value| (value as u32).wrapping_shl(8))
++                    // TEST FIXTURE ONLY: matches the descriptor event seed.
++                    .map(|value| (value as u32).wrapping_add(0x00ff_ff00).wrapping_shl(8))
+                     .ok_or(EOVERFLOW)?;
+                 let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
+                 if fragment_stamp != expected_stamp {
+@@ -6947,6 +6948,14 @@ pub(crate) fn poll_translated_render_completion(
+                     // Keep its ownership and fence pending without polling.
+                     return Ok(G17PRenderPollOutcome::Pending);
+                 }
++                if self.render_submission_ordinal == 0
++                    || (252..=258).contains(&self.render_submission_ordinal)
++                {
++                    pr_info!(
++                        "G17P test event-wrap verified qid={} ordinal={} stamp={:#x}\n",
++                        pair.fragment, self.render_submission_ordinal, fragment_stamp,
++                    );
++                }
+                 // Publish the exact GPU-written pass envelope while the completed job's
+                 // VM binding, ordinal and QIDs are still owned.  This is
+                 // observation only: it neither gates completion nor changes
+diff --git a/drivers/gpu/drm/asahi/g17_render.rs b/drivers/gpu/drm/asahi/g17_render.rs
+index b32e9a4993a9..ca89f6565122 100644
+--- a/drivers/gpu/drm/asahi/g17_render.rs
++++ b/drivers/gpu/drm/asahi/g17_render.rs
+@@ -1440,7 +1440,10 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
+         .ok_or(RenderBuildError::ArithmeticOverflow)? & 0xffffffffff;
+     // The native queue timestamp is 40 bits. Stamp-info carries its low
+     // 24 bits shifted by eight, with ordinary u32 wrap as on M1/M2.
+-    let event_value = (item_number as u32).wrapping_shl(8);
++    // TEST FIXTURE ONLY: cross the host-visible completion-value wrap after
++    // 256 real submissions. Keep hardware queue timestamps and dependencies
++    // unchanged. This build must never be used for CTS conformance evidence.
++    let event_value = (item_number as u32).wrapping_add(0x00ff_ff00).wrapping_shl(8);
+     match kind {
+         RenderDescriptorKind::Tiling => {
+             if raw.len() < TA_DESCRIPTOR_SIZE {

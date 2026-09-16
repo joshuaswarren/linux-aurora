@@ -1,0 +1,28 @@
+{
+  "compiler_path": "/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.5194.15.Wc8g1g/Metal.xctoolchain/usr/metal/32023/lib/libapplegpu-nt.dylib",
+  "compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "arm64_sha256": "b29231c242a8c5d738aaad50d20e906979731c87f829c93dfe0c56d5dc079175",
+  "function_count": 75408,
+  "hardware_execution": false,
+  "text": "agx3-sched-hints",
+  "string_addresses": [
+    "0x450cd5f"
+  ],
+  "candidate_references": [
+    {
+      "adrp": "0x329eb8",
+      "add": "0x329ecc",
+      "string": "0x450cd5f",
+      "function": "0x329e9c",
+      "function_end": "0x329f1c"
+    },
+    {
+      "adrp": "0x329ec8",
+      "add": "0x329ecc",
+      "string": "0x450cd5f",
+      "function": "0x329e9c",
+      "function_end": "0x329f1c"
+    }
+  ],
+  "scope": "ADRP/ADD candidates within eight following instructions; inspect register lifetime before treating as a proven reference"
+}

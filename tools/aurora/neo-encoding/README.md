@@ -1,5 +1,10 @@
 # Neo Linux hardware encoding
 
+The [September 16 OpenGL qualification archive](qualification/gl33-20260916/ARCHIVE-README.md)
+preserves the CTS harness, diagnostics, corrected failure accounting, and two
+passing replays of the 1,312 original failures. Full GL 3.3 conformance remains
+unverified; the broad rerun was intentionally stopped at the user's request.
+
 Native J700 / T8140 / Mac17,5 bring-up and diagnostic hardware encoders for
 Aurora Silicon. Builds run in the dedicated ARM64 `neo-builder` VM; the Neo
 runs the actual hardware qualification through KIS and guarded RAM boots.
