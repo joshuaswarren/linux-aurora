@@ -190,3 +190,25 @@ counter averaged 1.457 mW. These are modeled per-component estimates,
 not whole-machine watts, and do not prove the amount of static/leakage
 power covered. All 16 counters increased. The matching fresh PMGR mapping
 capture is `neo-pmgr-819CE0-energy` under the awake CPU artifact directory.
+
+Linux #48 boot `57a0b2d4-7dc1-487d-900e-d7bb9c01a9f1` completed the same
+120-second read-only measurement (`energy-linux-57a0b2d4-01`). All 16
+counters increased, no accumulator configuration was written, and SSH
+remained available. Both clusters were capped at their minimum frequencies
+(744/816 MHz), multi-user target, qualified cpuidle with CPU PM enabled.
+
+| Model counter | macOS mW | Linux mW |
+| --- | ---: | ---: |
+| P0 core | 1.057 | 70.221 |
+| P0 SRAM | 0.105 | 4.256 |
+| P1 core | 1.457 | 0.090 |
+| P-cluster CPM | 0.588 | 43.671 |
+| P-cluster CPM SRAM | 0.172 | 6.708 |
+
+E-core counters were each below 0.07 mW on this Linux interval. The P0 and
+P-cluster model readings strengthen the boot-core lead, but do not establish
+all calibration coefficients match between operating systems or assign
+whole-machine battery savings. These captures also have different observer
+overhead and OS background work. Do not add the rows and claim measured
+independent rail power, or claim solving P0 alone will achieve 200 mW.
+No new whole-machine power reduction is established by these diagnostics.
