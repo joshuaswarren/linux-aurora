@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Inherited J700 DCP management-only qualification, no display/DMA takeover.
- * Explicit OSLOG endpoint start is available for awake qualification. No
- * firmware reset, mapping change or new shared buffer.
+/* Inherited J700 DCP management qualification, no display takeover.
+ * Explicit OSLOG endpoint start is available for awake qualification.
+ * The opt-in scratch_dma cycle tests owned allocations in an empty DART
+ * branch without advertising buffers to firmware. No firmware reset.
  * Pins itself after adoption: remove the trial by reboot, not forced unload.
  */
 #include <linux/console.h>
@@ -21,6 +22,9 @@
 #include <linux/vmalloc.h>
 #include <linux/soc/apple/rtkit.h>
 
+static bool retained_ram(u64 pa, size_t size);
+#include "neo-dcp-owned.h"
+
 static bool sleep_enabled;
 module_param(sleep_enabled, bool, 0644);
 static bool stop_cpu;
@@ -37,6 +41,7 @@ static int overlay_id;
 static struct platform_device *adopted;
 
 struct neo_dcp {
+	struct neo_dcp_owned owned;
 	struct device *dev;
 	void __iomem *control;
 	void __iomem *dart;
@@ -517,6 +522,40 @@ out:
 	memunmap(page);
 	return ret ? ret : count;
 }
+static ssize_t scratch_dma_store(struct device *dev, struct device_attribute *a,
+				const char *buf, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	u64 pa;
+	unsigned int i;
+	int ret, restore;
+
+	if (!sysfs_streq(buf, "cycle"))
+		return -EINVAL;
+	guard(mutex)(&d->lock);
+	if (atomic_read(&d->failed) || d->touched || READ_ONCE(sleep_enabled))
+		return -EBUSY;
+	ret = neo_dcp_dma_prepare(&d->owned, dev, d->dart);
+	if (ret) {
+		if (d->owned.failed)
+			atomic_set(&d->failed, 1);
+		return ret;
+	}
+	for (i = 0; i < NEO_DCP_POOL_SIZE / SZ_16K; i++) {
+		ret = retained_translate(d->owned.root_pa, d->owned.iova + i*SZ_16K, &pa);
+		if (ret || pa != d->owned.pool_pa + i*SZ_16K) {
+			ret = ret ?: -ESTALE;
+			break;
+		}
+	}
+	restore = neo_dcp_dma_release(&d->owned);
+	dev_info(dev, "DCP scratch DMA cycle map=%d restore=%d; no buffer advertised or firmware command sent\n",
+		 ret, restore);
+	if (restore)
+		atomic_set(&d->failed, 1);
+	return ret ?: restore ?: count;
+}
+static DEVICE_ATTR_WO(scratch_dma);
 static DEVICE_ATTR_RO(status);
 static DEVICE_ATTR_WO(wake);
 static DEVICE_ATTR_WO(start_oslog);
@@ -526,7 +565,8 @@ static ssize_t awake_cycle_store(struct device *dev, struct device_attribute *a,
 static DEVICE_ATTR_WO(awake_cycle);
 static struct attribute *neo_dcp_attrs[] = {
 	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr,
-	&dev_attr_returning_idle.attr, &dev_attr_awake_cycle.attr, NULL
+	&dev_attr_returning_idle.attr, &dev_attr_awake_cycle.attr,
+	&dev_attr_scratch_dma.attr, NULL
 };
 static const struct bin_attribute *const neo_dcp_bin_attrs[] = {
 	&bin_attr_oslog_snapshot, NULL
@@ -737,6 +777,9 @@ static int probe(struct platform_device *pdev)
 	d->control = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(d->control))
 		return PTR_ERR(d->control);
+	if (!devm_request_mem_region(&pdev->dev, 0x412340000ULL, SZ_16K,
+				     "neo-dcp-retained-dart"))
+		return -EBUSY;
 	d->dart = devm_ioremap(&pdev->dev, 0x412340000ULL, SZ_16K);
 	if (!d->dart)
 		return -ENOMEM;
