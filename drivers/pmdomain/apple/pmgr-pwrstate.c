@@ -860,11 +860,29 @@ static const struct of_device_id apple_pmgr_ps_of_match[] = {
 
 MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
+/*
+ * genpd's provider sync_state powers off every domain firmware left active
+ * that has no Linux consumer.  On J700 that sweep (at ~1 s) gated the sensor
+ * rails (ispsens0/1) and dispext0_sys/fe, which also feed the 0x302800000
+ * bandwidth-scratch block the ISP firmware writes at CH_START (SError from
+ * the ISP, and from the AP on a read).  With apple_pmgr.no_auto_probe the
+ * boot preserves the firmware power state instead; otherwise defer to genpd.
+ */
+static void apple_pmgr_ps_sync_state(struct device *dev)
+{
+	if (apple_pmgr_no_auto_enable_on_probe) {
+		dev_info_once(dev, "diagnostic: keeping firmware-active domains on across sync_state\n");
+		return;
+	}
+	of_genpd_sync_state(dev->of_node);
+}
+
 static struct platform_driver apple_pmgr_ps_driver = {
 	.probe = apple_pmgr_ps_probe,
 	.driver = {
 		.name = "apple-pmgr-pwrstate",
 		.of_match_table = apple_pmgr_ps_of_match,
+		.sync_state = apple_pmgr_ps_sync_state,
 	},
 };
 
