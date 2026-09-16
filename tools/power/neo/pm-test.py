@@ -53,6 +53,7 @@ def snapshot():
              "/sys/kernel/debug/apple-pmp-v2/status",
              "/sys/kernel/debug/apple-pmp-v2/thermal_status",
              "/sys/bus/platform/devices/412e00000.neo-dcp-retained/status",
+             "/sys/bus/platform/devices/412e00000.neo-dcp-retained/epic_status",
              "/sys/kernel/debug/neo-sleep-irqs/stats",
              "/sys/kernel/debug/neo-pmgr-snapshot/stats",
              "/sys/kernel/debug/neo-smc-power/raw",
@@ -111,7 +112,7 @@ def check_firmware_health(capture):
             failed = re.search(r'\bfailed=(\d+)\b', status)
             if failed and int(failed[1]):
                 raise RuntimeError(f'{name} firmware epoch failed; a returned PM write is not successful recovery')
-            if name == 'DCP' and re.search(r'\b(?:touched|clocks_touched)=[1-9]', status):
+            if name == 'DCP' and re.search(r'\b(?:touched|clocks_touched|pm_panel_touched)=[1-9]', status):
                 raise RuntimeError('DCP firmware transition has not been restored')
 
 
