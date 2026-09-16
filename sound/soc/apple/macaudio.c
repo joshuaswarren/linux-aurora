@@ -81,6 +81,16 @@ struct macaudio_platform_cfg {
 	bool stereo;
 	int amp_gain;
 	int safe_vol;
+	/*
+	 * t8140 (J700): the AOP firmware runs the serializers, so the CPU
+	 * component is not the MCA.  Its front-end DAI names replace the
+	 * "mca-pcm-N" ones, the primary link runs at the firmware's fixed
+	 * frame length (125 SCLK per frame at 48 kHz on the jack) and with
+	 * the clock polarity the codec was measured with.
+	 */
+	const char *fe_dai_names[3];
+	unsigned int primary_bclk_ratio;
+	unsigned int dai_fmt;
 };
 
 static const char *volume_control_names[] = {
@@ -447,6 +457,8 @@ static int macaudio_parse_of_be_dai_link(struct macaudio_snd_data *ma,
 	int ret, i;
 
 	link->no_pcm = 1;
+	if (ma->cfg->dai_fmt)
+		link->dai_fmt = ma->cfg->dai_fmt;
 
 	link->dai_fmt = MACAUDIO_DAI_FMT;
 
@@ -575,6 +587,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			goto err_free;
 
 		memcpy(link_props, &macaudio_fe_link_props[i], sizeof(struct macaudio_link_props));
+		if (ma->cfg->fe_dai_names[i])
+			link->cpus[0].dai_name = ma->cfg->fe_dai_names[i];
+		if (ma->cfg->dai_fmt)
+			link->dai_fmt = ma->cfg->dai_fmt;
+		if (i == 0 && ma->cfg->primary_bclk_ratio)
+			link_props->bclk_ratio = ma->cfg->primary_bclk_ratio;
 		link++; link_props++;
 	}
 
@@ -1556,6 +1574,21 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	true,	10,	-20,
 };
 
+/*
+ * J700 (T8140, MacBook Neo): the AOP owns the audio fabric.  The jack is a
+ * CS42L83 on MCA1 fed by base-ns TX2 through the AOP cout service; the
+ * internal speaker (MAX98360, no current sense) is not exposed yet.
+ */
+struct macaudio_platform_cfg macaudio_j700_cfg = {
+	.enable_speakers = false,
+	.amp = AMP_NONE,
+	.speakers = SPKR_NONE,
+	.stereo = true,
+	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
+	.primary_bclk_ratio = 125,
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_NB_NF,
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -1633,6 +1666,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j457    AID7    ssm3515     15      2× 1W+1T Compat: apple,j456-macaudio */
 	/* j473    AID12   sn012776    20      1× 1W */
 	{ .compatible = "apple,j473-macaudio", .data = &macaudio_j37x_j47x_cfg },
+	/* j700    AOP-fed serializers, cs42l83 jack, MAX98360 speaker (off) */
+	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j474    AID26   sn012776    20      1× 1W    Compat: apple,j473-macaudio */
 	/* j475    AID25   sn012776    20      1× 1W    Compat: apple,j375-macaudio */
 	/* j493    AID18   sn012776    15      2× 2W */

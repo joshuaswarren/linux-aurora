@@ -91,6 +91,7 @@ const POWER_STATE_RUN: u32 = from_fourcc(b"runn");
 const POWER_STATE_IDLE: u32 = from_fourcc(b"idle");
 
 const AUDIO_DEV_SPKR: u32 = from_fourcc(b"spkr");
+const AUDIO_DEV_COUT: u32 = from_fourcc(b"cout");
 /// kIOReturnBusy from the firmware: the device is already attached.
 const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
@@ -298,6 +299,13 @@ struct LpmicData {
     hw_ptr_frames: Atomic<u32>,
     spkr_sequence: Atomic<u32>,
     spkr_reports: Atomic<u32>,
+    cout_sequence: Atomic<u32>,
+    cout_running: Atomic<u32>,
+    /// audio_mca1_m virtual power-domain device (dev_pm_domain_attach_by_name), 0 if none.
+    pd_mca1: Atomic<usize>,
+    /// DMA channels of the front-end PCMs, [FE DAI id][stream] (raw dma_chan pointers).
+    #[pin]
+    fe_chans: SpinLock<[[usize; 2]; FE_COUNT]>,
     #[pin]
     stream: SpinLock<StreamState>,
 }
@@ -474,33 +482,86 @@ impl LpmicData {
     }
 
     fn spkr_set_power(&self, state: u32) -> Result<()> {
-        let sequence = self.spkr_sequence.fetch_add(1, Relaxed) + 1;
+        self.out_set_power(AUDIO_DEV_SPKR, "spkr", &self.spkr_sequence, state)
+    }
+
+    /// Output device (spkr/cout) power request: property 202 with a per-
+    /// device sequence and the CNTVCT timestamp; pw0 is confirmed through
+    /// property 200 like the native host did.
+    fn out_set_power(&self, dev_id: u32, name: &str, seq: &Atomic<u32>, state: u32) -> Result<()> {
+        let sequence = seq.fetch_add(1, Relaxed) + 1;
         let req = SpkrPowerRequest {
-            dev_id: AUDIO_DEV_SPKR,
+            dev_id,
             sequence,
             timestamp: cntvct(),
             state,
             param: 0,
             ..SpkrPowerRequest::default()
         };
-        let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(
-            AUDIO_DEV_SPKR,
-            PROP_POWER_REQUEST,
-            req,
-        ))?;
+        let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(dev_id, PROP_POWER_REQUEST, req))?;
         if ret != 0 {
-            dev_err!(self.dev, "spkr power request {:#x} rejected: {:#x}\n", state, ret);
+            dev_err!(self.dev, "{} power request {:#x} rejected: {:#x}\n", name, state, ret);
             return Err(EIO);
         }
         if state == SPKR_POWER_STATE_PW0 {
-            let st = self.spkr_get_prop(PROP_POWER_STATE, 4)?;
-            let now = u32::from_le_bytes(st[4..8].try_into().unwrap());
+            let ret = self.epic_wrapped_call_ret(&AudioGetDeviceProp::new(dev_id, PROP_POWER_STATE), 8)?;
+            if ret.len() < 8 {
+                return Err(EIO);
+            }
+            let now = u32::from_le_bytes(ret[4..8].try_into().unwrap());
             if now != state {
-                dev_err!(self.dev, "spkr power state {:#x} after requesting {:#x}\n", now, state);
+                dev_err!(self.dev, "{} power state {:#x} after requesting {:#x}\n", name, now, state);
                 return Err(EIO);
             }
         }
         Ok(())
+    }
+
+    // ---- 3.5 mm jack: the AOP cout service feeding MCA1 from base-ns TX2 ----
+
+    /// Back-end DAI startup: attach cout, power audio_mca1_m, pw0.
+    fn cout_startup(&self) -> Result<()> {
+        self.attach_device(AUDIO_DEV_COUT, "cout")?;
+        let pd = self.pd_mca1.load(Relaxed);
+        if pd != 0 {
+            let rc = unsafe { bindings::pm_runtime_get_sync(pd as *mut bindings::device) };
+            if rc < 0 {
+                dev_err!(self.dev, "cout: audio_mca1_m did not power up: {}\n", rc);
+                return Err(EIO);
+            }
+        }
+        self.out_set_power(AUDIO_DEV_COUT, "cout", &self.cout_sequence, SPKR_POWER_STATE_PW0)?;
+        self.cout_running.store(0, Relaxed);
+        dev_info!(self.dev, "cout: attached, mca1 powered, pw0\n");
+        Ok(())
+    }
+
+    /// Back-end DAI prepare: pwrd starts the MCA1 clocks (the codec's PLL
+    /// locks to them when ASoC unmutes it right after this).
+    fn cout_prepare(&self) -> Result<()> {
+        if self.cout_running.load(Relaxed) != 0 {
+            return Ok(());
+        }
+        self.out_set_power(AUDIO_DEV_COUT, "cout", &self.cout_sequence, SPKR_POWER_STATE_PWRD)?;
+        self.cout_running.store(1, Relaxed);
+        dev_info!(self.dev, "cout: pwrd (MCA1 clocks running)\n");
+        Ok(())
+    }
+
+    /// Back-end DAI shutdown: pw0 (the codec is already muted and back on
+    /// its oscillator), then the power domain.
+    fn cout_shutdown(&self) {
+        if self.cout_running.load(Relaxed) != 0 {
+            if let Err(e) = self.out_set_power(AUDIO_DEV_COUT, "cout", &self.cout_sequence, SPKR_POWER_STATE_PW0) {
+                dev_err!(self.dev, "cout: pw0 failed: {:?}\n", e);
+            }
+            self.cout_running.store(0, Relaxed);
+        }
+        let pd = self.pd_mca1.load(Relaxed);
+        if pd != 0 {
+            unsafe { bindings::pm_runtime_put_sync(pd as *mut bindings::device) };
+        }
+        dev_info!(self.dev, "cout: pw0, mca1 released\n");
     }
 
     /// The native host's zero-DMA proof: attach spkr, read 401/402, pw0,
@@ -1100,9 +1161,361 @@ fn copy_str(target: &mut [u8], source: &[u8]) {
     target[..source.len()].copy_from_slice(source)
 }
 
+// ---- ASoC component: DPCM front-end PCMs on the ADMAC channels, back-end
+// DAIs on the AOP output services (macaudio's t8140 variant links them) ----
+
+/// Front-end PCM DAIs ("j700-pcm-N"): 0 primary playback (the jack),
+/// 1 secondary playback (the speaker, later), 2 capture (unused).
+const FE_COUNT: usize = 3;
+/// DMA channel name per front-end (dma-names on the audio child).
+/// (The speaker front-end's "spkr" channel is requested once the speaker
+/// link exists: requesting it touches the LEAP ADMAC.)
+const FE_DMA_NAMES: [Option<&core::ffi::CStr>; FE_COUNT] = [Some(c"cout"), None, None];
+/// Managed buffer sizes for the PCMs.
+const PCM_BUFFER_PREALLOC: usize = 256 * 1024;
+const PCM_BUFFER_MAX: usize = 1024 * 1024;
+const RATE_48000_BIT: u32 = 1 << 7; // SNDRV_PCM_RATE_48000
+
+/// Sync wrapper for the static ASoC descriptor tables (raw pointers inside).
+struct SyncCell<T>(T);
+unsafe impl<T> Sync for SyncCell<T> {}
+
+/// Driver data from an ASoC component (the platform device's drvdata is the
+/// pinned `LpmicDriver`).
+unsafe fn component_data<'a>(component: *mut bindings::snd_soc_component) -> &'a LpmicData {
+    let drv = unsafe { (*(*component).dev).driver_data } as *const LpmicDriver;
+    unsafe { &(*drv).data }
+}
+
+unsafe fn substream_rtd(substream: *mut bindings::snd_pcm_substream) -> *mut bindings::snd_soc_pcm_runtime {
+    unsafe { (*substream).private_data as *mut bindings::snd_soc_pcm_runtime }
+}
+
+unsafe fn rtd_is_be(rtd: *mut bindings::snd_soc_pcm_runtime) -> bool {
+    unsafe { (*(*rtd).dai_link).no_pcm() != 0 }
+}
+
+unsafe fn rtd_cpu_dai(rtd: *mut bindings::snd_soc_pcm_runtime) -> *mut bindings::snd_soc_dai {
+    unsafe { *(*rtd).dais }
+}
+
+/// DAI ids: 0 means "assign one" to ASoC, so the front-ends carry 1..=3
+/// (index + 1) and the back-ends start at 10.
+const FE_DAI_ID_BASE: u32 = 1;
+const BE_DAI_ID_COUT: u32 = 10;
+
+unsafe fn fe_index(rtd: *mut bindings::snd_soc_pcm_runtime) -> Option<usize> {
+    let id = unsafe { (*rtd_cpu_dai(rtd)).id } as u32;
+    if id >= FE_DAI_ID_BASE && id < FE_DAI_ID_BASE + FE_COUNT as u32 {
+        Some((id - FE_DAI_ID_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+unsafe extern "C" fn asoc_pcm_new(
+    component: *mut bindings::snd_soc_component,
+    rtd: *mut bindings::snd_soc_pcm_runtime,
+) -> i32 {
+    let data = unsafe { component_data(component) };
+    if unsafe { rtd_is_be(rtd) } {
+        return 0;
+    }
+    let Some(fe) = (unsafe { fe_index(rtd) }) else { return EINVAL.to_errno() };
+    let Some(name) = FE_DMA_NAMES[fe] else { return 0 };
+    let pcm = unsafe { (*rtd).pcm };
+    let substream = unsafe { (*pcm).streams[bindings::SNDRV_PCM_STREAM_PLAYBACK as usize].substream };
+    if substream.is_null() {
+        return 0;
+    }
+    let chan = match kernel::error::from_err_ptr(unsafe { bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr()) }) {
+        Ok(c) => c,
+        Err(e) => {
+            // The LEAP ADMAC's SRAM registers only answer with the LEAP
+            // leaves powered (they are off until the speaker back-end
+            // runs), so the speaker front-end stays without a channel for
+            // now: its PCM exists but opens with ENODEV.
+            dev_info!(data.dev, "front-end {}: DMA channel {:?} unavailable: {:?}\n", fe, name, e);
+            return 0;
+        }
+    };
+    data.fe_chans.lock()[fe][bindings::SNDRV_PCM_STREAM_PLAYBACK as usize] = chan as usize;
+    unsafe {
+        bindings::snd_pcm_set_managed_buffer(
+            substream,
+            bindings::SNDRV_DMA_TYPE_DEV as i32,
+            (*(*chan).device).dev,
+            PCM_BUFFER_PREALLOC,
+            PCM_BUFFER_MAX,
+        );
+    }
+    0
+}
+
+unsafe extern "C" fn asoc_pcm_free(component: *mut bindings::snd_soc_component, pcm: *mut bindings::snd_pcm) {
+    let data = unsafe { component_data(component) };
+    let rtd = unsafe { (*pcm).private_data as *mut bindings::snd_soc_pcm_runtime };
+    if unsafe { rtd_is_be(rtd) } {
+        return;
+    }
+    let Some(fe) = (unsafe { fe_index(rtd) }) else { return };
+    for stream in 0..2 {
+        let chan = core::mem::replace(&mut data.fe_chans.lock()[fe][stream], 0);
+        if chan != 0 {
+            unsafe { bindings::dma_release_channel(chan as *mut bindings::dma_chan) };
+        }
+    }
+}
+
+unsafe extern "C" fn asoc_pcm_open(
+    component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
+    let data = unsafe { component_data(component) };
+    let rtd = unsafe { substream_rtd(substream) };
+    if unsafe { rtd_is_be(rtd) } {
+        return 0;
+    }
+    let Some(fe) = (unsafe { fe_index(rtd) }) else { return EINVAL.to_errno() };
+    let stream = unsafe { (*substream).stream } as usize;
+    let chan = data.fe_chans.lock()[fe][stream & 1] as *mut bindings::dma_chan;
+    if chan.is_null() {
+        return ENODEV.to_errno();
+    }
+    let mut hw = bindings::snd_pcm_hardware::default();
+    hw.info = bindings::SNDRV_PCM_INFO_MMAP
+        | bindings::SNDRV_PCM_INFO_MMAP_VALID
+        | bindings::SNDRV_PCM_INFO_INTERLEAVED;
+    hw.periods_min = 2;
+    hw.periods_max = u32::MAX;
+    hw.period_bytes_min = 256;
+    // dma_get_max_seg_size() is inline: the ADMAC sets no dma_parms, SZ_64K.
+    hw.period_bytes_max = 0x10000;
+    hw.buffer_bytes_max = usize::MAX;
+    hw.fifo_size = 16;
+    let mut dma_data = bindings::snd_dmaengine_dai_dma_data::default();
+    let rc = unsafe {
+        bindings::snd_dmaengine_pcm_refine_runtime_hwparams(substream, &mut dma_data, &mut hw, chan)
+    };
+    if rc < 0 {
+        return rc;
+    }
+    // snd_soc_set_runtime_hwparams() is inline: copy into the runtime.
+    unsafe { (*(*substream).runtime).hw = hw };
+    unsafe { bindings::snd_dmaengine_pcm_open(substream, chan) }
+}
+
+unsafe extern "C" fn asoc_pcm_close(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    unsafe { bindings::snd_dmaengine_pcm_close(substream) }
+}
+
+unsafe extern "C" fn asoc_pcm_hw_params(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+    params: *mut bindings::snd_pcm_hw_params,
+) -> i32 {
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    let chan = unsafe { bindings::snd_dmaengine_pcm_get_chan(substream) };
+    let mut cfg = bindings::dma_slave_config::default();
+    let rc = unsafe { bindings::snd_hwparams_to_dma_slave_config(substream, params, &mut cfg) };
+    if rc < 0 {
+        return rc;
+    }
+    // Interval query for the channel count: bindgen has no inline helper.
+    let channels = unsafe {
+        let iv = &(*params).intervals[(bindings::SNDRV_PCM_HW_PARAM_CHANNELS
+            - bindings::SNDRV_PCM_HW_PARAM_FIRST_INTERVAL) as usize];
+        iv.min
+    };
+    let window = core::cmp::min(channels, 4);
+    if unsafe { (*substream).stream } == bindings::SNDRV_PCM_STREAM_PLAYBACK as i32 {
+        cfg.dst_port_window_size = window;
+    } else {
+        cfg.src_port_window_size = window;
+    }
+    unsafe {
+        match (*(*chan).device).device_config {
+            Some(f) => f(chan, &mut cfg),
+            None => ENOSYS.to_errno(),
+        }
+    }
+}
+
+unsafe extern "C" fn asoc_pcm_trigger(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+    cmd: i32,
+) -> i32 {
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) }
+}
+
+unsafe extern "C" fn asoc_pcm_pointer(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> bindings::snd_pcm_uframes_t {
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return ENOTSUPP_POINTER;
+    }
+    unsafe { bindings::snd_dmaengine_pcm_pointer(substream) }
+}
+
+/// -ENOTSUPP as the pointer callback returns it (mca does the same).
+const ENOTSUPP_POINTER: bindings::snd_pcm_uframes_t = (-524i64) as bindings::snd_pcm_uframes_t;
+
+static ASOC_COMPONENT: SyncCell<bindings::snd_soc_component_driver> = SyncCell(bindings::snd_soc_component_driver {
+    name: c"j700-aop-audio".as_ptr(),
+    open: Some(asoc_pcm_open),
+    close: Some(asoc_pcm_close),
+    hw_params: Some(asoc_pcm_hw_params),
+    trigger: Some(asoc_pcm_trigger),
+    pointer: Some(asoc_pcm_pointer),
+    pcm_new: Some(asoc_pcm_new),
+    pcm_free: Some(asoc_pcm_free),
+    // SAFETY: all-zero is a valid (empty) component driver; the fields
+    // above are the ones this component implements.
+    ..unsafe { core::mem::zeroed() }
+});
+
+unsafe fn dai_data<'a>(dai: *mut bindings::snd_soc_dai) -> &'a LpmicData {
+    unsafe { component_data((*dai).component) }
+}
+
+unsafe extern "C" fn dai_accept_fmt(_dai: *mut bindings::snd_soc_dai, _fmt: u32) -> i32 {
+    // The AOP runs the serializers: I2S, 32-bit slots, clocks from the firmware.
+    0
+}
+
+unsafe extern "C" fn dai_accept_sysclk(_dai: *mut bindings::snd_soc_dai, _id: i32, _freq: u32, _dir: i32) -> i32 {
+    0
+}
+
+unsafe extern "C" fn dai_accept_bclk_ratio(_dai: *mut bindings::snd_soc_dai, _ratio: u32) -> i32 {
+    0
+}
+
+unsafe extern "C" fn cout_dai_startup(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+    let data = unsafe { dai_data(dai) };
+    match data.cout_startup() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+unsafe extern "C" fn cout_dai_prepare(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+    let data = unsafe { dai_data(dai) };
+    match data.cout_prepare() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+unsafe extern "C" fn cout_dai_shutdown(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
+    let data = unsafe { dai_data(dai) };
+    data.cout_shutdown();
+}
+
+static COUT_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
+    startup: Some(cout_dai_startup),
+    prepare: Some(cout_dai_prepare),
+    shutdown: Some(cout_dai_shutdown),
+    set_fmt: Some(dai_accept_fmt),
+    set_sysclk: Some(dai_accept_sysclk),
+    set_bclk_ratio: Some(dai_accept_bclk_ratio),
+    // SAFETY: zero is an empty ops table.
+    ..unsafe { core::mem::zeroed() }
+});
+
+static FE_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
+    set_fmt: Some(dai_accept_fmt),
+    set_sysclk: Some(dai_accept_sysclk),
+    set_bclk_ratio: Some(dai_accept_bclk_ratio),
+    // SAFETY: zero is an empty ops table.
+    ..unsafe { core::mem::zeroed() }
+});
+
+const fn pcm_stream(name: &'static core::ffi::CStr, formats: u64) -> bindings::snd_soc_pcm_stream {
+    bindings::snd_soc_pcm_stream {
+        stream_name: name.as_ptr(),
+        formats,
+        subformats: 0,
+        rates: RATE_48000_BIT,
+        rate_min: 48000,
+        rate_max: 48000,
+        channels_min: 2,
+        channels_max: 2,
+        sig_bits: 0,
+    }
+}
+
+const fn empty_stream() -> bindings::snd_soc_pcm_stream {
+    bindings::snd_soc_pcm_stream {
+        stream_name: ptr::null(),
+        formats: 0,
+        subformats: 0,
+        rates: 0,
+        rate_min: 0,
+        rate_max: 0,
+        channels_min: 0,
+        channels_max: 0,
+        sig_bits: 0,
+    }
+}
+
+const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE | bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
+
+/// DAI table: [0] the cout back-end (DT index 0), then the front-end PCMs.
+static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 1 + FE_COUNT]> = SyncCell([
+    bindings::snd_soc_dai_driver {
+        name: c"cout".as_ptr(),
+        id: BE_DAI_ID_COUT,
+        ops: &COUT_DAI_OPS.0,
+        playback: pcm_stream(c"COUT TX", OUT_FORMATS),
+        capture: pcm_stream(c"COUT RX", OUT_FORMATS),
+        // SAFETY: zero is a valid base for the remaining fields.
+        ..unsafe { core::mem::zeroed() }
+    },
+    bindings::snd_soc_dai_driver {
+        name: c"j700-pcm-0".as_ptr(),
+        id: FE_DAI_ID_BASE,
+        ops: &FE_DAI_OPS.0,
+        playback: pcm_stream(c"PCM0 TX", OUT_FORMATS),
+        // macaudio routes "Headset Capture" into PCM0 RX; no channel yet.
+        capture: pcm_stream(c"PCM0 RX", OUT_FORMATS),
+        ..unsafe { core::mem::zeroed() }
+    },
+    bindings::snd_soc_dai_driver {
+        name: c"j700-pcm-1".as_ptr(),
+        id: FE_DAI_ID_BASE + 1,
+        ops: &FE_DAI_OPS.0,
+        playback: pcm_stream(c"PCM1 TX", OUT_FORMATS),
+        capture: empty_stream(),
+        ..unsafe { core::mem::zeroed() }
+    },
+    bindings::snd_soc_dai_driver {
+        name: c"j700-pcm-2".as_ptr(),
+        id: FE_DAI_ID_BASE + 2,
+        ops: &FE_DAI_OPS.0,
+        playback: empty_stream(),
+        capture: pcm_stream(c"PCM2 RX", OUT_FORMATS),
+        ..unsafe { core::mem::zeroed() }
+    },
+]);
+
 struct LpmicDriver {
     card: *mut bindings::snd_card,
     data: Arc<LpmicData>,
+    asoc_registered: bool,
 }
 
 impl LpmicDriver {
@@ -1128,6 +1541,7 @@ impl LpmicDriver {
         let mut this = LpmicDriver {
             card: ptr::null_mut(),
             data: data.clone(),
+            asoc_registered: false,
         };
         let ret = unsafe {
             bindings::snd_card_new(
@@ -1181,12 +1595,34 @@ impl LpmicDriver {
             dev_err!(data.dev, "Unable to register sound card\n");
             return Err(Error::from_errno(ret));
         }
+
+        // The ASoC side: the jack (cout) back-end and the front-end PCMs.
+        let ret = unsafe {
+            bindings::snd_soc_register_component(
+                data.dev.as_raw(),
+                &ASOC_COMPONENT.0,
+                ASOC_DAIS.0.as_ptr() as *mut bindings::snd_soc_dai_driver,
+                ASOC_DAIS.0.len() as i32,
+            )
+        };
+        if ret < 0 {
+            dev_err!(data.dev, "unable to register the ASoC component: {}\n", ret);
+            return Err(Error::from_errno(ret));
+        }
+        this.asoc_registered = true;
         Ok(this)
     }
 }
 
 impl Drop for LpmicDriver {
     fn drop(&mut self) {
+        if self.asoc_registered {
+            unsafe { bindings::snd_soc_unregister_component_by_driver(self.data.dev.as_raw(), ptr::null()) };
+        }
+        let pd = self.data.pd_mca1.xchg(0, Relaxed);
+        if pd != 0 {
+            unsafe { bindings::dev_pm_domain_detach(pd as *mut bindings::device, true) };
+        }
         if !self.card.is_null() {
             unsafe {
                 bindings::snd_card_free(self.card);
@@ -1252,6 +1688,10 @@ impl platform::Driver for LpmicDriver {
                 hw_ptr_frames: Atomic::new(0),
                 spkr_sequence: Atomic::new(0),
                 spkr_reports: Atomic::new(0),
+                cout_sequence: Atomic::new(0),
+                cout_running: Atomic::new(0),
+                pd_mca1: Atomic::new(0),
+                fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
                 stream <- new_spinlock!(StreamState {
                     substream: ptr::null_mut(),
                     running: false,
@@ -1273,6 +1713,14 @@ impl platform::Driver for LpmicDriver {
         data.adata
             .add_report_listener(svc, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
         dev_info!(dev, "J700 low-power microphone ready (source ring at {:#x})\n", ring_iova);
+        // The jack path's serializer domain (audio_mca1_m), held for the
+        // driver's lifetime and runtime-powered around cout streams.
+        let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), c"mca1".as_ptr()) };
+        match kernel::error::from_err_ptr(pd) {
+            Ok(p) if !p.is_null() => data.pd_mca1.store(p as usize, Relaxed),
+            Ok(_) => dev_warn!(dev, "no mca1 power domain: the jack path will not power its serializer\n"),
+            Err(e) => dev_warn!(dev, "mca1 power domain attach failed: {:?}\n", e),
+        }
         if *module_parameters::spkr_test.value() != 0 {
             match data.speaker_zero_dma_test(SpkrWave::Silence) {
                 Ok(()) => {}
