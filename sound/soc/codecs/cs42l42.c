@@ -832,6 +832,7 @@ static int cs42l42_asp_config(struct snd_soc_component *component,
 static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 {
 	struct snd_soc_component *component = codec_dai->component;
+	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
 	u32 asp_cfg_val = 0;
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
@@ -862,6 +863,25 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 					      CS42L42_ASP_5050_MASK |
 					      (CS42L42_ASP_FSD_1_0 <<
 						CS42L42_ASP_FSD_SHIFT));
+		cs42l42->dsp_a = false;
+		break;
+	case SND_SOC_DAIFMT_DSP_A:
+		/*
+		 * Pulse mode, frame starts on the rising edge of LRCLK,
+		 * data delayed by 1.0 SCLKs; the channels sit back to back
+		 * (hw_params places channel 2 at the slot width).  The T8140
+		 * AOP runs the CS42L83 jack link this way: a 125-SCLK frame
+		 * pulse with two 32-bit slots.
+		 */
+		snd_soc_component_update_bits(component,
+					      CS42L42_ASP_FRM_CFG,
+					      CS42L42_ASP_STP_MASK |
+					      CS42L42_ASP_5050_MASK |
+					      CS42L42_ASP_FSD_MASK,
+					      CS42L42_ASP_STP_MASK |
+					      (CS42L42_ASP_FSD_1_0 <<
+						CS42L42_ASP_FSD_SHIFT));
+		cs42l42->dsp_a = true;
 		break;
 	default:
 		return -EINVAL;
@@ -959,11 +979,36 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 		snd_soc_component_update_bits(component, CS42L42_ASP_RX_DAI0_CH1_AP_RES,
 							 CS42L42_ASP_RX_CH_AP_MASK |
 							 CS42L42_ASP_RX_CH_RES_MASK, val);
-		/* Channel 2 on high LRCLK */
-		val |= CS42L42_ASP_RX_CH_AP_HI << CS42L42_ASP_RX_CH_AP_SHIFT;
-		snd_soc_component_update_bits(component, CS42L42_ASP_RX_DAI0_CH2_AP_RES,
-							 CS42L42_ASP_RX_CH_AP_MASK |
-							 CS42L42_ASP_RX_CH_RES_MASK, val);
+		if (cs42l42->dsp_a) {
+			/*
+			 * Channel 2 follows channel 1 in the same phase, one
+			 * slot (the physical sample width) after the frame
+			 * start.
+			 */
+			unsigned int start = params_physical_width(params);
+
+			snd_soc_component_update_bits(component,
+						      CS42L42_ASP_RX_DAI0_CH2_AP_RES,
+						      CS42L42_ASP_RX_CH_AP_MASK |
+						      CS42L42_ASP_RX_CH_RES_MASK, val);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH1_BIT_MSB, 0);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH1_BIT_LSB, 0);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH2_BIT_MSB,
+						(start >> 8) & 0xff);
+			snd_soc_component_write(component,
+						CS42L42_ASP_RX_DAI0_CH2_BIT_LSB,
+						start & 0xff);
+		} else {
+			/* Channel 2 on high LRCLK */
+			val |= CS42L42_ASP_RX_CH_AP_HI << CS42L42_ASP_RX_CH_AP_SHIFT;
+			snd_soc_component_update_bits(component,
+						      CS42L42_ASP_RX_DAI0_CH2_AP_RES,
+						      CS42L42_ASP_RX_CH_AP_MASK |
+						      CS42L42_ASP_RX_CH_RES_MASK, val);
+		}
 
 		/* Channel B comes from the last active channel */
 		snd_soc_component_update_bits(component, CS42L42_SP_RX_CH_SEL,

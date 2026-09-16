@@ -51,6 +51,8 @@ struct  cs42l42_private {
 	u8 hs_bias_ramp_time;
 	u8 hs_bias_sense_en;
 	u8 stream_use;
+	/* DSP-A: frame pulse, channels back to back after a one-SCLK delay */
+	bool dsp_a;
 	bool hp_adc_up_pending;
 	bool suspended;
 	bool sdw_waiting_first_unattach;

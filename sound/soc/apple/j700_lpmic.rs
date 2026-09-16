@@ -1472,7 +1472,9 @@ const fn empty_stream() -> bindings::snd_soc_pcm_stream {
     }
 }
 
-const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE | bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
+/// The AOP-configured serializers take 24-bit samples from the low bits
+/// of each 32-bit DMA word (macOS "slot: 32bits smpl: 24bits"): S24_LE.
+const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
 
 /// DAI table: [0] the cout back-end (DT index 0), then the front-end PCMs.
 static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 1 + FE_COUNT]> = SyncCell([
