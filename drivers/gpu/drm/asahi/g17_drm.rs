@@ -884,20 +884,40 @@ pub(crate) struct G17PRenderWatchBackend {
     runtime: G17PRuntimeRef,
 }
 
+/// Scheduler teardown is not evidence that a published GPU job failed.
+/// Keep its owner alive and let the RTKit worker retire the hardware fence.
+/// This runs only at queue destruction, with no runtime mutex held, and is
+/// uninterruptible because the exiting task already has a fatal signal.
+/// Use the same finite bound as the render scheduler's watchdog; a genuinely
+/// stuck job still reaches the existing final-observation/quarantine path.
+fn wait_for_render_teardown(fence: &Fence) -> bool {
+    // SAFETY: The retained Fence reference lives across the entire wait.
+    unsafe {
+        bindings::dma_fence_wait_timeout(
+            fence.raw(),
+            false,
+            kernel::time::msecs_to_jiffies(2000) as _,
+        ) > 0
+    }
+}
+
 impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
     fn timed_out(
         &self,
         packet: Arc<g17_job::G17PRenderWatchPacket>,
     ) -> kernel::drm::sched::Status {
         self.runtime.mutex().lock().timeout_deferred_render(
-            packet.render_slot(), packet.submission_id(), ETIMEDOUT,
+            packet.render_slot(), packet.submission_id(), packet.completion(), ETIMEDOUT,
         );
         kernel::drm::sched::Status::Nominal
     }
 
     fn cancel(&self, packet: Arc<g17_job::G17PRenderWatchPacket>) {
+        if wait_for_render_teardown(&packet.fence()) {
+            return;
+        }
         self.runtime.mutex().lock().timeout_deferred_render(
-            packet.render_slot(), packet.submission_id(), ECANCELED,
+            packet.render_slot(), packet.submission_id(), packet.completion(), ETIMEDOUT,
         );
     }
 }
@@ -2317,19 +2337,19 @@ impl G17PQueue {
                 sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
                 if let Err(error) = submit {
                     self.runtime.mutex().lock().timeout_deferred_render(
-                        render_slot, submission_id, error,
+                        render_slot, submission_id, &completion, error,
                     );
                     return Err(Self::stage_fail(
                         submission_id, "submit-translated-render", error,
                     ));
                 }
                 let packet = match g17_job::G17PRenderWatchPacket::new(
-                    submission_id, render_slot, completion,
+                    submission_id, render_slot, completion.clone(),
                 ) {
                     Ok(packet) => packet,
                     Err(error) => {
                         self.runtime.mutex().lock().timeout_deferred_render(
-                            render_slot, submission_id, error,
+                            render_slot, submission_id, &completion, error,
                         );
                         return Err(Self::stage_fail(
                             submission_id, "allocate-render-watch", error,
@@ -2340,7 +2360,7 @@ impl G17PQueue {
                     Ok(fence) => fence,
                     Err(error) => {
                         self.runtime.mutex().lock().timeout_deferred_render(
-                            render_slot, submission_id, error,
+                            render_slot, submission_id, &completion, error,
                         );
                         return Err(Self::stage_fail(
                             submission_id, "schedule-render-watch", error,

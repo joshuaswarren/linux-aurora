@@ -4913,8 +4913,20 @@ impl G17PLiveRuntime {
         &mut self,
         render_slot: u8,
         submission_id: u64,
+        completion: &Arc<crate::g17_drm::G17PRenderCompletion>,
         error: Error,
     ) {
+        // A scheduler can retain a completed watch after its physical slot
+        // has been reused by another queue. Cancel/timeout belongs to this
+        // exact completion, not whoever now occupies the slot. The logged
+        // submission ID was previously used for diagnostics only.
+        let Some(current) = self.pending_render
+            .get(usize::from(render_slot)).and_then(Option::as_ref) else {
+                return;
+            };
+        if !Arc::ptr_eq(current, completion) {
+            return;
+        }
         self.settle_failed_deferred_render(
             render_slot,
             Some(submission_id),
