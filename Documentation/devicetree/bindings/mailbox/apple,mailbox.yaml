@@ -46,6 +46,14 @@ properties:
           - const: apple,t8015-asc-mailbox
 
       - description:
+          The second ("setup port") mailbox of the T8140 AOP, through which
+          its firmware exchanges the endpoint buffer setup and source-buffer
+          binding messages.  Two control words at 0x0/0x4, send registers at
+          0x180/0x188 and receive registers at 0x1b0/0x1b8.
+        items:
+          - const: apple,t8140-aop-setup-mailbox
+
+      - description:
           ASCWrap v6 mailbox transport for the two independent T8140 GPU
           firmware roles. The mailbox-v4 register ABI is embedded at offset
           0x8000 in the first register window. The second register window is

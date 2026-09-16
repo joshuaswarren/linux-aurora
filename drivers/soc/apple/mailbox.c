@@ -147,6 +147,18 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_SEND0 ==
 static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 	      0x8830);
 
+/*
+ * The T8140 AOP "setup port" (ADT aop-exclave-mailbox): the second mailbox
+ * the J700 AOP firmware boots through.  Layout measured on hardware by the
+ * native m1n1 microphone host (artifacts/j700-native-lpmic-20260906).
+ */
+#define APPLE_T8140_AOP_SETUP_A2I_CONTROL 0x000
+#define APPLE_T8140_AOP_SETUP_I2A_CONTROL 0x004
+#define APPLE_T8140_AOP_SETUP_A2I_SEND0   0x180
+#define APPLE_T8140_AOP_SETUP_A2I_SEND1   0x188
+#define APPLE_T8140_AOP_SETUP_I2A_RECV0   0x1b0
+#define APPLE_T8140_AOP_SETUP_I2A_RECV1   0x1b8
+
 #define APPLE_T8015_MBOX_A2I_CONTROL	0x108
 #define APPLE_T8015_MBOX_I2A_CONTROL	0x10c
 
@@ -1350,74 +1362,20 @@ static const struct apple_mbox_hw apple_mbox_ascwrap_v6_hw = {
 	.has_irq_controls = false,
 };
 
-/* J813/25G76 AppleASCWrapV6::_runCPU at 0xfffffe0008a42d34:
- * start reads +0x44 and sets bit4; stop clears bit4, rereads, then clears
- * bit5. This matches the provider transition above. The four ADT resource
- * bases move from T8140's 0x4... bank to T8142's 0x5... bank. Keep this an
- * explicit compatible; selecting it does not admit a GPU firmware ABI.
- */
-static const struct apple_mbox_hw apple_mbox_t8142_ascwrap_v6_hw = {
-	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
-	.is_ascwrap_v6 = true,
-	.ascwrap_v6_base_delta = APPLE_T8142_ASCWRAP_BASE_DELTA,
+static const struct apple_mbox_hw apple_mbox_t8140_aop_setup_hw = {
 	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
-	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
-	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
-	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
-	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
-	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
-	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+
+	.a2i_control = APPLE_T8140_AOP_SETUP_A2I_CONTROL,
+	.a2i_send0 = APPLE_T8140_AOP_SETUP_A2I_SEND0,
+	.a2i_send1 = APPLE_T8140_AOP_SETUP_A2I_SEND1,
+
+	.i2a_control = APPLE_T8140_AOP_SETUP_I2A_CONTROL,
+	.i2a_recv0 = APPLE_T8140_AOP_SETUP_I2A_RECV0,
+	.i2a_recv1 = APPLE_T8140_AOP_SETUP_I2A_RECV1,
+
 	.has_irq_controls = false,
 };
-
-static const struct apple_mbox_hw apple_mbox_t8152_v8_hw = {
-	.counted_fifo = true,
-	.control_full = GENMASK(11, 8), /* free TX slots */
-	.control_empty = GENMASK(3, 0), /* RX occupancy */
-	.a2i_control = 0x20,
-	.a2i_send0 = 0x10,
-	.a2i_send1 = 0x18,
-	.i2a_control = 0x20,
-	.i2a_recv0 = 0x00,
-	.i2a_recv1 = 0x08,
-	.has_irq_controls = false,
-};
-
-static const struct apple_mbox_hw apple_mbox_t8152_pmp_hw = {
-	.rx_poll_required = true,
-	.counted_fifo = true,
-	.control_full = GENMASK(11, 8),
-	.control_empty = GENMASK(3, 0),
-	.a2i_control = 0x20,
-	.a2i_send0 = 0x10,
-	.a2i_send1 = 0x18,
-	.i2a_control = 0x20,
-	.i2a_recv0 = 0x00,
-	.i2a_recv1 = 0x08,
-	.has_irq_controls = false,
-};
-
-/* T8152/J873 GPU GFX/GFX1 ASCWrap v8: the counted-FIFO layout of
- * apple_mbox_t8152_v8_hw at the role's post-office window (reg "mailbox"),
- * plus wrapper lifecycle reads gated on the role's PSD service. The SMC's
- * apple,t8152-ascwrap-v8-mailbox entry above is unchanged.
- */
-static const struct apple_mbox_hw apple_mbox_t8152_gfx_ascwrap_v8_hw = {
-	.is_ascwrap_v8 = true,
-	.counted_fifo = true,
-	.control_full = GENMASK(11, 8), /* free TX slots */
-	.control_empty = GENMASK(3, 0), /* RX occupancy */
-	.a2i_control = 0x20,
-	.a2i_send0 = 0x10,
-	.a2i_send1 = 0x18,
-	.i2a_control = 0x20,
-	.i2a_recv0 = 0x00,
-	.i2a_recv1 = 0x08,
-	.has_irq_controls = false,
-};
-
-static_assert(0x20 + sizeof(u32) <= APPLE_ASCWRAP_V8_MBOX_SIZE);
 
 static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.control_full = APPLE_M3_MBOX_CONTROL_FULL,
@@ -1444,6 +1402,7 @@ static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8152-gfx-ascwrap-v8", .data = &apple_mbox_t8152_gfx_ascwrap_v8_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
+	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
