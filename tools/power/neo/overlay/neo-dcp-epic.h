@@ -239,7 +239,7 @@ static int neo_epic_receive(struct neo_epic *e)
 				e->service = true;
 				e->channel = channel;
 			}
-		} else if (type == 4 && sub[5] == 0x20 &&
+		} else if ((type == 0 || type == 4) && sub[5] == 0x20 &&
 			   get_unaligned_le16(sub + 6) == 0xc0 &&
 			   channel == e->channel && e->waiting) {
 			const u8 *cmd = sub + 24;
