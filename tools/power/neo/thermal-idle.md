@@ -69,3 +69,13 @@ Use 0 for the normal-polling reference. The child independently bounds panel
 and backlight off time. Battery wattage applies to the idle interval, not the
 later gateway probe. Do not overlap these trials with other policy changes,
 CPU loads, uploads, or suspend experiments.
+
+## Paired awake result on #44
+
+Four 120-second panel-off, associated FASTPS intervals measured 1.159145 W
+(normal), 1.158336 W (100 ms), 1.151350 W (1000 ms), and 1.151085 W
+(restored normal). The final reference is indistinguishable from the 1-second
+setting: no resolved power benefit. SMC IRQs over the surrounding ~130-second
+interval fell from 25,890 to 8,904 at 100 ms, so the activity reduction is real
+but is not the missing >0.15 W. Gateway probes passed; policies restored to
+normal sampling and CAM. Captures: wifi-thermal-series44/.
