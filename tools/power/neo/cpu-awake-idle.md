@@ -238,3 +238,26 @@ after panel restoration, while native display idle can already have blanked
 its pipeline. Measure the CPU states and energy during qualified native
 SET_POWER(false), together with whole-machine battery draw, before treating
 the asymmetric CPU behavior as independent of display/firmware activity.
+
+
+### Display-off control, boot 57a0b2d4
+
+`display-control-57a0b2d4/measurement` completed a 120-second concurrent
+battery/CPU-energy interval with native SET_POWER(false), LCD power GPIO
+low both before and after, FAST Wi-Fi PS and both frequency caps unchanged.
+The panel and HPD returned, gateway pings passed, and boot identity stayed
+unchanged. The controller now optionally retains CPU energy and short busy
+hardware-state captures outside the battery measurement interval.
+
+P0 remained ACTIVE in both 200,000-sample snapshots. Its core model averaged
+70.557 mW and P-cluster CPM 43.710 mW; these agree with the earlier panel-on
+control. Thus native panel shutdown alone does not remove this asymmetry.
+The battery's sampled power averaged **1.084681 W**, still far above 0.2 W.
+Remaining-charge estimation is unreliable in this interval: charge_now
+jumped upward during measurement, producing a misleading endpoint estimate
+of 1.936 W. Retain both raw readings and report the sampled power with this
+limitation; the raw charge_counter unit remains unqualified.
+
+This is a diagnostic control, not a newly demonstrated power reduction.
+The controller's post-test addition only checkpoints the pre-measurement
+state earlier; the executed helper hash is retained in result.json.

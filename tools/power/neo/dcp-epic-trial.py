@@ -50,10 +50,16 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--seconds', type=int, default=120)
     p.add_argument('--ap-idle', action='store_true')
+    p.add_argument('--cpu-energy-client', type=Path,
+                   help='optional read-only cpu-energy-read binary')
+    p.add_argument('--cpu-state-client', type=Path,
+                   help='optional cpu-idle-sample binary; short busy samples outside measurement')
     a = p.parse_args()
     if not 10 <= a.seconds <= 240:
         p.error('seconds must be in 10..240')
     root = a.directory.resolve(strict=True)
+    energy_client = a.cpu_energy_client.resolve(strict=True) if a.cpu_energy_client else None
+    state_client = a.cpu_state_client.resolve(strict=True) if a.cpu_state_client else None
     out = a.output.resolve()
     lock = open('/run/neo-dcp-epic-trial.lock', 'w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -73,6 +79,11 @@ def main():
                   helper_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   power_helper_sha256=hashlib.sha256((root / 'sleep-power.py').read_bytes()).hexdigest(),
                   before=before)
+    if energy_client:
+        result['cpu_energy_client_sha256'] = hashlib.sha256(energy_client.read_bytes()).hexdigest()
+        result['cpu_energy_helper_sha256'] = hashlib.sha256((root / 'cpu-energy.py').read_bytes()).hexdigest()
+    if state_client:
+        result['cpu_state_client_sha256'] = hashlib.sha256(state_client.read_bytes()).hexdigest()
 
     def save():
         (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
@@ -86,6 +97,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     child = None
+    energy_child = None
     attr = 'epic_ap_cycle' if a.ap_idle else 'epic_power_cycle'
     try:
         save()
@@ -114,10 +126,29 @@ def main():
         if 'inherited=0\n' not in result['gpio_off_before']:
             raise RuntimeError('native display shutdown did not lower LCD power')
         time.sleep(10)
+        if state_client:
+            result['cpu_off_before'] = json.loads(subprocess.check_output(
+                [str(state_client), '--busy'], text=True, timeout=30))
+        save()
+        if energy_client:
+            with (out / 'cpu-energy.log').open('w') as log:
+                energy_child = subprocess.Popen(
+                    [sys.executable, str(root / 'cpu-energy.py'), '--client', str(energy_client),
+                     '--seconds', str(a.seconds), '--output', str(out / 'cpu-energy')],
+                    stdout=log, stderr=subprocess.STDOUT)
         with (out / 'power.log').open('w') as log:
             subprocess.run([sys.executable, str(root / 'sleep-power.py'), '--mode', 'awake',
                             '--seconds', str(a.seconds), '--output', str(out / 'power')],
                            stdout=log, stderr=subprocess.STDOUT, check=True)
+        if energy_child:
+            if energy_child.wait(timeout=30):
+                raise RuntimeError('CPU energy capture failed')
+            result['cpu_energy'] = json.loads((out / 'cpu-energy/result.json').read_text())
+            if result['cpu_energy']['status'] != 'complete':
+                raise RuntimeError('CPU energy capture incomplete')
+        if state_client:
+            result['cpu_off_after'] = json.loads(subprocess.check_output(
+                [str(state_client), '--busy'], text=True, timeout=30))
         result['off_after'] = status()
         result['gpio_off_after'] = gpio()
         if result['off_after']['power_stage'] != '2' or 'inherited=0\n' not in result['gpio_off_after']:
@@ -141,6 +172,13 @@ def main():
         result.update(status='failed', error=repr(error))
     finally:
         save()
+        if energy_child is not None and energy_child.poll() is None:
+            energy_child.terminate()
+            try:
+                energy_child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                energy_child.kill()
+                energy_child.wait()
         if child is not None and child.poll() is None:
             child.wait(timeout=320)
         (out / 'kernel.log').write_text(subprocess.check_output(['dmesg'], text=True))
