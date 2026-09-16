@@ -69,6 +69,18 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_SEND0 ==
 static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 	      0x8830);
 
+/*
+ * The T8140 AOP "setup port" (ADT aop-exclave-mailbox): the second mailbox
+ * the J700 AOP firmware boots through.  Layout measured on hardware by the
+ * native m1n1 microphone host (artifacts/j700-native-lpmic-20260906).
+ */
+#define APPLE_T8140_AOP_SETUP_A2I_CONTROL 0x000
+#define APPLE_T8140_AOP_SETUP_I2A_CONTROL 0x004
+#define APPLE_T8140_AOP_SETUP_A2I_SEND0   0x180
+#define APPLE_T8140_AOP_SETUP_A2I_SEND1   0x188
+#define APPLE_T8140_AOP_SETUP_I2A_RECV0   0x1b0
+#define APPLE_T8140_AOP_SETUP_I2A_RECV1   0x1b8
+
 #define APPLE_T8015_MBOX_A2I_CONTROL	0x108
 #define APPLE_T8015_MBOX_I2A_CONTROL	0x10c
 
@@ -775,6 +787,21 @@ static const struct apple_mbox_hw apple_mbox_ascwrap_v6_hw = {
 	.has_irq_controls = false,
 };
 
+static const struct apple_mbox_hw apple_mbox_t8140_aop_setup_hw = {
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_T8140_AOP_SETUP_A2I_CONTROL,
+	.a2i_send0 = APPLE_T8140_AOP_SETUP_A2I_SEND0,
+	.a2i_send1 = APPLE_T8140_AOP_SETUP_A2I_SEND1,
+
+	.i2a_control = APPLE_T8140_AOP_SETUP_I2A_CONTROL,
+	.i2a_recv0 = APPLE_T8140_AOP_SETUP_I2A_RECV0,
+	.i2a_recv1 = APPLE_T8140_AOP_SETUP_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
 static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.control_full = APPLE_M3_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_M3_MBOX_CONTROL_EMPTY,
@@ -797,6 +824,7 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
+	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
