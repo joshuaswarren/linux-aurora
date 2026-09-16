@@ -348,6 +348,7 @@ struct apple_dart_domain {
 
 	bool finalized;
 	u64 mask;
+	dma_addr_t dma_min;
 	dma_addr_t dma_max;
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
@@ -1154,6 +1155,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
+	dma_addr_t dma_min = dart_domain->dma_min ?: dart->dma_min;
 	dma_addr_t dma_max = dart_domain->dma_max ?: dart->dma_max;
 	u32 ias = min_t(u32, dart->ias, fls64(dma_max));
 	int locked_sid = -1;
@@ -1265,7 +1267,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		dart_domain->mask = DMA_BIT_MASK(min_t(u32, dart->ias, 47));
 
 	dart_domain->domain.pgsize_bitmap = pgtbl_cfg.pgsize_bitmap;
-	dart_domain->domain.geometry.aperture_start = dart->dma_min;
+	dart_domain->domain.geometry.aperture_start = dma_min;
 	dart_domain->domain.geometry.aperture_end = dma_max;
 	dart_domain->domain.geometry.force_aperture = true;
 
@@ -1550,6 +1552,26 @@ static struct iommu_domain *apple_dart_domain_alloc_paging(struct device *dev)
 				return ERR_PTR(-EINVAL);
 			}
 			dart_domain->dma_max = DMA_BIT_MASK(iova_bits);
+		}
+
+		/*
+		 * A consumer may carry its own window (base, size): on a locked
+		 * DART every stream root is the firmware's and each stream has
+		 * its own free 64 GiB slots and per-stream VM base, e.g. the J700
+		 * AOP's primary/setup/source streams.
+		 */
+		if (of_property_present(iova_node, "apple,dma-range")) {
+			u64 dma_range[2];
+
+			ret = of_property_read_u64_array(iova_node, "apple,dma-range",
+							 dma_range, 2);
+			if (ret || !dma_range[1] ||
+			    dma_range[0] + dma_range[1] - 1 < dma_range[0]) {
+				kfree(dart_domain);
+				return ERR_PTR(ret ?: -EINVAL);
+			}
+			dart_domain->dma_min = dma_range[0];
+			dart_domain->dma_max = dma_range[0] + dma_range[1] - 1;
 		}
 
 		ret = apple_dart_finalize_domain(dart_domain, cfg);
