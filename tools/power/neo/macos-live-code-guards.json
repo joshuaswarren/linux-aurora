@@ -64,5 +64,11 @@
     "address": "0xfffffe000944ad8c",
     "size": 92,
     "sha256": "97dc32521b463a5e26f0fbc03c620dac9a35e62a6c2e0818bd4e2ce6adb26cd4"
+  },
+  {
+    "name": "retentionV2",
+    "address": "0xfffffe000945ee04",
+    "size": 1372,
+    "sha256": "466268fca23bb86881675506c1c5236c9b52a92e9e3a52d7bc56aa7f0a51b3eb"
   }
 ]

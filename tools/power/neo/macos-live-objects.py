@@ -63,8 +63,8 @@ def retain(dev, entry_id, expected):
     return addr
 
 
-def pointer(addr):
-    if addr >> 48 != 0xffff or addr % 8:
+def pointer(addr, alignment=8):
+    if addr >> 48 != 0xffff or addr % alignment:
         raise RuntimeError('noncanonical or unaligned RAM pointer: %#x' % addr)
     return addr
 
@@ -93,7 +93,7 @@ def main():
         if not 0 <= slide < 1 << 32 or slide % 16384:
             raise RuntimeError('invalid slide')
         guards = json.loads(Path(__file__).with_name('macos-live-code-guards.json').read_text())
-        wanted = {'getRegMap', 'initRegMap', 'pmgrCtor', 'deviceOffset', 'deviceMap', 'deviceGroup', 'deviceIndex'} if a.kind == 'pmgr' else {'getStructuredLog', 'initLog', 'logMsg'}
+        wanted = {'getRegMap', 'initRegMap', 'pmgrCtor', 'deviceOffset', 'deviceMap', 'deviceGroup', 'deviceIndex', 'retentionV2'} if a.kind == 'pmgr' else {'getStructuredLog', 'initLog', 'logMsg'}
         if {g['name'] for g in guards if g['name'] in wanted} != wanted:
             raise RuntimeError('missing code guards')
         for g in guards:
@@ -136,7 +136,9 @@ def main():
                 raise RuntimeError('PS groups changed')
             (a.output / 'ps-groups.bin').write_bytes(groups)
             device_ptr, = struct.unpack('<Q', dev.read(addr + 0x9090, 8))
-            pointer(device_ptr)
+            # DeviceData is packed ADT data, aligned to four bytes, unlike
+            # the object and mapping pointers above.
+            pointer(device_ptr, 4)
             table = json.loads(Path(__file__).with_name('j700-pmgr-domains.json').read_text())
             wanted_devices = {'DISP_CPU', 'DISPEXT0_CPU', 'DISP_FE', 'DISP_SYS', 'SIO_CPU'}
             devices = []
@@ -153,6 +155,11 @@ def main():
                 if dev.read(device_ptr + index * 48, 48) != record:
                     raise RuntimeError('device record changed')
                 (a.output / (d['name'] + '.bin')).write_bytes(record)
+                native_id = struct.unpack_from('<H', record, 0x1a)[0] or record[3]
+                # Native getDevicePSRegOffset/Map resolve this ID again through
+                # _deviceIDToDeviceData. Refuse aliases until reviewed.
+                if native_id != device_id:
+                    raise RuntimeError('native device ID alias requires review')
                 group = record[0x13]
                 offset = struct.unpack_from('<I', record, 0x10)[0] & 0xffffff
                 if group >= group_count or offset % 8:
@@ -160,7 +167,27 @@ def main():
                 regmap, base_offset, mask = struct.unpack_from('<III', groups, group * 12)
                 mapping = next(x for x in rows if x['regmap_id'] == regmap and x['die'] == 0)
                 native_pa = int(mapping['physical'], 0) + base_offset + offset
-                devices.append(dict(name=d['name'], device_id=device_id, index=index,
+                if base_offset + offset + 4 > mapping['size']:
+                    raise RuntimeError('device register outside live mapping')
+                retention = []
+                for ptr_off, index_off, bitmap_off in [(0x170, 0x250, 0x188), (0x178, 0xed0, 0x1ec)]:
+                    ri, = struct.unpack('<I', dev.read(addr + index_off + 4*device_id, 4))
+                    row = dict(index=ri, table_pointer_offset=hex(ptr_off))
+                    if ri != 0xffffffff:
+                        if ri >= 800:
+                            raise RuntimeError('retention index out of bounds')
+                        rp, = struct.unpack('<Q', dev.read(addr + ptr_off, 8))
+                        rr = dev.read(pointer(rp, 4) + 16*ri, 16)
+                        if dev.read(rp + 16*ri, 16) != rr:
+                            raise RuntimeError('retention record changed')
+                        bit, roff, on, off = struct.unpack('<4I', rr)
+                        if bit >= 800:
+                            raise RuntimeError('retention feature bit out of bounds')
+                        bits, = struct.unpack('<I', dev.read(addr + bitmap_off + (bit//32)*4, 4))
+                        row.update(raw=rr.hex(), feature_bit=bit, enabled=bool(bits & (1 << (bit%32))),
+                                   regmap=101, offset=hex(roff), on=hex(on), off=hex(off))
+                    retention.append(row)
+                devices.append(dict(name=d['name'], device_id=device_id, index=index, retention_v2=retention,
                                     record=record.hex(), group=group, regmap=regmap,
                                     group_offset=hex(base_offset), device_offset=hex(offset),
                                     physical=hex(native_pa), archived_physical=hex(int(d['base'], 0) + d['offset'])))
