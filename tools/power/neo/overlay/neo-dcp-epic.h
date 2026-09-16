@@ -100,7 +100,7 @@ static int neo_epic_identify(struct neo_epic *e, const u8 *payload, u32 length)
 	struct neo_prop_cursor c;
 	const u8 *key, *value;
 	u32 tag, n, pairs, key_size, value_size;
-	bool found = false;
+	bool found = false, iboot_interface = false;
 
 	if (length < 32)
 		return -EINVAL;
@@ -128,11 +128,23 @@ static int neo_epic_identify(struct neo_epic *e, const u8 *payload, u32 length)
 			    !neo_prop_string(value, value_size, "disp0-service"))
 				return -ENODEV;
 			found = true;
+		} else if (neo_prop_string(key, key_size, "interface-id")) {
+			if (iboot_interface || ((tag >> 24) & 31) != 4 ||
+			    (tag & 0xffffff) != 64 || neo_prop_take(&c, 8, &value) ||
+			    get_unaligned_le32(value) != 3 || get_unaligned_le32(value + 4))
+				return -EINVAL;
+			iboot_interface = true;
 		} else if (neo_prop_value(&c, tag, 0)) {
 			return -EINVAL;
 		}
 	}
-	return found ? 0 : -ENODEV;
+	/* Native iBoot uses name + a 36-byte interface-id dictionary. The
+	 * upstream AFK matcher likewise uses the name for properties <=36
+	 * bytes; here additionally require the captured interface id 3.
+	 */
+	return found || (iboot_interface && pairs == 1 && length == 68 &&
+			strnlen(payload, 32) == strlen("disp0-service") &&
+			!memcmp(payload, "disp0-service", strlen("disp0-service"))) ? 0 : -ENODEV;
 }
 
 static int neo_epic_send(struct neo_epic *e, u64 word)
