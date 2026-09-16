@@ -49,3 +49,36 @@ traffic and reject connection/scan/HIF transitions. The default boot path
 does not enable this experiment. A submitted command is not an acknowledged
 firmware state; measure power, incoming SSH after idle, reconnection, and
 return to CAM before claiming support.
+
+## Kernel #43 battery results (2026-09-16)
+
+Boot `2254ffc7-7aae-4409-9fa4-ecc6339d97bc`, Image SHA256
+`98348457c1a2ee3635a35346740ee014f587b65bb2a3aa44011588276c32bec5`,
+source `f6ac7ac3a`. Multi-user, backlight and LCD supply off, awake and
+associated, battery discharging, 120 seconds per sample after ten seconds
+settling. Apple experimental cpuidle remained unbound. Whole-machine watts
+below use sampled current times voltage integrated over the interval:
+
+| Sequence | Station policy | PCIe policy | Watts |
+| --- | --- | --- | ---: |
+| 1 | CAM | default | 1.3354 |
+| 2 | FAST PS | default | 1.1585 |
+| 3 | FAST PS | powersupersave | 1.1637 |
+| 4 | FAST PS | default | 1.1629 |
+| 5 | CAM | default | 1.3345 |
+
+Captures: `wifi-idle/wifi-cam-01/`, `wifi-ps-01/`, and
+`wifi-policy-series43/` in the parent workspace's sleep artifacts. CAM
+returned to within 1 mW of its initial measurement. Station PS therefore
+resolves about 0.17 W reduction under these conditions; forcing PCIe L1.2
+adds no resolved saving. These are marginal whole-system comparisons, not
+a direct radio rail meter. Incoming SSH worked during the standalone pair;
+the final series retained successful gateway probes after each stage. A
+single FAST PS gateway probe took 621 ms, so latency still needs qualification.
+Reconnection and application throughput are not established by these runs.
+Raw accumulated counter/current calibration remained around 3.6 units/uAh;
+remaining-charge estimates sometimes increased and are not used.
+
+The earlier #42 `wifi-idle-cpupm-01` run overlapped upload/initramfs work;
+exclude it from CPU power comparisons. Its 1.3676 W cannot resolve the
+benefit of CPU PM. The uncontaminated #42 awake reference was 1.3394 W.
