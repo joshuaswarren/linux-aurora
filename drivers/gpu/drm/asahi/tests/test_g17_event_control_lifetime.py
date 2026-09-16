@@ -29,7 +29,7 @@ def block(pattern, text=source):
 
 constants = "\n".join(
     re.search(r"(?:pub\(crate\) )?const " + name + r": (?:usize|u32|u64) = .*?;", source).group()
-    for name in ["G17P_RENDER_QUEUE_METADATA_BASE", "G17P_RENDER_POOL_A_SLOTS", "G17P_RENDER_POOL_A",
+    for name in ["G17P_RENDER_POOL_A_SLOTS", "G17P_RENDER_POOL_A",
                  "G17P_RENDER_SHARED_CONTROL_INNER", "G17P_RETAINED_RENDER_ORDINALS",
                  "G17P_USER_TILING_RING", "G17P_USER_TILING_POINTERS",
                  "G17P_USER_TILING_OPTIONAL", "G17P_USER_TILING_EVENT",

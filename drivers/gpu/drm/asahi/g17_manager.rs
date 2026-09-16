@@ -1564,7 +1564,6 @@ struct G17PRenderSlotState {
     storage: Option<g17_resources::G17PUserRenderStorage>,
     sksm: Option<G17PRenderSksmQueues>,
     tracker: Option<G17PPartialOpeningRenderTracker>,
-    queued_tracker: Option<G17PPartialOpeningRenderTracker>,
     submission_ordinal: u64,
     auxiliary_timestamp: u64,
     hardware_buffer_id: Option<u32>,
@@ -8034,12 +8033,13 @@ impl G17PManagerConstruction {
                 // maintenance (25G83 B1 0x16ea0); queue/list retirement alone
                 // therefore cannot authorize a userspace-visible fence.
                 // The physical slot retains its ordinal across VM switches,
-                // has one in-flight pair, and refuses 24-bit stamp overflow.
+                // has one in-flight pair. The event value wraps as on M1/M2;
+                // the previous completed value differs even across zero.
                 // Require this exact generation, never a stale nonzero stamp.
                 let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
                 let expected_stamp = self.render_submission_ordinal
                     .checked_add(1)
-                    .and_then(|value| value.checked_mul(0x100))
+                    .map(|value| (value as u32).wrapping_shl(8))
                     .ok_or(EOVERFLOW)?;
                 let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
                 if fragment_stamp != expected_stamp {
@@ -9260,7 +9260,6 @@ impl G17PManagerConstruction {
         let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
             descriptor_low,
             u64::from(queue.submission_ordinal),
-            primary_checkpoint,
         )
         .map_err(|_| EINVAL)?;
         let prepared_entry = g17_submission::prepare_g17p_cl_kick_entry(
@@ -10086,7 +10085,6 @@ impl G17PManagerConstruction {
         let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
             descriptor_low,
             u64::from(queue.submission_ordinal),
-            primary_checkpoint,
         )
         .map_err(|_| EINVAL)?;
         let payload = [descriptor_high, queue.compute.queue_record_gpu_va()];
