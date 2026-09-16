@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Two logical render queues must each keep their own retained storage.
+"""Logical render queues retain affinity to their physical render pairs.
 
-The retained `G17PUserRenderStorage` behind a render slot -- its descriptors,
-render state, TVB pool, parameter-management graph and application-GART root --
-belongs to one descriptor context. Handing a slot to a different queue makes
-`handoff_retained_render_vm` tear that whole graph down and rebuild it for the
-incoming client, and every restage in between is a chance to be refused with
-EBUSY, which Mesa reports as VK_ERROR_DEVICE_LOST.
+Fixed render-pool storage belongs to the VM and pair; its selected descriptor
+context belongs to the current logical queue. Avoiding unnecessary pair moves
+reduces context retargets and cross-VM cached-graph handoffs. Cache reuse must
+still find the VM-owned storage when a sibling queue has a different context.
 
 This compiles the driver's real lease state machine and drives two clients
 alternating frames through it, counting how often a slot changes owner. It also
@@ -62,12 +60,12 @@ handoff_end = manager.index('    fn preserve_immediate_retired_render_graph(', h
 handoff = manager[handoff_start:handoff_end]
 assert 'execution_context: Arc<mmu::T8140ComputeExecutionContext>' in handoff
 assert 'u16::try_from(execution_context.context_id())' in handoff
-assert 'retained_graph_matches_owner(graph, vm, descriptor_context_id)' in handoff
-matcher_start = manager.index('fn retained_graph_matches_owner(')
+assert 'retained_graph_matches_vm(graph, vm)' in handoff
+matcher_start = manager.index('fn retained_graph_matches_vm(')
 matcher_end = manager.index('    /// The retained graph and global aliases', matcher_start)
 matcher = manager[matcher_start:matcher_end]
 assert 'graph.bind.matches(vm)' in matcher
-assert 'graph.storage.descriptor_context_id() == descriptor_context_id' in matcher
+assert 'graph.storage.descriptor_context_id() ==' not in matcher
 assert 'vm.render_pool_mappings_match(' in matcher
 
 # The lease is what decides which retained graph a submission lands on, so the

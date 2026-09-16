@@ -57,7 +57,7 @@ struct Manager {
 }
 impl Manager {
 ''' + "\n".join(function(marker) for marker in (
-    "fn retained_graph_matches_owner(",
+    "fn retained_graph_matches_vm(",
     "fn select_cached_render_graph(",
     "fn retired_render_graph_reclaimable(",
 )) + r'''
@@ -132,12 +132,22 @@ fn occupied_embedded_addresses_require_another_graph() {
     assert_eq!(m.select_cached_render_graph(&vm(), 5), (false, None));
 }
 #[test]
-fn same_vm_with_wrong_pool_or_context_is_not_cross_vm_rebound() {
+fn sibling_context_restores_same_vm_graph_but_stale_pool_is_rejected() {
     let mut m = manager();
     m.retired_render_handoff_graphs.push(graph(2, 4, 0, 9));
-    assert_eq!(m.select_cached_render_graph(&vm(), 5), (false, None));
+    assert_eq!(m.select_cached_render_graph(&vm(), 5), (false, Some(0)));
     let stale = mmu::Vm { id: 2, pools: [99, 99] };
     assert_eq!(m.select_cached_render_graph(&stale, 4), (false, None));
+}
+#[test]
+fn sibling_queue_graph_precedes_available_foreign_graphs() {
+    let mut m = manager();
+    m.retired_render_handoff_graph = Some(graph(1, 4, 0, 9));
+    m.retired_render_handoff_graphs.push(graph(3, 4, 0, 9));
+    m.retired_render_handoff_graphs.push(graph(2, 6, 0, 11));
+    assert_eq!(m.select_cached_render_graph(&vm(), 5), (false, Some(1)));
+    m.retired_render_handoff_graph = Some(graph(2, 6, 0, 11));
+    assert_eq!(m.select_cached_render_graph(&vm(), 5), (true, None));
 }
 '''
 
