@@ -243,3 +243,23 @@ minimum frequency, experimental cpuidle enabled on all CPUs with CPU PM,
 Wi-Fi station PS enabled, multi-user target, battery discharging. Evidence:
 `dcp-owned-dma/endpoint-cycle-v2/{measurement,reference}`. The old failed
 channel-3 guard trial remains separate and contributes no power result.
+
+Full-idle follow-up, #48 boot 9f325c11: the endpoint-only short control and
+HPD passed; returning_idle=2 was accepted. Native power-off, endpoint shutdown,
+AP IDLE and IOP IDLE all acknowledged. After the two-second hold, AP wake
+returned -ETIME (-62), CPU_STATUS=0x4e, RUN still set. No CPU-domain, clock or
+transport-stop write was made. Linux/Wi-Fi remained available, but panel
+restoration was impossible. Thus pipeline/endpoint activity is not sufficient
+to explain the prior full-idle wake failure. Reboot is required; this is not
+a qualified sleep mode. Full capture: dcp-owned-dma/endpoint-iop.
+
+Offline 25F84 AppleFirmwareKit analysis additionally locates the native AFK
+state-machine handshake: handleSetState at 0xfffffe0008ead8b0 maps state 2
+to desired notification 3; runStateMachine at 0xfffffe0008eac168 sends
+internal code 2 for quiescence and code 4 for resume. handleInternalPacket
+at 0xfffffe0008ead6b4 handles acknowledgements 3 and 5. sendInternalPacket
+at 0xfffffe0008eac94c emits a four-byte control payload. This is distinct
+from mailbox SHUTDOWN. The V2 compact transport envelope still needs to be
+matched to the firmware's mode-8 compatibility endpoint before sending it.
+Retain disassembly and decompilation under endpoint-cycle/native; do not
+transplant the four bytes into an EPIC command or claim wire qualification.
