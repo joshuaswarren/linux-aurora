@@ -82,3 +82,36 @@ remaining-charge estimates sometimes increased and are not used.
 The earlier #42 `wifi-idle-cpupm-01` run overlapped upload/initramfs work;
 exclude it from CPU power comparisons. Its 1.3676 W cannot resolve the
 benefit of CPU PM. The uncontaminated #42 awake reference was 1.3394 W.
+
+## GPU fabric isolation on the same boot
+
+`neo-auto-idle.ko` changes only the unmanaged physical AFGGFXNI0 word at
+Main PMGR+0x1b8. It rejects an existing DT provider, active GPU or unsafe
+initial policy; it retains the manual ACTIVE target and lets hardware
+arbitrate idleness. First 30-second trials with minimum state 4 (clock only)
+and 0 (power allowed) both restored ACTIVE and original AUTO/floor policy.
+No DCP CPU register or firmware mapping was changed.
+
+Subsequent 120-second awake panel-off runs with station FAST PS:
+
+| GPU fabric | End-of-measurement word | Whole-machine W |
+| --- | --- | ---: |
+| AUTO, minimum 4 | 0x1404434f | 1.1622 |
+| AUTO, minimum 0 | 0x1000430f | 1.1691 |
+| Original manual ACTIVE restored | 0x0f0043ff | 1.1664 |
+
+Thus automatic power-off reached the native observed state, but no useful
+battery saving was resolved. The initial immediate readback with minimum 0
+was still CLKGATE; the later read reached OFF. Restore returned original
+policy with `pending=N`, `failed=N`; sticky history bits need not match the
+original word. Captures: `wifi-afg43/`, `wifi-afg-series43/`,
+`wifi-afg-series43b/`. The module is not left active, and GPU rendering with
+this policy has not been qualified. Do not install it as a production fix.
+
+The first series used an inadequate fixed wait for the delayed restoration
+work. Its assertion ran while `pending=Y`; a later read and kernel log
+confirmed successful automatic restoration. The controller then stopped that
+already-measured series and unloaded the restored module. The second series
+waited for actual `pending=N` with a bounded deadline and completed. Preserve
+the first series's incomplete JSON alongside the final kernel log rather than
+rewriting it as a fully passed run.
