@@ -26,11 +26,12 @@
 #define IDLE_MASK 0x60000001
 
 static unsigned int seconds, before, during, after, config_before, idle_before;
-static bool tunables, pending, failed;
+static bool tunables, force_clock, pending, failed;
 static void __iomem *asc;
 static struct regmap *map;
 module_param(seconds, uint, 0444);
 module_param(tunables, bool, 0444);
+module_param(force_clock, bool, 0444);
 module_param(before, uint, 0444);
 module_param(during, uint, 0444);
 module_param(after, uint, 0444);
@@ -40,6 +41,7 @@ module_param(pending, bool, 0444);
 module_param(failed, bool, 0444);
 MODULE_PARM_DESC(seconds, "0 read-only; 1..600 automatic clock-idle trial with timed restore");
 MODULE_PARM_DESC(tunables, "Apply only the two native SIO ASC masks while the CPU remains stopped");
+MODULE_PARM_DESC(force_clock, "Request manual CLKGATE for the admitted stopped CPU; excludes tunables");
 
 static void restore(struct work_struct *work)
 {
@@ -48,7 +50,7 @@ static void restore(struct work_struct *work)
 
 	if (!pending)
 		return;
-	ret = regmap_update_bits(map, PS, AUTO | HISTORY, 0);
+	ret = regmap_update_bits(map, PS, AUTO | HISTORY | GENMASK(3, 0), 15);
 	if (!ret)
 		ret = regmap_read_poll_timeout(map, PS, after,
 			(after & 0xff) == 0xff && !(after & BIT(11)), 1, 10000);
@@ -81,7 +83,7 @@ static int __init sio_trial_init(void)
 	u32 status;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,j700") || seconds > 600)
+	if (!of_machine_is_compatible("apple,j700") || seconds > 600 || (force_clock && tunables))
 		return -EINVAL;
 	for_each_node_with_property(node, "reg") {
 		if (of_device_is_available(node) && !of_address_to_resource(node, 0, &res) &&
@@ -118,8 +120,8 @@ static int __init sio_trial_init(void)
 		ret = -EBUSY;
 		goto unmap;
 	}
-	pr_info("neo-sio-idle: admission ps=%#x config=%#x idle=%#x status=%#x seconds=%u tunables=%u\n",
-		before, config_before, idle_before, status, seconds, tunables);
+	pr_info("neo-sio-idle: admission ps=%#x config=%#x idle=%#x status=%#x seconds=%u tunables=%u force_clock=%u\n",
+		before, config_before, idle_before, status, seconds, tunables, force_clock);
 	if (!seconds)
 		return 0;
 	pending = true;
@@ -132,12 +134,19 @@ static int __init sio_trial_init(void)
 			goto rollback;
 		}
 	}
-	ret = regmap_update_bits(map, PS, FLOOR | HISTORY, FIELD_PREP(FLOOR, 4));
-	if (!ret)
-		ret = regmap_update_bits(map, PS, AUTO | HISTORY, AUTO);
-	if (!ret)
-		ret = regmap_read(map, PS, &during);
-	if (!ret && ((during & POLICY) != (AUTO | FIELD_PREP(FLOOR, 4) | 15) || (during & UNSAFE)))
+	if (force_clock) {
+		ret = regmap_update_bits(map, PS, GENMASK(3, 0) | HISTORY, 4);
+		if (!ret)
+			ret = regmap_read_poll_timeout(map, PS, during,
+				(during & 0xff) == 0x44 && !(during & BIT(11)), 1, 10000);
+	} else {
+		ret = regmap_update_bits(map, PS, FLOOR | HISTORY, FIELD_PREP(FLOOR, 4));
+		if (!ret)
+			ret = regmap_update_bits(map, PS, AUTO | HISTORY, AUTO);
+		if (!ret)
+			ret = regmap_read(map, PS, &during);
+	}
+	if (!ret && ((during & POLICY) != (force_clock ? 4 : (AUTO | FIELD_PREP(FLOOR, 4) | 15)) || (during & UNSAFE)))
 		ret = -EIO;
 	pr_info("neo-sio-idle: enable=%d during=%#x\n", ret, during);
 	if (!ret) {
