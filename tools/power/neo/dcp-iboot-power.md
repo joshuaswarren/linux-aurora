@@ -224,3 +224,11 @@ and restarted announcements passed ASan/UBSan replay, mismatched/zero channel,
 truncation and wrong-name rejection. Artifacts: dcp-owned-dma/endpoint-cycle.
 This fixes the diagnostic guard; complete hardware restoration remains to
 be qualified with the changed parser.
+
+A separate `epic_iop_cycle` probe adds AP/IOP IDLE only after native panel
+shutdown and AFK shutdown ACK. It requires returning_idle=2 and refuses
+stop_cpu/clock_depth options. Wake restores AP before reinitializing AFK and
+powering the panel; each result is retained. This changes two preconditions
+from older failed full-idle trials (native pipeline shutdown and acknowledged
+endpoint teardown). It still does not reproduce the complete macOS sequence
+or write any CPU power domain. Build passed; hardware qualification pending.
