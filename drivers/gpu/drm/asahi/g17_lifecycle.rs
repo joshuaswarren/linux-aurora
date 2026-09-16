@@ -235,15 +235,16 @@ pub(crate) const fn persistent_session_needs_recovery(
 
 /// Decide whether the next render must start a fresh firmware session.
 /// Physical 256-slot SKSM/outer rings wrap without a session restart. The
-/// current event writer admits 24-bit stamps; retain that real width bound.
+/// native 40-bit kick timestamp and 32-bit event value wrap independently of
+/// the software ordinal. Neither wrap requires a firmware session restart.
 /// A retained-graph owner change still requires a cold session if the normal
 /// graph-handoff path has not replaced it first.
 pub(crate) const fn retained_render_requires_recycle(
     retained_graph: bool,
     same_owner: bool,
-    next_ordinal: u32,
+    next_ordinal: u64,
 ) -> bool {
-    retained_graph && (!same_owner || next_ordinal >= 0x00ff_ffff)
+    retained_graph && (!same_owner || next_ordinal == u64::MAX)
 }
 
 /// Operations needed to dismantle a retained G17P runtime.
@@ -1241,11 +1242,13 @@ mod tests {
 
     #[test]
     fn physical_ring_wraps_do_not_rebuild_the_retained_session() {
-        for ordinal in [255, 256, 257, 426, 427, 999, 1000, 0x00ff_fffe] {
+        for ordinal in [255, 256, 257, 426, 427, 999, 1000, 0x00ff_fffe,
+                        0x00ff_ffff, 0x0100_0000, 0xffff_ffff, 0x1_0000_0000,
+                        0xffffffffff, 0x10000000000] {
             assert!(!retained_render_requires_recycle(true, true, ordinal));
             assert!(retained_render_requires_recycle(true, false, ordinal));
         }
-        let mut next_ordinal = 0x00ff_fffe;
+        let mut next_ordinal = u64::MAX - 1;
         assert!(!retained_render_requires_recycle(true, true, next_ordinal));
         next_ordinal += 1;
         assert!(retained_render_requires_recycle(true, true, next_ordinal));
