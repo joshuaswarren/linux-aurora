@@ -903,6 +903,15 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		break;
 	}
 
+	/*
+	 * DSP-A on the T8140 AOP link: the receiving serializer samples SDOUT
+	 * on the edge the codec would drive it, so drive SDOUT on the other
+	 * edge (the SCPOL field has one bit per direction: bit 0 SDIN, bit 1
+	 * SDOUT).
+	 */
+	if (cs42l42->dsp_a)
+		asp_cfg_val &= ~(BIT(1) << CS42L42_ASP_SCPOL_SHIFT);
+
 	snd_soc_component_update_bits(component, CS42L42_ASP_CLK_CFG, CS42L42_ASP_MODE_MASK |
 								      CS42L42_ASP_SCPOL_MASK |
 								      CS42L42_ASP_LCPOL_MASK,
@@ -964,10 +973,24 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 
 	switch (substream->stream) {
 	case SNDRV_PCM_STREAM_CAPTURE:
-		/* channel 2 on high LRCLK */
-		val = CS42L42_ASP_TX_CH2_AP_MASK |
-		      (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
-		      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+		if (cs42l42->dsp_a) {
+			/* Both channels in the frame phase, channel 2 one slot in */
+			unsigned int start = params_physical_width(params);
+
+			val = (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
+			      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_MSB, 0);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_LSB, 0);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_MSB,
+						(start >> 8) & 0xff);
+			snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_LSB,
+						start & 0xff);
+		} else {
+			/* channel 2 on high LRCLK */
+			val = CS42L42_ASP_TX_CH2_AP_MASK |
+			      (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
+			      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+		}
 
 		snd_soc_component_update_bits(component, CS42L42_ASP_TX_CH_AP_RES,
 				CS42L42_ASP_TX_CH1_AP_MASK | CS42L42_ASP_TX_CH2_AP_MASK |
