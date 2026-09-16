@@ -199,3 +199,22 @@ only a TODO and returns0. Neo has no SIO node in the current Linux DTS.
 The saved ADT describes /arm-io/sio as iop,ascwrap-v6 with DMA shims and a
 virtual SIO gate. This is a lead for firmware/ownership research, not evidence
 of how many watts it uses, nor authorization to gate its CPU domain blindly.
+
+## Awake automatic-idle checks, kernel #44
+
+Boot c1ac7bb7-6e41-4d97-89bd-7a0fbc4f67bd. The bounded auto-idle sidecar
+keeps the manual target ACTIVE and gives SIO/PMC/Nub candidates a minimum
+floor of CLKGATE; it never permits these candidates to power off. No live
+DT provider exists at the whitelisted offsets. None is a display CPU word.
+
+Separate 15-second trials restored original policy and actual ACTIVE, with
+pending=N, failed=N and gateway probes passing. SIO_CPU remained ACTIVE;
+PMC and DEBUG_GATED reached 0x1404024f; NUB_SPMI0 reached the same clock-gated
+word after an initially active read; NUB_SPMI1 remained ACTIVE. The 0x300
+history bits are observations, not restoration failures. No audio or debug
+port functionality is implied by a passing network probe.
+
+PMC's 120-second awake panel-off FASTPS measurement was 1.164346 W versus
+1.160563 W after restoring manual ACTIVE: no resolved saving. Nub wattage is
+not yet measured. Captures: wifi-auto44/qualify, wifi-auto44/qualify-nub, and
+wifi-pmc-series44 under the parent workspace wifi-idle artifact directory.
