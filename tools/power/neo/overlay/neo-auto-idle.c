@@ -50,7 +50,7 @@ static void restore(struct work_struct *work)
 		ret = regmap_update_bits(map, OFFSET, FLOOR | HISTORY, before & FLOOR);
 	if (!ret)
 		ret = regmap_read(map, OFFSET, &after);
-	if (!ret && ((after ^ before) & POLICY))
+	if (!ret && (((after ^ before) & POLICY) || (after & UNSAFE)))
 		ret = -EIO;
 	failed |= !!ret;
 	pending = !!ret;
@@ -108,7 +108,8 @@ static int __init trial_init(void)
 		ret = regmap_update_bits(map, OFFSET, AUTO | HISTORY, AUTO);
 	if (!ret)
 		ret = regmap_read(map, OFFSET, &during);
-	if (!ret && (during & POLICY) != (AUTO | FIELD_PREP(FLOOR, min_state) | 15))
+	if (!ret && ((during & POLICY) != (AUTO | FIELD_PREP(FLOOR, min_state) | 15) ||
+		     (during & UNSAFE)))
 		ret = -EIO;
 	pr_info("neo-auto-idle: AFGGFXNI0 enable=%d word=%#x\n", ret, during);
 	if (ret) {
