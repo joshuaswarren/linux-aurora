@@ -621,11 +621,12 @@ static ssize_t epic_status_show(struct device *dev, struct device_attribute *a, 
 	struct neo_epic *e = &d->epic;
 
 	guard(mutex)(&e->lock);
-	return sysfs_emit(buf, "active=%u started=%u error=%d last=%#llx ring_size=%u announcement_size=%u advertised=%u iova=%#llx service=%u channel=%u queried=%u response_size=%u retcode=%#x power_stage=%u cycles=%u off_result=%d on_result=%d\n",
+	return sysfs_emit(buf, "active=%u started=%u error=%d last=%#llx ring_size=%u announcement_size=%u advertised=%u iova=%#llx service=%u channel=%u queried=%u response_size=%u retcode=%#x power_stage=%u cycles=%u off_result=%d on_result=%d ap_cycle=%u ap_idle_result=%d ap_wake_result=%d\n",
 		e->active, e->started, e->error, e->last_message, e->ring_size,
 		e->announcement_size, d->owned.advertised, d->owned.iova,
 		e->service, e->channel, e->queried, e->response_size, e->retcode,
-		e->power_stage, e->power_cycles, e->power_off_result, e->power_on_result);
+		e->power_stage, e->power_cycles, e->power_off_result, e->power_on_result,
+		e->ap_cycle, e->ap_idle_result, e->ap_wake_result);
 }
 static ssize_t epic_query_store(struct device *dev, struct device_attribute *a,
 			       const char *buf, size_t count)
@@ -653,25 +654,40 @@ static ssize_t epic_query_store(struct device *dev, struct device_attribute *a,
 		 get_unaligned_le32(e->response + 12), get_unaligned_le32(e->response + 16));
 	return count;
 }
-static ssize_t epic_power_cycle_store(struct device *dev, struct device_attribute *a,
-				     const char *buf, size_t count)
+static ssize_t epic_cycle(struct device *dev, const char *buf, size_t count,
+			  bool ap_idle)
 {
 	struct neo_dcp *d = dev_get_drvdata(dev);
 	struct neo_epic *e = &d->epic;
 	u32 seconds;
-	int off, on;
+	int off, on, idle = 0, wake = 0;
 
 	if (kstrtou32(buf, 0, &seconds) || !seconds || seconds > 300)
 		return -EINVAL;
 	guard(mutex)(&d->lock);
 	if (atomic_read(&d->failed) || !e->queried || e->error ||
-	    READ_ONCE(sleep_enabled) || d->touched)
+	    READ_ONCE(sleep_enabled) || d->touched ||
+	    !apple_rtkit_is_running(d->rtk))
 		return -EBUSY;
+	WRITE_ONCE(e->ap_cycle, ap_idle);
+	WRITE_ONCE(e->ap_idle_result, 0);
+	WRITE_ONCE(e->ap_wake_result, 0);
 	WRITE_ONCE(e->power_stage, 1);
 	off = neo_epic_command(e, 2, false);
 	WRITE_ONCE(e->power_off_result, off);
 	dev_info(dev, "DCP iBoot power-off result=%d hold=%us\n", off, seconds);
-	if (!off) {
+	if (!off && ap_idle) {
+		/* Display shutdown precedes the already qualified AP-only
+		 * notification. Keep IOP, clocks, transport and DMA retained.
+		 */
+		d->touched = true;
+		idle = apple_rtkit_idle_ap(d->rtk);
+		WRITE_ONCE(e->ap_idle_result, idle);
+		dev_info(dev, "DCP pipeline-off AP idle result=%d\n", idle);
+		if (!idle)
+			d->sleeps++;
+	}
+	if (!off && !idle && !atomic_read(&d->failed)) {
 		WRITE_ONCE(e->power_stage, 2);
 		/* Always return to the power-on attempt, even if the userspace
 		 * writer receives a signal or closes its SSH session.
@@ -679,15 +695,32 @@ static ssize_t epic_power_cycle_store(struct device *dev, struct device_attribut
 		msleep(seconds * 1000);
 	}
 	WRITE_ONCE(e->power_stage, 3);
-	on = neo_epic_command(e, 2, true);
+	if (d->touched) {
+		/* A failed request may still have changed firmware state. Attempt
+		 * the same recovery as the retained PM path, then fail the trial.
+		 */
+		wake = wake_dcp(d);
+		WRITE_ONCE(e->ap_wake_result, wake);
+	}
+	on = wake ?: neo_epic_command(e, 2, true);
 	WRITE_ONCE(e->power_on_result, on);
-	WRITE_ONCE(e->power_stage, on ? 5 : 4);
-	if (!off && !on)
+	WRITE_ONCE(e->power_stage, off || idle || on ? 5 : 4);
+	if (!off && !idle && !on)
 		e->power_cycles++;
 	else
 		atomic_set(&d->failed, 1);
 	dev_info(dev, "DCP iBoot power-on result=%d completed cycles=%u\n", on, e->power_cycles);
-	return off ?: on ?: count;
+	return off ?: idle ?: on ?: count;
+}
+static ssize_t epic_power_cycle_store(struct device *dev, struct device_attribute *a,
+				     const char *buf, size_t count)
+{
+	return epic_cycle(dev, buf, count, false);
+}
+static ssize_t epic_ap_cycle_store(struct device *dev, struct device_attribute *a,
+				  const char *buf, size_t count)
+{
+	return epic_cycle(dev, buf, count, true);
 }
 static ssize_t epic_response_read(struct file *file, struct kobject *kobj,
 	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
@@ -704,6 +737,7 @@ static ssize_t epic_response_read(struct file *file, struct kobject *kobj,
 }
 static DEVICE_ATTR_WO(epic_query);
 static DEVICE_ATTR_WO(epic_power_cycle);
+static DEVICE_ATTR_WO(epic_ap_cycle);
 static BIN_ATTR_ADMIN_RO(epic_response, 128);
 static ssize_t epic_announcement_read(struct file *file, struct kobject *kobj,
 	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
@@ -752,7 +786,8 @@ static struct attribute *neo_dcp_attrs[] = {
 	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr,
 	&dev_attr_returning_idle.attr, &dev_attr_awake_cycle.attr,
 	&dev_attr_scratch_dma.attr, &dev_attr_epic_start.attr, &dev_attr_epic_status.attr,
-	&dev_attr_epic_query.attr, &dev_attr_epic_power_cycle.attr, NULL
+	&dev_attr_epic_query.attr, &dev_attr_epic_power_cycle.attr,
+	&dev_attr_epic_ap_cycle.attr, NULL
 };
 static const struct bin_attribute *const neo_dcp_bin_attrs[] = {
 	&bin_attr_oslog_snapshot, &bin_attr_epic_announcement, &bin_attr_epic_response,

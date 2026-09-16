@@ -38,6 +38,8 @@ struct neo_epic {
 	bool service, waiting, queried;
 	u32 power_stage, power_cycles;
 	int power_off_result, power_on_result;
+	bool ap_cycle;
+	int ap_idle_result, ap_wake_result;
 	int error;
 };
 
