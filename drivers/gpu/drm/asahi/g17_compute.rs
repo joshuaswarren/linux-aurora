@@ -45,6 +45,7 @@ pub(crate) enum ComputeBuildError {
     SamplerCountOutOfRange,
     SamplerPair,
     SamplerAlignment,
+    ScsRequestOutOfRange,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -131,11 +132,72 @@ fn add(address: u64, offset: u64) -> Result<u64, ComputeBuildError> {
         .ok_or(ComputeBuildError::AddressOverflow)
 }
 
+/// The three register values that carry a compute kick's ray-traversal (SCS)
+/// scratch request.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ScsRequestRegisters {
+    /// 0x101d1: pages in the low half, MiB in the high half.
+    pub(crate) size_word: u64,
+    /// 0xd479: the request's "extras" count.
+    pub(crate) extras: u64,
+    /// 0x107a1: window and enable, or the disabled constant.
+    pub(crate) window_word: u64,
+}
+
+/// The MiB half of the SCS request, derived from the page count exactly as
+/// AGXMetalG17P derives it in `ComputeContext::endComputePass`
+/// (0x216ac1f5c..0x216ac1f6c: `pages << 2`, `+ 0x3ff`, `>> 10`).
+fn scs_request_mib(pages: u32) -> u32 {
+    ((pages as u64 + 0xff) >> 8) as u32
+}
+
+/// Encode an SCS scratch request the way the kext's register builder does
+/// (generateCLRegisterListG16Common): the page and MiB counts share 0x101d1,
+/// the extras count is its own register, and 0x107a1 either carries the window
+/// with the enable bit or reads back the disabled constant 0x00ff_0000.
+///
+/// `mib` of zero means "derive it the way Metal does", which is what a faithful
+/// request wants; pass a non-zero value only to sweep the two halves of 0x101d1
+/// independently.  A request of zero pages reproduces the register program this
+/// driver has always emitted, so the default path is unchanged.
+pub(crate) fn scs_request_registers(
+    pages: u32,
+    mib: u32,
+    extras: u32,
+    window: u32,
+) -> Result<ScsRequestRegisters, ComputeBuildError> {
+    if pages == 0 {
+        return Ok(ScsRequestRegisters {
+            size_word: 0,
+            extras: 0,
+            window_word: 0xff_0000,
+        });
+    }
+    // Keep the page and MiB halves distinct, and the window below bit 24's
+    // enable flag. Reject unrepresentable diagnostic inputs before publishing
+    // any register program instead of overlapping fields or truncating them.
+    if pages > 0xffff || mib > 0xffff || window > 0xff {
+        return Err(ComputeBuildError::ScsRequestOutOfRange);
+    }
+    let mib = if mib == 0 { scs_request_mib(pages) } else { mib };
+    Ok(ScsRequestRegisters {
+        size_word: (pages as u64) | ((mib as u64) << 16),
+        extras: extras as u64,
+        window_word: ((window as u64) << 16) | 0x0100_0000,
+    })
+}
+
 /// Build the complete 40-write compute register program.
 pub(crate) fn build_compute_registers(
     p: ComputeRegisterParameters,
 ) -> Result<[ComputeRegister; COMPUTE_REGISTER_COUNT], ComputeBuildError> {
     let context_word = ((p.context_id as u64) << 8) | p.work_ordinal as u64;
+    let scs = scs_request_registers(
+        *crate::module_parameters::g17p_compute_scs_pages.value(),
+        *crate::module_parameters::g17p_compute_scs_mib.value(),
+        *crate::module_parameters::g17p_compute_scs_extras.value(),
+        *crate::module_parameters::g17p_compute_scs_window.value(),
+    )?;
 
     Ok([
         ComputeRegister::new(0x1a510, p.preempt_base),
@@ -157,10 +219,10 @@ pub(crate) fn build_compute_registers(
         ComputeRegister::new(0x1a061, 0),
         ComputeRegister::new(0x1a0b9, 0),
         ComputeRegister::new(0x1a0c1, 0),
-        ComputeRegister::new(0x101d1, 0),
-        ComputeRegister::new(0x0d479, 0),
+        ComputeRegister::new(0x101d1, scs.size_word),
+        ComputeRegister::new(0x0d479, scs.extras),
         ComputeRegister::new(0x1a0e9, 8),
-        ComputeRegister::new(0x107a1, 0xff_0000),
+        ComputeRegister::new(0x107a1, scs.window_word),
         ComputeRegister::new(0x0a599, 0x0000_0132_0040_0020),
         ComputeRegister::new(0x0d411, 0x0000_0002_0000_0001),
         ComputeRegister::new(0x1a540, p.dispatch_identity),
@@ -668,6 +730,58 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_scs_request_reproduces_the_historical_registers() {
+        // Zero pages is the kext's "this pass asks for no ray-traversal
+        // scratch" branch, and is what this driver emitted before the request
+        // became settable.  register_program_matches_the_hardware_tested_m1n1_builder
+        // above pins the same thing through the whole program's hash.
+        let scs = scs_request_registers(0, 0, 0, 0).unwrap();
+        assert_eq!(scs.size_word, 0);
+        assert_eq!(scs.extras, 0);
+        assert_eq!(scs.window_word, 0xff_0000);
+        // The window is ignored while no pages are requested.
+        assert_eq!(scs_request_registers(0, 7, 3, 9), scs_request_registers(0, 7, 3, 0));
+    }
+
+    #[test]
+    fn a_nonempty_scs_request_packs_pages_mib_extras_and_window() {
+        // 89 pages is the four-section floor (0x58000 bytes) plus the guard
+        // page AGXMetalG17P adds; one MiB covers it ((89 * 4 + 0x3ff) >> 10).
+        let scs = scs_request_registers(89, 1, 0, 0).unwrap();
+        assert_eq!(scs.size_word, 0x0001_0059);
+        assert_eq!(scs.extras, 0);
+        assert_eq!(scs.window_word, 0x0100_0000);
+
+        let wide = scs_request_registers(815, 4, 2, 0x20).unwrap();
+        assert_eq!(wide.size_word, 0x0004_032f);
+        assert_eq!(wide.extras, 2);
+        assert_eq!(wide.window_word, 0x0120_0000);
+    }
+
+    #[test]
+    fn an_unset_mib_is_derived_from_the_page_count_like_metal_does() {
+        // AGXMetalG17P computes MiB as (pages * 4 + 0x3ff) >> 10 and never
+        // leaves it zero next to a non-zero page count, so the driver must not
+        // either: an operator who sets only the page count still gets the
+        // register value a real ray-tracing kick carries.
+        // 0x59 pages = the four fixed sections plus the guard page.
+        assert_eq!(scs_request_registers(0x59, 0, 0, 0).unwrap().size_word, 0x0001_0059);
+        // 0x32f pages = the intersector<triangle_data> layout
+        // (traversal depth 0x70, driver payload 0x48, 96 cliques).
+        assert_eq!(scs_request_registers(0x32f, 0, 0, 0).unwrap().size_word, 0x0004_032f);
+        // 0x3c8 pages = the intersection_query<> layout (driver payload 0x114).
+        assert_eq!(scs_request_registers(0x3c8, 0, 0, 0).unwrap().size_word, 0x0004_03c8);
+        // 0x6a7 pages = intersection_query<instancing,triangle_data> on a
+        // top-level structure, the Vulkan rayQueryEXT shape
+        // (traversal depth 0xe8, driver payload 0x128).
+        assert_eq!(scs_request_registers(0x6a7, 0, 0, 0).unwrap().size_word, 0x0007_06a7);
+        // An explicit value still wins, so the halves stay separable.
+        assert_eq!(scs_request_registers(0x59, 9, 0, 0).unwrap().size_word, 0x0009_0059);
+        // Zero pages keeps the historical register exactly.
+        assert_eq!(scs_request_registers(0, 0, 0, 0).unwrap().size_word, 0);
+    }
+
+    #[test]
     fn descriptor_preserves_cdm_sampler_timestamp_and_queue_state() {
         let registers = build_compute_registers(register_parameters()).unwrap();
         let mut raw = [0u8; COMPUTE_DESCRIPTOR_SIZE];
@@ -823,7 +937,13 @@ mod tests {
                 write_index: 3,
             }
         );
-        assert_eq!(fnv1a64(&graph), 0x7eb0_0e86_2d6b_2c57);
+        // The original add3 fixture used FlushID index 1. The retained-queue
+        // builder switched that index to 0 in fcc1b7dfc8847. Check that field
+        // explicitly, then normalize only it to retain the original whole-
+        // graph golden instead of silently replacing the historical hash.
+        assert_eq!(&graph[COMPUTE_OPTIONAL + 0x46..COMPUTE_OPTIONAL + 0x48], &[0, 0]);
+        put_u16(&mut graph, COMPUTE_OPTIONAL + 0x46, 1);
+        assert_eq!(fnv1a64(&graph), 0xc8d6_b367_6415_8da7);
         assert_eq!(fnv1a64(&context), 0x5ba5_b355_8c90_0783);
     }
 }

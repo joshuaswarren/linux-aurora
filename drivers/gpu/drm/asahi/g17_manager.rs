@@ -6219,6 +6219,352 @@ mod tests {
     const ROOT: u64 = 0xffff_fc20_0100_0000;
     const UAT: u64 = 0x9000_0000;
 
+    #[test]
+    fn ta_hardware_buffer_ids_match_native_order_exhaustion_and_reuse() {
+        let mut allocator = G17PHardwareBufferIdAllocator::new();
+        for expected in 0..G17P_TA_HARDWARE_BUFFER_ID_COUNT as u32 {
+            assert_eq!(allocator.allocate(), Ok(expected));
+        }
+        assert_eq!(
+            allocator.allocate(),
+            Err(G17PHardwareBufferIdError::Exhausted)
+        );
+
+        allocator.release(42).unwrap();
+        assert_eq!(
+            allocator.release(42),
+            Err(G17PHardwareBufferIdError::DoubleFree)
+        );
+        assert_eq!(allocator.allocate(), Ok(42));
+        assert_eq!(
+            allocator.release(G17P_TA_HARDWARE_BUFFER_ID_COUNT as u32),
+            Err(G17PHardwareBufferIdError::InvalidId)
+        );
+    }
+
+    #[test]
+    fn command_buffer_state_allocator_is_shared_monotonic_and_skips_63() {
+        let mut allocator = G17PCommandBufferStateAllocator::new();
+        for expected in 0u32..63 {
+            let word = allocator.allocate_one().unwrap();
+            assert_eq!(word, expected);
+            assert!(allocator.release_one(word));
+        }
+        assert_eq!(allocator.allocate_one(), Some(64));
+        assert!(allocator.release_one(64));
+
+        allocator.next = 128;
+        let replacement = allocator.allocate_one().unwrap();
+        assert_eq!(replacement, 128);
+        // An ABA/stale completion cannot release the wrapped replacement.
+        assert!(!allocator.release_one(0));
+        assert!(allocator.release_one(replacement));
+
+        let mut full = G17PCommandBufferStateAllocator::new();
+        for _ in 0..63 {
+            assert!(full.allocate_one().is_some());
+        }
+        assert_eq!(full.allocate_one(), None);
+    }
+
+    #[test]
+    fn command_buffer_state_allocator_preserves_full_u32_across_wrap() {
+        let mut allocator = G17PCommandBufferStateAllocator::new();
+        allocator.next = u32::MAX - 1;
+        let word = allocator.allocate_one().unwrap();
+        assert_eq!(word, u32::MAX - 1);
+        assert_eq!(word & 63, 62);
+        assert!(allocator.release_one(word));
+    }
+
+    #[test]
+    fn native_render_visibility_and_ta_order_are_strict() {
+        assert!(g17p_native_fragment_only_visible(
+            0, 0, 4, 4, 1, 1, 0, 0
+        ));
+        assert!(!g17p_native_fragment_only_visible(
+            0, 4, 4, 4, 1, 1, 0, 0
+        ));
+        assert!(!g17p_native_fragment_only_visible(
+            0, 0, 4, 4, 1, 1, 1, 0
+        ));
+        assert!(g17p_native_tiling_fully_visible(4, 4, 1, 1));
+        assert!(!g17p_native_tiling_fully_visible(2, 4, 1, 1));
+
+        let mut order = G17PNativeRenderPublishOrder::after_fragment_doorbell();
+        assert_eq!(
+            order.advance(G17PNativeRenderPublishPhase::TilingSksm),
+            Err(())
+        );
+        for phase in [
+            G17PNativeRenderPublishPhase::TilingPrefix,
+            G17PNativeRenderPublishPhase::TilingSksm,
+            G17PNativeRenderPublishPhase::TilingKick,
+            G17PNativeRenderPublishPhase::TilingOuter,
+            G17PNativeRenderPublishPhase::PoolTransition,
+        ] {
+            assert_eq!(order.advance(phase), Ok(()));
+        }
+        assert_eq!(
+            order.advance(G17PNativeRenderPublishPhase::PoolTransition),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn native_render_mode_three_waits_for_exact_fragment_outer_consumption() {
+        assert!(!g17p_native_fragment_first_mode(0));
+        assert!(!g17p_native_fragment_first_mode(1));
+        assert!(g17p_native_fragment_first_mode(2));
+        assert!(g17p_native_fragment_first_mode(3));
+        assert!(!g17p_native_fragment_first_mode(4));
+
+        assert!(!g17p_native_fragment_preack_mode(2));
+        assert!(g17p_native_fragment_preack_mode(3));
+
+        assert!(!g17p_native_fragment_outer_consumed([0, 0, 1], 1));
+        assert!(!g17p_native_fragment_outer_consumed([0, 1, 1], 1));
+        assert!(g17p_native_fragment_outer_consumed([1, 0, 1], 1));
+        assert!(g17p_native_fragment_outer_consumed([1, 1, 1], 1));
+        assert!(!g17p_native_fragment_outer_consumed([1, 1, 2], 1));
+    }
+
+    #[test]
+    fn render_outer_deferral_mode_matrix_is_explicit() {
+        use g17_resources::G17PDeferredOuterPublication::{Both, None, Tiling};
+
+        assert_eq!(g17p_render_deferred_outer_mode(0, false), Both);
+        assert_eq!(g17p_render_deferred_outer_mode(1, false), None);
+        assert_eq!(g17p_render_deferred_outer_mode(2, false), Tiling);
+        assert_eq!(g17p_render_deferred_outer_mode(3, false), Tiling);
+        for mode in 0..=3 {
+            assert_eq!(g17p_render_deferred_outer_mode(mode, true), Both);
+        }
+    }
+
+    #[test]
+    fn bootstrap_async_flist_releases_only_after_type13_and_paired_render() {
+        let mut lifecycle = G17PBootstrapUmaLifecycle::new();
+        assert_eq!(
+            lifecycle.match_completion(lifecycle.request.unwrap()),
+            Err(G17PBootstrapUmaLifecycleError::WrongReferenceCount)
+        );
+        lifecycle.retire_prepare_reference().unwrap();
+        lifecycle.match_completion(lifecycle.request.unwrap()).unwrap();
+        assert_eq!(lifecycle.hardware_buffer_references, 2);
+        assert_eq!(lifecycle.pending_release_count, 2);
+        assert_eq!(lifecycle.pending_release(), None);
+        let release = lifecycle.retire_render_references().unwrap().unwrap();
+        assert_eq!(
+            release,
+            G17PBootstrapUmaRelease {
+                sequence: 0,
+                hardware_buffer_id: 0,
+            }
+        );
+        assert_eq!(lifecycle.hardware_buffer_references, 0);
+        assert_eq!(lifecycle.pending_release_count, 0);
+        assert_eq!(lifecycle.pending_release(), Some(release));
+        lifecycle.mark_published(release).unwrap();
+        lifecycle.mark_sent(29).unwrap();
+        assert_eq!(lifecycle.pending_release(), None);
+        assert!(lifecycle.release_sent());
+        assert_eq!(lifecycle.release_producer_after, Some(29));
+        assert!(lifecycle.mark_completed(28).is_err());
+        lifecycle.mark_completed(29).unwrap();
+        assert!(!lifecycle.release_sent());
+        assert_eq!(lifecycle.release_producer_after, None);
+    }
+
+    #[test]
+    fn bootstrap_async_flist_release_backpressure_tracks_exact_producer() {
+        fn sent_lifecycle(target: u32) -> G17PBootstrapUmaLifecycle {
+            let mut lifecycle = G17PBootstrapUmaLifecycle::new();
+            lifecycle.retire_prepare_reference().unwrap();
+            lifecycle
+                .match_completion(lifecycle.request.unwrap())
+                .unwrap();
+            let release = lifecycle.retire_render_references().unwrap().unwrap();
+            lifecycle.mark_published(release).unwrap();
+            lifecycle.mark_sent(target).unwrap();
+            lifecycle
+        }
+
+        let mut delayed = sent_lifecycle(29);
+        assert_eq!(delayed.observe_release_consumer(28), Ok(false));
+        assert!(delayed.release_sent());
+        assert_eq!(delayed.observe_release_consumer(29), Ok(true));
+        assert_eq!(delayed.state, G17PBootstrapUmaRequestState::Completed);
+
+        let mut timed_out = sent_lifecycle(41);
+        for _ in 0..20 {
+            assert_eq!(timed_out.observe_release_consumer(40), Ok(false));
+        }
+        assert!(timed_out.release_sent());
+        assert_eq!(timed_out.release_producer_after, Some(41));
+        assert_eq!(timed_out.observe_release_consumer(41), Ok(true));
+    }
+
+    #[test]
+    fn bootstrap_async_flist_rejects_raw_or_duplicate_type13_records() {
+        let mut lifecycle = G17PBootstrapUmaLifecycle::new();
+        lifecycle.retire_prepare_reference().unwrap();
+        let exact = lifecycle.request.unwrap();
+        for wrong in [
+            G17PBootstrapUmaCompletion {
+                cookie: exact.cookie + 0x40,
+                ..exact
+            },
+            G17PBootstrapUmaCompletion {
+                count: exact.count - 1,
+                ..exact
+            },
+            G17PBootstrapUmaCompletion {
+                hardware_buffer_id: 1,
+                ..exact
+            },
+        ] {
+            assert_eq!(
+                lifecycle.match_completion(wrong),
+                Err(G17PBootstrapUmaLifecycleError::WrongCompletion)
+            );
+        }
+        lifecycle.match_completion(exact).unwrap();
+        assert_eq!(
+            lifecycle.match_completion(exact),
+            Err(G17PBootstrapUmaLifecycleError::WrongPhase)
+        );
+    }
+
+    #[test]
+    fn shared_flist_holds_both_render_pairs_until_the_last_retirement() {
+        let mut first = G17PBootstrapUmaLifecycle::new();
+        first.retire_prepare_reference().unwrap();
+        first.match_completion(first.request.unwrap()).unwrap();
+        assert_eq!((first.hardware_buffer_references, first.pending_release_count), (2, 2));
+
+        let mut both = G17PBootstrapUmaLifecycle::acquire(Some(&first), 1).unwrap();
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (5, 4));
+        both.retire_prepare_reference().unwrap();
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (4, 4));
+        assert_eq!(both.retire_render_references().unwrap(), None);
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (2, 2));
+        let release = both.retire_render_references().unwrap().unwrap();
+        assert_eq!(release.sequence, 1);
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (0, 0));
+    }
+
+    #[test]
+    fn retained_flist_leases_grow_once_and_release_every_captured_generation() {
+        let mut previous = None;
+        let mut grows = 0;
+        let mut releases = 0;
+        for ordinal in 0..3 {
+            let sequence = u64::from(g17_submission::g17p_render_flist_generation(ordinal));
+            let mut lease = G17PBootstrapUmaLifecycle::acquire(previous.as_ref(), sequence).unwrap();
+            assert_eq!(lease.sequence, sequence);
+            assert_eq!(lease.pending_release_count, 2);
+            assert_eq!(lease.hardware_buffer_references, if ordinal == 0 { 4 } else { 3 });
+            assert_eq!(lease.retire_render_references(), Err(G17PBootstrapUmaLifecycleError::WrongPhase));
+            lease.retire_prepare_reference().unwrap();
+            if let Some(request) = lease.request {
+                grows += 1;
+                assert_eq!(lease.retire_render_references(), Err(G17PBootstrapUmaLifecycleError::WrongPhase));
+                lease.match_completion(request).unwrap();
+            }
+            assert_eq!(lease.state, G17PBootstrapUmaRequestState::Ready);
+            assert!(lease.retire_prepare_reference().is_err());
+            let release = lease.retire_render_references().unwrap().unwrap();
+            releases += 1;
+            assert_eq!(release.sequence, sequence);
+            assert_eq!(release.hardware_buffer_id, G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID);
+            assert!(lease.retire_render_references().is_err());
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
+            // Submission ordinals are wide; channel ring producers remain u32.
+            let producer_after = u32::try_from(ordinal + 20).unwrap();
+            assert!(lease.mark_completed(producer_after).is_err());
+            assert!(lease.mark_published(G17PBootstrapUmaRelease { sequence: sequence + 1, ..release }).is_err());
+            lease.mark_published(release).unwrap();
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
+            lease.mark_sent(producer_after).unwrap();
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
+            assert!(lease.mark_completed(producer_after + 1).is_err());
+            lease.mark_completed(producer_after).unwrap();
+            assert!(lease.mark_completed(producer_after).is_err());
+            assert!(lease.mark_published(release).is_err());
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence).is_err());
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 2).is_err());
+            previous = Some(lease);
+        }
+        assert_eq!((grows, releases), (1, 3));
+        assert!(G17PBootstrapUmaLifecycle::acquire(None, 1).is_err());
+        let mut wrong = previous.unwrap();
+        wrong.hardware_buffer_id += 1;
+        assert!(G17PBootstrapUmaLifecycle::acquire(Some(&wrong), 3).is_err());
+        let mut warm = G17PBootstrapUmaLifecycle::acquire(previous.as_ref(), 3).unwrap();
+        let stale = G17PBootstrapUmaLifecycle::new().request.unwrap();
+        assert_eq!(warm.match_completion(stale), Err(G17PBootstrapUmaLifecycleError::WrongCompletion));
+        warm.retire_prepare_reference().unwrap();
+        assert_eq!(warm.match_completion(stale), Err(G17PBootstrapUmaLifecycleError::WrongPhase));
+    }
+
+    fn decode_hex<const N: usize>(source: &[u8]) -> [u8; N] {
+        let source = source.strip_suffix(b"\n").unwrap_or(source);
+        assert_eq!(source.len(), N * 2);
+        let nibble = |value: u8| match value {
+            b'0'..=b'9' => value - b'0',
+            b'a'..=b'f' => value - b'a' + 10,
+            _ => panic!("invalid hex fixture"),
+        };
+        let mut out = [0u8; N];
+        let mut index = 0;
+        while index < N {
+            out[index] = nibble(source[index * 2]) << 4 | nibble(source[index * 2 + 1]);
+            index += 1;
+        }
+        out
+    }
+
+    fn instruction(bytes: &[u8], index: usize) -> u32 {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    }
+
+    fn sign_extend(value: u64, bits: u32) -> i64 {
+        ((value << (64 - bits)) as i64) >> (64 - bits)
+    }
+
+    fn adrp_target(pc: u64, value: u32) -> u64 {
+        assert_eq!(value & 0x9f00_0000, 0x9000_0000);
+        let immediate = (((value as u64 >> 5) & 0x7ffff) << 2)
+            | ((value as u64 >> 29) & 0x3);
+        (pc & !0xfff).wrapping_add((sign_extend(immediate, 21) << 12) as u64)
+    }
+
+    fn branch_target(pc: u64, value: u32) -> u64 {
+        assert_eq!(value & 0x7c00_0000, 0x1400_0000);
+        pc.wrapping_add((sign_extend((value & 0x03ff_ffff) as u64, 26) << 2) as u64)
+    }
+
+    fn conditional_branch_target(pc: u64, value: u32) -> u64 {
+        assert_eq!(value & 0xff00_0010, 0x5400_0000);
+        pc.wrapping_add((sign_extend(((value >> 5) & 0x7ffff) as u64, 19) << 2) as u64)
+    }
+
+    fn load_store_unsigned_offset(value: u32) -> usize {
+        let scale = value >> 30;
+        (((value >> 10) & 0xfff) as usize) << scale
+    }
+
+    fn add_immediate(value: u32) -> usize {
+        assert_eq!(value & 0x7f00_0000, 0x1100_0000);
+        (((value >> 10) & 0xfff) as usize) << (((value >> 22) & 1) * 12)
+    }
+
+    fn wide_immediate(value: u32) -> u64 {
+        let shift = ((value >> 21) & 0x3) * 16;
+        ((value as u64 >> 5) & 0xffff) << shift
+    }
+
     fn target() -> TargetObservation {
         TargetObservation {
             chip_id: 0x8140,
