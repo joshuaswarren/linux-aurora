@@ -9935,11 +9935,12 @@ mod tests {
             assert_eq!(release.hardware_buffer_id, G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID);
             assert!(lease.retire_render_references().is_err());
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
-            assert!(lease.mark_completed(ordinal + 20).is_err());
+            // Submission ordinals are wide; channel ring producers remain u32.
+            let producer_after = u32::try_from(ordinal + 20).unwrap();
+            assert!(lease.mark_completed(producer_after).is_err());
             assert!(lease.mark_published(G17PBootstrapUmaRelease { sequence: sequence + 1, ..release }).is_err());
             lease.mark_published(release).unwrap();
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
-            let producer_after = ordinal + 20;
             lease.mark_sent(producer_after).unwrap();
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
             assert!(lease.mark_completed(producer_after + 1).is_err());
