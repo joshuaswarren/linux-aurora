@@ -374,9 +374,13 @@ static int neo_epic_command(struct neo_epic *e, u32 op, bool power)
 	sub[4] = 4;
 	sub[5] = 0x30;
 	put_unaligned_le16(0xc0, sub + 6);
-	put_unaligned_le64(rx, cmd + 4);
+	/* SET_POWER sets response length to zero (25F84 0x42e16d8).
+	 * Do not offer an RX buffer: AFKEPCommandContext's buffer-copy path
+	 * asserts on a zero-byte copy at 0x404c224. HPD returns 20 bytes.
+	 */
+	put_unaligned_le64(op == 3 ? rx : 0, cmd + 4);
 	put_unaligned_le64(tx, cmd + 12);
-	put_unaligned_le32(SZ_16K, cmd + 20);
+	put_unaligned_le32(op == 3 ? SZ_16K : 0, cmd + 20);
 	put_unaligned_le32(txsize, cmd + 24);
 	if (r->size - wp < sizeof(message)) {
 		memcpy(r->data + wp, message, 16);
