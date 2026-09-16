@@ -83,3 +83,19 @@ provides no saving with this firmware/AP configuration; its draw resembles
 CAM. This is an observed outcome, not proof of how firmware interprets or
 honors that profile. The selector and original PS setting were restored.
 Capture: wifi-maxps-series45/.
+
+## #46 interrupt wake exposes a rearm failure
+
+Boot e9edfe4e-c27e-4ef9-9944-0a131b93a87c, Image SHA256
+8e8cdd4564cb6e9da1b5f895c9a370d1b293456ffcb1a5e8dc9f5a60f18fc9b0.
+The timer-only 100 ms control recovered and all three pings passed. With
+MSI wake armed, the next 100 ms trial ended in 12.07 ms with irq_woke=1,
+last ownership word4, result0 and admission/quiescence cleared. However,
+all subsequent gateway probes failed, so the harness saved logs and rebooted
+into normal #6. No power test ran. Capture: wifi-ownirq-qualify46/.
+
+A code review found the consumed MSI cause was never serviced by the guarded
+handler. Since the device mask was already enabled, restoring that same mask
+did not ensure a fresh edge. #47 masks the device, drains and acknowledges
+pending causes after ownership and DMA verification, then enables Linux IRQ.
+This is the next candidate fix, not a passing network result yet.
