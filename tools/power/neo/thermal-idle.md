@@ -51,3 +51,21 @@ The controller restored schedutil and normal polling explicitly, then the
 revised single-threaded harness used an explicit fork context and guarded joins.
 Keep `wifi-thermal-qualification44/harness-failure.log` as the failed tool run;
 it is not a hardware failure or a passing load test.
+
+## Reproducible paired measurement
+
+`idle-profile-trial.py` wraps the panel-off measurement with explicit station
+and CPU policies. It records frequency limits, IRQ counts, sample identities
+and a gateway probe; restores both policies independently on normal/error
+exit; and verifies restoration readbacks. Run it in a transient service,
+with the sleep inhibitor active, then test incoming SSH separately:
+
+```
+python3 idle-profile-trial.py --directory /root/dirtyroom-gpu/neo-suspend \
+  --output NEW_DIRECTORY --idle-poll-ms 100 --power-save on --seconds 120
+```
+
+Use 0 for the normal-polling reference. The child independently bounds panel
+and backlight off time. Battery wattage applies to the idle interval, not the
+later gateway probe. Do not overlap these trials with other policy changes,
+CPU loads, uploads, or suspend experiments.
