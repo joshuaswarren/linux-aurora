@@ -212,3 +212,29 @@ whole-machine battery savings. These captures also have different observer
 overhead and OS background work. Do not add the rows and claim measured
 independent rail power, or claim solving P0 alone will achieve 200 mW.
 No new whole-machine power reduction is established by these diagnostics.
+
+## Linux per-core system-register capture
+
+The opt-in `overlay/neo-cpu-regs.ko` takes read-only snapshots using pinned
+process-context workers, never IPI callbacks. Its temporary die notifier
+recognizes only the diagnostic's exact MRS sites and is removed before
+module initialization returns. Unsupported reads can still emit an Oops
+header and taint the kernel: require `kernel.panic_on_oops=0`. No MSR/MMIO
+writes or automatic interpretation of read-as-zero registers are provided.
+
+On boot 57a0b2d4, all nine selected registers read successfully on all six
+cores; the UNDEF recovery path was **not exercised**. Module unload passed
+and taint stayed 4096. Captures/binaries are in `registers-57a0b2d4`.
+
+P0 and P1 matched exactly: CYC_OVRD=0, ACC_CFG=0xd,
+ACC_OVRD=0x1800109000040212, MDSCR=0x1000, PMCR0=PMCR1=0,
+DBGPRCR=0, OSLSR=8, AMX_CTL=0. E cores differ only in ACC_OVRD
+(0x1800101000040212). Thus these registers do not identify a P0-only
+debug power request, enabled legacy PMU, AMX context or WFI override.
+This does not establish every PMU register's behavior on T8140.
+
+The next control must match display state: previous Linux CPU sampling was
+after panel restoration, while native display idle can already have blanked
+its pipeline. Measure the CPU states and energy during qualified native
+SET_POWER(false), together with whole-machine battery draw, before treating
+the asymmetric CPU behavior as independent of display/firmware activity.

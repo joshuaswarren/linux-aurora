@@ -13,3 +13,5 @@ obj-m += neo-pmgr-admission.o
 obj-m += neo-dcp-force-wake.o
 obj-m += neo-media-sleep.o
 obj-m += neo-auto-idle.o
+obj-m += neo-cpu-regs.o
+neo-cpu-regs-y := neo-cpu-regs-main.o neo-cpu-regs-read.o
