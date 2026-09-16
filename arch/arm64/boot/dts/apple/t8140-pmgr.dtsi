@@ -895,8 +895,13 @@
 	 * firmware is iBoot-loaded and running at Linux boot, so the AOP domains
 	 * iBoot leaves on are always-on (measured 2026-09-16: aop2_cpu,
 	 * aop2_piodma, aop_he_nrcs0/1, aop_i2cm3 and aop_spi1 are off at boot
-	 * and the HE NRCS pair refuses to power up, so those stay unmanaged);
-	 * the audio ones are runtime-managed by the audio drivers.
+	 * and the HE NRCS pair refuses to power up, so those stay unmanaged).
+	 * The audio fabric parents (audio_a, audio_fr, audio_p, audio_leap_a,
+	 * audio_leap_c) are on at boot and the AOP firmware relies on them: a
+	 * runtime-PM cycle of audio_leap_mca that let genpd switch audio_p off
+	 * left the firmware unable to answer lpai power requests (hb33,
+	 * 2026-09-16), so they are always-on; only the leaves (audio_leap_tx0,
+	 * audio_leap_mca, audio_leap_ns_a, ...) are runtime-managed.
 	 */
 	ps_aop_filter: power-controller@4000 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -943,6 +948,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_a";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
 		power-domains = <&ps_aop_filter>;
 	};
 
@@ -1106,6 +1113,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_fr";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
 		power-domains = <&ps_audio_a>;
 	};
 
@@ -1155,6 +1164,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_p";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
 		power-domains = <&ps_audio_fr>;
 	};
 
@@ -1164,6 +1175,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_leap_a";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
 		power-domains = <&ps_audio_fr>;
 	};
 
@@ -1263,6 +1276,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_leap_c";
+		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		apple,always-on;
 		power-domains = <&ps_audio_leap_a>;
 	};
 
