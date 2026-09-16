@@ -263,3 +263,10 @@ from mailbox SHUTDOWN. The V2 compact transport envelope still needs to be
 matched to the firmware's mode-8 compatibility endpoint before sending it.
 Retain disassembly and decompilation under endpoint-cycle/native; do not
 transplant the four bytes into an EPIC command or claim wire qualification.
+
+The nonrecovering full-idle state was measured separately while Linux/Wi-Fi
+remained alive: 120 seconds averaged 1.090767 W sampled battery power.
+This is a new boot and a failed-wake state, not a qualified sleep or a
+controlled saving. It does not show a useful reduction compared with the
+~1.08 W endpoint controls. Firmware idle alone is insufficient; matching
+native physical domain-off and wake ownership remains necessary.
