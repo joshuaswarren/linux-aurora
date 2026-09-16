@@ -110,10 +110,10 @@ fn storage(tiling:u32,fragment:u32,job_list_empty:bool,busy:bool)->Storage{
  Storage{state:G17PUserRenderQueueState{tiling:t,fragment:f,job_list_empty}}
 }
 
-fn base(ordinal:u32)->u32{G17PRenderItemPlan::new(ordinal,false).unwrap().base}
+fn base(ordinal:u64)->u32{G17PRenderItemPlan::new(ordinal,false).unwrap().base}
 
 #[test]fn an_aligned_graph_is_not_desynced(){
- for ordinal in [1u32,2,7,100,193,1000]{
+  for ordinal in [1u64,2,7,100,193,1000,1<<24,1<<32]{
   let mut s=storage(base(ordinal),base(ordinal),true,false);
   assert!(!s.restage_admission_desynced(ordinal).unwrap(),"ordinal {}",ordinal);
  }
@@ -121,7 +121,7 @@ fn base(ordinal:u32)->u32{G17PRenderItemPlan::new(ordinal,false).unwrap().base}
 
 #[test]fn a_staged_but_unpublished_group_is_desynced(){
  // The failure shape: the items went into the ring, the ordinal never moved.
- for ordinal in [1u32,2,7,100,193]{
+  for ordinal in [1u64,2,7,100,193,1<<24,1<<32]{
   let ahead=base(ordinal+1);
   let mut s=storage(ahead,ahead,true,false);
   assert!(s.restage_admission_desynced(ordinal).unwrap(),"ordinal {}",ordinal);

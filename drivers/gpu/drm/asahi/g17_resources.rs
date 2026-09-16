@@ -598,9 +598,10 @@ const G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE: usize =
         + mmu::UAT_PGSZ - 1) & !(mmu::UAT_PGSZ - 1);
 pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize =
     G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE;
-/// Exclusive ordinal bound of the current 24-bit event-stamp path. Physical
-/// ring slots and payload bytes wrap independently; they do not limit this.
-pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x00ff_ffff;
+/// Only the software sequence's checked increment bounds its lifetime.
+/// Physical rings, 40-bit kick timestamps and 32-bit event values wrap
+/// independently; none requires restarting a live firmware session.
+pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u64 = u64::MAX;
 pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0x14000;
 pub(crate) const G17P_RENDER_SUPPORT_SIZE: usize = 0x40000;
 
@@ -688,42 +689,42 @@ const G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET: usize =
 const G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA: u64 = 0x70_0000_0000;
 const G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA: u64 = 0x70_0009_8000;
 
-fn g17p_render_descriptor_slot(submission_ordinal: u32) -> usize {
+fn g17p_render_descriptor_slot(submission_ordinal: u64) -> usize {
     submission_ordinal as usize % G17P_RENDER_DESCRIPTOR_SLOT_COUNT
 }
 
-fn g17p_render_ta_descriptor_offset(submission_ordinal: u32) -> usize {
+fn g17p_render_ta_descriptor_offset(submission_ordinal: u64) -> usize {
     g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_TA_DESCRIPTOR_STRIDE
 }
 
-fn g17p_render_3d_descriptor_offset(submission_ordinal: u32) -> usize {
+fn g17p_render_3d_descriptor_offset(submission_ordinal: u64) -> usize {
     G17P_RENDER_3D_DESCRIPTOR_OFFSET
         + g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_3D_DESCRIPTOR_STRIDE
 }
 
-fn g17p_render_ta_descriptor_high_va(submission_ordinal: u32) -> Option<u64> {
+fn g17p_render_ta_descriptor_high_va(submission_ordinal: u64) -> Option<u64> {
     g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
         .checked_add(g17p_render_ta_descriptor_offset(submission_ordinal) as u64)
 }
 
-fn g17p_render_3d_descriptor_high_va(submission_ordinal: u32) -> Option<u64> {
+fn g17p_render_3d_descriptor_high_va(submission_ordinal: u64) -> Option<u64> {
     g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE.checked_add(
         (g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_3D_DESCRIPTOR_STRIDE) as u64,
     )
 }
 
-fn g17p_render_ta_descriptor_low_va(submission_ordinal: u32) -> Option<u64> {
+fn g17p_render_ta_descriptor_low_va(submission_ordinal: u64) -> Option<u64> {
     G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
         .checked_add(g17p_render_ta_descriptor_offset(submission_ordinal) as u64)
 }
 
-fn g17p_render_3d_descriptor_low_va(submission_ordinal: u32) -> Option<u64> {
+fn g17p_render_3d_descriptor_low_va(submission_ordinal: u64) -> Option<u64> {
     G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA.checked_add(
         (g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_3D_DESCRIPTOR_STRIDE) as u64,
     )
 }
 
-fn g17p_render_optional_offset(tiling: bool, submission_ordinal: u32) -> usize {
+fn g17p_render_optional_offset(tiling: bool, submission_ordinal: u64) -> usize {
     let base = if tiling {
         G17P_USER_TILING_OPTIONAL
     } else {
@@ -732,7 +733,7 @@ fn g17p_render_optional_offset(tiling: bool, submission_ordinal: u32) -> usize {
     base + g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_OPTIONAL_STRIDE
 }
 
-fn g17p_render_event_offset(tiling: bool, submission_ordinal: u32) -> usize {
+fn g17p_render_event_offset(tiling: bool, submission_ordinal: u64) -> usize {
     let base = if tiling {
         G17P_USER_TILING_EVENT
     } else {
@@ -849,7 +850,7 @@ impl G17PRenderQueuePair {
 /// Compact aliases are private to both a physical queue pair and one of its
 /// two command generations. Submission parity alone aliases pair 0 and pair 1
 /// in the same VM, which is exactly the two-in-flight ENOSPC failure.
-const fn g17p_render_alias_slot(pair: G17PRenderQueuePair, submission_ordinal: u32) -> Option<u64> {
+const fn g17p_render_alias_slot(pair: G17PRenderQueuePair, submission_ordinal: u64) -> Option<u64> {
     let slot = pair.slot() as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR
         + (submission_ordinal as u64 & 1);
     if slot < G17P_RENDER_USER_ALIAS_SLOT_COUNT {
@@ -885,7 +886,7 @@ const fn g17p_render_rt_memory_va(pair: G17PRenderQueuePair) -> Option<u64> {
     }
 }
 
-const fn g17p_render_rt_record_offset(submission_ordinal: u32) -> usize {
+const fn g17p_render_rt_record_offset(submission_ordinal: u64) -> usize {
     submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT
         * G17P_RENDER_RT_REGION_STRIDE
 }
@@ -2574,14 +2575,14 @@ fn map_fixed_wc_object(
 struct G17PRenderTargetMemory {
     rt_memory: MappedObject,
     tpc: MappedObject,
-    rt_slot_ordinals: [Option<u32>; G17P_RENDER_RT_EVENT_RECORD_COUNT],
+    rt_slot_ordinals: [Option<u64>; G17P_RENDER_RT_EVENT_RECORD_COUNT],
 }
 
 #[cfg(not(test))]
 impl G17PRenderTargetMemory {
     fn prepare_rt_slot(
         &mut self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
         layout: &G17PRenderStateLayout,
     ) -> Result<G17PRenderTargetAddresses> {
         let slot = submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT;
@@ -2589,7 +2590,7 @@ impl G17PRenderTargetMemory {
             submission_ordinal
                 .checked_sub(previous)
                 .is_none_or(|distance| {
-                    distance != 0 && distance < G17P_RENDER_RT_EVENT_RECORD_COUNT as u32
+                    distance != 0 && distance < G17P_RENDER_RT_EVENT_RECORD_COUNT as u64
                 })
         }) {
             return Err(EBUSY);
@@ -2621,7 +2622,7 @@ impl G17PRenderTargetMemory {
         self.tpc.iova()
     }
 
-    fn tilemap_va(&self, submission_ordinal: u32) -> Result<u64> {
+    fn tilemap_va(&self, submission_ordinal: u64) -> Result<u64> {
         self.rt_memory
             .iova()
             .checked_add(g17p_render_rt_record_offset(submission_ordinal) as u64)
@@ -2641,7 +2642,7 @@ impl G17PRenderTargetMemory {
 
     fn heapmeta_va(
         &self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
         layout: &G17PRenderStateLayout,
     ) -> Result<u64> {
         self.rt_region_va(submission_ordinal, layout, layout.heapmeta)
@@ -3427,7 +3428,7 @@ impl G17PRenderUserAliases {
         vm: &mmu::Vm,
         render_layout: &G17PRenderStateLayout,
         queue_pair: G17PRenderQueuePair,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result<Self> {
         let alias_slot = g17p_render_alias_slot(queue_pair, submission_ordinal).ok_or(EINVAL)?;
         let slot_base = G17P_RENDER_USER_ALIAS_START
@@ -3606,7 +3607,7 @@ pub(crate) struct G17PUserRenderStorage {
     descriptors: MappedObject,
     /// Native advances through descriptor arrays instead of rewriting the
     /// command at the address firmware and RCE have already consumed.
-    descriptor_ordinal: u32,
+    descriptor_ordinal: u64,
     /// Entries-only diagnostic mirror of the descriptor-embedded 3D RCE
     /// programs. Native KSM never binds this incomplete mirror.
     fragment_rce: MappedObject,
@@ -3815,11 +3816,11 @@ struct G17PRenderItemPlan {
 impl G17PRenderItemPlan {
     const CAPACITY: u32 = 0x500;
 
-    fn new(ordinal: u32, tag16: bool) -> Option<Self> {
+    fn new(ordinal: u64, tag16: bool) -> Option<Self> {
         Self::with_capacity(ordinal, tag16, Self::CAPACITY)
     }
 
-    fn with_capacity(ordinal: u32, tag16: bool, capacity: u32) -> Option<Self> {
+    fn with_capacity(ordinal: u64, tag16: bool, capacity: u32) -> Option<Self> {
         if ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return None;
         }
@@ -3827,7 +3828,8 @@ impl G17PRenderItemPlan {
         if capacity <= count {
             return None;
         }
-        let base = (u64::from(ordinal) * u64::from(count) % u64::from(capacity)) as u32;
+        let base = ((ordinal % u64::from(capacity)) * u64::from(count)
+            % u64::from(capacity)) as u32;
         let mut producer = base;
         let mut prefix_end = base;
         for item in 0..count {
@@ -4066,9 +4068,9 @@ fn build_g17p_late_tiling_bytes(
     queue_pair: G17PRenderQueuePair,
     optional_addresses: g17_submission::G17PColdOpeningOptionalAddresses,
     ta_tag15_context_id: u16,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     flist_generation: u64,
-    entry_stamp: u32,
+    entry_stamp: u64,
     tag16: bool,
     native_pool_a_first_record: bool,
     pool_a_slot_value: u32,
@@ -4097,7 +4099,7 @@ fn build_g17p_late_tiling_bytes(
         pool_a_slot_value,
         shared_inner_value: submission_ordinal
             .checked_add(1)
-            .and_then(|value| value.checked_mul(2))
+            .map(|value| (value as u32).wrapping_mul(2))
             .ok_or(g17_submission::SubmissionError::PartialOpeningQueueHeadOutOfRange)?,
     };
     let optional = graph
@@ -4118,7 +4120,7 @@ fn build_g17p_late_tiling_bytes(
             g17_submission::G17PComputeOptionalEvent {
                 queue_id: queue_pair.tiling,
                 // See the fragment sites: this field is the previous stamp.
-                old_timestamp: u64::from(entry_stamp).saturating_sub(1),
+                old_timestamp: entry_stamp.wrapping_sub(1) & g17_submission::KICK_TS_MASK,
             },
             &mut bytes.entry_signal,
         )?;
@@ -5540,12 +5542,12 @@ const G17P_PM_DISCARD_SIZE: usize = 0x8000;
 /// shorter 36-slot scratch ring; it does not provide concurrent Scene
 /// ownership.
 fn g17p_render_scene_index(
-    first_submission_ordinal: u32,
-    submission_ordinal: u32,
+    first_submission_ordinal: u64,
+    submission_ordinal: u64,
 ) -> Option<usize> {
     let local_ordinal = submission_ordinal.checked_sub(first_submission_ordinal)?;
     Some(
-        ((u64::from(local_ordinal) + G17P_PM_SELECTED_SCENE as u64)
+        ((local_ordinal % G17P_PM_SCENE_COUNT as u64 + G17P_PM_SELECTED_SCENE as u64)
             % G17P_PM_SCENE_COUNT as u64) as usize,
     )
 }
@@ -5794,7 +5796,7 @@ struct G17PParameterManagement {
     /// Queue ordinal of the first submission encoded against this manager.
     /// Scene selection is relative to this value, not to the retained queue's
     /// session-global producer ordinal.
-    first_submission_ordinal: u32,
+    first_submission_ordinal: u64,
     selected_scene: usize,
     manager_generation: u64,
 }
@@ -5894,7 +5896,7 @@ impl G17PParameterManagement {
         discard_va: u64,
         ta_hardware_buffer_id: u32,
         manager_generation: u64,
-        first_submission_ordinal: u32,
+        first_submission_ordinal: u64,
         render_layout: &G17PRenderStateLayout,
     ) -> Result<Self> {
         let layout = g17p_parameter_management_layout().ok_or(EINVAL)?;
@@ -5959,7 +5961,7 @@ impl G17PParameterManagement {
 
     fn prepare_retained_scene(
         &mut self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
         hardware_buffer_id: u32,
         page_list_vas: [u64; 2],
         render_layout: &G17PRenderStateLayout,
@@ -6096,14 +6098,14 @@ pub(crate) fn g17p_render_native_fragment_hwpb_enabled() -> bool {
 }
 
 /// Modular inner producer/outer queue-write target for this submission.
-pub(crate) fn g17p_render_published_prefix(submission_ordinal: u32) -> Result<u32> {
+pub(crate) fn g17p_render_published_prefix(submission_ordinal: u64) -> Result<u32> {
     G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
         .map(|items| items.final_end)
         .ok_or(EINVAL)
 }
 
 pub(crate) fn g17p_render_completion_window(
-    submission_ordinal: u32,
+    submission_ordinal: u64,
 ) -> Result<g17_completion::RenderQueueWindow> {
     let items = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
         .ok_or(EINVAL)?;
@@ -6719,7 +6721,7 @@ impl G17PUserRenderStorage {
         descriptor_context_id: u16,
         render_root_slot: u8,
         command_buffer_state_words: [u32; 2],
-        submission_ordinal: u32,
+        submission_ordinal: u64,
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<Self> {
@@ -8354,7 +8356,7 @@ impl G17PUserRenderStorage {
     /// walks the intentionally empty slots preceding that group.
     pub(crate) fn rebase_empty_queue_cursors(
         &mut self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result {
         if submission_ordinal == 0 {
             return Err(EINVAL);
@@ -8407,7 +8409,7 @@ impl G17PUserRenderStorage {
     /// again; no mapping or descriptor backing is rebuilt.
     pub(crate) fn prepare_cached_reactivation(
         &mut self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result {
         let plan = G17PRenderItemPlan::new(
             submission_ordinal,
@@ -8455,7 +8457,7 @@ impl G17PUserRenderStorage {
     /// true while the firmware still owns the previous group.
     pub(crate) fn restage_admission_desynced(
         &mut self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result<bool> {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Ok(false);
@@ -8477,7 +8479,7 @@ impl G17PUserRenderStorage {
     /// Tuple: (expected base, tiling write, fragment write).
     pub(crate) fn restage_admission_cursors(
         &mut self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result<(u32, u32, u32)> {
         let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
             .ok_or(EINVAL)?;
@@ -8497,7 +8499,7 @@ impl G17PUserRenderStorage {
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
         command_buffer_state_words: [u32; 2],
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result {
         macro_rules! restage_step {
             ($name:literal, $expression:expr) => {
@@ -9088,9 +9090,9 @@ impl G17PUserRenderStorage {
             put_u32(
                 support,
                 G17P_RENDER_SHARED_CONTROL_INNER,
-                submission_ordinal * 2 + 1,
+                (submission_ordinal as u32).wrapping_mul(2).wrapping_add(1),
             );
-            put_u32(support, G17P_RENDER_FLAG, submission_ordinal + 1);
+            put_u32(support, G17P_RENDER_FLAG, (submission_ordinal as u32).wrapping_add(1));
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         }
 
@@ -10026,7 +10028,7 @@ impl G17PUserRenderStorage {
         self.parameter_management.as_ref().map(|pm| pm.selected_scene).ok_or(ENODEV)
     }
 
-    pub(crate) fn stage_fragment(&mut self, submission_ordinal: u32) -> Result {
+    pub(crate) fn stage_fragment(&mut self, submission_ordinal: u64) -> Result {
         let graph_va = self.graph.iova();
         let optional_offset = g17p_render_optional_offset(false, submission_ordinal);
         let event_offset = g17p_render_event_offset(false, submission_ordinal);
@@ -10045,7 +10047,8 @@ impl G17PUserRenderStorage {
         // The stamp this path's tag-14 announces is `ordinal + 1`
         // (`apply_g17p_retained_event`), which is the 1 the firmware reported
         // in its 0x41 receipt. Tag-16 must name that same stamp.
-        let entry_stamp = submission_ordinal.checked_add(1).ok_or(EINVAL)?;
+        let entry_stamp = submission_ordinal.checked_add(1).ok_or(EINVAL)?
+            & g17_submission::KICK_TS_MASK;
         let entry_signal_va = graph_va + Self::FRAGMENT_ENTRY_SIGNAL as u64;
         self.graph.with_bytes_mut(|raw| {
             let mut group = [0u8; 32];
@@ -10085,7 +10088,7 @@ impl G17PUserRenderStorage {
                         // this field naming the stamp being queued, which let
                         // the firmware retire the entry before the dispatch
                         // ran; see the tag-16 fix that took compute to 100/100.
-                        old_timestamp: u64::from(entry_stamp).saturating_sub(1),
+                        old_timestamp: entry_stamp.wrapping_sub(1) & g17_submission::KICK_TS_MASK,
                     },
                     &mut raw[Self::FRAGMENT_ENTRY_SIGNAL
                         ..Self::FRAGMENT_ENTRY_SIGNAL
@@ -10153,7 +10156,7 @@ impl G17PUserRenderStorage {
     pub(crate) fn dump_submit_ready_fragment_descriptor(
         &mut self,
         dev: &AsahiDevice,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result {
         if *crate::module_parameters::g17p_render_dump_descriptor.value() == 0 {
             return Ok(());
@@ -10377,7 +10380,7 @@ impl G17PUserRenderStorage {
     /// pointers, then configures the QID and writes the KSM kick entry, and
     /// only then publishes the AddKicks that takes item 2 -- so the split is
     /// what lets the SKSM half sit where the captures put it.
-    pub(crate) fn stage_fragment_prefix(&mut self, submission_ordinal: u32) -> Result {
+    pub(crate) fn stage_fragment_prefix(&mut self, submission_ordinal: u64) -> Result {
         let graph_va = self.graph.iova();
         let optional_offset = g17p_render_optional_offset(false, submission_ordinal);
         let items = [
@@ -10422,8 +10425,8 @@ impl G17PUserRenderStorage {
     /// `entry_stamp`) and the item producer transition base+2 -> base+3/4.
     pub(crate) fn stage_fragment_kick(
         &mut self,
-        submission_ordinal: u32,
-        entry_stamp: u32,
+        submission_ordinal: u64,
+        entry_stamp: u64,
     ) -> Result {
         let graph_va = self.graph.iova();
         let event_offset = g17p_render_event_offset(false, submission_ordinal);
@@ -10456,7 +10459,7 @@ impl G17PUserRenderStorage {
                         // this field naming the stamp being queued, which let
                         // the firmware retire the entry before the dispatch
                         // ran; see the tag-16 fix that took compute to 100/100.
-                        old_timestamp: u64::from(entry_stamp).saturating_sub(1),
+                        old_timestamp: entry_stamp.wrapping_sub(1) & g17_submission::KICK_TS_MASK,
                     },
                     &mut raw[Self::FRAGMENT_ENTRY_SIGNAL
                         ..Self::FRAGMENT_ENTRY_SIGNAL
@@ -10479,10 +10482,11 @@ impl G17PUserRenderStorage {
 
     pub(crate) fn prepare_late_tiling_publication(
         &mut self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
     ) -> Result<G17PLateTilingPublication> {
-        let stamp = submission_ordinal.checked_add(1).ok_or(EINVAL)?;
-        self.prepare_late_tiling_publication_with_stamp(submission_ordinal, stamp)
+        let stamp = submission_ordinal.checked_add(1).ok_or(EINVAL)?
+            & g17_submission::KICK_TS_MASK;
+        self.prepare_late_tiling_publication_with_stamp(submission_ordinal, u64::from(stamp))
     }
 
     /// Same as [`Self::prepare_late_tiling_publication`], except that the
@@ -10492,8 +10496,8 @@ impl G17PUserRenderStorage {
     /// TA group's AddKicks announces are the same value by construction.
     pub(crate) fn prepare_late_tiling_publication_with_stamp(
         &mut self,
-        submission_ordinal: u32,
-        entry_stamp: u32,
+        submission_ordinal: u64,
+        entry_stamp: u64,
     ) -> Result<G17PLateTilingPublication> {
         let graph_va = self.graph.iova();
         // `restage_command` may have selected a reusable fallback instead of
@@ -16036,7 +16040,7 @@ impl G17ResourceOwner {
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
         command_buffer_state_words: [u32; 2],
-        submission_ordinal: u32,
+        submission_ordinal: u64,
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<G17PUserRenderStorage> {
@@ -18229,7 +18233,7 @@ mod tests {
         assert_eq!(G17P_COMPUTE_OPERAND_STATE_SIZE, 0x14000);
         assert_eq!(G17P_COMPUTE_SUPPORT_SIZE, 0xc000);
         assert_eq!(G17P_COMPUTE_QUEUE_GRAPH_SIZE, 0x8000);
-        assert_eq!(G17P_RETAINED_RENDER_ORDINALS, 0x00ff_ffff);
+        assert_eq!(G17P_RETAINED_RENDER_ORDINALS, u64::MAX);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS.len(), 18);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[0].slot, 0);
         assert_eq!(
@@ -19115,18 +19119,19 @@ mod tests {
     #[test]
     fn retained_render_item_plan_matches_native_append_and_bounds() {
         for tag16 in [false, true] {
-            let count = if tag16 { 4 } else { 3 };
-            for ordinal in 0..1000 {
+            let count = if tag16 { 4u32 } else { 3u32 };
+            for ordinal in (0..1000).chain([1 << 24, 1 << 32, 1 << 40, u64::MAX - 1]) {
                 let plan = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
-                assert_eq!(plan.base, ordinal * count % 1280);
+                let base = (u128::from(ordinal) * u128::from(count) % 1280) as u32;
+                assert_eq!(plan.base, base);
                 assert_eq!(plan.count, count);
-                assert_eq!(plan.prefix_end, (ordinal * count + 2) % 1280);
-                assert_eq!(plan.final_end, (ordinal + 1) * count % 1280);
+                assert_eq!(plan.prefix_end, (base + 2) % 1280);
+                assert_eq!(plan.final_end, (base + count) % 1280);
                 for capacity in 0..=count {
                     assert!(G17PRenderItemPlan::with_capacity(ordinal, tag16, capacity).is_none());
                 }
             }
-            for ordinal in [G17P_RETAINED_RENDER_ORDINALS, u32::MAX] {
+            for ordinal in [G17P_RETAINED_RENDER_ORDINALS] {
                 assert!(G17PRenderItemPlan::new(ordinal, tag16).is_none());
             }
         }
@@ -19192,7 +19197,7 @@ mod tests {
                     event_offset: 0xf000 + ordinal as usize % 32 * 0x80,
                     pool_a_slot_offset: 0,
                     pool_a_slot_value: 2,
-                    shared_inner_value: 2 * (ordinal + 1),
+                    shared_inner_value: (ordinal as u32).wrapping_add(1).wrapping_mul(2),
                 };
                 put_u32(&mut graph, G17P_USER_TILING_POINTERS, items.base);
                 put_u32(&mut graph, G17P_USER_TILING_POINTERS + 0x30, items.base);

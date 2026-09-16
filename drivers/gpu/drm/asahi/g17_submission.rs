@@ -1357,13 +1357,14 @@ pub(crate) fn apply_g17p_cold_opening_leaf_page(
 /// scenes can reuse an index across multiple sequence values, so the traces do
 /// not justify replacing Linux's retained `ordinal * 2` policy globally.
 pub(crate) const fn g17p_render_pool_a_record_index(
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     native_first_record: bool,
 ) -> usize {
     if native_first_record && submission_ordinal == 0 {
         1
     } else {
-        (submission_ordinal as usize * 2) % G17P_COLD_OPENING_RECORD_POOL_A_COUNT
+        ((submission_ordinal % G17P_COLD_OPENING_RECORD_POOL_A_COUNT as u64) as usize * 2)
+            % G17P_COLD_OPENING_RECORD_POOL_A_COUNT
     }
 }
 
@@ -1703,7 +1704,7 @@ pub(crate) fn apply_g17p_cold_opening_event(
 pub(crate) fn apply_g17p_retained_optional(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     bias_generation: bool,
     queue_id: u16,
     partner_queue_id: u16,
@@ -1738,7 +1739,7 @@ pub(crate) fn apply_g17p_retained_optional(
 pub(crate) fn apply_g17p_retained_optional_with_flist_generation(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     flist_generation: u64,
     bias_generation: bool,
     queue_id: u16,
@@ -1775,7 +1776,7 @@ pub(crate) fn apply_g17p_retained_optional_with_flist_generation(
 pub(crate) fn apply_g17p_retained_optional_with_flist_generation_and_context_update(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     flist_generation: u64,
     bias_generation: bool,
     queue_id: u16,
@@ -1786,12 +1787,7 @@ pub(crate) fn apply_g17p_retained_optional_with_flist_generation_and_context_upd
     context_update: bool,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
-    // The announced event stamp is ordinal + 1 on this serialized path and
-    // still has a 24-bit interface. Payload bytes are allowed to wrap; the
-    // retained owner generation below must not truncate with them.
-    if submission_ordinal >= 0x00ff_ffff {
-        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
-    }
+    // Payload bytes wrap independently of the full retained owner generation.
     apply_g17p_cold_opening_optional(
         stage,
         addresses,
@@ -1860,30 +1856,27 @@ pub(crate) fn apply_g17p_retained_optional_with_flist_generation_and_context_upd
 /// Host-owned equivalent of AGXUSCPrivMemFList +0xb0 for a retained render
 /// queue. Valid native cold records start at zero; each later retained restage
 /// advances the same generation once.
-pub(crate) const fn g17p_render_flist_generation(submission_ordinal: u32) -> u64 {
+pub(crate) const fn g17p_render_flist_generation(submission_ordinal: u64) -> u64 {
     submission_ordinal as u64
 }
 
 /// Refresh the canonical event record while retaining its physical address.
 ///
-/// `entry_stamp` is the u24 at tag-14 `+0x09`: the KSM producer stamp of the
-/// kick this AddKicks announces. `+0x08` stays the constant queue priority 2
-/// that every captured native AddKicks carries.
+/// Tag-14 +0x09 is an unaligned u64 containing the 40-bit KSM timestamp.
+/// 25G83 A000 reads it with `ldur x3, [x19, #9]` at 0x11730. Small cold
+/// captures do not establish a 24-bit field. +0x08 remains queue priority;
+/// the independently owned data-master field starts at +0x11.
 pub(crate) fn apply_g17p_retained_event_with_stamp(
     stage: G17PColdOpeningStage,
-    entry_stamp: u32,
+    entry_stamp: u64,
     queue_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
-    if entry_stamp == 0 || entry_stamp > 0x00ff_ffff {
-        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
+    if entry_stamp & !KICK_TS_MASK != 0 {
+        return Err(SubmissionError::KickTimestampOutOfRange);
     }
     apply_g17p_cold_opening_event(stage, queue_id, out)?;
-    put_u32_le(
-        out,
-        0x08,
-        (entry_stamp << 8) | u32::from(G17P_NATIVE_RENDER_DOORBELL_PRIORITY),
-    );
+    put_u64_le(out, 0x09, entry_stamp);
     Ok(())
 }
 
@@ -1896,14 +1889,14 @@ pub(crate) fn apply_g17p_retained_event_with_stamp(
 /// per kick.
 pub(crate) fn apply_g17p_retained_event(
     stage: G17PColdOpeningStage,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     queue_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
     let group_number = submission_ordinal
         .checked_add(1)
         .ok_or(SubmissionError::PartialOpeningQueueHeadOutOfRange)?;
-    apply_g17p_retained_event_with_stamp(stage, group_number, queue_id, out)
+    apply_g17p_retained_event_with_stamp(stage, group_number & KICK_TS_MASK, queue_id, out)
 }
 
 /// Write the cold class-2 queue record for the owning process.
@@ -2403,7 +2396,7 @@ pub(crate) const fn ring_next(index: u32, size: u32) -> Result<u32, SubmissionEr
 //    `g17_rtkit` to prove no drift.
 // ---------------------------------------------------------------------------
 
-/// TS occupies bits [39:0] (`and x0,x5,#0xffffffffff` @ 0x10c8c). 40-bit, per
+/// TS occupies bits [39:0] (`and x0,x5,#0xffffffffff` at 25G83 A000 0xfd18). 40-bit, per
 /// the firmware print `"TS=0x%010llx"`.
 pub(crate) const KICK_TS_BITS: u32 = 40;
 pub(crate) const KICK_TS_MASK: u64 = (1u64 << KICK_TS_BITS) - 1;
@@ -2567,7 +2560,7 @@ pub(crate) const fn encode_kick_timestamp(timestamp: KickTimestamp) -> u64 {
 /// so its ordinal determines that counter while this serialization holds.
 /// This byte wraps independently of the 40-bit SKSM timestamp; it is neither
 /// the queue ID nor an address-space tag.
-pub(crate) const fn g17p_serialized_render_scratch_payload(submission_ordinal: u32) -> u8 {
+pub(crate) const fn g17p_serialized_render_scratch_payload(submission_ordinal: u64) -> u8 {
     submission_ordinal.wrapping_add(1) as u8
 }
 
@@ -2842,6 +2835,27 @@ pub(crate) struct G17PClBarrierDependency {
     pub(crate) queue_id: u8,
 }
 
+/// Represent a render dependency using the native event word plus epoch.
+/// The event value advances by 0x100 and wraps as on M1/M2. Its high timestamp
+/// bits are carried separately; dropping them makes a dependency at 2^24
+/// name the wrong kick even if AddKicks itself preserves all forty bits.
+pub(crate) fn g17p_render_barrier_from_timestamp(
+    timestamp: u64,
+    queue_id: u8,
+) -> Result<G17PClBarrierDependency, SubmissionError> {
+    if timestamp & !KICK_TS_MASK != 0 {
+        return Err(SubmissionError::KickTimestampOutOfRange);
+    }
+    if queue_id > KICK_QID_MASK {
+        return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
+    }
+    Ok(G17PClBarrierDependency {
+        event_word: (timestamp as u32).wrapping_shl(8),
+        shared_stamp: timestamp >> 24,
+        queue_id,
+    })
+}
+
 /// Optional MCache aperture descriptor copied into entry +0x08.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PClMcacheAperture {
@@ -3054,7 +3068,7 @@ pub(crate) fn encode_g17p_compute_optional_event(
 
 pub(crate) fn prepare_g17p_compute_cl_command_state(
     descriptor_low: u64,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
 ) -> Result<G17PComputeClCommandState, SubmissionError> {
     let next = submission_ordinal
         .checked_add(1)
@@ -6036,7 +6050,7 @@ mod tests {
 
     /// Native tag-14 AddKicks, PROVEN on all 25 captured publishes:
     /// `+0x00 = 0x0e`, `+0x04 u16 = qid`, `+0x06 u16 = 1` kick, `+0x08 u8 = 2`
-    /// queue priority, `+0x09 u24 = entry stamp`, `+0x11 u8 = data master`,
+    /// queue priority, `+0x09 u64 = entry stamp`, `+0x11 u8 = data master`,
     /// everything else zero.
     #[test]
     fn g17p_retained_event_carries_native_addkicks_bytes() {
@@ -6045,11 +6059,11 @@ mod tests {
             (G17PColdOpeningStage::Fragment, 1u16, 1u8),
         ] {
             let mut event = [0xa5u8; G17P_COLD_OPENING_EVENT_SIZE];
-            apply_g17p_retained_event_with_stamp(stage, 0x3d9, 0, &mut event).unwrap();
+            apply_g17p_retained_event_with_stamp(stage, 0x3d9, qid, &mut event).unwrap();
             assert_eq!(get_u32_le(&event, 0x00), 0x0e);
             assert_eq!(get_u16_le(&event, 0x04), qid);
             assert_eq!(get_u16_le(&event, 0x06), 1);
-            assert_eq!(event[0x08], 2);
+            assert_eq!(event[0x08], G17P_NATIVE_RENDER_DOORBELL_PRIORITY);
             assert_eq!(
                 u32::from_le_bytes([event[0x09], event[0x0a], event[0x0b], 0]),
                 0x3d9
@@ -6061,11 +6075,11 @@ mod tests {
                 }
             }
         }
-        // A zero stamp is not a legal AddKicks value and must be refused
-        // rather than published.
+        // The native 40-bit producer wraps to zero. Values above its width
+        // must be refused before any record is modified.
         let mut event = [0u8; G17P_COLD_OPENING_EVENT_SIZE];
         assert!(
-            apply_g17p_retained_event_with_stamp(G17PColdOpeningStage::Tiling, 0, 0, &mut event)
+            apply_g17p_retained_event_with_stamp(G17PColdOpeningStage::Tiling, 1u64 << 40, 0, &mut event)
                 .is_err()
         );
     }

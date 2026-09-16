@@ -1007,7 +1007,7 @@ impl RenderDescriptorObjects {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct RenderDescriptorMetadata {
     pub(crate) context_id: u32,
-    pub(crate) submission_ordinal: u32,
+    pub(crate) submission_ordinal: u64,
     /// Monotonic state tag allocated by the command buffer's 36-entry state
     /// ring. This is neither the selected ring index nor any QID/HWID. Native
     /// retains the full word in the selected state object and places only its
@@ -1066,8 +1066,8 @@ pub(crate) fn set_render_event_control_generation(
     Ok(())
 }
 
-fn descriptor_work_ordinal(ordinal: u32) -> u32 {
-    ordinal + ordinal / 2
+fn descriptor_work_ordinal(ordinal: u64) -> u32 {
+    (ordinal as u32).wrapping_add((ordinal / 2) as u32)
 }
 
 fn write_common_descriptor(
@@ -1430,19 +1430,17 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
     runtime_control: u64,
     queue_id: u8,
     linked_fragment_queue_id: u8,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     cold_opening: bool,
     native_pm_bytes: bool,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
     let item_number = submission_ordinal
         .checked_add(1)
-        .ok_or(RenderBuildError::ArithmeticOverflow)?;
-    // Tag-14 and the current dependency/event interface carry a 24-bit stamp.
-    // This is a representability limit, not an eight-bit ring-slot lifetime.
-    if item_number > 0x00ff_ffff {
-        return Err(RenderBuildError::ArithmeticOverflow);
-    }
+        .ok_or(RenderBuildError::ArithmeticOverflow)? & 0xffffffffff;
+    // The native queue timestamp is 40 bits. Stamp-info carries its low
+    // 24 bits shifted by eight, with ordinary u32 wrap as on M1/M2.
+    let event_value = (item_number as u32).wrapping_shl(8);
     match kind {
         RenderDescriptorKind::Tiling => {
             if raw.len() < TA_DESCRIPTOR_SIZE {
@@ -1459,13 +1457,13 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // will consume this submission. This is queue allocator state,
             // not the type-1 fragment descriptor's distinct QID-0 RCE field.
             put_u32(raw, 0x079c, u32::from(linked_fragment_queue_id));
-            put_u32(raw, 0x07a0, item_number << 8);
+            put_u32(raw, 0x07a0, event_value);
             apply_g17p_ta_linked_completion_scratch(
                 u64::from(item_number), u64::from(item_number), item_number as u8, raw,
             )?;
             // Native writes a u32 at +0x8b6 (8a993f4). +0x8b4/+0x8b5
             // belong to the preceding stamp pointer, not this event value.
-            put_u32(raw, 0x08b6, item_number << 8);
+            put_u32(raw, 0x08b6, event_value);
             // B1 indexes the registered scheduler-resource table with this
             // value while admitting the completed TA, then passes the full
             // word to FUN_15424(linked_3d_qid, ta_qid). It is the TA queue's
@@ -1495,7 +1493,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             }
             // Native's host +0x1288 source is a u32 at +0x8d6 (8a990b8),
             // immediately after the qword lifecycle field beginning +0x8ce.
-            put_u32(raw, 0x08d6, submission_ordinal);
+            put_u32(raw, 0x08d6, submission_ordinal as u32);
             put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
                 // Retain the one-buffer GTP size installed by the cold
@@ -1523,7 +1521,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                         .ok_or(RenderBuildError::ArithmeticOverflow)?,
                 );
             }
-            put_u32(raw, 0x2150, item_number << 8);
+            put_u32(raw, 0x2150, event_value);
             // Valid native queues prove +0x2154 is the physical 3D QID: it is
             // 1/3/8 for qids 1/3/8, respectively. The old literal only happened
             // to match the first captured qid.
@@ -1537,7 +1535,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // the physical queue timestamp in bits [39:0] and the channel's
             // payload byte in bits [47:40]. G17PUserRenderStorage stages it
             // from the retained fragment producer immediately before publish.
-            put_u32(raw, 0x2170, submission_ordinal);
+            put_u32(raw, 0x2170, submission_ordinal as u32);
             put_u64(raw, 0x21ce, runtime_control);
             // +0x222c is the four-qword AGXCommandHWDSIDData mask tail.
             // Initial priority-0 3D_0 commands retain the generic 0x100 mask

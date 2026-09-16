@@ -76,6 +76,7 @@ body = "\n".join([
     r'''
 // Only the kernel mapping interface is mocked. Production helpers and methods
 // above operate directly on this byte vector and use their real error paths.
+mod mmu { pub struct KernelMapping; }
 struct MappedObject {
     bytes: Vec<u8>,
     address: u64,
@@ -99,9 +100,10 @@ fn patterned(size: usize) -> Vec<u8> {
 fn render_layout(blocks: usize) -> G17PRenderStateLayout {
     G17PRenderStateLayout { tvb_blocks: blocks, ..Default::default() }
 }
-fn new_pm_at(first_submission_ordinal: u32) -> G17PParameterManagement {
+fn new_pm_at(first_submission_ordinal: u64) -> G17PParameterManagement {
     let layout = g17p_parameter_management_layout().unwrap();
     G17PParameterManagement {
+        _page_list_low: mmu::KernelMapping,
         backing: MappedObject {
             bytes: patterned(layout.total_size), address: 0xffff_fc20_c006_0000,
             access_count: 0, fail_access: false,
@@ -116,7 +118,10 @@ fn new_pm_at(first_submission_ordinal: u32) -> G17PParameterManagement {
 fn new_pm() -> G17PParameterManagement { new_pm_at(0) }
 fn assert_only_scene_write(before: &[u8], after: &[u8], at: usize, generation: u64) {
     assert_eq!(before.len(), after.len());
-    assert_eq!(&after[..at + 0x48], &before[..at + 0x48]);
+    let mut expected = before.to_vec();
+    // loadPBDesc also restores the allocated HardwareBufferID on every use.
+    put_u32(&mut expected, g17p_parameter_management_layout().unwrap().hwpb_state + 0xc, 0);
+    assert_eq!(&after[..at + 0x48], &expected[..at + 0x48]);
     assert_eq!(&after[at + 0x48..at + 0x4c], &[0; 4]);
     assert_eq!(&after[at + 0x4c..at + 0x54], &generation.to_le_bytes());
     assert_eq!(&after[at + 0x54..], &before[at + 0x54..]);
@@ -137,14 +142,14 @@ fn live_block_table_follows_the_complete_scene_allocation() {
 #[test]
 fn all_scene_and_scratch_positions_match_native_ring_selection() {
     assert_eq!((G17P_PM_SCENE_COUNT, G17P_PM_SCENE_SCRATCH_SLOT_COUNT), (80, 36));
-    for ordinal in 0..=255u32 {
+    for ordinal in (0..=255u64).chain([1 << 24, 1 << 32, 1 << 40, u64::MAX]) {
         let scene = g17p_render_scene_index(0, ordinal).unwrap();
-        assert_eq!(scene, (ordinal as usize + 1) % 80);
+        assert_eq!(scene, ((u128::from(ordinal) + 1) % 80) as usize);
         assert_eq!(g17p_render_scene_registers(scene, SCRATCH, METRICS),
                    Some((0x178000 + (scene % 36) as u64 * 0x20,
                          0x80001 + scene as u64 * 4)));
     }
-    assert_eq!(g17p_render_scene_index(0, u32::MAX), Some(16));
+    assert_eq!(g17p_render_scene_index(0, u32::MAX as u64), Some(16));
     for (ordinal, cycle, metric) in [(0, 0x178020, 0x80005),
                                     (1, 0x178040, 0x80009),
                                     (2, 0x178060, 0x8000d)] {
@@ -158,7 +163,7 @@ fn all_scene_and_scratch_positions_match_native_ring_selection() {
 
 #[test]
 fn replacement_managers_rebase_the_retained_queue_ordinal() {
-    for first in [195, 2022] {
+    for first in [195, 2022, 1 << 24, 1 << 32, 1 << 40] {
         let mut pm = new_pm_at(first);
         pm.prepare_retained_scene(first, 0, pm.page_list_vas, &render_layout(32)).unwrap();
         assert_eq!(pm.selected_scene, 1);
@@ -191,13 +196,13 @@ fn register_encoding_rejects_invalid_ranges_and_preserves_native_domain_bit() {
 }
 
 #[test]
-fn every_scene_changes_only_its_twelve_host_owned_bytes() {
+fn every_scene_updates_its_host_fields_and_restores_hardware_buffer_id() {
     let layout = g17p_parameter_management_layout().unwrap();
     let before = patterned(layout.total_size);
     for scene in 0..80 {
         let mut raw = before.clone();
         let generation = 0x1234_5678_abcdef01;
-        prepare_g17p_retained_scene(&mut raw, &layout, scene, generation).unwrap();
+        prepare_g17p_retained_scene(&mut raw, &layout, scene, generation, 0).unwrap();
         assert_only_scene_write(&before, &raw,
                                 layout.scene_states + scene * 0x80, generation);
     }
@@ -209,13 +214,13 @@ fn invalid_scene_spans_fail_without_partial_writes() {
     for scene in [80, usize::MAX] {
         let mut raw = patterned(layout.total_size);
         let before = raw.clone();
-        assert_eq!(prepare_g17p_retained_scene(&mut raw, &layout, scene, 1), Err(EINVAL));
+        assert_eq!(prepare_g17p_retained_scene(&mut raw, &layout, scene, 1, 0), Err(EINVAL));
         assert_eq!(raw, before);
     }
     for size in [0, layout.scene_states, layout.scene_states + 0x100 - 1] {
         let mut raw = patterned(size);
         let before = raw.clone();
-        assert_eq!(prepare_g17p_retained_scene(&mut raw, &layout, 1, 1), Err(ERANGE));
+        assert_eq!(prepare_g17p_retained_scene(&mut raw, &layout, 1, 1, 0), Err(ERANGE));
         assert_eq!(raw, before);
     }
     for at in [usize::MAX, usize::MAX - 0x80] {
@@ -223,7 +228,7 @@ fn invalid_scene_spans_fail_without_partial_writes() {
         bad.scene_states = at;
         let mut raw = patterned(layout.total_size);
         let before = raw.clone();
-        assert_eq!(prepare_g17p_retained_scene(&mut raw, &bad, 1, 1), Err(ERANGE));
+        assert_eq!(prepare_g17p_retained_scene(&mut raw, &bad, 1, 1, 0), Err(ERANGE));
         assert_eq!(raw, before);
     }
 }
@@ -278,7 +283,7 @@ fn grown_pool_capacity_is_reused_by_smaller_scenes() {
     let mut pm = new_pm();
     pm.page_count = 512;
     for (ordinal, blocks) in [32, 64, 128, 32].into_iter().enumerate() {
-        assert_eq!(pm.prepare_retained_scene(ordinal as u32 + 1, 0,
+        assert_eq!(pm.prepare_retained_scene(ordinal as u64 + 1, 0,
             pm.page_list_vas, &render_layout(blocks)), Ok(()));
         assert_eq!(pm.page_count, 512);
         assert_eq!(pm.pb_descriptor().unwrap().2, 512);
