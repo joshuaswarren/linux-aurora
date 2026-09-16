@@ -28,6 +28,9 @@ static bool retained_ram(u64 pa, size_t size);
 
 static bool sleep_enabled;
 module_param(sleep_enabled, bool, 0644);
+static bool epic_sleep;
+module_param(epic_sleep, bool, 0644);
+MODULE_PARM_DESC(epic_sleep, "Native display power cycle around AP-only system sleep");
 static bool stop_cpu;
 module_param(stop_cpu, bool, 0644);
 static bool ap_only;
@@ -51,6 +54,7 @@ struct neo_dcp {
 	struct mutex lock;
 	atomic_t failed;
 	bool touched;
+	bool pm_panel_touched;
 	bool oslog_started;
 	u32 sleeps, wakes;
 	struct regmap *pmgr;
@@ -421,11 +425,11 @@ static ssize_t status_show(struct device *dev, struct device_attribute *a, char 
 	if (d->clocks_touched)
 		return sysfs_emit(buf, "failed=%d clocks_touched=%u (no gated ASC read)\n",
 			atomic_read(&d->failed), d->clocks_touched);
-	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x requested_iova=%#llx requested_size=%#zx oslog_started=%u log_flushes=%d firmware_idle_mode=%u\n",
+	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x requested_iova=%#llx requested_size=%#zx oslog_started=%u log_flushes=%d firmware_idle_mode=%u pm_panel_touched=%u\n",
 		atomic_read(&d->failed), d->touched, d->sleeps, d->wakes,
 		readl(d->control + 0x44), readl(d->control + 0x48),
 		d->requested_iova, d->requested_size, d->oslog_started,
-		atomic_read(&d->log_flushes), d->firmware_idle_mode);
+		atomic_read(&d->log_flushes), d->firmware_idle_mode, d->pm_panel_touched);
 }
 static ssize_t start_oslog_store(struct device *dev, struct device_attribute *a,
 				const char *buf, size_t count)
@@ -799,6 +803,45 @@ static const struct attribute_group neo_dcp_group = {
 };
 __ATTRIBUTE_GROUPS(neo_dcp);
 
+/* Called with the lifecycle mutex held and consoles suspended. Retain all
+ * endpoint buffers and IOP state; only AP IDLE has a qualified wake path.
+ */
+static int epic_pm_restore(struct neo_dcp *d)
+{
+	struct neo_epic *e = &d->epic;
+	int ret;
+	unsigned long deadline;
+
+	ret = d->touched ? wake_dcp(d) : 0;
+	if (ret)
+		return ret;
+	ret = neo_epic_command(e, 2, true);
+	if (ret)
+		goto failed;
+	/* Power-on acknowledges before panel detection has finished. Restore
+	 * detection before framebuffer console and ordinary clients resume.
+	 */
+	deadline = jiffies + msecs_to_jiffies(30000);
+	do {
+		ret = neo_epic_command(e, 3, false);
+		if (ret)
+			goto failed;
+		mutex_lock(&e->lock);
+		if (e->response_size == 20 && get_unaligned_le32(e->response) == 3 &&
+		    get_unaligned_le32(e->response + 4) == 20 && e->response[8] == 1) {
+			mutex_unlock(&e->lock);
+			d->pm_panel_touched = false;
+			return 0;
+		}
+		mutex_unlock(&e->lock);
+		msleep(100);
+	} while (time_before(jiffies, deadline));
+	ret = -ETIMEDOUT;
+failed:
+	atomic_set(&d->failed, 1);
+	return ret;
+}
+
 static int dcp_suspend(struct device *dev)
 {
 	struct neo_dcp *d = dev_get_drvdata(dev);
@@ -809,8 +852,8 @@ static int dcp_suspend(struct device *dev)
 	int ret;
 
 	guard(mutex)(&d->lock);
-	if (d->epic.active)
-		return -EBUSY; /* Awake AFK experiment has no system-sleep lifecycle. */
+	if (d->epic.active && (!READ_ONCE(epic_sleep) || !READ_ONCE(sleep_enabled)))
+		return -EBUSY;
 	if (!READ_ONCE(sleep_enabled))
 		return 0;
 	if (!READ_ONCE(console_suspend_enabled))
@@ -821,6 +864,27 @@ static int dcp_suspend(struct device *dev)
 		return -EAGAIN;
 	if (depth > 3 || (depth && !stop) || (ap && (depth || stop)))
 		return -EINVAL;
+	if (d->epic.active) {
+		if (!ap || stop || depth || d->pm_panel_touched ||
+		    !d->epic.queried || d->epic.error || !apple_rtkit_is_running(d->rtk))
+			return -EBUSY;
+		d->pm_panel_touched = true;
+		ret = neo_epic_command(&d->epic, 2, false);
+		if (!ret) {
+			d->touched = true;
+			ret = apple_rtkit_idle_ap(d->rtk);
+		}
+		if (!ret && atomic_read(&d->failed))
+			ret = -EIO;
+		if (ret) {
+			epic_pm_restore(d);
+			atomic_set(&d->failed, 1);
+		} else {
+			d->sleeps++;
+		}
+		dev_info(dev, "DCP native panel/AP suspend result=%d\n", ret);
+		return ret;
+	}
 	/* Map only for an explicitly requested gate trial. This window lies
 	 * outside the main PMGR syscon. No mapping or control writes for the
 	 * already qualified AP-only sleep path.
@@ -886,6 +950,8 @@ static int dcp_resume(struct device *dev)
 	struct neo_dcp *d = dev_get_drvdata(dev);
 
 	guard(mutex)(&d->lock);
+	if (d->pm_panel_touched)
+		return epic_pm_restore(d);
 	return d->touched ? wake_dcp(d) : 0;
 }
 

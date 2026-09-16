@@ -174,3 +174,20 @@ is retained separately and contributes no candidate power result.
 cycle and asynchronous HPD restoration first, verifies LCD supply low across
 measurement, waits for independent kernel restoration, then checks HPD, LCD
 power and gateway reachability. No separate GPIO/backlight cycle is used.
+
+An additional, default-off `epic_sleep=1` opt-in connects this sequence to
+system PM. It also requires sleep_enabled=1, ap_only=1, stop_cpu=0 and
+clock_depth=0. suspend_late powers down the native panel and notifies AP IDLE;
+resume_early restores AP ON, native panel power and HPD before console resume.
+Rollback retains a pending-panel flag until restoration is verified. The PM
+harness records both management and EPIC status and rejects an un-restored
+panel flag. Do not load neo-display-sleep or the separate backlight helper
+alongside this native panel owner. RTC/platform qualification is pending.
+
+The awake combined sequence passed on #48 boot
+7f8859df-08a6-4973-ba71-230ac47af06c with two AP idle/wake pairs, zero
+management/EPIC errors, panel detection restored and gateway reachable.
+The 120-second AP-IDLE interval measured 1.08557 W and the subsequent
+pipeline-off/AP-ON reference 1.09702 W (sampled power). This single pair
+suggests only 11 mW; it does not establish a repeatable saving or <1 W.
+Captures and module/source identities are in dcp-owned-dma/ap-cycle/.
