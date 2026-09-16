@@ -139,3 +139,21 @@ Unlike HPD, SET_POWER must advertise RX address/length zero. The helper now
 requests only its EPIC status reply for power commands. This fixes the reply
 contract rather than modifying firmware assertions or guessing a longer
 request. The captured request's operation=2 and length=17 matched dispatch.
+
+## Native display shutdown and AP notification
+
+On #48 boot 2aa3e354-45a7-48a5-9b16-6a153345f5ce, the status-only reply
+contract passed repeated two-second and 180-second power cycles. Native
+SET_POWER(false) lowers gP16/GPIO22 itself. The old panel-GPIO helper rejects
+this already-off state, so it must not be layered over native shutdown.
+Measure that interval directly with sleep-power.py and check the GPIO before
+and after. SET_POWER(true)'s acknowledgement precedes panel detection:
+poll HPD until connected before testing or taking a restored reference.
+
+The separate `epic_ap_cycle` attribute adds AP IDLE after native display
+shutdown, retaining IOP ON, transport, clocks and DMA. It uses the same
+bounded 1..300-second hold and restores AP ON before SET_POWER(true).
+Status includes separate AP idle/wake results; failed transitions latch the
+trial failed. This combines two previously qualified operations, but the
+combined path still requires its own short-cycle and power qualification.
+It does not claim DCP processor sleep or enable system suspend with AFK active.
