@@ -299,6 +299,9 @@ struct apple_dart {
 	DECLARE_BITMAP(static_bypass, DART_MAX_STREAMS);
 	DECLARE_BITMAP(static_enabled, DART_MAX_STREAMS);
 	bool has_static_enabled;
+	/* t8110 stream remap: source streams folded onto a target stream */
+	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
+	u8 remap_target[DART_MAX_STREAMS];
 
 	u32 save_tcr[DART_MAX_STREAMS];
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
@@ -890,6 +893,28 @@ static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
 					    false, 0, 0);
 }
 
+/*
+ * t8110 DARTs can fold a stream onto another one: the source stream is
+ * translated, filtered and TLB-tracked exactly as the target (the ADT
+ * "remap" list; on J700 the ISP firmware reaches its data segment through
+ * SID 10, which iBoot remaps onto SID 0).  The source keeps no TTBR of its
+ * own and stays out of the enable bitmap.
+ */
+static void apple_dart_hw_apply_remaps(struct apple_dart *dart)
+{
+	int sid;
+
+	if (dart->hw->type != DART_T8110)
+		return;
+
+	for_each_set_bit(sid, dart->remapped, dart->num_streams) {
+		writel(0, dart->regs + DART_TTBR(dart, sid, 0));
+		writel(DART_T8110_TCR_REMAP_EN |
+		       FIELD_PREP(DART_T8110_TCR_REMAP, dart->remap_target[sid]),
+		       dart->regs + DART_TCR(dart, sid));
+	}
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
@@ -904,6 +929,7 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
+	apple_dart_hw_apply_remaps(dart);
 
 	apple_dart_hw_enable_global_streams(dart);
 
@@ -2077,7 +2103,7 @@ static int apple_dart_pmp_admit(struct apple_dart *dart)
 
 static int apple_dart_probe(struct platform_device *pdev)
 {
-	int bypass_count, enabled_count, ret;
+	int bypass_count, enabled_count, remap_count, ret;
 	u32 dart_params[4], sid;
 	struct resource *res;
 	struct apple_dart *dart;
@@ -2236,6 +2262,34 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 	} else if (enabled_count != -EINVAL) {
 		ret = enabled_count;
+		goto err_clk_disable;
+	}
+	remap_count = of_property_count_u32_elems(dev->of_node,
+						   "apple,remap-streams");
+	if (remap_count > 0) {
+		u32 src, dst;
+
+		if (dart->hw->type != DART_T8110 || remap_count % 2) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		for (int i = 0; i < remap_count; i += 2) {
+			ret = of_property_read_u32_index(dev->of_node,
+							 "apple,remap-streams",
+							 i, &src);
+			ret = ret ?: of_property_read_u32_index(dev->of_node,
+								"apple,remap-streams",
+								i + 1, &dst);
+			if (ret || src >= dart->num_streams ||
+			    dst >= dart->num_streams || src == dst) {
+				ret = ret ?: -ERANGE;
+				goto err_clk_disable;
+			}
+			set_bit(src, dart->remapped);
+			dart->remap_target[src] = dst;
+		}
+	} else if (remap_count != -EINVAL) {
+		ret = remap_count;
 		goto err_clk_disable;
 	}
 
