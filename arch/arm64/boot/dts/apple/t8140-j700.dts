@@ -210,6 +210,45 @@
 	};
 };
 
+/*
+ * 3.5 mm headphone codec (live J700 ADT /arm-io/i2c0/audio-codec-output:
+ * audio-control,cs42l83 at 0x48, function-reset GPIO 103, interrupts
+ * [104, 1] on gpio0).  The m1n1 hardware proof released reset through
+ * GPIO 103, read ID 42/a8/3a revision B0 and heard a tone at 24 dB
+ * attenuation with upstream's 6 MHz -> 12 MHz MCLK PLL tuple.
+ */
+&i2c0 {
+	status = "okay";
+
+	jack_codec: codec@48 {
+		compatible = "cirrus,cs42l83";
+		reg = <0x48>;
+		reset-gpios = <&pinctrl_ap 103 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <104 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		cirrus,ts-inv = <1>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/*
+ * Internal speaker amplifier (ADT audio-speaker audio-control,max98360,
+ * function-reset GPIO 105 = the SD_MODE enable).  Kept disabled while the
+ * fail-closed hog below owns pin 105: the MAX98360 has no current/voltage
+ * sense, so speakersafetyd does not apply and the amp only leaves reset
+ * under a timer-bounded, gain-capped bring-up contract.
+ */
+/ {
+	speaker_amp: audio-amplifier {
+		compatible = "maxim,max98360a";
+		sdmode-gpios = <&pinctrl_ap 105 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Speaker";
+		status = "disabled";
+	};
+};
+
 &smc_mbox {
 	status = "okay";
 };
