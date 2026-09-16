@@ -521,3 +521,20 @@
 		apple,keyboard-layout-id = <5>;
 	};
 };
+
+/* AOP: the audio fabric owner (low-power microphone first). */
+&aop_dart {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
