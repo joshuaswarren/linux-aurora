@@ -55,11 +55,15 @@ inner = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\("
 assert inner.index('"new-user-render-storage"') < inner.index(".reserve(id)"), \
     "a fresh storage's ID is not reserved for the storage's lifetime"
 
-for name in ["recycle_desynced_render_storage",
-             "release_runtime_objects_after_processor_stop"]:
-    body = block(manager, r"^    (?:pub\(crate\) )?fn " + name + r"\(")
-    assert "unreserve" in body, f"{name} drops a storage without returning its ID"
-    assert body.index("unreserve") < body.rindex("self.render_storage = None"), name
+desync = block(manager, r"^    fn recycle_desynced_render_storage\(")
+assert "self.render_storage.take()" in desync
+assert "if !retained_firmware_state" in desync
+assert desync.index("if !retained_firmware_state") < desync.index("unreserve(id)")
+stop = block(manager, r"^    pub\(crate\) fn release_runtime_objects_after_processor_stop\(")
+assert "unreserve_render_storage_hardware_buffer_id" in stop
+assert stop.index("unreserve_render_storage_hardware_buffer_id") < stop.index(
+    "self.render_storage = None"
+)
 
 # A cross-VM handoff deliberately retains one completed generation and its
 # reserved ID. This prevents the incoming graph from immediately reusing the
@@ -68,7 +72,10 @@ handoff = block(manager, r"^    pub\(crate\) fn handoff_retained_render_vm\(")
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
 assert "unreserve_render_storage_hardware_buffer_id" not in handoff
 release_retired = block(manager, r"^    fn release_retired_handoff_graph\(")
-assert release_retired.index("ids.unreserve(id)") < release_retired.index("drop(retired)")
+assert "storage.into_retired_parameter_management()" in release_retired
+assert release_retired.index("if !retained_firmware_state") < release_retired.index(
+    "ids.unreserve(id)"
+)
 
 # The identity gate stays: the fix satisfies it, it does not bypass it.
 scene = block(resources, r"^    fn prepare_retained_scene\(")
@@ -87,12 +94,16 @@ assert retire.index("return Ok(false)") < retire.index("complete_g17p_cl_kicks("
     "bookkeeping must not run for a group the firmware still holds"
 abandon = block(runtime, r"^    pub\(crate\) fn abandon_deferred_render\(")
 assert "-> Result<bool>" in abandon
-assert "retire_abandoned_render_if_firmware_retired()" in abandon
+assert "retire_failed_deferred_render(render_slot, true)" in abandon
+abandon = block(runtime, r"^    fn retire_failed_deferred_render\(")
+assert "retire_abandoned_render_if_firmware_retired(" in abandon
 assert "retire_render_usc_freelist_at_completion()" in abandon
-assert abandon.index("retire_abandoned_render_if_firmware_retired()") \
+assert abandon.index("retire_abandoned_render_if_firmware_retired(") \
     < abandon.index("abandon_render_submission_after_timeout()")
 timeout = block(runtime, r"^    pub\(crate\) fn timeout_deferred_render\(")
-assert "abandon_deferred_render(render_slot).unwrap_or(false)" in timeout
+assert "settle_failed_deferred_render(" in timeout
+timeout = block(runtime, r"^    fn settle_failed_deferred_render\(")
+assert ".retire_failed_deferred_render(render_slot, submission_id.is_some())" in timeout
 assert timeout.index("if retired") < timeout.index("signal.complete(Err(EIO))")
 assert timeout.index("signal.complete(Err(EIO))") < timeout.index("signal.fail_while_owned(error)")
 assert "quarantined_render_completions" in timeout, \

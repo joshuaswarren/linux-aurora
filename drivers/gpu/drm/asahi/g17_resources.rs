@@ -3481,6 +3481,33 @@ impl G17PRenderUserAliases {
                 true,
             )
     }
+
+    fn remap(
+        &self,
+        render_state: &mut MappedObject,
+        vm: &mmu::Vm,
+        render_layout: &G17PRenderStateLayout,
+    ) -> Result<Self> {
+        let deflake = render_state.object.map_range_into_range(
+            vm,
+            G17P_RENDER_STATE_DEFLAKE..G17P_RENDER_STATE_DEFLAKE + mmu::UAT_PGSZ,
+            self.deflake.iova()..self.deflake.iova() + mmu::UAT_PGSZ as u64,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        let aux_fb = render_state.object.map_range_into_range(
+            vm,
+            render_layout.aux_fb
+                ..render_layout.aux_fb + G17P_RENDER_STATE_AUX_FB_SIZE,
+            self.aux_fb.iova()
+                ..self.aux_fb.iova() + G17P_RENDER_STATE_AUX_FB_SIZE as u64,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        Ok(Self { deflake, aux_fb })
+    }
 }
 
 #[cfg(not(test))]
@@ -5782,6 +5809,12 @@ struct G17PParameterManagement {
 pub(crate) struct G17PRetiredParameterManagement {
     _backing: MappedObject,
     _support: Option<MappedObject>,
+    hardware_buffer_id: u32,
+}
+
+#[cfg(not(test))]
+impl G17PRetiredParameterManagement {
+    pub(crate) fn hardware_buffer_id(&self) -> u32 { self.hardware_buffer_id }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -8028,6 +8061,7 @@ impl G17PUserRenderStorage {
             G17PRetiredParameterManagement {
                 _backing: backing,
                 _support: None,
+                hardware_buffer_id: manager.hardware_buffer_id,
             }
         })
     }
@@ -8054,6 +8088,7 @@ impl G17PUserRenderStorage {
             G17PRetiredParameterManagement {
                 _backing: backing,
                 _support: Some(support),
+                hardware_buffer_id: manager.hardware_buffer_id,
             }
         })
     }
@@ -8103,6 +8138,209 @@ impl G17PUserRenderStorage {
             vm, self.fragment_status_low.iova(), mmu::PROT_GPU_SHARED_RW,
         )?, GFP_KERNEL)?;
         Ok(aliases)
+    }
+
+    /// Cross-VM reuse preserves embedded GPU addresses. Check the complete
+    /// exclusive alias set before selecting a cached graph; a different VM
+    /// may already use those addresses for its other render pair or compute.
+    pub(crate) fn client_rebind_addresses_available(&self, vm: &mmu::Vm) -> bool {
+        let available = |name: &str, address: u64, size: u64| {
+            let mask = mmu::UAT_PGMSK as u64;
+            let start = address & !mask;
+            let Some(end) = address.checked_add(size)
+                .and_then(|end| end.checked_add(mask))
+                .map(|end| end & !mask)
+            else { return false; };
+            let mut ranges = [crate::pgtable::MappedRange::default(); 1];
+            match vm.mapped_ranges(start..end, &mut ranges) {
+                Ok((0, false)) => true,
+                Ok(_) => {
+                    pr_info!(
+                        "G17P graph cache: vm={} pair={} cannot reuse {} at {:#x}+{:#x}; occupied {:#x}..{:#x}\n",
+                        vm.id(), self.queue_pair.slot(), name, address, size,
+                        ranges[0].start, ranges[0].end,
+                    );
+                    false
+                }
+                Err(_) => false,
+            }
+        };
+        for (name, address, size) in [
+            ("render-state", self.render_state.iova(), self.render_state.logical_size as u64),
+            ("deflake", self.render_user_aliases.deflake.iova(), self.render_user_aliases.deflake.size() as u64),
+            ("aux-fb", self.render_user_aliases.aux_fb.iova(), self.render_user_aliases.aux_fb.size() as u64),
+            ("rt-memory", self.render_target_memory.rt_memory.iova(), self.render_target_memory.rt_memory.logical_size as u64),
+            ("tpc", self.render_target_memory.tpc.iova(), self.render_target_memory.tpc.logical_size as u64),
+            ("descriptor-ta", self.descriptor_ta_low.iova(), self.descriptor_ta_low.size() as u64),
+            ("descriptor-3d", self.descriptor_3d_low.iova(), self.descriptor_3d_low.size() as u64),
+            ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.logical_size as u64),
+            ("descriptor-3d-diagnostic", self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64),
+            ("fragment-status", self.fragment_status_low.iova(), self.fragment_status_low.size() as u64),
+        ] {
+            if !available(name, address, size) { return false; }
+        }
+        for object in [self.scene_scratch.as_ref(), self.discard.as_ref()].into_iter().flatten() {
+            if !available("scene/discard", object.iova(), object.logical_size as u64) {
+                return false;
+            }
+        }
+        if let Some(pm) = self.parameter_management.as_ref() {
+            if !available("page-list", pm.page_list_low_va(), G17P_PM_PAGE_LIST_SIZE as u64) {
+                return false;
+            }
+        }
+        if let Some(tvb) = self.render_tvb.as_ref() {
+            for index in 0..tvb.block_count {
+                let Some(address) = g17p_render_tvb_block_va(self.queue_pair, index) else {
+                    return false;
+                };
+                if !available("tvb", address, G17P_RENDER_TVB_BLOCK_SIZE as u64) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Rebind every client-root view of an idle cached graph to a different
+    /// VM without rebuilding any firmware-high queue, descriptor, support, PM
+    /// or TVB object. The complete mapping set is prepared before ownership is
+    /// changed, matching BufferManager's stable-slot reuse on M1/M2.
+    pub(crate) fn rebind_client_vm_aliases(
+        &mut self,
+        uat: &mmu::Uat,
+        vm: &mmu::Vm,
+        sksm_backing: &mut G17PRenderSksmBacking,
+    ) -> Result<(KVec<mmu::KernelMapping>, KVec<mmu::KernelMapping>)> {
+        if !sksm_backing.matches_queue_pair(self.queue_pair) {
+            return Err(EFAULT);
+        }
+
+        let render_state_mapping = self.render_state.object.map_at(
+            vm, self.render_state.iova(), mmu::PROT_GPU_FW_SHARED_RW, false,
+        )?;
+        let render_user_aliases = self.render_user_aliases.remap(
+            &mut self.render_state, vm, &self.render_layout,
+        )?;
+        let rt_memory_iova = self.render_target_memory.rt_memory.iova();
+        let rt_memory_mapping = self.render_target_memory.rt_memory.object.map_at(
+            vm,
+            rt_memory_iova,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        let tpc_iova = self.render_target_memory.tpc.iova();
+        let tpc_mapping = self.render_target_memory.tpc.object.map_at(
+            vm,
+            tpc_iova,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        let descriptor_ta_low = self.descriptors.object.map_range_into_range(
+            vm,
+            0..G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
+            self.descriptor_ta_low.iova()
+                ..self.descriptor_ta_low.iova() + G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE as u64,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RO,
+            false,
+        )?;
+        let descriptor_3d_low = self.descriptors.object.map_range_into_range(
+            vm,
+            G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
+            self.descriptor_3d_low.iova()
+                ..self.descriptor_3d_low.iova() + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE as u64,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RO,
+            false,
+        )?;
+        let scene_mapping = self.scene_scratch.as_mut().map(|object| {
+            object.map_alias_at(vm, object.iova(), mmu::PROT_GPU_SHARED_RW)
+        }).transpose()?;
+        let discard_mapping = self.discard.as_mut().map(|object| {
+            object.map_alias_at(vm, object.iova(), mmu::PROT_GPU_SHARED_RW)
+        }).transpose()?;
+        let page_list_mapping = self.parameter_management.as_mut().map(|pm| {
+            let size = page_align(G17P_PM_PAGE_LIST_SIZE).ok_or(EINVAL)?;
+            pm.backing.object.map_range_into_range(
+                vm,
+                pm.layout.page_list..pm.layout.page_list.checked_add(size).ok_or(EOVERFLOW)?,
+                pm.page_list_low_va()
+                    ..pm.page_list_low_va().checked_add(size as u64).ok_or(EOVERFLOW)?,
+                G17P_PM_PAGE_SIZE as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+                false,
+            )
+        }).transpose()?;
+        let tvb_mappings = self.render_tvb.as_mut()
+            .map(|tvb| tvb.map_cached_blocks(vm))
+            .transpose()?
+            .unwrap_or_else(KVec::new);
+        let fragment_rce_mapping = self.fragment_rce.map_alias_at(
+            vm, self.fragment_rce.iova(), mmu::PROT_GPU_SHARED_RO,
+        )?;
+        let descriptor_3d_render_mapping = self.descriptors.object.map_range_into_range(
+            vm,
+            G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + mmu::UAT_PGSZ,
+            self.descriptor_3d_render.iova()
+                ..self.descriptor_3d_render.iova() + self.descriptor_3d_render.size() as u64,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RO,
+            false,
+        )?;
+        let fragment_status_mapping = self.fragment_status.map_alias_at(
+            vm, self.fragment_status_low.iova(), mmu::PROT_GPU_SHARED_RW,
+        )?;
+        let render_peer_prot = if *crate::module_parameters::g17p_render_sksm.value() != 0 {
+            mmu::PROT_GPU_SHARED_RW
+        } else {
+            mmu::PROT_GPU_SHARED_RO
+        };
+        let (ta_context_low, ta_context_mapping) = prepare_render_sksm_vm_alias(
+            uat, vm, &mut sksm_backing.ta_context, self.queue_pair.low_va(true),
+            render_peer_prot, *crate::module_parameters::g17p_render_sksm.value() != 0,
+        )?;
+        let (fragment_context_low, fragment_context_mapping) = prepare_render_sksm_vm_alias(
+            uat, vm, &mut sksm_backing.fragment_context, self.queue_pair.low_va(false),
+            render_peer_prot, *crate::module_parameters::g17p_render_sksm.value() != 0,
+        )?;
+
+        self.render_state.mapping = Some(render_state_mapping);
+        self.render_user_aliases = render_user_aliases;
+        self.render_target_memory.rt_memory.mapping = Some(rt_memory_mapping);
+        self.render_target_memory.tpc.mapping = Some(tpc_mapping);
+        self.descriptor_ta_low = descriptor_ta_low;
+        self.descriptor_3d_low = descriptor_3d_low;
+        if let (Some(object), Some(mapping)) = (self.scene_scratch.as_mut(), scene_mapping) {
+            object.mapping = Some(mapping);
+        }
+        if let (Some(object), Some(mapping)) = (self.discard.as_mut(), discard_mapping) {
+            object.mapping = Some(mapping);
+        }
+        if let (Some(pm), Some(mapping)) = (self.parameter_management.as_mut(), page_list_mapping) {
+            pm._page_list_low = mapping;
+        }
+        if let Some(tvb) = self.render_tvb.as_mut() {
+            tvb.block_mappings = tvb_mappings;
+        }
+        self.fragment_rce.mapping = Some(fragment_rce_mapping);
+        self.render_operand_aliases = KVec::with_capacity(2, GFP_KERNEL)?;
+        self.render_operand_aliases.push(descriptor_3d_render_mapping, GFP_KERNEL)?;
+        self.render_operand_aliases.push(fragment_status_mapping, GFP_KERNEL)?;
+        self.ta_context_low = ta_context_low;
+        self.fragment_context_low = fragment_context_low;
+
+        let pool_mappings = self.take_persistent_client_mappings()?;
+        let mut sksm_mappings = KVec::with_capacity(2, GFP_KERNEL)?;
+        if let Some(mapping) = ta_context_mapping {
+            sksm_mappings.push(mapping, GFP_KERNEL)?;
+        }
+        if let Some(mapping) = fragment_context_mapping {
+            sksm_mappings.push(mapping, GFP_KERNEL)?;
+        }
+        Ok((pool_mappings, sksm_mappings))
     }
 
     /// Called only after semantic paired completion and FList release.
@@ -16128,6 +16366,35 @@ impl G17ResourceOwner {
         vm.append_driver_mappings(self.stage_user_render_flist(vm)?)?;
         vm.install_render_pool_mappings(render_slot, storage.render_pool_id(),
             storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)
+    }
+
+    pub(crate) fn rebind_cached_render_vm(
+        &mut self,
+        storage: &mut G17PUserRenderStorage,
+        vm: &mmu::Vm,
+        sksm_backing: &mut G17PRenderSksmBacking,
+    ) -> Result {
+        self.address_space.uat.require_t8140_vm_context(vm)?;
+        let render_slot = storage.queue_pair.slot();
+        vm.clear_render_pool_mappings(render_slot);
+        let (pool_mappings, sksm_mappings) = storage.rebind_client_vm_aliases(
+            &self.address_space.uat, vm, sksm_backing,
+        )?;
+        let job_context_mappings = self
+            .address_space
+            .uat
+            .install_t8140_job_context_aliases(vm)?;
+        vm.append_driver_mappings(job_context_mappings)?;
+        let flist_mappings = self.stage_user_render_flist(vm)?;
+        vm.append_driver_mappings(flist_mappings)?;
+        vm.install_render_pool_mappings(
+            render_slot,
+            storage.render_pool_id(),
+            storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count),
+            pool_mappings,
+        )?;
+        vm.append_driver_mappings(sksm_mappings)?;
+        self.address_space.uat.flush_t8140_vm_contexts(vm).map(|_| ())
     }
 
     /// Upgrade an ordinary compute-capable client VM to the complete native

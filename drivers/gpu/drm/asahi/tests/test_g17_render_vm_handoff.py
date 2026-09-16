@@ -43,7 +43,10 @@ assert retired_graph.index("context_aliases: Option<mmu::T8140NativeContextAlias
     "storage: g17_resources::G17PUserRenderStorage"
 )
 release_retired = function(manager, "fn release_retired_handoff_graph(")
-assert release_retired.index("ids.unreserve(id)") < release_retired.index("drop(retired)")
+assert "storage.into_retired_parameter_management()" in release_retired
+assert release_retired.index("if !retained_firmware_state") < release_retired.index(
+    "ids.unreserve(id)"
+)
 
 retired = function(manager, "fn require_retired_render_owner(")
 assert "snapshot.job_list_empty" in retired
