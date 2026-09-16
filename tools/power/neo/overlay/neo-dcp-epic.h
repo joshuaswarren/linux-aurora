@@ -41,7 +41,7 @@ struct neo_epic {
 	int power_off_result, power_on_result;
 	bool ap_cycle;
 	int ap_idle_result, ap_wake_result;
-	bool endpoint_cycle;
+	bool endpoint_cycle, iop_cycle;
 	int endpoint_stop_result, endpoint_start_result;
 	int error;
 };
