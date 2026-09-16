@@ -909,7 +909,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 	vbq->drv_priv = isp;
 	vbq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	vbq->io_modes = VB2_MMAP;
+	vbq->io_modes = VB2_MMAP | VB2_DMABUF;
 	vbq->dev = isp->dev;
 	vbq->ops = &isp_vb2_ops;
 	vbq->mem_ops = &vb2_dma_sg_memops;
@@ -935,6 +935,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	vdev->vfl_dir = VFL_DIR_RX;
 	vdev->release = video_device_release_empty;
 	vdev->lock = &isp->video_lock;
+	vdev->entity.flags |= MEDIA_ENT_FL_DEFAULT;
 	strscpy(vdev->name, APPLE_ISP_DEVICE_NAME, sizeof(vdev->name));
 	video_set_drvdata(vdev, isp);
 
