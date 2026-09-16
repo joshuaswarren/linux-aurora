@@ -159,3 +159,34 @@ Additional native checks exclude two tempting shortcuts:
 No macOS register writes or Linux power-saving change resulted from this
 capture. Investigate the boot-core startup/retention contract next; avoid
 guessing CYC_OVRD, AIC routing or CPU-domain writes.
+
+## Whole-machine target and energy-counter comparison
+
+The user clarified the awake target as **0.2 W whole-machine battery power**,
+with the actual panel/backlight off and Wi-Fi/SSH reachable. Neither 0.7 W
+nor 1 W is the completion threshold. CPU model estimates are diagnostic
+evidence; only a controlled battery measurement establishes target power.
+
+`cpu-energy.py` takes two read-only snapshots on either OS. The Linux
+backend is `cpu-energy-read.c`; the native backend is existing DevMem ABI 7.
+Neither backend enables, resets or calibrates accumulators. In particular,
+stalled or reset Linux counters must not be reported as zero watts.
+
+Native 25F84 implementation and live PMGR mappings establish:
+
+- Core/SRAM: cpu-impl + 0x9000/0x9008, native functions
+  0xfffffe000982f120 / 0xfffffe000982f2ec. Maps 14..17 are E0..3;
+  maps 26..27 are P0..1. The table is at 0xfffffe0007630ab8.
+- Cluster CPM/SRAM: map 10 (0x210e40000), map 22 (0x211e40000),
+  offsets 0x8000/0x8008. These are distinct named model counters;
+  do not assume their sum is independent rail power.
+- `energyAccumulatorToNanojoules` at 0xfffffe000982ef20 multiplies
+  by 2.5e-11 and then 1e9, using doubles at 0xfffffe00076309d0/9d8:
+  **25 pJ per count**. Retained disassembly: `native/core-energy.asm`.
+
+`neo-cpu-energy-819CE0-01` completed a native 120-second interval. P0's
+core counter averaged 1.057 mW, its SRAM counter 0.105 mW; P1's core
+counter averaged 1.457 mW. These are modeled per-component estimates,
+not whole-machine watts, and do not prove the amount of static/leakage
+power covered. All 16 counters increased. The matching fresh PMGR mapping
+capture is `neo-pmgr-819CE0-energy` under the awake CPU artifact directory.
