@@ -40,6 +40,7 @@ use kernel::{
         from_fourcc,
         EPICService,
         FakehidListener,
+        ReportListener,
         AOP, //
     },
     soc::apple::mailbox,
@@ -122,6 +123,12 @@ const SETUP_BUFFER_REQUEST: u64 = 0x12;
 const SETUP_BUFFER_REQUEST_ACK: u64 = 0x1200000000000000;
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
 const SETUP_BOOT_TIMEOUT_MS: i64 = 15000;
+const SETUP_SOURCE_EP: u8 = 0x20;
+const SETUP_SET_SOURCE_BUFFER: u64 = 0x6b803ce492bd9547;
+const SETUP_REQUEST_TYPE: u64 = 3 << 60;
+const SETUP_REQUEST_DONE: u64 = 4 << 60;
+const SETUP_REPLY_READY: u64 = 0x2000000000000001;
+const SETUP_REPLY_TIMEOUT_MS: i64 = 5000;
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
@@ -516,6 +523,8 @@ impl AFKEndpoint {
                 );
             } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
                 return client.process_fakehid_report(self, qhdr.channel, data);
+            } else if client.process_report(self, qhdr.channel, subtype, data)? {
+                return Ok(());
             } else {
                 dev_err!(
                     client.dev,
@@ -539,7 +548,24 @@ impl AFKEndpoint {
                     return Err(EIO);
                 }
                 let retcode = u32::from_ne_bytes(data[..4].try_into().unwrap());
-                let tag = ehdr.tag as usize;
+                let mut tag = ehdr.tag as usize;
+                if client.epic_v4 && (tag == 0 || tag > self.calls.len()) {
+                    // The t8140 firmware does not echo the request tag in its
+                    // replies; with one call in flight per endpoint (the native
+                    // host never had more) the reply is for that call.
+                    let inflight: KVec<usize> = {
+                        let mut v = KVec::new();
+                        for i in 0..self.calls.len() {
+                            if self.calls[i].is_some() {
+                                v.push(i + 1, GFP_KERNEL)?;
+                            }
+                        }
+                        v
+                    };
+                    if inflight.len() == 1 {
+                        tag = inflight[0];
+                    }
+                }
                 if tag == 0 || tag - 1 > self.calls.len() || self.calls[tag - 1].is_none() {
                     dev_err!(
                         client.dev,
@@ -711,6 +737,14 @@ struct ListenerEntry {
 
 unsafe impl Send for ListenerEntry {}
 
+struct ReportListenerEntry {
+    svc: EPICService,
+    subtype: u16,
+    listener: Arc<dyn ReportListener>,
+}
+
+unsafe impl Send for ReportListenerEntry {}
+
 /// One of the five setup-port endpoints: a host-to-AOP message page and an
 /// AOP-to-host reply window, both in the setup arena (dart-aop stream 1).
 #[derive(Clone, Copy, Default)]
@@ -730,6 +764,8 @@ struct SetupState {
     ap_ready: bool,
     power_sent: bool,
     failed: bool,
+    /// last non-boot message received on the source endpoint
+    reply: Option<u64>,
 }
 
 impl SetupState {
@@ -743,7 +779,21 @@ impl SetupState {
             ap_ready: false,
             power_sent: false,
             failed: false,
+            reply: None,
         }
+    }
+
+    fn endpoint(&self, ep: u8) -> Option<SetupEndpoint> {
+        self.endpoints.iter().flatten().find(|e| e.ep == ep).copied()
+    }
+
+    fn arena_offset(&self, iova: u64) -> Option<usize> {
+        let base = self.arena_iova();
+        let end = base + (SETUP_ARENA_PAGES * SETUP_PAGE) as u64;
+        if iova < base || iova >= end {
+            return None;
+        }
+        Some((iova - base) as usize)
     }
 
     fn arena_iova(&self) -> u64 {
@@ -818,6 +868,8 @@ struct AopData {
     ep_shutdown: FutureValue<()>,
     #[pin]
     hid_listeners: Mutex<KVec<ListenerEntry>>,
+    #[pin]
+    report_listeners: Mutex<KVec<ReportListenerEntry>>,
     #[pin]
     subdevices: Mutex<KVec<*mut bindings::platform_device>>,
 }
@@ -912,6 +964,7 @@ impl AopData {
                     }),
                     ep_shutdown <- FutureValue::pin_init(),
                     hid_listeners <- new_mutex!(KVec::new()),
+                    report_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
                 }
             ),
@@ -962,6 +1015,18 @@ impl AopData {
         let work = AopServiceRegisterWork::new(dev_name, self, svc)?;
         workqueue::system().enqueue(work);
         Ok(())
+    }
+
+    /// Returns Ok(true) when a registered listener took the report.
+    fn process_report(&self, ep: &AFKEndpoint, ch: u32, subtype: u16, data: &[u8]) -> Result<bool> {
+        let guard = self.report_listeners.lock();
+        for entry in &*guard {
+            if entry.svc.endpoint == ep.index && entry.svc.channel == ch && entry.subtype == subtype {
+                entry.listener.process_report(subtype, data)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn process_fakehid_report(&self, ep: &AFKEndpoint, ch: u32, data: &[u8]) -> Result<()> {
@@ -1052,9 +1117,68 @@ impl AopData {
             }
         } else if word >> 56 == SETUP_BUFFER_REQUEST {
             self.setup_endpoint_request(st, ep, word)
+        } else if st.endpoint(ep).is_some() {
+            st.reply = Some(word);
+            Ok(())
         } else {
             Err(EIO)
         }
+    }
+
+    /// The source-buffer bind: a 24-byte request in the endpoint's
+    /// host-to-AOP page, (3 << 60) | len on the endpoint, the firmware's
+    /// 0x2000000000000001, one status byte in the reply window, then
+    /// 4 << 60 to release it.
+    fn setup_bind_source(&self, iova: u64, size: u64) -> Result<()> {
+        let mut st = self.setup.lock();
+        let ep = st.endpoint(SETUP_SOURCE_EP).ok_or(ENXIO)?;
+        let tx_off = st.arena_offset(ep.tx_iova).ok_or(EIO)?;
+        let rx_off = st.arena_offset(ep.rx_iova).ok_or(EIO)?;
+        let mut req = [0u8; 24];
+        req[..8].copy_from_slice(&SETUP_SET_SOURCE_BUFFER.to_le_bytes());
+        req[8..16].copy_from_slice(&iova.to_le_bytes());
+        req[16..24].copy_from_slice(&size.to_le_bytes());
+        {
+            let arena = st.arena.as_mut().ok_or(ENXIO)?;
+            // SAFETY: the arena is a coherent allocation of
+            // SETUP_ARENA_PAGES pages and tx_off is a page inside it.
+            unsafe {
+                let buf = &mut arena.as_mut()[tx_off..tx_off + req.len()];
+                buf.copy_from_slice(&req);
+            }
+        }
+        mem_sync();
+        st.reply = None;
+        st.send(SETUP_SOURCE_EP, SETUP_REQUEST_TYPE | req.len() as u64)?;
+        let mut waited = 0i64;
+        while st.reply.is_none() {
+            let _ = self
+                .setup_cv
+                .wait_interruptible_timeout(&mut st, msecs_to_jiffies(100));
+            waited += 100;
+            if waited >= SETUP_REPLY_TIMEOUT_MS && st.reply.is_none() {
+                dev_err!(self.dev, "setup port: source bind timed out\n");
+                return Err(ETIMEDOUT);
+            }
+        }
+        let reply = st.reply.take().unwrap();
+        if reply != SETUP_REPLY_READY {
+            dev_err!(self.dev, "setup port: unexpected source bind reply {:#x}\n", reply);
+            return Err(EIO);
+        }
+        mem_sync();
+        let status = {
+            let arena = st.arena.as_ref().ok_or(ENXIO)?;
+            // SAFETY: rx_off is a page inside the arena.
+            unsafe { arena.as_ref()[rx_off] }
+        };
+        st.send(SETUP_SOURCE_EP, SETUP_REQUEST_DONE)?;
+        if status != 0 {
+            dev_err!(self.dev, "setup port: source bind status {:#x}\n", status);
+            return Err(EIO);
+        }
+        dev_info!(self.dev, "setup port: source ring {:#x} ({} bytes) bound\n", iova, size);
+        Ok(())
     }
 
     /// Endpoint buffer request: one host-to-AOP page and a reply window of
@@ -1196,6 +1320,38 @@ impl AOP for AopData {
             }
         }
         false
+    }
+    fn add_report_listener(
+        &self,
+        svc: EPICService,
+        subtype: u16,
+        listener: Arc<dyn ReportListener>,
+    ) -> Result<()> {
+        let mut guard = self.report_listeners.lock();
+        Ok(guard.push(
+            ReportListenerEntry {
+                svc,
+                subtype,
+                listener,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+    fn remove_report_listener(&self, svc: &EPICService, subtype: u16) -> bool {
+        let mut guard = self.report_listeners.lock();
+        for i in 0..guard.len() {
+            if guard[i].svc == *svc && guard[i].subtype == subtype {
+                guard.swap_remove(i);
+                return true;
+            }
+        }
+        false
+    }
+    fn bind_source_buffer(&self, iova: u64, size: u64) -> Result<()> {
+        if !self.epic_v4 {
+            return Err(ENODEV);
+        }
+        self.setup_bind_source(iova, size)
     }
     fn remove(&self) {
         if let Err(e) = self.stop() {
