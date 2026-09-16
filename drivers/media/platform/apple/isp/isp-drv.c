@@ -79,6 +79,40 @@ static int apple_isp_attach_genpd(struct apple_isp *isp)
 	return 0;
 }
 
+static void apple_isp_unmap_identity(struct apple_isp *isp, int count)
+{
+	for (int i = 0; i < count; i++)
+		iommu_unmap(isp->domain, isp->hw->identity[i].base,
+			    isp->hw->identity[i].size);
+}
+
+static int apple_isp_map_identity(struct apple_isp *isp)
+{
+	int i, err;
+
+	for (i = 0; i < isp->hw->num_identity; i++) {
+		const struct isp_identity_window *w = &isp->hw->identity[i];
+
+		/*
+		 * Plain cacheable PTEs, exactly as the native host mapped
+		 * them: with the NO_CACHE attribute the ISP's L2 took an
+		 * SError on its first PMP scratch write at CH_START.
+		 */
+		err = iommu_map(isp->domain, w->base, w->base, w->size,
+				IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+				GFP_KERNEL);
+		if (err) {
+			dev_err(isp->dev,
+				"failed to identity-map 0x%llx+0x%llx: %d\n",
+				w->base, w->size, err);
+			apple_isp_unmap_identity(isp, i);
+			return err;
+		}
+	}
+
+	return 0;
+}
+
 static int apple_isp_init_iommu(struct apple_isp *isp)
 {
 	struct device *dev = isp->dev;
@@ -95,6 +129,9 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	if (!isp->domain)
 		return -ENODEV;
 	isp->shift = __ffs(isp->domain->pgsize_bitmap);
+	/* t8140: the H17 firmware answers with vm-base 0x10000000000 set */
+	isp->fw_iova_mask = isp->hw->gen == ISP_GEN_T8140 ? GENMASK_ULL(35, 0) :
+							   ~0ULL;
 
 	idx = of_property_match_string(dev->of_node, "memory-region-names",
 				       "heap");
@@ -131,11 +168,18 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	drm_mm_init(&isp->iovad, isp->fw.heap_top,
 		    vm_size - (heap_base & 0xffffffff));
 
+	err = apple_isp_map_identity(isp);
+	if (err) {
+		drm_mm_takedown(&isp->iovad);
+		return err;
+	}
+
 	return 0;
 }
 
 static void apple_isp_free_iommu(struct apple_isp *isp)
 {
+	apple_isp_unmap_identity(isp, isp->hw->num_identity);
 	drm_mm_takedown(&isp->iovad);
 }
 
@@ -302,6 +346,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 
 	isp->dev = dev;
 	isp->hw = of_device_get_match_data(dev);
+	isp->fw_persistent = isp->hw->gen == ISP_GEN_T8140;
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
 
@@ -353,10 +398,24 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
-	isp->mbox2 = devm_platform_ioremap_resource_byname(pdev, "mbox2");
-	if (IS_ERR(isp->mbox2)) {
-		err = PTR_ERR(isp->mbox2);
-		goto detach_genpd;
+	if (isp->hw->mbox2_offset) {
+		/* t8140: doorbell/ack sit inside the "mbox" window */
+		isp->mbox2 = isp->mbox + isp->hw->mbox2_offset;
+	} else {
+		isp->mbox2 = devm_platform_ioremap_resource_byname(pdev, "mbox2");
+		if (IS_ERR(isp->mbox2)) {
+			err = PTR_ERR(isp->mbox2);
+			goto detach_genpd;
+		}
+	}
+
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		/* the EIC's ISP watchdog window; the frames stay masked without it */
+		isp->wdt = devm_platform_ioremap_resource_byname(pdev, "wdt");
+		if (IS_ERR(isp->wdt)) {
+			err = PTR_ERR(isp->wdt);
+			goto detach_genpd;
+		}
 	}
 
 	isp->irq = platform_get_irq(pdev, 0);
@@ -367,6 +426,15 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (!isp->irq) {
 		err = -ENODEV;
 		goto detach_genpd;
+	}
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		for (int i = 1; i < ARRAY_SIZE(isp->extra_irqs) + 1; i++) {
+			int irq = platform_get_irq_optional(pdev, i);
+
+			if (irq <= 0)
+				break;
+			isp->extra_irqs[isp->num_extra_irqs++] = irq;
+		}
 	}
 
 	mutex_init(&isp->iovad_lock);
@@ -603,6 +671,60 @@ static const struct apple_isp_hw apple_isp_hw_t6031 = {
 	.meta_size = ISP_META_SIZE_T6031,
 };
 
+/*
+ * J700 (T8140, ISP17a, macOS 26 H17 firmware).  DSID/PMP values are the ones
+ * the matched 25G83 init passes (SET_DSID_CLR_MULTI_BC_REG_BASE 0x220114000
+ * range 0x2fc, PMP_CTRL_SET clock scratch 0x3003d0ca0 / bandwidth scratch
+ * 0x302824000, 8-byte fields); meta size 0x4d00 and the capture-meta record
+ * 0x29fc0 come from CH_INFO_GET.  The ASC control/status block moved to
+ * +0x1600040, the doorbell/ack block is at mbox+0x410.
+ */
+/* dart-isp dapf-instance-0 slices, page-rounded (native host identity_ranges) */
+static const struct isp_identity_window apple_isp_identity_t8140[] = {
+	{ 0x220004000, 0x14000 },	/* DSID broadcast-clear windows 0..4 */
+	{ 0x220044000, 0x14000 },
+	{ 0x220084000, 0x14000 },
+	{ 0x2200c4000, 0x14000 },
+	{ 0x220104000, 0x14000 },
+	{ 0x3003c0000, 0x28000 },	/* PMGR scratch (PMP clock/bandwidth) */
+	{ 0x300704000, 0x4000 },	/* ISP-local power domains */
+	{ 0x300730000, 0x4000 },
+	{ 0x300e3c000, 0x4000 },
+	{ 0x302824000, 0x4000 },	/* PMP bandwidth scratch */
+	{ 0x31062c000, 0x20000 },
+	{ 0x401660000, 0x4000 },
+};
+
+static const struct apple_isp_hw apple_isp_hw_t8140 = {
+	.gen = ISP_GEN_T8140,
+	.pmu_base = 0x0,
+
+	.dsid_count = 1,
+	.dsid_clr_base0 = 0x220114000,
+	.dsid_clr_range0 = 0x2fc,
+
+	.clock_scratch = 0x3003d0ca0,
+	.clock_base = 0x0,
+	.clock_bit = 0x0,
+	.clock_size = 0x8,
+	.bandwidth_scratch = 0x302824000,
+	.bandwidth_base = 0x0,
+	.bandwidth_bit = 0x0,
+	.bandwidth_size = 0x8,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T8140,
+
+	.scl1 = false,
+	.lpdp = true,
+	.meta_size = ISP_META_SIZE_T8140,
+
+	.mbox2_offset = 0x410,
+	.asc_control = ISP_COPROC_CONTROL_T8140,
+	.asc_status = ISP_COPROC_STATUS_T8140,
+	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
+	.identity = apple_isp_identity_t8140,
+	.num_identity = ARRAY_SIZE(apple_isp_identity_t8140),
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
@@ -611,6 +733,7 @@ static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t6020-isp", .data = &apple_isp_hw_t6020 },
 	{ .compatible = "apple,t6030-isp", .data = &apple_isp_hw_t6030 },
 	{ .compatible = "apple,t6031-isp", .data = &apple_isp_hw_t6031 },
+	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_isp_of_match);

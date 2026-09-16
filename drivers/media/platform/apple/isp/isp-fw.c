@@ -38,6 +38,11 @@ static inline u32 isp_gpio_read32(struct apple_isp *isp, u32 reg)
 	return readl(isp->gpio + reg);
 }
 
+static inline u32 isp_asc_control_reg(struct apple_isp *isp)
+{
+	return isp->hw->asc_control ?: ISP_COPROC_CONTROL;
+}
+
 static inline void isp_gpio_write32(struct apple_isp *isp, u32 reg, u32 val)
 {
 	writel(val, isp->gpio + reg);
@@ -71,6 +76,15 @@ static void apple_isp_power_down_domains(struct apple_isp *isp)
 	int ret;
 
 	if (!isp->pds_active)
+		return;
+
+	/*
+	 * t8140: a gated ISP_CPU core never comes back (PS_TARGET=0xf,
+	 * PS_ACTUAL stays 0 on the next power-up, with or without the
+	 * DEV_DISABLE parking bit).  Keep the local chain powered between
+	 * firmware boots, as the native J700 host and m1n1 do.
+	 */
+	if (isp->hw->gen == ISP_GEN_T8140)
 		return;
 
 	for (int i = isp->pd_count - 1; i >= 1; i--) {
@@ -137,6 +151,39 @@ struct isp_firmware_bootargs {
 } __packed;
 static_assert(sizeof(struct isp_firmware_bootargs) == 0x180);
 
+/*
+ * ISP17a / H16-style boot descriptor (t8140).  Measured on the J700 with
+ * the macOS 26 (25G83) firmware: the queue-size word at +0x50 is 64-bit and
+ * carries args_offset + 1, +0x68 is 0x40 and the 0x200-byte connection
+ * descriptor at +0x70 only needs "no optical-dev-card-id" (+0xb0 = 1).
+ */
+#define ISP_H16_BOOTARGS_SIZE    0x290
+#define ISP_H16_DESCRIPTOR_SIZE  0x200
+#define ISP_H16_SHARED_SIZE_T8140 0xee000000ULL
+
+struct isp_firmware_bootargs_h16 {
+	u32 pad_0[2];
+	u64 ipc_iova;
+	u64 shared_base;
+	u64 shared_size;
+	u64 extra_iova;
+	u64 extra_size;
+	u32 platform_id;
+	u32 pad_34;
+	u64 logbuf_addr;
+	u64 logbuf_size;
+	u64 logbuf_entsize;
+	u64 ipc_queue_size;
+	u32 pad_58[4];
+	u32 unk_68;
+	u32 pad_6c;
+	u8 descriptor[ISP_H16_DESCRIPTOR_SIZE];
+	u32 pad_270[8];
+} __packed;
+static_assert(sizeof(struct isp_firmware_bootargs_h16) == ISP_H16_BOOTARGS_SIZE);
+
+#define ISP_H16_DESC_NO_OPTICAL_CARD_ID 0xb0
+
 struct isp_chan_desc {
 	char name[64];
 	u32 type;
@@ -163,9 +210,19 @@ static const struct isp_chan_ops bt_ops = {
 static irqreturn_t apple_isp_isr(int irq, void *dev)
 {
 	struct apple_isp *isp = dev;
+	u32 pending = isp_mbox_read32(isp, ISP_MBOX_IRQ_INTERRUPT);
 
-	isp_mbox2_write32(isp, ISP_MBOX2_IRQ_ACK,
-			 isp_mbox_read32(isp, ISP_MBOX_IRQ_INTERRUPT));
+	if (isp->num_extra_irqs) {
+		/* bring-up: identify the mailbox line among the ADT's five */
+		if (!pending)
+			return IRQ_NONE;
+		if (irq != isp->irq)
+			dev_info_ratelimited(isp->dev,
+					     "mailbox interrupt on extra line irq %d (pending 0x%x)\n",
+					     irq, pending);
+	}
+
+	isp_mbox2_write32(isp, ISP_MBOX2_IRQ_ACK, pending);
 
 	return IRQ_WAKE_THREAD;
 }
@@ -190,7 +247,13 @@ static irqreturn_t apple_isp_isr_thread(int irq, void *dev)
 static void isp_disable_irq(struct apple_isp *isp)
 {
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140, 0x0);
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
+	}
 	free_irq(isp->irq, isp);
+	for (int i = 0; i < isp->num_extra_irqs; i++)
+		free_irq(isp->extra_irqs[i], isp);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0xfeedbabe); /* real funny */
 }
 
@@ -204,10 +267,70 @@ static int isp_enable_irq(struct apple_isp *isp)
 		isp_err(isp, "failed to request IRQ#%u (%d)\n", isp->irq, err);
 		return err;
 	}
+	for (int i = 0; i < isp->num_extra_irqs; i++) {
+		err = request_threaded_irq(isp->extra_irqs[i], apple_isp_isr,
+					   apple_isp_isr_thread, 0, "apple-isp",
+					   isp);
+		if (err < 0) {
+			isp_err(isp, "failed to request extra IRQ#%u (%d)\n",
+				isp->extra_irqs[i], err);
+			while (i--)
+				free_irq(isp->extra_irqs[i], isp);
+			free_irq(isp->irq, isp);
+			return err;
+		}
+	}
 
 	isp_dbg(isp, "about to enable interrupts...\n");
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0xf);
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		/* ISP17a: two more enable words and an IRQ steering write */
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140,
+				 ISP_MBOX_IRQ_ENABLE1_T8140_VAL);
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140,
+				 ISP_MBOX_IRQ_ENABLE2_T8140_VAL);
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_STEER_T8140,
+				 ISP_MBOX_IRQ_STEER_T8140_VAL);
+	}
+
+	return 0;
+}
+
+/*
+ * t8140: AppleH16CamIn's PerformPowerGatingDisabledReset as replayed by the
+ * native J700 host (every successful native run, e.g. the 220 s stream of
+ * attempt 1419): EDPRCR, four fabric words, four IRQ masks, then the two
+ * reset-acknowledge words are read back.  The ASC status is not polled for
+ * WFI on this generation.
+ */
+static int isp_reset_coproc_t8140(struct apple_isp *isp)
+{
+	int retries;
+
+	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
+	for (retries = 0; retries < 100; retries++) {
+		if (!(isp_coproc_read32(isp, ISP_COPROC_EDPRCR) & 0x2))
+			break;
+		mdelay(1);
+	}
+	msleep(50);
+
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_1_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_2_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_3_T8140, 0xffffffff);
+
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_0_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_1_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_2_T8140, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_3_T8140, 0xffffffff);
+
+	for (retries = 0; retries < 8; retries++) {
+		isp_coproc_read32(isp, ISP_COPROC_RESET_ACK_0_T8140);
+		isp_coproc_read32(isp, ISP_COPROC_RESET_ACK_1_T8140);
+	}
+	msleep(50);
 
 	return 0;
 }
@@ -217,6 +340,9 @@ static int isp_reset_coproc(struct apple_isp *isp)
 	int retries;
 	u32 status;
 	u32 val;
+
+	if (isp->hw->gen == ISP_GEN_T8140)
+		return isp_reset_coproc_t8140(isp);
 
 	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
 
@@ -263,7 +389,7 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 {
-	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
+	isp_coproc_write32(isp, isp_asc_control_reg(isp), 0x0);
 
 	apple_isp_power_down_domains(isp);
 }
@@ -278,7 +404,9 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 		return err;
 
 
-	isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
+	/* ISP17a has no clock-enable GPIO word; the native host never wrote it */
+	if (isp->hw->gen != ISP_GEN_T8140)
+		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
 
 #if 0
 	/* This doesn't work well with system sleep */
@@ -300,13 +428,15 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	isp_gpio_write32(isp, ISP_GPIO_3, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_4, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_5, 0x0);
-	isp_gpio_write32(isp, ISP_GPIO_6, 0x0);
+	/* ISP_StartFirmware mode 0: the ISP17a boot-mode field is GPIO6 = 1 */
+	isp_gpio_write32(isp, ISP_GPIO_6,
+			 isp->hw->gen == ISP_GEN_T8140 ? 0x1 : 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_7, 0x0);
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
-	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
-	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x10);
+	isp_coproc_write32(isp, isp_asc_control_reg(isp), 0x0);
+	isp_coproc_write32(isp, isp_asc_control_reg(isp), 0x10);
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
 	for (retries = 0; retries < ISP_FIRMWARE_MAX_TRIES; retries++) {
@@ -365,12 +495,15 @@ static void isp_firmware_shutdown_stage2(struct apple_isp *isp)
 static int isp_firmware_boot_stage2(struct apple_isp *isp)
 {
 	struct isp_firmware_bootargs args;
+	struct isp_firmware_bootargs_h16 args_h16;
+	size_t args_size;
 	dma_addr_t args_iova;
 	void *args_virt;
 	int err, retries;
 
 	u32 num_ipc_chans = isp_gpio_read32(isp, ISP_GPIO_0);
 	u32 args_offset = isp_gpio_read32(isp, ISP_GPIO_1);
+	u32 desc_flags = isp_gpio_read32(isp, ISP_GPIO_2);
 	u32 extra_size = isp_gpio_read32(isp, ISP_GPIO_3);
 	isp->num_ipc_chans = num_ipc_chans;
 
@@ -389,24 +522,43 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 		return -ENOMEM;
 	}
 
+	args_size = isp->hw->gen == ISP_GEN_T8140 ? sizeof(args_h16) : sizeof(args);
 	args_iova = isp->ipc_surf->iova + args_offset + 0x40;
 	args_virt = isp->ipc_surf->virt + args_offset + 0x40;
-	isp->cmd_iova = args_iova + sizeof(args) + 0x40;
-	isp->cmd_virt = args_virt + sizeof(args) + 0x40;
+	isp->cmd_iova = args_iova + args_size + 0x40;
+	isp->cmd_virt = args_virt + args_size + 0x40;
 
-	memset(&args, 0, sizeof(args));
-	args.ipc_iova = isp->ipc_surf->iova;
-	args.ipc_size = isp->ipc_surf->size;
-	args.shared_base = isp->fw.heap_top & 0xffffffff;
-	args.shared_size = 0x10000000UL - args.shared_base;
-	args.extra_iova = isp->extra_surf->iova;
-	args.extra_size = isp->extra_surf->size;
-	args.platform_id = isp->platform_id;
-	args.unk5 = 0x40;
-	args.unk7 = 0x1; // 0?
-	args.unk_iova1 = args_iova + sizeof(args) - 0xc;
-	args.unk9 = 0x3;
-	memcpy(args_virt, &args, sizeof(args));
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		if (!(desc_flags & 0x2))
+			dev_warn(isp->dev,
+				 "firmware did not request the H16 descriptor (flags 0x%x)\n",
+				 desc_flags);
+		memset(&args_h16, 0, sizeof(args_h16));
+		args_h16.ipc_iova = isp->ipc_surf->iova;
+		args_h16.shared_base = isp->fw.heap_top & 0xffffffff;
+		args_h16.shared_size = ISP_H16_SHARED_SIZE_T8140;
+		args_h16.extra_iova = isp->extra_surf->iova;
+		args_h16.extra_size = isp->extra_surf->size;
+		args_h16.platform_id = isp->platform_id;
+		args_h16.ipc_queue_size = args_offset + 1;
+		args_h16.unk_68 = 0x40;
+		args_h16.descriptor[ISP_H16_DESC_NO_OPTICAL_CARD_ID] = 1;
+		memcpy(args_virt, &args_h16, sizeof(args_h16));
+	} else {
+		memset(&args, 0, sizeof(args));
+		args.ipc_iova = isp->ipc_surf->iova;
+		args.ipc_size = isp->ipc_surf->size;
+		args.shared_base = isp->fw.heap_top & 0xffffffff;
+		args.shared_size = 0x10000000UL - args.shared_base;
+		args.extra_iova = isp->extra_surf->iova;
+		args.extra_size = isp->extra_surf->size;
+		args.platform_id = isp->platform_id;
+		args.unk5 = 0x40;
+		args.unk7 = 0x1; // 0?
+		args.unk_iova1 = args_iova + sizeof(args) - 0xc;
+		args.unk9 = 0x3;
+		memcpy(args_virt, &args, sizeof(args));
+	}
 
 	isp_gpio_write32(isp, ISP_GPIO_0, args_iova);
 	/* TODO: handle this via Kconfig depends? hardware is only present on
@@ -472,7 +624,7 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 	u64 table_iova = isp_gpio_read32(isp, ISP_GPIO_0) |
 			 ((u64)isp_gpio_read32(isp, ISP_GPIO_1)) << 32;
 	void *table_virt = apple_isp_ipc_translate(
-		isp, table_iova,
+		isp, isp_fw_iova(isp, table_iova),
 		sizeof(struct isp_chan_desc) * isp->num_ipc_chans);
 
 	if (!table_virt) {
@@ -501,9 +653,9 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 		chan->doorbell = 1 << chan->src;
 		chan->num = desc.num;
 		chan->size = desc.num * ISP_IPC_MESSAGE_SIZE;
-		chan->iova = desc.iova;
+		chan->iova = isp_fw_iova(isp, desc.iova);
 		chan->virt =
-			apple_isp_ipc_translate(isp, desc.iova, chan->size);
+			apple_isp_ipc_translate(isp, chan->iova, chan->size);
 		chan->cursor = 0;
 		mutex_init(&chan->lock);
 
@@ -653,6 +805,19 @@ static int isp_start_command_processor(struct apple_isp *isp)
 	if (err)
 		return err;
 
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		/*
+		 * H17 init (matched from the macOS 25G83 J700 log): no PMU base,
+		 * one DSID broadcast-clear window in the multi-BC form, then the
+		 * PMP control set.
+		 */
+		err = isp_cmd_set_dsid_clr_multi_bc_reg_base(
+			isp, isp->hw->dsid_clr_base0, isp->hw->dsid_clr_range0);
+		if (err)
+			return err;
+		goto pmp;
+	}
+
 	err = isp_cmd_set_isp_pmu_base(isp, isp->hw->pmu_base);
 	if (err)
 		return err;
@@ -672,6 +837,7 @@ static int isp_start_command_processor(struct apple_isp *isp)
 			return err;
 	}
 
+pmp:
 	if (isp->hw->clock_scratch) {
 		err = isp_cmd_pmp_ctrl_set(
 			isp, isp->hw->clock_scratch, isp->hw->clock_base,
@@ -767,9 +933,59 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	isp_collect_gc_surface(isp);
 }
 
+/*
+ * t8140: the EIC exclave's ISP watchdog window.  On macOS the
+ * ExclaveIndicatorController kicks it at 30 Hz while the camera indicator is
+ * healthy; without the kicks the H17 firmware keeps running but every frame
+ * is the diagnostic fill (LINUX-ISP-HOT-FRAMES-REQUIREMENTS-2026-09-16).
+ */
+static void apple_isp_wdt_kick(struct apple_isp *isp)
+{
+	/* exact EIC sequence: clear, reload value, kick, dsb sy */
+	writel(0, isp->wdt + ISP_WDT_CLEAR);
+	writel(ISP_WDT_RELOAD_VAL, isp->wdt + ISP_WDT_RELOAD);
+	writel(1, isp->wdt + ISP_WDT_KICK);
+	dsb(sy);
+}
+
+static enum hrtimer_restart apple_isp_wdt_pet(struct hrtimer *timer)
+{
+	struct apple_isp *isp = container_of(timer, struct apple_isp, wdt_timer);
+
+	apple_isp_wdt_kick(isp);
+	hrtimer_forward_now(timer, ns_to_ktime(ISP_WDT_PERIOD_NS));
+	return HRTIMER_RESTART;
+}
+
+void apple_isp_wdt_start(struct apple_isp *isp)
+{
+	if (!isp->wdt || isp->wdt_running)
+		return;
+
+	hrtimer_setup(&isp->wdt_timer, apple_isp_wdt_pet, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_HARD);
+	isp->wdt_running = true;
+	/* first kick right away, then every 33 ms for the life of the stream */
+	apple_isp_wdt_kick(isp);
+	hrtimer_start(&isp->wdt_timer, ns_to_ktime(ISP_WDT_PERIOD_NS),
+		      HRTIMER_MODE_REL_HARD);
+}
+
+void apple_isp_wdt_stop(struct apple_isp *isp)
+{
+	if (!isp->wdt_running)
+		return;
+
+	hrtimer_cancel(&isp->wdt_timer);
+	isp->wdt_running = false;
+}
+
 int apple_isp_firmware_boot(struct apple_isp *isp)
 {
 	int err;
+
+	if (isp->fw_persistent && isp->fw_booted)
+		return 0;
 
 	/* Needs to be power cycled for IOMMU to behave correctly */
 	err = pm_runtime_resume_and_get(isp->dev);
@@ -785,11 +1001,18 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 		return err;
 	}
 
+	isp->fw_booted = true;
+
 	return 0;
 }
 
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
+	/* t8140: the firmware stays up (and keeps its runtime PM reference) */
+	if (isp->fw_persistent)
+		return;
+
 	isp_firmware_shutdown(isp);
+	isp->fw_booted = false;
 	pm_runtime_put_sync(isp->dev);
 }
