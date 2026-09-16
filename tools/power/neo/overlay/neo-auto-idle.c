@@ -15,9 +15,19 @@
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
 
-#define AFG_OFFSET 0x1b8
-#define SIO_OFFSET 0x2a8
-#define PMC_OFFSET 0x138
+static const struct {
+	const char *name;
+	u64 base;
+	u32 offset;
+} candidates[] = {
+	{ "AFGGFXNI0", 0x300700000ULL, 0x1b8 },
+	{ "SIO_CPU", 0x300700000ULL, 0x2a8 },
+	{ "PMC", 0x300700000ULL, 0x138 },
+	/* Native awake AUTO/CLKGATE. No Linux provider in the test DT. */
+	{ "DEBUG_GATED", 0x308280000ULL, 0 },
+	{ "NUB_SPMI0", 0x308280000ULL, 0x58 },
+	{ "NUB_SPMI1", 0x308280000ULL, 0x60 },
+};
 #define AUTO BIT(28)
 #define FLOOR GENMASK(19, 16)
 #define HISTORY GENMASK(9, 8)
@@ -37,7 +47,7 @@ module_param(during, uint, 0444);
 module_param(after, uint, 0444);
 module_param(pending, bool, 0444);
 module_param(failed, bool, 0444);
-MODULE_PARM_DESC(domain, "0 GPU fabric; 1 SIO CPU; 2 PMC (1/2 clock gating only)");
+MODULE_PARM_DESC(domain, "0 GPU fabric; 1 SIO CPU; 2 PMC; 3 DEBUG; 4 SPMI0; 5 SPMI1 (nonzero clock-only)");
 MODULE_PARM_DESC(seconds, "0 read-only admission; 1..600 enable automatic idle then restore");
 MODULE_PARM_DESC(min_state, "4 automatic clock gating only; 0 permits automatic power gating");
 static struct regmap *map;
@@ -77,17 +87,19 @@ static int __init trial_init(void)
 	int ret;
 
 	if (!of_machine_is_compatible("apple,j700") || seconds > 600 ||
-	    (min_state != 0 && min_state != 4) || domain > 2 ||
+	    (min_state != 0 && min_state != 4) || domain >= ARRAY_SIZE(candidates) ||
 	    (domain && min_state != 4))
 		return -EINVAL;
-	ps_offset = domain == 0 ? AFG_OFFSET : domain == 1 ? SIO_OFFSET : PMC_OFFSET;
-	domain_name = domain == 0 ? "AFGGFXNI0" : domain == 1 ? "SIO_CPU" : "PMC";
-	node = of_find_node_by_path("/soc/power-management@300700000");
+	ps_offset = candidates[domain].offset;
+	domain_name = candidates[domain].name;
+	node = of_find_node_by_path(domain < 3 ?
+		"/soc/power-management@300700000" :
+		"/soc/power-management@308280000");
 	if (!node)
 		return -ENODEV;
 	ret = of_address_to_resource(node, 0, &res);
-	if (ret || res.start != 0x300700000ULL ||
-	    resource_size(&res) < max_t(u32, ps_offset + 4, 0x1f4)) {
+	if (ret || res.start != candidates[domain].base ||
+	    resource_size(&res) < max_t(u32, ps_offset + 4, domain ? 0 : 0x1f4)) {
 		of_node_put(node);
 		return -ENODEV;
 	}
