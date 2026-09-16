@@ -93,7 +93,7 @@ def main():
         if not 0 <= slide < 1 << 32 or slide % 16384:
             raise RuntimeError('invalid slide')
         guards = json.loads(Path(__file__).with_name('macos-live-code-guards.json').read_text())
-        wanted = {'getRegMap', 'initRegMap', 'pmgrCtor'} if a.kind == 'pmgr' else {'getStructuredLog', 'initLog', 'logMsg'}
+        wanted = {'getRegMap', 'initRegMap', 'pmgrCtor', 'deviceOffset', 'deviceMap', 'deviceGroup', 'deviceIndex'} if a.kind == 'pmgr' else {'getStructuredLog', 'initLog', 'logMsg'}
         if {g['name'] for g in guards if g['name'] in wanted} != wanted:
             raise RuntimeError('missing code guards')
         for g in guards:
@@ -127,6 +127,46 @@ def main():
                         rows.append(dict(regmap_id=map_id, die=die, adt_reg_index=adt_reg,
                                          map_object=hex(obj), virtual=hex(va), physical=hex(pa), size=size))
             result.update(dies=dies, mappings=rows)
+            group_ptr, group_count = struct.unpack('<QI', dev.read(addr + 0x60a8, 12))
+            mode, = struct.unpack('<I', dev.read(addr + 0x1c08, 4))
+            if not 1 <= group_count <= 64 or mode != 2:
+                raise RuntimeError('unexpected native PS group mode/count')
+            groups = dev.read(pointer(group_ptr), group_count * 12)
+            if dev.read(group_ptr, len(groups)) != groups:
+                raise RuntimeError('PS groups changed')
+            (a.output / 'ps-groups.bin').write_bytes(groups)
+            device_ptr, = struct.unpack('<Q', dev.read(addr + 0x9090, 8))
+            pointer(device_ptr)
+            table = json.loads(Path(__file__).with_name('j700-pmgr-domains.json').read_text())
+            wanted_devices = {'DISP_CPU', 'DISPEXT0_CPU', 'DISP_FE', 'DISP_SYS', 'SIO_CPU'}
+            devices = []
+            for d in table:
+                if d['name'] not in wanted_devices:
+                    continue
+                device_id = d['device_id']
+                if not 0 < device_id < 800:
+                    raise RuntimeError('invalid device ID')
+                index, = struct.unpack('<H', dev.read(addr + 0x9d28 + device_id * 2, 2))
+                if index >= 296:
+                    raise RuntimeError('invalid native device index')
+                record = dev.read(device_ptr + index * 48, 48)
+                if dev.read(device_ptr + index * 48, 48) != record:
+                    raise RuntimeError('device record changed')
+                (a.output / (d['name'] + '.bin')).write_bytes(record)
+                group = record[0x13]
+                offset = struct.unpack_from('<I', record, 0x10)[0] & 0xffffff
+                if group >= group_count or offset % 8:
+                    raise RuntimeError('invalid native group/offset')
+                regmap, base_offset, mask = struct.unpack_from('<III', groups, group * 12)
+                mapping = next(x for x in rows if x['regmap_id'] == regmap and x['die'] == 0)
+                native_pa = int(mapping['physical'], 0) + base_offset + offset
+                devices.append(dict(name=d['name'], device_id=device_id, index=index,
+                                    record=record.hex(), group=group, regmap=regmap,
+                                    group_offset=hex(base_offset), device_offset=hex(offset),
+                                    physical=hex(native_pa), archived_physical=hex(int(d['base'], 0) + d['offset'])))
+            if len(devices) != len(wanted_devices):
+                raise RuntimeError('missing reviewed devices')
+            result.update(ps_group_mode=mode, ps_group_count=group_count, devices=devices)
         else:
             # AppleIOP::getStructuredLog returns this+0x90.
             head = dev.read(addr + 0x90, 0x20)
