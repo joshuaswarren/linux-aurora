@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
+#include <linux/module.h>
+
 #include "isp-iommu.h"
 #include "isp-ipc.h"
 #include "isp-regs.h"
@@ -160,7 +162,8 @@ static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
 	dma_rmb();
 
 	chan_read_msg(isp, chan, &chan->rsp);
-	if ((chan->rsp.arg0) == (chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
+	if (isp_fw_iova(isp, chan->rsp.arg0) ==
+	    isp_fw_iova(isp, chan->req.arg0 | ISP_IPC_FLAG_ACK)) {
 		chan_update_cursor(chan);
 		return true;
 	}
@@ -180,7 +183,33 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 	if (!timeout)
 		return 0;
 
-	t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
+	if (isp->hw->gen == ISP_GEN_T8140 && chan != isp->chan_sm &&
+	    chan != isp->chan_tm) {
+		/*
+		 * Bring-up safety net while the mailbox interrupt line is
+		 * being pinned down: service the firmware's SHAREDMALLOC and
+		 * TERMINAL rings ourselves every 10 ms so a missing interrupt
+		 * cannot deadlock the command path (the native J700 host
+		 * polled the same way).
+		 */
+		unsigned long deadline = jiffies + timeout;
+
+		t = 0;
+		while (time_before(jiffies, deadline)) {
+			t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan),
+					       msecs_to_jiffies(10));
+			if (t)
+				break;
+			ipc_chan_handle(isp, isp->chan_sm);
+			ipc_chan_handle(isp, isp->chan_tm);
+			if (chan_tx_done(isp, chan)) {
+				t = 1;
+				break;
+			}
+		}
+	} else {
+		t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
+	}
 	if (t == 0) {
 		dev_err(isp->dev,
 			"%s: timed out on request [0x%llx, 0x%llx, 0x%llx]\n",
@@ -194,25 +223,30 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 	return 0;
 }
 
+static bool fwlog;
+module_param(fwlog, bool, 0644);
+MODULE_PARM_DESC(fwlog, "Copy the ISP firmware's terminal output to the kernel log");
+
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *rsp = &chan->rsp;
-
-#ifdef APPLE_ISP_DEBUG
 	struct isp_message *req = &chan->req;
 	char buf[512];
-	dma_addr_t iova = req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK;
+	dma_addr_t iova = isp_fw_iova(isp, req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK);
 	u32 size = req->arg1;
-	if (iova && size && size < sizeof(buf) &&
-	    isp->log_surf) {
+
+	if (fwlog && iova && size &&
+	    size < sizeof(buf) && isp->log_surf) {
 		void *p = apple_isp_translate(isp, isp->log_surf, iova, size);
 		if (p) {
 			size = min_t(u32, size, 512);
 			memcpy(buf, p, size);
-			isp_dbg(isp, "ISPASC: %.*s", size, buf);
+			while (size && (buf[size - 1] == '\n' || buf[size - 1] == '\r' ||
+					buf[size - 1] == '\0'))
+				size--;
+			dev_info(isp->dev, "ISPASC: %.*s\n", size, buf);
 		}
 	}
-#endif
 
 	rsp->arg0 = ISP_IPC_FLAG_ACK;
 	rsp->arg1 = 0x0;
