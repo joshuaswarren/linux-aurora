@@ -20,6 +20,13 @@ pub trait FakehidListener {
     fn process_fakehid_report(&self, data: &[u8]) -> Result<()>;
 }
 
+/// Listener for any other EPIC report subtype on a service (e.g. the T8140
+/// low-power microphone producer reports, subtype 0x20).
+pub trait ReportListener {
+    /// Process the report payload (everything after the EPIC headers).
+    fn process_report(&self, subtype: u16, data: &[u8]) -> Result<()>;
+}
+
 /// AOP communications manager.
 pub trait AOP: Send + Sync {
     /// Calls a method on a specified service
@@ -41,6 +48,19 @@ pub trait AOP: Send + Sync {
     ) -> Result<()>;
     /// Remove the listener for the specified service
     fn remove_fakehid_listener(&self, svc: &EPICService) -> bool;
+    /// Adds a report listener for one subtype on the specified service
+    fn add_report_listener(
+        &self,
+        svc: EPICService,
+        subtype: u16,
+        listener: Arc<dyn ReportListener>,
+    ) -> Result<()>;
+    /// Remove the report listener for the specified service and subtype
+    fn remove_report_listener(&self, svc: &EPICService, subtype: u16) -> bool;
+    /// T8140: bind the low-power microphone source ring (IOVA through the
+    /// AOP's audio stream, size in bytes) over the setup port.  Returns
+    /// ENODEV on other generations.
+    fn bind_source_buffer(&self, iova: u64, size: u64) -> Result<()>;
     /// Internal method to detach the device.
     fn remove(&self);
 }
