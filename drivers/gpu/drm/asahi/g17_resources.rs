@@ -1204,7 +1204,7 @@ impl G17PRenderTargetMemory {
 
     fn rt_region_va(
         &self,
-        submission_ordinal: u32,
+        submission_ordinal: u64,
         layout: &G17PRenderStateLayout,
         region: usize,
     ) -> Result<u64> {
