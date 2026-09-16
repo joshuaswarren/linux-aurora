@@ -32,6 +32,826 @@ mod identity;
 use g17_initdata::InstanceRole;
 use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, SubmissionTransport};
 
+static G17P_STATE_DUMPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// One-shot guard for the hardware-data dump: it must fire on the first
+/// render checkpoint whatever the label, since gating it on a specific label
+/// simply never matched.
+static G17P_HW_DATA_DUMPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+// Kext RE: AsyncGrowEngine::updateSubmitInfo copies AGXUSCPrivMemFList +0xb0
+// into opcode-0x20 +0x0c, and the 3D submit path copies that same field into
+// tag-15 +0x3e. Valid cold native opcode-0x20 and qid0/qid1 tag-15 records
+// both publish generation zero; retained generations advance from there.
+const G17P_BOOTSTRAP_UMA_SEQUENCE: u64 =
+    g17_submission::g17p_render_flist_generation(0) as u64;
+const G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID: u32 =
+    g17_initdata::PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID;
+const G17P_BOOTSTRAP_UMA_STAMP: i32 = 1;
+// B1's type-13 completion echoes the submitted USC FList end address and the
+// record's fixed +0x2c count. Keep the retained owner matched to those wire
+// values rather than the adjacent operand-buffer cookie used by the older
+// opening graph.
+const G17P_BOOTSTRAP_UMA_COOKIE: u64 = g17_submission::G17P_USC_FREELIST_LOW_END;
+const G17P_BOOTSTRAP_UMA_COUNT: u32 =
+    g17_submission::G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES;
+// Direct 2026-09-01 entry-ring captures of ordinary Metal TA and 3D kicks
+// both carry this exact value at KSM entry +0x178.  It is selected by the
+// descriptor wrapper immediately before encodeKickEntry; it is not the host
+// physical-counter sample used by retained compute submissions.
+const G17P_NATIVE_RENDER_KICK_AUXILIARY: u64 = 0x003f_ffff_ffff_ffff;
+
+// Honeykrisp splits its T8140 main allocation heap into read/write and
+// read-only sparse-shadow halves at bit 40. A PDM fault in the upper half is
+// ambiguous unless recovery also checks the corresponding lower allocation.
+const G17P_HONEYKRISP_SPARSE_RO_BIT: u64 = 1 << 40;
+
+const fn g17p_fault_sparse_ro_lower(address: u64) -> Option<u64> {
+    if address & G17P_HONEYKRISP_SPARSE_RO_BIT == 0 {
+        None
+    } else {
+        Some(address & !G17P_HONEYKRISP_SPARSE_RO_BIT)
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PNativeRenderPublishPhase {
+    FragmentVisible,
+    TilingPrefix,
+    TilingSksm,
+    TilingKick,
+    TilingOuter,
+    PoolTransition,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PNativeRenderPublishOrder {
+    phase: G17PNativeRenderPublishPhase,
+}
+
+impl G17PNativeRenderPublishOrder {
+    const fn after_fragment_doorbell() -> Self {
+        Self {
+            phase: G17PNativeRenderPublishPhase::FragmentVisible,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        next: G17PNativeRenderPublishPhase,
+    ) -> core::result::Result<(), ()> {
+        let expected = match self.phase {
+            G17PNativeRenderPublishPhase::FragmentVisible => {
+                G17PNativeRenderPublishPhase::TilingPrefix
+            }
+            G17PNativeRenderPublishPhase::TilingPrefix => {
+                G17PNativeRenderPublishPhase::TilingSksm
+            }
+            G17PNativeRenderPublishPhase::TilingSksm => {
+                G17PNativeRenderPublishPhase::TilingKick
+            }
+            G17PNativeRenderPublishPhase::TilingKick => {
+                G17PNativeRenderPublishPhase::TilingOuter
+            }
+            G17PNativeRenderPublishPhase::TilingOuter => {
+                G17PNativeRenderPublishPhase::PoolTransition
+            }
+            G17PNativeRenderPublishPhase::PoolTransition => return Err(()),
+        };
+        if next != expected {
+            return Err(());
+        }
+        self.phase = next;
+        Ok(())
+    }
+}
+
+fn g17p_native_fragment_only_visible(
+    previous_tiling_inner: u32,
+    tiling_inner: u32,
+    fragment_inner: u32,
+    published_prefix: u32,
+    fragment_outer: u32,
+    fragment_outer_next: u32,
+    tiling_outer: u32,
+    tiling_outer_slot: u8,
+) -> bool {
+    tiling_inner == previous_tiling_inner
+        && fragment_inner == published_prefix
+        && fragment_outer == fragment_outer_next
+        && tiling_outer == u32::from(tiling_outer_slot)
+}
+
+fn g17p_native_tiling_fully_visible(
+    tiling_inner: u32,
+    published_prefix: u32,
+    tiling_outer: u32,
+    tiling_outer_next: u32,
+) -> bool {
+    tiling_inner == published_prefix && tiling_outer == tiling_outer_next
+}
+
+fn g17p_native_fragment_first_mode(mode: u32) -> bool {
+    mode == 2 || mode == 3
+}
+
+fn g17p_render_deferred_outer_mode(
+    native_doorbell_mode: u32,
+    split_launch: bool,
+) -> g17_resources::G17PDeferredOuterPublication {
+    if split_launch {
+        // The TA group is complete, but the USC FList control notification
+        // can wake it before the intended initial doorbell. Retain both here;
+        // split launch publishes only TA after the FList transaction retires.
+        g17_resources::G17PDeferredOuterPublication::Both
+    } else if g17p_native_fragment_first_mode(native_doorbell_mode) {
+        g17_resources::G17PDeferredOuterPublication::Tiling
+    } else if native_doorbell_mode == 0 {
+        g17_resources::G17PDeferredOuterPublication::Both
+    } else {
+        g17_resources::G17PDeferredOuterPublication::None
+    }
+}
+
+fn g17p_native_fragment_preack_mode(mode: u32) -> bool {
+    mode == 3
+}
+
+fn g17p_native_fragment_outer_consumed(counters: [u32; 3], expected: u32) -> bool {
+    counters[0] == expected && counters[2] == expected
+}
+
+/// Native TA hardware-buffer ID namespace (`AGXAccelerator + 0x13380`).
+///
+/// `AGXHardwareBufferIDManager::init` receives 0x7f. Its initial free stack
+/// contains 126..0 and is popped from the end, so allocations are exactly
+/// 0, 1, ... 126. The bitmap fallback runs only after that stack is empty.
+/// The kext's owner array, reference counts, bitmap, and free stack are CPU
+/// bookkeeping, but the allocated number has five coupled firmware-visible
+/// consumers: TA register 0x1c830, command +0x18, ConfigUpdate +0x7e,
+/// PBState +0x0c, and the PBDesc ring index.
+const G17P_TA_HARDWARE_BUFFER_ID_COUNT: usize = 0x7f;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PHardwareBufferIdError {
+    Exhausted,
+    InvalidId,
+    DoubleFree,
+    NotReserved,
+}
+
+/// `g17p_render_slot_globals` bit: derive the outer ring entry's "channel
+/// started" byte from the selected native queue pair's retained channel state.
+pub(crate) const G17P_RENDER_SLOT_GLOBAL_CHANNEL_STARTED: u32 = 1;
+/// `g17p_render_slot_globals` bit: tag-15 `+0x3e` publishes the device-global
+/// FList lifecycle sequence rather than the slot's ordinal.
+pub(crate) const G17P_RENDER_SLOT_GLOBAL_FLIST_GENERATION: u32 = 2;
+
+fn g17p_render_slot_globals() -> u32 {
+    *module_parameters::g17p_render_slot_globals.value()
+}
+
+fn g17p_render_pair_first_outer_submit(started: &[bool; 2], slot: u8) -> Option<bool> {
+    started.get(usize::from(slot)).map(|started| !*started)
+}
+
+const G17P_COMMAND_BUFFER_STATE_COUNT: usize = 64;
+const G17P_COMMAND_BUFFER_EXCLUDED_STATE: usize = 63;
+
+/// Host mirror of the native AGXShared command-buffer-state allocator.
+///
+/// Native keeps a full u32 allocation sequence at Shared +0x180 and a
+/// 64-entry event array at +0x190. Candidate state is `sequence & 63`; state
+/// 63 is skipped, and a state whose prior event has not completed is scanned
+/// past under the Shared lock. The selected 36-object command-buffer ring is
+/// a separate object lifetime: its selected object merely records the full
+/// sequence word. Linux serializes this manager already, so exact live tags
+/// are sufficient to model event availability without another lock.
+#[derive(Debug, Clone)]
+struct G17PCommandBufferStateAllocator {
+    next: u32,
+    live: [Option<u32>; G17P_COMMAND_BUFFER_STATE_COUNT],
+}
+
+impl G17PCommandBufferStateAllocator {
+    const fn new() -> Self {
+        Self {
+            next: 0,
+            live: [None; G17P_COMMAND_BUFFER_STATE_COUNT],
+        }
+    }
+
+    fn allocate_one(&mut self) -> Option<u32> {
+        let mut candidate = self.next;
+        for _ in 0..G17P_COMMAND_BUFFER_STATE_COUNT {
+            let state = (candidate as usize) & (G17P_COMMAND_BUFFER_STATE_COUNT - 1);
+            if state != G17P_COMMAND_BUFFER_EXCLUDED_STATE && self.live[state].is_none() {
+                self.live[state] = Some(candidate);
+                self.next = candidate.wrapping_add(1);
+                return Some(candidate);
+            }
+            candidate = candidate.wrapping_add(1);
+            self.next = candidate;
+        }
+        None
+    }
+
+    fn release_one(&mut self, word: u32) -> bool {
+        let state = (word as usize) & (G17P_COMMAND_BUFFER_STATE_COUNT - 1);
+        if state == G17P_COMMAND_BUFFER_EXCLUDED_STATE || self.live[state] != Some(word) {
+            return false;
+        }
+        self.live[state] = None;
+        true
+    }
+
+}
+
+#[derive(Debug, Clone)]
+struct G17PHardwareBufferIdAllocator {
+    free: [u64; 2],
+    stack: [u8; G17P_TA_HARDWARE_BUFFER_ID_COUNT],
+    stack_len: usize,
+    next_parameter_buffer_token: u64,
+    /// IDs owned by a live retained render storage. A storage's
+    /// parameter-management graph and PBDesc slot are encoded against one ID
+    /// for the storage's whole lifetime (`prepare_retained_scene` refuses any
+    /// other), so between that storage's submissions the ID is free but must
+    /// never be handed to a different owner: it leaves this set only when the
+    /// storage is dropped.
+    reserved: [u64; 2],
+}
+
+impl G17PHardwareBufferIdAllocator {
+    fn new() -> Self {
+        let mut stack = [0u8; G17P_TA_HARDWARE_BUFFER_ID_COUNT];
+        for (index, slot) in stack.iter_mut().enumerate() {
+            *slot = (G17P_TA_HARDWARE_BUFFER_ID_COUNT - 1 - index) as u8;
+        }
+        Self {
+            // 127 valid bits: IDs 0..126.
+            free: [u64::MAX, u64::MAX >> 1],
+            stack,
+            stack_len: G17P_TA_HARDWARE_BUFFER_ID_COUNT,
+            next_parameter_buffer_token: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    fn is_free(&self, id: u32) -> bool {
+        let index = id as usize;
+        index < G17P_TA_HARDWARE_BUFFER_ID_COUNT
+            && self.free[index / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    fn is_reserved(&self, id: u32) -> bool {
+        let index = id as usize;
+        index < G17P_TA_HARDWARE_BUFFER_ID_COUNT
+            && self.reserved[index / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    fn push_stack(&mut self, id: u32) {
+        if self.stack[..self.stack_len].contains(&(id as u8)) {
+            return;
+        }
+        if self.stack_len < self.stack.len() {
+            self.stack[self.stack_len] = id as u8;
+            self.stack_len += 1;
+        }
+    }
+
+    fn remove_from_stack(&mut self, id: u32) {
+        if let Some(at) = self.stack[..self.stack_len].iter().position(|entry| *entry == id as u8) {
+            self.stack.copy_within(at + 1..self.stack_len, at);
+            self.stack_len -= 1;
+        }
+    }
+
+    /// Hand out an ID no live storage owns, in native order.
+    fn allocate(&mut self) -> core::result::Result<u32, G17PHardwareBufferIdError> {
+        let mut popped = None;
+        while self.stack_len != 0 {
+            self.stack_len -= 1;
+            let candidate = self.stack[self.stack_len] as u32;
+            // A reserved ID is removed from the stack when reserved; skipping
+            // one here is defence in depth, never the normal path.
+            if !self.is_reserved(candidate) {
+                popped = Some(candidate);
+                break;
+            }
+        }
+        let id = if let Some(id) = popped {
+            id
+        } else {
+            let available = [
+                self.free[0] & !self.reserved[0],
+                self.free[1] & !self.reserved[1],
+            ];
+            if available[0] != 0 {
+                available[0].trailing_zeros()
+            } else if available[1] != 0 {
+                64 + available[1].trailing_zeros()
+            } else {
+                return Err(G17PHardwareBufferIdError::Exhausted);
+            }
+        };
+        if !self.is_free(id) {
+            return Err(G17PHardwareBufferIdError::DoubleFree);
+        }
+        let index = id as usize;
+        self.free[index / 64] &= !(1u64 << (index % 64));
+        Ok(id)
+    }
+
+    /// Allocate a retained compute owner from the same HardwareBufferID
+    /// namespace as render. ID zero belongs to the bootstrap/render owner;
+    /// native's captured retained CL queues then receive 1, 2 and 3 in
+    /// creation order. A compute owner keeps its ID until the firmware session
+    /// is stopped because its tag-15 record and QoS scheduler-state slot both
+    /// retain that identity.
+    fn allocate_compute(&mut self) -> core::result::Result<u32, G17PHardwareBufferIdError> {
+        for id in 1..G17P_TA_HARDWARE_BUFFER_ID_COUNT as u32 {
+            if self.is_free(id) && !self.is_reserved(id) {
+                let index = id as usize;
+                self.free[index / 64] &= !(1u64 << (index % 64));
+                self.remove_from_stack(id);
+                return Ok(id);
+            }
+        }
+        Err(G17PHardwareBufferIdError::Exhausted)
+    }
+
+    /// Mark `id` as owned by a live retained storage. Usually called while the
+    /// storage's first submission still holds the ID; tolerated at any time.
+    fn reserve(&mut self, id: u32) -> core::result::Result<(), G17PHardwareBufferIdError> {
+        let index = id as usize;
+        if index >= G17P_TA_HARDWARE_BUFFER_ID_COUNT {
+            return Err(G17PHardwareBufferIdError::InvalidId);
+        }
+        self.reserved[index / 64] |= 1u64 << (index % 64);
+        self.remove_from_stack(id);
+        Ok(())
+    }
+
+    /// End a storage's ownership of `id`. If no submission holds it, it goes
+    /// back on the free list for the next owner. A no-op for an unreserved ID.
+    fn unreserve(&mut self, id: u32) {
+        if !self.is_reserved(id) {
+            return;
+        }
+        let index = id as usize;
+        self.reserved[index / 64] &= !(1u64 << (index % 64));
+        if self.is_free(id) {
+            self.push_stack(id);
+        }
+    }
+
+    /// Take the ID a retained storage already owns for one more submission.
+    fn acquire_reserved(&mut self, id: u32) -> core::result::Result<u32, G17PHardwareBufferIdError> {
+        if !self.is_reserved(id) {
+            return Err(G17PHardwareBufferIdError::NotReserved);
+        }
+        if !self.is_free(id) {
+            return Err(G17PHardwareBufferIdError::DoubleFree);
+        }
+        let index = id as usize;
+        self.free[index / 64] &= !(1u64 << (index % 64));
+        Ok(id)
+    }
+
+    fn next_token(&mut self) -> u64 {
+        let token = if self.next_parameter_buffer_token == u64::MAX {
+            0
+        } else {
+            self.next_parameter_buffer_token
+        };
+        self.next_parameter_buffer_token = token.wrapping_add(1);
+        token
+    }
+
+    /// `acquire_reserved` plus a fresh PB owner lease token, exactly as
+    /// `allocate_with_token` pairs them for a fresh ID.
+    fn acquire_reserved_with_token(
+        &mut self,
+        id: u32,
+    ) -> core::result::Result<(u32, u64), G17PHardwareBufferIdError> {
+        let id = self.acquire_reserved(id)?;
+        Ok((id, self.next_token()))
+    }
+
+    /// Acquire a new PB owner lease, not a render-ordinal-derived generation.
+    /// Native IDManager::alloc calls HWPB::prepareBufferResources(true) only
+    /// on the reference-count 0 -> 1 transition (8a66f24..8a66f6c). That
+    /// prepare uses a shared u64 counter, skipping -1 (8a741f0..8a7421c).
+    /// Our serialized allocator has no already-referenced-ID acquisition;
+    /// every successful allocation is that transition. Keep the counter
+    /// across releases and processor-stop recovery, independently of Scene,
+    /// queue ordinals and the separate FList generation namespace.
+    fn allocate_with_token(
+        &mut self,
+    ) -> core::result::Result<(u32, u64), G17PHardwareBufferIdError> {
+        let id = self.allocate()?;
+        Ok((id, self.next_token()))
+    }
+
+    /// Return a submission's hold on `id`. A reserved ID stays with its
+    /// storage -- off the free list -- until that storage unreserves it.
+    fn release(&mut self, id: u32) -> core::result::Result<(), G17PHardwareBufferIdError> {
+        let index = id as usize;
+        if index >= G17P_TA_HARDWARE_BUFFER_ID_COUNT {
+            return Err(G17PHardwareBufferIdError::InvalidId);
+        }
+        if self.is_free(id) {
+            return Err(G17PHardwareBufferIdError::DoubleFree);
+        }
+        self.free[index / 64] |= 1u64 << (index % 64);
+        if !self.is_reserved(id) {
+            self.push_stack(id);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PBootstrapUmaCompletion {
+    pub(crate) stamp: i32,
+    pub(crate) hardware_buffer_id: u32,
+    pub(crate) shared_control: u64,
+    pub(crate) operand_table: u64,
+    pub(crate) cookie: u64,
+    pub(crate) count: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PBootstrapUmaRelease {
+    pub(crate) sequence: u64,
+    pub(crate) hardware_buffer_id: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PBootstrapUmaRequestState {
+    Submitted,
+    Ready,
+    Published,
+    Sent,
+    Completed,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PBootstrapUmaLifecycleError {
+    WrongPhase,
+    WrongCompletion,
+    WrongOwner,
+    WrongReferenceCount,
+    WrongPendingCount,
+}
+
+/// One command-pair lease on a retained FList. Pool bytes outlive this lease.
+/// Native updateSubmitInfo increments pending command updates independently
+/// of optional async growth; final reference retirement emits one 0x2e using
+/// the command's captured generation (KEXT 8aa1804/8aa5340).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PBootstrapUmaLifecycle {
+    sequence: u64,
+    hardware_buffer_id: u32,
+    hardware_buffer_owned: bool,
+    hardware_buffer_references: u32,
+    pending_release_count: u32,
+    release_producer_after: Option<u32>,
+    request: Option<G17PBootstrapUmaCompletion>,
+    state: G17PBootstrapUmaRequestState,
+}
+
+impl G17PBootstrapUmaLifecycle {
+    const fn new() -> Self {
+        Self {
+            sequence: G17P_BOOTSTRAP_UMA_SEQUENCE,
+            hardware_buffer_id: G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID,
+            hardware_buffer_owned: true,
+            // prepareBufferResources, Async updateSubmitInfo, TA and 3D each
+            // hold one reference. Publication retires prepare; type 13 retires
+            // only the async-grow request. Metal keeps the two command refs
+            // until normal paired render completion, so type 13 is not the
+            // point at which opcode 0x2e may be emitted.
+            hardware_buffer_references: 4,
+            pending_release_count: 2,
+            release_producer_after: None,
+            request: Some(G17PBootstrapUmaCompletion {
+                stamp: G17P_BOOTSTRAP_UMA_STAMP,
+                hardware_buffer_id: G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID,
+                shared_control: g17_initdata::CONTROL_SHARED_ADDRESS,
+                operand_table: g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
+                cookie: G17P_BOOTSTRAP_UMA_COOKIE,
+                count: G17P_BOOTSTRAP_UMA_COUNT,
+            }),
+            state: G17PBootstrapUmaRequestState::Submitted,
+        }
+    }
+
+    /// The current fixed pool has one cold grow request. Reacquiring the
+    /// unchanged pool creates command references, not another grow request.
+    /// B1 12278..12298 calls 1b230 from warm tag-15 even with install=0;
+    /// this rebinds the owner/generation invalidated by the preceding 0x2e.
+    fn acquire(
+        previous: Option<&Self>,
+        sequence: u64,
+    ) -> core::result::Result<Self, G17PBootstrapUmaLifecycleError> {
+        let Some(previous) = previous else {
+            return if sequence == G17P_BOOTSTRAP_UMA_SEQUENCE {
+                Ok(Self::new())
+            } else {
+                Err(G17PBootstrapUmaLifecycleError::WrongOwner)
+            };
+        };
+        if previous.hardware_buffer_id != G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID
+            || previous.sequence.checked_add(1) != Some(sequence)
+        {
+            return Err(G17PBootstrapUmaLifecycleError::WrongOwner);
+        }
+        let overlapping = previous.state == G17PBootstrapUmaRequestState::Ready
+            && previous.hardware_buffer_owned
+            && previous.hardware_buffer_references >= 2
+            && previous.pending_release_count >= 2;
+        let reacquire = previous.state == G17PBootstrapUmaRequestState::Completed
+            && !previous.hardware_buffer_owned
+            && previous.hardware_buffer_references == 0
+            && previous.pending_release_count == 0;
+        if !overlapping && !reacquire {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        Ok(Self {
+            sequence,
+            hardware_buffer_id: previous.hardware_buffer_id,
+            hardware_buffer_owned: true,
+            hardware_buffer_references: previous
+                .hardware_buffer_references
+                .checked_add(3)
+                .ok_or(G17PBootstrapUmaLifecycleError::WrongReferenceCount)?,
+            pending_release_count: previous
+                .pending_release_count
+                .checked_add(2)
+                .ok_or(G17PBootstrapUmaLifecycleError::WrongPendingCount)?,
+            release_producer_after: None,
+            request: None,
+            state: G17PBootstrapUmaRequestState::Submitted,
+        })
+    }
+
+    fn retire_prepare_reference(
+        &mut self,
+    ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+        if self.state != G17PBootstrapUmaRequestState::Submitted
+            || !self.hardware_buffer_owned
+            || self.hardware_buffer_references < if self.request.is_some() { 4 } else { 3 }
+        {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        self.hardware_buffer_references -= 1;
+        if self.request.is_none() {
+            self.state = G17PBootstrapUmaRequestState::Ready;
+        }
+        Ok(())
+    }
+
+    fn match_completion(
+        &mut self,
+        completion: G17PBootstrapUmaCompletion,
+    ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+        if self.state != G17PBootstrapUmaRequestState::Submitted {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        if Some(completion) != self.request {
+            return Err(G17PBootstrapUmaLifecycleError::WrongCompletion);
+        }
+        if !self.hardware_buffer_owned
+            || completion.hardware_buffer_id != self.hardware_buffer_id
+        {
+            return Err(G17PBootstrapUmaLifecycleError::WrongOwner);
+        }
+        if self.hardware_buffer_references != 3 {
+            return Err(G17PBootstrapUmaLifecycleError::WrongReferenceCount);
+        }
+        if self.pending_release_count == 0 {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPendingCount);
+        }
+
+        self.hardware_buffer_references = 2;
+        self.state = G17PBootstrapUmaRequestState::Ready;
+        Ok(())
+    }
+
+    fn retire_render_references(
+        &mut self,
+    ) -> core::result::Result<Option<G17PBootstrapUmaRelease>, G17PBootstrapUmaLifecycleError> {
+        if self.state != G17PBootstrapUmaRequestState::Ready
+            || !self.hardware_buffer_owned
+            || self.hardware_buffer_references < 2
+        {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        if self.pending_release_count < 2 {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPendingCount);
+        }
+        self.hardware_buffer_references -= 2;
+        self.pending_release_count -= 2;
+        if self.hardware_buffer_references != 0 {
+            return Ok(None);
+        }
+        self.hardware_buffer_owned = false;
+        Ok(Some(G17PBootstrapUmaRelease {
+            sequence: self.sequence,
+            hardware_buffer_id: self.hardware_buffer_id,
+        }))
+    }
+
+    fn pending_release(&self) -> Option<G17PBootstrapUmaRelease> {
+        (self.state == G17PBootstrapUmaRequestState::Ready
+            && self.hardware_buffer_references == 0)
+        .then_some(
+            G17PBootstrapUmaRelease {
+                sequence: self.sequence,
+                hardware_buffer_id: self.hardware_buffer_id,
+            },
+        )
+    }
+
+    fn mark_published(
+        &mut self,
+        release: G17PBootstrapUmaRelease,
+    ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+        if self.pending_release() != Some(release) {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        self.state = G17PBootstrapUmaRequestState::Published;
+        Ok(())
+    }
+
+    fn mark_sent(
+        &mut self,
+        producer_after: u32,
+    ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+        if self.state != G17PBootstrapUmaRequestState::Published
+            || self.release_producer_after.is_some()
+        {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        self.release_producer_after = Some(producer_after);
+        self.state = G17PBootstrapUmaRequestState::Sent;
+        Ok(())
+    }
+
+    fn release_sent(&self) -> bool {
+        self.state == G17PBootstrapUmaRequestState::Sent
+            && self.release_producer_after.is_some()
+    }
+
+    fn mark_completed(
+        &mut self,
+        producer_after: u32,
+    ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+        if !self.release_sent() || self.release_producer_after != Some(producer_after) {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        self.release_producer_after = None;
+        self.state = G17PBootstrapUmaRequestState::Completed;
+        Ok(())
+    }
+
+    fn observe_release_consumer(
+        &mut self,
+        consumer: u32,
+    ) -> core::result::Result<bool, G17PBootstrapUmaLifecycleError> {
+        let target = self
+            .release_producer_after
+            .ok_or(G17PBootstrapUmaLifecycleError::WrongPhase)?;
+        if !self.release_sent() {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        if consumer != target {
+            return Ok(false);
+        }
+        self.mark_completed(target)?;
+        Ok(true)
+    }
+}
+
+// Pinned J700 T8140 GFX A000 scheduler root used by the exact EP type-4
+// thunk. The extracted image has SHA-256
+// 3e2821bb40d3abffe30488a06ede5f523cfa47544d6a0ad7654a08be6b5dc30f.
+// Its __DATA vmaddr/size are 0xfffffc000004c000/0x134000, exactly matching
+// the J700 gfx-data carveout size. These addresses are diagnostic only.
+const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
+const G17P_GFX_LINK_DATA_END: u64 = 0xffff_fc00_0018_0000;
+const G17P_GFX_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
+
+/// Translate a GFX firmware LINK address into the physical address the host
+/// can map. Same arithmetic the render status-page probes use.
+pub(crate) fn g17p_gfx_link_to_physical(link: u64) -> u64 {
+    G17P_GFX_PHYSICAL_DATA_BASE + (link - G17P_GFX_LINK_DATA_BASE)
+}
+/// Firmware per-QID dependency records: `0x1261f0 + qid*0x18`, valid byte at
+/// `+0`, completed stamp at `+8`. Firmware DATA segment, so host-readable.
+const G17P_DEPENDENCY_RECORD_LINK_BASE: u64 = 0xffff_fc00_0012_61f0;
+/// GDirector per-HardwareBufferID shadow, `{u8 priority, u8 share}` per entry.
+/// `FUN_1451c` writes `sgx+0xd058 = prio | (share << 8)` and mirrors it here,
+/// where `share = ((weight << 5) / sum_weights) - 1` clamped at 0 and `0xff`
+/// means never programmed. A share of 0 gives the queue no scheduling weight.
+const G17P_GDIRECTOR_SHADOW_LINK_BASE: u64 = 0xffff_fc00_0012_f560;
+/// Submit-time firmware DRAM the tag-15 handler maintains. These are the only
+/// structures the KSM front-end plausibly scans that have never been diffed
+/// between a queue that launches and one that does not.
+/// Per-DM active-queue bitmap, `0x128a30 + dm*0x10` (+`0x08` is its sibling).
+/// The scheduler pass ANDs against exactly these before launching.
+const G17P_DM_ACTIVE_BITMAP_LINK_BASE: u64 = 0xffff_fc00_0012_8a30;
+/// Per-queue state, `0x127628 + qid*0x28` (written at fw `0x119b4`).
+const G17P_QUEUE_STATE_LINK_BASE: u64 = 0xffff_fc00_0012_7628;
+/// KSM park record, `0x58010 + qid*0x28`: byte A at +0x418, B at +0x419,
+/// C at +0x41a, deadline at +0x400. FW_PROVEN: the scheduler pass compares
+/// A and B at 0x13100 and PARKS the queue when they are equal -- KTrace 0x42,
+/// runnable bit cleared, then a status-4 NOP retire. A is written only by the
+/// admit block at 0x12e38 (which also zeroes B and C); B only by the retire
+/// path at 0xcf0c. Both start at zero, so a queue whose admit never ran is
+/// parked by construction. Nothing has ever read these bytes from the host.
+const G17P_KSM_PARK_RECORD_LINK_BASE: u64 = 0xffff_fc00_0005_8010;
+/// Ready mask (fw `0x11b5c`).
+const G17P_READY_MASK_LINK_BASE: u64 = 0xffff_fc00_0017_6ec0;
+/// `0x175aa0 + qid*0x28 + 0x40` (fw `0x11b3c`).
+const G17P_QUEUE_FLAG_LINK_BASE: u64 = 0xffff_fc00_0017_5aa0;
+const G17P_DEPENDENCY_RECORD_STRIDE: u64 = 0x18;
+const G17P_GFX1_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
+const G17P_GFX1_LINK_DATA_END: u64 = 0xffff_fc00_0017_8000;
+const G17P_GFX1_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01eb_0000;
+const G17P_SCHEDULER_ROOT_LINK_ADDRESS: u64 = 0xffff_fc00_0017_7190;
+const G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7190;
+const G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE: usize = 0x80;
+const G17P_SCHEDULER_ROOT_PENDING_OFFSET: usize = 0x00;
+const G17P_SCHEDULER_ROOT_DEFERRED_OFFSET: usize = 0x50;
+const G17P_SCHEDULER_ROOT_STATE_OFFSET: usize = 0x68;
+const G17P_RUNTIME_MAIN_GLOBAL_LINK_ADDRESS: u64 = 0xffff_fc00_0017_7030;
+const G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7030;
+const G17P_TYPE4_EP_HANDLER_LINK_ADDRESS: u64 = 0xffff_fc00_0002_2e24;
+const G17P_TYPE4_THUNK_LINK_ADDRESS: u64 = 0xffff_fc00_0002_635c;
+const G17P_TYPE4_DRAIN_LINK_ADDRESS: u64 = 0xffff_fc00_0000_3a74;
+const G17P_TYPE4_PENDING_MASK: u64 = 0x0002_0000;
+const G17P_SCHEDULER_DEFERRED_REQUEUE_LINK_ADDRESS: u64 = 0xffff_fc00_0002_5ea4;
+const G17P_TYPE4_MAIN_CONTROL_POINTER_OFFSETS: [usize; 3] = [0x1a0, 0x1a8, 0x1b0];
+const G17P_MBI_GLOBAL_LINK_ADDRESS: u64 = 0xffff_fc00_0006_e840;
+const G17P_MBI_STATIC_ARRAY_LINK_ADDRESS: u64 = 0xffff_fc00_0006_e800;
+const G17P_MBI_GROUP_COUNT: u32 = 8;
+const G17P_MBI_TRACE_CAPACITY: u32 = 128;
+const G17P_MBI_TRACE_RECORD_SIZE: usize = 0x18;
+// Primary A000 0x19184..0x191a0 initializes the adjacent endpoint handles;
+// EP21 type 9 increments the lease at 0x22de4..0x22df8.
+const G17P_PRIMARY_PEER_LEASE_LINK_ADDRESS: u64 = 0xffff_fc00_0017_7798;
+const G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7798;
+// Exact J700 GFX1 A000 (SHA-256 0caf8165...17fd63) initializes handles at
+// 0x1bde0..0x1bdfc, increments this lease at 0x26738..0x26748, and decrements
+// it only on ACTIVE->SLEEP at 0x25e70..0x25e7c. ACTIVE->NAP bypasses the write.
+const G17P_GFX1_PEER_LEASE_LINK_ADDRESS: u64 = 0xffff_fc00_0016_d1c8;
+const G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01fd_11c8;
+const G17P_RTKIT_PRIVATE_ADDRESS_MASK: u64 = (1u64 << 42) - 1;
+
+#[cfg(not(test))]
+const _: () = {
+    assert!(
+        G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS
+            == g17_adt_j700::J700_GFX_DATA.base
+                + (G17P_SCHEDULER_ROOT_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE)
+    );
+    assert!(
+        G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS + G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE as u64
+            <= g17_adt_j700::J700_GFX_DATA.base + g17_adt_j700::J700_GFX_DATA.size
+    );
+    assert!(G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS & 7 == 0);
+    assert!(G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE & 7 == 0);
+    assert!(G17P_SCHEDULER_ROOT_STATE_OFFSET + 1 <= G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE);
+    assert!(G17P_GFX_LINK_DATA_END - G17P_GFX_LINK_DATA_BASE == 0x13_4000);
+    assert!(G17P_GFX1_LINK_DATA_END - G17P_GFX1_LINK_DATA_BASE == 0x12_c000);
+    assert!(G17P_GFX_PHYSICAL_DATA_BASE == g17_adt_j700::J700_GFX_DATA.base);
+    assert!(G17P_GFX1_PHYSICAL_DATA_BASE == g17_adt_j700::J700_GFX1_DATA.base);
+    assert!(
+        G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS
+            == g17_adt_j700::J700_GFX_DATA.base
+                + (G17P_RUNTIME_MAIN_GLOBAL_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE)
+    );
+    assert!(
+        G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS + core::mem::size_of::<u64>() as u64
+            <= g17_adt_j700::J700_GFX_DATA.base + g17_adt_j700::J700_GFX_DATA.size
+    );
+    assert!(
+        G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS
+            == G17P_GFX_PHYSICAL_DATA_BASE
+                + (G17P_PRIMARY_PEER_LEASE_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE)
+    );
+    assert!(
+        G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS
+            == G17P_GFX1_PHYSICAL_DATA_BASE
+                + (G17P_GFX1_PEER_LEASE_LINK_ADDRESS - G17P_GFX1_LINK_DATA_BASE)
+    );
+};
+
 /// Grounded manager inputs for T8140. Power and tuning values are excluded.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct T8140ManagerConfig {
@@ -324,6 +1144,9 @@ pub(crate) struct G17PManagerConstruction {
 #[cfg(not(test))]
 pub(crate) struct G17PSksmQueue {
     queue_id: u8,
+    /// Queue-lifetime AGXQOSQueue/HardwareBufferID identity. Native copies it
+    /// into ConfigUpdate +0x56 and indexes the QoS scheduler-state table by it.
+    hardware_buffer_id: u8,
     scratch: G17SksmScratchGeometry,
     uat_owner: u64,
     disable_pair: g17_submission::G17SksmOrderedWritePair,
@@ -899,6 +1722,32 @@ impl G17PManagerConstruction {
         self.render_tracker = None;
         self.render_storage = None;
         self.render_submission_ordinal = 0;
+        self.render_auxiliary_timestamp = 0;
+        self.next_render_flist_sequence = G17P_BOOTSTRAP_UMA_SEQUENCE;
+        self.next_render_pm_manager_generation =
+            g17_resources::G17P_PM_INITIAL_HWPB_MANAGER_GENERATION;
+        self.render_parameter_buffer_owner = 0;
+        self.render_command_buffer_states = G17PCommandBufferStateAllocator::new();
+        self.render_command_buffer_state_pairs = [None, None];
+        self.active_render_slot = 0;
+        // Both processors are stopped and every retained compute/render graph
+        // is gone, so queue-lifetime HardwareBufferIDs can be allocated from
+        // the native cold-session order again (render/bootstrap 0, compute 1+).
+        self.render_hardware_buffer_ids = G17PHardwareBufferIdAllocator::new();
+        // Every compute graph and the boot graph have been dropped after both
+        // processors stopped. Their QIDs are no longer installed in firmware,
+        // so the replacement session owns a fresh namespace. Leaving this at
+        // its previous high-water mark exhausted QID 127 after enough bounded
+        // recoveries even though no hardware graph survived any of them.
+        self.next_compute_queue_id = Some(G17P_COMPUTE_QUEUE_ID_BASE);
+        // These values name the stopped session's descriptor and deferred
+        // AddKicks record. Replaying either against the replacement boot graph
+        // can acknowledge or kick the wrong QID even when that QID number was
+        // legitimately reused above.
+        self.pending_add_kicks = None;
+        self.last_published_descriptor = 0;
+        self.last_completion_end = 0;
+        self.compute_stamp_armed = false;
     }
 
     /// Restore cold initdata in the existing mappings after both CPUs stop.
@@ -1995,7 +2844,15 @@ impl G17PManagerConstruction {
         dev: &AsahiDevice,
         registers: &regs::Resources,
     ) -> Result<G17PSksmQueue> {
-        const QUEUE_ID: u8 = 4;
+        let queue_id = self.allocate_compute_queue_id()?;
+        let hardware_buffer_id = match self.render_hardware_buffer_ids.allocate_compute() {
+            Ok(id) => u8::try_from(id).map_err(|_| ERANGE)?,
+            Err(_) => {
+                self.next_compute_queue_id = Some(queue_id);
+                return Err(ENOSPC);
+            }
+        };
+        let result = (|| {
         const COMPLETION_SELECTOR: u8 = 2;
 
         let mut storage = g17_resources::G17PClRuntimeStorage::new(dev, self.uat())?;
@@ -2040,6 +2897,7 @@ impl G17PManagerConstruction {
 
         Ok(G17PSksmQueue {
             queue_id: routing.queue_id,
+            hardware_buffer_id,
             scratch: self.sksm_scratch(),
             uat_owner: self.uat().ttb_base(),
             disable_pair: config.disable_pair,
@@ -2065,6 +2923,52 @@ impl G17PManagerConstruction {
             submission_ordinal: 0,
             b2_activation: g17_submission::G17PClB2ActivationState::Pending,
         })
+        })();
+        // No firmware publication occurs in this constructor. A failed host
+        // allocation must not consume the finite QID namespace permanently.
+        if result.is_err() {
+            self.next_compute_queue_id = Some(queue_id);
+            self.render_hardware_buffer_ids
+                .release(u32::from(hardware_buffer_id))
+                .map_err(|_| EIO)?;
+        }
+        result
+    }
+
+    /// Prepare a queue for its firmware-mediated tag-15 installation.
+    ///
+    /// Native performs no host MMIO during steady-state rendering, and the
+    /// working QID4 path also succeeds with the AP SKSM aperture suppressed.
+    /// The queue therefore becomes installed only when its tag-15 group is
+    /// published to the firmware channel below, never from an AP port write.
+    fn prepare_compute_firmware_install(
+        &self,
+        queue: &mut G17PSksmQueue,
+    ) -> Result {
+        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+            return Err(EINVAL);
+        }
+        if queue.hardware_state != G17PSksmQueueHardwareState::PreparedMemory {
+            return Err(EBUSY);
+        }
+        if queue.configure_guard_accelerator_stamp != queue.configure_guard_event_stamp {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P QID {} configure guard mismatch accelerator={} event-machine={}\n",
+                queue.queue_id,
+                queue.configure_guard_accelerator_stamp,
+                queue.configure_guard_event_stamp
+            );
+            return Err(EBUSY);
+        }
+        queue.storage.prepare_live_mappings(self.uat())?;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P submitBuffer/prepareMappings: low/high QID4 aliases published to live UAT\n"
+        );
+
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Remove a retained queue from the hardware bridge before releasing its
@@ -2307,6 +3211,7 @@ impl G17PManagerConstruction {
                 shared_control,
                 queue.storage.channel_control_gpu_va(),
                 queue.queue_id,
+                queue.hardware_buffer_id,
                 install_queue,
                 binding.declared_context_id(),
             )?;
@@ -2343,6 +3248,11 @@ impl G17PManagerConstruction {
         self.arm_compute_completion(queue, descriptor_high)?;
         self.publish_compute_b2_once(queue)?;
         submission_phase.store(G17P_SUBMIT_PHASE_B2, Ordering::Release);
+        self.resources.publish_compute_qos_queue_record(
+            queue.queue_id,
+            queue.hardware_buffer_id,
+            queue.storage.channel_control_gpu_va(),
+        )?;
         queue
             .compute
             .publish_initial_config_update_pointer(group)?;
@@ -2653,8 +3563,74 @@ impl G17PManagerConstruction {
             sksm_entry_aliases,
             shared_control,
             queue.storage.channel_control_gpu_va(),
+            queue.queue_id,
+            queue.hardware_buffer_id,
+            rewind,
+            binding.declared_context_id(),
         )?;
-        self.publish_compute_b2_once(queue)?;
+        // `queue_config_dirty` is already false here, so the lifecycle reports
+        // no first-bind publications and -- because the channel identity is
+        // unchanged -- no priority-2 activation either. The repeat notifies
+        // with the direct EP 0x21 kick alone.
+        let mut lifecycle = g17_submission::prepare_g17p_direct_cl_lifecycle(
+            queue.direct_lifecycle,
+            group.queue,
+            true,
+            backend,
+        )
+        .map_err(|_| EINVAL)?;
+        if *module_parameters::g17p_repeat_activation.value() != 0
+            && lifecycle.notifications.activation.is_none()
+        {
+            lifecycle.notifications.activation =
+                Some(g17_submission::encode_g17p_cl_activation(2).map_err(|_| EINVAL)?);
+        }
+
+        // The ring is genuinely circular now, so depth is unbounded rather than
+        // capped at 0x500/4 = 320 submissions. Free space is measured against
+        // the firmware's consumer, which hardware has proven it owns.
+        let free = queue.compute.compute_ring_free_slots()?;
+        if free < G17P_COMPUTE_REPEAT_RING_RECORDS {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P compute: item ring full, {} slots free but {} needed; the firmware consumer has stopped advancing\n",
+                free,
+                G17P_COMPUTE_REPEAT_RING_RECORDS
+            );
+            return Err(ENOSPC);
+        }
+        let producer_before = group.write_index;
+        self.arm_compute_completion(queue, descriptor_high)?;
+        // Order matters and is native's: the command record's pointer first,
+        // then ConfigUpdate, then AddKicks, then the EntrySignal whose handler
+        // ends with the broadcast "go" poke.
+        let after_command = self.publish_repeat_record(
+            queue,
+            "the tag-3 command pointer",
+            producer_before,
+            G17PRepeatRecord::Pointer(descriptor_high),
+        )?;
+        submission_phase.store(G17P_SUBMIT_PHASE_B2, Ordering::Release);
+        self.resources.publish_compute_qos_queue_record(
+            queue.queue_id,
+            queue.hardware_buffer_id,
+            queue.storage.channel_control_gpu_va(),
+        )?;
+        let after_config = self.publish_repeat_record(
+            queue,
+            "the tag-15 ConfigUpdate pointer",
+            after_command,
+            G17PRepeatRecord::Pointer(group.optional),
+        )?;
+        submission_phase.store(G17P_SUBMIT_PHASE_TAG15, Ordering::Release);
+
+        if g17p_compute_sksm_entry_enabled() {
+            queue.storage.write_entry(
+                prepared_entry.entry_offset as usize,
+                prepared_entry.zero_length as usize,
+                &prepared_entry.entry,
+            )?;
+        }
         fence(Ordering::SeqCst);
         let prepared = self
             .resources

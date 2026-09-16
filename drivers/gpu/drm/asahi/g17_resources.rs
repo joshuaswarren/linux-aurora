@@ -100,6 +100,41 @@ pub(crate) const G17P_CL_B2_OBJECT_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_CHANNEL_CONTROL_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_SUPPORT_STATE_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_OPERAND_TABLE_SIZE: usize = 0x4000;
+const G17P_PB_DESCRIPTOR_TABLE_SIZE: usize = 0x4000;
+const G17P_UMA_PAGE_POOL_DESCRIPTOR_TABLE_SIZE: usize = 0x4000;
+const G17P_LAST_SUBMITTED_HW_TIMESTAMP_COUNT: usize = 128;
+const G17P_LAST_SUBMITTED_HW_TIMESTAMP_STRIDE: usize = 0x10;
+const G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE: usize =
+    G17P_LAST_SUBMITTED_HW_TIMESTAMP_COUNT * G17P_LAST_SUBMITTED_HW_TIMESTAMP_STRIDE;
+/// `AGXQOSManager` constructs its `QOSQueueIDAllocator` with capacity 0x80;
+/// firmware's QID/HWBufferID tables have the same 128-entry geometry.
+const G17P_QOS_QUEUE_COUNT: usize = 0x80;
+/// QoS class selected by `AGXQOSManager::registerQueue` for the valid cold
+/// qid0/qid1 render profile.
+///
+/// Both valid full captures have byte-exact rows `00 0f 00...` for the initial
+/// physical qids 0 and 1. Their tag-15 and channel-control class is also 0x0f;
+/// Linux's old 0x14 made the QID resource disagree with its own queue class.
+/// Kext RE confirms the five-byte table is selected through accelerator policy
+/// fields, not by directly indexing it with the outer doorbell priority.
+const G17P_DEFAULT_QOS_CLASS: u8 = 0x0f;
+/// Native's normalized per-HardwareBufferID share, read out of the same
+/// capture's `+0xc00` index row:
+///
+///     +0xc00: [0x1000, 0x2000, 0x2000, 0x1000, 0x2000, 0, ...]
+///
+/// The render queue's HardwareBufferID is 4 and its share is 0x2000 == 2^13,
+/// i.e. the whole normalization base for a single registered queue. The old
+/// `class << 13` form produced 0x28000, which overshoots that base by 20x --
+/// it cannot be a normalized share at all.
+const G17P_SINGLE_QUEUE_QOS_SHARE: u32 = 0x2000;
+/// `AGXArmFirmware::initFirmwareSharedData` publishes this allocation through
+/// primary main-config `+0x274`, the fifth pointer in the packed bundle-view
+/// array.  The native CPU mapping is `AGXFirmware + 0x2f0`, its firmware GPU
+/// pointer is `AGXFirmware + 0x338`, and the allocation is exactly 0x800 bytes.
+const G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_VIEW_INDEX: usize = 4;
+const G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET: usize =
+    g17_initdata::BUNDLE_VIEW_OFFSETS[G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_VIEW_INDEX];
 pub(crate) const G17P_CL_LOW_VA_START: u64 = 0x70_0000_0000;
 pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
 pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE: usize = 0x4000;
@@ -1915,6 +1950,10 @@ impl G17PComputeDescriptorStorage {
         context_low: u64,
         shared_control: u64,
         channel_control: u64,
+        queue_id: u8,
+        hardware_buffer_id: u8,
+        install_queue: bool,
+        context_id: Option<u16>,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
         let context_high = self.queue_context_high.iova();
@@ -1938,10 +1977,517 @@ impl G17PComputeDescriptorStorage {
             context_high,
             shared_control,
             channel_control,
+            queue_id,
+            hardware_buffer_id,
             graph,
             queue_context,
         )
-        .map_err(|_| EINVAL)
+        .map_err(|_| EINVAL)?;
+
+        // The source builder provides all command bytes. Direct first bind
+        // begins with only the main descriptor reachable at slot zero; tag 15
+        // and tag 16 are published through distinct ordered transitions around
+        // the SKSM entry. Tag 14 remains omitted in direct mode.
+        graph[g17_compute::COMPUTE_EVENT
+            ..g17_compute::COMPUTE_EVENT + g17_compute::COMPUTE_EVENT_SIZE]
+            .fill(0);
+        put_u64(graph, g17_compute::COMPUTE_ITEM_RING + 0x08, 0);
+        put_u64(graph, g17_compute::COMPUTE_ITEM_RING + 0x10, 0);
+        put_u32(graph, g17_compute::COMPUTE_QUEUE_POINTERS + 0x40, 1);
+        group.write_index = 3;
+        Ok(group)
+    }
+
+    /// Current item-ring producer of the retained compute queue graph.
+    ///
+    /// A repeat submission must append at this cursor. The first-bind builder
+    /// resets it to 1, which is exactly why re-running that builder for a
+    /// second submission made the firmware's consumer and our producer
+    /// disagree and nothing was ever picked up.
+    pub(crate) fn compute_ring_producer(&mut self) -> Result<u32> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        self.queue_graph.with_bytes_mut(|graph| {
+            let offset = g17_compute::COMPUTE_QUEUE_POINTERS + 0x40;
+            Ok(u32::from_le_bytes(
+                graph
+                    .get(offset..offset + 4)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            ))
+        })
+    }
+
+    /// Never follows a pointer supplied by firmware. The expected high VA
+    /// must select an aligned slot inside this queue's retained descriptor BO.
+    /// Reads can race firmware progress, but perform no publication or writes.
+    pub(crate) fn snapshot_compute_submission(
+        &mut self,
+        descriptor: u64,
+    ) -> Result<G17PComputeSubmissionSnapshot> {
+        let offset = usize::try_from(descriptor.checked_sub(self.descriptors_high.iova())
+            .ok_or(ERANGE)?).map_err(|_| ERANGE)?;
+        if offset % G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE != 0 {
+            return Err(EINVAL);
+        }
+        let end = offset.checked_add(G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE).ok_or(ERANGE)?;
+        let read_u32 = |raw: &[u8], at: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(raw.get(at..at + 4).ok_or(ERANGE)?
+                .try_into().map_err(|_| ERANGE)?))
+        };
+        let read_u64 = |raw: &[u8], at: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(raw.get(at..at + 8).ok_or(ERANGE)?
+                .try_into().map_err(|_| ERANGE)?))
+        };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut snapshot = self.descriptors.with_bytes_mut(|bytes| {
+            let raw = bytes.get(offset..end).ok_or(ERANGE)?;
+            let mut work_key = None;
+            // The Linux builder emits forty 12-byte primary RCE entries at
+            // +0x40. Report the encoded 0x10201 value, not a reconstructed key.
+            for index in 0..g17_compute::COMPUTE_REGISTER_COUNT {
+                let at = 0x40 + index * 12;
+                if read_u32(raw, at)? == 0x10201 {
+                    work_key = Some(read_u64(raw, at + 4)?);
+                }
+            }
+            Ok(G17PComputeSubmissionSnapshot {
+                descriptor, selector: read_u32(raw, 0)?, context: read_u32(raw, 0x0c)?,
+                grid: read_u32(raw, 0xf54)?, work_key,
+                scheduler_record: read_u64(raw, 0x10)?,
+                stamp_pointer: read_u64(raw, 0xf40)?, stamp_value: read_u32(raw, 0xf50)?,
+                tsq: [0; 3], tag15: [0; 12], tag16: [0; 3], tag14: [0; 8],
+            })
+        })?;
+        let base = self.support.iova();
+        snapshot.tsq = [self.support.read_u32(base + mmu::UAT_PGSZ as u64 + 4)?,
+            self.support.read_u32(base + 0x10c)?, self.read_compute_stamp()?];
+        self.queue_graph.with_bytes_mut(|raw| {
+            for (index, word) in snapshot.tag15.iter_mut().enumerate() {
+                *word = read_u64(raw, g17_compute::COMPUTE_OPTIONAL + index * 8)?;
+            }
+            for (index, word) in snapshot.tag16.iter_mut().enumerate() {
+                *word = read_u64(raw, g17_compute::COMPUTE_EVENT + index * 8)?;
+            }
+            for (index, word) in snapshot.tag14.iter_mut().enumerate() {
+                *word = read_u64(raw, g17_compute::COMPUTE_ADD_KICKS + index * 8)?;
+            }
+            Ok(())
+        })?;
+        Ok(snapshot)
+    }
+
+    /// Read the item-ring cursors and the first eight slots.
+    ///
+    /// The decisive number is `consumer`. If it advances to 4 after a
+    /// submission the firmware has demonstrably executed, the firmware tracks a
+    /// consumer cursor and appending at the producer is the right model. If it
+    /// stays 0 across a working submission, that word is not a firmware-owned
+    /// consumer and the host is expected to rewind and reuse slots 0..3
+    /// instead -- see `g17p_repeat_ring`.
+    pub(crate) fn read_compute_ring_state(&mut self) -> Result<G17PComputeRingState> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let queue = self.queue_graph.iova();
+        let reclaimed = self.ring_reclaimed;
+        let reclaimed_total = self.ring_reclaimed_total;
+        self.queue_graph.with_bytes_mut(|graph| {
+            let read_u32 = |offset: usize| -> Result<u32> {
+                Ok(u32::from_le_bytes(
+                    graph
+                        .get(offset..offset + 4)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| ERANGE)?,
+                ))
+            };
+            let read_u64 = |offset: usize| -> Result<u64> {
+                Ok(u64::from_le_bytes(
+                    graph
+                        .get(offset..offset + 8)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| ERANGE)?,
+                ))
+            };
+            let pointers = g17_compute::COMPUTE_QUEUE_POINTERS;
+            let ring = g17_compute::COMPUTE_ITEM_RING;
+            let mut items = [0u64; 8];
+            for (index, slot) in items.iter_mut().enumerate() {
+                *slot = read_u64(ring + index * 8)?;
+            }
+            Ok(G17PComputeRingState {
+                queue,
+                consumer: read_u32(pointers)?,
+                producer: read_u32(pointers + 0x40)?,
+                mirror: read_u32(pointers + 0x50)?,
+                count: read_u32(pointers + 0x60)?,
+                items,
+                reclaimed,
+                reclaimed_total,
+            })
+        })
+    }
+
+    /// Zero every item-ring slot the firmware has already consumed.
+    ///
+    /// `apply_g17p_initial_command_pointer` refuses to write a slot that is not
+    /// already zero. That guard is worth keeping -- it is what would catch us
+    /// overwriting a record still in flight -- but nothing was ever clearing
+    /// consumed slots, so the ring was single-use: 0x500 entries at four
+    /// records per submission is 320 submissions and then a hard stop. That is
+    /// enough for a probe and nowhere near enough for a CTS run.
+    ///
+    /// Recycling is only sound because the firmware's ownership of the consumer
+    /// cursor is now PROVEN on hardware: across two successive submissions the
+    /// cursor read 4 and then 8, exactly tracking what we published. Slots
+    /// strictly behind it are therefore known-retired and safe to clear.
+    ///
+    /// Returns the number of slots reclaimed.
+    pub(crate) fn recycle_consumed_ring_slots(&mut self) -> Result<u32> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut reclaimed = self.ring_reclaimed;
+        let count = self.queue_graph.with_bytes_mut(|graph| {
+            let pointers = g17_compute::COMPUTE_QUEUE_POINTERS;
+            let read_u32 = |graph: &[u8], offset: usize| -> Result<u32> {
+                Ok(u32::from_le_bytes(
+                    graph
+                        .get(offset..offset + 4)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| ERANGE)?,
+                ))
+            };
+            let entries = read_u32(graph, pointers + 0x60)?;
+            if entries == 0 {
+                return Err(ERANGE);
+            }
+            let raw_consumer = read_u32(graph, pointers)?;
+            // Normalising a cursor that reads `>= entries` is OPT-IN. It was
+            // meant to survive a consumer reported as exactly `entries` at the
+            // wrap, but if the firmware can report an out-of-range consumer for
+            // any OTHER reason, folding it mod `entries` makes reclaim zero
+            // slots the firmware has not consumed -- letting a later repeat
+            // overwrite live entries. Refusing, as the 319-deep build did, is
+            // the conservative behaviour and is the default.
+            let consumer = if *crate::module_parameters::g17p_ring_normalize.value() != 0 {
+                raw_consumer % entries
+            } else {
+                if raw_consumer >= entries {
+                    return Err(ERANGE);
+                }
+                raw_consumer
+            };
+            if reclaimed >= entries {
+                return Err(ERANGE);
+            }
+            let ring = g17_compute::COMPUTE_ITEM_RING;
+            let mut cleared = 0u32;
+            while reclaimed != consumer {
+                let slot = ring
+                    .checked_add(reclaimed as usize * core::mem::size_of::<u64>())
+                    .ok_or(ERANGE)?;
+                graph
+                    .get_mut(slot..slot + core::mem::size_of::<u64>())
+                    .ok_or(ERANGE)?
+                    .fill(0);
+                reclaimed = reclaimed.wrapping_add(1) % entries;
+                cleared = cleared.saturating_add(1);
+                // The ring cannot need more than a full lap of clearing; refuse
+                // to spin if the cursors are inconsistent.
+                if cleared > entries {
+                    return Err(ERANGE);
+                }
+            }
+            Ok(cleared)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.ring_reclaimed = reclaimed;
+        self.ring_reclaimed_total = self.ring_reclaimed_total.saturating_add(count as u64);
+        Ok(count)
+    }
+
+    /// Republish the tag-15 ConfigUpdate record for an ALREADY-installed queue.
+    ///
+    /// Only the optional-record window is rewritten: the queue header, the
+    /// item ring, the ring producer, the tag-16 window and the queue context
+    /// all keep the state the firmware is already using. `install_queue` is
+    /// false, which is the one field macOS varies between a first bind and a
+    /// repeat.
+    pub(crate) fn stage_repeat_config_update(
+        &mut self,
+        sksm_entries: g17_compute::ComputeSksmEntryAliases,
+        shared_control: u64,
+        channel_control: u64,
+        queue_id: u8,
+        hardware_buffer_id: u8,
+        rewind: bool,
+        context_id: Option<u16>,
+    ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
+        let queue = self.queue_graph.iova();
+        let optional = queue
+            .checked_add(g17_compute::COMPUTE_OPTIONAL as u64)
+            .ok_or(EINVAL)?;
+        let event = queue
+            .checked_add(g17_compute::COMPUTE_EVENT as u64)
+            .ok_or(EINVAL)?;
+        self.queue_graph.with_bytes_mut(|graph| {
+            g17_compute::encode_compute_config_update(
+                graph,
+                sksm_entries,
+                shared_control,
+                channel_control,
+                queue_id,
+                hardware_buffer_id,
+                // A repeat is by definition not a first bind, so the install
+                // flag is clear -- which is also what every captured macOS
+                // steady-state submission sends.
+                false,
+                context_id,
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        if rewind {
+            // Reuse ring slots 0..3 instead of appending: zero them and put the
+            // producer back to 0, so the four records land exactly where the
+            // first bind put them. This is the alternative to the append model
+            // and it is what the layout implies IF the firmware does not own
+            // the `+0x100` consumer word. Nothing else in the graph is touched
+            // -- the header, UUID and queue context stay as the first bind left
+            // them, and no QID configure is re-issued.
+            let records = g17_compute::COMPUTE_REPEAT_RING_RECORD_COUNT;
+            self.queue_graph.with_bytes_mut(|graph| {
+                let ring = g17_compute::COMPUTE_ITEM_RING;
+                graph
+                    .get_mut(ring..ring + records * core::mem::size_of::<u64>())
+                    .ok_or(ERANGE)?
+                    .fill(0);
+                put_u32(graph, g17_compute::COMPUTE_QUEUE_POINTERS + 0x40, 0);
+                Ok(())
+            })?;
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        let write_index = self.compute_ring_producer()?;
+        Ok(g17_compute::ComputeChannelGroupAddresses {
+            queue,
+            optional,
+            event,
+            write_index,
+        })
+    }
+
+    /// Read the support-page words the descriptor names: dispatch A/B at
+    /// `+0x300`/`+0x308` and status A/B at `+0x310`/`+0x318`.
+    ///
+    /// These are the GPU/firmware's own progress words for the submission, and
+    /// they are DRAM the driver allocated, so they are safe to sample at any
+    /// time -- unlike anything in the sgx register file. If they stop advancing
+    /// while completion records keep arriving, the firmware is retiring work the
+    /// GPU never executed.
+    pub(crate) fn read_compute_support_words(&mut self) -> Result<[u64; 4]> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let base = self.support.iova();
+        Ok([
+            self.support.read_u64(base + 0x300)?,
+            self.support.read_u64(base + 0x308)?,
+            self.support.read_u64(base + 0x310)?,
+            self.support.read_u64(base + 0x318)?,
+        ])
+    }
+
+    /// Point the retained queue-context item at the descriptor a repeat is
+    /// publishing.
+    ///
+    /// The first-bind builder writes this item once, with `+0x10` naming the
+    /// descriptor it published. A repeat publishes a DIFFERENT descriptor slot,
+    /// and nothing was updating this, so the item kept naming submission 1's
+    /// descriptor. Whatever the firmware uses the item for, "consistent with
+    /// the work actually published" is the only defensible state, and it is the
+    /// state the working first bind is in.
+    ///
+    /// Only the descriptor qword is rewritten. The rest of the item -- the
+    /// `0x1000_1000_0000_0004` header, the queue base, `0xffff_0801_0000_0001`,
+    /// the data-master word and the tail constants -- is left exactly as the
+    /// first bind established it.
+    pub(crate) fn refresh_repeat_queue_context(&mut self, descriptor: u64) -> Result {
+        let item = g17_compute::COMPUTE_QUEUE_CONTEXT_ITEM_OFFSET;
+        self.queue_context_high.with_bytes_mut(|context| {
+            let slot = item.checked_add(0x10).ok_or(ERANGE)?;
+            if slot.checked_add(8).ok_or(ERANGE)? > context.len() {
+                return Err(ERANGE);
+            }
+            put_u64(context, slot, descriptor);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Write a COMPLETE queue-context item for this submission's stamp index.
+    ///
+    /// The alternative to `refresh_repeat_queue_context`, which rewrites item 1
+    /// -- the first bind's -- in place. If the array is indexed by stamp then
+    /// items 2.. have never been written at all and every repeat has been
+    /// running against a zero item while overwriting the first bind's; if it is
+    /// a single current-work record then rewriting item 1 is right and this is
+    /// wrong. Six consecutive passes were achieved with item 1 being rewritten,
+    /// so that is the default and this is the experiment.
+    pub(crate) fn write_repeat_queue_context_item(
+        &mut self,
+        stamp_index: u8,
+        descriptor: u64,
+        queue_id: u8,
+    ) -> Result {
+        let queue_base = self.queue_graph.iova();
+        self.queue_context_high.with_bytes_mut(|context| {
+            g17_compute::encode_compute_queue_context_item(
+                context,
+                stamp_index as usize,
+                descriptor,
+                queue_base,
+                queue_id,
+            )
+            .map_err(|_| ERANGE)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Entries in the queue's item ring, as the graph reports them.
+    pub(crate) fn compute_ring_entries(&mut self) -> Result<u32> {
+        Ok(self.read_compute_ring_state()?.count)
+    }
+
+    /// Item-ring slots free for the host to publish into, i.e. the distance
+    /// from the producer to the firmware's consumer, less the one slot a ring
+    /// must always keep empty to stay distinguishable from full.
+    pub(crate) fn compute_ring_free_slots(&mut self) -> Result<u32> {
+        let state = self.read_compute_ring_state()?;
+        if state.count == 0 {
+            return Err(ERANGE);
+        }
+        let state = if *crate::module_parameters::g17p_ring_normalize.value() != 0 {
+            G17PComputeRingState {
+                producer: state.producer % state.count,
+                consumer: state.consumer % state.count,
+                ..state
+            }
+        } else {
+            if state.producer >= state.count || state.consumer >= state.count {
+                return Err(ERANGE);
+            }
+            state
+        };
+        Ok(state
+            .consumer
+            .wrapping_sub(state.producer)
+            .wrapping_add(state.count)
+            .wrapping_sub(1)
+            % state.count)
+    }
+
+    /// Publish one already-resident record pointer at an explicit ring
+    /// producer. Used by the repeat path for the tag-3 command record, whose
+    /// address changes with the descriptor slot.
+    pub(crate) fn publish_command_pointer_at(
+        &mut self,
+        expected_producer: u32,
+        command_gpu_va: u64,
+    ) -> Result<u32> {
+        // Take the producer the ring transition itself computed. It is
+        // `(producer + 1) % count`; comparing it against a locally computed
+        // `expected_producer + 1` was THE 320-submission wall. The item ring is
+        // `0x500` entries and a submission publishes four records, so
+        // submission 320's last record lands at producer `0x4ff`, the
+        // transition correctly returns 0, the caller expected `0x500`, and the
+        // publish was refused with EBUSY on a ring that was entirely free.
+        // `apply_g17p_initial_command_pointer` already validates everything the
+        // comparison was standing in for: that the graph's producer really is
+        // `expected_producer`, that the programmed count matches, that the next
+        // slot is not the consumer, and that the target slot is zero.
+        self.queue_graph.with_bytes_mut(|graph| {
+            apply_g17p_initial_command_pointer(graph, expected_producer, command_gpu_va)
+                .ok_or(EBUSY)
+        })
+    }
+
+    /// Publish the prepared tag-15 ConfigUpdate pointer at channel slot one.
+    pub(crate) fn publish_initial_config_update_pointer(
+        &mut self,
+        group: g17_compute::ComputeChannelGroupAddresses,
+    ) -> Result {
+        self.queue_graph.with_bytes_mut(|graph| {
+            apply_g17p_initial_command_pointer(graph, 1, group.optional)
+                .ok_or(EBUSY)
+                .map(|_| ())
+        })
+    }
+
+    /// Write and publish the first-bind tag-16 EntrySignal at channel slot two.
+    pub(crate) fn publish_initial_entry_signal(
+        &mut self,
+        entry_signal: &[u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
+    ) -> Result {
+        self.publish_initial_entry_signal_at(2, entry_signal).map(|_| ())
+    }
+
+    /// As above, but at an explicit ring producer. Native's transport order is
+    /// tag 3 -> 15 -> 14 -> 16, so tag 16 does not always land at producer 2:
+    /// its handler ends with a broadcast `MMIO[0x210e0]/[0x210d8] = -1` "go"
+    /// poke, which native issues strictly after AddKicks.
+    pub(crate) fn publish_initial_entry_signal_at(
+        &mut self,
+        expected_producer: u32,
+        entry_signal: &[u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
+    ) -> Result<u32> {
+        let entry_signal_gpu_va =
+            self.queue_graph.iova() + g17_compute::COMPUTE_EVENT as u64;
+        self.queue_graph.with_bytes_mut(|graph| {
+            graph[g17_compute::COMPUTE_EVENT
+                ..g17_compute::COMPUTE_EVENT + entry_signal.len()]
+                .copy_from_slice(entry_signal);
+            // Wrap-safe: see `publish_command_pointer_at`. This is the record
+            // that actually hit the wall, because the tag-16 EntrySignal is the
+            // fourth and last of a submission's four records and therefore the
+            // one that lands on the ring's final slot.
+            apply_g17p_initial_command_pointer(graph, expected_producer, entry_signal_gpu_va)
+                .ok_or(EBUSY)
+        })
+    }
+
+    /// Write and publish one tag-14 `KsmKickQueueAddKicks` channel command.
+    ///
+    /// This is the firmware transport for the host `addKicks` MMIO pair. J700
+    /// cannot reach the SKSM tag/data port at all, but the matched A000 image
+    /// dispatches command type 14 to `0xfffffc0000011710`, which writes the QID
+    /// to `sgx+0x103a8` and the record's count to `sgx+0x21018` from the
+    /// firmware side. The record is placed in the retained queue graph exactly
+    /// as tags 15 and 16 are, and published through the same command-pointer
+    /// ring transition that `AGXChannel::writeChannelCommandPointer` performs.
+    ///
+    /// The whole reserved window is zeroed first: the A000 handler
+    /// cache-invalidates `G17P_KSM_ADD_KICKS_COMMAND_FETCH_SIZE` bytes, which is
+    /// wider than the host-written extent.
+    ///
+    /// Returns the ring producer after the publication.
+    pub(crate) fn publish_add_kicks_command(
+        &mut self,
+        expected_producer: u32,
+        add_kicks: &[u8; g17_submission::G17P_KSM_ADD_KICKS_COMMAND_SIZE],
+    ) -> Result<u32> {
+        let add_kicks_gpu_va = self.queue_graph.iova() + g17_compute::COMPUTE_ADD_KICKS as u64;
+        self.queue_graph.with_bytes_mut(|graph| {
+            let window = graph
+                .get_mut(
+                    g17_compute::COMPUTE_ADD_KICKS
+                        ..g17_compute::COMPUTE_ADD_KICKS + g17_compute::COMPUTE_ADD_KICKS_SIZE,
+                )
+                .ok_or(ERANGE)?;
+            window.fill(0);
+            window[..add_kicks.len()].copy_from_slice(add_kicks);
+            // Wrap-safe: see `publish_command_pointer_at`.
+            apply_g17p_initial_command_pointer(graph, expected_producer, add_kicks_gpu_va)
+                .ok_or(EBUSY)
+        })
     }
 
     pub(crate) fn snapshot_initial_channel_group(&mut self) -> Result<G17PComputeGraphSnapshot> {
@@ -5891,6 +6437,495 @@ impl G17ResourceOwner {
         self.address_space.uat.mark_firmware_cache_flush_ready();
     }
 
+    /// Validate the two immutable PBDesc/UMA low/high pairs published at
+    /// initdata time. Native never changes these four main-config words across
+    /// compute, system render, or userspace render submissions.
+    fn stage_primary_region_views(
+        &mut self,
+        label: &str,
+        low: [u64; 2],
+        high: [u64; 2],
+    ) -> Result {
+        let shared_base = self.resources.shared_cluster.iova();
+        let main_offset: usize = self
+            .handoff
+            .primary
+            .instance
+            .main_config
+            .checked_sub(shared_base)
+            .ok_or(ERANGE)?
+            .try_into()
+            .map_err(|_| ERANGE)?;
+        let values = [low[0], high[0], low[1], high[1]];
+        let mut changed = false;
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            for (index, value) in values.into_iter().enumerate() {
+                let offset = main_offset
+                    .checked_add(0x2d8 + index * 8)
+                    .ok_or(EOVERFLOW)?;
+                let slot = bytes.get(offset..offset + 8).ok_or(ERANGE)?;
+                let previous = u64::from_le_bytes(slot.try_into().map_err(|_| ERANGE)?);
+                if previous != value {
+                    changed = true;
+                }
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if changed {
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P resources: immutable primary PBDesc/UMA views disagree at {} [{:#x},{:#x}] [{:#x},{:#x}]\n",
+                label,
+                low[0],
+                high[0],
+                low[1],
+                high[1],
+            );
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_compute_region_views(&mut self) -> Result {
+        let low = [
+            self.resources.pb_descriptor_table_low.iova(),
+            self.resources.uma_page_pool_descriptor_table_low.iova(),
+        ];
+        let high = [
+            self.resources.pb_descriptor_table.iova(),
+            self.resources.uma_page_pool_descriptor_table.iova(),
+        ];
+        self.stage_primary_region_views("compute", low, high)
+    }
+
+    pub(crate) fn stage_render_region_views(&mut self) -> Result {
+        let low = [
+            self.resources.pb_descriptor_table_low.iova(),
+            self.resources.uma_page_pool_descriptor_table_low.iova(),
+        ];
+        let high = [
+            self.resources.pb_descriptor_table.iova(),
+            self.resources.uma_page_pool_descriptor_table.iova(),
+        ];
+        self.stage_primary_region_views("render", low, high)
+    }
+
+    /// Read one AGXQOSManager firmware-visible 8-byte queue record. Native
+    /// `AGXQOSQueue::willSubmit` writes `{hardware_buffer_id, qos_class}` into
+    /// bytes 0/1 at `queue_id * 8`; ConfigUpdate +0x56 carries that same
+    /// hardware-buffer id. This resource is ordinary shared DRAM, so it is
+    /// safe to sample after a timeout.
+    pub(crate) fn qos_queue_record(&mut self, queue_id: u8) -> Result<[u8; 8]> {
+        let offset = usize::from(queue_id).checked_mul(8).ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let vmap = self.resources.qos_resource.object.vmap()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete QoS resource and the slot
+            // range is bounds-checked below.
+            core::slice::from_raw_parts(vmap.as_ptr(), self.resources.qos_resource.logical_size)
+        };
+        let mut record = [0u8; 8];
+        record.copy_from_slice(bytes.get(offset..offset + 8).ok_or(EINVAL)?);
+        Ok(record)
+    }
+
+    /// Publish the firmware-visible part of native
+    /// `AGXQOSQueue::willSubmit` for one render data master.
+    ///
+    /// The first 0x400 bytes of the 0xe40-byte QoS object are 128 records
+    /// indexed by queue ID, not by HardwareBufferID. Native writes the
+    /// ConfigUpdate `+0x56` HardwareBufferID to byte 0 and the queue's QoS
+    /// class to byte 1 before it makes tag-15 visible. On the first submit it
+    /// also publishes two HardwareBufferID-indexed properties: `+0x800` is the
+    /// exact same `_AGFISchedulerState` firmware VA carried by ConfigUpdate
+    /// `+0x4a`, while `+0xc00` is the queue's normalized QoS share. Finally it
+    /// increments the total at `+0xe00`, records `mach_absolute_time()` in the
+    /// data-master slot at `+0xe08 + dm*8`, and increments the matching count
+    /// at `+0xe20 + dm*8`. The remaining six queue-record bytes belong to other
+    /// runtime state and must not be reset on a retained submission.
+    fn publish_qos_queue_record(
+        &mut self,
+        queue_id: u8,
+        hardware_buffer_id: u8,
+        qos_class: u8,
+        scheduler_state: u64,
+        data_master: u8,
+        share: u32,
+    ) -> Result<[u8; 8]> {
+        if usize::from(queue_id) >= G17P_QOS_QUEUE_COUNT
+            || usize::from(hardware_buffer_id) >= G17P_QOS_QUEUE_COUNT {
+            return Err(EINVAL);
+        }
+        if scheduler_state == 0 {
+            return Err(EINVAL);
+        }
+        let offset = usize::from(queue_id)
+            .checked_mul(8)
+            .ok_or(EINVAL)?;
+        let hardware_buffer_id = usize::from(hardware_buffer_id);
+        let scheduler_state_offset = 0x800usize
+            .checked_add(hardware_buffer_id.checked_mul(8).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        let share_offset = 0xc00usize
+            .checked_add(hardware_buffer_id.checked_mul(4).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        let data_master = usize::from(data_master);
+        let data_master_time_offset = 0xe08usize
+            .checked_add(data_master.checked_mul(8).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        let data_master_count_offset = 0xe20usize
+            .checked_add(data_master.checked_mul(8).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        let submit_time: u64;
+        // Native stores mach_absolute_time(), which is the architectural
+        // physical counter on arm64. Read that same counter rather than a
+        // nanosecond-converted Linux clock or a captured fixture literal.
+        // SAFETY: CNTPCT_EL0 is enabled for kernel reads and this assembly has
+        // no memory side effects.
+        unsafe {
+            core::arch::asm!(
+                "mrs {counter}, CNTPCT_EL0",
+                counter = out(reg) submit_time,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let mut published = [0u8; 8];
+        self.resources.qos_resource.with_bytes_mut(|bytes| {
+            let record = bytes.get_mut(offset..offset + 8).ok_or(EINVAL)?;
+            record[0] = hardware_buffer_id as u8;
+            record[1] = qos_class;
+            published.copy_from_slice(record);
+            bytes
+                .get_mut(scheduler_state_offset..scheduler_state_offset + 8)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&scheduler_state.to_le_bytes());
+            bytes
+                .get_mut(share_offset..share_offset + 4)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&share.to_le_bytes());
+            // `AGXQOSQueue::willSubmit(qid, dm)` @ 0xfffffe0008b7a248 also
+            // updates its monotonic accounting in this object. Decoded from
+            // the kext and checked against the valid cold native capture:
+            //
+            //   x9 = QoS base
+            //   +0x400 + qid*4   u32, ldr/add #1/str            (qid-indexed)
+            //   +0x600 + idx*4   u32, ldr/add #1/str            (idx = obj+0x10)
+            //   +0xe00           u64, ldr/add #1/str            (total)
+            //   +0xe08 + dm*8    u64, mach_absolute_time/str    (DM-indexed)
+            //   +0xe20 + dm*8    u64, ldr/add #1/str, then dmb  (DM-indexed)
+            //
+            // The object is 0xe40 bytes, which is exactly 0xe20 plus four u64s
+            // -- an independent check that the per-data-master block really is
+            // the last one and really is 8-byte strided.
+            //
+            // `+0x600`'s index is
+            // `AGXQOSQueue+0x10`, which `init` @ 0xfffffe0008a81520 sets to
+            // 0xffffffff and something outside init assigns. Writing it on a
+            // guessed index would scribble on the object, so it stays open.
+            let submit_counter_offset = 0x400usize
+                .checked_add(usize::from(queue_id).checked_mul(4).ok_or(EINVAL)?)
+                .ok_or(EINVAL)?;
+            let counter = bytes
+                .get_mut(submit_counter_offset..submit_counter_offset + 4)
+                .ok_or(EINVAL)?;
+            let bumped = u32::from_le_bytes(counter.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            counter.copy_from_slice(&bumped.to_le_bytes());
+
+            let hardware_buffer_counter_offset = 0x600usize
+                .checked_add(hardware_buffer_id.checked_mul(4).ok_or(EINVAL)?)
+                .ok_or(EINVAL)?;
+            let counter = bytes
+                .get_mut(hardware_buffer_counter_offset..hardware_buffer_counter_offset + 4)
+                .ok_or(EINVAL)?;
+            let bumped = u32::from_le_bytes(counter.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            counter.copy_from_slice(&bumped.to_le_bytes());
+
+            let total = bytes.get_mut(0xe00..0xe08).ok_or(EINVAL)?;
+            let bumped = u64::from_le_bytes(total.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            total.copy_from_slice(&bumped.to_le_bytes());
+
+            bytes
+                .get_mut(data_master_time_offset..data_master_time_offset + 8)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&submit_time.to_le_bytes());
+
+            let per_dm = bytes
+                .get_mut(data_master_count_offset..data_master_count_offset + 8)
+                .ok_or(EINVAL)?;
+            let bumped = u64::from_le_bytes(per_dm.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            per_dm.copy_from_slice(&bumped.to_le_bytes());
+            Ok(())
+        })?;
+        // Native ends `willSubmit` with `dmb ish`. Order these shared WC
+        // stores before any inner/outer producer or doorbell can expose the
+        // corresponding tag-15 record to firmware.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(published)
+    }
+
+    pub(crate) fn publish_render_qos_queue_record(
+        &mut self,
+        header: G17PRenderConfigUpdateHeader,
+    ) -> Result<[u8; 8]> {
+        self.publish_qos_queue_record(
+            u8::try_from(header.queue_id).map_err(|_| EINVAL)?,
+            u8::try_from(header.field_56).map_err(|_| EINVAL)?,
+            G17P_DEFAULT_QOS_CLASS,
+            header.scheduler_state,
+            u8::try_from(header.data_master).map_err(|_| EINVAL)?,
+            G17P_SINGLE_QUEUE_QOS_SHARE,
+        )
+    }
+
+    /// Publish the same `AGXQOSQueue::willSubmit` state that native writes
+    /// immediately before exposing a compute ConfigUpdate. The kext supplies
+    /// data master 2 here; Linux uses the already hardware-validated default
+    /// class/share. The queue-specific HardwareBufferID is directly observed
+    /// in native CL captures and keeps their scheduler-state slots distinct.
+    pub(crate) fn publish_compute_qos_queue_record(
+        &mut self,
+        queue_id: u8,
+        hardware_buffer_id: u8,
+        scheduler_state: u64,
+    ) -> Result<[u8; 8]> {
+        self.publish_qos_queue_record(
+            queue_id,
+            hardware_buffer_id,
+            G17P_DEFAULT_QOS_CLASS,
+            scheduler_state,
+            2,
+            G17P_SINGLE_QUEUE_QOS_SHARE,
+        )
+    }
+
+    /// Dump the QOS resource regions `AGXQOSQueue::willSubmit` touches.
+    ///
+    /// The kext writes rows at `qid*8`, counters at `+0x400+qid*4`, `+0x600`,
+    /// a u64 firmware VA per index at `+0x800`, `+0xc00`, and a further block
+    /// at `+0xe00` that is indexed PER DATA MASTER. This driver writes only
+    /// the `qid*8` row, `+0x800` and `+0xc00`, so the per-data-master block
+    /// has never been written by us at all -- and data master 1 is the one
+    /// that never dispatches, while 0 and 2 both do.
+    /// DIAGNOSTIC. Dump the whole hardware-data block this driver builds.
+    ///
+    /// HW_DATA_OPAQUE_RUNS -- the 269 hardcoded bytes -- is verified byte-exact
+    /// against native. The REST of the 0x3db4 block is computed here (register
+    /// windows, completion aliases, QoS and SKSM resource pointers, geometry)
+    /// and has never been compared. Native's equivalent block was captured
+    /// whole from AGXArmFirmwareASC + 0x2b8, so a full diff is possible; only
+    /// the address-shaped fields are expected to differ.
+    ///
+    /// Copies through a heap buffer in ONE `with_bytes_mut` call rather than
+    /// logging chunk by chunk. Each call to that helper takes a fresh `vmap()`,
+    /// and calling it in a loop stopped producing bytes after the first chunk;
+    /// one call also lets the device handle be taken after the borrow ends.
+    pub(crate) fn dump_hw_data(&mut self, label: &str) {
+        let size = g17_initdata::HW_DATA_SIZE;
+        let mut buf: KVec<u8> = match KVec::with_capacity(size, GFP_KERNEL) {
+            Ok(buf) => buf,
+            Err(_) => return,
+        };
+        let mut exposed = 0usize;
+        let filled = self
+            .resources
+            .shared_cluster
+            .with_bytes_mut(|bytes| {
+                exposed = bytes.len();
+                let take = core::cmp::min(size, bytes.len());
+                let src = bytes.get(..take).ok_or(ERANGE)?;
+                for byte in src.iter() {
+                    buf.push(*byte, GFP_KERNEL)?;
+                }
+                Ok(())
+            })
+            .is_ok();
+        {
+            let dev = self.dev().clone();
+            dev_info!(
+                dev.as_ref(),
+                "G17PHWDATA {} extent: exposed={:#x} wanted={:#x} filled={} got={:#x}\n",
+                label,
+                exposed,
+                size,
+                filled,
+                buf.len(),
+            );
+        }
+        if !filled {
+            return;
+        }
+        let dev = self.dev().clone();
+        let mut offset = 0usize;
+        while offset + 16 <= buf.len() {
+            dev_info!(
+                dev.as_ref(),
+                "G17PHWDATA {} {:#07x} {:02x?}\n",
+                label,
+                offset,
+                &buf[offset..offset + 16],
+            );
+            offset += 16;
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G17PHWDATA {} complete: {} bytes\n",
+            label,
+            buf.len(),
+        );
+    }
+
+    /// DIAGNOSTIC. Dump the primary firmware-visible state object.
+    ///
+    /// A completed compute is what makes the tiler run. Registers have been
+    /// compared cold-vs-warm and only work-channels[0] differed, which was
+    /// refuted as a cause by seeding it. The firmware-visible DRAM the
+    /// firmware itself keeps state in has never been compared, and whatever a
+    /// compute changes there is the candidate set for the bootstrap.
+    pub(crate) fn dump_primary_state(&mut self, label: &str, len: usize) {
+        let mut buf: KVec<u8> = match KVec::with_capacity(len, GFP_KERNEL) {
+            Ok(buf) => buf,
+            Err(_) => return,
+        };
+        let mut exposed = 0usize;
+        let ok = self
+            .resources
+            .primary_state
+            .with_bytes_mut(|bytes| {
+                exposed = bytes.len();
+                let take = core::cmp::min(len, bytes.len());
+                for byte in bytes.get(..take).ok_or(ERANGE)?.iter() {
+                    buf.push(*byte, GFP_KERNEL)?;
+                }
+                Ok(())
+            })
+            .is_ok();
+        let dev = self.dev().clone();
+        dev_info!(
+            dev.as_ref(),
+            "G17PSTATE {} exposed={:#x} got={:#x} ok={}\n",
+            label,
+            exposed,
+            buf.len(),
+            ok,
+        );
+        if !ok {
+            return;
+        }
+        let mut offset = 0usize;
+        while offset + 16 <= buf.len() {
+            dev_info!(
+                dev.as_ref(),
+                "G17PSTATE {} {:#07x} {:02x?}\n",
+                label,
+                offset,
+                &buf[offset..offset + 16],
+            );
+            offset += 16;
+        }
+    }
+
+    /// DIAGNOSTIC. Checksum every 0x100 block of the primary state object.
+    ///
+    /// The object is 0xc4000 bytes; dumping it raw is ~50k printk lines. A
+    /// per-block hash covers all of it in a few hundred, and the blocks that
+    /// differ between a cold and a compute-first boot can then be dumped raw.
+    pub(crate) fn checksum_primary_state(&mut self, label: &str) {
+        let mut hashes: KVec<u32> = KVec::new();
+        let ok = self
+            .resources
+            .primary_state
+            .with_bytes_mut(|bytes| {
+                let mut off = 0usize;
+                while off + 0x100 <= bytes.len() {
+                    let mut h: u32 = 0x811c9dc5;
+                    let mut k = 0usize;
+                    while k < 0x100 {
+                        h ^= bytes[off + k] as u32;
+                        h = h.wrapping_mul(0x0100_0193);
+                        k += 1;
+                    }
+                    hashes.push(h, GFP_KERNEL)?;
+                    off += 0x100;
+                }
+                Ok(())
+            })
+            .is_ok();
+        let dev = self.dev().clone();
+        dev_info!(
+            dev.as_ref(),
+            "G17PSUM {} blocks={} ok={}\n",
+            label,
+            hashes.len(),
+            ok,
+        );
+        if !ok {
+            return;
+        }
+        let mut i = 0usize;
+        while i + 8 <= hashes.len() {
+            dev_info!(
+                dev.as_ref(),
+                "G17PSUM {} {:#07x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                label,
+                i * 0x100,
+                hashes[i], hashes[i + 1], hashes[i + 2], hashes[i + 3],
+                hashes[i + 4], hashes[i + 5], hashes[i + 6], hashes[i + 7],
+            );
+            i += 8;
+        }
+    }
+
+    pub(crate) fn dump_render_qos_regions(&mut self, label: &str) {
+        if !crate::util::g17p_verbose() {
+            return;
+        }
+        const REGIONS: [(&str, usize, usize); 6] = [
+            ("rows", 0x000, 0x40),
+            ("cnt400", 0x400, 0x40),
+            ("blk600", 0x600, 0x40),
+            ("sched800", 0x800, 0x40),
+            ("sharec00", 0xc00, 0x40),
+            ("perdme00", 0xe00, 0x80),
+        ];
+        let mut windows = [[0u8; 0x80]; 6];
+        let mut ok = [false; 6];
+        let _ = self.resources.qos_resource.with_bytes_mut(|bytes| {
+            for (index, (_, base, len)) in REGIONS.iter().enumerate() {
+                let end = match base.checked_add(*len) {
+                    Some(end) => end,
+                    None => continue,
+                };
+                if let Some(slice) = bytes.get(*base..end) {
+                    windows[index][..*len].copy_from_slice(slice);
+                    ok[index] = true;
+                }
+            }
+            Ok(())
+        });
+        let dev = self.dev().clone();
+        for (index, (name, base, len)) in REGIONS.iter().enumerate() {
+            if !ok[index] {
+                continue;
+            }
+            for row in 0..(len / 16) {
+                let at = row * 16;
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P QOS[{}] {} +{:#05x}: {:02x?}\n",
+                    label,
+                    name,
+                    base + at,
+                    &windows[index][at..at + 16],
+                );
+            }
+        }
+    }
+
     pub(crate) fn control_counters(&mut self) -> Result<G17PControlCounters> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let primary = read_control_counters(
@@ -7850,6 +8885,173 @@ impl G17ResourceOwner {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dm1_watchdog_slot0_validates_pointer_identity_and_complete_extent() {
+        let view = 0xffff_fc20_c078_b380;
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, 0), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, 1), Some(view + 0xa58));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, DM1_WATCHDOG_SLOT_COUNT - 1), Some(view + 0xc68));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, DM1_WATCHDOG_SLOT_COUNT), None);
+        assert_eq!(DM1_WATCHDOG_SLOT_COUNT, 24);
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xa58, 0), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xa57, 0), None);
+        assert_eq!(g17p_dm1_slot_address(view + 4, view, 0xc80, 0), None);
+    }
+
+    #[test]
+    fn dm1_watchdog_slot0_rejects_start_and_end_overflow() {
+        let start_overflow = u64::MAX - 0xa3f;
+        assert_eq!(g17p_dm1_slot_address(start_overflow, start_overflow, 0xc80, 0), None);
+        let end_overflow = u64::MAX - 0xa40;
+        assert_eq!(g17p_dm1_slot_address(end_overflow, end_overflow, 0xc80, 0), None);
+    }
+
+    #[test]
+    fn dm1_watchdog_slot0_timestamp_uses_unaligned_words_three_and_four() {
+        let snapshot = G17PFirmwareDm1SlotSnapshot {
+            slot: 0,
+            address: 0,
+            raw: [2, 0x1111_1111, 0x2222_2222, 0x89ab_cdef, 0x0123_4567, 0x5555_5555],
+        };
+        assert_eq!(snapshot.state(), 2);
+        assert_eq!(snapshot.timestamp(), 0x0123_4567_89ab_cdef);
+        assert_eq!(snapshot.raw[2], 0x2222_2222);
+    }
+
+    #[test]
+    fn initial_render_qos_row_matches_valid_qid0_qid1_profile() {
+        assert_eq!(g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY, 0);
+        assert_eq!(G17P_DEFAULT_QOS_CLASS, 0x0f);
+    }
+
+    #[test]
+    fn compute_flist_stops_before_native_completion_aliases() {
+        let mut raw = vec![0xa5; G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE];
+        assert!(encode_g17p_compute_flist_runs(&mut raw));
+        let count = g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT;
+        assert_eq!(count, 21);
+        for buffer_index in 0..count {
+            let base = g17p_compute_operand_buffer_va(buffer_index).unwrap();
+            let offset = buffer_index * core::mem::size_of::<u64>();
+            assert_eq!(
+                u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap()),
+                (base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
+                    | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52)
+            );
+        }
+        assert!(raw[count * core::mem::size_of::<u64>()..]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        let last_end = g17p_compute_operand_buffer_va(count - 1).unwrap()
+            + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        let first_completion = g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[0];
+        assert!(last_end <= first_completion);
+        let opening_only = g17p_compute_operand_buffer_va(count).unwrap();
+        assert!(opening_only < first_completion);
+        assert!(opening_only + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64 <= first_completion);
+    }
+
+    #[test]
+    fn render_flist_run_list_matches_native_initial_and_first_grow_slots() {
+        let mut raw = vec![0xa5; G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE];
+        assert!(encode_g17p_pre_qid_flist_runs(&mut raw));
+        for buffer_index in 0..G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT {
+            let base = g17p_control_operand_buffer_va(buffer_index).unwrap();
+            let offset = buffer_index * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE;
+            assert_eq!(
+                u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap()),
+                (base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
+                    | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52)
+            );
+            assert!(raw[offset + 8..offset + G17P_CONTROL_OPERAND_RUN_SLOT_SIZE]
+                .iter()
+                .all(|byte| *byte == 0));
+        }
+        let used = G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT
+            * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE;
+        assert_eq!(G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT * 0x40, 0x440);
+        assert_eq!(G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT * 8, 0x28);
+        assert!(raw[used..].iter().all(|byte| *byte == 0));
+        assert!(!encode_g17p_pre_qid_flist_runs(
+            &mut raw[..G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE - 1]
+        ));
+    }
+
+    #[test]
+    fn render_flist_initial_page_list_expands_the_17_native_blocks() {
+        let mut raw = vec![0xa5; G17P_CONTROL_OPERAND_PAGE_LIST_SIZE];
+        assert!(encode_g17p_initial_flist_page_list(&mut raw));
+        let entries = G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT
+            * G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES as usize;
+        assert_eq!(entries, 0x1100);
+        for block in 0..G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT {
+            let base = g17p_control_operand_buffer_va(block).unwrap();
+            for page in 0..G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES as usize {
+                let entry = block * G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES as usize + page;
+                let offset = entry * 8;
+                assert_eq!(
+                    u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap()),
+                    base + (page * 0x1000) as u64,
+                );
+            }
+        }
+        assert!(raw[entries * 8..].iter().all(|byte| *byte == 0));
+        assert!(!encode_g17p_initial_flist_page_list(
+            &mut raw[..G17P_CONTROL_OPERAND_PAGE_LIST_SIZE - 1]
+        ));
+    }
+
+    #[test]
+    fn last_submitted_timestamp_table_is_exactly_bundle_view_four() {
+        assert_eq!(G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_VIEW_INDEX, 4);
+        assert_eq!(G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET, 0xbd00);
+        assert_eq!(G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE, 0x800);
+        assert_eq!(
+            G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET
+                + G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE,
+            0xc500
+        );
+        assert!(
+            G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET
+                + G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE
+                <= g17_initdata::NATIVE_SHARED_CLUSTER_SIZE
+        );
+
+        let mut short = vec![
+            0xa5;
+            G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET
+                + G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE
+                - 1
+        ];
+        assert!(g17p_last_submitted_hw_timestamp_table_mut(&mut short).is_none());
+    }
+
+    #[test]
+    fn empty_recovery_updates_only_bundle_view_four_timestamp_records() {
+        let mut raw = vec![0xa5; g17_initdata::NATIVE_SHARED_CLUSTER_SIZE];
+        let table = g17p_last_submitted_hw_timestamp_table_mut(&mut raw).unwrap();
+        assert!(clear_g17p_last_submitted_hw_timestamps(table));
+        for qid in 0..G17P_LAST_SUBMITTED_HW_TIMESTAMP_COUNT {
+            let entry = qid * G17P_LAST_SUBMITTED_HW_TIMESTAMP_STRIDE;
+            let entry = G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET + entry;
+            assert_eq!(&raw[entry..entry + 4], &[0; 4]);
+            assert_eq!(&raw[entry + 4..entry + 8], &[0xa5; 4]);
+            assert_eq!(&raw[entry + 8..entry + 0x10], &[0; 8]);
+        }
+        assert!(raw[..G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET]
+            .iter()
+            .all(|byte| *byte == 0xa5));
+        assert!(raw[G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET
+            + G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE..]
+            .iter()
+            .all(|byte| *byte == 0xa5));
+
+        let mut short = vec![0xa5; G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE - 1];
+        assert!(!clear_g17p_last_submitted_hw_timestamps(&mut short));
+        assert!(short.iter().all(|byte| *byte == 0xa5));
+    }
+
     const KERN: u64 = 0xffff_fc20_0000_0000;
 
     fn get_u32(raw: &[u8], offset: usize) -> u32 {
@@ -8362,6 +9564,7 @@ mod tests {
             SHARED_SUPPORT,
             CHANNEL_CONTROL,
             4,
+            1,
             &mut graph,
             &mut context,
             true,
@@ -8410,6 +9613,7 @@ mod tests {
             SHARED_SUPPORT,
             CHANNEL_CONTROL,
             4,
+            1,
             &mut relocated_graph,
             &mut relocated_context,
             true,

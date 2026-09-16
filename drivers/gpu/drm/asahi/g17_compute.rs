@@ -231,6 +231,175 @@ pub(crate) fn build_compute_queue_graph(
     Ok(addresses)
 }
 
+/// Usable entries in the queue's item ring, as programmed into the graph's
+/// pointer block at `+0x160` and read back by both the host publisher and the
+/// firmware.
+///
+/// Normally the full `0x500`. `g17p_ring_limit` shrinks it so the ring WRAP can
+/// be reached in a handful of submissions instead of 320: at four records per
+/// submission, a 32-entry ring wraps on the eighth. Wrap behaviour is identical
+/// at any size, so this turns a 400-iteration run -- which also overflows the
+/// kernel log and destroys its own evidence -- into a 20-iteration one.
+pub(crate) fn compute_item_ring_entries() -> u32 {
+    const FULL: u32 = 0x500;
+    let requested = *crate::module_parameters::g17p_ring_limit.value();
+    if requested == 0 {
+        return FULL;
+    }
+    // Must stay a multiple of the per-submission record count so a batch never
+    // straddles the wrap differently than it would at full size, and must leave
+    // room for at least two submissions plus the always-empty slot.
+    let clamped = requested.clamp(
+        2 * COMPUTE_REPEAT_RING_RECORD_COUNT as u32 + 4,
+        FULL,
+    );
+    clamped - (clamped % COMPUTE_REPEAT_RING_RECORD_COUNT as u32)
+}
+
+/// Encode the tag-15 `KSMKickQueueConfigUpdate` record inside a retained
+/// queue graph.
+///
+/// Split out of the first-bind builder because macOS republishes this record
+/// on EVERY submission -- both live captures (QID 0x11 and QID 0x16) are of
+/// already-installed queues and both still carry a tag-15 ConfigUpdate. The
+/// only field that differs between a first bind and a repeat is the
+/// queue-install flag at `+0x1a`. Nothing outside the optional-record window
+/// is touched, so a repeat submission can call this without resetting the
+/// item-ring producer or rewriting the queue header the way the first-bind
+/// builder does.
+pub(crate) fn encode_compute_config_update(
+    graph: &mut [u8],
+    sksm_entries: ComputeSksmEntryAliases,
+    shared_control: u64,
+    channel_control: u64,
+    queue_id: u8,
+    hardware_buffer_id: u8,
+    install_queue: bool,
+    context_id: Option<u16>,
+) -> Result<(), ComputeBuildError> {
+    // Record +0x32 is the hardware context this queue's work is declared to run
+    // in. It has always been the literal 2, from when every compute client ran
+    // in the fixed pair `T8140_COMPUTE_CTXS = [2, 3]`.
+    //
+    // Those two contexts are a SINGLE GLOBAL alias pair:
+    // `install_t8140_compute_context_alias` publishes the current client's VM
+    // root into both and records one `t8140_alias_owner`. With one compute
+    // client that is correct. With a second, the alias is re-pointed and the
+    // loser's kicks -- still declaring 2 -- no longer name their own root,
+    // while their real root lives in the app context the execution context
+    // allocated (5..62). The kick already declares that real context at
+    // `sgx+0x10428`; only this record still says 2.
+    //
+    // Probe-gated and default-off: 0 sends the historical constant, byte
+    // identical to the previous driver; 1 sends the client's real context when
+    // one is known. See `g17p_compute_config_context`.
+    let declared_context = match context_id {
+        Some(context) if *crate::module_parameters::g17p_compute_config_context.value() != 0 => {
+            context
+        }
+        _ => 2u16,
+    };
+    let flushid_fix = *crate::module_parameters::g17p_flushid_fix.value() != 0;
+    let (flushid_object, flushid_slot, flushid_index) = if flushid_fix {
+        (0u64, 0xffffu16, 0xffffu16)
+    } else {
+        (shared_control, 0x3fu16, 0u16)
+    };
+    let optional_raw = graph
+        .get_mut(COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE)
+        .ok_or(ComputeBuildError::BufferTooSmall)?;
+    optional_raw.fill(0);
+    put_u32(optional_raw, 0x00, 0x0f);
+    put_u64(optional_raw, 0x08, sksm_entries.low());
+    put_u64(optional_raw, 0x10, sksm_entries.high());
+    for (offset, value) in [
+        (0x18, u16::from(queue_id)),
+        // +0x1a is the QUEUE-INSTALL flag, and it must be non-zero on a first
+        // bind. Firmware RE (2026-08-31): the only writer of the per-queue slot
+        // `0x127628 + qid*0x28` is at 0x119b8, and that store -- together with
+        // slot[+0x00]=1, the per-data-master active bitmap, the sgx+0x21008
+        // queue-base write and the 0x40 KTrace receipt -- is reachable only when
+        // this field is non-zero. Sending 0 left slot[+0x08] NULL, and the tag-16
+        // handler then faulted dereferencing it (firmware exception pc=0x1190c
+        // far=0x340 esr=0x96000004, a level-0 translation fault), which is why
+        // pause bit 7 taken at 0x118c0 was never cleared at 0x11948.
+        //
+        // The two captured macOS records show 0 here because both were taken on
+        // already-installed queues, not on a first bind. Absence of the 0x40
+        // KTrace code is the receipt that the install branch was not taken.
+        // Queue-install flag: 1 only on a queue's FIRST bind. Native clears it
+        // afterwards -- leaving it set forces a disable/reprogram/enable cycle
+        // on the KSMFE queue for every submission, which is why a second submit
+        // published fine and then never completed.
+        (0x1a, if install_queue { 1 } else { 0 }),
+        (0x1e, 2),
+        (0x22, 2),
+        (0x32, declared_context),
+        (0x3e, flushid_slot),
+        (0x46, flushid_index),
+        (0x52, 1),
+        // AGXCLChannelSKSM::submitBuffer copies AGXQOSQueue +0x10 here.
+        // Native retained CL queues receive distinct HardwareBufferIDs in
+        // allocation order (1, 2, 3 in the captured QID 4/5/7 sequence).
+        // This field is therefore queue identity, not the literal 1 from the
+        // first output-positive queue.
+        (0x56, u16::from(hardware_buffer_id)),
+        (0x5a, 0x170),
+        (0x5e, 2),
+        (0x62, 1),
+        (0x66, 1),
+    ] {
+        put_u16(optional_raw, offset, value);
+    }
+    put_u64(optional_raw, 0x36, flushid_object);
+    put_u64(optional_raw, 0x4a, channel_control);
+    optional_raw[0x76..0x86].fill(0xff);
+    Ok(())
+}
+
+/// Encode one queue-context item.
+///
+/// The array is a sibling of the SKSM entry array, not a single record:
+/// `COMPUTE_QUEUE_CONTEXT_EXTENT` is `8 * 0x4000 = 0x20000`, the item stride is
+/// `0x200`, so it holds `0x100` items -- exactly the queue geometry's
+/// `stamp_count`, and exactly the size and stride of the entry backing
+/// (`0x100 * 0x200 = 0x20000`). The first bind writes item 1 and consumes stamp
+/// index 1, which is consistent with the item being indexed by stamp.
+///
+/// That reading is INFERRED from the geometry, not proven, which is why the
+/// repeat path selects between "rewrite item 1" and "write item[stamp]" by
+/// parameter instead of assuming.
+pub(crate) fn encode_compute_queue_context_item(
+    queue_context: &mut [u8],
+    item_index: usize,
+    descriptor: u64,
+    queue_base: u64,
+    queue_id: u8,
+) -> Result<(), ComputeBuildError> {
+    let offset = item_index
+        .checked_mul(COMPUTE_QUEUE_CONTEXT_ITEM)
+        .ok_or(ComputeBuildError::AddressOverflow)?;
+    let end = offset
+        .checked_add(COMPUTE_QUEUE_CONTEXT_ITEM)
+        .ok_or(ComputeBuildError::AddressOverflow)?;
+    if end > queue_context.len() {
+        return Err(ComputeBuildError::BufferTooSmall);
+    }
+    let context = &mut queue_context[offset..end];
+    context.fill(0);
+    put_u64(context, 0x00, 0x1000_1000_0000_0004);
+    put_u64(context, 0x10, descriptor);
+    put_u64(context, 0x18, queue_base);
+    put_u64(context, 0x20, 0xffff_0801_0000_0001);
+    put_u64(context, 0x28, u64::from(queue_id) << 40);
+    put_u64(context, 0x130, 0);
+    put_u64(context, 0x138, 4);
+    put_u64(context, 0x150, 0x0001_1003_8001_a002);
+    put_u64(context, 0x158, 0x0000_2003_8001_a03b);
+    put_u64(context, 0x178, 0x003f_ffff_ffff_ffff);
+    Ok(())
+}
+
 /// Stage the first hardware-proven direct-compute group in a retained queue.
 ///
 /// This is the CL_2 channel graph used by the output-positive m1n1 add3 test:
@@ -244,6 +413,8 @@ pub(crate) fn build_initial_compute_channel_group(
     context_high: u64,
     shared_control: u64,
     channel_control: u64,
+    queue_id: u8,
+    hardware_buffer_id: u8,
     graph: &mut [u8],
     queue_context: &mut [u8],
 ) -> Result<ComputeChannelGroupAddresses, ComputeBuildError> {
@@ -268,31 +439,28 @@ pub(crate) fn build_initial_compute_channel_group(
         COMPUTE_CHANNEL_WRITE_INDEX,
     );
 
-    let optional_raw = &mut graph[COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE];
-    optional_raw.fill(0);
-    put_u32(optional_raw, 0x00, 0x0f);
-    put_u64(optional_raw, 0x08, context_low);
-    put_u64(optional_raw, 0x10, context_high);
-    for (offset, value) in [
-        (0x18, 4u16),
-        (0x1a, 1),
-        (0x1e, 2),
-        (0x22, 2),
-        (0x32, 2),
-        (0x3e, 0x3f),
-        (0x46, 1),
-        (0x52, 1),
-        (0x56, 1),
-        (0x5a, 0x170),
-        (0x5e, 2),
-        (0x62, 1),
-        (0x66, 1),
-    ] {
-        put_u16(optional_raw, offset, value);
-    }
-    put_u64(optional_raw, 0x36, shared_control);
-    put_u64(optional_raw, 0x4a, channel_control);
-    optional_raw[0x76..0x86].fill(0xff);
+    // Tag-15 FlushID triple. Ours (shared_control / 0x3f / 1) is inferred, and
+    // because +0x36 is non-zero the firmware runs its FlushID bind path, which
+    // indexes `0x5b778 + rec[0x46]*0xe8` unbounded. The kext writes 0 / -1 / -1
+    // for a non-first bind, which makes the firmware skip the block, and
+    // PROVENANCE.md records that T8140 leaves the AGXSKSMFlushID bit clear.
+    // The non-fix tuple's third element lands at +0x46. Native writes 0 there:
+    // both compute-queue tag-15 records captured live on macOS 26.6.2 (QID 0x11
+    // and QID 0x16) have +0x46 = 0, so it is a constant. The +0x3e slot is NOT a
+    // constant -- native carries a live per-queue counter there (0x719 / 0x770,
+    // copied from AGXKSMKickQueueG16 +0x28), so 0x3f stays until that counter's
+    // provenance is known. Do not substitute the kext's 0/-1/-1 non-first-bind
+    // constants; those have hard-killed the machine twice.
+    encode_compute_config_update(
+        graph,
+        sksm_entries,
+        shared_control,
+        channel_control,
+        queue_id,
+        hardware_buffer_id,
+        install_queue,
+        context_id,
+    )?;
 
     let event_raw = &mut graph[COMPUTE_EVENT..COMPUTE_EVENT + COMPUTE_EVENT_SIZE];
     event_raw.fill(0);
@@ -640,6 +808,8 @@ mod tests {
             0xffff_fc20_c300_0000,
             0xffff_fc20_c400_0000,
             0xffff_fc20_c500_0000,
+            4,
+            1,
             &mut graph,
             &mut context,
         )
