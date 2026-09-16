@@ -143,15 +143,17 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
 }
 
 /// Decide whether the next render must start a fresh firmware session.
-/// Ordinal 255 is representable; 256 is the first value outside the retained
-/// optional-record ABI. A VM change also needs a cold session because the
-/// retained graph belongs to its original VM.
+/// Physical 256-slot SKSM/outer rings wrap without a session restart. The
+/// native 40-bit kick timestamp and 32-bit event value wrap independently of
+/// the software ordinal. Neither wrap requires a firmware session restart.
+/// A retained-graph owner change still requires a cold session if the normal
+/// graph-handoff path has not replaced it first.
 pub(crate) const fn retained_render_requires_recycle(
     retained_graph: bool,
-    same_vm: bool,
-    next_ordinal: u32,
+    same_owner: bool,
+    next_ordinal: u64,
 ) -> bool {
-    retained_graph && (!same_vm || next_ordinal > u8::MAX as u32)
+    retained_graph && (!same_owner || next_ordinal == u64::MAX)
 }
 
 /// Operations needed to dismantle a retained G17P runtime.
@@ -839,8 +841,49 @@ mod tests {
     }
 
     #[test]
-    fn ordinal_255_rebuilds_the_session_before_the_following_submit() {
-        let mut next_ordinal = 255;
+    fn failed_stop_signals_two_clients_once_but_retains_their_hardware_owners() {
+        let mut owner = RepeatedFenceRecovery::new(1, 0);
+        assert_eq!(recover_persistent_runtime(&mut owner), Err(TestError::StopPair));
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && job.retained));
+        assert_eq!(owner.release_calls, 0);
+
+        // A later successful stop releases both owners without signalling
+        // either fence a second time, then rebuilds and resumes normally.
+        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
+        assert_eq!(owner.release_calls, 1);
+        assert_eq!(owner.rebuild_calls, 1);
+        assert!(owner.resumed);
+    }
+
+    #[test]
+    fn disable_failure_releases_two_clients_and_a_retry_rebuilds() {
+        let mut owner = RepeatedFenceRecovery::new(0, 1);
+        assert_eq!(
+            recover_persistent_runtime(&mut owner),
+            Err(TestError::DisableSksm)
+        );
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
+        assert_eq!(owner.release_calls, 1);
+        assert_eq!(owner.rebuild_calls, 0);
+        assert!(!owner.resumed);
+
+        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
+        assert_eq!(owner.release_calls, 2);
+        assert_eq!(owner.rebuild_calls, 1);
+        assert!(owner.resumed);
+    }
+
+    #[test]
+    fn physical_ring_wraps_do_not_rebuild_the_retained_session() {
+        for ordinal in [255, 256, 257, 426, 427, 999, 1000, 0x00ff_fffe,
+                        0x00ff_ffff, 0x0100_0000, 0xffff_ffff, 0x1_0000_0000,
+                        0xffffffffff, 0x10000000000] {
+            assert!(!retained_render_requires_recycle(true, true, ordinal));
+            assert!(retained_render_requires_recycle(true, false, ordinal));
+        }
+        let mut next_ordinal = u64::MAX - 1;
         assert!(!retained_render_requires_recycle(true, true, next_ordinal));
         next_ordinal += 1;
         assert!(retained_render_requires_recycle(true, true, next_ordinal));

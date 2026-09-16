@@ -669,8 +669,19 @@ pub(crate) struct RenderDescriptorObjects {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct RenderDescriptorMetadata {
     pub(crate) context_id: u32,
-    pub(crate) submission_ordinal: u32,
-    pub(crate) queue_pair: u32,
+    pub(crate) submission_ordinal: u64,
+    /// Monotonic state tag allocated by the command buffer's 36-entry state
+    /// ring. This is neither the selected ring index nor any QID/HWID. Native
+    /// retains the full word in the selected state object and places only its
+    /// low six bits in the stage work key.
+    pub(crate) command_buffer_state_word: u32,
+    /// TA HardwareBufferID copied to firmware descriptor +0x18.
+    ///
+    /// Every working native descriptor corpus couples this field to register
+    /// 0x1c830 exactly (for example 2/2, 4/4, and 5/5). The same allocator
+    /// result is also PBState +0x0c and the descriptor-ring index consumed by
+    /// `halLoadPBDesc`.
+    pub(crate) ta_hardware_buffer_id: u32,
     pub(crate) submit_sequence: u64,
 }
 
@@ -713,8 +724,8 @@ pub(crate) fn set_render_event_control_generation(
     Ok(())
 }
 
-fn descriptor_work_ordinal(ordinal: u32) -> u32 {
-    ordinal + ordinal / 2
+fn descriptor_work_ordinal(ordinal: u64) -> u32 {
+    (ordinal as u32).wrapping_add((ordinal / 2) as u32)
 }
 
 fn write_common_descriptor(
@@ -974,16 +985,18 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
     kind: RenderDescriptorKind,
     descriptor_gpu_va: u64,
     runtime_control: u64,
-    submission_ordinal: u32,
+    queue_id: u8,
+    linked_fragment_queue_id: u8,
+    submission_ordinal: u64,
     cold_opening: bool,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
     let item_number = submission_ordinal
         .checked_add(1)
-        .ok_or(RenderBuildError::ArithmeticOverflow)?;
-    if item_number > 0xff {
-        return Err(RenderBuildError::ArithmeticOverflow);
-    }
+        .ok_or(RenderBuildError::ArithmeticOverflow)? & 0xffffffffff;
+    // The native queue timestamp is 40 bits. Stamp-info carries its low
+    // 24 bits shifted by eight, with ordinary u32 wrap as on M1/M2.
+    let event_value = (item_number as u32).wrapping_shl(8);
     match kind {
         RenderDescriptorKind::Tiling => {
             if raw.len() < TA_DESCRIPTOR_SIZE {
@@ -996,14 +1009,47 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                     .checked_add(0x60)
                     .ok_or(RenderBuildError::ArithmeticOverflow)?,
             );
-            put_u32(raw, 0x079c, 1);
-            put_u32(raw, 0x07a0, item_number << 8);
-            put_u32(raw, 0x07a8, item_number);
-            put_u32(raw, 0x07b0, item_number | (item_number << 8));
-            put_u32(raw, 0x08b4, (item_number << 24) | 0xffff);
-            put_u32(raw, 0x08c4, item_number << 16);
-            put_u32(raw, 0x08c8, item_number << 24);
-            put_u32(raw, 0x08d4, submission_ordinal << 16);
+            // Native TA links directly to the physical 3D kick queue which
+            // will consume this submission. This is queue allocator state,
+            // not the type-1 fragment descriptor's distinct QID-0 RCE field.
+            put_u32(raw, 0x079c, u32::from(linked_fragment_queue_id));
+            put_u32(raw, 0x07a0, event_value);
+            apply_g17p_ta_linked_completion_scratch(
+                u64::from(item_number), u64::from(item_number), item_number as u8, raw,
+            )?;
+            // Native writes a u32 at +0x8b6 (8a993f4). +0x8b4/+0x8b5
+            // belong to the preceding stamp pointer, not this event value.
+            put_u32(raw, 0x08b6, event_value);
+            // B1 indexes the registered scheduler-resource table with this
+            // value while admitting the completed TA, then passes the full
+            // word to FUN_15424(linked_3d_qid, ta_qid). It is the TA queue's
+            // own physical QID, not a captured literal: two independent Metal
+            // commands carry 7 here while +0x79c links QID 8, and 9 here while
+            // +0x79c links QID 10. Leaving it zero made Linux consult the
+            // unrelated QID-0 scheduler state at the TA-to-3D handoff.
+            put_u32(
+                raw,
+                0x08ba,
+                if *crate::module_parameters::g17p_render_ta_qid_field.value() != 0 {
+                    u32::from(queue_id)
+                } else {
+                    0
+                },
+            );
+            // This is a priority-zero channel policy, not a QID identity bit.
+            // Native's priority-zero TA keeps the stamp-info force flag set:
+            // FUN_ab64 ORs it into Pool-A +0x20 and FUN_168d0 publishes the
+            // TA stamp/handoff even while its paired fragment keeps the batch
+            // incomplete. Restricting it to QID 0 let a second independently
+            // allocated priority-zero pair execute TA on QID 2 but never
+            // release the fragment parent on QID 3. Higher-priority native
+            // queues carry their own batching policy and remain unaffected.
+            if crate::g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
+                put_u32(raw, 0x08c2, 1);
+            }
+            // Native's host +0x1288 source is a u32 at +0x8d6 (8a990b8),
+            // immediately after the qword lifecycle field beginning +0x8ce.
+            put_u32(raw, 0x08d6, submission_ordinal as u32);
             put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
                 put_u8(raw, 0x0789, 0x08);
@@ -1029,12 +1075,21 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                         .ok_or(RenderBuildError::ArithmeticOverflow)?,
                 );
             }
-            put_u32(raw, 0x2150, item_number << 8);
-            put_u32(raw, 0x2154, 1);
-            put_u32(raw, 0x215c, if cold_opening { 0 } else { item_number });
-            put_u32(raw, 0x2160, item_number);
-            put_u32(raw, 0x2164, item_number << 8);
-            put_u32(raw, 0x2170, submission_ordinal);
+            put_u32(raw, 0x2150, event_value);
+            // Valid native queues prove +0x2154 is the physical 3D QID: it is
+            // 1/3/8 for qids 1/3/8, respectively. The old literal only happened
+            // to match the first captured qid.
+            put_u32(raw, 0x2154, u32::from(queue_id));
+            // Valid cold QIDs 1 and 8 both carry 1; every later submission on
+            // the retained physical queue carries 0. The prior IO-fence guard
+            // was an unsupported semantic guess which inverted this native
+            // lifecycle exactly where first-work setup needs it.
+            put_u32(raw, 0x215c, u32::from(submission_ordinal == 0));
+            // +0x2160 is the packed 3D-channel SKSM completion scratch value:
+            // the physical queue timestamp in bits [39:0] and the channel's
+            // payload byte in bits [47:40]. G17PUserRenderStorage stages it
+            // from the retained fragment producer immediately before publish.
+            put_u32(raw, 0x2170, submission_ordinal as u32);
             put_u64(raw, 0x21ce, runtime_control);
             if cold_opening {
                 put_u8(raw, 0x21d8, 0x10);
