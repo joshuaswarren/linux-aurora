@@ -718,6 +718,26 @@ static ssize_t epic_announcement_read(struct file *file, struct kobject *kobj,
 	memcpy(buf, e->announcement + off, count);
 	return count;
 }
+/* The advertised allocation is pinned until reboot. Expose only our own
+ * coherent buffer, never arbitrary DART/physical memory. Firmware can still
+ * update it, so retain pre/post captures when a stable snapshot is needed.
+ */
+static ssize_t epic_pool_read(struct file *file, struct kobject *kobj,
+	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(kobj_to_dev(kobj));
+
+	guard(mutex)(&d->epic.lock);
+	if (!d->epic.active || !d->owned.advertised || !d->owned.pool)
+		return -ENODATA;
+	if (off >= NEO_DCP_POOL_SIZE)
+		return 0;
+	count = min_t(size_t, count, NEO_DCP_POOL_SIZE - off);
+	dma_rmb();
+	memcpy(buf, d->owned.pool + off, count);
+	return count;
+}
+static BIN_ATTR_ADMIN_RO(epic_pool, NEO_DCP_POOL_SIZE);
 static DEVICE_ATTR_WO(epic_start);
 static DEVICE_ATTR_RO(epic_status);
 static BIN_ATTR_ADMIN_RO(epic_announcement, 4096);
@@ -735,7 +755,8 @@ static struct attribute *neo_dcp_attrs[] = {
 	&dev_attr_epic_query.attr, &dev_attr_epic_power_cycle.attr, NULL
 };
 static const struct bin_attribute *const neo_dcp_bin_attrs[] = {
-	&bin_attr_oslog_snapshot, &bin_attr_epic_announcement, &bin_attr_epic_response, NULL
+	&bin_attr_oslog_snapshot, &bin_attr_epic_announcement, &bin_attr_epic_response,
+	&bin_attr_epic_pool, NULL
 };
 static const struct attribute_group neo_dcp_group = {
 	.attrs = neo_dcp_attrs,

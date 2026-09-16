@@ -112,3 +112,13 @@ The message paths test that flag and translate compact/legacy headers
 and checks its 192-byte/64-byte layout and legacy header before commands.
 The successful 128-byte capture is retained; it is not silently interpreted
 as the older protocol.
+
+Compatibility mode on boot a79ac4d4-e6a0-4c59-ae97-5e4f89ab1d8f correctly
+announced channel 3 and the legacy EPIC v2 format. Native iBoot identifies
+itself by exact name plus a 36-byte interface-id=3 dictionary, now structurally
+validated. The HPD reply reached RX with type NOTIFY, category REPLY and
+subtype 0xc0. m1n1's afk_epic_command explicitly accepts NOTIFY or REPLY
+outer types; the helper now does too, retaining all outstanding-command,
+channel, subtype and owned-RX-buffer checks. No power command was sent on
+this boot. A root-only, read-only owned-pool attribute replaces ad-hoc
+private-layout probes for subsequent captures.
