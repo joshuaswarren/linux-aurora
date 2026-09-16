@@ -1,0 +1,370 @@
+--- normal/src/asahi/compiler/test/test-agx3-compile-fail-closed.c
++++ probe/src/asahi/compiler/test/test-agx3-compile-fail-closed.c
+@@ -1034,7 +1034,7 @@
+  * uniform dwords. Each dword uses Apple's byte-exact reg-to-uniform copy form;
+  * this checks the complete compiler path which Gallium's blitter VS needs. */
+ static bool
+-check_preamble_compute(enum agx_isa_encoding encoding)
++check_preamble_compute(enum agx_isa_encoding encoding, bool enable)
+ {
+    nir_builder b = nir_builder_init_simple_shader(
+       MESA_SHADER_COMPUTE, &agx_nir_options, "AGX3 generated preamble");
+@@ -1056,16 +1056,29 @@
+ 
+    struct agx_shader_key key = {0};
+    key.dev.encoding = encoding;
++   key.no_preamble = !enable;
+    key.reserved_preamble = 4 * (1 + 1);
+    key.has_scratch = true;
+    key.promote_constants = true;
+    key.promote_textures = true;
+    struct agx_shader_part part = {0};
+    const bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
+-   const bool valid = encoding == AGX_ISA_ENCODING_AGX3B
+-                         ? compiled && part.binary != NULL &&
+-                              part.info.has_preamble && part.info.binary_size > 8
+-                         : !compiled && part.binary == NULL;
++   const bool valid = compiled && part.binary &&
++                      part.info.has_preamble == enable;
++   printf("{\"encoding\":%u,\"preamble_enabled\":%s,"
++          "\"compiled\":%s,\"has_preamble\":%s,"
++          "\"binary_size\":%u,\"main_offset\":%u,\"main_size\":%u,"
++          "\"preamble_offset\":%u,\"push_halfs\":%u,"
++          "\"main_gprs\":%u,\"preamble_gprs\":%u,"
++          "\"scratch\":%u,\"preamble_scratch\":%u,\"binary_hex\":\"",
++          encoding, enable ? "true" : "false", compiled ? "true" : "false",
++          part.info.has_preamble ? "true" : "false", part.info.binary_size,
++          part.info.main_offset, part.info.main_size, part.info.preamble_offset,
++          part.info.push_count, part.info.nr_gprs, part.info.nr_preamble_gprs,
++          part.info.scratch_size, part.info.preamble_scratch_size);
++   for (unsigned i = 0; i < part.info.binary_size; ++i)
++      printf("%02x", ((const unsigned char *)part.binary)[i]);
++   puts("\"}");
+    if (!valid)
+       fprintf(stderr, "AGX3 generated 64-bit preamble write failed\n");
+ 
+@@ -2035,316 +2048,13 @@
+ }
+ 
+ int
+-main(int argc, char **argv)
+-{
+-   if (argc == 2 && !strcmp(argv[1], "--subgroup-multiply-only")) {
+-      const bool valid = check_subgroup_multiply_compute();
+-      fprintf(stderr, "G17P subgroup multiply compute: %s\n",
+-               valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-abs-only")) {
+-      const bool valid = check_half_abs_compute();
+-      fprintf(stderr, "G17P shaderFloat16 abs: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-neg-only")) {
+-      const bool valid = check_half_neg_compute();
+-      fprintf(stderr, "G17P shaderFloat16 negate: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-min-only")) {
+-      const bool valid = check_half_min_compute();
+-      fprintf(stderr, "G17P shaderFloat16 minimum: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-max-only")) {
+-      const bool valid = check_half_max_compute();
+-      fprintf(stderr, "G17P shaderFloat16 maximum: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-clamp-only")) {
+-      const bool valid = check_half_clamp_compute();
+-      fprintf(stderr, "G17P shaderFloat16 clamp: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-divide-only")) {
+-      const bool valid = check_half_divide_compute();
+-      fprintf(stderr, "G17P shaderFloat16 divide: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--half-fma-only")) {
+-      const bool valid = check_half_fma_compute();
+-      fprintf(stderr, "G17P shaderFloat16 FMA: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--pk-immediate-fma-only")) {
+-      const bool valid = check_pk_immediate_fma_sequence();
+-      fprintf(stderr, "G17P CTS pk_immediate FMA sequence: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--half-fms-only")) {
+-      const bool valid = check_half_fms_compute();
+-      fprintf(stderr, "G17P shaderFloat16 FMS: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-add-only")) {
+-      const bool valid = check_half_add_compute();
+-      fprintf(stderr, "G17P shaderFloat16 add: %s\n",
+-               valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--device-ballot-only")) {
+-      const bool valid =
+-         check_device_ballot_compute(AGX_ISA_ENCODING_AGX3B) &&
+-         check_device_ballot_compute(AGX_ISA_ENCODING_AGX3C);
+-      fprintf(stderr, "AGX3 device-load ballot compute: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--subgroup-vote-only")) {
+-      const bool valid = check_g17p_subgroup_vote_compute() &&
+-                         check_g17p_signed_immediate_ballot_rejected();
+-      fprintf(stderr, "G17P subgroup vote: %s\n", valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--subgroup-quad-only")) {
+-      const bool valid = check_g17p_subgroup_quad_compute(true) &&
+-                         check_g17p_subgroup_quad_compute(false);
+-      fprintf(stderr, "G17P subgroup quad: %s\n", valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--device-shuffle-only")) {
+-      const bool valid =
+-         check_device_shuffle_compute(AGX_ISA_ENCODING_AGX3B) &&
+-         check_device_shuffle_compute(AGX_ISA_ENCODING_AGX3C);
+-      fprintf(stderr, "AGX3 device-load shuffle compute: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--elect-only")) {
+-      const bool valid =
+-         check_elect_broadcast_first_compute(AGX_ISA_ENCODING_AGX2) &&
+-         check_elect_broadcast_first_compute(AGX_ISA_ENCODING_AGX3B);
+-      fprintf(stderr, "elect/broadcast-first lowering: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-
+-   if (argc == 2 && !strcmp(argv[1], "--half-compare-only")) {
+-      const bool valid = check_half_compare_select_compute();
+-      fprintf(stderr, "G17P shaderFloat16 comparison select: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--half-classify-only")) {
+-      const bool valid = check_half_isnan_isinf_compute();
+-      fprintf(stderr, "G17P shaderFloat16 isnan/isinf: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--f32-abs-select-only")) {
+-      const bool valid = check_f32_abs_zero_compare_select_compute();
+-      fprintf(stderr, "G17P f32 absolute zero comparison select: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--half-sqrt-only")) {
+-      const bool valid = check_half_sqrt_compute();
+-      fprintf(stderr, "G17P shaderFloat16 square root: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--half-rsqrt-only")) {
+-      const bool valid = check_half_rsqrt_compute();
+-      fprintf(stderr, "G17P shaderFloat16 reciprocal square root: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--half-exp2-only")) {
+-      const bool valid = check_half_exp2_compute();
+-      fprintf(stderr, "G17P shaderFloat16 exp2: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if (argc == 2 && !strcmp(argv[1], "--half-log2-only")) {
+-      const bool valid = check_half_log2_compute();
+-      fprintf(stderr, "G17P shaderFloat16 log2: %s\n",
+-              valid ? "PASS" : "FAIL");
+-      return valid ? 0 : 1;
+-   }
+-   if(argc==2&&!strcmp(argv[1],"--half-floor-only")) {
+-      const bool valid=check_half_floor_compute();
+-      fprintf(stderr,"G17P shaderFloat16 floor: %s\n",valid?"PASS":"FAIL");
+-      return valid?0:1;
+-   }
+-   if(argc==2&&!strcmp(argv[1],"--half-ceil-only")) {
+-      const bool valid=check_half_ceil_compute();
+-      fprintf(stderr,"G17P shaderFloat16 ceil: %s\n",valid?"PASS":"FAIL");
+-      return valid?0:1;
+-   }
+-   const enum agx_isa_encoding encodings[] = {
+-      AGX_ISA_ENCODING_AGX3B,
+-      AGX_ISA_ENCODING_AGX3C,
+-   };
+-
+-   /* glsl_array_type() in the constant-array case needs the type singleton. */
++main(void)
++{
+    glsl_type_singleton_init_or_ref();
+-
+-   if (argc == 2 && strcmp(argv[1], "--device-atomics-only") == 0) {
+-      for (unsigned i = 0; i < ARRAY_SIZE(encodings); ++i) {
+-         if (!check_device_atomic_compute(encodings[i]))
+-            return 1;
+-      }
+-      return 0;
+-   }
+-   if (argc != 1) {
+-      fprintf(stderr, "usage: %s [--device-atomics-only]\n", argv[0]);
+-      return 1;
+-   }
+-
+-   if (!check_uniform_alu_policy())
+-      return 1;
+-   for (unsigned ifs = 0; ifs <= 6; ++ifs) {
+-      if (!check_deep_loop_break_compute(ifs))
+-         return 1;
+-   }
+-   if (!check_agx2_legacy_printf_address_accepted())
+-      return 1;
+-   if (!check_mixed_fma_neg_compute())
+-      return 1;
+-   if (!check_subgroup_multiply_compute())
+-      return 1;
+-   if (!check_half_add_compute())
+-      return 1;
+-   if (!check_half_fma_compute())
+-      return 1;
+-   if (!check_half_fms_compute())
+-      return 1;
+-   if (!check_half_abs_compute())
+-      return 1;
+-   if (!check_half_neg_compute())
+-      return 1;
+-   if (!check_half_min_compute())
+-      return 1;
+-   if (!check_half_max_compute())
+-      return 1;
+-   if (!check_half_clamp_compute())
+-      return 1;
+-   if (!check_half_divide_compute())
+-      return 1;
+-   if (!check_half_compare_select_compute())
+-      return 1;
+-   if (!check_half_isnan_isinf_compute())
+-      return 1;
+-   if (!check_f32_abs_zero_compare_select_compute())
+-      return 1;
+-   if (!check_half_sqrt_compute())
+-      return 1;
+-   if (!check_half_rsqrt_compute())
+-      return 1;
+-   if (!check_half_exp2_compute())
+-      return 1;
+-   if (!check_half_log2_compute())
+-      return 1;
+-   if (!check_half_floor_compute())
+-      return 1;
+-   if (!check_half_ceil_compute())
+-      return 1;
+-   if (!check_elect_broadcast_first_compute(AGX_ISA_ENCODING_AGX2))
+-      return 1;
+-   if (!check_active_count_lowering(false) ||
+-       !check_active_count_lowering(true))
+-      return 1;
+-   if (!check_g17p_subgroup_vote_compute() ||
+-       !check_g17p_signed_immediate_ballot_rejected())
+-      return 1;
+-   if (!check_g17p_subgroup_quad_compute(true) ||
+-       !check_g17p_subgroup_quad_compute(false))
+-      return 1;
+-
+-   for (unsigned i = 0; i < sizeof(encodings) / sizeof(encodings[0]); ++i) {
+-      if (!check_empty_compute(encodings[i]))
+-         return 1;
+-      if (!check_unlowered_printf_address_rejected(encodings[i]))
+-         return 1;
+-      if (!check_shared_store_compute(encodings[i]))
+-         return 1;
+-      if (!check_shared_rmw_compute(encodings[i]))
+-         return 1;
+-      if (!check_local_id_compute(encodings[i]))
+-         return 1;
+-      if (!check_subgroup_id_compute(encodings[i]))
+-         return 1;
+-      if (!check_device_ballot_compute(encodings[i]))
+-         return 1;
+-      if (!check_device_shuffle_compute(encodings[i]))
+-         return 1;
+-      if (encodings[i] == AGX_ISA_ENCODING_AGX3B &&
+-          !check_elect_broadcast_first_compute(encodings[i]))
+-         return 1;
+-      if (!check_device_rmw_compute(encodings[i]))
+-         return 1;
+-      if (!check_device_atomic_compute(encodings[i]))
+-         return 1;
+-      if (!check_shared_atomic_compute(encodings[i]))
+-         return 1;
+-      if (!check_constant_data_compute(encodings[i], false) ||
+-          !check_constant_data_compute(encodings[i], true))
+-         return 1;
+-      if (!check_preamble_compute(encodings[i]))
+-         return 1;
+-      if (!check_constant_array_ordering(encodings[i], true) ||
+-          !check_constant_array_ordering(encodings[i], false))
+-         return 1;
+-
+-      nir_builder b = nir_builder_init_simple_shader(
+-         MESA_SHADER_COMPUTE, &agx_nir_options, "unlowered ray query");
+-      b.shader->info.io_lowered = true;
+-      b.shader->info.ray_queries = 1;
+-
+-      struct agx_shader_key key = {0};
+-      key.dev.encoding = encodings[i];
+-      struct agx_shader_part part;
+-      memset(&part, 0xa5, sizeof(part));
+-
+-      if (agx_compile_shader_nir(b.shader, &key, &part)) {
+-         fprintf(stderr, "AGX3 unlowered ray query was accepted\n");
+-         ralloc_free(b.shader);
+-         return 1;
+-      }
+-
+-      const uint8_t zero[sizeof(part)] = {0};
+-      if (memcmp(&part, zero, sizeof(part)) != 0) {
+-         fprintf(stderr, "AGX3 rejection did not clear compiler output\n");
+-         ralloc_free(b.shader);
+-         return 1;
+-      }
+-
+-      ralloc_free(b.shader);
+-   }
+-
++   bool ok = check_preamble_compute(AGX_ISA_ENCODING_AGX2, false);
++   ok &= check_preamble_compute(AGX_ISA_ENCODING_AGX2, true);
++   ok &= check_preamble_compute(AGX_ISA_ENCODING_AGX3B, false);
++   ok &= check_preamble_compute(AGX_ISA_ENCODING_AGX3B, true);
+    glsl_type_singleton_decref();
+-
+-   puts("agx3_compile: compute SR/shared-memory/constant-data paths emitted; "
+-        "constant arrays kept out of scratch; unlowered ray queries and "
+-        "printf addresses rejected");
+-   return 0;
+-}
++   return ok ? 0 : 1;
++}

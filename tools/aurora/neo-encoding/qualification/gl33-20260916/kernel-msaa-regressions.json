@@ -1,0 +1,20 @@
+{
+  "baseline": {
+    "exit_code": 101,
+    "summary": "test result: FAILED. 16 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "failed": [
+      "g17_render::tests::cold_opening_descriptors_apply_only_the_native_first_work_overrides",
+      "g17_render::tests::descriptors_match_m1n1_9165484_and_duplicate_pipeline_fields",
+      "g17_render::tests::register_programs_match_m1n1_9165484"
+    ]
+  },
+  "candidate": {
+    "exit_code": 101,
+    "summary": "test result: FAILED. 17 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "failed": [
+      "g17_render::tests::cold_opening_descriptors_apply_only_the_native_first_work_overrides",
+      "g17_render::tests::descriptors_match_m1n1_9165484_and_duplicate_pipeline_fields",
+      "g17_render::tests::register_programs_match_m1n1_9165484"
+    ]
+  }
+}

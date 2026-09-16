@@ -1,0 +1,546 @@
+{
+  "hardware_execution": false,
+  "comparisons": [
+    {
+      "control": "gb-off",
+      "buffers": 1,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "cda9794bff466492c4a307ab6434efab0a1a03b21e72de3dea76cce7aad2ce58",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 32,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 2,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 64,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 202
+        }
+      }
+    },
+    {
+      "control": "gb-off",
+      "buffers": 7,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "c80bb36f2e1776463e3b1f35702a95ad0528c7912ec6d2f3a3bad3e43e827634",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 80,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 14,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 320,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 458
+        }
+      }
+    },
+    {
+      "control": "gb-on",
+      "buffers": 1,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "cda9794bff466492c4a307ab6434efab0a1a03b21e72de3dea76cce7aad2ce58",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 32,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 2,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 64,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 202
+        }
+      }
+    },
+    {
+      "control": "gb-on",
+      "buffers": 7,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "c80bb36f2e1776463e3b1f35702a95ad0528c7912ec6d2f3a3bad3e43e827634",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 80,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 14,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 320,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 458
+        }
+      }
+    },
+    {
+      "control": "yield-off",
+      "buffers": 1,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "cda9794bff466492c4a307ab6434efab0a1a03b21e72de3dea76cce7aad2ce58",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 32,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 2,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 64,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 202
+        }
+      }
+    },
+    {
+      "control": "yield-off",
+      "buffers": 7,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "c80bb36f2e1776463e3b1f35702a95ad0528c7912ec6d2f3a3bad3e43e827634",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 80,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 14,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 320,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 458
+        }
+      }
+    },
+    {
+      "control": "yield-on",
+      "buffers": 1,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "cda9794bff466492c4a307ab6434efab0a1a03b21e72de3dea76cce7aad2ce58",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 32,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 2,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 64,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 202
+        }
+      }
+    },
+    {
+      "control": "yield-on",
+      "buffers": 7,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "c80bb36f2e1776463e3b1f35702a95ad0528c7912ec6d2f3a3bad3e43e827634",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 80,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 14,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 320,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 458
+        }
+      }
+    },
+    {
+      "control": "uniform-option-off",
+      "buffers": 1,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "cda9794bff466492c4a307ab6434efab0a1a03b21e72de3dea76cce7aad2ce58",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 32,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 2,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 64,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 202
+        }
+      }
+    },
+    {
+      "control": "uniform-option-off",
+      "buffers": 7,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "c80bb36f2e1776463e3b1f35702a95ad0528c7912ec6d2f3a3bad3e43e827634",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 80,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 14,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 320,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 458
+        }
+      }
+    },
+    {
+      "control": "uniform-option-on",
+      "buffers": 1,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "cda9794bff466492c4a307ab6434efab0a1a03b21e72de3dea76cce7aad2ce58",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 32,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 2,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 64,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 202
+        }
+      }
+    },
+    {
+      "control": "uniform-option-on",
+      "buffers": 7,
+      "matches_default": true,
+      "observed": {
+        "text_sha256": "c80bb36f2e1776463e3b1f35702a95ad0528c7912ec6d2f3a3bad3e43e827634",
+        "metadata": {
+          "temporary_register_count": 2,
+          "thread_invariant_spill_buffer_bytes": 80,
+          "thread_invariant_largest_ipr_bytes": 0,
+          "largest_ipr_bytes": 20,
+          "entry_ipr_bytes": 20,
+          "constant_phases": [
+            {
+              "name": "agc.main.constant_program",
+              "execution_rate_raw": 3,
+              "temporary_register_count": 14,
+              "cprog_uniform_inputs": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27
+              ]
+            }
+          ],
+          "text_symbols": {
+            "_agc.main": 320,
+            "_agc.main.constant_program": 0
+          },
+          "text_size_including_constant_program_and_padding": 458
+        }
+      }
+    }
+  ],
+  "conclusion": "No observed effect for these inputs; no claim the controls were honored."
+}

@@ -1,0 +1,842 @@
+{
+  "scope": "CPU comparison of computed waits given native result-slot choices; no GPU execution.",
+  "mesa_head": "8ec7c5b8bee8f97944e9bdfdccf93765d8921e54",
+  "source_sha256": {
+    "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/probes/cprog-slot-bridge.c": "60d0c8610f3313d47beb527c6c95c2a2a11ef7c6e5f0d7fe079610f43551f489",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/compiler/agx3_slot_core.c": "a802c682883ce95622c2ebdb9a120b4cda8b44d1d76f8d96f200b9115de46031",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/compiler/agx3_slot_core.h": "8953b9dfe1210ec820b410f674c0cff9a0f023c268d487ea89f3d2849306a0bc",
+    "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/probes/verify-native-cprog-slots.py": "6057cb03fa0ab8c38f514d7509502a90439398d5f55f17d39a882ea709a49855"
+  },
+  "capture_receipt_sha256": "ab2d3d7cc1e0ad17757f04b0018a5a3ad0a2ea7295f5ec1c453231c05b420997",
+  "native_compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "command": [
+    "clang",
+    "-std=c11",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-shared",
+    "-fPIC",
+    "-I/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/compiler",
+    "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/probes/cprog-slot-bridge.c",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/compiler/agx3_slot_core.c",
+    "-o",
+    "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/probes/cprog-slot-bridge.dylib"
+  ],
+  "captures": [
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-uniforms-host27/vertex-0",
+      "reloads": 0,
+      "slots_and_waits": [],
+      "native_sha256": "8df434cab9ec9ad3fed8aea89f7d20bbefbe5744c9196054bec19c51951cf9b6"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-uniforms-host27/vertex-1",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "63168d2ce1fc369ae7007002529821d031418acc053b0d209f3ced1c1160e7aa"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-uniforms-host27/vertex-32",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "db3a1e23e99af9d85c0f0f2f9a61d41701b4f2aaa2a792ec6755a0e25c1091c2"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-uniforms-host27/vertex-64",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "7a8c20504e8856d7637f1d581765325bca24c67b151b68253a708c94444b2640"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-sampling-host27/vertex-2d-uniform",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "14901a45f572729865b55c2fd657be1b11450e3cefe7c865652b662ff547bdfa"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-sampling-host27/vertex-2d-varying",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "4cdaf8931811e9ec08c72feba4ecb8d4e86ddce113c5dcb6a8b8b160b40b2a62"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-sampling-host27/vertex-cube-uniform",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "68affc859d0b360e2a6f8fa8ca579af20962894245a28de56098f9be3f9c7925"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-pressure-host27/vertex-128",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "e2204b8e609b5a9dcd1b1c0db948e70e506767ef94099d1078d4d28e63db9ee7"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-pressure-host27/vertex-256",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "0a1fa8489bae8ab6688a4b00ac5de510828821647e5522d4032346155017095c"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-pressure-host27/vertex-512",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "030ff5c99e1f59b36b47dfa51937ba041be6815dc2a543256ab29177f82879c4"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-buffers-host27/vertex-buffers-0",
+      "reloads": 0,
+      "slots_and_waits": [],
+      "native_sha256": "f13011f59939daace4c32f6b2101c608a47b193f8646c7f801d4f2873dfac867"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-buffers-host27/vertex-buffers-1",
+      "reloads": 2,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ]
+      ],
+      "native_sha256": "0b0ecd5f7f0defcc2901218a4768265031a80a03d944a0def7d3fbd5b529ae5f"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-buffers-host27/vertex-buffers-16",
+      "reloads": 32,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ]
+      ],
+      "native_sha256": "27bad4cfbf3604f9f3a1cd9abfb011f06996f720afc941ee94fda1bbd0ec01b8"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-buffers-host27/vertex-buffers-2",
+      "reloads": 4,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "native_sha256": "2fa464ae14973719b123370aeedde43199669c28455a78722504d29dcfdc3ea0"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-buffers-host27/vertex-buffers-3",
+      "reloads": 6,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ]
+      ],
+      "native_sha256": "2076e05a7f6ed40d0b7771a0bc497038aa8a4d934ee03c59f745665749ca26dd"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-buffers-host27/vertex-buffers-4",
+      "reloads": 8,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ]
+      ],
+      "native_sha256": "95e4ef74da28c4880e9b60d01dbb09612a8a18bc6d77927480c8c80f4ea0c198"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-buffers-host27/vertex-buffers-8",
+      "reloads": 16,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ]
+      ],
+      "native_sha256": "75fe8cd7456895ea8b4b70acb207b95f9c07711397eed2cd8d284159b04be81a"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-entry-window-host27/vertex-buffers-12",
+      "reloads": 24,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ]
+      ],
+      "native_sha256": "6b6f5f6391f763541d518c2a5a254b1c27e71d0d122072d03cdb9ddca23b35ba"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-entry-window-host27/vertex-buffers-5",
+      "reloads": 10,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ]
+      ],
+      "native_sha256": "3548a5a5f1b73b0c98f934cd4b2768211b6c278a15681881677176617009a0be"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-entry-window-host27/vertex-buffers-6",
+      "reloads": 12,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ]
+      ],
+      "native_sha256": "c820c3267794a257900d260dc3fe5e57bd536c841a9b12614f90857116e05da7"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-entry-window-host27/vertex-buffers-7",
+      "reloads": 14,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ]
+      ],
+      "native_sha256": "2f78ae43092655d21c7ba6ea49a0f266270ce2377db0dc714ccf99309a91c434"
+    },
+    {
+      "directory": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/native-preamble-entry-window-host27/vertex-buffers-9",
+      "reloads": 18,
+      "slots_and_waits": [
+        [
+          2,
+          32
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          6,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          0
+        ]
+      ],
+      "native_sha256": "f8f149733b026fc1ea021a65c292c19bbce4577d6567d70df5da8e8983c2ea67"
+    }
+  ],
+  "boundaries": [
+    "Result-slot choices are replay inputs, not independently inferred or qualified policy.",
+    "Compares computed wait fields, not RLD structural flags or mirror policy.",
+    "No compiler lowering or runtime caller enables the new path yet.",
+    "Importing a live range does not model external asynchronous source readers."
+  ]
+}

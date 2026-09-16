@@ -1,0 +1,118 @@
+{
+  "scope": "Existing offline compiler captures, not a runtime or performance result.",
+  "compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "schemas_verified": 4,
+  "captures": [
+    {
+      "directory": "native-preamble-uniforms-host27/vertex-0",
+      "words": 0,
+      "workload": "vertex-0",
+      "native_sha256": "8df434cab9ec9ad3fed8aea89f7d20bbefbe5744c9196054bec19c51951cf9b6",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 0,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 1,
+          "cprog_uniform_inputs": []
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 64,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 202
+    },
+    {
+      "directory": "native-preamble-uniforms-host27/vertex-1",
+      "words": 1,
+      "workload": "vertex-1",
+      "native_sha256": "63168d2ce1fc369ae7007002529821d031418acc053b0d209f3ced1c1160e7aa",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 2,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 64,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 202
+    },
+    {
+      "directory": "native-preamble-uniforms-host27/vertex-32",
+      "words": 32,
+      "workload": "vertex-32",
+      "native_sha256": "db3a1e23e99af9d85c0f0f2f9a61d41701b4f2aaa2a792ec6755a0e25c1091c2",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 33,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 704,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 842
+    },
+    {
+      "directory": "native-preamble-uniforms-host27/vertex-64",
+      "words": 64,
+      "workload": "vertex-64",
+      "native_sha256": "7a8c20504e8856d7637f1d581765325bca24c67b151b68253a708c94444b2640",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 65,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 1344,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 1482
+    }
+  ]
+}

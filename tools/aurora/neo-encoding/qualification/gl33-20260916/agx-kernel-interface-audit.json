@@ -1,0 +1,14 @@
+{
+  "candidate_head": "67e5e2a121028b2f1d95c53ee0383fa035008ab4",
+  "kernel_head": "4863a3c90a3b52963bf00fb31376629e02984940",
+  "live_mesa_reference": "b79a17bbe784cda8e34b3471317fc690505d993a",
+  "candidate_header_sha256": "c993d916769fdc10d2d29c8169d1011540623e139d6a4b43fa0eb02c76cd7115",
+  "kernel_header_sha256": "a010e273d300956b188af87c6085e01741746151522a2a8d8d556bb813350a18",
+  "live_header_sha256": "c993d916769fdc10d2d29c8169d1011540623e139d6a4b43fa0eb02c76cd7115",
+  "candidate_matches_live_header": true,
+  "candidate_matches_kernel_declarations": true,
+  "normalized_declarations_sha256": "0e2d54ae0aa3f4f6bc3cdf03069ea6322472871a1c47ee48a8514d3628502040",
+  "hardware_execution": false,
+  "runtime_compatibility_verified": false,
+  "scope": "Shared UAPI declarations only; GPU firmware commands and runtime behaviour still need hardware qualification."
+}

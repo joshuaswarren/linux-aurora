@@ -1,0 +1,27 @@
+{
+  "boot": "a888fccf-9641-467e-84eb-5c9356f53d65",
+  "production_commit": "378b14ac9d89",
+  "diagnostic_commit": "cd6595e2a555",
+  "module_sha256": "fc3c7367555041557df6b593e5f3ed98bcbd309c09aaa5472cab9f9b32279d51",
+  "mesa_sha256": "362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56",
+  "cts_conformance": false,
+  "hardware_test_pass": true,
+  "completion_witnesses": {
+    "1": {
+      "0": 4294902016
+    },
+    "3": {
+      "0": 4294902016,
+      "252": 4294966528,
+      "253": 4294966784,
+      "254": 4294967040,
+      "255": 0,
+      "256": 256,
+      "257": 512,
+      "258": 768
+    }
+  },
+  "kernel_fault": false,
+  "kernel_log_overrun": false,
+  "kernel_stream_errors": []
+}

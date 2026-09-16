@@ -1,0 +1,16 @@
+{"family":"agx3b","ep":0,"hint":0,"accepted":true,"hex":"04881820"}
+{"family":"agx3b","ep":0,"hint":1,"accepted":false,"hex":""}
+{"family":"agx3b","ep":0,"hint":2,"accepted":false,"hex":""}
+{"family":"agx3b","ep":0,"hint":3,"accepted":false,"hex":""}
+{"family":"agx3b","ep":1,"hint":0,"accepted":true,"hex":"0488192000000000"}
+{"family":"agx3b","ep":1,"hint":1,"accepted":true,"hex":"0488192060000000"}
+{"family":"agx3b","ep":1,"hint":2,"accepted":true,"hex":"04881920c0000000"}
+{"family":"agx3b","ep":1,"hint":3,"accepted":false,"hex":""}
+{"family":"agx3c","ep":0,"hint":0,"accepted":true,"hex":"04881820"}
+{"family":"agx3c","ep":0,"hint":1,"accepted":false,"hex":""}
+{"family":"agx3c","ep":0,"hint":2,"accepted":false,"hex":""}
+{"family":"agx3c","ep":0,"hint":3,"accepted":false,"hex":""}
+{"family":"agx3c","ep":1,"hint":0,"accepted":true,"hex":"248021102401a102"}
+{"family":"agx3c","ep":1,"hint":1,"accepted":true,"hex":"248021104401a102"}
+{"family":"agx3c","ep":1,"hint":2,"accepted":true,"hex":"248021100401a102"}
+{"family":"agx3c","ep":1,"hint":3,"accepted":false,"hex":""}
