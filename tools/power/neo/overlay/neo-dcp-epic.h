@@ -26,8 +26,9 @@ struct neo_epic {
 	struct mutex lock;
 	struct completion ready;
 	struct completion reply;
+	struct completion stopped;
 	struct neo_epic_ring tx, rx;
-	bool active, started;
+	bool active, started, stopping;
 	u16 tag;
 	u32 ring_size, announcement_size;
 	u64 last_message;
@@ -40,6 +41,8 @@ struct neo_epic {
 	int power_off_result, power_on_result;
 	bool ap_cycle;
 	int ap_idle_result, ap_wake_result;
+	bool endpoint_cycle;
+	int endpoint_stop_result, endpoint_start_result;
 	int error;
 };
 
@@ -315,6 +318,15 @@ static int neo_epic_message(struct neo_epic *e, u64 word)
 		if (!ret && e->announcement_size)
 			complete_all(&e->ready);
 		break;
+	case 0xc1:
+		if (!e->stopping || !e->started) {
+			ret = -EPROTO;
+			break;
+		}
+		e->started = false;
+		e->stopping = false;
+		complete_all(&e->stopped);
+		break;
 	case 0x85:
 		ret = neo_epic_receive(e);
 		break;
@@ -325,6 +337,7 @@ static int neo_epic_message(struct neo_epic *e, u64 word)
 		e->error = ret;
 		complete_all(&e->ready);
 		complete_all(&e->reply);
+		complete_all(&e->stopped);
 	}
 	return ret;
 }
@@ -412,4 +425,62 @@ unlock:
 	}
 	guard(mutex)(&e->lock);
 	return e->error ?: (e->retcode ? -EREMOTEIO : 0);
+}
+
+/* AFK SHUTDOWN/ACK follows m1n1 afk_epic_shutdown_ep and Linux afk_shutdown.
+ * This is endpoint teardown, not the shared-memory notifications visible
+ * before native macOS idle. Keep DMA mapped even after acknowledgement.
+ * Caller serializes the complete lifecycle using the device mutex.
+ */
+static int neo_epic_stop(struct neo_epic *e)
+{
+	int ret;
+
+	mutex_lock(&e->lock);
+	if (!e->started || e->waiting || e->stopping || e->error) {
+		mutex_unlock(&e->lock);
+		return -EBUSY;
+	}
+	reinit_completion(&e->stopped);
+	e->stopping = true;
+	ret = neo_epic_send(e, 0xc0ULL << 48);
+	mutex_unlock(&e->lock);
+	if (!ret && !wait_for_completion_timeout(&e->stopped, msecs_to_jiffies(5000)))
+		ret = -ETIMEDOUT;
+	guard(mutex)(&e->lock);
+	ret = ret ?: e->error;
+	if (ret)
+		e->error = ret;
+	return ret;
+}
+
+static int neo_epic_restart(struct neo_epic *e)
+{
+	int ret;
+
+	mutex_lock(&e->lock);
+	if (e->started || e->stopping || e->waiting || e->error) {
+		mutex_unlock(&e->lock);
+		return -EBUSY;
+	}
+	/* Only an acknowledged shutdown allows forgetting the old ring layout.
+	 * The mapping and pool stay alive; GETBUF re-advertises the same pool.
+	 */
+	e->tx = (struct neo_epic_ring){};
+	e->rx = (struct neo_epic_ring){};
+	e->ring_size = e->announcement_size = e->response_size = 0;
+	e->channel = e->retcode = e->sequence = e->tag = 0;
+	e->service = e->queried = false;
+	reinit_completion(&e->ready);
+	ret = neo_epic_send(e, (0x80ULL << 48) | 8);
+	mutex_unlock(&e->lock);
+	if (!ret && !wait_for_completion_timeout(&e->ready, msecs_to_jiffies(15000)))
+		ret = -ETIMEDOUT;
+	guard(mutex)(&e->lock);
+	ret = ret ?: e->error;
+	if (!ret && (!e->started || !e->service))
+		ret = -ENODEV;
+	if (ret)
+		e->error = ret;
+	return ret;
 }
