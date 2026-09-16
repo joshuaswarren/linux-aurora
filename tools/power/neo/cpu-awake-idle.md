@@ -106,3 +106,56 @@ The saved macOS powermetrics capture reports P-cluster idle residency of
 99.51% and 99.71%, E-cluster 97.35% and 96.51%, and CPU power 3 mW in each
 5-second interval. Those are the native tool's reported estimates, not
 whole-machine battery watts or a controlled comparison with this Linux boot.
+
+## Matched native capture, macOS boot 819CE0F3
+
+macOS 26.5.2 build 25F84, boot UUID
+`819CE0F3-62A5-4DC7-A5B8-4B337D40C12A`. System sleep remained disabled.
+The same `cpu-awake-config.py` completed 256 rounds in 11.610 seconds;
+retain `neo-cpu-awake-819CE0-01/{metadata.json,reads.jsonl,result.json}`
+under the artifact directory above.
+
+| Physical core | OFF observations | ACTIVE observations |
+| --- | ---: | ---: |
+| E0 | 207 | 49 |
+| E1 | 224 | 32 |
+| E2 | 250 | 6 |
+| E3 | 253 | 3 |
+| P0 (boot core) | 113 | 143 |
+| P1 | 147 | 109 |
+
+OFF reads were 0x100 and ACTIVE reads 0x1f0 on both operating systems.
+P0 therefore can reach OFF during native awake operation. Subprocess
+creation perturbs scheduling; these counts are not residency percentages
+and the sequential core reads do not establish simultaneous cluster OFF.
+The AIC version/configuration, both IRQ_CFG words and both CPM gating words
+were identical to Linux before and after the capture. The two CPM gating
+enable bits are already set on Linux; writing them again is not a fix.
+
+A separate, otherwise idle `powermetrics` capture reported E-cluster active
+residency 6.28%/5.94%, P-cluster 0.81%/0.32% and CPU power 6/5 mW in two
+five-second intervals. These are Apple's reported CPU estimates, not
+whole-machine battery power. Full IODeviceTree, CPU/PMGR registry and
+powermetrics outputs are retained in `native/*819CE0*`.
+
+Sven Peter independently describes the same *register-state-loss*
+asymmetry on newer Apple CPUs: the boot CPU retains state across WFI,
+secondaries can lose state, and no explanatory Apple sysreg difference
+was found. This is consistent with our physical-state observations but
+does not establish a common cause or assign power to it:
+https://lkml.iu.edu/2606.2/06457.html
+
+Additional native checks exclude two tempting shortcuts:
+
+- `AppleARMLightEmUp::start` (0xfffffe00089918b0) gates CPU halt setup on
+  the `light-em-up` boot argument. It does not unconditionally clear a
+  boot-core debug power request. The fresh CPU-debug device has no
+  `light-em-up` property.
+- The 25F84 iBoot reference to `arm-io/cpu-debug-interface` at
+  0x1007fbf1010 reads `panic-trace-mode` and selects panic tracing; this
+  reference is not an idle power-control operation. Retained iBoot SHA256:
+  `7293fc9e1842dd83fe8a464890377dc309720540eeab74cb0fb05bd588fc57af`.
+
+No macOS register writes or Linux power-saving change resulted from this
+capture. Investigate the boot-core startup/retention contract next; avoid
+guessing CYC_OVRD, AIC routing or CPU-domain writes.
