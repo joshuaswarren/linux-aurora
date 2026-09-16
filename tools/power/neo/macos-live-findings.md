@@ -203,3 +203,28 @@ setting; a different profile value is not the missing awake-power fix.
 The earlier 10-second exploratory capture called +0x123bc a reference count;
 the retained helper now labels it own_enable_word to avoid asserting an
 unverified field name. All state remains read-only.
+
+
+## Continuous capture prepared for native wake comparison
+
+`macos-live-objects.py --kind mailbox --registry-id ID --output NEWDIR
+--watch-seconds 30 --interval .02` adds a bounded observer of the existing
+128-entry native log. It validates the same build, code, class and retained
+object first, then checkpoints status=watching before the test controller
+triggers a managed display wake. No kernel hooks, MMIO writes or display
+commands are performed by this collector.
+
+Every raw frame retains monotonic_ns, 32-byte header, two ring copies and a
+32-byte trailing header. Only matching copies with unchanged headers and
+ordered timestamps contribute deduplicated records; racing frames remain in
+the binary evidence. The frame size is recorded in result.json. Polling can
+miss ring wraps between samples and perturbs execution, so this is transition
+capture, not power measurement or proof of a complete message history.
+Syntax and CLI validation passed locally; native watch qualification awaits
+macOS availability. The previous one-shot capture behavior remains the default.
+
+The next comparison must capture managed display-off -> on -> off, including
+DCP/DCPEXT mailbox transitions and their corresponding PMGR CPU/SYS/FE state.
+Prior Linux native-panel + endpoint teardown + returning-mode full IOP idle
+still failed AP wake and remained about 1.09 W. Do not repeat CPU-domain
+writes that already faulted; determine the native wake/ownership sequence.
