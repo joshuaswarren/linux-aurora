@@ -730,6 +730,8 @@ impl AFKEndpoint {
         };
         self.call_returns[tag - 1] = ret;
         let hdr_bytes = if client.epic_v4 {
+            // SAFETY: `hdr_v4` is a packed, plain-data header that lives
+            // for the whole call; the slice covers exactly its bytes.
             unsafe {
                 slice::from_raw_parts(
                     &hdr_v4 as *const EPICHeaderV4 as *const u8,
