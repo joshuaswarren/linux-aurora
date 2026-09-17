@@ -1618,16 +1618,13 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
 /*
  * J700 (T8140, MacBook Neo): the AOP owns the audio fabric.  The jack is a
  * CS42L83 on MCA1 fed by base-ns TX2 through the AOP cout service; the
- * internal speaker (MAX98360, no current sense) is not exposed yet.
+ * speakers are one MAX98360A per channel on the AOP's LEAP TX0, with no
+ * sense lines and no amplifier controls.  The CPU DAI (t8140-aop-audio)
+ * limits every sample to -20 dBFS on the wire and provides the "Speaker
+ * Playback Volume" below that, which the volume lock holds 20 dB down
+ * until the protection daemon takes it.
  */
 struct macaudio_platform_cfg macaudio_j700_cfg = {
-	/*
-	 * One MAX98360A per channel on the AOP's LEAP TX0.  No sense lines
-	 * and no amplifier controls: the CPU DAI (t8140-aop-audio) limits
-	 * every sample to -20 dBFS on the wire and provides the "Speaker
-	 * Playback Volume" below that, which the volume lock holds 20 dB
-	 * down until the protection daemon takes it.
-	 */
 	.enable_speakers = true,
 	.amp = AMP_MAX98360A,
 	.speakers = SPKR_1W,
@@ -1717,7 +1714,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j457    AID7    ssm3515     15      2× 1W+1T Compat: apple,j456-macaudio */
 	/* j473    AID12   sn012776    20      1× 1W */
 	{ .compatible = "apple,j473-macaudio", .data = &macaudio_j37x_j47x_cfg },
-	/* j700    AOP-fed serializers, cs42l83 jack, MAX98360 speaker (off) */
+	/* j700    AID44   max98360a   -       2× 1W (AOP-fed, no sense) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j474    AID26   sn012776    20      1× 1W    Compat: apple,j473-macaudio */
 	/* j475    AID25   sn012776    20      1× 1W    Compat: apple,j375-macaudio */
