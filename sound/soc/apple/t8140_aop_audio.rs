@@ -336,8 +336,10 @@ struct LpmicData {
     spkr_sequence: Atomic<u32>,
     spkr_reports: Atomic<u32>,
     tap_sequence: Atomic<u32>,
-    tap_channel: Atomic<usize>,
-    tap_domain: Atomic<usize>,
+    /// The tap service is in pwrd (sense back-end prepared).
+    tap_running: Atomic<u32>,
+    /// audio_mca0_m (the tap's serializer domain), 0 if absent.
+    pd_mca0: Atomic<usize>,
     cout_sequence: Atomic<u32>,
     cout_running: Atomic<u32>,
     cin_sequence: Atomic<u32>,
@@ -582,33 +584,55 @@ impl LpmicData {
         Ok(())
     }
 
-    /// Temporary capture diagnostic: the native SpeakerTap is base-ns RX1
-    /// under the tap service on MCA0. It observes the speaker serial stream;
-    /// it is not an amplifier current/voltage sensor and never enables it.
-    fn tap_setup(&self) -> Result<*mut bindings::dma_chan> {
+    // ---- speaker sense: the native SpeakerTap, base-ns RX1 under the tap service on MCA0 ----
+    //
+    // The words the amplifier receives come back on this stream (the card's
+    // "Speaker Sense" capture, device 2); it observes the serial data, it is
+    // not a current or voltage sensor, and it never touches the amplifier.
+
+    /// Sense back-end startup: attach the tap service, power MCA0, pw0.
+    fn sense_startup(&self) -> Result<()> {
         self.attach_device(AUDIO_DEV_TAP, "tap")?;
-        self.out_set_power(AUDIO_DEV_TAP, "tap", &self.tap_sequence, SPKR_POWER_STATE_PW0)?;
-        let pd = unsafe { bindings::dev_pm_domain_attach_by_name(self.dev.as_raw(), c"mca0".as_ptr()) };
-        let pd = kernel::error::from_err_ptr(pd)?;
-        if pd.is_null() {
-            return Err(ENODEV);
-        }
-        let rc = unsafe { bindings::pm_runtime_get_sync(pd) };
-        if rc < 0 {
-            unsafe {
-                bindings::pm_runtime_put_noidle(pd);
-                bindings::dev_pm_domain_detach(pd, true);
+        let pd = self.pd_mca0.load(Relaxed);
+        if pd != 0 {
+            let rc = unsafe { bindings::pm_runtime_get_sync(pd as *mut bindings::device) };
+            if rc < 0 {
+                dev_err!(self.dev, "tap: audio_mca0_m did not power up: {}\n", rc);
+                return Err(EIO);
             }
-            return Err(Error::from_errno(rc));
         }
-        self.tap_domain.store(pd as usize, Relaxed);
-        let chan = unsafe { bindings::dma_request_chan(self.dev.as_raw(), c"spkr-tap".as_ptr()) };
-        let chan = kernel::error::from_err_ptr(chan)?;
-        if chan.is_null() {
-            return Err(ENODEV);
+        if let Err(e) = self.out_set_power(AUDIO_DEV_TAP, "tap", &self.tap_sequence, SPKR_POWER_STATE_PW0) {
+            if pd != 0 {
+                unsafe { bindings::pm_runtime_put_sync(pd as *mut bindings::device) };
+            }
+            return Err(e);
         }
-        self.tap_channel.store(chan as usize, Relaxed);
-        Ok(chan)
+        self.tap_running.store(0, Relaxed);
+        Ok(())
+    }
+
+    /// Sense back-end prepare: pwrd starts the tap delivering into the RX DMA.
+    fn sense_prepare(&self) -> Result<()> {
+        if self.tap_running.load(Relaxed) != 0 {
+            return Ok(());
+        }
+        self.out_set_power(AUDIO_DEV_TAP, "tap", &self.tap_sequence, SPKR_POWER_STATE_PWRD)?;
+        self.tap_running.store(1, Relaxed);
+        Ok(())
+    }
+
+    /// Sense back-end shutdown: pw0, release MCA0.
+    fn sense_shutdown(&self) {
+        if self.tap_running.load(Relaxed) != 0 {
+            if let Err(e) = self.out_set_power(AUDIO_DEV_TAP, "tap", &self.tap_sequence, SPKR_POWER_STATE_PW0) {
+                dev_warn!(self.dev, "tap: pw0 failed: {:?}\n", e);
+            }
+            self.tap_running.store(0, Relaxed);
+        }
+        let pd = self.pd_mca0.load(Relaxed);
+        if pd != 0 {
+            unsafe { bindings::pm_runtime_put_sync(pd as *mut bindings::device) };
+        }
     }
 
     // ---- 3.5 mm jack: the AOP cout/cin services on MCA1, base-ns TX2/RX2 ----
@@ -1422,71 +1446,6 @@ unsafe extern "C" fn lpmic_pcm_pointer(
     data.hw_ptr_frames.load(Relaxed) as bindings::snd_pcm_uframes_t
 }
 
-// Capture-only diagnostic PCM. Keep the output amplifier disabled while
-// measuring the relationship between LEAP inputs and the serial PCM output.
-unsafe extern "C" fn tap_pcm_open(substream: *mut bindings::snd_pcm_substream) -> i32 {
-    let data = unsafe { Arc::<LpmicData>::borrow((*substream).private_data.cast()) };
-    let chan = data.tap_channel.load(Relaxed) as *mut bindings::dma_chan;
-    if chan.is_null() {
-        return ENODEV.to_errno();
-    }
-    let mut hw = bindings::snd_pcm_hardware::default();
-    hw.info = bindings::SNDRV_PCM_INFO_MMAP | bindings::SNDRV_PCM_INFO_MMAP_VALID
-        | bindings::SNDRV_PCM_INFO_INTERLEAVED | bindings::SNDRV_PCM_INFO_BLOCK_TRANSFER;
-    hw.formats = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
-    hw.rates = RATE_48000_BIT;
-    hw.rate_min = 48000;
-    hw.rate_max = 48000;
-    hw.channels_min = 2;
-    hw.channels_max = 2;
-    hw.periods_min = 2;
-    hw.periods_max = 64;
-    hw.period_bytes_min = 256;
-    hw.period_bytes_max = 0x10000;
-    hw.buffer_bytes_max = PCM_BUFFER_MAX;
-    hw.fifo_size = 16;
-    unsafe { (*(*substream).runtime).hw = hw };
-    unsafe { bindings::snd_dmaengine_pcm_open(substream, chan) }
-}
-
-unsafe extern "C" fn tap_pcm_hw_params(
-    substream: *mut bindings::snd_pcm_substream,
-    params: *mut bindings::snd_pcm_hw_params,
-) -> i32 {
-    let chan = unsafe { bindings::snd_dmaengine_pcm_get_chan(substream) };
-    let mut cfg = bindings::dma_slave_config::default();
-    let ret = unsafe { bindings::snd_hwparams_to_dma_slave_config(substream, params, &mut cfg) };
-    if ret < 0 {
-        return ret;
-    }
-    cfg.src_port_window_size = 2;
-    unsafe {
-        match (*(*chan).device).device_config {
-            Some(f) => f(chan, &mut cfg),
-            None => ENOSYS.to_errno(),
-        }
-    }
-}
-
-unsafe extern "C" fn tap_pcm_prepare(substream: *mut bindings::snd_pcm_substream) -> i32 {
-    let data = unsafe { Arc::<LpmicData>::borrow((*substream).private_data.cast()) };
-    match data.out_set_power(AUDIO_DEV_TAP, "tap", &data.tap_sequence, SPKR_POWER_STATE_PWRD) {
-        Ok(()) => 0,
-        Err(e) => e.to_errno(),
-    }
-}
-
-unsafe extern "C" fn tap_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
-    let data = unsafe { Arc::<LpmicData>::borrow((*substream).private_data.cast()) };
-    // The DMA helper synchronizes outstanding callbacks before releasing its
-    // runtime state. Firmware power-down is a bounded process-context call.
-    let ret = unsafe { bindings::snd_dmaengine_pcm_close(substream) };
-    if let Err(e) = data.out_set_power(AUDIO_DEV_TAP, "tap", &data.tap_sequence, SPKR_POWER_STATE_PW0) {
-        dev_warn!(data.dev, "speaker tap power-down failed: {:?}\n", e);
-    }
-    ret
-}
-
 unsafe extern "C" fn lpmic_pcm_free_private(pcm: *mut bindings::snd_pcm) {
     unsafe {
         Arc::<LpmicData>::from_foreign((*pcm).private_data.cast());
@@ -1509,7 +1468,7 @@ const FE_COUNT: usize = 3;
 /// front-end's "spkr" channel is requested once the speaker link exists:
 /// requesting it touches the LEAP ADMAC.
 const FE_DMA_NAMES: [[Option<&core::ffi::CStr>; 2]; FE_COUNT] =
-    [[Some(c"cout"), Some(c"cin")], [Some(c"spkr"), None], [None, None]];
+    [[Some(c"cout"), Some(c"cin")], [Some(c"spkr"), None], [None, Some(c"spkr-tap")]];
 /// The front-end that plays the internal speaker (j700-pcm-1, the card's
 /// "Secondary" PCM): its data goes through `spkr_copy` below.
 const FE_SPKR: usize = 1;
@@ -1990,16 +1949,38 @@ unsafe extern "C" fn cout_dai_shutdown(substream: *mut bindings::snd_pcm_substre
     data.jack_shutdown(unsafe { substream_is_playback(substream) });
 }
 
-unsafe extern "C" fn spkr_dai_startup(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn spkr_dai_startup(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
     let data = unsafe { dai_data(dai) };
-    match data.spkr_startup() {
+    let ret = if unsafe { substream_is_playback(substream) } {
+        data.spkr_startup()
+    } else {
+        data.sense_startup()
+    };
+    match ret {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }
 }
 
-/// Atomic context: queue the sleeping start, or note the stop.
-unsafe extern "C" fn spkr_dai_trigger(_substream: *mut bindings::snd_pcm_substream, cmd: i32, dai: *mut bindings::snd_soc_dai) -> i32 {
+/// The sense (capture) side runs from prepare: the RX DMA is armed by then
+/// and a capture may start before or after the speaker plays.
+unsafe extern "C" fn spkr_dai_prepare(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+    if unsafe { substream_is_playback(substream) } {
+        return 0;
+    }
+    let data = unsafe { dai_data(dai) };
+    match data.sense_prepare() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Atomic context: queue the sleeping start, or note the stop (playback
+/// only; the sense side needs nothing here).
+unsafe extern "C" fn spkr_dai_trigger(substream: *mut bindings::snd_pcm_substream, cmd: i32, dai: *mut bindings::snd_soc_dai) -> i32 {
+    if !unsafe { substream_is_playback(substream) } {
+        return 0;
+    }
     let drv = unsafe { component_driver((*dai).component) };
     match cmd as u32 {
         bindings::SNDRV_PCM_TRIGGER_START
@@ -2022,8 +2003,12 @@ unsafe extern "C" fn spkr_dai_trigger(_substream: *mut bindings::snd_pcm_substre
     }
 }
 
-unsafe extern "C" fn spkr_dai_shutdown(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
+unsafe extern "C" fn spkr_dai_shutdown(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
     let drv = unsafe { component_driver((*dai).component) };
+    if !unsafe { substream_is_playback(substream) } {
+        drv.data.sense_shutdown();
+        return;
+    }
     drv.data.spkr_want_run.store(0, Relaxed);
     if let Some(work) = drv.spkr_start.as_ref() {
         // A start still queued or running must finish before the mute/pw0.
@@ -2037,6 +2022,7 @@ unsafe extern "C" fn spkr_dai_shutdown(_substream: *mut bindings::snd_pcm_substr
 
 static SPKR_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
     startup: Some(spkr_dai_startup),
+    prepare: Some(spkr_dai_prepare),
     trigger: Some(spkr_dai_trigger),
     shutdown: Some(spkr_dai_shutdown),
     set_fmt: Some(dai_accept_fmt),
@@ -2137,17 +2123,19 @@ static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 2 + FE_COUNT]> = SyncC
         id: FE_DAI_ID_BASE + 2,
         ops: &FE_DAI_OPS.0,
         playback: empty_stream(),
-        capture: pcm_stream(c"PCM2 RX", OUT_FORMATS),
+        // the speaker sense front-end: the words on the speaker wire
+        capture: pcm_stream(c"PCM2 RX", FMTBIT_S32_LE),
         ..unsafe { core::mem::zeroed() }
     },
     // The internal speaker back-end: LEAP TX0 under the AOP spkr service,
-    // the MAX98360A's SD_MODE driven by its own codec driver.
+    // the MAX98360A's SD_MODE driven by its own codec driver; its capture
+    // side is the SpeakerTap (base-ns RX1, the tap service).
     bindings::snd_soc_dai_driver {
         name: c"spkr".as_ptr(),
         id: BE_DAI_ID_SPKR,
         ops: &SPKR_DAI_OPS.0,
         playback: pcm_stream(c"SPKR TX", FMTBIT_S32_LE),
-        capture: empty_stream(),
+        capture: pcm_stream(c"SPKR RX", FMTBIT_S32_LE),
         ..unsafe { core::mem::zeroed() }
     },
 ]);
@@ -2161,18 +2149,6 @@ struct LpmicDriver {
 }
 
 impl LpmicDriver {
-    const TAP_VTABLE: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
-        open: Some(tap_pcm_open),
-        close: Some(tap_pcm_close),
-        hw_params: Some(tap_pcm_hw_params),
-        prepare: Some(tap_pcm_prepare),
-        trigger: Some(bindings::snd_dmaengine_pcm_trigger),
-        pointer: Some(bindings::snd_dmaengine_pcm_pointer),
-        sync_stop: Some(bindings::snd_dmaengine_pcm_sync_stop),
-        ioctl: Some(bindings::snd_pcm_lib_ioctl),
-        ..unsafe { core::mem::zeroed() }
-    };
-
     const VTABLE: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
         open: Some(lpmic_pcm_open),
         close: Some(lpmic_pcm_close),
@@ -2254,23 +2230,6 @@ impl LpmicDriver {
             );
         }
 
-        if *module_parameters::spkr_tap.value() != 0 {
-            let chan = data.tap_setup()?;
-            let mut tap = ptr::null_mut();
-            let ret = unsafe { bindings::snd_pcm_new(this.card, c"Speaker Tap".as_ptr(), 1, 0, 1, &mut tap) };
-            if ret < 0 {
-                return Err(Error::from_errno(ret));
-            }
-            unsafe {
-                (*tap).private_data = data.clone().into_foreign() as _;
-                (*tap).private_free = Some(lpmic_pcm_free_private);
-                copy_str(&mut (*tap).name, c"Speaker Tap (diagnostic)".to_bytes_with_nul());
-                bindings::snd_pcm_set_ops(tap, bindings::SNDRV_PCM_STREAM_CAPTURE as i32, &Self::TAP_VTABLE);
-                bindings::snd_pcm_set_managed_buffer_all(tap, bindings::SNDRV_DMA_TYPE_DEV as i32,
-                    (*(*chan).device).dev, PCM_BUFFER_PREALLOC, PCM_BUFFER_MAX);
-            }
-            dev_info!(data.dev, "Speaker Tap capture ready; amplifier remains disabled\n");
-        }
         let ret = unsafe { bindings::snd_card_register(this.card) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to register sound card\n");
@@ -2323,7 +2282,7 @@ impl Drop for LpmicDriver {
                 bindings::flush_work(raw);
             }
         }
-        for slot in [&self.data.pd_mca1, &self.data.pd_tx0, &self.data.pd_leap_mca] {
+        for slot in [&self.data.pd_mca1, &self.data.pd_mca0, &self.data.pd_tx0, &self.data.pd_leap_mca] {
             let pd = slot.xchg(0, Relaxed);
             if pd != 0 {
                 unsafe { bindings::dev_pm_domain_detach(pd as *mut bindings::device, true) };
@@ -2332,17 +2291,6 @@ impl Drop for LpmicDriver {
         if !self.card.is_null() {
             unsafe {
                 bindings::snd_card_free(self.card);
-            }
-        }
-        let chan = self.data.tap_channel.xchg(0, Relaxed);
-        if chan != 0 {
-            unsafe { bindings::dma_release_channel(chan as *mut bindings::dma_chan) };
-        }
-        let pd = self.data.tap_domain.xchg(0, Relaxed);
-        if pd != 0 {
-            unsafe {
-                bindings::pm_runtime_put_sync(pd as *mut bindings::device);
-                bindings::dev_pm_domain_detach(pd as *mut bindings::device, true);
             }
         }
         // The AOP keeps dispatching producer reports to the first listener
@@ -2406,8 +2354,8 @@ impl platform::Driver for LpmicDriver {
                 spkr_sequence: Atomic::new(0),
                 spkr_reports: Atomic::new(0),
                 tap_sequence: Atomic::new(0),
-                tap_channel: Atomic::new(0),
-                tap_domain: Atomic::new(0),
+                tap_running: Atomic::new(0),
+                pd_mca0: Atomic::new(0),
                 cout_sequence: Atomic::new(0),
                 cout_running: Atomic::new(0),
                 cin_sequence: Atomic::new(0),
@@ -2451,11 +2399,11 @@ impl platform::Driver for LpmicDriver {
         }
         // The speaker path's LEAP leaves (tx0 -> leap_c -> leap_a -> audio_fr
         // -> audio_a, leap_mca -> audio_p), runtime-powered around streams.
-        for (name, slot) in [(c"tx0", &data.pd_tx0), (c"mca", &data.pd_leap_mca)] {
+        for (name, slot) in [(c"tx0", &data.pd_tx0), (c"mca", &data.pd_leap_mca), (c"mca0", &data.pd_mca0)] {
             let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), name.as_ptr()) };
             match kernel::error::from_err_ptr(pd) {
                 Ok(p) if !p.is_null() => slot.store(p as usize, Relaxed),
-                Ok(_) => dev_warn!(dev, "no {:?} power domain: the speaker path is unavailable\n", name),
+                Ok(_) => dev_warn!(dev, "no {:?} power domain: the speaker or sense path is unavailable\n", name),
                 Err(e) => dev_warn!(dev, "{:?} power domain attach failed: {:?}\n", name, e),
             }
         }
@@ -2482,10 +2430,6 @@ impl platform::Driver for LpmicDriver {
             let tone_ms = core::cmp::min(*module_parameters::spkr_tone_ms.value(), SPKR_TONE_MS_MAX);
             let amp_ms = core::cmp::min(*module_parameters::spkr_amp_ms.value(), SPKR_AMP_MS_MAX);
             let delay_ms = *module_parameters::spkr_tone_delay_ms.value();
-            if *module_parameters::spkr_tap.value() != 0 && amp_ms != 0 {
-                dev_err!(dev, "Speaker Tap diagnostics require spkr_amp_ms=0\n");
-                return Err(EINVAL);
-            }
             if tone_amp > SPKR_TONE_AMP_MAX {
                 dev_err!(dev, "spkr_tone_amp {} exceeds the ceiling {}, refusing\n",
                          tone_amp, SPKR_TONE_AMP_MAX);
@@ -2520,10 +2464,6 @@ module_platform_driver! {
     description: "Apple T8140 (J700) AOP audio: low-power microphone, jack and speaker paths",
     license: "Dual MIT/GPL",
     params: {
-        spkr_tap: u8 {
-            default: 0,
-            description: "Bench: capture-only native SpeakerTap PCM, requires amplifier kept off",
-        },
         spkr_test: u8 {
             default: 0,
             description: "Bench: run the internal speaker zero-DMA proof at probe (no amplifier enable)",
