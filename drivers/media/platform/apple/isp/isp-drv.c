@@ -752,6 +752,13 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	 */
 	apple_isp_video_suspend(isp);
 
+	/*
+	 * Resident firmware (t8140) does not survive the sleep: halt it so
+	 * that the next stream boots it again instead of talking to a dead
+	 * coprocessor.
+	 */
+	apple_isp_firmware_halt(isp);
+
 	return 0;
 }
 
