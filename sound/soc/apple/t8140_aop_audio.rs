@@ -158,13 +158,34 @@ fn mem_sync() {
     }
 }
 
-fn cntvct() -> u64 {
-    let v: u64;
-    // SAFETY: reading the architectural counter has no side effects.
-    unsafe {
-        asm!("mrs {}, cntvct_el0", out(reg) v);
+// Firmware power timestamps use the 24 MHz always-on timebase. The
+// architectural counter can run at a different rate (1 GHz on T8140).
+const AOP_TIMEBASE_HZ: u64 = 24_000_000;
+
+fn aop_counter_ticks(counter: u64, frequency: u64) -> Result<u64> {
+    if frequency == 0 || frequency > u32::MAX as u64 {
+        return Err(EINVAL);
     }
-    v
+    // Split whole seconds from the remainder to avoid overflowing a u64
+    // multiplication on an otherwise ordinary long-running system.
+    let seconds = counter / frequency;
+    let remainder = (counter % frequency) * AOP_TIMEBASE_HZ / frequency;
+    seconds.checked_mul(AOP_TIMEBASE_HZ)
+        .and_then(|ticks| ticks.checked_add(remainder))
+        .ok_or(EOVERFLOW)
+}
+
+fn aop_timestamp() -> Result<u64> {
+    let counter: u64;
+    let frequency: u64;
+    // SAFETY: architectural read-only timer registers; no private EL2
+    // register access is needed for the firmware's timestamp domain.
+    unsafe {
+        asm!("isb", "mrs {counter}, cntvct_el0", "mrs {frequency}, cntfrq_el0",
+             counter = out(reg) counter, frequency = out(reg) frequency,
+             options(nostack, preserves_flags));
+    }
+    aop_counter_ticks(counter, frequency)
 }
 
 #[repr(C, packed(4))]
@@ -273,7 +294,7 @@ struct PowerRequest {
     _zero1: [u8; 20],
 }
 
-/// Property 202 on the spkr service: FourCC, sequence, CNTVCT timestamp, a
+/// Property 202 on the spkr service: FourCC, sequence, 24 MHz timestamp, a
 /// zero word, the target state FourCC, a zero parameter and 20 zero bytes.
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
@@ -444,7 +465,7 @@ impl LpmicData {
         let req = PowerRequest {
             node: 0,
             sequence,
-            timestamp: cntvct(),
+            timestamp: aop_timestamp()?,
             state,
             param: 1,
             ..PowerRequest::default()
@@ -517,14 +538,14 @@ impl LpmicData {
     }
 
     /// Output device (spkr/cout) power request: property 202 with a per-
-    /// device sequence and the CNTVCT timestamp; pw0 is confirmed through
+    /// device sequence and a 24 MHz timestamp; pw0 is confirmed through
     /// property 200 like the native host did.
     fn out_set_power(&self, dev_id: u32, name: &str, seq: &Atomic<u32>, state: u32) -> Result<()> {
         let sequence = seq.fetch_add(1, Relaxed) + 1;
         let req = SpkrPowerRequest {
             dev_id,
             sequence,
-            timestamp: cntvct(),
+            timestamp: aop_timestamp()?,
             state,
             param: 0,
             ..SpkrPowerRequest::default()
