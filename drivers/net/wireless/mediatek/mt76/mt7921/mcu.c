@@ -2333,6 +2333,8 @@ out_release:
 }
 EXPORT_SYMBOL_GPL(mt7932_mcu_load_customer_cfg);
 
+static int mt7932_mcu_wait_calibration_space(struct mt792x_dev *dev);
+
 int mt7932_mcu_load_power_transcript(struct mt792x_dev *dev)
 {
 	static const u8 group_end[] = { 10, 11, 12, 13, 28, 42 };
@@ -2395,6 +2397,16 @@ int mt7932_mcu_load_power_transcript(struct mt792x_dev *dev)
 
 		cmd = __MCU_CMD_FIELD_CE |
 		      FIELD_PREP(__MCU_CMD_FIELD_ID, record->cid);
+		/* After a large one-time-calibration upload the MCU drains
+		 * TX17 far more slowly than the generic send path's bounded
+		 * 5ms pressure reclaim tolerates, and the 24-entry ring fills
+		 * (J700_MT7932_RAW_TX_FAIL: stage=ring-full).  Wait for ring
+		 * space exactly as the calibration path does.  Only the pacing
+		 * changes; the command stream and its order are untouched.
+		 */
+		ret = mt7932_mcu_wait_calibration_space(dev);
+		if (ret)
+			goto release_firmware;
 		ret = mt76_mcu_send_msg(&dev->mt76, cmd, data, data_len,
 					false);
 		if (ret)
@@ -3569,6 +3581,10 @@ int mt7932_mcu_drain_tx17(struct mt792x_dev *dev, const char *phase,
 	return -ETIMEDOUT;
 }
 
+static u32 mt7932_cal_wait_polls;
+static u32 mt7932_cal_wait_max;
+static u32 mt7932_cal_wait_immediate;
+
 static int mt7932_mcu_wait_calibration_space(struct mt792x_dev *dev)
 {
 	struct mt76_dev *mdev = &dev->mt76;
@@ -3579,10 +3595,15 @@ static int mt7932_mcu_wait_calibration_space(struct mt792x_dev *dev)
 		return -EOPNOTSUPP;
 
 	for (i = 0; i < 5000; i++) {
+		if (i == 0 && READ_ONCE(q->queued) + 1 < q->ndesc - 1)
+			mt7932_cal_wait_immediate++;
+		mt7932_cal_wait_polls++;
+		if (i > mt7932_cal_wait_max)
+			mt7932_cal_wait_max = i;
 		mdev->queue_ops->tx_cleanup(mdev, q, false);
 		if (READ_ONCE(q->queued) + 1 < q->ndesc - 1)
 			return 0;
-		usleep_range(100, 200);
+		usleep_range(1000, 2000);
 	}
 
 	dev_err(mdev->dev,
@@ -3598,6 +3619,7 @@ int mt7932_mcu_load_one_time_cal(struct mt792x_dev *dev)
 	size_t offset;
 	u16 count, i;
 	int cmd = MCU_CMD(ONE_TIME_CAL);
+	unsigned long cal_start;
 	int ret;
 
 	if (!is_mt7932(&dev->mt76))
@@ -3608,6 +3630,7 @@ int mt7932_mcu_load_one_time_cal(struct mt792x_dev *dev)
 	ret = mt7932_validate_cal_stream(firmware, &count);
 	if (ret)
 		goto release_firmware;
+	cal_start = jiffies;
 	ret = mt7932_mcu_drain_tx17(dev, "cal-pre", true);
 	if (ret)
 		goto release_firmware;
@@ -3637,6 +3660,11 @@ int mt7932_mcu_load_one_time_cal(struct mt792x_dev *dev)
 	dev_info(dev->mt76.dev,
 		 "J700_MT7932_ONE_TIME_CAL_PASS: cid=d6 records=%u wire_header=20 data_max=1080 rf_enabled=0\n",
 		 count);
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_CAL_PACING: records=%u polls=%u max_polls_one_record=%u no_wait_records=%u elapsed_ms=%u\n",
+		 count, mt7932_cal_wait_polls, mt7932_cal_wait_max,
+		 mt7932_cal_wait_immediate,
+		 jiffies_to_msecs(jiffies - cal_start));
 
 release_firmware:
 	release_firmware(firmware);
