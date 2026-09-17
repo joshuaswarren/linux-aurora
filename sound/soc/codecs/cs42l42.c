@@ -1739,24 +1739,39 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	unsigned int current_plug_status;
 	unsigned int current_button_status;
 	unsigned int i;
+	irqreturn_t result = IRQ_NONE;
+	bool use_runtime_pm = pm_runtime_enabled(cs42l42->dev);
+	int ret;
 
-	pm_runtime_get_sync(cs42l42->dev);
+	/* SoundWire uses runtime PM; the I2C transport stays powered. */
+	if (use_runtime_pm) {
+		ret = pm_runtime_resume_and_get(cs42l42->dev);
+		if (ret < 0)
+			return IRQ_NONE;
+	}
 	mutex_lock(&cs42l42->irq_lock);
 	if (cs42l42->suspended || !cs42l42->init_done) {
 		mutex_unlock(&cs42l42->irq_lock);
-		pm_runtime_put_autosuspend(cs42l42->dev);
+		if (use_runtime_pm)
+			pm_runtime_put_autosuspend(cs42l42->dev);
 		return IRQ_NONE;
 	}
 
 	/* Read sticky registers to clear interrupt */
 	for (i = 0; i < ARRAY_SIZE(stickies); i++) {
-		regmap_read(cs42l42->regmap, irq_params_table[i].status_addr,
-				&(stickies[i]));
-		regmap_read(cs42l42->regmap, irq_params_table[i].mask_addr,
-				&(masks[i]));
+		ret = regmap_read(cs42l42->regmap, irq_params_table[i].status_addr,
+				  &stickies[i]);
+		if (ret)
+			goto out_error;
+		ret = regmap_read(cs42l42->regmap, irq_params_table[i].mask_addr,
+				  &masks[i]);
+		if (ret)
+			goto out_error;
 		stickies[i] = stickies[i] & (~masks[i]) &
 				irq_params_table[i].mask;
 	}
+
+	result = IRQ_HANDLED;
 
 	/* Read tip sense status before handling type detect */
 	current_plug_status = (stickies[11] &
@@ -1777,6 +1792,7 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	if ((~masks[5]) & irq_params_table[5].mask) {
 		if (stickies[5] & CS42L42_HSDET_AUTO_DONE_MASK) {
 			cs42l42_process_hs_type_detect(cs42l42);
+
 			switch (cs42l42->hs_type) {
 			case CS42L42_PLUG_CTIA:
 			case CS42L42_PLUG_OMTP:
@@ -1846,10 +1862,16 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 		}
 	}
 
-	mutex_unlock(&cs42l42->irq_lock);
-	pm_runtime_put_autosuspend(cs42l42->dev);
+	goto out_unlock;
 
-	return IRQ_HANDLED;
+out_error:
+	dev_err_ratelimited(cs42l42->dev, "Failed to read jack interrupt state: %d\n", ret);
+out_unlock:
+	mutex_unlock(&cs42l42->irq_lock);
+	if (use_runtime_pm)
+		pm_runtime_put_autosuspend(cs42l42->dev);
+
+	return result;
 }
 EXPORT_SYMBOL_NS_GPL(cs42l42_irq_thread, "SND_SOC_CS42L42_CORE");
 
