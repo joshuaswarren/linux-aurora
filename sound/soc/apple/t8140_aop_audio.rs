@@ -85,7 +85,7 @@ use kernel::{
 };
 use kernel::impl_has_hr_timer;
 use kernel::time::msecs_to_jiffies;
-use kernel::workqueue::{impl_has_delayed_work, new_delayed_work};
+use kernel::workqueue::{impl_has_delayed_work, impl_has_work, new_delayed_work, new_work, Work};
 use pin_init::stack_pin_init;
 
 const EPIC_SUBTYPE_WRAPPED_CALL: u16 = 0x20;
@@ -344,6 +344,17 @@ struct LpmicData {
     cin_running: Atomic<u32>,
     /// audio_mca1_m virtual power-domain device (dev_pm_domain_attach_by_name), 0 if none.
     pd_mca1: Atomic<usize>,
+    /// The speaker path's LEAP domains (audio_leap_tx0, audio_leap_mca):
+    /// virtual power-domain devices held for the driver's lifetime and
+    /// runtime-powered around speaker streams; 0 if absent.
+    pd_tx0: Atomic<usize>,
+    pd_leap_mca: Atomic<usize>,
+    /// The spkr service is in pwrd and unmuted (speaker back-end prepared).
+    spkr_running: Atomic<u32>,
+    /// A speaker stream has been triggered and not yet stopped.
+    spkr_want_run: Atomic<u32>,
+    /// Copy calls into the speaker buffer since the last prepare (debug).
+    spkr_copies: Atomic<u32>,
     /// DMA channels of the front-end PCMs, [FE DAI id][stream] (raw dma_chan pointers).
     #[pin]
     fe_chans: SpinLock<[[usize; 2]; FE_COUNT]>,
@@ -668,6 +679,86 @@ impl LpmicData {
             unsafe { bindings::pm_runtime_put_sync(pd as *mut bindings::device) };
         }
         dev_info!(self.dev, "{}: pw0, mca1 released\n", name);
+    }
+
+    // ---- internal speaker: the AOP spkr service on LEAP TX0 (admac-leap-ns 0) ----
+
+    /// Runtime-power (or release) the LEAP leaves of the speaker path.
+    fn spkr_domains(&self, on: bool) -> Result<()> {
+        let pds = [self.pd_tx0.load(Relaxed), self.pd_leap_mca.load(Relaxed)];
+        if pds.iter().any(|&pd| pd == 0) {
+            dev_err!(self.dev, "spkr: LEAP power domains are not attached\n");
+            return Err(ENODEV);
+        }
+        if on {
+            for (i, &pd) in pds.iter().enumerate() {
+                let rc = unsafe { bindings::pm_runtime_get_sync(pd as *mut bindings::device) };
+                if rc < 0 {
+                    dev_err!(self.dev, "spkr: LEAP power domain {} did not power up: {}\n", i, rc);
+                    for &done in pds[..=i].iter() {
+                        unsafe { bindings::pm_runtime_put_sync(done as *mut bindings::device) };
+                    }
+                    return Err(EIO);
+                }
+            }
+        } else {
+            for &pd in pds.iter().rev() {
+                unsafe { bindings::pm_runtime_put_sync(pd as *mut bindings::device) };
+            }
+        }
+        Ok(())
+    }
+
+    /// Speaker back-end startup: attach the service, power the LEAP leaves,
+    /// pw0 -- the order the native host proved (zero-DMA, then the tone).
+    fn spkr_startup(&self) -> Result<()> {
+        self.attach_device(AUDIO_DEV_SPKR, "spkr")?;
+        self.spkr_domains(true)?;
+        if let Err(e) = self.spkr_set_power(SPKR_POWER_STATE_PW0) {
+            let _ = self.spkr_domains(false);
+            return Err(e);
+        }
+        self.spkr_running.store(0, Relaxed);
+        dev_info!(self.dev, "spkr: attached, LEAP domains powered, pw0\n");
+        Ok(())
+    }
+
+    /// Speaker stream start, from the system workqueue right after trigger
+    /// START (the DMA is running by then, the order the native host and the
+    /// bench proved: descriptors first, then pwrd): pwrd starts the LEAP
+    /// consuming, then the firmware unmute (property 700, the value the
+    /// native amplifier driver writes after enabling its output).
+    fn spkr_go(&self) -> Result<()> {
+        if self.spkr_want_run.load(Relaxed) == 0 || self.spkr_running.load(Relaxed) != 0 {
+            return Ok(());
+        }
+        self.spkr_set_power(SPKR_POWER_STATE_PWRD)?;
+        if let Err(e) = self.spkr_set_mute(false) {
+            let _ = self.spkr_set_power(SPKR_POWER_STATE_PW0);
+            return Err(e);
+        }
+        self.spkr_running.store(1, Relaxed);
+        dev_info!(self.dev, "spkr: pwrd, unmuted (wire ceiling -20 dBFS), {} copies so far\n",
+                  self.spkr_copies.load(Relaxed));
+        Ok(())
+    }
+
+    /// Speaker back-end shutdown: mute, pw0, release the LEAP leaves.  The
+    /// amplifier is already off (codec trigger STOP); a start still queued
+    /// was flushed by the caller.
+    fn spkr_shutdown(&self) {
+        self.spkr_want_run.store(0, Relaxed);
+        if self.spkr_running.load(Relaxed) != 0 {
+            if let Err(e) = self.spkr_set_mute(true) {
+                dev_err!(self.dev, "spkr: mute failed: {:?}\n", e);
+            }
+            if let Err(e) = self.spkr_set_power(SPKR_POWER_STATE_PW0) {
+                dev_err!(self.dev, "spkr: pw0 failed: {:?}\n", e);
+            }
+            self.spkr_running.store(0, Relaxed);
+        }
+        let _ = self.spkr_domains(false);
+        dev_info!(self.dev, "spkr: muted, pw0, LEAP domains released\n");
     }
 
     /// The native host's zero-DMA proof: attach spkr, read 401/402, pw0,
@@ -1132,6 +1223,30 @@ impl_has_hr_timer! {
     }
 }
 
+/// The speaker stream start (pwrd + unmute), queued by the back-end DAI's
+/// trigger START: those are sleeping firmware calls, and the DMA must already
+/// be running when the LEAP starts consuming.
+#[pin_data]
+struct SpkrStartWork {
+    data: Arc<LpmicData>,
+    #[pin]
+    work: Work<SpkrStartWork>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for SpkrStartWork { self.work }
+}
+
+impl WorkItem for SpkrStartWork {
+    type Pointer = Arc<SpkrStartWork>;
+
+    fn run(this: Arc<SpkrStartWork>) {
+        if let Err(e) = this.data.spkr_go() {
+            dev_err!(this.data.dev, "spkr: start failed: {:?}\n", e);
+        }
+    }
+}
+
 /// The bench tone, run from the system workqueue after a delay so a
 /// microphone capture can be running while the speaker plays.
 #[pin_data]
@@ -1392,7 +1507,28 @@ const FE_COUNT: usize = 3;
 /// front-end's "spkr" channel is requested once the speaker link exists:
 /// requesting it touches the LEAP ADMAC.
 const FE_DMA_NAMES: [[Option<&core::ffi::CStr>; 2]; FE_COUNT] =
-    [[Some(c"cout"), Some(c"cin")], [None, None], [None, None]];
+    [[Some(c"cout"), Some(c"cin")], [Some(c"spkr"), None], [None, None]];
+/// The front-end that plays the internal speaker (j700-pcm-1, the card's
+/// "Secondary" PCM): its data goes through `spkr_copy` below.
+const FE_SPKR: usize = 1;
+/// SNDRV_PCM_FMTBIT_S32_LE (format index 10).
+const FMTBIT_S32_LE: u64 = 1 << 10;
+
+/// Digital ceiling of the speaker path, as a Q31 gain applied to every
+/// sample userspace writes: 0.05 = -26 dB.
+///
+/// Measured at the SpeakerTap on 2026-09-17 (hb51, amp off), the words on the
+/// speaker wire are exactly `2 × float × 2^31` -- a float of 6 791 000/2^31
+/// came back as a clean 1 kHz sine with peak 13 582 000 and nothing else in
+/// the path.  So a full-scale S32 sample scaled by 0.05 reaches the MAX98360A
+/// as 0.1 × 2^31: the wire never exceeds **-20 dBFS**.  At that level a
+/// MAX98360A (about 3 W full scale at 5 V into 4 Ω) delivers ~30 mW, an order
+/// of magnitude under the rating of any laptop micro-speaker, indefinitely,
+/// without a thermal model.  Apple's own bring-up profile of this speaker's
+/// CoreAudio graph (DEVICE_BRING_UP in the AID44 tuning) does the same thing:
+/// it replaces the loudspeaker manager with a plain -20 dB gain.
+/// Raising this needs a signal-domain protection model fed by the tap.
+const SPKR_CEILING_Q31: i64 = 107_374_182;
 /// Managed buffer sizes for the PCMs.
 const PCM_BUFFER_PREALLOC: usize = 256 * 1024;
 const PCM_BUFFER_MAX: usize = 1024 * 1024;
@@ -1407,6 +1543,11 @@ unsafe impl<T> Sync for SyncCell<T> {}
 unsafe fn component_data<'a>(component: *mut bindings::snd_soc_component) -> &'a LpmicData {
     let drv = unsafe { (*(*component).dev).driver_data } as *const LpmicDriver;
     unsafe { &(*drv).data }
+}
+
+unsafe fn component_driver<'a>(component: *mut bindings::snd_soc_component) -> &'a LpmicDriver {
+    let drv = unsafe { (*(*component).dev).driver_data } as *const LpmicDriver;
+    unsafe { &*drv }
 }
 
 unsafe fn substream_rtd(substream: *mut bindings::snd_pcm_substream) -> *mut bindings::snd_soc_pcm_runtime {
@@ -1425,6 +1566,7 @@ unsafe fn rtd_cpu_dai(rtd: *mut bindings::snd_soc_pcm_runtime) -> *mut bindings:
 /// (index + 1) and the back-ends start at 10.
 const FE_DAI_ID_BASE: u32 = 1;
 const BE_DAI_ID_COUT: u32 = 10;
+const BE_DAI_ID_SPKR: u32 = 11;
 
 unsafe fn fe_index(rtd: *mut bindings::snd_soc_pcm_runtime) -> Option<usize> {
     let id = unsafe { (*rtd_cpu_dai(rtd)).id } as u32;
@@ -1451,13 +1593,18 @@ unsafe extern "C" fn asoc_pcm_new(
         if substream.is_null() {
             continue;
         }
-        let chan = match kernel::error::from_err_ptr(unsafe { bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr()) }) {
+        // The LEAP ADMAC's SRAM registers only answer with the LEAP leaves
+        // powered, so the speaker channel is requested with them on.
+        let powered = fe == FE_SPKR && data.spkr_domains(true).is_ok();
+        let requested = kernel::error::from_err_ptr(unsafe { bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr()) });
+        if powered {
+            let _ = data.spkr_domains(false);
+        }
+        let chan = match requested {
             Ok(c) => c,
             Err(e) => {
-                // The LEAP ADMAC's SRAM registers only answer with the LEAP
-                // leaves powered (they are off until the speaker back-end
-                // runs), so a front-end can be left without a channel: its
-                // PCM exists but opens with ENODEV.
+                // A front-end can be left without a channel: its PCM exists
+                // but opens with ENODEV.
                 dev_info!(data.dev, "front-end {}: DMA channel {:?} unavailable: {:?}\n", fe, name, e);
                 continue;
             }
@@ -1507,9 +1654,16 @@ unsafe extern "C" fn asoc_pcm_open(
         return ENODEV.to_errno();
     }
     let mut hw = bindings::snd_pcm_hardware::default();
-    hw.info = bindings::SNDRV_PCM_INFO_MMAP
-        | bindings::SNDRV_PCM_INFO_MMAP_VALID
-        | bindings::SNDRV_PCM_INFO_INTERLEAVED;
+    if fe == FE_SPKR {
+        // No mmap: every sample goes through spkr_copy's fixed ceiling and
+        // the S32 -> float32 conversion the LEAP consumes.
+        hw.info = bindings::SNDRV_PCM_INFO_INTERLEAVED;
+        hw.formats = FMTBIT_S32_LE;
+    } else {
+        hw.info = bindings::SNDRV_PCM_INFO_MMAP
+            | bindings::SNDRV_PCM_INFO_MMAP_VALID
+            | bindings::SNDRV_PCM_INFO_INTERLEAVED;
+    }
     hw.periods_min = 2;
     hw.periods_max = u32::MAX;
     hw.period_bytes_min = 256;
@@ -1573,6 +1727,92 @@ unsafe extern "C" fn asoc_pcm_hw_params(
     }
 }
 
+/// The speaker front-end's DMA buffer must never carry stale words: the LEAP
+/// starts consuming at pwrd (back-end prepare), before the DMA is started.
+unsafe extern "C" fn asoc_pcm_prepare(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
+    let rtd = unsafe { substream_rtd(substream) };
+    if unsafe { rtd_is_be(rtd) } || unsafe { fe_index(rtd) } != Some(FE_SPKR) {
+        return 0;
+    }
+    let runtime = unsafe { (*substream).runtime };
+    let (area, bytes) = unsafe { ((*runtime).dma_area, (*runtime).dma_bytes) };
+    if !area.is_null() && bytes != 0 {
+        // SAFETY: the managed buffer is dma_bytes long and no DMA runs before
+        // trigger START.
+        unsafe { core::ptr::write_bytes(area, 0, bytes) };
+    }
+    unsafe { component_data(_component) }.spkr_copies.store(0, Relaxed);
+    0
+}
+
+/// One S32 sample -> the float32 word the LEAP consumes, through the ceiling.
+fn spkr_f32_bits(sample: i32) -> u32 {
+    let scaled = ((sample as i64) * SPKR_CEILING_Q31) >> 31; // |scaled| <= SPKR_CEILING_Q31
+    SpkrEnc::f32_bits_of_scaled(scaled as i32)
+}
+
+/// Copy between userspace and the front-end buffers.  The speaker front-end
+/// converts and limits; the jack front-ends copy verbatim (their buffers are
+/// also mmap-able, this path serves read()/write()).
+unsafe extern "C" fn asoc_pcm_copy(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+    _channel: i32,
+    pos: usize,
+    iter: *mut bindings::iov_iter,
+    bytes: usize,
+) -> i32 {
+    let rtd = unsafe { substream_rtd(substream) };
+    if unsafe { rtd_is_be(rtd) } {
+        return EINVAL.to_errno();
+    }
+    let runtime = unsafe { (*substream).runtime };
+    let (area, dma_bytes) = unsafe { ((*runtime).dma_area, (*runtime).dma_bytes) };
+    if area.is_null() || pos.checked_add(bytes).map_or(true, |end| end > dma_bytes) {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: bounds checked against the managed buffer above.
+    let dst = unsafe { core::slice::from_raw_parts_mut(area.add(pos), bytes) };
+    let playback = unsafe { substream_is_playback(substream) };
+    if !playback {
+        // SAFETY: ALSA hands us a live iov_iter for the whole call.
+        let iov = unsafe { kernel::iov::IovIterDest::from_raw(iter) };
+        return if iov.copy_to_iter(dst) == bytes { 0 } else { EFAULT.to_errno() };
+    }
+    // SAFETY: as above.
+    let iov = unsafe { kernel::iov::IovIterSource::from_raw(iter) };
+    if unsafe { fe_index(rtd) } != Some(FE_SPKR) {
+        return if iov.copy_from_iter(dst) == bytes { 0 } else { EFAULT.to_errno() };
+    }
+    // S32_LE interleaved stereo in, float32 LE out, same byte count.
+    let data = unsafe { component_data(_component) };
+    let n_copy = data.spkr_copies.fetch_add(1, Relaxed);
+    let mut chunk = [0u8; 512];
+    let mut off = 0;
+    while off < bytes {
+        let n = core::cmp::min(chunk.len(), bytes - off) & !3;
+        if n == 0 {
+            return EINVAL.to_errno();
+        }
+        if iov.copy_from_iter(&mut chunk[..n]) != n {
+            return EFAULT.to_errno();
+        }
+        for (i, word) in chunk[..n].chunks_exact(4).enumerate() {
+            let sample = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            let bits = spkr_f32_bits(sample);
+            if n_copy == 0 && off == 0 && i == 0 {
+                dev_dbg!(data.dev, "spkr copy: pos {} bytes {} first sample {:#x} -> {:#x}\n", pos, bytes, sample, bits);
+            }
+            dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&bits.to_le_bytes());
+        }
+        off += n;
+    }
+    0
+}
+
 unsafe extern "C" fn asoc_pcm_trigger(
     _component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
@@ -1602,8 +1842,10 @@ static ASOC_COMPONENT: SyncCell<bindings::snd_soc_component_driver> = SyncCell(b
     open: Some(asoc_pcm_open),
     close: Some(asoc_pcm_close),
     hw_params: Some(asoc_pcm_hw_params),
+    prepare: Some(asoc_pcm_prepare),
     trigger: Some(asoc_pcm_trigger),
     pointer: Some(asoc_pcm_pointer),
+    copy: Some(asoc_pcm_copy),
     pcm_new: Some(asoc_pcm_new),
     pcm_free: Some(asoc_pcm_free),
     // SAFETY: all-zero is a valid (empty) component driver; the fields
@@ -1653,6 +1895,62 @@ unsafe extern "C" fn cout_dai_shutdown(substream: *mut bindings::snd_pcm_substre
     let data = unsafe { dai_data(dai) };
     data.jack_shutdown(unsafe { substream_is_playback(substream) });
 }
+
+unsafe extern "C" fn spkr_dai_startup(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+    let data = unsafe { dai_data(dai) };
+    match data.spkr_startup() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Atomic context: queue the sleeping start, or note the stop.
+unsafe extern "C" fn spkr_dai_trigger(_substream: *mut bindings::snd_pcm_substream, cmd: i32, dai: *mut bindings::snd_soc_dai) -> i32 {
+    let drv = unsafe { component_driver((*dai).component) };
+    match cmd as u32 {
+        bindings::SNDRV_PCM_TRIGGER_START
+        | bindings::SNDRV_PCM_TRIGGER_RESUME
+        | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
+            drv.data.spkr_want_run.store(1, Relaxed);
+            if let Some(work) = drv.spkr_start.as_ref() {
+                // Err = already queued: the pending run will see want_run.
+                let _ = workqueue::system().enqueue(work.clone());
+            }
+            0
+        }
+        bindings::SNDRV_PCM_TRIGGER_STOP
+        | bindings::SNDRV_PCM_TRIGGER_SUSPEND
+        | bindings::SNDRV_PCM_TRIGGER_PAUSE_PUSH => {
+            drv.data.spkr_want_run.store(0, Relaxed);
+            0
+        }
+        _ => EINVAL.to_errno(),
+    }
+}
+
+unsafe extern "C" fn spkr_dai_shutdown(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
+    let drv = unsafe { component_driver((*dai).component) };
+    drv.data.spkr_want_run.store(0, Relaxed);
+    if let Some(work) = drv.spkr_start.as_ref() {
+        // A start still queued or running must finish before the mute/pw0.
+        unsafe {
+            let raw = workqueue::Work::raw_get(&work.work);
+            bindings::flush_work(raw);
+        }
+    }
+    drv.data.spkr_shutdown();
+}
+
+static SPKR_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
+    startup: Some(spkr_dai_startup),
+    trigger: Some(spkr_dai_trigger),
+    shutdown: Some(spkr_dai_shutdown),
+    set_fmt: Some(dai_accept_fmt),
+    set_sysclk: Some(dai_accept_sysclk),
+    set_bclk_ratio: Some(dai_accept_bclk_ratio),
+    // SAFETY: zero is an empty ops table.
+    ..unsafe { core::mem::zeroed() }
+});
 
 static COUT_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
     startup: Some(cout_dai_startup),
@@ -1709,8 +2007,9 @@ const fn empty_stream() -> bindings::snd_soc_pcm_stream {
 /// of each 32-bit DMA word (macOS "slot: 32bits smpl: 24bits"): S24_LE.
 const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
 
-/// DAI table: [0] the cout back-end (DT index 0), then the front-end PCMs.
-static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 1 + FE_COUNT]> = SyncCell([
+/// DAI table: [0] the cout back-end (DT index 0), the front-end PCMs, then
+/// [4] the speaker back-end (DT index 4).
+static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 2 + FE_COUNT]> = SyncCell([
     bindings::snd_soc_dai_driver {
         name: c"cout".as_ptr(),
         id: BE_DAI_ID_COUT,
@@ -1734,7 +2033,8 @@ static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 1 + FE_COUNT]> = SyncC
         name: c"j700-pcm-1".as_ptr(),
         id: FE_DAI_ID_BASE + 1,
         ops: &FE_DAI_OPS.0,
-        playback: pcm_stream(c"PCM1 TX", OUT_FORMATS),
+        // the speaker front-end: S32 in, converted through the ceiling
+        playback: pcm_stream(c"PCM1 TX", FMTBIT_S32_LE),
         capture: empty_stream(),
         ..unsafe { core::mem::zeroed() }
     },
@@ -1746,6 +2046,16 @@ static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 1 + FE_COUNT]> = SyncC
         capture: pcm_stream(c"PCM2 RX", OUT_FORMATS),
         ..unsafe { core::mem::zeroed() }
     },
+    // The internal speaker back-end: LEAP TX0 under the AOP spkr service,
+    // the MAX98360A's SD_MODE driven by its own codec driver.
+    bindings::snd_soc_dai_driver {
+        name: c"spkr".as_ptr(),
+        id: BE_DAI_ID_SPKR,
+        ops: &SPKR_DAI_OPS.0,
+        playback: pcm_stream(c"SPKR TX", FMTBIT_S32_LE),
+        capture: empty_stream(),
+        ..unsafe { core::mem::zeroed() }
+    },
 ]);
 
 struct LpmicDriver {
@@ -1753,6 +2063,7 @@ struct LpmicDriver {
     data: Arc<LpmicData>,
     asoc_registered: bool,
     speaker_work: Option<Arc<SpkrToneWork>>,
+    spkr_start: Option<Arc<SpkrStartWork>>,
 }
 
 impl LpmicDriver {
@@ -1787,11 +2098,20 @@ impl LpmicDriver {
     };
 
     fn new(data: Arc<LpmicData>) -> Result<Self> {
+        let start_data = data.clone();
+        let spkr_start = Arc::pin_init(
+            pin_init!(SpkrStartWork {
+                data: start_data,
+                work <- new_work!("SpkrStartWork::work"),
+            }),
+            GFP_KERNEL,
+        )?;
         let mut this = LpmicDriver {
             card: ptr::null_mut(),
             data: data.clone(),
             asoc_registered: false,
             speaker_work: None,
+            spkr_start: Some(spkr_start),
         };
         let ret = unsafe {
             bindings::snd_card_new(
@@ -1895,9 +2215,18 @@ impl Drop for LpmicDriver {
         if self.asoc_registered {
             unsafe { bindings::snd_soc_unregister_component_by_driver(self.data.dev.as_raw(), ptr::null()) };
         }
-        let pd = self.data.pd_mca1.xchg(0, Relaxed);
-        if pd != 0 {
-            unsafe { bindings::dev_pm_domain_detach(pd as *mut bindings::device, true) };
+        if let Some(work) = self.spkr_start.take() {
+            self.data.spkr_want_run.store(0, Relaxed);
+            unsafe {
+                let raw = workqueue::Work::raw_get(&work.work);
+                bindings::flush_work(raw);
+            }
+        }
+        for slot in [&self.data.pd_mca1, &self.data.pd_tx0, &self.data.pd_leap_mca] {
+            let pd = slot.xchg(0, Relaxed);
+            if pd != 0 {
+                unsafe { bindings::dev_pm_domain_detach(pd as *mut bindings::device, true) };
+            }
         }
         if !self.card.is_null() {
             unsafe {
@@ -1983,6 +2312,11 @@ impl platform::Driver for LpmicDriver {
                 cin_sequence: Atomic::new(0),
                 cin_running: Atomic::new(0),
                 pd_mca1: Atomic::new(0),
+                pd_tx0: Atomic::new(0),
+                pd_leap_mca: Atomic::new(0),
+                spkr_running: Atomic::new(0),
+                spkr_want_run: Atomic::new(0),
+                spkr_copies: Atomic::new(0),
                 fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
                 stream <- new_spinlock!(StreamState {
                     substream: ptr::null_mut(),
@@ -2012,6 +2346,16 @@ impl platform::Driver for LpmicDriver {
             Ok(p) if !p.is_null() => data.pd_mca1.store(p as usize, Relaxed),
             Ok(_) => dev_warn!(dev, "no mca1 power domain: the jack path will not power its serializer\n"),
             Err(e) => dev_warn!(dev, "mca1 power domain attach failed: {:?}\n", e),
+        }
+        // The speaker path's LEAP leaves (tx0 -> leap_c -> leap_a -> audio_fr
+        // -> audio_a, leap_mca -> audio_p), runtime-powered around streams.
+        for (name, slot) in [(c"tx0", &data.pd_tx0), (c"mca", &data.pd_leap_mca)] {
+            let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), name.as_ptr()) };
+            match kernel::error::from_err_ptr(pd) {
+                Ok(p) if !p.is_null() => slot.store(p as usize, Relaxed),
+                Ok(_) => dev_warn!(dev, "no {:?} power domain: the speaker path is unavailable\n", name),
+                Err(e) => dev_warn!(dev, "{:?} power domain attach failed: {:?}\n", name, e),
+            }
         }
         if *module_parameters::spkr_test.value() != 0 {
             match data.speaker_zero_dma_test(SpkrWave::Silence) {
