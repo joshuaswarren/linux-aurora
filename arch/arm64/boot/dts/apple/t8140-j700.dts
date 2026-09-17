@@ -544,5 +544,21 @@
 				sound-dai = <&jack_codec>;
 			};
 		};
+
+		/*
+		 * Internal speakers: the AOP's LEAP TX0 (spkr service) into the
+		 * MAX98360A, whose SD_MODE the codec driver drives.  The CPU DAI
+		 * fixes the digital level at -20 dBFS on the wire.
+		 */
+		dai-link@1 {
+			link-name = "Speaker";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+			codec {
+				sound-dai = <&speaker_amp>;
+			};
+		};
 	};
 };
