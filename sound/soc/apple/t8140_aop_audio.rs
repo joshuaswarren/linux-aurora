@@ -22,9 +22,9 @@
 //!   The macaudio J700 variant links them to the codecs.
 //!
 //! The speaker front-end is copy-only: the LEAP consumes float32 and the
-//! driver converts each S32 sample through a fixed digital ceiling and the
-//! "Speaker Playback Volume" control, so the amplifier can never receive
-//! more than -20 dBFS on the wire.
+//! driver converts each S32 sample through the amplifier's full scale and
+//! the "Speaker Playback Volume" control, which the card's volume lock holds
+//! 20 dB down whenever no speaker-protection daemon owns it.
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
@@ -932,20 +932,19 @@ const FE_SPKR: usize = 1;
 const FMTBIT_S32_LE: u64 = 1 << 10;
 
 /// Digital ceiling of the speaker path, as a Q31 gain applied to every
-/// sample userspace writes: 0.05 = -26 dB.
+/// sample userspace writes: 0.5, the amplifier's full scale.
 ///
 /// Measured at the SpeakerTap on 2026-09-17 (hb51, amp off), the words on the
 /// speaker wire are exactly `2 × float × 2^31` -- a float of 6 791 000/2^31
 /// came back as a clean 1 kHz sine with peak 13 582 000 and nothing else in
-/// the path.  So a full-scale S32 sample scaled by 0.05 reaches the MAX98360A
-/// as 0.1 × 2^31: the wire never exceeds **-20 dBFS**.  At that level a
-/// MAX98360A (about 3 W full scale at 5 V into 4 Ω) delivers ~30 mW, an order
-/// of magnitude under the rating of any laptop micro-speaker, indefinitely,
-/// without a thermal model.  Apple's own bring-up profile of this speaker's
-/// CoreAudio graph (DEVICE_BRING_UP in the AID44 tuning) does the same thing:
-/// it replaces the loudspeaker manager with a plain -20 dB gain.
-/// Raising this needs a signal-domain protection model fed by the tap.
-const SPKR_CEILING_Q31: i64 = 107_374_182;
+/// the path.  A float of 0.5 is therefore the I2S full scale (0 dBFS on the
+/// wire, 7.3 V peak at the MAX98360A's output on the J700) and anything
+/// above it would wrap.  Protection is the userspace daemon's job, exactly
+/// as on the other Apple laptops: it owns "Speaker Playback Volume" and
+/// governs it from the sense stream with the speaker's thermal model; when
+/// no daemon holds the lock, macaudio keeps the control 20 dB down (the
+/// level Apple's own bring-up profile of this speaker uses).
+const SPKR_CEILING_Q31: i64 = 1 << 30;
 
 /// "Speaker Playback Volume": the software gain below the ceiling that the
 /// speaker-protection daemon and the card's volume lock drive, 0.5 dB per
@@ -954,22 +953,22 @@ const SPKR_CEILING_Q31: i64 = 107_374_182;
 const SPKR_VOLUME_MAX: u32 = 127;
 const _: () = assert!(SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64 == SPKR_CEILING_Q31);
 const SPKR_VOLUME_Q31: [u32; 128] = [
-            0,     76015,     80519,     85290,     90344,     95697,    101368,    107374,
-       113737,    120476,    127614,    135176,    143186,    151670,    160657,    170177,
-       180260,    190941,    202255,    214240,    226934,    240381,    254624,    269712,
-       285693,    302622,    320553,    339547,    359666,    380978,    403552,    427464,
-       452793,    479623,    508042,    538146,    570033,    603809,    639587,    677485,
-       717629,    760151,    805193,    852903,    903441,    956973,   1013678,   1073742,
-      1137365,   1204758,   1276145,   1351761,   1431858,   1516701,   1606571,   1701766,
-      1802602,   1909413,   2022553,   2142397,   2269342,   2403809,   2546243,   2697118,
-      2856932,   3026216,   3205530,   3395470,   3596664,   3809780,   4035523,   4274643,
-      4527932,   4796229,   5080423,   5381457,   5700328,   6038094,   6395874,   6774853,
-      7176288,   7601510,   8051928,   8529034,   9034412,   9569734,  10136776,  10737418,
-     11373650,  12047581,  12761445,  13517609,  14318577,  15167006,  16065708,  17017661,
-     18026021,  19094130,  20225528,  21423966,  22693416,  24038085,  25462431,  26971175,
-     28569318,  30262156,  32055302,  33954698,  35966640,  38097797,  40355234,  42746432,
-     45279317,  47962285,  50804229,  53814569,  57003283,  60380940,  63958735,  67748529,
-     71762881,  76015099,  80519277,  85290344,  90344115,  95697340, 101367764, 107374182,
+             0,     760151,     805193,     852903,     903441,     956973,    1013678,    1073742,
+       1137365,    1204758,    1276145,    1351761,    1431858,    1516701,    1606571,    1701766,
+       1802602,    1909413,    2022553,    2142397,    2269342,    2403809,    2546243,    2697118,
+       2856932,    3026216,    3205530,    3395470,    3596664,    3809780,    4035523,    4274643,
+       4527932,    4796229,    5080423,    5381457,    5700328,    6038094,    6395874,    6774853,
+       7176288,    7601510,    8051928,    8529034,    9034412,    9569734,   10136776,   10737418,
+      11373650,   12047581,   12761445,   13517609,   14318577,   15167006,   16065708,   17017661,
+      18026021,   19094130,   20225528,   21423966,   22693416,   24038085,   25462431,   26971175,
+      28569318,   30262156,   32055302,   33954698,   35966640,   38097798,   40355234,   42746432,
+      45279317,   47962285,   50804230,   53814569,   57003283,   60380940,   63958736,   67748529,
+      71762882,   76015100,   80519278,   85290345,   90344115,   95697341,  101367765,  107374182,
+     113736503,  120475814,  127614455,  135176087,  143185773,  151670064,  160657080,  170176611,
+     180260209,  190941298,  202255281,  214239660,  226934158,  240380852,  254624313,  269711752,
+     285693178,  302621563,  320553018,  339546978,  359666402,  380977976,  403552340,  427464319,
+     452793173,  479622855,  508042296,  538145694,  570032831,  603809400,  639587356,  677485290,
+     717628817,  760150998,  805192776,  852903448,  903441154,  956973408, 1013677647, 1073741824,
 ];
 /// The component's only "register": the speaker volume.
 const REG_SPKR_VOLUME: u32 = 0;
@@ -1313,7 +1312,7 @@ fn f32_bits_of_q31(v: i32) -> u32 {
 /// One S32 sample -> the float32 word the LEAP consumes, through the volume
 /// table (whose top entry is the ceiling).
 fn spkr_f32_bits(sample: i32, gain_q31: u32) -> u32 {
-    let scaled = ((sample as i64) * gain_q31 as i64) >> 31; // |scaled| <= SPKR_CEILING_Q31
+    let scaled = ((sample as i64) * gain_q31 as i64) >> 31; // |scaled| < SPKR_CEILING_Q31
     f32_bits_of_q31(scaled as i32)
 }
 
