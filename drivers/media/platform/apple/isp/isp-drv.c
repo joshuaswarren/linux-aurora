@@ -416,6 +416,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 			err = PTR_ERR(isp->wdt);
 			goto detach_genpd;
 		}
+		apple_isp_wdt_init(isp);
 	}
 
 	isp->irq = platform_get_irq(pdev, 0);
@@ -426,15 +427,6 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (!isp->irq) {
 		err = -ENODEV;
 		goto detach_genpd;
-	}
-	if (isp->hw->gen == ISP_GEN_T8140) {
-		for (int i = 1; i < ARRAY_SIZE(isp->extra_irqs) + 1; i++) {
-			int irq = platform_get_irq_optional(pdev, i);
-
-			if (irq <= 0)
-				break;
-			isp->extra_irqs[isp->num_extra_irqs++] = irq;
-		}
 	}
 
 	mutex_init(&isp->iovad_lock);
@@ -474,13 +466,15 @@ static int apple_isp_probe(struct platform_device *pdev)
 	err = apple_isp_setup_video(isp);
 	if (err) {
 		dev_err(dev, "failed to register video device: %d\n", err);
-		goto free_surface;
+		goto halt_firmware;
 	}
 
 	dev_info(dev, "apple-isp probe!\n");
 
 	return 0;
 
+halt_firmware:
+	apple_isp_firmware_halt(isp);
 free_surface:
 	pm_runtime_disable(dev);
 	apple_isp_free_firmware_surface(isp);
@@ -498,6 +492,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 	struct apple_isp *isp = platform_get_drvdata(pdev);
 
 	apple_isp_remove_video(isp);
+	apple_isp_firmware_halt(isp);
 	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
@@ -719,7 +714,6 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 
 	.mbox2_offset = 0x410,
 	.asc_control = ISP_COPROC_CONTROL_T8140,
-	.asc_status = ISP_COPROC_STATUS_T8140,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.identity = apple_isp_identity_t8140,
 	.num_identity = ARRAY_SIZE(apple_isp_identity_t8140),

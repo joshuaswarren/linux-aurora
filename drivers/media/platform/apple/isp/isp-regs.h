@@ -47,8 +47,10 @@
 #define ISP_MBOX2_IRQ_DOORBELL    0x00
 #define ISP_MBOX2_IRQ_ACK         0x0c
 
-/* t8140: doorbell/ack live at mbox+0x410 (apple_isp_hw.mbox2_offset) and
- * three more enable words plus a steering write accompany IRQ_ENABLE (+0x8). */
+/*
+ * t8140: doorbell/ack live at mbox+0x410 (apple_isp_hw.mbox2_offset) and two
+ * more enable words plus a steering write accompany IRQ_ENABLE (+0x8).
+ */
 #define ISP_MBOX_IRQ_ENABLE_T8140   0x08
 #define ISP_MBOX_IRQ_ENABLE1_T8140  0x18
 #define ISP_MBOX_IRQ_ENABLE2_T8140  0x38
@@ -57,8 +59,10 @@
 #define ISP_MBOX_IRQ_ENABLE2_T8140_VAL 0x700000
 #define ISP_MBOX_IRQ_STEER_T8140_VAL   0x8
 
-/* EIC "mmio-wd-isp" window: kicked at 30 Hz while the sensor streams, or
- * the H17 firmware masks every frame with its diagnostic fill. */
+/*
+ * EIC "mmio-wd-isp" window: kicked at 30 Hz while the sensor streams, or the
+ * H17 firmware masks every frame with its diagnostic fill.
+ */
 #define ISP_WDT_KICK       0x00
 #define ISP_WDT_RELOAD     0x08
 #define ISP_WDT_CLEAR      0x0c
@@ -74,8 +78,6 @@
 #define ISP_GPIO_6	       0x18
 #define ISP_GPIO_7	       0x1c
 #define ISP_GPIO_CLOCK_EN      0x20
-/* t8140: GPIO6 carries the ISP17a boot-mode field, set to 1 before release */
-#define ISP_GPIO_BOOT_MODE_T8140 ISP_GPIO_6
 
 static inline u32 isp_mbox_read32(struct apple_isp *isp, u32 reg)
 {
