@@ -64,6 +64,11 @@ enum macaudio_amp_type {
 	AMP_TAS5770,
 	AMP_SN012776,
 	AMP_SSM3515,
+	/*
+	 * A fixed-gain amplifier with no controls of its own; the volume is
+	 * the CPU DAI's software gain below its fixed ceiling (J700).
+	 */
+	AMP_MAX98360A,
 };
 
 enum macaudio_spkr_config {
@@ -102,6 +107,7 @@ static const char *volume_control_names[] = {
 	[AMP_TAS5770] = "* Speaker Playback Volume",
 	[AMP_SN012776] = "* Speaker Volume",
 	[AMP_SSM3515] = "* DAC Playback Volume",
+	[AMP_MAX98360A] = "* Speaker Playback Volume",
 };
 
 #define SN012776_0DB 201
@@ -112,6 +118,10 @@ static const char *volume_control_names[] = {
 
 #define SSM3515_0DB (255 - 64) /* +24dB max, steps of 3/8 dB */
 #define SSM3515_DB(x) (SSM3515_0DB + (8 * (x) / 3))
+
+/* t8140-aop-audio "Speaker Playback Volume": 0.5 dB steps, 127 = the ceiling */
+#define MAX98360A_0DB 127
+#define MAX98360A_DB(x) (MAX98360A_0DB + 2 * (x))
 
 struct ma_codec_idle {
 	int idle_mode;
@@ -274,6 +284,12 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			max = SSM3515_0DB;
 		else
 			max = SSM3515_DB(ma->cfg->safe_vol);
+		break;
+	case AMP_MAX98360A:
+		if (unlock)
+			max = MAX98360A_0DB;
+		else
+			max = MAX98360A_DB(ma->cfg->safe_vol);
 		break;
 	}
 
@@ -1017,7 +1033,7 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 		 * amplifier with no TDM interface (J700's MAX98360A, whose
 		 * frame the AOP firmware fixes).
 		 */
-		if (ret == -ENOTSUPP && (props->is_headphones || ma->cfg->amp == AMP_NONE))
+		if (ret == -ENOTSUPP && (props->is_headphones || ma->cfg->amp == AMP_MAX98360A))
 			return 0;
 
 		return ret;
@@ -1317,10 +1333,10 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 
 		/* TODO: HPF, needs new call to set */
 		break;
-	case AMP_NONE:
+	case AMP_MAX98360A:
 		/*
-		 * MAX98360A (J700): a fixed-gain amplifier with no controls.
-		 * The level limit is the CPU DAI's fixed digital ceiling.
+		 * A fixed-gain amplifier with no controls of its own; the
+		 * volume control lives on the CPU DAI, below its ceiling.
 		 */
 		break;
 	default:
@@ -1606,14 +1622,17 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
  */
 struct macaudio_platform_cfg macaudio_j700_cfg = {
 	/*
-	 * One MAX98360A per channel on the AOP's LEAP TX0.  No sense lines,
-	 * no amplifier controls: the speaker path is safe because the CPU
-	 * DAI (t8140-aop-audio) limits every sample to -20 dBFS on the wire.
+	 * One MAX98360A per channel on the AOP's LEAP TX0.  No sense lines
+	 * and no amplifier controls: the CPU DAI (t8140-aop-audio) limits
+	 * every sample to -20 dBFS on the wire and provides the "Speaker
+	 * Playback Volume" below that, which the volume lock holds 20 dB
+	 * down until the protection daemon takes it.
 	 */
 	.enable_speakers = true,
-	.amp = AMP_NONE,
+	.amp = AMP_MAX98360A,
 	.speakers = SPKR_1W,
 	.stereo = true,
+	.safe_vol = -20,
 	.spk_out_widget = "Speaker",
 	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
 	.primary_bclk_ratio = 125,
