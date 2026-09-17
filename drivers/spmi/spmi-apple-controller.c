@@ -471,7 +471,7 @@ static int apple_spmi_probe(struct platform_device *pdev)
 
 	dev_info(&pdev->dev,
 		 "J700_HPM_SPMI_READY: irq=%d status=%08x\n",
-		 spmi->irq, readl(spmi->regs + spmi->hw->status_reg));
+		 spmi->irq, readl(spmi->regs + SPMI_STATUS_REG));
 
 	return 0;
 }
