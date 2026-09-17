@@ -10,7 +10,12 @@
 //! this module only validates and encodes them.
 
 pub(crate) const COMPUTE_DESCRIPTOR_SIZE: usize = 0x4000;
+/// Registers a kick with no SCS scratch request emits.
 pub(crate) const COMPUTE_REGISTER_COUNT: usize = 40;
+/// One more slot for the SCS enable register `generateCLRegisterListG16Common`
+/// PREPENDS when the descriptor carries a non-zero scratch request
+/// (mac17p `0xfffffe0008a5fa90`..`0xfffffe0008a5fac8`).
+pub(crate) const COMPUTE_REGISTER_MAX: usize = COMPUTE_REGISTER_COUNT + 1;
 pub(crate) const COMPUTE_REGISTER_CAPACITY: usize = 128;
 pub(crate) const COMPUTE_REGISTER_SIZE: usize = 0x0c;
 pub(crate) const COMPUTE_QUEUE_GRAPH_SIZE: usize = 0x8000;
@@ -22,9 +27,28 @@ pub(crate) const COMPUTE_CHANNEL_WRITE_INDEX: u32 = 3;
 pub(crate) const COMPUTE_QUEUE_POINTERS: usize = 0x100;
 const COMPUTE_QUEUE_CONTEXT_ITEM: usize = 0x200;
 pub(crate) const COMPUTE_ITEM_RING: usize = 0x4000;
-pub(crate) const COMPUTE_OPTIONAL: usize = 0x5000;
-pub(crate) const COMPUTE_EVENT: usize = 0x5400;
-const _: () = assert!(COMPUTE_REGISTER_COUNT <= COMPUTE_REGISTER_CAPACITY);
+pub(crate) const COMPUTE_ITEM_RING_SIZE: usize = 0x500 * 8;
+pub(crate) const COMPUTE_OPTIONAL: usize = 0x6800;
+pub(crate) const COMPUTE_EVENT: usize = 0x6c00;
+/// Storage for the tag-14 `KsmKickQueueAddKicks` channel command.
+///
+/// Native allocates this record from a firmware-owned pool
+/// (`AGXFirmware::requestChannelCommandKSMKickQueueAddKicks`,
+/// mac17p `0xfffffe0008a2d664`). Linux keeps one retained slot per queue graph,
+/// placed after the tag-16 window exactly as tags 15 and 16 are placed after the
+/// command-pointer ring. A000 `0xfffffc0000011710` cache-invalidates `0x18`
+/// bytes of the record before reading it, so the reserved window is zeroed as a
+/// whole even though the host writes only `0x15` bytes.
+/// Records one steady-state submission publishes into the item ring:
+/// the tag-3 command pointer, tag 15, tag 14, tag 16.
+pub(crate) const COMPUTE_REPEAT_RING_RECORD_COUNT: usize = 4;
+pub(crate) const COMPUTE_ADD_KICKS: usize = 0x7000;
+pub(crate) const COMPUTE_ADD_KICKS_SIZE: usize = 0x40;
+const _: () = assert!(COMPUTE_ITEM_RING + COMPUTE_ITEM_RING_SIZE <= COMPUTE_OPTIONAL);
+const _: () = assert!(COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE <= COMPUTE_EVENT);
+const _: () = assert!(COMPUTE_EVENT + COMPUTE_EVENT_SIZE <= COMPUTE_ADD_KICKS);
+const _: () = assert!(COMPUTE_ADD_KICKS + COMPUTE_ADD_KICKS_SIZE <= COMPUTE_QUEUE_GRAPH_SIZE);
+const _: () = assert!(COMPUTE_REGISTER_MAX <= COMPUTE_REGISTER_CAPACITY);
 
 const COMPUTE_SELECTOR: u32 = 3;
 const COMPUTE_REGISTER_START: usize = 0x40;
@@ -142,6 +166,14 @@ pub(crate) struct ScsRequestRegisters {
     pub(crate) extras: u64,
     /// 0x107a1: window and enable, or the disabled constant.
     pub(crate) window_word: u64,
+    /// `AGXCLCommandDescriptor+0x5c8`, which `processComputeSetup` sets to
+    /// `pages != 0` (mac17p `0xfffffe0008a07ab8`..`0xfffffe0008a07ac0`).
+    /// `generateCLRegisterListG16Common` branches on it twice: once to prepend
+    /// register `0x17d9 = 1` (`0xfffffe0008a5fa90`) and once to choose the
+    /// 0x107a0 value (`0xfffffe0008a60280`).  The three request registers alone
+    /// do NOT tell the two arms apart, so carry the flag rather than inferring
+    /// it from a value.
+    pub(crate) enabled: bool,
 }
 
 /// The MiB half of the SCS request, derived from the page count exactly as
@@ -171,6 +203,7 @@ pub(crate) fn scs_request_registers(
             size_word: 0,
             extras: 0,
             window_word: 0xff_0000,
+            enabled: false,
         });
     }
     // Keep the page and MiB halves distinct, and the window below bit 24's
@@ -184,22 +217,56 @@ pub(crate) fn scs_request_registers(
         size_word: (pages as u64) | ((mib as u64) << 16),
         extras: extras as u64,
         window_word: ((window as u64) << 16) | 0x0100_0000,
+        enabled: true,
     })
 }
 
-/// Build the complete 40-write compute register program.
+/// One compute kick's primary register program.
+///
+/// The length is not fixed: `generateCLRegisterListG16Common` emits one extra
+/// leading register when the descriptor carries an SCS scratch request, so the
+/// descriptor's own count word at `COMPUTE_PRIMARY_COUNT` has to follow.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct ComputeRegisterProgram {
+    registers: [ComputeRegister; COMPUTE_REGISTER_MAX],
+    len: usize,
+}
+
+impl ComputeRegisterProgram {
+    pub(crate) fn as_slice(&self) -> &[ComputeRegister] {
+        &self.registers[..self.len]
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Build the compute register program, taking the SCS request from the module
+/// parameters.
 pub(crate) fn build_compute_registers(
     p: ComputeRegisterParameters,
-) -> Result<[ComputeRegister; COMPUTE_REGISTER_COUNT], ComputeBuildError> {
-    let context_word = ((p.context_id as u64) << 8) | p.work_ordinal as u64;
+) -> Result<ComputeRegisterProgram, ComputeBuildError> {
     let scs = scs_request_registers(
         *crate::module_parameters::g17p_compute_scs_pages.value(),
         *crate::module_parameters::g17p_compute_scs_mib.value(),
         *crate::module_parameters::g17p_compute_scs_extras.value(),
         *crate::module_parameters::g17p_compute_scs_window.value(),
     )?;
+    build_compute_registers_with_scs(p, scs)
+}
 
-    Ok([
+/// The register program for an explicit SCS request.
+///
+/// Split out of `build_compute_registers` so the enabled arm is reachable from
+/// a host test without a module parameter.
+pub(crate) fn build_compute_registers_with_scs(
+    p: ComputeRegisterParameters,
+    scs: ScsRequestRegisters,
+) -> Result<ComputeRegisterProgram, ComputeBuildError> {
+    let context_word = ((p.context_id as u64) << 8) | p.work_ordinal as u64;
+
+    let body = [
         ComputeRegister::new(0x1a510, p.preempt_base),
         ComputeRegister::new(0x1a420, p.cdm_base),
         ComputeRegister::new(0x1a4d0, add(p.preempt_base, 0x1480)?),
@@ -223,7 +290,37 @@ pub(crate) fn build_compute_registers(
         ComputeRegister::new(0x0d479, scs.extras),
         ComputeRegister::new(0x1a0e9, 8),
         ComputeRegister::new(0x107a1, scs.window_word),
-        ComputeRegister::new(0x0a599, 0x0000_0132_0040_0020),
+        // `A[47:32]` is the per-thread private-context ("PTC"/DUPM) maximum.
+        // `generateCLRegisterListG16Common` builds this value twice and both
+        // times from the same accelerator constant, so the two emissions are
+        // always equal; this driver's 0x132 was not:
+        //
+        //   first emission  `0xfffffe0008a6030c`: reads
+        //     `AGXCLCommandDescriptor+0x548` and emits
+        //     `CL[0x548] ? 0x0040_0020 | CL[0x548] << 32
+        //                : 0x0000_0060_0040_0020` (`0xfffffe0008a6032c`);
+        //   second emission `0xfffffe0008a60b4c`: reads the accelerator fields
+        //     directly -- `accel[0x10790] ? (u32)accel[0x10790]
+        //                                 : accel[0x10778]` -- and applies the
+        //     identical expression (`0xfffffe0008a60b7c`).
+        //
+        // `CL+0x548` is seeded from `AGXUMADataRec+0x88`
+        // (`AGXCLCommandDescriptor::prepare`, `0xfffffe00089fb85c`), which
+        // `AGXUSCPrivMemPoolUMA::allocatePagesEnd` fills with that same
+        // `accel[0x10790] ?: accel[0x10778]` (`0xfffffe0008aa7688`..
+        // `0xfffffe0008aa76a0`).
+        //
+        // For G17P that constant is 0x60: `AGXAcceleratorG16::configureDevice`
+        // stores `accel[0x10778] = 0x60` unconditionally
+        // (`0xfffffe0008a55688`: `mov w8, #0x60`; `0xfffffe0008a5568c`:
+        // `str w8, [x21, #0x1b8]`, x21 = accel+0x105c0), and
+        // `AGXAcceleratorG17P::configureDevice` calls it as its first
+        // instruction (`0xfffffe0008a64df8`).  Nothing in com.apple.AGXG17P
+        // writes `accel[0x10790]`, so the `?:` selects `accel[0x10778]`, and
+        // Apple's own zero-source fallback constant in the same expression is
+        // literally `0x60` -- the two agree.  The render lists already emit
+        // `0x0000_0060_0040_0020` for their analogues 0x0a5a1 and 0x0a5a9.
+        ComputeRegister::new(0x0a599, 0x0000_0060_0040_0020),
         ComputeRegister::new(0x0d411, 0x0000_0002_0000_0001),
         ComputeRegister::new(0x1a540, p.dispatch_identity),
         ComputeRegister::new(0x014a9, p.dispatch_identity),
@@ -240,7 +337,43 @@ pub(crate) fn build_compute_registers(
         ComputeRegister::new(0x0a5c9, add(p.operand_state_base, 0x9000)?),
         ComputeRegister::new(0x1a440, 0x0000_0001_5402_4209),
         ComputeRegister::new(0x0a599, 0x0000_0060_0040_0020),
-    ])
+    ];
+
+    // `generateCLRegisterListG16Common` writes its first register list entry
+    // at buffer offset 0 only when `AGXCLCommandDescriptor+0x5c8` is clear.
+    // When it is set the first entry is `0x17d9 = 1` and everything else moves
+    // up by one 12-byte entry (mac17p `0xfffffe0008a5fa90` takes the branch,
+    // `0xfffffe0008a5faa0` ORs the selector `0x17d9` into the entry word,
+    // `0xfffffe0008a5fab0` stores the value 1, `0xfffffe0008a5fac4` sets the
+    // cursor to 12 so `0x1a510` lands at entry 1; the clear arm at
+    // `0xfffffe0008a5facc` sets the cursor to 0 instead).  The TA and 3D list
+    // builders do the same thing with the same selector and value, each gated
+    // on its own descriptor flag (`0xfffffe0008a585b8` on TA `+0x598`,
+    // `0xfffffe0008a5a84c` on 3D `+0xb70`).
+    //
+    // This driver had never emitted `0x17d9`, which is the only difference
+    // left between its `g17p_compute_scs_pages=1` program and the kext's: that
+    // run already sent the byte-exact 0x101d1 / 0xd479 / 0x107a1 triple and its
+    // shader still never launched.  That `0x17d9` is what the launch was
+    // waiting on is an INFERENCE, not a measured result.
+    //
+    // What `0x17d9` means to the hardware is not established either.  None of
+    // the selectors this program emits appears as an immediate anywhere in the
+    // B100 firmware image (checked 0x17d8/0x17d9, 0x101d0, 0xd478, 0x107a0,
+    // 0xa598, 0x1a510, 0x14070 and 0x1748), so the firmware replays the list
+    // rather than interpreting it and the meaning is the GPU's, not the
+    // firmware's.
+    let mut registers = [ComputeRegister::new(0, 0); COMPUTE_REGISTER_MAX];
+    let mut len = 0;
+    if scs.enabled {
+        registers[len] = ComputeRegister::new(0x17d9, 1);
+        len += 1;
+    }
+    for register in body {
+        registers[len] = register;
+        len += 1;
+    }
+    Ok(ComputeRegisterProgram { registers, len })
 }
 
 fn put_u8(raw: &mut [u8], offset: usize, value: u8) {
@@ -573,12 +706,13 @@ fn register_value(registers: &[ComputeRegister], number: u32, occurrence: usize)
 /// Encode a selector-3 descriptor without dropping sampler, timestamp, or CDM
 /// command state.
 pub(crate) fn build_compute_descriptor(
-    registers: &[ComputeRegister; COMPUTE_REGISTER_COUNT],
+    program: &ComputeRegisterProgram,
     objects: ComputeDescriptorObjects,
     metadata: ComputeDescriptorMetadata,
     command: ComputeDescriptorCommand,
     raw: &mut [u8],
 ) -> Result<(), ComputeBuildError> {
+    let registers = program.as_slice();
     if raw.len() < COMPUTE_DESCRIPTOR_SIZE {
         return Err(ComputeBuildError::BufferTooSmall);
     }
@@ -617,11 +751,14 @@ pub(crate) fn build_compute_descriptor(
         0x740,
         add(objects.descriptor_low_alias, COMPUTE_REGISTER_START as u64)?,
     );
+    // The count word follows the program, which grows by one entry when the
+    // kick carries an SCS request -- exactly as the kext's own
+    // `[sp,#0x58]`/`[sp,#0x5a]` byte-size and entry-count pair does
+    // (`0xfffffe0008a5fab4` seeds them with 12 and 1 on the request arm).
     put_u32(
         raw,
         COMPUTE_PRIMARY_COUNT,
-        ((COMPUTE_REGISTER_COUNT * COMPUTE_REGISTER_SIZE) as u32) << 16
-            | COMPUTE_REGISTER_COUNT as u32,
+        ((program.len() * COMPUTE_REGISTER_SIZE) as u32) << 16 | program.len() as u32,
     );
 
     let secondary = [
@@ -721,12 +858,73 @@ mod tests {
 
     #[test]
     fn register_program_matches_the_hardware_tested_m1n1_builder() {
-        let registers = build_compute_registers(register_parameters()).unwrap();
+        let program = build_compute_registers(register_parameters()).unwrap();
+        let registers = program.as_slice();
+        assert_eq!(program.len(), COMPUTE_REGISTER_COUNT);
         let mut raw = [0u8; COMPUTE_REGISTER_COUNT * COMPUTE_REGISTER_SIZE];
-        encode_registers(&mut raw, 0, &registers);
-        assert_eq!(fnv1a64(&raw), 0xc2e9_a727_fcf7_d740);
+        encode_registers(&mut raw, 0, registers);
+        // Re-pinned when 0x0a599's first emission was corrected from 0x132
+        // to the 0x60 both of the kext's emissions carry.
+        assert_eq!(fnv1a64(&raw), 0x2d33_2bc4_ecd2_8bdd);
         assert_eq!(registers[0], ComputeRegister::new(0x1a510, 0x100_0404_0000));
         assert_eq!(registers[39], ComputeRegister::new(0x0a599, 0x6000_4000_20));
+    }
+
+    #[test]
+    fn both_0xa599_emissions_carry_the_same_accelerator_constant() {
+        // `generateCLRegisterListG16Common` reads one accelerator quantity for
+        // both 0xa598 emissions (`0xfffffe0008a6030c` through
+        // `AGXCLCommandDescriptor+0x548`, and `0xfffffe0008a60b4c` straight
+        // from `accel[0x10790] ?: accel[0x10778]`), so they cannot disagree.
+        // This driver's two writes did; the first carried 0x132.
+        let program = build_compute_registers(register_parameters()).unwrap();
+        let first = register_value(program.as_slice(), 0x0a599, 0);
+        let second = register_value(program.as_slice(), 0x0a599, 1);
+        assert_eq!(first, second);
+        // 0x60 is `AGXAcceleratorG16::configureDevice`'s
+        // `accel[0x10778] = 0x60` (`0xfffffe0008a5568c`), and also the kext's
+        // own zero-source fallback constant in the same expression.
+        assert_eq!(first, 0x0000_0060_0040_0020);
+    }
+
+    #[test]
+    fn an_scs_request_prepends_the_0x17d9_enable_register() {
+        let scs = scs_request_registers(89, 1, 0, 0).unwrap();
+        assert!(scs.enabled);
+        let program =
+            build_compute_registers_with_scs(register_parameters(), scs).unwrap();
+        assert_eq!(program.len(), COMPUTE_REGISTER_MAX);
+        // Entry 0 is the enable register, and the historical program follows
+        // it unchanged -- the kext moves its cursor to 12 before writing
+        // 0x1a510 (`0xfffffe0008a5fac4`).
+        assert_eq!(program.as_slice()[0], ComputeRegister::new(0x17d9, 1));
+        assert_eq!(
+            program.as_slice()[1],
+            ComputeRegister::new(0x1a510, 0x100_0404_0000)
+        );
+        // Nothing else moves: the same registers in the same order, and only
+        // the three request registers change value.
+        let disabled = build_compute_registers(register_parameters()).unwrap();
+        assert_eq!(program.as_slice().len(), disabled.as_slice().len() + 1);
+        for (enabled, disabled) in program.as_slice()[1..].iter().zip(disabled.as_slice()) {
+            assert_eq!(enabled.number, disabled.number);
+            if !matches!(enabled.number, 0x101d1 | 0x0d479 | 0x107a1) {
+                assert_eq!(enabled.value, disabled.value);
+            }
+        }
+        // The three request registers still carry the request itself.
+        assert_eq!(register_value(program.as_slice(), 0x101d1, 0), 0x0001_0059);
+        assert_eq!(register_value(program.as_slice(), 0x107a1, 0), 0x0100_0000);
+    }
+
+    #[test]
+    fn no_scs_request_emits_no_enable_register() {
+        let program = build_compute_registers(register_parameters()).unwrap();
+        assert!(program
+            .as_slice()
+            .iter()
+            .all(|register| register.number != 0x17d9));
+        assert_eq!(register_value(program.as_slice(), 0x107a1, 0), 0xff_0000);
     }
 
     #[test]
@@ -819,7 +1017,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fnv1a64(&raw), 0x9a59_8076_3ca3_6a2a);
+        // Re-pinned with the corrected 0x0a599 first emission.
+        assert_eq!(fnv1a64(&raw), 0x8913_dca2_ae5b_2133);
         assert_eq!(u64::from_le_bytes(raw[0x0ee0..0x0ee8].try_into().unwrap()), 0x100_0410_002c);
         assert_eq!(u64::from_le_bytes(raw[COMPUTE_SAMPLER_ARRAY..COMPUTE_SAMPLER_ARRAY + 8].try_into().unwrap()), 0x100_0800_0000);
         assert_eq!(u32::from_le_bytes(raw[COMPUTE_SAMPLER_COUNT..COMPUTE_SAMPLER_COUNT + 4].try_into().unwrap()), 4);

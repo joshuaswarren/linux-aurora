@@ -510,6 +510,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "DIAGNOSTIC: SCS window field, 0..255, placed below the enable bit in register 0x107a1. Ignored while SCS pages is zero.",
         },
+        g17p_compute_usage_slot: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: zero the 0x40-byte per-kick usage record register 0x14070 already names, and log it back on completion. Native does exactly this -- AGXUSCPrivMemFList::updateSubmitInfo zeroes a 0x40-byte slot before every kick (mac17p 0xfffffe0008aa1910) and AGXUSCPrivMemPool::updateStatistics reads word 0 and word 1 back afterwards (0xfffffe0008aa6bf8, 0xfffffe0008aa6c40) and compares them against the private-memory pool's size in pages. Linux has always pointed 0x14070 at a page nothing reads. This changes no register value and costs one 64-byte memset plus one read per kick; 0 (default) does neither. Set it to see whether the GPU reports scratch usage at all, which is the only direct evidence of whether a non-zero g17p_compute_scs_pages request was honoured.",
+        },
         g17p_completion_stamp: u32 {
             default: 1,
             description: "Gate a compute retire on the firmware's COMPLETION STAMP, not just on the KSM completion record. Firmware RE (b1): the KSM completion record is produced by the KSM hardware block and is consumed by the firmware at the TOP of the completion interrupt; only afterwards does the firmware run its GPU cache-maintenance command (sgx+0x1_8030, polled on 0x1_8038 bit 1) and then store the stamp value from descriptor +0x0F50 through the pointer at descriptor +0x0F40 -- which is the queue support page's dispatch-A word. So the record's arrival says nothing about the dispatch's stores being visible, while the stamp write happens strictly after the flush and does. 1 (default) zeroes that word before publishing and holds the retire until the firmware writes it back, which is what makes completion imply visibility. If the stamp never arrives the retire proceeds anyway with a loud log, so this can only be as bad as 0. 0 restores record-only retire.",

@@ -2636,6 +2636,90 @@ impl G17PComputeDescriptorStorage {
         Ok(group)
     }
 
+    /// Granule of the record register 0x14070 names.
+    ///
+    /// The register's value is masked to a 64-byte boundary
+    /// (`and x8, x0, #0x7ffffffffc0`, mac17p `0xfffffe0008a606f4`), and the
+    /// one host-side producer/consumer pair the kext has for a record of this
+    /// shape works in 0x40-byte units: `AGXUSCPrivMemFList::updateSubmitInfo`
+    /// hands out slots `cursor + 0x40` apart (`0xfffffe0008aa18a8`) and zeroes
+    /// the claimed one with two `stp q0, q0` pairs
+    /// (`0xfffffe0008aa1910`..`0xfffffe0008aa1918`).
+    pub(crate) const COMPUTE_USAGE_SLOT_SIZE: usize = 0x40;
+
+    /// Zero the record register 0x14070 names, before the kick names it.
+    ///
+    /// `generateCLRegisterListG16Common` emits 0x14070 (`0x14028 + 0x48`,
+    /// mac17p `0xfffffe0008a60724`) as
+    /// `(base + AGXCLCommandDescriptor[0x7d0]) & 0x7ffffffffc0 | 1`
+    /// (`0xfffffe0008a606f0`..`0xfffffe0008a60728`), where `base` comes from a
+    /// vtable call (slot +0x158) on `[[CL[0x7c8] + 0x30] + 0x58]`; `CL+0x7c8`
+    /// is copied from `AGXChannel+0x150` in `processComputeSetup`
+    /// (`0xfffffe0008a07684`) and `CL+0x7d0` is zeroed at allocation
+    /// (`AGXCLCommandDescriptor::MetaClass::alloc`, `0xfffffe00089fc00c`) and
+    /// written by nothing on the compute path -- so native's offset into that
+    /// object is 0, exactly as Linux's is.
+    ///
+    /// The zero-then-read-back protocol is the kext's own, from the
+    /// `AGXUSCPrivMemFList`/`AGXUSCPrivMemPool` pair cited on
+    /// `read_compute_usage_slot`. Whether that pair's record and 0x14070's
+    /// target are the same buffer is NOT established here: they reach their
+    /// base through different vtable slots (+0x138 against +0x158) and
+    /// different fields of the owning object (+0x60 against +0x58). What is
+    /// established is that 0x14070 names driver-owned memory at offset 0 that
+    /// Linux has never read, and that zeroing it first is what makes any
+    /// non-zero readback evidence rather than noise.
+    ///
+    /// This writes only driver-owned memory. It does not touch the register
+    /// program, so it is identical work whether or not an SCS request is set.
+    pub(crate) fn clear_compute_usage_slot(&mut self) -> Result {
+        self.robustness.with_bytes_mut(|bytes| {
+            bytes
+                .get_mut(..Self::COMPUTE_USAGE_SLOT_SIZE)
+                .ok_or(ERANGE)?
+                .fill(0);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Read the record back after a kick.
+    ///
+    /// `AGXUSCPrivMemPool::updateStatistics` consumes exactly two words of the
+    /// record it tracks: word 0 (`0xfffffe0008aa6bf8`) and word 1
+    /// (`0xfffffe0008aa6c40`), converting both to float alongside the pool's
+    /// total size in pages (`AGXUMADataRec+0x68 >> 12`,
+    /// `0xfffffe0008aa6c44`..`0xfffffe0008aa6c64`) before handing them to
+    /// `AGXUSCPrivMemHWMetrics::updateStatistics`. Nothing in the kext names
+    /// those two words, so this reports them as words rather than inventing
+    /// units for them, and returns the whole 0x40-byte granule so the other
+    /// fourteen show up if the GPU writes them.
+    pub(crate) fn read_compute_usage_slot(&mut self) -> Result<[u32; 16]> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        self.robustness.with_bytes_mut(|bytes| {
+            let raw = bytes
+                .get(..Self::COMPUTE_USAGE_SLOT_SIZE)
+                .ok_or(ERANGE)?;
+            let mut words = [0u32; 16];
+            for (index, word) in words.iter_mut().enumerate() {
+                let at = index * 4;
+                *word = u32::from_le_bytes(
+                    raw.get(at..at + 4)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| ERANGE)?,
+                );
+            }
+            Ok(words)
+        })
+    }
+
+    /// GPU address register 0x14070 names, for the diagnostic log line.
+    pub(crate) fn compute_usage_slot_gpu_va(&self) -> u64 {
+        self.robustness.iova()
+    }
+
     /// Current item-ring producer of the retained compute queue graph.
     ///
     /// A repeat submission must append at this cursor. The first-bind builder
@@ -2682,8 +2766,12 @@ impl G17PComputeDescriptorStorage {
             let raw = bytes.get(offset..end).ok_or(ERANGE)?;
             let mut work_key = None;
             // The Linux builder emits forty 12-byte primary RCE entries at
-            // +0x40. Report the encoded 0x10201 value, not a reconstructed key.
-            for index in 0..g17_compute::COMPUTE_REGISTER_COUNT {
+            // +0x40, or forty-one when the kick carries an SCS scratch
+            // request. Report the encoded 0x10201 value, not a reconstructed
+            // key. Scanning the longer program is safe on the shorter one: the
+            // descriptor is zero-filled before encoding, so the unused entry
+            // reads back as register 0.
+            for index in 0..g17_compute::COMPUTE_REGISTER_MAX {
                 let at = 0x40 + index * 12;
                 if read_u32(raw, at)? == 0x10201 {
                     work_key = Some(read_u64(raw, at + 4)?);

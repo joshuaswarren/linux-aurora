@@ -34,12 +34,24 @@ def block(text, marker):
 
 
 # The register program must consume the request, not the old constants.
-program = block(compute, "pub(crate) fn build_compute_registers(")
+program = block(compute, "pub(crate) fn build_compute_registers_with_scs(")
 assert "ComputeRegister::new(0x101d1, scs.size_word)" in program
 assert "ComputeRegister::new(0x0d479, scs.extras)" in program
 assert "ComputeRegister::new(0x107a1, scs.window_word)" in program
 assert "0x101d1, 0)" not in program
 assert "0x107a1, 0xff_0000)" not in program
+# A request also has to turn the enable register on. generateCLRegisterListG16Common
+# prepends 0x17d9 = 1 as the list's FIRST entry whenever
+# AGXCLCommandDescriptor+0x5c8 is set (mac17p 0xfffffe0008a5fa90 branch,
+# 0xfffffe0008a5faa0 selector, 0xfffffe0008a5fab0 value, 0xfffffe0008a5fac4
+# cursor); the clear arm at 0xfffffe0008a5facc leaves the cursor at 0.
+assert "ComputeRegister::new(0x17d9, 1)" in program
+assert "if scs.enabled {" in program
+# Both 0xa599 emissions read one accelerator constant in the kext
+# (0xfffffe0008a6030c via CL+0x548, 0xfffffe0008a60b4c straight from
+# accel[0x10790] ?: accel[0x10778]), so they can never disagree.
+assert program.count("ComputeRegister::new(0x0a599, 0x0000_0060_0040_0020)") == 2
+assert "0x0000_0132_0040_0020" not in program
 
 # Every knob is opt-in: a default build must be byte-identical to before.
 for name in (
@@ -47,6 +59,7 @@ for name in (
     "g17p_compute_scs_mib",
     "g17p_compute_scs_extras",
     "g17p_compute_scs_window",
+    "g17p_compute_usage_slot",
 ):
     declaration = block(params, f"        {name}: u32 {{")
     assert "default: 0," in declaration, f"{name} must default to 0"
@@ -99,6 +112,27 @@ rust += r'''
  assert_eq!(max.size_word, 0xffff_ffff);
  assert_eq!(max.extras, u32::MAX as u64);
  assert_eq!(max.window_word, 0x01ff_0000);
+}
+#[test] fn the_enable_register_leads_the_program_only_when_pages_are_requested() {
+ let parameters = ComputeRegisterParameters {
+  preempt_base: 0x100_0404_0000, cdm_base: 0x100_0410_0000,
+  usc_exec_base: 0x1_0000_0000, helper_binary: 0, helper_data: 0,
+  helper_config: 0, dispatch_identity: 1, context_id: 3, work_ordinal: 7,
+  robustness: 0x100_0430_0000, operand_state_base: 0x70_0022_8000,
+  execution_gate: 2,
+ };
+ let off = build_compute_registers(parameters).unwrap();
+ assert_eq!(off.len(), COMPUTE_REGISTER_COUNT);
+ assert!(off.as_slice().iter().all(|r| r.number != 0x17d9));
+ let on = build_compute_registers_with_scs(
+  parameters, scs_request_registers(89, 1, 0, 0).unwrap()).unwrap();
+ assert_eq!(on.len(), COMPUTE_REGISTER_MAX);
+ assert_eq!(on.as_slice()[0].number, 0x17d9);
+ assert_eq!(on.as_slice()[0].value, 1);
+ // Everything else keeps its order; only the three request registers move.
+ let names: Vec<u32> = on.as_slice()[1..].iter().map(|r| r.number).collect();
+ let baseline: Vec<u32> = off.as_slice().iter().map(|r| r.number).collect();
+ assert_eq!(names, baseline);
 }
 #[test] fn derived_mib_rounds_up_at_every_page_boundary() {
  for pages in 1..=0xffff {

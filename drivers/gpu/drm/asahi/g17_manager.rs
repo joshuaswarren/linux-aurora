@@ -5214,9 +5214,150 @@ impl G17PManagerConstruction {
         })
     }
 
-    /// Configure the hardware-proven G17P compute queue through resource 0 and
-    /// return its retained state only after the QID-valid bit is published.
-    pub(crate) fn configure_g17p_compute_queue(
+    pub(crate) fn bind_independent_compute_user_vm(
+        &mut self, queue: &mut G17PSksmQueue, vm: &mmu::Vm,
+        context: Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result<G17PComputeUserBinding> {
+        if !context.matches(vm) || !context.is_current() { return Err(EFAULT); }
+        self.resources.cache_compute_vm_mappings(vm)?;
+        let sksm_entries = queue.storage.map_user_entry_alias(vm)?;
+        let mappings = queue.compute.map_user_execution_state(vm)?;
+        let (high, low) = queue.compute.descriptor_gpu_vas(0);
+        if !mappings.all_reachable_from(vm) || mappings.descriptor_gpu_va(0) != low
+            || vm.translate_iova(low)? != self.uat().kernel_vm().translate_iova(high)?
+        { return Err(EFAULT); }
+        queue.independent_context = true;
+        Ok(G17PComputeUserBinding {
+            mappings, _sksm_entries: sksm_entries, _vm_bind: None,
+            _execution_context: Some(context.clone()),
+        })
+    }
+
+    /// Start one shared-ring transaction. All target queues are staged before
+    /// the ring is read, so a coalesced event incurs one DRAM walk regardless
+    /// of how many clients completed in the batch.
+    pub(crate) fn begin_independent_compute_completion_batch(&mut self) {
+        self.compute_completion_batch.clear();
+    }
+
+    pub(crate) fn stage_independent_compute_completion(
+        &mut self,
+        queue: &G17PSksmQueue,
+    ) -> Result<bool> {
+        if !queue.independent_context || queue.completion_descriptor == 0 {
+            return Ok(false);
+        }
+        self.compute_completion_batch.request(
+            queue.queue_id,
+            queue.completion_descriptor,
+            queue.completion_last_end,
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn scan_independent_compute_completion_batch(&mut self) -> Result {
+        self.resources
+            .scan_compute_completion_batch(&mut self.compute_completion_batch)
+    }
+
+    /// Consume this queue's record from the single acquired batch snapshot.
+    /// Completion identity and visibility remain queue-local: the snapshot is
+    /// only an index, and retirement still validates the exact descriptor,
+    /// monotonic end timestamp, and final queue stamp before releasing owners.
+    pub(crate) fn poll_staged_independent_compute_completion(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+    ) -> Result<Option<[u64; 2]>> {
+        if !queue.independent_context || queue.completion_descriptor == 0 {
+            return Ok(None);
+        }
+        // Two different failures leave this function as a bare EIO, and the
+        // caller turns either one into `session-crashed
+        // reason=async-compute-completion-unclassifiable` -- terminal, because
+        // the rebuild it arms ends in rtkit-boot ETIME and ENODEV. They want
+        // opposite responses and the log could not tell them apart. Name them.
+        let candidate = match self.compute_completion_batch.take(
+            queue.queue_id,
+            queue.completion_descriptor,
+            queue.completion_last_end,
+        ) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                // The batch slot is indexed by queue_id and was staged by
+                // `request()` with this queue's descriptor and last-consumed
+                // end. A mismatch means the slot's identity moved underneath
+                // us -- which a graph rebound to a new owner without reinstall
+                // can do, since the QID is retained across the handoff.
+                dev_err!(self.resources.dev().as_ref(),
+                    "G17P async compute: UNCLASSIFIABLE qid={} cause=batch-slot-identity descriptor={:#x} last-end={} ({:?})\n",
+                    queue.queue_id, queue.completion_descriptor,
+                    queue.completion_last_end, error);
+                return Err(error);
+            }
+        };
+        let timestamps = candidate.timestamps;
+        if timestamps[0] == timestamps[1] {
+            // Retired without executing. This is the DOCUMENTED post-recovery
+            // outcome -- `g17p_zero_duration` says so in as many words: "every
+            // submission after a fault-blamed firmware recovery retires with
+            // duration 0" -- and that parameter's default 1 is "fail the
+            // submission ... but do NOT rebuild the firmware session". This
+            // path never consulted it and killed the device instead.
+            G17P_MARK_ZERO_DURATION.fetch_add(1, Ordering::Relaxed);
+            self.log_compute_usage_slot(queue, "zero-duration");
+            dev_err!(self.resources.dev().as_ref(),
+                "G17P async compute: UNCLASSIFIABLE qid={} cause=zero-duration descriptor={:#x} timestamps=[{},{}] -- retired without executing, the expected shape after a firmware recovery\n",
+                queue.queue_id, queue.completion_descriptor,
+                timestamps[0], timestamps[1]);
+            return Err(EIO);
+        }
+        if queue.completion_stamp_armed && queue.compute.read_compute_stamp()? == 0 {
+            return Err(EAGAIN);
+        }
+        if let Some(pair) = candidate.interval {
+            if crate::util::g17p_verbose() {
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P async compute: GPU-INTERVAL qid={} descriptor={:#x} start={} end={}\n",
+                    queue.queue_id, queue.completion_descriptor, pair[0], pair[1]);
+            }
+        }
+        self.log_compute_usage_slot(queue, "retired");
+        queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, 1)
+            .map_err(|_| EINVAL)?;
+        queue.completion_last_end = timestamps[1];
+        queue.completion_descriptor = 0;
+        queue.completion_stamp_armed = false;
+        Ok(Some(timestamps))
+    }
+
+    /// Hand out the QID for a freshly prepared compute graph.
+    ///
+    /// The first graph of a boot always gets `G17P_COMPUTE_QUEUE_ID_BASE` (4),
+    /// which is the QID the captured native CL2 queue uses and the only one any
+    /// of this driver's proven runs have exercised. A fresh additional graph
+    /// advances into the unused pool at QID 5; QIDs 0..3 are the two retained
+    /// TA/3D pairs.
+    ///
+    /// Skips the two render QIDs and never wraps onto an installed queue.
+    fn allocate_compute_queue_id(&mut self) -> Result<u8> {
+        let id = self.next_compute_queue_id.ok_or(ENOSPC)?;
+        let mut next = id.checked_add(1);
+        while next.is_some_and(|candidate| {
+            candidate == g17_resources::g17p_render_queue_id(true) as u8
+                || candidate == g17_resources::g17p_render_queue_id(false) as u8
+        }) {
+            next = next.and_then(|candidate| candidate.checked_add(1));
+        }
+        self.next_compute_queue_id =
+            next.filter(|candidate| *candidate <= G17P_COMPUTE_QUEUE_ID_LAST);
+        Ok(id)
+    }
+
+    /// Allocate and encode the native compute queue without touching the SKSM
+    /// hardware bridge. The dirty first direct submitBuffer asks firmware to
+    /// install the QID through tag 15 once startup is complete.
+    pub(crate) fn prepare_g17p_compute_queue(
         &mut self,
         dev: &AsahiDevice,
         registers: &regs::Resources,
@@ -5470,6 +5611,13 @@ impl G17PManagerConstruction {
             shared_control,
             zero_page: queue.compute.zero_page_gpu_va(),
         };
+        // Zero the per-kick usage record before the descriptor names it, the
+        // way `AGXUSCPrivMemFList::updateSubmitInfo` does
+        // (mac17p `0xfffffe0008aa1910`). Driver-owned memory only; the
+        // register program is byte-identical either way.
+        if *crate::module_parameters::g17p_compute_usage_slot.value() != 0 {
+            let _ = queue.compute.clear_compute_usage_slot();
+        }
         queue.compute.with_descriptor_mut(descriptor_slot, |raw| {
             g17_uapi::build_compute_descriptor(
                 command,
@@ -5832,6 +5980,13 @@ impl G17PManagerConstruction {
             shared_control,
             zero_page: queue.compute.zero_page_gpu_va(),
         };
+        // Zero the per-kick usage record before the descriptor names it, the
+        // way `AGXUSCPrivMemFList::updateSubmitInfo` does
+        // (mac17p `0xfffffe0008aa1910`). Driver-owned memory only; the
+        // register program is byte-identical either way.
+        if *crate::module_parameters::g17p_compute_usage_slot.value() != 0 {
+            let _ = queue.compute.clear_compute_usage_slot();
+        }
         queue.compute.with_descriptor_mut(descriptor_slot, |raw| {
             g17_uapi::build_compute_descriptor(
                 command,
@@ -6118,6 +6273,13 @@ impl G17PManagerConstruction {
             shared_control,
             zero_page: queue.compute.zero_page_gpu_va(),
         };
+        // Zero the per-kick usage record before the descriptor names it, the
+        // way `AGXUSCPrivMemFList::updateSubmitInfo` does
+        // (mac17p `0xfffffe0008aa1910`). Driver-owned memory only; the
+        // register program is byte-identical either way.
+        if *crate::module_parameters::g17p_compute_usage_slot.value() != 0 {
+            let _ = queue.compute.clear_compute_usage_slot();
+        }
         queue
             .compute
             .with_descriptor_mut(prepared.entry_index, |raw| {
@@ -6155,6 +6317,361 @@ impl G17PManagerConstruction {
         queue.submission_ordinal = next_ordinal;
         let _ = timestamp;
         Ok(None)
+    }
+
+    /// Report the record register 0x14070 names.
+    ///
+    /// Pure observation of driver-owned DRAM. `clear_compute_usage_slot` zeroed
+    /// it before the kick, so a record that is still all zeroes here means the
+    /// GPU wrote nothing through 0x14070 at all. Words 0 and 1 are the two the
+    /// kext's `AGXUSCPrivMemPool::updateStatistics` consumes from the record it
+    /// tracks (mac17p `0xfffffe0008aa6bf8` and `0xfffffe0008aa6c40`); see
+    /// `clear_compute_usage_slot` for why that record and this one are not
+    /// proven to be the same buffer.
+    fn log_compute_usage_slot(&mut self, queue: &mut G17PSksmQueue, phase: &str) {
+        if *crate::module_parameters::g17p_compute_usage_slot.value() == 0 {
+            return;
+        }
+        let address = queue.compute.compute_usage_slot_gpu_va();
+        match queue.compute.read_compute_usage_slot() {
+            Ok(words) => dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P compute usage[{}]: qid={} slot={:#x} word0={:#x} word1={:#x} rest={:#x?}\n",
+                phase,
+                queue.queue_id,
+                address,
+                words[0],
+                words[1],
+                &words[2..]
+            ),
+            Err(error) => dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P compute usage[{}]: qid={} slot={:#x} unreadable ({:?})\n",
+                phase,
+                queue.queue_id,
+                address,
+                error
+            ),
+        }
+    }
+
+    /// Log the queue-graph ring cursors. DRAM only -- safe on a timeout path,
+    /// unlike anything that reads the sgx register file once the cores have
+    /// powered back down.
+    pub(crate) fn log_compute_ring_state(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+        label: &'static str,
+    ) {
+        // Never gate the failure samples: they are the whole point.
+        if !Self::compute_trace_enabled(queue.submission_ordinal)
+            && label != "timeout"
+            && label != "publish-failed"
+        {
+            return;
+        }
+        let state = match queue.compute.read_compute_ring_state() {
+            Ok(state) => state,
+            Err(error) => {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P ring[{}]: unreadable ({:?})\n",
+                    label,
+                    error
+                );
+                return;
+            }
+        };
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P ring[{}]: queue {:#x} consumer {} producer {} mirror {:#x} count {:#x} submitted {} ordinal {} reclaim-cursor {} reclaimed-total {} items {:#x?}\n",
+            label,
+            state.queue,
+            state.consumer,
+            state.producer,
+            state.mirror,
+            state.count,
+            queue.producer.submitted,
+            queue.submission_ordinal,
+            state.reclaimed,
+            state.reclaimed_total,
+            state.items
+        );
+    }
+
+    /// Bounded, read-only timeout evidence for the retained asynchronous owner.
+    /// The shared outer slot is the most recent publication, not necessarily
+    /// this queue's slot. Samples are sequential DRAM observations, not an
+    /// atomic hardware snapshot; no firmware pause or MMIO is attempted.
+    pub(crate) fn log_async_compute_timeout(&mut self, queue: &mut G17PSksmQueue) {
+        let ring = queue.compute.read_compute_ring_state();
+        let outer = self.resources.snapshot_compute_channel();
+        let submission = queue.compute.snapshot_compute_submission(queue.completion_descriptor);
+        self.log_compute_usage_slot(queue, "timeout");
+        let roots = (|| -> Result<(u64, u64)> {
+            let decoded = submission.as_ref().map_err(|error| *error)?;
+            let context = u8::try_from(decoded.context).map_err(|_| EINVAL)?;
+            Ok(self.uat().t8140_selected_context_roots([context; 4])?[0])
+        })();
+        let control = queue.storage.snapshot_channel_control_prefix();
+        let b2_channel_control = self.resources.compute_b2_channel_control();
+        let expected_channel_control = queue.storage.channel_control_gpu_va();
+        let qos_rows = [4u8, 5, 6, 7]
+            .map(|qid| (qid, self.resources.qos_queue_record(qid)));
+        let entry = (|| -> Result<_> {
+            if !queue.producer.previous_valid { return Err(EINVAL); }
+            let last = g17_submission::prepare_kick_submission(
+                queue.producer.previous_timestamp, queue.queue_id,
+                queue.producer.geometry.stamp_count(), queue.producer.geometry.entry_stride(),
+            ).map_err(|_| EINVAL)?;
+            Ok((last.entry_offset,
+                queue.storage.snapshot_compute_entry(last.entry_offset as usize)?))
+        })();
+        // The fork this whole class of wedge turns on, sampled at the moment
+        // it fails rather than inferred afterwards. Three outcomes, three
+        // different bugs, and until now the log could not tell them apart:
+        //
+        //   completed < ordinal   the firmware never retired the work -- a
+        //                         scheduling/dispatch failure, and the
+        //                         publication-time TSQ check should already
+        //                         have said so;
+        //   completed == ordinal, stamp == 0
+        //                         retired, but the completion stamp was never
+        //                         made visible -- the poller has been returning
+        //                         EAGAIN, which is swallowed silently;
+        //   completed == ordinal, stamp != 0
+        //                         retired and stamped, so the loss is in the
+        //                         completion RECORD: the poller has been
+        //                         returning Ok(None) because no record folded.
+        let counters = queue.compute.read_compute_submitted_counters();
+        let stamp_word = queue.compute.read_compute_stamp();
+        // The firmware's own dependency record for THIS queue.
+        //
+        // Every kick declares an implicit in-order self-dependency on its own
+        // previous stamp -- the encoder writes {own qid, converted_command
+        // _timestamp - 1} -- and the firmware's rule is: satisfied iff the
+        // record is valid (byte 0) and dep_stamp <= completed_stamp. So a queue
+        // reading `completed = target - 1` is exactly the arithmetic of one kick
+        // parked on a self-dependency that never resolved, which is also the
+        // render event-control class's signature (submitted=386 completed=385).
+        // Nothing has ever sampled this record at an async-compute timeout.
+        //
+        // Deliberately NOT gated on `g17p_dep_records`: that parameter is
+        // overloaded and also enables `log_render_sksm_entries`, a ~19 KB
+        // hexdump per call at pre-doorbell that has itself caused
+        // VK_ERROR_DEVICE_LOST. This is three words on a path that only runs
+        // when a submission has already timed out.
+        let dependency = {
+            let phys = G17P_GFX_PHYSICAL_DATA_BASE
+                + (G17P_DEPENDENCY_RECORD_LINK_BASE - G17P_GFX_LINK_DATA_BASE)
+                + u64::from(queue.queue_id) * G17P_DEPENDENCY_RECORD_STRIDE;
+            let valid = pgtable::LiveFirmwareU64Probe::new(phys)
+                .and_then(|p| p.observe_mask(u64::MAX, 1))
+                .map(|o| o.first);
+            let completed = pgtable::LiveFirmwareU64Probe::new(phys + 8)
+                .and_then(|p| p.observe_mask(u64::MAX, 1))
+                .map(|o| o.first);
+            (valid, completed)
+        };
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout dependency: qid={} record={:#x} valid-word={:x?} completed-stamp={:x?} -- a kick is satisfied iff valid and dep_stamp <= completed_stamp\n",
+            queue.queue_id,
+            G17P_DEPENDENCY_RECORD_LINK_BASE
+                + u64::from(queue.queue_id) * G17P_DEPENDENCY_RECORD_STRIDE,
+            dependency.0,
+            dependency.1);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout retirement: qid={} ordinal={} counters(target,completed)={:x?} stamp-word={:x?} stamp-armed={} awaited-descriptor={:#x}\n",
+            queue.queue_id, queue.submission_ordinal, counters, stamp_word,
+            queue.completion_stamp_armed, queue.completion_descriptor);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout owner: qid={} descriptor={:#x} ordinal={} producer={:?} direct={:?} hardware={:?}\n",
+            queue.queue_id, queue.completion_descriptor, queue.submission_ordinal,
+            queue.producer, queue.direct_lifecycle, queue.hardware_state);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout ring: {:x?}\n", ring);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout outer-latest-not-owner: {:x?}\n", outer);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout submission: {:x?} descriptor-context-ttbat={:x?}\n", submission, roots);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout channel-control: {:x?}\n", control);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout B2 channel-control(actual,expected): ({:x?},{:#x}) QoS rows(qid,result)={:x?}\n",
+            b2_channel_control, expected_channel_control, qos_rows);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout last-host-entry(offset,words): {:x?}\n", entry);
+    }
+
+    /// Whether the noisy per-submission traces should be emitted.
+    ///
+    /// A 400-deep run emits thousands of lines and overflows the kernel ring
+    /// buffer, which destroys exactly the evidence at the end of the run that
+    /// matters -- and makes any count obtained by grepping dmesg a measure of
+    /// how much survived rather than of what happened. Trace the opening
+    /// submissions, then go quiet; errors and end-of-run summaries are never
+    /// gated.
+    fn compute_trace_enabled(ordinal: u32) -> bool {
+        let depth = *module_parameters::g17p_trace_depth.value();
+        depth == 0 || ordinal <= depth
+    }
+
+    /// Log the OUTER CL_2 work-channel cursors and its most recent slot.
+    ///
+    /// The inner item ring and the outer channel are two different rings and
+    /// either can stall independently: the item ring says whether the firmware
+    /// walked the records we appended, this says whether it ever looked at the
+    /// slot that points at them. Also DRAM only -- `primary_state` and
+    /// `shared_cluster` are driver-allocated objects, not MMIO.
+    pub(crate) fn log_compute_outer_channel(&mut self, label: &'static str) {
+        let snapshot = match self.resources.snapshot_compute_channel() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P outer[{}]: unreadable ({:?})\n",
+                    label,
+                    error
+                );
+                return;
+            }
+        };
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P outer[{}]: table {} ring {:#x} cursors(actual,mirror,producer)={:?} slot {} queue {:#x} kind {} flags {:#x}\n",
+            label,
+            snapshot.table_index,
+            snapshot.ring,
+            snapshot.cursors,
+            snapshot.slot_index,
+            snapshot.slot_queue,
+            snapshot.slot_kind,
+            snapshot.slot_flags
+        );
+    }
+
+    /// Zero the KSM completion record and remember which descriptor the
+    /// submission about to be published owns.
+    ///
+    /// Must run after the descriptor is encoded and before ANY firmware-
+    /// visible publication, so that from the firmware's first opportunity to
+    /// write the record onwards, "populated" means "written for this
+    /// submission". Without it the record left by a previous submission
+    /// satisfies the next wait immediately -- which is how a run whose GPU
+    /// cores never powered (`gpc-state = 0x0`) still reported a woken doorbell
+    /// and retired.
+    fn arm_compute_completion(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+        descriptor: u64,
+    ) -> Result {
+        if queue.independent_context {
+            let count = queue.submission_ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+            let [previous, completed] = queue.compute.publish_compute_submitted_count(count)?;
+            if queue.submission_ordinal < 4 {
+                // Four rather than two: the steady-state relationship between
+                // `completed` and the ordinal is what the violation test below
+                // rests on, and it is not observable from the first two
+                // publications alone.
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P compute TSQ: qid={} ordinal={} target={} previous={} completed={} before-publication\n",
+                    queue.queue_id, queue.submission_ordinal, count, previous, completed);
+            }
+            // `MAX_IN_FLIGHT_PER_QUEUE` is 1, so publishing target
+            // `ordinal + 1` means the firmware must already have retired every
+            // earlier publication -- its completed counter should read exactly
+            // `ordinal`. When it lags, the previous submission was accepted and
+            // never executed, and stacking this one on top guarantees the
+            // client waits out a full scheduler timeout and then quarantines
+            // the queue. That wedge is otherwise only visible two seconds
+            // later, as an ETIMEDOUT with no fault anywhere.
+            //
+            // Measured against `ordinal`, NOT against `previous`: `previous` is
+            // the target word's prior contents, and first-bind staging seeds it
+            // to 1, so on a fresh queue it reads target=1 previous=1
+            // completed=0 -- which the first version of this test called a
+            // violation. Three fired on a green idle boot that never wedged.
+            // The firmware cannot have *stopped* retiring before it has retired
+            // anything, so ordinal 0 is excluded by construction rather than by
+            // a special case.
+            //
+            // Logged rather than refused: a refusal is the right end state but
+            // it has to be proven not to fire on a healthy boot first, and this
+            // line is what proves it.
+            // Two independent gates, both of which the fresh-queue case fails.
+            //
+            // `submission_ordinal > 0` is definitional: the field is written
+            // only at construction (0), at first bind, and by the steady
+            // advance -- never reset -- so `target == 1` means this queue has
+            // published nothing, and a queue that has published nothing cannot
+            // have stopped retiring. That alone explains all three fires on the
+            // green boot, including the late one: compute QIDs are handed out
+            // ascending and never reused, so 5, 6 and 7 arriving at t=19, t=20
+            // and t=224 are three new clients, not one queue stalling.
+            //
+            // `completion_last_end != 0` is the stronger witness and is what
+            // the check actually wants: that field is written only by a
+            // successful `poll_staged_independent_compute_completion`, so it is
+            // proof the firmware has retired at least once on THIS queue. The
+            // condition being tested is that it has stopped, which is not a
+            // statement anyone can make about a queue that never started.
+            if queue.submission_ordinal > 0
+                && queue.completion_last_end != 0
+                && completed != queue.submission_ordinal
+            {
+                dev_err!(self.resources.dev().as_ref(),
+                    "G17P compute TSQ: qid={} publishing target={} at ordinal={} while firmware completed={} (lag={}, previous={}) -- an earlier submission never retired; this publication will not complete\n",
+                    queue.queue_id,
+                    count,
+                    queue.submission_ordinal,
+                    completed,
+                    queue.submission_ordinal.saturating_sub(completed),
+                    previous);
+            }
+        }
+        let previous = if queue.independent_context { [0, 0] }
+            else { self.resources.clear_compute_completion()? };
+        queue.completion_descriptor = descriptor;
+        self.last_published_descriptor = descriptor;
+        // Arm the completion stamp as well. The KSM completion record is
+        // produced by the KSM hardware block and consumed by the firmware at
+        // the TOP of the completion interrupt; the firmware's GPU
+        // cache-maintenance command and the stamp store both happen after
+        // that. So the record proves scheduling, and only the stamp proves
+        // visibility -- see `await_compute_stamp`.
+        if *module_parameters::g17p_completion_stamp.value() != 0 {
+            let discarded = queue.compute.arm_compute_stamp()?;
+            self.compute_stamp_armed = true;
+            queue.completion_stamp_armed = true;
+            if discarded != 0 && Self::compute_trace_enabled(queue.submission_ordinal) {
+                dev_info!(
+                    self.resources.dev().as_ref(),
+                    "G17P completion stamp: discarded {:#x} before publishing {:#x}\n",
+                    discarded,
+                    descriptor
+                );
+            }
+        }
+        // Do NOT reset `last_completion_end` here. It is the floor that makes
+        // "strictly newer than the completion already consumed" mean anything,
+        // and zeroing it once per submission made that test vacuous -- which
+        // is why tightening the scan from `end == last_consumed_end` to
+        // `end <= last_consumed_end` measured as noise: with the floor at 0 the
+        // two predicates are identical. GPU timestamps are monotonic across a
+        // manager's lifetime, so the previous submission's end is a valid
+        // floor for this one; the field is initialised to 0 when the manager is
+        // constructed, and a recovery rebuilds the manager, so a teardown
+        // resets it without any per-submission help.
+        if previous[0] != 0 {
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P completion: cleared stale record descriptor {:#x} end {:#x} before publishing {:#x}\n",
+                previous[0],
+                previous[1],
+                descriptor
+            );
+        }
+        Ok(())
     }
 
     /// Completion ingress for the descriptor-provided completed-kick count.
