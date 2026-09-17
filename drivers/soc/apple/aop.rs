@@ -52,6 +52,7 @@ use kernel::{
         ArcBorrow,
         CondVar,
         Mutex,
+        MutexGuard,
         SpinLock, //
     },
     new_spinlock,
@@ -784,7 +785,6 @@ struct SetupEndpoint {
     ep: u8,
     tx_iova: u64,
     rx_iova: u64,
-    rx_pages: usize,
 }
 
 struct SetupState {
@@ -896,6 +896,10 @@ struct AopData {
     rtkit: Mutex<Option<rtkit::RtKit<AopData>>>,
     #[pin]
     endpoints: [Mutex<AFKEndpoint>; AFK_ENDPOINT_COUNT as usize],
+    /// The EPIC v4 firmware answers without the request tag, so an endpoint
+    /// carries one call at a time: callers queue here for their turn.
+    #[pin]
+    call_turn: [Mutex<()>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
     ep_shutdown: FutureValue<()>,
     #[pin]
@@ -996,6 +1000,7 @@ impl AopData {
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
                     }),
+                    call_turn <- pin_init::pin_init_array_from_fn(|_| new_mutex!(())),
                     ep_shutdown <- FutureValue::pin_init(),
                     hid_listeners <- new_mutex!(KVec::new()),
                     report_listeners <- new_mutex!(KVec::new()),
@@ -1240,7 +1245,6 @@ impl AopData {
             ep,
             tx_iova,
             rx_iova,
-            rx_pages,
         });
         dev_info!(
             self.dev,
@@ -1302,6 +1306,12 @@ impl AopData {
 }
 
 impl AopData {
+    /// Serializes the calls on an endpoint whose replies carry no tag; the
+    /// guard is held until the reply (or the timeout) so that a reply can
+    /// only belong to the one call in flight.
+    fn take_call_turn(&self, ep_idx: u8) -> Option<MutexGuard<'_, ()>> {
+        self.epic_v4.then(|| self.call_turn[ep_idx as usize].lock())
+    }
     /// Waits for a call's reply with a bound; on timeout the call slot is
     /// released so a late reply is dropped instead of completing a later call.
     fn wait_call(
@@ -1332,6 +1342,7 @@ impl AopData {
 impl AOP for AopData {
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
         let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
+        let _turn = self.take_call_turn(ep_idx);
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
@@ -1348,6 +1359,7 @@ impl AOP for AopData {
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)> {
         let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
+        let _turn = self.take_call_turn(ep_idx);
         let call = {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
