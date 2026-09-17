@@ -7784,6 +7784,7 @@ impl G17PManagerConstruction {
             // submission ... but do NOT rebuild the firmware session". This
             // path never consulted it and killed the device instead.
             G17P_MARK_ZERO_DURATION.fetch_add(1, Ordering::Relaxed);
+            self.log_compute_usage_slot(queue, "zero-duration");
             dev_err!(self.resources.dev().as_ref(),
                 "G17P async compute: UNCLASSIFIABLE qid={} cause=zero-duration descriptor={:#x} timestamps=[{},{}] -- retired without executing, the expected shape after a firmware recovery\n",
                 queue.queue_id, queue.completion_descriptor,
@@ -7800,6 +7801,7 @@ impl G17PManagerConstruction {
                     queue.queue_id, queue.completion_descriptor, pair[0], pair[1]);
             }
         }
+        self.log_compute_usage_slot(queue, "retired");
         queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, 1)
             .map_err(|_| EINVAL)?;
         queue.completion_last_end = timestamps[1];
@@ -8116,6 +8118,13 @@ impl G17PManagerConstruction {
             shared_control,
             zero_page: queue.compute.zero_page_gpu_va(),
         };
+        // Zero the per-kick usage record before the descriptor names it, the
+        // way `AGXUSCPrivMemFList::updateSubmitInfo` does
+        // (mac17p `0xfffffe0008aa1910`). Driver-owned memory only; the
+        // register program is byte-identical either way.
+        if *crate::module_parameters::g17p_compute_usage_slot.value() != 0 {
+            let _ = queue.compute.clear_compute_usage_slot();
+        }
         queue.compute.with_descriptor_mut(descriptor_slot, |raw| {
             g17_uapi::build_compute_descriptor(
                 command,
@@ -8484,6 +8493,13 @@ impl G17PManagerConstruction {
             shared_control,
             zero_page: queue.compute.zero_page_gpu_va(),
         };
+        // Zero the per-kick usage record before the descriptor names it, the
+        // way `AGXUSCPrivMemFList::updateSubmitInfo` does
+        // (mac17p `0xfffffe0008aa1910`). Driver-owned memory only; the
+        // register program is byte-identical either way.
+        if *crate::module_parameters::g17p_compute_usage_slot.value() != 0 {
+            let _ = queue.compute.clear_compute_usage_slot();
+        }
         queue.compute.with_descriptor_mut(descriptor_slot, |raw| {
             g17_uapi::build_compute_descriptor(
                 command,
@@ -8965,6 +8981,13 @@ impl G17PManagerConstruction {
             shared_control,
             zero_page: queue.compute.zero_page_gpu_va(),
         };
+        // Zero the per-kick usage record before the descriptor names it, the
+        // way `AGXUSCPrivMemFList::updateSubmitInfo` does
+        // (mac17p `0xfffffe0008aa1910`). Driver-owned memory only; the
+        // register program is byte-identical either way.
+        if *crate::module_parameters::g17p_compute_usage_slot.value() != 0 {
+            let _ = queue.compute.clear_compute_usage_slot();
+        }
         queue
             .compute
             .with_descriptor_mut(prepared.entry_index, |raw| {
@@ -9002,6 +9025,42 @@ impl G17PManagerConstruction {
         queue.submission_ordinal = next_ordinal;
         let _ = timestamp;
         Ok(None)
+    }
+
+    /// Report the record register 0x14070 names.
+    ///
+    /// Pure observation of driver-owned DRAM. `clear_compute_usage_slot` zeroed
+    /// it before the kick, so a record that is still all zeroes here means the
+    /// GPU wrote nothing through 0x14070 at all. Words 0 and 1 are the two the
+    /// kext's `AGXUSCPrivMemPool::updateStatistics` consumes from the record it
+    /// tracks (mac17p `0xfffffe0008aa6bf8` and `0xfffffe0008aa6c40`); see
+    /// `clear_compute_usage_slot` for why that record and this one are not
+    /// proven to be the same buffer.
+    fn log_compute_usage_slot(&mut self, queue: &mut G17PSksmQueue, phase: &str) {
+        if *crate::module_parameters::g17p_compute_usage_slot.value() == 0 {
+            return;
+        }
+        let address = queue.compute.compute_usage_slot_gpu_va();
+        match queue.compute.read_compute_usage_slot() {
+            Ok(words) => dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P compute usage[{}]: qid={} slot={:#x} word0={:#x} word1={:#x} rest={:#x?}\n",
+                phase,
+                queue.queue_id,
+                address,
+                words[0],
+                words[1],
+                &words[2..]
+            ),
+            Err(error) => dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P compute usage[{}]: qid={} slot={:#x} unreadable ({:?})\n",
+                phase,
+                queue.queue_id,
+                address,
+                error
+            ),
+        }
     }
 
     /// Log the queue-graph ring cursors. DRAM only -- safe on a timeout path,
@@ -9056,6 +9115,7 @@ impl G17PManagerConstruction {
         let ring = queue.compute.read_compute_ring_state();
         let outer = self.resources.snapshot_compute_channel();
         let submission = queue.compute.snapshot_compute_submission(queue.completion_descriptor);
+        self.log_compute_usage_slot(queue, "timeout");
         let roots = (|| -> Result<(u64, u64)> {
             let decoded = submission.as_ref().map_err(|error| *error)?;
             let context = u8::try_from(decoded.context).map_err(|_| EINVAL)?;
