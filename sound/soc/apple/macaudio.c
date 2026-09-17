@@ -91,6 +91,11 @@ struct macaudio_platform_cfg {
 	const char *fe_dai_names[3];
 	unsigned int primary_bclk_ratio;
 	unsigned int dai_fmt;
+	/*
+	 * The speaker codec's output widget, "OUT" (TAS/SSM amplifiers) unless
+	 * set: the MAX98360A on J700 calls it "Speaker".
+	 */
+	const char *spk_out_widget;
 };
 
 static const char *volume_control_names[] = {
@@ -1008,9 +1013,11 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 
 		/*
 		 * Headphones get a pass on -ENOTSUPP (see the comment
-		 * around bclk_ratio value for primary FE).
+		 * around bclk_ratio value for primary FE), as does an
+		 * amplifier with no TDM interface (J700's MAX98360A, whose
+		 * frame the AOP firmware fixes).
 		 */
-		if (ret == -ENOTSUPP && props->is_headphones)
+		if (ret == -ENOTSUPP && (props->is_headphones || ma->cfg->amp == AMP_NONE))
 			return 0;
 
 		return ret;
@@ -1149,8 +1156,8 @@ static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_
 		r->sink = "Headset Capture";
 	}
 
-	/* If speakers, add sense capture path */
-	if (is_speakers) {
+	/* If speakers, add sense capture path (a playback-only CPU DAI has none) */
+	if (is_speakers && dai->stream[SNDRV_PCM_STREAM_CAPTURE].widget) {
 		r = &routes[nroutes++];
 		r->source = dai->stream[SNDRV_PCM_STREAM_CAPTURE].widget->name;
 		r->sink = "Speaker Sense Capture";
@@ -1166,6 +1173,7 @@ static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_
 static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_component *component,
 				   bool is_speakers)
 {
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	struct snd_soc_dapm_route routes[2];
 	struct snd_soc_dapm_route *r;
 	int nroutes = 0;
@@ -1176,10 +1184,12 @@ static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_com
 
 	/* Connect the far ends of CODECs to pins */
 	if (is_speakers) {
+		const char *out = ma->cfg->spk_out_widget ?: "OUT";
+
 		r = &routes[nroutes++];
-		r->source = "OUT";
+		r->source = out;
 		if (component->name_prefix) {
-			snprintf(buf, sizeof(buf) - 1, "%s OUT", component->name_prefix);
+			snprintf(buf, sizeof(buf) - 1, "%s %s", component->name_prefix, out);
 			r->source = buf;
 		}
 		r->sink = "Speaker";
@@ -1306,6 +1316,12 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 			CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
 
 		/* TODO: HPF, needs new call to set */
+		break;
+	case AMP_NONE:
+		/*
+		 * MAX98360A (J700): a fixed-gain amplifier with no controls.
+		 * The level limit is the CPU DAI's fixed digital ceiling.
+		 */
 		break;
 	default:
 		return -EINVAL;
@@ -1589,10 +1605,16 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
  * internal speaker (MAX98360, no current sense) is not exposed yet.
  */
 struct macaudio_platform_cfg macaudio_j700_cfg = {
-	.enable_speakers = false,
+	/*
+	 * One MAX98360A per channel on the AOP's LEAP TX0.  No sense lines,
+	 * no amplifier controls: the speaker path is safe because the CPU
+	 * DAI (t8140-aop-audio) limits every sample to -20 dBFS on the wire.
+	 */
+	.enable_speakers = true,
 	.amp = AMP_NONE,
-	.speakers = SPKR_NONE,
+	.speakers = SPKR_1W,
 	.stereo = true,
+	.spk_out_widget = "Speaker",
 	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
 	.primary_bclk_ratio = 125,
 	/* 125-SCLK frame pulse, two 32-bit slots back to back, 24-bit samples */
