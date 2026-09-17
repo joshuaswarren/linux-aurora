@@ -12,3 +12,8 @@ __rust_helper int rust_helper_pm_runtime_put_sync(struct device *dev)
 {
 	return pm_runtime_put_sync(dev);
 }
+
+__rust_helper void rust_helper_pm_runtime_put_noidle(struct device *dev)
+{
+	pm_runtime_put_noidle(dev);
+}
