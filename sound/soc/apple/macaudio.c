@@ -66,7 +66,7 @@ enum macaudio_amp_type {
 	AMP_SSM3515,
 	/*
 	 * A fixed-gain amplifier with no controls of its own; the volume is
-	 * the CPU DAI's software gain below its fixed ceiling (J700).
+	 * the CPU DAI's software gain (J700).
 	 */
 	AMP_MAX98360A,
 };
@@ -119,7 +119,7 @@ static const char *volume_control_names[] = {
 #define SSM3515_0DB (255 - 64) /* +24dB max, steps of 3/8 dB */
 #define SSM3515_DB(x) (SSM3515_0DB + (8 * (x) / 3))
 
-/* t8140-aop-audio "Speaker Playback Volume": 0.5 dB steps, 127 = the ceiling */
+/* t8140-aop-audio "Speaker Playback Volume": 0.5 dB steps, 127 = full scale */
 #define MAX98360A_0DB 127
 #define MAX98360A_DB(x) (MAX98360A_0DB + 2 * (x))
 
@@ -1620,9 +1620,9 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
  * CS42L83 on MCA1 fed by base-ns TX2 through the AOP cout service; the
  * speakers are one MAX98360A per channel on the AOP's LEAP TX0, with no
  * sense lines and no amplifier controls.  The CPU DAI (t8140-aop-audio)
- * limits every sample to -20 dBFS on the wire and provides the "Speaker
- * Playback Volume" below that, which the volume lock holds 20 dB down
- * until the protection daemon takes it.
+ * provides the "Speaker Playback Volume" up to the amplifier's full scale;
+ * the volume lock holds it 20 dB down until the protection daemon, which
+ * models the speaker from the sense stream, takes it.
  */
 struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.enable_speakers = true,
