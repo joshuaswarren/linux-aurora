@@ -355,6 +355,8 @@ struct LpmicData {
     spkr_want_run: Atomic<u32>,
     /// Copy calls into the speaker buffer since the last prepare (debug).
     spkr_copies: Atomic<u32>,
+    /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
+    spkr_volume: Atomic<u32>,
     /// DMA channels of the front-end PCMs, [FE DAI id][stream] (raw dma_chan pointers).
     #[pin]
     fe_chans: SpinLock<[[usize; 2]; FE_COUNT]>,
@@ -1529,6 +1531,38 @@ const FMTBIT_S32_LE: u64 = 1 << 10;
 /// it replaces the loudspeaker manager with a plain -20 dB gain.
 /// Raising this needs a signal-domain protection model fed by the tap.
 const SPKR_CEILING_Q31: i64 = 107_374_182;
+
+/// "Speaker Playback Volume": the software gain below the ceiling that the
+/// speaker-protection daemon and the card's volume lock drive, 0.5 dB per
+/// step from -63.5 dB (1) to 0 dB (127) relative to SPKR_CEILING_Q31, 0 =
+/// mute; entry i = round(SPKR_CEILING_Q31 * 10^(-(127 - i) / 40)).
+const SPKR_VOLUME_MAX: u32 = 127;
+const _: () = assert!(SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64 == SPKR_CEILING_Q31);
+const SPKR_VOLUME_Q31: [u32; 128] = [
+            0,     76015,     80519,     85290,     90344,     95697,    101368,    107374,
+       113737,    120476,    127614,    135176,    143186,    151670,    160657,    170177,
+       180260,    190941,    202255,    214240,    226934,    240381,    254624,    269712,
+       285693,    302622,    320553,    339547,    359666,    380978,    403552,    427464,
+       452793,    479623,    508042,    538146,    570033,    603809,    639587,    677485,
+       717629,    760151,    805193,    852903,    903441,    956973,   1013678,   1073742,
+      1137365,   1204758,   1276145,   1351761,   1431858,   1516701,   1606571,   1701766,
+      1802602,   1909413,   2022553,   2142397,   2269342,   2403809,   2546243,   2697118,
+      2856932,   3026216,   3205530,   3395470,   3596664,   3809780,   4035523,   4274643,
+      4527932,   4796229,   5080423,   5381457,   5700328,   6038094,   6395874,   6774853,
+      7176288,   7601510,   8051928,   8529034,   9034412,   9569734,  10136776,  10737418,
+     11373650,  12047581,  12761445,  13517609,  14318577,  15167006,  16065708,  17017661,
+     18026021,  19094130,  20225528,  21423966,  22693416,  24038085,  25462431,  26971175,
+     28569318,  30262156,  32055302,  33954698,  35966640,  38097797,  40355234,  42746432,
+     45279317,  47962285,  50804229,  53814569,  57003283,  60380940,  63958735,  67748529,
+     71762881,  76015099,  80519277,  85290344,  90344115,  95697340, 101367764, 107374182,
+];
+/// The component's only "register": the speaker volume.
+const REG_SPKR_VOLUME: u32 = 0;
+/// SNDRV_CTL_ELEM_IFACE_MIXER (a __force-cast macro bindgen cannot import).
+const SNDRV_CTL_ELEM_IFACE_MIXER: bindings::snd_ctl_elem_iface_t = 2;
+/// DECLARE_TLV_DB_SCALE(-6350, 50, 1): SNDRV_CTL_TLVT_DB_SCALE, 8 bytes,
+/// min -63.50 dB, 0.50 dB steps, the lowest value mutes.
+static SPKR_VOLUME_TLV: [u32; 4] = [1, 8, (-6350i32) as u32, 50 | 0x10000];
 /// Managed buffer sizes for the PCMs.
 const PCM_BUFFER_PREALLOC: usize = 256 * 1024;
 const PCM_BUFFER_MAX: usize = 1024 * 1024;
@@ -1748,9 +1782,10 @@ unsafe extern "C" fn asoc_pcm_prepare(
     0
 }
 
-/// One S32 sample -> the float32 word the LEAP consumes, through the ceiling.
-fn spkr_f32_bits(sample: i32) -> u32 {
-    let scaled = ((sample as i64) * SPKR_CEILING_Q31) >> 31; // |scaled| <= SPKR_CEILING_Q31
+/// One S32 sample -> the float32 word the LEAP consumes, through the volume
+/// table (whose top entry is the ceiling).
+fn spkr_f32_bits(sample: i32, gain_q31: u32) -> u32 {
+    let scaled = ((sample as i64) * gain_q31 as i64) >> 31; // |scaled| <= SPKR_CEILING_Q31
     SpkrEnc::f32_bits_of_scaled(scaled as i32)
 }
 
@@ -1790,6 +1825,8 @@ unsafe extern "C" fn asoc_pcm_copy(
     // S32_LE interleaved stereo in, float32 LE out, same byte count.
     let data = unsafe { component_data(_component) };
     let n_copy = data.spkr_copies.fetch_add(1, Relaxed);
+    let volume = core::cmp::min(data.spkr_volume.load(Relaxed), SPKR_VOLUME_MAX) as usize;
+    let gain = SPKR_VOLUME_Q31[volume];
     let mut chunk = [0u8; 512];
     let mut off = 0;
     while off < bytes {
@@ -1802,7 +1839,7 @@ unsafe extern "C" fn asoc_pcm_copy(
         }
         for (i, word) in chunk[..n].chunks_exact(4).enumerate() {
             let sample = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-            let bits = spkr_f32_bits(sample);
+            let bits = spkr_f32_bits(sample, gain);
             if n_copy == 0 && off == 0 && i == 0 {
                 dev_dbg!(data.dev, "spkr copy: pos {} bytes {} first sample {:#x} -> {:#x}\n", pos, bytes, sample, bits);
             }
@@ -1837,8 +1874,65 @@ unsafe extern "C" fn asoc_pcm_pointer(
 /// -ENOTSUPP as the pointer callback returns it (mca does the same).
 const ENOTSUPP_POINTER: bindings::snd_pcm_uframes_t = (-524i64) as bindings::snd_pcm_uframes_t;
 
-static ASOC_COMPONENT: SyncCell<bindings::snd_soc_component_driver> = SyncCell(bindings::snd_soc_component_driver {
+/// The component's register file: the speaker volume, read and written by
+/// the standard volsw control helpers.
+unsafe extern "C" fn asoc_component_read(component: *mut bindings::snd_soc_component, reg: u32) -> u32 {
+    let data = unsafe { component_data(component) };
+    match reg {
+        REG_SPKR_VOLUME => data.spkr_volume.load(Relaxed),
+        _ => 0,
+    }
+}
+
+unsafe extern "C" fn asoc_component_write(component: *mut bindings::snd_soc_component, reg: u32, val: u32) -> i32 {
+    let data = unsafe { component_data(component) };
+    match reg {
+        REG_SPKR_VOLUME => {
+            data.spkr_volume.store(core::cmp::min(val, SPKR_VOLUME_MAX), Relaxed);
+            0
+        }
+        _ => EINVAL.to_errno(),
+    }
+}
+
+/// Writable, like the C compound literal: the card's volume lock updates
+/// `platform_max` in place.
+static mut SPKR_VOLUME_MC: bindings::soc_mixer_control = bindings::soc_mixer_control {
+    min: 0,
+    max: SPKR_VOLUME_MAX as i32,
+    platform_max: SPKR_VOLUME_MAX as i32,
+    reg: REG_SPKR_VOLUME as i32,
+    rreg: REG_SPKR_VOLUME as i32,
+    shift: 0,
+    rshift: 0,
+    // SAFETY: zero is the C initializer's value for the remaining fields
+    // (sign_bit, invert, autodisable, topology object).
+    ..unsafe { core::mem::zeroed() }
+};
+
+/// SOC_SINGLE_TLV("Speaker Playback Volume", REG_SPKR_VOLUME, 0, 127, 0, tlv);
+/// `private_value` (the mixer control's address) is filled in at probe, as
+/// const evaluation cannot cast a pointer.
+static mut ASOC_CONTROLS: [bindings::snd_kcontrol_new; 1] = [bindings::snd_kcontrol_new {
+    iface: SNDRV_CTL_ELEM_IFACE_MIXER,
+    name: c"Speaker Playback Volume".as_ptr(),
+    access: bindings::SNDRV_CTL_ELEM_ACCESS_TLV_READ | bindings::SNDRV_CTL_ELEM_ACCESS_READWRITE,
+    info: Some(bindings::snd_soc_info_volsw),
+    get: Some(bindings::snd_soc_get_volsw),
+    put: Some(bindings::snd_soc_put_volsw),
+    tlv: bindings::snd_kcontrol_new__bindgen_ty_1 { p: SPKR_VOLUME_TLV.as_ptr() },
+    private_value: 0,
+    // SAFETY: zero is a valid value for the remaining fields (device, subdevice,
+    // index, count, lock, unlock).
+    ..unsafe { core::mem::zeroed() }
+}];
+
+static mut ASOC_COMPONENT: bindings::snd_soc_component_driver = bindings::snd_soc_component_driver {
     name: c"j700-aop-audio".as_ptr(),
+    read: Some(asoc_component_read),
+    write: Some(asoc_component_write),
+    controls: ptr::null(),
+    num_controls: 1,
     open: Some(asoc_pcm_open),
     close: Some(asoc_pcm_close),
     hw_params: Some(asoc_pcm_hw_params),
@@ -1851,7 +1945,7 @@ static ASOC_COMPONENT: SyncCell<bindings::snd_soc_component_driver> = SyncCell(b
     // SAFETY: all-zero is a valid (empty) component driver; the fields
     // above are the ones this component implements.
     ..unsafe { core::mem::zeroed() }
-});
+};
 
 unsafe fn dai_data<'a>(dai: *mut bindings::snd_soc_dai) -> &'a LpmicData {
     unsafe { component_data((*dai).component) }
@@ -2183,11 +2277,18 @@ impl LpmicDriver {
             return Err(Error::from_errno(ret));
         }
 
-        // The ASoC side: the jack (cout) back-end and the front-end PCMs.
+        // The ASoC side: the jack (cout) and speaker back-ends, the
+        // front-end PCMs and the speaker volume control.
+        // SAFETY: probe runs once at a time; the statics are only completed
+        // here, before the component is registered, and never changed again.
         let ret = unsafe {
+            let controls = &raw mut ASOC_CONTROLS;
+            (*controls)[0].private_value = (&raw mut SPKR_VOLUME_MC) as usize as _;
+            let component = &raw mut ASOC_COMPONENT;
+            (*component).controls = (*controls).as_ptr();
             bindings::snd_soc_register_component(
                 data.dev.as_raw(),
-                &ASOC_COMPONENT.0,
+                component,
                 ASOC_DAIS.0.as_ptr() as *mut bindings::snd_soc_dai_driver,
                 ASOC_DAIS.0.len() as i32,
             )
@@ -2317,6 +2418,7 @@ impl platform::Driver for LpmicDriver {
                 spkr_running: Atomic::new(0),
                 spkr_want_run: Atomic::new(0),
                 spkr_copies: Atomic::new(0),
+                spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
                 fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
                 stream <- new_spinlock!(StreamState {
                     substream: ptr::null_mut(),
