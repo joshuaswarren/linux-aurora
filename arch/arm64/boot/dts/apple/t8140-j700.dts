@@ -515,6 +515,11 @@
 	status = "okay";
 };
 
+&aop_audio {
+	apple,chassis-name = "J700";
+	apple,machine-kind = "MacBook Neo";
+};
+
 &admac_leap_ns {
 	status = "okay";
 };
@@ -524,10 +529,9 @@
 };
 
 /*
- * The sound card (macaudio's J700 variant).  One back-end so far: the
- * 3.5 mm jack, AOP cout service on the audio child's DAI 0 with the
- * CS42L83.  The internal speaker link is added once its LEAP sample
- * path is calibrated.
+ * The sound card (macaudio's J700 variant): the 3.5 mm jack (AOP cout/cin
+ * services on the audio child's DAI 0 with the CS42L83) and the internal
+ * speakers (DAI 4, the LEAP serializer into the MAX98360A amplifiers).
  */
 / {
 	sound {
