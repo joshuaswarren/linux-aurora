@@ -76,7 +76,7 @@ use kernel::{
         Instant,
         Monotonic, //
     },
-    types::ForeignOwnable,
+    types::{ForeignOwnable, Opaque, ScopeGuard},
     workqueue::{
         self,
         DelayedWork,
@@ -103,6 +103,7 @@ const POWER_STATE_RUN: u32 = from_fourcc(b"runn");
 const POWER_STATE_IDLE: u32 = from_fourcc(b"idle");
 
 const AUDIO_DEV_SPKR: u32 = from_fourcc(b"spkr");
+const AUDIO_DEV_TAP: u32 = from_fourcc(b"tap ");
 const AUDIO_DEV_COUT: u32 = from_fourcc(b"cout");
 const AUDIO_DEV_CIN: u32 = from_fourcc(b"cin ");
 /// kIOReturnBusy from the firmware: the device is already attached.
@@ -125,7 +126,8 @@ const SPKR_TONE_PERIOD_BYTES: usize = 0x8000;
 const SPKR_TONE_LEAD_FRAMES: usize = 48000 * 40 / 1000;
 const SPKR_TONE_RAMP_FRAMES: usize = 48000 * 20 / 1000;
 const SPKR_TONE_MS_MAX: u32 = 150;
-/// Hard digital ceiling for the bench tone: -50 dBFS re 2^31.
+/// Numeric input bound for diagnostics (-50 dB relative to unity).
+/// This is not an acoustic or electrical safety limit until LEAP gain is known.
 const SPKR_TONE_AMP_MAX: u32 = 6_791_000;
 /// Amplifier window: the thread lowers GPIO105 after `spkr_amp_ms` (at
 /// most SPKR_AMP_MS_MAX) and an hrtimer forces it low at SPKR_AMP_GUARD_MS
@@ -312,6 +314,9 @@ struct LpmicData {
     hw_ptr_frames: Atomic<u32>,
     spkr_sequence: Atomic<u32>,
     spkr_reports: Atomic<u32>,
+    tap_sequence: Atomic<u32>,
+    tap_channel: Atomic<usize>,
+    tap_domain: Atomic<usize>,
     cout_sequence: Atomic<u32>,
     cout_running: Atomic<u32>,
     cin_sequence: Atomic<u32>,
@@ -500,6 +505,17 @@ impl LpmicData {
         self.out_set_power(AUDIO_DEV_SPKR, "spkr", &self.spkr_sequence, state)
     }
 
+    // Output mute/ramp is independent of the amplifier enable GPIO. Keep the
+    // amplifier disabled while changing this state or handling an IPC failure.
+    fn spkr_set_mute(&self, muted: bool) -> Result<()> {
+        let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(AUDIO_DEV_SPKR, 700, muted as u32))?;
+        if ret != 0 {
+            dev_err!(self.dev, "speaker mute request rejected: {:#x}\n", ret);
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
     /// Output device (spkr/cout) power request: property 202 with a per-
     /// device sequence and the CNTVCT timestamp; pw0 is confirmed through
     /// property 200 like the native host did.
@@ -530,6 +546,35 @@ impl LpmicData {
             }
         }
         Ok(())
+    }
+
+    /// Temporary capture diagnostic: the native SpeakerTap is base-ns RX1
+    /// under the tap service on MCA0. It observes the speaker serial stream;
+    /// it is not an amplifier current/voltage sensor and never enables it.
+    fn tap_setup(&self) -> Result<*mut bindings::dma_chan> {
+        self.attach_device(AUDIO_DEV_TAP, "tap")?;
+        self.out_set_power(AUDIO_DEV_TAP, "tap", &self.tap_sequence, SPKR_POWER_STATE_PW0)?;
+        let pd = unsafe { bindings::dev_pm_domain_attach_by_name(self.dev.as_raw(), c"mca0".as_ptr()) };
+        let pd = kernel::error::from_err_ptr(pd)?;
+        if pd.is_null() {
+            return Err(ENODEV);
+        }
+        let rc = unsafe { bindings::pm_runtime_get_sync(pd) };
+        if rc < 0 {
+            unsafe {
+                bindings::pm_runtime_put_noidle(pd);
+                bindings::dev_pm_domain_detach(pd, true);
+            }
+            return Err(Error::from_errno(rc));
+        }
+        self.tap_domain.store(pd as usize, Relaxed);
+        let chan = unsafe { bindings::dma_request_chan(self.dev.as_raw(), c"spkr-tap".as_ptr()) };
+        let chan = kernel::error::from_err_ptr(chan)?;
+        if chan.is_null() {
+            return Err(ENODEV);
+        }
+        self.tap_channel.store(chan as usize, Relaxed);
+        Ok(chan)
     }
 
     // ---- 3.5 mm jack: the AOP cout/cin services on MCA1, base-ns TX2/RX2 ----
@@ -625,32 +670,37 @@ impl LpmicData {
         // leap_mca (-> audio_p -> audio_fr), attached by index and powered up.
         let raw_dev = self.dev.as_raw();
         let mut pds: [*mut bindings::device; 2] = [ptr::null_mut(); 2];
-        for (i, idx) in [SPKR_PD_TX0, SPKR_PD_MCA].iter().enumerate() {
-            // SAFETY: plain C calls on our bound device.
-            let pd = unsafe { bindings::dev_pm_domain_attach_by_id(raw_dev, *idx) };
-            if pd.is_null() {
-                dev_err!(self.dev, "no power domain {} for the speaker\n", idx);
-                return Err(ENODEV);
-            }
-            let err = kernel::error::from_err_ptr(pd);
-            let pd = match err {
-                Ok(p) => p,
-                Err(e) => {
-                    dev_err!(self.dev, "power domain {} attach failed: {:?}\n", idx, e);
-                    return Err(e);
+        let result = (|| -> Result<()> {
+            for (i, idx) in [SPKR_PD_TX0, SPKR_PD_MCA].iter().enumerate() {
+                // SAFETY: plain C calls on our bound device.
+                let pd = unsafe { bindings::dev_pm_domain_attach_by_id(raw_dev, *idx) };
+                if pd.is_null() {
+                    dev_err!(self.dev, "no power domain {} for the speaker\n", idx);
+                    return Err(ENODEV);
                 }
-            };
-            let rc = unsafe { bindings::pm_runtime_get_sync(pd) };
-            if rc < 0 {
-                dev_err!(self.dev, "power domain {} did not power up: {}\n", idx, rc);
-                unsafe { bindings::dev_pm_domain_detach(pd, true) };
-                return Err(EIO);
+                let err = kernel::error::from_err_ptr(pd);
+                let pd = match err {
+                    Ok(p) => p,
+                    Err(e) => {
+                        dev_err!(self.dev, "power domain {} attach failed: {:?}\n", idx, e);
+                        return Err(e);
+                    }
+                };
+                let rc = unsafe { bindings::pm_runtime_get_sync(pd) };
+                if rc < 0 {
+                    dev_err!(self.dev, "power domain {} did not power up: {}\n", idx, rc);
+                    unsafe {
+                        bindings::pm_runtime_put_noidle(pd);
+                        bindings::dev_pm_domain_detach(pd, true);
+                    };
+                    return Err(EIO);
+                }
+                pds[i] = pd;
             }
-            pds[i] = pd;
-        }
-        dev_info!(self.dev, "spkr: LEAP power domains up\n");
+            dev_info!(self.dev, "spkr: LEAP power domains up\n");
 
-        let result = self.speaker_zero_dma_run(wave);
+            self.speaker_zero_dma_run(wave)
+        })();
 
         for pd in pds.iter().rev() {
             if !pd.is_null() {
@@ -719,6 +769,10 @@ impl LpmicData {
         if desc.is_null() {
             return Err(ENODEV);
         }
+        if unsafe { bindings::gpiod_cansleep(desc) } != 0 {
+            unsafe { bindings::gpiod_put(desc) };
+            return Err(EINVAL);
+        }
         if unsafe { bindings::gpiod_get_value(desc) } != 0 {
             dev_err!(self.dev, "spkr: amplifier enable is not low, refusing\n");
             unsafe { bindings::gpiod_put(desc) };
@@ -736,12 +790,21 @@ impl LpmicData {
             SpkrWave::Tone { .. } => Some(self.spkr_amp_gpio()?),
             SpkrWave::Silence => None,
         };
+        let _amp_release = ScopeGuard::new(|| {
+            if let Some(gpio) = amp_gpio {
+                unsafe {
+                    bindings::gpiod_set_value(gpio, 0);
+                    bindings::gpiod_put(gpio);
+                }
+            }
+        });
         let chan = unsafe {
             kernel::error::from_err_ptr(bindings::dma_request_chan(
                 self.dev.as_raw(),
                 c_str!("spkr").as_char_ptr(),
             ))
         }?;
+        let _channel_release = ScopeGuard::new(|| unsafe { bindings::dma_release_channel(chan) });
         let res = (|| -> Result<()> {
             // The buffer must be mapped through the DMA controller's own
             // stream (dart-aop 10), so allocate it on the controller device.
@@ -749,6 +812,19 @@ impl LpmicData {
             let dma_dev: &device::Device = unsafe { device::Device::from_raw((*(*chan).device).dev) };
             let bound = unsafe { dma_dev.as_bound() };
             let buf = Coherent::<u8>::zeroed_slice(bound, buf_bytes, GFP_KERNEL)?;
+            // Stop the amp and synchronize DMA callbacks before freeing the
+            // buffer, including failures after DMA submission.
+            let _dma_stop = ScopeGuard::new(|| unsafe {
+                if let Some(gpio) = amp_gpio {
+                    bindings::gpiod_set_value(gpio, 0);
+                }
+                if let Some(f) = (*(*chan).device).device_terminate_all {
+                    f(chan);
+                }
+                if let Some(f) = (*(*chan).device).device_synchronize {
+                    f(chan);
+                }
+            });
             // SAFETY: the allocation is buf_bytes long and no DMA runs yet.
             Self::spkr_fill(unsafe { buf.as_mut() }, wave);
             mem_sync();
@@ -800,22 +876,35 @@ impl LpmicData {
                     f(chan);
                 }
             }
+            // An unsuccessful power request may still have reached firmware.
+            let _power_idle = ScopeGuard::new(|| {
+                let _ = self.spkr_set_power(SPKR_POWER_STATE_PW0);
+            });
             self.spkr_set_power(SPKR_POWER_STATE_PWRD)?;
+            let _mute = ScopeGuard::new(|| { let _ = self.spkr_set_mute(true); });
+            self.spkr_set_mute(false)?;
             if let (SpkrWave::Tone { amp, tone_ms, amp_ms, enc }, Some(gpio)) = (wave, amp_gpio) {
                 // The amplifier window: pin high, sleep, pin low, with the
                 // hrtimer forcing it low at SPKR_AMP_GUARD_MS regardless.
                 let t0 = Instant::<Monotonic>::now();
                 stack_pin_init!(let guard = AmpGuard::new(gpio));
-                guard.as_ref().start_scoped(Delta::from_millis(SPKR_AMP_GUARD_MS), || {
-                    unsafe { bindings::gpiod_set_value(gpio, 1) };
-                    kernel::time::delay::fsleep(Delta::from_millis(amp_ms as i64));
-                    unsafe { bindings::gpiod_set_value(gpio, 0) };
+                let high = guard.as_ref().start_scoped(Delta::from_millis(SPKR_AMP_GUARD_MS), || {
+                    if amp_ms != 0 && guard.enable() {
+                        let high = unsafe { bindings::gpiod_get_value(gpio) } == 1;
+                        if high {
+                            kernel::time::delay::fsleep(Delta::from_millis(amp_ms as i64));
+                        }
+                        guard.disable();
+                        high
+                    } else {
+                        false
+                    }
                 });
                 let window_ms = t0.elapsed().as_millis();
                 let low = unsafe { bindings::gpiod_get_value(gpio) } == 0;
                 dev_info!(self.dev,
-                          "J700 SPEAKER_TONE_WINDOW: amp {} enc {} ({} ms tone), enable {} ms, guard fired {}, pin low {}\n",
-                          amp, enc as u32, tone_ms, window_ms, guard.fired.load(Relaxed), low);
+                          "J700 SPEAKER_TONE_WINDOW: amp {} enc {} ({} ms tone), enable {} ms, guard fired {}, pin high {}, pin low {}\n",
+                          amp, enc as u32, tone_ms, window_ms, guard.fired.load(Relaxed), high, low);
                 if !low {
                     unsafe { bindings::gpiod_set_value(gpio, 0) };
                 }
@@ -826,12 +915,6 @@ impl LpmicData {
                 waited += 10;
             }
             let reports = self.spkr_reports.load(Relaxed);
-            self.spkr_set_power(SPKR_POWER_STATE_PW0)?;
-            unsafe {
-                if let Some(f) = (*(*chan).device).device_terminate_all {
-                    f(chan);
-                }
-            }
             if reports < SPKR_TEST_REPORTS {
                 dev_err!(self.dev, "J700 SPEAKER_ZERO_DMA_FAILED: {} of {} period reports in {} ms\n",
                          reports, SPKR_TEST_REPORTS, waited);
@@ -851,13 +934,6 @@ impl LpmicData {
             }
             Ok(())
         })();
-        unsafe { bindings::dma_release_channel(chan) };
-        if let Some(gpio) = amp_gpio {
-            unsafe {
-                bindings::gpiod_set_value(gpio, 0);
-                bindings::gpiod_put(gpio);
-            }
-        }
         res
     }
 
@@ -972,17 +1048,48 @@ unsafe extern "C" fn spkr_dma_callback(param: *mut core::ffi::c_void) {
 struct AmpGuard {
     #[pin]
     timer: HrTimer<Self>,
+    #[pin]
+    lock: Opaque<bindings::raw_spinlock_t>,
     gpio: usize,
+    closed: Atomic<u32>,
     fired: Atomic<u32>,
 }
+
+// SAFETY: the opaque raw spinlock is pinned and initialized before use. It
+// serializes GPIO writes and the closed state between the task and hard IRQ;
+// the remaining shared state is atomic or immutable.
+unsafe impl Sync for AmpGuard {}
 
 impl AmpGuard {
     fn new(gpio: *mut bindings::gpio_desc) -> impl PinInit<Self> {
         pin_init!(Self {
             timer <- HrTimer::new(),
+            lock <- Opaque::ffi_init(|slot| unsafe { bindings::raw_spin_lock_init(slot) }),
             gpio: gpio as usize,
+            closed: Atomic::new(0),
             fired: Atomic::new(0),
         })
+    }
+}
+
+impl AmpGuard {
+    fn enable(&self) -> bool {
+        // Expiry and GPIO writes share a lock. A delayed task must not raise
+        // the pin after the timer has already muted the amplifier.
+        let flags = unsafe { bindings::raw_spin_lock_irqsave(self.lock.get()) };
+        let enabled = self.closed.load(Relaxed) == 0;
+        if enabled {
+            unsafe { bindings::gpiod_set_value(self.gpio as *mut bindings::gpio_desc, 1) };
+        }
+        unsafe { bindings::raw_spin_unlock_irqrestore(self.lock.get(), flags) };
+        enabled
+    }
+
+    fn disable(&self) {
+        let flags = unsafe { bindings::raw_spin_lock_irqsave(self.lock.get()) };
+        unsafe { bindings::gpiod_set_value(self.gpio as *mut bindings::gpio_desc, 0) };
+        self.closed.store(1, Relaxed);
+        unsafe { bindings::raw_spin_unlock_irqrestore(self.lock.get(), flags) };
     }
 }
 
@@ -992,7 +1099,7 @@ impl HrTimerCallback for AmpGuard {
     fn run(this: Pin<&Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
         // SAFETY: the descriptor stays valid for the scoped timer's lifetime;
         // the AP GPIO controller is memory-mapped and cannot sleep.
-        unsafe { bindings::gpiod_set_value(this.gpio as *mut bindings::gpio_desc, 0) };
+        this.disable();
         this.fired.store(1, Relaxed);
         HrTimerRestart::NoRestart
     }
@@ -1010,6 +1117,7 @@ impl_has_hr_timer! {
 struct SpkrToneWork {
     data: Arc<LpmicData>,
     wave: SpkrWave,
+    cancelled: Atomic<u32>,
     #[pin]
     work: DelayedWork<SpkrToneWork>,
 }
@@ -1022,6 +1130,9 @@ impl WorkItem for SpkrToneWork {
     type Pointer = Arc<SpkrToneWork>;
 
     fn run(this: Arc<SpkrToneWork>) {
+        if this.cancelled.load(kernel::sync::atomic::Acquire) != 0 {
+            return;
+        }
         match this.data.speaker_zero_dma_test(this.wave) {
             Ok(()) => {}
             Err(e) => dev_err!(this.data.dev, "speaker bounded tone failed: {:?}\n", e),
@@ -1029,30 +1140,15 @@ impl WorkItem for SpkrToneWork {
     }
 }
 
-/// How a tone sample is written into its 32-bit slot (bench: the LEAP's
-/// sample representation is being established).
+/// Diagnostic float32 samples. The software stream format is known, but the
+/// DMA interpretation and acoustic gain still require independent validation.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 enum SpkrEnc {
-    /// Little-endian signed 32-bit integer.
-    IntLe,
-    /// Big-endian signed 32-bit integer.
-    IntBe,
-    /// Little-endian IEEE-754 float32 of amp / 2^31.
-    FloatLe,
-    /// Big-endian IEEE-754 float32 of amp / 2^31.
-    FloatBe,
+    FloatLe = 2,
 }
 
 impl SpkrEnc {
-    fn from_param(v: u32) -> Self {
-        match v {
-            1 => SpkrEnc::IntBe,
-            2 => SpkrEnc::FloatLe,
-            3 => SpkrEnc::FloatBe,
-            _ => SpkrEnc::IntLe,
-        }
-    }
-
     /// float32 bit pattern of `v / 2^31` built with integer arithmetic (no
     /// floating point in the kernel).
     fn f32_bits_of_scaled(v: i32) -> u32 {
@@ -1074,10 +1170,7 @@ impl SpkrEnc {
 
     fn encode(self, v: i32) -> [u8; 4] {
         match self {
-            SpkrEnc::IntLe => v.to_le_bytes(),
-            SpkrEnc::IntBe => v.to_be_bytes(),
             SpkrEnc::FloatLe => Self::f32_bits_of_scaled(v).to_le_bytes(),
-            SpkrEnc::FloatBe => Self::f32_bits_of_scaled(v).to_be_bytes(),
         }
     }
 }
@@ -1189,6 +1282,71 @@ unsafe extern "C" fn lpmic_pcm_pointer(
 ) -> bindings::snd_pcm_uframes_t {
     let data = unsafe { Arc::<LpmicData>::borrow((*substream).private_data.cast()) };
     data.hw_ptr_frames.load(Relaxed) as bindings::snd_pcm_uframes_t
+}
+
+// Capture-only diagnostic PCM. Keep the output amplifier disabled while
+// measuring the relationship between LEAP inputs and the serial PCM output.
+unsafe extern "C" fn tap_pcm_open(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    let data = unsafe { Arc::<LpmicData>::borrow((*substream).private_data.cast()) };
+    let chan = data.tap_channel.load(Relaxed) as *mut bindings::dma_chan;
+    if chan.is_null() {
+        return ENODEV.to_errno();
+    }
+    let mut hw = bindings::snd_pcm_hardware::default();
+    hw.info = bindings::SNDRV_PCM_INFO_MMAP | bindings::SNDRV_PCM_INFO_MMAP_VALID
+        | bindings::SNDRV_PCM_INFO_INTERLEAVED | bindings::SNDRV_PCM_INFO_BLOCK_TRANSFER;
+    hw.formats = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
+    hw.rates = RATE_48000_BIT;
+    hw.rate_min = 48000;
+    hw.rate_max = 48000;
+    hw.channels_min = 2;
+    hw.channels_max = 2;
+    hw.periods_min = 2;
+    hw.periods_max = 64;
+    hw.period_bytes_min = 256;
+    hw.period_bytes_max = 0x10000;
+    hw.buffer_bytes_max = PCM_BUFFER_MAX;
+    hw.fifo_size = 16;
+    unsafe { (*(*substream).runtime).hw = hw };
+    unsafe { bindings::snd_dmaengine_pcm_open(substream, chan) }
+}
+
+unsafe extern "C" fn tap_pcm_hw_params(
+    substream: *mut bindings::snd_pcm_substream,
+    params: *mut bindings::snd_pcm_hw_params,
+) -> i32 {
+    let chan = unsafe { bindings::snd_dmaengine_pcm_get_chan(substream) };
+    let mut cfg = bindings::dma_slave_config::default();
+    let ret = unsafe { bindings::snd_hwparams_to_dma_slave_config(substream, params, &mut cfg) };
+    if ret < 0 {
+        return ret;
+    }
+    cfg.src_port_window_size = 2;
+    unsafe {
+        match (*(*chan).device).device_config {
+            Some(f) => f(chan, &mut cfg),
+            None => ENOSYS.to_errno(),
+        }
+    }
+}
+
+unsafe extern "C" fn tap_pcm_prepare(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    let data = unsafe { Arc::<LpmicData>::borrow((*substream).private_data.cast()) };
+    match data.out_set_power(AUDIO_DEV_TAP, "tap", &data.tap_sequence, SPKR_POWER_STATE_PWRD) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+unsafe extern "C" fn tap_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    let data = unsafe { Arc::<LpmicData>::borrow((*substream).private_data.cast()) };
+    // The DMA helper synchronizes outstanding callbacks before releasing its
+    // runtime state. Firmware power-down is a bounded process-context call.
+    let ret = unsafe { bindings::snd_dmaengine_pcm_close(substream) };
+    if let Err(e) = data.out_set_power(AUDIO_DEV_TAP, "tap", &data.tap_sequence, SPKR_POWER_STATE_PW0) {
+        dev_warn!(data.dev, "speaker tap power-down failed: {:?}\n", e);
+    }
+    ret
 }
 
 unsafe extern "C" fn lpmic_pcm_free_private(pcm: *mut bindings::snd_pcm) {
@@ -1573,9 +1731,22 @@ struct LpmicDriver {
     card: *mut bindings::snd_card,
     data: Arc<LpmicData>,
     asoc_registered: bool,
+    speaker_work: Option<Arc<SpkrToneWork>>,
 }
 
 impl LpmicDriver {
+    const TAP_VTABLE: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
+        open: Some(tap_pcm_open),
+        close: Some(tap_pcm_close),
+        hw_params: Some(tap_pcm_hw_params),
+        prepare: Some(tap_pcm_prepare),
+        trigger: Some(bindings::snd_dmaengine_pcm_trigger),
+        pointer: Some(bindings::snd_dmaengine_pcm_pointer),
+        sync_stop: Some(bindings::snd_dmaengine_pcm_sync_stop),
+        ioctl: Some(bindings::snd_pcm_lib_ioctl),
+        ..unsafe { core::mem::zeroed() }
+    };
+
     const VTABLE: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
         open: Some(lpmic_pcm_open),
         close: Some(lpmic_pcm_close),
@@ -1599,6 +1770,7 @@ impl LpmicDriver {
             card: ptr::null_mut(),
             data: data.clone(),
             asoc_registered: false,
+            speaker_work: None,
         };
         let ret = unsafe {
             bindings::snd_card_new(
@@ -1647,6 +1819,23 @@ impl LpmicDriver {
             );
         }
 
+        if *module_parameters::spkr_tap.value() != 0 {
+            let chan = data.tap_setup()?;
+            let mut tap = ptr::null_mut();
+            let ret = unsafe { bindings::snd_pcm_new(this.card, c"Speaker Tap".as_ptr(), 1, 0, 1, &mut tap) };
+            if ret < 0 {
+                return Err(Error::from_errno(ret));
+            }
+            unsafe {
+                (*tap).private_data = data.clone().into_foreign() as _;
+                (*tap).private_free = Some(lpmic_pcm_free_private);
+                copy_str(&mut (*tap).name, c"Speaker Tap (diagnostic)".to_bytes_with_nul());
+                bindings::snd_pcm_set_ops(tap, bindings::SNDRV_PCM_STREAM_CAPTURE as i32, &Self::TAP_VTABLE);
+                bindings::snd_pcm_set_managed_buffer_all(tap, bindings::SNDRV_DMA_TYPE_DEV as i32,
+                    (*(*chan).device).dev, PCM_BUFFER_PREALLOC, PCM_BUFFER_MAX);
+            }
+            dev_info!(data.dev, "Speaker Tap capture ready; amplifier remains disabled\n");
+        }
         let ret = unsafe { bindings::snd_card_register(this.card) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to register sound card\n");
@@ -1673,6 +1862,15 @@ impl LpmicDriver {
 
 impl Drop for LpmicDriver {
     fn drop(&mut self) {
+        if let Some(work) = self.speaker_work.take() {
+            work.cancelled.store(1, kernel::sync::atomic::Release);
+            // Flush a queued item as a no-op, or wait for an in-flight bounded
+            // test, before unregistering devices or unloading module text.
+            unsafe {
+                let raw = workqueue::Work::raw_get(DelayedWork::raw_as_work(&work.work));
+                bindings::flush_delayed_work(raw.cast());
+            }
+        }
         if self.asoc_registered {
             unsafe { bindings::snd_soc_unregister_component_by_driver(self.data.dev.as_raw(), ptr::null()) };
         }
@@ -1683,6 +1881,17 @@ impl Drop for LpmicDriver {
         if !self.card.is_null() {
             unsafe {
                 bindings::snd_card_free(self.card);
+            }
+        }
+        let chan = self.data.tap_channel.xchg(0, Relaxed);
+        if chan != 0 {
+            unsafe { bindings::dma_release_channel(chan as *mut bindings::dma_chan) };
+        }
+        let pd = self.data.tap_domain.xchg(0, Relaxed);
+        if pd != 0 {
+            unsafe {
+                bindings::pm_runtime_put_sync(pd as *mut bindings::device);
+                bindings::dev_pm_domain_detach(pd as *mut bindings::device, true);
             }
         }
         // The AOP keeps dispatching producer reports to the first listener
@@ -1745,6 +1954,9 @@ impl platform::Driver for LpmicDriver {
                 hw_ptr_frames: Atomic::new(0),
                 spkr_sequence: Atomic::new(0),
                 spkr_reports: Atomic::new(0),
+                tap_sequence: Atomic::new(0),
+                tap_channel: Atomic::new(0),
+                tap_domain: Atomic::new(0),
                 cout_sequence: Atomic::new(0),
                 cout_running: Atomic::new(0),
                 cin_sequence: Atomic::new(0),
@@ -1789,7 +2001,7 @@ impl platform::Driver for LpmicDriver {
         if *module_parameters::spkr_props.value() != 0 {
             // Silent: attach and read the descriptors the firmware exposes.
             if data.attach_device(AUDIO_DEV_SPKR, "spkr").is_ok() {
-                for m in [300u32, 301, 302, 303, 304, 305, 400, 401, 402, 403, 404, 405, 500, 501] {
+                for m in [300u32, 301, 302, 303, 304, 305, 400, 401, 402, 403, 404, 405, 500, 501, 700] {
                     data.dump_prop(AUDIO_DEV_SPKR, "spkr", m);
                 }
             }
@@ -1797,31 +2009,41 @@ impl platform::Driver for LpmicDriver {
                 data.dump_prop(AUDIO_DEV_LPAI, "lpai", m);
             }
         }
+        let mut driver = Self::new(data.clone())?;
         let tone_amp = *module_parameters::spkr_tone_amp.value();
         if tone_amp != 0 {
             let tone_ms = core::cmp::min(*module_parameters::spkr_tone_ms.value(), SPKR_TONE_MS_MAX);
             let amp_ms = core::cmp::min(*module_parameters::spkr_amp_ms.value(), SPKR_AMP_MS_MAX);
             let delay_ms = *module_parameters::spkr_tone_delay_ms.value();
+            if *module_parameters::spkr_tap.value() != 0 && amp_ms != 0 {
+                dev_err!(dev, "Speaker Tap diagnostics require spkr_amp_ms=0\n");
+                return Err(EINVAL);
+            }
             if tone_amp > SPKR_TONE_AMP_MAX {
                 dev_err!(dev, "spkr_tone_amp {} exceeds the ceiling {}, refusing\n",
                          tone_amp, SPKR_TONE_AMP_MAX);
+            } else if *module_parameters::spkr_tone_enc.value() != 2 {
+                dev_err!(dev, "speaker bench requires explicit float LE encoding; integer experiments are disabled\n");
+                return Err(EINVAL);
             } else {
-                let enc = SpkrEnc::from_param(*module_parameters::spkr_tone_enc.value());
+                let enc = SpkrEnc::FloatLe;
                 let wave = SpkrWave::Tone { amp: tone_amp, tone_ms, amp_ms, enc };
                 let work_data = data.clone();
                 let work = Arc::pin_init(
                     pin_init!(SpkrToneWork {
                         data: work_data,
                         wave,
+                        cancelled: Atomic::new(0),
                         work <- new_delayed_work!("SpkrToneWork::work"),
                     }),
                     GFP_KERNEL,
                 )?;
                 dev_info!(dev, "spkr: bounded tone (amp {}) scheduled in {} ms\n", tone_amp, delay_ms);
+                driver.speaker_work = Some(work.clone());
                 let _ = workqueue::system().enqueue_delayed(work, msecs_to_jiffies(delay_ms));
             }
         }
-        Ok(Self::new(data)?)
+        Ok(driver)
     }
 }
 
@@ -1831,6 +2053,10 @@ module_platform_driver! {
     description: "Apple T8140 (J700) AOP audio: low-power microphone, jack and speaker paths",
     license: "Dual MIT/GPL",
     params: {
+        spkr_tap: u8 {
+            default: 0,
+            description: "Bench: capture-only native SpeakerTap PCM, requires amplifier kept off",
+        },
         spkr_test: u8 {
             default: 0,
             description: "Bench: run the internal speaker zero-DMA proof at probe (no amplifier enable)",
@@ -1857,7 +2083,7 @@ module_platform_driver! {
         },
         spkr_tone_enc: u32 {
             default: 0,
-            description: "Bench: tone sample encoding, 0 int LE, 1 int BE, 2 float LE, 3 float BE (amp re 2^31)",
+            description: "Bench: must explicitly select 2 for float LE; all other encodings are rejected",
         },
     },
 }
