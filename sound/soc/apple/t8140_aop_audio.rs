@@ -273,9 +273,12 @@ impl Service {
     }
 }
 
+/// The low-power microphone stream, guarded by a spinlock that is never taken
+/// with the ALSA stream lock held (trigger only touches the atomic run
+/// flag), so the report path may call snd_pcm_period_elapsed() while holding
+/// it and close cannot free the substream under a report.
 struct StreamState {
     substream: *mut bindings::snd_pcm_substream,
-    running: bool,
     /// absolute producer byte count at the last report
     last_absolute: Option<u64>,
     /// absolute producer byte count already copied into the ALSA buffer
@@ -298,6 +301,9 @@ struct SndSocT8140AopData {
     ring_bytes: Atomic<u32>,
     sequence: Atomic<u32>,
     powered: Atomic<u32>,
+    /// The microphone stream is triggered (set and cleared under the ALSA
+    /// stream lock, read by the report path).
+    running: Atomic<u32>,
     hw_ptr_frames: Atomic<u32>,
     /// The back-end services: the jack's output and headset microphone,
     /// the speakers and their sense.
@@ -699,57 +705,49 @@ impl ReportListener for SndSocT8140AopData {
             return Ok(());
         }
 
-        let mut elapsed = false;
-        let mut substream = ptr::null_mut();
-        {
-            let mut st = self.stream.lock();
-            st.last_absolute = Some(absolute);
-            if !st.running || st.substream.is_null() {
-                return Ok(());
-            }
-            let copied = match st.copied {
-                Some(c) => c,
-                None => {
-                    // start at a completed producer position, not at ring zero
-                    st.copied = Some(absolute);
-                    return Ok(());
-                }
-            };
-            if absolute < copied {
-                dev_warn!(self.dev, "lpai producer moved backwards\n");
-                st.copied = Some(absolute);
-                return Ok(());
-            }
-            let delta = (absolute - copied) as usize;
-            if delta >= ring_bytes {
-                st.overruns += 1;
-                st.copied = Some(absolute);
-                dev_warn!(self.dev, "lpai source overrun ({} bytes)\n", delta);
-                return Ok(());
-            }
-            if delta == 0 {
-                return Ok(());
-            }
-            let runtime = unsafe { (*st.substream).runtime };
-            let dma_area = unsafe { (*runtime).dma_area };
-            let buffer_bytes = st.buffer_bytes;
-            let new_ptr = copy_span(self, dma_area, buffer_bytes, ring_bytes, copied, delta,
-                                    st.hw_ptr_bytes);
-            st.hw_ptr_bytes = new_ptr;
-            st.copied = Some(absolute);
-            st.period_acc += delta;
-            if st.period_acc >= PERIOD_BYTES {
-                st.period_acc %= PERIOD_BYTES;
-                elapsed = true;
-                substream = st.substream;
-            }
-            self.hw_ptr_frames
-                .store((new_ptr / FRAME_BYTES) as u32, Relaxed);
+        let mut st = self.stream.lock();
+        st.last_absolute = Some(absolute);
+        if self.running.load(Relaxed) == 0 || st.substream.is_null() {
+            return Ok(());
         }
-        if elapsed {
-            // SAFETY: the substream stays valid while it is registered in
-            // the stream state (cleared in close under the same lock).
-            unsafe { bindings::snd_pcm_period_elapsed(substream) };
+        let copied = match st.copied {
+            Some(c) => c,
+            None => {
+                // start at a completed producer position, not at ring zero
+                st.copied = Some(absolute);
+                return Ok(());
+            }
+        };
+        if absolute < copied {
+            dev_warn!(self.dev, "lpai producer moved backwards\n");
+            st.copied = Some(absolute);
+            return Ok(());
+        }
+        let delta = (absolute - copied) as usize;
+        if delta >= ring_bytes {
+            st.overruns += 1;
+            st.copied = Some(absolute);
+            dev_warn!(self.dev, "lpai source overrun ({} bytes)\n", delta);
+            return Ok(());
+        }
+        if delta == 0 {
+            return Ok(());
+        }
+        let runtime = unsafe { (*st.substream).runtime };
+        let dma_area = unsafe { (*runtime).dma_area };
+        let buffer_bytes = st.buffer_bytes;
+        let new_ptr = copy_span(self, dma_area, buffer_bytes, ring_bytes, copied, delta,
+                                st.hw_ptr_bytes);
+        st.hw_ptr_bytes = new_ptr;
+        st.copied = Some(absolute);
+        st.period_acc += delta;
+        self.hw_ptr_frames
+            .store((new_ptr / FRAME_BYTES) as u32, Relaxed);
+        if st.period_acc >= PERIOD_BYTES {
+            st.period_acc %= PERIOD_BYTES;
+            // SAFETY: the substream is valid while it is registered in
+            // the stream state, which close clears under this lock.
+            unsafe { bindings::snd_pcm_period_elapsed(st.substream) };
         }
         Ok(())
     }
@@ -802,9 +800,9 @@ unsafe extern "C" fn lpai_pcm_open(substream: *mut bindings::snd_pcm_substream) 
     unsafe {
         (*(*substream).runtime).hw = hw;
     }
+    data.running.store(0, Relaxed);
     let mut st = data.stream.lock();
     st.substream = substream;
-    st.running = false;
     st.copied = None;
     st.hw_ptr_bytes = 0;
     st.period_acc = 0;
@@ -814,9 +812,9 @@ unsafe extern "C" fn lpai_pcm_open(substream: *mut bindings::snd_pcm_substream) 
 
 unsafe extern "C" fn lpai_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
     let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
+    data.running.store(0, Relaxed);
     {
         let mut st = data.stream.lock();
-        st.running = false;
         st.substream = ptr::null_mut();
     }
     if data.powered.load(Relaxed) != 0 {
@@ -850,20 +848,17 @@ unsafe extern "C" fn lpai_pcm_prepare(substream: *mut bindings::snd_pcm_substrea
     0
 }
 
+/// Called with the ALSA stream lock held: only the run flag changes here,
+/// the counters were reset by prepare.
 unsafe extern "C" fn lpai_pcm_trigger(substream: *mut bindings::snd_pcm_substream, cmd: i32) -> i32 {
     let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
-    let mut st = data.stream.lock();
     match cmd as u32 {
         bindings::SNDRV_PCM_TRIGGER_START | bindings::SNDRV_PCM_TRIGGER_RESUME => {
-            st.copied = None;
-            st.hw_ptr_bytes = 0;
-            st.period_acc = 0;
-            data.hw_ptr_frames.store(0, Relaxed);
-            st.running = true;
+            data.running.store(1, Relaxed);
             0
         }
         bindings::SNDRV_PCM_TRIGGER_STOP | bindings::SNDRV_PCM_TRIGGER_SUSPEND => {
-            st.running = false;
+            data.running.store(0, Relaxed);
             0
         }
         _ => EINVAL.to_errno(),
@@ -1796,6 +1791,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 ring_bytes: Atomic::new(0),
                 sequence: Atomic::new(0),
                 powered: Atomic::new(0),
+                running: Atomic::new(0),
                 hw_ptr_frames: Atomic::new(0),
                 cout: Service::new(AUDIO_DEV_COUT, "cout"),
                 cin: Service::new(AUDIO_DEV_CIN, "cin"),
@@ -1810,7 +1806,6 @@ impl platform::Driver for SndSocT8140AopDriver {
                 fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
                 stream <- new_spinlock!(StreamState {
                     substream: ptr::null_mut(),
-                    running: false,
                     last_absolute: None,
                     copied: None,
                     hw_ptr_bytes: 0,
