@@ -31,6 +31,15 @@
 
 /* used to limit the user space buffers to the buffer_pool_config */
 #define ISP_MAX_BUFFERS 16
+
+/*
+ * MMIO windows the firmware reaches through its DART (the DAPF slices of the
+ * ADT dart-isp node), mapped 1:1 in the ISP domain as the native host did.
+ */
+struct isp_identity_window {
+	u64 base;
+	u64 size;
+};
 /* t8140: capture-metadata pool entries the H17 receiver keeps queued */
 #define ISP_CAPMETA_BUFFERS 8
 #define ISP_POOL_TYPE_CAPMETA_SUBMIT 2
@@ -136,25 +145,15 @@ struct apple_isp_hw {
 
 	/*
 	 * t8140 (ISP17a / H17 firmware): the doorbell/ack block is inside the
-	 * "mbox" window (mbox2_offset), the ASC control/status registers moved,
-	 * the firmware takes the 0x290-byte H16 boot descriptor and the EIC's
-	 * ISP watchdog window must be petted by the host while streaming.
+	 * "mbox" window (mbox2_offset), the ASC control register moved, the
+	 * firmware takes the 0x290-byte H16 boot descriptor and the EIC's ISP
+	 * watchdog window must be petted by the host while streaming.
 	 */
 	u32 mbox2_offset;
 	u32 asc_control;
-	u32 asc_status;
 	u32 capture_meta_size;
 	const struct isp_identity_window *identity;
 	int num_identity;
-};
-
-/*
- * MMIO windows the firmware reaches through its DART (the DAPF slices of the
- * ADT dart-isp node), mapped 1:1 in the ISP domain as the native host did.
- */
-struct isp_identity_window {
-	u64 base;
-	u64 size;
 };
 
 enum isp_sensor_id {
@@ -246,10 +245,6 @@ struct apple_isp {
 	bool pds_active;
 
 	int irq;
-	/* t8140 bring-up: the ADT lists five ISP lines; request them all and
-	 * report which one carries the mailbox until it is pinned in the DT */
-	int extra_irqs[8];
-	int num_extra_irqs;
 
 	void __iomem *coproc;
 	void __iomem *mbox;
@@ -276,7 +271,8 @@ struct apple_isp {
 	/*
 	 * t8140: the H17 firmware does not come back from a warm restart
 	 * (no first handshake after suspend + ASC reset), so it is booted once
-	 * at probe and kept running; every stream re-configures its channel.
+	 * at probe and kept running until the driver goes away; every stream
+	 * re-configures its channel.
 	 */
 	bool fw_persistent;
 	bool fw_booted;

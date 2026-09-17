@@ -44,8 +44,11 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX514_2820_04] = {0x514, 0x28200405, "apple/isp_2820_04XX.dat", 0xa198},
 	[ISP_IMX558_1921_01] = {0x558, 0x19210106, "apple/isp_1921_01XX.dat", 0xad40},
 	[ISP_IMX558_1922_02] = {0x558, 0x19220201, "apple/isp_1922_02XX.dat", 0xad40},
-	/* header version 0x21: the only layout the macOS 26 H17 firmware parses */
-	/* 0xcba6 bytes on disk, loaded zero-padded to the 0xcbc0 the kext passes */
+	/*
+	 * Header version 0x21, the only layout the macOS 26 H17 firmware
+	 * parses; 0xcba6 bytes on disk, loaded zero-padded to the 0xcbc0 the
+	 * kext passes.
+	 */
 	[ISP_IMX558_1925_03] = {0x558, 0x19250306, "apple/isp_1925_03XX.dat", 0xcbc0},
 	[ISP_IMX603_7920_01] = {0x603, 0x79200109, "apple/isp_7920_01XX.dat", 0xad2c},
 	[ISP_IMX603_7920_02] = {0x603, 0x79200205, "apple/isp_7920_02XX.dat", 0xad2c},
@@ -302,7 +305,7 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 	if (isp->fw_persistent) {
 		/* the firmware stays up; the channel is configured at first use */
 		if (err)
-			apple_isp_firmware_shutdown(isp);
+			apple_isp_firmware_halt(isp);
 		return err;
 	}
 
@@ -331,8 +334,8 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		return err;
 	}
 
-	/* the H17 file is 0xcba6 bytes for a 0xcbc0 load: allow a short tail */
-	if (fw->size < setfile->size - 0x40) {
+	/* the H17 file is 0xcba6 bytes for a 0xcbc0 load: zero-padded below */
+	if (ALIGN(fw->size, 0x40) < setfile->size) {
 		dev_err(isp->dev, "setfile too small (0x%zx/0x%zx)\n", fw->size,
 			setfile->size);
 		release_firmware(fw);
@@ -611,8 +614,6 @@ static int isp_ch_configure_capture_t8140(struct apple_isp *isp, u32 ch)
 
 static int isp_configure_capture(struct apple_isp *isp)
 {
-	int err;
-
 	/*
 	 * Resident firmware (t8140): CH_STOP drops the channel's fusion/raw
 	 * configuration (a bare CH_START afterwards asserts in
@@ -620,10 +621,9 @@ static int isp_configure_capture(struct apple_isp *isp)
 	 * configured again for every stream.
 	 */
 	if (isp->hw->gen == ISP_GEN_T8140)
-		err = isp_ch_configure_capture_t8140(isp, isp->current_ch);
-	else
-		err = isp_ch_configure_capture(isp, isp->current_ch);
-	return err;
+		return isp_ch_configure_capture_t8140(isp, isp->current_ch);
+
+	return isp_ch_configure_capture(isp, isp->current_ch);
 }
 
 int apple_isp_start_camera(struct apple_isp *isp)

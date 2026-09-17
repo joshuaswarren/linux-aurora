@@ -38,14 +38,14 @@ static inline u32 isp_gpio_read32(struct apple_isp *isp, u32 reg)
 	return readl(isp->gpio + reg);
 }
 
-static inline u32 isp_asc_control_reg(struct apple_isp *isp)
-{
-	return isp->hw->asc_control ?: ISP_COPROC_CONTROL;
-}
-
 static inline void isp_gpio_write32(struct apple_isp *isp, u32 reg, u32 val)
 {
 	writel(val, isp->gpio + reg);
+}
+
+static inline u32 isp_asc_control_reg(struct apple_isp *isp)
+{
+	return isp->hw->asc_control ?: ISP_COPROC_CONTROL;
 }
 
 static int apple_isp_power_up_domains(struct apple_isp *isp)
@@ -76,15 +76,6 @@ static void apple_isp_power_down_domains(struct apple_isp *isp)
 	int ret;
 
 	if (!isp->pds_active)
-		return;
-
-	/*
-	 * t8140: a gated ISP_CPU core never comes back (PS_TARGET=0xf,
-	 * PS_ACTUAL stays 0 on the next power-up, with or without the
-	 * DEV_DISABLE parking bit).  Keep the local chain powered between
-	 * firmware boots, as the native J700 host and m1n1 do.
-	 */
-	if (isp->hw->gen == ISP_GEN_T8140)
 		return;
 
 	for (int i = isp->pd_count - 1; i >= 1; i--) {
@@ -210,19 +201,9 @@ static const struct isp_chan_ops bt_ops = {
 static irqreturn_t apple_isp_isr(int irq, void *dev)
 {
 	struct apple_isp *isp = dev;
-	u32 pending = isp_mbox_read32(isp, ISP_MBOX_IRQ_INTERRUPT);
 
-	if (isp->num_extra_irqs) {
-		/* bring-up: identify the mailbox line among the ADT's five */
-		if (!pending)
-			return IRQ_NONE;
-		if (irq != isp->irq)
-			dev_info_ratelimited(isp->dev,
-					     "mailbox interrupt on extra line irq %d (pending 0x%x)\n",
-					     irq, pending);
-	}
-
-	isp_mbox2_write32(isp, ISP_MBOX2_IRQ_ACK, pending);
+	isp_mbox2_write32(isp, ISP_MBOX2_IRQ_ACK,
+			 isp_mbox_read32(isp, ISP_MBOX_IRQ_INTERRUPT));
 
 	return IRQ_WAKE_THREAD;
 }
@@ -252,8 +233,6 @@ static void isp_disable_irq(struct apple_isp *isp)
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
 	}
 	free_irq(isp->irq, isp);
-	for (int i = 0; i < isp->num_extra_irqs; i++)
-		free_irq(isp->extra_irqs[i], isp);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0xfeedbabe); /* real funny */
 }
 
@@ -267,20 +246,6 @@ static int isp_enable_irq(struct apple_isp *isp)
 		isp_err(isp, "failed to request IRQ#%u (%d)\n", isp->irq, err);
 		return err;
 	}
-	for (int i = 0; i < isp->num_extra_irqs; i++) {
-		err = request_threaded_irq(isp->extra_irqs[i], apple_isp_isr,
-					   apple_isp_isr_thread, 0, "apple-isp",
-					   isp);
-		if (err < 0) {
-			isp_err(isp, "failed to request extra IRQ#%u (%d)\n",
-				isp->extra_irqs[i], err);
-			while (i--)
-				free_irq(isp->extra_irqs[i], isp);
-			free_irq(isp->irq, isp);
-			return err;
-		}
-	}
-
 	isp_dbg(isp, "about to enable interrupts...\n");
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0xf);
@@ -428,7 +393,7 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	isp_gpio_write32(isp, ISP_GPIO_3, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_4, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_5, 0x0);
-	/* ISP_StartFirmware mode 0: the ISP17a boot-mode field is GPIO6 = 1 */
+	/* ISP17a: GPIO6 is the boot-mode field, ISP_StartFirmware mode 0 = 1 */
 	isp_gpio_write32(isp, ISP_GPIO_6,
 			 isp->hw->gen == ISP_GEN_T8140 ? 0x1 : 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_7, 0x0);
@@ -957,13 +922,17 @@ static enum hrtimer_restart apple_isp_wdt_pet(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+void apple_isp_wdt_init(struct apple_isp *isp)
+{
+	hrtimer_setup(&isp->wdt_timer, apple_isp_wdt_pet, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_HARD);
+}
+
 void apple_isp_wdt_start(struct apple_isp *isp)
 {
 	if (!isp->wdt || isp->wdt_running)
 		return;
 
-	hrtimer_setup(&isp->wdt_timer, apple_isp_wdt_pet, CLOCK_MONOTONIC,
-		      HRTIMER_MODE_REL_HARD);
 	isp->wdt_running = true;
 	/* first kick right away, then every 33 ms for the life of the stream */
 	apple_isp_wdt_kick(isp);
@@ -1006,10 +975,24 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	return 0;
 }
 
+/* The end of a stream: resident firmware (t8140) keeps running. */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
-	/* t8140: the firmware stays up (and keeps its runtime PM reference) */
 	if (isp->fw_persistent)
+		return;
+
+	apple_isp_firmware_halt(isp);
+}
+
+/*
+ * The driver going away (or failing to probe): the firmware is stopped and
+ * its power domains released whether or not it is kept resident between
+ * streams.  On t8140 a gated ISP_CPU core does not come back until the
+ * next cold boot, so a re-probe after this cannot boot the firmware.
+ */
+void apple_isp_firmware_halt(struct apple_isp *isp)
+{
+	if (!isp->fw_booted)
 		return;
 
 	isp_firmware_shutdown(isp);

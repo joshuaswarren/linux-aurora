@@ -288,8 +288,10 @@ int isp_cmd_ch_buffer_return(struct apple_isp *isp, u32 chan)
 int isp_cmd_ch_set_file_load(struct apple_isp *isp, u32 chan, u64 addr,
 			     u32 size)
 {
-	/* the H17 kext (H16CamInChannel::SendSetfileToFirmware) uses the 64-bit
-	 * form with an 0x18-byte reply (in 0x18 / out 0x18) */
+	/*
+	 * The H17 kext (H16CamInChannel::SendSetfileToFirmware) uses the
+	 * 64-bit form with an 0x18-byte reply (in 0x18 / out 0x18).
+	 */
 	if (isp->fw_compat >= ISP_FIRMWARE_V_13_5 || isp->hw->gen == ISP_GEN_T8140) {
 		struct cmd_ch_set_file_load64 args = {
 			.opcode = CISP_OPCODE(CISP_CMD_CH_SET_FILE_LOAD),

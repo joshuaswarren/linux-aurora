@@ -39,9 +39,9 @@
 #define CISP_CMD_CH_PROPERTY_WRITE			     0x0122
 #define CISP_CMD_CH_PROPERTY_READ			     0x0123
 #define CISP_CMD_CH_LOCAL_RAW_BUFFER_ENABLE		     0x0125
-#define CISP_CMD_CH_MASTER_SLAVE_SYNC_MODE_SET		     0x0138
 #define CISP_CMD_CH_META_DATA_ENABLE			     0x0126
 #define CISP_CMD_CH_CAMERA_MIPI_FREQUENCY_TOTAL_GET	     0x0133
+#define CISP_CMD_CH_MASTER_SLAVE_SYNC_MODE_SET		     0x0138
 #define CISP_CMD_CH_SBS_ENABLE				     0x013b
 #define CISP_CMD_CH_LSC_POLYNOMIAL_COEFF_GET		     0x0142
 #define CISP_CMD_CH_SET_META_DATA_REQUIRED		     0x014f
@@ -340,9 +340,11 @@ struct cmd_ch_info {
 } __packed;
 static_assert(sizeof(struct cmd_ch_info) == 0x118);
 
-/* t8140 (H17 firmware) CH_INFO_GET is a 0x190-byte in/out record whose first
- * 0x118 bytes match cmd_ch_info (version at +0x20, num_presets at +0x60,
- * the per-frame meta size 0x4d00 at +0x68). */
+/*
+ * t8140 (H17 firmware) CH_INFO_GET is a 0x190-byte in/out record whose first
+ * 0x118 bytes match cmd_ch_info (version at +0x20, num_presets at +0x60, the
+ * per-frame meta size 0x4d00 at +0x68).
+ */
 struct cmd_ch_info_t8140 {
 	struct cmd_ch_info info;
 	u32 unk_118[0x1e];

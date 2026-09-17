@@ -183,33 +183,7 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 	if (!timeout)
 		return 0;
 
-	if (isp->hw->gen == ISP_GEN_T8140 && chan != isp->chan_sm &&
-	    chan != isp->chan_tm) {
-		/*
-		 * Bring-up safety net while the mailbox interrupt line is
-		 * being pinned down: service the firmware's SHAREDMALLOC and
-		 * TERMINAL rings ourselves every 10 ms so a missing interrupt
-		 * cannot deadlock the command path (the native J700 host
-		 * polled the same way).
-		 */
-		unsigned long deadline = jiffies + timeout;
-
-		t = 0;
-		while (time_before(jiffies, deadline)) {
-			t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan),
-					       msecs_to_jiffies(10));
-			if (t)
-				break;
-			ipc_chan_handle(isp, isp->chan_sm);
-			ipc_chan_handle(isp, isp->chan_tm);
-			if (chan_tx_done(isp, chan)) {
-				t = 1;
-				break;
-			}
-		}
-	} else {
-		t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
-	}
+	t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
 	if (t == 0) {
 		dev_err(isp->dev,
 			"%s: timed out on request [0x%llx, 0x%llx, 0x%llx]\n",
