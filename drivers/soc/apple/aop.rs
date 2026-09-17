@@ -51,6 +51,7 @@ use kernel::{
         Arc,
         ArcBorrow,
         CondVar,
+        CondVarTimeoutResult,
         Mutex,
         MutexGuard,
         SpinLock, //
@@ -259,16 +260,20 @@ impl<T> FutureValue<T> {
         ret_guard.take().unwrap()
     }
     /// Waits at most `timeout_ms`; `None` when the value never arrived.
+    ///
+    /// The wait is uninterruptible: a firmware transaction must not be
+    /// abandoned because the calling task has a signal pending (a daemon
+    /// closing its PCM on SIGTERM), or its prompt reply would arrive for a
+    /// call that no longer exists.
     fn wait_timeout(&self, timeout_ms: i64) -> Option<T> {
         let mut ret_guard = self.val.lock();
-        let mut waited = 0i64;
+        let mut left = msecs_to_jiffies(timeout_ms as u32);
         while ret_guard.is_none() {
-            let _ = self
-                .completion
-                .wait_interruptible_timeout(&mut ret_guard, msecs_to_jiffies(100));
-            waited += 100;
-            if waited >= timeout_ms && ret_guard.is_none() {
-                return None;
+            match self.completion.wait_timeout(&mut ret_guard, left) {
+                CondVarTimeoutResult::Timeout => return ret_guard.take(),
+                CondVarTimeoutResult::Woken { jiffies } | CondVarTimeoutResult::Signal { jiffies } => {
+                    left = jiffies;
+                }
             }
         }
         ret_guard.take()
@@ -588,13 +593,15 @@ impl AFKEndpoint {
                     }
                 }
                 if tag == 0 || tag - 1 > self.calls.len() || self.calls[tag - 1].is_none() {
-                    dev_err!(
+                    // A reply for a call that timed out, or no call at all:
+                    // drop it, the rest of the ring is still good.
+                    dev_warn!(
                         client.dev,
-                        "Got a retcode with invalid tag {:?} on endpoint {}",
+                        "Dropping a retcode with no call in flight (tag {:?}) on endpoint {}",
                         tag,
                         self.index
                     );
-                    return Err(EIO);
+                    return Ok(());
                 }
                 let future = self.calls[tag - 1].take().unwrap();
                 let extra_data = if let Some(mut ret) = self.call_returns[tag - 1].take() {
