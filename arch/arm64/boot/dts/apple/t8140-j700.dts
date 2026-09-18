@@ -279,6 +279,21 @@
 			apple,key-id = "Tp0D";
 			label = "P-cluster Temperature 4";
 		};
+
+		/*
+		 * Whole-machine power telemetry (the keys hwmon-common.dtsi
+		 * expects everywhere; a key the J700 SMC lacks is skipped).
+		 * The backlight work reads these to show the panel power
+		 * following the brightness with the machine on AC.
+		 */
+		power-PSTR {
+			apple,key-id = "PSTR";
+			label = "Total System Power";
+		};
+		power-PDTR {
+			apple,key-id = "PDTR";
+			label = "AC Input Power";
+		};
 	};
 };
 
