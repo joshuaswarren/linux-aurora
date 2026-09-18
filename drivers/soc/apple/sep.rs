@@ -38,6 +38,7 @@ use kernel::{
     bindings,
     device,
     dma,
+    dma::Device as _,
     driver,
     new_mutex,
     of,
@@ -2095,6 +2096,12 @@ impl platform::Driver for SepDriver {
             return Err(EINVAL);
         }
         let sep_node = dt::DtNode::of_device(dev).ok_or(ENODEV)?;
+
+        // The SEP's DART window can sit above 4 GiB (the J700's stream-0
+        // window starts at BIT(40)); the platform device's default 32-bit
+        // mask makes every coherent allocation fail with ENOMEM there.
+        // SAFETY: probe runs before any DMA allocation for this device.
+        unsafe { pdev.dma_set_mask_and_coherent(dma::DmaMask::new::<42>())? };
 
         if dt::registration_already_sent(&sep_node) {
             dev_err!(
