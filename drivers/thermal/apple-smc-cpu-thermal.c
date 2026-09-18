@@ -361,6 +361,42 @@ int apple_smc_thermal_aux_set_policy(int temperature, int hysteresis,
 		backup_trip, backup_trip, backup_release);
 	return 0;
 }
+
+/* The auxiliary policy gave up: drop its zone and restore this zone's own
+ * two-tier policy (80 C passive, 95 C minimum) as the sole throttle.
+ */
+void apple_smc_thermal_aux_unregister(void)
+{
+	struct smc_aux_trip_update backup = {
+		.temperature = SMC_TRIP_MC,
+		.hysteresis = SMC_TRIP_MC - SMC_RELEASE_MC,
+	};
+	struct thermal_zone_device *zone;
+
+	guard(mutex)(&smc_provider_lock);
+	zone = smc_aux_zone;
+	smc_aux_zone = NULL;
+	if (zone) {
+		thermal_zone_device_disable(zone);
+		thermal_zone_device_unregister(zone);
+	}
+	mutex_lock(&smc_lock);
+	smc_hot_mc = SMC_HOT_MC;
+	smc_hot_release_mc = SMC_HOT_RELEASE_MC;
+	if (smc_value >= smc_hot_mc)
+		smc_hot = true;
+	else if (smc_value < smc_hot_release_mc)
+		smc_hot = false;
+	smc_update_guards();
+	mutex_unlock(&smc_lock);
+	if (!smc_zone)
+		return;
+	backup.zone = smc_zone;
+	thermal_zone_for_each_trip(smc_zone, smc_aux_set_trip, &backup);
+	thermal_zone_device_update(smc_zone, THERMAL_TRIP_CHANGED);
+	pr_info("apple-smc-thermal: two-tier policy restored: passive %d mC, minimum from %d mC\n",
+		SMC_TRIP_MC, SMC_HOT_MC);
+}
 #endif
 
 /* provider_lock held; never register/update a zone while holding smc_lock. */

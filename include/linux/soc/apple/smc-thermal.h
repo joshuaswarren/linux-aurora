@@ -34,6 +34,7 @@ bool apple_smc_thermal_healthy(void);
 int apple_smc_thermal_aux_register(const struct thermal_zone_device_ops *ops,
 				 const struct thermal_trip *trips, int count);
 void apple_smc_thermal_aux_update(void);
+void apple_smc_thermal_aux_unregister(void);
 int apple_smc_thermal_aux_set_policy(int temperature, int hysteresis,
 				     int backup_trip, int backup_release);
 bool apple_smc_thermal_aux_matches(struct thermal_cooling_device *cdev);

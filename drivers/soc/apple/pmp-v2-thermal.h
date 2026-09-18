@@ -388,6 +388,8 @@ fail:
 	pt_error = ret;
 	pt_guard(false);
 	if (startup_fallback && !pt_stopping) {
+		int released;
+
 		/* Never admitted: release this policy's own constraints and the
 		 * cpufreq boot caps; the SMC two-tier policy remains the throttle.
 		 */
@@ -395,9 +397,10 @@ fail:
 			if (freq_qos_update_request(&pt_qos[i], FREQ_QOS_MAX_DEFAULT_VALUE) >= 0)
 				pt_applied[i] = 0;
 		mutex_unlock(&pt_lock);
-		i = pt_release_bootcaps();
+		apple_smc_thermal_aux_unregister();
+		released = pt_release_bootcaps();
 		dev_err(pt_owner->dev, "PMP thermal startup failed (%d); SMC policy is the throttle (startup_fallback, boot caps %s)\n",
-			ret, i ? "NOT released" : "released");
+			ret, released ? "NOT released" : "released");
 		return;
 	}
 	mutex_unlock(&pt_lock);
