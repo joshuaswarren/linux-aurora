@@ -126,6 +126,13 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	if (crtc_state->active_changed && !crtc_state->active) {
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+
+		/*
+		 * The ACTIVE_ONLY plane pass of commit_tail_rpm() skips this
+		 * CRTC's planes and flush, so hold its framebuffers here: the
+		 * coprocessor keeps scanning the last one out.
+		 */
+		dcp_retain_unbound_fbs_pdev(apple_crtc->dcp, crtc, state);
 		dcp_poweroff(apple_crtc->dcp);
 	}
 
