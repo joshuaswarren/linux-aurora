@@ -1,0 +1,36 @@
+{
+  "compiler_path": "/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.5194.15.Wc8g1g/Metal.xctoolchain/usr/metal/32023/lib/libapplegpu-nt.dylib",
+  "compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "arm64_sha256": "b29231c242a8c5d738aaad50d20e906979731c87f829c93dfe0c56d5dc079175",
+  "function_count": 75408,
+  "hardware_execution": false,
+  "function": "0x329e9c",
+  "function_end": "0x329f1c",
+  "instructions": [
+    {
+      "address": "0x329e9c",
+      "mnemonic": "stp",
+      "operands": "x20, x19, [sp, #-0x20]!"
+    }
+  ],
+  "export_path": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/probes/native-agx3-sched-hints-region-arm64.bin",
+  "export_sha256": "3b5a319d66cd0ba1192880ba5b7b592625577aa0a30f8809837082c9892ea5bb",
+  "export_base_address": "0x329e9c",
+  "export_size": 6164,
+  "export_end_address": "0x32b6b0",
+  "export_functions": [
+    "0x329e9c",
+    "0x329f1c",
+    "0x329f9c",
+    "0x32a030",
+    "0x32a0ac",
+    "0x32a0bc",
+    "0x32a0ec",
+    "0x32ade8",
+    "0x32aeac",
+    "0x32af48",
+    "0x32b038",
+    "0x32b0a4",
+    "0x32b360"
+  ]
+}

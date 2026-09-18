@@ -24,7 +24,7 @@ def block(pattern):
 
 
 constant = re.search(
-    r"pub\(crate\) const G17P_RETAINED_RENDER_ORDINALS: u32 = .*?;", source
+    r"pub\(crate\) const G17P_RETAINED_RENDER_ORDINALS: u64 = .*?;", source
 ).group()
 names = [
     "G17P_USER_TILING_RING", "G17P_USER_TILING_POINTERS",

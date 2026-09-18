@@ -1,0 +1,94 @@
+{
+  "scope": "Existing offline compiler captures, not a runtime or performance result.",
+  "compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "schemas_verified": 4,
+  "captures": [
+    {
+      "directory": "native-preamble-sampling-host27/vertex-2d-uniform",
+      "words": null,
+      "workload": "vertex-2d-uniform",
+      "native_sha256": "14901a45f572729865b55c2fd657be1b11450e3cefe7c865652b662ff547bdfa",
+      "temporary_register_count": 6,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 32,
+      "entry_ipr_bytes": 32,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 4,
+          "cprog_uniform_inputs": [
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 128,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 342
+    },
+    {
+      "directory": "native-preamble-sampling-host27/vertex-2d-varying",
+      "words": null,
+      "workload": "vertex-2d-varying",
+      "native_sha256": "4cdaf8931811e9ec08c72feba4ecb8d4e86ddce113c5dcb6a8b8b160b40b2a62",
+      "temporary_register_count": 6,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 32,
+      "entry_ipr_bytes": 32,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 4,
+          "cprog_uniform_inputs": [
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 128,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 358
+    },
+    {
+      "directory": "native-preamble-sampling-host27/vertex-cube-uniform",
+      "words": null,
+      "workload": "vertex-cube-uniform",
+      "native_sha256": "68affc859d0b360e2a6f8fa8ca579af20962894245a28de56098f9be3f9c7925",
+      "temporary_register_count": 6,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 32,
+      "entry_ipr_bytes": 32,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 2,
+          "cprog_uniform_inputs": [
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 128,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 416
+    }
+  ]
+}

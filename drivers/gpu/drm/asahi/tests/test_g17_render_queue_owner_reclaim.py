@@ -38,9 +38,11 @@ assert "snapshot.job_list_empty" in release_slot
 assert "state.storage.take()" not in release_slot
 assert "state.bind.take()" not in release_slot
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
-assert "same_vm_different_context" in handoff
-assert ".retarget_command_context(vm, execution_context.clone())" in handoff
-assert "render_context_retirement = Some(G17PRenderContextRetirement" in handoff
+retarget = function(manager, "fn retarget_retained_render_context(")
+assert "same_vm_different_context" in retarget
+assert ".retarget_command_context(vm, execution_context.clone())" in retarget
+assert "render_context_retirement = Some(G17PRenderContextRetirement" in retarget
+assert handoff.count("self.retarget_retained_render_context(") == 3
 assert "Self::retired_render_graph_reclaimable(" in preserve
 assert "manager.release_render_context_owner(context)" in runtime_release
 complete = function(manager, "fn complete_render_context_update_retirement(")

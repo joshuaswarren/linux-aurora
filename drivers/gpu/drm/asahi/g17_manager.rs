@@ -1207,7 +1207,7 @@ pub(crate) struct G17PManagerConstruction {
     /// its scheduler entity drained. The bit also prevents a graph which was
     /// concurrently moved into the retirement cache from escaping teardown.
     released_render_contexts: u64,
-    render_submission_ordinal: u32,
+    render_submission_ordinal: u64,
     /// Per-command host timestamp shared by the TA and 3D KSM entries. Native
     /// prepares it once in the combined render descriptor, before either
     /// stage wrapper encodes its entry.
@@ -1322,7 +1322,7 @@ struct G17PRenderSlotState {
     storage: Option<g17_resources::G17PUserRenderStorage>,
     sksm: Option<G17PRenderSksmQueues>,
     tracker: Option<G17PPartialOpeningRenderTracker>,
-    submission_ordinal: u32,
+    submission_ordinal: u64,
     auxiliary_timestamp: u64,
     hardware_buffer_id: Option<u32>,
     hardware_buffer_published: bool,
@@ -3385,13 +3385,14 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    fn retained_graph_matches_owner(
+    fn retained_graph_matches_vm(
         graph: &G17PRetiredRenderGraph,
         vm: &mmu::Vm,
-        descriptor_context_id: u16,
     ) -> bool {
+        // Fixed RT/TPC mappings belong to the VM and physical pair, not the
+        // logical queue's descriptor context. A cached graph may therefore
+        // need a context retarget before it can execute the incoming queue.
         graph.bind.matches(vm)
-            && graph.storage.descriptor_context_id() == descriptor_context_id
             && vm.render_pool_mappings_match(
                 graph.storage.queue_pair().slot(),
                 graph.storage.render_pool_id(),
@@ -3495,11 +3496,11 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    pub(crate) fn handoff_retained_render_vm(
+    fn retarget_retained_render_context(
         &mut self,
         vm: &mmu::Vm,
         execution_context: Arc<mmu::T8140ComputeExecutionContext>,
-    ) -> Result {
+    ) -> Result<bool> {
         let descriptor_context_id =
             u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
         // Logical queues in one DRM VM receive independent descriptor
@@ -3559,6 +3560,19 @@ impl G17PManagerConstruction {
                 descriptor_context_id,
                 retire_after_context_epoch,
             );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn handoff_retained_render_vm(
+        &mut self,
+        vm: &mmu::Vm,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result {
+        let descriptor_context_id =
+            u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
+        if self.retarget_retained_render_context(vm, execution_context.clone())? {
             return Ok(());
         }
         // A pre-publication failure can leave this slot with no selected graph
@@ -3572,14 +3586,14 @@ impl G17PManagerConstruction {
                 .retired_render_handoff_graph
                 .as_ref()
                 .is_some_and(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == pair_slot
                 });
             let cached_index = if cached_immediate {
                 None
             } else {
                 self.retired_render_handoff_graphs.iter().position(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == pair_slot
                 })
             };
@@ -3617,6 +3631,7 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
+            self.retarget_retained_render_context(vm, execution_context)?;
             self.prune_unreferenced_retired_render_graphs()?;
             dev_info!(
                 self.resources.dev().as_ref(),
@@ -3647,7 +3662,7 @@ impl G17PManagerConstruction {
             .retired_render_handoff_graph
             .as_ref()
             .is_some_and(|graph| {
-                Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                Self::retained_graph_matches_vm(graph, vm)
                     && graph.storage.queue_pair().slot() == self.active_render_slot
             });
         let cached_index = if cached_immediate {
@@ -3656,7 +3671,7 @@ impl G17PManagerConstruction {
             self.retired_render_handoff_graphs
                 .iter()
                 .position(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == self.active_render_slot
                 })
         };
@@ -3689,7 +3704,7 @@ impl G17PManagerConstruction {
                 .retired_render_handoff_graphs
                 .iter()
                 .position(|graph| {
-                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    Self::retained_graph_matches_vm(graph, vm)
                         && graph.storage.queue_pair().slot() == self.active_render_slot
                 })
                 .ok_or(EIO)?;
@@ -3718,6 +3733,7 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
+            self.retarget_retained_render_context(vm, execution_context)?;
             self.prune_unreferenced_retired_render_graphs()?;
             if crate::util::g17p_verbose() {
                 dev_info!(self.resources.dev().as_ref(),
@@ -4179,11 +4195,19 @@ impl G17PManagerConstruction {
         vm: &mmu::Vm,
         descriptor_context_id: u16,
     ) -> bool {
-        g17_lifecycle::retained_render_requires_recycle(
-            self.render_storage.is_some() || self.render_context_aliases.is_some(),
-            !self.retained_render_has_other_owner(vm, descriptor_context_id),
+        let retained_graph = self.render_storage.is_some() || self.render_context_aliases.is_some();
+        let same_owner = !self.retained_render_has_other_owner(vm, descriptor_context_id);
+        let recycle = g17_lifecycle::retained_render_requires_recycle(
+            retained_graph,
+            same_owner,
             self.render_submission_ordinal,
-        )
+        );
+        if recycle {
+            dev_warn!(self.resources.dev().as_ref(),
+                "G17P render: session recycle requested ordinal={} retained={} same-owner={} descriptor-context={}\n",
+                self.render_submission_ordinal, retained_graph, same_owner, descriptor_context_id);
+        }
+        recycle
     }
 
     /// Prepare the two render KSM kick queues without touching the hardware
@@ -4840,15 +4864,10 @@ impl G17PManagerConstruction {
             *crate::module_parameters::g17p_render_native_doorbells.value(),
         );
         if !split_launch {
-            let event_word = u32::try_from(ta_stamp)
-                .ok()
-                .and_then(|stamp| stamp.checked_mul(0x100))
-                .ok_or_else(|| Self::render_stage_fail("sksm-event-word", EINVAL))?;
-            let barrier = [g17_submission::G17PClBarrierDependency {
-                event_word,
-                shared_stamp: 0,
-                queue_id: ta_queue_id,
-            }];
+            let barrier = [g17_submission::g17p_render_barrier_from_timestamp(
+                ta_stamp, ta_queue_id,
+            ).map_err(|_| Self::render_stage_fail("sksm-event-word", EINVAL))?];
+            let event_word = barrier[0].event_word;
             // DIAGNOSTIC, not a fix. Metal reserves a barrier SLOT per render
             // pass; suppressing the dependency asks only whether that missing
             // lifecycle is what stalls the fragment group.
@@ -4880,8 +4899,6 @@ impl G17PManagerConstruction {
                     dev_warn!(dev.as_ref(), "G17P render route: post-3D snapshot failed ({:?})\n", error);
                 }
             }
-            let fragment_stamp = u32::try_from(fragment_stamp)
-                .map_err(|_| Self::render_stage_fail("sksm-fragment-stamp-width", EINVAL))?;
             self.render_storage
                 .as_mut()
                 .ok_or(ENODEV)?
@@ -4955,8 +4972,6 @@ impl G17PManagerConstruction {
             );
             return Err(Self::render_stage_fail("sksm-tiling-stamp-mismatch", EINVAL));
         }
-        let tiling_stamp = u32::try_from(tiling_stamp)
-            .map_err(|_| Self::render_stage_fail("sksm-tiling-stamp-width", EINVAL))?;
         let late_tiling = self
             .render_storage
             .as_mut()
@@ -6595,15 +6610,10 @@ impl G17PManagerConstruction {
                 queues.tiling.queue_id,
             )
         };
-        let event_word = u32::try_from(ta_stamp)
-            .ok()
-            .and_then(|stamp| stamp.checked_mul(0x100))
-            .ok_or(EINVAL)?;
-        let barrier = [g17_submission::G17PClBarrierDependency {
-            event_word,
-            shared_stamp: 0,
-            queue_id: ta_queue_id,
-        }];
+        let barrier = [g17_submission::g17p_render_barrier_from_timestamp(
+            ta_stamp, ta_queue_id,
+        ).map_err(|_| EINVAL)?];
+        let event_word = barrier[0].event_word;
         let suppress_barrier =
             *crate::module_parameters::g17p_render_no_barrier.value() != 0;
         let barrier_slice: &[g17_submission::G17PClBarrierDependency] =
@@ -6634,8 +6644,6 @@ impl G17PManagerConstruction {
         let fragment_stamp = self
             .publish_render_sksm_group(dev, false, fragment_queue, barrier_slice)
             .map_err(|error| Self::render_stage_fail("split-sksm-publish-fragment", error))?;
-        let fragment_stamp = u32::try_from(fragment_stamp)
-            .map_err(|_| Self::render_stage_fail("split-sksm-fragment-stamp-width", EINVAL))?;
         self.render_storage
             .as_mut()
             .ok_or(ENODEV)?
@@ -6698,7 +6706,7 @@ impl G17PManagerConstruction {
             .ok_or(ENODEV)?
             .prepare_late_tiling_publication_with_stamp(
                 ordinal,
-                u32::try_from(expected_stamp).map_err(|_| EINVAL)?,
+                expected_stamp,
             )
             .map_err(|error| Self::render_stage_fail("native-prepare-tiling", error))?;
         let mut order = G17PNativeRenderPublishOrder::after_fragment_doorbell();
@@ -6932,12 +6940,13 @@ impl G17PManagerConstruction {
                 // maintenance (25G83 B1 0x16ea0); queue/list retirement alone
                 // therefore cannot authorize a userspace-visible fence.
                 // The physical slot retains its ordinal across VM switches,
-                // has one in-flight pair, and refuses 24-bit stamp overflow.
+                // has one in-flight pair. The event value wraps as on M1/M2;
+                // the previous completed value differs even across zero.
                 // Require this exact generation, never a stale nonzero stamp.
                 let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
                 let expected_stamp = self.render_submission_ordinal
                     .checked_add(1)
-                    .and_then(|value| value.checked_mul(0x100))
+                    .map(|value| (value as u32).wrapping_shl(8))
                     .ok_or(EOVERFLOW)?;
                 let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
                 if fragment_stamp != expected_stamp {
@@ -8047,7 +8056,7 @@ impl G17PManagerConstruction {
 
         let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
             descriptor_low,
-            queue.submission_ordinal,
+            u64::from(queue.submission_ordinal),
         )
         .map_err(|_| EINVAL)?;
         let prepared_entry = g17_submission::prepare_g17p_cl_kick_entry(
@@ -8802,7 +8811,7 @@ impl G17PManagerConstruction {
             .descriptor_gpu_va(timestamp.stamp_index);
         let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
             descriptor_low,
-            queue.submission_ordinal,
+            u64::from(queue.submission_ordinal),
         )
         .map_err(|_| EINVAL)?;
         let payload = [descriptor_high, queue.compute.queue_record_gpu_va()];

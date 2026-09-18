@@ -1,0 +1,54 @@
+{
+  "compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "compiler_arm64_sha256": "b29231c242a8c5d738aaad50d20e906979731c87f829c93dfe0c56d5dc079175",
+  "native_driver_sha256": "666816a37045b6dcd351b63ad56a1f5ce284f3acb2157262226e090ade9cfca2",
+  "converters": [
+    "0x383c3c",
+    "0x383f58",
+    "0x3840dc"
+  ],
+  "kind": 145,
+  "mapper": "0x40caac",
+  "helper": "0x381198",
+  "named_driver_mapper": [
+    "__ZN4llvm4AGX3L22mapInstrSpecFields_rldERKNS0_10USCInstr_uERNS0_21USCInstrFieldValueMapE"
+  ],
+  "metadata_cases": 616,
+  "comparisons": 2464,
+  "all_compiler_and_named_driver_fields_identical": true,
+  "result_sha256": "d042d8ff541ed633f605288f5071fc98d7d2df1091983c8a62b2b5ed371f924b",
+  "examples": [
+    {
+      "family": 0,
+      "metadata": "0x1000000000",
+      "field": 41,
+      "value": 1
+    },
+    {
+      "family": 0,
+      "metadata": "0x2000000000",
+      "field": 41,
+      "value": 2
+    },
+    {
+      "family": 3,
+      "metadata": "0x1000000000",
+      "field": 44,
+      "value": 1
+    },
+    {
+      "family": 3,
+      "metadata": "0x2000000000",
+      "field": 44,
+      "value": 2
+    }
+  ],
+  "established": "RLD field 41 (family 0) or 44 (families 1-3) is metadata bits 36:37; scheduling fields and wait fields are distinct.",
+  "not_established": [
+    "Scheduling hint placement policy",
+    "Hardware meaning of hint values",
+    "Safe Mesa preamble enablement",
+    "CTS conformance"
+  ],
+  "hardware_execution": false
+}

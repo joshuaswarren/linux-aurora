@@ -1,0 +1,395 @@
+{
+  "same_schedule": true,
+  "shared_executions": 43901,
+  "old_schedule": 43901,
+  "new_schedule": 43901,
+  "old_status": {
+    "Pass": 2413,
+    "Fail": 200,
+    "InternalError": 9,
+    "ResourceError": 1,
+    "NotRun": 41278
+  },
+  "new_status": {
+    "Pass": 40599,
+    "Fail": 3152,
+    "InternalError": 150
+  },
+  "old_config_status": {
+    "Pass": 15
+  },
+  "new_config_status": {
+    "Pass": 15
+  },
+  "transitions": [
+    {
+      "old": "Fail",
+      "new": "Fail",
+      "count": 185
+    },
+    {
+      "old": "Fail",
+      "new": "Pass",
+      "count": 15
+    },
+    {
+      "old": "InternalError",
+      "new": "InternalError",
+      "count": 9
+    },
+    {
+      "old": "NotRun",
+      "new": "Fail",
+      "count": 2966
+    },
+    {
+      "old": "NotRun",
+      "new": "InternalError",
+      "count": 141
+    },
+    {
+      "old": "NotRun",
+      "new": "Pass",
+      "count": 38171
+    },
+    {
+      "old": "Pass",
+      "new": "Pass",
+      "count": 2413
+    },
+    {
+      "old": "ResourceError",
+      "new": "Fail",
+      "count": 1
+    }
+  ],
+  "recovered_executions": [
+    {
+      "log": "config-gl30-main-cfg-1-run-44-width-64-height-64-seed-1-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelod.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-44-width-64-height-64-seed-1-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelodoffset.sampler2darrayshadow_fragment",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-44-width-64-height-64-seed-1-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelodoffset.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-44-width-64-height-64-seed-1-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.textureoffset.sampler2darrayshadow_bias_fragment",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-44-width-64-height-64-seed-1-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.textureoffset.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-45-width-113-height-47-seed-2-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelod.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-45-width-113-height-47-seed-2-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelodoffset.sampler2darrayshadow_fragment",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-45-width-113-height-47-seed-2-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelodoffset.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-45-width-113-height-47-seed-2-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.textureoffset.sampler2darrayshadow_bias_fragment",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-45-width-113-height-47-seed-2-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.textureoffset.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-46-width-64-height--1-seed-3-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelod.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-46-width-64-height--1-seed-3-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelodoffset.sampler2darrayshadow_fragment",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-46-width-64-height--1-seed-3-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.texturelodoffset.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-46-width-64-height--1-seed-3-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.textureoffset.sampler2darrayshadow_bias_fragment",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    },
+    {
+      "log": "config-gl30-main-cfg-1-run-46-width-64-height--1-seed-3-egl.qpa",
+      "case": "KHR-GL30.ext_texture_shadow_lod.textureoffset.sampler2darrayshadow_vertex",
+      "status": "Pass",
+      "message": "Pass",
+      "details": []
+    }
+  ],
+  "regressed_executions": [],
+  "family_status": {
+    "gl30": {
+      "old": {
+        "Pass": 1
+      },
+      "new": {
+        "Pass": 1
+      }
+    },
+    "info": {
+      "old": {
+        "Pass": 18,
+        "NotRun": 282
+      },
+      "new": {
+        "Pass": 300
+      }
+    },
+    "clip_distance": {
+      "old": {
+        "Fail": 6,
+        "Pass": 3,
+        "NotRun": 141
+      },
+      "new": {
+        "Fail": 100,
+        "Pass": 50
+      }
+    },
+    "glsl_noperspective": {
+      "old": {
+        "Pass": 3,
+        "NotRun": 47
+      },
+      "new": {
+        "Pass": 50
+      }
+    },
+    "transform_feedback": {
+      "old": {
+        "Pass": 30,
+        "InternalError": 9,
+        "Fail": 24,
+        "NotRun": 987
+      },
+      "new": {
+        "Pass": 500,
+        "InternalError": 150,
+        "Fail": 400
+      }
+    },
+    "transform_feedback3": {
+      "old": {
+        "Fail": 9,
+        "NotRun": 141
+      },
+      "new": {
+        "Fail": 150
+      }
+    },
+    "texture_repeat_mode": {
+      "old": {
+        "Pass": 378,
+        "Fail": 108,
+        "NotRun": 7614
+      },
+      "new": {
+        "Pass": 6300,
+        "Fail": 1800
+      }
+    },
+    "texture_lod_basic": {
+      "old": {
+        "Pass": 3,
+        "NotRun": 47
+      },
+      "new": {
+        "Pass": 50
+      }
+    },
+    "shaders30": {
+      "old": {
+        "Pass": 1953,
+        "NotRun": 30597
+      },
+      "new": {
+        "Pass": 32550
+      }
+    },
+    "ext_texture_shadow_lod": {
+      "old": {
+        "Pass": 6,
+        "Fail": 39,
+        "NotRun": 705
+      },
+      "new": {
+        "Pass": 350,
+        "Fail": 400
+      }
+    },
+    "framebuffer_blit": {
+      "old": {
+        "Fail": 8,
+        "ResourceError": 1,
+        "NotRun": 141
+      },
+      "new": {
+        "Fail": 150
+      }
+    },
+    "texture_lod_bias": {
+      "old": {
+        "Fail": 2,
+        "NotRun": 48
+      },
+      "new": {
+        "Fail": 50
+      }
+    },
+    "buffer_objects": {
+      "old": {
+        "Pass": 8,
+        "Fail": 2,
+        "NotRun": 240
+      },
+      "new": {
+        "Pass": 200,
+        "Fail": 50
+      }
+    },
+    "transform_feedback2": {
+      "old": {
+        "Fail": 2,
+        "NotRun": 48
+      },
+      "new": {
+        "Fail": 50
+      }
+    },
+    "api": {
+      "old": {
+        "Pass": 2,
+        "NotRun": 48
+      },
+      "new": {
+        "Pass": 48,
+        "Fail": 2
+      }
+    },
+    "get_uniform_tests": {
+      "old": {
+        "Pass": 2,
+        "NotRun": 48
+      },
+      "new": {
+        "Pass": 50
+      }
+    },
+    "frag_coord_conventions": {
+      "old": {
+        "Pass": 2,
+        "NotRun": 48
+      },
+      "new": {
+        "Pass": 50
+      }
+    },
+    "texture_storage": {
+      "old": {
+        "Pass": 2,
+        "NotRun": 48
+      },
+      "new": {
+        "Pass": 50
+      }
+    },
+    "draw_buffers": {
+      "old": {
+        "Pass": 2,
+        "NotRun": 48
+      },
+      "new": {
+        "Pass": 50
+      }
+    }
+  },
+  "old_receipt": {
+    "boot": "bac77c46-149d-42d4-aba1-dcae3a6422cb",
+    "mode": "full",
+    "profile": "gl30",
+    "platform": "x11",
+    "exit_code": -15,
+    "diagnostic_case": null,
+    "command_trace": false,
+    "command_trace_mode": null,
+    "mesa_sha256": "a3efd34389676c6570ef265c64d24953eeca5b2fb3543c90a85888078f8bf746",
+    "cts_commit": "067e8832315e79817ede1c4863804e440f5d1c80",
+    "cts_runner_sha256": "80263c0bc5c6fa1cf26b0c6d5ac1306e3b6ded6c50449e46e72eb81561f7de20",
+    "kernel_fault": true,
+    "kernel_stream_overruns": 0,
+    "elapsed_seconds": 27.954282321999926,
+    "verdict_note": "Interpret the official summary and complete run inventory; process exit alone is not conformance."
+  },
+  "new_receipt": {
+    "boot": "f80b3c8f-a9e7-4fe1-9024-1e03dcd756a4",
+    "mode": "full",
+    "profile": "gl30",
+    "platform": "x11",
+    "exit_code": 1,
+    "diagnostic_case": null,
+    "diagnostic_session": null,
+    "command_trace": false,
+    "command_trace_mode": null,
+    "mesa_sha256": "8a8162978caa19159d6a51cb2d8180ad431f43f3b3f99adce9ed986431e14c9f",
+    "cts_commit": "067e8832315e79817ede1c4863804e440f5d1c80",
+    "cts_runner_sha256": "80263c0bc5c6fa1cf26b0c6d5ac1306e3b6ded6c50449e46e72eb81561f7de20",
+    "kernel_fault": false,
+    "kernel_stream_overruns": 0,
+    "elapsed_seconds": 441.9091639629996,
+    "verdict_note": "Interpret the official summary and complete run inventory; process exit alone is not conformance."
+  }
+}

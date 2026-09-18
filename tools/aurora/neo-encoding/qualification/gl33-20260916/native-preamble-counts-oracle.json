@@ -1,0 +1,73 @@
+{
+  "status": "pass",
+  "native_binary_sha256": "666816a37045b6dcd351b63ad56a1f5ce284f3acb2157262226e090ade9cfca2",
+  "source_sha256": {
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib/agx_vdm_state_update_core.c": "15faddefe8fc8f9a11884abeaf55fa4ed446bf7f9be5d88ca80cbb8b59123930",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib/agx_vdm_state_core.c": "5f5f8af42a36db80e546941fc71e2cdca0e04edf8e5d096f05920c07fe694e79",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib/agx_vdm_state_update_core.h": "a3315ceea7a0d191461abc27caa563d284c14f28006bee5962e3a975f81df8d7",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib/agx_vdm_state_core.h": "567da4b98f557eee004cd82d653923e9b2b14297cbab79a4808eb1d702a44c8f",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib/agx_chip.h": "2c4b4292a1dd9d54ba1d4f3f8d5eca6677a1a68a54f52ee826c2fb402322774a"
+  },
+  "native_instructions": [
+    {
+      "address": "0x216b8b644",
+      "bytes": "890d0011",
+      "mnemonic": "add",
+      "operands": "w9, w12, #3"
+    },
+    {
+      "address": "0x216b8b648",
+      "bytes": "297d0253",
+      "mnemonic": "lsr",
+      "operands": "w9, w9, #2"
+    },
+    {
+      "address": "0x216b8b64c",
+      "bytes": "29050011",
+      "mnemonic": "add",
+      "operands": "w9, w9, #1"
+    },
+    {
+      "address": "0x216b8b650",
+      "bytes": "29751f12",
+      "mnemonic": "and",
+      "operands": "w9, w9, #0x7ffffffe"
+    },
+    {
+      "address": "0x216b8b638",
+      "bytes": "490d0011",
+      "mnemonic": "add",
+      "operands": "w9, w10, #3"
+    },
+    {
+      "address": "0x216b8b63c",
+      "bytes": "297d0253",
+      "mnemonic": "lsr",
+      "operands": "w9, w9, #2"
+    }
+  ],
+  "assembly_sha256": "58d5728e1bf22715ad11e70400f4b62526fe6774fc653079c49202cd2df17cab",
+  "harness_sha256": "bac55819b67e3a136a3c7bb313c0f46975592d84de81f5baee7b9af408372815",
+  "build_command": [
+    "clang",
+    "-std=c11",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-fsanitize=undefined",
+    "-fno-sanitize-recover=all",
+    "-I/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/include",
+    "-I/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib/agx_vdm_state_update_core.c",
+    "/Users/mcruz/Developer/aurora-silicon/mesa-j700-preamble-20260915/src/asahi/lib/agx_vdm_state_core.c",
+    "/var/folders/6x/yksc7mzx7pb381hcxqm3zszm0000gn/T/j700-native-counts-snffrgy3/native.S",
+    "/var/folders/6x/yksc7mzx7pb381hcxqm3zszm0000gn/T/j700-native-counts-snffrgy3/harness.c",
+    "-o",
+    "/var/folders/6x/yksc7mzx7pb381hcxqm3zszm0000gn/T/j700-native-counts-snffrgy3/verify"
+  ],
+  "build_log": "",
+  "result": "1064950 native arithmetic comparisons; 7 rejection/zero-output controls; PASS\n",
+  "stderr": "",
+  "scope": "CPU arithmetic/field bounds only; no GPU or nonzero-IPR runtime qualification."
+}

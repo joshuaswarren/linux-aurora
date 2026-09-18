@@ -1,0 +1,36 @@
+{
+  "boot": "94c3f079-27bc-456d-93a2-5db1e7ed2171",
+  "mode": "replay",
+  "profile": "gl33",
+  "platform": "x11",
+  "exit_code": 0,
+  "diagnostic_case": null,
+  "diagnostic_session": null,
+  "replay_sessions": [
+    {
+      "round": 1,
+      "group": 1,
+      "qpa": "replay-r001-g001.qpa",
+      "expected": 1312,
+      "exit_code": 0,
+      "elapsed_seconds": 179.38780342500002
+    }
+  ],
+  "command_trace": false,
+  "command_trace_mode": null,
+  "shader_cache_policy": "isolated",
+  "shader_cache_directory": "/home/mcruz/.cache/neo-cts-shaders/362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56/51541904ae00503eb3c44d6bf5356e206ce7085296d047d489452247977b1594",
+  "mesa_sha256": "362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56",
+  "cts_commit": "067e8832315e79817ede1c4863804e440f5d1c80",
+  "asahi_module_sha256": "51541904ae00503eb3c44d6bf5356e206ce7085296d047d489452247977b1594",
+  "asahi_loaded_build_note": "040000001400000003000000474e550049c8e401e7bcb16817650697f63f1010dbda1cb7",
+  "probe_source_sha256": null,
+  "probe_binary_sha256": null,
+  "probe_result": null,
+  "cts_runner_sha256": "80263c0bc5c6fa1cf26b0c6d5ac1306e3b6ded6c50449e46e72eb81561f7de20",
+  "kernel_fault": false,
+  "kernel_stream_overruns": 0,
+  "firmware_dumps": null,
+  "elapsed_seconds": 179.733355523,
+  "verdict_note": "Interpret the official summary and complete run inventory; process exit alone is not conformance."
+}
