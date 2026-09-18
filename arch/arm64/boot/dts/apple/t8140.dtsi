@@ -534,7 +534,10 @@
 		 */
 		sep_dart: iommu@280b80000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
-			reg = <0x2 0x80b80000 0x0 0x4000>;
+			/* The ADT's 0x20000 aperture: the T8110 v2 exception bitmap
+			 * (0x4000) and per-SID records (0x8000 + 0x40 * sid) that the
+			 * driver drains at reset lie past the first 16 KiB. */
+			reg = <0x2 0x80b80000 0x0 0x20000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
