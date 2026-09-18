@@ -184,7 +184,7 @@ fn sks_declared_sizes() -> (usize, usize) {
     (0x8000, 0x4000)
 }
 
-struct Hex<'a>(&'a [u8]);
+pub(crate) struct Hex<'a>(pub(crate) &'a [u8]);
 
 impl kernel::fmt::Display for Hex<'_> {
     fn fmt(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {

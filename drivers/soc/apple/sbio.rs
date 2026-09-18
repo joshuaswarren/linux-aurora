@@ -20,20 +20,31 @@ impl SepData {
     pub(crate) fn sbio_call(&self, op: &crate::sbio::SbioOp) -> SbioOutcome {
         let done = match self.sbio_transfer(op) {
             Ok(done) => done,
-            Err(_) => {
+            Err(e) => {
+                dev_warn!(self.dev, "sbio: {} transfer failed ({:?})\n", op.name(), e);
                 return SbioOutcome::Other;
             }
         };
 
         let Some(err) = done.status.answered() else {
+            dev_warn!(self.dev, "sbio: {} not answered ({})\n", op.name(), done.status);
             return SbioOutcome::Other;
         };
 
         match err as u16 {
             crate::sbio::SBIO_STATUS_OK => SbioOutcome::Ok(done.payload),
-            crate::sbio::SBIO_STATUS_PREREQUISITE => SbioOutcome::PrerequisiteMissing,
-            crate::sbio::SBIO_STATUS_16 => SbioOutcome::Status16,
-            _ => SbioOutcome::Other,
+            crate::sbio::SBIO_STATUS_PREREQUISITE => {
+                dev_warn!(self.dev, "sbio: {} answered status {:#x} (prerequisite missing)\n", op.name(), err);
+                SbioOutcome::PrerequisiteMissing
+            }
+            crate::sbio::SBIO_STATUS_16 => {
+                dev_warn!(self.dev, "sbio: {} answered status {:#x}\n", op.name(), err);
+                SbioOutcome::Status16
+            }
+            _ => {
+                dev_warn!(self.dev, "sbio: {} answered status {:#x}\n", op.name(), err);
+                SbioOutcome::Other
+            }
         }
     }
 
@@ -1177,7 +1188,8 @@ impl SepData {
 
         let serial = match sensor::read_sensor_serial() {
             Ok(serial) => serial,
-            Err(_) => {
+            Err(e) => {
+                dev_err!(self.dev, "sensor: reading the sensor serial failed ({:?})\n", e);
                 return false;
             }
         };
@@ -1210,10 +1222,18 @@ impl SepData {
             }
             let st = match sensor::status() {
                 Ok(st) => st,
-                Err(_) => {
+                Err(e) => {
+                    dev_err!(self.dev, "sensor: status read failed ({:?})\n", e);
                     return None;
                 }
             };
+            dev_info!(
+                self.dev,
+                "sensor: status after +{} ms: state {:#x} raw {}\n",
+                delay,
+                st.state,
+                crate::Hex(&st.raw)
+            );
             if st.is_silent() {
                 continue;
             }
@@ -1234,6 +1254,12 @@ impl SepData {
                 continue;
             };
             if !self.register_sensor(&id) {
+                dev_err!(
+                    self.dev,
+                    "sensor: registering identifier {:#06x} with the enclave failed (bring-up stage {})\n",
+                    id.value(),
+                    self.bringup.load(Relaxed)
+                );
                 return None;
             }
 
