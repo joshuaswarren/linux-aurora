@@ -35,7 +35,7 @@ const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> =
 /// How long to wait for the firmware to report a compute submission complete.
 /// Generous relative to the ~170 GPU ticks a first add3 actually takes; this is
 /// a stuck-firmware backstop, not a pacing knob.
-const G17P_COMPUTE_COMPLETION_TIMEOUT_MS: u32 = 2000;
+pub(crate) const G17P_COMPUTE_COMPLETION_TIMEOUT_MS: u32 = 2000;
 
 /// Most mapped VA runs one submit-time audit will report before it truncates.
 const G17P_VM_AUDIT_MAX_RANGES: usize = 64;
@@ -370,10 +370,38 @@ impl G17PQueueRegistry {
     /// unbounded by design -- a client that has to wait loses latency, whereas
     /// an EBUSY from this path reaches Mesa as VK_ERROR_DEVICE_LOST and takes
     /// the client's whole context with it.
+    /// Does the compute poison still reach clients that are not the owner?
+    ///
+    /// `compute_faulted` is set by `G17PComputeLeaseGuard::quarantine()` on
+    /// every compute quarantine and is only ever cleared by
+    /// `rehabilitate_after_processor_stop`, i.e. by a session rebuild. It is
+    /// read in three places: `acquire_compute`, `acquire_lease` -- the RENDER
+    /// path -- and `submission_error`. That third and second reader are why a
+    /// single lost compute submission takes the whole device down: measured on
+    /// G17P 2026-09-18, a scoped quarantine on qid=8 was followed 27s later by
+    /// an unrelated client failing `stage=acquire-lease errno=-5`, and a
+    /// freshly launched render-only client reported DEVICE_LOST.
+    ///
+    /// `g17p_quarantine_scope` bit 0 already skips `session_recovery_pending`
+    /// and narrows the compute submission gate to the owning client, but it
+    /// never reached this latch, so setting it did not do what its own
+    /// description says. Under bit 0 the poison stops reaching the render path
+    /// and the device-wide submission error.
+    ///
+    /// `acquire_compute` keeps reading it unscoped on purpose: it is what wakes
+    /// and fails a client parked in `lease_free.wait_interruptible` waiting for
+    /// a compute install that is never going to complete. Removing it there
+    /// would trade a dead device for a stuck one.
+    fn compute_poison_is_device_wide(&self) -> bool {
+        *module_parameters::g17p_quarantine_scope.value() & 1 == 0
+    }
+
     fn acquire_lease(self: &Arc<Self>, owner: u64) -> Result<G17PLeaseGuard> {
         let mut held = self.lease.lock();
         let slot = loop {
-            if self.compute_faulted.load(Ordering::Acquire) != 0 {
+            if self.compute_faulted.load(Ordering::Acquire) != 0
+                && self.compute_poison_is_device_wide()
+            {
                 return Err(EIO);
             }
             // Every slot retired: no wait can ever succeed, so report the dead
@@ -678,7 +706,13 @@ impl DrmGpu for G17PDrmGpu {
     }
 
     fn submission_error(&self) -> i32 {
-        if self.registry.compute_faulted.load(Ordering::Acquire) != 0 { EIO.to_errno() } else { 0 }
+        if self.registry.compute_faulted.load(Ordering::Acquire) != 0
+            && self.registry.compute_poison_is_device_wide()
+        {
+            EIO.to_errno()
+        } else {
+            0
+        }
     }
 
     fn update_globals(&self) {}
