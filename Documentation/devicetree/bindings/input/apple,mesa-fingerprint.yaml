@@ -37,6 +37,21 @@ properties:
     maxItems: 1
     description: Power line to the sensor, asserted to power it up.
 
+  apple,smc-power-key:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      Boards whose sensor rails are switched by the SMC instead of an AP GPIO
+      (the MacBook Neo, J700) name the four-character SMC key here.  Each rail
+      is switched with an 8-byte write of the little-endian pair
+      { u32 on/off, u32 rail word }, the platform device tree's "pKW8" form.
+
+  apple,smc-power-rails:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    description:
+      One rail word per rail, in power-on order (powered off in reverse).
+
   firmware-name:
     maxItems: 1
     description:
@@ -51,8 +66,14 @@ properties:
 required:
   - compatible
   - reg
-  - enable-gpios
   - firmware-name
+
+oneOf:
+  - required:
+      - enable-gpios
+  - required:
+      - apple,smc-power-key
+      - apple,smc-power-rails
 
 unevaluatedProperties: false
 
