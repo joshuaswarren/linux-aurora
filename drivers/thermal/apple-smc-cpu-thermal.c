@@ -17,8 +17,17 @@
  * successful reads by roughly a second in observed load traces. Faster host
  * polling does not bound sensor age; higher OPP admission must remain limited.
  */
-#define SMC_TRIP_MC 65000
-#define SMC_RELEASE_MC 60000
+/*
+ * Two tiers, the values the cleanroom qualification settled on for J700 once
+ * the full P ladder was exposed: a passive trip at 80 C (10 C hysteresis) that
+ * lets step_wise walk the cpufreq cooling devices down state by state, and a
+ * hard tier at 95 C (release at 85 C) that pins both clusters to their minimum
+ * frequency through the QoS guard.  The SMC's own backup remains at 105/95 C.
+ */
+#define SMC_TRIP_MC 80000
+#define SMC_RELEASE_MC 70000
+#define SMC_HOT_MC 95000
+#define SMC_HOT_RELEASE_MC 85000
 #define SMC_SAMPLE_MS 25
 #define SMC_MAX_AGE_MS APPLE_SMC_THERMAL_MAX_AGE_MS
 #define SMC_WATCH_MS 25
@@ -193,9 +202,9 @@ static void smc_sample_work(struct work_struct *work)
 		smc_sample_time = start; /* Bound the age of the oldest read in the round. */
 		if (smc_good < 3)
 			smc_good++;
-		if (value >= SMC_TRIP_MC)
+		if (value >= SMC_HOT_MC)
 			smc_hot = true;
-		else if (value < SMC_RELEASE_MC)
+		else if (value < SMC_HOT_RELEASE_MC)
 			smc_hot = false;
 	}
 	smc_update_guards();
