@@ -202,6 +202,9 @@ pub(crate) fn is_bound() -> bool {
     unsafe { sep_sensor_bound() != 0 }
 }
 
+/// The GPIO number of the power line, if the sensor is powered by one (the
+/// SMC-rail path has none; diagnostics only).
+#[allow(dead_code)]
 pub(crate) fn power_line() -> Option<i32> {
     // SAFETY: no arguments; returns a negative errno when unbound.
     let n = unsafe { sep_sensor_power_line() };

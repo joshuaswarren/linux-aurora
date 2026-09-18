@@ -10,10 +10,14 @@
 #include <linux/gpio/driver.h>
 #include <linux/gpio/machine.h>
 #include <linux/interrupt.h>
+#include <linux/mfd/macsmc.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
+#include <linux/unaligned.h>
 
 #include "shim.h"
 
@@ -50,8 +54,25 @@ static bool sep_registered;
 #define SEP_POWER_NONE		0
 #define SEP_POWER_NODE_PROPERTY	1
 #define SEP_POWER_CHIP_LINE		2
+#define SEP_POWER_SMC_RAILS	3
 
 static int sep_power_source;
+
+/*
+ * Rails switched through the SMC instead of an AP GPIO (the MacBook Neo,
+ * J700: the ADT's function-mesa_pwr1v8 / function-mesa_pwr are pKW8
+ * "8-byte key write" platform functions of the SMC PMU nub).  The sensor
+ * node names the key ("apple,smc-power-key") and one 32-bit rail word per
+ * rail ("apple,smc-power-rails", in power-on order).  A pKW8 write is the
+ * 8-byte little-endian pair { u32 value, u32 rail word } where the platform
+ * function only ever replaces the low 16 bits of the value with the caller's
+ * on/off argument; the rail word is copied verbatim.
+ */
+#define SEP_SMC_MAX_RAILS	4
+static struct apple_smc *sep_smc;
+static smc_key sep_smc_key;
+static u32 sep_smc_rails[SEP_SMC_MAX_RAILS];
+static int sep_smc_nrails;
 
 /*
  * Data-ready line for interrupt-driven capture. On j414s it is the pin adjacent
@@ -63,6 +84,119 @@ static struct gpio_desc *sep_drdy;	/* set only when we own the gpiochip line (j4
 static int sep_drdy_irq = -1;
 static DECLARE_COMPLETION(sep_drdy_done);
 
+#if IS_ENABLED(CONFIG_MFD_MACSMC)
+static int sep_smc_write_rail(u32 rail, u16 value)
+{
+	u8 payload[8];
+
+	put_unaligned_le32(value, payload);
+	put_unaligned_le32(rail, payload + 4);
+	return apple_smc_write(sep_smc, sep_smc_key, payload, sizeof(payload));
+}
+
+/* Rails on in the described order; off in reverse. */
+static int sep_smc_set_power(int on)
+{
+	int i, rc = 0;
+
+	if (on) {
+		for (i = 0; i < sep_smc_nrails && !rc; i++)
+			rc = sep_smc_write_rail(sep_smc_rails[i], 1);
+	} else {
+		for (i = sep_smc_nrails - 1; i >= 0 && !rc; i--)
+			rc = sep_smc_write_rail(sep_smc_rails[i], 0);
+	}
+	if (rc)
+		pr_err("apple_sep: sensor: SMC rail write failed (%d)\n", rc);
+	return rc;
+}
+
+/*
+ * Resolve an SMC-switched power path from the sensor node.  Returns true when
+ * the node describes one and the SMC is reachable; the rails are then driven
+ * off, so the first power cycle starts from a known state exactly like the
+ * GPIO path.  Nothing is written before the key is confirmed to exist with the
+ * expected 8-byte size.
+ */
+static bool sep_acquire_smc_power(struct spi_device *spi)
+{
+	struct device_node *np = spi->dev.of_node, *smc_np;
+	struct platform_device *smc_pdev;
+	struct apple_smc_key_info info;
+	const char *key = NULL;
+	int n, rc;
+
+	if (!np || of_property_read_string(np, "apple,smc-power-key", &key))
+		return false;
+	if (!key || strlen(key) != 4) {
+		dev_warn(&spi->dev, "sep sensor: apple,smc-power-key must be a 4-character SMC key\n");
+		return false;
+	}
+	n = of_property_count_u32_elems(np, "apple,smc-power-rails");
+	if (n <= 0 || n > SEP_SMC_MAX_RAILS) {
+		dev_warn(&spi->dev, "sep sensor: apple,smc-power-rails must list 1..%d rail words\n",
+			 SEP_SMC_MAX_RAILS);
+		return false;
+	}
+	if (of_property_read_u32_array(np, "apple,smc-power-rails", sep_smc_rails, n))
+		return false;
+
+	smc_np = of_find_compatible_node(NULL, NULL, "apple,smc");
+	if (!smc_np) {
+		dev_warn(&spi->dev, "sep sensor: no apple,smc node for the sensor rails\n");
+		return false;
+	}
+	smc_pdev = of_find_device_by_node(smc_np);
+	of_node_put(smc_np);
+	if (!smc_pdev) {
+		dev_warn(&spi->dev, "sep sensor: the SMC has no platform device yet\n");
+		return false;
+	}
+	sep_smc = dev_get_drvdata(&smc_pdev->dev);
+	put_device(&smc_pdev->dev);
+	if (!sep_smc) {
+		dev_warn(&spi->dev, "sep sensor: the SMC driver has not probed; no sensor power\n");
+		return false;
+	}
+
+	sep_smc_key = __SMC_KEY(key[0], key[1], key[2], key[3]);
+	rc = apple_smc_get_key_info(sep_smc, sep_smc_key, &info);
+	if (rc) {
+		dev_warn(&spi->dev, "sep sensor: SMC key %s is not available (%d); no sensor power\n",
+			 key, rc);
+		sep_smc = NULL;
+		return false;
+	}
+	if (info.size != 8) {
+		dev_warn(&spi->dev, "sep sensor: SMC key %s is %u bytes, expected the 8-byte pKW8 form; no sensor power\n",
+			 key, info.size);
+		sep_smc = NULL;
+		return false;
+	}
+	sep_smc_nrails = n;
+	sep_power_source = SEP_POWER_SMC_RAILS;
+	dev_info(&spi->dev,
+		 "sep sensor: power from SMC key %s (%d rail%s, type %#010x, flags %#x), driving the rails off\n",
+		 key, n, n == 1 ? "" : "s", info.type_code, info.flags);
+	sep_smc_set_power(0);
+	return true;
+}
+#else
+static int sep_smc_set_power(int on)
+{
+	return -ENODEV;
+}
+
+static bool sep_acquire_smc_power(struct spi_device *spi)
+{
+	if (spi->dev.of_node &&
+	    of_property_present(spi->dev.of_node, "apple,smc-power-key"))
+		dev_warn(&spi->dev,
+			 "sep sensor: node describes SMC-switched rails but CONFIG_MFD_MACSMC is off\n");
+	return false;
+}
+#endif
+
 /*
  * Takes the power line as an output driven low: the power cycle begins with an
  * off phase, so the line must be actively driven off, not merely read as low.
@@ -72,6 +206,9 @@ static void sep_acquire_power(struct spi_device *spi)
 	struct device_node *np;
 	struct gpio_device *gdev;
 	struct gpio_chip *gc;
+
+	if (sep_acquire_smc_power(spi))
+		return;
 
 	sep_power = gpiod_get_index(&spi->dev, NULL, 0, GPIOD_OUT_LOW);
 	if (!IS_ERR(sep_power)) {
@@ -137,6 +274,13 @@ static void sep_acquire_power(struct spi_device *spi)
 
 static void sep_release_power(void)
 {
+	if (sep_power_source == SEP_POWER_SMC_RAILS) {
+		sep_smc_set_power(0);
+		sep_smc = NULL;
+		sep_smc_nrails = 0;
+		sep_power_source = SEP_POWER_NONE;
+		return;
+	}
 	if (!sep_power)
 		return;
 	gpiod_set_value_cansleep(sep_power, 0);
@@ -312,6 +456,18 @@ int sep_sensor_cs_timing_mode(void)
 /* Power cycle: off, 10 ms, on, 7 ms. -ENODEV if there is no power line. */
 int sep_sensor_power_cycle(void)
 {
+	if (sep_power_source == SEP_POWER_SMC_RAILS) {
+		int rc = sep_smc_set_power(0);
+
+		if (rc)
+			return rc;
+		msleep(SEP_SENSOR_OFF_DELAY_MS);
+		rc = sep_smc_set_power(1);
+		if (rc)
+			return rc;
+		msleep(SEP_SENSOR_ON_DELAY_MS);
+		return 0;
+	}
 	if (!sep_power)
 		return -ENODEV;
 
@@ -330,6 +486,8 @@ int sep_sensor_power_source(void)
 
 int sep_sensor_power_line(void)
 {
+	if (sep_power_source == SEP_POWER_SMC_RAILS)
+		return -ENODEV;	/* not a GPIO line */
 	if (!sep_power)
 		return -ENODEV;
 	return desc_to_gpio(sep_power);
@@ -354,6 +512,17 @@ const char *sep_sensor_firmware_name(void)
 /* Powers the sensor on/off, holding the hardware settling delay. */
 int sep_sensor_power(int on)
 {
+	if (sep_power_source == SEP_POWER_SMC_RAILS) {
+		int rc = sep_smc_set_power(on ? 1 : 0);
+
+		if (rc)
+			return rc;
+		if (on)
+			msleep(SEP_SENSOR_ON_DELAY_MS);
+		else
+			msleep(SEP_SENSOR_OFF_DELAY_MS);
+		return 0;
+	}
 	if (!sep_power)
 		return -ENODEV;
 
