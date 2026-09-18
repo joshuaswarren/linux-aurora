@@ -329,8 +329,9 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	if (!memcmp(reg.alpha2, "00", 2))
 		memcpy(reg.domain, "XZ", 2);
 	reg.domain[4] = reg.domain[5] = 1; /* native 20 MHz selectors */
-	for (i = 0; i < 17; i++) {
-		struct ieee80211_channel *channel = i < 13 ? &m->channels[i] : &m->channels5[i - 13];
+	for (i = 0; i < MT7932_CHANNELS; i++) {
+		struct ieee80211_channel *channel = i < MT7932_CHANNELS_2G ?
+			&m->channels[i] : &m->channels5[i - MT7932_CHANNELS_2G];
 		u32 flags = channel->flags;
 
 		reg.power[i] = channel->max_power;
@@ -348,7 +349,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		put_unaligned_le16(channel->hw_value, reg.domain + 12 + count * 8);
 		put_unaligned_le32(0x1b0 | flags, reg.domain + 16 + count * 8);
 		count++;
-		reg.domain[i < 13 ? 8 : 9]++;
+		reg.domain[i < MT7932_CHANNELS_2G ? 8 : 9]++;
 	}
 	reg.length = 12 + count * 8;
 	if (!count)
@@ -419,7 +420,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	 * Global hints from other radios still reach the notifier and are handled.
 	 */
 	m->wiphy->regulatory_flags |= REGULATORY_COUNTRY_IE_IGNORE;
-	for (i = 0; i < 13; i++) {
+	for (i = 0; i < MT7932_CHANNELS_2G; i++) {
 		m->channels[i].band = NL80211_BAND_2GHZ;
 		m->channels[i].center_freq = 2412 + 5 * i;
 		m->channels[i].hw_value = i + 1;
@@ -437,9 +438,11 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy->bands[NL80211_BAND_2GHZ] = &m->band2;
 	{
 		for (i = 0; i < ARRAY_SIZE(m->channels5); i++) {
+			unsigned int hw = i < 4 ? 36 + 4 * i : 149 + 4 * (i - 4);
+
 			m->channels5[i].band = NL80211_BAND_5GHZ;
-			m->channels5[i].center_freq = 5180 + 20 * i;
-			m->channels5[i].hw_value = 36 + 4 * i;
+			m->channels5[i].center_freq = 5000 + 5 * hw;
+			m->channels5[i].hw_value = hw;
 			m->channels5[i].max_power = 20;
 			m->channels5[i].flags = IEEE80211_CHAN_NO_HT40 |
 				IEEE80211_CHAN_NO_80MHZ | IEEE80211_CHAN_NO_160MHZ;
