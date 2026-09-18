@@ -8,12 +8,16 @@
 //! here once. The driver reads addresses from the device tree, never scans for
 //! them, and never patches properties at runtime.
 //!
-//! Two bring-up targets are modelled:
+//! Three bring-up targets are modelled:
 //!
 //! * `T8103` / J313 (MacBook Air, M1): the host boots the SEP with the boot
 //!   endpoint handshake over a 0x30000 shared-memory window.
 //! * `T6020` / J414s (MacBook Pro 14", M2 Pro): the driver does the warm
 //!   single-message registration over a 0x40000 window.
+//! * `T8140` / J700 (MacBook Neo, A18 Pro): iBoot boots sepOS before the AP
+//!   OS (`sepfw-booted = 1` in the ADT), so the driver warm-registers like
+//!   T6020; the sensor sits on spi2 in the power button and is powered by two
+//!   SMC-controlled rails rather than an AP GPIO.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
@@ -173,10 +177,50 @@ const T6020: PlatformProfile = PlatformProfile {
     },
 };
 
+/// MacBook Neo (J700, A18 Pro).  Everything here is read from this machine's
+/// ADT: /arm-io/sep is "iop-sep,ascwrap-v6" with `sepfw-booted = 1` (warm
+/// path, the same one-shot EP 0xFE registration as T6020, and the newer item
+/// spelling); /arm-io/spi2 sits at arm-io + 0x175108000 = 0x385108000 with
+/// "null" for spi_cs0 (native chip select); /arm-io/spi2/mesa carries
+/// `sensor-id = 0x3356`, `spi-frequency = 8000000`, power-on-delay 7 ms and
+/// power-off-delay 10 ms.  The SEP DART (dart,t8110) publishes its stream-0
+/// window as vm-base-0 = BIT(40) + 0x4000, vm-size-0 = 0xffff0000, so the
+/// device tree states `apple,dma-range` for it.  The OS identity is the
+/// `/chosen/apfs-preboot-uuid` the boot chain forwards (the booted APFS
+/// volume group, i.e. the Linux stub's, as macOS answers GET_OS_UUID); the
+/// identity keybag uses the strict (macOS) field encoding, since this enclave
+/// generation post-dates T6020's.
+const T8140: PlatformProfile = PlatformProfile {
+    name: "T8140/J700",
+    shmem_capacity: 0x4_0000,
+    shmem_first_item: b"CINP",
+    bootstrap: Bootstrap::WarmRegister,
+    identity: IdentitySource::Chosen,
+    sensor: SensorProfile {
+        controller_base: 0x3_8510_8000,
+        chip_select: 0,
+        max_hz: 8_000_000,
+        cs_setup_ns: 20,
+        cs_hold_ns: 20,
+        mode: SpiMode::Mode2,
+        expected_id: 0x3356,
+        capture_qualified: false,
+    },
+    dart_range_required: true,
+    firmware_region: c"sepfw",
+    keybag_create: KeybagCreate {
+        variant: 0,
+        bag_type: 0x20000,
+        arg: 0,
+    },
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
+static_assert!(T8140.shmem_capacity == 0x40000);
 static_assert!(T8103.sensor.controller_base == 0x235108000);
 static_assert!(T6020.sensor.controller_base == 0x39b108000);
+static_assert!(T8140.sensor.controller_base == 0x385108000);
 static_assert!(T8103.sensor.expected_id == T6020.sensor.expected_id);
 
 /// Whether the machine root declares `compatible`.
@@ -215,6 +259,9 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     }
     if machine_has(b"apple,t6020") {
         return Ok(&T6020);
+    }
+    if machine_has(b"apple,t8140") {
+        return Ok(&T8140);
     }
     Err(ENODEV)
 }
