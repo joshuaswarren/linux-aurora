@@ -7,9 +7,42 @@
 #include <drm/drm_modeset_lock.h>
 
 #include <linux/backlight.h>
+#include <linux/bitops.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/minmax.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
+#include "linux/jiffies.h"
 
 #include "dcp.h"
 #include "dcp-internal.h"
+
+/*
+ * H17P (J700) does not tell us the level iBoot left the panel at (D006
+ * reports 0 nits until the AP sets one), so the first swap after power-on
+ * applies this.  40 % of the panel's 525 nits.
+ */
+static unsigned int initial_brightness = 210;
+module_param(initial_brightness, uint, 0644);
+MODULE_PARM_DESC(initial_brightness,
+		 "Brightness in nits to apply at power-on when the firmware cannot report the current one (H17P)");
+
+/*
+ * The J700 DCP firmware turns the backlight supply on and off through the
+ * SMC key pmBL over its own SMC route (ControllerPMU's smc-enable-key).
+ * The same key is writable from the AP through macsmc (a 4-byte boolean;
+ * write-only), which Eryk qualified and Ryan confirmed on the panel.  With
+ * this on, a blank/unblank or a level of 0 also drives the key from here,
+ * in case the firmware's route is not available under Linux.
+ */
+static bool smc_backlight;
+module_param(smc_backlight, bool, 0644);
+MODULE_PARM_DESC(smc_backlight,
+		 "Also switch the backlight supply through the SMC key pmBL on blank/unblank (H17P)");
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -82,6 +115,83 @@ static int dcp_get_brightness(struct backlight_device *bd)
 	struct apple_dcp *dcp = bl_get_data(bd);
 
 	return dcp->brightness.nits;
+}
+
+/*
+ * IEEE-754 binary64 bit pattern of a small non-negative integer, built
+ * without touching the FPU: the H17P swap record carries the brightness as
+ * a double in nits.
+ */
+u64 dcp_nits_to_double_bits(u32 nits)
+{
+	unsigned int msb;
+	u64 mant;
+
+	if (!nits)
+		return 0;
+
+	msb = fls(nits) - 1;
+	mant = ((u64)nits << (52 - msb)) & ((1ULL << 52) - 1);
+
+	return ((u64)(1023 + msb) << 52) | mant;
+}
+
+u32 dcp_h17p_initial_nits(struct apple_dcp *dcp)
+{
+	u32 max = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+
+	return clamp_t(u32, initial_brightness, 1, max);
+}
+
+static struct apple_smc *dcp_backlight_smc(struct apple_dcp *dcp)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+	struct apple_smc *smc;
+
+	if (dcp->brightness.smc)
+		return dcp->brightness.smc;
+
+	np = of_find_compatible_node(NULL, NULL, "apple,smc");
+	if (!np)
+		return NULL;
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return NULL;
+	smc = dev_get_drvdata(&pdev->dev);
+	put_device(&pdev->dev);
+	if (!smc)
+		return NULL;
+
+	if (!apple_smc_key_exists(smc, SMC_KEY(pmBL))) {
+		dev_warn(dcp->dev, "SMC has no pmBL key, not switching the backlight supply\n");
+		return NULL;
+	}
+	dcp->brightness.smc = smc;
+
+	return smc;
+}
+
+static void dcp_backlight_smc_enable(struct apple_dcp *dcp, bool on)
+{
+	struct apple_smc *smc;
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !smc_backlight)
+		return;
+	if (dcp->brightness.smc_on == on)
+		return;
+
+	smc = dcp_backlight_smc(dcp);
+	if (!smc)
+		return;
+
+	ret = apple_smc_write_u32(smc, SMC_KEY(pmBL), on);
+	dev_info(dcp->dev, "backlight supply %s through SMC pmBL: %d\n",
+		 on ? "on" : "off", ret);
+	if (!ret)
+		dcp->brightness.smc_on = on;
 }
 
 #define SCALE_FACTOR (1 << 10)
@@ -207,11 +317,24 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	}
 
 	dcp->brightness.dac = calculate_dac(dcp, brightness);
+	/*
+	 * H17P takes the level in nits and does the DAC mapping itself; on the
+	 * older firmware nits is only ever what the DCP reported back.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		dcp->brightness.nits = brightness;
 	dcp->brightness.update = true;
 
 	drm_modeset_drop_locks(&ctx);
 
-	return dcp_backlight_update(dcp);
+	/* supply on before the level is applied, off after it went to 0 */
+	if (brightness > 0)
+		dcp_backlight_smc_enable(dcp, true);
+	ret = dcp_backlight_update(dcp);
+	if (brightness == 0)
+		dcp_backlight_smc_enable(dcp, false);
+
+	return ret;
 }
 
 static const struct backlight_ops dcp_backlight_ops = {
@@ -238,6 +361,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 
 	dcp->brightness.bl_dev = bl_dev;
 	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+	/* the panel is lit when we get here: iBoot (or the DCP) enabled it */
+	dcp->brightness.smc_on = true;
 
 	return 0;
 }

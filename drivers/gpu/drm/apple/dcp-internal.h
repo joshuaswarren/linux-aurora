@@ -114,9 +114,15 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
+	/* H17P: the level the firmware last reported in D006, in millinits */
+	u32 h17p_reported_millinits;
+	/* H17P: optional backlight supply switch through the SMC (pmBL) */
+	struct apple_smc *smc;
+	bool smc_on;
 };
 
 struct audiosrv_data;
+struct apple_smc;
 
 /** laptop/AiO integrated panel parameters from DT */
 struct dcp_panel {
@@ -364,6 +370,8 @@ void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+u64 dcp_nits_to_double_bits(u32 nits);
+u32 dcp_h17p_initial_nits(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15

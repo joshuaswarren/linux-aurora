@@ -16,6 +16,7 @@
 #include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -472,12 +473,19 @@ dcpep_cb_get_uint_prop(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *req)
 	    .value = 0
 	};
 
-	if (dcp->panel.has_mini_led &&
+	if ((dcp->panel.has_mini_led ||
+	     (DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0) && dcp_has_panel(dcp))) &&
 	    memcmp(req->obj, "SUMP", sizeof(req->obj)) == 0) { /* "PMUS */
 	    if (strncmp(req->key, "Temperature", sizeof(req->key)) == 0) {
 		/*
 		 * TODO: value from j314c, find out if it is temperature in
 		 *       centigrade C and which temperature sensor reports it
+		 *
+		 * H17P (J700) asks for this too and logs "set_PMU_service:
+		 * failed to read PMU temperature property!" without an
+		 * answer; macOS 25G83 answered 2997 (29.97 C) in the capture,
+		 * which the firmware then used as the backlight temperature
+		 * compensator's initial guess.
 		 */
 		resp.value = 3029;
 		resp.ret = true;
@@ -1201,6 +1209,21 @@ dcpep_cb_set_frame_sync_props_h17p(struct apple_dcp *dcp,
 	struct dcp_set_frame_sync_props_resp_h17p resp = {};
 	static const u16 identity_at[] = { 0x24, 0x28, 0x2c };
 	unsigned int i;
+	u32 millinits;
+
+	/*
+	 * +0x04 is the brightness the firmware is driving, in 16.16 nits
+	 * (5957818 = 90.909 nits in the capture, +0x08 = 500.0 alongside it).
+	 * It reads 0 until the AP has set one.  Keep it as evidence of what
+	 * the firmware accepted; the backlight device reports the requested
+	 * level, as on every other firmware.
+	 */
+	millinits = (u32)(((u64)get_unaligned_le32(&req->unk[4]) * 1000) >> 16);
+	if (millinits != dcp->brightness.h17p_reported_millinits) {
+		dcp->brightness.h17p_reported_millinits = millinits;
+		dev_info(dcp->dev, "DCP reports brightness %u.%03u nits\n",
+			 millinits / 1000, millinits % 1000);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(identity_at); i++) {
 		u32 v = DCP_FRAME_SYNC_IDENTITY;
@@ -1209,6 +1232,39 @@ dcpep_cb_set_frame_sync_props_h17p(struct apple_dcp *dcp,
 	}
 
 	return resp;
+}
+
+/*
+ * Fill the H17P swap record's backlight block the way the one
+ * brightness-changing A408 of the macOS 25G83 capture does (see the field
+ * comments in iomfb_template.h).  The firmware converts the nits to a DAC
+ * code with the ADT's iDAC/mA tables itself and drives the Melbourne PMU
+ * over its own SPMI transport, and the backlight enable through its SMC
+ * service -- nothing of that goes through the AP.
+ */
+static void dcp_h17p_set_swap_brightness(struct apple_dcp *dcp,
+					 struct DCP_FW_NAME(dcp_swap) *swap,
+					 u32 nits)
+{
+	static const u8 flags[6] = { 1, 1, 1, 0, 1, 0 };
+	const u64 one = 0x3ff0000000000000ULL;	/* 1.0 */
+	u64 max = dcp_nits_to_double_bits(dcp->brightness.maximum);
+
+	swap->bl_h17p_update = 1;
+	memcpy(swap->bl_h17p_flags, flags, sizeof(flags));
+	memset(swap->bl_h17p_d, 0, sizeof(swap->bl_h17p_d));
+	swap->bl_h17p_d[0] = cpu_to_le64(dcp_nits_to_double_bits(nits));
+	/*
+	 * [2]/[3] were 477.38 in the capture's brightness swap and 462.32 in
+	 * the next one, both below the panel's 525-nit LmaxProduct and never
+	 * zero while a level was in flight.  Whether that is an ambient
+	 * reading or a ceiling, the panel maximum is the value that cannot
+	 * clamp the request.
+	 */
+	swap->bl_h17p_d[2] = cpu_to_le64(max);
+	swap->bl_h17p_d[3] = cpu_to_le64(max);
+	swap->bl_h17p_d[4] = cpu_to_le64(one);
+	swap->bl_h17p_d[17] = cpu_to_le64(one);
 }
 #endif
 
@@ -1440,6 +1496,24 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 
 	kref_put(&cookie->refcount, release_wait_cookie);;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * H17P never publishes IOMFB_PROPERTY_NITS, so nothing registers the
+	 * backlight device for us, and the firmware reports 0 nits in D006
+	 * until the AP has set a brightness (macOS's DCP does the same: the
+	 * first D006 records of the capture carry 0 while the panel is lit at
+	 * iBoot's level).  Seed the level once and register the device; the
+	 * forced update below applies it with the first swap, so what sysfs
+	 * shows is what the panel does.
+	 */
+	if (dcp_has_panel(dcp) && dcp->brightness.maximum > 0 &&
+	    !dcp->brightness.bl_dev) {
+		if (!dcp->brightness.nits)
+			dcp->brightness.nits = dcp_h17p_initial_nits(dcp);
+		schedule_work(&dcp->bl_register_wq);
+	}
+#endif
+
 	/* Force a brightness update after poweron, to restore the brightness */
 	dcp->brightness.update = true;
 }
@@ -1507,9 +1581,13 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * brightness.
 	 */
 	if (dcp_has_panel(dcp)) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		dcp_h17p_set_swap_brightness(dcp, &swap->swap, 0);
+#else
 		swap->swap.bl_unk = 1;
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
+#endif
 	}
 
 	/* Null all surfaces */
@@ -2036,9 +2114,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		dcp_h17p_set_swap_brightness(dcp, &req->swap, dcp->brightness.nits);
+#else
 		req->swap.bl_unk = 1;
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+#endif
 		dcp->brightness.update = false;
 	}
 
