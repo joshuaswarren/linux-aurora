@@ -637,6 +637,22 @@ static int pmp_v2_dart_probe(struct pmp_v2 *pmp, struct platform_device *pdev)
 	return 0;
 }
 
+/* Read-only evidence for a refused admission; nothing is cleared or written. */
+static void pmp_v2_dart_dump(struct pmp_v2 *pmp, const char *why)
+{
+	struct pmp_v2_dart *dart = pmp_v2_dart_of(pmp);
+
+	dev_err(dart->dev, "%s: run=%u mailbox_idle=%u gates=%08x/%08x protect=%08x lock=%08x error_mask=%08x enable=%08x tcr0=%08x ttbr0=%08x tcr2=%08x ttbr2=%08x block=%08x pending=%08x apf0=%08x/%08x apf7=%08x\n",
+		why, pmp_v2_dart_owner_running(pmp), pmp_v2_dart_owner_mailbox_idle(pmp),
+		readl(dart->gate_status), readl(dart->gate_status + 8),
+		readl(dart->regs + PMP_DART_PROTECT), readl(dart->regs + PMP_DART_PROTECT_LOCK),
+		readl(dart->regs + PMP_DART_ERROR_MASK), readl(dart->regs + PMP_DART_ENABLE_STREAMS),
+		readl(dart->regs + PMP_DART_TCR(0)), readl(dart->regs + PMP_DART_TTBR(0)),
+		readl(dart->regs + PMP_DART_TCR(2)), readl(dart->regs + PMP_DART_TTBR(2)),
+		readl(dart->regs + PMP_DART_BLOCK_ERROR), readl(dart->regs + PMP_DART_EXCEPTION(0)),
+		readl(dart->apf.regs + 0), readl(dart->apf.regs + 8), readl(dart->apf.regs + 7 * 64));
+}
+
 /* Admit the stopped instance, prepare the APF, then install the SID0 root. */
 static int pmp_v2_dart_start(struct pmp_v2 *pmp)
 {
@@ -644,11 +660,14 @@ static int pmp_v2_dart_start(struct pmp_v2 *pmp)
 	int ret;
 
 	ret = pmp_v2_dart_admit(pmp);
-	if (ret)
+	if (ret) {
+		pmp_v2_dart_dump(pmp, "PMP DART admission refused");
 		return dev_err_probe(dart->dev, ret, "PMP DART admission (inherited SID0 root or protected)\n");
+	}
 	ret = apple_pmp_apf_initialize(&dart->apf, dart->regs, pmp_v2_dart_apf_admit, pmp, false);
 	if (ret) {
 		WRITE_ONCE(dart->failed, true);
+		pmp_v2_dart_dump(pmp, "PMP APF preparation refused");
 		return dev_err_probe(dart->dev, ret, "PMP APF failed; no DMA root or firmware start\n");
 	}
 	dev_info(dart->dev, "PMP APF prepared: 26 SID0 rows verified; TRAD/SID2 retained, ASC stopped\n");
