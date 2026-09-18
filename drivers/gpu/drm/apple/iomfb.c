@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -651,10 +652,70 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	return lookup_mode(dcp, mode) != NULL;
 }
 
+/*
+ * Retain every framebuffer this commit unbinds from the CRTC's planes until
+ * a later swap has replaced it on the panel.
+ *
+ * This has to happen for every commit, whether or not it results in a swap:
+ * the coprocessor keeps scanning out the previous surface until a swap
+ * replaces it, so a commit that is skipped -- the command channel busy, a
+ * plane disabled with nothing to show, the CRTC going off -- must not let
+ * the framebuffer (and with it the display DART mapping the firmware is
+ * still fetching through) go away.  The J700 showed what happens
+ * otherwise: on DPMS off the disp0 DART logged "read PTE invalid" faults
+ * across the whole old surface 400 us after the CRTC disable, and the
+ * firmware took an axi_rd_err NMI (hb100).
+ *
+ * Entries are queued unarmed; the swap that unbinds them stamps its id in
+ * dcp_arm_swapped_out_fbs(), and a commit without a swap leaves them held
+ * until the next swap does.
+ *
+ * The CRTC-disable commit never reaches dcp_flush(): the driver commits
+ * through drm_atomic_helper_commit_tail_rpm(), whose ACTIVE_ONLY plane pass
+ * skips the planes and the flush of a CRTC that is going inactive.  That
+ * commit calls this from the CRTC's atomic_disable instead.  An entry that
+ * is queued twice for the same framebuffer only holds one more reference,
+ * which the same release path drops.
+ */
+static void dcp_retain_unbound_fbs(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			    struct drm_atomic_state *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old_state, *new_state;
+	int i;
+
+	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, i) {
+		struct dcp_fb_reference *entry;
+		unsigned long flags;
+
+		if (old_state->crtc != crtc && new_state->crtc != crtc)
+			continue;
+		if (!old_state->fb || new_state->fb == old_state->fb)
+			continue;
+
+		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+		if (!entry)
+			continue;
+		entry->fb = old_state->fb;
+		drm_framebuffer_get(old_state->fb);
+		spin_lock_irqsave(&dcp->swapped_out_lock, flags);
+		list_add_tail(&entry->head, &dcp->swapped_out_fbs);
+		spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
+	}
+}
+
+void dcp_retain_unbound_fbs_pdev(struct platform_device *pdev, struct drm_crtc *crtc,
+				 struct drm_atomic_state *state)
+{
+	dcp_retain_unbound_fbs(platform_get_drvdata(pdev), crtc, state);
+}
+
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	dcp_retain_unbound_fbs(dcp, crtc, state);
 
 	if (dcp_channel_busy(&dcp->ch_cmd))
 	{

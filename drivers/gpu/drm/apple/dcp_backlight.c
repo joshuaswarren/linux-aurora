@@ -7,12 +7,25 @@
 #include <drm/drm_modeset_lock.h>
 
 #include <linux/backlight.h>
+#include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/minmax.h>
+#include <linux/module.h>
 #include "linux/jiffies.h"
 
 #include "dcp.h"
 #include "dcp-internal.h"
+
+/*
+ * H17P (J700) does not tell us the level iBoot left the panel at (D006
+ * reports 0 nits until the AP sets one), so the first swap after power-on
+ * applies this.  40 % of the panel's 525 nits.
+ */
+static unsigned int initial_brightness = 210;
+module_param(initial_brightness, uint, 0644);
+MODULE_PARM_DESC(initial_brightness,
+		 "Brightness in nits to apply at power-on when the firmware cannot report the current one (H17P)");
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -87,6 +100,32 @@ static int dcp_get_brightness(struct backlight_device *bd)
 	struct apple_dcp *dcp = bl_get_data(bd);
 
 	return dcp->brightness.nits;
+}
+
+/*
+ * IEEE-754 binary64 bit pattern of a small non-negative integer, built
+ * without touching the FPU: the H17P swap record carries the brightness as
+ * a double in nits.
+ */
+u64 dcp_nits_to_double_bits(u32 nits)
+{
+	unsigned int msb;
+	u64 mant;
+
+	if (!nits)
+		return 0;
+
+	msb = fls(nits) - 1;
+	mant = ((u64)nits << (52 - msb)) & ((1ULL << 52) - 1);
+
+	return ((u64)(1023 + msb) << 52) | mant;
+}
+
+u32 dcp_h17p_initial_nits(struct apple_dcp *dcp)
+{
+	u32 max = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+
+	return clamp_t(u32, initial_brightness, 1, max);
 }
 
 #define SCALE_FACTOR (1 << 10)
@@ -216,6 +255,12 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	}
 
 	dcp->brightness.dac = calculate_dac(dcp, brightness);
+	/*
+	 * H17P takes the level in nits and does the DAC mapping itself; on the
+	 * older firmware nits is only ever what the DCP reported back.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		dcp->brightness.nits = brightness;
 	dcp->brightness.update = true;
 
 	drm_modeset_drop_locks(&ctx);

@@ -61,6 +61,11 @@ struct apple_rtkit_ops {
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
 	int (*shmem_setup)(void *cookie, struct apple_rtkit_shmem *bfr);
 	void (*shmem_destroy)(void *cookie, struct apple_rtkit_shmem *bfr);
+	/*
+	 * Optional exact protocol version required by the client. Zero retains
+	 * the normal highest-supported-version negotiation.
+	 */
+	u16 protocol_version;
 };
 
 struct apple_rtkit;
