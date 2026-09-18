@@ -64,6 +64,11 @@ enum macaudio_amp_type {
 	AMP_TAS5770,
 	AMP_SN012776,
 	AMP_SSM3515,
+	/*
+	 * A fixed-gain amplifier with no controls of its own; the volume is
+	 * the CPU DAI's software gain (J700).
+	 */
+	AMP_MAX98360A,
 };
 
 enum macaudio_spkr_config {
@@ -81,12 +86,28 @@ struct macaudio_platform_cfg {
 	bool stereo;
 	int amp_gain;
 	int safe_vol;
+	/*
+	 * t8140 (J700): the AOP firmware runs the serializers, so the CPU
+	 * component is not the MCA.  Its front-end DAI names replace the
+	 * "mca-pcm-N" ones, the primary link runs at the firmware's fixed
+	 * frame length (125 SCLK per frame at 48 kHz on the jack) and with
+	 * the clock polarity the codec was measured with.
+	 */
+	const char *fe_dai_names[3];
+	unsigned int primary_bclk_ratio;
+	unsigned int dai_fmt;
+	/*
+	 * The speaker codec's output widget, "OUT" (TAS/SSM amplifiers) unless
+	 * set: the MAX98360A on J700 calls it "Speaker".
+	 */
+	const char *spk_out_widget;
 };
 
 static const char *volume_control_names[] = {
 	[AMP_TAS5770] = "* Speaker Playback Volume",
 	[AMP_SN012776] = "* Speaker Volume",
 	[AMP_SSM3515] = "* DAC Playback Volume",
+	[AMP_MAX98360A] = "* Speaker Playback Volume",
 };
 
 #define SN012776_0DB 201
@@ -97,6 +118,10 @@ static const char *volume_control_names[] = {
 
 #define SSM3515_0DB (255 - 64) /* +24dB max, steps of 3/8 dB */
 #define SSM3515_DB(x) (SSM3515_0DB + (8 * (x) / 3))
+
+/* t8140-aop-audio "Speaker Playback Volume": 0.5 dB steps, 127 = full scale */
+#define MAX98360A_0DB 127
+#define MAX98360A_DB(x) (MAX98360A_0DB + 2 * (x))
 
 struct ma_codec_idle {
 	int idle_mode;
@@ -259,6 +284,12 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			max = SSM3515_0DB;
 		else
 			max = SSM3515_DB(ma->cfg->safe_vol);
+		break;
+	case AMP_MAX98360A:
+		if (unlock)
+			max = MAX98360A_0DB;
+		else
+			max = MAX98360A_DB(ma->cfg->safe_vol);
 		break;
 	}
 
@@ -448,7 +479,7 @@ static int macaudio_parse_of_be_dai_link(struct macaudio_snd_data *ma,
 
 	link->no_pcm = 1;
 
-	link->dai_fmt = MACAUDIO_DAI_FMT;
+	link->dai_fmt = ma->cfg->dai_fmt ?: MACAUDIO_DAI_FMT;
 
 	link->num_codecs = ncodecs_per_be;
 	link->codecs = devm_kcalloc(dev, ncodecs_per_be,
@@ -575,6 +606,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			goto err_free;
 
 		memcpy(link_props, &macaudio_fe_link_props[i], sizeof(struct macaudio_link_props));
+		if (ma->cfg->fe_dai_names[i])
+			link->cpus[0].dai_name = ma->cfg->fe_dai_names[i];
+		if (ma->cfg->dai_fmt)
+			link->dai_fmt = ma->cfg->dai_fmt;
+		if (i == 0 && ma->cfg->primary_bclk_ratio)
+			link_props->bclk_ratio = ma->cfg->primary_bclk_ratio;
 		link++; link_props++;
 	}
 
@@ -992,9 +1029,11 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 
 		/*
 		 * Headphones get a pass on -ENOTSUPP (see the comment
-		 * around bclk_ratio value for primary FE).
+		 * around bclk_ratio value for primary FE), as does an
+		 * amplifier with no TDM interface (J700's MAX98360A, whose
+		 * frame the AOP firmware fixes).
 		 */
-		if (ret == -ENOTSUPP && props->is_headphones)
+		if (ret == -ENOTSUPP && (props->is_headphones || ma->cfg->amp == AMP_MAX98360A))
 			return 0;
 
 		return ret;
@@ -1085,7 +1124,9 @@ static int macaudio_probe(struct snd_soc_card *card)
 	dev_dbg(card->dev, "%s!\n", __func__);
 
 	ret = snd_soc_card_jack_new_pins(card, "Headphone Jack",
-			SND_JACK_HEADSET | SND_JACK_HEADPHONE,
+			SND_JACK_HEADSET | SND_JACK_HEADPHONE |
+			SND_JACK_BTN_0 | SND_JACK_BTN_1 |
+			SND_JACK_BTN_2 | SND_JACK_BTN_3,
 			&ma->jack, macaudio_jack_pins,
 			ARRAY_SIZE(macaudio_jack_pins));
 	if (ret < 0) {
@@ -1093,7 +1134,16 @@ static int macaudio_probe(struct snd_soc_card *card)
 		return ret;
 	}
 
-	return ret;
+	/*
+	 * Map the codec's four headset button functions to media keys.
+	 * Apple remote volume buttons also require codec protocol support.
+	 */
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
+	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
+
+	return 0;
 }
 
 static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_soc_dai *dai,
@@ -1122,8 +1172,8 @@ static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_
 		r->sink = "Headset Capture";
 	}
 
-	/* If speakers, add sense capture path */
-	if (is_speakers) {
+	/* If speakers, add sense capture path (a playback-only CPU DAI has none) */
+	if (is_speakers && dai->stream[SNDRV_PCM_STREAM_CAPTURE].widget) {
 		r = &routes[nroutes++];
 		r->source = dai->stream[SNDRV_PCM_STREAM_CAPTURE].widget->name;
 		r->sink = "Speaker Sense Capture";
@@ -1139,6 +1189,7 @@ static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_
 static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_component *component,
 				   bool is_speakers)
 {
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	struct snd_soc_dapm_route routes[2];
 	struct snd_soc_dapm_route *r;
 	int nroutes = 0;
@@ -1149,10 +1200,12 @@ static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_com
 
 	/* Connect the far ends of CODECs to pins */
 	if (is_speakers) {
+		const char *out = ma->cfg->spk_out_widget ?: "OUT";
+
 		r = &routes[nroutes++];
-		r->source = "OUT";
+		r->source = out;
 		if (component->name_prefix) {
-			snprintf(buf, sizeof(buf) - 1, "%s OUT", component->name_prefix);
+			snprintf(buf, sizeof(buf) - 1, "%s %s", component->name_prefix, out);
 			r->source = buf;
 		}
 		r->sink = "Speaker";
@@ -1279,6 +1332,12 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 			CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
 
 		/* TODO: HPF, needs new call to set */
+		break;
+	case AMP_MAX98360A:
+		/*
+		 * A fixed-gain amplifier with no controls of its own; the
+		 * volume control lives on the CPU DAI, below its ceiling.
+		 */
 		break;
 	default:
 		return -EINVAL;
@@ -1556,6 +1615,28 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	true,	10,	-20,
 };
 
+/*
+ * J700 (T8140, MacBook Neo): the AOP owns the audio fabric.  The jack is a
+ * CS42L83 on MCA1 fed by base-ns TX2 through the AOP cout service; the
+ * speakers are one MAX98360A per channel on the AOP's LEAP TX0, with no
+ * sense lines and no amplifier controls.  The CPU DAI (t8140-aop-audio)
+ * provides the "Speaker Playback Volume" up to the amplifier's full scale;
+ * the volume lock holds it 20 dB down until the protection daemon, which
+ * models the speaker from the sense stream, takes it.
+ */
+struct macaudio_platform_cfg macaudio_j700_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_MAX98360A,
+	.speakers = SPKR_1W,
+	.stereo = true,
+	.safe_vol = -20,
+	.spk_out_widget = "Speaker",
+	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
+	.primary_bclk_ratio = 125,
+	/* 125-SCLK frame pulse, two 32-bit slots back to back, 24-bit samples */
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_NB_NF,
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -1633,6 +1714,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j457    AID7    ssm3515     15      2× 1W+1T Compat: apple,j456-macaudio */
 	/* j473    AID12   sn012776    20      1× 1W */
 	{ .compatible = "apple,j473-macaudio", .data = &macaudio_j37x_j47x_cfg },
+	/* j700    AID44   max98360a   -       2× 1W (AOP-fed, no sense) */
+	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j474    AID26   sn012776    20      1× 1W    Compat: apple,j473-macaudio */
 	/* j475    AID25   sn012776    20      1× 1W    Compat: apple,j375-macaudio */
 	/* j493    AID18   sn012776    15      2× 2W */
