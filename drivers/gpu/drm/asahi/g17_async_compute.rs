@@ -16,6 +16,11 @@ struct G17PAsyncComputeQueue {
     active: Option<G17PAsyncComputeActive>,
     released: bool,
     quarantined: bool,
+    /// Quarantined because `drm_sched_fini()` cancelled a pending job when the
+    /// client destroyed its queue -- not because anything faulted. The queue is
+    /// still permanently retired, so its memory stays safe, but it must not
+    /// refuse OTHER clients' submissions: the owner that tore it down is gone.
+    retired_by_teardown: bool,
     terminal_fanout: Option<(Arc<crate::g17_status::VmStatus>, Error)>,
 }
 
@@ -93,7 +98,8 @@ impl G17PLiveRuntime {
             let index = self.async_compute_queues.len();
             self.async_compute_queues.push(G17PAsyncComputeQueue {
                 owner: None, queue, binding: None, context: None, active: None,
-                released: false, quarantined: false, terminal_fanout: None,
+                released: false, quarantined: false, retired_by_teardown: false,
+                terminal_fanout: None,
             }, GFP_KERNEL)?;
             index
         };
@@ -169,7 +175,15 @@ impl G17PLiveRuntime {
         // retirement does not already protect. See `g17p_quarantine_scope`.
         let scoped = *crate::module_parameters::g17p_quarantine_scope.value() & 1 != 0;
         let blocked = self.async_compute_queues.iter().any(|q| {
-            q.quarantined && (!scoped || q.owner == Some(owner))
+            // A queue retired by client teardown never refuses anyone but its
+            // own (already departed) owner. Leaving it in the device-wide test
+            // was the second half of the kill: even with the session flag not
+            // raised, one exited process holding a quarantined queue would
+            // refuse EVERY later compute submit on the device for the rest of
+            // the boot.
+            q.quarantined
+                && (!scoped || q.owner == Some(owner))
+                && (!q.retired_by_teardown || q.owner == Some(owner))
         });
         if blocked {
             return Err(EIO);
@@ -558,7 +572,54 @@ impl G17PLiveRuntime {
                 if active.packet.submission_id() == submission {
                     matched = true;
                     if !q.quarantined {
-                        if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
+                        // ECANCELED is not a fault. `drm_sched_fini()` is its
+                        // only source: `drm_sched_cancel_remaining_jobs()` walks
+                        // the pending list and calls `cancel_job` on each entry
+                        // purely so their fences are signalled before the
+                        // scheduler is torn down. So this errno means "the
+                        // client destroyed its queue while a submission was
+                        // still pending", which is ordinary lifecycle -- a
+                        // process exiting with work in flight -- and says
+                        // nothing about the firmware or the hardware.
+                        //
+                        // Measured on G17P, two boots, both ECANCELED:
+                        //   qid=7 submission=448    owner=6    PUBLISHED +271us
+                        //   qid=8 submission=297575 owner=1921 PUBLISHED +274us
+                        // Both carried `root-current=true`, so the VM root was
+                        // still live; neither was preceded by a `publishing
+                        // target=` lag line in any boot; and the scheduler's
+                        // timeout is 2000ms, three orders of magnitude away.
+                        // Nothing timed out and the firmware was never behind.
+                        //
+                        // Escalating it killed the device: `note_session_
+                        // recovery_pending` makes `is_crashed()` true, so every
+                        // new client gets ENODEV and every existing one EIO,
+                        // and it arms a firmware rebuild that is known to end in
+                        // `apple_rtkit_boot` ETIME and ENODEV for the rest of
+                        // the boot. A CTS sweep exits a deqp process thousands
+                        // of times, so one of them eventually races an unretired
+                        // submission and takes the whole GPU with it.
+                        //
+                        // The QUEUE still quarantines, which is what keeps
+                        // firmware-referenced memory safe: a quarantined queue
+                        // is permanently retired, `release_async_compute_queue`
+                        // will not strip it, `reusable_idle_compute_graph` and
+                        // `rebindable_released_compute_graph` exclude it, and
+                        // `prepare_async_compute_queue` skips it. The session
+                        // flag never contributed to that safety -- see the
+                        // `g17p_quarantine_scope` description in asahi.rs.
+                        //
+                        // Scope: ECANCELED only. ETIMEDOUT and EIO still
+                        // escalate exactly as before.
+                        let client_teardown = error == ECANCELED;
+                        q.retired_by_teardown = client_teardown;
+                        if client_teardown {
+                            if let Some(pdev) = &self.pdev {
+                                dev_info!(pdev.as_ref(),
+                                    "G17P async compute: queue retired after client teardown owner={} qid={} submission={} -- drm_sched_fini cancelled a pending job; the session stays up\n",
+                                    owner, q.queue.queue_id(), submission);
+                            }
+                        } else if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
                             crate::g17_live_boot::note_session_recovery_pending(
                                 &mut self.session_recovery_pending,
                                 self.pdev.as_ref(),
