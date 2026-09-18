@@ -356,7 +356,25 @@ impl G17PLiveRuntime {
                     // bit 0 already means "retire this queue and fail its client,
                     // leave the session up for everyone else"; that is the same
                     // judgement this route needs, so let the one flag cover both.
-                    if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
+                    // ENODATA is the zero-duration retire: a submission that
+                    // retired without executing, which `g17p_zero_duration`
+                    // documents as the expected shape after a fault-blamed
+                    // firmware recovery and whose default of 1 means "fail the
+                    // submission but do NOT rebuild the firmware session". The
+                    // poller used to return EIO for it, so this arm escalated a
+                    // documented-expected outcome into a device-wide crash --
+                    // every new client ENODEV, and a rebuild known to end in
+                    // apple_rtkit_boot ETIME. The queue is still firmware-owned,
+                    // so it is retired exactly as before; only the session-wide
+                    // escalation is skipped.
+                    let submission_scoped = error == ENODATA;
+                    if submission_scoped {
+                        if let Some(pdev) = &self.pdev {
+                            dev_info!(pdev.as_ref(),
+                                "G17P async compute: queue retired after a zero-duration retire qid={} -- the client fails, the session stays up\n",
+                                q.queue.queue_id());
+                        }
+                    } else if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
                         crate::g17_live_boot::note_session_recovery_pending(
                             &mut self.session_recovery_pending,
                             self.pdev.as_ref(),

@@ -5307,9 +5307,19 @@ impl G17PManagerConstruction {
             G17P_MARK_ZERO_DURATION.fetch_add(1, Ordering::Relaxed);
             self.log_compute_usage_slot(queue, "zero-duration");
             dev_err!(self.resources.dev().as_ref(),
-                "G17P async compute: UNCLASSIFIABLE qid={} cause=zero-duration descriptor={:#x} timestamps=[{},{}] -- retired without executing, the expected shape after a firmware recovery\n",
+                "G17P async compute: zero-duration qid={} descriptor={:#x} timestamps=[{},{}] -- retired without executing, the expected shape after a firmware recovery\n",
                 queue.queue_id, queue.completion_descriptor,
                 timestamps[0], timestamps[1]);
+            // ENODATA, not EIO, when the parameter is enabled: its default of 1
+            // means "fail the submission but do NOT rebuild the firmware
+            // session", and returning EIO here made the caller escalate to
+            // `note_session_recovery_pending`, which is exactly the rebuild the
+            // parameter says not to do. The caller treats ENODATA as
+            // submission-scoped. Setting the parameter to 0 restores the old
+            // device-wide behaviour byte for byte.
+            if *module_parameters::g17p_zero_duration.value() != 0 {
+                return Err(ENODATA);
+            }
             return Err(EIO);
         }
         if queue.completion_stamp_armed && queue.compute.read_compute_stamp()? == 0 {
