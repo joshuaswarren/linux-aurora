@@ -207,9 +207,10 @@
 	};
 
 	/*
-	 * P1..P6 only: the cleanroom policy releases P7..P17 (2.688..4.044 GHz) solely under
-	 * the fast PMP thermal controller, which is not merged here; the SMC 65 C step-wise
-	 * policy alone is qualified for this ceiling.
+	 * The full P ladder to P17 = 4.044 GHz (macOS's ceiling).  The cleanroom tree only
+	 * releases P7..P17 under its fast PMP thermal controller; here the SMC step-wise policy
+	 * (65 C passive trip, minimum frequency on stale telemetry, 105/95 C backup) is the
+	 * only software throttle, so it stays enabled whenever this table is present.
 	 */
 	pcpu_opp: opp-table-pcpu {
 		compatible = "operating-points-v2";
@@ -243,6 +244,61 @@
 		opp06 {
 			opp-hz = /bits/ 64 <2472000000>;
 			opp-level = <6>;
+			clock-latency-ns = <7500>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2688000000>;
+			opp-level = <7>;
+			clock-latency-ns = <7500>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <2916000000>;
+			opp-level = <8>;
+			clock-latency-ns = <7500>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3144000000>;
+			opp-level = <9>;
+			clock-latency-ns = <7500>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3336000000>;
+			opp-level = <10>;
+			clock-latency-ns = <7500>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <3504000000>;
+			opp-level = <11>;
+			clock-latency-ns = <7500>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <3648000000>;
+			opp-level = <12>;
+			clock-latency-ns = <7500>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <3756000000>;
+			opp-level = <13>;
+			clock-latency-ns = <7500>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <3864000000>;
+			opp-level = <14>;
+			clock-latency-ns = <7500>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <3924000000>;
+			opp-level = <15>;
+			clock-latency-ns = <7500>;
+		};
+		opp16 {
+			opp-hz = /bits/ 64 <3972000000>;
+			opp-level = <16>;
+			clock-latency-ns = <7500>;
+		};
+		opp17 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <17>;
 			clock-latency-ns = <7500>;
 		};
 	};
