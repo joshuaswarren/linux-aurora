@@ -280,10 +280,14 @@ impl G17PLiveRuntime {
             }
         }
         let outstanding = self.async_compute_queues.iter().filter(|q| q.active.is_some()).count();
+        // Per-submission, and ungated until now while every other trace in this
+        // path already honoured g17p_trace_depth. See that parameter.
+        if crate::g17_manager::g17p_compute_trace_enabled(packet.submission_id() as u32) {
         dev_info!(self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
             "G17P async compute: PUBLISHED submission={} owner={} qid={} context={} root={:#x} outstanding={}\n",
             packet.submission_id(), owner, packet.hardware_queue_id(),
             packet.context().context_id(), packet.context().root(), outstanding);
+        }
         Ok(())
     }
 
@@ -339,7 +343,10 @@ impl G17PLiveRuntime {
             match manager.poll_staged_independent_compute_completion(&mut q.queue) {
                 Ok(Some(timestamps)) => {
                     let active = q.active.take().ok_or(EIO)?;
-                    if let Some(pdev) = self.pdev.as_ref() {
+                    if let Some(pdev) = self.pdev.as_ref().filter(|_| {
+                        crate::g17_manager::g17p_compute_trace_enabled(
+                            active.packet.submission_id() as u32)
+                    }) {
                         dev_info!(pdev.as_ref(),
                             "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={}\n",
                             active.packet.submission_id(), q.queue.queue_id(),

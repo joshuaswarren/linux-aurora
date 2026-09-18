@@ -32,6 +32,13 @@ mod identity;
 use g17_initdata::InstanceRole;
 use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, SubmissionTransport};
 
+/// Free-function form of the per-submission trace gate, so paths outside this
+/// file's impl block honour the same `g17p_trace_depth` policy.
+pub(crate) fn g17p_compute_trace_enabled(ordinal: u32) -> bool {
+    let depth = *module_parameters::g17p_trace_depth.value();
+    depth == 0 || ordinal <= depth
+}
+
 static G17P_STATE_DUMPED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
