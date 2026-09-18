@@ -14175,8 +14175,8 @@ impl G17ResourceOwner {
         let mut matched: Option<u64> = None;
         // slot, descriptor, queue, pair-A start, pair-B start, pair-B end,
         // and the +0x08 routing word.
-        let mut lines: [(u64, u64, u64, u64, u64, u64, u32); LOG_LIMIT] =
-            [(0, 0, 0, 0, 0, 0, 0); LOG_LIMIT];
+        let mut lines: [(u64, u64, u64, u64, u64, u64, u32, u64, u8); LOG_LIMIT] =
+            [(0, 0, 0, 0, 0, 0, 0, 0, 0); LOG_LIMIT];
         // Scope the object borrow so the logging below can reach `self.dev()`.
         let (base, logical_size, slots) = {
             let object = &mut self.resources.completion_ordinal_0;
@@ -14209,7 +14209,15 @@ impl G17ResourceOwner {
                     matched = Some(slot);
                 }
                 if logged < LOG_LIMIT {
-                    lines[logged] = (slot, descriptor, queue, a_start, start, end, routing);
+                    // `control` (+0x00) is the word `G17PComputeCompletionBatch::
+                    // fold_record` routes on, and `route_qid` is the queue it
+                    // routes to. Nothing printed them before, so a record the
+                    // batch reader dropped for routing to a different (or an
+                    // unrequested) slot looked identical here to one it folded.
+                    let control = object.read_u64(rec + 0x00)?;
+                    let route_qid = g17_completion::g17p_ksm_completion_queue_id(control);
+                    lines[logged] =
+                        (slot, descriptor, queue, a_start, start, end, routing, control, route_qid);
                     logged += 1;
                 }
             }
@@ -14219,7 +14227,7 @@ impl G17ResourceOwner {
         for entry in lines.iter().take(logged) {
             dev_info!(
                 dev.as_ref(),
-                "G17P completion[{}]: rec {} descriptor {:#x} queue {:#x} a-start {:#x} b-start {:#x} b-end {:#x} route {:#x}\n",
+                "G17P completion[{}]: rec {} descriptor {:#x} queue {:#x} a-start {:#x} b-start {:#x} b-end {:#x} route {:#x} control {:#x} route-qid {}\n",
                 label,
                 entry.0,
                 entry.1,
@@ -14227,7 +14235,9 @@ impl G17ResourceOwner {
                 entry.3,
                 entry.4,
                 entry.5,
-                entry.6
+                entry.6,
+                entry.7,
+                entry.8
             );
         }
         dev_info!(
