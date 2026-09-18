@@ -68,11 +68,16 @@ static inline void mt7932_scan_passive(u8 body[0x4d4])
 	memset(body + 0x458, 0, 6);
 }
 
-/* Bounded standard caller-IE carriage, not the reference's silent override. */
+/* Bounded standard caller-IE carriage, not the reference's silent override.
+ * Zero-length elements are dropped: wpa_supplicant 2.11 appends one (element
+ * 114, length 0) after its Extended Capabilities, and the J700 firmware then
+ * consumes the CID03 request without scanning or reporting completion, which
+ * leaves every later request blocked behind the retired sequence.
+ */
 static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,
 				      size_t ssid_length, const u8 *ies, size_t ie_length)
 {
-	size_t offset = 0;
+	size_t offset = 0, kept = 0;
 
 	if (ssid_length > 32 || ie_length > 600 || (!body[2] && ssid_length))
 		return -EINVAL;
@@ -89,9 +94,13 @@ static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,
 	}
 	if (ie_length || ssid_length) {
 		memset(body + 0xe2, 0, 600);
-		put_unaligned_le16(ie_length, body + 0xe0);
-		if (ie_length)
-			memcpy(body + 0xe2, ies, ie_length);
+		for (offset = 0; offset < ie_length; offset += 2 + ies[offset + 1]) {
+			if (!ies[offset + 1])
+				continue;
+			memcpy(body + 0xe2 + kept, ies + offset, 2 + ies[offset + 1]);
+			kept += 2 + ies[offset + 1];
+		}
+		put_unaligned_le16(kept, body + 0xe0);
 	}
 	return 0;
 }
