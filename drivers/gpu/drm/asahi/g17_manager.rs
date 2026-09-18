@@ -6480,10 +6480,19 @@ impl G17PManagerConstruction {
                 + u64::from(queue.queue_id) * G17P_DEPENDENCY_RECORD_STRIDE,
             dependency.0,
             dependency.1);
+        // `consumed-end-floor` is `G17PComputeCompletionBatchSlot::
+        // last_consumed_end`, the value `fold_record` compares every candidate
+        // against with `pair_b_end <= floor -> reject`. That rejection is
+        // PERMANENT for the record, and nothing has ever printed the floor, so
+        // a record the decoded dump reports as `matched-rec Some(n)` could be
+        // one the batch reader had already refused on this comparison and the
+        // two readers' disagreement was invisible. Printed next to the record
+        // dump's per-record `b-end` so the two can be compared directly.
         dev_err!(self.resources.dev().as_ref(),
-            "G17P async-timeout retirement: qid={} ordinal={} counters(target,completed)={:x?} stamp-word={:x?} stamp-armed={} awaited-descriptor={:#x}\n",
+            "G17P async-timeout retirement: qid={} ordinal={} counters(target,completed)={:x?} stamp-word={:x?} stamp-armed={} awaited-descriptor={:#x} consumed-end-floor={:#x} independent-context={}\n",
             queue.queue_id, queue.submission_ordinal, counters, stamp_word,
-            queue.completion_stamp_armed, queue.completion_descriptor);
+            queue.completion_stamp_armed, queue.completion_descriptor,
+            queue.completion_last_end, queue.independent_context);
         dev_err!(self.resources.dev().as_ref(),
             "G17P async-timeout owner: qid={} descriptor={:#x} ordinal={} producer={:?} direct={:?} hardware={:?}\n",
             queue.queue_id, queue.completion_descriptor, queue.submission_ordinal,

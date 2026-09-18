@@ -9663,6 +9663,1682 @@ impl G17ResourceOwner {
         Ok(G17PControlCounters { primary, secondary })
     }
 
+    /// Read the exact primary channel-12 pointers serialized at main
+    /// `+0x1a0/+0x1a8/+0x1b0`, then follow them through the retained WC state
+    /// object. This is diagnostic only and performs no firmware write.
+    pub(crate) fn control_pointer_snapshot(&mut self) -> Result<G17PControlPointerSnapshot> {
+        let entry = g17_initdata::channel_table_entry_range(
+            g17_initdata::CONTROL_CHANNEL_INDEX,
+        )
+        .ok_or(EINVAL)?;
+        let main_config = self.handoff.primary.instance.main_config;
+        let expected = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            main_config,
+            self.handoff.shared.hw_data_bundle,
+        )[g17_initdata::CONTROL_CHANNEL_INDEX];
+        let mut raw_state_pointers = [0u64; g17_initdata::CHANNEL_ENTRY_STATE_COUNT];
+        let mut state_values = [0u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT];
+        for index in 0..g17_initdata::CHANNEL_ENTRY_STATE_COUNT {
+            let address = main_config
+                .checked_add(entry.start as u64)
+                .and_then(|address| address.checked_add(index as u64 * 8))
+                .ok_or(EINVAL)?;
+            raw_state_pointers[index] = self.resources.shared_cluster.read_u64(address)?;
+            state_values[index] = self.resources.primary_state.read_u32(raw_state_pointers[index])?;
+        }
+        Ok(G17PControlPointerSnapshot {
+            main_config,
+            raw_state_pointers,
+            expected_state_pointers: expected.states,
+            state_values,
+        })
+    }
+
+    /// Read primary Status-A `+0x0c/+0x10/+0x14` through the existing WC
+    /// object. Firmware maps this host-owned state grid uncached, so this
+    /// snapshot does not rely on dirty private firmware cachelines.
+    pub(crate) fn status_a_snapshot(&mut self) -> Result<G17PStatusASnapshot> {
+        let scan_address = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET)
+            .ok_or(EINVAL)?;
+        let address = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET)
+            .ok_or(EINVAL)?;
+        let status_a = self.handoff.primary.instance.status_a;
+        if scan_address
+            != status_a
+                .checked_add(PRIMARY_STATUS_A_WORK_SCAN_OFFSET)
+                .ok_or(EINVAL)?
+            || address
+                != status_a
+                    .checked_add(PRIMARY_STATUS_A_RUNTIME_OFFSET)
+                    .ok_or(EINVAL)?
+        {
+            return Err(EINVAL);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let scan_active = self.resources.primary_state.read_u32(scan_address)?;
+        let raw = self.resources.primary_state.read_u64(address)?;
+        Ok(G17PStatusASnapshot::decode(
+            scan_address,
+            scan_active,
+            address,
+            raw,
+        ))
+    }
+
+    /// Read the exact primary Status-B firmware-recovery state through the
+    /// existing WC object. Firmware maps this host-owned state grid uncached,
+    /// so no private firmware cacheline is sampled.
+    /// Read the firmware's fault report.
+    ///
+    /// The firmware reaches it through the pointer the host writes at
+    /// `main_config + 0x26c`, which is bundle view 3, i.e.
+    /// `hw_data_bundle + BUNDLE_VIEW_OFFSETS[3]`. The report names the blamed
+    /// kick queue, that queue's data master, the reason, and the recovery
+    /// state. The driver has never read it, so a firmware-initiated recovery
+    /// has always been anonymous on our side.
+    ///
+    /// Two firmware paths fill it: the queue-progress fault scan in
+    /// `fw_gpu_recovery` (b1 `0x5450`, which zeroes the presence tags at
+    /// `0x5494-0x54a4` before scanning) and the KSM kick-timeout blame path in
+    /// the recovery worker (b1 `0x26c94`, `0x26e40-0x26e9c`). Both can fill
+    /// the slot and data-master fields; only the latter supplies a QID.
+    pub(crate) fn firmware_fault_report_snapshot(
+        &mut self,
+    ) -> Result<G17PFirmwareFaultReportSnapshot> {
+        let main_config = self.handoff.primary.instance.main_config;
+        let pointer_address = main_config
+            .checked_add(MAIN_CONFIG_FAULT_REPORT_POINTER)
+            .ok_or(EINVAL)?;
+        let expected = self
+            .handoff
+            .shared
+            .hw_data_bundle
+            .checked_add(g17_initdata::BUNDLE_VIEW_OFFSETS[FAULT_REPORT_VIEW_INDEX] as u64)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let report = self.resources.shared_cluster.read_u64(pointer_address)?;
+        if report != expected {
+            return Err(EINVAL);
+        }
+        let mut read = |offset: u64| -> Result<u32> {
+            self.resources
+                .shared_cluster
+                .read_u32(report.checked_add(offset).ok_or(EINVAL)?)
+        };
+        Ok(G17PFirmwareFaultReportSnapshot {
+            report,
+            state: read(FAULT_REPORT_RECOVERY_STATE)?,
+            host_requested: read(FAULT_REPORT_HOST_REQUESTED)?,
+            slot_present: read(FAULT_REPORT_BLAMED_SLOT_PRESENT)?,
+            slot: read(FAULT_REPORT_BLAMED_SLOT)?,
+            qid_present: read(FAULT_REPORT_BLAMED_QID_PRESENT)?,
+            qid: read(FAULT_REPORT_BLAMED_QID)?,
+            data_master_present: read(FAULT_REPORT_DATA_MASTER_PRESENT)?,
+            data_master: read(FAULT_REPORT_DATA_MASTER)?,
+            source_count: read(FAULT_REPORT_SOURCE_COUNT)?,
+            reason: read(FAULT_REPORT_REASON)?,
+        })
+    }
+
+    /// Sample DM1 hardware slot 0's progress record through the retained WC
+    /// shared object. This does not read SGX registers or firmware-private
+    /// cached memory, and it cannot follow a pointer outside bundle view 1.
+    pub(crate) fn firmware_dm1_slot_snapshot(
+        &mut self,
+        slot: usize,
+    ) -> Result<G17PFirmwareDm1SlotSnapshot> {
+        if slot >= DM1_WATCHDOG_SLOT_COUNT {
+            return Err(EINVAL);
+        }
+        let pointer_address = self
+            .handoff
+            .primary
+            .instance
+            .main_config
+            .checked_add(MAIN_CONFIG_DM1_WATCHDOG_POINTER)
+            .ok_or(EINVAL)?;
+        let expected_view = self
+            .handoff
+            .shared
+            .hw_data_bundle
+            .checked_add(g17_initdata::BUNDLE_VIEW_OFFSETS[DM1_WATCHDOG_VIEW_INDEX] as u64)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let view_pointer = self.resources.shared_cluster.read_u64(pointer_address)?;
+        let address = g17p_dm1_slot_address(
+            view_pointer,
+            expected_view,
+            g17_initdata::BUNDLE_VIEW_EXTENTS[DM1_WATCHDOG_VIEW_INDEX],
+            slot,
+        )
+        .ok_or(EINVAL)?;
+        let mut raw = [0u32; 6];
+        for (index, word) in raw.iter_mut().enumerate() {
+            *word = self
+                .resources
+                .shared_cluster
+                .read_u32(address.checked_add(index as u64 * 4).ok_or(EINVAL)?)?;
+        }
+        Ok(G17PFirmwareDm1SlotSnapshot { slot, address, raw })
+    }
+
+    pub(crate) fn firmware_recovery_handshake_snapshot(
+        &mut self,
+    ) -> Result<G17PFirmwareRecoveryHandshakeSnapshot> {
+        let status_b = self.handoff.primary.instance.status_b;
+        let expected_status_b = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET as u64)
+            .ok_or(EINVAL)?;
+        if status_b != expected_status_b {
+            return Err(EINVAL);
+        }
+        let epoch_address = status_b
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_EPOCH_OFFSET)
+            .ok_or(EINVAL)?;
+        let state_address = status_b
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET)
+            .ok_or(EINVAL)?;
+        let power_callback_count_address = self
+            .handoff
+            .primary
+            .instance
+            .status_a
+            .checked_add(PRIMARY_STATUS_A_POWER_CALLBACK_COUNT_OFFSET)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let epoch = self.resources.primary_state.read_u64(epoch_address)?;
+        let state = self.resources.primary_state.read_u32(state_address)?;
+        let power_callback_count = self
+            .resources
+            .primary_state
+            .read_u32(power_callback_count_address)?;
+        Ok(G17PFirmwareRecoveryHandshakeSnapshot::decode(
+            status_b,
+            epoch_address,
+            epoch,
+            state_address,
+            state,
+            power_callback_count_address,
+            power_callback_count,
+        ))
+    }
+
+    /// Consume one primary firmware-event record using the exact native ring
+    /// pointer pair serialized at main-config channel 13. J700 A000 treats
+    /// word 0 as the shared cursor object and word 1 as the 0x48-byte ring
+    /// base; producer is cursor `+0x20`. The consumer is published only after
+    /// the complete record has been copied.
+    pub(crate) fn drain_primary_firmware_event(
+        &mut self,
+    ) -> Result<Option<G17PPrimaryFirmwareEventRecord>> {
+        self.drain_firmware_event(InstanceRole::Primary)
+    }
+
+    pub(crate) fn drain_firmware_event(
+        &mut self, role: InstanceRole,
+    ) -> Result<Option<G17PPrimaryFirmwareEventRecord>> {
+        let entry = g17_initdata::channel_table_entry_range(
+            PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX,
+        )
+        .ok_or(EINVAL)?;
+        let (main_config, state_grid, status_a) = match role {
+            InstanceRole::Primary => (self.handoff.primary.instance.main_config,
+                self.handoff.primary.state_grid, self.handoff.primary.instance.status_a),
+            InstanceRole::Secondary => (self.handoff.secondary.instance.main_config,
+                self.handoff.secondary.state_grid, self.handoff.secondary.instance.status_a),
+        };
+        let expected = g17_initdata::derive_channel_table(
+            role, state_grid, status_a, main_config,
+            self.handoff.shared.hw_data_bundle,
+        )[PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX];
+        let cursor_address = self.resources.shared_cluster.read_u64(
+            main_config
+                .checked_add(entry.start as u64)
+                .ok_or(EINVAL)?,
+        )?;
+        let ring_address = self.resources.shared_cluster.read_u64(
+            main_config
+                .checked_add(entry.start as u64)
+                .and_then(|address| address.checked_add(8))
+                .ok_or(EINVAL)?,
+        )?;
+        if cursor_address != expected.states[0] || ring_address != expected.states[1] {
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P firmware-event ring: pointer mismatch cursor={:#x}/{:#x} ring={:#x}/{:#x}\n",
+                cursor_address,
+                expected.states[0],
+                ring_address,
+                expected.states[1]
+            );
+            return Err(EINVAL);
+        }
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let consumer = self.ktrace_object(role).read_u32(cursor_address)?;
+        let producer = self.ktrace_object(role).read_u32(
+            cursor_address
+                .checked_add(g17_completion::G17P_FIRMWARE_EVENT_PRODUCER_OFFSET as u64)
+                .ok_or(EINVAL)?,
+        )?;
+        let read = match g17_completion::prepare_g17p_firmware_event_read(
+            g17_completion::G17PFirmwareEventCursor {
+                consumer,
+                producer,
+            },
+        ) {
+            Ok(read) => read,
+            Err(g17_completion::CompletionDecodeError::FirmwareEventEmpty) => return Ok(None),
+            Err(error) => {
+                dev_err!(
+                    self.dev().as_ref(),
+                    "G17P firmware-event ring: cursor consumer={} producer={} rejected ({:?})\n",
+                    consumer,
+                    producer,
+                    error
+                );
+                return Err(EIO);
+            }
+        };
+        let record_address = ring_address
+            .checked_add(read.entry_offset as u64)
+            .ok_or(EINVAL)?;
+        let record_offset = record_address
+            .checked_sub(self.ktrace_object(role).iova())
+            .ok_or(EINVAL)? as usize;
+        let record_end = record_offset
+            .checked_add(g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE)
+            .ok_or(EINVAL)?;
+        let mut raw = [0u8; g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE];
+        self.ktrace_object(role).with_bytes_mut(|bytes| {
+            raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+            Ok(())
+        })?;
+        let event_type = u32::from_le_bytes(raw[0..4].try_into().map_err(|_| EIO)?);
+        let validation = match event_type {
+            // Type 1 has had a decoder in g17_completion since the completion
+            // work, but nothing ever dispatched to it, so every stamp-signal
+            // record was logged as unmodelled and dropped. It is the
+            // firmware's own statement of which stamps it signalled: compute
+            // emits mask 0x10 (stamp 4, its QID) on the submission that
+            // passes, and a failing render emits 0x22 (stamps 1 and 5).
+            g17_completion::G17P_FIRMWARE_EVENT_STAMP_TYPE => {
+                match g17_completion::decode_g17p_firmware_stamp_event(&raw) {
+                    Ok(event) => {
+                        if crate::util::g17p_verbose() {
+                            dev_info!(
+                                self.dev().as_ref(),
+                                "G17P firmware-event ring role={:?}: stamp signal cursor={} producer={} masks=[{:#018x},{:#018x}] diagnostics={}\n",
+                                role, consumer,
+                                producer,
+                                event.masks[0],
+                                event.masks[1],
+                                event.diagnostic_pair_count,
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            g17_completion::G17P_FIRMWARE_EVENT_TVB_GROW_TYPE => {
+                g17_completion::G17PFirmwareTvbGrowEvent::decode(&raw).map(|_| ())
+            }
+            g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE => {
+                g17_completion::decode_g17p_firmware_recovery_event(&raw).map(|_| ())
+            }
+            g17_completion::G17P_FIRMWARE_EVENT_UMA_GROW_TYPE => {
+                g17_completion::decode_g17p_firmware_uma_grow_event(&raw).map(|_| ())
+            }
+            _ => Err(g17_completion::CompletionDecodeError::FirmwareEventType),
+        };
+        if let Err(error) = validation {
+            let raw_qword = |offset: usize| {
+                u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap_or([0; 8]))
+            };
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P firmware-event ring role={:?}: record type={} cursor={} producer={} raw=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] unmodelled ({:?}); consuming\n",
+                role, event_type,
+                consumer,
+                producer,
+                raw_qword(0x00),
+                raw_qword(0x08),
+                raw_qword(0x10),
+                raw_qword(0x18),
+                raw_qword(0x20),
+                raw_qword(0x28),
+                raw_qword(0x30),
+                raw_qword(0x38),
+                raw_qword(0x40),
+                error
+            );
+            // Do NOT stall the ring on a record we do not model. Holding the
+            // consumer back made one unmodelled entry block every later record
+            // forever: once the firmware actually executed a kick it published
+            // a type-1 record (payload tagged "RTKSTACK") ahead of the
+            // completion, and the strict type-4/type-13 allowlist rejected it
+            // with the consumer unchanged, so the drain returned EIO on every
+            // poll and the submission could never retire. Log it and fall
+            // through to the consumer publish below; the batch dispatcher
+            // counts it as unhandled.
+        }
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.ktrace_object(role)
+            .write_u32(cursor_address, read.published_consumer)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(Some(G17PPrimaryFirmwareEventRecord {
+            raw,
+            consumer_before: consumer,
+            producer_snapshot: producer,
+            consumer_published: read.published_consumer,
+        }))
+    }
+
+    pub(crate) fn primary_firmware_recovery_cause_snapshot(
+        &mut self,
+    ) -> Result<G17PFirmwareRecoveryCauseSnapshot> {
+        let status_b = self.handoff.primary.instance.status_b;
+        let mut read_u32 = |offset: u64| {
+            self.resources
+                .primary_state
+                .read_u32(status_b.checked_add(offset).ok_or(EINVAL)?)
+        };
+        let zero_0 = read_u32(PRIMARY_STATUS_B_RECOVERY_ZERO_0_OFFSET)?;
+        let detected_source_count =
+            read_u32(PRIMARY_STATUS_B_RECOVERY_SOURCE_COUNT_OFFSET)?;
+        let zero_1 = read_u32(PRIMARY_STATUS_B_RECOVERY_ZERO_1_OFFSET)?;
+        let command_word = read_u32(PRIMARY_STATUS_B_RECOVERY_COMMAND_WORD_OFFSET)?;
+        let raw_48cc = read_u32(PRIMARY_STATUS_B_RECOVERY_RAW_48CC_OFFSET)?;
+        let host_recovery = read_u32(PRIMARY_STATUS_B_RECOVERY_OBJECT_ACTIVE_OFFSET)?;
+        let raw_48d0 = self.resources.primary_state.read_u64(
+            status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_RAW_48D0_OFFSET)
+                .ok_or(EINVAL)?,
+        )?;
+        let slot_mask = self.resources.primary_state.read_u64(
+            status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_SLOT_MASK_OFFSET)
+                .ok_or(EINVAL)?,
+        )?;
+        Ok(G17PFirmwareRecoveryCauseSnapshot {
+            zero_0,
+            detected_source_count,
+            zero_1,
+            command_word,
+            raw_48cc,
+            raw_48d0,
+            slot_mask,
+            host_recovery,
+        })
+    }
+
+    /// Scan the exact 256-entry Status-B recovery-info table after firmware
+    /// publishes state 3. Native macOS checks every entry's VALID bit instead
+    /// of trusting the emitted-entry count at the end of the table.
+    pub(crate) fn primary_firmware_recovery_info_snapshot(
+        &mut self,
+    ) -> Result<G17PFirmwareRecoveryInfoSnapshot> {
+        let status_b = self.handoff.primary.instance.status_b;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut valid_entry_count = 0u32;
+        let mut first_valid_index = None;
+        let mut first_valid_flags = 0u32;
+        for index in 0..PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_COUNT {
+            let flags = self.resources.primary_state.read_u32(
+                status_b
+                    .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET)
+                    .and_then(|address| {
+                        address.checked_add(
+                            (index as u64)
+                                .checked_mul(PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_STRIDE)?,
+                        )
+                    })
+                    .ok_or(EINVAL)?,
+            )?;
+            if flags & 1 != 0 {
+                valid_entry_count = valid_entry_count.checked_add(1).ok_or(EOVERFLOW)?;
+                if first_valid_index.is_none() {
+                    first_valid_index = Some(index as u32);
+                    first_valid_flags = flags;
+                }
+            }
+        }
+        let emitted_entry_count = self.resources.primary_state.read_u32(
+            status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_EMITTED_COUNT_OFFSET)
+                .ok_or(EINVAL)?,
+        )?;
+        Ok(G17PFirmwareRecoveryInfoSnapshot {
+            emitted_entry_count,
+            valid_entry_count,
+            first_valid_index,
+            first_valid_flags,
+        })
+    }
+
+    /// Dump the raw recovery cause block that follows the recovery-info table
+    /// (`status_b + 0x48b8` onward, where the emitted count lives) plus the
+    /// first few table entries. The driver only decodes a handful of named
+    /// fields from here; on J700 every looping recovery reports the same
+    /// `+0x48cc == 3` with everything else zero, so the surrounding words are
+    /// what is needed to identify the request.
+    /// Drain the firmware log ring. Nine per-thread sub-rings share one text
+    /// area; each control block is `status_a + 0x80 + i*0x30`, with the read
+    /// pointer at `+0x00` and the write pointer at `+0x20`. Text records are
+    /// `0xd8` bytes: `{u32 type, u32 seq, u64 timestamp, char[0xc8]}`, already
+    /// formatted ASCII.
+    /// Arm the firmware trace-class mask at `status_a + 0x00`. The firmware
+    /// samples it while parsing initdata, so this must run before the ASCs are
+    /// started. It gates the verbose log classes and the KTrace ring.
+    pub(crate) fn arm_firmware_trace_classes(&mut self, mask: u32) -> Result {
+        // Each ASC parses its own initdata, latches its own `status_a`
+        // pointer, and runs its own guarded trace sites, so the mask has to
+        // land in both objects. Both existing call sites already run after the
+        // resource re-encode that zero-fills `secondary_status_a` and rewrites
+        // the two status blocks, and both run before the initdata doorbell,
+        // which is when the firmware samples this word.
+        let primary = self.handoff.primary.instance.status_a;
+        let secondary = self.handoff.secondary.instance.status_a;
+        let before_primary = self.resources.primary_state.read_u32(primary)?;
+        self.resources.primary_state.write_u32(primary, mask)?;
+        let after_primary = self.resources.primary_state.read_u32(primary)?;
+        let before_secondary = self.resources.secondary_status_a.read_u32(secondary)?;
+        self.resources
+            .secondary_status_a
+            .write_u32(secondary, mask)?;
+        let after_secondary = self.resources.secondary_status_a.read_u32(secondary)?;
+        dev_info!(
+            self.dev().as_ref(),
+            "G17P firmware trace classes: primary {:#x} -> {:#x} secondary {:#x} -> {:#x} (requested {:#x})\n",
+            before_primary,
+            after_primary,
+            before_secondary,
+            after_secondary,
+            mask
+        );
+        Ok(())
+    }
+
+    /// Read the KSM completion record for the in-flight compute submission.
+    ///
+    /// Layout of completion ordinal 0, from the firmware's own consumer
+    /// (`b1` `0xd550` reads the ring; `0xab64` decodes one record). The
+    /// producer is the KSM hardware block, not the firmware -- the firmware
+    /// only `clean_invalidate`s the entries and reads them, so there is no
+    /// firmware store order to appeal to and every field must be validated on
+    /// its own terms:
+    ///
+    /// ```text
+    /// +0x00   packed control word (kind, class, data master, queue id, stamp)
+    /// +0x08   u32; only bits [28:5] are tested, and they select which
+    ///         completion tail the firmware runs -- unmodelled here
+    /// +0x10, +0x18   timestamp pair A, each masked to 54 bits
+    /// +0x20, +0x28   timestamp pair B, each masked to 54 bits; this is the
+    ///                pair fed to the execution-time attributor and rebased
+    ///                into the descriptor's user-timestamp objects
+    /// +0x30   the submitted descriptor address, with a FLAG in bit 0
+    /// +0x38   the CL queue address
+    /// ```
+    ///
+    /// So it is two ordered (start, end) pairs, not "four increasing
+    /// timestamps", and the top ten bits of each are tag bits rather than
+    /// time. Returns pair B, which is what a completion means and what the
+    /// compute UAPI reports.
+    /// Zero KSM completion ordinal 0 immediately before a submission is
+    /// published.
+    ///
+    /// Ordinal 0 is a single slot the firmware overwrites, so without this a
+    /// record left by an EARLIER submission is indistinguishable from a fresh
+    /// one and satisfies the next wait instantly. That is not hypothetical: a
+    /// submission observed with `gpc-state = 0x0` -- GPU cores never powered,
+    /// so the work provably never ran -- still "woke" the doorbell and
+    /// retired, because the predicate only asked whether the record was
+    /// populated. After this, populated means written since this publish.
+    ///
+    /// Returns the record's previous `+0x30` (descriptor back-reference, with
+    /// the bit-0 flag masked off) and `+0x28` (pair-B end timestamp, masked to
+    /// 54 bits) so a caller can log what it is discarding.
+    pub(crate) fn clear_compute_completion(&mut self) -> Result<[u64; 2]> {
+        let object = &mut self.resources.completion_ordinal_0;
+        let base = object.iova();
+        if object.logical_size < G17P_COMPUTE_COMPLETION_RECORD_SIZE {
+            return Err(ERANGE);
+        }
+        let previous = [
+            object.read_u64(base + 0x30)? & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK,
+            object.read_u64(base + 0x28)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK,
+        ];
+        object.with_bytes_mut(|raw| {
+            raw.get_mut(..G17P_COMPUTE_COMPLETION_RECORD_SIZE)
+                .ok_or(ERANGE)?
+                .fill(0);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(previous)
+    }
+
+    /// Read KSM completion ordinal 0, rejecting a record that is not the one
+    /// the caller is waiting for.
+    ///
+    /// Ordinal 0 is a single slot the firmware overwrites, so once more than
+    /// one submission runs per boot a populated record is NOT automatically
+    /// ours. Two independent discriminators are applied:
+    ///
+    ///  * `+0x30` echoes the submitted descriptor address (established on
+    ///    hardware: it matched `0xfffffc20003a4000`). Every submission uses a
+    ///    different descriptor slot, so this identifies the owner directly.
+    ///    It is advisory -- a mismatch is logged, not fatal -- because the
+    ///    field's meaning rests on one observation.
+    ///  * `+0x28`, one of four monotonically increasing GPU timestamps, must
+    ///    differ from the end timestamp of the completion already consumed.
+    ///    This one is layout-independent and is what actually gates the
+    ///    return, so a stale record can never satisfy the next wait.
+    /// Decode every completion-ring slot: index, descriptor, queue, start/end.
+    ///
+    /// The raw word dump proved the buffer is a ring; this makes the ring's
+    /// contents legible in one run so a depth failure can be diagnosed without
+    /// hand-decoding hex.
+    /// Scan both KSM completion ordinals.
+    ///
+    /// Ordinal 0 is compute's. RENDER's completion selector is 2
+    /// (`RENDER_COMPLETION_SELECTOR` in `new_render_sksm_queues`), and until now
+    /// nothing read ordinal 2 at all -- so a render kick that DID complete
+    /// would have written a record no code path ever looked at, and would have
+    /// been indistinguishable from one that never ran.
+    pub(crate) fn dump_completion_records(&mut self, label: &'static str) -> Result {
+        self.dump_completion_ordinal(label, 0)?;
+        self.dump_completion_ordinal(label, 2)
+    }
+
+    /// Whether either hardware completion ring still names a descriptor in
+    /// `range`. Native retains a command descriptor's exact memory map until
+    /// work-queue pruning observes its event. Linux does not yet model that
+    /// private event object, but this KSM back-reference is an exact observable
+    /// lower bound: releasing a graph while it remains published is unsafe.
+    pub(crate) fn completion_references_descriptor_range(
+        &mut self,
+        range: &Range<u64>,
+    ) -> Result<bool> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        for ordinal in [0u8, 2u8] {
+            let object = if ordinal == 0 {
+                &mut self.resources.completion_ordinal_0
+            } else {
+                &mut self.resources.completion_ordinal_2
+            };
+            let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE;
+            let slots = object.logical_size / stride;
+            let mut referenced = false;
+            object.with_bytes_mut(|bytes| {
+                for slot in 0..slots {
+                    let at = slot.checked_mul(stride).ok_or(EOVERFLOW)?;
+                    let record = bytes.get(at..at + stride).ok_or(ERANGE)?;
+                    let descriptor = u64::from_le_bytes(
+                        record[0x30..0x38].try_into().map_err(|_| EINVAL)?,
+                    ) & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
+                    if descriptor >= range.start && descriptor < range.end {
+                        referenced = true;
+                        break;
+                    }
+                }
+                Ok(())
+            })?;
+            if referenced {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn dump_completion_ordinal(&mut self, label: &'static str, ordinal: u8) -> Result {
+        let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE as u64;
+        let mut rows: [(u64, u64, u64, u64); 24] = [(0, 0, 0, 0); 24];
+        let mut n = 0usize;
+        let (base, slots) = {
+            let object = if ordinal == 0 {
+                &mut self.resources.completion_ordinal_0
+            } else {
+                &mut self.resources.completion_ordinal_2
+            };
+            let base = object.iova();
+            let slots = (object.logical_size as u64 / stride).min(24);
+            for slot in 0..slots {
+                let rec = base + slot * stride;
+                let descriptor =
+                    object.read_u64(rec + 0x30)? & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
+                let queue = object.read_u64(rec + 0x38)?;
+                // Pair B, masked -- the window a completion actually reports.
+                let start =
+                    object.read_u64(rec + 0x20)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                let end =
+                    object.read_u64(rec + 0x28)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                if descriptor != 0 || queue != 0 || end != 0 {
+                    rows[n] = (slot, descriptor, start, end);
+                    n += 1;
+                }
+            }
+            (base, slots)
+        };
+        let dev = self.dev().clone();
+        dev_info!(
+            dev.as_ref(),
+            "G17P completion ring[{}] ordinal={} base={:#x} slots={} populated={}\n",
+            label,
+            ordinal,
+            base,
+            slots,
+            n
+        );
+        for row in rows.iter().take(n) {
+            dev_info!(
+                dev.as_ref(),
+                "G17P completion ring[{}] ordinal={} slot {} desc={:#x} start={:#x} end={:#x}\n",
+                label,
+                ordinal,
+                row.0,
+                row.1,
+                row.2,
+                row.3
+            );
+        }
+        Ok(())
+    }
+
+    /// Return one coherent timestamp pair from the exact completed descriptor
+    /// record. The legacy retire API combines pair-A start with pair-B end;
+    /// that interval must never be used as proof of simultaneous execution.
+    /// Pair B is the pair copied to native's command timestamp destinations.
+    pub(crate) fn read_compute_execution_interval(
+        &mut self, expected_descriptor: u64, completed_end: u64,
+    ) -> Result<Option<[u64; 2]>> {
+        let object = &mut self.resources.completion_ordinal_0;
+        let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE;
+        let slots = core::cmp::min(object.logical_size / stride,
+            g17_initdata::G17P_KSM_COMPLETION_CAPACITY as usize);
+        object.with_bytes_mut(|bytes| {
+            for slot in 0..slots {
+                let offset = slot * stride;
+                let record = bytes.get(offset..offset + stride).ok_or(ERANGE)?;
+                let field = |at: usize| -> u64 {
+                    u64::from_le_bytes(record[at..at + 8].try_into().unwrap_or([0; 8]))
+                };
+                if field(0x30) & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK != expected_descriptor
+                    || field(0x38) == 0 { continue; }
+                let start = field(0x20) & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                let end = field(0x28) & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                if end == completed_end && start != 0 && start < end {
+                    return Ok(Some([start, end]));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    /// Decode the shared completion ring once for every QID requested by one
+    /// service transaction. Type-1 events provide the exact QID set; the
+    /// explicit acquire also makes the identity-less/watchdog fallback a
+    /// standalone ordered observation before any queue owner is released.
+    pub(crate) fn scan_compute_completion_batch(
+        &mut self,
+        batch: &mut G17PComputeCompletionBatch,
+    ) -> Result {
+        let object = &mut self.resources.completion_ordinal_0;
+        let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE;
+        let slots = core::cmp::min(
+            object.logical_size / stride,
+            g17_initdata::G17P_KSM_COMPLETION_CAPACITY as usize,
+        );
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        object.with_bytes_mut(|bytes| {
+            for slot in 0..slots {
+                let offset = slot.checked_mul(stride).ok_or(EOVERFLOW)?;
+                let end = offset.checked_add(stride).ok_or(EOVERFLOW)?;
+                batch.fold_record(bytes.get(offset..end).ok_or(ERANGE)?)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn read_compute_completion(
+        &mut self,
+        expected_descriptor: u64,
+        last_consumed_end: u64,
+    ) -> Result<Option<[u64; 2]>> {
+        // The completion buffer is a RING of 0x40-strided records, not a single
+        // record. Proven on hardware: after a repeat submission timed out, the
+        // timeout dump showed a second descriptor/queue back-reference pair at
+        // +0x70/+0x78 -- exactly 0x40 past the first at +0x30/+0x38. Reading only
+        // record 0 is why repeats "published but never signalled": the firmware
+        // had reported the completion, into the next slot, and we never looked.
+        let object = &mut self.resources.completion_ordinal_0;
+        let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE;
+        // Take the slot count from the geometry that was published to the
+        // firmware, not from a guess. Initdata programs this ring as
+        // `G17P_KSM_COMPLETION_CAPACITY` records of
+        // `G17P_KSM_COMPLETION_ENTRY_SIZE` bytes and the object is sized to
+        // exactly that, so the two models agree by construction.
+        //
+        // The previous `.min(64)` was a latent SECOND wall: nothing keeps the
+        // KSM's write index inside the first 64 slots, and a completion landing
+        // beyond them would simply never be found -- an unbounded run would
+        // have hit it as a hang. It is NOT the 320 wall; that one is the ITEM
+        // ring (`0x500` entries at four records per submission = 320
+        // submissions), which is a different ring in a different object.
+        let slots = core::cmp::min(
+            object.logical_size / stride,
+            g17_initdata::G17P_KSM_COMPLETION_CAPACITY as usize,
+        );
+        if slots == 0 {
+            return Ok(None);
+        }
+        // One borrow for the whole ring. The producer is the KSM hardware
+        // block, which can update a record between two host loads, so reading
+        // a record's back-reference and its timestamps as separate loads can
+        // mix a fresh back-reference with a not-yet-written timestamp. Each
+        // record below is decoded from one contiguous slice; the firmware does
+        // the same thing -- `clean_invalidate` the entries, then decode.
+        object.with_bytes_mut(|bytes| {
+        let mut best: Option<[u64; 2]> = None;
+        for slot in 0..slots {
+            let offset = slot * stride;
+            let record = bytes.get(offset..offset + stride).ok_or(ERANGE)?;
+            let field = |at: usize| -> u64 {
+                u64::from_le_bytes(record[at..at + 8].try_into().unwrap_or([0; 8]))
+            };
+            // +0x30 carries a flag in bit 0. The firmware masks it off before
+            // it dereferences the pointer (`and x26, x22, #~1`), so an exact
+            // comparison against the published descriptor address can miss --
+            // or, worse, a record whose only populated field is that flag
+            // looks like a live back-reference. Mask first, then compare.
+            let descriptor = field(0x30) & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
+            if descriptor == 0 || field(0x38) == 0 {
+                continue;
+            }
+            if expected_descriptor != 0 && descriptor != expected_descriptor {
+                continue;
+            }
+            // The record does NOT carry "four increasing timestamps": it
+            // carries TWO (start, end) pairs, A at +0x10/+0x18 and B at
+            // +0x20/+0x28, and the firmware masks every one of them to 54 bits
+            // before use -- the top ten bits are tag bits, not time. Reading
+            // them raw is a real defect: a record that has been claimed but
+            // not yet stamped has `raw != 0` while the timestamp itself is
+            // still zero, so the old "end != 0" test could accept a slot the
+            // KSM had only reserved.
+            //
+            // The FIELDS are deliberately the same two the proven reader used,
+            // so this is a correction and not a new predicate; only the
+            // masking is new. Gating on pair B's start as well would be more
+            // faithful to the firmware's own use of the record, but nothing
+            // establishes that a compute completion stamps it, and an unproven
+            // field in the predicate can only add ways to hang. The decoded
+            // dump prints all of them so that can be settled from a run.
+            let start = field(0x10) & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+            let end = field(0x28) & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+            if start == 0 || end == 0 {
+                continue;
+            }
+            // Timestamps are monotonic, so ANY record from a previous
+            // submission has end <= last_consumed_end. Excluding only the
+            // single most-recently-consumed end (== ) left every OLDER slot
+            // eligible: on a fast repeat, before the firmware had written this
+            // submission's record, a record from two-or-more submissions ago
+            // was accepted as ours. The caller then read a buffer the GPU had
+            // not written yet and saw zeroes. Proven on hardware: repeat depth
+            // tracked how much delay the submit path happened to get -- 8 with
+            // light logging, 28 with a 2ms settle, 100 only when console
+            // tracing padded every submission by milliseconds.
+            if end <= last_consumed_end {
+                continue;
+            }
+            // Prefer the newest record, so a stale slot can never win over the
+            // one this submission just produced.
+            if best.is_none_or(|b| end > b[1]) {
+                best = Some([start, end]);
+            }
+        }
+        Ok(best)
+        })
+    }
+
+    /// Decode and log the KSM completion ring.
+    ///
+    /// The raw word dump is what found the ring in the first place, but it
+    /// truncates at 24 non-zero words -- about three records -- and prints
+    /// offsets rather than meaning. This prints one line per POPULATED record:
+    /// slot index, the descriptor it reports, the queue, and the start/end
+    /// timestamps, alongside the descriptor the waiting submission expects. A
+    /// timeout is then a one-run diagnosis: either the expected descriptor is
+    /// absent (the firmware reported nothing for this submission) or it is
+    /// present (the firmware reported it and the reader's predicate rejected
+    /// it).
+    ///
+    /// Scans the whole object, not the first `0x400` bytes. DRAM only.
+    pub(crate) fn dump_compute_completion_records(
+        &mut self,
+        label: &'static str,
+        expected_descriptor: u64,
+    ) -> Result {
+        const LOG_LIMIT: usize = 24;
+        let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE as u64;
+        let mut populated = 0usize;
+        let mut logged = 0usize;
+        let mut newest: Option<(u64, u64)> = None;
+        let mut matched: Option<u64> = None;
+        // slot, descriptor, queue, pair-A start, pair-B start, pair-B end,
+        // and the +0x08 routing word.
+        let mut lines: [(u64, u64, u64, u64, u64, u64, u32, u64, u8); LOG_LIMIT] =
+            [(0, 0, 0, 0, 0, 0, 0, 0, 0); LOG_LIMIT];
+        // Scope the object borrow so the logging below can reach `self.dev()`.
+        let (base, logical_size, slots) = {
+            let object = &mut self.resources.completion_ordinal_0;
+            let base = object.iova();
+            let logical_size = object.logical_size;
+            let slots = logical_size as u64 / stride;
+            for slot in 0..slots {
+                let rec = base + slot * stride;
+                let descriptor =
+                    object.read_u64(rec + 0x30)? & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
+                let queue = object.read_u64(rec + 0x38)?;
+                if descriptor == 0 && queue == 0 {
+                    continue;
+                }
+                // Every timestamp masked exactly as the firmware masks it, so
+                // a record that is claimed but not yet stamped shows as zero
+                // here instead of as a large tag-bit value.
+                let a_start =
+                    object.read_u64(rec + 0x10)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                let start =
+                    object.read_u64(rec + 0x20)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                let end =
+                    object.read_u64(rec + 0x28)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                let routing = object.read_u32(rec + 0x08)?;
+                populated += 1;
+                if newest.is_none_or(|(_, best_end)| end > best_end) {
+                    newest = Some((slot, end));
+                }
+                if expected_descriptor != 0 && descriptor == expected_descriptor {
+                    matched = Some(slot);
+                }
+                if logged < LOG_LIMIT {
+                    // `control` (+0x00) is the word `G17PComputeCompletionBatch::
+                    // fold_record` routes on, and `route_qid` is the queue it
+                    // routes to. Nothing printed them before, so a record the
+                    // batch reader dropped for routing to a different (or an
+                    // unrequested) slot looked identical here to one it folded.
+                    let control = object.read_u64(rec + 0x00)?;
+                    let route_qid = g17_completion::g17p_ksm_completion_queue_id(control);
+                    lines[logged] =
+                        (slot, descriptor, queue, a_start, start, end, routing, control, route_qid);
+                    logged += 1;
+                }
+            }
+            (base, logical_size, slots)
+        };
+        let dev = self.dev().clone();
+        for entry in lines.iter().take(logged) {
+            dev_info!(
+                dev.as_ref(),
+                "G17P completion[{}]: rec {} descriptor {:#x} queue {:#x} a-start {:#x} b-start {:#x} b-end {:#x} route {:#x} control {:#x} route-qid {}\n",
+                label,
+                entry.0,
+                entry.1,
+                entry.2,
+                entry.3,
+                entry.4,
+                entry.5,
+                entry.6,
+                entry.7,
+                entry.8
+            );
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G17P completion[{}]: base {:#x} size {:#x} stride {:#x} slots {} populated {} logged {} expected-descriptor {:#x} matched-rec {:?} newest-rec {:?}\n",
+            label,
+            base,
+            logical_size,
+            stride,
+            slots,
+            populated,
+            logged,
+            expected_descriptor,
+            matched,
+            newest.map(|(slot, _)| slot)
+        );
+        Ok(())
+    }
+
+    /// Dump the KSM completion-stamp buffers.
+    ///
+    /// On M1/M2 the firmware reports work completion by writing an event
+    /// "stamp" into memory (upstream `EventValue`, which advances by 0x100 per
+    /// completion) rather than by publishing a record in the firmware event
+    /// ring -- that ring carries telemetry. macOS confirms the same split on
+    /// G17P: its event ring only produced types 0x11-0x1c during a compute
+    /// dispatch while the completion ran on a separate thread. Our firmware
+    /// KTrace shows `0x0e stamp-update value=0x100 index=4`, so the stamp lands
+    /// somewhere in these buffers; report every non-zero word so the layout can
+    /// be established from hardware rather than guessed.
+    pub(crate) fn dump_completion_stamps(&mut self, label: &'static str) -> Result {
+        let mut found: [(usize, usize, u32); 24] = [(0, 0, 0); 24];
+        let mut n = 0usize;
+        let mut counts = [0usize; 2];
+        let mut bases = [0u64; 2];
+        let mut limits = [0usize; 2];
+        for (slot, which) in [0usize, 2usize].into_iter().enumerate() {
+            let object = if which == 0 {
+                &mut self.resources.completion_ordinal_0
+            } else {
+                &mut self.resources.completion_ordinal_2
+            };
+            let base = object.iova();
+            let limit = core::cmp::min(object.logical_size, 0x400);
+            bases[slot] = base;
+            limits[slot] = limit;
+            let mut offset = 0usize;
+            while offset < limit {
+                let value = object.read_u32(base + offset as u64)?;
+                if value != 0 {
+                    if n < found.len() {
+                        found[n] = (which, offset, value);
+                        n += 1;
+                    }
+                    counts[slot] += 1;
+                }
+                offset += 4;
+            }
+        }
+        let dev = self.dev().clone();
+        for entry in found.iter().take(n) {
+            dev_info!(
+                dev.as_ref(),
+                "G17P completion stamps[{}] ord{} +{:#x} = {:#x}\n",
+                label,
+                entry.0,
+                entry.1,
+                entry.2
+            );
+        }
+        for (slot, which) in [0usize, 2usize].into_iter().enumerate() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P completion stamps[{}] ord{} base={:#x} scanned={:#x} non-zero={}\n",
+                label,
+                which,
+                bases[slot],
+                limits[slot],
+                counts[slot]
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dump_firmware_log(&mut self, max_records: usize) -> Result<usize> {
+        const CONTROL_BASE: u64 = 0x80;
+        const CONTROL_STRIDE: u64 = 0x30;
+        const RING_COUNT: u64 = 9;
+        const TEXT_BASE: u64 = 0x2d2c0;
+        const RECORD_STRIDE: u64 = 0xd8;
+        const RECORD_TEXT: u64 = 0x10;
+        const RECORDS_PER_RING: u64 = 0x900 / RING_COUNT;
+
+        let status_a = self.handoff.primary.instance.status_a;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut shown = 0usize;
+        for ring in 0..RING_COUNT {
+            let control = status_a
+                .checked_add(CONTROL_BASE + ring * CONTROL_STRIDE)
+                .ok_or(EINVAL)?;
+            let read_ptr = self.resources.primary_state.read_u32(control)?;
+            let write_ptr = self
+                .resources
+                .primary_state
+                .read_u32(control.checked_add(0x20).ok_or(EINVAL)?)?;
+            if write_ptr == 0 && read_ptr == 0 {
+                continue;
+            }
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P fwlog ring {}: read={} write={}\n",
+                ring,
+                read_ptr,
+                write_ptr
+            );
+            for index in 0..write_ptr.min(RECORDS_PER_RING as u32) {
+                if shown >= max_records {
+                    return Ok(shown);
+                }
+                let record = status_a
+                    .checked_add(TEXT_BASE)
+                    .and_then(|a| {
+                        a.checked_add((ring * RECORDS_PER_RING + index as u64) * RECORD_STRIDE)
+                    })
+                    .ok_or(EINVAL)?;
+                let mut text = [0u8; 0x60];
+                for (i, byte) in text.iter_mut().enumerate() {
+                    let word = self.resources.primary_state.read_u32(
+                        record
+                            .checked_add(RECORD_TEXT + (i as u64 & !3))
+                            .ok_or(EINVAL)?,
+                    )?;
+                    *byte = (word >> ((i as u32 & 3) * 8)) as u8;
+                }
+                let end = text.iter().position(|b| *b == 0).unwrap_or(text.len());
+                let printable = &text[..end];
+                if printable.is_empty() {
+                    continue;
+                }
+                dev_info!(
+                    self.dev().as_ref(),
+                    "G17P fwlog[{}.{}]: {}\n",
+                    ring,
+                    index,
+                    core::str::from_utf8(printable).unwrap_or("<non-utf8>")
+                );
+                shown += 1;
+            }
+        }
+        Ok(shown)
+    }
+
+    /// The mapped object that backs one role's `status_a` block. Primary
+    /// `status_a` lives inside `primary_state` at +0xee40; the secondary owns
+    /// a dedicated object whose base *is* its `status_a`.
+    fn ktrace_object(&mut self, role: InstanceRole) -> &mut MappedObject {
+        match role {
+            InstanceRole::Primary => &mut self.resources.primary_state,
+            InstanceRole::Secondary => &mut self.resources.secondary_status_a,
+        }
+    }
+
+    /// Cross-check the published channel-13 event pointer pair against the
+    /// channel-table derivation, exactly as the channel-14 check does.
+    pub(crate) fn check_report_ring_pointers(&mut self, role: InstanceRole) -> Result<(u64, u64)> {
+        let entry = g17_initdata::channel_table_entry_range(
+            g17_completion::G17P_EVENT_CHANNEL_TABLE_INDEX,
+        )
+        .ok_or(EINVAL)?;
+        let (main_config, status_a, state_grid) = match role {
+            InstanceRole::Primary => (
+                self.handoff.primary.instance.main_config,
+                self.handoff.primary.instance.status_a,
+                self.handoff.primary.state_grid,
+            ),
+            InstanceRole::Secondary => (
+                self.handoff.secondary.instance.main_config,
+                self.handoff.secondary.instance.status_a,
+                self.handoff.secondary.state_grid,
+            ),
+        };
+        let expected = g17_initdata::derive_channel_table(
+            role,
+            state_grid,
+            status_a,
+            main_config,
+            self.handoff.shared.hw_data_bundle,
+        )[g17_completion::G17P_EVENT_CHANNEL_TABLE_INDEX];
+        let base = main_config.checked_add(entry.start as u64).ok_or(EINVAL)?;
+        let published_state = self.resources.shared_cluster.read_u64(base)?;
+        let published_ring = self
+            .resources
+            .shared_cluster
+            .read_u64(base.checked_add(8).ok_or(EINVAL)?)?;
+        if published_state != expected.states[0] || published_ring != expected.states[1] {
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P report: channel-13 pointer mismatch state={:#x}/{:#x} ring={:#x}/{:#x}\n",
+                published_state,
+                expected.states[0],
+                published_ring,
+                expected.states[1]
+            );
+            return Err(EINVAL);
+        }
+        Ok((published_state, published_ring))
+    }
+
+    /// Read one instance's firmware event ring (channel-table entry 13).
+    ///
+    /// This ring carries `Fault` / `Flag` / `Timeout` / `GrowTilingBuffer` /
+    /// `ChannelError`, and this driver has never read it: `decode_firmware_report`
+    /// and `decode_channel13_event` had no live caller at all, so a firmware
+    /// request for the host to grow the tiling parameter buffer would have sat
+    /// unread in DRAM while the tiler waited for a reply that never came.
+    ///
+    /// `advance` publishes the consumer cursor. It defaults off at the call
+    /// sites: publishing is a write to firmware-shared state on a ring whose
+    /// consumer has never moved on this driver, and the question this answers
+    /// -- is anything *there* -- does not require consuming it. Nothing here
+    /// acts on a record; servicing a growth request is a separate change.
+    pub(crate) fn drain_report_ring(
+        &mut self,
+        role: InstanceRole,
+        advance: bool,
+        print_budget: u32,
+    ) -> Result<G17PReportDrainStats> {
+        let status_a = match role {
+            InstanceRole::Primary => self.handoff.primary.instance.status_a,
+            InstanceRole::Secondary => self.handoff.secondary.instance.status_a,
+        };
+        let role_name = match role {
+            InstanceRole::Primary => "primary",
+            InstanceRole::Secondary => "secondary",
+        };
+        let state = status_a
+            .checked_add(g17_completion::G17P_EVENT_STATE_STATUS_A_OFFSET)
+            .ok_or(EINVAL)?;
+        let ring = status_a
+            .checked_add(g17_completion::G17P_EVENT_RING_STATUS_A_OFFSET)
+            .ok_or(EINVAL)?;
+        let consumer_address = state
+            .checked_add(g17_completion::G17P_EVENT_CONSUMER_OFFSET)
+            .ok_or(EINVAL)?;
+        let producer_address = state
+            .checked_add(g17_completion::G17P_EVENT_PRODUCER_OFFSET)
+            .ok_or(EINVAL)?;
+        let fwlog_write_address = status_a
+            .checked_add(g17_completion::G17P_FWLOG_CONTROL_STATUS_A_OFFSET)
+            .and_then(|address| address.checked_add(0x20))
+            .ok_or(EINVAL)?;
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut consumer = self.ktrace_object(role).read_u32(consumer_address)?;
+        let producer = self.ktrace_object(role).read_u32(producer_address)?;
+        let fwlog_write = self.ktrace_object(role).read_u32(fwlog_write_address)?;
+        let mut stats = G17PReportDrainStats {
+            producer,
+            consumer_before: consumer,
+            fwlog_write,
+            ..G17PReportDrainStats::default()
+        };
+        if producer >= g17_completion::G17P_EVENT_CAPACITY
+            || consumer >= g17_completion::G17P_EVENT_CAPACITY
+        {
+            stats.cursor_out_of_range = true;
+            dev_warn!(
+                self.dev().as_ref(),
+                "G17P report[{}]: cursor out of range consumer={} producer={}\n",
+                role_name,
+                consumer,
+                producer
+            );
+            return Ok(stats);
+        }
+
+        // The consumer is already level with the producer by the time any
+        // render checkpoint runs -- the event worker services this ring during
+        // the submit -- so a cursor-driven walk reports pending=0 and reads
+        // nothing, and the records that actually described the render are
+        // never seen. They are still in DRAM: dump the slots ending at the
+        // producer regardless of the cursor, so a stalled render can be read
+        // after the fact.
+        {
+            let size = g17_completion::G17P_EVENT_ENTRY_SIZE;
+            let history = g17_completion::g17p_report_history_count(print_budget);
+            for index in 0..history {
+                let slot = g17_completion::g17p_report_history_slot(producer, history, index)
+                    .ok_or(EINVAL)?;
+                let record_address = ring
+                    .checked_add((slot as usize * size) as u64)
+                    .ok_or(EINVAL)?;
+                let record_offset = record_address
+                    .checked_sub(self.ktrace_object(role).iova())
+                    .ok_or(EINVAL)? as usize;
+                let record_end = record_offset.checked_add(size).ok_or(EINVAL)?;
+                let mut raw = [0u8; g17_completion::G17P_EVENT_ENTRY_SIZE];
+                if self
+                    .ktrace_object(role)
+                    .with_bytes_mut(|bytes| {
+                        raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+                        Ok(())
+                    })
+                    .is_err()
+                {
+                    continue;
+                }
+                if raw.iter().all(|byte| *byte == 0) {
+                    continue;
+                }
+                let event_type = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                stats.history_records = stats.history_records.saturating_add(1);
+                if event_type == G17P_EVENT_GROW_REQUEST_TYPE {
+                    stats.history_grow_requests = stats.history_grow_requests.saturating_add(1);
+                }
+                if event_type == g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE {
+                    stats.history_restart_requests =
+                        stats.history_restart_requests.saturating_add(1);
+                }
+                dev_info!(
+                    self.dev().as_ref(),
+                    "G17P report[{}] history slot {} type={} ({}): {:02x?}\n",
+                    role_name,
+                    slot,
+                    event_type,
+                    g17_completion::g17p_firmware_event_name(event_type),
+                    &raw[..],
+                );
+            }
+        }
+
+        let mut budget = g17_completion::G17P_EVENT_CAPACITY;
+        while consumer != producer && budget > 0 {
+            budget -= 1;
+            let entry_offset = consumer as usize * g17_completion::G17P_EVENT_ENTRY_SIZE;
+            let published = (consumer + 1) & (g17_completion::G17P_EVENT_CAPACITY - 1);
+            let record_address = ring.checked_add(entry_offset as u64).ok_or(EINVAL)?;
+            let record_offset = record_address
+                .checked_sub(self.ktrace_object(role).iova())
+                .ok_or(EINVAL)? as usize;
+            let record_end = record_offset
+                .checked_add(g17_completion::G17P_EVENT_ENTRY_SIZE)
+                .ok_or(EINVAL)?;
+            let mut raw = [0u8; g17_completion::G17P_EVENT_ENTRY_SIZE];
+            self.ktrace_object(role).with_bytes_mut(|bytes| {
+                raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+                Ok(())
+            })?;
+
+            if advance {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                self.ktrace_object(role)
+                    .write_u32(consumer_address, published)?;
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            let slot = consumer;
+            consumer = published;
+            stats.consumed = stats.consumed.saturating_add(1);
+
+            // Decode with the G17P-native firmware-event model, NOT the AGX2
+            // `Channel13EventRecord` shape: this ring is the one
+            // `read_primary_firmware_event` already services, so type 4 is
+            // `kAGFIFirmwareEventTypeGPURestart` (generation at +0x04, stamp
+            // index at +0x0c, -1 meaning "no stamp to attribute"), not a bare
+            // timeout. Always dump the whole 0x48-byte record: the earlier
+            // 0x40-byte model silently discarded the tail.
+            let event_type = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            if event_type == g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE {
+                stats.restart_requests = stats.restart_requests.saturating_add(1);
+            }
+            // Type 7 is the host-serviced grow request (the kext's type-7 arm
+            // bounds-checks a vm index < 5 and a buffer index < 3 before
+            // signalling). Counted so `grow-requests` keeps a live writer.
+            if event_type == G17P_EVENT_GROW_REQUEST_TYPE {
+                stats.grow_requests = stats.grow_requests.saturating_add(1);
+            }
+            if print_budget == 0 || stats.printed < print_budget {
+                stats.printed = stats.printed.saturating_add(1);
+                let qword = |offset: usize| {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&raw[offset..offset + 8]);
+                    u64::from_le_bytes(bytes)
+                };
+                match g17_completion::decode_g17p_firmware_recovery_event(&raw) {
+                    Ok(record) => dev_info!(
+                        self.dev().as_ref(),
+                        "G17P report[{}.{}]: type={} ({}) generation={:#x} stamp-index={}\n",
+                        role_name,
+                        slot,
+                        event_type,
+                        g17_completion::g17p_firmware_event_name(event_type),
+                        record.generation,
+                        record.stamp_index
+                    ),
+                    Err(_) => {
+                        stats.skipped = stats.skipped.saturating_add(1);
+                    }
+                }
+                dev_info!(
+                    self.dev().as_ref(),
+                    "G17P report[{}.{}]: type={} ({}) raw=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]\n",
+                    role_name,
+                    slot,
+                    event_type,
+                    g17_completion::g17p_firmware_event_name(event_type),
+                    qword(0x00),
+                    qword(0x08),
+                    qword(0x10),
+                    qword(0x18),
+                    qword(0x20),
+                    qword(0x28),
+                    qword(0x30),
+                    qword(0x38),
+                    qword(0x40)
+                );
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Cross-check the published channel-14 KTrace pointer pair against the
+    /// channel-table derivation. Cheap; meant to run once per boot so a
+    /// mis-encode does not masquerade as "the firmware never traced".
+    pub(crate) fn check_ktrace_ring_pointers(&mut self, role: InstanceRole) -> Result<(u64, u64)> {
+        let entry = g17_initdata::channel_table_entry_range(
+            g17_completion::G17P_KTRACE_CHANNEL_TABLE_INDEX,
+        )
+        .ok_or(EINVAL)?;
+        let (main_config, status_a, state_grid) = match role {
+            InstanceRole::Primary => (
+                self.handoff.primary.instance.main_config,
+                self.handoff.primary.instance.status_a,
+                self.handoff.primary.state_grid,
+            ),
+            InstanceRole::Secondary => (
+                self.handoff.secondary.instance.main_config,
+                self.handoff.secondary.instance.status_a,
+                self.handoff.secondary.state_grid,
+            ),
+        };
+        let expected = g17_initdata::derive_channel_table(
+            role,
+            state_grid,
+            status_a,
+            main_config,
+            self.handoff.shared.hw_data_bundle,
+        )[g17_completion::G17P_KTRACE_CHANNEL_TABLE_INDEX];
+        let base = main_config.checked_add(entry.start as u64).ok_or(EINVAL)?;
+        let published_state = self.resources.shared_cluster.read_u64(base)?;
+        let published_ring = self
+            .resources
+            .shared_cluster
+            .read_u64(base.checked_add(8).ok_or(EINVAL)?)?;
+        if published_state != expected.states[0] || published_ring != expected.states[1] {
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P ktrace: channel-14 pointer mismatch state={:#x}/{:#x} ring={:#x}/{:#x}\n",
+                published_state,
+                expected.states[0],
+                published_ring,
+                expected.states[1]
+            );
+            return Err(EINVAL);
+        }
+        Ok((published_state, published_ring))
+    }
+
+    /// Drain one instance's KTrace ring at `status_a + 0xa6ac0`.
+    ///
+    /// Every available record is consumed and the read pointer is published
+    /// per record, exactly as `AGXFirmwareRingValidator::fetchNextEntry` does.
+    /// That is not optional: when the ring fills the emitter busy-waits up to
+    /// 0x11940 timebase ticks once and then latches a lost counter, and its
+    /// EP-0x20 nudge is re-raised only while the consumer keeps moving. A
+    /// drain that does not publish its read pointer is worse than no drain.
+    ///
+    /// Printing is filtered to the submission-path codes (plus the ungated
+    /// records-lost marker) unless `verbose`, and capped at `print_budget`
+    /// lines per call (0: unlimited). Submission class0 and native DM
+    /// progress-monitor records each have a separate 64-record allowance
+    /// with explicit drop accounting, so ordinary verbose chatter cannot
+    /// silently hide completion or monitor transitions. Records over every
+    /// print budget are still consumed.
+    pub(crate) fn drain_ktrace_ring(
+        &mut self,
+        role: InstanceRole,
+        verbose: bool,
+        print_budget: u32,
+    ) -> Result<G17PKtraceDrainStats> {
+        let status_a = match role {
+            InstanceRole::Primary => self.handoff.primary.instance.status_a,
+            InstanceRole::Secondary => self.handoff.secondary.instance.status_a,
+        };
+        let role_name = match role {
+            InstanceRole::Primary => "primary",
+            InstanceRole::Secondary => "secondary",
+        };
+        let state = status_a
+            .checked_add(g17_completion::G17P_KTRACE_STATE_STATUS_A_OFFSET)
+            .ok_or(EINVAL)?;
+        let ring = status_a
+            .checked_add(g17_completion::G17P_KTRACE_RING_STATUS_A_OFFSET)
+            .ok_or(EINVAL)?;
+        let consumer_address = state
+            .checked_add(g17_completion::G17P_KTRACE_CONSUMER_OFFSET)
+            .ok_or(EINVAL)?;
+        let producer_address = state
+            .checked_add(g17_completion::G17P_KTRACE_PRODUCER_OFFSET)
+            .ok_or(EINVAL)?;
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut consumer = self.ktrace_object(role).read_u32(consumer_address)?;
+        let producer = self.ktrace_object(role).read_u32(producer_address)?;
+        let mut stats = G17PKtraceDrainStats {
+            producer,
+            consumer_before: consumer,
+            ..G17PKtraceDrainStats::default()
+        };
+        if producer >= g17_completion::G17P_KTRACE_CAPACITY
+            || consumer >= g17_completion::G17P_KTRACE_CAPACITY
+        {
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P ktrace[{}]: cursor out of range consumer={} producer={}\n",
+                role_name,
+                consumer,
+                producer
+            );
+            return Err(EIO);
+        }
+
+        // Bound the walk by the ring capacity, never by the producer alone: a
+        // corrupt pointer must not spin the submit path.
+        let mut budget = g17_completion::G17P_KTRACE_CAPACITY;
+        let mut printing = g17_completion::G17PKtracePrintBudget::default();
+        while consumer != producer && budget > 0 {
+            budget -= 1;
+            let (entry_offset, published) =
+                match g17_completion::prepare_g17p_ktrace_read(consumer, producer) {
+                    Ok(read) => read,
+                    Err(g17_completion::CompletionDecodeError::FirmwareEventEmpty) => break,
+                    Err(error) => {
+                        dev_err!(
+                            self.dev().as_ref(),
+                            "G17P ktrace[{}]: cursor consumer={} producer={} rejected ({:?})\n",
+                            role_name,
+                            consumer,
+                            producer,
+                            error
+                        );
+                        return Err(EIO);
+                    }
+                };
+            let record_address = ring.checked_add(entry_offset as u64).ok_or(EINVAL)?;
+            let record_offset = record_address
+                .checked_sub(self.ktrace_object(role).iova())
+                .ok_or(EINVAL)? as usize;
+            let record_end = record_offset
+                .checked_add(g17_completion::G17P_KTRACE_ENTRY_SIZE)
+                .ok_or(EINVAL)?;
+            let mut raw = [0u8; g17_completion::G17P_KTRACE_ENTRY_SIZE];
+            self.ktrace_object(role).with_bytes_mut(|bytes| {
+                raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+                Ok(())
+            })?;
+
+            // Publish before decoding or printing. dev_info! is slow and the
+            // firmware watches this word to decide whether to nudge or stall.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            self.ktrace_object(role)
+                .write_u32(consumer_address, published)?;
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            consumer = published;
+            stats.consumed = stats.consumed.saturating_add(1);
+
+            let record = match g17_completion::decode_g17p_ktrace(&raw) {
+                Ok(record) => record,
+                Err(_) => {
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    continue;
+                }
+            };
+            let key = record.key();
+            let lost_marker = key == g17_completion::G17P_KTRACE_LOST_KEY;
+            if lost_marker {
+                stats.lost_windows = stats.lost_windows.saturating_add(1);
+                stats.lost_records = stats.lost_records.saturating_add(record.args[0]);
+            }
+            if key == g17_completion::G17P_KTRACE_ADD_KICKS_KEY {
+                stats.saw_add_kicks = true;
+            }
+            if key == g17_completion::G17P_KTRACE_PAUSE_REASON_KEY {
+                stats.last_pause_mask = record.args[2];
+            }
+            let wanted = verbose || g17_completion::g17p_ktrace_key_is_interesting(key);
+            if wanted && printing.allow(key, print_budget) {
+                let name = g17_completion::g17p_ktrace_key_name(key);
+                dev_info!(
+                    self.dev().as_ref(),
+                    "G17P ktrace[{}] t={:#x} ch={} code={:#04x} thr={} flag={} a=[{:#x},{:#x},{:#x},{:#x}] {}\n",
+                    role_name,
+                    record.timestamp,
+                    record.channel,
+                    record.code,
+                    record.thread,
+                    record.flag,
+                    record.args[0],
+                    record.args[1],
+                    record.args[2],
+                    record.args[3],
+                    name
+                );
+                stats.printed = stats.printed.saturating_add(1);
+            }
+        }
+        if printing.monitor_printed != 0 || printing.monitor_dropped != 0
+            || printing.submission_printed != 0 || printing.submission_dropped != 0
+        {
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P ktrace[{}] print-budgets class0-printed={} class0-dropped={} monitor-printed={} monitor-dropped={} per-class-limit=64 ordinary-printed={}\n",
+                role_name,
+                printing.submission_printed,
+                printing.submission_dropped,
+                printing.monitor_printed,
+                printing.monitor_dropped,
+                printing.ordinary_printed,
+            );
+        }
+        Ok(stats)
+    }
+
+    pub(crate) fn dump_primary_recovery_cause_block(&mut self) -> Result {
+        let status_b = self.handoff.primary.instance.status_b;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        for base in [0x4890u64, 0x48b0, 0x48d0, 0x48f0] {
+            let mut words = [0u32; 8];
+            for (i, word) in words.iter_mut().enumerate() {
+                *word = self.resources.primary_state.read_u32(
+                    status_b
+                        .checked_add(base)
+                        .and_then(|a| a.checked_add((i as u64).checked_mul(4)?))
+                        .ok_or(EINVAL)?,
+                )?;
+            }
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P recovery raw +{:#06x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                base, words[0], words[1], words[2], words[3],
+                words[4], words[5], words[6], words[7]
+            );
+        }
+        let mut entries = [0u32; 8];
+        for (i, word) in entries.iter_mut().enumerate() {
+            *word = self.resources.primary_state.read_u32(
+                status_b
+                    .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET)
+                    .and_then(|a| a.checked_add((i as u64).checked_mul(4)?))
+                    .ok_or(EINVAL)?,
+            )?;
+        }
+        dev_info!(
+            self.dev().as_ref(),
+            "G17P recovery info entries[0..2]: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+            entries[0], entries[1], entries[2], entries[3],
+            entries[4], entries[5], entries[6], entries[7]
+        );
+        // +0x48e0 and +0x48e8 are NOT firmware fault output and are not a
+        // lead. They are `PRIMARY_STATUS_B_FWCTL_STATE` / `..._FWCTL_RING`,
+        // which *this driver* writes at init via `encode_primary_status_b(
+        // fwctl.iova(), fwctl.iova() + CONTROL_RECORD_SIZE)`. They are the
+        // same two constants on every boot and every fault, and they read
+        // back "unreadable" only because the loop below probes them through
+        // `primary_state`, whose subview ends long before the fwctl object.
+        // Check them against what we published instead: a mismatch would mean
+        // the firmware moved our own pointers, which is worth knowing; equality
+        // is the expected, uninteresting answer.
+        let published_state = self.resources.fwctl.iova();
+        let published_ring = published_state
+            .checked_add(g17_initdata::CONTROL_RECORD_SIZE as u64)
+            .ok_or(EINVAL)?;
+        for (slot, published) in [
+            (g17_initdata::PRIMARY_STATUS_B_FWCTL_STATE as u64, published_state),
+            (g17_initdata::PRIMARY_STATUS_B_FWCTL_RING as u64, published_ring),
+        ] {
+            let found = self
+                .resources
+                .primary_state
+                .read_u64(status_b.checked_add(slot).ok_or(EINVAL)?)?;
+            let matches = found == published;
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P recovery fwctl pointer +{:#06x} found={:#x} published={:#x} match={}\n",
+                slot,
+                found,
+                published,
+                matches,
+            );
+        }
+        Ok(())
+    }
+
+    /// Apply one native ArmFirmware recovery acknowledgement. Shipping macOS
+    /// checks the current phase, executes `dmb ish`, writes the next phase,
+    /// then executes a second `dmb ish`.
+    pub(crate) fn acknowledge_primary_firmware_recovery(
+        &mut self,
+        expected: u32,
+        next: u32,
+    ) -> Result {
+        if !matches!((expected, next), (1, 2) | (3, 0)) {
+            return Err(EINVAL);
+        }
+        let state_address = self
+            .handoff
+            .primary
+            .instance
+            .status_b
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        if self.resources.primary_state.read_u32(state_address)? != expected {
+            return Err(EBUSY);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.resources
+            .primary_state
+            .write_u32(state_address, next)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let shared_cursor_address = self
