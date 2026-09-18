@@ -16,6 +16,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/reboot.h>
 #include <linux/seq_file.h>
+#include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/workqueue.h>
 
@@ -579,6 +580,7 @@ static int pmp_v2_probe_owner(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct dev_pm_domain_list *domains;
 	struct device_node *mailbox;
+	struct apple_mbox *transport;
 	struct resource *resource, mbox;
 	const void *raw;
 	struct pmp_v2 *pmp;
@@ -670,6 +672,12 @@ static int pmp_v2_probe_owner(struct platform_device *pdev)
 	of_node_put(mailbox);
 	if (ret || mbox.start != 0x300e08000ULL || resource_size(&mbox) < 0x1000)
 		return -EINVAL;
+	/* The transport must exist before the one-shot start can be attempted;
+	 * defer the whole probe rather than failing the epoch later.
+	 */
+	transport = apple_mbox_get(dev, 0);
+	if (IS_ERR(transport))
+		return PTR_ERR(transport) == -EPROBE_DEFER ? -EPROBE_DEFER : -ENODEV;
 	/* Non-consuming status view; the mailbox driver alone owns its FIFOs. */
 	pmp->mailbox_status = devm_ioremap(dev, mbox.start + 0x110, 8);
 	if (!pmp->mailbox_status)
