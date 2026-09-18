@@ -420,6 +420,27 @@ static bool mt_open_request(const struct cfg80211_connect_params *p)
 		 p->auth_type == NL80211_AUTHTYPE_AUTOMATIC);
 }
 
+/* wpa_supplicant 2.11 lists every AKM the profile allows on a PSK+SAE AP
+ * (PSK and PSK-SHA256 together) so a fullmac driver can choose; the firmware
+ * handshake here is WPA2-PSK, so accept the list when PSK is in it and nothing
+ * outside the PSK family is.
+ */
+static bool mt_psk_akm_list(const struct cfg80211_connect_params *p)
+{
+	bool psk = false;
+	int i;
+
+	if (!p->crypto.n_akm_suites)
+		return false;
+	for (i = 0; i < p->crypto.n_akm_suites; i++) {
+		if (p->crypto.akm_suites[i] == WLAN_AKM_SUITE_PSK)
+			psk = true;
+		else if (p->crypto.akm_suites[i] != WLAN_AKM_SUITE_PSK_SHA256)
+			return false;
+	}
+	return psk;
+}
+
 int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		      struct cfg80211_connect_params *params)
 {
@@ -438,7 +459,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	if (!open && (params->crypto.wpa_versions != NL80211_WPA_VERSION_2 ||
 	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
 	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.n_akm_suites != 1 || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
+	    !mt_psk_akm_list(params) ||
 	    !params->crypto.psk || params->mfp == NL80211_MFP_REQUIRED ||
 	    !params->ssid_len || params->ssid_len > 32))
 		return -EOPNOTSUPP;
