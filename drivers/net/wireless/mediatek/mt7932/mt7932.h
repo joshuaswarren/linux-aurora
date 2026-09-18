@@ -113,6 +113,7 @@ struct mt7932 {
 	u8 connect_ssid[32], connect_pmk[32], connect_bssid[6];
 	u8 connect_ssid_length, connect_channel, peer_wtbl;
 	bool connecting, connected, peer_valid, link_failed, connect_open;
+	u8 ps_profile; /* requested associated-station policy (CAM=0, MAX=1, FAST=2); command_mutex */
 	bool disconnecting, disconnect_seen, disconnect_event_received, disconnect_local;
 	u16 disconnect_reason;
 	int connect_error;
@@ -175,6 +176,9 @@ int mt_deauth(struct wiphy *wiphy, struct net_device *netdev,
 int mt_change_interface(struct wiphy *wiphy, struct net_device *netdev,
 			       enum nl80211_iftype type, struct vif_params *params);
 int mt_register_regulatory_gate(struct mt7932 *m);
+int mt_station_ps_restore(struct mt7932 *m);
+int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
+		      bool enabled, int timeout);
 
 bool mt_transport_polled(void);
 

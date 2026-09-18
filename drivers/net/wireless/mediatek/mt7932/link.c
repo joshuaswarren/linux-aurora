@@ -7,6 +7,68 @@ static void mt_peer_release(struct mt7932 *m);
 static int mt_retire_connection(struct mt7932 *m);
 static bool mt_open_request(const struct cfg80211_connect_params *p);
 
+/* command_mutex held.  The native J700 nicConfigPowerSaveProfile sends legacy
+ * CID05, set=1, no response, four bytes: BSS index, profile, two reserved
+ * bytes; CAM=0, MAX PS=1, FAST PS=2 (AppleSunriseWLAN
+ * _wlanoidSet802dot11PowerSaveProfile; the same layout as MediaTek's published
+ * gen3 CMD_ID_POWER_SAVE_MODE).  Station radio policy only: the HIF, DMA and
+ * Ethernet path keep running.  A submission is not a firmware acknowledgement.
+ */
+static int mt_station_ps_submit(struct mt7932 *m, u8 profile)
+{
+	u8 body[4] = {0, profile, 0, 0};
+	int ret;
+
+	lockdep_assert_held(&m->command_mutex);
+	ret = mt_request(m, 0x05, true, true, false, body, sizeof(body));
+	dev_info(&m->pdev->dev, "STATION_PS_SUBMIT: bss=0 profile=%u result=%d\n",
+		 profile, ret);
+	return ret;
+}
+
+/* Reapply the requested policy after each association, before reporting it
+ * to cfg80211: the firmware's own default for a fresh peer is a power-saving
+ * profile, which on the J700 bench showed as 50-150 ms mean and 700 ms peak
+ * gateway RTTs with a few percent loss; CAM (the default here, and what
+ * NetworkManager asks for with powersave=disable) removes that.
+ */
+int mt_station_ps_restore(struct mt7932 *m)
+{
+	return mt_station_ps_submit(m, m->ps_profile);
+}
+
+int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
+		      bool enabled, int timeout)
+{
+	struct mt7932 *m = mt_from_wiphy(wiphy);
+	u8 profile = enabled ? (timeout == -1 ? 2 : 1) : 0;
+	int ret = 0;
+
+	if (netdev != m->netdev || m->wdev.iftype != NL80211_IFTYPE_STATION)
+		return -EINVAL;
+	mutex_lock(&m->command_mutex);
+	if (m->connecting || m->disconnecting || m->scan_request ||
+	    m->retired_scan_seq || m->link_failed) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (m->connected) {
+		if (!mt_rf_allowed(m)) {
+			ret = -EBUSY;
+			goto out;
+		}
+		ret = mt_station_ps_submit(m, profile);
+	}
+	/* cfg80211 can set policy before association. Cache it without sending
+	 * a command to an absent BSS; connect_work applies it after association.
+	 */
+	if (!ret)
+		m->ps_profile = profile;
+out:
+	mutex_unlock(&m->command_mutex);
+	return ret;
+}
+
 /* One owned station, firmware WPA2-PSK handshake; no host key fabrication. */
 static int mt_peer_reserve(struct mt7932 *m)
 {
@@ -338,6 +400,8 @@ free:
 	mutex_lock(&m->command_mutex);
 report:
 	ret = ret ?: READ_ONCE(m->connect_error);
+	if (!ret)
+		ret = mt_station_ps_restore(m);
 	if (ret)
 		mt_transport_snapshot(m);
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
