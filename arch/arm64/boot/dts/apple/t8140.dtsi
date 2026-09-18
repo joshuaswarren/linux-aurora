@@ -20,6 +20,7 @@
 
 	aliases {
 		gpu = &gpu;
+		sep = &sep;
 	};
 
 	cpus {
@@ -509,6 +510,79 @@
 			interrupts = <AIC_IRQ 1106 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clk_200m>;
 			power-domains = <&ps_qspi>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
+		 * Secure Enclave (ADT /arm-io/sep, "iop-sep,ascwrap-v6", sepfw-booted=1:
+		 * iBoot boots sepOS before the AP OS, so the Linux driver warm-attaches
+		 * with the one-shot shared-memory registration and never restarts the
+		 * ASC).  reg = the ADT's first aperture (0x72600000 + 0x88000 in the
+		 * 0x210000000 arm-io window); the mailbox sits at +0x8000 with the four
+		 * ASC IRQs in the ADT's [not-empty, empty] pairs (344,343,346,345), spelt
+		 * here in the send-empty, send-not-empty, recv-empty, recv-not-empty
+		 * order the other T8140 mailboxes use.  ps_sep is always-on.
+		 *
+		 * The SEP DART (ADT /arm-io/dart-sep, "dart,t8110", 3 SIDs: mapper-sep,
+		 * mapper-sep-mpm, mapper-sep-exclave) is left disabled: the SEP driver
+		 * enables it and the sep node through a runtime changeset at module
+		 * init.  The AP-visible stream 0 window is the ADT's vm-base-0/vm-size-0
+		 * (BIT(40) + 0x4000, 0xffff0000 bytes), the same shape as the other
+		 * T8140 DARTs here; the registration message carries the IOVA >> 12.
+		 */
+		sep_dart: iommu@280b80000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x80b80000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0x0 0xffff0000>;
+			status = "disabled";
+		};
+
+		sep: sep@282600000 {
+			compatible = "apple,sep";
+			reg = <0x2 0x82600000 0x0 0x88000>;
+			mboxes = <&sep_mbox>;
+			mbox-names = "mbox";
+			iommus = <&sep_dart 0>;
+			power-domains = <&ps_sep>;
+			status = "disabled";
+		};
+
+		sep_mbox: mailbox@282608000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x2 0x82608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 343 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 344 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 345 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 346 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		/*
+		 * SPI2 (ADT /arm-io/spi2, "spi-1,spimc", reg 0x175108000 + 0x4000, AIC
+		 * IRQ 1102, clock-gates spi2, clock-ids 407 = 24 MHz per
+		 * /arm-io/clock-frequencies, 8 MHz sensor clock = divider 3).  The J700
+		 * ADT has no other SPI bus and gives spi2 "null" for spi_cs0, so the
+		 * controller's native chip select is used (the sensor needs the
+		 * hardware CS setup/hold).  No pinmux group is described: the J700 ADT
+		 * carries no pad list for spi2 and the pads are left as iBoot's pad
+		 * table programmed them (peripheral function), as on every other
+		 * Apple laptop where the sensor was brought up.
+		 */
+		spi2: spi@385108000 {
+			compatible = "apple,t8140-spi", "apple,spi";
+			reg = <0x3 0x85108000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1102 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi2>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
