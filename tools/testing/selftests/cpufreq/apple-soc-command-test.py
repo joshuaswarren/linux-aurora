@@ -29,7 +29,8 @@ typedef uint64_t u64;
 #define FIELD_GET(m,v) (((v) & (m)) >> __builtin_ctzll(m))
 #define FIELD_PREP(m,v) (((u64)(v) << __builtin_ctzll(m)) & (m))
 struct cpufreq_frequency_table { unsigned int driver_data; };
-struct cpufreq_policy { void *driver_data; struct cpufreq_frequency_table *freq_table; };
+struct cpufreq_policy { void *driver_data; struct cpufreq_frequency_table *freq_table; unsigned cpu; };
+struct freq_qos_request { int unused; };
 struct apple_smc_thermal_cpu;
 static void apple_smc_thermal_cpu_fault(struct apple_smc_thermal_cpu *cpu) { (void)cpu; }
 static u64 command, written;
@@ -58,7 +59,7 @@ int main(void) {
     unsigned char mmio[0x28];
     struct apple_cpu_priv p = {.reg_base = mmio, .info = &soc_t8140_info};
     struct cpufreq_frequency_table table[2] = {{1}, {2}};
-    struct cpufreq_policy policy = {&p, table};
+    struct cpufreq_policy policy = {&p, table, 7};
     reset(&p);
     assert(apple_soc_cpufreq_set_target(&policy, 0) == 0 && writes == 0);
     assert(apple_soc_cpufreq_set_target(&policy, 1) == 0 && writes == 1);
@@ -67,7 +68,11 @@ int main(void) {
     assert(apple_soc_cpufreq_set_target(&policy, 0) == 0 && writes == 2);
     for (unsigned int state = 0; state <= 32; state++) {
         reset(&p); table[0].driver_data = state;
-        if (state >= 1 && state <= 31) {
+        /* The j700 tree exposes the full DT ladder under the SMC two-tier
+         * policy; the PMP policy and its QoS constraints own the cap.
+         */
+        const unsigned maximum = 31;
+        if (state >= 1 && state <= maximum) {
             assert(apple_soc_cpufreq_set_target(&policy, 0) == 0);
             assert(FIELD_GET(APPLE_DVFS_CMD_PS1, command) == state);
             assert((command & ~31ULL) == 0xa550000000400100ULL);
@@ -76,6 +81,15 @@ int main(void) {
         assert(apple_soc_cpufreq_set_target(&policy, 0) == -EINVAL);
         assert(reads == 0 && writes == 0);
     }
+    /* An inherited P17 request is honoured as the current state, and the
+     * minimum state is reached with one verified command.
+     */
+    reset(&p); command=(command & ~31ULL)|17; p.expected_pstate=17;
+    table[0].driver_data=17;
+    assert(apple_soc_cpufreq_set_target(&policy,0)==0 && reads==1 && !writes);
+    table[0].driver_data=1;
+    assert(apple_soc_cpufreq_set_target(&policy,0)==0 && writes==1);
+    assert(p.expected_pstate==1);
     table[0].driver_data = 1;
     reset(&p); command = (command & ~31ULL) | 2;
     assert(apple_soc_cpufreq_set_target(&policy, 1) == -EIO);
@@ -114,7 +128,8 @@ with tempfile.TemporaryDirectory(prefix='apple-cpufreq-test-') as tmp:
     source = Path(tmp) / 'test.c'
     binary = Path(tmp) / 'test'
     source.write_text(prefix + defs + callback + test)
-    subprocess.run([os.environ.get('CC', 'cc'), '-O1', '-g', '-Wall', '-Wextra',
-                    '-Werror', '-fsanitize=address,undefined', '-fno-pie', '-no-pie',
-                    str(source), '-o', str(binary)], check=True)
-    subprocess.run([str(binary)], check=True)
+    for flags in ([], ['-DCONFIG_APPLE_PMP_V2_THERMAL']):
+        subprocess.run([os.environ.get('CC', 'cc'), '-O1', '-g', '-Wall', '-Wextra',
+                        '-Werror', '-fsanitize=address,undefined', '-fno-pie', '-no-pie',
+                        *flags, str(source), '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
