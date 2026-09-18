@@ -134,6 +134,7 @@ int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len);
  * wake the capture loop the instant a frame is ready instead of polling.
  */
 int sep_sensor_irq_setup(void);
+const char *sep_sensor_firmware_name(void);
 void sep_sensor_irq_teardown(void);
 int sep_sensor_irq_available(void);
 void sep_sensor_irq_arm(void);
