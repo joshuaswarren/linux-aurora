@@ -327,6 +327,38 @@
 };
 
 /*
+ * Touch ID: the Mesa fingerprint sensor in the power button (ADT
+ * /arm-io/spi2/mesa, "biosensor,mesa", mesaType 1, sensor-id 0x3356, 8 MHz,
+ * interrupts [135, 3] on gpio0 = the data-ready line).  Its two rails are not
+ * AP GPIOs on the J700: the ADT's function-mesa_pwr1v8 / function-mesa_pwr are
+ * pKW8 writes of SMC key "pcLD" through the SMC PMU nub (8-byte payload:
+ * u16 on/off, then the rail word 0x01010000 for 1.8 V and 0x01020000 for
+ * 3.0 V), so the sensor node names the key and rail words for the SEP driver's
+ * SMC power path instead of enable-gpios.  power-on-delay 7 ms / power-off-delay
+ * 10 ms are the ADT's.  The calibration blob is this unit's FDR class FSCl
+ * (biometrickitd's "FDR" calibration source 3), taken read-only from the
+ * Hardware APFS volume of the iBoot system container.
+ */
+&spi2 {
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <135 IRQ_TYPE_EDGE_RISING>;
+		apple,smc-power-key = "pcLD";
+		apple,smc-power-rails = <0x01010000 0x01020000>;
+		firmware-name = "apple/mesacal-j700.bin";
+		status = "okay";
+	};
+};
+
+/*
  * Keep the fixed VL122 out of reset for the complete Linux lifetime.  Its I2C
  * plane NACKs while the USB core is running, so only configure and open the
  * independent TICD2E22 eUSB repeater at address 0x21.
