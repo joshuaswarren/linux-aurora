@@ -68,10 +68,33 @@ struct DCP_FW_NAME(dcp_swap) {
 	u64 bl_unk;
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * H17P moved the backlight block and changed its shape.  In the macOS
+	 * 25G83 capture (223 swaps) exactly one A408 changes the brightness,
+	 * and the firmware answers it with "brightness_changed: brightness
+	 * value: 5957818" (= 90.909 nits in 16.16) and "send_brightness: dbv:
+	 * 1402".  That swap carries, at +0x354, a u8 1 and at +0x358 the bytes
+	 * 01 01 01 00 01 00, followed by a run of IEEE-754 doubles at an 8-byte
+	 * stride from +0x35e: [0] = 90.909 (the nits), [2] = [3] = 477.38
+	 * (slowly varying in later swaps, ambient light by the look of it),
+	 * [4] = 1.0 and [17] = 1.0.  Every other swap leaves the block zero
+	 * apart from the bl_h17p_d[2]/[3] pair.  The old bl_unk/bl_value/
+	 * bl_power slots above are zero in all of them.
+	 */
+	u8 unk_33c[0x18];
+	u8 bl_h17p_update;	/* +0x354 */
+	u8 unk_355[3];
+	u8 bl_h17p_flags[6];	/* +0x358: 01 01 01 00 01 00 on an update */
+	__le64 bl_h17p_d[18];	/* +0x35e: doubles, [0] = nits */
+	u8 unk_3ee[0xba];
+	u64 unk_1;
+#else
 	u8 unk_2f3[0x2d];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unk_320[0x13f];
 	u64 unk_1;
+#endif
 #endif
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/* Sized from the wire: a captured A408 request is 0xe9c bytes, which with
