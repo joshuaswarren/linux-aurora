@@ -22,6 +22,9 @@
 #include <linux/pm_opp.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/smc-thermal.h>
+#ifdef CONFIG_APPLE_PMP_V2_THERMAL
+#include <linux/soc/apple/pmp-cpufreq.h>
+#endif
 
 #define APPLE_DVFS_CMD				0x20
 #define APPLE_DVFS_CMD_BUSY			BIT(31)
@@ -79,6 +82,9 @@ struct apple_cpu_priv {
 	bool transition_failed;
 	unsigned int expected_pstate;
 	struct apple_smc_thermal_cpu *thermal;
+#ifdef CONFIG_APPLE_PMP_V2_THERMAL
+	struct freq_qos_request boot_guard;
+#endif
 };
 
 static struct cpufreq_driver apple_soc_cpufreq_driver;
@@ -477,8 +483,40 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		}
 	}
 
+#ifdef CONFIG_APPLE_PMP_V2_THERMAL
+	if (info == &soc_t8140_info) {
+		/* Before governor startup, install the boot constraint at the
+		 * minimum state and complete the inherited-to-minimum transition.
+		 * The PMP thermal policy installs its own constraints before
+		 * releasing this boot constraint; if it never starts, it hands
+		 * the range back to the SMC policy (pmp_v2.startup_fallback).
+		 */
+		for (i = 0; freq_table[i].frequency != CPUFREQ_TABLE_END; i++)
+			if (freq_table[i].driver_data == 1)
+				break;
+		if (freq_table[i].frequency == CPUFREQ_TABLE_END) {
+			ret = -EINVAL;
+			goto out_thermal;
+		}
+		ret = freq_qos_add_request(&policy->constraints, &priv->boot_guard,
+					  FREQ_QOS_MAX, freq_table[i].frequency);
+		if (ret < 0)
+			goto out_thermal;
+		ret = apple_soc_cpufreq_set_target(policy, i);
+		if (ret) {
+			freq_qos_remove_request(&priv->boot_guard);
+			goto out_thermal;
+		}
+		policy->cur = freq_table[i].frequency;
+	}
+#endif
+
 	return 0;
 
+#ifdef CONFIG_APPLE_PMP_V2_THERMAL
+out_thermal:
+	apple_smc_thermal_cpu_remove(priv->thermal);
+#endif
 out_free_cpufreq_table:
 	dev_pm_opp_free_cpufreq_table(cpu_dev, &freq_table);
 out_free_table:
@@ -494,12 +532,50 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 {
 	struct apple_cpu_priv *priv = policy->driver_data;
 
+#ifdef CONFIG_APPLE_PMP_V2_THERMAL
+	if (freq_qos_request_active(&priv->boot_guard))
+		freq_qos_remove_request(&priv->boot_guard);
+#endif
 	apple_smc_thermal_cpu_remove(priv->thermal);
 	dev_pm_opp_free_cpufreq_table(priv->cpu_dev, &policy->freq_table);
 	dev_pm_opp_of_cpumask_remove_table(policy->cpus);
 	iounmap(priv->reg_base);
 	kfree(priv);
 }
+
+#ifdef CONFIG_APPLE_PMP_V2_THERMAL
+int apple_pmp_cpufreq_readback(unsigned int cpu)
+{
+	struct cpufreq_policy *policy = cpufreq_cpu_get_raw(cpu);
+	struct apple_cpu_priv *priv;
+	u64 value;
+	unsigned int state;
+
+	if (!policy || !policy->driver_data)
+		return -ENODEV;
+	priv = policy->driver_data;
+	if (priv->info != &soc_t8140_info || priv->transition_failed)
+		return -EIO;
+	value = readq(priv->reg_base + APPLE_DVFS_CMD);
+	state = FIELD_GET(APPLE_DVFS_CMD_PS1, value);
+	if ((value & APPLE_DVFS_CMD_BUSY) || state != priv->expected_pstate)
+		return -EIO;
+	return state;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_cpufreq_readback);
+
+int apple_pmp_thermal_release_bootcap(struct cpufreq_policy *policy)
+{
+	struct apple_cpu_priv *priv = policy->driver_data;
+	int ret;
+
+	if (!priv || priv->info != &soc_t8140_info || !freq_qos_request_active(&priv->boot_guard))
+		return -EINVAL;
+	ret = freq_qos_update_request(&priv->boot_guard, FREQ_QOS_MAX_DEFAULT_VALUE);
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_thermal_release_bootcap);
+#endif
 
 static struct cpufreq_driver apple_soc_cpufreq_driver = {
 	.name		= "apple-cpufreq",
