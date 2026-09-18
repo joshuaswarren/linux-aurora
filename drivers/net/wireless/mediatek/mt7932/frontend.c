@@ -306,7 +306,7 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	dev_info(&m->pdev->dev, "SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
 		 request->n_channels, request->n_ssids, request->ie_len, request->flags,
 		 request->duration, request->duration_mandatory);
-	if (!request->n_channels || request->n_channels > 17 || request->ie_len > 600 ||
+	if (!request->n_channels || request->n_channels > MT7932_CHANNELS || request->ie_len > 600 ||
 	    request->duration_mandatory ||
 	    (request->flags & ~(NL80211_SCAN_FLAG_FLUSH | NL80211_SCAN_FLAG_COLOCATED_6GHZ)) || request->n_ssids > 1 ||
 	    (request->n_ssids && request->ssids[0].ssid_len > 32))

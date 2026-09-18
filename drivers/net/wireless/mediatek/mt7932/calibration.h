@@ -2,6 +2,8 @@
 #ifndef MT7932_CALIBRATION_H
 #define MT7932_CALIBRATION_H
 
+#include "channels.h"
+
 #include "protocol.h"
 
 /* Protected by the RX/procedure lock. One active logical procedure only;
@@ -145,9 +147,9 @@ static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel
 	unsigned int group, part;
 	int ret;
 
-	if (channel >= 1 && channel <= 13)
+	if (mt7932_channel_band(channel) == 1)
 		group = 0;
-	else if (channel >= 36 && channel <= 48 && !(channel % 4))
+	else if (mt7932_channel_band(channel) == 2)
 		group = 1;
 	else
 		return -EOPNOTSUPP;
@@ -229,7 +231,7 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 	int ret;
 
 	if (upper != 0x1000 || version != 12 || module != 0x89 ||
-	    channel < 36 || channel > 48 || channel % 4)
+	    mt7932_channel_band(channel) != 2)
 		return -EOPNOTSUPP;
 	ret = mt7932_cal_validate(data, size);
 	if (ret)
@@ -243,7 +245,7 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 	for (i = 0; i < segment.length; i++)
 		if (segment.data[i])
 			return -EOPNOTSUPP;
-	selected = channel <= 40 ? 38 : 46;
+	selected = mt7932_channel_cal_centre(channel);
 	params[0] = 0x10000001;
 	params[1] = 0x10001000 | channel;
 	params[2] = 0x10001000 | (channel << 17) | selected;
