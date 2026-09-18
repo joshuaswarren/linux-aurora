@@ -2426,29 +2426,38 @@ impl G17PQueue {
                 // and the worker that drains it needs this same mutex -- so
                 // holding it across the wait (as the old in-submit poll did)
                 // guarantees the completion can never be observed.
-                pr_info!("G17P submit: compute arm, submission {}\n", submission_id);
-                // The Vulkan dispatch faults on a correctly-encoded program
-                // pointer (level-2 read fault), which means the page is simply
-                // not resident. Report whether the two bases the driver *does*
-                // know about are mapped, so an unmapped USC window shows up here
-                // instead of only as a firmware fault address.
-                pr_info!(
-                    "G17P submit: usc_exec_base={:#x} mapped={} cs_base={:#x} mapped={} cs_end={:#x}\n",
-                    translated.usc_exec_base,
-                    self.vm.covers_range(translated.usc_exec_base, mmu::UAT_PGSZ as u64, false, false),
-                    translated.control_stream_base,
-                    self.vm.covers_range(translated.control_stream_base, mmu::UAT_PGSZ as u64, false, false),
-                    translated.control_stream_end,
-                );
-                self.log_vm_pointer_audit(&translated);
-                self.runtime
-                    .mutex()
-                    .lock()
-                    .log_compute_status_pages("pre-doorbell");
-                self.runtime
-                    .mutex()
-                    .lock()
-                    .log_compute_sksm_entries("pre-doorbell");
+                // All of this is per-submission diagnostics, and it was not
+                // free: the two `covers_range` calls below are page-table
+                // walks performed only to format a log line, and the two
+                // status-page dumps each take the runtime mutex -- the same
+                // mutex the completion worker needs, so they serialise
+                // submission against completion. Honour the trace gate that
+                // the rest of this path already honours.
+                if crate::g17_manager::g17p_compute_trace_enabled(submission_id as u32) {
+                    pr_info!("G17P submit: compute arm, submission {}\n", submission_id);
+                    // The Vulkan dispatch faults on a correctly-encoded program
+                    // pointer (level-2 read fault), which means the page is simply
+                    // not resident. Report whether the two bases the driver *does*
+                    // know about are mapped, so an unmapped USC window shows up here
+                    // instead of only as a firmware fault address.
+                    pr_info!(
+                        "G17P submit: usc_exec_base={:#x} mapped={} cs_base={:#x} mapped={} cs_end={:#x}\n",
+                        translated.usc_exec_base,
+                        self.vm.covers_range(translated.usc_exec_base, mmu::UAT_PGSZ as u64, false, false),
+                        translated.control_stream_base,
+                        self.vm.covers_range(translated.control_stream_base, mmu::UAT_PGSZ as u64, false, false),
+                        translated.control_stream_end,
+                    );
+                    self.log_vm_pointer_audit(&translated);
+                    self.runtime
+                        .mutex()
+                        .lock()
+                        .log_compute_status_pages("pre-doorbell");
+                    self.runtime
+                        .mutex()
+                        .lock()
+                        .log_compute_sksm_entries("pre-doorbell");
+                }
                 let outcome = self
                     .runtime
                     .mutex()
@@ -2462,30 +2471,39 @@ impl G17PQueue {
                     .map_err(|error| {
                         Self::stage_fail(submission_id, "submit-translated-compute", error)
                     })?;
-                self.runtime
-                    .mutex()
-                    .lock()
-                    .log_compute_status_pages("post-doorbell");
+                if crate::g17_manager::g17p_compute_trace_enabled(submission_id as u32) {
+                    self.runtime
+                        .mutex()
+                        .lock()
+                        .log_compute_status_pages("post-doorbell");
+                }
                 let completion = match outcome {
                     g17_live_boot::G17PSubmitOutcome::Completed(completion) => completion,
                     g17_live_boot::G17PSubmitOutcome::Pending(signal) => {
                         let woken = signal.wait_timeout(G17P_COMPUTE_COMPLETION_TIMEOUT_MS);
                         match woken {
                             Some(completion) => {
-                                self.runtime.mutex().lock().log_gate("post-doorbell");
-                                self.runtime
-                                    .mutex()
-                                    .lock()
-                                    .log_compute_status_pages("post-completion");
-                                self.runtime
-                                    .mutex()
-                                    .lock()
-                                    .log_compute_sksm_entries("post-completion");
-                                pr_info!(
-                                    "G17P submit: doorbell wait woken, timestamps=[{:#x},{:#x}]\n",
-                                    completion.timestamps[0],
-                                    completion.timestamps[1]
-                                );
+                                // Three more runtime-mutex takes, and
+                                // `log_gate` also performs MMIO. Same gate as
+                                // everything else on this path.
+                                if crate::g17_manager::g17p_compute_trace_enabled(
+                                    submission_id as u32,
+                                ) {
+                                    self.runtime.mutex().lock().log_gate("post-doorbell");
+                                    self.runtime
+                                        .mutex()
+                                        .lock()
+                                        .log_compute_status_pages("post-completion");
+                                    self.runtime
+                                        .mutex()
+                                        .lock()
+                                        .log_compute_sksm_entries("post-completion");
+                                    pr_info!(
+                                        "G17P submit: doorbell wait woken, timestamps=[{:#x},{:#x}]\n",
+                                        completion.timestamps[0],
+                                        completion.timestamps[1]
+                                    );
+                                }
                                 let finished =
                                     self.runtime.mutex().lock().finish_compute_submission();
                                 match finished {
