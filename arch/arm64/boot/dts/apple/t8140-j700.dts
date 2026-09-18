@@ -646,6 +646,30 @@
 	};
 };
 
+/*
+ * PMP: the stopped-epoch owner of the preloaded T8140 PMP firmware and the
+ * J700 fast CPU thermal policy (CONFIG_APPLE_PMP_V2_THERMAL).  The own-device
+ * metadata the cleanroom bootloader would forward is generated from this
+ * machine's ADT into t8140-j700-pmp.dtsi.
+ */
+&pmp_mbox {
+	status = "okay";
+};
+
+#include "t8140-j700-pmp.dtsi"
+
+/*
+ * FaceTime HD camera: IMX558 behind the ISP17a.  The platform id is the ADT
+ * sensor-type (0x70) the macOS 25G83 init passes in the H16 boot descriptor;
+ * the newer IMX558 machines run the temporal filter at strength 1.
+ */
+#include "isp-imx558.dtsi"
+
+&isp {
+	apple,platform-id = <0x70>;
+	apple,temporal-filter = <1>;
+};
+
 /* AOP: the audio fabric owner (low-power microphone first). */
 &aop_dart {
 	status = "okay";

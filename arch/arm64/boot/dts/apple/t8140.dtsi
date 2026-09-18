@@ -913,6 +913,49 @@
 			};
 		};
 
+		/*
+		 * Live J700 ADT /arm-io/pmp (iop,ascwrap-v6): reg[0] the ASCWrap v6
+		 * block at 0x300e00000 whose mailbox sits at +0x8000, reg[2] the
+		 * 640 KiB SRAM iBoot preloads the PMP firmware into.  The paired
+		 * pending/empty ADT interrupt tuple (824, 823, 826, 825) is
+		 * normalized to the ascending mailbox channel order like the SMC.
+		 * The PMP DART (/arm-io/dart-pmp, T8110 v2.3, 16 streams) and its
+		 * address filter are owned by the PMP-v2 driver itself, stream 0
+		 * only; ps_pmp (id 100) and ps_pms_sram (id 101) are its gates.
+		 * The board DTS supplies the own-firmware metadata and enables it.
+		 */
+		pmp_mbox: mailbox@300e08000 {
+			compatible = "apple,t8140-asc-mailbox",
+				     "apple,asc-mailbox-v4";
+			reg = <0x3 0x00e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 823 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 824 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 825 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 826 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			power-domains = <&ps_pmp>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		pmp: pmp@300e00000 {
+			compatible = "apple,t8140-pmp-v2";
+			reg = <0x3 0x00e00000 0x0 0x48>,
+			      <0x3 0x00500000 0x0 0xa0000>,
+			      <0x3 0x00300000 0x0 0xc000>,
+			      <0x3 0x00310000 0x0 0x4000>;
+			reg-names = "control", "firmware", "dart", "apf";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 827 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dart";
+			mboxes = <&pmp_mbox>;
+			power-domains = <&ps_pmp>, <&ps_pms_sram>;
+			power-domain-names = "pmp", "sram";
+			status = "disabled";
+		};
+
 		ans_mbox: mailbox@389608000 {
 			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
 			reg = <0x3 0x89608000 0x0 0x4000>;
