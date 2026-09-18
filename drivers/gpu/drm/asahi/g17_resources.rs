@@ -413,14 +413,12 @@ const fn g17p_render_fragment_status_va(pair: G17PRenderQueuePair) -> Option<u64
 /// subranges. Every independently live render pair owns two alternating
 /// 512-KiB generations, so one pair can stage its next command without
 /// colliding with either its prior generation or the other in-flight pair.
-/// The larger slots keep command-owned RT-memory below the persistent TPC
-/// aperture and leave both views aligned.
+/// The slot size is historical -- it once also held the persistent TPC in its
+/// tail -- and is kept so that every alias address is unchanged; the TPC now
+/// scales with the render target and owns its own arena.
 const G17P_RENDER_USER_ALIAS_START: u64 = 0x10_0200_0000;
 const G17P_RENDER_USER_ALIAS_SLOT_SIZE: u64 = 0x8_0000;
 const G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR: u64 = 2;
-const G17P_RENDER_TPC_OFFSET: u64 = 0x5_0000;
-const G17P_RENDER_TPC_CAPACITY: usize =
-    (G17P_RENDER_USER_ALIAS_SLOT_SIZE - G17P_RENDER_TPC_OFFSET) as usize;
 const G17P_RENDER_USER_ALIAS_SLOT_COUNT: u64 =
     G17PRenderQueuePair::SLOT_COUNT as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR;
 const G17P_RENDER_USER_ALIAS_END: u64 = G17P_RENDER_USER_ALIAS_START
@@ -429,12 +427,45 @@ const G17P_RENDER_USER_ALIAS_END: u64 = G17P_RENDER_USER_ALIAS_START
 /// four backing regions live so each record's TMAP/HMTA memory survives until
 /// three later channel-event completions have made that record reusable.
 const G17P_RENDER_RT_EVENT_RECORD_COUNT: usize = 4;
-const G17P_RENDER_RT_REGION_STRIDE: usize = 0x4_0000;
-const G17P_RENDER_RT_MEMORY_START: u64 = G17P_RENDER_USER_ALIAS_END;
-const G17P_RENDER_RT_MEMORY_PAIR_SIZE: usize =
-    G17P_RENDER_RT_EVENT_RECORD_COUNT * G17P_RENDER_RT_REGION_STRIDE;
-const G17P_RENDER_RT_MEMORY_END: u64 = G17P_RENDER_RT_MEMORY_START
-    + G17PRenderQueuePair::SLOT_COUNT as u64 * G17P_RENDER_RT_MEMORY_PAIR_SIZE as u64;
+/// The tail-pointer cache and the rotating TMAP/HMTA record are both sized by
+/// `g17p_render_state_layout` as
+///
+///     tpc_size     = 128 * utiles_per_tile * tiles_per_mtile * layers * clusters
+///     tilemap_size =  80 * utiles_per_tile * tiles_per_mtile * layers
+///
+/// i.e. both scale with framebuffer AREA. The fixed carve-outs this driver
+/// inherited -- 192 KiB of TPC inside a 512-KiB alias slot, and a 256-KiB
+/// record -- hold a 4096x4096 single-sampled target (128 KiB / 80 KiB) and
+/// nothing larger: 8192x8192 needs 512 KiB / 320 KiB and the advertised
+/// 16384x16384 limit needs 2 MiB / 1.25 MiB. Every larger command was refused
+/// with a bare ERANGE out of `restage_command`, which reaches userspace as
+/// VK_ERROR_DEVICE_LOST.
+///
+/// Keep the inherited sizes as FLOORS -- a small render then allocates exactly
+/// what it allocated before -- and size anything larger from the command's own
+/// layout, in a dedicated compact-GART arena with room to grow in place.
+const G17P_RENDER_RT_REGION_FLOOR: usize = 0x4_0000;
+const G17P_RENDER_TPC_FLOOR: usize = 0x3_0000;
+/// Ceilings for one render pair's two dynamic objects. 32 MiB of TPC covers
+/// 16384x16384 at four utiles per tile on both clusters; an 8-MiB record
+/// covers the same target, and 2048 layers of any target that fits in RAM.
+/// Beyond them the request is refused with a named ERANGE rather than a
+/// silent one.
+const G17P_RENDER_TPC_MAX_SIZE: usize = 0x200_0000;
+const G17P_RENDER_RT_REGION_MAX_STRIDE: usize = 0x80_0000;
+const G17P_RENDER_RT_MEMORY_MAX_SIZE: usize =
+    G17P_RENDER_RT_EVENT_RECORD_COUNT * G17P_RENDER_RT_REGION_MAX_STRIDE;
+/// Dynamic render-target arena, one block per render pair: the TPC first, then
+/// the four-record TMAP/HMTA memory. Reserving virtual addresses costs no
+/// memory, and both objects keep a stable address for the graph's lifetime so
+/// a growth step can replace the backing without moving anything firmware has
+/// been told about. It sits above both TVB growth arenas and far below the
+/// descending Honeykrisp VDM alias tail at the top of the 4-GiB window.
+const G17P_RENDER_RT_DYNAMIC_START: u64 = G17P_RENDER_USER_BASE + 0x5000_0000;
+const G17P_RENDER_RT_DYNAMIC_PAIR_STRIDE: u64 =
+    (G17P_RENDER_TPC_MAX_SIZE + G17P_RENDER_RT_MEMORY_MAX_SIZE) as u64;
+const G17P_RENDER_RT_DYNAMIC_END: u64 = G17P_RENDER_RT_DYNAMIC_START
+    + G17PRenderQueuePair::SLOT_COUNT as u64 * G17P_RENDER_RT_DYNAMIC_PAIR_STRIDE;
 /// AXFB comes from the queue's ordinary user allocator on macOS, rather than
 /// the compact Buffer/Scene allocator used for tilemap and heap metadata.
 /// Preserve that separate upper user-GART address class with the same
@@ -860,35 +891,34 @@ const fn g17p_render_alias_slot(pair: G17PRenderQueuePair, submission_ordinal: u
     }
 }
 
-/// Native retains the Tail Pointer Cache with its render-target-memory owner;
-/// command-buffer parity must not move or unmap it between submissions.
-const fn g17p_render_tpc_va(pair: G17PRenderQueuePair) -> Option<u64> {
-    let alias_slot = pair.slot() as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR;
-    if alias_slot < G17P_RENDER_USER_ALIAS_SLOT_COUNT {
+const fn g17p_render_rt_dynamic_base(pair: G17PRenderQueuePair) -> Option<u64> {
+    if pair.slot() < G17PRenderQueuePair::SLOT_COUNT {
         Some(
-            G17P_RENDER_USER_ALIAS_START
-                + alias_slot * G17P_RENDER_USER_ALIAS_SLOT_SIZE
-                + G17P_RENDER_TPC_OFFSET,
+            G17P_RENDER_RT_DYNAMIC_START
+                + pair.slot() as u64 * G17P_RENDER_RT_DYNAMIC_PAIR_STRIDE,
         )
     } else {
         None
     }
+}
+
+/// Native retains the Tail Pointer Cache with its render-target-memory owner;
+/// command-buffer parity must not move or unmap it between submissions. Its
+/// size follows the render target, so it owns the head of the pair's dynamic
+/// arena rather than the tail of an alias slot.
+const fn g17p_render_tpc_va(pair: G17PRenderQueuePair) -> Option<u64> {
+    g17p_render_rt_dynamic_base(pair)
 }
 
 const fn g17p_render_rt_memory_va(pair: G17PRenderQueuePair) -> Option<u64> {
-    if pair.slot() < G17PRenderQueuePair::SLOT_COUNT {
-        Some(
-            G17P_RENDER_RT_MEMORY_START
-                + pair.slot() as u64 * G17P_RENDER_RT_MEMORY_PAIR_SIZE as u64,
-        )
-    } else {
-        None
+    match g17p_render_rt_dynamic_base(pair) {
+        Some(base) => Some(base + G17P_RENDER_TPC_MAX_SIZE as u64),
+        None => None,
     }
 }
 
-const fn g17p_render_rt_record_offset(submission_ordinal: u64) -> usize {
+const fn g17p_render_rt_record_slot(submission_ordinal: u64) -> usize {
     submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT
-        * G17P_RENDER_RT_REGION_STRIDE
 }
 
 const _: () = assert!(G17PRenderQueuePair::for_slot(1).unwrap().fragment == 3);
@@ -1261,6 +1291,29 @@ fn g17p_parameter_management_layout() -> Option<G17PParameterManagementLayout> {
 
 fn align_four(value: usize) -> Option<usize> {
     value.checked_add(3).map(|value| value & !3)
+}
+
+/// Backing the tail-pointer cache needs for `layout`, never below the
+/// inherited fixed size so that ordinary renders allocate exactly what they
+/// always did.
+fn g17p_render_tpc_capacity(layout: &G17PRenderStateLayout) -> Result<usize> {
+    Ok(page_align(layout.tpc_size)
+        .ok_or(EOVERFLOW)?
+        .max(G17P_RENDER_TPC_FLOOR))
+}
+
+/// Bytes one rotating TMAP/HMTA record needs for `layout`: the page-aligned
+/// tilemap span, the per-layer tiler metadata and the heap metadata, exactly
+/// as `prepare_rt_slot` measures them.
+fn g17p_render_rt_region_stride(layout: &G17PRenderStateLayout) -> Result<usize> {
+    let used = layout
+        .heapmeta
+        .checked_add(layout.heapmeta_size)
+        .and_then(|end| end.checked_sub(layout.tilemap))
+        .ok_or(EINVAL)?;
+    Ok(page_align(used)
+        .ok_or(EOVERFLOW)?
+        .max(G17P_RENDER_RT_REGION_FLOOR))
 }
 
 pub(crate) fn required_render_tvb_blocks(
@@ -2573,8 +2626,12 @@ fn map_fixed_wc_object(
 
 #[cfg(not(test))]
 struct G17PRenderTargetMemory {
+    queue_pair: G17PRenderQueuePair,
     rt_memory: MappedObject,
     tpc: MappedObject,
+    /// Bytes between two rotating TMAP/HMTA records. Sized from the first
+    /// command's layout and grown, never shrunk, by `ensure_capacity`.
+    record_stride: usize,
     rt_slot_ordinals: [Option<u64>; G17P_RENDER_RT_EVENT_RECORD_COUNT],
 }
 
@@ -2600,12 +2657,13 @@ impl G17PRenderTargetMemory {
             .checked_add(layout.heapmeta_size)
             .and_then(|end| end.checked_sub(layout.tilemap))
             .ok_or(EINVAL)?;
-        if used > G17P_RENDER_RT_REGION_STRIDE {
+        if used > self.record_stride {
             return Err(ERANGE);
         }
-        let offset = g17p_render_rt_record_offset(submission_ordinal);
+        let offset = self.record_offset(submission_ordinal);
+        let stride = self.record_stride;
         self.rt_memory.with_bytes_mut(|raw| {
-            raw.get_mut(offset..offset + G17P_RENDER_RT_REGION_STRIDE)
+            raw.get_mut(offset..offset + stride)
                 .ok_or(ERANGE)?
                 .fill(0);
             Ok(())
@@ -2622,10 +2680,91 @@ impl G17PRenderTargetMemory {
         self.tpc.iova()
     }
 
+    fn record_offset(&self, submission_ordinal: u64) -> usize {
+        g17p_render_rt_record_slot(submission_ordinal) * self.record_stride
+    }
+
+    /// Grow the tail-pointer cache and the rotating TMAP/HMTA records to what
+    /// `layout` needs, in place, at the addresses this graph already owns.
+    ///
+    /// Both sizes scale with framebuffer area, so a retained graph whose next
+    /// command has a larger render target must resize rather than refuse: the
+    /// previous refusal was a bare `ERANGE` that reached Mesa as
+    /// `VK_ERROR_DEVICE_LOST` for every target above 4096x4096.
+    ///
+    /// `restage_command` has already proved the previous group is complete --
+    /// empty job list, both queues done == read == write -- before it calls
+    /// this, so no firmware work refers to either object while it is replaced.
+    /// Each replacement allocates its new backing BEFORE releasing the old
+    /// aperture, so a failed allocation leaves the graph exactly as it was.
+    fn ensure_capacity(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        layout: &G17PRenderStateLayout,
+    ) -> Result<bool> {
+        let tpc_size = g17p_render_tpc_capacity(layout)?;
+        let record_stride = g17p_render_rt_region_stride(layout)?;
+        let mut grew = false;
+        if tpc_size > self.tpc.logical_size {
+            if tpc_size > G17P_RENDER_TPC_MAX_SIZE {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render: tail-pointer cache needs {:#x} bytes, above the {:#x} ceiling (tiles-per-mtile x utiles-per-tile x layers x clusters); refusing this render target\n",
+                    tpc_size,
+                    G17P_RENDER_TPC_MAX_SIZE,
+                );
+                return Err(ERANGE);
+            }
+            let address = g17p_render_tpc_va(self.queue_pair).ok_or(EINVAL)?;
+            let previous = self.tpc.logical_size;
+            self.tpc.regrow_wc_at(dev, vm, address, tpc_size)?;
+            dev_info!(
+                dev.as_ref(),
+                "G17P render TPC grew: {:#x} -> {:#x} bytes at {:#x}\n",
+                previous,
+                tpc_size,
+                address,
+            );
+            grew = true;
+        }
+        if record_stride > self.record_stride {
+            if record_stride > G17P_RENDER_RT_REGION_MAX_STRIDE {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render: TMAP/HMTA record needs {:#x} bytes, above the {:#x} ceiling; refusing this render target\n",
+                    record_stride,
+                    G17P_RENDER_RT_REGION_MAX_STRIDE,
+                );
+                return Err(ERANGE);
+            }
+            let address = g17p_render_rt_memory_va(self.queue_pair).ok_or(EINVAL)?;
+            let size = record_stride
+                .checked_mul(G17P_RENDER_RT_EVENT_RECORD_COUNT)
+                .ok_or(EOVERFLOW)?;
+            let previous = self.record_stride;
+            self.rt_memory.regrow_wc_at(dev, vm, address, size)?;
+            self.record_stride = record_stride;
+            // Every record moved to fresh, zeroed backing, so no ordinal owns
+            // one any more; the reuse guard must start again from empty.
+            self.rt_slot_ordinals = [None; G17P_RENDER_RT_EVENT_RECORD_COUNT];
+            dev_info!(
+                dev.as_ref(),
+                "G17P render RT records grew: stride {:#x} -> {:#x}, {:#x} bytes at {:#x}\n",
+                previous,
+                record_stride,
+                size,
+                address,
+            );
+            grew = true;
+        }
+        Ok(grew)
+    }
+
     fn tilemap_va(&self, submission_ordinal: u64) -> Result<u64> {
         self.rt_memory
             .iova()
-            .checked_add(g17p_render_rt_record_offset(submission_ordinal) as u64)
+            .checked_add(self.record_offset(submission_ordinal) as u64)
             .ok_or(EOVERFLOW)
     }
 
@@ -2669,25 +2808,45 @@ fn new_g17p_render_target_memory(
     dev: &AsahiDevice,
     vm: &mmu::Vm,
     queue_pair: G17PRenderQueuePair,
+    layout: &G17PRenderStateLayout,
 ) -> Result<KBox<G17PRenderTargetMemory>> {
+    let tpc_size = g17p_render_tpc_capacity(layout)?;
+    let record_stride = g17p_render_rt_region_stride(layout)?;
+    if tpc_size > G17P_RENDER_TPC_MAX_SIZE
+        || record_stride > G17P_RENDER_RT_REGION_MAX_STRIDE
+    {
+        dev_err!(
+            dev.as_ref(),
+            "G17P render: render target needs tpc {:#x} (max {:#x}) and record {:#x} (max {:#x})\n",
+            tpc_size,
+            G17P_RENDER_TPC_MAX_SIZE,
+            record_stride,
+            G17P_RENDER_RT_REGION_MAX_STRIDE,
+        );
+        return Err(ERANGE);
+    }
     let rt_memory = MappedObject::new_wc_at(
         dev,
         vm,
         g17p_render_rt_memory_va(queue_pair).ok_or(EINVAL)?,
-        G17P_RENDER_RT_MEMORY_PAIR_SIZE,
+        record_stride
+            .checked_mul(G17P_RENDER_RT_EVENT_RECORD_COUNT)
+            .ok_or(EOVERFLOW)?,
         mmu::PROT_GPU_FW_SHARED_RW,
     )?;
     let tpc = MappedObject::new_wc_at(
             dev,
             vm,
             g17p_render_tpc_va(queue_pair).ok_or(EINVAL)?,
-            G17P_RENDER_TPC_CAPACITY,
+            tpc_size,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
     Ok(KBox::new(
         G17PRenderTargetMemory {
+            queue_pair,
             rt_memory,
             tpc,
+            record_stride,
             rt_slot_ordinals: [None; G17P_RENDER_RT_EVENT_RECORD_COUNT],
         },
         GFP_KERNEL,
@@ -2754,6 +2913,35 @@ impl MappedObject {
             logical_size: size,
             cpu_wc: true,
         })
+    }
+
+    /// Replace this object's backing with a larger one at the SAME address.
+    ///
+    /// The replacement is allocated and zeroed before the old aperture is
+    /// released, so an allocation failure leaves the caller's object intact
+    /// and mapped. Only the caller can know that nothing is reading the old
+    /// backing; this helper does not synchronize.
+    fn regrow_wc_at(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        address: u64,
+        size: usize,
+    ) -> Result {
+        if size <= self.logical_size {
+            return Ok(());
+        }
+        let mut object = gem::new_kernel_object_wc(dev, size)?;
+        object.vmap()?.memset(0);
+        self.mapping = None;
+        let mapping = object.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW, false)?;
+        self.iova = mapping.iova();
+        self.mapping = Some(mapping);
+        self.object = object;
+        self.object_offset = 0;
+        self.logical_size = size;
+        self.cpu_wc = true;
+        Ok(())
     }
 
     fn new_in_range(
@@ -6418,7 +6606,9 @@ impl G17PUserRenderStorage {
             item.dva = mapping.iova();
             self.render_state.capture_trace_range(archive, item, offset, mapping.size(), clock)?;
         }
-        let rt_offset = g17p_render_rt_record_offset(self.descriptor_ordinal);
+        let rt_offset = self
+            .render_target_memory
+            .record_offset(self.descriptor_ordinal);
         for (instance, offset, size, dva) in [
             (
                 2,
@@ -7016,14 +7206,9 @@ impl G17PUserRenderStorage {
             "state layout",
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or_else(|| render_build_fail(1))
         );
-        if page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?
-            > G17P_RENDER_TPC_CAPACITY
-        {
-            return Err(ERANGE);
-        }
         let mut render_target_memory = bootstrap_stage!(
             "persistent render-target-memory allocation",
-            new_g17p_render_target_memory(dev, vm, queue_pair)
+            new_g17p_render_target_memory(dev, vm, queue_pair, &render_layout)
         );
         let render_target_addresses = bootstrap_stage!(
             "render-target-memory record",
@@ -8673,11 +8858,15 @@ impl G17PUserRenderStorage {
         };
         let render_layout =
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
-        if page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?
-            > self.render_target_memory.tpc.logical_size
-        {
-            return Err(ERANGE);
-        }
+        // The tail-pointer cache and the TMAP/HMTA records scale with the
+        // render target, and this command's may be larger than the one this
+        // retained graph was built for. Resize before anything is staged: the
+        // guard that used to stand here refused every target above 4096x4096
+        // with a bare ERANGE, which Mesa reports as VK_ERROR_DEVICE_LOST.
+        restage_step!(
+            "render-target capacity",
+            self.render_target_memory.ensure_capacity(dev, vm, &render_layout)
+        );
         let render_target_addresses = restage_step!(
             "render-target-memory record",
             self.render_target_memory
@@ -8710,6 +8899,20 @@ impl G17PUserRenderStorage {
                 || render_layout.tvb_blocks > tvb.block_count
                 || !tvb.all_reachable_from(vm)
             {
+                // The last bare refusal on this path. Name it: an anonymous
+                // ERANGE out of `restage_command` is indistinguishable in
+                // dmesg from any other, and one such refusal is what hid the
+                // render-target capacity wall above.
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render restage: parameter-buffer pool too small; have {:#x} bytes / {} blocks, need {:#x} / {} (reachable={}) ordinal={}\n",
+                    tvb.logical_size,
+                    tvb.block_count,
+                    render_layout.tvb_size,
+                    render_layout.tvb_blocks,
+                    tvb.all_reachable_from(vm),
+                    submission_ordinal,
+                );
                 return Err(ERANGE);
             }
             // Native retains this pool and lets firmware recycle its pages.
@@ -9305,7 +9508,9 @@ impl G17PUserRenderStorage {
                 .count();
             Ok(())
         });
-        let rt_offset = g17p_render_rt_record_offset(self.descriptor_ordinal);
+        let rt_offset = self
+            .render_target_memory
+            .record_offset(self.descriptor_ordinal);
         let rt_read = self.render_target_memory.rt_memory.with_bytes_mut(|raw| {
             let tilemap_start = rt_offset;
             let heapmeta_start = rt_offset
@@ -16949,7 +17154,7 @@ impl G17ResourceOwner {
             GFP_KERNEL,
         )?;
         reserved_ranges.push(
-            G17P_RENDER_RT_MEMORY_START..G17P_RENDER_RT_MEMORY_END,
+            G17P_RENDER_RT_DYNAMIC_START..G17P_RENDER_RT_DYNAMIC_END,
             GFP_KERNEL,
         )?;
         for index in 0..G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len() {
@@ -18211,10 +18416,21 @@ mod tests {
         assert_eq!(G17P_RENDER_USER_ALIAS_START, 0x10_0200_0000);
         assert_eq!(G17P_RENDER_USER_ALIAS_END, 0x10_0220_0000);
         assert_eq!(G17P_RENDER_RT_EVENT_RECORD_COUNT, 4);
-        assert_eq!(G17P_RENDER_RT_REGION_STRIDE, 0x4_0000);
-        assert_eq!(G17P_RENDER_RT_MEMORY_START, 0x10_0220_0000);
-        assert_eq!(G17P_RENDER_RT_MEMORY_PAIR_SIZE, 0x10_0000);
-        assert_eq!(G17P_RENDER_RT_MEMORY_END, 0x10_0240_0000);
+        assert_eq!(G17P_RENDER_RT_REGION_FLOOR, 0x4_0000);
+        assert_eq!(G17P_RENDER_TPC_FLOOR, 0x3_0000);
+        assert_eq!(G17P_RENDER_RT_DYNAMIC_START, 0x10_5000_0000);
+        assert_eq!(G17P_RENDER_RT_DYNAMIC_PAIR_STRIDE, 0x400_0000);
+        assert_eq!(G17P_RENDER_RT_DYNAMIC_END, 0x10_5800_0000);
+        // The dynamic arena must clear both TVB growth arenas below it and the
+        // descending Honeykrisp VDM alias tail above it.
+        assert!(
+            G17P_RENDER_RT_DYNAMIC_START
+                >= G17P_RENDER_TVB_GROWTH_START
+                    + (G17PRenderQueuePair::SLOT_COUNT as u64 - 1)
+                        * G17P_RENDER_TVB_PAIR_STRIDE
+                    + (G17P_PM_MAX_OWNED_BLOCKS * G17P_RENDER_TVB_BLOCK_STRIDE) as u64
+        );
+        assert!(G17P_RENDER_RT_DYNAMIC_END < G17P_RENDER_USER_END);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_VA, 0x10_0017_8000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, 0x8000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, G17P_PM_SCENE_SCRATCH_SIZE);
@@ -18241,11 +18457,13 @@ mod tests {
         assert_eq!(g17p_render_alias_slot(pair1, 0), Some(2));
         assert_eq!(g17p_render_alias_slot(pair1, 1), Some(3));
         assert_eq!(g17p_render_alias_slot(pair1, 2), Some(2));
-        assert_eq!(g17p_render_rt_memory_va(pair0), Some(0x10_0220_0000));
-        assert_eq!(g17p_render_rt_memory_va(pair1), Some(0x10_0230_0000));
-        assert_eq!(g17p_render_rt_record_offset(0), 0);
-        assert_eq!(g17p_render_rt_record_offset(3), 0xc_0000);
-        assert_eq!(g17p_render_rt_record_offset(4), 0);
+        assert_eq!(g17p_render_tpc_va(pair0), Some(0x10_5000_0000));
+        assert_eq!(g17p_render_tpc_va(pair1), Some(0x10_5400_0000));
+        assert_eq!(g17p_render_rt_memory_va(pair0), Some(0x10_5200_0000));
+        assert_eq!(g17p_render_rt_memory_va(pair1), Some(0x10_5600_0000));
+        assert_eq!(g17p_render_rt_record_slot(0), 0);
+        assert_eq!(g17p_render_rt_record_slot(3), 3);
+        assert_eq!(g17p_render_rt_record_slot(4), 0);
         assert_eq!(g17p_render_scene_scratch_va(pair0), Some(0x10_0017_8000));
         assert_eq!(g17p_render_discard_va(pair0), Some(0x10_0018_0000));
         assert_eq!(g17p_render_page_list_va(pair0), Some(0x10_0019_0000));
@@ -19128,6 +19346,90 @@ mod tests {
         assert_eq!(
             G17P_BOOTSTRAP_3D_STATUS_VA,
             g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS
+        );
+    }
+
+    /// The render-target capacity walls this driver used to have, and the
+    /// sizes that replace them.
+    ///
+    /// `tpc_size` and the rotating TMAP/HMTA record both scale with
+    /// `tiles_per_mtile * utiles_per_tile * layers` (and `num_clusters` for
+    /// the TPC), i.e. with framebuffer AREA. The inherited carve-outs were a
+    /// fixed 0x30000-byte TPC and a fixed 0x40000-byte record: they hold
+    /// 4096x4096 single-sampled on one cluster and nothing larger, while the
+    /// driver advertises maxFramebufferWidth/Height = 16384.
+    #[test]
+    fn render_target_capacity_follows_framebuffer_area() {
+        let base = g17_render::G17pRenderParameters::source_rsrc8();
+        let layout_for = |width: u32, height: u32, clusters: u32| {
+            let mut parameters = base;
+            parameters.width = width;
+            parameters.height = height;
+            g17p_render_state_layout(&parameters, clusters).unwrap()
+        };
+        // (framebuffer, tpc_size, record bytes) at layers = 1, clusters = 1,
+        // 32x32 utiles -- the CTS primitive_size.points render sizes plus the
+        // advertised limit.
+        for (width, height, tpc_size, record) in [
+            (4096u32, 4096u32, 0x2_0000usize, 0x1_4200usize),
+            (8192, 8192, 0x8_0000, 0x5_0200),
+            (9216, 9216, 0xa_2000, 0x6_6200),
+            (10240, 10240, 0xc_8000, 0x7_d200),
+            (16384, 16384, 0x20_0000, 0x14_0200),
+        ] {
+            let layout = layout_for(width, height, 1);
+            assert_eq!(layout.tpc_size, tpc_size);
+            assert_eq!(
+                layout.heapmeta + layout.heapmeta_size - layout.tilemap,
+                record
+            );
+            assert!(g17p_render_tpc_capacity(&layout).unwrap() <= G17P_RENDER_TPC_MAX_SIZE);
+            assert!(
+                g17p_render_rt_region_stride(&layout).unwrap()
+                    <= G17P_RENDER_RT_REGION_MAX_STRIDE
+            );
+        }
+        // 4096x4096 is the largest target the old carve-out held, and only at
+        // one cluster: a second cluster doubles the TPC on its own.
+        assert_eq!(
+            g17p_render_tpc_capacity(&layout_for(4096, 4096, 1)).unwrap(),
+            G17P_RENDER_TPC_FLOOR
+        );
+        assert!(
+            g17p_render_tpc_capacity(&layout_for(4096, 4096, 2)).unwrap()
+                > G17P_RENDER_TPC_FLOOR
+        );
+        // Small renders keep allocating exactly what they allocated before.
+        let small = layout_for(64, 64, 1);
+        assert_eq!(g17p_render_tpc_capacity(&small).unwrap(), G17P_RENDER_TPC_FLOOR);
+        assert_eq!(
+            g17p_render_rt_region_stride(&small).unwrap(),
+            G17P_RENDER_RT_REGION_FLOOR
+        );
+        // Worst advertised case: 16384x16384 with four utiles per tile on two
+        // clusters still fits both ceilings.
+        let mut worst_parameters = base;
+        worst_parameters.width = 16384;
+        worst_parameters.height = 16384;
+        worst_parameters.utile_width = 16;
+        worst_parameters.utile_height = 16;
+        let worst = g17p_render_state_layout(&worst_parameters, 2).unwrap();
+        assert_eq!(worst.tpc_size, 0x100_0000);
+        assert!(g17p_render_tpc_capacity(&worst).unwrap() <= G17P_RENDER_TPC_MAX_SIZE);
+        assert!(
+            g17p_render_rt_region_stride(&worst).unwrap()
+                <= G17P_RENDER_RT_REGION_MAX_STRIDE
+        );
+        // 2048 layers of a small target -- the advertised maxFramebufferLayers
+        // -- is the other axis the fixed carve-out could not follow.
+        let mut layered_parameters = base;
+        layered_parameters.layers = 2048;
+        let layered = g17p_render_state_layout(&layered_parameters, 1).unwrap();
+        assert!(layered.tpc_size > G17P_RENDER_TPC_FLOOR);
+        assert!(g17p_render_tpc_capacity(&layered).unwrap() <= G17P_RENDER_TPC_MAX_SIZE);
+        assert!(
+            g17p_render_rt_region_stride(&layered).unwrap()
+                <= G17P_RENDER_RT_REGION_MAX_STRIDE
         );
     }
 
