@@ -357,12 +357,19 @@ static void pmp_v2_health(struct work_struct *work)
 	struct pmp_v2 *pmp = container_of(to_delayed_work(work), struct pmp_v2, health);
 	int ret;
 
-	mutex_lock(&pmp->lock);
+	/* Read-only DART checks and the mailbox poll need no registry lock:
+	 * received words are dispatched to pmp_v2_receive(), which takes it.
+	 * Holding the lock here made the 25 ms sampler's trylock fail whenever
+	 * the two timer expiries aligned, clamping both clusters for nothing.
+	 */
 	ret = pmp_v2_dart_check(pmp);
 	if (!ret)
 		ret = min(apple_rtkit_poll(pmp->rtk), 0);
-	if (ret || apple_rtkit_is_crashed(pmp->rtk))
-		pmp_v2_fail(pmp, ret ?: -EIO);
+	if (!ret && apple_rtkit_is_crashed(pmp->rtk))
+		ret = -EIO;
+	mutex_lock(&pmp->lock);
+	if (ret)
+		pmp_v2_fail(pmp, ret);
 	/* Transport status only; this period is NOT a temperature-freshness ABI. */
 	if (!pmp->protocol.failed && !READ_ONCE(pmp->stopping))
 		schedule_delayed_work(&pmp->health, HZ);
