@@ -245,6 +245,41 @@
 	reboot {
 		compatible = "apple,smc-reboot";
 	};
+
+	/*
+	 * Exactly the six SMC die temperatures the J700 CPU thermal policy samples
+	 * (apple-smc-cpu-thermal, cleanroom 0d7db87fa26c): the policy refuses any
+	 * other temperature channel set, so keep this list as is.
+	 */
+	hwmon {
+		compatible = "apple,smc-hwmon";
+		apple,cpu-thermal-policy;
+
+		temperature-Te05 {
+			apple,key-id = "Te05";
+			label = "E-cluster Temperature 1";
+		};
+		temperature-Te0S {
+			apple,key-id = "Te0S";
+			label = "E-cluster Temperature 2";
+		};
+		temperature-Tp01 {
+			apple,key-id = "Tp01";
+			label = "P-cluster Temperature 1";
+		};
+		temperature-Tp05 {
+			apple,key-id = "Tp05";
+			label = "P-cluster Temperature 2";
+		};
+		temperature-Tp09 {
+			apple,key-id = "Tp09";
+			label = "P-cluster Temperature 3";
+		};
+		temperature-Tp0D {
+			apple,key-id = "Tp0D";
+			label = "P-cluster Temperature 4";
+		};
+	};
 };
 
 &smc_mbox {
@@ -490,6 +525,41 @@
 	/* T8140 has no described SMC NVMEM provider; restart does not need it. */
 	reboot {
 		compatible = "apple,smc-reboot";
+	};
+
+	/*
+	 * Exactly the six SMC die temperatures the J700 CPU thermal policy samples
+	 * (apple-smc-cpu-thermal, cleanroom 0d7db87fa26c): the policy refuses any
+	 * other temperature channel set, so keep this list as is.
+	 */
+	hwmon {
+		compatible = "apple,smc-hwmon";
+		apple,cpu-thermal-policy;
+
+		temperature-Te05 {
+			apple,key-id = "Te05";
+			label = "E-cluster Temperature 1";
+		};
+		temperature-Te0S {
+			apple,key-id = "Te0S";
+			label = "E-cluster Temperature 2";
+		};
+		temperature-Tp01 {
+			apple,key-id = "Tp01";
+			label = "P-cluster Temperature 1";
+		};
+		temperature-Tp05 {
+			apple,key-id = "Tp05";
+			label = "P-cluster Temperature 2";
+		};
+		temperature-Tp09 {
+			apple,key-id = "Tp09";
+			label = "P-cluster Temperature 3";
+		};
+		temperature-Tp0D {
+			apple,key-id = "Tp0D";
+			label = "P-cluster Temperature 4";
+		};
 	};
 };
 

@@ -59,6 +59,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			capacity-dmips-mhz = <714>;
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&ecpu_opp>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -68,6 +71,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			capacity-dmips-mhz = <714>;
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&ecpu_opp>;
 		};
 
 
@@ -78,6 +84,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			capacity-dmips-mhz = <714>;
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&ecpu_opp>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -87,6 +96,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			capacity-dmips-mhz = <714>;
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&ecpu_opp>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -96,6 +108,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p>;
+			operating-points-v2 = <&pcpu_opp>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -105,6 +120,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p>;
+			operating-points-v2 = <&pcpu_opp>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -137,6 +155,96 @@
 		#clock-cells = <0>;
 		clock-frequency = <24000000>;
 		clock-output-names = "clkref";
+	};
+
+	/* /arm-io/clock-frequencies[0x18c - 0x100] on J700. */
+	clk_200m: clock-200m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "clk_200m";
+	};
+
+	/*
+	 * CPU DVFS ladders from this SoC's ADT (/arm-io/pmgr voltage-states1-sram for the
+	 * four-core E cluster, voltage-states5-sram for the two-core P cluster); opp-level is
+	 * the hardware P-state written to CLUSTER_PSTATE by apple-soc-cpufreq.
+	 */
+	ecpu_opp: opp-table-ecpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <816000000>;
+			opp-level = <1>;
+			clock-latency-ns = <7500>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1140000000>;
+			opp-level = <2>;
+			clock-latency-ns = <7500>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1464000000>;
+			opp-level = <3>;
+			clock-latency-ns = <7500>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1788000000>;
+			opp-level = <4>;
+			clock-latency-ns = <7500>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2112000000>;
+			opp-level = <5>;
+			clock-latency-ns = <7500>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2424000000>;
+			opp-level = <6>;
+			clock-latency-ns = <7500>;
+		};
+	};
+
+	/*
+	 * P1..P6 only: the cleanroom policy releases P7..P17 (2.688..4.044 GHz) solely under
+	 * the fast PMP thermal controller, which is not merged here; the SMC 65 C step-wise
+	 * policy alone is qualified for this ceiling.
+	 */
+	pcpu_opp: opp-table-pcpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <744000000>;
+			opp-level = <1>;
+			clock-latency-ns = <7500>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1260000000>;
+			opp-level = <2>;
+			clock-latency-ns = <7500>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1620000000>;
+			opp-level = <3>;
+			clock-latency-ns = <7500>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1944000000>;
+			opp-level = <4>;
+			clock-latency-ns = <7500>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2196000000>;
+			opp-level = <5>;
+			clock-latency-ns = <7500>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2472000000>;
+			opp-level = <6>;
+			clock-latency-ns = <7500>;
+		};
 	};
 
 	gpu_opp: opp-table-gpu {
@@ -629,6 +737,18 @@
 		 * inherited-session adoption without the ordinary macsmc notification
 		 * and child-device writes before a board DTS enables it.
 		 */
+		cpufreq_e: cpufreq@210e20000 {
+			compatible = "apple,t8140-cluster-cpufreq", "apple,cluster-cpufreq";
+			reg = <0x2 0x10e20000 0x0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		cpufreq_p: cpufreq@211e20000 {
+			compatible = "apple,t8140-cluster-cpufreq", "apple,cluster-cpufreq";
+			reg = <0x2 0x11e20000 0x0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
 		smc_mbox: mailbox@30c608000 {
 			compatible = "apple,t8140-asc-mailbox",
 				     "apple,asc-mailbox-v4";
