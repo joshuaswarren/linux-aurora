@@ -115,7 +115,12 @@ impl G17PJobCompletion {
         if let Some(vm_job) = self.vm_job.lock().as_ref() {
             vm_job.quarantine();
         }
-        self.status.record(error.to_errno());
+        // The fence always carries the exact error to this client. The VM's
+        // sticky status is different: it retires the VM for every later
+        // submission, so a submission-scoped failure -- ENODATA from a
+        // zero-duration retire, which g17p_zero_duration exists to keep
+        // submission-scoped -- must not be written there.
+        self.status.record_if_device_loss(error.to_errno());
         self.fence.set_error(error);
         self.fence.signal();
     }
@@ -232,7 +237,11 @@ impl<B: G17PQueueBackend> sched::JobImpl for G17PScheduledJob<B> {
             // DRM also signals its finished fence when run_job fails before
             // publication; that failure must be visible through the same API.
             if let Ok(completion) = job.packet.completion() {
-                completion.status.record(error.to_errno());
+                // A publish failure is often contention -- "firmware recovery
+                // still open after N polls; refusing to publish" returns EBUSY
+                // -- and this status is the VM's, so recording it retired the
+                // whole client for a transient condition.
+                completion.status.record_if_device_loss(error.to_errno());
             }
         }).map(Some)
     }
