@@ -2127,28 +2127,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		l = apple_plane->iomfb_surface;
 		req->swap.swap_enabled |= BIT(l);
 
-		if (old_state->fb && new_state->fb != old_state->fb) {
-			/* Retain the old framebuffer until its replacement is stable. */
-			struct dcp_fb_reference *entry =
-				kzalloc(sizeof(*entry), GFP_KERNEL);
-			unsigned long flags;
-
-			if (entry) {
-				entry->fb = old_state->fb;
-				/*
-				 * Left unarmed: the id of the swap that
-				 * unbinds this framebuffer is not known until
-				 * the firmware answers swap_start.
-				 */
-				spin_lock_irqsave(&dcp->swapped_out_lock,
-						  flags);
-				list_add_tail(&entry->head,
-					      &dcp->swapped_out_fbs);
-				spin_unlock_irqrestore(&dcp->swapped_out_lock,
-						       flags);
-			}
-			drm_framebuffer_get(old_state->fb);
-		}
+		/* the old framebuffer was retained by dcp_flush() already */
 
 		if (!new_state->fb || !new_state->visible) {
 			continue;
