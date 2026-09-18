@@ -432,7 +432,7 @@ impl SepData {
         // bag differently; the per-SoC profile carries the correct field values
         // so the proven T6020 path is unchanged while T8103 gets the bag type in
         // the third word (see profile::KeybagCreate).
-        let enc = &self.profile.keybag_create;
+        let enc = self.keybag_create_encoding();
         let mut body = image::Body::new();
         body.put_u32(enc.variant)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
@@ -453,6 +453,18 @@ impl SepData {
             msg,
             img,
         })
+    }
+
+    /// The CREATE_KEYBAG field encoding: the profile's, unless the
+    /// keybag_encoding module parameter picks the strict (1) or lenient (2)
+    /// form explicitly — a first bring-up can then retry the other encoding
+    /// after a rejected create without a rebuild.
+    fn keybag_create_encoding(&self) -> profile::KeybagCreate {
+        match *module_parameters::keybag_encoding.value() {
+            1 => profile::KEYBAG_CREATE_STRICT,
+            2 => profile::KEYBAG_CREATE_LENIENT,
+            _ => self.profile.keybag_create,
+        }
     }
 
     pub(crate) fn sks_provision_identity_keybag(&self) -> bool {
@@ -519,7 +531,7 @@ impl SepData {
         let Some((_fv_data, end)) = image::read_blob(body, 8) else {
             return false;
         };
-        if variant != self.profile.keybag_create.variant || raw_handle < 0 || end != body.len()
+        if variant != self.keybag_create_encoding().variant || raw_handle < 0 || end != body.len()
         {
             dev_err!(
                 self.dev,
