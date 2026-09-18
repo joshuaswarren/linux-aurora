@@ -485,7 +485,24 @@ impl File {
             let vm = guard.get(vm_id as usize).ok_or(ENOENT)?;
             vm.vm.status().clone()
         };
-        status.record(device.gpu.submission_error());
+        /* A status QUERY must not be what kills a healthy VM. Name it when it
+         * does: `submission_error()` is device-wide, so recording it here
+         * poisons every client that merely asks whether it is alive, and the
+         * poison then surfaces as `stage=vm-status` on the next submit with no
+         * other kernel diagnostic. Measured on G17P 2026-09-18: a brand-new
+         * client reported DEVICE_LOST with zero kernel lines attributable to
+         * it. */
+        let device_error = device.gpu.submission_error();
+        let before = status.get();
+        status.record(device_error);
+        if before == 0 && status.get() != 0 {
+            dev_err!(
+                device.as_ref(),
+                "G17PMARK vm-status poisoned by QUERY: vm {} was clean, device submission_error={} -- this client never submitted anything\n",
+                vm_id,
+                device_error,
+            );
+        }
         let bytes = encode_response(vm_id, status.get());
         UserSlice::new(user, VM_STATUS_SIZE).writer().write_slice(&bytes)?;
         Ok(0)

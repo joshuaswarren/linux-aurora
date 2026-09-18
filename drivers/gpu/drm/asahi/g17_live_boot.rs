@@ -3356,6 +3356,30 @@ impl G17PLiveRuntime {
                 return Err(error);
             }
         };
+        // The recovery above acknowledged its final clear at state=0, so the
+        // firmware is alive and reset. That is a rehabilitation boundary, and
+        // until now nothing treated it as one: `compute_faulted` was cleared
+        // only by `rehabilitate_after_processor_stop`, i.e. by a session
+        // rebuild that is known to end in rtkit-boot ETIME. So one quarantined
+        // compute queue poisoned the device for the rest of the boot. Every
+        // lease guard shares one registry, so clearing through any live guard
+        // clears it for everyone.
+        if *module_parameters::g17p_clear_poison_on_recovery.value() != 0 {
+            let mut cleared = false;
+            for q in &self.async_compute_queues {
+                if let Some(active) = q.active.as_ref() {
+                    active._lease.rehabilitate_after_processor_stop();
+                    cleared = true;
+                    break;
+                }
+            }
+            if cleared {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17PMARK recovery cleared the device-wide compute admission poison\n",
+                );
+            }
+        }
         if let Some(stamp) = blamed_stamp {
             self.settle_render_blamed_by_recovery(stamp, EIO);
         }

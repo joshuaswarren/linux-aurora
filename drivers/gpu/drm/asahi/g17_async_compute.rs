@@ -4,7 +4,20 @@
 struct G17PAsyncComputeActive {
     packet: Arc<crate::g17_job::G17PComputeJobPacket>,
     _lease: crate::g17_drm::G17PComputeLeaseGuard,
+    /// `G17P_COMPLETIONS_SEEN` when this submission was published. Comparing it
+    /// against the counter at quarantine time answers the one question the
+    /// QUARANTINE line could not: was the firmware still retiring OTHER work
+    /// when we gave up on this one? A non-zero delta means the 2000ms wall
+    /// clock in `G17P_COMPUTE_COMPLETION_TIMEOUT_MS` expired on a firmware that
+    /// was demonstrably alive and making progress, which is a different defect
+    /// from a firmware that is stuck. Diagnostic only -- nothing branches on it.
+    completions_at_publish: u64,
 }
+
+/// Successful async-compute completions this boot. Read by
+/// `g17p_quarantine_selftest` and by the quarantine progress witness.
+static G17P_COMPLETIONS_SEEN: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Installed queue graphs survive logical queue destruction. Firmware retains
 /// their addresses; exact command retirement permits rebinding, not freeing.
@@ -223,7 +236,11 @@ impl G17PLiveRuntime {
         state.submission_phase.store(g17_manager::G17P_SUBMIT_PHASE_IDLE, Ordering::Release);
         // From this point, every error retains the packet, mappings and root.
         // A failed notification does not prove the firmware missed the kick.
-        q.active = Some(G17PAsyncComputeActive { packet: packet.clone(), _lease: lease });
+        q.active = Some(G17PAsyncComputeActive {
+            packet: packet.clone(),
+            _lease: lease,
+            completions_at_publish: G17P_COMPLETIONS_SEEN.load(Ordering::Acquire),
+        });
         let result = (|| {
             let notifications = self.manager.as_mut().ok_or(ENODEV)?.submit_translated_compute(
                 self.registers.as_ref().ok_or(ENODEV)?, &mut q.queue,
@@ -327,6 +344,22 @@ impl G17PLiveRuntime {
                             "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={}\n",
                             active.packet.submission_id(), q.queue.queue_id(),
                             active.packet.context().context_id(), timestamps[0], timestamps[1]);
+                    }
+                    // Reproduction oracle for the quarantine blast radius; see
+                    // `g17p_quarantine_selftest`. Off unless the parameter is
+                    // set, and it fires at most once per boot.
+                    let selftest = *crate::module_parameters::g17p_quarantine_selftest.value();
+                    if selftest != 0 {
+                        let seen = G17P_COMPLETIONS_SEEN.fetch_add(1, Ordering::AcqRel) + 1;
+                        if seen == selftest as u64 {
+                            active._lease.quarantine();
+                            q.quarantined = true;
+                            if let Some(pdev) = self.pdev.as_ref() {
+                                dev_err!(pdev.as_ref(),
+                                    "G17PMARK quarantine-selftest fired at completion {} qid={} -- the device-wide arm ran; this client still completes\n",
+                                    seen, q.queue.queue_id());
+                            }
+                        }
                     }
                     active.packet.completion()?.complete(Ok(timestamps));
                     drop(active);
@@ -657,6 +690,12 @@ impl G17PLiveRuntime {
                                 active.packet.context().vm_id(), active.packet.context().root(),
                                 active.packet.context().is_current(),
                                 self.gfx_state.as_ref().map(|s| s.submission_phase.load(Ordering::Acquire)), error);
+                            let now = G17P_COMPLETIONS_SEEN.load(Ordering::Acquire);
+                            let retired_since = now.saturating_sub(active.completions_at_publish);
+                            dev_err!(pdev.as_ref(),
+                                "G17PMARK quarantine-progress submission={} qid={} other-completions-retired-since-publish={} -- non-zero means the firmware was alive and retiring work when the {}ms timer gave up on this submission\n",
+                                submission, q.queue.queue_id(), retired_since,
+                                crate::g17_drm::G17P_COMPUTE_COMPLETION_TIMEOUT_MS);
                         }
                         if let Some(manager) = self.manager.as_mut() {
                             // Sample the actual retained owner, not the legacy
