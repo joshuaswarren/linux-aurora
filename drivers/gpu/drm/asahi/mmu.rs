@@ -1952,6 +1952,19 @@ impl Drop for KernelMapping {
             );
             mem::sync();
         }
+
+        // On T8140 the bind slot is not the only context that publishes this
+        // root. kernel_lower_vm is installed directly in contexts 0/1 and has
+        // no slot at all, and client roots are also leased to application-GART
+        // contexts. A translation any of them still caches outlives the leaf
+        // removed above, and this range returns to the VA allocator when the
+        // node is released after this function: the next mapping placed there
+        // would otherwise be read through the stale entry from the previous
+        // owner's freed backing. Invalidate every context naming the root
+        // before the address can be reused, as GPUVM unmap already does.
+        if owner.uat_inner.t8140 {
+            owner.tlbi_live_contexts(self.iova(), self.size() as u64);
+        }
     }
 }
 
@@ -2000,6 +2013,9 @@ struct UatInner {
     /// claimed before their TTBAT roots become visible and released only
     /// after lease teardown invalidates the corresponding ASID.
     t8140_app_contexts: AtomicU64,
+    /// T8140 publishes one page-table root in contexts other than a VM's bind
+    /// slot, so unmapping must invalidate every context naming that root.
+    t8140: bool,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
@@ -5446,7 +5462,11 @@ impl Uat {
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
-    fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode) -> Result<Arc<UatInner>> {
+    fn make_inner(
+        dev: &driver::AsahiDevice,
+        cfg: UatConfig,
+        handoff_mode: HandoffMode,
+    ) -> Result<Arc<UatInner>> {
         let handoff_rgn = Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, true)?;
         let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, true)?;
 
@@ -5462,6 +5482,7 @@ impl Uat {
                     handoff_mode == HandoffMode::FirmwareDekker
                 ),
                 t8140_alias_owner: AtomicU64::new(0),
+                t8140: cfg == UatConfig::T8140,
                 // Contexts 0..4 have fixed architectural meaning, and the
                 // bind band belongs to `Uat::bind`. Reserving the band here as
                 // well means the two allocators cannot collide even if the
@@ -5741,7 +5762,7 @@ impl Uat {
             }
         }
 
-        let inner = Self::make_inner(dev, handoff_mode)?;
+        let inner = Self::make_inner(dev, cfg, handoff_mode)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;

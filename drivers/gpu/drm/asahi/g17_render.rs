@@ -197,6 +197,10 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) height: u32,
     pub(crate) context_base: u64,
     pub(crate) tilemap: u64,
+    /// Per-layer tiler metadata, which native places between the tilemap and
+    /// the heap metadata. It is empty, and so equal to `heapmeta`, for a
+    /// single-layer target.
+    pub(crate) layermeta: u64,
     pub(crate) heapmeta: u64,
     pub(crate) tpc: u64,
     pub(crate) deflake_1: u64,
@@ -253,12 +257,8 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) process_empty_tiles: bool,
     pub(crate) ta_timestamp_start: u64,
     pub(crate) ta_timestamp_end: u64,
-    pub(crate) ta_user_timestamp_start: u64,
-    pub(crate) ta_user_timestamp_end: u64,
     pub(crate) fragment_timestamp_start: u64,
     pub(crate) fragment_timestamp_end: u64,
-    pub(crate) fragment_user_timestamp_start: u64,
-    pub(crate) fragment_user_timestamp_end: u64,
     /// Write the VDM control-stream register (0x1c880) as a full GPU virtual
     /// address instead of the native user-process compact form.
     ///
@@ -341,6 +341,7 @@ impl G17pRenderParameters {
             height: 64,
             context_base: 0x0000_0010_0000_0000,
             tilemap: 0x0000_0010_001b_0000,
+            layermeta: 0x0000_0010_001b_5000,
             heapmeta: 0x0000_0010_001b_5000,
             tpc: 0x0000_0010_0024_0000,
             deflake_1: 0x0000_0010_0006_82a0,
@@ -394,12 +395,8 @@ impl G17pRenderParameters {
             process_empty_tiles: true,
             ta_timestamp_start: 0xffff_fc20_0002_4c68,
             ta_timestamp_end: 0,
-            ta_user_timestamp_start: 0,
-            ta_user_timestamp_end: 0,
             fragment_timestamp_start: 0xffff_fc20_0002_4c68,
             fragment_timestamp_end: 0xffff_fc20_0002_4c70,
-            fragment_user_timestamp_start: 0,
-            fragment_user_timestamp_end: 0,
             absolute_pointers: false,
             bg_resource_prefix: 0,
             native_pm_bytes: false,
@@ -544,6 +541,7 @@ fn build_ta_registers_for_work_key(
 ) -> Result<[RegisterWrite; TA_REGISTER_COUNT], RenderBuildError> {
     let g = geometry(p)?;
     let tilemap = ta_resource_offset(p, p.tilemap)?;
+    let layermeta = ta_resource_offset(p, p.layermeta)?;
     let heapmeta = ta_resource_offset(p, p.heapmeta)?;
     let tpc = ta_resource_offset(p, p.tpc)?;
     let deflake_1 = ta_user_offset(p.deflake_1)?;
@@ -562,11 +560,13 @@ fn build_ta_registers_for_work_key(
     } else {
         vdm_user_offset(p.encoder)?
     };
-    let layer_mode = if p.layers > 1 {
-        0xe000 | (p.layers as u64 - 1)
-    } else {
-        0x8000
-    };
+    // generateTARegisterListG16Common: the layer count less one with bit 15,
+    // plus bit 14 and a process-empty-tiles select for a layered target. The
+    // pipe mirror 0x1c9e8 keeps only the layered bit and the count.
+    let mut layer_mode = 0x8000 | (p.layers as u64 - 1);
+    if p.layers > 1 {
+        layer_mode |= 0x4000 | if p.process_empty_tiles { 0x2000 } else { 0x1000 };
+    }
 
     Ok([
         RegisterWrite::new(0x01748, 1),
@@ -590,8 +590,8 @@ fn build_ta_registers_for_work_key(
         RegisterWrite::new(0x1c950, deflake_3 | 0x0004_0000_0000_0000),
         RegisterWrite::new(0x1c930, 0),
         RegisterWrite::new(0x1c880, encoder),
-        RegisterWrite::new(0x1c079, heapmeta),
-        RegisterWrite::new(0x1c9d8, heapmeta),
+        RegisterWrite::new(0x1c079, layermeta),
+        RegisterWrite::new(0x1c9d8, layermeta),
         RegisterWrite::new(0x10151, 0),
         RegisterWrite::new(0x1c199, 0),
         RegisterWrite::new(0x1c1a1, 0),
@@ -616,7 +616,7 @@ fn build_ta_registers_for_work_key(
         RegisterWrite::new(0x1c8e8, u64::MAX),
         RegisterWrite::new(0x1c898, 0),
         RegisterWrite::new(0x101e1, 0x1c),
-        RegisterWrite::new(0x1c9e8, 0),
+        RegisterWrite::new(0x1c9e8, layer_mode & 0x47ff),
         RegisterWrite::new(0x1a099, 0),
         RegisterWrite::new(0x1a0a1, 0),
         RegisterWrite::new(0x1a069, 0),
@@ -776,7 +776,7 @@ fn build_fragment_registers_for_work_key(
         RegisterWrite::new(0x153d9, p.stencil_aux_buffer),
         RegisterWrite::new(0x15439, p.stencil_aux_stride),
         RegisterWrite::new(0x16429, p.tilemap),
-        RegisterWrite::new(0x16060, p.heapmeta),
+        RegisterWrite::new(0x16060, p.layermeta),
         RegisterWrite::new(0x16431, (4 * g.size1) << 24),
         RegisterWrite::new(0x10039, p.tile_config),
         RegisterWrite::new(0x16020, 0),
@@ -1156,8 +1156,9 @@ pub(crate) fn build_ta_descriptor(
     put_u8(raw, 0x094d, if parameters.native_pm_bytes { 3 } else { 1 });
     put_u64(raw, 0x08fe, parameters.ta_timestamp_start);
     put_u64(raw, 0x0906, parameters.ta_timestamp_end);
-    put_u64(raw, 0x090e, parameters.ta_user_timestamp_start);
-    put_u64(raw, 0x0916, parameters.ta_user_timestamp_end);
+    // +0x090e/+0x0916 are caller-visible timestamp destinations. Firmware
+    // writes them only inside its timestamp aperture, so they stay zero; the
+    // completion publishes the pass envelope to userspace instead.
     // AGXTAChannelSKSM::submitBuffer mirrors the same dependency/current pair
     // consumed by the TA RCE program into the firmware command. These fields
     // are deliberately unaligned in the native 0x9c0-byte command layout.
@@ -1357,8 +1358,7 @@ pub(crate) fn build_fragment_descriptor(
     put_u64(raw, 0x2168, parameters.fragment_lifecycle as u32 as u64);
     put_u64(raw, 0x2198, parameters.fragment_timestamp_start);
     put_u64(raw, 0x21a0, parameters.fragment_timestamp_end);
-    put_u64(raw, 0x21a8, parameters.fragment_user_timestamp_start);
-    put_u64(raw, 0x21b0, parameters.fragment_user_timestamp_end);
+    // +0x21a8/+0x21b0: caller-visible destinations, zero as in the TA record.
     put_u8(raw, 0x21cc, 0x53);
     put_u8(raw, 0x21d6, 1);
     put_u8(raw, 0x21e7, 1);
@@ -1900,6 +1900,7 @@ mod tests {
         let mut parameters = G17pRenderParameters::source_rsrc8();
         parameters.context_base = 0x70_0000_0000;
         parameters.tilemap = 0x70_011e_0a00;
+        parameters.layermeta = 0x70_011e_2a00;
         parameters.heapmeta = 0x70_011e_2a00;
         parameters.tpc = 0x70_0129_0000;
         parameters.deflake_3 = 0x10_0009_ca60;

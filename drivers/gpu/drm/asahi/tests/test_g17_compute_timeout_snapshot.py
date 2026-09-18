@@ -42,7 +42,8 @@ submission_source = (root / "g17_submission.rs").read_text()
 source += "mod g17_submission {" + constant(submission_source, "G17P_CL_KICK_ENTRY_SIZE") + "}\n"
 compute = (root / "g17_compute.rs").read_text()
 source += "mod g17_compute {\n" + "\n".join(constant(compute, name) for name in [
-    "COMPUTE_REGISTER_COUNT", "COMPUTE_OPTIONAL", "COMPUTE_EVENT", "COMPUTE_ADD_KICKS",
+    "COMPUTE_REGISTER_COUNT", "COMPUTE_REGISTER_MAX", "COMPUTE_OPTIONAL", "COMPUTE_EVENT",
+    "COMPUTE_ADD_KICKS",
     "COMPUTE_QUEUE_POINTERS", "COMPUTE_ITEM_RING"]) + "}\n"
 source += "\n".join(constant(resources, name) for name in [
     "G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE", "G17P_COMPUTE_STAMP_SUPPORT_OFFSET"])

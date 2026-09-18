@@ -2239,15 +2239,17 @@ fn prepare_g17p_partial_opening_outer_slot(
 pub(crate) fn prepare_g17p_compute_channel_work(
     state: G17PPartialOpeningOuterChannelState,
     queue_id: u8,
+    channel_started: bool,
 ) -> Result<PreparedG17PComputeChannelWork, SubmissionError> {
-    // Compute is left byte-for-byte as proven by 2000 consecutive passing
-    // submissions; only the render stages are moved onto the measured value.
+    // Match AGXArmFirmware::encodeAcceleratorRingCommand for every pipe:
+    // +0x17 is !AGXChannel[0x3c], so it is one only for the first publication
+    // of a physical channel and zero after that channel has started.
     let outer = prepare_g17p_partial_opening_outer_slot(
         state,
         G17P_COMPUTE_CHANNEL_TABLE_INDEX,
         queue_id,
         PipeType::Compute as u32,
-        false,
+        channel_started,
     )?;
     Ok(PreparedG17PComputeChannelWork {
         outer,
@@ -3614,6 +3616,7 @@ pub(crate) fn apply_g17p_cl_retained_static_state(
     support_state: &mut [u8],
     scheduler_state: &mut [u8],
     channel_control: &mut [u8],
+    page_list_gpu_va: u64,
     operand_table_gpu_va: u64,
     support_state_gpu_va: u64,
     scheduler_state_gpu_va: u64,
@@ -3634,7 +3637,10 @@ pub(crate) fn apply_g17p_cl_retained_static_state(
     put_u64_le(shared_support, 0x00, 2);
     put_u64_le(shared_support, 0x08, 1);
     put_u64_le(shared_support, 0x10, 2);
-    put_u64_le(shared_support, 0x18, 0x0004_0000_0000_0070);
+    // _AGFIUMAPagePoolState stores the full VA at unaligned +0x14.
+    // Copying the native +0x18 qword leaves compute naming render's pool.
+    put_u64_le(shared_support, 0x14, page_list_gpu_va);
+    put_u32_le(shared_support, 0x1c, 0x4_0000);
     put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
     put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
     put_u64_le(shared_support, 0x30, operand_table_gpu_va);
@@ -5818,6 +5824,8 @@ mod tests {
                 queue_gpu_va: 0xffff_fc20_c100_0000,
                 queue_write_index: 3,
             },
+            4,
+            false,
         )
         .unwrap();
         assert_eq!(compute.outer.channel_table_index, 8);
@@ -5836,6 +5844,26 @@ mod tests {
             0x0104_0003
         );
         assert_eq!(compute.doorbell, 0x0083_0000_0000_000a);
+
+        let compute_repeat = prepare_g17p_compute_channel_work(
+            G17PPartialOpeningOuterChannelState {
+                consumers: [1, 1],
+                producer: 1,
+                queue_gpu_va: 0xffff_fc20_c100_0000,
+                queue_write_index: 7,
+            },
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                compute_repeat.outer.slot[0x14..0x18]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x0004_0007
+        );
 
         let full = G17PPartialOpeningOuterChannelState {
             consumers: [0, 7],

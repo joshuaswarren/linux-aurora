@@ -1,4 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Phase 2 for the J700 radio: authorize DMA.
+ *
+ * The base DTB describes the APCIe host bridge well enough to train the link
+ * and enumerate both MT7932 functions, but gives it no IOMMU. Without one,
+ * dma_alloc_coherent() returns a raw physical address, and this machine has
+ * no RAM below 4 GiB at all, so mt7932_mcu_share_info_init() rejects the MCU
+ * share buffers with -ERANGE and mt7921e probe fails with -34.
+ *
+ * This overlay adds ONLY what the base DTB is missing. It deliberately does
+ * not restate reg, ranges, interrupts, interrupt-map, reset-gpios,
+ * pwren-gpios or power-domains: those already exist and are correct, and
+ * of_overlay would overwrite them. The phandle literals the previous revision
+ * of this file carried for them are stale against the DTB actually in use --
+ * power-domains was <0x7002> where the live value is 0x14, reset-gpios
+ * <0x1f ...> where it is 0x20, pwren-gpios <0x31 ...> where it is 0x3e --
+ * so restating them would replace working references with dangling ones.
+ *
+ * The two raw phandles kept below are on a node this overlay creates, and are
+ * the measured live values: 0x9 is the AIC, and interrupts/apertures are as
+ * recorded from the J700 ADT.
+ */
 /dts-v1/;
 /plugin/;
 
@@ -7,13 +29,19 @@
 		target-path = "/soc";
 
 		__overlay__ {
+			/*
+			 * Re-declared only so this overlay owns a label for the
+			 * node; iommu-map and iommus below reference it. See
+			 * j700_radio_overlay.c for why that reference needs help
+			 * to resolve against a node already in the live tree.
+			 */
 			dart_apcie: iommu@390000000 {
-				compatible = "apple,t8140-dart", "apple,t8110-dart";
-				reg = <0x3 0x90000000 0x0 0x20000>;
+				/*
+				 * Identical to the live value; restated only so
+				 * dtc can validate the iommus reference below
+				 * rather than warning that it is missing.
+				 */
 				#iommu-cells = <1>;
-				interrupt-parent = <0x9>;
-				interrupts = <0x0 0x4b6 0x4>;
-				power-domains = <0x7002>;
 				apple,force-available;
 			};
 
@@ -35,55 +63,19 @@
 					<0x0 0x40000000>;
 			};
 
-			pcie_radio: pcie@1cb0000000 {
-				compatible = "apple,t8140-pcie", "apple,t6020-pcie";
-				device_type = "pci";
-				reg = <0x1c 0xb0000000 0x0 0x10000000
-				       0x3 0x94000000 0x0 0x4000
-				       0x3 0x90028000 0x0 0x8000
-				       0x3 0x97020000 0x0 0x4000>;
-				reg-names = "config", "rc", "port0", "phy0";
-				interrupt-parent = <0x9>;
-				interrupts = <0x0 0x4b5 0x4>;
-				msi-controller;
-				msi-parent = <&pcie_radio>;
-				msi-ranges = <0x9 0x0 0x533 0x1 0x20>;
+			pcie@1cb0000000 {
 				iommu-map = <0x100 &dart_apcie 0x1 0x1
 					     0x101 &dart_apcie 0x2 0x1>;
 				iommu-map-mask = <0xffff>;
-				bus-range = <0x0 0x8>;
-				#address-cells = <3>;
-				#size-cells = <2>;
-				ranges = <0x43000000 0xb 0xc0000000
-					  0xb 0xc0000000 0x0 0x20000000
-					  0x02000000 0x0 0x80000000
-					  0xb 0x80000000 0x0 0x40000000>;
 				apple,valid-functions = <0x3>;
 				apple,endpoint-iova-address-bits = <32>;
-				dma-coherent;
 				apple,piodma = <&piodma_radio>;
-				power-domains = <0x7002>;
+				dma-coherent;
 
-				pcie_radio_port: pci@0,0 {
-					device_type = "pci";
-					reg = <0x0 0x0 0x0 0x0 0x0>;
-					reset-gpios = <0x1f 0x72 0x1>;
-					pwren-gpios = <0x31 0x8 0x0>;
-					maximum-link-speed = <2>;
+				pci@0,0 {
+					/* Identical to the live values; see above. */
 					#address-cells = <3>;
 					#size-cells = <2>;
-					ranges;
-					interrupt-controller;
-					#interrupt-cells = <1>;
-					interrupt-map-mask = <0x0 0x0 0x0 0x7>;
-					interrupt-map = <0x0 0x0 0x0 0x1
-							 &pcie_radio_port 0x0
-						 0x0 0x0 0x0 0x2
-							 &pcie_radio_port 0x1
-						 0x0 0x0 0x0 0x3
-							 &pcie_radio_port 0x2
-						 0x0 0x0 0x0 0x4
-							 &pcie_radio_port 0x3>;
 
 					wifi@0,0 {
 						compatible = "pci14c3,7932";

@@ -69,6 +69,8 @@ fn manager(records:Vec<Record>)->Manager{Manager{resources:Resources{records,pub
 thread_local! { static TIMEOUTS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) }; }
 impl Manager {
  fn log_async_compute_timeout(&mut self,q:&mut G17PSksmQueue){TIMEOUTS.with(|t|t.borrow_mut().push(q.completion_descriptor));}
+ // Opt-in diagnostic: reads driver-owned DRAM and logs it, never a register.
+ fn log_compute_usage_slot(&mut self,_q:&mut G17PSksmQueue,_phase:&str){}
  fn dump_compute_completion_records(&mut self,_label:&str)->Result{Ok(())}
 '''+manager_batch+r'''
 }

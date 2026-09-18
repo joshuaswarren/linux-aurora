@@ -49,6 +49,28 @@ pub(crate) struct TimestampDestination {
     pub(crate) offset: usize,
 }
 
+/// Rate of the command completion timestamps firmware records: its 24 MHz
+/// command-time counter, the architectural counter scaled to 24 MHz.
+pub(crate) const G17P_COMMAND_TIMESTAMP_HZ: u64 = 24_000_000;
+
+impl TimestampDestination {
+    /// Publish one firmware completion timestamp. UAPI timestamps are
+    /// nanoseconds, the unit `DRM_IOCTL_ASAHI_GET_TIME` reports.
+    pub(crate) fn write(&self, ticks: u64) -> Result {
+        const NSEC_PER_SEC: u64 = 1_000_000_000;
+        let timestamp = ticks / G17P_COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC
+            + ticks % G17P_COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / G17P_COMMAND_TIMESTAMP_HZ;
+        self.mapping.with_cpu_bytes(|bytes| {
+            let end = self.offset.checked_add(8).ok_or(EINVAL)?;
+            bytes.get_mut(self.offset..end).ok_or(EINVAL)?
+                .copy_from_slice(&timestamp.to_le_bytes());
+            Ok(())
+        })?;
+        fence(Ordering::Release);
+        Ok(())
+    }
+}
+
 pub(crate) struct G17PJobCompletion {
     pub(crate) status: Arc<crate::g17_status::VmStatus>,
     fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
@@ -106,12 +128,7 @@ impl G17PJobCompletion {
         let result = result.and_then(|timestamps| {
             for (destination, timestamp) in self.destinations.iter().zip(timestamps) {
                 if let Some(destination) = destination {
-                    destination.mapping.with_cpu_bytes(|bytes| {
-                        let end = destination.offset.checked_add(8).ok_or(EINVAL)?;
-                        bytes.get_mut(destination.offset..end).ok_or(EINVAL)?
-                            .copy_from_slice(&timestamp.to_le_bytes());
-                        Ok(())
-                    })?;
+                    destination.write(timestamp)?;
                 }
             }
             Ok(())
@@ -261,6 +278,9 @@ impl G17PRenderWatchPacket {
 
     pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
     pub(crate) fn render_slot(&self) -> u8 { self.render_slot }
+    pub(crate) fn completion(&self) -> &Arc<crate::g17_drm::G17PRenderCompletion> {
+        &self.completion
+    }
     pub(crate) fn fence(&self) -> Fence { self.completion.fence() }
 }
 

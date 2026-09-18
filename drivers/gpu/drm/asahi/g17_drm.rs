@@ -473,6 +473,8 @@ struct G17PLeaseGuard {
 /// fast return can hand the physical slot to another client before retirement.
 pub(crate) struct G17PRenderCompletion {
     fence: UserFence<G17PSubmissionFence>,
+    /// Vertex start/end and fragment start/end UAPI destinations.
+    timestamps: [Option<TimestampDestination>; 4],
     status: Arc<crate::g17_status::VmStatus>,
     lease: Arc<Mutex<Option<G17PLeaseGuard>>>,
     vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
@@ -482,6 +484,7 @@ pub(crate) struct G17PRenderCompletion {
 impl G17PRenderCompletion {
     fn new(
         fence: UserFence<G17PSubmissionFence>,
+        timestamps: [Option<TimestampDestination>; 4],
         status: Arc<crate::g17_status::VmStatus>,
         lease: G17PLeaseGuard,
         vm_job: mmu::T8140VmJobGuard,
@@ -496,6 +499,7 @@ impl G17PRenderCompletion {
         )?;
         Ok(Arc::new(Self {
             fence,
+            timestamps,
             status,
             lease,
             vm_job,
@@ -552,7 +556,24 @@ impl G17PRenderCompletion {
             return;
         }
         let result = result.and_then(|completion| {
-            if completion.complete { Ok(()) } else { Err(EIO) }
+            if !completion.complete {
+                return Err(EIO);
+            }
+            // The tiler stamps the pass start and the fragment stage its end;
+            // publish them before the fence lets userspace read the results.
+            let execution = completion.execution;
+            let observed = [
+                execution.tiling_timestamps[0],
+                execution.tiling_timestamps[1],
+                execution.fragment_timestamps[0],
+                execution.fragment_timestamps[1],
+            ];
+            for (destination, timestamp) in self.timestamps.iter().zip(observed) {
+                if let Some(destination) = destination {
+                    destination.write(timestamp)?;
+                }
+            }
+            Ok(())
         });
         if let Err(error) = result {
             self.status.record(error.to_errno());
@@ -695,7 +716,18 @@ impl DrmGpu for G17PDrmGpu {
     }
 
     fn base_clock_hz(&self) -> u32 {
-        24_000_000
+        // `DRM_IOCTL_ASAHI_GET_TIME` scales CNTPCT_EL0 by this rate. T8140
+        // runs the architectural counter at its own CNTFRQ_EL0, not at the
+        // GPU's 24 MHz command timestamp rate.
+        let frequency: u64;
+        // SAFETY: CNTFRQ_EL0 is a read-only system register.
+        unsafe {
+            core::arch::asm!(
+                "mrs {x}, CNTFRQ_EL0",
+                x = out(reg) frequency
+            );
+        }
+        frequency as u32
     }
 
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm> {
@@ -852,20 +884,40 @@ pub(crate) struct G17PRenderWatchBackend {
     runtime: G17PRuntimeRef,
 }
 
+/// Scheduler teardown is not evidence that a published GPU job failed.
+/// Keep its owner alive and let the RTKit worker retire the hardware fence.
+/// This runs only at queue destruction, with no runtime mutex held, and is
+/// uninterruptible because the exiting task already has a fatal signal.
+/// Use the same finite bound as the render scheduler's watchdog; a genuinely
+/// stuck job still reaches the existing final-observation/quarantine path.
+fn wait_for_render_teardown(fence: &Fence) -> bool {
+    // SAFETY: The retained Fence reference lives across the entire wait.
+    unsafe {
+        bindings::dma_fence_wait_timeout(
+            fence.raw(),
+            false,
+            kernel::time::msecs_to_jiffies(2000) as _,
+        ) > 0
+    }
+}
+
 impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
     fn timed_out(
         &self,
         packet: Arc<g17_job::G17PRenderWatchPacket>,
     ) -> kernel::drm::sched::Status {
         self.runtime.mutex().lock().timeout_deferred_render(
-            packet.render_slot(), packet.submission_id(), ETIMEDOUT,
+            packet.render_slot(), packet.submission_id(), packet.completion(), ETIMEDOUT,
         );
         kernel::drm::sched::Status::Nominal
     }
 
     fn cancel(&self, packet: Arc<g17_job::G17PRenderWatchPacket>) {
+        if wait_for_render_teardown(&packet.fence()) {
+            return;
+        }
         self.runtime.mutex().lock().timeout_deferred_render(
-            packet.render_slot(), packet.submission_id(), ECANCELED,
+            packet.render_slot(), packet.submission_id(), packet.completion(), ETIMEDOUT,
         );
     }
 }
@@ -1402,42 +1454,6 @@ impl G17PQueue {
         Ok(())
     }
 
-    fn timestamp_address(
-        objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
-        vm: &mmu::Vm,
-        timestamp: g17_uapi::UapiTimestamp,
-        aliases: &mut KVec<mmu::KernelMapping>,
-    ) -> Result<u64> {
-        if timestamp.handle == 0 {
-            return Ok(0);
-        }
-        let guard = objects.lock();
-        let object = guard
-            .get(timestamp.handle.try_into()?)
-            .ok_or(ENOENT)?
-            .clone();
-        core::mem::drop(guard);
-        match object {
-            file::Object::TimestampBuffer(mapping) => {
-                let end = timestamp.offset.checked_add(8).ok_or(EINVAL)? as usize;
-                if end > mapping.size() {
-                    return Err(ERANGE);
-                }
-                let alias = mapping.map_alias_into_range(
-                    vm,
-                    T8140_TIMESTAMP_ALIAS_RANGE.clone(),
-                    mmu::PROT_GPU_FW_SHARED_RW,
-                )?;
-                let address = alias
-                    .iova()
-                    .checked_add(timestamp.offset as u64)
-                    .ok_or(EINVAL)?;
-                aliases.push(alias, GFP_KERNEL)?;
-                Ok(address)
-            }
-        }
-    }
-
     fn timestamp_destination(
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         timestamp: g17_uapi::UapiTimestamp,
@@ -1464,16 +1480,7 @@ impl G17PQueue {
     }
 
     fn copy_timestamp(destination: Option<TimestampDestination>, value: u64) -> Result {
-        let Some(destination) = destination else {
-            return Ok(());
-        };
-        destination.mapping.with_cpu_bytes(|raw| {
-            let end = destination.offset.checked_add(8).ok_or(EINVAL)?;
-            let bytes = raw.get_mut(destination.offset..end).ok_or(ERANGE)?;
-            bytes.copy_from_slice(&value.to_le_bytes());
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            Ok(())
-        })
+        destination.map_or(Ok(()), |destination| destination.write(value))
     }
 
     fn owned_compute_timestamps(&self) -> Result<mmu::KernelMapping> {
@@ -2282,36 +2289,19 @@ impl G17PQueue {
         let lease = self.acquire_ready_lease(submission_id, &syncs[..in_sync_count])?;
         match pending {
             G17PPendingCommand::Render(translated) => {
-                let mut timestamp_aliases = KVec::new();
+                // Firmware writes caller timestamp pointers only inside its
+                // dedicated timestamp aperture, which this driver does not
+                // configure. Publish the pass envelope the completion observes
+                // instead, as compute publishes its completion record.
                 let timestamps = [
-                    Self::timestamp_address(
-                        objects,
-                        &self.vm,
-                        translated.vertex_timestamps.start,
-                        &mut timestamp_aliases,
-                    )
-                    .map_err(|error| Self::stage_fail(submission_id, "ts-vtx-start", error))?,
-                    Self::timestamp_address(
-                        objects,
-                        &self.vm,
-                        translated.vertex_timestamps.end,
-                        &mut timestamp_aliases,
-                    )
-                    .map_err(|error| Self::stage_fail(submission_id, "ts-vtx-end", error))?,
-                    Self::timestamp_address(
-                        objects,
-                        &self.vm,
-                        translated.fragment_timestamps.start,
-                        &mut timestamp_aliases,
-                    )
-                    .map_err(|error| Self::stage_fail(submission_id, "ts-frag-start", error))?,
-                    Self::timestamp_address(
-                        objects,
-                        &self.vm,
-                        translated.fragment_timestamps.end,
-                        &mut timestamp_aliases,
-                    )
-                    .map_err(|error| Self::stage_fail(submission_id, "ts-frag-end", error))?,
+                    Self::timestamp_destination(objects, translated.vertex_timestamps.start)
+                        .map_err(|error| Self::stage_fail(submission_id, "ts-vtx-start", error))?,
+                    Self::timestamp_destination(objects, translated.vertex_timestamps.end)
+                        .map_err(|error| Self::stage_fail(submission_id, "ts-vtx-end", error))?,
+                    Self::timestamp_destination(objects, translated.fragment_timestamps.start)
+                        .map_err(|error| Self::stage_fail(submission_id, "ts-frag-start", error))?,
+                    Self::timestamp_destination(objects, translated.fragment_timestamps.end)
+                        .map_err(|error| Self::stage_fail(submission_id, "ts-frag-end", error))?,
                 ];
                 if crate::util::g17p_verbose() {
                     pr_info!(
@@ -2327,6 +2317,7 @@ impl G17PQueue {
                     .into();
                 let completion = G17PRenderCompletion::new(
                     hardware_fence,
+                    timestamps,
                     self.vm.status().clone(),
                     lease,
                     vm_job,
@@ -2341,26 +2332,24 @@ impl G17PQueue {
                         true,
                         self.context.clone(),
                         &translated,
-                        timestamps,
-                        timestamp_aliases,
                         completion.clone(),
                     );
                 sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
                 if let Err(error) = submit {
                     self.runtime.mutex().lock().timeout_deferred_render(
-                        render_slot, submission_id, error,
+                        render_slot, submission_id, &completion, error,
                     );
                     return Err(Self::stage_fail(
                         submission_id, "submit-translated-render", error,
                     ));
                 }
                 let packet = match g17_job::G17PRenderWatchPacket::new(
-                    submission_id, render_slot, completion,
+                    submission_id, render_slot, completion.clone(),
                 ) {
                     Ok(packet) => packet,
                     Err(error) => {
                         self.runtime.mutex().lock().timeout_deferred_render(
-                            render_slot, submission_id, error,
+                            render_slot, submission_id, &completion, error,
                         );
                         return Err(Self::stage_fail(
                             submission_id, "allocate-render-watch", error,
@@ -2371,7 +2360,7 @@ impl G17PQueue {
                     Ok(fence) => fence,
                     Err(error) => {
                         self.runtime.mutex().lock().timeout_deferred_render(
-                            render_slot, submission_id, error,
+                            render_slot, submission_id, &completion, error,
                         );
                         return Err(Self::stage_fail(
                             submission_id, "schedule-render-watch", error,

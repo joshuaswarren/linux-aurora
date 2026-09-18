@@ -1,0 +1,17 @@
+MT7932 host protocol and lifecycle regression tests
+=================================================
+
+Run with Python 3 and a host C compiler (no Apple hardware needed):
+
+    for test in tools/testing/selftests/mt7932/test_*.py; do
+        python "$test" || exit
+    done
+
+These tests compile the actual driver parsers/callbacks with host mocks and
+ASan/UBSan. They were moved into the kernel series from the cleanroom enablement
+repository so that a kernel-only checkout retains the self-contained coverage.
+They do not prove DMA coherency, RF behavior or physical device operation.
+
+Additional own-device calibration, stock configuration and regulatory fixture
+tests remain in linux-enablement-mac-alpha/tests; they require its extraction
+tools and local opaque firmware inputs. Those fixtures are not redistributed.
