@@ -95,6 +95,7 @@ pub(crate) struct SensorProfile {
 /// lenient T6020 enclave accepts there; macOS carries the type in the third
 /// word instead. Kept per-SoC so the strict path is correct without disturbing
 /// the proven T6020 encoding (hardware-verified for enrol, match, and reboot).
+#[derive(Clone, Copy)]
 pub(crate) struct KeybagCreate {
     /// First word: request variant, echoed back in the reply.
     pub(crate) variant: u32,
@@ -104,6 +105,20 @@ pub(crate) struct KeybagCreate {
     /// Fourth word: create argument / parent handle.
     pub(crate) arg: i32,
 }
+
+/// The two known CREATE_KEYBAG encodings, selectable at load time on a board
+/// whose enclave has not been observed yet (`keybag_encoding=`): 1 = strict
+/// (macOS: bag type in the third word), 2 = lenient (T6020: variant first).
+pub(crate) const KEYBAG_CREATE_STRICT: KeybagCreate = KeybagCreate {
+    variant: 0,
+    bag_type: 0x20000,
+    arg: 0,
+};
+pub(crate) const KEYBAG_CREATE_LENIENT: KeybagCreate = KeybagCreate {
+    variant: 5,
+    bag_type: 0,
+    arg: -1,
+};
 
 pub(crate) struct PlatformProfile {
     pub(crate) name: &'static str,

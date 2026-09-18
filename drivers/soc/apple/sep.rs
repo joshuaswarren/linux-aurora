@@ -2197,6 +2197,10 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        keybag_encoding: u8 {
+            default: 0,
+            description: "CREATE_KEYBAG field encoding: 0 = the platform profile's, 1 = strict (macOS, bag type in the third word), 2 = lenient (T6020, variant in the first word)",
+        },
         sensor_probe_only: u8 {
             default: 0,
             description: "Bring-up diagnostics: on the first open of the biometric device run the sensor bring-up (rails, identifier, patch, calibration, parameters) without a keybag and leave Touch ID inactive",
