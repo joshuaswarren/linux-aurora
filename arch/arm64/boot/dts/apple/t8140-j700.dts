@@ -261,6 +261,25 @@
 			#address-cells = <1>;
 			#size-cells = <1>;
 
+			/*
+			 * ADT /arm-io/qspi/spinor/syscfg reg: <0x0 0x2000>, <0x4000 0x20000>
+			 * ("diagnostic-data,format1"): the factory station log ("iPCB"
+			 * records) and an erased area.  The per-device calibration (FDR)
+			 * is not here; it lives on the NVMe Hardware APFS volume.  Exposed
+			 * read-only for diagnostics; nothing may write these ranges.
+			 */
+			syscfg_hdr: partition@0 {
+				label = "syscfg-hdr";
+				reg = <0x0 0x2000>;
+				read-only;
+			};
+
+			syscfg: partition@4000 {
+				label = "syscfg";
+				reg = <0x4000 0x20000>;
+				read-only;
+			};
+
 			nvram: partition@24000 {
 				label = "nvram";
 				reg = <0x24000 0x1d0000>;
