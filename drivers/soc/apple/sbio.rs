@@ -823,6 +823,19 @@ impl SepData {
                 e
             );
         })?;
+        // Bring-up diagnostics for a new board: exercise the sensor path (rails,
+        // SPI status and identifier, patch, calibration, parameters) without a
+        // keybag, i.e. without any xART write, and leave Touch ID inactive.
+        if *module_parameters::sensor_probe_only.value() != 0 {
+            let online = self.bring_sensor_online();
+            dev_info!(
+                self.dev,
+                "sensor probe only: sensor bring-up {}; Touch ID left inactive (no keybag needed)\n",
+                if online { "SUCCEEDED" } else { "FAILED" }
+            );
+            let _ = sensor::idle();
+            return Err(ENOENT);
+        }
         let stored = match keybag::read(keybag::Slot::Identity) {
             Ok(keybag::State::Present(stored)) => stored,
             Ok(keybag::State::Absent(_)) => {

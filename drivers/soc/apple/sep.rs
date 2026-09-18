@@ -2197,5 +2197,9 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        sensor_probe_only: u8 {
+            default: 0,
+            description: "Bring-up diagnostics: on the first open of the biometric device run the sensor bring-up (rails, identifier, patch, calibration, parameters) without a keybag and leave Touch ID inactive",
+        },
     },
 }
