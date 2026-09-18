@@ -1449,6 +1449,19 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * Resuming from the H17P soft power-off (see iomfb_poweroff): the
+	 * pipe never went down, so there is no power state to restore; the
+	 * next swap re-applies the backlight level.
+	 */
+	if (dcp->brightness.soft_off) {
+		dcp->brightness.soft_off = false;
+		dev_info(dcp->dev, "dcp_poweron() from soft power-off: pipe was never down\n");
+		return;
+	}
+#endif
+
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
@@ -1557,6 +1570,38 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *poff_cookie;
 	struct DCP_FW_NAME(dcp_swap_start_req) swap_req = { 0 };
 	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * The pre-H17P power-off -- a swap that unbinds every surface, then
+	 * A473 power 0 -- kills this firmware: with no surface bound the pipe
+	 * fetches from a null base, the display DART rejects it and the
+	 * coprocessor panics ("panic(app): app NMI, pidx: 1", crashlog on
+	 * endpoint 1, then A466/A406 never answered; J700 hb94, sway
+	 * "output * power off").  Cutting the backlight supply from the AP
+	 * (SMC pmBL) while the pipe runs is just as fatal ("IOMFB
+	 * int_handler_gated: failure: axi_rd_err [0x40300000]" five
+	 * milliseconds later, hb95), and so is re-presenting the last frame
+	 * at 0 nits from here, outside a live commit (the firmware answers
+	 * "send_brightness: dbv: 0" and takes the same axi_rd_err at
+	 * +0x34 14 ms later, hb99) -- while the very same 0-nits level
+	 * requested through the backlight device on a live pipe is clean
+	 * (hb94: 2.27 W gone at 210 nits, no send_brightness, no crash).
+	 * Only a reboot brings the panel back from any of the three.
+	 *
+	 * So a DPMS-off does nothing to the coprocessor at all: the pipe
+	 * keeps scanning out the last frame at the current level, and the
+	 * power saving belongs to the backlight device (a session idle hook
+	 * setting brightness 0 and restoring it), which is the path the
+	 * firmware handles.
+	 */
+	if (dcp_has_panel(dcp)) {
+		dcp->brightness.soft_off = true;
+		dev_info(dcp->dev,
+			 "DPMS off: keeping the H17P pipe up at the current level (the firmware panics on every off path; dim through the backlight device instead)\n");
+		return;
+	}
+#endif
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
@@ -2063,6 +2108,28 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (!new_state->fb || !new_state->visible) {
 			continue;
 		}
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		/*
+		 * The firmware fetches straight from the display DART; a
+		 * surface it cannot translate is the app NMI of
+		 * iomfb_poweroff.  Check the surface's first and last page in
+		 * the display domain before handing the address over, and
+		 * keep the last good surface instead of a refused one.
+		 */
+		if (dcp->disp_iommu_dom && apple_state->surf.buf_size) {
+			dma_addr_t first = apple_state->iova;
+			dma_addr_t last = first + apple_state->surf.buf_size - 1;
+
+			if (!iommu_iova_to_phys(dcp->disp_iommu_dom, first) ||
+			    !iommu_iova_to_phys(dcp->disp_iommu_dom, last)) {
+				dev_warn_ratelimited(dcp->dev,
+					"fb %u: surface %pad+%#x is not mapped in the display DART, not scanning it out\n",
+					new_state->fb->base.id, &first,
+					apple_state->surf.buf_size);
+				continue;
+			}
+		}
+#endif
 		req->surf_null[l] = false;
 		has_surface = 1;
 
@@ -2098,6 +2165,20 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.bg_color = 0xFF000000;
 		req->clear = 1;
 	}
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * A swap with no surface at all makes this firmware fetch from a null
+	 * base and take the app NMI described in iomfb_poweroff.  Keep the
+	 * last surface on the panel instead and let the commit complete.
+	 */
+	if (!has_surface) {
+		dev_warn_once(dcp->dev,
+			      "refusing a surface-less swap on H17P; keeping the last surface\n");
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
+#endif
 
 	if (has_surface && dcp->use_timestamps) {
 		/*

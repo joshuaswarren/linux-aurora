@@ -116,13 +116,11 @@ struct dcp_brightness {
 	bool update;
 	/* H17P: the level the firmware last reported in D006, in millinits */
 	u32 h17p_reported_millinits;
-	/* H17P: optional backlight supply switch through the SMC (pmBL) */
-	struct apple_smc *smc;
-	bool smc_on;
+	/* H17P: DPMS off leaves the pipe (and the level) alone */
+	bool soft_off;
 };
 
 struct audiosrv_data;
-struct apple_smc;
 
 /** laptop/AiO integrated panel parameters from DT */
 struct dcp_panel {
