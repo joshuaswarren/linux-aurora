@@ -53,6 +53,15 @@ static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 	memcpy(&off, p_off, RTC_BYTES);
 	kfree(p_off);
 
+	/*
+	 * No offset has ever been stored: the raw counter is time since the SMC
+	 * first powered up, not wall-clock time (it reads as 1971). Report the
+	 * time as invalid so hctosys leaves the system clock alone instead of
+	 * setting it decades into the past.
+	 */
+	if (!off)
+		return -EINVAL;
+
 	/* Sign extend from 48 to 64 bits, then arithmetic shift right 15 bits to get seconds */
 	now = sign_extend64(ctr + off, RTC_BITS - 1) >> RTC_SEC_SHIFT;
 	rtc_time64_to_tm(now, tm);
