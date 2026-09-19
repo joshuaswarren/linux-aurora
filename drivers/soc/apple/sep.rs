@@ -1600,6 +1600,10 @@ impl SepData {
 
     fn establish_scrd_match_context(&self, user: crate::sbio::UserId) {
         if !self.scrd_ready() {
+            dev_warn!(
+                self.dev,
+                "scrd: endpoint unavailable; no match context can be established\n"
+            );
             return;
         }
         let Some(du) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) else {
@@ -1613,7 +1617,7 @@ impl SepData {
             }
         };
 
-        let _ = (|| -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        let acm = (|| -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
             let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize())?;
             if status != 0 {
                 return None;
@@ -1636,6 +1640,15 @@ impl SepData {
             self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
             Some(acm_handle)
         })();
+        if acm.is_some() {
+            dev_info!(self.dev, "scrd: match context established for user {}\n", user.value());
+        } else {
+            dev_warn!(
+                self.dev,
+                "scrd: no match context for user {} (a step answered non-zero or the endpoint is absent); the enclave's match arm asserts one\n",
+                user.value()
+            );
+        }
     }
 
 
@@ -2204,6 +2217,10 @@ module! {
         os_uuid_lo: u64 {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
+        },
+        session_mode: u32 {
+            default: 0,
+            description: "Pin the SBIO session-share mode word (0 = try the known enumeration, starting with the built-in 1). The whole request is this word; the enclave answers 0x16 for a value it does not take.",
         },
         keybag_encoding: u8 {
             default: 0,
