@@ -577,6 +577,8 @@ struct SepData {
     sbio_ready: Atomic<bool>,
     /// Set once the enclave has handed out a sensor session share.
     session_established: Atomic<bool>,
+    /// Set once the Mesa Secure Root Key has been accepted this SEP boot.
+    msrk_loaded: Atomic<bool>,
 
     templates_restored: Atomic<bool>,
 
@@ -808,6 +810,7 @@ impl SepData {
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
                 sbio_ready: Atomic::new(false),
                 session_established: Atomic::new(false),
+                msrk_loaded: Atomic::new(false),
                 sensor_present: Atomic::new(false),
                 bio_session <- new_mutex!(bio::Session::new()),
                 bio_index <- new_mutex!(bio_index),
@@ -2220,6 +2223,10 @@ module! {
         os_uuid_lo: u64 {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
+        },
+        send_msrk: u8 {
+            default: 1,
+            description: "Load the Mesa Secure Root Key (SBIO 0x86) from apple/msrk-j700.bin before the key exchange; the enclave refuses the session with 0x16 without it.",
         },
         platform_serial: u8 {
             default: 1,
