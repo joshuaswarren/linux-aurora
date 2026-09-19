@@ -388,11 +388,12 @@ impl SepData {
         }
     }
 
-    fn restore_all_components(&self) -> bool {
+    fn restore_all_components(&self) -> RestoreSummary {
         // 0x6b is re-read before every component, not once up front.
         let user_id = SBIO_PROBE_USER_ID;
         let mut any = false;
         let mut missing_files = false;
+        let mut all_absent = true;
         let mut user_outcome = RestoreOutcome::NoStoredFile;
 
         // 0x8002 (cold transition) is a success only on the owner component.
@@ -412,14 +413,20 @@ impl SepData {
             (user_id, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb", false),
         ] {
             let Some(reply) = self.read_component_states() else {
-                return false;
+                return RestoreSummary {
+                    restored: false,
+                    never_enrolled: false,
+                };
             };
             let states = crate::sbio::ComponentStates::new(&reply);
             let outcome = self.restore_catacomb(states.state_for(id), id, kind, what, cold_ok);
             match outcome {
-                RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => any = true,
+                RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => {
+                    any = true;
+                    all_absent = false;
+                }
                 RestoreOutcome::NoStoredFile => missing_files = true,
-                RestoreOutcome::Failed | RestoreOutcome::EmptyTolerated => {}
+                RestoreOutcome::Failed | RestoreOutcome::EmptyTolerated => all_absent = false,
             }
             if id == user_id {
                 user_outcome = outcome;
@@ -431,16 +438,28 @@ impl SepData {
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive
         );
         let lockout = match self.restore_lockout() {
-            RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => true,
-            RestoreOutcome::EmptyTolerated => true,
+            RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => {
+                all_absent = false;
+                true
+            }
+            RestoreOutcome::EmptyTolerated => {
+                all_absent = false;
+                true
+            }
             RestoreOutcome::NoStoredFile => {
                 missing_files = true;
                 false
             }
-            RestoreOutcome::Failed => false,
+            RestoreOutcome::Failed => {
+                all_absent = false;
+                false
+            }
         };
 
-        if missing_files {
+        let restored = user_ok && lockout;
+        let never_enrolled = !restored && all_absent;
+
+        if missing_files && !never_enrolled {
             dev_warn!(
                 self.dev,
                 "sbio: at least one of four artefacts has no file on disk; if enrolled before the four-artefact save, re-enrol once to write all four\n"
@@ -448,7 +467,10 @@ impl SepData {
         }
 
         let _ = any;
-        user_ok && lockout
+        RestoreSummary {
+            restored,
+            never_enrolled,
+        }
     }
 
     fn read_component_states(&self) -> Option<KVec<u8>> {
@@ -2186,14 +2208,27 @@ impl SepData {
     }
 
     fn ensure_restored_after(&self, _prepared: bool) {
-        let restored = self.restore_all_components();
-        self.templates_restored.store(restored, Relaxed);
-        if !restored {
+        let summary = self.restore_all_components();
+        self.templates_restored.store(summary.restored, Relaxed);
+        if !summary.restored && !summary.never_enrolled {
             dev_err!(
                 self.dev,
                 "matching unavailable this boot: restore did not complete, enclave holds no template (every match refused 0x1). Not the sensor or the finger; on-disk enrolments intact\n"
             );
             return;
+        }
+        if !summary.restored {
+            // No artefact exists yet: this machine has never enrolled. There is
+            // nothing to restore, which is not a failure, and returning here
+            // would skip the two enclave-side steps below -- so the designated
+            // user keybag would stay locked and no ACM context would exist, and
+            // the sensor session the first enrolment needs is refused (SBIO
+            // SESSION_SHARE answers 0x16). Matching stays unavailable until a
+            // template exists, which `templates_restored` already reflects.
+            dev_info!(
+                self.dev,
+                "sbio: no catacomb artefacts exist yet (never enrolled on this machine); preparing the enclave-side user context for a first enrolment\n"
+            );
         }
 
         if self.keybag_designated.load(Relaxed) {
