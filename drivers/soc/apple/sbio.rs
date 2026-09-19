@@ -1312,6 +1312,41 @@ impl SepData {
             );
         }
 
+        // The enclave will not open a session until the Mesa Secure Root Key is
+        // loaded, and it must follow 0x80 + 0x17 because the decryption label is
+        // built from the sensor serial.
+        if !self.msrk_loaded.load(Relaxed) && *module_parameters::send_msrk.value() != 0 {
+            let name = c"apple/msrk-j700.bin";
+            match kernel::firmware::Firmware::request(name, &self.dev) {
+                Ok(fw) if fw.data().len() == crate::sbio::SBIO_MSRK_LEN => {
+                    let mut blob = [0u8; crate::sbio::SBIO_MSRK_LEN];
+                    blob.copy_from_slice(fw.data());
+                    match self.sbio_call(&crate::sbio::sbio_set_msrk(&blob)) {
+                        SbioOutcome::Ok(_) => {
+                            self.msrk_loaded.store(true, Relaxed);
+                            dev_info!(self.dev, "sensor: Mesa Secure Root Key loaded\n");
+                        }
+                        _ => dev_err!(
+                            self.dev,
+                            "sensor: the enclave refused the Mesa Secure Root Key; the session will be refused with 0x16\n"
+                        ),
+                    }
+                }
+                Ok(fw) => dev_err!(
+                    self.dev,
+                    "sensor: {} is {} bytes, expected {}\n",
+                    name,
+                    fw.data().len(),
+                    crate::sbio::SBIO_MSRK_LEN
+                ),
+                Err(e) => dev_err!(
+                    self.dev,
+                    "sensor: the Mesa Secure Root Key blob is missing ({:?}); it is per-device data carved from FDR class MSRk and cannot be synthesised\n",
+                    e
+                ),
+            }
+        }
+
         self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
 
         // macOS: prepareSession() issues no SBIO traffic of its own, so the key
@@ -2877,6 +2912,23 @@ pub(crate) fn sbio_register_nonce(nonce: &[u8; 32]) -> SbioOp {
         payload: pad_payload(nonce),
         payload_len: 32,
         name: c"REGISTER_NONCE",
+    }
+}
+
+/// The Mesa Secure Root Key: 72 bytes of per-device material, sealed to this
+/// sensor's serial, that the enclave requires before it will open a biometric
+/// session.  sepOS's 0x15 handler tests the "MSRk loaded" flag as its very
+/// first act and answers 0x16 when it is clear; the flag lives in __zerofill,
+/// so this has to be sent once per SEP boot.  macOS reads the blob from FDR
+/// class mesa_fdr and sends it as SBIO 0x86 (AppleMesaSEPDriver::setMSRkData).
+const OP_SBIO_SET_MSRK: u16 = 0x86;
+pub(crate) const SBIO_MSRK_LEN: usize = 72;
+pub(crate) fn sbio_set_msrk(blob: &[u8; SBIO_MSRK_LEN]) -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_SET_MSRK,
+        payload: pad_payload(blob),
+        payload_len: SBIO_MSRK_LEN,
+        name: c"SET_MSRK",
     }
 }
 
