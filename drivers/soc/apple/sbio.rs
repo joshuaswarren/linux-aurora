@@ -1399,12 +1399,12 @@ impl SepData {
     /// Register the sensor nonce with the enclave (macOS's second identifier
     /// message for this sensor class).
     fn register_sensor_nonce(&self) -> bool {
-        let cmd = *module_parameters::nonce_cmd.value();
+        let mut cmd = *module_parameters::nonce_cmd.value();
         if cmd == 0 {
-            return true;
+            cmd = sensor::NONCE_CMD;
         }
-        let nonce = match sensor::read_sensor_nonce(cmd) {
-            Ok(n) => n,
+        let read = match sensor::read_sensor_nonce(cmd) {
+            Ok(r) => r,
             Err(e) => {
                 dev_err!(
                     self.dev,
@@ -1415,6 +1415,22 @@ impl SepData {
                 return false;
             }
         };
+        dev_info!(
+            self.dev,
+            "sensor: nonce command {:#04x}: status byte {:#04x}, {} bytes available, head {}\n",
+            cmd,
+            read.status_byte,
+            read.available,
+            crate::Hex(&read.head)
+        );
+        let Some(nonce) = read.nonce else {
+            dev_warn!(
+                self.dev,
+                "sensor: no nonce payload was produced; not registering one\n"
+            );
+            return false;
+        };
+        dev_info!(self.dev, "sensor: nonce {}\n", crate::Hex(&nonce));
         match self.sbio_call(&crate::sbio::sbio_register_nonce(&nonce)) {
             SbioOutcome::Ok(_) => {
                 dev_info!(self.dev, "sensor: nonce registered with the enclave\n");
