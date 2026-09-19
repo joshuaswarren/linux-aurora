@@ -1131,6 +1131,43 @@ impl AopData {
         Ok(())
     }
 
+    /// Log every key the AOP's bootargs arena holds, with its size and value.
+    /// Read-only: the arena is copied out and never written back.
+    fn dump_bootargs(&self, aop_mmio: &IoMem<AOP_MMIO_SIZE>) -> Result<()> {
+        let aop_mmio = aop_mmio.relaxed();
+        let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
+        let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
+        dev_info!(self.dev, "aop bootargs arena: offset {:#x} size {:#x}\n", offset, size);
+        if size == 0 || size > 0x10000 {
+            dev_info!(self.dev, "aop bootargs: arena not exposed at this MMIO layout\n");
+            return Ok(());
+        }
+        let mut arg_bytes = KVec::<u8>::from_elem(0, size, GFP_KERNEL)?;
+        aop_mmio.try_memcpy_fromio(&mut arg_bytes, offset)?;
+        let mut idx = 0;
+        while idx + 8 <= size {
+            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
+            let vsize = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+            idx += 8;
+            if vsize == 0 || idx + vsize > size {
+                break;
+            }
+            let mut val = [0u8; 8];
+            let n = core::cmp::min(vsize, 8);
+            val[..n].copy_from_slice(&arg_bytes[idx..idx + n]);
+            let k = key.to_le_bytes();
+            dev_info!(
+                self.dev,
+                "aop bootarg {}{}{}{} size {} = {:#x}\n",
+                k[3] as char, k[2] as char, k[1] as char, k[0] as char,
+                vsize,
+                u64::from_le_bytes(val),
+            );
+            idx += vsize;
+        }
+        Ok(())
+    }
+
     fn patch_bootargs(
         &self,
         aop_mmio: &IoMem<AOP_MMIO_SIZE>,
@@ -1598,6 +1635,24 @@ impl platform::Driver for AopDriver {
                     (from_fourcc(b"AOPt"), cfg.aopt),
                 ],
             )?;
+        } else {
+            // T8140 has never had its AOP bootargs touched, so the firmware runs
+            // with whatever iBoot left -- including `nCal`, the flag the ADT
+            // mirrors as `als-new-calibration-path = 1`.  On the older parts the
+            // driver forces `nCal = 0`, which is the path that takes a
+            // host-supplied ALS calibration; here the ALS accepts a calibration
+            // and an interval with rc 0 and then never reports, which is what a
+            // firmware on the *other* path would do.  Dumping the arena and
+            // patching that one key are both opt-in, because this AOP also owns
+            // the speakers and the microphones.
+            if *module_parameters::dump_bootargs.value() != 0 {
+                let _ = data.dump_bootargs(aop_mmio);
+            }
+            let ncal = *module_parameters::t8140_ncal.value();
+            if ncal != u32::MAX {
+                dev_info!(pdev.as_ref(), "aop: patching T8140 bootarg nCal = {:#x}\n", ncal);
+                data.patch_bootargs(aop_mmio, &[(from_fourcc(b"nCal"), ncal as u64)])?;
+            }
         }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
         *data.rtkit.lock() = Some(rtkit);
@@ -1672,6 +1727,14 @@ module_platform_driver! {
         report_trace: u8 {
             default: 0,
             description: "Log fakehid reports that match no registered listener, so a sensor that produces nothing can be told from one reporting on another endpoint or channel",
+        },
+        dump_bootargs: u8 {
+            default: 0,
+            description: "Log every key in the AOP's bootargs arena at probe (read-only); T8140 only, where the driver otherwise never reads them",
+        },
+        t8140_ncal: u32 {
+            default: 0xffffffff,
+            description: "Patch the T8140 AOP bootarg nCal to this value before the AOP CPU starts; 0 selects the host-supplied ALS calibration path the older parts use, 0xffffffff leaves iBoot's value alone",
         },
     },
 }

@@ -51,14 +51,38 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
     // that does need the blob simply reports uncalibrated lux until it is
     // supplied, which is visible and recoverable.
     if let Ok(fw) = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
-        set_als_property(aop, svc, 0xb, fw.data())?;
+        let rc = set_als_property(aop, svc, 0xb, fw.data())?;
+        dev_info!(dev.as_ref(), "als: CALIBRATION (0xb) {} bytes -> rc {:#x}\n", fw.data().len(), rc);
     } else {
         dev_warn!(
             dev.as_ref(),
             "apple/aop-als-cal.bin is absent; enabling the sensor without pushing a calibration (the AOP may hold its own)\n"
         );
     }
-    set_als_property(aop, svc, 0, &200000u32.to_le_bytes())?;
+    // The AOP answers the calibration and interval writes with rc 0 and then
+    // sends no reports at all.  macOS's ALS driver knows two more property keys
+    // that we have never written -- MODE (0xd7) and 0xe4 -- so expose them, and
+    // the verbosity key, as load-time knobs: one of them is what arms a part on
+    // the `als-new-calibration-path` generation.  u32::MAX means "leave alone",
+    // and a write that the AOP rejects is logged rather than failing the probe,
+    // so a sweep can run without losing the iio device.
+    let try_prop = |tag: u32, val: u32, name: &'static str| {
+        if val == u32::MAX {
+            return;
+        }
+        match set_als_property(aop, svc, tag, &val.to_le_bytes()) {
+            Ok(rc) => dev_info!(dev.as_ref(), "als: {} ({:#x}) = {:#x} -> rc {:#x}\n", name, tag, val, rc),
+            Err(e) => dev_info!(dev.as_ref(), "als: {} ({:#x}) = {:#x} -> error {:?}\n", name, tag, val, e),
+        }
+    };
+
+    try_prop(0xe1, *module_parameters::set_verbosity.value(), "VERBOSITY");
+    try_prop(0xd7, *module_parameters::set_mode.value(), "MODE");
+    try_prop(0xe4, *module_parameters::set_unke4.value(), "UNKE4");
+
+    let ivl = *module_parameters::interval_us.value();
+    let rc = set_als_property(aop, svc, 0, &ivl.to_le_bytes())?;
+    dev_info!(dev.as_ref(), "als: INTERVAL (0x0) = {} us -> rc {:#x}\n", ivl, rc);
 
     Ok(())
 }
@@ -181,10 +205,16 @@ impl platform::Driver for IIOAopAlsDriver {
             // machine.  Ask it what it actually exposes: property 0xf is the
             // part name, and the neighbours carry the sampling state and, on a
             // generation that holds its own calibration, the calibration too.
-            for tag in 0u32..0x80 {
-                match get_aop_property(adata.as_ref(), &service, tag, 64) {
+            // Sweep the whole 8-bit tag space, not just the low half: the
+            // ALS property keys macOS uses (MODE 0xd7, VERBOSITY 0xe1, 0xe4)
+            // all live above 0x80 and had never been read.  Ask for a large
+            // buffer too -- a CT720-shaped calibration is 145 bytes, so a
+            // 64-byte request would have truncated or missed one.
+            let plen = *module_parameters::prop_len.value() as usize;
+            for tag in 0u32..0x100 {
+                match get_aop_property(adata.as_ref(), &service, tag, plen) {
                     Ok((rc, v)) if rc == 0 || !v.is_empty() => {
-                        let n = core::cmp::min(v.len(), 48);
+                        let n = core::cmp::min(v.len(), 160);
                         pr_info!(
                             "aop-als: property {:#04x} -> rc {:#x}, {} bytes: {:02x?}\n",
                             tag,
@@ -225,6 +255,10 @@ module_platform_driver! {
             default: 0,
             description: "Override the byte offset of the little-endian f32 lux value in the AOP report (0 = the part's known offset)",
         },
+        prop_len: u32 {
+            default: 256,
+            description: "Bytes to request for each property during the dump_props sweep",
+        },
         dump_props: u8 {
             default: 0,
             description: "Enumerate the AOP ALS EPIC properties at probe and log each reply, to find why the sensor is enabled but sends no reports",
@@ -232,6 +266,22 @@ module_platform_driver! {
         dump_report: u8 {
             default: 0,
             description: "Log each AOP ALS report and every offset that decodes to a plausible lux value, to identify the layout of an unknown part",
+        },
+        set_mode: u32 {
+            default: 0xffffffff,
+            description: "Write the ALS MODE property (0xd7) with this value before the interval; 0xffffffff leaves it alone",
+        },
+        set_unke4: u32 {
+            default: 0xffffffff,
+            description: "Write the ALS property 0xe4 with this value before the interval; 0xffffffff leaves it alone",
+        },
+        set_verbosity: u32 {
+            default: 0xffffffff,
+            description: "Write the ALS VERBOSITY property (0xe1); macOS sends 0xffffffff here, and 0xffffffff means leave it alone",
+        },
+        interval_us: u32 {
+            default: 200000,
+            description: "Reporting interval in microseconds written to ALS property 0",
         },
     },
 }
