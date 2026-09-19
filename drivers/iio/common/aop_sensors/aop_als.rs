@@ -181,10 +181,10 @@ impl platform::Driver for IIOAopAlsDriver {
             // machine.  Ask it what it actually exposes: property 0xf is the
             // part name, and the neighbours carry the sampling state and, on a
             // generation that holds its own calibration, the calibration too.
-            for tag in 0u32..0x20 {
+            for tag in 0u32..0x80 {
                 match get_aop_property(adata.as_ref(), &service, tag, 64) {
-                    Ok((rc, v)) => {
-                        let n = core::cmp::min(v.len(), 32);
+                    Ok((rc, v)) if rc == 0 || !v.is_empty() => {
+                        let n = core::cmp::min(v.len(), 48);
                         pr_info!(
                             "aop-als: property {:#04x} -> rc {:#x}, {} bytes: {:02x?}\n",
                             tag,
@@ -193,7 +193,8 @@ impl platform::Driver for IIOAopAlsDriver {
                             &v[..n]
                         );
                     }
-                    Err(e) => pr_info!("aop-als: property {:#04x} -> error {:?}\n", tag, e),
+                    Ok(_) => {}
+                    Err(_) => {}
                 }
             }
         }
