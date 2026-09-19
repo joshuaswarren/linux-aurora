@@ -2221,6 +2221,14 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        register_nonce: u8 {
+            default: 1,
+            description: "Register the 32-byte sensor nonce (SBIO 0x81) alongside the serial, as macOS does for the 0x3356 sensor class.",
+        },
+        init_comm: u8 {
+            default: 1,
+            description: "Open the SBIO channel with 0x73 (u32 = 6) as macOS's initSbioCommunication does.",
+        },
         nonce_cmd: u8 {
             default: 0,
             description: "SPI command byte that asks the sensor for its 32-byte nonce (0 = do not read or register one).",
