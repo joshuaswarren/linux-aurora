@@ -43,8 +43,20 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
 }
 
 fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
-    let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
-    set_als_property(aop, svc, 0xb, fw.data())?;
+    // The calibration is per-device factory data that the installer extracts
+    // from a running macOS.  The J700's ADT sets `als-new-calibration-path = 1`
+    // and carries no blob of its own, which suggests the AOP already holds its
+    // calibration on this generation -- so a missing file is a warning and the
+    // sensor is still enabled, rather than failing probe outright.  A machine
+    // that does need the blob simply reports uncalibrated lux until it is
+    // supplied, which is visible and recoverable.
+    match Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
+        Ok(fw) => set_als_property(aop, svc, 0xb, fw.data())?,
+        Err(_) => dev_warn!(
+            dev.as_ref(),
+            "apple/aop-als-cal.bin is absent; enabling the sensor without pushing a calibration (the AOP may hold its own)\n"
+        ),
+    }
     set_als_property(aop, svc, 0, &200000u32.to_le_bytes())?;
 
     Ok(())
