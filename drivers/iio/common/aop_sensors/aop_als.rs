@@ -176,6 +176,27 @@ impl platform::Driver for IIOAopAlsDriver {
         // SAFETY: AOP sets the platform data correctly
         let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
         let ty = bindings::BINDINGS_IIO_LIGHT;
+        if *module_parameters::dump_props.value() != 0 {
+            // The AOP accepts the enable but delivers no reports on this
+            // machine.  Ask it what it actually exposes: property 0xf is the
+            // part name, and the neighbours carry the sampling state and, on a
+            // generation that holds its own calibration, the calibration too.
+            for tag in 0u32..0x20 {
+                match get_aop_property(adata.as_ref(), &service, tag, 64) {
+                    Ok((rc, v)) => {
+                        let n = core::cmp::min(v.len(), 32);
+                        pr_info!(
+                            "aop-als: property {:#04x} -> rc {:#x}, {} bytes: {:02x?}\n",
+                            tag,
+                            rc,
+                            v.len(),
+                            &v[..n]
+                        );
+                    }
+                    Err(e) => pr_info!("aop-als: property {:#04x} -> error {:?}\n", tag, e),
+                }
+            }
+        }
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
         adata.add_fakehid_listener(service, data.clone())?;
@@ -202,6 +223,10 @@ module_platform_driver! {
         lux_offset: u32 {
             default: 0,
             description: "Override the byte offset of the little-endian f32 lux value in the AOP report (0 = the part's known offset)",
+        },
+        dump_props: u8 {
+            default: 0,
+            description: "Enumerate the AOP ALS EPIC properties at probe and log each reply, to find why the sensor is enabled but sends no reports",
         },
         dump_report: u8 {
             default: 0,
