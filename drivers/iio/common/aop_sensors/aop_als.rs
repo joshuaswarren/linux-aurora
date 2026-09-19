@@ -155,17 +155,6 @@ impl MessageProcessor for MsgProc {
 #[repr(transparent)]
 struct IIOAopAlsDriver(IIORegistration<MsgProc>);
 
-kernel::module_parameters! {
-    lux_offset: u32 {
-        default: 0,
-        description: "Override the byte offset of the little-endian f32 lux value in the AOP report (0 = the part's known offset).",
-    },
-    dump_report: u8 {
-        default: 0,
-        description: "Log each AOP ALS report and every offset that decodes to a plausible lux value, to identify the layout of an unknown part.",
-    },
-}
-
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
@@ -209,4 +198,14 @@ module_platform_driver! {
     license: "Dual MIT/GPL",
     alias: ["platform:iio_aop_als"],
     firmware: ["apple/aop-als-cal.bin"],
+    params: {
+        lux_offset: u32 {
+            default: 0,
+            description: "Override the byte offset of the little-endian f32 lux value in the AOP report (0 = the part's known offset)",
+        },
+        dump_report: u8 {
+            default: 0,
+            description: "Log each AOP ALS report and every offset that decodes to a plausible lux value, to identify the layout of an unknown part",
+        },
+    },
 }
