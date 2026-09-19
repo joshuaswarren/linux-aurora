@@ -2221,6 +2221,10 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        platform_serial: u8 {
+            default: 1,
+            description: "Send the machine's IOPlatformSerialNumber to the biometric endpoint (SBIO 0x48) as macOS does.",
+        },
         register_nonce: u8 {
             default: 1,
             description: "Register the 32-byte sensor nonce (SBIO 0x81) alongside the serial, as macOS does for the 0x3356 sensor class.",

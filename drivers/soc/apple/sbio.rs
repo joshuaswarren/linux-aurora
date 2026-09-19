@@ -748,8 +748,10 @@ impl SepData {
 
         self.register_ool(&self.ool_sbio)?;
 
-        // macOS's initSbioCommunication opens the channel with a u32 = 6 before
-        // any biometric traffic.
+        // The transfer path refuses anything before sbio_ready, so mark the
+        // channel up first and then send macOS's initSbioCommunication (u32 = 6).
+        self.sbio_ready.store(true, Relaxed);
+
         if *module_parameters::init_comm.value() != 0 {
             match self.sbio_call(&crate::sbio::sbio_init_comm()) {
                 SbioOutcome::Ok(_) => dev_info!(self.dev, "sbio: channel opened (0x73)\n"),
@@ -757,7 +759,6 @@ impl SepData {
             }
         }
 
-        self.sbio_ready.store(true, Relaxed);
         Ok(())
     }
 
@@ -1239,6 +1240,27 @@ impl SepData {
 
     fn register_sensor(&self, id: &sensor::Identifier) -> bool {
         let stage = self.bringup.load(Relaxed);
+
+        if *module_parameters::platform_serial.value() != 0 {
+            let mut serial = [0u8; crate::sbio::SBIO_PLATFORM_SERIAL_LEN];
+            match shim::platform_serial(&mut serial) {
+                Ok(n) => {
+                    match self.sbio_call(&crate::sbio::sbio_platform_serial(&serial)) {
+                        SbioOutcome::Ok(_) => dev_info!(
+                            self.dev,
+                            "sbio: platform serial registered ({} chars)\n",
+                            n
+                        ),
+                        _ => dev_warn!(self.dev, "sbio: PLATFORM_SERIAL (0x48) was refused\n"),
+                    }
+                }
+                Err(e) => dev_warn!(
+                    self.dev,
+                    "sbio: could not read the platform serial ({:?})\n",
+                    e
+                ),
+            }
+        }
 
         // macOS's HandleReset order, which this had inverted: 0x80
         // REGISTER_SENSOR goes first and is re-sent after EVERY identification
@@ -2855,6 +2877,20 @@ pub(crate) fn sbio_register_nonce(nonce: &[u8; 32]) -> SbioOp {
         payload: pad_payload(nonce),
         payload_len: 32,
         name: c"REGISTER_NONCE",
+    }
+}
+
+/// macOS sends the machine's IOPlatformSerialNumber to the biometric endpoint
+/// as a 12-byte message.  It is the only AP-visible message left unsent once
+/// the identification prologue matches.
+const OP_SBIO_PLATFORM_SERIAL: u16 = 0x48;
+pub(crate) const SBIO_PLATFORM_SERIAL_LEN: usize = 12;
+pub(crate) fn sbio_platform_serial(serial: &[u8; SBIO_PLATFORM_SERIAL_LEN]) -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_PLATFORM_SERIAL,
+        payload: pad_payload(serial),
+        payload_len: SBIO_PLATFORM_SERIAL_LEN,
+        name: c"PLATFORM_SERIAL",
     }
 }
 
