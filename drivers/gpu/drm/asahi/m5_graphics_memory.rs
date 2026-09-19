@@ -34,6 +34,29 @@ impl M5GraphicsMemory {
         Ok(Self { context, user_mappings: Some(user_mappings), pages: KVec::new(), usc, output_first: None })
     }
 
+    /// Hand the retained USC pool and this context slot to another
+    /// application VM. The previous roots are retracted first (with ASID
+    /// invalidation), the same hardware context is re-leased for `vm`, and
+    /// the pool is aliased at unchanged addresses, so every firmware record
+    /// that names the context or the pool keeps its value. The caller has
+    /// verified that the previous owner's work is completely retired and
+    /// publishes the new roots explicitly afterwards.
+    pub(super) fn rebind(&mut self, dev: &AsahiDevice, vm: &mmu::Vm)
+        -> Result<KVec<mmu::KernelMapping>> {
+        crate::m5_vm::compact_range(&vm.kernel_range()).ok_or(EINVAL)?;
+        // Only application owners hand over; the native diagnostic program
+        // keeps captured pages in its private VM.
+        if !self.pages.is_empty() || self.output_first.is_some() { return Err(ENOTSUPP); }
+        let user_mappings = vm.retain_t8140_job()?;
+        self.context.rebind(vm)?;
+        // Release the previous VM's mapping hold only after its roots are gone.
+        self.user_mappings = Some(user_mappings);
+        let aliases = self.usc.alias_into(vm)?;
+        dev_info!(dev.as_ref(), "M5_GRAPHICS_CONTEXT id={} rebound vm={} roots={:x?}; USC pool aliased\n",
+            self.context.context_id(), vm.id(), self.context.roots());
+        Ok(aliases)
+    }
+
     /// Return an owning allocation in the compact TA resource arena. The
     /// render job retains it until completion or confirmed processor stop.
     pub(super) fn allocate_compact(

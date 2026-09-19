@@ -518,7 +518,17 @@ impl M5FirmwareMemory {
             || !Self::graphics_pair_complete(self.graphics_completion()?, previous) {
             return Err(EBUSY);
         }
+        // A different submitting VM takes over the retired job in place: same
+        // context slot, descriptor graph, queues and PB/USC pools. The
+        // single application compute owner still binds to one VM, so no
+        // handoff happens while it exists.
+        let handoff = !self.graphics.as_ref().ok_or(EINVAL)?.0.owns_vm(vm);
+        if handoff && self.application_compute.is_some() { return Err(ENOTSUPP); }
         let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
+        if handoff {
+            job.rebind_vm(dev, vm)?;
+            job.publish_context()?;
+        }
         job.prepare_application_frame(dev, vm, parameters, controls, clusters,
             usc_required, generation)?;
         queues.publish_next_draw(job, generation)?;
@@ -585,32 +595,43 @@ impl M5FirmwareMemory {
         Ok(compute.counters()? == [1; 3] && compute.installed()?)
     }
 
-    pub(crate) fn publish_application_compute(&mut self, dispatch: bool) -> Result {
-        let (outer, _, _) = self.graphics_status()?;
-        if outer != [self.application_outer_head; 3] || self.application_outer_head >= 256 {
+    /// Publish one command-ring record for queue 12. `dispatch` false is the
+    /// installation record; true is dispatch generation `generation`, whose
+    /// inner head is the producer that generation's three pointers reach.
+    pub(crate) fn publish_application_compute(&mut self, dispatch: bool,
+        generation: u32) -> Result {
+        let outer_index = self.application_outer_head as usize;
+        if outer_index >= 256 || self.graphics_status()?.0 != [outer_index as u32; 3] {
             return Err(EBUSY);
         }
+        let inner_head = u16::try_from(application_compute::compute_pointer_head(
+            if dispatch { generation } else { 0 })).map_err(|_| EINVAL)?;
         let compute = self.application_compute.as_mut().ok_or(EINVAL)?;
         if dispatch {
             // Preserve the retired graphics notifications for later render reuse.
             self.graphics_stamp_flags &= !(1u128 << application_compute::QUEUE_ID);
-            compute.publish_dispatch()?;
+            compute.publish_dispatch(generation)?;
         } else if compute.counters()? != [0, 0, 1] { return Err(EBUSY); }
-        let offset = init::WORK_RING_BUNDLE_OFFSETS[8]
-            + self.application_outer_head as usize * 24;
+        let offset = init::WORK_RING_BUNDLE_OFFSETS[8] + outer_index * 24;
         self.shared.with_bytes_mut(|out| {
             let record = &mut out[offset..offset + 24];
-            if record.iter().any(|byte| *byte != 0) { return Err(EBUSY); }
+            // Only the first user of a slot finds it zeroed; from then on the
+            // prior dispatch that owned it has retired, as for the graphics
+            // records published through the same ring.
+            if generation < 2 && record.iter().any(|byte| *byte != 0) {
+                return Err(EBUSY);
+            }
+            record.fill(0);
             record[8..16].copy_from_slice(
                 &application_compute::M5ApplicationCompute::queue_address().to_le_bytes());
             record[16..20].copy_from_slice(&2u32.to_le_bytes());
-            record[20..22].copy_from_slice(&(if dispatch { 4u16 } else { 1 }).to_le_bytes());
+            record[20..22].copy_from_slice(&inner_head.to_le_bytes());
             record[22] = application_compute::QUEUE_ID;
             record[23] = 1;
             Ok(())
         })?;
         fence(Ordering::SeqCst);
-        let head = self.application_outer_head + 1;
+        let head = ((outer_index + 1) % 256) as u32;
         let producer = init::WORK_STATE_GRID_OFFSETS[8] + 2 * init::CHANNEL_STATE_SPACING;
         self.private.write_u32(PRIVATE_BASE + producer as u64, head)?;
         self.application_outer_head = head;
@@ -618,11 +639,23 @@ impl M5FirmwareMemory {
         Ok(())
     }
 
-    pub(crate) fn application_compute_complete(&mut self) -> Result<bool> {
+    /// Stage a further dispatch on the already installed compute queue. The
+    /// installed owner keeps its VM, USC and operand storage; only the command
+    /// stream and the generation's stamps change.
+    pub(crate) fn prepare_next_application_compute(&mut self, vm: &mmu::Vm,
+        command: &crate::g17_uapi::TranslatedComputeCommand, generation: u32) -> Result {
+        if !(2..=MAX_GRAPHICS_GENERATION).contains(&generation) { return Err(EINVAL); }
+        let (job, _) = self.graphics.as_ref().ok_or(EINVAL)?;
+        if !job.owns_vm(vm) { return Err(ENOTSUPP); }
+        self.application_compute.as_mut().ok_or(EINVAL)?
+            .prepare_next_dispatch(job, command, generation)
+    }
+
+    pub(crate) fn application_compute_complete(&mut self, generation: u32) -> Result<bool> {
         let (outer, _, _) = self.graphics_status()?;
         Ok(outer == [self.application_outer_head; 3]
             && self.application_compute.as_mut().ok_or(EINVAL)?
-                .complete(self.graphics_stamp_flags)?)
+                .complete(self.graphics_stamp_flags, generation)?)
     }
 
     pub(crate) fn application_compute_status(&mut self)

@@ -2946,6 +2946,21 @@ impl MappedObject {
         self.object.map_at(vm, address, prot, false)
     }
 
+    /// Alias this object into another Vm at a fixed address while reserving
+    /// the same trailing guard pages as the original allocation.
+    fn map_alias_at_with_guards(
+        &mut self,
+        vm: &mmu::Vm,
+        address: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<mmu::KernelMapping> {
+        if self.object_offset != 0 {
+            return Err(EINVAL);
+        }
+        self.object.map_at_with_guards(vm, address, prot, guard_pages)
+    }
+
     fn map_alias_in_range(
         &mut self,
         vm: &mmu::Vm,

@@ -232,6 +232,9 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
     pub(crate) layers: u16,
+    /// Sample count: 1, 2 or 4. Defaults to 1, so every existing parameter
+    /// vector keeps its exact register program.
+    pub(crate) samples: u8,
     pub(crate) utile_width: u8,
     pub(crate) utile_height: u8,
     pub(crate) utile_config: u64,
@@ -335,6 +338,30 @@ pub(crate) struct G17pRenderParameters {
 }
 
 impl G17pRenderParameters {
+    /// Apply the witnessed multisample register triple for a sample count.
+    ///
+    /// Captured constants, not derived: from Apple's own renders on this part
+    /// (logs/m5-msaa-native-hv-20260915-101837) at one, two and four samples,
+    /// with a same-mode control in a second oracle process establishing the
+    /// noise floor. `multisample_control` is the sample POSITION table --
+    /// 0x88 is the centre (8,8), 0x44cc is (4,4),(12,12), and 0xeaa26e26
+    /// unpacks to (14,10),(10,2),(6,14),(2,6), the rotated-grid 4x pattern in
+    /// 1/16 pixel units. `utile_config`'s low nibble is log2(samples);
+    /// `tib_blocks` is samples << 16, zero at one sample.
+    pub(crate) fn set_samples(&mut self, samples: u8) -> bool {
+        let (multisample_control, utile_config, tib_blocks) = match samples {
+            1 => (0x88, 0xa000, 0),
+            2 => (0x44cc, 0xa001, 0x2_0000),
+            4 => (0xeaa2_6e26, 0x6002, 0x4_0000),
+            _ => return false,
+        };
+        self.samples = samples;
+        self.multisample_control = multisample_control;
+        self.utile_config = utile_config;
+        self.tib_blocks = tib_blocks;
+        true
+    }
+
     pub(crate) const fn source_rsrc8() -> Self {
         Self {
             width: 64,
@@ -376,6 +403,7 @@ impl G17pRenderParameters {
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
             layers: 1,
+            samples: 1,
             utile_width: 32,
             utile_height: 32,
             utile_config: 0xa000,
@@ -450,6 +478,15 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
     }
     let utiles_per_tile_x = TILE_WIDTH / utile_width as u64;
     let utiles_per_tile_y = TILE_HEIGHT / utile_height as u64;
+    // Four samples split the utile in Y. Measured against Apple's own
+    // four-sample render: size1 0x14 -> 0x28, size3 0x20 -> 0x40 and
+    // macro_size 0x40004 -> 0x40008, where only the y term moves. All three
+    // follow from doubling this one term; two samples do not split.
+    let utiles_per_tile_y = if parameters.samples == 4 {
+        utiles_per_tile_y * 2
+    } else {
+        utiles_per_tile_y
+    };
     let utiles_per_tile = utiles_per_tile_x * utiles_per_tile_y;
     let mtile_x1 = align((tiles_x + MACRO_TILES_X - 1) / MACRO_TILES_X, 4);
     let mtile_y1 = align((tiles_y + MACRO_TILES_Y - 1) / MACRO_TILES_Y, 4);
@@ -601,7 +638,12 @@ fn build_ta_registers_for_work_key(
         RegisterWrite::new(0x1c8f8, 0x8860),
         RegisterWrite::new(0x1c0b1, g.size1),
         RegisterWrite::new(0x1c850, g.size1),
-        RegisterWrite::new(0x10131, p.multisample_control),
+        // Silicon holds 0x10131 at 0x88 at ONE, TWO and FOUR samples while
+        // 0x10139 carries the real sample position table (all five captures in
+        // logs/m5-msaa-native-hv-20260915-101837). Driving this from
+        // multisample_control would write the position table here, which
+        // Apple never does.
+        RegisterWrite::new(0x10131, 0x88),
         RegisterWrite::new(0x10121, p.ppp_control),
         RegisterWrite::new(0x10129, g.pixels),
         RegisterWrite::new(0x101b9, g.screen),

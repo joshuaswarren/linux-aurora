@@ -45,6 +45,9 @@ pub(super) struct M5GraphicsJob {
     parameter_buffer: M5ParameterBuffer,
     target_memory: M5TargetMemory,
     aliases: KVec<mmu::KernelMapping>,
+    // PB/USC pool views in a VM this job was handed to; empty for the first
+    // owner, whose pools were allocated in its own VM.
+    vm_aliases: KVec<mmu::KernelMapping>,
     graph_alias: mmu::KernelMapping,
     graph: MappedObject,
     signals: MappedObject,
@@ -163,8 +166,8 @@ impl M5GraphicsJob {
             scene_template.extend_from_slice(&out[SCENES + 0x80..SCENES + 0x100], GFP_KERNEL)?;
             Ok(())
         })?;
-        Ok(Self { program, parameter_buffer, target_memory, aliases, graph_alias, graph, signals,
-            descriptor_template, scene_template, generation: 1,
+        Ok(Self { program, parameter_buffer, target_memory, aliases, vm_aliases: KVec::new(),
+            graph_alias, graph, signals, descriptor_template, scene_template, generation: 1,
             target_shape: [p.width, p.height, u32::from(p.layers),
                 u32::from(p.utile_width), u32::from(p.utile_height)] })
     }
@@ -247,6 +250,33 @@ impl M5GraphicsJob {
 
     pub(super) fn owns_vm(&self, vm: &mmu::Vm) -> bool {
         self.program.vm().id() == vm.id()
+    }
+
+    /// Hand this fully retired job to another submitting VM. The hardware
+    /// context slot, descriptor graph, signals, queues and the PB/USC pools
+    /// all keep their firmware-visible addresses: the context is re-leased
+    /// for the new VM and the pools are aliased into it. The previous VM's
+    /// render targets are not carried over; the recorded shape is
+    /// invalidated so the next application frame allocates replacements in
+    /// the new VM. The caller publishes the new roots before the next draw.
+    pub(super) fn rebind_vm(&mut self, dev: &AsahiDevice, vm: &mmu::Vm) -> Result {
+        if self.owns_vm(vm) { return Ok(()); }
+        if self.scheduler_status()? != [2, 0] { return Err(EBUSY); }
+        let progress = self.progress()?;
+        if progress[0] != 2 || progress[1] != self.generation * 0x100
+            || progress[3] != self.generation * 0x100 { return Err(EBUSY); }
+        // Release an earlier handoff's views before reserving the same
+        // addresses in the incoming VM.
+        self.vm_aliases = KVec::new();
+        let mut aliases = self.program.rebind(dev, vm)?;
+        for alias in self.parameter_buffer.alias_into(vm)? {
+            aliases.push(alias, GFP_KERNEL)?;
+        }
+        self.vm_aliases = aliases;
+        self.target_shape = [0; 5];
+        dev_info!(dev.as_ref(), "M5_RENDER_VM_HANDOFF context={} generation={} vm={}\n",
+            self.program.context_id(), self.generation, vm.id());
+        Ok(())
     }
 
     /// Compute shares this application's published roots and USC owner. Only

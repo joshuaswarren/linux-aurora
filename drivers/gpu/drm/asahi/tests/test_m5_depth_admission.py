@@ -34,8 +34,12 @@ start = test.index('        payload.width = 256;')
 test = test[:test.index('{') + 1] + (
     '\n        let mut payload = UapiRenderCommand::default();\n'
     '        payload.layers = 1;\n') + test[start:]
+constants = re.findall(
+    r'^pub\(crate\) const (?:M5_MAX_RENDER_DIMENSION|PAGE_SIZE)[^;]*;', source, re.M)
+assert constants, 'the guard\'s constants moved'
+
 harness = '\n'.join([
-    '#![allow(dead_code)]', *declarations,
+    '#![allow(dead_code)]', *constants, *declarations,
     '#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n' +
     block(r'^pub\(crate\) enum GpuAccess \{'),
     block(r'^pub\(crate\) trait GpuAddressSpace \{'),

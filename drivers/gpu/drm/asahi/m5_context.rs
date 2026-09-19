@@ -157,10 +157,27 @@ impl M5ExecutionContext {
         slot.ttb0.load(Ordering::Acquire) == roots[0]
             && slot.ttb1.load(Ordering::Acquire) == roots[1]
     }
-}
 
-impl Drop for M5ExecutionContext {
-    fn drop(&mut self) {
+    /// Retarget this lease at another application VM without giving up the
+    /// hardware context slot. Any published roots are retracted and the ASID
+    /// invalidated first, exactly as on drop; the caller has already verified
+    /// that no work of the previous VM is outstanding. Publication of the new
+    /// lower root is explicit again, once the new owner's graph is prepared.
+    pub(crate) fn rebind(&mut self, vm: &Vm) -> Result {
+        {
+            let owner = vm.inner.exec_lock(None, false)?;
+            if owner.is_kernel || !core::ptr::eq(
+                Arc::as_ptr(&owner.uat_inner), Arc::as_ptr(&self.slot.inner),
+            ) {
+                return Err(EINVAL);
+            }
+        }
+        self.retract();
+        self.low = vm.clone();
+        Ok(())
+    }
+
+    fn retract(&mut self) {
         if !self.published { return; }
         let roots = self.roots();
         {
@@ -177,6 +194,13 @@ impl Drop for M5ExecutionContext {
         fence(Ordering::SeqCst);
         mem::tlbi_asid(self.context_id());
         mem::sync();
+        self.published = false;
+    }
+}
+
+impl Drop for M5ExecutionContext {
+    fn drop(&mut self) {
+        self.retract();
     }
 }
 

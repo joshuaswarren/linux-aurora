@@ -3065,6 +3065,23 @@ impl Vm {
         prot: Prot,
         guard: bool,
     ) -> Result<KernelMapping> {
+        self.map_at_with_guards(addr, size, gem, prot, usize::from(guard))
+    }
+
+    /// Map a GEM object at a specific address and reserve `guard_pages`
+    /// trailing unmapped pages in the same allocator node, so an alias of a
+    /// guarded allocation keeps its hardware guard gap in this Vm too.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_at_with_guards(
+        &self,
+        addr: u64,
+        size: usize,
+        gem: ARef<gem::Object>,
+        prot: Prot,
+        guard_pages: usize,
+    ) -> Result<KernelMapping> {
+        let reserved = guard_pages.checked_mul(UAT_PGSZ)
+            .and_then(|guard| size.checked_add(guard)).ok_or(EOVERFLOW)?;
         let sgt = gem.owned_sg_table()?;
         let mut inner = self.inner.exec_lock(Some(&gem), false)?;
 
@@ -3091,7 +3108,7 @@ impl Vm {
                 mapped_size: size,
             },
             addr,
-            (size + if guard { UAT_PGSZ } else { 0 }) as u64, // Add guard page
+            reserved as u64, // Mapping plus its trailing guard pages
             0,
         );
         let mut node = match node_result {
