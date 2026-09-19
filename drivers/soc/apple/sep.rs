@@ -575,6 +575,8 @@ struct SepData {
     sbio_wq: CondVar,
 
     sbio_ready: Atomic<bool>,
+    /// Set once the enclave has handed out a sensor session share.
+    session_established: Atomic<bool>,
 
     templates_restored: Atomic<bool>,
 
@@ -805,6 +807,7 @@ impl SepData {
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
                 sbio_ready: Atomic::new(false),
+                session_established: Atomic::new(false),
                 sensor_present: Atomic::new(false),
                 bio_session <- new_mutex!(bio::Session::new()),
                 bio_index <- new_mutex!(bio_index),
