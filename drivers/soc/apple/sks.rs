@@ -30,6 +30,26 @@ impl<'a> KeybagCreateIntent<'a> {
     fn sending(&mut self) {
         self.sent = true;
     }
+
+    /// The enclave answered the create with an error status: nothing was
+    /// created, so the intent is marked retryable and a second encoding may be
+    /// sent under a fresh intent record.
+    fn refused(&mut self) -> bool {
+        if let Err(e) = keybag::mark_refused(self.slot) {
+            dev_err!(
+                self.dev,
+                "sks: cannot mark refused keybag create retryable: {:?}\n",
+                e
+            );
+            return false;
+        }
+        if let Err(e) = keybag::write_intent(self.slot) {
+            dev_err!(self.dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
+            return false;
+        }
+        self.sent = false;
+        true
+    }
 }
 
 impl Drop for KeybagCreateIntent<'_> {
@@ -424,6 +444,7 @@ impl SepData {
         secret: &[u8],
         uuid: &[u8; crate::sks::SKS_IDENTITY_UUID_LEN],
         proof: keybag::NoStoredKeyBag,
+        enc: profile::KeybagCreate,
     ) -> Result<SksRequest> {
         if proof.slot() != keybag::Slot::Identity {
             return Err(EINVAL);
@@ -432,7 +453,6 @@ impl SepData {
         // bag differently; the per-SoC profile carries the correct field values
         // so the proven T6020 path is unchanged while T8103 gets the bag type in
         // the third word (see profile::KeybagCreate).
-        let enc = self.keybag_create_encoding();
         let mut body = image::Body::new();
         body.put_u32(enc.variant)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
@@ -499,56 +519,161 @@ impl SepData {
         uuid[6] = (uuid[6] & 0x0f) | 0x40;
         uuid[8] = (uuid[8] & 0x3f) | 0x80;
 
-        let request = match self.sks_req_create_identity_keybag(&secret, &uuid, proof) {
-            Ok(request) => request,
-            Err(e) => {
+        // The profile's encoding first; when the module parameter left the
+        // choice to the profile and the enclave answers with an error status
+        // (nothing created), the other known encoding is sent once under a
+        // fresh intent -- the manual keybag_encoding= fallback without a reboot.
+        let first = self.keybag_create_encoding();
+        let fallback = if *module_parameters::keybag_encoding.value() == 0 {
+            if first.bag_type == profile::KEYBAG_CREATE_STRICT.bag_type
+                && first.variant == profile::KEYBAG_CREATE_STRICT.variant
+            {
+                Some(profile::KEYBAG_CREATE_LENIENT)
+            } else {
+                Some(profile::KEYBAG_CREATE_STRICT)
+            }
+        } else {
+            None
+        };
+        let mut attempt = 0u32;
+        let mut enc = first;
+        let (variant, raw_handle, body_len) = loop {
+            attempt += 1;
+            let request = match self.sks_req_create_identity_keybag(&secret, &uuid, proof, enc) {
+                Ok(request) => request,
+                Err(e) => {
+                    dev_err!(
+                        self.dev,
+                        "sks: cannot build identity keybag request: {:?}\n",
+                        e
+                    );
+                    return false;
+                }
+            };
+            intent.sending();
+            let Some(out) = self.sks_exchange(request.name, request.msg, &request.img) else {
                 dev_err!(
                     self.dev,
-                    "sks: cannot build identity keybag request: {:?}\n",
-                    e
+                    "sks: CREATE_KEYBAG (variant {}, bag type {:#x}, arg {}) could not be exchanged (buffers, wedge or send); outcome unknown, intent kept\n",
+                    enc.variant,
+                    enc.bag_type,
+                    enc.arg
+                );
+                return false;
+            };
+            dev_info!(
+                self.dev,
+                "sks: CREATE_KEYBAG attempt {} (variant {}, bag type {:#x}, arg {}): mailbox status {}, response {} bytes\n",
+                attempt,
+                enc.variant,
+                enc.bag_type,
+                enc.arg,
+                out.reply.status,
+                out.response.len()
+            );
+            if out.reply.status != 0 {
+                // An error status is the enclave declining the request; the bag
+                // does not exist.  Try the other encoding once, else give up
+                // with the intent marked retryable.
+                if !intent.refused() {
+                    return false;
+                }
+                match fallback {
+                    Some(next) if attempt == 1 => {
+                        dev_warn!(
+                            self.dev,
+                            "sks: CREATE_KEYBAG refused with status {}; retrying with the other encoding\n",
+                            out.reply.status
+                        );
+                        enc = next;
+                        continue;
+                    }
+                    _ => {
+                        dev_err!(
+                            self.dev,
+                            "sks: CREATE_KEYBAG refused: mailbox status {} (try keybag_encoding=1 or 2 explicitly)\n",
+                            out.reply.status
+                        );
+                        return false;
+                    }
+                }
+            }
+            let Some(body) = self.sks_report_response(crate::sks::SKS_CREATE_NAME, &out) else {
+                dev_err!(
+                    self.dev,
+                    "sks: CREATE_KEYBAG answered status 0 with an unparseable {}-byte response: {:02x?}; outcome unknown, intent kept\n",
+                    out.response.len(),
+                    &out.response[..core::cmp::min(out.response.len(), 16)]
+                );
+                return false;
+            };
+            if body.len() < 12 {
+                dev_err!(
+                    self.dev,
+                    "sks: CREATE_KEYBAG failed: mailbox {}, body {} bytes\n",
+                    out.reply.status,
+                    body.len()
                 );
                 return false;
             }
+            let variant = u32::from_le_bytes(body[0..4].try_into().unwrap());
+            let raw_handle = i32::from_le_bytes(body[4..8].try_into().unwrap());
+            let Some((_fv_data, end)) = image::read_blob(body, 8) else {
+                dev_err!(
+                    self.dev,
+                    "sks: CREATE_KEYBAG reply without a readable blob: variant {}, handle {}, body {} bytes\n",
+                    variant,
+                    raw_handle,
+                    body.len()
+                );
+                return false;
+            };
+            if variant != enc.variant || raw_handle < 0 || end != body.len() {
+                dev_err!(
+                    self.dev,
+                    "sks: invalid CREATE_KEYBAG reply: variant {} (sent {}), handle {}, blob end {} of {}\n",
+                    variant,
+                    enc.variant,
+                    raw_handle,
+                    end,
+                    body.len()
+                );
+                return false;
+            }
+            break (variant, raw_handle, body.len());
         };
-        intent.sending();
-        let Some(out) = self.sks_exchange(request.name, request.msg, &request.img) else {
-            return false;
-        };
-        let Some(body) = self.sks_report_response(crate::sks::SKS_CREATE_NAME, &out) else {
-            return false;
-        };
-        if out.reply.status != 0 || body.len() < 12 {
+        dev_info!(
+            self.dev,
+            "sks: identity keybag created: variant {}, handle {}, body {} bytes\n",
+            variant,
+            raw_handle,
+            body_len
+        );
+        let handle = crate::sks::KeyBagHandle::from_create_reply(raw_handle);
+        let Some(bag_uuid) = self.sks_read_uuid(handle) else {
             dev_err!(
                 self.dev,
-                "sks: CREATE_KEYBAG failed: mailbox {}, body {} bytes\n",
-                out.reply.status,
-                body.len()
-            );
-            return false;
-        }
-        let variant = u32::from_le_bytes(body[0..4].try_into().unwrap());
-        let raw_handle = i32::from_le_bytes(body[4..8].try_into().unwrap());
-        let Some((_fv_data, end)) = image::read_blob(body, 8) else {
-            return false;
-        };
-        if variant != self.keybag_create_encoding().variant || raw_handle < 0 || end != body.len()
-        {
-            dev_err!(
-                self.dev,
-                "sks: invalid CREATE_KEYBAG reply: variant {}, handle {}\n",
-                variant,
+                "sks: COPY_KEYBAG_UUID failed for the new identity keybag (handle {}); the bag is orphaned in the enclave until the next SEP reset\n",
                 raw_handle
             );
             return false;
-        }
-        let handle = crate::sks::KeyBagHandle::from_create_reply(raw_handle);
-        let Some(bag_uuid) = self.sks_read_uuid(handle) else {
-            return false;
         };
         let Some(out) = self.sks_send(self.sks_req_copy_keybag(handle)) else {
+            dev_err!(
+                self.dev,
+                "sks: COPY_KEYBAG did not complete for the new identity keybag (handle {}); the bag is orphaned in the enclave until the next SEP reset\n",
+                raw_handle
+            );
             return false;
         };
         let Some(wrapped) = self.wrapped_from_copy_reply(&out, c"new identity keybag") else {
+            dev_err!(
+                self.dev,
+                "sks: COPY_KEYBAG reply unusable for the new identity keybag (handle {}, status {}, {} bytes); the bag is orphaned in the enclave until the next SEP reset\n",
+                raw_handle,
+                out.reply.status,
+                out.response.len()
+            );
             return false;
         };
         if let Err(e) = keybag::write_bag_uuid(slot, &wrapped, &bag_uuid, &secret) {
