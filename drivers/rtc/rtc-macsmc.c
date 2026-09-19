@@ -20,11 +20,19 @@
 /* 32768 Hz clock */
 #define RTC_SEC_SHIFT 15
 
+/*
+ * Offset stored as whole seconds (t8140 "baku" PMU): a 64-bit little-endian
+ * count of seconds that macOS keeps in the PMU's legacy scratchpad, added to
+ * the counter's integer seconds.
+ */
+#define RTC_OFFSET_SEC_BYTES 8
+
 struct macsmc_rtc {
 	struct device *dev;
 	struct apple_smc *smc;
 	struct rtc_device *rtc_dev;
 	struct nvmem_cell *rtc_offset;
+	bool offset_in_seconds;
 };
 
 static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
@@ -45,12 +53,12 @@ static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 	p_off = nvmem_cell_read(rtc->rtc_offset, &len);
 	if (IS_ERR(p_off))
 		return PTR_ERR(p_off);
-	if (len < RTC_BYTES) {
+	if (len < (rtc->offset_in_seconds ? RTC_OFFSET_SEC_BYTES : RTC_BYTES)) {
 		kfree(p_off);
 		return -EIO;
 	}
 
-	memcpy(&off, p_off, RTC_BYTES);
+	memcpy(&off, p_off, rtc->offset_in_seconds ? RTC_OFFSET_SEC_BYTES : RTC_BYTES);
 	kfree(p_off);
 
 	/*
@@ -62,8 +70,11 @@ static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 	if (!off)
 		return -EINVAL;
 
-	/* Sign extend from 48 to 64 bits, then arithmetic shift right 15 bits to get seconds */
-	now = sign_extend64(ctr + off, RTC_BITS - 1) >> RTC_SEC_SHIFT;
+	if (rtc->offset_in_seconds)
+		now = (time64_t)(ctr >> RTC_SEC_SHIFT) + (s64)off;
+	else
+		/* Sign extend from 48 to 64 bits, then arithmetic shift right 15 bits to get seconds */
+		now = sign_extend64(ctr + off, RTC_BITS - 1) >> RTC_SEC_SHIFT;
 	rtc_time64_to_tm(now, tm);
 
 	return ret;
@@ -80,6 +91,12 @@ static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
 		return ret;
 	if (ret != RTC_BYTES)
 		return -EIO;
+
+	if (rtc->offset_in_seconds) {
+		/* Whole seconds: the counter's fraction of a second carries over */
+		off = rtc_tm_to_time64(tm) - (ctr >> RTC_SEC_SHIFT);
+		return nvmem_cell_write(rtc->rtc_offset, &off, RTC_OFFSET_SEC_BYTES);
+	}
 
 	/* This sets the offset such that the set second begins now */
 	off = (rtc_tm_to_time64(tm) << RTC_SEC_SHIFT) - ctr;
@@ -115,6 +132,9 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	if (IS_ERR(rtc->rtc_offset))
 		return dev_err_probe(&pdev->dev, PTR_ERR(rtc->rtc_offset),
 				     "Failed to get rtc_offset NVMEM cell\n");
+
+	rtc->offset_in_seconds = of_property_read_bool(pdev->dev.of_node,
+						       "apple,rtc-offset-seconds");
 
 	rtc->rtc_dev = devm_rtc_allocate_device(&pdev->dev);
 	if (IS_ERR(rtc->rtc_dev))
