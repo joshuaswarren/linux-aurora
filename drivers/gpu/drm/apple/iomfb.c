@@ -141,6 +141,19 @@ int dcp_dither_request = -1;
 module_param_named(dither, dcp_dither_request, int, 0644);
 MODULE_PARM_DESC(dither, "write 0/1 to disable/enable panel dithering after the next completed swap (H17P, A448)");
 
+/*
+ * A030 IOMFB::UPPipeAP_H17P::read_crc(Notify_Info_Index, u32): pipe CRCs
+ * at points other than the blend output (the index enum is unknown; probe
+ * it).  pipe_crc_reads=N reads index pipe_crc_idx after the next N
+ * completed swaps and logs the value.
+ */
+int dcp_pipe_crc_reads;
+module_param_named(pipe_crc_reads, dcp_pipe_crc_reads, int, 0644);
+MODULE_PARM_DESC(pipe_crc_reads, "read A030 read_crc(pipe_crc_idx, 0) after the next N completed swaps (H17P)");
+unsigned int dcp_pipe_crc_idx;
+module_param_named(pipe_crc_idx, dcp_pipe_crc_idx, uint, 0644);
+MODULE_PARM_DESC(pipe_crc_idx, "Notify_Info_Index for pipe_crc_reads");
+
 char dcp_h17p_swap_poke[128];
 module_param_string(h17p_swap_poke, dcp_h17p_swap_poke, sizeof(dcp_h17p_swap_poke), 0644);
 MODULE_PARM_DESC(h17p_swap_poke, "hex off=val byte pokes into the fixed-up H17P swap record (debug)");

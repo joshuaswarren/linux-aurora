@@ -180,6 +180,7 @@ DCP_THUNK_OUT(dcp_is_main_display, dcpep_is_main_display, u32);
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 DCP_THUNK_OUT(dcp_read_blend_crc, dcpep_read_blend_crc, u32);
 DCP_THUNK_INOUT(dcp_enable_disable_dithering, dcpep_enable_disable_dithering, u32, u32);
+DCP_THUNK_INOUT(dcp_read_crc, dcpep_read_crc, struct dcp_read_crc_req, u32);
 #endif
 
 /* DCP callback handlers */
@@ -289,6 +290,15 @@ static void res_dither(struct apple_dcp *dcp, void *out, void *cookie)
 	dev_info(dcp->dev, "enable_disable_dithering(%u): status %#x\n",
 		 (u32)(uintptr_t)cookie, st);
 }
+
+static void res_pipe_crc(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	u32 v = out ? *(u32 *)out : 0xffffffff;
+
+	dev_info(dcp->dev, "pipe-crc: idx %u swap %u value %#010x t=%lld us\n",
+		 dcp_pipe_crc_idx, (u32)(uintptr_t)cookie, v,
+		 ktime_to_us(ktime_get()));
+}
 #endif
 
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
@@ -309,6 +319,13 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		dcp_blend_crc_reads--;
 		dcp_read_blend_crc(dcp, false, res_blend_crc,
 				   (void *)(uintptr_t)resp->swap_id);
+	}
+	if (dcp_pipe_crc_reads > 0) {
+		struct dcp_read_crc_req rq = { .index = dcp_pipe_crc_idx, .arg = 0 };
+
+		dcp_pipe_crc_reads--;
+		dcp_read_crc(dcp, false, &rq, res_pipe_crc,
+			     (void *)(uintptr_t)resp->swap_id);
 	}
 	if (dcp_dither_request >= 0) {
 		u32 v = dcp_dither_request ? 1 : 0;

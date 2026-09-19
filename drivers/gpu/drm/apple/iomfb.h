@@ -202,6 +202,8 @@ enum dcpep_method {
 	dcpep_read_blend_crc,
 	/* IOMobileFramebufferAP::enable_disable_dithering(u32): (0x4, 0x4) */
 	dcpep_enable_disable_dithering,
+	/* IOMFB::UPPipeAP_H17P::read_crc(Notify_Info_Index, u32): (0x8, 0x4) */
+	dcpep_read_crc,
 	dcpep_num_methods
 };
 
@@ -320,6 +322,11 @@ struct dcp_set_dcpav_prop_chunk_req {
 
 struct dcp_set_dcpav_prop_end_req {
 	char key[0x40];
+} __packed;
+
+struct dcp_read_crc_req {
+	u32 index;
+	u32 arg;
 } __packed;
 
 struct dcp_set_parameter_dcp {
