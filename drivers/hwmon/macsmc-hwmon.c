@@ -36,6 +36,13 @@
 /* Temperature, voltage, current, power, fan(s) */
 #define NUM_SENSOR_TYPES	5
 
+/*
+ * The J700 CPU thermal policy samples a fixed set of die temperatures, which
+ * must therefore be the first temperature channels; any further channels are
+ * only reported to userspace and never feed the policy.
+ */
+#define APPLE_SMC_CPU_POLICY_SENSORS	6
+
 #define FLT_EXP_BIAS	127
 #define FLT_EXP_MASK	GENMASK(30, 23)
 #define FLT_MANT_BIAS	23
@@ -93,7 +100,7 @@ struct macsmc_hwmon {
 	bool register_thermal_zones;
 	bool cpu_thermal_policy;
 	struct mutex thermal_cache_lock;
-	long thermal_cache[6];
+	long thermal_cache[APPLE_SMC_CPU_POLICY_SENSORS];
 	unsigned long thermal_cache_time;
 	int thermal_cache_error;
 };
@@ -409,7 +416,7 @@ static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 
 	switch (type) {
 	case hwmon_temp:
-		if (hwmon->cpu_thermal_policy) {
+		if (hwmon->cpu_thermal_policy && channel < APPLE_SMC_CPU_POLICY_SENSORS) {
 			guard(mutex)(&hwmon->thermal_cache_lock);
 
 			if (hwmon->thermal_cache_error)
@@ -847,7 +854,7 @@ static int macsmc_hwmon_cpu_sample(void *ctx, int *temp)
 {
 	struct macsmc_hwmon *hwmon = ctx;
 	unsigned long start = jiffies;
-	long values[6], maximum = LONG_MIN;
+	long values[APPLE_SMC_CPU_POLICY_SENSORS], maximum = LONG_MIN;
 	unsigned int i;
 	int ret = 0;
 
@@ -881,11 +888,13 @@ static int macsmc_hwmon_cpu_policy(struct macsmc_hwmon *hwmon)
 	};
 	unsigned int i, j, seen = 0;
 
+	static_assert(ARRAY_SIZE(keys) == APPLE_SMC_CPU_POLICY_SENSORS);
+
 	if (!of_property_read_bool(hwmon->dev->of_node, "apple,cpu-thermal-policy"))
 		return 0;
-	if (!of_machine_is_compatible("apple,j700") || hwmon->temp.count != ARRAY_SIZE(keys))
+	if (!of_machine_is_compatible("apple,j700") || hwmon->temp.count < ARRAY_SIZE(keys))
 		return -EINVAL;
-	for (i = 0; i < hwmon->temp.count; i++) {
+	for (i = 0; i < ARRAY_SIZE(keys); i++) {
 		struct macsmc_hwmon_sensor *sensor = &hwmon->temp.sensors[i];
 
 		if (sensor->info.type_code != __SMC_KEY('f', 'l', 't', ' ') ||
