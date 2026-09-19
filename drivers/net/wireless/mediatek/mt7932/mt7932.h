@@ -103,6 +103,17 @@ struct mt7932 {
 	unsigned long peer_alloc;
 	struct mt7932_peer_ids peer_ids;
 	struct cfg80211_bss *connect_bss;
+
+	/*
+	 * RSSI of the associated AP, taken from its own beacons, and the
+	 * connection-quality thresholds wpa_supplicant asks us to watch.  Written
+	 * from the RX path, read from cfg80211 ops, so keep them access-once.
+	 */
+	int assoc_signal_dbm;
+	bool assoc_signal_valid;
+	s32 cqm_rssi_thold;
+	u32 cqm_rssi_hyst;
+	int cqm_rssi_state;
 	struct work_struct connect_work, disconnect_work;
 	struct completion assoc_start, assoc_done, disconnect_done;
 	struct completion discovery_done;
@@ -179,6 +190,12 @@ int mt_register_regulatory_gate(struct mt7932 *m);
 int mt_station_ps_restore(struct mt7932 *m);
 int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout);
+
+int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
+		   const u8 *mac, struct station_info *sinfo);
+int mt_set_cqm_rssi_config(struct wiphy *wiphy, struct net_device *netdev,
+			   s32 rssi_thold, u32 rssi_hyst);
+void mt_signal_update(struct mt7932 *m, const struct mt7932_rx_frame *frame, int signal);
 
 bool mt_transport_polled(void);
 
