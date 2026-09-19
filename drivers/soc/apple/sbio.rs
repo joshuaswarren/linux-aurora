@@ -31,6 +31,15 @@ impl SepData {
             return SbioOutcome::Other;
         };
 
+        if *module_parameters::sbio_trace.value() != 0 {
+            dev_info!(
+                self.dev,
+                "sbio-trace: {} -> status {:#x}, {} payload bytes\n",
+                op.name(),
+                err,
+                done.payload.len()
+            );
+        }
         match err as u16 {
             crate::sbio::SBIO_STATUS_OK => SbioOutcome::Ok(done.payload),
             crate::sbio::SBIO_STATUS_PREREQUISITE => {
