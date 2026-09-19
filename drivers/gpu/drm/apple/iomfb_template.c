@@ -2150,6 +2150,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		req->swap.surf_flags[l] = dcp_h17p_surf_flags;
+#endif
 
 		/* Use sRGB colorspace only for internal panels. External
 		 * displays are expected to have EDID and user space can use

@@ -97,6 +97,19 @@ bool dcp_swap_trace;
 module_param_named(swap_trace, dcp_swap_trace, bool, 0644);
 MODULE_PARM_DESC(swap_trace, "log every swap start/submit/complete with its id and time (flicker diagnosis)");
 
+/*
+ * H17P per-layer swap flags.  macOS 25G83 carries surf_flags[0] = 1 in every
+ * captured A408 and m1n1's dcp experiment uses the same [1, 0, 0, 0]; the
+ * Linux driver has always sent 0 and relied on is_premultiplied, which the
+ * H17P surface no longer has (the firmware then blends the XRGB X byte as
+ * straight alpha: black wherever a Vulkan-rendered frame leaves it 0).
+ * Runtime knob so a Vulkan session can flip it without a reboot; 0 keeps
+ * today's behaviour until a capture proves what bit 0 does.
+ */
+unsigned int dcp_h17p_surf_flags;
+module_param_named(h17p_surf_flags, dcp_h17p_surf_flags, uint, 0644);
+MODULE_PARM_DESC(h17p_surf_flags, "value for the enabled layer's swap.surf_flags on H17P (macOS: 1; default 0)");
+
 static int dcp_trace_budget;
 module_param_named(trace_rpc, dcp_trace_budget, int, 0644);
 MODULE_PARM_DESC(trace_rpc,
