@@ -369,6 +369,7 @@ void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 u64 dcp_nits_to_double_bits(u32 nits);
+extern bool dcp_swap_trace;
 u32 dcp_h17p_initial_nits(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 

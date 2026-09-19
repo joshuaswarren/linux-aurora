@@ -274,6 +274,9 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 {
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+	if (dcp_swap_trace)
+		dev_info(dcp->dev, "swap-trace: complete id=%u t=%lld us\n",
+			 resp->swap_id, ktime_to_us(now));
 	dcp->last_swap_id = resp->swap_id;
 	dcp->have_swap_complete = true;
 
@@ -1882,6 +1885,10 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	dcp->swap_start = ktime_get();
+	if (dcp_swap_trace)
+		dev_info(dcp->dev, "swap-trace: submitted id=%u t=%lld us\n",
+			 DCP_FW_UNION(dcp->swap).swap.swap_id,
+			 ktime_to_us(dcp->swap_start));
 
 	dcp_release_swapped_out_fbs(dcp);
 }
@@ -1894,6 +1901,10 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
+	if (dcp_swap_trace)
+		dev_info(dcp->dev, "swap-trace: started id=%u t=%lld us surf0=%#llx\n",
+			 resp->swap_id, ktime_to_us(ktime_get()),
+			 (unsigned long long)DCP_FW_UNION(dcp->swap).surf_iova[0]);
 	dcp_h17p_fix_swap_surfaces(dcp);
 	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swapped, NULL);
 }

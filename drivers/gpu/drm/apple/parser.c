@@ -581,8 +581,13 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	if (ret)
 		return ERR_PTR(ret);
 
-	/* Start with a worst case allocation */
-	modes = kmalloc_array(it.len, sizeof(*modes), GFP_KERNEL);
+	/*
+	 * Start with a worst case allocation.  Zeroed: parse_mode() only ever
+	 * sets ->vrr on the j314/j316 120 Hz modes, so the flag (and with it
+	 * use_timestamps) was stack garbage for every other mode -- one J700
+	 * boot logged "vrr:193" and drove the swaps with fake timestamps.
+	 */
+	modes = kcalloc(it.len, sizeof(*modes), GFP_KERNEL);
 	*count = 0;
 
 	if (!modes)

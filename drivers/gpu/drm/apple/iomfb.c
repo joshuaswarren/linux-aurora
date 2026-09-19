@@ -93,6 +93,10 @@ static bool skip_hotplug;
 module_param(skip_hotplug, bool, 0644);
 MODULE_PARM_DESC(skip_hotplug, "do not raise the DRM hotplug event (bring-up bisect)");
 
+bool dcp_swap_trace;
+module_param_named(swap_trace, dcp_swap_trace, bool, 0644);
+MODULE_PARM_DESC(swap_trace, "log every swap start/submit/complete with its id and time (flicker diagnosis)");
+
 static int dcp_trace_budget;
 module_param_named(trace_rpc, dcp_trace_budget, int, 0644);
 MODULE_PARM_DESC(trace_rpc,
