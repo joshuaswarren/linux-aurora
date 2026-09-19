@@ -250,6 +250,50 @@ fn scs_request_mib(pages: u32) -> u32 {
     ((pages as u64 + 0xff) >> 8) as u32
 }
 
+/// Derive the per-core SCS request from Apple's packed ScsLayoutGen1 word.
+///
+/// AGXMetalG17P's `getSectionEnd(ScsSection::End)` has four fixed sections
+/// totaling 0x58000 bytes, followed by per-VRID ray-stack, driver-payload and
+/// user-payload storage. The virtual-ray count is the packed clique byte times
+/// 32. `endComputePass` rounds that total to 4 KiB and adds one guard page.
+///
+/// A layout with neither user nor driver payload is the native "no traversal
+/// scratch" gate even if other fields are populated. Arithmetic is checked
+/// here rather than reproducing Apple's 32-bit wrapping: a wrapped request
+/// would under-allocate kernel-owned backing.
+pub(crate) fn scs_pages_for_layout(layout: u64) -> Result<u32, ComputeBuildError> {
+    let depth = layout & 0xffff;
+    let cliques = (layout >> 24) & 0xff;
+    let user = (layout >> 32) & 0xffff;
+    let driver = (layout >> 48) & 0xffff;
+
+    if user == 0 && driver == 0 {
+        return Ok(0);
+    }
+
+    let vrids = cliques
+        .checked_mul(32)
+        .ok_or(ComputeBuildError::ScsRequestOutOfRange)?;
+    let per_vrid = depth
+        .checked_mul(8)
+        .and_then(|value| value.checked_add(driver))
+        .and_then(|value| value.checked_add(user))
+        .ok_or(ComputeBuildError::ScsRequestOutOfRange)?;
+    let bytes = vrids
+        .checked_mul(per_vrid)
+        .and_then(|value| value.checked_add(0x58000))
+        .and_then(|value| value.checked_add(0x1fff))
+        .ok_or(ComputeBuildError::ScsRequestOutOfRange)?
+        & !0xfff;
+    let pages = bytes >> 12;
+
+    if pages > 0xffff {
+        return Err(ComputeBuildError::ScsRequestOutOfRange);
+    }
+
+    Ok(pages as u32)
+}
+
 /// Encode an SCS scratch request the way the kext's register builder does
 /// (generateCLRegisterListG16Common): the page and MiB counts share 0x101d1,
 /// the extras count is its own register, and 0x107a1 either carries the window
@@ -315,11 +359,22 @@ pub(crate) fn build_compute_registers(
     p: ComputeRegisterParameters,
 ) -> Result<ComputeRegisterProgram, ComputeBuildError> {
     let scs = scs_request_registers(
-        *crate::module_parameters::g17p_compute_scs_pages.value(),
-        *crate::module_parameters::g17p_compute_scs_mib.value(),
-        *crate::module_parameters::g17p_compute_scs_extras.value(),
-        *crate::module_parameters::g17p_compute_scs_window.value(),
+        crate::g17_config::COMPUTE_SCS_PAGES,
+        crate::g17_config::COMPUTE_SCS_MIB,
+        crate::g17_config::COMPUTE_SCS_EXTRAS,
+        crate::g17_config::COMPUTE_SCS_WINDOW,
     )?;
+    build_compute_registers_with_scs(p, scs)
+}
+
+/// Build a production compute register program from the per-command SCS ABI.
+/// A zero/non-RT layout is byte-identical to the historical register program.
+pub(crate) fn build_compute_registers_for_layout(
+    p: ComputeRegisterParameters,
+    layout: u64,
+) -> Result<ComputeRegisterProgram, ComputeBuildError> {
+    let pages = scs_pages_for_layout(layout)?;
+    let scs = scs_request_registers(pages, 0, 0, 0)?;
     build_compute_registers_with_scs(p, scs)
 }
 
@@ -504,7 +559,7 @@ pub(crate) fn build_compute_queue_graph(
 /// kernel log and destroys its own evidence -- into a 20-iteration one.
 pub(crate) fn compute_item_ring_entries() -> u32 {
     const FULL: u32 = 0x500;
-    let requested = *crate::module_parameters::g17p_ring_limit.value();
+    let requested = crate::g17_config::RING_LIMIT;
     if requested == 0 {
         return FULL;
     }
@@ -556,12 +611,12 @@ pub(crate) fn encode_compute_config_update(
     // identical to the previous driver; 1 sends the client's real context when
     // one is known. See `g17p_compute_config_context`.
     let declared_context = match context_id {
-        Some(context) if *crate::module_parameters::g17p_compute_config_context.value() != 0 => {
+        Some(context) if crate::g17_config::COMPUTE_CONFIG_CONTEXT != 0 => {
             context
         }
         _ => 2u16,
     };
-    let flushid_fix = *crate::module_parameters::g17p_flushid_fix.value() != 0;
+    let flushid_fix = crate::g17_config::FLUSHID_FIX != 0;
     let (flushid_object, flushid_slot, flushid_index) = if flushid_fix {
         (0u64, 0xffffu16, 0xffffu16)
     } else {
@@ -1037,6 +1092,28 @@ mod tests {
         assert_eq!(scs_request_registers(0x59, 9, 0, 0).unwrap().size_word, 0x0009_0059);
         // Zero pages keeps the historical register exactly.
         assert_eq!(scs_request_registers(0, 0, 0, 0).unwrap().size_word, 0);
+    }
+
+    #[test]
+    fn scs_layout_sizes_match_the_measured_metal_shapes() {
+        let layout = |depth: u64, driver: u64| depth | (96 << 24) | (driver << 48);
+
+        assert_eq!(scs_pages_for_layout(layout(0x70, 0x48)).unwrap(), 0x32f);
+        assert_eq!(scs_pages_for_layout(layout(0x70, 0x114)).unwrap(), 0x3c8);
+        assert_eq!(scs_pages_for_layout(layout(0xe8, 0x128)).unwrap(), 0x6a7);
+
+        // The native endComputePass gate suppresses a request when both
+        // payload sizes are zero, even if depth/clique fields are populated.
+        assert_eq!(scs_pages_for_layout(0x70 | (96 << 24)).unwrap(), 0);
+        assert_eq!(scs_pages_for_layout(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn scs_layout_rejects_an_unrepresentable_request() {
+        assert_eq!(
+            scs_pages_for_layout(u64::MAX),
+            Err(ComputeBuildError::ScsRequestOutOfRange)
+        );
     }
 
     #[test]

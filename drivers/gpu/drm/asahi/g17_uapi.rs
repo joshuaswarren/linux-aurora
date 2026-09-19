@@ -32,7 +32,7 @@ use g17_submission::{
 
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
 pub(crate) const UAPI_RENDER_SIZE: usize = 256;
-pub(crate) const UAPI_COMPUTE_SIZE: usize = 64;
+pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
@@ -401,6 +401,7 @@ pub(crate) struct UapiComputeCommand {
     pub(crate) sampler_heap: u64,
     pub(crate) helper: UapiHelperProgram,
     pub(crate) timestamps: UapiTimestamps,
+    pub(crate) scs_layout: u64,
 }
 
 impl UapiComputeCommand {
@@ -414,6 +415,7 @@ impl UapiComputeCommand {
             sampler_heap: get_u64(&raw, 0x18),
             helper: helper(&raw, 0x20),
             timestamps: timestamps(&raw, 0x30),
+            scs_layout: get_u64(&raw, 0x40),
         })
     }
 }
@@ -972,6 +974,7 @@ pub(crate) struct TranslatedComputeCommand {
     pub(crate) attachments: UapiAttachmentList,
     pub(crate) g17p_add3_buffers: Option<[u64; 3]>,
     pub(crate) timestamps: UapiTimestamps,
+    pub(crate) scs_layout: u64,
 }
 
 pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
@@ -1048,6 +1051,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         attachments,
         g17p_add3_buffers,
         timestamps: command.timestamps,
+        scs_layout: command.scs_layout,
     })
 }
 
@@ -1094,7 +1098,7 @@ pub(crate) fn build_compute_descriptor(
     timestamps: ComputeTimestampAddresses,
     raw: &mut [u8],
 ) -> Result<(), UapiTranslateError> {
-    let registers = g17_compute::build_compute_registers(
+    let registers = g17_compute::build_compute_registers_for_layout(
         g17_compute::ComputeRegisterParameters {
             preempt_base: internal.preempt_base,
             cdm_base: command.control_stream_base,
@@ -1109,6 +1113,7 @@ pub(crate) fn build_compute_descriptor(
             operand_state_base: internal.operand_state_base,
             execution_gate: internal.execution_gate,
         },
+        command.scs_layout,
     )?;
     g17_compute::build_compute_descriptor(
         &registers,
@@ -1636,6 +1641,7 @@ mod tests {
                                 offset: 0,
                             },
                         },
+                        scs_layout: 0,
                     }
                 );
             }
