@@ -3380,7 +3380,12 @@ pub(crate) const SBIO_STATUS_16: u16 = 0x16;
 static_assert!(SBIO_STATUS_PREREQUISITE != SBIO_STATUS_16);
 pub(crate) const SBIO_SESSION_MODE: u32 = 1;
 /// Values to try for the session-share mode word when none is pinned.
-pub(crate) const SBIO_SESSION_MODES: [u32; 9] = [1, 0, 2, 3, 4, 5, 6, 7, 8];
+/// Hardware, J700 2026-09-19: mode 1 is answered 0x16 and every other word
+/// 0,2..8 is answered 0x2d, i.e. the enclave recognises 1 and rejects the rest
+/// outright -- the built-in value is correct and 0x16 is about some other
+/// prerequisite. Sweeping is left available through `session_mode=` but is no
+/// longer done on its own.
+pub(crate) const SBIO_SESSION_MODES: [u32; 1] = [SBIO_SESSION_MODE];
 static_assert!(SBIO_SESSION_SHARE_LEN <= SBIO_MAX_PAYLOAD);
 
 const OP_SBIO_SESSION_SHARE: u16 = 0x15;
