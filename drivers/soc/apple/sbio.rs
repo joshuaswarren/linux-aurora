@@ -1291,6 +1291,24 @@ impl SepData {
         }
 
         self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
+
+        // macOS: prepareSession() issues no SBIO traffic of its own, so the key
+        // exchange follows the two identifiers directly.  This completes the
+        // prologue 0x73 -> 0x80 -> 0x19 -> 0x17 -> 0x81 -> 0x15.
+        if !self.session_established.load(Relaxed) {
+            if self.establish_session() {
+                self.session_established.store(true, Relaxed);
+                dev_info!(
+                    self.dev,
+                    "sensor: session established after the identifiers\n"
+                );
+            } else {
+                dev_warn!(
+                    self.dev,
+                    "sensor: the session was refused after both identifiers\n"
+                );
+            }
+        }
         true
     }
 
