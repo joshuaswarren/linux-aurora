@@ -238,12 +238,59 @@
 	status = "okay";
 };
 
+/*
+ * The PMU (baku, USID 0xe on nub-spmi0) carries the boot-stage / error /
+ * panic counters, the shutdown flag and the RTC offset as SPMI NVMEM cells
+ * (J700 ADT pmu-main@E, info-leg_scrpad 0xf700, info-rtc 0xf802; satchlj's
+ * t8140-j700-radio.dts, 2026-09-18).  Without the shutdown flag every
+ * poweroff turns into a reboot.  The RTC offset cell is wired but not yet
+ * proven to commit: rtc-macsmc reports an invalid time until an offset
+ * exists rather than 1971.
+ */
+&{/soc} {
+	nub_spmi0: spmi@308714000 {
+		compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x08714000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 487 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_nub_spmi0>;
+
+		pmic@e {
+			compatible = "apple,baku-pmic", "apple,spmi-nvmem";
+			reg = <0xe SPMI_USID>;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				boot_stage: boot-stage@f701 { reg = <0xf701 0x1>; };
+				boot_error_count: boot-error-count@f702,0 { reg = <0xf702 0x1>; bits = <0 4>; };
+				panic_count: panic-count@f702,4 { reg = <0xf702 0x1>; bits = <4 4>; };
+				shutdown_flag: shutdown-flag@f70f,3 { reg = <0xf70f 0x1>; bits = <3 1>; };
+				rtc_offset: rtc-offset@f802 { reg = <0xf802 0x6>; };
+			};
+		};
+	};
+};
+
 &smc {
 	status = "okay";
 
-	/* T8140 has no described SMC NVMEM provider; restart does not need it. */
 	reboot {
 		compatible = "apple,smc-reboot";
+		nvmem-cells = <&shutdown_flag>, <&boot_stage>, <&boot_error_count>, <&panic_count>;
+		nvmem-cell-names = "shutdown_flag", "boot_stage", "boot_error_count", "panic_count";
+	};
+
+	rtc {
+		compatible = "apple,smc-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
 	};
 
 	/*
@@ -568,11 +615,6 @@
 
 &smc {
 	status = "okay";
-
-	/* T8140 has no described SMC NVMEM provider; restart does not need it. */
-	reboot {
-		compatible = "apple,smc-reboot";
-	};
 
 	/*
 	 * Exactly the six SMC die temperatures the J700 CPU thermal policy samples
