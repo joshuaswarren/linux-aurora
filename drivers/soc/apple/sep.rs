@@ -2218,6 +2218,10 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        calibrate_after_params: u8 {
+            default: 0,
+            description: "Load the sensor calibration AFTER the sensor parameters and transparent channel rather than before (J700/0x3356 order: the enclave gates MODULE_CHALLENGE on the parameters and COMPLETE_INIT on the calibration).",
+        },
         patch_ack_accept: u8 {
             default: 0,
             description: "Additional status[8] value to treat as 'sensor patch already accepted' (0 = only the built-in 0x29). For a sensor revision that reports a different ack.",

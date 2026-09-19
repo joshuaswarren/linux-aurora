@@ -763,6 +763,15 @@ impl SepData {
         let Some(patch) = self.wake_sensor() else {
             return;
         };
+        if *module_parameters::calibrate_after_params.value() != 0 {
+            if !self.bring_sensor_online() {
+                dev_warn!(
+                    self.dev,
+                    "sbio: attach-time sensor bring-up did not complete; matching remains unavailable until a later bring-up succeeds.\n"
+                );
+            }
+            return;
+        }
         if !self.complete_bringup(patch) {
             dev_warn!(
                 self.dev,
@@ -775,6 +784,25 @@ impl SepData {
         let Some(mut patch) = self.wake_sensor() else {
             return false;
         };
+
+        // J700 (0x3356 sensor, newer sepOS): the enclave refuses MODULE_CHALLENGE
+        // with "prerequisite missing" until the sensor parameters and the
+        // transparent channel are in place, and refuses COMPLETE_INIT (0x101)
+        // until the calibration has been loaded -- the mirror image of the
+        // order that works on T6020.  Both were observed on hardware.
+        if *module_parameters::calibrate_after_params.value() != 0 {
+            let Some(params) = self.apply_sensor_parameters() else {
+                dev_err!(self.dev, "sensor: parameters failed before calibration\n");
+                return false;
+            };
+            if !self.sensor_calibrated.load(Relaxed) {
+                if !self.calibrate_sensor() {
+                    return false;
+                }
+                self.sensor_calibrated.store(true, Relaxed);
+            }
+            return self.finish_bringup(patch, params);
+        }
 
         if !self.sensor_calibrated.load(Relaxed) {
             if !self.calibrate_sensor() {
@@ -1407,7 +1435,12 @@ impl SepData {
         let Some(params) = self.apply_sensor_parameters() else {
             return false;
         };
+        self.finish_bringup(patch, params)
+    }
 
+    /// The half after the sensor parameters: on the J700 the calibration has to
+    /// be loaded between the two, so the caller runs it in the gap.
+    fn finish_bringup(&self, patch: PatchLoaded, params: ParametersApplied) -> bool {
         let op = crate::sbio::sbio_complete_init(patch, params);
         if self.sbio_expect_ok(&op).is_none() {
             dev_err!(
