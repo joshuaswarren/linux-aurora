@@ -2059,6 +2059,26 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	req->unkU32Ptr_null = true;
 	req->unkU32out_null = true;
 #endif
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * macOS 25G83 never sends an H17P swap with bl_h17p_d[2]/[3] at zero:
+	 * every one of the 223 captured swaps carries ~477 nits there even
+	 * when the block is otherwise idle (see the field comments in
+	 * iomfb_template.h).  Ours left them at zero after the memset above.
+	 * With wlroots' Vulkan renderer submitting swaps back to back, the
+	 * firmware reported "brightness 0.000 nits" and the panel went dark
+	 * while the cursor moved (BRIO captures, 2026-09-19); paced swaps
+	 * (gles2/pixman/synchronous submits) never did.  Seed the pair with
+	 * the panel maximum on every swap so an idle block can never read as
+	 * a zero ceiling.
+	 */
+	if (dcp_has_panel(dcp) && dcp->brightness.maximum > 0) {
+		u64 max = dcp_nits_to_double_bits(dcp->brightness.maximum);
+
+		req->swap.bl_h17p_d[2] = cpu_to_le64(max);
+		req->swap.bl_h17p_d[3] = cpu_to_le64(max);
+	}
+#endif
 
 	/*
 	 * Clear all surfaces on startup. The boot framebuffer in surface 0
