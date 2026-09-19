@@ -1362,6 +1362,36 @@ impl SepData {
             }
         }
 
+        // Control experiment: 0x5b LOAD_CALIBRATION goes through the SAME
+        // container decoder as 0x86, with the same arg7 and the same status
+        // pass-through.  Sending a comb-wrapped calibration here separates "the
+        // trust bundle and anchor are good, the problem is MSRk-specific" (0x0)
+        // from "the assembled bundle is not the one the anchor digests" (0x12e)
+        // from "the container is malformed" (0x1c).
+        if *module_parameters::calib_probe.value() != 0 {
+            match kernel::firmware::Firmware::request(c"apple/calib-comb-j700.bin", &self.dev) {
+                Ok(fw) => {
+                    let mut body = KVec::new();
+                    if body
+                        .extend_from_slice(&crate::sbio::SBIO_CALIBRATION_SOURCE.to_le_bytes(), GFP_KERNEL)
+                        .is_ok()
+                        && body.extend_from_slice(fw.data(), GFP_KERNEL).is_ok()
+                    {
+                        match self.sbio_transfer_raw(0x5b, c"CALIB_PROBE", &body) {
+                            Ok(done) => dev_info!(
+                                self.dev,
+                                "calib-probe: 0x5b with a comb-wrapped calibration ({} B) -> {}\n",
+                                body.len(),
+                                done.status
+                            ),
+                            Err(e) => dev_info!(self.dev, "calib-probe: transfer failed {:?}\n", e),
+                        }
+                    }
+                }
+                Err(e) => dev_info!(self.dev, "calib-probe: no comb calibration file ({:?})\n", e),
+            }
+        }
+
         self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
 
         // macOS: prepareSession() issues no SBIO traffic of its own, so the key
