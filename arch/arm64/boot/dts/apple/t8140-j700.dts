@@ -272,7 +272,8 @@
 				boot_error_count: boot-error-count@f702,0 { reg = <0xf702 0x1>; bits = <0 4>; };
 				panic_count: panic-count@f702,4 { reg = <0xf702 0x1>; bits = <4 4>; };
 				shutdown_flag: shutdown-flag@f70f,3 { reg = <0xf70f 0x1>; bits = <3 1>; };
-				rtc_offset: rtc-offset@f802 { reg = <0xf802 0x6>; };
+				/* macOS: legacy scratchpad +4, 64-bit seconds; 0xf802 is the 65536 Hz counter itself */
+				rtc_offset: rtc-offset@f704 { reg = <0xf704 0x8>; };
 			};
 		};
 	};
@@ -291,6 +292,7 @@
 		compatible = "apple,smc-rtc";
 		nvmem-cells = <&rtc_offset>;
 		nvmem-cell-names = "rtc_offset";
+		apple,rtc-offset-seconds;
 	};
 
 	/*

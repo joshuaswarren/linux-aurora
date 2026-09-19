@@ -21,11 +21,21 @@ properties:
 
   nvmem-cells:
     items:
-      - description: 48bit RTC offset, specified in 32768 (2^15) Hz clock ticks
+      - description:
+          RTC offset. 48bit, specified in 32768 (2^15) Hz clock ticks, unless
+          apple,rtc-offset-seconds is set, in which case it is a 64bit
+          little-endian count of whole seconds.
 
   nvmem-cell-names:
     items:
       - const: rtc_offset
+
+  apple,rtc-offset-seconds:
+    type: boolean
+    description:
+      The PMU keeps the RTC offset as whole seconds in its legacy scratchpad
+      (t8140 "baku" PMU and later) rather than as 32768 Hz ticks. The current
+      time is then the counter's integer seconds plus the offset.
 
 required:
   - compatible
