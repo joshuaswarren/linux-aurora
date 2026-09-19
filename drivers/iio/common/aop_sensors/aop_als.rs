@@ -50,12 +50,13 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
     // sensor is still enabled, rather than failing probe outright.  A machine
     // that does need the blob simply reports uncalibrated lux until it is
     // supplied, which is visible and recoverable.
-    match Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
-        Ok(fw) => set_als_property(aop, svc, 0xb, fw.data())?,
-        Err(_) => dev_warn!(
+    if let Ok(fw) = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
+        set_als_property(aop, svc, 0xb, fw.data())?;
+    } else {
+        dev_warn!(
             dev.as_ref(),
             "apple/aop-als-cal.bin is absent; enabling the sensor without pushing a calibration (the AOP may hold its own)\n"
-        ),
+        );
     }
     set_als_property(aop, svc, 0, &200000u32.to_le_bytes())?;
 
