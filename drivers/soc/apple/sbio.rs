@@ -393,7 +393,6 @@ impl SepData {
         let user_id = SBIO_PROBE_USER_ID;
         let mut any = false;
         let mut missing_files = false;
-        let mut all_absent = true;
         let mut user_outcome = RestoreOutcome::NoStoredFile;
 
         // 0x8002 (cold transition) is a success only on the owner component.
@@ -421,12 +420,9 @@ impl SepData {
             let states = crate::sbio::ComponentStates::new(&reply);
             let outcome = self.restore_catacomb(states.state_for(id), id, kind, what, cold_ok);
             match outcome {
-                RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => {
-                    any = true;
-                    all_absent = false;
-                }
+                RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => any = true,
                 RestoreOutcome::NoStoredFile => missing_files = true,
-                RestoreOutcome::Failed | RestoreOutcome::EmptyTolerated => all_absent = false,
+                RestoreOutcome::Failed | RestoreOutcome::EmptyTolerated => {}
             }
             if id == user_id {
                 user_outcome = outcome;
@@ -438,26 +434,21 @@ impl SepData {
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive
         );
         let lockout = match self.restore_lockout() {
-            RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => {
-                all_absent = false;
-                true
-            }
-            RestoreOutcome::EmptyTolerated => {
-                all_absent = false;
-                true
-            }
+            RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => true,
+            RestoreOutcome::EmptyTolerated => true,
             RestoreOutcome::NoStoredFile => {
                 missing_files = true;
                 false
             }
-            RestoreOutcome::Failed => {
-                all_absent = false;
-                false
-            }
+            RestoreOutcome::Failed => false,
         };
 
         let restored = user_ok && lockout;
-        let never_enrolled = !restored && all_absent;
+        // "Never enrolled" is a statement about the host's four artefact files,
+        // not about the enclave's component states: a virgin enclave reports the
+        // master and owner components already active, so an outcome-based test
+        // never fires.
+        let never_enrolled = !restored && self.no_stored_artefacts();
 
         if missing_files && !never_enrolled {
             dev_warn!(
@@ -605,6 +596,22 @@ impl SepData {
             Some(Err(_)) => None,
             None => None,
         }
+    }
+
+    /// True when none of the four persisted artefacts exists: this machine has
+    /// never completed an enrolment, so there is nothing to restore.
+    fn no_stored_artefacts(&self) -> bool {
+        for (kind, what) in [
+            (PRIVATE_TYPE_CATACOMB_MASTER, c"master catacomb"),
+            (PRIVATE_TYPE_CATACOMB_OWNER, c"owner catacomb"),
+            (PRIVATE_TYPE_CATACOMB_USER, c"user catacomb"),
+            (PRIVATE_TYPE_LOCKOUT, c"bio lockout record"),
+        ] {
+            if self.read_stored(kind, what).is_some() {
+                return false;
+            }
+        }
+        true
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
