@@ -1486,18 +1486,55 @@ impl SepData {
     }
 
     fn establish_session(&self) -> bool {
-        let share = match self.sbio_call(&crate::sbio::sbio_request_session_share()) {
-            SbioOutcome::Ok(sh) => sh,
-            SbioOutcome::Status16 => {
-                return false;
-            }
-            SbioOutcome::PrerequisiteMissing => {
-                return false;
-            }
-            SbioOutcome::Other => {
-                return false;
-            }
+        // The request carries nothing but a mode word. Status 0x16 on it is the
+        // enclave rejecting that word, so when the module parameter has not
+        // pinned one, walk the small enumeration instead of giving up on the
+        // value a different SoC's enclave happened to take.
+        let pinned = *module_parameters::session_mode.value();
+        let candidates: &[u32] = if pinned != 0 {
+            &[]
+        } else {
+            &crate::sbio::SBIO_SESSION_MODES
         };
+        let first = if pinned != 0 {
+            pinned
+        } else {
+            crate::sbio::SBIO_SESSION_MODE
+        };
+
+        let mut share = None;
+        let mut mode_used = first;
+        for (n, mode) in core::iter::once(first)
+            .chain(candidates.iter().copied().filter(|m| *m != first))
+            .enumerate()
+        {
+            match self.sbio_call(&crate::sbio::sbio_request_session_share_mode(mode)) {
+                SbioOutcome::Ok(sh) => {
+                    if n > 0 {
+                        dev_info!(
+                            self.dev,
+                            "sbio: SESSION_SHARE accepted mode {} (the built-in {} was refused); pin it with session_mode={}\n",
+                            mode,
+                            first,
+                            mode
+                        );
+                    }
+                    mode_used = mode;
+                    share = Some(sh);
+                    break;
+                }
+                SbioOutcome::Status16 => continue,
+                SbioOutcome::PrerequisiteMissing | SbioOutcome::Other => return false,
+            }
+        }
+        let Some(share) = share else {
+            dev_err!(
+                self.dev,
+                "sbio: SESSION_SHARE refused every mode tried; the sensor session cannot be opened on this enclave\n"
+            );
+            return false;
+        };
+        let _ = mode_used;
 
         // 0x30 reserved for this reply; length is a floor, take the first 40
         if share.len() < sensor::SESSION_SHARE_LEN {
@@ -3329,16 +3366,24 @@ pub(crate) const SBIO_STATUS_PREREQUISITE: u16 = 0x01;
 pub(crate) const SBIO_STATUS_16: u16 = 0x16;
 static_assert!(SBIO_STATUS_PREREQUISITE != SBIO_STATUS_16);
 pub(crate) const SBIO_SESSION_MODE: u32 = 1;
+/// Values to try for the session-share mode word when none is pinned.
+pub(crate) const SBIO_SESSION_MODES: [u32; 5] = [1, 0, 2, 3, 4];
 static_assert!(SBIO_SESSION_SHARE_LEN <= SBIO_MAX_PAYLOAD);
 
 const OP_SBIO_SESSION_SHARE: u16 = 0x15;
-pub(crate) fn sbio_request_session_share() -> SbioOp {
+/// The whole request is one mode word. `SBIO_SESSION_MODE` (1) is the value the
+/// T6020 enclave takes; a board whose enclave has not been observed can sweep
+/// the small enumeration with `session_mode=`.
+pub(crate) fn sbio_request_session_share_mode(mode: u32) -> SbioOp {
     SbioOp {
         opcode: OP_SBIO_SESSION_SHARE,
-        payload: pad_payload(&SBIO_SESSION_MODE.to_le_bytes()),
+        payload: pad_payload(&mode.to_le_bytes()),
         payload_len: 4,
         name: c"SESSION_SHARE",
     }
+}
+pub(crate) fn sbio_request_session_share() -> SbioOp {
+    sbio_request_session_share_mode(SBIO_SESSION_MODE)
 }
 
 const OP_SBIO_COMMIT_SESSION: u16 = 0x16;
