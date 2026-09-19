@@ -1380,6 +1380,34 @@ impl SepData {
             }
         };
 
+        // J700: MODULE_CHALLENGE answers "prerequisite missing" even with the
+        // parameters and transparent channel in place.  The remaining ordering
+        // difference inside calibration is the blob itself, so allow it to be
+        // loaded before the challenge rather than after the commit.
+        let calibration_first = *module_parameters::calibration_before_challenge.value() != 0;
+        let load_calibration = |what: &str| -> bool {
+            let request = match crate::sbio::SbioCalibration::new(&blob) {
+                Ok(request) => request,
+                Err(_) => return false,
+            };
+            let ok = self
+                .sbio_transfer_raw(request.opcode(), request.name(), request.payload())
+                .ok()
+                .filter(|done| done.status.is_ok())
+                .is_some();
+            if !ok {
+                dev_err!(
+                    self.dev,
+                    "sensor: 0x5b LOAD_CALIBRATION failed ({}). Without it every capture is refused with status 1.\n",
+                    what
+                );
+            }
+            ok
+        };
+        if calibration_first && !load_calibration("before the module challenge") {
+            return false;
+        }
+
         let Some(challenge) = self.sbio_expect_ok(&crate::sbio::sbio_module_challenge()) else {
             return false;
         };
@@ -1407,22 +1435,7 @@ impl SepData {
             return false;
         };
 
-        let request = match crate::sbio::SbioCalibration::new(&blob) {
-            Ok(request) => request,
-            Err(_) => {
-                return false;
-            }
-        };
-        if self
-            .sbio_transfer_raw(request.opcode(), request.name(), request.payload())
-            .ok()
-            .filter(|done| done.status.is_ok())
-            .is_none()
-        {
-            dev_err!(
-                self.dev,
-                "sensor: 0x5b LOAD_CALIBRATION failed. Without it every capture is refused with status 1.\n"
-            );
+        if !calibration_first && !load_calibration("after the module commit") {
             return false;
         }
 
