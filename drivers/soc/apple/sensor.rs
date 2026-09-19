@@ -594,12 +594,67 @@ pub(crate) const SENSOR_NONCE_AT: usize = 9;
 static_assert!(SENSOR_NONCE_AT == SENSOR_SERIAL_AT);
 static_assert!(SENSOR_NONCE_AT + SENSOR_NONCE_LEN <= SENSOR_NONCE_REPLY_LEN - CRC_LEN);
 
-pub(crate) fn read_sensor_nonce(cmd_byte: u8) -> Result<[u8; SENSOR_NONCE_LEN]> {
+/// macOS's `GetSensorNonce` (command id 0x8f) builds the plain 7-byte frame
+/// `80 35 00 07 00 00 00`, takes an 11-byte acknowledgement, then polls the
+/// 16-byte status and branches on status byte 10 before reading the payload.
+/// Accept and reject are both 11 bytes, so the status byte is the only
+/// discriminator.
+pub(crate) const NONCE_CMD: u8 = 0x35;
+pub(crate) const NONCE_ACK_LEN: usize = 0xb;
+pub(crate) const STATUS_RESULT_AT: usize = 10;
+
+pub(crate) struct NonceRead {
+    pub(crate) status_byte: u8,
+    pub(crate) available: usize,
+    pub(crate) head: [u8; 24],
+    pub(crate) nonce: Option<[u8; SENSOR_NONCE_LEN]>,
+}
+
+pub(crate) fn read_sensor_nonce(cmd_byte: u8) -> Result<NonceRead> {
     let frame: [u8; CMD_LEN] = [0x80, cmd_byte, 0x00, 0x07, 0x00, 0x00, 0x00];
     command(&frame)?;
-    let mut nonce = [0u8; SENSOR_NONCE_LEN];
-    read_framed_verified(SENSOR_NONCE_REPLY_LEN, SENSOR_NONCE_AT, &mut nonce)?;
-    Ok(nonce)
+
+    // The acknowledgement first, then the status; the payload length is
+    // whatever the sensor then advertises rather than a constant we assume.
+    let mut ack = [0xffu8; MAX_REPLY];
+    let _ = read_reply_ready(NONCE_ACK_LEN, &mut ack);
+
+    let st = status()?;
+    let status_byte = st.raw[STATUS_RESULT_AT];
+
+    let mut available = 0usize;
+    for _ in 0..READ_POLL_ATTEMPTS {
+        if let Offset12::Available(count) = status()?.offset12() {
+            available = count as usize;
+            break;
+        }
+        fsleep(Delta::from_millis(READ_POLL_MS));
+    }
+
+    let mut head = [0u8; 24];
+    let mut nonce = None;
+    if available >= SENSOR_NONCE_AT + SENSOR_NONCE_LEN + CRC_LEN && available <= MAX_REPLY {
+        let mut buf = [0xffu8; MAX_REPLY];
+        if read_reply_ready(available, &mut buf).is_ok() {
+            head.copy_from_slice(&buf[..24]);
+            let mut n = [0u8; SENSOR_NONCE_LEN];
+            n.copy_from_slice(&buf[SENSOR_NONCE_AT..SENSOR_NONCE_AT + SENSOR_NONCE_LEN]);
+            nonce = Some(n);
+        }
+    } else if available > 0 && available <= MAX_REPLY {
+        let mut buf = [0xffu8; MAX_REPLY];
+        if read_reply_ready(available, &mut buf).is_ok() {
+            let n = core::cmp::min(24, available);
+            head[..n].copy_from_slice(&buf[..n]);
+        }
+    }
+
+    Ok(NonceRead {
+        status_byte,
+        available,
+        head,
+        nonce,
+    })
 }
 
 /// Send one 7-byte command and report the reply length the sensor then
