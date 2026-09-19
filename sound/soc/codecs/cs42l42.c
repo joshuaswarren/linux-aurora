@@ -868,11 +868,20 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		break;
 	case SND_SOC_DAIFMT_DSP_A:
 		/*
-		 * Pulse mode, frame starts on the rising edge of LRCLK,
-		 * data delayed by 1.0 SCLKs; the channels sit back to back
-		 * (hw_params places channel 2 at the slot width).  The T8140
-		 * AOP runs the CS42L83 jack link this way: a 125-SCLK frame
-		 * pulse with two 32-bit slots.
+		 * Pulse mode, frame starts on the rising edge of LRCLK; the
+		 * channels sit back to back (hw_params places channel 2 at the
+		 * slot width).  The T8140 AOP runs the CS42L83 jack link this
+		 * way: a 125-SCLK frame pulse with two 32-bit slots.
+		 *
+		 * The data follows the frame pulse by half an SCLK, not the
+		 * whole one DSP-A nominally implies.  With FSD = 1.0 the codec
+		 * sampled every slot one bit late: the sample arrived doubled
+		 * and everything above half scale wrapped -- measured on the
+		 * J700 jack through a line-in (60 Hz sines: THD -60 dB up to
+		 * -12 dBFS, then the fundamental fell and THD reached +6 dB
+		 * from -6 dBFS up, 1800 discontinuities in three seconds), which
+		 * the listener heard as static riding on the bass at high
+		 * volume.  FSD = 0.5 gives THD -60 dB all the way to -1 dBFS.
 		 */
 		snd_soc_component_update_bits(component,
 					      CS42L42_ASP_FRM_CFG,
@@ -880,7 +889,7 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 					      CS42L42_ASP_5050_MASK |
 					      CS42L42_ASP_FSD_MASK,
 					      CS42L42_ASP_STP_MASK |
-					      (CS42L42_ASP_FSD_1_0 <<
+					      (CS42L42_ASP_FSD_0_5 <<
 						CS42L42_ASP_FSD_SHIFT));
 		cs42l42->dsp_a = true;
 		break;
