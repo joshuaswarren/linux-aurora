@@ -1502,12 +1502,19 @@ impl SepData {
             crate::sbio::SBIO_SESSION_MODE
         };
 
+        let mut order: KVec<u32> = KVec::new();
+        if order.push(first, GFP_KERNEL).is_err() {
+            return false;
+        }
+        for mode in candidates.iter().copied() {
+            if mode != first && order.push(mode, GFP_KERNEL).is_err() {
+                return false;
+            }
+        }
+
         let mut share = None;
         let mut mode_used = first;
-        for (n, mode) in core::iter::once(first)
-            .chain(candidates.iter().copied().filter(|m| *m != first))
-            .enumerate()
-        {
+        for (n, mode) in order.iter().copied().enumerate() {
             match self.sbio_call(&crate::sbio::sbio_request_session_share_mode(mode)) {
                 SbioOutcome::Ok(sh) => {
                     if n > 0 {
