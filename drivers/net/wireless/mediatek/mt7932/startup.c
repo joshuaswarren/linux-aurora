@@ -384,6 +384,8 @@ static const struct cfg80211_ops mt_cfg_ops = {
 	.deauth = mt_deauth,
 	.change_virtual_intf = mt_change_interface,
 	.set_power_mgmt = mt_set_power_mgmt,
+	.get_station = mt_get_station,
+	.set_cqm_rssi_config = mt_set_cqm_rssi_config,
 };
 
 int mt_register_regulatory_gate(struct mt7932 *m)

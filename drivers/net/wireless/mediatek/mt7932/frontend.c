@@ -515,6 +515,7 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 	struct cfg80211_bss *bss;
 	struct ieee80211_channel *channel;
 	unsigned int band;
+	int signal;
 	int ret = mt7932_rx_frame(packet, length, &frame);
 
 	if (ret || !READ_ONCE(m->rf_ready))
@@ -529,9 +530,11 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 	}
 	if (!frame.signal_valid || !mt7932_rx_beacon(&frame))
 		return;
+	signal = mt7932_rx_signal(&frame, m->antenna_mask);
+	mt_signal_update(m, &frame, signal);
 	bss = cfg80211_inform_bss_frame(m->wiphy, channel,
 				      (struct ieee80211_mgmt *)frame.data, frame.length,
-				      mt7932_rx_signal(&frame, m->antenna_mask) * 100, GFP_ATOMIC);
+				      signal * 100, GFP_ATOMIC);
 	if (bss) {
 		m->beacons++;
 		dev_dbg_ratelimited(&m->pdev->dev, "BSS_RECEIVED: channel=%u BSSID=%pM\n", frame.channel, bss->bssid);

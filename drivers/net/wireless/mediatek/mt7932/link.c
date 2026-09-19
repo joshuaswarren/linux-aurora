@@ -37,6 +37,77 @@ int mt_station_ps_restore(struct mt7932 *m)
 	return mt_station_ps_submit(m, m->ps_profile);
 }
 
+/*
+ * wpa_supplicant enables connection-quality monitoring so that it only scans
+ * when the link actually degrades.  Without it `bgscan simple` falls back to a
+ * timed sweep of every channel -- on this machine every ~31 s, which shows up
+ * as periodic latency spikes on an otherwise idle link.  The associated AP's
+ * beacons already carry an RSSI, so drive both the threshold events and the
+ * station signal from those rather than polling the firmware.
+ */
+void mt_signal_update(struct mt7932 *m, const struct mt7932_rx_frame *frame, int signal)
+{
+	enum nl80211_cqm_rssi_threshold_event event;
+	s32 thold;
+	u32 hyst;
+	int state;
+
+	/* addr3 of a beacon is the BSSID; mt7932_rx_beacon() checked the length. */
+	if (!READ_ONCE(m->connected) || frame->length < 22 || signal <= -128)
+		return;
+	if (!ether_addr_equal(frame->data + 16, m->connect_bssid))
+		return;
+
+	WRITE_ONCE(m->assoc_signal_dbm, signal);
+	WRITE_ONCE(m->assoc_signal_valid, true);
+
+	thold = READ_ONCE(m->cqm_rssi_thold);
+	if (!thold)
+		return;
+	hyst = READ_ONCE(m->cqm_rssi_hyst);
+	if (signal >= thold + (int)hyst)
+		state = 1;
+	else if (signal <= thold - (int)hyst)
+		state = -1;
+	else
+		return;				/* inside the hysteresis band */
+	if (state == READ_ONCE(m->cqm_rssi_state))
+		return;
+	WRITE_ONCE(m->cqm_rssi_state, state);
+	event = state > 0 ? NL80211_CQM_RSSI_THRESHOLD_EVENT_HIGH :
+			    NL80211_CQM_RSSI_THRESHOLD_EVENT_LOW;
+	cfg80211_cqm_rssi_notify(m->netdev, event, signal, GFP_ATOMIC);
+}
+
+int mt_set_cqm_rssi_config(struct wiphy *wiphy, struct net_device *netdev,
+			   s32 rssi_thold, u32 rssi_hyst)
+{
+	struct mt7932 *m = mt_from_wiphy(wiphy);
+
+	if (netdev != m->netdev || m->wdev.iftype != NL80211_IFTYPE_STATION)
+		return -EINVAL;
+	WRITE_ONCE(m->cqm_rssi_thold, rssi_thold);
+	WRITE_ONCE(m->cqm_rssi_hyst, rssi_hyst);
+	WRITE_ONCE(m->cqm_rssi_state, 0);	/* re-arm: report the next crossing */
+	return 0;
+}
+
+int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
+		   const u8 *mac, struct station_info *sinfo)
+{
+	struct mt7932 *m = mt_from_wiphy(wiphy);
+
+	if (wdev != &m->wdev || !READ_ONCE(m->connected))
+		return -ENOENT;
+	if (mac && !ether_addr_equal(mac, m->connect_bssid))
+		return -ENOENT;
+	if (READ_ONCE(m->assoc_signal_valid)) {
+		sinfo->signal = READ_ONCE(m->assoc_signal_dbm);
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+	}
+	return 0;
+}
+
 int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout)
 {
