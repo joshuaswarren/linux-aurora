@@ -1316,32 +1316,42 @@ impl SepData {
         // loaded, and it must follow 0x80 + 0x17 because the decryption label is
         // built from the sensor serial.
         if !self.msrk_loaded.load(Relaxed) && *module_parameters::send_msrk.value() != 0 {
+            // The whole signed IMG4, unmodified and with no prefix: the handler
+            // runs a real IMG4 decode-and-verify (the same decoder 0x5b uses)
+            // and requires the decoded plaintext to be exactly 72 bytes.  The
+            // bare payload dies at the first DER step, and the object is far
+            // larger than the inline limit, so it goes through the chunked
+            // transfer path.
             let name = c"apple/msrk-j700.bin";
             match kernel::firmware::Firmware::request(name, &self.dev) {
-                Ok(fw) if fw.data().len() == crate::sbio::SBIO_MSRK_LEN => {
-                    let mut blob = [0u8; crate::sbio::SBIO_MSRK_LEN];
-                    blob.copy_from_slice(fw.data());
-                    match self.sbio_call(&crate::sbio::sbio_set_msrk(&blob)) {
-                        SbioOutcome::Ok(_) => {
+                Ok(fw) => {
+                    let blob = fw.data();
+                    match self
+                        .sbio_transfer_raw(crate::sbio::OP_SBIO_SET_MSRK, c"SET_MSRK", blob)
+                    {
+                        Ok(done) if done.status.is_ok() => {
                             self.msrk_loaded.store(true, Relaxed);
-                            dev_info!(self.dev, "sensor: Mesa Secure Root Key loaded\n");
+                            dev_info!(
+                                self.dev,
+                                "sensor: Mesa Secure Root Key loaded ({} byte IMG4)\n",
+                                blob.len()
+                            );
                         }
-                        _ => dev_err!(
+                        Ok(done) => dev_err!(
                             self.dev,
-                            "sensor: the enclave refused the Mesa Secure Root Key; the session will be refused with 0x16\n"
+                            "sensor: the enclave refused the Mesa Secure Root Key ({}); the session will be refused with 0x16\n",
+                            done.status
+                        ),
+                        Err(e) => dev_err!(
+                            self.dev,
+                            "sensor: could not send the Mesa Secure Root Key ({:?})\n",
+                            e
                         ),
                     }
                 }
-                Ok(fw) => dev_err!(
-                    self.dev,
-                    "sensor: {} is {} bytes, expected {}\n",
-                    name,
-                    fw.data().len(),
-                    crate::sbio::SBIO_MSRK_LEN
-                ),
                 Err(e) => dev_err!(
                     self.dev,
-                    "sensor: the Mesa Secure Root Key blob is missing ({:?}); it is per-device data carved from FDR class MSRk and cannot be synthesised\n",
+                    "sensor: the Mesa Secure Root Key blob is missing ({:?}); it is the per-device MSRk IMG4 carved from the FDR store and cannot be synthesised\n",
                     e
                 ),
             }
@@ -2921,16 +2931,10 @@ pub(crate) fn sbio_register_nonce(nonce: &[u8; 32]) -> SbioOp {
 /// first act and answers 0x16 when it is clear; the flag lives in __zerofill,
 /// so this has to be sent once per SEP boot.  macOS reads the blob from FDR
 /// class mesa_fdr and sends it as SBIO 0x86 (AppleMesaSEPDriver::setMSRkData).
-const OP_SBIO_SET_MSRK: u16 = 0x86;
-pub(crate) const SBIO_MSRK_LEN: usize = 72;
-pub(crate) fn sbio_set_msrk(blob: &[u8; SBIO_MSRK_LEN]) -> SbioOp {
-    SbioOp {
-        opcode: OP_SBIO_SET_MSRK,
-        payload: pad_payload(blob),
-        payload_len: SBIO_MSRK_LEN,
-        name: c"SET_MSRK",
-    }
-}
+pub(crate) const OP_SBIO_SET_MSRK: u16 = 0x86;
+/// The decoded key material is 72 bytes; what we send is the signed IMG4 that
+/// decodes to it.
+pub(crate) const SBIO_MSRK_PLAIN_LEN: usize = 72;
 
 /// macOS sends the machine's IOPlatformSerialNumber to the biometric endpoint
 /// as a 12-byte message.  It is the only AP-visible message left unsent once
