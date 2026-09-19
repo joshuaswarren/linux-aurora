@@ -2218,6 +2218,10 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        calibration_before_challenge: u8 {
+            default: 0,
+            description: "Send 0x5b LOAD_CALIBRATION before the module challenge instead of after the commit.",
+        },
         calibrate_after_params: u8 {
             default: 0,
             description: "Load the sensor calibration AFTER the sensor parameters and transparent channel rather than before (J700/0x3356 order: the enclave gates MODULE_CHALLENGE on the parameters and COMPLETE_INIT on the calibration).",
