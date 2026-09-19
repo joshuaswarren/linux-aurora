@@ -585,6 +585,42 @@ pub(crate) fn read_sensor_serial() -> Result<SensorSerial> {
     Ok(SensorSerial(serial))
 }
 
+/// macOS's `AppleMesa::GetSensorNonce`: 32 bytes at the usual payload offset of
+/// a 143-byte reply frame.  Only the 0x3356/0x3357 ("Poseidon") class provides
+/// it, and the enclave will not open a session without it.
+pub(crate) const SENSOR_NONCE_LEN: usize = 32;
+pub(crate) const SENSOR_NONCE_REPLY_LEN: usize = 143;
+pub(crate) const SENSOR_NONCE_AT: usize = 9;
+static_assert!(SENSOR_NONCE_AT == SENSOR_SERIAL_AT);
+static_assert!(SENSOR_NONCE_AT + SENSOR_NONCE_LEN <= SENSOR_NONCE_REPLY_LEN - CRC_LEN);
+
+pub(crate) fn read_sensor_nonce(cmd_byte: u8) -> Result<[u8; SENSOR_NONCE_LEN]> {
+    let frame: [u8; CMD_LEN] = [0x80, cmd_byte, 0x00, 0x07, 0x00, 0x00, 0x00];
+    command(&frame)?;
+    let mut nonce = [0u8; SENSOR_NONCE_LEN];
+    read_framed_verified(SENSOR_NONCE_REPLY_LEN, SENSOR_NONCE_AT, &mut nonce)?;
+    Ok(nonce)
+}
+
+/// Send one 7-byte command and report the reply length the sensor then
+/// advertises, so the command that produces the nonce frame can be identified
+/// by its 143-byte signature rather than guessed.
+pub(crate) fn probe_command(cmd_byte: u8) -> Option<usize> {
+    let frame: [u8; CMD_LEN] = [0x80, cmd_byte, 0x00, 0x07, 0x00, 0x00, 0x00];
+    if command(&frame).is_err() {
+        return None;
+    }
+    for _ in 0..6 {
+        if let Ok(st) = status() {
+            if let Offset12::Available(count) = st.offset12() {
+                return Some(count as usize);
+            }
+        }
+        fsleep(Delta::from_millis(READ_POLL_MS));
+    }
+    None
+}
+
 pub(crate) fn read_session_reply() -> Result<[u8; SESSION_SHARE_LEN]> {
     let mut share = [0u8; SESSION_SHARE_LEN];
     read_framed(SESSION_REPLY_LEN, SESSION_REPLY_AT, &mut share)?;
