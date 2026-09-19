@@ -614,11 +614,9 @@ pub(crate) fn read_sensor_nonce(cmd_byte: u8) -> Result<NonceRead> {
     let frame: [u8; CMD_LEN] = [0x80, cmd_byte, 0x00, 0x07, 0x00, 0x00, 0x00];
     command(&frame)?;
 
-    // The acknowledgement first, then the status; the payload length is
-    // whatever the sensor then advertises rather than a constant we assume.
-    let mut ack = [0xffu8; MAX_REPLY];
-    let _ = read_reply_ready(NONCE_ACK_LEN, &mut ack);
-
+    // Do NOT read an acknowledgement first: macOS's 11-byte case is the ERROR
+    // reply, and consuming 11 bytes of a good 43-byte frame destroys it.  Poll
+    // the status and read exactly what the sensor advertises.
     let st = status()?;
     let status_byte = st.raw[STATUS_RESULT_AT];
 
