@@ -110,6 +110,17 @@ unsigned int dcp_h17p_surf_flags;
 module_param_named(h17p_surf_flags, dcp_h17p_surf_flags, uint, 0644);
 MODULE_PARM_DESC(h17p_surf_flags, "value for the enabled layer's swap.surf_flags on H17P (macOS: 1; default 0)");
 
+/*
+ * Camera-free check of what the panel is fed: after each of the next N
+ * swap_complete callbacks read the blend-output CRC (A106,
+ * IOMFB::UPPipe2::read_blend_crc) and log it with the swap id.  Two frames
+ * that differ only in bytes the pipe should ignore (the XRGB X byte) must
+ * give the same CRC; a static desktop must give a constant one.
+ */
+int dcp_blend_crc_reads;
+module_param_named(blend_crc_reads, dcp_blend_crc_reads, int, 0644);
+MODULE_PARM_DESC(blend_crc_reads, "read and log the blend-output CRC after the next N completed swaps (H17P)");
+
 static int dcp_trace_budget;
 module_param_named(trace_rpc, dcp_trace_budget, int, 0644);
 MODULE_PARM_DESC(trace_rpc,

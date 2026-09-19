@@ -198,6 +198,8 @@ enum dcpep_method {
 	dcpep_pipe_set_476,
 	dcpep_pipe_cfg_438,
 	dcpep_pipe_set_428,
+	/* IOMFB::UPPipe2::read_blend_crc() const: (0, 0x4), the blend-output CRC */
+	dcpep_read_blend_crc,
 	dcpep_num_methods
 };
 

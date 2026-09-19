@@ -177,6 +177,9 @@ DCP_THUNK_INOUT(dcp_enable_disable_video_power_savings,
 		dcpep_enable_disable_video_power_savings, u32, int);
 
 DCP_THUNK_OUT(dcp_is_main_display, dcpep_is_main_display, u32);
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+DCP_THUNK_OUT(dcp_read_blend_crc, dcpep_read_blend_crc, u32);
+#endif
 
 /* DCP callback handlers */
 static void dcpep_cb_nop(struct apple_dcp *dcp)
@@ -269,6 +272,16 @@ static void dcp_release_swapped_out_fbs(struct apple_dcp *dcp)
 	}
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+static void res_blend_crc(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	u32 crc = out ? *(u32 *)out : 0;
+
+	dev_info(dcp->dev, "blend-crc: swap %u crc %#010x t=%lld us\n",
+		 (u32)(uintptr_t)cookie, crc, ktime_to_us(ktime_get()));
+}
+#endif
+
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
@@ -282,6 +295,13 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 
 	dcp_drm_crtc_page_flip(dcp, now);
 	dcp_release_swapped_out_fbs(dcp);
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	if (dcp_blend_crc_reads > 0) {
+		dcp_blend_crc_reads--;
+		dcp_read_blend_crc(dcp, false, res_blend_crc,
+				   (void *)(uintptr_t)resp->swap_id);
+	}
+#endif
 	if (dcp->crc_enabled) {
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
