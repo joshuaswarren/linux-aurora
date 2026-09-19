@@ -1441,8 +1441,23 @@ impl SepData {
     }
 
     fn calibrate_sensor(&self) -> bool {
+        // Both identifier messages first (the serial went with the sensor
+        // registration): macOS sets _sensorIdentifiersValid only once the nonce
+        // has been registered too, and that flag is what gates the session.
         if !self.register_sensor_nonce() {
             dev_warn!(self.dev, "sensor: nonce registration did not complete\n");
+        } else if !self.session_established.load(Relaxed) {
+            // With the identifiers complete the enclave should now hand out the
+            // session share it was refusing with 0x16.
+            if self.establish_session() {
+                self.session_established.store(true, Relaxed);
+                dev_info!(self.dev, "sensor: session established after the nonce\n");
+            } else {
+                dev_warn!(
+                    self.dev,
+                    "sensor: the session was still refused after registering the nonce\n"
+                );
+            }
         }
         // The blob is per-device factory data, so its name is board data: take
         // it from the sensor node's firmware-name, falling back to the default.
