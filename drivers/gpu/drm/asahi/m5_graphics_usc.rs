@@ -106,9 +106,47 @@ impl M5GraphicsUsc {
         Ok(())
     }
 
+    /// Map the retained pool into another application VM at the same
+    /// addresses, reproducing each allocation's guard reservation, so every
+    /// firmware record naming the directory, free list or blocks stays valid
+    /// across a render client handoff. The returned aliases must be kept for
+    /// as long as that VM may submit.
+    pub(super) fn alias_into(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
+        let range = crate::m5_vm::auxiliary_range(&vm.kernel_range()).ok_or(EINVAL)?;
+        let mut aliases = KVec::new();
+        let alias = |object: &mut MappedObject, size: usize, guards: usize,
+                     aliases: &mut KVec<mmu::KernelMapping>| -> Result {
+            let end = object.iova().checked_add((size + guards * mmu::UAT_PGSZ) as u64)
+                .ok_or(EOVERFLOW)?;
+            if object.iova() < range.start || end > range.end { return Err(ERANGE); }
+            let mapping = object.map_alias_at_with_guards(
+                vm, object.iova(), mmu::PROT_GPU_SHARED_RW, guards)?;
+            aliases.push(mapping, GFP_KERNEL)?;
+            Ok(())
+        };
+        alias(&mut self.directory, DIRECTORY_ENTRIES * 8, 2, &mut aliases)?;
+        alias(&mut self.freelist, mmu::UAT_PGSZ, 1, &mut aliases)?;
+        for block in self.blocks.iter_mut() {
+            alias(block, BLOCK_BYTES, 2, &mut aliases)?;
+        }
+        // Only the mappings are checked here: the firmware has been
+        // advancing the free-ring cursors and returning directory units
+        // while the pool was in use, so the construction-time contents no
+        // longer hold and must not be re-asserted on handoff.
+        self.validate_mappings(vm)?;
+        Ok(aliases)
+    }
+
     /// Verify every CPU page named by the populated 4-KiB directory and the
     /// free-block heads. The allocator keeps the underlying mappings alive.
     pub(super) fn validate(&mut self, vm: &mmu::Vm) -> Result {
+        self.validate_mappings(vm)?;
+        self.validate_contents()
+    }
+
+    /// Range, alignment, guard-gap and translation checks for every pool
+    /// object in `vm`; valid before and after firmware use of the pool.
+    fn validate_mappings(&self, vm: &mmu::Vm) -> Result {
         if self.blocks.len() != BLOCK_COUNT { return Err(EFAULT); }
         let range = vm.kernel_range();
         let validate_guards = |object: &MappedObject, size: usize, guards: usize| -> Result {
@@ -128,14 +166,26 @@ impl M5GraphicsUsc {
         validate_guards(&self.directory, DIRECTORY_ENTRIES * 8, 2)?;
         validate_guards(&self.freelist, mmu::UAT_PGSZ, 1)?;
         for block in &self.blocks { validate_guards(block, BLOCK_BYTES, 2)?; }
+        let translate_all = |object: &MappedObject| -> Result {
+            for offset in (0..object.logical_size).step_by(mmu::UAT_PGSZ) {
+                vm.translate_iova(object.iova() + offset as u64)?;
+            }
+            Ok(())
+        };
+        translate_all(&self.directory)?;
+        translate_all(&self.freelist)?;
+        for block in &self.blocks { translate_all(block)?; }
+        Ok(())
+    }
+
+    /// Construction-time contents: an all-free block list and a directory
+    /// that names every unit in order. Firmware use changes both.
+    fn validate_contents(&mut self) -> Result {
         for block in 0..BLOCK_COUNT {
             let base = self.blocks[block].iova();
             if self.freelist.read_u64(self.freelist.iova() + (block * 0x40) as u64)?
                     != (base | (1u64 << 61)) {
                 return Err(EFAULT);
-            }
-            for offset in (0..BLOCK_BYTES).step_by(mmu::UAT_PGSZ) {
-                vm.translate_iova(base + offset as u64)?;
             }
         }
         for unit in 0..UNIT_COUNT {

@@ -455,6 +455,7 @@ pub(crate) struct M5Runtime {
     application: bool,
     faulted: bool,
     application_generation: u32,
+    application_compute_generation: u32,
 }
 
 impl M5Runtime {
@@ -494,7 +495,7 @@ impl M5Runtime {
         // This explicit RAM-boot experiment is released by reboot only.
         unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()); }
         Ok(Self { session: Some(session), application: false, faulted: false,
-            application_generation: 0 })
+            application_generation: 0, application_compute_generation: 0 })
     }
 
     pub(crate) fn start(
@@ -655,22 +656,37 @@ impl M5Runtime {
         result
     }
 
-    /// Execute a first compute command in the already retained application VM.
+    /// Execute a compute command in the already retained application VM.
     /// Installation, dispatch and retirement are separate firmware transitions.
+    /// The first submission installs queue 12 and dispatches generation 1;
+    /// every later one reuses that owner and dispatches the next generation,
+    /// as submit_application() does for the graphics pair.
     pub(crate) fn submit_application_compute(&mut self, vm: &mmu::Vm,
         command: &crate::g17_uapi::TranslatedComputeCommand) -> Result {
         if !self.application || self.is_crashed() || self.application_generation == 0 {
             return Err(ENOTSUPP);
         }
+        if self.application_compute_generation >= MAX_GRAPHICS_GENERATION {
+            return Err(EBUSY);
+        }
+        let generation = self.application_compute_generation + 1;
         let session = self.session.as_deref_mut().ok_or(EIO)?;
-        session.memory.as_mut().ok_or(EIO)?.initialize_application_compute(
-            &session.dev, vm, command, self.application_generation)?;
-        // The owner is retained before the first publication. Even a failed
-        // mailbox send can follow firmware seeing the new producer.
+        if generation == 1 {
+            session.memory.as_mut().ok_or(EIO)?.initialize_application_compute(
+                &session.dev, vm, command, self.application_generation)?;
+        } else {
+            session.memory.as_mut().ok_or(EIO)?.prepare_next_application_compute(
+                vm, command, generation)?;
+        }
+        // The owner is retained from installation onward. Even a failed mailbox
+        // send can follow firmware seeing the new producer, so never unwind.
+        self.application_compute_generation = generation;
         let result = (|| {
             let memory = session.memory.as_mut().ok_or(EIO)?;
-            for dispatch in [false, true] {
-                memory.publish_application_compute(dispatch)?;
+            // Installation is published once; the dispatch record every time.
+            let stages: &[bool] = if generation == 1 { &[false, true] } else { &[true] };
+            for &dispatch in stages {
+                memory.publish_application_compute(dispatch, generation)?;
                 Pin::new(&mut session.roles[0].rtkit)
                     .send_message(0x21, 0x0083_0000_0000_000a)?;
                 let mut retired = false;
@@ -681,7 +697,7 @@ impl M5Runtime {
                     }
                     let (outer, _, _) = memory.graphics_status()?;
                     if outer == [memory.application_outer_head(); 3]
-                        && if dispatch { memory.application_compute_complete()? }
+                        && if dispatch { memory.application_compute_complete(generation)? }
                             else { memory.application_compute_installed()? } {
                         retired = true;
                         break;
@@ -690,8 +706,8 @@ impl M5Runtime {
                 }
                 if !retired { return Err(ETIMEDOUT); }
                 dev_info!(session.dev.as_ref(),
-                    "M5_APPLICATION_COMPUTE {} queue=12 outer={} status={:x?}\n",
-                    if dispatch { "completed" } else { "installed" },
+                    "M5_APPLICATION_COMPUTE {} generation={} queue=12 outer={} status={:x?}\n",
+                    if dispatch { "completed" } else { "installed" }, generation,
                     memory.application_outer_head(), memory.application_compute_status());
             }
             Ok(())

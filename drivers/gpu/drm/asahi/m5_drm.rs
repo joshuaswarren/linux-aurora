@@ -12,6 +12,12 @@ use crate::{alloc, drm_gpu::{DrmGpu, DrmGpuParams},
 
 pub(crate) type SharedM5Runtime = Arc<Mutex<M5Runtime>>;
 const USER_END: u64 = (1 << 42) - 2 * mmu::UAT_PGSZ as u64;
+
+/// Bytes of CDM control stream the witnessed M5 compute profile covers. The
+/// captured stream (m5_compute_program::STREAM) is twelve words: one dispatch
+/// and the terminator at +44. Nothing longer has native evidence, and a
+/// longer one is what a geometry-shader prepass submits.
+const M5_COMPUTE_STREAM_BYTES: u64 = 48;
 static QUEUE_NAME: &CStr = c_str!("m5_queue");
 static QUEUE_CLASS_KEY: Pin<&'static kernel::sync::LockClassKey> = static_lock_class!();
 
@@ -159,12 +165,36 @@ impl queue::Queue for M5Queue {
             let address_space = UserAddressSpace { vm: &self.vm };
             let mut parser = g17_uapi::UapiCommandParser::new(cmdbuf_raw);
             let command = parser.next_hardware().map_err(|_| EINVAL)?.ok_or(EINVAL)?;
-            if parser.next_hardware().map_err(|_| EINVAL)?.is_some() { return Err(ENOTSUPP); }
+            if parser.next_hardware().map_err(|_| EINVAL)?.is_some() {
+                pr_err!("M5 submit admission rejected: more than one hardware command\n");
+                return Err(ENOTSUPP);
+            }
             parser.finish().map_err(|_| EINVAL)?;
             if let g17_uapi::ParsedHardwareCommand::Compute { payload, attachments, .. } = command {
                 let timestamps = [payload.timestamps.start, payload.timestamps.end];
                 if payload.flags != 0 || payload.sampler_heap != 0 || payload.sampler_count != 0
                     || timestamps.iter().any(|t| t.handle != 0 || t.offset != 0) {
+                    pr_err!("M5 compute admission rejected flags={:#x} sampler_heap={:#x} samplers={} timestamps={}\n",
+                        payload.flags, payload.sampler_heap, payload.sampler_count,
+                        timestamps.iter().any(|t| t.handle != 0 || t.offset != 0));
+                    return Err(ENOTSUPP);
+                }
+                // The witnessed M5 compute profile is one dispatch: the
+                // captured control stream is twelve words, a single dispatch
+                // followed by the terminator at +44, and the descriptor
+                // carries exactly one dispatch identity, one submission index
+                // and one pair of dispatch stamps. A longer stream -- every
+                // geometry-shader and transform-feedback prepass emits four or
+                // five dispatches -- is accepted by firmware, linked into the
+                // job list and never retired, so the submitting ioctl times
+                // out after forty seconds and quarantines the VM. Refuse it
+                // here instead: the client drops the batch and the session
+                // survives, exactly as it does for an out-of-profile render.
+                let stream_bytes = payload.control_stream_end
+                    .saturating_sub(payload.control_stream_base);
+                if stream_bytes > M5_COMPUTE_STREAM_BYTES {
+                    pr_err!("M5 compute admission rejected stream_bytes={} (profile admits one dispatch, {})\n",
+                        stream_bytes, M5_COMPUTE_STREAM_BYTES);
                     return Err(ENOTSUPP);
                 }
                 let translated = g17_uapi::translate_compute_command(payload, attachments,
@@ -173,13 +203,26 @@ impl queue::Queue for M5Queue {
             }
             let g17_uapi::ParsedHardwareCommand::Render {
                 payload, vertex_attachments, fragment_attachments, ..
-            } = command else { return Err(ENOTSUPP); };
+            } = command else {
+                pr_err!("M5 submit admission rejected: neither a render nor a compute command\n");
+                return Err(ENOTSUPP);
+            };
             admit_reference_render(&payload).map_err(|error| {
                 pr_err!("M5 render admission rejected size={}x{} layers={} utiles={}x{} samples={}\n",
                     payload.width, payload.height, payload.layers,
                     payload.utile_width, payload.utile_height, payload.samples);
                 error
             })?;
+            // An attached stencil plane is admitted only while it is inert:
+            // its buffers are range-checked with the depth ones and its
+            // registers are written from the same parameter block, but a
+            // render that loads or stores it, or that runs the stencil unit,
+            // is outside the witnessed profile.
+            if payload.zls_control & 0x44000 != 0 {
+                pr_err!("M5 render admission rejected stencil transfer control={:#x}\n",
+                    payload.zls_control);
+                return Err(ENOTSUPP);
+            }
             g17_uapi::validate_m5_reference_depth(&payload, &address_space)
                 .map_err(|error| {
                     pr_err!("M5 depth admission rejected {:?}: size={}x{} dimensions={:#x} control={:#x} stride={:#x} meta_stride={:#x} base={:#x} meta={:#x} clear={:#x}\n",
@@ -199,7 +242,14 @@ impl queue::Queue for M5Queue {
             // Native 25G76 indexed draws use 15021=0x10c000. The reference
             // triangle's low bit causes fragment recovery with larger
             // indexed overdraw, even after the tiling stage completes.
-            translated.parameters.aux_fb_flags = 0x10c000;
+            // Bit18 selects the narrow depth plane: the same controlled
+            // render against a Depth16Unorm attachment publishes 0x14c001
+            // where the 32-bit one publishes 0x10c001, and that bit is the
+            // only difference in the whole register program beyond the ZLS
+            // format field and the integer clear value.
+            let z16 = payload.zls_control & (3 << 25) == (2 << 25);
+            translated.parameters.aux_fb_flags =
+                if z16 { 0x14c000 } else { 0x10c000 };
             // M5's second store-program pair refers to the same EOT program
             // in the admitted native profile, with caller-owned program VAs.
             controls.store_pipeline_2 = translated.parameters.store_pipeline;
@@ -227,7 +277,6 @@ fn admit_reference_render(command: &g17_uapi::UapiRenderCommand) -> Result {
         || !(1..=g17_uapi::M5_MAX_RENDER_DIMENSION).contains(&u32::from(command.height))
         || command.layers != 1
         || command.utile_width != 32 || command.utile_height != 32 || command.samples != 1
-        || command.stencil.base != 0 || command.stencil.compression_base != 0
         || command.sampler_heap != 0 || command.sampler_count != 0
         || command.occlusion_query_base != 0
         || timestamps.iter().any(|timestamp| timestamp.handle != 0 || timestamp.offset != 0) {

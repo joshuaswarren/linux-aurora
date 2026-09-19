@@ -739,16 +739,56 @@ pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
 ) -> Result<(), UapiTranslateError> {
     let depth = command.depth;
     if depth.base == 0 {
+        // No depth plane. The surface may still carry an inert stencil one,
+        // which contributes nothing but its compression pair and the shared
+        // pixel dimensions; a render that transfers it is refused with the
+        // rest of the stencil profile.
+        let stencil_only = command.stencil.base != 0
+            && command.zls_control
+                == if command.stencil.compression_base != 0 { 0x110 } else { 0 }
+            && command.depth_dimensions
+                == ((u32::from(command.width) - 1)
+                    | ((u32::from(command.height) - 1) << 16));
         return if depth.compression_base == 0 && depth.stride == 0
-            && depth.compression_stride == 0 && command.zls_control == 0
-            && command.depth_dimensions == 0 {
+            && depth.compression_stride == 0
+            && (stencil_only
+                || (command.zls_control == 0 && command.depth_dimensions == 0)) {
             Ok(())
         } else {
             Err(UapiTranslateError::ZlsFields)
         };
     }
     let compressed = depth.compression_base != 0;
-    let expected_control = if compressed { 0x80044 } else { 0x80000 };
+    // The control word's load and store bits are the only part a render
+    // chooses: bit15 loads the depth plane and bit19 stores it, and a render
+    // that neither tests nor writes depth sets neither, which is how a
+    // conformance surface with an unused depth buffer arrives. Everything
+    // else -- the compression pair in bits 2 and 6, the GPU tiling, the 32F
+    // format -- is the witnessed profile and stays exact. depth_flags reaches
+    // register 0x15319 unchanged either way, so the admitted envelope is the
+    // set of load/store combinations over that fixed remainder.
+    let compression_bits = if compressed { 0x44 } else { 0 };
+    // Bits 25-26 select the depth format: 0 is 32-bit float, 2 is 16-bit
+    // unorm. The narrow plane was captured on 25G76 alongside the wide one
+    // and moves nothing else in the register program except the clear value
+    // and one ISP flag, both of which the caller derives. Its compression
+    // metadata has no witness, so a compressed 16-bit plane stays out.
+    let z16 = command.zls_control & (3 << 25) == (2 << 25);
+    if z16 && compressed {
+        return Err(UapiTranslateError::ZlsFields);
+    }
+    let format_bits = if z16 { 2 << 25 } else { 0 };
+    // A stencil plane may be attached without being transferred: a surface
+    // with a depth-stencil buffer carries one for every render, whether or
+    // not the render uses it. Its compression pair in bits 4 and 8 describes
+    // the attached layout and is the only stencil state admitted here --
+    // loading or storing the plane (bits 14 and 18) needs its own witnesses,
+    // as does the stencil unit in the graphics record.
+    let stencil_compression_bits =
+        if command.stencil.compression_base != 0 { 0x110 } else { 0 };
+    let control_transfers = command.zls_control & 0x88000;
+    let expected_control =
+        compression_bits | stencil_compression_bits | format_bits | control_transfers;
     let width = u32::from(command.width);
     let height = u32::from(command.height);
     if !(1..=M5_MAX_RENDER_DIMENSION).contains(&width)
@@ -756,31 +796,40 @@ pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
         || command.layers != 1 || (compressed && (width < 16 || height < 16)) {
         return Err(UapiTranslateError::ZlsFields);
     }
-    // AIL uses full 64x64 D32 tiles while both axes fit a tile. If either
-    // axis is smaller, the level uses a power-of-two miptail, aligned to a
-    // 128-byte cacheline. Single-layer M5 surfaces are not page-padded.
-    let data_bytes = if width >= 64 && height >= 64 {
-        u64::from(width.div_ceil(64)) * u64::from(height.div_ceil(64)) * 0x4000
+    // AIL tiles are 16 KiB whatever the format: 64x64 at four bytes a pixel,
+    // 128x64 at two. While both axes fit one tile the level is a whole
+    // number of them; if either axis is smaller, the level uses a
+    // power-of-two miptail aligned to a 128-byte cacheline. Single-layer M5
+    // surfaces are not page-padded.
+    let (tile_width, bytes_per_pixel) = if z16 { (128u32, 2u64) } else { (64u32, 4u64) };
+    let data_bytes = if width >= tile_width && height >= 64 {
+        u64::from(width.div_ceil(tile_width)) * u64::from(height.div_ceil(64)) * 0x4000
     } else {
         (u64::from(width.next_power_of_two())
-            * u64::from(height.next_power_of_two()) * 4).div_ceil(128) * 128
+            * u64::from(height.next_power_of_two()) * bytes_per_pixel)
+            .div_ceil(128) * 128
     };
     let metadata_bytes = (u64::from(width.next_power_of_two().div_ceil(16))
         * u64::from(height.next_power_of_two().div_ceil(16)) * 8).div_ceil(128) * 128;
-    let expected_stride = if data_bytes >= 0x4000 && data_bytes & 0x3fff == 0 {
-        ((data_bytes / 0x4000 - 1) << 14) | 1
-    } else { 0 };
-    let expected_metadata_stride = (metadata_bytes / 128 - 1) << 14;
     let dimensions = (width - 1) | ((height - 1) << 16);
     if command.depth_dimensions != dimensions
         || command.zls_control != expected_control
-        || command.depth_clear != 0x3f800000
+        // The clear value is whatever the application asked for; it reaches
+        // register 0x15301 verbatim and is only consumed when the render
+        // actually clears the plane.
+        || (command.depth_clear & 0x7fffffff) > 0x7f800000
         // Image suballocations and small miptails use cacheline alignment;
         // the backing VM pages remain independently validated below.
         || depth.base & 0x7f != 0 || depth.compression_base & 0x7f != 0
-        || (depth.stride != 0 && u64::from(depth.stride) != expected_stride)
-        || (depth.compression_stride != 0
-            && u64::from(depth.compression_stride) != expected_metadata_stride)
+        // Both strides are array strides, and the M5 caller zeroes them
+        // because native single-layer ZLS does not encode one. Every render
+        // admitted here is single-layer -- layers != 1 is refused above -- so
+        // the value that arrives is whatever the userspace packer computed
+        // and the hardware never sees it: for a surface smaller than a page
+        // Mesa's (pages - 1) << 14 | 1 underflows to 0xffffc001. Comparing it
+        // would refuse a valid render over a field that is discarded. The
+        // backing store is still validated in full below, from the
+        // dimensions rather than from either stride.
         || (!compressed && depth.compression_stride != 0) {
         return Err(UapiTranslateError::ZlsFields);
     }
@@ -1329,21 +1378,56 @@ mod tests {
         assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
             Err(UapiTranslateError::AddressRange));
         payload = valid;
-        payload.zls_control |= 0x8000; // Load is outside the initial clear profile.
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
+        // Every combination of the load and store bits is a render the
+        // application may ask for, including neither: a bound depth buffer
+        // that this render does not test is not written back.
+        for transfers in [0u64, 0x8000, 0x80000, 0x88000] {
+            payload.zls_control = 0x44 | transfers;
+            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+                Ok(()));
+        }
+        // Nothing outside those two bits may move: stencil transfers, the
+        // twiddled tilings, the 16-bit format and the resolve bits all still
+        // need their own witnesses.
+        for stray in [0x2u64, 0x4000, 0x40000, 1 << 25, 1 << 56] {
+            payload.zls_control = 0x80044 | stray;
+            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+                Err(UapiTranslateError::ZlsFields));
+        }
         payload = valid;
         payload.layers = 2;
         assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
             Err(UapiTranslateError::ZlsFields));
         payload = valid;
-        payload.depth_clear = 0;
+        // The clear value is the application's float and reaches register
+        // 0x15301 unchanged; only a NaN payload is refused.
+        for clear in [0u32, 0x3f000000, 0xbf800000, 0x7f800000] {
+            payload.depth_clear = clear;
+            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+                Ok(()));
+        }
+        payload.depth_clear = 0x7fc00000;
         assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
             Err(UapiTranslateError::ZlsFields));
+        // An attached stencil plane contributes only its compression pair.
+        payload = valid;
+        payload.stencil.base = 0x10000;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
+        payload.stencil.compression_base = 0x60000;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::ZlsFields));
+        payload.zls_control = 0x80154;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
+        // Loading or storing it is outside the profile.
+        for transfer in [0x4000u64, 0x40000] {
+            payload.zls_control = 0x80154 | transfer;
+            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+                Err(UapiTranslateError::ZlsFields));
+        }
     }
 
     #[test]
-    fn m5_resized_depth_validates_tile_padding_strides_and_complete_backing() {
+    fn m5_resized_depth_validates_tile_padding_and_complete_backing() {
         let mut parser = UapiCommandParser::new(&RENDER_FIXTURE);
         let ParsedHardwareCommand::Render { mut payload, .. } =
             parser.next_hardware().unwrap().unwrap() else { panic!("not render") };
@@ -1358,11 +1442,20 @@ mod tests {
         payload.depth_clear = 0x3f800000;
         assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
         let valid = payload;
-        payload.depth.stride = 0x3c001; // Old 256x256 stride.
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
+        // The array strides are discarded for a single-layer render, so any
+        // value in them is admitted -- including the underflow a surface
+        // smaller than one page produces. The backing store below is what
+        // actually bounds the render.
+        for stride in [0u32, 0x3c001, 0xffffc001] {
+            payload.depth.stride = stride;
+            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+                Ok(()));
+        }
         payload = valid;
         payload.depth.compression_stride = 0x3c000; // Old metadata stride.
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
+        payload = valid;
+        payload.depth.compression_base = 0; // Metadata stride without metadata.
         assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
             Err(UapiTranslateError::ZlsFields));
         payload = valid;
@@ -1373,8 +1466,6 @@ mod tests {
         payload.width = 1024;
         payload.height = 1024;
         payload.depth_dimensions = 1023 | (1023 << 16);
-        payload.depth.stride = 0x3fc001;
-        payload.depth.compression_stride = 0x3fc000;
         assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
             Err(UapiTranslateError::AddressRange)); // Four MiB exceeds this test VM.
     }
