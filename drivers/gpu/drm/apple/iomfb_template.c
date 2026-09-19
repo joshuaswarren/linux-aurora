@@ -179,6 +179,7 @@ DCP_THUNK_INOUT(dcp_enable_disable_video_power_savings,
 DCP_THUNK_OUT(dcp_is_main_display, dcpep_is_main_display, u32);
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 DCP_THUNK_OUT(dcp_read_blend_crc, dcpep_read_blend_crc, u32);
+DCP_THUNK_INOUT(dcp_enable_disable_dithering, dcpep_enable_disable_dithering, u32, u32);
 #endif
 
 /* DCP callback handlers */
@@ -280,6 +281,14 @@ static void res_blend_crc(struct apple_dcp *dcp, void *out, void *cookie)
 	dev_info(dcp->dev, "blend-crc: swap %u crc %#010x t=%lld us\n",
 		 (u32)(uintptr_t)cookie, crc, ktime_to_us(ktime_get()));
 }
+
+static void res_dither(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	u32 st = out ? *(u32 *)out : 0xffffffff;
+
+	dev_info(dcp->dev, "enable_disable_dithering(%u): status %#x\n",
+		 (u32)(uintptr_t)cookie, st);
+}
 #endif
 
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
@@ -300,6 +309,13 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		dcp_blend_crc_reads--;
 		dcp_read_blend_crc(dcp, false, res_blend_crc,
 				   (void *)(uintptr_t)resp->swap_id);
+	}
+	if (dcp_dither_request >= 0) {
+		u32 v = dcp_dither_request ? 1 : 0;
+
+		dcp_dither_request = -1;
+		dcp_enable_disable_dithering(dcp, false, &v, res_dither,
+					     (void *)(uintptr_t)v);
 	}
 #endif
 	if (dcp->crc_enabled) {

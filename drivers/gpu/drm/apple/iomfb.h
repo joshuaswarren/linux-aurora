@@ -200,6 +200,8 @@ enum dcpep_method {
 	dcpep_pipe_set_428,
 	/* IOMFB::UPPipe2::read_blend_crc() const: (0, 0x4), the blend-output CRC */
 	dcpep_read_blend_crc,
+	/* IOMobileFramebufferAP::enable_disable_dithering(u32): (0x4, 0x4) */
+	dcpep_enable_disable_dithering,
 	dcpep_num_methods
 };
 

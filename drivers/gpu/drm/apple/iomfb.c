@@ -128,6 +128,19 @@ MODULE_PARM_DESC(blend_crc_reads, "read and log the blend-output CRC after the n
  * script search the record for the bit that marks a layer opaque without
  * a rebuild per guess.  Empty = no pokes.
  */
+/*
+ * Panel dither control: A448 IOMobileFramebufferAP::enable_disable_dithering(u32)
+ * (in u32, out u32 status).  Writing 0 or 1 issues the call after the next
+ * completed swap and logs the status; the value then returns to -1.  The
+ * DCP's UPBlock_Dither_v3 temporally dithers the pipe's output to the panel
+ * depth ("IOMFB: dither, enabled: %s legacy: %s"), which is the first
+ * suspect for the CRT-like shimmer Ryan sees on 10-bit output and faintly
+ * on 8-bit.
+ */
+int dcp_dither_request = -1;
+module_param_named(dither, dcp_dither_request, int, 0644);
+MODULE_PARM_DESC(dither, "write 0/1 to disable/enable panel dithering after the next completed swap (H17P, A448)");
+
 char dcp_h17p_swap_poke[128];
 module_param_string(h17p_swap_poke, dcp_h17p_swap_poke, sizeof(dcp_h17p_swap_poke), 0644);
 MODULE_PARM_DESC(h17p_swap_poke, "hex off=val byte pokes into the fixed-up H17P swap record (debug)");

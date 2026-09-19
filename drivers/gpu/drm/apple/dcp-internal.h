@@ -373,6 +373,7 @@ extern bool dcp_swap_trace;
 extern unsigned int dcp_h17p_surf_flags;
 extern int dcp_blend_crc_reads;
 extern char dcp_h17p_swap_poke[128];
+extern int dcp_dither_request;
 u32 dcp_h17p_initial_nits(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
