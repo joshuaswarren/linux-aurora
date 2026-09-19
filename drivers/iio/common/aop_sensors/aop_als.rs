@@ -109,6 +109,44 @@ struct MsgProc(usize);
 impl MessageProcessor for MsgProc {
     fn process(&self, message: &[u8]) -> u32 {
         let offset = self.0;
+        // The lux is a little-endian f32 whose position depends on the sensor
+        // part.  On a part whose layout is not known yet, dumping the report
+        // and the float each candidate offset would yield identifies it from
+        // real light instead of guesswork.
+        if *module_parameters::dump_report.value() != 0 {
+            let mut plausible = [0u32; 16];
+            let mut n = 0usize;
+            let mut off = 0usize;
+            while off + 4 <= message.len() && n < plausible.len() {
+                let v = f32_to_u32(u32::from_le_bytes(
+                    message[off..off + 4].try_into().unwrap(),
+                ));
+                if v > 0 && v < 100_000 {
+                    plausible[n] = ((off as u32) << 20) | (v & 0xfffff);
+                    n += 1;
+                }
+                off += 1;
+            }
+            pr_info!(
+                "aop-als: report {} bytes: {:02x?}\n",
+                message.len(),
+                message
+            );
+            for i in 0..n {
+                pr_info!(
+                    "aop-als:   offset {} -> {} lux (plausible)\n",
+                    plausible[i] >> 20,
+                    plausible[i] & 0xfffff
+                );
+            }
+        }
+        let offset = match *module_parameters::lux_offset.value() {
+            0 => offset,
+            v => v as usize,
+        };
+        if offset + 4 > message.len() {
+            return 0;
+        }
         let raw = u32::from_le_bytes(message[offset..offset + 4].try_into().unwrap());
         f32_to_u32(raw)
     }
@@ -116,6 +154,17 @@ impl MessageProcessor for MsgProc {
 
 #[repr(transparent)]
 struct IIOAopAlsDriver(IIORegistration<MsgProc>);
+
+kernel::module_parameters! {
+    lux_offset: u32 {
+        default: 0,
+        description: "Override the byte offset of the little-endian f32 lux value in the AOP report (0 = the part's known offset).",
+    },
+    dump_report: u8 {
+        default: 0,
+        description: "Log each AOP ALS report and every offset that decodes to a plausible lux value, to identify the layout of an unknown part.",
+    },
+}
 
 kernel::of_device_table!(
     OF_TABLE,
