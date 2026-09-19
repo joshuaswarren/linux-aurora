@@ -59,6 +59,10 @@ struct apple_rtkit {
 
 	struct apple_rtkit_shmem ioreport_buffer;
 	struct apple_rtkit_shmem crashlog_buffer;
+	/* Re-reads a firmware-provided crash buffer a while after the request. */
+	struct delayed_work crashlog_probe;
+	unsigned int crashlog_probe_attempt;
+	unsigned int crashlog_probe_elapsed_ms;
 	struct apple_rtkit_shmem oslog_buffer;
 	struct apple_rtkit_shmem pmp_aux_buffer;
 

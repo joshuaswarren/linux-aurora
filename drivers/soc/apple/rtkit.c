@@ -484,6 +484,68 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 		memcpy(dst, bfr->buffer + offset, len);
 }
 
+/*
+ * Dump the crash buffer if it already carries a crash log.  Returns true
+ * when it did (the coprocessor is then marked crashed and the client told).
+ */
+static bool apple_rtkit_crashlog_dump_if_present(struct apple_rtkit *rtk)
+{
+	u8 probe[0x20];
+	u8 *bfr __free(kfree) = NULL;
+
+	if (rtk->crashed || rtk->crashlog_buffer.size < sizeof(probe) ||
+	    (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem))
+		return false;
+	apple_rtkit_memcpy(rtk, probe, &rtk->crashlog_buffer, 0, sizeof(probe));
+	if (!apple_rtkit_crashlog_present(probe, sizeof(probe)))
+		return false;
+
+	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
+	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_KERNEL);
+	if (bfr) {
+		apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0,
+				   rtk->crashlog_buffer.size);
+		apple_rtkit_crashlog_dump(rtk, bfr, rtk->crashlog_buffer.size);
+	} else {
+		dev_err(rtk->dev,
+			"RTKit: Couldn't allocate crashlog shadow buffer\n");
+	}
+
+	rtk->crashed = true;
+	if (rtk->ops->crashed)
+		rtk->ops->crashed(rtk->cookie, bfr, bfr ? rtk->crashlog_buffer.size : 0);
+	return true;
+}
+
+/*
+ * A loader-booted coprocessor (the J700's DCP) requests its crash buffer only
+ * once it is already crashing, and the log lands in that buffer a little
+ * after the request -- with no second message on some firmwares.  Look again
+ * a few times after the request so the panic is never lost.
+ */
+static void apple_rtkit_crashlog_probe_work(struct work_struct *work)
+{
+	struct apple_rtkit *rtk =
+		container_of(to_delayed_work(work), struct apple_rtkit, crashlog_probe);
+	static const unsigned int retry_ms[] = { 250, 1000, 5000, 30000 };
+	unsigned int attempt = rtk->crashlog_probe_attempt;
+
+	if (READ_ONCE(rtk->shutting_down))
+		return;
+	if (apple_rtkit_crashlog_dump_if_present(rtk)) {
+		dev_err(rtk->dev,
+			"RTKit: crash log found %u ms after the buffer request\n",
+			rtk->crashlog_probe_elapsed_ms);
+		return;
+	}
+	if (attempt >= ARRAY_SIZE(retry_ms))
+		return;
+	rtk->crashlog_probe_elapsed_ms += retry_ms[attempt];
+	rtk->crashlog_probe_attempt = attempt + 1;
+	queue_delayed_work(rtk->wq, &rtk->crashlog_probe,
+			   msecs_to_jiffies(retry_ms[attempt]));
+}
+
 static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
@@ -496,31 +558,28 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	if (!rtk->crashlog_buffer.size) {
-		struct apple_rtkit_crashlog_header_probe {
-			u8 bytes[0x20];
-		} probe;
-
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						 APPLE_RTKIT_EP_CRASHLOG, msg);
 		/*
 		 * A firmware whose crashlog endpoint was never started by us --
 		 * the J700's loader-booted DCP, handed over running -- sends its
-		 * first crashlog message only once it is already crashing.  The
-		 * buffer it names then holds the finished crash log and no second
-		 * message follows (2026-09-19 06:02: "undiscovered endpoint 0x01",
-		 * the buffer mapped, silence, and a dead panel 530 s later).  If
-		 * the buffer already carries a crash log header, this IS the
-		 * crash: fall through and dump it now.
+		 * first crashlog message only once it is already crashing
+		 * (2026-09-19, three boots: "undiscovered endpoint 0x01" exactly
+		 * 3600 s after INIT, the buffer mapped, then a dead panel).  The
+		 * log was not in the buffer at request time but was there
+		 * minutes later.  Dump it now if it is, else keep looking for a
+		 * while.
 		 */
-		if (rtk->crashlog_buffer.size < sizeof(probe) ||
-		    (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem))
+		if (apple_rtkit_crashlog_dump_if_present(rtk)) {
+			dev_err(rtk->dev,
+				"RTKit: crash log delivered with the buffer request\n");
 			return;
-		apple_rtkit_memcpy(rtk, &probe, &rtk->crashlog_buffer, 0,
-				   sizeof(probe));
-		if (!apple_rtkit_crashlog_present(probe.bytes, sizeof(probe)))
-			return;
-		dev_err(rtk->dev,
-			"RTKit: crash log delivered with the buffer request\n");
+		}
+		rtk->crashlog_probe_attempt = 0;
+		rtk->crashlog_probe_elapsed_ms = 0;
+		queue_delayed_work(rtk->wq, &rtk->crashlog_probe,
+				   msecs_to_jiffies(250));
+		return;
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
@@ -925,6 +984,7 @@ static struct apple_rtkit *__apple_rtkit_init(
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
 	init_completion(&rtk->iop_idle_completion);
+	INIT_DELAYED_WORK(&rtk->crashlog_probe, apple_rtkit_crashlog_probe_work);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	bitmap_zero(rtk->discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
@@ -1360,6 +1420,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	 * that IRQ.
 	 */
 	WRITE_ONCE(rtk->shutting_down, true);
+	cancel_delayed_work_sync(&rtk->crashlog_probe);
 	flush_workqueue(rtk->wq);
 	apple_mbox_stop(rtk->mbox);
 	rtk->mbox->rx = NULL;
