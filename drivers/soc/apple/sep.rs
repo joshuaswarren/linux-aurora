@@ -338,6 +338,14 @@ enum RestoreOutcome {
     EmptyTolerated,
 }
 
+/// What a restore pass found. `never_enrolled` separates a machine that has no
+/// artefacts at all -- nothing to restore, which is the normal state before the
+/// first enrolment -- from one whose artefacts exist but did not load.
+pub(crate) struct RestoreSummary {
+    pub(crate) restored: bool,
+    pub(crate) never_enrolled: bool,
+}
+
 const PRIVATE_TYPE_CATACOMB_MASTER: u8 = 0xF2;
 const PRIVATE_TYPE_CATACOMB_OWNER: u8 = 0xF3;
 const PRIVATE_TYPE_CATACOMB_USER: u8 = 0xF4;

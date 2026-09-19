@@ -203,8 +203,8 @@ const T6020: PlatformProfile = PlatformProfile {
 /// device tree states `apple,dma-range` for it.  The OS identity is the
 /// `/chosen/apfs-preboot-uuid` the boot chain forwards (the booted APFS
 /// volume group, i.e. the Linux stub's, as macOS answers GET_OS_UUID); the
-/// identity keybag uses the strict (macOS) field encoding, since this enclave
-/// generation post-dates T6020's.
+/// identity keybag uses the lenient (T6020) field encoding -- the strict form
+/// this enclave generation was expected to want is refused with -13.
 const T8140: PlatformProfile = PlatformProfile {
     name: "T8140/J700",
     shmem_capacity: 0x4_0000,
@@ -223,11 +223,10 @@ const T8140: PlatformProfile = PlatformProfile {
     },
     dart_range_required: true,
     firmware_region: c"sepfw",
-    keybag_create: KeybagCreate {
-        variant: 0,
-        bag_type: 0x20000,
-        arg: 0,
-    },
+    // Hardware, 2026-09-19: the J700 enclave refuses the strict (macOS) form
+    // with mailbox status -13 and accepts the lenient one, which created this
+    // machine's identity bag (variant 5, handle 1).
+    keybag_create: KEYBAG_CREATE_LENIENT,
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);
