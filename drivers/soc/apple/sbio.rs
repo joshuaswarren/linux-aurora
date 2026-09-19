@@ -1298,6 +1298,11 @@ impl SepData {
             }
         };
 
+        dev_info!(
+            self.dev,
+            "sensor: serial {} (the enclave builds its MSRk label from this)\n",
+            crate::Hex(serial.bytes())
+        );
         let op = crate::sbio::sbio_register_sensor_serial(&serial);
         if !matches!(self.sbio_call(&op), SbioOutcome::Ok(_)) {
             return false;
