@@ -1390,6 +1390,26 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 		static_assert(sizeof(*req) == 0xe9c, "H17P request size");
 		memmove(r + off - 2, r + off, n - off);
 		memset(r + n - 2, 0, 2);
+
+		/* debug pokes, last so they land in the final layout */
+		if (dcp_h17p_swap_poke[0]) {
+			const char *c = dcp_h17p_swap_poke;
+
+			while (*c) {
+				unsigned long o, v;
+				char *e;
+
+				o = simple_strtoul(c, &e, 16);
+				if (*e != '=')
+					break;
+				v = simple_strtoul(e + 1, &e, 16);
+				if (o < n)
+					r[o] = v;
+				if (*e != ',')
+					break;
+				c = e + 1;
+			}
+		}
 	}
 }
 #else

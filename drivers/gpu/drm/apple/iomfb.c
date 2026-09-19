@@ -121,6 +121,17 @@ int dcp_blend_crc_reads;
 module_param_named(blend_crc_reads, dcp_blend_crc_reads, int, 0644);
 MODULE_PARM_DESC(blend_crc_reads, "read and log the blend-output CRC after the next N completed swaps (H17P)");
 
+/*
+ * Byte pokes into the outgoing H17P swap record, applied after the layout
+ * fix-ups: "off=val[,off=val...]" with hex offsets into the 0xe9c A408
+ * request and hex byte values.  Together with blend_crc_reads this lets a
+ * script search the record for the bit that marks a layer opaque without
+ * a rebuild per guess.  Empty = no pokes.
+ */
+char dcp_h17p_swap_poke[128];
+module_param_string(h17p_swap_poke, dcp_h17p_swap_poke, sizeof(dcp_h17p_swap_poke), 0644);
+MODULE_PARM_DESC(h17p_swap_poke, "hex off=val byte pokes into the fixed-up H17P swap record (debug)");
+
 static int dcp_trace_budget;
 module_param_named(trace_rpc, dcp_trace_budget, int, 0644);
 MODULE_PARM_DESC(trace_rpc,
