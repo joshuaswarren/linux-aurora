@@ -663,13 +663,36 @@ report:
  * The standard supplicant's Ethernet EAPOL control-port declaration is allowed;
  * nl80211 control-port transport and key/802.1X offloads are not implemented.
  */
+/* iwd (and wpa_supplicant) attach Extended Capabilities and similar
+ * informational elements to every connect, open networks included; only
+ * elements that negotiate security make a request non-open. Measured on a
+ * J700 against an open hotel SSID: "CONNECT_REQUEST: WPA=0 ... IE-bytes=12"
+ * was refused with -EOPNOTSUPP and the network was unusable.
+ */
+static bool mt_open_ies(const u8 *ies, size_t len)
+{
+	const struct element *elem;
+
+	if (!len)
+		return true;
+	for_each_element(elem, ies, len) {
+		if (elem->id == WLAN_EID_RSN || elem->id == WLAN_EID_RSNX)
+			return false;
+		if (elem->id == WLAN_EID_VENDOR_SPECIFIC && elem->datalen >= 4 &&
+		    elem->data[0] == 0x00 && elem->data[1] == 0x50 &&
+		    elem->data[2] == 0xf2 && (elem->data[3] == 1 || elem->data[3] == 4))
+			return false; /* WPA1 or WPS */
+	}
+	return for_each_element_completed(elem, ies, len);
+}
+
 static bool mt_open_request(const struct cfg80211_connect_params *p)
 {
 	return !p->privacy && !p->crypto.wpa_versions &&
 		!p->crypto.n_ciphers_pairwise && !p->crypto.cipher_group &&
 		!p->crypto.n_akm_suites && !p->crypto.psk &&
 		!p->key && !p->key_len && !p->crypto.sae_pwd && !p->crypto.sae_pwd_len &&
-		p->mfp == NL80211_MFP_NO && !p->ie_len && !p->want_1x &&
+		p->mfp == NL80211_MFP_NO && mt_open_ies(p->ie, p->ie_len) && !p->want_1x &&
 		!p->fils_erp_username && !p->fils_erp_username_len &&
 		!p->fils_erp_realm && !p->fils_erp_realm_len &&
 		!p->fils_erp_rrk && !p->fils_erp_rrk_len &&
