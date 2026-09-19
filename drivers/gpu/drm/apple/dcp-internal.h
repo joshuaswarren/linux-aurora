@@ -373,6 +373,7 @@ extern bool dcp_swap_trace;
 extern unsigned int dcp_h17p_surf_flags;
 extern int dcp_blend_crc_reads;
 extern char dcp_h17p_swap_poke[128];
+extern char dcp_rtp_request[32];
 extern int dcp_dither_request;
 extern int dcp_pipe_crc_reads;
 extern unsigned int dcp_pipe_crc_idx;

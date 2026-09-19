@@ -79,6 +79,8 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A106", dcpep_read_blend_crc),          /* (0, 0x4) kernelcache stub: out u32 seeded 0xaaaaaaaa */
 	IOMFB_METHOD("A448", dcpep_enable_disable_dithering), /* (0x4, 0x4) kernelcache stub: in u32 enable, out u32 status */
 	IOMFB_METHOD("A030", dcpep_read_crc),                /* (0x8, 0x4) kernelcache stub: in {u32 index, u32 arg}, out u32 */
+	IOMFB_METHOD("A200", dcpep_rtp_set_bool),            /* (0x8, 0x4) PropRelay::setBool(RuntimeProperty, bool) */
+	IOMFB_METHOD("A201", dcpep_rtp_set_int),             /* (0x8, 0x4) PropRelay::setInt(RuntimeProperty, u32) */
 	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings), /* init_1 position, in = u32 0 */
 	IOMFB_METHOD("A457", dcpep_first_client_open), /* init_2, between A450 and A412; (0,0) */
 	/* UNRESOLVED: A466 is never called by macOS.  No capture contains a

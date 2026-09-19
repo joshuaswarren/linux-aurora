@@ -181,6 +181,8 @@ DCP_THUNK_OUT(dcp_is_main_display, dcpep_is_main_display, u32);
 DCP_THUNK_OUT(dcp_read_blend_crc, dcpep_read_blend_crc, u32);
 DCP_THUNK_INOUT(dcp_enable_disable_dithering, dcpep_enable_disable_dithering, u32, u32);
 DCP_THUNK_INOUT(dcp_read_crc, dcpep_read_crc, struct dcp_read_crc_req, u32);
+DCP_THUNK_INOUT(dcp_rtp_set_bool, dcpep_rtp_set_bool, struct dcp_rtp_set_bool_req, u32);
+DCP_THUNK_INOUT(dcp_rtp_set_int, dcpep_rtp_set_int, struct dcp_rtp_set_int_req, u32);
 #endif
 
 /* DCP callback handlers */
@@ -291,6 +293,42 @@ static void res_dither(struct apple_dcp *dcp, void *out, void *cookie)
 		 (u32)(uintptr_t)cookie, st);
 }
 
+static void res_rtp(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	u32 st = out ? *(u32 *)out : 0xffffffff;
+
+	dev_info(dcp->dev, "rtp set %#lx: status %#x\n",
+		 (unsigned long)(uintptr_t)cookie, st);
+}
+
+static void dcp_issue_rtp_request(struct apple_dcp *dcp)
+{
+	char kind = dcp_rtp_request[0];
+	const char *c = dcp_rtp_request + 2;
+	char *e;
+	unsigned long prop, val;
+
+	if (!kind || dcp_rtp_request[1] != ':')
+		goto done;
+	prop = simple_strtoul(c, &e, 16);
+	if (*e != '=')
+		goto done;
+	val = simple_strtoul(e + 1, &e, 16);
+	if (kind == 'b') {
+		struct dcp_rtp_set_bool_req rq = { .prop = prop, .value = !!val };
+
+		dcp_rtp_set_bool(dcp, false, &rq, res_rtp,
+				 (void *)(uintptr_t)((prop << 8) | rq.value));
+	} else if (kind == 'i') {
+		struct dcp_rtp_set_int_req rq = { .prop = prop, .value = val };
+
+		dcp_rtp_set_int(dcp, false, &rq, res_rtp,
+				(void *)(uintptr_t)((prop << 8) | (val & 0xff)));
+	}
+done:
+	dcp_rtp_request[0] = '\0';
+}
+
 static void res_pipe_crc(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 v = out ? *(u32 *)out : 0xffffffff;
@@ -327,6 +365,8 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		dcp_read_crc(dcp, false, &rq, res_pipe_crc,
 			     (void *)(uintptr_t)resp->swap_id);
 	}
+	if (dcp_rtp_request[0])
+		dcp_issue_rtp_request(dcp);
 	if (dcp_dither_request >= 0) {
 		u32 v = dcp_dither_request ? 1 : 0;
 
