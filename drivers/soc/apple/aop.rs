@@ -1085,6 +1085,27 @@ impl AopData {
                 return entry.listener.process_fakehid_report(data);
             }
         }
+        // A report that matches no listener is invisible otherwise, which is
+        // indistinguishable from the AOP sending nothing at all.  On the J700
+        // the ALS registers but never produces a reading; log the unmatched
+        // reports so "no data" can be told apart from "data on another
+        // endpoint/channel".
+        if *module_parameters::report_trace.value() != 0 {
+            pr_info!(
+                "aop: unmatched fakehid report on endpoint {} channel {} ({} bytes); {} listener(s) registered\n",
+                ep.index,
+                ch,
+                data.len(),
+                guard.len()
+            );
+            for entry in &*guard {
+                pr_info!(
+                    "aop:   listener wants endpoint {} channel {}\n",
+                    entry.svc.endpoint,
+                    entry.svc.channel
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1647,4 +1668,10 @@ module_platform_driver! {
     name: "apple_aop",
     description: "AOP driver",
     license: "Dual MIT/GPL",
+    params: {
+        report_trace: u8 {
+            default: 0,
+            description: "Log fakehid reports that match no registered listener, so a sensor that produces nothing can be told from one reporting on another endpoint or channel",
+        },
+    },
 }
