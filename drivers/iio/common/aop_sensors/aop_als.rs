@@ -26,6 +26,11 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     match name.as_slice() {
         b"Redbird\0" => Ok(LUX_OFFSET_VD6286),
         b"FireFish2\0" => Ok(LUX_OFFSET_CT720),
+        // J700 (MacBook Neo): the AOP reports the part number itself rather
+        // than a codename.  CT817 is the same family as the CT720 behind
+        // "FireFish2", so it takes that report layout; the offset is a
+        // hypothesis until a reading has been checked against real light.
+        b"CT817\0" => Ok(LUX_OFFSET_CT720),
         _ => {
             dev_warn!(
                 dev.as_ref(),
