@@ -496,9 +496,31 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	if (!rtk->crashlog_buffer.size) {
+		struct apple_rtkit_crashlog_header_probe {
+			u8 bytes[0x20];
+		} probe;
+
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						 APPLE_RTKIT_EP_CRASHLOG, msg);
-		return;
+		/*
+		 * A firmware whose crashlog endpoint was never started by us --
+		 * the J700's loader-booted DCP, handed over running -- sends its
+		 * first crashlog message only once it is already crashing.  The
+		 * buffer it names then holds the finished crash log and no second
+		 * message follows (2026-09-19 06:02: "undiscovered endpoint 0x01",
+		 * the buffer mapped, silence, and a dead panel 530 s later).  If
+		 * the buffer already carries a crash log header, this IS the
+		 * crash: fall through and dump it now.
+		 */
+		if (rtk->crashlog_buffer.size < sizeof(probe) ||
+		    (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem))
+			return;
+		apple_rtkit_memcpy(rtk, &probe, &rtk->crashlog_buffer, 0,
+				   sizeof(probe));
+		if (!apple_rtkit_crashlog_present(probe.bytes, sizeof(probe)))
+			return;
+		dev_err(rtk->dev,
+			"RTKit: crash log delivered with the buffer request\n");
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");

@@ -71,5 +71,6 @@ struct apple_rtkit {
 };
 
 void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size);
+bool apple_rtkit_crashlog_present(const u8 *bfr, size_t size);
 
 #endif
