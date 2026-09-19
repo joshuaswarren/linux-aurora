@@ -1319,6 +1319,9 @@ impl SepData {
                 answered_without_identifier = true;
                 continue;
             };
+            if *module_parameters::nonce_cmd_probe.value() != 0 {
+                self.probe_nonce_command();
+            }
             if !self.register_sensor(&id) {
                 dev_err!(
                     self.dev,
@@ -1363,7 +1366,68 @@ impl SepData {
         None
     }
 
+    /// Identify the SPI command that asks the sensor for its nonce: the right
+    /// one makes a 143-byte reply available.  The command byte is not in the
+    /// kernelcache for this sensor class, so it is found by its signature.
+    fn probe_nonce_command(&self) {
+        const CANDIDATES: [u8; 14] = [
+            0x20, 0x50, 0x71, 0x72, 0x73, 0x74, 0x75, 0x78, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0,
+        ];
+        for cmd in CANDIDATES {
+            match sensor::probe_command(cmd) {
+                Some(len) if len == sensor::SENSOR_NONCE_REPLY_LEN => dev_info!(
+                    self.dev,
+                    "sensor: nonce-probe cmd {:#04x} -> {} bytes available *** MATCHES THE NONCE FRAME ***\n",
+                    cmd,
+                    len
+                ),
+                Some(len) => dev_info!(
+                    self.dev,
+                    "sensor: nonce-probe cmd {:#04x} -> {} bytes available\n",
+                    cmd,
+                    len
+                ),
+                None => dev_info!(
+                    self.dev,
+                    "sensor: nonce-probe cmd {:#04x} -> no reply\n",
+                    cmd
+                ),
+            }
+        }
+    }
+
+    /// Register the sensor nonce with the enclave (macOS's second identifier
+    /// message for this sensor class).
+    fn register_sensor_nonce(&self) -> bool {
+        let cmd = *module_parameters::nonce_cmd.value();
+        if cmd == 0 {
+            return true;
+        }
+        let nonce = match sensor::read_sensor_nonce(cmd) {
+            Ok(n) => n,
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "sensor: reading the nonce with command {:#04x} failed ({:?})\n",
+                    cmd,
+                    e
+                );
+                return false;
+            }
+        };
+        match self.sbio_call(&crate::sbio::sbio_register_nonce(&nonce)) {
+            SbioOutcome::Ok(_) => {
+                dev_info!(self.dev, "sensor: nonce registered with the enclave\n");
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn calibrate_sensor(&self) -> bool {
+        if !self.register_sensor_nonce() {
+            dev_warn!(self.dev, "sensor: nonce registration did not complete\n");
+        }
         // The blob is per-device factory data, so its name is board data: take
         // it from the sensor node's firmware-name, falling back to the default.
         let name = sensor::firmware_name().unwrap_or(CALIBRATION_FIRMWARE);
@@ -2721,6 +2785,32 @@ pub(crate) fn sbio_begin_enrol(
         payload: pad_payload(&body),
         payload_len: SBIO_BEGIN_ENROL_LEN,
         name: c"BEGIN_ENROL",
+    }
+}
+
+/// macOS `getSensorIdentifiers()` sends this second identifier message -- the
+/// 32-byte sensor nonce -- only for the 0x3356/0x3357 sensor class, and only
+/// then sets `_sensorIdentifiersValid`, which `prepareSession()` asserts before
+/// the key exchange (SESSION_SHARE).  Without it the J700 enclave refuses the
+/// session with 0x16 and every downstream crypto op with 0x01.
+const OP_SBIO_REGISTER_NONCE: u16 = 0x81;
+pub(crate) fn sbio_register_nonce(nonce: &[u8; 32]) -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_REGISTER_NONCE,
+        payload: pad_payload(nonce),
+        payload_len: 32,
+        name: c"REGISTER_NONCE",
+    }
+}
+
+/// macOS `initSbioCommunication`: opens the channel with a u32 = 6.
+const OP_SBIO_INIT_COMM: u16 = 0x73;
+pub(crate) fn sbio_init_comm() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_INIT_COMM,
+        payload: pad_payload(&6u32.to_le_bytes()),
+        payload_len: 4,
+        name: c"INIT_COMM",
     }
 }
 

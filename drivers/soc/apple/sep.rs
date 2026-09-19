@@ -2218,6 +2218,14 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        nonce_cmd: u8 {
+            default: 0,
+            description: "SPI command byte that asks the sensor for its 32-byte nonce (0 = do not read or register one).",
+        },
+        nonce_cmd_probe: u8 {
+            default: 0,
+            description: "Sweep candidate SPI command bytes and log the reply length each makes available; the nonce frame is 143 bytes.",
+        },
         calibration_before_challenge: u8 {
             default: 0,
             description: "Send 0x5b LOAD_CALIBRATION before the module challenge instead of after the commit.",
