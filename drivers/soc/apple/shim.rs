@@ -16,6 +16,19 @@ extern "C" {
     fn sep_store_write(handle: *mut c_void, off: i64, buf: *const c_void, len: usize) -> c_long;
     fn sep_store_sync(handle: *mut c_void) -> c_int;
     fn sep_random_bytes(buf: *mut c_void, len: usize) -> c_int;
+    fn sep_platform_serial(out: *mut c_char, len: c_int) -> c_int;
+}
+
+/// The machine's IOPlatformSerialNumber from the device tree root, NUL-padded
+/// into `out`; returns the string length.
+pub(crate) fn platform_serial(out: &mut [u8]) -> Result<usize> {
+    // SAFETY: `out` is valid for writes of `out.len()` bytes for the call and
+    // the shim writes at most that many, retaining no reference.
+    let rc = unsafe { sep_platform_serial(out.as_mut_ptr().cast(), out.len() as i32) };
+    if rc < 0 {
+        return Err(kernel::error::Error::from_errno(rc));
+    }
+    Ok(rc as usize)
 }
 
 pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {

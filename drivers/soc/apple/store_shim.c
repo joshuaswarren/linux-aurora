@@ -11,6 +11,7 @@
  */
 
 #include <linux/cred.h>
+#include <linux/of.h>
 #include <linux/blkdev.h>
 #include <linux/err.h>
 #include <linux/fs.h>
@@ -124,4 +125,32 @@ long sep_store_write(void *handle, long long off, const void *buf,
 int sep_store_sync(void *handle)
 {
 	return vfs_fsync((struct file *)handle, 0);
+}
+
+/*
+ * The machine's IOPlatformSerialNumber, which macOS sends to the biometric
+ * endpoint as SBIO 0x48.  Copies at most `len` bytes of the device tree's
+ * root "serial-number" into `out`, NUL-padded, and returns the string length.
+ */
+int sep_platform_serial(char *out, int len)
+{
+	struct device_node *root;
+	const char *serial = NULL;
+	int n;
+
+	if (!out || len <= 0)
+		return -EINVAL;
+	memset(out, 0, len);
+
+	root = of_find_node_by_path("/");
+	if (!root)
+		return -ENODEV;
+	if (of_property_read_string(root, "serial-number", &serial) || !serial) {
+		of_node_put(root);
+		return -ENOENT;
+	}
+	n = strlen(serial);
+	memcpy(out, serial, min(n, len));
+	of_node_put(root);
+	return n;
 }
