@@ -1530,14 +1530,20 @@ impl SepData {
                     share = Some(sh);
                     break;
                 }
-                SbioOutcome::Status16 => continue,
-                SbioOutcome::PrerequisiteMissing | SbioOutcome::Other => return false,
+                // Any refusal is information, not a reason to stop: the J700
+                // enclave answers 0x16 to one mode word and 0x2d to another, so
+                // walk the whole enumeration and let the summary say what each
+                // value did.
+                SbioOutcome::Status16
+                | SbioOutcome::PrerequisiteMissing
+                | SbioOutcome::Other => continue,
             }
         }
         let Some(share) = share else {
             dev_err!(
                 self.dev,
-                "sbio: SESSION_SHARE refused every mode tried; the sensor session cannot be opened on this enclave\n"
+                "sbio: SESSION_SHARE refused all {} mode words tried (each status is logged above); the sensor session cannot be opened on this enclave\n",
+                order.len()
             );
             return false;
         };
@@ -3374,7 +3380,7 @@ pub(crate) const SBIO_STATUS_16: u16 = 0x16;
 static_assert!(SBIO_STATUS_PREREQUISITE != SBIO_STATUS_16);
 pub(crate) const SBIO_SESSION_MODE: u32 = 1;
 /// Values to try for the session-share mode word when none is pinned.
-pub(crate) const SBIO_SESSION_MODES: [u32; 5] = [1, 0, 2, 3, 4];
+pub(crate) const SBIO_SESSION_MODES: [u32; 9] = [1, 0, 2, 3, 4, 5, 6, 7, 8];
 static_assert!(SBIO_SESSION_SHARE_LEN <= SBIO_MAX_PAYLOAD);
 
 const OP_SBIO_SESSION_SHARE: u16 = 0x15;
