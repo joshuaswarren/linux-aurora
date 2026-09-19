@@ -1302,7 +1302,21 @@ impl SepData {
             }
 
             // The patch decision is made on status[8], not on state 9.
-            if st.patch_ack() == sensor::PATCH_ACCEPTED {
+            // `patch_ack_accept=` lets a board whose sensor revision reports a
+            // different "already patched" value skip the patch: the J700's
+            // 0x3356 sits in STATE_IDLE with ack 0x60 and refuses the whole
+            // patch/challenge/session chain, which is what a sensor that has
+            // nothing to patch would do.
+            let extra = *module_parameters::patch_ack_accept.value();
+            if st.patch_ack() == sensor::PATCH_ACCEPTED
+                || (extra != 0 && st.patch_ack() == extra)
+            {
+                dev_info!(
+                    self.dev,
+                    "sensor: patch ack {:#x} accepted (state {:#x}); no patch needed\n",
+                    st.patch_ack(),
+                    st.state
+                );
                 return Some(PatchLoaded(()));
             }
             return self.apply_sensor_patch(st.patch_ack());
