@@ -13,6 +13,7 @@ constants byte for byte, and a real request packs the fields the way the kext
 does.
 """
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import json
 import re
 import subprocess
@@ -53,16 +54,21 @@ assert "if scs.enabled {" in program
 assert program.count("ComputeRegister::new(0x0a599, 0x0000_0060_0040_0020)") == 2
 assert "0x0000_0132_0040_0020" not in program
 
-# Every knob is opt-in: a default build must be byte-identical to before.
-for name in (
-    "g17p_compute_scs_pages",
-    "g17p_compute_scs_mib",
-    "g17p_compute_scs_extras",
-    "g17p_compute_scs_window",
-    "g17p_compute_usage_slot",
-):
-    declaration = block(params, f"        {name}: u32 {{")
-    assert "default: 0," in declaration, f"{name} must default to 0"
+# The qualified path keeps its zero scratch request. The pure encoder below
+# still verifies nonzero requests without reintroducing runtime ABI switches.
+config = (root / "g17_config.rs").read_text()
+for name in ("COMPUTE_SCS_PAGES", "COMPUTE_SCS_MIB", "COMPUTE_SCS_EXTRAS", "COMPUTE_SCS_WINDOW"):
+    assert f"const {name}: u32 = 0;" in config
+assert "default: 0," in block(params, "        g17p_compute_usage_slot: u32 {")
+
+# Production requests are command-scoped: the extensible compute payload
+# carries the packed layout and the modern G17 UAPI path derives registers from
+# that field. This must not regress to one global diagnostic choice.
+uapi = (root / "g17_uapi.rs").read_text()
+assert "pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;" in uapi
+assert "scs_layout: get_u64(&raw, 0x40)" in uapi
+assert "build_compute_registers_for_layout(" in uapi
+assert "command.scs_layout," in uapi
 
 # Compile the actual complete module, including its historical 40-register
 # hash test. Stub only module-parameter access, using the real defaults.
@@ -141,11 +147,27 @@ rust += r'''
   assert_eq!(scs.size_word >> 16, ((pages as u64 * 4096) + 0xfffff) >> 20);
  }
 }
+#[test] fn command_layout_drives_the_production_request() {
+ let parameters = ComputeRegisterParameters {
+  preempt_base: 0x100_0404_0000, cdm_base: 0x100_0410_0000,
+  usc_exec_base: 0x1_0000_0000, helper_binary: 0, helper_data: 0,
+  helper_config: 0, dispatch_identity: 1, context_id: 3, work_ordinal: 7,
+  robustness: 0x100_0430_0000, operand_state_base: 0x70_0022_8000,
+  execution_gate: 2,
+ };
+ let layout = 0x70u64 | (96u64 << 24) | (0x48u64 << 48);
+ let on = build_compute_registers_for_layout(parameters, layout).unwrap();
+ assert_eq!(on.as_slice()[0].number, 0x17d9);
+ assert_eq!(on.as_slice().iter().find(|r| r.number == 0x101d1).unwrap().value,
+            0x0004_032f);
+ let off = build_compute_registers_for_layout(parameters, 0x70 | (96 << 24)).unwrap();
+ assert_eq!(off.len(), COMPUTE_REGISTER_COUNT);
+}
 '''
 
 with tempfile.TemporaryDirectory() as d:
     source = Path(d) / "test.rs"
-    source.write_text(rust)
+    source.write_text(with_g17_config(rust))
     exe = Path(d) / "test"
     subprocess.run(["rustc", "--edition=2021", "--test", str(source), "-o", str(exe)], check=True)
     subprocess.run([str(exe), "--test-threads=1"], check=True)
