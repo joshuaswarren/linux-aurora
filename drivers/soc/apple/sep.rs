@@ -2218,6 +2218,10 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        sbio_trace: u8 {
+            default: 0,
+            description: "Log every SBIO opcode and the status the enclave answers, not only the failures. Bring-up diagnostic.",
+        },
         session_mode: u32 {
             default: 0,
             description: "Pin the SBIO session-share mode word (0 = try the known enumeration, starting with the built-in 1). The whole request is this word; the enclave answers 0x16 for a value it does not take.",
