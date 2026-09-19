@@ -443,7 +443,7 @@ impl SepData {
         &self,
         secret: &[u8],
         uuid: &[u8; crate::sks::SKS_IDENTITY_UUID_LEN],
-        proof: keybag::NoStoredKeyBag,
+        proof: &keybag::NoStoredKeyBag,
         enc: profile::KeybagCreate,
     ) -> Result<SksRequest> {
         if proof.slot() != keybag::Slot::Identity {
@@ -539,7 +539,7 @@ impl SepData {
         let mut enc = first;
         let (variant, raw_handle, body_len) = loop {
             attempt += 1;
-            let request = match self.sks_req_create_identity_keybag(&secret, &uuid, proof, enc) {
+            let request = match self.sks_req_create_identity_keybag(&secret, &uuid, &proof, enc) {
                 Ok(request) => request,
                 Err(e) => {
                     dev_err!(
