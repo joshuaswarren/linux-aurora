@@ -2218,6 +2218,10 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
+        patch_ack_accept: u8 {
+            default: 0,
+            description: "Additional status[8] value to treat as 'sensor patch already accepted' (0 = only the built-in 0x29). For a sensor revision that reports a different ack.",
+        },
         sbio_trace: u8 {
             default: 0,
             description: "Log every SBIO opcode and the status the enclave answers, not only the failures. Bring-up diagnostic.",
