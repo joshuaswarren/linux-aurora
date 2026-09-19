@@ -468,19 +468,15 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		if (!phy_addr)
 			return -ENOMEM;
 
-		for (offset = 0; offset < bfr->size; offset += SZ_16K) {
-			if (iommu_iova_to_phys(domain, bfr->iova + offset) !=
-			    phy_addr + offset)
-				return -EINVAL;
-		}
-
 		/*
-		 * RTBuddy invalidates firmware-owned buffers before CPU access on
-		 * non-coherent systems.  Keep this mapping Normal-NC so the generic
-		 * RTKit reader never observes a stale write-back cache line.
+		 * The firmware writes these regions (its crash log above all)
+		 * behind the CPU's back, so map them uncached: with a
+		 * write-back mapping the crash-log probe re-read stale zeros
+		 * from its own first read for the whole 36 s it looked, while
+		 * a scan of the untouched remainder found the log.
 		 */
-		bfr->iomem = ioremap_wc(phy_addr, bfr->size);
-		if (!bfr->iomem)
+		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WC);
+		if (!bfr->buffer)
 			return -ENOMEM;
 
 		bfr->is_mapped = true;

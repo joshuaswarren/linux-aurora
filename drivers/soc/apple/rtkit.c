@@ -527,7 +527,7 @@ static void apple_rtkit_crashlog_probe_work(struct work_struct *work)
 {
 	struct apple_rtkit *rtk =
 		container_of(to_delayed_work(work), struct apple_rtkit, crashlog_probe);
-	static const unsigned int retry_ms[] = { 250, 1000, 5000, 30000 };
+	static const unsigned int retry_ms[] = { 250, 1000, 5000, 30000, 60000, 120000 };
 	unsigned int attempt = rtk->crashlog_probe_attempt;
 
 	if (READ_ONCE(rtk->shutting_down))
