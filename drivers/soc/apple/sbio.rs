@@ -748,6 +748,15 @@ impl SepData {
 
         self.register_ool(&self.ool_sbio)?;
 
+        // macOS's initSbioCommunication opens the channel with a u32 = 6 before
+        // any biometric traffic.
+        if *module_parameters::init_comm.value() != 0 {
+            match self.sbio_call(&crate::sbio::sbio_init_comm()) {
+                SbioOutcome::Ok(_) => dev_info!(self.dev, "sbio: channel opened (0x73)\n"),
+                _ => dev_warn!(self.dev, "sbio: INIT_COMM (0x73) was not accepted\n"),
+            }
+        }
+
         self.sbio_ready.store(true, Relaxed);
         Ok(())
     }
@@ -1231,24 +1240,31 @@ impl SepData {
     fn register_sensor(&self, id: &sensor::Identifier) -> bool {
         let stage = self.bringup.load(Relaxed);
 
+        // macOS's HandleReset order, which this had inverted: 0x80
+        // REGISTER_SENSOR goes first and is re-sent after EVERY identification
+        // (setSensorID clears the guard, so macOS never reaches a key exchange
+        // without a fresh 0x80), and 0x19 CLEAR_STATE follows it and only when
+        // the sensor state is non-zero.  Sending CLEAR_STATE first and omitting
+        // 0x80 leaves the enclave cleared and never told which sensor it is,
+        // which is the state in which it refuses the session with 0x16.
+        let op = crate::sbio::sbio_register_sensor(id);
+        match self.sbio_call(&op) {
+            SbioOutcome::Ok(_payload) => {
+                if stage == BRINGUP_FRESH {
+                    self.bringup.store(BRINGUP_IDENTIFIED, Relaxed);
+                }
+            }
+            _ => {
+                return false;
+            }
+        }
+
         if stage >= BRINGUP_ESTABLISHED {
             if self
                 .sbio_expect_ok(&crate::sbio::sbio_clear_state())
                 .is_none()
             {
                 return false;
-            }
-        }
-
-        if stage == BRINGUP_FRESH {
-            let op = crate::sbio::sbio_register_sensor(id);
-            match self.sbio_call(&op) {
-                SbioOutcome::Ok(_payload) => {
-                    self.bringup.store(BRINGUP_IDENTIFIED, Relaxed);
-                }
-                _ => {
-                    return false;
-                }
             }
         }
 
@@ -1261,13 +1277,21 @@ impl SepData {
         };
 
         let op = crate::sbio::sbio_register_sensor_serial(&serial);
-        match self.sbio_call(&op) {
-            SbioOutcome::Ok(_payload) => {
-                self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
-                true
-            }
-            _ => false,
+        if !matches!(self.sbio_call(&op), SbioOutcome::Ok(_)) {
+            return false;
         }
+
+        // The second identifier goes with the first: macOS sets
+        // _sensorIdentifiersValid only after both, with nothing in between.
+        if *module_parameters::register_nonce.value() != 0 && !self.register_sensor_nonce() {
+            dev_warn!(
+                self.dev,
+                "sensor: the nonce identifier did not register; the session will be refused\n"
+            );
+        }
+
+        self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
+        true
     }
 
     fn wake_sensor(&self) -> Option<PatchLoaded> {
@@ -1441,24 +1465,6 @@ impl SepData {
     }
 
     fn calibrate_sensor(&self) -> bool {
-        // Both identifier messages first (the serial went with the sensor
-        // registration): macOS sets _sensorIdentifiersValid only once the nonce
-        // has been registered too, and that flag is what gates the session.
-        if !self.register_sensor_nonce() {
-            dev_warn!(self.dev, "sensor: nonce registration did not complete\n");
-        } else if !self.session_established.load(Relaxed) {
-            // With the identifiers complete the enclave should now hand out the
-            // session share it was refusing with 0x16.
-            if self.establish_session() {
-                self.session_established.store(true, Relaxed);
-                dev_info!(self.dev, "sensor: session established after the nonce\n");
-            } else {
-                dev_warn!(
-                    self.dev,
-                    "sensor: the session was still refused after registering the nonce\n"
-                );
-            }
-        }
         // The blob is per-device factory data, so its name is board data: take
         // it from the sensor node's firmware-name, falling back to the default.
         let name = sensor::firmware_name().unwrap_or(CALIBRATION_FIRMWARE);
