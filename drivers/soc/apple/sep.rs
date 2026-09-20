@@ -553,6 +553,12 @@ struct SepData {
     control_wq: CondVar,
 
     sks_wedged: Atomic<u32>,
+    /// `sks_ready()` is called on every poll of the key store, and on a
+    /// machine whose SEP never advertises endpoint 0x12 that turned one real
+    /// diagnostic into hundreds of identical lines (235 in a single boot),
+    /// burying everything else in dmesg and wrapping the log ring.  Say it
+    /// once.
+    sks_absent_warned: Atomic<bool>,
 
     sks_seq: Atomic<u32>,
 
@@ -783,6 +789,7 @@ impl SepData {
                 control_wq <- new_condvar!("SepData::control_wq"),
                 sks_seq: Atomic::new(0),
                 sks_wedged: Atomic::new(0),
+                sks_absent_warned: Atomic::new(false),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),

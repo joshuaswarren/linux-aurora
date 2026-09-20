@@ -976,16 +976,20 @@ impl SepData {
             return true;
         }
         if !self.endpoint_present(proto::EP_SKS) {
-            dev_err!(
-                self.dev,
-                "sks: endpoint 0x{:02x} (key store) not advertised; {} EPs up (control={} xarm={} sbio={} scrd={}); keybag/ref-key cannot run\n",
-                proto::EP_SKS,
-                self.endpoint_count(),
-                self.endpoint_present(proto::EP_CONTROL) as u8,
-                self.endpoint_present(proto::EP_XARM) as u8,
-                self.endpoint_present(proto::EP_SBIO) as u8,
-                self.endpoint_present(proto::EP_SCRD) as u8,
-            );
+            // Once: this is polled, and the condition does not change within a
+            // boot.  Repeating it filled dmesg and wrapped the log ring.
+            if !self.sks_absent_warned.xchg(true, Relaxed) {
+                dev_err!(
+                    self.dev,
+                    "sks: endpoint 0x{:02x} (key store) not advertised; {} EPs up (control={} xarm={} sbio={} scrd={}); keybag/ref-key cannot run\n",
+                    proto::EP_SKS,
+                    self.endpoint_count(),
+                    self.endpoint_present(proto::EP_CONTROL) as u8,
+                    self.endpoint_present(proto::EP_XARM) as u8,
+                    self.endpoint_present(proto::EP_SBIO) as u8,
+                    self.endpoint_present(proto::EP_SCRD) as u8,
+                );
+            }
             return false;
         }
         if let Err(e) = self.enable_sks() {
