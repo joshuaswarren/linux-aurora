@@ -30,9 +30,6 @@ const EPIC_SUBTYPE_GET_HID_DESCRIPTOR: u16 = 0x1;
  * (mov w2,#0xa; mov w4,#0x4), where the AOP `als` service takes a
  * [u32 zero, u32 tag] envelope.  That 4-byte prefix is why the earlier 256-tag
  * sweep of endpoint 0x20 was silent. */
-const SPU_PKT_GET_PROPERTY: u16 = 0x0a;
-const SPU_PKT_SET_PROPERTY: u16 = 0x04;
-/* SpuProperty ids (AppleSPUInterface). */
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
 /* CT817's report is exactly 32 bytes and the lux float sits at +0x1c, read off
@@ -249,17 +246,6 @@ fn get_aop_property(
     aop.epic_call_ret(svc, EPIC_SUBTYPE_GET_AOP_PROPERTY, &buf, data_len)
 }
 
-fn spu_get_property(
-    aop: &dyn AOP,
-    svc: &EPICService,
-    prop: u32,
-    data_len: usize,
-) -> Result<(u32, KVec<u8>)> {
-    let mut buf = KVec::new();
-    buf.resize(4, 0, GFP_KERNEL)?;
-    buf[0..4].copy_from_slice(&prop.to_le_bytes());
-    aop.epic_call_ret(svc, SPU_PKT_GET_PROPERTY, &buf, data_len)
-}
 
 
 fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> Result<u32> {
