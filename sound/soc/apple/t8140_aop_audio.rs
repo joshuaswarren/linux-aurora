@@ -499,6 +499,75 @@ impl SndSocT8140AopData {
         dev_info!(self.dev, "hpai: {} properties answered\n", found);
     }
 
+    /// Ask the firmware to take the array out of `idle`, read back the state
+    /// it lands in, and put it back.
+    ///
+    /// This is the last question that matters before any ASoC plumbing.
+    /// Attaching proves the firmware will *talk* about the array to a client
+    /// that is not the exclave; only a power request proves it will *run* it.
+    ///
+    /// Unlike the sweeps above this one **writes**: property 202 with a
+    /// `PowerRequest`, which is the same 48-byte record the output services
+    /// already use and exactly the length the array reports for 202, so it is
+    /// a well-formed call for this device rather than a guess. It is behind
+    /// `hpai_probe=3` all the same.
+    ///
+    /// `param` is 1 for `lpai` and 0 for the output services and nothing says
+    /// which an `iop-audio-s` capture device wants, so try 0 then 1.
+    ///
+    /// No audio is captured: the stream is never started, and the device is
+    /// returned to `pw0 ` before this returns.
+    fn probe_hpai_power(&self) {
+        let mut sequence = 0u32;
+        for param in [0u32, 1u32] {
+            sequence += 1;
+            let req = match PowerRequest::new(AUDIO_DEV_HPAI, sequence, SPKR_POWER_STATE_PWRD, param) {
+                Ok(r) => r,
+                Err(e) => {
+                    dev_info!(self.dev, "hpai: power request build failed: {:?}\n", e);
+                    return;
+                }
+            };
+            match self.epic_wrapped_call(&AudioSetDeviceProp::new(
+                AUDIO_DEV_HPAI,
+                PROP_POWER_REQUEST,
+                req,
+            )) {
+                Ok(0) => dev_info!(self.dev, "hpai: pwrd accepted (param {})\n", param),
+                Ok(rc) => {
+                    dev_info!(self.dev, "hpai: pwrd (param {}) rejected: {:#x}\n", param, rc);
+                    continue;
+                }
+                Err(e) => {
+                    dev_info!(self.dev, "hpai: pwrd (param {}) failed: {:?}\n", param, e);
+                    continue;
+                }
+            }
+            match self.epic_wrapped_call_ret_code(
+                &AudioGetDeviceProp::new(AUDIO_DEV_HPAI, PROP_POWER_STATE),
+                8,
+            ) {
+                Ok((0, v)) if v.len() >= 8 => {
+                    dev_info!(self.dev, "hpai: state after pwrd (param {}) = {:02x?}\n", param, &v[4..8]);
+                    break;
+                }
+                Ok((rc, _)) => dev_info!(self.dev, "hpai: state read back return code {:#x}\n", rc),
+                Err(e) => dev_info!(self.dev, "hpai: state read back failed: {:?}\n", e),
+            }
+        }
+        sequence += 1;
+        if let Ok(req) = PowerRequest::new(AUDIO_DEV_HPAI, sequence, SPKR_POWER_STATE_PW0, 0) {
+            match self.epic_wrapped_call(&AudioSetDeviceProp::new(
+                AUDIO_DEV_HPAI,
+                PROP_POWER_REQUEST,
+                req,
+            )) {
+                Ok(rc) => dev_info!(self.dev, "hpai: returned to pw0 (return code {:#x})\n", rc),
+                Err(e) => dev_info!(self.dev, "hpai: returning to pw0 failed: {:?}\n", e),
+            }
+        }
+    }
+
     fn set_channel_control(&self) -> Result<()> {
         let ctl = ChannelControl {
             supported: 3,
@@ -2139,6 +2208,9 @@ impl platform::Driver for SndSocT8140AopDriver {
             if *module_parameters::hpai_probe.value() >= 2 {
                 data.probe_hpai_properties();
             }
+            if *module_parameters::hpai_probe.value() >= 3 {
+                data.probe_hpai_power();
+            }
         }
         let listener: Arc<dyn ReportListener> = data.clone();
         data.adata
@@ -2176,7 +2248,7 @@ module_platform_driver! {
     params: {
         hpai_probe: u8 {
             default: 0,
-            description: "Attach the high-quality microphone array ('hpai', the ADT's audio-hp-mic) on the AOP audio service at probe and log what it reports. 1 reads the three properties the lpai bring-up reads; 2 also sweeps a bounded range of property ids, since the array answers 200 but refuses 301/302 (kIOReturnNotFound) and its property space has to be found rather than assumed. Reads only. Off by default: a property call this firmware does not recognise wedges the AOP for the rest of the boot",
+            description: "Attach the high-quality microphone array ('hpai', the ADT's audio-hp-mic) on the AOP audio service at probe and log what it reports. 1 reads the three properties the lpai bring-up reads; 2 also sweeps a bounded range of property ids, since the array answers 200 but refuses 301/302 (kIOReturnNotFound) and its property space has to be found rather than assumed. 3 also asks the firmware to take the array out of idle and puts it straight back, which is the only way to learn whether it will run the array for a client that is not the exclave; 1 and 2 read only, 3 writes one well-formed power request. Off by default: a property call this firmware does not recognise wedges the AOP for the rest of the boot",
         },
     },
 }
