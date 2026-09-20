@@ -336,6 +336,8 @@ struct SndSocT8140AopData {
     pd_rx0: Atomic<usize>,
     /// A speaker stream has been triggered and not yet stopped.
     spkr_want_run: Atomic<u32>,
+    /// A HQ-mic stream has been triggered and not yet stopped.
+    hpai_want_run: Atomic<u32>,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
     spkr_volume: Atomic<u32>,
     /// DMA channels of the front-end PCMs, [FE DAI id][stream] (raw dma_chan pointers).
@@ -828,11 +830,30 @@ impl SndSocT8140AopData {
         self.service_startup(&self.hpai, &self.hpai_domain_refs())
     }
 
+    /// Deliberately does NOT start the array.  `prepare` runs before the ALSA
+    /// trigger, i.e. before `snd_dmaengine_pcm_trigger` has started the ADMAC,
+    /// and `pwrd` makes the LEAP start *producing* immediately.  Samples the
+    /// array emits into a ring the DMA is not yet servicing are lost, and the
+    /// capture returns whatever was in the buffer for its whole duration --
+    /// measured at about one capture in three being pure noise, all-or-nothing.
+    /// The start moves to `hpai_go`, queued from trigger START.  This is the
+    /// capture mirror of the speaker rule: the DMA must be running before the
+    /// LEAP starts moving samples.
     fn hpai_prepare(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// HQ-mic start (`pwrd`), from the system workqueue right after trigger
+    /// START: a sleeping firmware call, so it cannot run in the atomic trigger.
+    fn hpai_go(&self) -> Result<()> {
+        if self.hpai_want_run.load(Relaxed) == 0 || self.hpai.running.load(Relaxed) != 0 {
+            return Ok(());
+        }
         self.service_run(&self.hpai)
     }
 
     fn hpai_shutdown(&self) {
+        self.hpai_want_run.store(0, Relaxed);
         self.service_shutdown(&self.hpai, &self.hpai_domain_refs())
     }
 
@@ -1005,6 +1026,30 @@ impl WorkItem for SpkrStartWork {
     fn run(this: Arc<SpkrStartWork>) {
         if let Err(e) = this.data.spkr_go() {
             dev_err!(this.data.dev, "spkr: start failed: {:?}\n", e);
+        }
+    }
+}
+
+/// The HQ-mic stream start (`pwrd`), queued by the back-end DAI's trigger
+/// START for the same reason as the speaker's: the ADMAC must already be
+/// running before the LEAP starts producing.
+#[pin_data]
+struct HpaiStartWork {
+    data: Arc<SndSocT8140AopData>,
+    #[pin]
+    work: Work<HpaiStartWork>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for HpaiStartWork { self.work }
+}
+
+impl WorkItem for HpaiStartWork {
+    type Pointer = Arc<HpaiStartWork>;
+
+    fn run(this: Arc<HpaiStartWork>) {
+        if let Err(e) = this.data.hpai_go() {
+            dev_err!(this.data.dev, "hpai: start failed: {:?}\n", e);
         }
     }
 }
@@ -1907,6 +1952,31 @@ unsafe extern "C" fn hpai_dai_prepare(_substream: *mut bindings::snd_pcm_substre
     }
 }
 
+unsafe extern "C" fn hpai_dai_trigger(_substream: *mut bindings::snd_pcm_substream, cmd: i32, dai: *mut bindings::snd_soc_dai) -> i32 {
+    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
+    // driver.
+    let drv = unsafe { component_driver((*dai).component) };
+    match cmd as u32 {
+        bindings::SNDRV_PCM_TRIGGER_START
+        | bindings::SNDRV_PCM_TRIGGER_RESUME
+        | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
+            drv.data.hpai_want_run.store(1, Relaxed);
+            if let Some(work) = drv.hpai_start.as_ref() {
+                // Err = already queued: the pending run will see want_run.
+                let _ = workqueue::system().enqueue(work.clone());
+            }
+            0
+        }
+        bindings::SNDRV_PCM_TRIGGER_STOP
+        | bindings::SNDRV_PCM_TRIGGER_SUSPEND
+        | bindings::SNDRV_PCM_TRIGGER_PAUSE_PUSH => {
+            drv.data.hpai_want_run.store(0, Relaxed);
+            0
+        }
+        _ => EINVAL.to_errno(),
+    }
+}
+
 unsafe extern "C" fn hpai_dai_shutdown(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     unsafe { dai_data(dai) }.hpai_shutdown();
@@ -1915,6 +1985,7 @@ unsafe extern "C" fn hpai_dai_shutdown(_substream: *mut bindings::snd_pcm_substr
 static HPAI_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
     startup: Some(hpai_dai_startup),
     prepare: Some(hpai_dai_prepare),
+    trigger: Some(hpai_dai_trigger),
     shutdown: Some(hpai_dai_shutdown),
     set_fmt: Some(dai_accept_fmt),
     set_sysclk: Some(dai_accept_sysclk),
@@ -2081,6 +2152,7 @@ struct SndSocT8140AopDriver {
     data: Arc<SndSocT8140AopData>,
     asoc_registered: bool,
     spkr_start: Option<Arc<SpkrStartWork>>,
+    hpai_start: Option<Arc<HpaiStartWork>>,
 }
 
 impl SndSocT8140AopDriver {
@@ -2111,11 +2183,20 @@ impl SndSocT8140AopDriver {
             }),
             GFP_KERNEL,
         )?;
+        let hpai_data = data.clone();
+        let hpai_start = Arc::pin_init(
+            pin_init!(HpaiStartWork {
+                data: hpai_data,
+                work <- new_work!("HpaiStartWork::work"),
+            }),
+            GFP_KERNEL,
+        )?;
         let mut this = SndSocT8140AopDriver {
             card: ptr::null_mut(),
             data: data.clone(),
             asoc_registered: false,
             spkr_start: Some(spkr_start),
+            hpai_start: Some(hpai_start),
         };
         // SAFETY: FFI call with the live device and the module; `this.card` receives the new card.
         let ret = unsafe {
@@ -2217,6 +2298,15 @@ impl Drop for SndSocT8140AopDriver {
             // SAFETY: the component was registered with this driver descriptor in probe.
             unsafe { bindings::snd_soc_unregister_component_by_driver(self.data.dev.as_raw(), ptr::null()) };
         }
+        if let Some(work) = self.hpai_start.take() {
+            self.data.hpai_want_run.store(0, Relaxed);
+            // SAFETY: the work item lives in the pinned driver data; flushing waits for a queued
+            // `hpai_go`.
+            unsafe {
+                let raw = workqueue::Work::raw_get(&work.work);
+                bindings::flush_work(raw);
+            }
+        }
         if let Some(work) = self.spkr_start.take() {
             self.data.spkr_want_run.store(0, Relaxed);
             // SAFETY: the work item lives in the pinned driver data; flushing waits for a queued
@@ -2311,6 +2401,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 pd_leap_mca: Atomic::new(0),
                 pd_rx0: Atomic::new(0),
                 spkr_want_run: Atomic::new(0),
+                hpai_want_run: Atomic::new(0),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
                 fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
                 stream <- new_spinlock!(StreamState {
