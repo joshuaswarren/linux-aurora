@@ -691,6 +691,7 @@ static void soc_pcm_hw_init(struct snd_pcm_hardware *hw, bool force)
 		hw->channels_min = 0;
 		hw->channels_max = UINT_MAX;
 		hw->formats = ULLONG_MAX;
+		hw->subformats = UINT_MAX;
 	} else {
 		/* Preserve initialized parameters */
 		if (!hw->rates)
@@ -701,6 +702,8 @@ static void soc_pcm_hw_init(struct snd_pcm_hardware *hw, bool force)
 			hw->channels_max = UINT_MAX;
 		if (!hw->formats)
 			hw->formats = ULLONG_MAX;
+		if (!hw->subformats)
+			hw->subformats = UINT_MAX;
 	}
 }
 
@@ -728,7 +731,15 @@ static void soc_pcm_hw_update_format(struct snd_pcm_hardware *hw,
 				     const struct snd_soc_pcm_stream *p)
 {
 	hw->formats	&= p->formats;
-	hw->subformats	&= p->subformats;
+	/*
+	 * A DAI that declares no subformats places no constraint on them.
+	 * Intersecting with an undeclared mask would collapse hw->subformats
+	 * to zero and fail every open of a non-DPCM link in
+	 * snd_pcm_hw_constraints_complete(); snd-soc-dummy-dai declares none,
+	 * so any link with a dummy codec hits this.
+	 */
+	if (p->subformats)
+		hw->subformats &= p->subformats;
 }
 
 /**
@@ -950,7 +961,6 @@ static int soc_hw_sanity_check(struct snd_pcm_substream *substream)
 							hw->channels_max);
 	dev_dbg(dev, "ASoC: rate min %d max %d\n",	hw->rate_min,
 							hw->rate_max);
-
 	return 0;
 
 config_err:
