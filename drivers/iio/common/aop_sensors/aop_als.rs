@@ -602,8 +602,8 @@ module_platform_driver! {
             description: "Write the ALS VERBOSITY property (0xe1). macOS writes 6 here on this machine (traced 2026-09-20, answered NotPermitted); 0xffffffff means leave it alone",
         },
         replay_open: u8 {
-            default: 1,
-            description: "Replay macOS's opening before enabling: fetch the HID report descriptor (subtype 0x01) and read the eight properties AppleSPUCT817 reads, as traced under the hypervisor 2026-09-20. Clear it to go straight to the enable if the opening ever wedges the endpoint",
+            default: 0,
+            description: "Replay macOS's opening before enabling: fetch the HID report descriptor (subtype 0x01) and read the eight properties AppleSPUCT817 reads, as traced under the hypervisor 2026-09-20. OFF by default: the AOP never answers 0x01 on the untrusted side -- the ALS frontend it would reach is a property surface, while CT817Hal, ALSCT817 and ALSTrustedClientManager are trusted-side (see ALS-STATE-2026-09-20.md) -- and an unanswered EPIC call wedges the endpoint's call slot, which costs the iio device entirely. Set it to 1 only to re-measure that",
         },
         stop_first: u8 {
             default: 0,
