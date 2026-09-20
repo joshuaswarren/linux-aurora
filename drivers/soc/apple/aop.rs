@@ -147,6 +147,30 @@ const SETUP_BUFFER_REQUEST_ACK: u64 = 0x1200000000000000;
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
 const SETUP_BOOT_TIMEOUT_MS: i64 = 15000;
 const SETUP_SOURCE_EP: u8 = 0x20;
+/// The ALS lives on setup-port endpoint 0x21, and the trusted side will not
+/// power the CT817 until its calibration has been pushed there.
+const SETUP_ALS_EP: u8 = 0x21;
+/// The calibration message, captured verbatim from the exclave's own
+/// setup-port traffic on 2026-09-21 (see ALS-STATE-2026-09-20.md).  Eighty
+/// bytes on the wire: operation 0x0746b8d665152e31, an inner length of 56,
+/// then fourteen float32 -- five channel coefficients and two
+/// (1, gain, ?, max) triplets.  These are this part's numbers; they come from
+/// the machine, not from us, which is why they are carried verbatim.
+const SETUP_ALS_CALIBRATION: [u8; 80] = [
+    0x31, 0x2e, 0x15, 0x65, 0xd6, 0xb8, 0x46, 0x07,
+    0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xe4, 0x9e, 0xe3, 0x3e, 0xaf, 0xc0, 0xae, 0x3f,
+    0xb7, 0xe8, 0x36, 0x3e, 0x96, 0xc0, 0x95, 0x3e,
+    0x84, 0x89, 0x03, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+    0x00, 0x00, 0x80, 0x3f, 0x9d, 0x9c, 0xfc, 0x40,
+    0xb1, 0xb0, 0x80, 0x41, 0x72, 0x72, 0xfa, 0x42,
+    0x00, 0x00, 0x80, 0x3f, 0x9e, 0x9d, 0xfd, 0x40,
+    0xe2, 0xe1, 0x81, 0x41, 0x78, 0x78, 0xfe, 0x42,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+/// The AOP answers the calibration with 0x2000000000000004 rather than the
+/// 0x2000000000000001 the source bind gets.
+const SETUP_REPLY_READY_ALT: u64 = 0x2000000000000004;
 const SETUP_SET_SOURCE_BUFFER: u64 = 0x6b803ce492bd9547;
 const SETUP_REQUEST_TYPE: u64 = 3 << 60;
 const SETUP_REQUEST_DONE: u64 = 4 << 60;
@@ -1461,6 +1485,66 @@ impl AopData {
         Ok(())
     }
 
+    /// Push the ALS calibration on setup-port endpoint 0x21.
+    ///
+    /// Without it the sensor answers every property correctly and accepts the
+    /// arming interval, and then reports nothing at all, because the trusted
+    /// side never powers the part.  With it the samples start immediately.
+    /// Measured on a cold AOP under m1n1 with no secure kernel present, which
+    /// is the point: the exclave is needed to learn these bytes, not to send
+    /// them.
+    fn setup_push_als_calibration(&self) -> Result<()> {
+        let mut st = self.setup.lock();
+        let ep = match st.endpoint(SETUP_ALS_EP) {
+            Some(ep) => ep,
+            None => {
+                dev_warn!(self.dev, "setup port: no endpoint {:#04x}; ALS uncalibrated\n",
+                          SETUP_ALS_EP);
+                return Ok(());
+            }
+        };
+        let tx_off = st.arena_offset(ep.tx_iova).ok_or(EIO)?;
+        let rx_off = st.arena_offset(ep.rx_iova).ok_or(EIO)?;
+        {
+            let arena = st.arena.as_mut().ok_or(ENXIO)?;
+            // SAFETY: the arena is a coherent allocation of SETUP_ARENA_PAGES
+            // pages and tx_off is a page inside it.
+            unsafe {
+                let buf = &mut arena.as_mut()[tx_off..tx_off + SETUP_ALS_CALIBRATION.len()];
+                buf.copy_from_slice(&SETUP_ALS_CALIBRATION);
+            }
+        }
+        mem_sync();
+        st.reply = None;
+        st.send(SETUP_ALS_EP, SETUP_REQUEST_TYPE | SETUP_ALS_CALIBRATION.len() as u64)?;
+        let mut waited = 0i64;
+        while st.reply.is_none() {
+            let _ = self
+                .setup_cv
+                .wait_interruptible_timeout(&mut st, msecs_to_jiffies(100));
+            waited += 100;
+            if waited >= SETUP_REPLY_TIMEOUT_MS && st.reply.is_none() {
+                dev_err!(self.dev, "setup port: ALS calibration timed out\n");
+                return Err(ETIMEDOUT);
+            }
+        }
+        let reply = st.reply.take().unwrap();
+        if reply != SETUP_REPLY_READY && reply != SETUP_REPLY_READY_ALT {
+            dev_err!(self.dev, "setup port: unexpected ALS calibration reply {:#x}\n", reply);
+            return Err(EIO);
+        }
+        mem_sync();
+        let status = {
+            let arena = st.arena.as_ref().ok_or(ENXIO)?;
+            // SAFETY: rx_off is a page inside the arena.
+            unsafe { arena.as_ref()[rx_off] }
+        };
+        st.send(SETUP_ALS_EP, SETUP_REQUEST_DONE)?;
+        dev_info!(self.dev, "setup port: ALS calibration pushed (reply {:#x}, status {:#x})\n",
+                  reply, status);
+        Ok(())
+    }
+
     /// Endpoint buffer request: one host-to-AOP page and a reply window of
     /// requested * 16 bytes, both handed out from the pre-mapped arena.
     fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
@@ -1985,6 +2069,11 @@ impl platform::Driver for AopDriver {
                 rtk.as_mut().wake()?;
             }
             data.setup_finish_boot()?;
+            // Before any EPIC client opens the ALS: the trusted side wants the
+            // calibration first, and a failure here must not cost us the AOP.
+            if let Err(e) = data.setup_push_als_calibration() {
+                dev_warn!(pdev.as_ref(), "t8140 AOP: ALS calibration failed ({:?})\n", e);
+            }
             dev_info!(pdev.as_ref(), "t8140 AOP: both ports up, starting AFK endpoints\n");
             data.start_afk()?;
         } else {
