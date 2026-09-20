@@ -185,8 +185,16 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
     let batch = *module_parameters::batch_interval_us.value();
     let raw = *module_parameters::raw_interval_us.value();
 
-    let rc = set_als_property(aop, svc, 0, &0u32.to_le_bytes())?;
-    dev_info!(dev.as_ref(), "als: INTERVAL (0x0) = 0 (stop) -> rc {:#x}\n", rc);
+    // macOS does NOT write 0x00 = 0 before the enable.  The "0 -> non-zero
+    // transition of 0x00 is what arms it" reading came from disassembling
+    // setPropertiesGated; the live trace supersedes it -- macOS writes
+    // 0xe1 = 6, 0x16 = 1, 0x5c = 0, then 0x00 = 200000, and the reports start.
+    // Keep the stop write available, off by default, in case a re-arm after a
+    // previous session needs it.
+    if *module_parameters::stop_first.value() != 0 {
+        let rc = set_als_property(aop, svc, 0, &0u32.to_le_bytes())?;
+        dev_info!(dev.as_ref(), "als: INTERVAL (0x0) = 0 (stop) -> rc {:#x}\n", rc);
+    }
     match set_als_property(aop, svc, 0x16, &batch.to_le_bytes()) {
         Ok(rc) => dev_info!(dev.as_ref(), "als: BATCH_INTERVAL (0x16) = {} us -> rc {:#x}\n", batch, rc),
         Err(e) => dev_info!(dev.as_ref(), "als: BATCH_INTERVAL (0x16) = {} us -> error {:?}\n", batch, e),
@@ -534,12 +542,12 @@ module_platform_driver! {
             description: "With spu_probe set and the CT817 identified, write this microsecond report interval to SPU property 0x00 to arm periodic reporting (macOS defaults: 50000/100000/200000, or 10000 for a client that does not ask); 0 only identifies the part",
         },
         batch_interval_us: u32 {
-            default: 500000,
-            description: "SPU property 0x16 BatchInterval in microseconds, written before the report interval exactly as AppleSPUHIDDriver::setPropertiesGated does; CT817's own slow-rate pairing is report 200000 with batch 500000",
+            default: 1,
+            description: "ALS property 0x16, written before the report interval. Default is what macOS writes on this machine (1, not an interval at all) as traced under the hypervisor 2026-09-20; the AOP answers kIOReturnNotPermitted to macOS too and arms anyway",
         },
         raw_interval_us: u32 {
-            default: 200000,
-            description: "SPU property 0x5c RawInterval in microseconds, written between the batch and report intervals",
+            default: 0,
+            description: "ALS property 0x5c, written between 0x16 and the report interval. Default is what macOS writes on this machine (0), traced 2026-09-20; also answered NotPermitted for macOS",
         },
         dump_props: u8 {
             default: 0,
@@ -558,12 +566,16 @@ module_platform_driver! {
             description: "Write the ALS property 0xe4 with this value before the interval; 0xffffffff leaves it alone",
         },
         set_verbosity: u32 {
-            default: 0xffffffff,
-            description: "Write the ALS VERBOSITY property (0xe1); macOS sends 0xffffffff here, and 0xffffffff means leave it alone",
+            default: 6,
+            description: "Write the ALS VERBOSITY property (0xe1). macOS writes 6 here on this machine (traced 2026-09-20, answered NotPermitted); 0xffffffff means leave it alone",
+        },
+        stop_first: u8 {
+            default: 0,
+            description: "Write ALS property 0x00 = 0 before the enable. macOS does not do this; off by default since the trace of 2026-09-20 superseded the transition theory it was added for",
         },
         interval_us: u32 {
             default: 200000,
-            description: "Reporting interval in microseconds written to ALS property 0",
+            description: "Reporting interval in microseconds written to ALS property 0. macOS writes 200000 on this machine and the 0xc4 reports follow at that rate",
         },
     },
 }
