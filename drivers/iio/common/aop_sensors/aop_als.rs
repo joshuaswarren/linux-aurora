@@ -159,6 +159,24 @@ fn replay_macos_open(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -
 }
 
 fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
+    // macOS registers two client buffers before it writes the enable (trace
+    // 2026-09-20, seq 24-29: EPIC category COMMAND, subtype 0x0a, 28 bytes
+    // carrying two IOVAs with 0x100 lengths, answered by echoing the first).
+    // It is the last thing on the ALS channel that macOS does and this driver
+    // never has, and the trusted-side manager logs
+    // "Dispatching samples for client=%d enabled=%d", which implies exactly
+    // such a per-client registration.
+    //
+    // Off by default: an unanswered EPIC call wedges the endpoint's call slot
+    // and would cost the iio device, so this is opt-in until it is shown to be
+    // answered.
+    if *module_parameters::register_buffers.value() != 0 {
+        match aop.als_register_buffers(svc) {
+            Ok(rc) => dev_info!(dev.as_ref(), "als: client buffers -> rc {:#x}\n", rc),
+            Err(e) => dev_warn!(dev.as_ref(), "als: client buffers -> error {:?}\n", e),
+        }
+    }
+
     // The calibration is per-device factory data that the installer extracts
     // from a running macOS.  The J700's ADT sets `als-new-calibration-path = 1`
     // and carries no blob of its own, which suggests the AOP already holds its
@@ -604,6 +622,10 @@ module_platform_driver! {
         replay_open: u8 {
             default: 0,
             description: "Replay macOS's opening before enabling: fetch the HID report descriptor (subtype 0x01) and read the eight properties AppleSPUCT817 reads, as traced under the hypervisor 2026-09-20. OFF by default: the AOP never answers 0x01 on the untrusted side -- the ALS frontend it would reach is a property surface, while CT817Hal, ALSCT817 and ALSTrustedClientManager are trusted-side (see ALS-STATE-2026-09-20.md) -- and an unanswered EPIC call wedges the endpoint's call slot, which costs the iio device entirely. Set it to 1 only to re-measure that",
+        },
+        register_buffers: u8 {
+            default: 0,
+            description: "Send the ALS client-buffer registration macOS sends before the enable: EPIC category COMMAND, subtype 0x0a, 28 bytes carrying two 0x100-byte IOVAs (traced 2026-09-20). The trusted-side manager logs 'Dispatching samples for client=%d enabled=%d', so a per-client registration is what the host appears to be missing. Off by default because an unanswered EPIC call wedges the endpoint and costs the iio device",
         },
         stop_first: u8 {
             default: 0,
