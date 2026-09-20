@@ -21,6 +21,7 @@
 #include <linux/workqueue.h>
 
 #include "pmp-v2-protocol.h"
+#include <linux/suspend.h>
 #include "pmp-v2-resident.h"
 #include "pmp-v2-profile.h"
 #include "pmp-v2-dart.h"
@@ -760,8 +761,32 @@ static int pmp_v2_suspend(struct device *dev)
 	return -EBUSY; /* Shared power/firmware quiescence not qualified. */
 }
 
+static int pmp_v2_suspend_system(struct device *dev)
+{
+	/*
+	 * The blanket refusal above exists because quiescing the PMP means
+	 * quiescing a firmware that owns a resident window this driver has
+	 * patched, and nothing has qualified doing that on this part.
+	 *
+	 * Suspend-to-idle does not ask for any of it.  The SoC is not powered
+	 * down, the resident window stays mapped and valid, the firmware keeps
+	 * running and keeps servicing the thermal policy -- which matters on a
+	 * fanless machine -- so the correct behaviour is to do nothing and
+	 * succeed.  Refusing it instead aborts the whole cycle for every other
+	 * device (measured on J700, 2026-09-21: "apple-pmp-v2 ... failed to
+	 * suspend: error -16" then "PM: Some devices failed to suspend").
+	 *
+	 * Deeper states still have to quiesce the firmware, and that is the
+	 * part that is unqualified, so they keep the refusal.
+	 */
+	if (pm_suspend_target_state == PM_SUSPEND_TO_IDLE)
+		return 0;
+
+	return pmp_v2_suspend(dev);
+}
+
 static const struct dev_pm_ops pmp_v2_pm_ops = {
-	.suspend = pmp_v2_suspend,
+	.suspend = pmp_v2_suspend_system,
 	.freeze = pmp_v2_suspend,
 	.poweroff = pmp_v2_suspend,
 	.runtime_suspend = pmp_v2_suspend,
