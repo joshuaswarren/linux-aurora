@@ -105,17 +105,6 @@ const EPIC_TYPE_NOTIFY: u32 = 0;
 const EPIC_CATEGORY_REPORT: u8 = 0x00;
 const EPIC_CATEGORY_NOTIFY: u8 = 0x10;
 const EPIC_CATEGORY_REPLY: u8 = 0x20;
-/// macOS sends the ALS buffer/client registration with this category;
-/// ordinary property reads stay NOTIFY.  Traced 2026-09-20.
-const EPIC_CATEGORY_COMMAND: u8 = 0x30;
-/// Subtype the ALS client-buffer registration rides on (same id as a property
-/// get, but sent with category COMMAND).
-const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
-/// Each traced ALS client buffer is 0x100 bytes.
-const ALS_CLIENT_BUF_LEN: usize = 0x100;
-/// Reply capacity macOS advertises on that call (inline_len 0x18), which is
-/// deliberately not the 0x1c payload length.
-const ALS_CLIENT_REPLY_LEN: usize = 0x18;
 const EPIC_SUBTYPE_STD_SERVICE: u16 = 0xc0;
 const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
@@ -350,6 +339,9 @@ struct AFKEndpoint {
     seq: u16,
     calls: [Option<Arc<FutureValue<CallResult>>>; AOP_MAX_CALLS],
     call_returns: [Option<KVec<u8>>; AOP_MAX_CALLS],
+    /// Reports seen on this endpoint, so the log records that they arrive
+    /// without one line every 200 ms for the life of the boot.
+    reports: u32,
 }
 
 unsafe impl Send for AFKEndpoint {}
@@ -364,6 +356,7 @@ impl AFKEndpoint {
             seq: 0,
             calls: [const { None }; AOP_MAX_CALLS],
             call_returns: [const { None }; AOP_MAX_CALLS],
+            reports: 0,
         }
     }
 
@@ -586,20 +579,28 @@ impl AFKEndpoint {
             // all, on any endpoint or channel?" has to be answerable without
             // depending on a module parameter.  aop.report_trace could not be
             // read back from /sys/module/aop/parameters on this build, so a
-            // silent log left it untestable.  One line per report, always.
+            // silent log left it untestable.
+            //
+            // The first report on the endpoint answers that question; the ALS
+            // then streams one every 200 ms, and logging each wrapped the
+            // kernel ring every couple of minutes and destroyed every other
+            // driver's boot log.  Say it once and count the rest.
             // QEHeader is repr(C, packed): bind the field to a local before
             // formatting, or rustc rejects the unaligned reference (E0793).
             let rep_ch = qhdr.channel;
             let rep_ep = self.index;
             let rep_len = data.len();
-            dev_info!(
-                client.dev,
-                "aop: EPIC report ep {:#04x} channel {:#x} subtype {:#06x} ({} bytes)\n",
-                rep_ep,
-                rep_ch,
-                subtype,
-                rep_len
-            );
+            self.reports = self.reports.saturating_add(1);
+            if self.reports == 1 {
+                dev_info!(
+                    client.dev,
+                    "aop: EPIC report ep {:#04x} channel {:#x} subtype {:#06x} ({} bytes); further reports on this endpoint are not logged\n",
+                    rep_ep,
+                    rep_ch,
+                    subtype,
+                    rep_len
+                );
+            }
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
                 let announce = unsafe { &*(data.as_ptr() as *const EPICServiceAnnounce) };
                 let chan = announce.channel;
@@ -1049,9 +1050,6 @@ struct AopData {
     subdevices: Mutex<KVec<*mut bindings::platform_device>>,
     #[pin]
     source_ring: Mutex<Option<Arc<SourceRing>>>,
-    /// The two ALS client buffers, kept alive once registered.
-    #[pin]
-    als_bufs: Mutex<Option<(Coherent<[u8]>, Coherent<[u8]>)>>,
 }
 
 unsafe impl Send for AopData {}
@@ -1148,7 +1146,6 @@ impl AopData {
                     report_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
                     source_ring <- new_mutex!(None),
-                    als_bufs <- new_mutex!(None),
                 }
             ),
             GFP_KERNEL,
@@ -1749,34 +1746,6 @@ impl AOP for AopData {
         Ok((res.retcode, res.extra_data.unwrap()))
     }
 
-    fn epic_command_ret(
-        &self,
-        svc: &EPICService,
-        subtype: u16,
-        msg_bytes: &[u8],
-        ret_len: usize,
-    ) -> Result<(u32, KVec<u8>)> {
-        let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
-        let _turn = self.take_call_turn(ep_idx);
-        let call = {
-            let mut rtk_guard = self.rtkit.lock();
-            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
-            let mut ep_guard = self.endpoints[ep_idx as usize].lock();
-            let mut ret_buf = KVec::new();
-            ret_buf.resize(ret_len, 0, GFP_KERNEL)?;
-            ep_guard.epic_notify(
-                self,
-                rtk.as_mut(),
-                svc.channel,
-                subtype,
-                EPIC_CATEGORY_COMMAND,
-                msg_bytes,
-                Some(ret_buf),
-            )?
-        };
-        let res = self.wait_call(ep_idx, svc, subtype, call)?;
-        Ok((res.retcode, res.extra_data.unwrap()))
-    }
     fn add_fakehid_listener(
         &self,
         svc: EPICService,
@@ -1820,43 +1789,6 @@ impl AOP for AopData {
             }
         }
         false
-    }
-    fn als_register_buffers(&self, svc: &EPICService) -> Result<u32> {
-        let mut guard = self.als_bufs.lock();
-        if guard.is_some() {
-            return Err(EBUSY);
-        }
-        // SAFETY: same contract as the AFK buffer allocation above -- the AOP
-        // device is bound for the whole life of this driver.
-        let bound = unsafe { self.dev.as_bound() };
-        let a = Coherent::<u8>::zeroed_slice(bound, ALS_CLIENT_BUF_LEN, GFP_KERNEL)?;
-        let b = Coherent::<u8>::zeroed_slice(bound, ALS_CLIENT_BUF_LEN, GFP_KERNEL)?;
-        let iova_a = a.dma_handle() as u32;
-        let iova_b = b.dma_handle() as u32;
-
-        // The traced payload, field for field:
-        //   u32 0, u32 iova_a, u32 len_a, u32 iova_b, u32 len_b, u32 0x100, u32 4
-        let mut buf = KVec::new();
-        buf.resize(28, 0, GFP_KERNEL)?;
-        buf[4..8].copy_from_slice(&iova_a.to_le_bytes());
-        buf[8..12].copy_from_slice(&(ALS_CLIENT_BUF_LEN as u32).to_le_bytes());
-        buf[12..16].copy_from_slice(&iova_b.to_le_bytes());
-        buf[16..20].copy_from_slice(&(ALS_CLIENT_BUF_LEN as u32).to_le_bytes());
-        buf[20..24].copy_from_slice(&(ALS_CLIENT_BUF_LEN as u32).to_le_bytes());
-        buf[24..28].copy_from_slice(&4u32.to_le_bytes());
-
-        dev_info!(self.dev, "als: registering client buffers {:#x}/{:#x} len {:#x}\n",
-                  iova_a, iova_b, ALS_CLIENT_BUF_LEN);
-        // Reply capacity is 0x18, not 0x1c.  macOS's sub-header says
-        //     0x18: 1c 00 00 00   sub.length   = 28 (the payload we send)
-        //     0x2c: 18 00 00 00   inline_len   = 24 (the capacity it offers)
-        // Those two are not the same number, and taking the length from the
-        // payload rather than from the traced header is the mistake that cost
-        // three boot cycles on subtype 0x01 earlier tonight.
-        let (rc, _reply) =
-            self.epic_command_ret(svc, EPIC_SUBTYPE_GET_AOP_PROPERTY, &buf, ALS_CLIENT_REPLY_LEN)?;
-        *guard = Some((a, b));
-        Ok(rc)
     }
     fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
         if !self.epic_v4 {
