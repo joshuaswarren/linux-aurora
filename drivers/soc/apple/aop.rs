@@ -76,21 +76,16 @@ const BOOTARGS_SIZE: usize = 0x230;
 const CPU_CONTROL: usize = 0x44;
 const CPU_RUN: u32 = 0x1 << 4;
 const AFK_ENDPOINT_START: u8 = 0x20;
-/// 0x20..=0x32.  This was 0xf (0x20..=0x2e), which left the two endpoints the
-/// J700 setup port itself sets up -- 0x30 and 0x32, see SETUP_ENDPOINTS --
-/// structurally unreachable: they were given ring buffers by the setup port and
-/// then never offered to start_afk(), so nothing ever listened on them.  That
-/// matters for the ambient light sensor: the `als` service on 0x23 answers
-/// identity (0x0f -> "CT817"), productID (0x5b -> 10), calibration (0x0b) and
-/// the report interval (0x00), but refuses the two rate properties that
-/// actually arm reporting (0x16 batch, 0x5c raw) with kIOReturnNotPermitted --
-/// it is the AOP's property bridge, not the sample path.  macOS carries the
-/// samples over an SPU ring whose endpoint it looks up at runtime
-/// (AppleSPU->[0xA8]->[0x88], named "AppleSPU_ep%d"), and 0x30/0x32 are the
-/// only endpoints this firmware advertises that nothing on the host claims.
-/// has_endpoint() still gates every start, so an endpoint RTKit did not
-/// discover is skipped exactly as before.
-const AFK_ENDPOINT_COUNT: u8 = 0x13;
+/// 0x20..=0x2e.  This deliberately matches macOS, which was measured under the
+/// hypervisor on 2026-09-20 starting exactly 0x08 (oslog), 0x20, 0x21, 0x22,
+/// 0x23 and 0x2b on this AOP -- the same five AFK endpoints started here.
+///
+/// It is tempting to widen this: the J700 setup port sets up 0x30 and 0x32 too
+/// (see SETUP_ENDPOINTS), giving them ring buffers that nothing then listens
+/// on, and they looked like a candidate for the ambient light sensor's missing
+/// sample path.  The trace settles it -- macOS never starts them either -- so
+/// do not go there again without new evidence.
+const AFK_ENDPOINT_COUNT: u8 = 0xf;
 const AFK_OPC_GET_BUF: u64 = 0x89;
 const AFK_OPC_INIT: u64 = 0x80;
 const AFK_OPC_INIT_RX: u64 = 0x8b;
