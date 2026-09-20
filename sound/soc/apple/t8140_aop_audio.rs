@@ -97,6 +97,12 @@ const AUDIO_DEV_SPKR: u32 = from_fourcc(b"spkr");
 const AUDIO_DEV_TAP: u32 = from_fourcc(b"tap ");
 const AUDIO_DEV_COUT: u32 = from_fourcc(b"cout");
 const AUDIO_DEV_CIN: u32 = from_fourcc(b"cin ");
+/// The high-quality microphone array (ADT /arm-io/iop-audio-controller/
+/// audio-hp-mic, identifier 'iaph' -- ADT FourCCs are byte-reversed).  Unlike
+/// `lpai` it is the machine's only `iop-audio-s` stream: its data comes back
+/// over leap-s ADMAC RX0, not the AOP source ring, and macOS reaches it
+/// through the HPMicAudioDriver exclave rather than this EPIC service.
+const AUDIO_DEV_HPAI: u32 = from_fourcc(b"hpai");
 /// kIOReturnBusy from the firmware: the device is already attached.
 const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
@@ -376,6 +382,45 @@ impl SndSocT8140AopData {
 
     fn attach_lpai(&self) -> Result<()> {
         self.attach_device(AUDIO_DEV_LPAI, "lpai")
+    }
+
+    /// Ask the firmware what it knows about the high-quality microphone
+    /// array, without claiming it: attach, then read back the three
+    /// properties the `lpai` bring-up reads.  This answers the only question
+    /// the ADT cannot -- whether the AOP's own audio service exposes `hpai`
+    /// at all, or whether the array is reachable solely through the
+    /// AOP2/HPMicAudioDriver exclave.
+    ///
+    /// Behind `hpai_probe` because a property call the firmware does not
+    /// recognise wedges the AOP for the rest of the boot, taking the working
+    /// low-power microphone, jack and speaker paths with it (the same
+    /// failure the ALS `set_mode`/`set_unke4` parameters caused).  Never
+    /// fatal, so a rejection still leaves a usable card.
+    fn probe_hpai(&self) {
+        let ret = match self.epic_wrapped_call(&AudioAttachDevice::new(AUDIO_DEV_HPAI)) {
+            Ok(r) => r,
+            Err(e) => {
+                dev_info!(self.dev, "hpai: attach call failed: {:?}\n", e);
+                return;
+            }
+        };
+        if ret != 0 && ret != AUDIO_RET_BUSY {
+            dev_info!(self.dev, "hpai: attach rejected, return code {:#x}\n", ret);
+            return;
+        }
+        dev_info!(self.dev, "hpai: attached (return code {:#x})\n", ret);
+        for &(modifier, len, what) in [
+            (PROP_STREAM_FORMAT, 16usize, "stream format"),
+            (PROP_RING_GEOMETRY, 24usize, "ring geometry"),
+            (PROP_POWER_STATE, 4usize, "power state"),
+        ]
+        .iter()
+        {
+            match self.epic_wrapped_call_ret(&AudioGetDeviceProp::new(AUDIO_DEV_HPAI, modifier), 4 + len) {
+                Ok(v) => dev_info!(self.dev, "hpai: {} ({}) = {:02x?}\n", what, modifier, &v[..]),
+                Err(e) => dev_info!(self.dev, "hpai: {} ({}) failed: {:?}\n", what, modifier, e),
+            }
+        }
     }
 
     fn set_channel_control(&self) -> Result<()> {
@@ -2013,6 +2058,9 @@ impl platform::Driver for SndSocT8140AopDriver {
         data.attach_lpai()?;
         data.set_channel_control()?;
         data.read_geometry()?;
+        if *module_parameters::hpai_probe.value() != 0 {
+            data.probe_hpai();
+        }
         let listener: Arc<dyn ReportListener> = data.clone();
         data.adata
             .add_report_listener(svc, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
@@ -2046,4 +2094,10 @@ module_platform_driver! {
     name: "snd_soc_t8140_aop_audio",
     description: "Apple T8140 (J700) AOP audio: low-power microphone, jack and speaker paths",
     license: "Dual MIT/GPL",
+    params: {
+        hpai_probe: u8 {
+            default: 0,
+            description: "Attach the high-quality microphone array ('hpai', the ADT's audio-hp-mic) on the AOP audio service at probe and log the stream format, ring geometry and power state it reports, to establish whether the array is reachable without the HPMicAudioDriver exclave. Off by default: a property call this firmware does not recognise wedges the AOP for the rest of the boot",
+        },
+    },
 }
