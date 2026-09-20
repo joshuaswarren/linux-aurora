@@ -802,7 +802,9 @@ impl AFKEndpoint {
             ..EPICHeaderV4::default()
         };
         self.call_returns[tag - 1] = ret;
-        let hdr_bytes = if client.epic_v4 {
+        // macOS speaks v2 to this firmware; see the epic_tx_v2 parameter.
+        let tx_v4 = client.epic_v4 && *module_parameters::epic_tx_v2.value() == 0;
+        let hdr_bytes = if tx_v4 {
             // SAFETY: `hdr_v4` is a packed, plain-data header that lives
             // for the whole call; the slice covers exactly its bytes.
             unsafe {
@@ -1928,6 +1930,10 @@ module_platform_driver! {
     description: "AOP driver",
     license: "Dual MIT/GPL",
     params: {
+        epic_tx_v2: u8 {
+            default: 0,
+            description: "Transmit EPIC sub-headers in v2 form (sub_version 2, tag at +0x08) instead of t8140's v4 (sub_version 4, sub_timestamp at +0x08, tag at +0x10). macOS uses v2 on this AOP -- every packet of the 2026-09-20 hypervisor capture has sub_version 2 and echoes the request tag, which is why this driver believes the firmware does not echo tags: it reads the tag from the v4 offset, where the firmware put a timestamp whose low 16 bits are the tag. Reply parsing already handles both layouts (epic_decode reads sub_version off the packet), so this only changes what is sent",
+        },
         report_trace: u8 {
             default: 0,
             description: "Log fakehid reports that match no registered listener, so a sensor that produces nothing can be told from one reporting on another endpoint or channel",
