@@ -1079,6 +1079,13 @@ impl AopData {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
             b"als" => c_str!("als"),
+            // The SPU application endpoint.  On the J700 the ambient light
+            // sensor is a CT817 HID device reached through here, not through
+            // the `als` EPIC service (which answers property reads and then
+            // never reports).  Create the sub-devices so a driver can bind and
+            // claim the channel; HibernationAppUntrusted stays dropped.
+            b"SPUApp" => c_str!("spu"),
+            b"SPUAppUntrusted" => c_str!("spu-untrusted"),
             _ => {
                 return Ok(());
             }
@@ -1402,7 +1409,51 @@ impl AopData {
             return Err(ETIMEDOUT);
         }
         dev_info!(self.dev, "setup port: dual-mailbox boot complete\n");
+        self.dump_setup_rings();
         Ok(())
+    }
+
+    /// Endpoints 0x30 and 0x32 get setup-port tx/rx buffers and then nothing
+    /// runs on them: they are not started as AFK/EPIC endpoints.  macOS reaches
+    /// the SPU (and so the CT817 ambient light sensor) over a RemoteDataQueue
+    /// pair on an iop_ringbuffer, not over EPIC, so one of these is the likely
+    /// carrier.  An iop_ringbuffer is identifiable without any traffic: its
+    /// header word at ring+4 carries the protocol version in the high half, and
+    /// iop_ringbuffer_enqueue_msg_vec only emits the "AOP " magic when that is
+    /// 0x0007xxxx.  Dump the head of every setup buffer so the ring -- if there
+    /// is one -- names itself.
+    fn dump_setup_rings(&self) {
+        let st = self.setup.lock();
+        let Some(arena) = st.arena.as_ref() else {
+            return;
+        };
+        // SAFETY: the arena is a live coherent allocation of SETUP_ARENA_PAGES
+        // pages and every offset below is bounds-checked against it.
+        let bytes = unsafe { arena.as_ref() };
+        for slot in st.endpoints.iter().flatten() {
+            for (what, iova) in [("tx", slot.tx_iova), ("rx", slot.rx_iova)] {
+                let Some(off) = st.arena_offset(iova) else {
+                    continue;
+                };
+                if off + 64 > bytes.len() {
+                    continue;
+                }
+                let head = &bytes[off..off + 64];
+                let w0 = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+                let w1 = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+                let ring = (w1 & 0xffff0000) == 0x0007_0000;
+                dev_info!(
+                    self.dev,
+                    "setup port: ep {:#x} {} head w0 {:#010x} w1 {:#010x}{} {:02x?}\n",
+                    slot.ep,
+                    what,
+                    w0,
+                    w1,
+                    if ring { " IOP_RINGBUFFER(v7)" } else { "" },
+                    head
+                );
+            }
+        }
     }
 
     fn start_cpu(&self, asc_mmio: &RelaxedMmio<ASC_MMIO_SIZE>) -> Result<()> {
