@@ -105,6 +105,9 @@ const AUDIO_DEV_CIN: u32 = from_fourcc(b"cin ");
 const AUDIO_DEV_HPAI: u32 = from_fourcc(b"hpai");
 /// kIOReturnBusy from the firmware: the device is already attached.
 const AUDIO_RET_BUSY: u32 = 0xe00002d5;
+/// kIOReturnNotFound: the device has no such property.  `hpai` answers this
+/// for 301/302, which are source-ring concepts it has no business holding.
+const AUDIO_RET_NOT_FOUND: u32 = 0xe00002f0;
 const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
 const SPKR_POWER_STATE_PWRD: u32 = from_fourcc(b"pwrd");
 const RATE: u32 = 16000;
@@ -348,15 +351,23 @@ impl SndSocT8140AopData {
             .epic_call(&self.service, EPIC_SUBTYPE_WRAPPED_CALL, msg_bytes)
     }
 
-    fn epic_wrapped_call_ret<T>(&self, data: &T, ret_len: usize) -> Result<KVec<u8>> {
+    /// The raw form: hands back the firmware's return code with the reply and
+    /// logs nothing, so a caller that expects some calls to be refused (a
+    /// property sweep) does not fill the log with errors.
+    fn epic_wrapped_call_ret_code<T>(&self, data: &T, ret_len: usize) -> Result<(u32, KVec<u8>)> {
         // SAFETY: T is a plain packed firmware record.
         let msg_bytes =
             unsafe { slice::from_raw_parts(data as *const T as *const u8, mem::size_of::<T>()) };
-        let (retcode, ret) =
-            self.adata
-                .epic_call_ret(&self.service, EPIC_SUBTYPE_WRAPPED_CALL, msg_bytes, ret_len)?;
+        self.adata
+            .epic_call_ret(&self.service, EPIC_SUBTYPE_WRAPPED_CALL, msg_bytes, ret_len)
+    }
+
+    fn epic_wrapped_call_ret<T>(&self, data: &T, ret_len: usize) -> Result<KVec<u8>> {
+        let (retcode, ret) = self.epic_wrapped_call_ret_code(data, ret_len)?;
         if retcode != 0 {
-            dev_err!(self.dev, "lpai call failed, return code {:#x}\n", retcode);
+            // Not "lpai": this helper serves every device on the service, and
+            // naming one of them made an hpai failure read as an lpai failure.
+            dev_err!(self.dev, "audio wrapped call failed, return code {:#x}\n", retcode);
             return Err(EIO);
         }
         Ok(ret)
@@ -421,6 +432,38 @@ impl SndSocT8140AopData {
                 Err(e) => dev_info!(self.dev, "hpai: {} ({}) failed: {:?}\n", what, modifier, e),
             }
         }
+    }
+
+    /// Walk a bounded set of property ids on `hpai` and report which ones the
+    /// firmware knows.  The array answered 200 and refused 301/302 with
+    /// `kIOReturnNotFound`, so its property space has to be found rather than
+    /// assumed -- it is an ADMAC device where `lpai` is a ring device.
+    ///
+    /// Reads only.  `_commandNodeGetProperty` changes no state and a refusal
+    /// comes back as a clean return code, which is why a sweep is safe here
+    /// when the ALS parameter *writes* were not.  Each reply is asked for at
+    /// the 8 bytes that worked for property 200; the firmware states the real
+    /// length in the first word, so a longer property still identifies itself.
+    fn probe_hpai_properties(&self) {
+        const GROUPS: [(u32, u32); 4] = [(200, 206), (300, 310), (400, 404), (700, 702)];
+        let mut found = 0;
+        for &(first, last) in GROUPS.iter() {
+            for modifier in first..=last {
+                match self
+                    .epic_wrapped_call_ret_code(&AudioGetDeviceProp::new(AUDIO_DEV_HPAI, modifier), 8)
+                {
+                    Ok((0, v)) => {
+                        found += 1;
+                        dev_info!(self.dev, "hpai: property {} = {:02x?}\n", modifier, &v[..]);
+                    }
+                    // the expected negative; say nothing
+                    Ok((AUDIO_RET_NOT_FOUND, _)) => (),
+                    Ok((rc, _)) => dev_info!(self.dev, "hpai: property {} return code {:#x}\n", modifier, rc),
+                    Err(e) => dev_info!(self.dev, "hpai: property {} call failed: {:?}\n", modifier, e),
+                }
+            }
+        }
+        dev_info!(self.dev, "hpai: {} properties answered\n", found);
     }
 
     fn set_channel_control(&self) -> Result<()> {
@@ -2060,6 +2103,9 @@ impl platform::Driver for SndSocT8140AopDriver {
         data.read_geometry()?;
         if *module_parameters::hpai_probe.value() != 0 {
             data.probe_hpai();
+            if *module_parameters::hpai_probe.value() >= 2 {
+                data.probe_hpai_properties();
+            }
         }
         let listener: Arc<dyn ReportListener> = data.clone();
         data.adata
@@ -2097,7 +2143,7 @@ module_platform_driver! {
     params: {
         hpai_probe: u8 {
             default: 0,
-            description: "Attach the high-quality microphone array ('hpai', the ADT's audio-hp-mic) on the AOP audio service at probe and log the stream format, ring geometry and power state it reports, to establish whether the array is reachable without the HPMicAudioDriver exclave. Off by default: a property call this firmware does not recognise wedges the AOP for the rest of the boot",
+            description: "Attach the high-quality microphone array ('hpai', the ADT's audio-hp-mic) on the AOP audio service at probe and log what it reports. 1 reads the three properties the lpai bring-up reads; 2 also sweeps a bounded range of property ids, since the array answers 200 but refuses 301/302 (kIOReturnNotFound) and its property space has to be found rather than assumed. Reads only. Off by default: a property call this firmware does not recognise wedges the AOP for the rest of the boot",
         },
     },
 }
