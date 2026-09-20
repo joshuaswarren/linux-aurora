@@ -1293,27 +1293,41 @@ impl SepData {
     }
 
     fn service_xarm(&self, req: &crate::xarm::XarmRequest) {
+        let trace = *module_parameters::trace_xarm.value() != 0;
+        if trace {
+            dev_info!(
+                self.dev,
+                "xarm: tag={:#04x} op={:#04x} len={} args=[{:#04x},{:#04x},{:#04x}]\n",
+                req.tag,
+                req.opcode,
+                req.length,
+                req.args[0],
+                req.args[1],
+                req.args[2],
+            );
+        }
+
         let want = req.length as usize;
         if want > OOL_SIZE_XARM {
-            self.fail_xarm(req.tag);
+            self.fail_xarm_because(req.tag, "request longer than the out-of-line buffer");
             return;
         }
 
         if want > 0 && !self.ool_await_written(&self.ool_xarm, 0, want) {
-            self.fail_xarm(req.tag);
+            self.fail_xarm_because(req.tag, "payload never landed in the out-of-line buffer");
             return;
         }
         let payload = match self.ool_read(&self.ool_xarm, 0, want) {
             Ok(p) => p,
             Err(_) => {
-                self.fail_xarm(req.tag);
+                self.fail_xarm_because(req.tag, "could not read the out-of-line buffer");
                 return;
             }
         };
 
         let mut staging = KVec::new();
         if staging.resize(OOL_SIZE_XARM, 0u8, GFP_KERNEL).is_err() {
-            self.fail_xarm(req.tag);
+            self.fail_xarm_because(req.tag, "out of memory staging the reply");
             return;
         }
 
@@ -1329,17 +1343,27 @@ impl SepData {
             )
         });
         let Some(done) = serviced else {
-            self.fail_xarm(req.tag);
+            self.fail_xarm_because(req.tag, "no xART store is open");
             return;
         };
 
         if done.reply_bytes > 0 {
             if self.ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes]).is_err() {
-                self.fail_xarm(req.tag);
+                self.fail_xarm_because(req.tag, "could not write the reply buffer");
                 return;
             }
         }
 
+        if trace {
+            dev_info!(
+                self.dev,
+                "xarm: tag={:#04x} -> status={:#04x} len={} ({} bytes out)\n",
+                done.reply.tag,
+                done.reply.status,
+                done.reply.length,
+                done.reply_bytes,
+            );
+        }
         self.send_xarm_reply(&done.reply);
     }
 
@@ -1398,6 +1422,15 @@ impl SepData {
     }
 
     fn fail_xarm(&self, tag: u8) {
+        self.fail_xarm_because(tag, "unspecified")
+    }
+
+    /// Refuse an xARM request, recording why.  Every refusal looks identical
+    /// to the SEP, so the reason only ever exists in this log.
+    fn fail_xarm_because(&self, tag: u8, reason: &str) {
+        if *module_parameters::trace_xarm.value() != 0 {
+            dev_info!(self.dev, "xarm: tag={:#04x} REFUSED ({})\n", tag, reason);
+        }
         self.send_xarm_reply(&crate::xarm::XarmReply {
             tag,
             status: xarm::STATUS_FAILED,
@@ -1898,11 +1931,42 @@ impl SepData {
 
     fn on_discovery(&self, _msg: Message, f: proto::Fields) {
         let mut table = self.endpoints.lock();
-        match f.ty {
-            proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
-                let _ = table.slot(f.param);
+        let known = matches!(
+            f.ty,
+            proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG
+        );
+        if *module_parameters::trace_discovery.value() != 0 {
+            // DATA carries the endpoint's four-character name, big-endian, on
+            // the descriptor message.  Render it as text when it is printable
+            // so the log names the endpoint rather than numbering it.
+            let d = f.data_lo.to_be_bytes();
+            let printable = d.iter().all(|b| (0x20..0x7f).contains(b));
+            if printable {
+                dev_info!(
+                    self.dev,
+                    "sep: discovery ty={:#04x} ep={:#04x} data={:#010x} '{}{}{}{}'{}\n",
+                    f.ty,
+                    f.param,
+                    f.data_lo,
+                    d[0] as char,
+                    d[1] as char,
+                    d[2] as char,
+                    d[3] as char,
+                    if known { "" } else { " (type not acted on)" },
+                );
+            } else {
+                dev_info!(
+                    self.dev,
+                    "sep: discovery ty={:#04x} ep={:#04x} data={:#010x}{}\n",
+                    f.ty,
+                    f.param,
+                    f.data_lo,
+                    if known { "" } else { " (type not acted on)" },
+                );
             }
-            _ => {}
+        }
+        if known {
+            let _ = table.slot(f.param);
         }
     }
 
@@ -2292,6 +2356,14 @@ module! {
         sensor_probe_only: u8 {
             default: 0,
             description: "Bring-up diagnostics: on the first open of the biometric device run the sensor bring-up (rails, identifier, patch, calibration, parameters) without a keybag and leave Touch ID inactive",
+        },
+        trace_xarm: u8 {
+            default: 0,
+            description: "Log every xARM request the SEP makes of this driver and the answer given, including the reason for each refusal. xARM is a service the OS provides TO the SEP -- it asks us to read and write its anti-replay records -- and every refusal path answers STATUS_FAILED silently, so a store lookup that fails is indistinguishable from one that succeeds. A SEP that stalls below 12 endpoints has usually been refused something here. Bring-up diagnostic, default off",
+        },
+        trace_discovery: u8 {
+            default: 0,
+            description: "Log every message the SEP sends on the discovery endpoint (0xFD), including the types this driver does not act on, and print the resulting endpoint list once the attach settles. The endpoint ladder a healthy machine climbs is 7 -> 11 (sbio, scrd) -> 12 (key store); a machine that stalls below 12 gives no other view of what the SEP actually announced. Bring-up diagnostic, default off",
         },
     },
 }
