@@ -1115,6 +1115,47 @@ static void mt_shutdown(struct pci_dev *pdev)
 	/* Storage remains allocated through reset, even if the engine is stuck. */
 }
 
+static int __maybe_unused mt_suspend(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mt7932 *m = pci_get_drvdata(pdev);
+
+	/*
+	 * mt_irq() reads W + 0x200 to decide whether the interrupt is ours.
+	 * That read is fatal once the device has left D0: this platform reports
+	 * it as an asynchronous SError rather than returning all-ones, and an
+	 * SError panics the kernel.  Measured 2026-09-21 -- a devices-level
+	 * pm_test cycle aborted on apple-pmp-v2 returning -EBUSY and then died
+	 * in mt_irq() during the resume rollback with "SError Interrupt on CPU0,
+	 * code 0xbe000000", taking the machine with it.
+	 *
+	 * Silence the source while the device is still in D0, then stop the
+	 * handler entirely; disable_irq() also waits for the threaded half to
+	 * finish, so nothing is left in flight across the transition.
+	 */
+	WRITE_ONCE(m->running, false);
+	mt_write(m, W + 0x204, 0);
+	disable_irq(pci_irq_vector(pdev, 0));
+	return 0;
+}
+
+static int __maybe_unused mt_resume(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mt7932 *m = pci_get_drvdata(pdev);
+
+	/* The PCI core has put the device back in D0 before this runs, so the
+	 * register write below is safe again.
+	 */
+	enable_irq(pci_irq_vector(pdev, 0));
+	WRITE_ONCE(m->running, true);
+	if (!poll_test)
+		mt_write(m, W + 0x204, m->irq_mask);
+	return 0;
+}
+
+static SIMPLE_DEV_PM_OPS(mt_pm_ops, mt_suspend, mt_resume);
+
 static const struct pci_device_id mt_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7932) },
 	{}
@@ -1126,6 +1167,7 @@ static struct pci_driver mt_driver = {
 	.probe = mt_probe,
 	.shutdown = mt_shutdown,
 	.driver.suppress_bind_attrs = true,
+	.driver.pm = &mt_pm_ops,
 };
 module_pci_driver(mt_driver);
 MODULE_LICENSE("GPL");
