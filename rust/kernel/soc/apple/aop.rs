@@ -63,6 +63,21 @@ pub trait AOP: Send + Sync {
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)>;
 
+    /// Like `epic_call_ret`, but sends the sub-packet with EPIC category
+    /// COMMAND (0x30) instead of NOTIFY (0x10).
+    ///
+    /// macOS uses COMMAND for the ambient light sensor's buffer/client
+    /// registration -- traced under the hypervisor on 2026-09-20, subtype 0x0a
+    /// with a 28-byte payload carrying two IOVAs -- and NOTIFY for ordinary
+    /// property reads.  Nothing here had ever sent anything but NOTIFY.
+    fn epic_command_ret(
+        &self,
+        svc: &EPICService,
+        subtype: u16,
+        msg_bytes: &[u8],
+        ret_len: usize,
+    ) -> Result<(u32, KVec<u8>)>;
+
     /// Adds the listener for the specified service
     fn add_fakehid_listener(
         &self,

@@ -18,6 +18,9 @@ use kernel::{
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
 const EPIC_SUBTYPE_SET_ALS_PROPERTY: u16 = 0x4;
+/// The HID report descriptor.  macOS asks for this before anything else
+/// (hypervisor trace, 2026-09-20); Linux never has.
+const EPIC_SUBTYPE_GET_HID_DESCRIPTOR: u16 = 0x1;
 /* The EPIC sub-header's `subtype` at +0x06 is macOS's SpuPacketType: Linux's
  * EPICHeaderV4 and macOS's _AOPSubPacket are the same 0x18-byte structure, and
  * the AFK ring is the same transport (Linux's QE_MAGIC2 " POA" is the "AOP "
@@ -71,6 +74,61 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
 }
 
 fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
+    // Replay macOS's opening, captured from this exact machine under the
+    // hypervisor on 2026-09-20 (ALS-STATE-2026-09-20.md, "THE macOS ALS
+    // CONVERSATION, CAPTURED").  Before any calibration or rate write,
+    // AppleSPUCT817 fetches the HID report descriptor and reads eight
+    // properties.  Linux has never done any of it.
+    //
+    // Everything here is logged and nothing fails the probe: macOS itself is
+    // answered kIOReturnNotPermitted on 0x5a, 0x3e, 0x11 and 0x3f and carries
+    // straight on, so a refusal here is the expected reference behaviour and
+    // not an error.  This is replay of traced traffic, not a subtype sweep --
+    // the rule against those still stands.
+    {
+        // Reply is 20 bytes after the u32 status, and decodes as:
+        //   06 00 ff  Usage Page (Vendor-defined 0xFF00)
+        //   0a 04 00  Usage (0x0004)      a1 01  Collection (Application)
+        //   15 00     Logical Minimum 0   26 ff 00  Logical Maximum 255
+        //   75 08     Report Size 8       95 20  Report Count 32
+        //   81 00     Input               c0     End Collection
+        // i.e. exactly the 32-byte vendor report this driver already decodes.
+        let mut buf = KVec::new();
+        buf.resize(8, 0, GFP_KERNEL)?;
+        match aop.epic_call_ret(svc, EPIC_SUBTYPE_GET_HID_DESCRIPTOR, &buf, 0xe4) {
+            Ok((rc, d)) => {
+                let n = core::cmp::min(d.len(), 32);
+                dev_info!(dev.as_ref(), "als: HID descriptor (0x01) -> rc {:#x}, {} bytes {:?}\n",
+                          rc, d.len(), &d[..n])
+            }
+            Err(e) => dev_info!(dev.as_ref(), "als: HID descriptor (0x01) -> error {:?}\n", e),
+        }
+
+        // macOS's order.  0x1e is AppleSPUALSLuxDriver:getOrientation and 0x2e
+        // is getPlacement -- both answer 1 on the J700, which is what the
+        // panel's own log prints ("AOP orientation = 1", "AOP placement = 1").
+        for &(tag, len, name) in &[
+            (0x5au32, 2usize, "UNK5A"),
+            (0x5b, 2, "PRODUCT_ID"),
+            (0x30, 4, "UNK30"),
+            (0x3e, 0x40, "UNK3E"),
+            (0x0f, 0x40, "NAME"),
+            (0x113, 1, "UNK113"),
+            (0x2e, 4, "PLACEMENT"),
+            (0x1e, 4, "ORIENTATION"),
+        ] {
+            match get_aop_property(aop, svc, tag, len) {
+                Ok((rc, d)) => {
+                    let n = core::cmp::min(d.len(), 16);
+                    dev_info!(dev.as_ref(), "als: probe {} ({:#x}) -> rc {:#x} {:?}\n",
+                              name, tag, rc, &d[..n])
+                }
+                Err(e) => dev_info!(dev.as_ref(), "als: probe {} ({:#x}) -> error {:?}\n",
+                                    name, tag, e),
+            }
+        }
+    }
+
     // The calibration is per-device factory data that the installer extracts
     // from a running macOS.  The J700's ADT sets `als-new-calibration-path = 1`
     // and carries no blob of its own, which suggests the AOP already holds its

@@ -105,6 +105,9 @@ const EPIC_TYPE_NOTIFY: u32 = 0;
 const EPIC_CATEGORY_REPORT: u8 = 0x00;
 const EPIC_CATEGORY_NOTIFY: u8 = 0x10;
 const EPIC_CATEGORY_REPLY: u8 = 0x20;
+/// macOS sends the ALS buffer/client registration with this category;
+/// ordinary property reads stay NOTIFY.  Traced 2026-09-20.
+const EPIC_CATEGORY_COMMAND: u8 = 0x30;
 const EPIC_SUBTYPE_STD_SERVICE: u16 = 0xc0;
 const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
@@ -748,6 +751,7 @@ impl AFKEndpoint {
         rtkit: Pin<&mut rtkit::RtKit<AopData>>,
         channel: u32,
         subtype: u16,
+        category: u8,
         data: &[u8],
         ret: Option<KVec<u8>>,
     ) -> Result<Arc<FutureValue<CallResult>>> {
@@ -772,7 +776,7 @@ impl AFKEndpoint {
             seq: self.seq,
             length: data.len() as u32,
             sub_version: 2,
-            category: EPIC_CATEGORY_NOTIFY,
+            category,
             subtype,
             tag: tag as u16,
             ..EPICHeader::default()
@@ -782,7 +786,7 @@ impl AFKEndpoint {
             seq: self.seq,
             length: data.len() as u32,
             sub_version: 4,
-            category: EPIC_CATEGORY_NOTIFY,
+            category,
             subtype,
             tag: tag as u16,
             ..EPICHeaderV4::default()
@@ -1573,7 +1577,8 @@ impl AOP for AopData {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
             let mut ep_guard = self.endpoints[ep_idx as usize].lock();
-            ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, None)?
+            ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype,
+                                 EPIC_CATEGORY_NOTIFY, msg_bytes, None)?
         };
         Ok(self.wait_call(ep_idx, svc, subtype, call)?.retcode)
     }
@@ -1597,6 +1602,36 @@ impl AOP for AopData {
                 rtk.as_mut(),
                 svc.channel,
                 subtype,
+                EPIC_CATEGORY_NOTIFY,
+                msg_bytes,
+                Some(ret_buf),
+            )?
+        };
+        let res = self.wait_call(ep_idx, svc, subtype, call)?;
+        Ok((res.retcode, res.extra_data.unwrap()))
+    }
+
+    fn epic_command_ret(
+        &self,
+        svc: &EPICService,
+        subtype: u16,
+        msg_bytes: &[u8],
+        ret_len: usize,
+    ) -> Result<(u32, KVec<u8>)> {
+        let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
+        let _turn = self.take_call_turn(ep_idx);
+        let call = {
+            let mut rtk_guard = self.rtkit.lock();
+            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
+            let mut ep_guard = self.endpoints[ep_idx as usize].lock();
+            let mut ret_buf = KVec::new();
+            ret_buf.resize(ret_len, 0, GFP_KERNEL)?;
+            ep_guard.epic_notify(
+                self,
+                rtk.as_mut(),
+                svc.channel,
+                subtype,
+                EPIC_CATEGORY_COMMAND,
                 msg_bytes,
                 Some(ret_buf),
             )?
