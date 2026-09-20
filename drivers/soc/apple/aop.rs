@@ -821,6 +821,36 @@ impl AFKEndpoint {
                 )
             }
         };
+
+        // Dump exactly what goes on the wire, so a call the firmware refuses to
+        // answer can be diffed against the same call from macOS rather than
+        // reasoned about.  The 2026-09-20 capture gives the reference bytes;
+        // three guesses at the difference (payload length, reply capacity,
+        // framing version) have each cost a boot cycle.
+        if *module_parameters::epic_tx_dump.value() != 0 {
+            let mut line: [u8; 3 * 48 + 1] = [0; 3 * 48 + 1];
+            let n = core::cmp::min(hdr_bytes.len(), 48);
+            for (k, b) in hdr_bytes[..n].iter().enumerate() {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                line[k * 3] = HEX[(b >> 4) as usize];
+                line[k * 3 + 1] = HEX[(b & 0xf) as usize];
+                line[k * 3 + 2] = b' ';
+            }
+            let hdr_hex = core::str::from_utf8(&line[..n * 3]).unwrap_or("?");
+            let mut pline: [u8; 3 * 32 + 1] = [0; 3 * 32 + 1];
+            let pn = core::cmp::min(data.len(), 32);
+            for (k, b) in data[..pn].iter().enumerate() {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                pline[k * 3] = HEX[(b >> 4) as usize];
+                pline[k * 3 + 1] = HEX[(b & 0xf) as usize];
+                pline[k * 3 + 2] = b' ';
+            }
+            let pay_hex = core::str::from_utf8(&pline[..pn * 3]).unwrap_or("?");
+            dev_info!(client.dev,
+                      "aop: TX ep {:#04x} chan {:#x} sub {:#06x} cat {:#04x} hdr[{}] {}| payload[{}] {}\n",
+                      self.index, channel, subtype, category, hdr_bytes.len(), hdr_hex,
+                      data.len(), pay_hex);
+        }
         self.send_rb(client, rtkit, channel, EPIC_TYPE_NOTIFY, hdr_bytes, data)?;
         self.seq = self.seq.wrapping_add(1);
         self.calls[tag - 1] = Some(call.clone());
@@ -1930,6 +1960,10 @@ module_platform_driver! {
     description: "AOP driver",
     license: "Dual MIT/GPL",
     params: {
+        epic_tx_dump: u8 {
+            default: 0,
+            description: "Hex-dump every EPIC sub-header and payload this driver transmits, so a call the firmware never answers can be diffed byte for byte against the same call captured from macOS under the hypervisor",
+        },
         epic_tx_v2: u8 {
             default: 0,
             description: "Transmit EPIC sub-headers in v2 form (sub_version 2, tag at +0x08) instead of t8140's v4 (sub_version 4, sub_timestamp at +0x08, tag at +0x10). macOS uses v2 on this AOP -- every packet of the 2026-09-20 hypervisor capture has sub_version 2 and echoes the request tag, which is why this driver believes the firmware does not echo tags: it reads the tag from the v4 offset, where the firmware put a timestamp whose low 16 bits are the tag. Reply parsing already handles both layouts (epic_decode reads sub_version off the packet), so this only changes what is sent",
