@@ -1220,7 +1220,15 @@
 			#dma-cells = <1>;
 			iommus = <&aop_dart 11>;
 			power-domains = <&ps_audio_leap_s_a>;
-			resets = <&ps_audio_leap_s_a>;
+			/*
+			 * No resets, for the same reason as admac_leap_ns: the
+			 * AOP firmware owns the LEAP fabric, and apple-admac
+			 * pulses reset_control_reset() at probe.  Resetting the
+			 * secure LEAP ADMAC out from under the firmware leaves
+			 * its per-channel/SRAM registers dead, and the first
+			 * dma_request_chan() on it then takes an asynchronous
+			 * SError and panics the machine.
+			 */
 			status = "disabled";
 		};
 

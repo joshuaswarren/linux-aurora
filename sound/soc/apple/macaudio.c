@@ -1695,11 +1695,11 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.safe_vol = -20,
 	.spk_out_widget = "Speaker",
 	/*
-	 * No fourth name yet.  The high-quality microphone array's front end
-	 * (j700-pcm-3) is complete and the firmware side of it is proven, but
-	 * requesting its leap-s DMA channel still takes an asynchronous SError
-	 * in dma_request_chan(); naming it here is what turns the front end on,
-	 * so it stays unnamed until that is fixed.
+	 * No fourth name.  The microphone array's front end (j700-pcm-3) is
+	 * complete and its firmware side is proven, but writing the secure
+	 * LEAP ADMAC's per-channel SRAM carveout register takes an
+	 * asynchronous SError; naming the DAI here is what turns the front end
+	 * on, so it stays unnamed until that is understood.
 	 */
 	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
 	.primary_bclk_ratio = 125,
