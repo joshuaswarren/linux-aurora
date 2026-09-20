@@ -23,6 +23,7 @@
 #define APPLE_RTKIT_MAX_ENDPOINTS 0x100
 
 #include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
 struct apple_rtkit {
 	void *cookie;
@@ -73,6 +74,7 @@ struct apple_rtkit {
 	 * read-only through debugfs so it can be inspected. */
 	struct debugfs_blob_wrapper oslog_blob;
 	struct dentry *oslog_dentry;
+	struct dentry *endpoints_dentry;
 
 	struct apple_rtkit_shmem syslog_buffer;
 	char *syslog_msg_buffer;

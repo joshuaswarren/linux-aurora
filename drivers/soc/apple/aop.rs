@@ -546,6 +546,27 @@ impl AFKEndpoint {
                     .iter()
                     .position(|x| *x == 0)
                     .unwrap_or(announce.name.len());
+                // This report is macOS's _ReadyReportData: name[0x20], then u20
+                // at +0x20 (what we call `channel`), flags at +0x24 and
+                // bInterfaceNumber at +0x28.  macOS addresses later commands by
+                // the interface id, not by u20, and an EPIC call to a channel
+                // the AOP does not recognise is simply never answered -- which
+                // wedges the endpoint and, with it, the audio services on this
+                // ASC.  Log every field so the right one can be identified
+                // without sending a speculative call.
+                let arrival = qhdr.channel;
+                let unk2 = announce._unk2;
+                let unk3 = announce._unk3;
+                dev_info!(
+                    client.dev,
+                    "aop: announce ep {:#04x} arrival-chan {:#x} body-chan {:#x} flags {:#x} iface {:#x} name {}\n",
+                    self.index,
+                    arrival,
+                    chan,
+                    unk2,
+                    unk3,
+                    core::str::from_utf8(&announce.name[..name_len]).unwrap_or("<non-utf8>")
+                );
                 return Into::<Arc<_>>::into(client).register_service(
                     self,
                     chan,

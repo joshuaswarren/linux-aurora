@@ -195,6 +195,22 @@ abort_boot:
 	}
 }
 
+/* The endpoint bitmap is the firmware's own inventory of what it exposes, and
+ * it is otherwise only visible through dev_dbg.  Publishing it matters because
+ * an endpoint the firmware advertises and Linux never starts is invisible: on
+ * the J700 the ambient light sensor lives behind exactly such an endpoint.
+ */
+static int apple_rtkit_endpoints_show(struct seq_file *s, void *unused)
+{
+	struct apple_rtkit *rtk = s->private;
+	int ep;
+
+	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS)
+		seq_printf(s, "0x%02x\n", ep);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(apple_rtkit_endpoints);
+
 static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 {
 	int i, ep, ret;
@@ -221,6 +237,14 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		set_bit(ep, rtk->endpoints);
 		if (rtk->epmap_only)
 			set_bit(ep, rtk->discovery_endpoints);
+	}
+
+	if (!rtk->endpoints_dentry) {
+		char name[64];
+
+		snprintf(name, sizeof(name), "%s-endpoints", dev_name(rtk->dev));
+		rtk->endpoints_dentry = debugfs_create_file(name, 0400, NULL, rtk,
+							    &apple_rtkit_endpoints_fops);
 	}
 
 	/*
@@ -1105,6 +1129,8 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	debugfs_remove(rtk->oslog_dentry);
 	rtk->oslog_dentry = NULL;
+	debugfs_remove(rtk->endpoints_dentry);
+	rtk->endpoints_dentry = NULL;
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
@@ -1447,6 +1473,8 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	debugfs_remove(rtk->oslog_dentry);
 	rtk->oslog_dentry = NULL;
+	debugfs_remove(rtk->endpoints_dentry);
+	rtk->endpoints_dentry = NULL;
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
