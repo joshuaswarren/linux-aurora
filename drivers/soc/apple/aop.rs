@@ -76,7 +76,21 @@ const BOOTARGS_SIZE: usize = 0x230;
 const CPU_CONTROL: usize = 0x44;
 const CPU_RUN: u32 = 0x1 << 4;
 const AFK_ENDPOINT_START: u8 = 0x20;
-const AFK_ENDPOINT_COUNT: u8 = 0xf;
+/// 0x20..=0x32.  This was 0xf (0x20..=0x2e), which left the two endpoints the
+/// J700 setup port itself sets up -- 0x30 and 0x32, see SETUP_ENDPOINTS --
+/// structurally unreachable: they were given ring buffers by the setup port and
+/// then never offered to start_afk(), so nothing ever listened on them.  That
+/// matters for the ambient light sensor: the `als` service on 0x23 answers
+/// identity (0x0f -> "CT817"), productID (0x5b -> 10), calibration (0x0b) and
+/// the report interval (0x00), but refuses the two rate properties that
+/// actually arm reporting (0x16 batch, 0x5c raw) with kIOReturnNotPermitted --
+/// it is the AOP's property bridge, not the sample path.  macOS carries the
+/// samples over an SPU ring whose endpoint it looks up at runtime
+/// (AppleSPU->[0xA8]->[0x88], named "AppleSPU_ep%d"), and 0x30/0x32 are the
+/// only endpoints this firmware advertises that nothing on the host claims.
+/// has_endpoint() still gates every start, so an endpoint RTKit did not
+/// discover is skipped exactly as before.
+const AFK_ENDPOINT_COUNT: u8 = 0x13;
 const AFK_OPC_GET_BUF: u64 = 0x89;
 const AFK_OPC_INIT: u64 = 0x80;
 const AFK_OPC_INIT_RX: u64 = 0x8b;
@@ -1084,9 +1098,29 @@ impl AopData {
             // blocks its own startup until every advertised endpoint is
             // enabled, so record which ones are actually present here.
             dev_info!(self.dev, "AFK: starting endpoint {:#04x}\n", rtk_ep_num);
-            rtk.as_mut().start_endpoint(rtk_ep_num)?;
+            // The five endpoints of the proven J700 application map stay fatal:
+            // audio depends on 0x21/0x2b and probe should not come up half
+            // working.  0x30/0x32 only became reachable when AFK_ENDPOINT_COUNT
+            // was widened and nothing has ever spoken to them, so if one will
+            // not start, say so and carry on rather than failing the whole AOP
+            // probe and taking the speakers down to test a hypothesis.
+            let required = matches!(rtk_ep_num, 0x20 | 0x21 | 0x22 | 0x23 | 0x2b);
+            if let Err(e) = rtk.as_mut().start_endpoint(rtk_ep_num) {
+                if required {
+                    return Err(e);
+                }
+                dev_warn!(self.dev, "AFK: endpoint {:#04x} did not start ({:?}), skipping\n",
+                          rtk_ep_num, e);
+                continue;
+            }
             let ep_guard = self.endpoints[ep as usize].lock();
-            ep_guard.start(rtk.as_mut())?;
+            if let Err(e) = ep_guard.start(rtk.as_mut()) {
+                if required {
+                    return Err(e);
+                }
+                dev_warn!(self.dev, "AFK: endpoint {:#04x} AFK init failed ({:?}), skipping\n",
+                          rtk_ep_num, e);
+            }
         }
         Ok(())
     }
