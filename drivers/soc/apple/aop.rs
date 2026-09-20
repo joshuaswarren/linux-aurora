@@ -538,6 +538,24 @@ impl AFKEndpoint {
     ) -> Result<()> {
         let subtype = ehdr.subtype;
         if ehdr.category == EPIC_CATEGORY_REPORT {
+            // Unconditional: the question "does the AOP ever send a report at
+            // all, on any endpoint or channel?" has to be answerable without
+            // depending on a module parameter.  aop.report_trace could not be
+            // read back from /sys/module/aop/parameters on this build, so a
+            // silent log left it untestable.  One line per report, always.
+            // QEHeader is repr(C, packed): bind the field to a local before
+            // formatting, or rustc rejects the unaligned reference (E0793).
+            let rep_ch = qhdr.channel;
+            let rep_ep = self.index;
+            let rep_len = data.len();
+            dev_info!(
+                client.dev,
+                "aop: EPIC report ep {:#04x} channel {:#x} subtype {:#06x} ({} bytes)\n",
+                rep_ep,
+                rep_ch,
+                subtype,
+                rep_len
+            );
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
                 let announce = unsafe { &*(data.as_ptr() as *const EPICServiceAnnounce) };
                 let chan = announce.channel;

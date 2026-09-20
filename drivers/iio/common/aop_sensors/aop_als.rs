@@ -34,6 +34,20 @@ const SPU_PROP_REPORT_INTERVAL_US: u32 = 0x00;
 const SPU_PROP_DEVICE_NAME: u32 = 0x0f;
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
+/* CT817's report is exactly 32 bytes and the lux float sits at +0x1c, read off
+ * AppleSPUCT817::handleInterruptReport (0xfffffe0008e417a8):
+ *
+ *     cmp  x0, #0x20 ; b.ne drop      ; length must be exactly 32
+ *     ldp  q0, q1, [x22] ; stp q0, q1, [sp]
+ *     ldr  s8,  [sp, #0x1c]           ; lux
+ *     ldp  s0, s1, [sp, #0x8]         ; rawChannel0, rawChannel1
+ *
+ * This is one byte below the CT720's 0x1d, which CT817 was borrowing on the
+ * assumption that the same family shares a layout. */
+const LUX_OFFSET_CT817: usize = 0x1c;
+const RAW_CH0_OFFSET_CT817: usize = 0x08;
+const RAW_CH1_OFFSET_CT817: usize = 0x0c;
+const CT817_REPORT_LEN: usize = 0x20;
 
 fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<usize> {
     let name = get_aop_property(aop, svc, 0xf, 16)?.1;
@@ -41,10 +55,10 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
         b"Redbird\0" => Ok(LUX_OFFSET_VD6286),
         b"FireFish2\0" => Ok(LUX_OFFSET_CT720),
         // J700 (MacBook Neo): the AOP reports the part number itself rather
-        // than a codename.  CT817 is the same family as the CT720 behind
-        // "FireFish2", so it takes that report layout; the offset is a
-        // hypothesis until a reading has been checked against real light.
-        b"CT817\0" => Ok(LUX_OFFSET_CT720),
+        // than a codename.  CT817 does NOT share the CT720's layout -- its lux
+        // float is at +0x1c of a 32-byte report, one byte below the CT720's
+        // 0x1d (see LUX_OFFSET_CT817).
+        b"CT817\0" => Ok(LUX_OFFSET_CT817),
         _ => {
             dev_warn!(
                 dev.as_ref(),
@@ -226,6 +240,27 @@ impl MessageProcessor for MsgProc {
                 );
             }
         }
+        // A CT817 report is exactly 32 bytes; macOS drops anything else
+        // (cmp x0,#0x20 / b.ne).  Log the two raw channels alongside the lux so
+        // a reading can be sanity-checked against real light: ch0/ch1 should
+        // track the lux, and all-zero channels with non-zero lux would mean the
+        // offsets are wrong rather than the sensor being dark.
+        if message.len() == CT817_REPORT_LEN
+            && RAW_CH1_OFFSET_CT817 + 4 <= message.len()
+            && *module_parameters::dump_report.value() != 0
+        {
+            let ch0 = f32_to_u32(u32::from_le_bytes(
+                message[RAW_CH0_OFFSET_CT817..RAW_CH0_OFFSET_CT817 + 4]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let ch1 = f32_to_u32(u32::from_le_bytes(
+                message[RAW_CH1_OFFSET_CT817..RAW_CH1_OFFSET_CT817 + 4]
+                    .try_into()
+                    .unwrap(),
+            ));
+            pr_info!("aop-als: CT817 raw ch0 {} ch1 {}\n", ch0, ch1);
+        }
         let offset = match *module_parameters::lux_offset.value() {
             0 => offset,
             v => v as usize,
@@ -280,46 +315,77 @@ impl platform::Driver for IIOAopAlsDriver {
                 channel: spu_chan,
                 endpoint: 0x20,
             };
-            // NEVER sweep unknown subtypes here.  An unimplemented subtype
-            // does not answer, and an unanswered call wedges the endpoint
-            // permanently: a 0x00..0x1f sweep on 2026-09-20 left every later
-            // call -- including subtype 0x0a, which had answered seconds
-            // before -- returning ETIMEDOUT until a reboot.  Only subtype 0x0a
-            // is known to reply, so vary the channel and keep the subtype
-            // fixed.  Channel order is deliberate: SPUAppUntrusted first
-            // (the untrusted nub is the one a non-secure OS should own, and
-            // AOPALSDriverCT817Untrusted exists), then Hibernation, with
-            // SPUApp last as a canary -- it answered kIOReturnUnsupported
-            // before, so if it stops answering, something above it wedged.
-            let mut probe: KVec<u8> = KVec::new();
-            probe.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
-            probe.extend_from_slice(&SPU_PROP_DEVICE_NAME.to_le_bytes(), GFP_KERNEL)?;
-            for (label, chan) in [
-                ("SPUAppUntrusted", spu_chan + 1),
-                ("HibernationAppUntrusted", spu_chan + 2),
-                ("SPUApp(canary)", spu_chan),
-            ] {
-                let svc = EPICService {
-                    channel: chan,
-                    endpoint: 0x20,
-                };
+            // NEVER sweep unknown subtypes here: an unimplemented subtype
+            // never answers and one unanswered call wedges the endpoint until
+            // reboot (0x00..0x1f sweep, 2026-09-20).  Only subtype 0x0a (GET)
+            // and 0x04 (SET) are known to reply on this endpoint.
+            //
+            // macOS writes the rate triple 0x16/0x5c/0x00 from
+            // AppleSPUHIDDriver::setPropertiesGated at EL1 -- ordinary kernel
+            // code, not GL and not the exclave -- and it reaches them through
+            // AppleSPUInterface::SetProperty, i.e. THE SPU, not the AOP `als`
+            // EPIC service.  Writing them to `als` returns 0xe00002e2
+            // kIOReturnNotPermitted, which is very likely "not this service's
+            // property" rather than a privilege refusal: the same service
+            // accepts 0x00 and 0x0b happily.  So send them where macOS sends
+            // them.  _spuSetPropertyGated's payload is le32 prop_id followed by
+            // the value (inLen = 4 + len).
+            let spu = EPICService {
+                channel: spu_chan,
+                endpoint: 0x20,
+            };
+            // SET (0x04) on this channel answers 0xe00002c2 kIOReturnBadArgument,
+            // NOT 0xe00002c7 kIOReturnUnsupported -- so the operation exists on
+            // the SPU and only the payload shape is wrong.  (GET 0x0a is the
+            // other way round: Unsupported with the 8-byte envelope.)  Sweep
+            // the plausible encodings for one property and report each rc, so
+            // the accepted shape can be identified in a single boot.
+            let batch = *module_parameters::batch_interval_us.value();
+            let prop = 0x16u32;
+            let mut shapes: KVec<(&'static str, KVec<u8>)> = KVec::new();
+            {   // [prop, value] -- macOS _spuSetPropertyGated inline form
+                let mut b: KVec<u8> = KVec::new();
+                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
+                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
+                shapes.push(("[prop,val]", b), GFP_KERNEL)?;
+            }
+            {   // [0, prop, value] -- the AOP `als` service's envelope
+                let mut b: KVec<u8> = KVec::new();
+                b.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
+                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
+                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
+                shapes.push(("[0,prop,val]", b), GFP_KERNEL)?;
+            }
+            {   // [prop, 0, value]
+                let mut b: KVec<u8> = KVec::new();
+                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
+                b.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
+                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
+                shapes.push(("[prop,0,val]", b), GFP_KERNEL)?;
+            }
+            {   // [prop, value] with a 2-byte value (the int16 ms form)
+                let mut b: KVec<u8> = KVec::new();
+                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
+                b.extend_from_slice(&((batch / 1000) as u16).to_le_bytes(), GFP_KERNEL)?;
+                shapes.push(("[prop,u16]", b), GFP_KERNEL)?;
+            }
+            {   // value only, no property id
+                let mut b: KVec<u8> = KVec::new();
+                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
+                shapes.push(("[val]", b), GFP_KERNEL)?;
+            }
+            for (label, buf) in shapes.iter() {
                 match adata
                     .as_ref()
-                    .epic_call_ret(&svc, SPU_PKT_GET_PROPERTY, &probe, 0x20)
+                    .epic_call(&spu, SPU_PKT_SET_PROPERTY, buf)
                 {
-                    Ok((rc, v)) => {
-                        let n = core::cmp::min(v.len(), 32);
-                        let name = core::str::from_utf8(&v[..n])
-                            .unwrap_or("<non-utf8>")
-                            .trim_end_matches('\0');
-                        pr_info!(
-                            "aop-als: SPU ch {:#x} ({}) get 0x0f -> rc {:#x}, {} bytes {:02x?} name {}\n",
-                            chan, label, rc, v.len(), &v[..n], name
-                        );
-                    }
+                    Ok(rc) => pr_info!(
+                        "aop-als: SPU ch {:#x} SET 0x16 {} ({} bytes) -> rc {:#x}\n",
+                        spu_chan, label, buf.len(), rc
+                    ),
                     Err(e) => pr_info!(
-                        "aop-als: SPU ch {:#x} ({}) get 0x0f ERR {:?}\n",
-                        chan, label, e
+                        "aop-als: SPU ch {:#x} SET 0x16 {} ({} bytes) ERR {:?}\n",
+                        spu_chan, label, buf.len(), e
                     ),
                 }
             }
