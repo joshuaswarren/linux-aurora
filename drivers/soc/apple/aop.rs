@@ -771,6 +771,14 @@ impl AFKEndpoint {
             return Err(EIO);
         }
         let call = Arc::pin_init(FutureValue::pin_init(), GFP_KERNEL)?;
+        // 2026-09-20: this field was declared and never set, so every call this
+        // driver has ever made advertised a reply capacity of zero.  macOS sets
+        // it on every call -- 0xe4 for the ALS HID-descriptor fetch (subtype
+        // 0x01), and 2 / 4 / 0x40 matching each property's width for the
+        // property reads.  Property gets happen to be answered anyway with a
+        // zero here, which is why it went unnoticed; do not assume the same of
+        // a call the firmware has never been asked by this driver before.
+        let inline_len = ret.as_ref().map(|b| b.len() as u32).unwrap_or(0);
         let hdr_v2 = EPICHeader {
             version: 2,
             seq: self.seq,
@@ -779,6 +787,7 @@ impl AFKEndpoint {
             category,
             subtype,
             tag: tag as u16,
+            inline_len,
             ..EPICHeader::default()
         };
         let hdr_v4 = EPICHeaderV4 {
@@ -789,6 +798,7 @@ impl AFKEndpoint {
             category,
             subtype,
             tag: tag as u16,
+            inline_len,
             ..EPICHeaderV4::default()
         };
         self.call_returns[tag - 1] = ret;
