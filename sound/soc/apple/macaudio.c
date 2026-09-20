@@ -1697,7 +1697,7 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 	/*
 	 * No fourth name.  The microphone array's front end (j700-pcm-3) is
 	 * complete and its firmware side is proven, but writing the secure
-	 * LEAP ADMAC's per-channel SRAM carveout register takes an
+	 * LEAP ADMAC's per-channel SRAM carveout register still takes an
 	 * asynchronous SError; naming the DAI here is what turns the front end
 	 * on, so it stays unnamed until that is understood.
 	 */

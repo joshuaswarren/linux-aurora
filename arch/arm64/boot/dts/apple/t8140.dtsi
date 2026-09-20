@@ -1156,9 +1156,21 @@
 				 * (channel 5) under the cin service; the serializer
 				 * domain audio_mca1_m is the AP's to power.
 				 */
+				/*
+				 * "rx0" is audio_leap_rx0, the exact sibling of
+				 * audio_leap_tx0 that the speaker path holds.  A
+				 * LEAP ADMAC's per-channel SRAM registers only
+				 * answer with its own leaf powered, so the
+				 * microphone array's leap-s RX0 channel needs
+				 * this one the way the speaker's leap-ns TX0
+				 * needs tx0; without it the first write to
+				 * REG_CHAN_SRAM_CARVEOUT takes an asynchronous
+				 * SError and panics the machine.
+				 */
 				power-domains = <&ps_audio_leap_tx0>, <&ps_audio_leap_mca>,
-						<&ps_audio_mca1_m>, <&ps_audio_mca0_m>;
-				power-domain-names = "tx0", "mca", "mca1", "mca0";
+						<&ps_audio_mca1_m>, <&ps_audio_mca0_m>,
+						<&ps_audio_leap_rx0>;
+				power-domain-names = "tx0", "mca", "mca1", "mca0", "rx0";
 				#sound-dai-cells = <1>;
 			};
 		};
