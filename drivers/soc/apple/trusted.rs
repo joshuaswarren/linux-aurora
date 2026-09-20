@@ -11,6 +11,8 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use kernel::sync::atomic::Relaxed;
+
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::types::ForeignOwnable;
@@ -106,11 +108,16 @@ unsafe extern "C" fn tk_seal(p: *mut c_void, _datablob: *mut c_char) -> c_int {
         let blob = match sep.refkey_seal_trusted(key) {
             Ok(blob) => blob,
             Err(e) => {
-                dev_warn!(
-                    sep.dev,
-                    "trusted-keys: seal failed ({:?}); the machine ref-key may not be established yet\n",
-                    e
-                );
+                // Once: every key seals through here and they all fail the
+                // same way while the ref-key is unavailable, so this said the
+                // same thing ten times in one boot.
+                if !sep.refkey_seal_warned.xchg(true, Relaxed) {
+                    dev_warn!(
+                        sep.dev,
+                        "trusted-keys: seal failed ({:?}); the machine ref-key may not be established yet\n",
+                        e
+                    );
+                }
                 return e.to_errno();
             }
         };

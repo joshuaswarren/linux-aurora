@@ -559,6 +559,11 @@ struct SepData {
     /// burying everything else in dmesg and wrapping the log ring.  Say it
     /// once.
     sks_absent_warned: Atomic<bool>,
+    /// Same shape as `sks_absent_warned`: the trusted-key seal is attempted per
+    /// key and fails identically for every one of them while the machine
+    /// ref-key is unavailable, which on this machine meant the same warning ten
+    /// times over in one boot.
+    refkey_seal_warned: Atomic<bool>,
 
     sks_seq: Atomic<u32>,
 
@@ -790,6 +795,7 @@ impl SepData {
                 sks_seq: Atomic::new(0),
                 sks_wedged: Atomic::new(0),
                 sks_absent_warned: Atomic::new(false),
+                refkey_seal_warned: Atomic::new(false),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),
