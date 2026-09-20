@@ -193,13 +193,14 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
             "apple/aop-als-cal.bin is absent; enabling the sensor without pushing a calibration (the AOP may hold its own)\n"
         );
     }
-    // The AOP answers the calibration and interval writes with rc 0 and then
-    // sends no reports at all.  macOS's ALS driver knows two more property keys
-    // that we have never written -- MODE (0xd7) and 0xe4 -- so expose them, and
-    // the verbosity key, as load-time knobs: one of them is what arms a part on
-    // the `als-new-calibration-path` generation.  u32::MAX means "leave alone",
-    // and a write that the AOP rejects is logged rather than failing the probe,
-    // so a sweep can run without losing the iio device.
+    // Verbosity is written the way macOS writes it.  MODE (0xd7) and 0xe4 used
+    // to be written here as well, on the theory that one of them armed a part on
+    // the `als-new-calibration-path` generation.  Neither does, and both are
+    // actively harmful: each wedges the AOP outright (measured 2026-09-21 -- the
+    // call never answers and every later call on the endpoint times out).  What
+    // actually arms this part is the calibration the AOP driver pushes on
+    // setup-port endpoint 0x21; see soc/apple/aop.rs.  u32::MAX means "leave
+    // alone", and a rejected write is logged rather than failing the probe.
     let try_prop = |tag: u32, val: u32, name: &'static str| {
         if val == u32::MAX {
             return;
@@ -211,8 +212,6 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
     };
 
     try_prop(0xe1, *module_parameters::set_verbosity.value(), "VERBOSITY");
-    try_prop(0xd7, *module_parameters::set_mode.value(), "MODE");
-    try_prop(0xe4, *module_parameters::set_unke4.value(), "UNKE4");
 
     // macOS never writes the report interval on its own.  
     // AppleSPUHIDDriver::setPropertiesGated (0xfffffe00096cfb80..0xfffffe00096cfbac)
@@ -606,14 +605,6 @@ module_platform_driver! {
         dump_report: u8 {
             default: 0,
             description: "Log each AOP ALS report and every offset that decodes to a plausible lux value, to identify the layout of an unknown part",
-        },
-        set_mode: u32 {
-            default: 0xffffffff,
-            description: "Write the ALS MODE property (0xd7) with this value before the interval; 0xffffffff leaves it alone",
-        },
-        set_unke4: u32 {
-            default: 0xffffffff,
-            description: "Write the ALS property 0xe4 with this value before the interval; 0xffffffff leaves it alone",
         },
         set_verbosity: u32 {
             default: 6,
