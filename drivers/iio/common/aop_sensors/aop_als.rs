@@ -74,19 +74,26 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
 }
 
 fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
-    // Replay macOS's opening, captured from this exact machine under the
-    // hypervisor on 2026-09-20 (ALS-STATE-2026-09-20.md, "THE macOS ALS
-    // CONVERSATION, CAPTURED").  Before any calibration or rate write,
-    // AppleSPUCT817 fetches the HID report descriptor and reads eight
-    // properties.  Linux has never done any of it.
+    // Replay macOS's opening, captured from this machine under the hypervisor
+    // on 2026-09-20 (ALS-STATE-2026-09-20.md, "THE macOS ALS CONVERSATION,
+    // CAPTURED").  Before any calibration or rate write, AppleSPUCT817 fetches
+    // the HID report descriptor and reads eight properties.
     //
-    // Everything here is logged and nothing fails the probe: macOS itself is
-    // answered kIOReturnNotPermitted on 0x5a, 0x3e, 0x11 and 0x3f and carries
-    // straight on, so a refusal here is the expected reference behaviour and
-    // not an error.  This is replay of traced traffic, not a subtype sweep --
-    // the rule against those still stands.
-    {
-        // Reply is 20 bytes after the u32 status, and decodes as:
+    // Refusals are expected: macOS is answered kIOReturnNotPermitted on 0x5a,
+    // 0x3e, 0x11 and 0x3f and carries straight on.  A *timeout* is not -- an
+    // unanswered EPIC call wedges the endpoint, and the first attempt at this
+    // replay proved it by sending the wrong payload length (see below), after
+    // which all nine calls and the enable itself came back ETIMEDOUT and probe
+    // failed with no iio device at all.  So: stop at the first unanswered
+    // call, and keep the whole thing behind a parameter that can be cleared
+    // without a rebuild.
+    if *module_parameters::replay_open.value() != 0 {
+        // The payload here is FOUR bytes, not the eight a property call takes.
+        // Read the traced sub-header rather than the call next to it:
+        //     0x18: 04 00 00 00   sub.length = 4
+        //     0x2c: e4 00 00 00   reply capacity
+        //     0x30: 00 00 00 00   payload
+        // The reply is 20 bytes after the u32 status and decodes as
         //   06 00 ff  Usage Page (Vendor-defined 0xFF00)
         //   0a 04 00  Usage (0x0004)      a1 01  Collection (Application)
         //   15 00     Logical Minimum 0   26 ff 00  Logical Maximum 255
@@ -94,21 +101,27 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
         //   81 00     Input               c0     End Collection
         // i.e. exactly the 32-byte vendor report this driver already decodes.
         let mut buf = KVec::new();
-        buf.resize(8, 0, GFP_KERNEL)?;
-        match aop.epic_call_ret(svc, EPIC_SUBTYPE_GET_HID_DESCRIPTOR, &buf, 0xe4) {
+        buf.resize(4, 0, GFP_KERNEL)?;
+        let hid_ok = match aop.epic_call_ret(svc, EPIC_SUBTYPE_GET_HID_DESCRIPTOR, &buf, 0xe4) {
             Ok((rc, d)) => {
                 let n = core::cmp::min(d.len(), 32);
                 dev_info!(dev.as_ref(), "als: HID descriptor (0x01) -> rc {:#x}, {} bytes {:?}\n",
-                          rc, d.len(), &d[..n])
+                          rc, d.len(), &d[..n]);
+                true
             }
-            Err(e) => dev_info!(dev.as_ref(), "als: HID descriptor (0x01) -> error {:?}\n", e),
-        }
+            Err(e) => {
+                dev_warn!(dev.as_ref(),
+                          "als: HID descriptor (0x01) -> error {:?}; skipping the rest of the \
+                           macOS opening so a wedged endpoint is not hammered\n", e);
+                false
+            }
+        };
 
         // macOS's order.  0x1e is AppleSPUALSLuxDriver:getOrientation and 0x2e
-        // is getPlacement -- both answer 1 on the J700, which is what the
-        // panel's own log prints ("AOP orientation = 1", "AOP placement = 1").
-        for &(tag, len, name) in &[
-            (0x5au32, 2usize, "UNK5A"),
+        // is getPlacement -- both answer 1 here, which is what the panel's own
+        // log prints ("AOP orientation = 1", "AOP placement = 1").
+        const PROBE_PROPS: [(u32, usize, &str); 8] = [
+            (0x5a, 2, "UNK5A"),
             (0x5b, 2, "PRODUCT_ID"),
             (0x30, 4, "UNK30"),
             (0x3e, 0x40, "UNK3E"),
@@ -116,15 +129,20 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
             (0x113, 1, "UNK113"),
             (0x2e, 4, "PLACEMENT"),
             (0x1e, 4, "ORIENTATION"),
-        ] {
+        ];
+        let props: &[(u32, usize, &str)] = if hid_ok { &PROBE_PROPS } else { &[] };
+        for &(tag, len, name) in props {
             match get_aop_property(aop, svc, tag, len) {
                 Ok((rc, d)) => {
                     let n = core::cmp::min(d.len(), 16);
                     dev_info!(dev.as_ref(), "als: probe {} ({:#x}) -> rc {:#x} {:?}\n",
                               name, tag, rc, &d[..n])
                 }
-                Err(e) => dev_info!(dev.as_ref(), "als: probe {} ({:#x}) -> error {:?}\n",
-                                    name, tag, e),
+                Err(e) => {
+                    dev_warn!(dev.as_ref(), "als: probe {} ({:#x}) -> error {:?}; stopping\n",
+                              name, tag, e);
+                    break;
+                }
             }
         }
     }
@@ -568,6 +586,10 @@ module_platform_driver! {
         set_verbosity: u32 {
             default: 6,
             description: "Write the ALS VERBOSITY property (0xe1). macOS writes 6 here on this machine (traced 2026-09-20, answered NotPermitted); 0xffffffff means leave it alone",
+        },
+        replay_open: u8 {
+            default: 1,
+            description: "Replay macOS's opening before enabling: fetch the HID report descriptor (subtype 0x01) and read the eight properties AppleSPUCT817 reads, as traced under the hypervisor 2026-09-20. Clear it to go straight to the enable if the opening ever wedges the endpoint",
         },
         stop_first: u8 {
             default: 0,
