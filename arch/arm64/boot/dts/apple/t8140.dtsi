@@ -1131,8 +1131,7 @@
 				 * first from tx0 and leap_mca.
 				 */
 				dmas = <&admac_leap_ns 0>, <&admac_base_ns 4>,
-				       <&admac_base_ns 5>, <&admac_base_ns 3>,
-				       <&admac_leap_s 0>;
+				       <&admac_base_ns 5>, <&admac_base_ns 3>;
 				/*
 				 * SpeakerTap is the native base-ns RX1 serial monitor.
 				 * "hpai" is the high-quality microphone array: the ADT
@@ -1140,8 +1139,16 @@
 				 * only iop-audio-s stream.  The AOP attaches and powers
 				 * the array for an ordinary EPIC client, so the host can
 				 * own this channel directly.
+				 *
+				 * Channel 1, not 0: admac_chan_direction() hardwires
+				 * even channels to MEM_TO_DEV and odd to DEV_TO_MEM, so
+				 * the ADT's tx-N is Linux 2N and its rx-N is 2N+1 --
+				 * which is why cout (tx-2) is 4 and cin (rx-2) is 5
+				 * above.  rx-0 is therefore 1; asking for 0 hands back
+				 * a transmit channel, and admac_device_config() then
+				 * rejects the capture slave config with -EINVAL.
 				 */
-				dma-names = "spkr", "cout", "cin", "spkr-tap", "hpai";
+				dma-names = "spkr", "cout", "cin", "spkr-tap";
 				/*
 				 * 3.5 mm jack: base-ns TX2 (channel 4, dart-aop stream 8)
 				 * into MCA1 while the AOP cout service is in pwrd, the
