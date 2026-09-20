@@ -320,6 +320,8 @@ struct SndSocT8140AopData {
     cin: Service,
     spkr: Service,
     tap: Service,
+    /// The high-quality microphone array (leap-s ADMAC RX0).
+    hpai: Service,
     /// Virtual power-domain devices (dev_pm_domain_attach_by_name) of the
     /// serializer leaves, held for the driver's lifetime and runtime-powered
     /// around streams; 0 if absent: audio_mca1_m (jack), audio_mca0_m
@@ -806,6 +808,24 @@ impl SndSocT8140AopData {
         self.service_shutdown(&self.tap, &[&self.pd_mca0])
     }
 
+    // ---- the high-quality microphone array: the hpai service feeding
+    // leap-s ADMAC RX0.  The firmware owns this array's fabric entirely -- a
+    // bare PowerRequest took it idle -> pwrd -> pw0 with no host-side
+    // power-domain work at all -- so unlike the jack and speaker paths this
+    // back-end holds no serializer leaves of its own. ----
+
+    fn hpai_startup(&self) -> Result<()> {
+        self.service_startup(&self.hpai, &[])
+    }
+
+    fn hpai_prepare(&self) -> Result<()> {
+        self.service_run(&self.hpai)
+    }
+
+    fn hpai_shutdown(&self) {
+        self.service_shutdown(&self.hpai, &[])
+    }
+
     // ---- internal speakers: the spkr service on LEAP TX0 (leap-ns ADMAC
     // channel 0); the leaves are tx0 (-> leap_c -> leap_a -> audio_fr ->
     // audio_a), leap_mca (-> audio_p) and the MCA0 serializer the LEAP
@@ -1107,17 +1127,25 @@ fn copy_str(target: &mut [u8], source: &[u8]) {
 
 /// Front-end PCM DAIs ("j700-pcm-N"): 0 primary playback (the jack),
 /// 1 secondary playback (the speaker, later), 2 capture (unused).
-const FE_COUNT: usize = 3;
+const FE_COUNT: usize = 4;
 /// DMA channel names per front-end and stream (dma-names on the audio
 /// child): [playback, capture].  The primary front-end is the jack: cout on
 /// base-ns TX2, cin (the headset microphone) on base-ns RX2.  The speaker
 /// front-end's "spkr" channel is requested once the speaker link exists:
 /// requesting it touches the LEAP ADMAC.
-const FE_DMA_NAMES: [[Option<&core::ffi::CStr>; 2]; FE_COUNT] =
-    [[Some(c"cout"), Some(c"cin")], [Some(c"spkr"), None], [None, Some(c"spkr-tap")]];
+const FE_DMA_NAMES: [[Option<&core::ffi::CStr>; 2]; FE_COUNT] = [
+    [Some(c"cout"), Some(c"cin")],
+    [Some(c"spkr"), None],
+    [None, Some(c"spkr-tap")],
+    // the HQ microphone array, leap-s ADMAC RX0
+    [None, Some(c"hpai")],
+];
 /// The front-end that plays the internal speaker (j700-pcm-1, the card's
 /// "Secondary" PCM): its data goes through `spkr_copy` below.
 const FE_SPKR: usize = 1;
+/// The microphone-array front-end (j700-pcm-3).  Unlike the other three it is
+/// not a DPCM front end, so nothing overwrites its runtime hw afterwards.
+const FE_HPAI: usize = 3;
 /// SNDRV_PCM_FMTBIT_S32_LE (format index 10).
 const FMTBIT_S32_LE: u64 = 1 << 10;
 
@@ -1377,6 +1405,18 @@ unsafe extern "C" fn asoc_pcm_open(
     hw.period_bytes_max = 0x10000;
     hw.buffer_bytes_max = usize::MAX;
     hw.fifo_size = 16;
+    if fe == FE_HPAI {
+        // The other three front ends are DPCM, and dpcm_set_fe_runtime()
+        // replaces runtime->hw with the merged back-end hardware before ALSA
+        // ever sees the open bounds above.  This one is a plain link -- the
+        // array has no back end to merge with -- so the unbounded values
+        // survive into snd_pcm_hw_constraints_complete(), where a periods and
+        // buffer-bytes maximum of "as large as the type allows" refines to an
+        // empty interval and the open fails with EINVAL.  Give ALSA the real
+        // bounds of the managed buffer instead.
+        hw.buffer_bytes_max = PCM_BUFFER_MAX;
+        hw.periods_max = (PCM_BUFFER_MAX / hw.period_bytes_min as usize) as u32;
+    }
     let mut dma_data = bindings::snd_dmaengine_dai_dma_data::default();
     // SAFETY: the substream is live and `chan` is the channel requested for this front-end in
     // `asoc_pcm_new`.
@@ -1824,6 +1864,43 @@ unsafe extern "C" fn spkr_dai_shutdown(substream: *mut bindings::snd_pcm_substre
     drv.data.spkr_shutdown();
 }
 
+/// The microphone array's DAI: capture only, and the firmware does the rest.
+/// `pwrd` from prepare, like the speaker sense, so the RX DMA is armed before
+/// the firmware starts filling it.
+unsafe extern "C" fn hpai_dai_startup(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
+    let data = unsafe { dai_data(dai) };
+    match data.hpai_startup() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+unsafe extern "C" fn hpai_dai_prepare(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
+    let data = unsafe { dai_data(dai) };
+    match data.hpai_prepare() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+unsafe extern "C" fn hpai_dai_shutdown(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
+    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
+    unsafe { dai_data(dai) }.hpai_shutdown();
+}
+
+static HPAI_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
+    startup: Some(hpai_dai_startup),
+    prepare: Some(hpai_dai_prepare),
+    shutdown: Some(hpai_dai_shutdown),
+    set_fmt: Some(dai_accept_fmt),
+    set_sysclk: Some(dai_accept_sysclk),
+    set_bclk_ratio: Some(dai_accept_bclk_ratio),
+    // SAFETY: zero is an empty ops table.
+    ..unsafe { core::mem::zeroed() }
+});
+
 static SPKR_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
     startup: Some(spkr_dai_startup),
     prepare: Some(spkr_dai_prepare),
@@ -1859,7 +1936,12 @@ const fn pcm_stream_ch(name: &'static core::ffi::CStr, formats: u64, channels: u
     bindings::snd_soc_pcm_stream {
         stream_name: name.as_ptr(),
         formats,
-        subformats: 0,
+        // An empty subformat mask fails a non-DPCM open: snd_soc_runtime_calc_hw()
+        // does `hw->subformats &= p->subformats`, and snd_pcm_hw_constraints_complete()
+        // then refines SNDRV_PCM_HW_PARAM_SUBFORMAT against nothing and returns
+        // -EINVAL.  The three DPCM front ends never reached that path, so 0 went
+        // unnoticed until the microphone array's plain link.
+        subformats: bindings::BINDINGS_SNDRV_PCM_SUBFMTBIT_STD,
         rates: RATE_48000_BIT,
         rate_min: 48000,
         rate_max: 48000,
@@ -1893,6 +1975,10 @@ const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
 
 /// DAI table: [0] the cout back-end (DT index 0), the front-end PCMs, then
 /// [4] the speaker back-end (DT index 4).
+/// Order is ABI: `sound-dai = <&aop_audio N>` in the machine DTS indexes this
+/// array, so `<&aop_audio 0>` is cout and `<&aop_audio 4>` is spkr. Append new
+/// DAIs at the end; inserting one renumbers every DAI after it and silently
+/// repoints the existing dai-links.
 static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 2 + FE_COUNT]> = SyncCell([
     bindings::snd_soc_dai_driver {
         name: c"cout".as_ptr(),
@@ -1946,6 +2032,22 @@ static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 2 + FE_COUNT]> = SyncC
         ops: &SPKR_DAI_OPS.0,
         playback: pcm_stream(c"SPKR TX", FMTBIT_S32_LE),
         capture: pcm_stream(c"SPKR RX", FMTBIT_S32_LE),
+        // SAFETY: all-zero is a valid (empty) value of this C descriptor; the fields set above are
+        // the ones used.
+        ..unsafe { core::mem::zeroed() }
+    },
+
+    bindings::snd_soc_dai_driver {
+        name: c"j700-pcm-3".as_ptr(),
+        id: FE_DAI_ID_BASE + 3,
+        // The array has no codec and no serializer of ours -- it is a PDM part
+        // on the AOP's own sense PDM controller -- so there is nothing for a
+        // back-end to represent and this front-end drives the hpai service
+        // itself.  HPAI_DAI_OPS is a superset of FE_DAI_OPS.
+        ops: &HPAI_DAI_OPS.0,
+        playback: empty_stream(),
+        // the HQ microphone array: 48 kHz stereo, 8 bytes per frame
+        capture: pcm_stream(c"PCM3 RX", FMTBIT_S32_LE),
         // SAFETY: all-zero is a valid (empty) value of this C descriptor; the fields set above are
         // the ones used.
         ..unsafe { core::mem::zeroed() }
@@ -2180,6 +2282,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 cin: Service::new(AUDIO_DEV_CIN, "cin"),
                 spkr: Service::new(AUDIO_DEV_SPKR, "spkr"),
                 tap: Service::new(AUDIO_DEV_TAP, "tap"),
+                hpai: Service::new(AUDIO_DEV_HPAI, "hpai"),
                 pd_mca1: Atomic::new(0),
                 pd_mca0: Atomic::new(0),
                 pd_tx0: Atomic::new(0),

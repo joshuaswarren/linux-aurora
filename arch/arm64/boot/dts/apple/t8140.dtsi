@@ -1131,9 +1131,17 @@
 				 * first from tx0 and leap_mca.
 				 */
 				dmas = <&admac_leap_ns 0>, <&admac_base_ns 4>,
-				       <&admac_base_ns 5>, <&admac_base_ns 3>;
-				/* SpeakerTap is the native base-ns RX1 serial monitor. */
-				dma-names = "spkr", "cout", "cin", "spkr-tap";
+				       <&admac_base_ns 5>, <&admac_base_ns 3>,
+				       <&admac_leap_s 0>;
+				/*
+				 * SpeakerTap is the native base-ns RX1 serial monitor.
+				 * "hpai" is the high-quality microphone array: the ADT
+				 * routes audio-hp-mic to leap-s-adma-rx-0, the machine's
+				 * only iop-audio-s stream.  The AOP attaches and powers
+				 * the array for an ordinary EPIC client, so the host can
+				 * own this channel directly.
+				 */
+				dma-names = "spkr", "cout", "cin", "spkr-tap", "hpai";
 				/*
 				 * 3.5 mm jack: base-ns TX2 (channel 4, dart-aop stream 8)
 				 * into MCA1 while the AOP cout service is in pwrd, the
