@@ -18,6 +18,20 @@ use kernel::{
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
 const EPIC_SUBTYPE_SET_ALS_PROPERTY: u16 = 0x4;
+/* The EPIC sub-header's `subtype` at +0x06 is macOS's SpuPacketType: Linux's
+ * EPICHeaderV4 and macOS's _AOPSubPacket are the same 0x18-byte structure, and
+ * the AFK ring is the same transport (Linux's QE_MAGIC2 " POA" is the "AOP "
+ * magic of iop_ringbuffer_enqueue_msg_vec).  So the SPU is reachable with the
+ * calls we already have -- only the payload differs.  macOS's
+ * _spuGetPropertyGated sends the bare property id as the whole inline payload
+ * (mov w2,#0xa; mov w4,#0x4), where the AOP `als` service takes a
+ * [u32 zero, u32 tag] envelope.  That 4-byte prefix is why the earlier 256-tag
+ * sweep of endpoint 0x20 was silent. */
+const SPU_PKT_GET_PROPERTY: u16 = 0x0a;
+const SPU_PKT_SET_PROPERTY: u16 = 0x04;
+/* SpuProperty ids (AppleSPUInterface). */
+const SPU_PROP_REPORT_INTERVAL_US: u32 = 0x00;
+const SPU_PROP_DEVICE_NAME: u32 = 0x0f;
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
 
@@ -80,7 +94,35 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
     try_prop(0xd7, *module_parameters::set_mode.value(), "MODE");
     try_prop(0xe4, *module_parameters::set_unke4.value(), "UNKE4");
 
+    // macOS never writes the report interval on its own.  
+    // AppleSPUHIDDriver::setPropertiesGated (0xfffffe00096cfb80..0xfffffe00096cfbac)
+    // writes three rate properties in a fixed order every time:
+    //
+    //     SetProperty(0x16, batchInterval, 4)   ; BatchInterval
+    //     SetProperty(0x5c, rawInterval,   4)   ; RawInterval
+    //     SetProperty(0x00, reportInterval,4)   ; ReportInterval
+    //
+    // and it is the 0 -> non-zero transition of 0x00 that calls
+    // startSensorWatchdog() (0xfffffe00096cfb5c) -- writing the same non-zero
+    // value again does nothing.  We had only ever written 0x00, once, which the
+    // AOP acks with rc 0 and then sends nothing.  Write zero first so the
+    // transition is guaranteed, then the full triple in macOS's order.
+    // CT817's own tables (0xfffffe000738e420) pair report 200000 us with batch
+    // 500000 us at the slow rate.
     let ivl = *module_parameters::interval_us.value();
+    let batch = *module_parameters::batch_interval_us.value();
+    let raw = *module_parameters::raw_interval_us.value();
+
+    let rc = set_als_property(aop, svc, 0, &0u32.to_le_bytes())?;
+    dev_info!(dev.as_ref(), "als: INTERVAL (0x0) = 0 (stop) -> rc {:#x}\n", rc);
+    match set_als_property(aop, svc, 0x16, &batch.to_le_bytes()) {
+        Ok(rc) => dev_info!(dev.as_ref(), "als: BATCH_INTERVAL (0x16) = {} us -> rc {:#x}\n", batch, rc),
+        Err(e) => dev_info!(dev.as_ref(), "als: BATCH_INTERVAL (0x16) = {} us -> error {:?}\n", batch, e),
+    }
+    match set_als_property(aop, svc, 0x5c, &raw.to_le_bytes()) {
+        Ok(rc) => dev_info!(dev.as_ref(), "als: RAW_INTERVAL (0x5c) = {} us -> rc {:#x}\n", raw, rc),
+        Err(e) => dev_info!(dev.as_ref(), "als: RAW_INTERVAL (0x5c) = {} us -> error {:?}\n", raw, e),
+    }
     let rc = set_als_property(aop, svc, 0, &ivl.to_le_bytes())?;
     dev_info!(dev.as_ref(), "als: INTERVAL (0x0) = {} us -> rc {:#x}\n", ivl, rc);
 
@@ -97,6 +139,26 @@ fn get_aop_property(
     buf.resize(8, 0, GFP_KERNEL)?;
     buf[4..8].copy_from_slice(&tag.to_le_bytes());
     aop.epic_call_ret(svc, EPIC_SUBTYPE_GET_AOP_PROPERTY, &buf, data_len)
+}
+
+fn spu_get_property(
+    aop: &dyn AOP,
+    svc: &EPICService,
+    prop: u32,
+    data_len: usize,
+) -> Result<(u32, KVec<u8>)> {
+    let mut buf = KVec::new();
+    buf.resize(4, 0, GFP_KERNEL)?;
+    buf[0..4].copy_from_slice(&prop.to_le_bytes());
+    aop.epic_call_ret(svc, SPU_PKT_GET_PROPERTY, &buf, data_len)
+}
+
+fn spu_set_property(aop: &dyn AOP, svc: &EPICService, prop: u32, data: &[u8]) -> Result<u32> {
+    let mut buf = KVec::new();
+    buf.resize(4 + data.len(), 0, GFP_KERNEL)?;
+    buf[0..4].copy_from_slice(&prop.to_le_bytes());
+    buf[4..].copy_from_slice(data);
+    aop.epic_call(svc, SPU_PKT_SET_PROPERTY, &buf)
 }
 
 fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> Result<u32> {
@@ -200,24 +262,83 @@ impl platform::Driver for IIOAopAlsDriver {
         // SAFETY: AOP sets the platform data correctly
         let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
         let ty = bindings::BINDINGS_IIO_LIGHT;
-        let spu_chan = *module_parameters::spu_probe.value();
-        if spu_chan != 0 {
-            // Endpoint 0x20 announces SPUApp / SPUAppUntrusted; the sensor and
-            // its reports live behind that, so ask it the same questions the
-            // `als` service answers and see which side actually knows.
-            let spu = EPICService { channel: spu_chan, endpoint: 0x20 };
-            let plen = *module_parameters::prop_len.value() as usize;
-            pr_info!("aop-als: SPU sweep on endpoint 0x20 channel {:#x}\n", spu_chan);
-            for tag in 0u32..0x100 {
-                match get_aop_property(adata.as_ref(), &spu, tag, plen) {
-                    Ok((rc, v)) if rc == 0 || !v.is_empty() => {
-                        let n = core::cmp::min(v.len(), 160);
+        // u64 so that channel 0 is expressible: the announce log shows the
+        // endpoint-0x20 services arriving on channels 0, 1 and 2 while their
+        // announce bodies advertise 0x10000000/3/4, and every service whose
+        // calls work (als, aop-audio, aop-voicetrigger, aop-audprov) has
+        // arrival == body.  u64::MAX is "off".
+        let spu_probe_raw = *module_parameters::spu_probe.value();
+        let spu_chan = spu_probe_raw as u32;
+        if spu_probe_raw != 0xffffffffffffffff {
+            // macOS AppleSPUCT817::probe gates on GetProperty(0x0F) == "CT817"
+            // (0xfffffe0008e415d0) and then the sensor is armed by writing a
+            // non-zero microsecond interval to property 0x00.  The earlier
+            // sweep of this endpoint used the `als` service's [u32 zero,
+            // u32 tag] payload; the SPU wants the bare property id, so it
+            // answered nothing.  Ask with the right shape.
+            let spu = EPICService {
+                channel: spu_chan,
+                endpoint: 0x20,
+            };
+            // NEVER sweep unknown subtypes here.  An unimplemented subtype
+            // does not answer, and an unanswered call wedges the endpoint
+            // permanently: a 0x00..0x1f sweep on 2026-09-20 left every later
+            // call -- including subtype 0x0a, which had answered seconds
+            // before -- returning ETIMEDOUT until a reboot.  Only subtype 0x0a
+            // is known to reply, so vary the channel and keep the subtype
+            // fixed.  Channel order is deliberate: SPUAppUntrusted first
+            // (the untrusted nub is the one a non-secure OS should own, and
+            // AOPALSDriverCT817Untrusted exists), then Hibernation, with
+            // SPUApp last as a canary -- it answered kIOReturnUnsupported
+            // before, so if it stops answering, something above it wedged.
+            let mut probe: KVec<u8> = KVec::new();
+            probe.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
+            probe.extend_from_slice(&SPU_PROP_DEVICE_NAME.to_le_bytes(), GFP_KERNEL)?;
+            for (label, chan) in [
+                ("SPUAppUntrusted", spu_chan + 1),
+                ("HibernationAppUntrusted", spu_chan + 2),
+                ("SPUApp(canary)", spu_chan),
+            ] {
+                let svc = EPICService {
+                    channel: chan,
+                    endpoint: 0x20,
+                };
+                match adata
+                    .as_ref()
+                    .epic_call_ret(&svc, SPU_PKT_GET_PROPERTY, &probe, 0x20)
+                {
+                    Ok((rc, v)) => {
+                        let n = core::cmp::min(v.len(), 32);
+                        let name = core::str::from_utf8(&v[..n])
+                            .unwrap_or("<non-utf8>")
+                            .trim_end_matches('\0');
                         pr_info!(
-                            "aop-als: SPU property {:#04x} -> rc {:#x}, {} bytes: {:02x?}\n",
-                            tag, rc, v.len(), &v[..n]
+                            "aop-als: SPU ch {:#x} ({}) get 0x0f -> rc {:#x}, {} bytes {:02x?} name {}\n",
+                            chan, label, rc, v.len(), &v[..n], name
                         );
                     }
-                    _ => {}
+                    Err(e) => pr_info!(
+                        "aop-als: SPU ch {:#x} ({}) get 0x0f ERR {:?}\n",
+                        chan, label, e
+                    ),
+                }
+            }
+            let us = *module_parameters::spu_interval_us.value();
+            if us != 0 {
+                match spu_set_property(
+                    adata.as_ref(),
+                    &spu,
+                    SPU_PROP_REPORT_INTERVAL_US,
+                    &us.to_le_bytes(),
+                ) {
+                    Ok(rc) => pr_info!(
+                        "aop-als: SPU ch {:#x} report interval {} us -> rc {:#x}\n",
+                        spu_chan, us, rc
+                    ),
+                    Err(e) => pr_info!(
+                        "aop-als: SPU ch {:#x} report interval {} us failed: {:?}\n",
+                        spu_chan, us, e
+                    ),
                 }
             }
         }
@@ -280,9 +401,21 @@ module_platform_driver! {
             default: 256,
             description: "Bytes to request for each property during the dump_props sweep",
         },
-        spu_probe: u32 {
+        spu_probe: u64 {
+            default: 0xffffffffffffffff,
+            description: "DANGEROUS, default off. EPIC channel on AOP endpoint 0x20 to address the SPU for CT817 property calls. An EPIC call to a channel the AOP does not recognise is never answered, and the unanswered call wedges this ASC: verified 2026-09-20 that a probe on channel 0x10000000 timed out and then broke aop_audio (snd_soc_dai_startup on spkr, -110) until a reboot. Do not set this on a machine whose audio is in use, and confirm the channel from the announce log first",
+        },
+        spu_interval_us: u32 {
             default: 0,
-            description: "EPIC channel on AOP endpoint 0x20 (SPUApp 0x10000000, SPUAppUntrusted 0x10000003) to sweep for properties; the J700's ambient light sensor is a CT817 HID device on the SPU (macOS AppleSPUCT817 -> AppleSPUHIDDriver::spuCopyProperty), not something the `als` service streams, so 0 leaves this off",
+            description: "With spu_probe set and the CT817 identified, write this microsecond report interval to SPU property 0x00 to arm periodic reporting (macOS defaults: 50000/100000/200000, or 10000 for a client that does not ask); 0 only identifies the part",
+        },
+        batch_interval_us: u32 {
+            default: 500000,
+            description: "SPU property 0x16 BatchInterval in microseconds, written before the report interval exactly as AppleSPUHIDDriver::setPropertiesGated does; CT817's own slow-rate pairing is report 200000 with batch 500000",
+        },
+        raw_interval_us: u32 {
+            default: 200000,
+            description: "SPU property 0x5c RawInterval in microseconds, written between the batch and report intervals",
         },
         dump_props: u8 {
             default: 0,
