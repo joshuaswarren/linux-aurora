@@ -33,8 +33,6 @@ const EPIC_SUBTYPE_GET_HID_DESCRIPTOR: u16 = 0x1;
 const SPU_PKT_GET_PROPERTY: u16 = 0x0a;
 const SPU_PKT_SET_PROPERTY: u16 = 0x04;
 /* SpuProperty ids (AppleSPUInterface). */
-const SPU_PROP_REPORT_INTERVAL_US: u32 = 0x00;
-const SPU_PROP_DEVICE_NAME: u32 = 0x0f;
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
 /* CT817's report is exactly 32 bytes and the lux float sits at +0x1c, read off
@@ -159,23 +157,6 @@ fn replay_macos_open(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -
 }
 
 fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
-    // macOS registers two client buffers before it writes the enable (trace
-    // 2026-09-20, seq 24-29: EPIC category COMMAND, subtype 0x0a, 28 bytes
-    // carrying two IOVAs with 0x100 lengths, answered by echoing the first).
-    // It is the last thing on the ALS channel that macOS does and this driver
-    // never has, and the trusted-side manager logs
-    // "Dispatching samples for client=%d enabled=%d", which implies exactly
-    // such a per-client registration.
-    //
-    // Off by default: an unanswered EPIC call wedges the endpoint's call slot
-    // and would cost the iio device, so this is opt-in until it is shown to be
-    // answered.
-    if *module_parameters::register_buffers.value() != 0 {
-        match aop.als_register_buffers(svc) {
-            Ok(rc) => dev_info!(dev.as_ref(), "als: client buffers -> rc {:#x}\n", rc),
-            Err(e) => dev_warn!(dev.as_ref(), "als: client buffers -> error {:?}\n", e),
-        }
-    }
 
     // The calibration is per-device factory data that the installer extracts
     // from a running macOS.  The J700's ADT sets `als-new-calibration-path = 1`
@@ -280,13 +261,6 @@ fn spu_get_property(
     aop.epic_call_ret(svc, SPU_PKT_GET_PROPERTY, &buf, data_len)
 }
 
-fn spu_set_property(aop: &dyn AOP, svc: &EPICService, prop: u32, data: &[u8]) -> Result<u32> {
-    let mut buf = KVec::new();
-    buf.resize(4 + data.len(), 0, GFP_KERNEL)?;
-    buf[0..4].copy_from_slice(&prop.to_le_bytes());
-    buf[4..].copy_from_slice(data);
-    aop.epic_call(svc, SPU_PKT_SET_PROPERTY, &buf)
-}
 
 fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> Result<u32> {
     let mut buf = KVec::new();
@@ -410,117 +384,6 @@ impl platform::Driver for IIOAopAlsDriver {
         // SAFETY: AOP sets the platform data correctly
         let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
         let ty = bindings::BINDINGS_IIO_LIGHT;
-        // u64 so that channel 0 is expressible: the announce log shows the
-        // endpoint-0x20 services arriving on channels 0, 1 and 2 while their
-        // announce bodies advertise 0x10000000/3/4, and every service whose
-        // calls work (als, aop-audio, aop-voicetrigger, aop-audprov) has
-        // arrival == body.  u64::MAX is "off".
-        let spu_probe_raw = *module_parameters::spu_probe.value();
-        let spu_chan = spu_probe_raw as u32;
-        if spu_probe_raw != 0xffffffffffffffff {
-            // macOS AppleSPUCT817::probe gates on GetProperty(0x0F) == "CT817"
-            // (0xfffffe0008e415d0) and then the sensor is armed by writing a
-            // non-zero microsecond interval to property 0x00.  The earlier
-            // sweep of this endpoint used the `als` service's [u32 zero,
-            // u32 tag] payload; the SPU wants the bare property id, so it
-            // answered nothing.  Ask with the right shape.
-            let spu = EPICService {
-                channel: spu_chan,
-                endpoint: 0x20,
-            };
-            // NEVER sweep unknown subtypes here: an unimplemented subtype
-            // never answers and one unanswered call wedges the endpoint until
-            // reboot (0x00..0x1f sweep, 2026-09-20).  Only subtype 0x0a (GET)
-            // and 0x04 (SET) are known to reply on this endpoint.
-            //
-            // macOS writes the rate triple 0x16/0x5c/0x00 from
-            // AppleSPUHIDDriver::setPropertiesGated at EL1 -- ordinary kernel
-            // code, not GL and not the exclave -- and it reaches them through
-            // AppleSPUInterface::SetProperty, i.e. THE SPU, not the AOP `als`
-            // EPIC service.  Writing them to `als` returns 0xe00002e2
-            // kIOReturnNotPermitted, which is very likely "not this service's
-            // property" rather than a privilege refusal: the same service
-            // accepts 0x00 and 0x0b happily.  So send them where macOS sends
-            // them.  _spuSetPropertyGated's payload is le32 prop_id followed by
-            // the value (inLen = 4 + len).
-            let spu = EPICService {
-                channel: spu_chan,
-                endpoint: 0x20,
-            };
-            // SET (0x04) on this channel answers 0xe00002c2 kIOReturnBadArgument,
-            // NOT 0xe00002c7 kIOReturnUnsupported -- so the operation exists on
-            // the SPU and only the payload shape is wrong.  (GET 0x0a is the
-            // other way round: Unsupported with the 8-byte envelope.)  Sweep
-            // the plausible encodings for one property and report each rc, so
-            // the accepted shape can be identified in a single boot.
-            let batch = *module_parameters::batch_interval_us.value();
-            let prop = 0x16u32;
-            let mut shapes: KVec<(&'static str, KVec<u8>)> = KVec::new();
-            {   // [prop, value] -- macOS _spuSetPropertyGated inline form
-                let mut b: KVec<u8> = KVec::new();
-                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
-                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
-                shapes.push(("[prop,val]", b), GFP_KERNEL)?;
-            }
-            {   // [0, prop, value] -- the AOP `als` service's envelope
-                let mut b: KVec<u8> = KVec::new();
-                b.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
-                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
-                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
-                shapes.push(("[0,prop,val]", b), GFP_KERNEL)?;
-            }
-            {   // [prop, 0, value]
-                let mut b: KVec<u8> = KVec::new();
-                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
-                b.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
-                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
-                shapes.push(("[prop,0,val]", b), GFP_KERNEL)?;
-            }
-            {   // [prop, value] with a 2-byte value (the int16 ms form)
-                let mut b: KVec<u8> = KVec::new();
-                b.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
-                b.extend_from_slice(&((batch / 1000) as u16).to_le_bytes(), GFP_KERNEL)?;
-                shapes.push(("[prop,u16]", b), GFP_KERNEL)?;
-            }
-            {   // value only, no property id
-                let mut b: KVec<u8> = KVec::new();
-                b.extend_from_slice(&batch.to_le_bytes(), GFP_KERNEL)?;
-                shapes.push(("[val]", b), GFP_KERNEL)?;
-            }
-            for (label, buf) in shapes.iter() {
-                match adata
-                    .as_ref()
-                    .epic_call(&spu, SPU_PKT_SET_PROPERTY, buf)
-                {
-                    Ok(rc) => pr_info!(
-                        "aop-als: SPU ch {:#x} SET 0x16 {} ({} bytes) -> rc {:#x}\n",
-                        spu_chan, label, buf.len(), rc
-                    ),
-                    Err(e) => pr_info!(
-                        "aop-als: SPU ch {:#x} SET 0x16 {} ({} bytes) ERR {:?}\n",
-                        spu_chan, label, buf.len(), e
-                    ),
-                }
-            }
-            let us = *module_parameters::spu_interval_us.value();
-            if us != 0 {
-                match spu_set_property(
-                    adata.as_ref(),
-                    &spu,
-                    SPU_PROP_REPORT_INTERVAL_US,
-                    &us.to_le_bytes(),
-                ) {
-                    Ok(rc) => pr_info!(
-                        "aop-als: SPU ch {:#x} report interval {} us -> rc {:#x}\n",
-                        spu_chan, us, rc
-                    ),
-                    Err(e) => pr_info!(
-                        "aop-als: SPU ch {:#x} report interval {} us failed: {:?}\n",
-                        spu_chan, us, e
-                    ),
-                }
-            }
-        }
         if *module_parameters::dump_props.value() != 0 {
             // The AOP accepts the enable but delivers no reports on this
             // machine.  Ask it what it actually exposes: property 0xf is the
@@ -582,14 +445,6 @@ module_platform_driver! {
             default: 256,
             description: "Bytes to request for each property during the dump_props sweep",
         },
-        spu_probe: u64 {
-            default: 0xffffffffffffffff,
-            description: "DANGEROUS, default off. EPIC channel on AOP endpoint 0x20 to address the SPU for CT817 property calls. An EPIC call to a channel the AOP does not recognise is never answered, and the unanswered call wedges this ASC: verified 2026-09-20 that a probe on channel 0x10000000 timed out and then broke aop_audio (snd_soc_dai_startup on spkr, -110) until a reboot. Do not set this on a machine whose audio is in use, and confirm the channel from the announce log first",
-        },
-        spu_interval_us: u32 {
-            default: 0,
-            description: "With spu_probe set and the CT817 identified, write this microsecond report interval to SPU property 0x00 to arm periodic reporting (macOS defaults: 50000/100000/200000, or 10000 for a client that does not ask); 0 only identifies the part",
-        },
         batch_interval_us: u32 {
             default: 1,
             description: "ALS property 0x16, written before the report interval. Default is what macOS writes on this machine (1, not an interval at all) as traced under the hypervisor 2026-09-20; the AOP answers kIOReturnNotPermitted to macOS too and arms anyway",
@@ -613,10 +468,6 @@ module_platform_driver! {
         replay_open: u8 {
             default: 0,
             description: "Replay macOS's opening before enabling: fetch the HID report descriptor (subtype 0x01) and read the eight properties AppleSPUCT817 reads, as traced under the hypervisor 2026-09-20. OFF by default: the AOP never answers 0x01 on the untrusted side -- the ALS frontend it would reach is a property surface, while CT817Hal, ALSCT817 and ALSTrustedClientManager are trusted-side (see ALS-STATE-2026-09-20.md) -- and an unanswered EPIC call wedges the endpoint's call slot, which costs the iio device entirely. Set it to 1 only to re-measure that",
-        },
-        register_buffers: u8 {
-            default: 0,
-            description: "Send the ALS client-buffer registration macOS sends before the enable: EPIC category COMMAND, subtype 0x0a, 28 bytes carrying two 0x100-byte IOVAs (traced 2026-09-20). The trusted-side manager logs 'Dispatching samples for client=%d enabled=%d', so a per-client registration is what the host appears to be missing. Off by default because an unanswered EPIC call wedges the endpoint and costs the iio device",
         },
         stop_first: u8 {
             default: 0,
