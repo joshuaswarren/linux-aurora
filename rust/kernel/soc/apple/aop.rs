@@ -78,6 +78,17 @@ pub trait AOP: Send + Sync {
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)>;
 
+    /// Register the two client buffers the ALS asks for, as macOS does.
+    ///
+    /// Traced 2026-09-20: EPIC category COMMAND (0x30), subtype 0x0a, a
+    /// 28-byte payload `[0, iova_a, 0x100, iova_b, 0x100, 0x100, 4]`, answered
+    /// by echoing the first IOVA.  It is the only thing macOS does on the ALS
+    /// channel that this driver has never done, and the trusted-side client
+    /// manager's own log (`Dispatching samples for client=%d enabled=%d`)
+    /// implies a per-client registration that this is the obvious candidate
+    /// for.  The buffers are kept for the life of the driver.
+    fn als_register_buffers(&self, svc: &EPICService) -> Result<u32>;
+
     /// Adds the listener for the specified service
     fn add_fakehid_listener(
         &self,

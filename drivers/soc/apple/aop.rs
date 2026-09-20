@@ -108,6 +108,14 @@ const EPIC_CATEGORY_REPLY: u8 = 0x20;
 /// macOS sends the ALS buffer/client registration with this category;
 /// ordinary property reads stay NOTIFY.  Traced 2026-09-20.
 const EPIC_CATEGORY_COMMAND: u8 = 0x30;
+/// Subtype the ALS client-buffer registration rides on (same id as a property
+/// get, but sent with category COMMAND).
+const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
+/// Each traced ALS client buffer is 0x100 bytes.
+const ALS_CLIENT_BUF_LEN: usize = 0x100;
+/// Reply capacity macOS advertises on that call (inline_len 0x18), which is
+/// deliberately not the 0x1c payload length.
+const ALS_CLIENT_REPLY_LEN: usize = 0x18;
 const EPIC_SUBTYPE_STD_SERVICE: u16 = 0xc0;
 const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
@@ -1017,6 +1025,9 @@ struct AopData {
     subdevices: Mutex<KVec<*mut bindings::platform_device>>,
     #[pin]
     source_ring: Mutex<Option<Arc<SourceRing>>>,
+    /// The two ALS client buffers, kept alive once registered.
+    #[pin]
+    als_bufs: Mutex<Option<(Coherent<[u8]>, Coherent<[u8]>)>>,
 }
 
 unsafe impl Send for AopData {}
@@ -1113,6 +1124,7 @@ impl AopData {
                     report_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
                     source_ring <- new_mutex!(None),
+                    als_bufs <- new_mutex!(None),
                 }
             ),
             GFP_KERNEL,
@@ -1724,6 +1736,43 @@ impl AOP for AopData {
             }
         }
         false
+    }
+    fn als_register_buffers(&self, svc: &EPICService) -> Result<u32> {
+        let mut guard = self.als_bufs.lock();
+        if guard.is_some() {
+            return Err(EBUSY);
+        }
+        // SAFETY: same contract as the AFK buffer allocation above -- the AOP
+        // device is bound for the whole life of this driver.
+        let bound = unsafe { self.dev.as_bound() };
+        let a = Coherent::<u8>::zeroed_slice(bound, ALS_CLIENT_BUF_LEN, GFP_KERNEL)?;
+        let b = Coherent::<u8>::zeroed_slice(bound, ALS_CLIENT_BUF_LEN, GFP_KERNEL)?;
+        let iova_a = a.dma_handle() as u32;
+        let iova_b = b.dma_handle() as u32;
+
+        // The traced payload, field for field:
+        //   u32 0, u32 iova_a, u32 len_a, u32 iova_b, u32 len_b, u32 0x100, u32 4
+        let mut buf = KVec::new();
+        buf.resize(28, 0, GFP_KERNEL)?;
+        buf[4..8].copy_from_slice(&iova_a.to_le_bytes());
+        buf[8..12].copy_from_slice(&(ALS_CLIENT_BUF_LEN as u32).to_le_bytes());
+        buf[12..16].copy_from_slice(&iova_b.to_le_bytes());
+        buf[16..20].copy_from_slice(&(ALS_CLIENT_BUF_LEN as u32).to_le_bytes());
+        buf[20..24].copy_from_slice(&(ALS_CLIENT_BUF_LEN as u32).to_le_bytes());
+        buf[24..28].copy_from_slice(&4u32.to_le_bytes());
+
+        dev_info!(self.dev, "als: registering client buffers {:#x}/{:#x} len {:#x}\n",
+                  iova_a, iova_b, ALS_CLIENT_BUF_LEN);
+        // Reply capacity is 0x18, not 0x1c.  macOS's sub-header says
+        //     0x18: 1c 00 00 00   sub.length   = 28 (the payload we send)
+        //     0x2c: 18 00 00 00   inline_len   = 24 (the capacity it offers)
+        // Those two are not the same number, and taking the length from the
+        // payload rather than from the traced header is the mistake that cost
+        // three boot cycles on subtype 0x01 earlier tonight.
+        let (rc, _reply) =
+            self.epic_command_ret(svc, EPIC_SUBTYPE_GET_AOP_PROPERTY, &buf, ALS_CLIENT_REPLY_LEN)?;
+        *guard = Some((a, b));
+        Ok(rc)
     }
     fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
         if !self.epic_v4 {
