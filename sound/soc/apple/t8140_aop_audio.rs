@@ -1305,9 +1305,13 @@ unsafe extern "C" fn asoc_pcm_new(
             continue;
         }
         // The LEAP ADMAC's SRAM registers only answer with the LEAP leaves
-        // powered, so the speaker channel is requested with them on.
+        // powered, so a LEAP channel is requested with them on.  That is both
+        // the speaker (leap-ns TX0) and the microphone array (leap-s RX0):
+        // requesting the array's channel with the leaves down takes an
+        // asynchronous SError and panics the machine in dma_request_chan().
         let leap = data.spkr_domain_refs();
-        let powered = fe == FE_SPKR && data.domains(&data.spkr, &leap, true).is_ok();
+        let powered = (fe == FE_SPKR || fe == FE_HPAI)
+            && data.domains(&data.spkr, &leap, true).is_ok();
         // SAFETY: FFI call with the live platform device and a NUL-terminated channel name.
         let requested = kernel::error::from_err_ptr(unsafe { bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr()) });
         if powered {
