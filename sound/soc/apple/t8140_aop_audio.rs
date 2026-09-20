@@ -330,6 +330,10 @@ struct SndSocT8140AopData {
     pd_mca0: Atomic<usize>,
     pd_tx0: Atomic<usize>,
     pd_leap_mca: Atomic<usize>,
+    /// audio_leap_rx0: the microphone array's leap-s RX0 leaf, the exact
+    /// sibling of `pd_tx0`.  A LEAP ADMAC only answers on a channel whose own
+    /// leaf is powered.
+    pd_rx0: Atomic<usize>,
     /// A speaker stream has been triggered and not yet stopped.
     spkr_want_run: Atomic<u32>,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
@@ -814,8 +818,14 @@ impl SndSocT8140AopData {
     // power-domain work at all -- so unlike the jack and speaker paths this
     // back-end holds no serializer leaves of its own. ----
 
+    /// The array's LEAP leaves: its own RX0 channel leaf, plus the LEAP MCA
+    /// the speaker path also holds.
+    fn hpai_domain_refs(&self) -> [&Atomic<usize>; 2] {
+        [&self.pd_rx0, &self.pd_leap_mca]
+    }
+
     fn hpai_startup(&self) -> Result<()> {
-        self.service_startup(&self.hpai, &[])
+        self.service_startup(&self.hpai, &self.hpai_domain_refs())
     }
 
     fn hpai_prepare(&self) -> Result<()> {
@@ -823,7 +833,7 @@ impl SndSocT8140AopData {
     }
 
     fn hpai_shutdown(&self) {
-        self.service_shutdown(&self.hpai, &[])
+        self.service_shutdown(&self.hpai, &self.hpai_domain_refs())
     }
 
     // ---- internal speakers: the spkr service on LEAP TX0 (leap-ns ADMAC
@@ -1304,18 +1314,26 @@ unsafe extern "C" fn asoc_pcm_new(
         if substream.is_null() {
             continue;
         }
-        // The LEAP ADMAC's SRAM registers only answer with the LEAP leaves
-        // powered, so a LEAP channel is requested with them on.  That is both
-        // the speaker (leap-ns TX0) and the microphone array (leap-s RX0):
-        // requesting the array's channel with the leaves down takes an
-        // asynchronous SError and panics the machine in dma_request_chan().
-        let leap = data.spkr_domain_refs();
+        // A LEAP ADMAC's per-channel SRAM registers only answer with that
+        // channel's own leaf powered, so a LEAP channel is requested with it
+        // on: tx0 for the speaker's leap-ns TX0, rx0 for the array's leap-s
+        // RX0.  Requesting either with its leaf down writes
+        // REG_CHAN_SRAM_CARVEOUT into a dead aperture, which takes an
+        // asynchronous SError and panics the machine inside
+        // dma_request_chan().
+        let spkr_leap = data.spkr_domain_refs();
+        let hpai_leap = data.hpai_domain_refs();
+        let (leap_svc, leap): (&Service, &[&Atomic<usize>]) = if fe == FE_HPAI {
+            (&data.hpai, &hpai_leap[..])
+        } else {
+            (&data.spkr, &spkr_leap[..])
+        };
         let powered = (fe == FE_SPKR || fe == FE_HPAI)
-            && data.domains(&data.spkr, &leap, true).is_ok();
+            && data.domains(leap_svc, leap, true).is_ok();
         // SAFETY: FFI call with the live platform device and a NUL-terminated channel name.
         let requested = kernel::error::from_err_ptr(unsafe { bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr()) });
         if powered {
-            let _ = data.domains(&data.spkr, &leap, false);
+            let _ = data.domains(leap_svc, leap, false);
         }
         let chan = match requested {
             Ok(c) => c,
@@ -2291,6 +2309,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 pd_mca0: Atomic::new(0),
                 pd_tx0: Atomic::new(0),
                 pd_leap_mca: Atomic::new(0),
+                pd_rx0: Atomic::new(0),
                 spkr_want_run: Atomic::new(0),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
                 fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
@@ -2334,7 +2353,8 @@ impl platform::Driver for SndSocT8140AopDriver {
         }
         // The speaker path's LEAP leaves (tx0 -> leap_c -> leap_a -> audio_fr
         // -> audio_a, leap_mca -> audio_p), runtime-powered around streams.
-        for (name, slot) in [(c"tx0", &data.pd_tx0), (c"mca", &data.pd_leap_mca), (c"mca0", &data.pd_mca0)] {
+        for (name, slot) in [(c"tx0", &data.pd_tx0), (c"mca", &data.pd_leap_mca), (c"mca0", &data.pd_mca0),
+                             (c"rx0", &data.pd_rx0)] {
             // SAFETY: FFI call with the live platform device and a NUL-terminated domain name.
             let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), name.as_ptr()) };
             match kernel::error::from_err_ptr(pd) {
