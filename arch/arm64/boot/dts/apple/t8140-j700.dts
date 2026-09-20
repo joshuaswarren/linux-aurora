@@ -1074,6 +1074,22 @@
 };
 
 /*
+ * The secure LEAP ADMAC.  It carries the high-quality microphone array's only
+ * data path (ADT audio-hp-mic, dma-provider-rx = leap-s-adma-rx-0), and macOS
+ * reaches it through the HPMicAudioDriver exclave's proxy aperture at
+ * 0x353200000.  With no secure kernel running nothing claims it, and the AOP
+ * attaches the array to an ordinary EPIC client, so the host can own the
+ * controller directly.
+ *
+ * Unlike its two siblings this node still has `resets`; if a reset pulse here
+ * disturbs the LEAP fabric the way it did for admac_leap_ns, drop the property
+ * rather than the node.
+ */
+&admac_leap_s {
+	status = "okay";
+};
+
+/*
  * The sound card (macaudio's J700 variant): the 3.5 mm jack (AOP cout/cin
  * services on the audio child's DAI 0 with the CS42L83) and the internal
  * speakers (DAI 4, the LEAP serializer into the MAX98360A amplifiers).
