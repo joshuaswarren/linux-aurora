@@ -455,6 +455,39 @@ impl SndSocT8140AopData {
                     Ok((0, v)) => {
                         found += 1;
                         dev_info!(self.dev, "hpai: property {} = {:02x?}\n", modifier, &v[..]);
+                        // The firmware states the property's real length in the
+                        // first word.  Anything longer than the 8 bytes asked
+                        // for above is the interesting kind -- 203 is 224 bytes
+                        // and is where the stream description has to live,
+                        // since this device has no 301/302 -- so read it again
+                        // at its own length and dump it whole.
+                        let reported = u32::from_le_bytes(v[..4].try_into().unwrap()) as usize;
+                        if reported > 4 && reported <= 512 {
+                            match self.epic_wrapped_call_ret_code(
+                                &AudioGetDeviceProp::new(AUDIO_DEV_HPAI, modifier),
+                                4 + reported,
+                            ) {
+                                Ok((0, full)) => dev_info!(
+                                    self.dev,
+                                    "hpai: property {} full ({} bytes) = {:02x?}\n",
+                                    modifier,
+                                    reported,
+                                    &full[..]
+                                ),
+                                Ok((rc, _)) => dev_info!(
+                                    self.dev,
+                                    "hpai: property {} full read return code {:#x}\n",
+                                    modifier,
+                                    rc
+                                ),
+                                Err(e) => dev_info!(
+                                    self.dev,
+                                    "hpai: property {} full read failed: {:?}\n",
+                                    modifier,
+                                    e
+                                ),
+                            }
+                        }
                     }
                     // the expected negative; say nothing
                     Ok((AUDIO_RET_NOT_FOUND, _)) => (),
