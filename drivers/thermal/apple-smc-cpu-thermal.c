@@ -18,20 +18,29 @@
  * polling does not bound sensor age; higher OPP admission must remain limited.
  */
 /*
- * Two tiers, the values the cleanroom qualification settled on for J700 once
- * the full P ladder was exposed: a passive trip at 80 C (10 C hysteresis) that
- * lets step_wise walk the cpufreq cooling devices down state by state, and a
- * hard tier at 95 C (release at 85 C) that pins both clusters to their minimum
- * frequency through the QoS guard.  The SMC's own backup remains at 105/95 C.
+ * Two tiers: a passive trip that lets step_wise walk the cpufreq cooling
+ * devices down state by state, and a hard tier that pins both clusters to
+ * their minimum frequency through the QoS guard.  The SMC's own backup
+ * remains at 105 C, which is Apple's own passive limit for this part.
  *
  * While the PMP fast policy (CONFIG_APPLE_PMP_V2_THERMAL) runs it retunes
- * this zone into the independent backup: passive trip and hard tier both at
- * 105 C (release 95 C), leaving the 80/95 C tiers to the 25 ms PMP zone.
+ * this zone into the independent backup at 105 C, leaving these tiers to the
+ * 25 ms PMP zone.
+ *
+ * The original qualification numbers were 80 C passive / 70 C release.  That
+ * band is unusable on J700 silicon: the die sits at 70-77 C at idle and light
+ * load (measured 2026-09-20, load average 0.4, one browser), i.e. permanently
+ * inside the step_wise hold band.  The first excursion past 80 C latched the
+ * throttle and it could never walk back out, because walking back out needs
+ * < 70 C and the only way to get there was the minimum-frequency guard itself.
+ * Observed result: P cluster held at 1.26-2.20 GHz of 4.044 GHz indefinitely.
+ * The band is therefore moved above the idle temperature, keeping the same
+ * 10 C hysteresis and staying under Apple's 105 C backup.
  */
-#define SMC_TRIP_MC 80000
-#define SMC_RELEASE_MC 70000
-#define SMC_HOT_MC 95000
-#define SMC_HOT_RELEASE_MC 85000
+#define SMC_TRIP_MC 95000
+#define SMC_RELEASE_MC 85000
+#define SMC_HOT_MC 103000
+#define SMC_HOT_RELEASE_MC 98000
 #define SMC_SAMPLE_MS 25
 #define SMC_MAX_AGE_MS APPLE_SMC_THERMAL_MAX_AGE_MS
 #define SMC_WATCH_MS 25
@@ -363,7 +372,7 @@ int apple_smc_thermal_aux_set_policy(int temperature, int hysteresis,
 }
 
 /* The auxiliary policy gave up: drop its zone and restore this zone's own
- * two-tier policy (80 C passive, 95 C minimum) as the sole throttle.
+ * two-tier policy (95 C passive, 103 C minimum) as the sole throttle.
  */
 void apple_smc_thermal_aux_unregister(void)
 {
