@@ -220,12 +220,16 @@ fn epic_decode(hdr_bytes: &[u8]) -> EPICDecoded {
     }
 }
 
+/// `_ReadyReportData` as the matched AppleSPU parser reads it: a 32-byte name
+/// followed by the channel at 0x20.  The name field was previously declared as
+/// 20 bytes with three u32s standing in for its tail, which silently truncated
+/// every announcement longer than 20 characters -- on the J700
+/// `HibernationAppUntrusted` (23) arrived as `HibernationAppUntrus`.  The
+/// channel offset was right by accident, because 20 + 4 + 4 + 4 == 0x20.
+/// Bytes after the name's NUL can hold stale data and are ignored.
 #[repr(C, packed)]
 struct EPICServiceAnnounce {
-    name: [u8; 20],
-    _unk0: u32,
-    retcode: u32,
-    _unk1: u32,
+    name: [u8; 32],
     channel: u32,
     _unk2: u32,
     _unk3: u32,
@@ -1036,6 +1040,11 @@ impl AopData {
             if !rtk.as_mut().has_endpoint(rtk_ep_num) {
                 continue;
             }
+            // The J700 application map is 0x20 misc, 0x21 aop-audio,
+            // 0x22 aop-voicetrigger, 0x23 als, 0x2b aop-audprov.  The firmware
+            // blocks its own startup until every advertised endpoint is
+            // enabled, so record which ones are actually present here.
+            dev_info!(self.dev, "AFK: starting endpoint {:#04x}\n", rtk_ep_num);
             rtk.as_mut().start_endpoint(rtk_ep_num)?;
             let ep_guard = self.endpoints[ep as usize].lock();
             ep_guard.start(rtk.as_mut())?;
@@ -1052,6 +1061,20 @@ impl AopData {
             channel,
             endpoint: ep.index,
         };
+        // Every announcement is logged, including the ones with no sub-device.
+        // On the J700 endpoint 0x20 announces SPUApp / SPUAppUntrusted /
+        // HibernationAppUntrusted and all three used to be dropped in silence,
+        // which hid the fact that the ambient light sensor is a CT817 HID
+        // device on the SPU (macOS: AppleSPUCT817 -> IOHIDEventService ->
+        // AppleSPUALSDriver::eventServiceCallback) rather than something the
+        // `als` EPIC service streams.
+        dev_info!(
+            self.dev,
+            "aop: service announce ep {:#04x} channel {:#x} name {}\n",
+            ep.index,
+            channel,
+            core::str::from_utf8(name).unwrap_or("<non-utf8>")
+        );
         let dev_name = match name {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
@@ -1208,6 +1231,23 @@ impl AopData {
                     st.send(SETUP_MGMT_EP, (SETUP_TYPE_HELLO_REPLY << 52) | SETUP_HELLO_VERSION)
                 }
                 SETUP_TYPE_EPMAP => {
+                    // The firmware advertises its endpoint set here, and the
+                    // driver otherwise discards it and requests SETUP_ENDPOINTS
+                    // blindly.  RTKit packs a 32-bit bitmap plus a 3-bit base,
+                    // so the endpoint number is base * 32 + bit.  Log it: the
+                    // J700 map differs from the M1/M2 one this list was written
+                    // for, and a missing endpoint stalls firmware startup.
+                    let bitmap = (word & 0xffffffff) as u32;
+                    let base = ((word >> 32) & 0x7) as u8;
+                    for bit in 0..32u8 {
+                        if bitmap & (1u32 << bit) != 0 {
+                            dev_info!(
+                                self.dev,
+                                "setup port: firmware advertises endpoint {:#04x}\n",
+                                base * 32 + bit
+                            );
+                        }
+                    }
                     st.send(SETUP_MGMT_EP, word)?;
                     if word & SETUP_EPMAP_LAST != 0 {
                         st.map_done = true;
