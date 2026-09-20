@@ -73,7 +73,16 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     }
 }
 
-fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
+/// macOS's opening, in macOS's position: **before any property read**.
+///
+/// The 2026-09-20 wire dump showed the one difference that was left.  macOS
+/// sends subtype 0x01, the HID report descriptor fetch, as the very first
+/// call on the ALS channel.  This driver sent a property read first -- the
+/// 0x0f name query that picks the lux offset -- and only then the 0x01, which
+/// the firmware never answered.  Every byte of the two 0x01 calls matched
+/// otherwise: same channel (0x1000000a), EPIC type, category, subtype,
+/// payload (4 bytes) and reply capacity (0xe4).  Order was the difference.
+fn replay_macos_open(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
     // Replay macOS's opening, captured from this machine under the hypervisor
     // on 2026-09-20 (ALS-STATE-2026-09-20.md, "THE macOS ALS CONVERSATION,
     // CAPTURED").  Before any calibration or rate write, AppleSPUCT817 fetches
@@ -146,7 +155,10 @@ fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Resul
             }
         }
     }
+    Ok(())
+}
 
+fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
     // The calibration is per-device factory data that the installer extracts
     // from a running macOS.  The J700's ADT sets `als-new-calibration-path = 1`
     // and carries no blob of its own, which suggests the AOP already holds its
@@ -520,6 +532,8 @@ impl platform::Driver for IIOAopAlsDriver {
                 }
             }
         }
+        // Before anything else on this channel: see replay_macos_open().
+        replay_macos_open(adata.as_ref(), pdev, &service)?;
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
         adata.add_fakehid_listener(service, data.clone())?;
