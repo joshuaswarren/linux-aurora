@@ -22,6 +22,8 @@
 #define APPLE_RTKIT_APP_ENDPOINT_START 0x20
 #define APPLE_RTKIT_MAX_ENDPOINTS 0x100
 
+#include <linux/debugfs.h>
+
 struct apple_rtkit {
 	void *cookie;
 	const struct apple_rtkit_ops *ops;
@@ -64,7 +66,13 @@ struct apple_rtkit {
 	unsigned int crashlog_probe_attempt;
 	unsigned int crashlog_probe_elapsed_ms;
 	struct apple_rtkit_shmem oslog_buffer;
-	struct apple_rtkit_shmem pmp_aux_buffer;
+	/* The AOP logs through oslog, not syslog: on a J700 the MTP emits
+	 * decoded "RTKit: syslog message: ..." lines while the AOP emits
+	 * only "Unknown oslog message", so every [AOP][ALS]/CT817Hal
+	 * diagnostic lands in this buffer and is never read.  Expose it
+	 * read-only through debugfs so it can be inspected. */
+	struct debugfs_blob_wrapper oslog_blob;
+	struct dentry *oslog_dentry;
 
 	struct apple_rtkit_shmem syslog_buffer;
 	char *syslog_msg_buffer;

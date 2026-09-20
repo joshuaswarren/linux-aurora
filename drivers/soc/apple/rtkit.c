@@ -733,6 +733,20 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
 						 APPLE_RTKIT_EP_OSLOG, msg);
+		/* Publish the buffer read-only.  Nothing here parses the oslog
+		 * entry format; the point is that the firmware's own text is
+		 * otherwise unreachable from Linux. */
+		if (!rtk->oslog_dentry && rtk->oslog_buffer.buffer &&
+		    rtk->oslog_buffer.size) {
+			rtk->oslog_blob.data = rtk->oslog_buffer.buffer;
+			rtk->oslog_blob.size = rtk->oslog_buffer.size;
+			rtk->oslog_dentry = debugfs_create_blob(
+				dev_name(rtk->dev), 0400, NULL,
+				&rtk->oslog_blob);
+			dev_info(rtk->dev,
+				 "RTKit: oslog buffer %zu bytes at debugfs %s\n",
+				 rtk->oslog_buffer.size, dev_name(rtk->dev));
+		}
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
@@ -1089,6 +1103,8 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
+	debugfs_remove(rtk->oslog_dentry);
+	rtk->oslog_dentry = NULL;
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
@@ -1429,6 +1445,8 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
+	debugfs_remove(rtk->oslog_dentry);
+	rtk->oslog_dentry = NULL;
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
