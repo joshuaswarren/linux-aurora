@@ -935,12 +935,22 @@ static int macaudio_fe_startup(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		return ret;
 
-	max_rate = MACAUDIO_MAX_BCLK_FREQ / props->bclk_ratio;
-	ret = snd_pcm_hw_constraint_minmax(substream->runtime,
-					   SNDRV_PCM_HW_PARAM_RATE,
-					   0, max_rate);
-	if (ret < 0)
-		return ret;
+	/*
+	 * A front end with no serial bus of its own (the J700 microphone array
+	 * is a PDM part inside the AOP, reached over DMA) has no bclk-derived
+	 * rate ceiling.  Guard the division: arm64 UDIV by zero is defined to
+	 * yield 0 rather than trap, so a zero bclk_ratio would silently pin the
+	 * rate to [0,0] here and fail every open of that PCM with -EINVAL,
+	 * several steps later inside snd_pcm_hw_constraints_complete().
+	 */
+	if (props->bclk_ratio) {
+		max_rate = MACAUDIO_MAX_BCLK_FREQ / props->bclk_ratio;
+		ret = snd_pcm_hw_constraint_minmax(substream->runtime,
+						   SNDRV_PCM_HW_PARAM_RATE,
+						   0, max_rate);
+		if (ret < 0)
+			return ret;
+	}
 
 	return 0;
 }
@@ -1684,9 +1694,14 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.stereo = true,
 	.safe_vol = -20,
 	.spk_out_widget = "Speaker",
-	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2",
-			  /* the high-quality microphone array */
-			  "j700-pcm-3" },
+	/*
+	 * No fourth name yet.  The high-quality microphone array's front end
+	 * (j700-pcm-3) is complete and the firmware side of it is proven, but
+	 * requesting its leap-s DMA channel still takes an asynchronous SError
+	 * in dma_request_chan(); naming it here is what turns the front end on,
+	 * so it stays unnamed until that is fixed.
+	 */
+	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
 	.primary_bclk_ratio = 125,
 	/* 125-SCLK frame pulse, two 32-bit slots back to back, 24-bit samples */
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_NB_NF,
@@ -1847,10 +1862,18 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 			link->ops = &macaudio_be_ops;
 			link->init = macaudio_be_init;
 			link->exit = macaudio_be_exit;
-		} else {
+		} else if (link->dynamic) {
 			link->ops = &macaudio_fe_ops;
 			link->init = macaudio_fe_init;
 		}
+		/*
+		 * A plain link -- neither a DPCM front end nor a back end --
+		 * gets neither set.  macaudio_fe_hw_params() insists on a
+		 * back end to route to ("no audio route configured by the
+		 * user") and there is none: the J700 microphone array is a
+		 * PDM part inside the AOP whose CPU DAI owns the firmware
+		 * service directly, with no codec to link to.
+		 */
 	}
 
 	INIT_WORK(&data->lock_update_work, macaudio_vlimit_update_work);
