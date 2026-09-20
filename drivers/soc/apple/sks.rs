@@ -989,6 +989,14 @@ impl SepData {
                     self.endpoint_present(proto::EP_SBIO) as u8,
                     self.endpoint_present(proto::EP_SCRD) as u8,
                 );
+                // Which endpoints DID come up is the next question and the
+                // counts above do not answer it.
+                if *module_parameters::trace_discovery.value() != 0 {
+                    let guard = self.endpoints.lock();
+                    for (i, ep) in guard.eps.iter().enumerate() {
+                        dev_info!(self.dev, "sks: endpoint[{}] = {:#04x}\n", i, ep.id);
+                    }
+                }
             }
             return false;
         }
