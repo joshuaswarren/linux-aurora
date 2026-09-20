@@ -10,10 +10,16 @@
 #include <linux/soc/apple/pmp-cpufreq.h>
 #include <linux/soc/apple/smc-thermal.h>
 
-/* Initial qualification settings, not Apple safety limits or a peak guarantee. */
-#define PT_TRIP_MC 80000
+/* Not Apple safety limits or a peak guarantee.  The band must sit above the
+ * die's idle temperature or step_wise can never leave it: J700 idles at
+ * 70-77 C, so the original 80 C trip / 70 C release latched the throttle
+ * permanently (see the rationale in drivers/thermal/apple-smc-cpu-thermal.c).
+ * Release is PT_TRIP_MC - PT_HYST_MC = 85 C, clear of idle; the minimum tier
+ * and the SMC backup stay ordered 95 < 100 < 105 C.
+ */
+#define PT_TRIP_MC 95000
 #define PT_HYST_MC 10000
-#define PT_MINIMUM_TRIP_MC 95000
+#define PT_MINIMUM_TRIP_MC 100000
 #define PT_FIRST_CAP_KHZ 2472000
 #define PT_POLL_MS 25
 
@@ -45,6 +51,20 @@ static DECLARE_DELAYED_WORK(pt_start_work, pt_start);
 static bool startup_fallback = true;
 module_param(startup_fallback, bool, 0444);
 MODULE_PARM_DESC(startup_fallback, "Hand over to the SMC policy if the PMP policy never starts (default Y)");
+
+/* This policy samples only while the cores are awake, so it requires idle=nop
+ * -- and idle=nop is expensive: arm64's ARM64_IDLE_NOP takes neither the wfi()
+ * nor the yield branch of cpu_do_idle(), so every core spins at full clock
+ * whenever the system is idle.  Measured on J700 2026-09-20: 43.4 C idle with
+ * idle=wfi against 85-92 C (peaks of 106.7 C) with idle=nop, at the same load
+ * average.  That heat is what forced the cpufreq cooling states down and made
+ * the machine sluggish.  Setting pmp_v2.thermal_policy=0 boots idle=wfi and
+ * leaves the independent two-tier SMC policy as the sole throttle -- the same
+ * regime startup_fallback selects.
+ */
+static bool thermal_policy = true;
+module_param(thermal_policy, bool, 0444);
+MODULE_PARM_DESC(thermal_policy, "Run the PMP fast thermal policy (default Y; requires idle=nop). N leaves the SMC policy as the throttle and allows idle=wfi.");
 
 static unsigned int pt_policy_frequency(struct cpufreq_policy *policy, unsigned int state)
 {
@@ -361,7 +381,7 @@ static void pt_start(struct work_struct *work)
 	if (ret)
 		goto fail;
 	/* Keep the SMC backup; unlike LAB, zone re-enable may recover normally. */
-	ret = apple_smc_thermal_aux_set_policy(PT_TRIP_MC, PT_HYST_MC, 105000, 95000);
+	ret = apple_smc_thermal_aux_set_policy(PT_TRIP_MC, PT_HYST_MC, 105000, 100000);
 	if (ret)
 		goto fail;
 	for (i = 0; i < 2; i++) {
@@ -454,8 +474,17 @@ DEFINE_SHOW_ATTRIBUTE(pt_status);
 
 static int pt_init(struct pmp_v2 *pmp)
 {
-	pt_owner = pmp;
 	debugfs_create_file("thermal_status", 0400, pmp->debug, pmp, &pt_status_fops);
+	if (!thermal_policy) {
+		/* Leave pt_owner NULL: pt_start then takes the fallback branch,
+		 * releases the cpufreq boot caps and returns, which leaves the
+		 * SMC zone's own two-tier policy as the throttle.
+		 */
+		pr_info("apple-pmp-v2: PMP thermal policy off (pmp_v2.thermal_policy=0); SMC policy is the throttle\n");
+		schedule_delayed_work(&pt_start_work, 0);
+		return 0;
+	}
+	pt_owner = pmp;
 	schedule_delayed_work(&pt_start_work, 0);
 	return 0;
 }
