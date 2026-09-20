@@ -200,6 +200,27 @@ impl platform::Driver for IIOAopAlsDriver {
         // SAFETY: AOP sets the platform data correctly
         let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
         let ty = bindings::BINDINGS_IIO_LIGHT;
+        let spu_chan = *module_parameters::spu_probe.value();
+        if spu_chan != 0 {
+            // Endpoint 0x20 announces SPUApp / SPUAppUntrusted; the sensor and
+            // its reports live behind that, so ask it the same questions the
+            // `als` service answers and see which side actually knows.
+            let spu = EPICService { channel: spu_chan, endpoint: 0x20 };
+            let plen = *module_parameters::prop_len.value() as usize;
+            pr_info!("aop-als: SPU sweep on endpoint 0x20 channel {:#x}\n", spu_chan);
+            for tag in 0u32..0x100 {
+                match get_aop_property(adata.as_ref(), &spu, tag, plen) {
+                    Ok((rc, v)) if rc == 0 || !v.is_empty() => {
+                        let n = core::cmp::min(v.len(), 160);
+                        pr_info!(
+                            "aop-als: SPU property {:#04x} -> rc {:#x}, {} bytes: {:02x?}\n",
+                            tag, rc, v.len(), &v[..n]
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
         if *module_parameters::dump_props.value() != 0 {
             // The AOP accepts the enable but delivers no reports on this
             // machine.  Ask it what it actually exposes: property 0xf is the
@@ -258,6 +279,10 @@ module_platform_driver! {
         prop_len: u32 {
             default: 256,
             description: "Bytes to request for each property during the dump_props sweep",
+        },
+        spu_probe: u32 {
+            default: 0,
+            description: "EPIC channel on AOP endpoint 0x20 (SPUApp 0x10000000, SPUAppUntrusted 0x10000003) to sweep for properties; the J700's ambient light sensor is a CT817 HID device on the SPU (macOS AppleSPUCT817 -> AppleSPUHIDDriver::spuCopyProperty), not something the `als` service streams, so 0 leaves this off",
         },
         dump_props: u8 {
             default: 0,
