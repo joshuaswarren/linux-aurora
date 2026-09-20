@@ -86,7 +86,21 @@ const VERIFY_WORK_ID: u64 = 3;
 static_assert!(VERIFY_WORK_ID != ENROL_WORK_ID && VERIFY_WORK_ID != SETTLE_WORK_ID);
 static_assert!(VERIFY_WORK_ID != 0);
 
-const EXCHANGE_TIMEOUT_MS: time::Msecs = 15000;
+/// How long to wait for the SEP to finish advertising its application
+/// endpoints after the infrastructure burst.
+///
+/// 15 s was chosen on a machine where the key store follows scrd "a beat"
+/// later.  On the J700 it does not: the infrastructure burst lands at 9.44 s
+/// and the SEP then goes quiet for **33 seconds** before it opens the xARM
+/// exchange at 42.72 s and advertises sbio/skdl/sse/scrd/sks at 42.94-43.03 s.
+/// A 15 s bound gives up at ~24 s, enters PHASE_READY with no key store, and
+/// `activate_touchid()` is skipped for the rest of the boot -- which is the
+/// whole of the J700's "SEP stalls at 7 endpoints" failure.
+///
+/// Waiting longer costs a healthy machine nothing: the wait exits as soon as
+/// the key store is present, so a SEP that advertises it promptly is
+/// unaffected.
+const EXCHANGE_TIMEOUT_MS: time::Msecs = 90000;
 
 const PHASE_ATTACH: u32 = 0;
 const PHASE_EXCHANGE: u32 = 1;
