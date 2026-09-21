@@ -1148,5 +1148,17 @@
 	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
 	clock-names = "clock-154", "clock-194";
 	apple,iomfb-surfaces = <0>;
+
+	/*
+	 * The J700 has no HDMI socket: this DCP's only output is the DP-Alt
+	 * path on the rear Type-C connector, so the connector is a USB-C one.
+	 * Without this property dcp_probe() falls through to
+	 * DRM_MODE_CONNECTOR_Unknown and DRM reports the connector as
+	 * "Unknown-2", which is wrong in every mode list, log and randr
+	 * output userspace prints.  No kernel path branches between Unknown
+	 * and USB -- the two HPD decisions in dcp.c test for DisplayPort and
+	 * eDP -- so this changes the name and nothing else.
+	 */
+	apple,connector-type = "USB-C";
 	status = "okay";
 };
