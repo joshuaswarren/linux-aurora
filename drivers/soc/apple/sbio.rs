@@ -1333,6 +1333,10 @@ impl SepData {
             .sbio_expect_ok(&crate::sbio::sbio_prepare_image_processing())
             .is_none()
         {
+            dev_err!(
+                self.dev,
+                "verify: the enclave refused PREPARE_IMAGE_PROCESSING\n"
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
         let _image = ImageContext { sep: self };
@@ -1347,6 +1351,10 @@ impl SepData {
             crate::shim::monotonic_ns(),
         );
         if self.sbio_expect_ok(&init).is_none() {
+            dev_err!(
+                self.dev,
+                "verify: the enclave refused IMAGE_PROCESSING_INIT for a match\n"
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
@@ -1361,9 +1369,16 @@ impl SepData {
         drop(capture);
 
         let Some(assessment) = self.sbio_expect_ok(&crate::sbio::sbio_image_assessment()) else {
+            dev_err!(self.dev, "verify: the enclave refused IMAGE_ASSESSMENT\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         if assessment.len() <= crate::sbio::ASSESS_USABLE_MATCH {
+            dev_err!(
+                self.dev,
+                "verify: assessment is {} bytes, too short to reach ASSESS_USABLE_MATCH ({:#04x}); that offset is reverse-engineered\n",
+                assessment.len(),
+                crate::sbio::ASSESS_USABLE_MATCH
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
@@ -1372,9 +1387,23 @@ impl SepData {
         }
 
         let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_match_result()) else {
+            dev_err!(self.dev, "verify: the enclave refused MATCH_RESULT\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
+            // Same shape as the enrolment-result parse: a short reply fails the
+            // length gate and, left silent, every unlock would fail with
+            // nothing to say why.  SBIO_MATCH_RESULT_LEN is confirmed against
+            // AppleMesaSEPDriver::handleMatch, which gates on `cmp x8, #0xca2`,
+            // so a mismatch here means the enclave sent something unexpected
+            // rather than that the constant is wrong.
+            dev_err!(
+                self.dev,
+                "verify: MATCH_RESULT was {} bytes, expected at least {}; head={:02x?}\n",
+                result.len(),
+                crate::sbio::SBIO_MATCH_RESULT_LEN,
+                &result[..core::cmp::min(24, result.len())]
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
