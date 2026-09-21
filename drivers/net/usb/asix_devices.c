@@ -597,17 +597,39 @@ static void ax88772_suspend(struct usbnet *dev)
 {
 	struct asix_common_private *priv = dev->driver_priv;
 	u16 medium;
+	u8 opt = 0;
+	bool wol;
+
+	/*
+	 * Ask the chip what it is armed to wake on rather than assuming it is
+	 * nothing.  asix_set_wol() writes the monitor-mode register directly,
+	 * so this is the authoritative state, and asix_read_cmd()'s in_pm form
+	 * is safe here for the same reason asix_read_medium_status(dev, 1) is.
+	 *
+	 * Passing wol_enabled = false unconditionally made phylink power the
+	 * PHY down on every suspend, and clearing AX_MEDIUM_RE stopped the MAC
+	 * receiving, so a magic packet could never reach the part however the
+	 * monitor-mode register was set.  On J700 that was the last of three
+	 * independent reasons Wake-on-LAN did nothing -- the others being that
+	 * the AIC could not arm a wake at all, and that dwc3-apple never
+	 * declared itself wakeup-capable.
+	 */
+	if (asix_read_cmd(dev, AX_CMD_READ_MONITOR_MODE, 0, 0, 1, &opt, 1) < 0)
+		opt = 0;
+	wol = opt & (AX_MONITOR_LINK | AX_MONITOR_MAGIC);
 
 	if (netif_running(dev->net)) {
 		rtnl_lock();
-		phylink_suspend(priv->phylink, false);
+		phylink_suspend(priv->phylink, wol);
 		rtnl_unlock();
 	}
 
-	/* Stop MAC operation */
-	medium = asix_read_medium_status(dev, 1);
-	medium &= ~AX_MEDIUM_RE;
-	asix_write_medium_mode(dev, medium, 1);
+	/* Stop MAC operation -- but not when it has to keep listening. */
+	if (!wol) {
+		medium = asix_read_medium_status(dev, 1);
+		medium &= ~AX_MEDIUM_RE;
+		asix_write_medium_mode(dev, medium, 1);
+	}
 
 	netdev_dbg(dev->net, "ax88772_suspend: medium=0x%04x\n",
 		   asix_read_medium_status(dev, 1));

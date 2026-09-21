@@ -486,6 +486,23 @@ static struct irq_chip aic2_chip = {
 	.irq_unmask = aic_irq_unmask,
 	.irq_eoi = aic_irq_eoi,
 	.irq_set_type = aic_irq_set_type,
+	/*
+	 * The AIC needs no programming to arm a wakeup.  These machines only
+	 * implement s2idle -- /sys/power/mem_sleep reads "[s2idle]" -- where
+	 * the CPUs park in a shallow idle with interrupts live, so an
+	 * interrupt that suspend_device_irqs() has been told to leave alone is
+	 * all that is required to end the suspend.
+	 *
+	 * Without this flag enable_irq_wake() fails with -ENXIO for every AIC
+	 * interrupt, so nothing on the machine can be a wake source: every
+	 * /sys/kernel/irq/N/wakeup reads "disabled", and a suspended J700 had
+	 * to be recovered with a VDM reset because no Wake-on-LAN packet could
+	 * reach the AP.
+	 *
+	 * A deeper state that gates power would need real wake programming
+	 * here; none is implemented on this platform.
+	 */
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 /*
