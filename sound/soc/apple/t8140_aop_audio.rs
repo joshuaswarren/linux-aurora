@@ -105,9 +105,6 @@ const AUDIO_DEV_CIN: u32 = from_fourcc(b"cin ");
 const AUDIO_DEV_HPAI: u32 = from_fourcc(b"hpai");
 /// kIOReturnBusy from the firmware: the device is already attached.
 const AUDIO_RET_BUSY: u32 = 0xe00002d5;
-/// kIOReturnNotFound: the device has no such property.  `hpai` answers this
-/// for 301/302, which are source-ring concepts it has no business holding.
-const AUDIO_RET_NOT_FOUND: u32 = 0xe00002f0;
 const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
 const SPKR_POWER_STATE_PWRD: u32 = from_fourcc(b"pwrd");
 const RATE: u32 = 16000;
@@ -131,7 +128,8 @@ fn aop_counter_ticks(counter: u64, frequency: u64) -> Result<u64> {
     // multiplication on an otherwise ordinary long-running system.
     let seconds = counter / frequency;
     let remainder = (counter % frequency) * AOP_TIMEBASE_HZ / frequency;
-    seconds.checked_mul(AOP_TIMEBASE_HZ)
+    seconds
+        .checked_mul(AOP_TIMEBASE_HZ)
         .and_then(|ticks| ticks.checked_add(remainder))
         .ok_or(EOVERFLOW)
 }
@@ -259,7 +257,14 @@ struct PowerRequest {
 
 impl PowerRequest {
     fn new(dev_id: u32, sequence: u32, state: u32, param: u32) -> Result<PowerRequest> {
-        Ok(PowerRequest { dev_id, sequence, timestamp: aop_timestamp()?, state, param, ..PowerRequest::default() })
+        Ok(PowerRequest {
+            dev_id,
+            sequence,
+            timestamp: aop_timestamp()?,
+            state,
+            param,
+            ..PowerRequest::default()
+        })
     }
 }
 
@@ -278,7 +283,12 @@ struct Service {
 
 impl Service {
     const fn new(dev_id: u32, name: &'static str) -> Service {
-        Service { dev_id, name, sequence: Atomic::new(0), running: Atomic::new(0) }
+        Service {
+            dev_id,
+            name,
+            sequence: Atomic::new(0),
+            running: Atomic::new(0),
+        }
     }
 }
 
@@ -375,7 +385,11 @@ impl SndSocT8140AopData {
         if retcode != 0 {
             // Not "lpai": this helper serves every device on the service, and
             // naming one of them made an hpai failure read as an lpai failure.
-            dev_err!(self.dev, "audio wrapped call failed, return code {:#x}\n", retcode);
+            dev_err!(
+                self.dev,
+                "audio wrapped call failed, return code {:#x}\n",
+                retcode
+            );
             return Err(EIO);
         }
         Ok(ret)
@@ -389,11 +403,20 @@ impl SndSocT8140AopData {
         match ret {
             0 => Ok(()),
             AUDIO_RET_BUSY => {
-                dev_dbg!(self.dev, "{} already attached by an earlier instance\n", name);
+                dev_dbg!(
+                    self.dev,
+                    "{} already attached by an earlier instance\n",
+                    name
+                );
                 Ok(())
             }
             _ => {
-                dev_err!(self.dev, "unable to attach {}, return code {:#x}\n", name, ret);
+                dev_err!(
+                    self.dev,
+                    "unable to attach {}, return code {:#x}\n",
+                    name,
+                    ret
+                );
                 Err(EIO)
             }
         }
@@ -401,179 +424,6 @@ impl SndSocT8140AopData {
 
     fn attach_lpai(&self) -> Result<()> {
         self.attach_device(AUDIO_DEV_LPAI, "lpai")
-    }
-
-    /// Ask the firmware what it knows about the high-quality microphone
-    /// array, without claiming it: attach, then read back the three
-    /// properties the `lpai` bring-up reads.  This answers the only question
-    /// the ADT cannot -- whether the AOP's own audio service exposes `hpai`
-    /// at all, or whether the array is reachable solely through the
-    /// AOP2/HPMicAudioDriver exclave.
-    ///
-    /// Behind `hpai_probe` because a property call the firmware does not
-    /// recognise wedges the AOP for the rest of the boot, taking the working
-    /// low-power microphone, jack and speaker paths with it (the same
-    /// failure the ALS `set_mode`/`set_unke4` parameters caused).  Never
-    /// fatal, so a rejection still leaves a usable card.
-    fn probe_hpai(&self) {
-        let ret = match self.epic_wrapped_call(&AudioAttachDevice::new(AUDIO_DEV_HPAI)) {
-            Ok(r) => r,
-            Err(e) => {
-                dev_info!(self.dev, "hpai: attach call failed: {:?}\n", e);
-                return;
-            }
-        };
-        if ret != 0 && ret != AUDIO_RET_BUSY {
-            dev_info!(self.dev, "hpai: attach rejected, return code {:#x}\n", ret);
-            return;
-        }
-        dev_info!(self.dev, "hpai: attached (return code {:#x})\n", ret);
-        for &(modifier, len, what) in [
-            (PROP_STREAM_FORMAT, 16usize, "stream format"),
-            (PROP_RING_GEOMETRY, 24usize, "ring geometry"),
-            (PROP_POWER_STATE, 4usize, "power state"),
-        ]
-        .iter()
-        {
-            match self.epic_wrapped_call_ret(&AudioGetDeviceProp::new(AUDIO_DEV_HPAI, modifier), 4 + len) {
-                Ok(v) => dev_info!(self.dev, "hpai: {} ({}) = {:02x?}\n", what, modifier, &v[..]),
-                Err(e) => dev_info!(self.dev, "hpai: {} ({}) failed: {:?}\n", what, modifier, e),
-            }
-        }
-    }
-
-    /// Walk a bounded set of property ids on `hpai` and report which ones the
-    /// firmware knows.  The array answered 200 and refused 301/302 with
-    /// `kIOReturnNotFound`, so its property space has to be found rather than
-    /// assumed -- it is an ADMAC device where `lpai` is a ring device.
-    ///
-    /// Reads only.  `_commandNodeGetProperty` changes no state and a refusal
-    /// comes back as a clean return code, which is why a sweep is safe here
-    /// when the ALS parameter *writes* were not.  Each reply is asked for at
-    /// the 8 bytes that worked for property 200; the firmware states the real
-    /// length in the first word, so a longer property still identifies itself.
-    fn probe_hpai_properties(&self) {
-        const GROUPS: [(u32, u32); 4] = [(200, 206), (300, 310), (400, 404), (700, 702)];
-        let mut found = 0;
-        for &(first, last) in GROUPS.iter() {
-            for modifier in first..=last {
-                match self
-                    .epic_wrapped_call_ret_code(&AudioGetDeviceProp::new(AUDIO_DEV_HPAI, modifier), 8)
-                {
-                    Ok((0, v)) => {
-                        found += 1;
-                        dev_info!(self.dev, "hpai: property {} = {:02x?}\n", modifier, &v[..]);
-                        // The firmware states the property's real length in the
-                        // first word.  Anything longer than the 8 bytes asked
-                        // for above is the interesting kind -- 203 is 224 bytes
-                        // and is where the stream description has to live,
-                        // since this device has no 301/302 -- so read it again
-                        // at its own length and dump it whole.
-                        let reported = u32::from_le_bytes(v[..4].try_into().unwrap()) as usize;
-                        if reported > 4 && reported <= 512 {
-                            match self.epic_wrapped_call_ret_code(
-                                &AudioGetDeviceProp::new(AUDIO_DEV_HPAI, modifier),
-                                4 + reported,
-                            ) {
-                                Ok((0, full)) => dev_info!(
-                                    self.dev,
-                                    "hpai: property {} full ({} bytes) = {:02x?}\n",
-                                    modifier,
-                                    reported,
-                                    &full[..]
-                                ),
-                                Ok((rc, _)) => dev_info!(
-                                    self.dev,
-                                    "hpai: property {} full read return code {:#x}\n",
-                                    modifier,
-                                    rc
-                                ),
-                                Err(e) => dev_info!(
-                                    self.dev,
-                                    "hpai: property {} full read failed: {:?}\n",
-                                    modifier,
-                                    e
-                                ),
-                            }
-                        }
-                    }
-                    // the expected negative; say nothing
-                    Ok((AUDIO_RET_NOT_FOUND, _)) => (),
-                    Ok((rc, _)) => dev_info!(self.dev, "hpai: property {} return code {:#x}\n", modifier, rc),
-                    Err(e) => dev_info!(self.dev, "hpai: property {} call failed: {:?}\n", modifier, e),
-                }
-            }
-        }
-        dev_info!(self.dev, "hpai: {} properties answered\n", found);
-    }
-
-    /// Ask the firmware to take the array out of `idle`, read back the state
-    /// it lands in, and put it back.
-    ///
-    /// This is the last question that matters before any ASoC plumbing.
-    /// Attaching proves the firmware will *talk* about the array to a client
-    /// that is not the exclave; only a power request proves it will *run* it.
-    ///
-    /// Unlike the sweeps above this one **writes**: property 202 with a
-    /// `PowerRequest`, which is the same 48-byte record the output services
-    /// already use and exactly the length the array reports for 202, so it is
-    /// a well-formed call for this device rather than a guess. It is behind
-    /// `hpai_probe=3` all the same.
-    ///
-    /// `param` is 1 for `lpai` and 0 for the output services and nothing says
-    /// which an `iop-audio-s` capture device wants, so try 0 then 1.
-    ///
-    /// No audio is captured: the stream is never started, and the device is
-    /// returned to `pw0 ` before this returns.
-    fn probe_hpai_power(&self) {
-        let mut sequence = 0u32;
-        for param in [0u32, 1u32] {
-            sequence += 1;
-            let req = match PowerRequest::new(AUDIO_DEV_HPAI, sequence, SPKR_POWER_STATE_PWRD, param) {
-                Ok(r) => r,
-                Err(e) => {
-                    dev_info!(self.dev, "hpai: power request build failed: {:?}\n", e);
-                    return;
-                }
-            };
-            match self.epic_wrapped_call(&AudioSetDeviceProp::new(
-                AUDIO_DEV_HPAI,
-                PROP_POWER_REQUEST,
-                req,
-            )) {
-                Ok(0) => dev_info!(self.dev, "hpai: pwrd accepted (param {})\n", param),
-                Ok(rc) => {
-                    dev_info!(self.dev, "hpai: pwrd (param {}) rejected: {:#x}\n", param, rc);
-                    continue;
-                }
-                Err(e) => {
-                    dev_info!(self.dev, "hpai: pwrd (param {}) failed: {:?}\n", param, e);
-                    continue;
-                }
-            }
-            match self.epic_wrapped_call_ret_code(
-                &AudioGetDeviceProp::new(AUDIO_DEV_HPAI, PROP_POWER_STATE),
-                8,
-            ) {
-                Ok((0, v)) if v.len() >= 8 => {
-                    dev_info!(self.dev, "hpai: state after pwrd (param {}) = {:02x?}\n", param, &v[4..8]);
-                    break;
-                }
-                Ok((rc, _)) => dev_info!(self.dev, "hpai: state read back return code {:#x}\n", rc),
-                Err(e) => dev_info!(self.dev, "hpai: state read back failed: {:?}\n", e),
-            }
-        }
-        sequence += 1;
-        if let Ok(req) = PowerRequest::new(AUDIO_DEV_HPAI, sequence, SPKR_POWER_STATE_PW0, 0) {
-            match self.epic_wrapped_call(&AudioSetDeviceProp::new(
-                AUDIO_DEV_HPAI,
-                PROP_POWER_REQUEST,
-                req,
-            )) {
-                Ok(rc) => dev_info!(self.dev, "hpai: returned to pw0 (return code {:#x})\n", rc),
-                Err(e) => dev_info!(self.dev, "hpai: returning to pw0 failed: {:?}\n", e),
-            }
-        }
     }
 
     fn set_channel_control(&self) -> Result<()> {
@@ -588,7 +438,11 @@ impl SndSocT8140AopData {
             ctl,
         ))?;
         if ret != 0 {
-            dev_err!(self.dev, "unable to set lpai channels, return code {:#x}\n", ret);
+            dev_err!(
+                self.dev,
+                "unable to set lpai channels, return code {:#x}\n",
+                ret
+            );
             return Err(EIO);
         }
         Ok(())
@@ -596,14 +450,26 @@ impl SndSocT8140AopData {
 
     /// Reply layout after the retcode: u32 length, then the property bytes.
     fn get_prop(&self, modifier: u32, len: usize) -> Result<KVec<u8>> {
-        let ret = self.epic_wrapped_call_ret(&AudioGetDeviceProp::new(AUDIO_DEV_LPAI, modifier), 4 + len)?;
+        let ret = self
+            .epic_wrapped_call_ret(&AudioGetDeviceProp::new(AUDIO_DEV_LPAI, modifier), 4 + len)?;
         if ret.len() < 4 + len {
-            dev_err!(self.dev, "lpai property {} reply too short ({})\n", modifier, ret.len());
+            dev_err!(
+                self.dev,
+                "lpai property {} reply too short ({})\n",
+                modifier,
+                ret.len()
+            );
             return Err(EIO);
         }
         let reported = u32::from_le_bytes(ret[..4].try_into().unwrap()) as usize;
         if reported != len {
-            dev_err!(self.dev, "lpai property {} length {} (expected {})\n", modifier, reported, len);
+            dev_err!(
+                self.dev,
+                "lpai property {} length {} (expected {})\n",
+                modifier,
+                reported,
+                len
+            );
             return Err(EIO);
         }
         Ok(ret)
@@ -615,10 +481,16 @@ impl SndSocT8140AopData {
         let frames = u64::from_le_bytes(geo[12..20].try_into().unwrap());
         let quantum = u64::from_le_bytes(geo[20..28].try_into().unwrap());
         if frames == 0 || frames as usize * FRAME_BYTES > RING_BYTES || quantum == 0 {
-            dev_err!(self.dev, "invalid lpai ring geometry: {} frames, {} per report\n", frames, quantum);
+            dev_err!(
+                self.dev,
+                "invalid lpai ring geometry: {} frames, {} per report\n",
+                frames,
+                quantum
+            );
             return Err(EIO);
         }
-        self.ring_bytes.store((frames as usize * FRAME_BYTES) as u32, Relaxed);
+        self.ring_bytes
+            .store((frames as usize * FRAME_BYTES) as u32, Relaxed);
         // 301: stream format, sample rate at +4
         let fmt = self.get_prop(PROP_STREAM_FORMAT, 16)?;
         let rate = u32::from_le_bytes(fmt[8..12].try_into().unwrap());
@@ -646,13 +518,23 @@ impl SndSocT8140AopData {
             req,
         ))?;
         if ret != 0 {
-            dev_err!(self.dev, "lpai power request {:#x} rejected: {:#x}\n", state, ret);
+            dev_err!(
+                self.dev,
+                "lpai power request {:#x} rejected: {:#x}\n",
+                state,
+                ret
+            );
             return Err(EIO);
         }
         let st = self.get_prop(PROP_POWER_STATE, 4)?;
         let now = u32::from_le_bytes(st[4..8].try_into().unwrap());
         if now != state {
-            dev_err!(self.dev, "lpai power state {:#x} after requesting {:#x}\n", now, state);
+            dev_err!(
+                self.dev,
+                "lpai power state {:#x} after requesting {:#x}\n",
+                now,
+                state
+            );
             return Err(EIO);
         }
         Ok(())
@@ -665,19 +547,36 @@ impl SndSocT8140AopData {
     fn service_set_power(&self, svc: &Service, state: u32) -> Result<()> {
         let sequence = svc.sequence.fetch_add(1, Relaxed) + 1;
         let req = PowerRequest::new(svc.dev_id, sequence, state, 0)?;
-        let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(svc.dev_id, PROP_POWER_REQUEST, req))?;
+        let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(
+            svc.dev_id,
+            PROP_POWER_REQUEST,
+            req,
+        ))?;
         if ret != 0 {
-            dev_err!(self.dev, "{} power request {:#x} rejected: {:#x}\n", svc.name, state, ret);
+            dev_err!(
+                self.dev,
+                "{} power request {:#x} rejected: {:#x}\n",
+                svc.name,
+                state,
+                ret
+            );
             return Err(EIO);
         }
         if state == SPKR_POWER_STATE_PW0 {
-            let ret = self.epic_wrapped_call_ret(&AudioGetDeviceProp::new(svc.dev_id, PROP_POWER_STATE), 8)?;
+            let ret = self
+                .epic_wrapped_call_ret(&AudioGetDeviceProp::new(svc.dev_id, PROP_POWER_STATE), 8)?;
             if ret.len() < 8 {
                 return Err(EIO);
             }
             let now = u32::from_le_bytes(ret[4..8].try_into().unwrap());
             if now != state {
-                dev_err!(self.dev, "{} power state {:#x} after requesting {:#x}\n", svc.name, now, state);
+                dev_err!(
+                    self.dev,
+                    "{} power state {:#x} after requesting {:#x}\n",
+                    svc.name,
+                    now,
+                    state
+                );
                 return Err(EIO);
             }
         }
@@ -688,7 +587,11 @@ impl SndSocT8140AopData {
     /// way up.
     fn domains(&self, svc: &Service, pds: &[&Atomic<usize>], on: bool) -> Result<()> {
         if pds.iter().any(|pd| pd.load(Relaxed) == 0) {
-            dev_err!(self.dev, "{}: its power domains are not attached\n", svc.name);
+            dev_err!(
+                self.dev,
+                "{}: its power domains are not attached\n",
+                svc.name
+            );
             return Err(ENODEV);
         }
         if on {
@@ -702,12 +605,21 @@ impl SndSocT8140AopData {
                     // after boot; a failed resume leaves the virtual device
                     // in the runtime-PM error state, so clear that and try
                     // once more before giving up.
-                    dev_warn!(self.dev, "{}: power domain {} did not power up: {}, retrying\n", svc.name, i, rc);
+                    dev_warn!(
+                        self.dev,
+                        "{}: power domain {} did not power up: {}, retrying\n",
+                        svc.name,
+                        i,
+                        rc
+                    );
                     // SAFETY: `dev` is a power-domain device attached at probe and detached only in
                     // `Drop`.
                     unsafe {
                         bindings::pm_runtime_put_noidle(dev);
-                        bindings::__pm_runtime_set_status(dev, bindings::rpm_status_RPM_SUSPENDED as u32);
+                        bindings::__pm_runtime_set_status(
+                            dev,
+                            bindings::rpm_status_RPM_SUSPENDED as u32,
+                        );
                     }
                     kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
                     // SAFETY: `dev` is a power-domain device attached at probe and detached only in
@@ -715,14 +627,24 @@ impl SndSocT8140AopData {
                     rc = unsafe { bindings::pm_runtime_get_sync(dev) };
                 }
                 if rc < 0 {
-                    dev_err!(self.dev, "{}: power domain {} did not power up: {}\n", svc.name, i, rc);
+                    dev_err!(
+                        self.dev,
+                        "{}: power domain {} did not power up: {}\n",
+                        svc.name,
+                        i,
+                        rc
+                    );
                     // SAFETY: `dev` is a power-domain device attached at probe and detached only in
                     // `Drop`.
                     unsafe { bindings::pm_runtime_put_noidle(dev) };
                     for done in pds[..i].iter() {
                         // SAFETY: `done` holds a power-domain device attached at probe; the get
                         // above succeeded for it.
-                        unsafe { bindings::pm_runtime_put_sync(done.load(Relaxed) as *mut bindings::device) };
+                        unsafe {
+                            bindings::pm_runtime_put_sync(
+                                done.load(Relaxed) as *mut bindings::device
+                            )
+                        };
                     }
                     return Err(EIO);
                 }
@@ -866,7 +788,11 @@ impl SndSocT8140AopData {
     /// Output mute (property 700) is independent of the amplifier's SD_MODE;
     /// the amplifier stays off across a failure here.
     fn spkr_set_mute(&self, muted: bool) -> Result<()> {
-        let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(AUDIO_DEV_SPKR, PROP_OUTPUT_MUTE, muted as u32))?;
+        let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(
+            AUDIO_DEV_SPKR,
+            PROP_OUTPUT_MUTE,
+            muted as u32,
+        ))?;
         if ret != 0 {
             dev_err!(self.dev, "speaker mute request rejected: {:#x}\n", ret);
             return Err(EIO);
@@ -921,8 +847,15 @@ impl SndSocT8140AopData {
 
 /// Copy `len` bytes from the source ring (absolute producer offset `from`)
 /// into the ALSA buffer at `hw_ptr`, both wrapping.
-fn copy_span(data: &SndSocT8140AopData, dma_area: *mut u8, buffer_bytes: usize, ring_bytes: usize,
-             from: u64, len: usize, hw_ptr: usize) -> usize {
+fn copy_span(
+    data: &SndSocT8140AopData,
+    dma_area: *mut u8,
+    buffer_bytes: usize,
+    ring_bytes: usize,
+    from: u64,
+    len: usize,
+    hw_ptr: usize,
+) -> usize {
     let mut src = (from % ring_bytes as u64) as usize;
     let mut dst = hw_ptr;
     let mut left = len;
@@ -942,7 +875,11 @@ fn copy_span(data: &SndSocT8140AopData, dma_area: *mut u8, buffer_bytes: usize, 
 impl ReportListener for SndSocT8140AopData {
     fn process_report(&self, _subtype: u16, report: &[u8]) -> Result<()> {
         if report.len() < REPORT_MIN_LEN {
-            dev_err!(self.dev, "short lpai producer report ({} bytes)\n", report.len());
+            dev_err!(
+                self.dev,
+                "short lpai producer report ({} bytes)\n",
+                report.len()
+            );
             return Ok(());
         }
         let frames = u64::from_le_bytes(report[0x40..0x48].try_into().unwrap()) + 1;
@@ -950,7 +887,12 @@ impl ReportListener for SndSocT8140AopData {
         let ring_bytes = self.ring_bytes.load(Relaxed) as usize;
         let absolute = frames * FRAME_BYTES as u64;
         if ring_bytes == 0 || cursor != absolute % ring_bytes as u64 {
-            dev_warn!(self.dev, "inconsistent lpai report: frames {} cursor {:#x}\n", frames, cursor);
+            dev_warn!(
+                self.dev,
+                "inconsistent lpai report: frames {} cursor {:#x}\n",
+                frames,
+                cursor
+            );
             return Ok(());
         }
 
@@ -989,8 +931,15 @@ impl ReportListener for SndSocT8140AopData {
         // the op's duration (between hw_params and hw_free for the buffer).
         let dma_area = unsafe { (*runtime).dma_area };
         let buffer_bytes = st.buffer_bytes;
-        let new_ptr = copy_span(self, dma_area, buffer_bytes, ring_bytes, copied, delta,
-                                st.hw_ptr_bytes);
+        let new_ptr = copy_span(
+            self,
+            dma_area,
+            buffer_bytes,
+            ring_bytes,
+            copied,
+            delta,
+            st.hw_ptr_bytes,
+        );
         st.hw_ptr_bytes = new_ptr;
         st.copied = Some(absolute);
         st.period_acc += delta;
@@ -1139,7 +1088,10 @@ unsafe extern "C" fn lpai_pcm_prepare(substream: *mut bindings::snd_pcm_substrea
 
 /// Called with the ALSA stream lock held: only the run flag changes here,
 /// the counters were reset by prepare.
-unsafe extern "C" fn lpai_pcm_trigger(substream: *mut bindings::snd_pcm_substream, cmd: i32) -> i32 {
+unsafe extern "C" fn lpai_pcm_trigger(
+    substream: *mut bindings::snd_pcm_substream,
+    cmd: i32,
+) -> i32 {
     // SAFETY: the PCM's private data is the `Arc` handed to ALSA at probe, released in
     // `lpai_pcm_free_private` after the last op.
     let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
@@ -1226,22 +1178,21 @@ const SPKR_CEILING_Q31: i64 = 1 << 30;
 const SPKR_VOLUME_MAX: u32 = 127;
 const _: () = assert!(SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64 == SPKR_CEILING_Q31);
 const SPKR_VOLUME_Q31: [u32; 128] = [
-             0,     760151,     805193,     852903,     903441,     956973,    1013678,    1073742,
-       1137365,    1204758,    1276145,    1351761,    1431858,    1516701,    1606571,    1701766,
-       1802602,    1909413,    2022553,    2142397,    2269342,    2403809,    2546243,    2697118,
-       2856932,    3026216,    3205530,    3395470,    3596664,    3809780,    4035523,    4274643,
-       4527932,    4796229,    5080423,    5381457,    5700328,    6038094,    6395874,    6774853,
-       7176288,    7601510,    8051928,    8529034,    9034412,    9569734,   10136776,   10737418,
-      11373650,   12047581,   12761445,   13517609,   14318577,   15167006,   16065708,   17017661,
-      18026021,   19094130,   20225528,   21423966,   22693416,   24038085,   25462431,   26971175,
-      28569318,   30262156,   32055302,   33954698,   35966640,   38097798,   40355234,   42746432,
-      45279317,   47962285,   50804230,   53814569,   57003283,   60380940,   63958736,   67748529,
-      71762882,   76015100,   80519278,   85290345,   90344115,   95697341,  101367765,  107374182,
-     113736503,  120475814,  127614455,  135176087,  143185773,  151670064,  160657080,  170176611,
-     180260209,  190941298,  202255281,  214239660,  226934158,  240380852,  254624313,  269711752,
-     285693178,  302621563,  320553018,  339546978,  359666402,  380977976,  403552340,  427464319,
-     452793173,  479622855,  508042296,  538145694,  570032831,  603809400,  639587356,  677485290,
-     717628817,  760150998,  805192776,  852903448,  903441154,  956973408, 1013677647, 1073741824,
+    0, 760151, 805193, 852903, 903441, 956973, 1013678, 1073742, 1137365, 1204758, 1276145,
+    1351761, 1431858, 1516701, 1606571, 1701766, 1802602, 1909413, 2022553, 2142397, 2269342,
+    2403809, 2546243, 2697118, 2856932, 3026216, 3205530, 3395470, 3596664, 3809780, 4035523,
+    4274643, 4527932, 4796229, 5080423, 5381457, 5700328, 6038094, 6395874, 6774853, 7176288,
+    7601510, 8051928, 8529034, 9034412, 9569734, 10136776, 10737418, 11373650, 12047581, 12761445,
+    13517609, 14318577, 15167006, 16065708, 17017661, 18026021, 19094130, 20225528, 21423966,
+    22693416, 24038085, 25462431, 26971175, 28569318, 30262156, 32055302, 33954698, 35966640,
+    38097798, 40355234, 42746432, 45279317, 47962285, 50804230, 53814569, 57003283, 60380940,
+    63958736, 67748529, 71762882, 76015100, 80519278, 85290345, 90344115, 95697341, 101367765,
+    107374182, 113736503, 120475814, 127614455, 135176087, 143185773, 151670064, 160657080,
+    170176611, 180260209, 190941298, 202255281, 214239660, 226934158, 240380852, 254624313,
+    269711752, 285693178, 302621563, 320553018, 339546978, 359666402, 380977976, 403552340,
+    427464319, 452793173, 479622855, 508042296, 538145694, 570032831, 603809400, 639587356,
+    677485290, 717628817, 760150998, 805192776, 852903448, 903441154, 956973408, 1013677647,
+    1073741824,
 ];
 /// The component's only "register": the speaker volume.
 const REG_SPKR_VOLUME: u32 = 0;
@@ -1265,7 +1216,9 @@ unsafe impl<T> Sync for SyncCell<T> {}
 ///
 /// `component` must be this driver's registered component: its device's
 /// drvdata is the pinned `SndSocT8140AopDriver`, which outlives every op.
-unsafe fn component_data<'a>(component: *mut bindings::snd_soc_component) -> &'a SndSocT8140AopData {
+unsafe fn component_data<'a>(
+    component: *mut bindings::snd_soc_component,
+) -> &'a SndSocT8140AopData {
     // SAFETY: by the caller's contract.
     unsafe { &component_driver(component).data }
 }
@@ -1275,7 +1228,9 @@ unsafe fn component_data<'a>(component: *mut bindings::snd_soc_component) -> &'a
 /// # Safety
 ///
 /// As for [`component_data`].
-unsafe fn component_driver<'a>(component: *mut bindings::snd_soc_component) -> &'a SndSocT8140AopDriver {
+unsafe fn component_driver<'a>(
+    component: *mut bindings::snd_soc_component,
+) -> &'a SndSocT8140AopDriver {
     // SAFETY: by the caller's contract.
     let drv = unsafe { (*(*component).dev).driver_data } as *const SndSocT8140AopDriver;
     // SAFETY: by the caller's contract.
@@ -1287,7 +1242,9 @@ unsafe fn component_driver<'a>(component: *mut bindings::snd_soc_component) -> &
 /// # Safety
 ///
 /// `substream` must be live and belong to one of this component's links.
-unsafe fn substream_rtd(substream: *mut bindings::snd_pcm_substream) -> *mut bindings::snd_soc_pcm_runtime {
+unsafe fn substream_rtd(
+    substream: *mut bindings::snd_pcm_substream,
+) -> *mut bindings::snd_soc_pcm_runtime {
     // SAFETY: by the caller's contract.
     unsafe { (*substream).private_data as *mut bindings::snd_soc_pcm_runtime }
 }
@@ -1347,12 +1304,16 @@ unsafe extern "C" fn asoc_pcm_new(
     }
     // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    let Some(fe) = (unsafe { fe_index(rtd) }) else { return EINVAL.to_errno() };
+    let Some(fe) = (unsafe { fe_index(rtd) }) else {
+        return EINVAL.to_errno();
+    };
     // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
     let pcm = unsafe { (*rtd).pcm };
     for stream in 0..2usize {
-        let Some(name) = FE_DMA_NAMES[fe][stream] else { continue };
+        let Some(name) = FE_DMA_NAMES[fe][stream] else {
+            continue;
+        };
         // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
         // `snd_soc_pcm_runtime` of one of this component's links.
         let substream = unsafe { (*pcm).streams[stream].substream };
@@ -1373,10 +1334,12 @@ unsafe extern "C" fn asoc_pcm_new(
         } else {
             (&data.spkr, &spkr_leap[..])
         };
-        let powered = (fe == FE_SPKR || fe == FE_HPAI)
-            && data.domains(leap_svc, leap, true).is_ok();
+        let powered =
+            (fe == FE_SPKR || fe == FE_HPAI) && data.domains(leap_svc, leap, true).is_ok();
         // SAFETY: FFI call with the live platform device and a NUL-terminated channel name.
-        let requested = kernel::error::from_err_ptr(unsafe { bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr()) });
+        let requested = kernel::error::from_err_ptr(unsafe {
+            bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr())
+        });
         if powered {
             let _ = data.domains(leap_svc, leap, false);
         }
@@ -1385,7 +1348,13 @@ unsafe extern "C" fn asoc_pcm_new(
             Err(e) => {
                 // A front-end can be left without a channel: its PCM exists
                 // but opens with ENODEV.
-                dev_info!(data.dev, "front-end {}: DMA channel {:?} unavailable: {:?}\n", fe, name, e);
+                dev_info!(
+                    data.dev,
+                    "front-end {}: DMA channel {:?} unavailable: {:?}\n",
+                    fe,
+                    name,
+                    e
+                );
                 continue;
             }
         };
@@ -1405,7 +1374,10 @@ unsafe extern "C" fn asoc_pcm_new(
     0
 }
 
-unsafe extern "C" fn asoc_pcm_free(component: *mut bindings::snd_soc_component, pcm: *mut bindings::snd_pcm) {
+unsafe extern "C" fn asoc_pcm_free(
+    component: *mut bindings::snd_soc_component,
+    pcm: *mut bindings::snd_pcm,
+) {
     // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
     // driver.
     let data = unsafe { component_data(component) };
@@ -1419,7 +1391,9 @@ unsafe extern "C" fn asoc_pcm_free(component: *mut bindings::snd_soc_component, 
     }
     // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    let Some(fe) = (unsafe { fe_index(rtd) }) else { return };
+    let Some(fe) = (unsafe { fe_index(rtd) }) else {
+        return;
+    };
     for stream in 0..2 {
         let chan = core::mem::replace(&mut data.fe_chans.lock()[fe][stream], 0);
         if chan != 0 {
@@ -1447,7 +1421,9 @@ unsafe extern "C" fn asoc_pcm_open(
     }
     // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    let Some(fe) = (unsafe { fe_index(rtd) }) else { return EINVAL.to_errno() };
+    let Some(fe) = (unsafe { fe_index(rtd) }) else {
+        return EINVAL.to_errno();
+    };
     // SAFETY: the substream is live for the duration of the op.
     let stream = unsafe { (*substream).stream } as usize;
     let chan = data.fe_chans.lock()[fe][stream & 1] as *mut bindings::dma_chan;
@@ -1540,7 +1516,8 @@ unsafe extern "C" fn asoc_pcm_hw_params(
     // SAFETY: ASoC calls hw_params with a live `snd_pcm_hw_params`.
     let channels = unsafe {
         let iv = &(*params).intervals[(bindings::SNDRV_PCM_HW_PARAM_CHANNELS
-            - bindings::SNDRV_PCM_HW_PARAM_FIRST_INTERVAL) as usize];
+            - bindings::SNDRV_PCM_HW_PARAM_FIRST_INTERVAL)
+            as usize];
         iv.min
     };
     let window = core::cmp::min(channels, 4);
@@ -1596,7 +1573,7 @@ fn f32_bits_of_q31(v: i32) -> u32 {
     let sign = if v < 0 { 1u32 << 31 } else { 0 };
     let m = v.unsigned_abs();
     let p = 31 - m.leading_zeros(); // position of the leading one, 0..=31
-    // value = m * 2^-31 = 1.f * 2^(p - 31)
+                                    // value = m * 2^-31 = 1.f * 2^(p - 31)
     let exp = (p as i32 - 31 + 127) as u32;
     let mant = if p >= 23 {
         (m >> (p - 23)) & 0x7f_ffff
@@ -1647,12 +1624,20 @@ unsafe extern "C" fn asoc_pcm_copy(
     if !playback {
         // SAFETY: ALSA hands us a live iov_iter for the whole call.
         let iov = unsafe { kernel::iov::IovIterDest::from_raw(iter) };
-        return if iov.copy_to_iter(dst) == bytes { 0 } else { EFAULT.to_errno() };
+        return if iov.copy_to_iter(dst) == bytes {
+            0
+        } else {
+            EFAULT.to_errno()
+        };
     }
     // SAFETY: as above.
     let iov = unsafe { kernel::iov::IovIterSource::from_raw(iter) };
     if unsafe { fe_index(rtd) } != Some(FE_SPKR) {
-        return if iov.copy_from_iter(dst) == bytes { 0 } else { EFAULT.to_errno() };
+        return if iov.copy_from_iter(dst) == bytes {
+            0
+        } else {
+            EFAULT.to_errno()
+        };
     }
     // S32_LE interleaved stereo in, float32 LE out, same byte count.
     // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
@@ -1714,7 +1699,10 @@ const ENOTSUPP_POINTER: bindings::snd_pcm_uframes_t = (-524i64) as bindings::snd
 
 /// The component's register file: the speaker volume, read and written by
 /// the standard volsw control helpers.
-unsafe extern "C" fn asoc_component_read(component: *mut bindings::snd_soc_component, reg: u32) -> u32 {
+unsafe extern "C" fn asoc_component_read(
+    component: *mut bindings::snd_soc_component,
+    reg: u32,
+) -> u32 {
     // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
     // driver.
     let data = unsafe { component_data(component) };
@@ -1724,13 +1712,18 @@ unsafe extern "C" fn asoc_component_read(component: *mut bindings::snd_soc_compo
     }
 }
 
-unsafe extern "C" fn asoc_component_write(component: *mut bindings::snd_soc_component, reg: u32, val: u32) -> i32 {
+unsafe extern "C" fn asoc_component_write(
+    component: *mut bindings::snd_soc_component,
+    reg: u32,
+    val: u32,
+) -> i32 {
     // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
     // driver.
     let data = unsafe { component_data(component) };
     match reg {
         REG_SPKR_VOLUME => {
-            data.spkr_volume.store(core::cmp::min(val, SPKR_VOLUME_MAX), Relaxed);
+            data.spkr_volume
+                .store(core::cmp::min(val, SPKR_VOLUME_MAX), Relaxed);
             0
         }
         _ => EINVAL.to_errno(),
@@ -1762,32 +1755,35 @@ static mut ASOC_CONTROLS: [bindings::snd_kcontrol_new; 1] = [bindings::snd_kcont
     info: Some(bindings::snd_soc_info_volsw),
     get: Some(bindings::snd_soc_get_volsw),
     put: Some(bindings::snd_soc_put_volsw),
-    tlv: bindings::snd_kcontrol_new__bindgen_ty_1 { p: SPKR_VOLUME_TLV.as_ptr() },
+    tlv: bindings::snd_kcontrol_new__bindgen_ty_1 {
+        p: SPKR_VOLUME_TLV.as_ptr(),
+    },
     private_value: 0,
     // SAFETY: zero is a valid value for the remaining fields (device, subdevice,
     // index, count, lock, unlock).
     ..unsafe { core::mem::zeroed() }
 }];
 
-static mut ASOC_COMPONENT: bindings::snd_soc_component_driver = bindings::snd_soc_component_driver {
-    name: c"j700-aop-audio".as_ptr(),
-    read: Some(asoc_component_read),
-    write: Some(asoc_component_write),
-    controls: ptr::null(),
-    num_controls: 1,
-    open: Some(asoc_pcm_open),
-    close: Some(asoc_pcm_close),
-    hw_params: Some(asoc_pcm_hw_params),
-    prepare: Some(asoc_pcm_prepare),
-    trigger: Some(asoc_pcm_trigger),
-    pointer: Some(asoc_pcm_pointer),
-    copy: Some(asoc_pcm_copy),
-    pcm_new: Some(asoc_pcm_new),
-    pcm_free: Some(asoc_pcm_free),
-    // SAFETY: all-zero is a valid (empty) component driver; the fields
-    // above are the ones this component implements.
-    ..unsafe { core::mem::zeroed() }
-};
+static mut ASOC_COMPONENT: bindings::snd_soc_component_driver =
+    bindings::snd_soc_component_driver {
+        name: c"j700-aop-audio".as_ptr(),
+        read: Some(asoc_component_read),
+        write: Some(asoc_component_write),
+        controls: ptr::null(),
+        num_controls: 1,
+        open: Some(asoc_pcm_open),
+        close: Some(asoc_pcm_close),
+        hw_params: Some(asoc_pcm_hw_params),
+        prepare: Some(asoc_pcm_prepare),
+        trigger: Some(asoc_pcm_trigger),
+        pointer: Some(asoc_pcm_pointer),
+        copy: Some(asoc_pcm_copy),
+        pcm_new: Some(asoc_pcm_new),
+        pcm_free: Some(asoc_pcm_free),
+        // SAFETY: all-zero is a valid (empty) component driver; the fields
+        // above are the ones this component implements.
+        ..unsafe { core::mem::zeroed() }
+    };
 
 /// Driver data from one of this component's DAIs.
 ///
@@ -1804,7 +1800,12 @@ unsafe extern "C" fn dai_accept_fmt(_dai: *mut bindings::snd_soc_dai, _fmt: u32)
     0
 }
 
-unsafe extern "C" fn dai_accept_sysclk(_dai: *mut bindings::snd_soc_dai, _id: i32, _freq: u32, _dir: i32) -> i32 {
+unsafe extern "C" fn dai_accept_sysclk(
+    _dai: *mut bindings::snd_soc_dai,
+    _id: i32,
+    _freq: u32,
+    _dir: i32,
+) -> i32 {
     0
 }
 
@@ -1821,7 +1822,10 @@ unsafe fn substream_is_playback(substream: *mut bindings::snd_pcm_substream) -> 
     stream == bindings::SNDRV_PCM_STREAM_PLAYBACK as i32
 }
 
-unsafe extern "C" fn cout_dai_startup(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn cout_dai_startup(
+    substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
     // SAFETY: the substream is live for the duration of the op.
@@ -1831,7 +1835,10 @@ unsafe extern "C" fn cout_dai_startup(substream: *mut bindings::snd_pcm_substrea
     }
 }
 
-unsafe extern "C" fn cout_dai_prepare(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn cout_dai_prepare(
+    substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
     // SAFETY: the substream is live for the duration of the op.
@@ -1841,14 +1848,20 @@ unsafe extern "C" fn cout_dai_prepare(substream: *mut bindings::snd_pcm_substrea
     }
 }
 
-unsafe extern "C" fn cout_dai_shutdown(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
+unsafe extern "C" fn cout_dai_shutdown(
+    substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
     // SAFETY: the substream is live for the duration of the op.
     data.jack_shutdown(unsafe { substream_is_playback(substream) });
 }
 
-unsafe extern "C" fn spkr_dai_startup(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn spkr_dai_startup(
+    substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
     // SAFETY: the substream is live for the duration of the op.
@@ -1865,7 +1878,10 @@ unsafe extern "C" fn spkr_dai_startup(substream: *mut bindings::snd_pcm_substrea
 
 /// The sense (capture) side runs from prepare: the RX DMA is armed by then
 /// and a capture may start before or after the speaker plays.
-unsafe extern "C" fn spkr_dai_prepare(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn spkr_dai_prepare(
+    substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: the substream is live for the duration of the op.
     if unsafe { substream_is_playback(substream) } {
         return 0;
@@ -1880,7 +1896,11 @@ unsafe extern "C" fn spkr_dai_prepare(substream: *mut bindings::snd_pcm_substrea
 
 /// Atomic context: queue the sleeping start, or note the stop (playback
 /// only; the sense side needs nothing here).
-unsafe extern "C" fn spkr_dai_trigger(substream: *mut bindings::snd_pcm_substream, cmd: i32, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn spkr_dai_trigger(
+    substream: *mut bindings::snd_pcm_substream,
+    cmd: i32,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: the substream is live for the duration of the op.
     if !unsafe { substream_is_playback(substream) } {
         return 0;
@@ -1909,7 +1929,10 @@ unsafe extern "C" fn spkr_dai_trigger(substream: *mut bindings::snd_pcm_substrea
     }
 }
 
-unsafe extern "C" fn spkr_dai_shutdown(substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
+unsafe extern "C" fn spkr_dai_shutdown(
+    substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) {
     // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
     // driver.
     let drv = unsafe { component_driver((*dai).component) };
@@ -1934,7 +1957,10 @@ unsafe extern "C" fn spkr_dai_shutdown(substream: *mut bindings::snd_pcm_substre
 /// The microphone array's DAI: capture only, and the firmware does the rest.
 /// `pwrd` from prepare, like the speaker sense, so the RX DMA is armed before
 /// the firmware starts filling it.
-unsafe extern "C" fn hpai_dai_startup(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn hpai_dai_startup(
+    _substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
     match data.hpai_startup() {
@@ -1943,7 +1969,10 @@ unsafe extern "C" fn hpai_dai_startup(_substream: *mut bindings::snd_pcm_substre
     }
 }
 
-unsafe extern "C" fn hpai_dai_prepare(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn hpai_dai_prepare(
+    _substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
     match data.hpai_prepare() {
@@ -1952,7 +1981,11 @@ unsafe extern "C" fn hpai_dai_prepare(_substream: *mut bindings::snd_pcm_substre
     }
 }
 
-unsafe extern "C" fn hpai_dai_trigger(_substream: *mut bindings::snd_pcm_substream, cmd: i32, dai: *mut bindings::snd_soc_dai) -> i32 {
+unsafe extern "C" fn hpai_dai_trigger(
+    _substream: *mut bindings::snd_pcm_substream,
+    cmd: i32,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
     // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
     // driver.
     let drv = unsafe { component_driver((*dai).component) };
@@ -1977,7 +2010,10 @@ unsafe extern "C" fn hpai_dai_trigger(_substream: *mut bindings::snd_pcm_substre
     }
 }
 
-unsafe extern "C" fn hpai_dai_shutdown(_substream: *mut bindings::snd_pcm_substream, dai: *mut bindings::snd_soc_dai) {
+unsafe extern "C" fn hpai_dai_shutdown(
+    _substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) {
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     unsafe { dai_data(dai) }.hpai_shutdown();
 }
@@ -2025,7 +2061,11 @@ static FE_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_
     ..unsafe { core::mem::zeroed() }
 });
 
-const fn pcm_stream_ch(name: &'static core::ffi::CStr, formats: u64, channels: u32) -> bindings::snd_soc_pcm_stream {
+const fn pcm_stream_ch(
+    name: &'static core::ffi::CStr,
+    formats: u64,
+    channels: u32,
+) -> bindings::snd_soc_pcm_stream {
     bindings::snd_soc_pcm_stream {
         stream_name: name.as_ptr(),
         formats,
@@ -2129,7 +2169,6 @@ static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 2 + FE_COUNT]> = SyncC
         // the ones used.
         ..unsafe { core::mem::zeroed() }
     },
-
     bindings::snd_soc_dai_driver {
         name: c"j700-pcm-3".as_ptr(),
         id: FE_DAI_ID_BASE + 3,
@@ -2224,7 +2263,11 @@ impl SndSocT8140AopDriver {
             .required_by(&data.dev)?;
         let id_str = CString::try_from_fmt(fmt!("Apple{}LPAI", *chassis))?;
         let shortname = CString::try_from_fmt(fmt!("{} {} LPAI", *machine_kind, *chassis))?;
-        let longname = CString::try_from_fmt(fmt!("{} {} Low-Power Audio Interface", *machine_kind, *chassis))?;
+        let longname = CString::try_from_fmt(fmt!(
+            "{} {} Low-Power Audio Interface",
+            *machine_kind,
+            *chassis
+        ))?;
         // SAFETY: `card` was created by `snd_card_new` above; the fixed-size name fields are filled
         // with NUL-terminated strings that fit.
         unsafe {
@@ -2236,9 +2279,8 @@ impl SndSocT8140AopDriver {
 
         let mut pcm = ptr::null_mut();
         // SAFETY: `card` was created by `snd_card_new` above; `pcm` receives the new PCM.
-        let ret = unsafe {
-            bindings::snd_pcm_new(this.card, longname.as_ptr() as _, 0, 0, 1, &mut pcm)
-        };
+        let ret =
+            unsafe { bindings::snd_pcm_new(this.card, longname.as_ptr() as _, 0, 0, 1, &mut pcm) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to allocate PCM device\n");
             return Err(Error::from_errno(ret));
@@ -2246,7 +2288,11 @@ impl SndSocT8140AopDriver {
         // SAFETY: `pcm` was created by `snd_pcm_new` above; the vtable is static and the private
         // data is an `Arc` released by `lpai_pcm_free_private`.
         unsafe {
-            bindings::snd_pcm_set_ops(pcm, bindings::SNDRV_PCM_STREAM_CAPTURE as i32, &Self::VTABLE);
+            bindings::snd_pcm_set_ops(
+                pcm,
+                bindings::SNDRV_PCM_STREAM_CAPTURE as i32,
+                &Self::VTABLE,
+            );
             (*pcm).private_data = data.clone().into_foreign() as _;
             (*pcm).private_free = Some(lpai_pcm_free_private);
             (*pcm).info_flags = 0;
@@ -2296,7 +2342,12 @@ impl Drop for SndSocT8140AopDriver {
     fn drop(&mut self) {
         if self.asoc_registered {
             // SAFETY: the component was registered with this driver descriptor in probe.
-            unsafe { bindings::snd_soc_unregister_component_by_driver(self.data.dev.as_raw(), ptr::null()) };
+            unsafe {
+                bindings::snd_soc_unregister_component_by_driver(
+                    self.data.dev.as_raw(),
+                    ptr::null(),
+                )
+            };
         }
         if let Some(work) = self.hpai_start.take() {
             self.data.hpai_want_run.store(0, Relaxed);
@@ -2316,7 +2367,12 @@ impl Drop for SndSocT8140AopDriver {
                 bindings::flush_work(raw);
             }
         }
-        for slot in [&self.data.pd_mca1, &self.data.pd_mca0, &self.data.pd_tx0, &self.data.pd_leap_mca] {
+        for slot in [
+            &self.data.pd_mca1,
+            &self.data.pd_mca0,
+            &self.data.pd_tx0,
+            &self.data.pd_leap_mca,
+        ] {
             let pd = slot.xchg(0, Relaxed);
             if pd != 0 {
                 // SAFETY: `pd` is a device returned by `dev_pm_domain_attach_by_name` in probe.
@@ -2358,7 +2414,10 @@ impl platform::Driver for SndSocT8140AopDriver {
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(pdev: &platform::Device<Core>, _info: Option<&Self::IdInfo>) -> impl PinInit<Self, Error> {
+    fn probe(
+        pdev: &platform::Device<Core>,
+        _info: Option<&Self::IdInfo>,
+    ) -> impl PinInit<Self, Error> {
         let dev = ARef::<device::Device>::from(pdev.as_ref());
         let parent = pdev.as_ref().parent().ok_or(ENODEV)?;
         // SAFETY: our parent is the AOP, whose drvdata is a pinned Arc<dyn AOP>.
@@ -2420,37 +2479,43 @@ impl platform::Driver for SndSocT8140AopDriver {
         data.attach_lpai()?;
         data.set_channel_control()?;
         data.read_geometry()?;
-        if *module_parameters::hpai_probe.value() != 0 {
-            data.probe_hpai();
-            if *module_parameters::hpai_probe.value() >= 2 {
-                data.probe_hpai_properties();
-            }
-            if *module_parameters::hpai_probe.value() >= 3 {
-                data.probe_hpai_power();
-            }
-        }
         let listener: Arc<dyn ReportListener> = data.clone();
         data.adata
             .add_report_listener(svc, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
-        dev_dbg!(dev, "low-power microphone ready (source ring at {:#x})\n", ring_iova);
+        dev_dbg!(
+            dev,
+            "low-power microphone ready (source ring at {:#x})\n",
+            ring_iova
+        );
         // The jack path's serializer domain (audio_mca1_m), held for the
         // driver's lifetime and runtime-powered around cout streams.
         // SAFETY: FFI call with the live platform device and a NUL-terminated domain name.
         let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), c"mca1".as_ptr()) };
         match kernel::error::from_err_ptr(pd) {
             Ok(p) if !p.is_null() => data.pd_mca1.store(p as usize, Relaxed),
-            Ok(_) => dev_warn!(dev, "no mca1 power domain: the jack path will not power its serializer\n"),
+            Ok(_) => dev_warn!(
+                dev,
+                "no mca1 power domain: the jack path will not power its serializer\n"
+            ),
             Err(e) => dev_warn!(dev, "mca1 power domain attach failed: {:?}\n", e),
         }
         // The speaker path's LEAP leaves (tx0 -> leap_c -> leap_a -> audio_fr
         // -> audio_a, leap_mca -> audio_p), runtime-powered around streams.
-        for (name, slot) in [(c"tx0", &data.pd_tx0), (c"mca", &data.pd_leap_mca), (c"mca0", &data.pd_mca0),
-                             (c"rx0", &data.pd_rx0)] {
+        for (name, slot) in [
+            (c"tx0", &data.pd_tx0),
+            (c"mca", &data.pd_leap_mca),
+            (c"mca0", &data.pd_mca0),
+            (c"rx0", &data.pd_rx0),
+        ] {
             // SAFETY: FFI call with the live platform device and a NUL-terminated domain name.
             let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), name.as_ptr()) };
             match kernel::error::from_err_ptr(pd) {
                 Ok(p) if !p.is_null() => slot.store(p as usize, Relaxed),
-                Ok(_) => dev_warn!(dev, "no {:?} power domain: the speaker or sense path is unavailable\n", name),
+                Ok(_) => dev_warn!(
+                    dev,
+                    "no {:?} power domain: the speaker or sense path is unavailable\n",
+                    name
+                ),
                 Err(e) => dev_warn!(dev, "{:?} power domain attach failed: {:?}\n", name, e),
             }
         }
@@ -2461,12 +2526,6 @@ impl platform::Driver for SndSocT8140AopDriver {
 module_platform_driver! {
     type: SndSocT8140AopDriver,
     name: "snd_soc_t8140_aop_audio",
-    description: "Apple T8140 (J700) AOP audio: low-power microphone, jack and speaker paths",
+    description: "Apple T8140 AOP audio: microphones, headphone jack and speakers",
     license: "Dual MIT/GPL",
-    params: {
-        hpai_probe: u8 {
-            default: 0,
-            description: "Attach the high-quality microphone array ('hpai', the ADT's audio-hp-mic) on the AOP audio service at probe and log what it reports. 1 reads the three properties the lpai bring-up reads; 2 also sweeps a bounded range of property ids, since the array answers 200 but refuses 301/302 (kIOReturnNotFound) and its property space has to be found rather than assumed. 3 also asks the firmware to take the array out of idle and puts it straight back, which is the only way to learn whether it will run the array for a client that is not the exclave; 1 and 2 read only, 3 writes one well-formed power request. Off by default: a property call this firmware does not recognise wedges the AOP for the rest of the boot",
-        },
-    },
 }
