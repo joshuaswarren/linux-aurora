@@ -2312,11 +2312,19 @@ impl SepData {
         if assessment.len() < crate::sbio::ASSESS_MIN_LEN {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
-        // A no-finger frame must not be judged usable.  On J700 enrolment
-        // reports "stage passed" without the sensor being touched at all,
-        // which means this gate is reading the wrong byte: dump the whole
-        // assessment so the real usable/quality field can be identified by
-        // comparing a touched frame with an untouched one.
+        // Dump the whole assessment before the usability gate below.
+        //
+        // ASSESS_USABLE_ENROL is reverse-engineered.  If it names the wrong
+        // byte the gate rejects every frame, enrolment never progresses, and
+        // the sensor appears to do nothing at all -- so the dump has to happen
+        // first, and a touched frame can then be compared with an untouched one
+        // to find the real field.
+        //
+        // An earlier note here blamed this gate for enrolment reporting "stage
+        // passed" with nothing on the sensor.  That was wrong: the spurious
+        // stage is fprintd's own pre-enrol duplicate-check IDENTIFY, proven by
+        // bisect against raw libfprint, which reports no stage in the same
+        // state.
         if *module_parameters::sbio_trace.value() != 0 {
             dev_info!(
                 self.dev,
@@ -2328,6 +2336,18 @@ impl SepData {
         }
         let usable = assessment[crate::sbio::ASSESS_USABLE_ENROL] != 0;
         if !usable {
+            // Silent here means a pressed finger produces no visible effect at
+            // all, which is indistinguishable from a dead sensor.  Say so, and
+            // name the byte, so a wrong ASSESS_USABLE_ENROL is one log away.
+            if *module_parameters::sbio_trace.value() != 0 {
+                dev_info!(
+                    self.dev,
+                    "assessment[{}]: frame not usable for enrolment -- assessment[{:#04x}] = {:#04x}; retrying. If every frame is rejected, ASSESS_USABLE_ENROL is the suspect: compare this dump against a known-good touch\n",
+                    counter,
+                    crate::sbio::ASSESS_USABLE_ENROL,
+                    assessment[crate::sbio::ASSESS_USABLE_ENROL]
+                );
+            }
             return ImageOutcome::Retry;
         }
 
@@ -4113,6 +4133,10 @@ pub(crate) const ASSESS_USABLE_MATCH: usize = 0x06;
 pub(crate) const ASSESS_USABLE_ENROL: usize = 0x07;
 
 static_assert!(ASSESS_USABLE_MATCH < ASSESS_USABLE_ENROL);
+// Both offsets are indexed directly after a `len() < ASSESS_MIN_LEN` guard, so
+// an out-of-range value would be an in-kernel panic rather than a refusal.
+static_assert!(ASSESS_USABLE_MATCH < ASSESS_MIN_LEN);
+static_assert!(ASSESS_USABLE_ENROL < ASSESS_MIN_LEN);
 
 pub(crate) const SBIO_SESSION_SHARE_LEN: usize = 40;
 
