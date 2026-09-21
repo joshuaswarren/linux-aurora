@@ -1338,7 +1338,7 @@ impl SepData {
                 Ok(fw) => {
                     let mut body = KVec::new();
                     if body
-                        .extend_from_slice(&crate::sbio::SBIO_CALIBRATION_SOURCE.to_le_bytes(), GFP_KERNEL)
+                        .extend_from_slice(&crate::sbio::calibration_source().to_le_bytes(), GFP_KERNEL)
                         .is_ok()
                         && body.extend_from_slice(fw.data(), GFP_KERNEL).is_ok()
                     {
@@ -1621,18 +1621,33 @@ impl SepData {
                 Ok(request) => request,
                 Err(_) => return false,
             };
-            let ok = self
-                .sbio_transfer_raw(request.opcode(), request.name(), request.payload())
-                .ok()
-                .filter(|done| done.status.is_ok())
-                .is_some();
-            if !ok {
-                dev_err!(
-                    self.dev,
-                    "sensor: 0x5b LOAD_CALIBRATION failed ({}). Without it every capture is refused with status 1.\n",
-                    what
-                );
-            }
+            // Report the status the enclave answered, not just "failed": the
+            // difference between a refused container and a refused source word
+            // is only visible here.
+            let ok = match self.sbio_transfer_raw(request.opcode(), request.name(), request.payload())
+            {
+                Ok(done) if done.status.is_ok() => true,
+                Ok(done) => {
+                    dev_err!(
+                        self.dev,
+                        "sensor: 0x5b LOAD_CALIBRATION refused ({}) with status {}, source word {}, {} payload bytes. Without it every capture is refused with status 1.\n",
+                        what,
+                        done.status,
+                        calibration_source(),
+                        request.payload().len()
+                    );
+                    false
+                }
+                Err(e) => {
+                    dev_err!(
+                        self.dev,
+                        "sensor: 0x5b LOAD_CALIBRATION transfer failed ({}): {:?}\n",
+                        what,
+                        e
+                    );
+                    false
+                }
+            };
             ok
         };
         if calibration_first && !load_calibration("before the module challenge") {
@@ -3039,7 +3054,18 @@ pub(crate) fn sbio_module_commit(reply: &[u8]) -> Option<SbioOp> {
 
 const OP_SBIO_LOAD_CALIBRATION: u16 = 0x5b;
 
-pub(crate) const SBIO_CALIBRATION_SOURCE: u32 = 3;
+/// The wire payload for 0x5b is a little-endian u32 followed by the `comb`
+/// container.  That word is not the container's length: macOS sends **6**,
+/// observed on the wire on 2026-09-21 by sweeping the SEP DMA window at each
+/// of the nine 0x5b chunk writes while macOS ran under the m1n1 hypervisor.
+/// The first chunk begins `06 00 00 00 30 83 02 04 a6 16 04 "comb"`.
+///
+/// We had been sending 3, which the enclave refuses even when the container
+/// itself is byte-for-byte the one macOS sends -- proven by installing macOS's
+/// captured container alone and watching 0x5b still fail.
+pub(crate) fn calibration_source() -> u32 {
+    *module_parameters::calibration_source.value()
+}
 
 pub(crate) struct SbioCalibration(KVec<u8>);
 
@@ -3047,7 +3073,7 @@ impl SbioCalibration {
     pub(crate) fn new(blob: &crate::CalibrationBlob) -> Result<SbioCalibration> {
         let bytes = blob.bytes();
         let mut body = KVec::new();
-        body.extend_from_slice(&SBIO_CALIBRATION_SOURCE.to_le_bytes(), GFP_KERNEL)?;
+        body.extend_from_slice(&calibration_source().to_le_bytes(), GFP_KERNEL)?;
         body.extend_from_slice(bytes, GFP_KERNEL)?;
         Ok(SbioCalibration(body))
     }

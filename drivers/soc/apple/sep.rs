@@ -2319,6 +2319,10 @@ module! {
             default: 0,
             description: "Control experiment: send a comb-wrapped calibration through 0x5b, which shares the container decoder with 0x86, to tell a bad trust bundle from an MSRk-specific problem.",
         },
+        calibration_source: u32 {
+            default: 6,
+            description: "The little-endian u32 that prefixes the 0x5b LOAD_CALIBRATION container on the wire. macOS sends 6, captured from the wire under the hypervisor; we sent 3 for a long time and the enclave refused the load even with macOS's own container.",
+        },
         send_msrk: u8 {
             default: 1,
             description: "Load the Mesa Secure Root Key (SBIO 0x86) from apple/msrk-j700.bin before the key exchange; the enclave refuses the session with 0x16 without it.",
