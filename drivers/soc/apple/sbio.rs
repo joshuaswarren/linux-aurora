@@ -1423,6 +1423,9 @@ impl SepData {
     }
 
     pub(crate) fn run_enrolment(&self) {
+        // A retry must start from stage one, not continue the abandoned run.
+        self.enrol_frames_accepted.store(0, Relaxed);
+
         if !self.bring_sensor_online() {
             self.finish_enrolment(Err(ENROL_STATUS_SENSOR));
             let _ = sensor::idle();
@@ -2596,10 +2599,31 @@ impl SepData {
 
         let percent = parsed.progress_percent();
 
+        // Advance one stage per accepted frame, not per percentage bucket.
+        //
+        // The enclave's progress is *coverage* on a 0-255 scale, not a count of
+        // presses, and bucketing it saturates: a real enrolment ran
+        // 24, 47, 57, 94, 95, 96, 96, 96, 100 percent, which through
+        // (percent * 8).div_ceil(100) is stages 2, 4, 5, 8, 8, 8, 8, 8, 8.
+        // bio.rs only reports Progress when the stage *advances*, so the user
+        // saw four "stage passed" for nine accepted frames and then nothing at
+        // all -- no stage, no prompt, no feedback -- while the enclave was
+        // still happily taking frames. It looks exactly like a hang, and the
+        // first attempt was abandoned because of it.
+        //
+        // One frame the enclave accepted is one thing the user did, so that is
+        // what a stage should be. The final stage is reserved for completion,
+        // so a run that needs more frames than we advertise stalls the counter
+        // rather than claiming to have finished.
+        let accepted = self.enrol_frames_accepted.fetch_add(1, Relaxed) + 1;
+        let stage = if parsed.complete() {
+            bio::ENROL_STAGES
+        } else {
+            accepted.min(bio::ENROL_STAGES - 1)
+        };
+
         ImageOutcome::Progress {
-            stage: (percent * bio::ENROL_STAGES)
-                .div_ceil(100)
-                .min(bio::ENROL_STAGES),
+            stage,
             percent,
             complete: parsed.complete(),
             has_template: parsed.has_template(),

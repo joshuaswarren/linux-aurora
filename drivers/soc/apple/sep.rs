@@ -680,6 +680,14 @@ struct SepData {
     #[pin]
     enrol_prev: Mutex<KVec<u8>>,
 
+    /// Frames the enclave accepted in the current enrolment.
+    ///
+    /// The stage reported to libfprint is this count, not a bucket of the
+    /// enclave's coverage percentage -- see the comment at the ImageOutcome in
+    /// sbio.rs. Reset when an enrolment begins, so a second attempt starts
+    /// from stage one rather than continuing the first.
+    enrol_frames_accepted: Atomic<u32>,
+
     rng_shutdown: Atomic<bool>,
 
     rng_failures: Atomic<u64>,
@@ -856,6 +864,7 @@ impl SepData {
                 rng_shutdown: Atomic::new(false),
                 rng_failures: Atomic::new(0),
                 enrol_prev <- new_mutex!(KVec::new()),
+                enrol_frames_accepted: Atomic::new(0),
                 rx: rxring::RxRing::new(),
                 rx_count: Atomic::new(0),
                 settle_mark: Atomic::new(0),

@@ -49,7 +49,11 @@ enum MatchResult {
     NotCompared = 2,
 }
 
-pub(crate) const ENROL_STAGES: u32 = 8;
+// One stage per frame the enclave accepts, with the last reserved for
+// completion, so this is the frame budget a user is asked to fill. A real
+// J700 enrolment took nine accepted frames to reach 100%, which at the
+// previous value of 8 could not be represented at all.
+pub(crate) const ENROL_STAGES: u32 = 16;
 
 const TOKEN_LIFETIME_NS: u64 = 10 * 1_000_000_000;
 
