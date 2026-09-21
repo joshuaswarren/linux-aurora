@@ -1127,3 +1127,29 @@
 		};
 	};
 };
+
+/*
+ * External display pipe.  Proven on hardware: the coprocessor boots, RTKit
+ * handshakes at protocol version 12, the firmware's AFK logging comes up and
+ * apple-drm binds it, adding a second connector beside the internal eDP.
+ * No external display was attached when this was verified, so what is shown
+ * on one has not been exercised.
+ */
+&dcpext_dart {
+	status = "okay";
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext_mbox {
+	status = "okay";
+};
+
+&dcpext {
+	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
+	clock-names = "clock-154", "clock-194";
+	apple,iomfb-surfaces = <0>;
+	status = "okay";
+};
