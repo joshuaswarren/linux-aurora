@@ -405,6 +405,28 @@
 		power-domains = <&ps_dispext0_sys>;
 	};
 
+	/*
+	 * The external display pipe's CPU domain, read out of the J700 ADT as
+	 * PMGR device DISPEXT0_CPU, group 0, offset 0x328.
+	 *
+	 * Not derivable by analogy with the internal pipe: DISP_CPU lives at
+	 * 0x10000 in a separate block, so the obvious guess of 0x10008 is
+	 * DISP_GP0 -- a different domain entirely.  The outer domains do line
+	 * up (DISP_SYS 0x280 / DISPEXT0_SYS 0x288, DISP_FE 0x318 /
+	 * DISPEXT0_FE 0x320), which is what makes the CPU one misleading.
+	 *
+	 * Nothing references this yet; it is the prerequisite for a dcpext
+	 * node, which needs it for both power-domains and resets.
+	 */
+	ps_dispext0_cpu: power-controller@328 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_cpu";
+		power-domains = <&ps_dispext0_fe>;
+	};
+
 	ps_spi0: power-controller@330 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x330 4>;
