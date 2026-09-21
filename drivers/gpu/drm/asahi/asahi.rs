@@ -261,6 +261,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Publish the fragment descriptor MCache table as a KSM entry aperture. 1 (default) matches the valid cold class-0 qid1 entry: header bit58 set and +0x08 naming descriptor +0x6a0, index 0, count 2. 0 suppresses the KSM aperture for later native priority-2 profiles whose host command count is zero. The native class-0 shape was tested on Neo without regression. The TA entry never receives an aperture.",
         },
+        g17p_render_no_barrier: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- delete the real TA timestamp dependency from the 3D KSM entry. Kext RE corrected the earlier pool theory: the KSM dependency contains only timestamp+QID, never a barrier-pool slot or pointer. Native does reserve temporary vendevtBarrierRec storage while building the event list, but setupBarrierCommand compares source ownership against the target context ID and deliberately skips publishing tag-4 for this captured same-context TA-to-3D edge; completion releases the temporary host record regardless. Therefore Linux's one explicit dependency is the native payload and there is no dangling unowned slot. 0: correct dependency present (default). 1: historical suppression diagnostic only; not a fix.",
+        },
         g17p_render_split_launch: u32 {
             default: 0,
             description: "DIAGNOSTIC ONLY -- make the paired render submission a true whole-group split. Before the first channel-0 doorbell the 3D command/tag-15 bytes may be staged in host memory, but its SKSM entry, tag-14 AddKicks/item producer, and outer data-master producer all remain unpublished; only the complete TA group is visible. After both TA-owned timestamps become non-zero, the driver publishes the 3D SKSM entry/dependency, then tag-14 and its inner producer, then the retained 3D outer slot/producer, and sends the same channel-0 doorbell again. This isolates 3D descriptor execution from simultaneous paired-launch/dependency chronology without ever publishing and rewinding live state. 0: normal fragment-first paired publication (default, byte-for-byte unchanged), 1: TA completion then complete 3D group publication.",
@@ -410,6 +414,10 @@ kernel::module_platform_driver! {
         g17p_no_implicit_dep: u32 {
             default: 0,
             description: "DIAGNOSTIC. Omit the kick entry's implicit in-order self-dependency on a queue's FIRST submit. On a first submit the encoder declares {own qid, converted_command_timestamp - 1} = {qid, stamp 0}. Measured at the stall: the stuck tiler's entry dependency word is 0x0000050000000000 = {qid 5, stamp 0}, while the hardware's completed register 0x21028[5] reads 0x862cde4910 -- neither zero nor the firmware's documented never-completed convention of base-1 = 0. Firmware RE says the promotion-side dependency evaluator is in the KSM front-end and NOT in the b1 image, so whether it satisfies stamp 0 against that register cannot be answered statically. This isolates it: with the implicit dependency omitted the tiler's entry declares no parents at all, so if it still refuses to promote, the front-end is not withholding it on a dependency. 0: off (default). 1: omit on first submit only.",
+        },
+        g17p_render_first_submit: u32 {
+            default: 0,
+            description: "Deprecated compatibility parameter; ignored. The render now derives outer-slot +0x17 from retained queue lifecycle: 1 on the physical queue's first submit and 0 thereafter, matching every valid native trace.",
         },
         g17p_render_ta_qid_field: u32 {
             default: 1,

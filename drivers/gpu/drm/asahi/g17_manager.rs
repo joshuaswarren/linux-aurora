@@ -5633,7 +5633,21 @@ impl G17PManagerConstruction {
             let barrier = [g17_submission::g17p_render_barrier_from_timestamp(
                 ta_stamp, ta_queue_id,
             ).map_err(|_| Self::render_stage_fail("sksm-event-word", EINVAL))?];
-            let barrier_slice: &[g17_submission::G17PClBarrierDependency] = &barrier;
+            let event_word = barrier[0].event_word;
+            // DIAGNOSTIC, not a fix. Metal reserves a barrier SLOT per render
+            // pass; suppressing the dependency asks only whether that missing
+            // lifecycle is what stalls the fragment group.
+            let suppress_barrier =
+                *crate::module_parameters::g17p_render_no_barrier.value() != 0;
+            let barrier_slice: &[g17_submission::G17PClBarrierDependency] =
+                if suppress_barrier { &[] } else { &barrier };
+            if suppress_barrier {
+                pr_info!(
+                    "G17P render: DIAGNOSTIC barrier dependency suppressed (event_word {:#x} qid {})\n",
+                    event_word,
+                    ta_queue_id
+                );
+            }
             let fragment_first_install = self
                 .render_sksm
                 .as_ref()
@@ -7642,7 +7656,19 @@ impl G17PManagerConstruction {
         let barrier = [g17_submission::g17p_render_barrier_from_timestamp(
             ta_stamp, ta_queue_id,
         ).map_err(|_| EINVAL)?];
-        let barrier_slice: &[g17_submission::G17PClBarrierDependency] = &barrier;
+        let event_word = barrier[0].event_word;
+        let suppress_barrier =
+            *crate::module_parameters::g17p_render_no_barrier.value() != 0;
+        let barrier_slice: &[g17_submission::G17PClBarrierDependency] =
+            if suppress_barrier { &[] } else { &barrier };
+        if suppress_barrier {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render split-launch: DIAGNOSTIC barrier dependency suppressed (event_word {:#x} qid {})\n",
+                event_word,
+                ta_queue_id
+            );
+        }
         let fragment_queue = self
             .render_storage
             .as_ref()
