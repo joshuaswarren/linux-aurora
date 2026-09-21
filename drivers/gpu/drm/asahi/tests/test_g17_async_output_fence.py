@@ -109,7 +109,7 @@ assert "&mut self.quarantined_render_completions" in retain_failure
 # Cancellation and submit-error cleanup must classify the final hardware state
 # before permanently retiring a physical slot. A successful one-frame process
 # can close while its already-completed watch job is still queued.
-watch = block("impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {")
+watch = block("impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {")
 for marker in ("fn timed_out(", "fn cancel("):
     body = watch[watch.index(marker):]
     body = body[:body.index("\n    }", body.index("{"))]
@@ -117,12 +117,16 @@ for marker in ("fn timed_out(", "fn cancel("):
     assert "quarantine_render_slot(" not in body, marker
     assert "if quarantine" not in body, marker
 
-render_submit_start = source.index("let submit = self.runtime")
-render_submit_end = source.index("publication.publish_async(&finished);", render_submit_start)
-render_submit = source[render_submit_start:render_submit_end]
-assert "if quarantine" not in render_submit
-assert "quarantine_render_slot(" not in render_submit
-assert render_submit.count("timeout_deferred_render(") == 3
+render_publish = watch[watch.index("fn publish("):watch.index("fn timed_out(")]
+assert "if quarantine" not in render_publish
+assert "quarantine_render_slot(" not in render_publish
+assert render_publish.count("timeout_deferred_render(") == 1
+assert render_publish.index("packet.begin_publication()") < render_publish.index(
+    "self.registry.acquire_lease(self.owner)?"
+)
+assert render_publish.index("completion.attach_lease(lease)?") < render_publish.index(
+    "runtime.submit_translated_render("
+)
 
 # The submit path must hand the guard to the asynchronous compute path, and the
 # asynchronous path must publish through it only after the job is enqueued.
@@ -338,15 +342,16 @@ fn failed_compute_publishes_the_exact_error() {
     assert_eq!(installed.error(), EIO.0);
 }
 
-/// The synchronous render path is unchanged: the work is done, so the ioctl's
-/// own fence is the right answer.
+/// A render may complete before its ioctl publishes the scheduler fence.
 #[test]
 fn completed_render_publishes_a_signalled_fence() {
     let syncobj = Syncobj::default();
     let early = UserFence::<G17PSubmissionFence>::new();
+    let finished = Fence::new();
+    finished.signal();
     {
         let mut publication = arm(&early, vec![out_sync(&syncobj)]);
-        publication.succeeded();
+        publication.publish_async(&finished);
     }
     let installed = syncobj.installed().expect("nothing published on success");
     assert!(installed.is_signalled());

@@ -33,10 +33,12 @@ prepare = block(
     "pub(crate) fn prepare_g17p_compute_queue(",
     "/// Prepare a queue for its firmware-mediated tag-15 installation.",
 )
-assert prepare.index("allocate_compute_queue_id()") < prepare.index("allocate_compute()")
+assert "allocate_compute_queue_id()" in prepare
+assert "allocate_compute()" not in prepare
 assert "hardware_buffer_id," in prepare
-assert "release(u32::from(hardware_buffer_id))" in prepare
-assert "self.next_compute_queue_id = Some(queue_id)" in prepare
+logical = block(MANAGER, "pub(crate) fn prepare_logical_queue_context(", "pub(crate) fn prepare_g17p_compute_queue(")
+assert "G17PLogicalQosLease::new" in logical
+assert "self.channel_ids.cancel_unpublished(channel_lease)" in prepare
 
 encoder = block(
     COMPUTE,
@@ -80,7 +82,8 @@ first_stage = first.index("stage_initial_channel_group_without_fallback_event(")
 first_qos = first.index("publish_compute_qos_queue_record(")
 first_tag15 = first.index("publish_initial_config_update_pointer(group)")
 assert first_stage < first_qos < first_tag15
-assert first.count("queue.hardware_buffer_id") >= 2
+assert first.count("queue.qos_hardware_buffer_id()") >= 2
+assert "cancel_qos_publication(qos_publication)" in first
 
 repeat = block(
     MANAGER,
@@ -92,7 +95,18 @@ repeat_command = repeat.index('"the tag-3 command pointer"')
 repeat_qos = repeat.index("publish_compute_qos_queue_record(")
 repeat_tag15 = repeat.index('"the tag-15 ConfigUpdate pointer"')
 assert repeat_stage < repeat_command < repeat_qos < repeat_tag15
-assert repeat.count("queue.hardware_buffer_id") >= 2
+assert repeat.count("queue.qos_hardware_buffer_id()") >= 2
+assert "cancel_qos_publication(qos_publication)" in repeat
+complete = block(MANAGER, "pub(crate) fn poll_staged_independent_compute_completion(", "fn allocate_compute_queue_id(")
+assert complete.index("read_compute_stamp()?") < complete.index("complete_qos_queue_records(")
+assert complete.index("complete_qos_queue_records(") < complete.index("queue.completion_descriptor = 0")
+paired = MANAGER[MANAGER.index("let retired_sksm ="):]
+assert paired.index("complete_qos_queue_records(") < paired.index(
+    "self.render_tracker = self.render_queued_tracker.take()"
+)
+retire = block(RESOURCES, "pub(crate) fn complete_qos_queue_records(", "/// Dump the QOS resource regions")
+assert retire.index("row[0] != hbid") < retire.index("bytes[offset] = 0xff")
+assert "owners[..index]" in retire
 
 reset = block(
     MANAGER,
@@ -101,7 +115,7 @@ reset = block(
 )
 assert "self.render_hardware_buffer_ids = G17PHardwareBufferIdAllocator::new();" in reset
 assert reset.index("G17PHardwareBufferIdAllocator::new()") < reset.index(
-    "self.next_compute_queue_id = Some(G17P_COMPUTE_QUEUE_ID_BASE)"
+    "self.channel_ids = g17p_initial_channel_table()"
 )
 
 print("g17 compute HardwareBufferID/QoS publication checks: PASS")

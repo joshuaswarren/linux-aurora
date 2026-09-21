@@ -20,19 +20,21 @@ pub(crate) const BIND_CONTEXT_MASK: u64 =
 pub(crate) const COMPUTE_CONTEXT_MASK: u64 =
     ((1u64 << BIND_CONTEXT_FIRST) - 1) & !((1u64 << COMPUTE_CONTEXT_FIRST) - 1);
 pub(crate) const MAX_QUEUES: u32 = COMPUTE_CONTEXT_MASK.count_ones();
-pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 1;
-/// One GiB boundary inside the existing four GiB runtime reservation. The
-/// canonical portion has room for all queues' 256-descriptor backing arrays
-/// and auxiliary mappings; the remaining 3 GiB hold per-VM private aliases.
-pub(crate) const CLIENT_LOW_VA_START: u64 = 0x70_4000_0000;
+/// Native G17P configures two independent TA/3D work-queue pairs per logical
+/// command queue. Concurrency comes from rotating those pairs, not publishing
+/// a second live command onto one physical pair.
+pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 2;
+pub(crate) const MAX_COMPUTE_IN_FLIGHT_PER_QUEUE: u32 = 1;
+/// Two GiB boundary inside the existing four GiB runtime reservation. In
+/// addition to descriptor arrays, each independently executing CL graph owns
+/// a 23-MiB private-memory pool. Keep room for every advertised queue without
+/// reducing concurrency; the remaining 2 GiB hold per-VM private aliases.
+pub(crate) const CLIENT_LOW_VA_START: u64 = 0x70_8000_0000;
 
-/// An idle ownerless graph may be rebound without reinstalling its QID.
-///
-/// QID routing names the session-owned queue/descriptor backing. The client
-/// execution context and root live in the command descriptor and retained
-/// binding, so exact completion followed by dropping that binding leaves the
-/// installed graph reusable. This is the same retained-queue handoff the
-/// synchronous path already uses; reinstalling the QID is explicitly wrong.
+/// Host ownership eligibility for an empty graph, not firmware detachment.
+/// Callers must separately establish whether the graph was installed and what
+/// firmware references survive. Command completion alone is not a proven
+/// cross-VM graph-switch contract; the repeat path does not reinstall the QID.
 pub(crate) const fn reusable_idle_compute_graph(
     owner_free: bool,
     active_free: bool,
@@ -43,21 +45,20 @@ pub(crate) const fn reusable_idle_compute_graph(
     owner_free && active_free && binding_free && context_free && !quarantined
 }
 
-/// An idle graph whose client has gone but whose binding is deliberately still
-/// held, because the firmware has not been told to forget its QID.
+/// An idle graph whose exact client has gone but whose binding is deliberately
+/// retained while the same physical QID is handed to a replacement owner.
 ///
 /// The firmware keeps the installed slot pointer for a queue until something
 /// clears it, and the only clearing transaction the driver has --
 /// `unregister_compute_sksm_queue`'s disable pair -- is a suppressed no-op
 /// whenever `g17p_sksm_mmio` is 0, which is its default because the SKSM port
 /// raises an SError on this SoC. So a released queue's SKSM entry mapping and
-/// context root must outlive the client and be dropped only where the
-/// synchronous path already drops them: immediately before the next bind
-/// reinstalls those roots, or after both firmware CPUs have stopped.
+/// context root must outlive the client. Rebinding preserves the installed
+/// graph and monotonic stamp sequence, while the outgoing root remains owned
+/// through the replacement submission's exact completion.
 ///
-/// Such a graph is still reusable -- rebinding is exactly the boundary that
-/// makes dropping the old binding safe -- so it must be found by the same
-/// search, which is what this predicate is for.
+/// This predicate never authorizes releasing roots. Timeout, fault and
+/// ambiguous publication still quarantine the graph through processor stop.
 pub(crate) const fn rebindable_released_compute_graph(
     owner_free: bool,
     active_free: bool,

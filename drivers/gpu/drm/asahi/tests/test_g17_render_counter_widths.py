@@ -5,6 +5,7 @@ Only module-parameter reads are mocked. --native-blobs optionally verifies the
 SHA-identified valid 092506 retained TA records; it does not label them executing.
 """
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import argparse
 import hashlib
 import re
@@ -214,7 +215,7 @@ fn long_width_event_stamp_retains_native_forty_bit_boundary() {
 with tempfile.TemporaryDirectory(prefix="g17-render-counter-widths-") as temp:
     binary = Path(temp) / "tests"
     subprocess.run(["rustc", "--edition=2021", "--test", "-", "-o", str(binary)],
-                   input=body, text=True, check=True)
+                   input=with_g17_config(body), text=True, check=True)
     subprocess.run([str(binary), "long_width_"], check=True)
 
 if args.native_blobs:

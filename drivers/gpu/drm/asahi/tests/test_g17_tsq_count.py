@@ -26,10 +26,11 @@ with tempfile.TemporaryDirectory() as d:
  subprocess.run([str(Path(d)/'test')],check=True)
 # Execute the decisive compare/conditional-compare instructions from the saved
 # firmware disassembly. This is a predicate test, not a GPU/firmware run.
-raw=Path('/tmp/g17p-re/fwb1/b1_raw.txt').read_text().splitlines()
+raw=Path(__file__).with_name('fixtures').joinpath('b1-retirement-predicate.txt').read_text().splitlines()
 lines=[l for l in raw if re.match(r'fffffc0000016a(?:3[048c]|4[048c]|5[048]):',l)]
 assert len(lines)==11,lines
-compare=[l.split(':',1)[1].strip().split(';')[0].strip() for l in lines if '\tcmp\t' in l or '\tccmp\t' in l or '\tcset\t' in l]
+decoded=[l.split(':',1)[1].strip().split(None,1)[1] for l in lines]
+compare=[l for l in decoded if l.split()[0] in ('cmp','ccmp','cset')]
 assert len(compare)==5,compare
 # LDP/loads establish these registers. Each later CCMP reads the post-LDP
 # engine1/2 counts (CMP at16a40 uses engine0 before that LDP).
@@ -37,7 +38,7 @@ def native_gate(completed,target,batches=(1,0,0),threshold=80):
  regs={'w3':completed,'w9':target,'w10':batches[0],'w11':threshold,'w12':batches[2]};flags=0
  def sub(a,b):
   r=(a-b)&0xffffffff;return ((r>>31)<<3)|((r==0)<<2)|((a>=b)<<1)|(((a^b)&(a^r))>>31)
- def condition(c):return {'lo':not(flags&2),'ne':not(flags&4),'hs':bool(flags&2)}[c]
+ def condition(c):return {'cc':not(flags&2),'ne':not(flags&4),'cs':bool(flags&2)}[c]
  for i,line in enumerate(compare):
   op,args=line.split(None,1);args=[x.strip() for x in args.split(',')]
   if op=='cmp':flags=sub(regs[args[0]],regs[args[1]]);regs['w10']=batches[1]

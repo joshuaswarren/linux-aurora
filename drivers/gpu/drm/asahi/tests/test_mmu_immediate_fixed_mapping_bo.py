@@ -43,6 +43,8 @@ assert "bo: Option<ARef<gpuvm::GpuVmBo" not in mapping
 # Both GEM-backed fixed mapping constructors transfer their obtained reference
 # to the immediate-mode owner before the returned mapping can escape.
 map_in_range = block(MMU, "pub(crate) fn map_in_range(")
+assert "self.map_in_range_with_guard_size(" in map_in_range
+map_in_range = block(MMU, "pub(crate) fn map_in_range_with_guard_size(")
 map_at = block(MMU, "pub(crate) fn map_at(")
 for constructor in [map_in_range, map_at]:
     assert "ImmediateGpuVmBoRef::new(" in constructor

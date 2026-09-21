@@ -12,6 +12,7 @@ This compiles the real tag-15 optional encoder and pins the manager's sources
 for both fields.
 """
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import re
 import subprocess
 import tempfile
@@ -47,7 +48,7 @@ assert "first_outer_submit," in publish
 assert inner.index("self.render_hardware_buffer_published = true;") \
     < inner.index("self.render_outer_channels_started[usize::from(queue_pair.slot())] = true;")
 stop = block(manager, "release_runtime_objects_after_processor_stop")
-assert "self.render_outer_channels_started = [false, false];" in stop
+assert "self.render_outer_channels_started = [false; 64];" in stop
 outer = block(sub, "prepare_g17p_partial_opening_work_pair")
 assert "let render_channel_started = !first_submit;" in outer
 
@@ -73,7 +74,7 @@ for name in ["stage_fragment", "stage_fragment_prefix", "prepare_late_tiling_pub
 consistency = block(manager, "validate_render_queue_consistency")
 assert "header.context_update != u16::from(context_update)" in consistency
 completion = block(manager, "poll_translated_render_completion")
-assert "complete_render_context_update_retirement()?" in completion
+assert "complete_render_context_update_retirement(true)?" in completion
 context_retirement = block(manager, "complete_render_context_update_retirement")
 assert "complete_context_update()" in context_retirement
 
@@ -181,7 +182,7 @@ fn secondary_pair_outer_slots_match_native_first_and_repeat_bytes() {
 #[test]
 fn plus_3e_follows_the_device_generation_and_nothing_else_moves() {
     for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
-        for ordinal in [0u32, 5, 1458] {
+        for ordinal in [0u64, 5, 1458] {
             for generation in [0u64, 1, 1459, 0x1_0000_0000] {
                 let mut raw = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
                 apply_g17p_retained_optional_with_flist_generation(
@@ -241,6 +242,6 @@ fn a_fresh_nonzero_ordinal_updates_context_then_retained_work_does_not() {
 with tempfile.TemporaryDirectory(prefix="g17-slot-globals-") as tmp:
     binary = Path(tmp) / "tests"
     subprocess.run(["rustc", "-Awarnings", "--edition=2021", "--test", "-", "-o", str(binary)],
-                   input=body, text=True, check=True)
+                   input=with_g17_config(body), text=True, check=True)
     subprocess.run([str(binary), "--test-threads=1"], check=True)
 print("PASS: channel-started byte and FList generation follow the device, not the slot")

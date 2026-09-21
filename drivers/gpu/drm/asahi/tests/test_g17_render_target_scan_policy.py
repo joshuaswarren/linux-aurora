@@ -19,7 +19,7 @@ assert "G17P render status[{}]: TA" in call_site
 assert "G17P render status[{}]: 3D" in call_site
 assert """if g17p_render_target_scan_due(
             label,
-            *crate::module_parameters::g17p_dep_records.value() != 0,
+            crate::g17_config::DEP_RECORDS != 0,
             status_read_failed,
         ) {
             self.log_render_target_state(dev, label);

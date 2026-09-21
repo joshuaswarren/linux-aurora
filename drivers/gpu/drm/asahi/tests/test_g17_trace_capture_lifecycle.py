@@ -47,12 +47,48 @@ class CaptureLifecycle(unittest.TestCase):
         self.assertEqual(body.count(".capture_prepared_render_trace("), 1)
         self.assertIn("native_doorbell_mode == 0 && !split_launch", body[scan:flist])
 
+    def test_firmware_code_capture_is_opt_in_read_only_and_boot_only(self):
+        dump = self.manager[self.manager.index("impl G17PTraceDump {"):]
+        body = function(dump, "new")
+        self.assertLess(body.index("g17p_binary_capture.value() & 2"),
+                        body.index("context0_upper_root()"))
+        self.assertIn("copy_firmware_range(0, output.len())", body)
+        self.assertIn("meta.expected_len = 0x4_c000", body)
+        for forbidden in ("set_bits(", "write_u64(", "g17p_gfx_link_to_physical"):
+            self.assertNotIn(forbidden, body)
+
+    def test_unprepared_boot_archive_follows_first_real_slot(self):
+        source = self.manager
+        start = source.index("let unattached = self.trace_capture.as_ref()")
+        decision = source[start:start + 340]
+        self.assertIn("!capture.prepared", decision)
+        self.assertIn("if !unattached || state.trace_capture.is_some()", decision)
+        self.assertIn("core::mem::swap(&mut self.trace_capture", decision)
+
     def test_halt_scan_after_validation_before_ack(self):
         body = function(self.live, "complete_primary_real_recovery")
         scan = body.index("finish_g17p_render_trace(")
         self.assertLess(body.index("manager.validate_empty_primary_firmware_recovery(generation)?"), scan)
         self.assertLess(body.index("if cause.host_recovery != 0"), scan)
         self.assertLess(scan, body.index("manager.acknowledge_primary_firmware_recovery(1, 2)?"))
+
+    def test_compute_fault_tail_is_drained_before_ack(self):
+        body = function(self.live, "complete_primary_real_recovery")
+        drain = body.index('probe_g17p_ktrace(pdev.as_ref(), manager, "fault-before-ack")')
+        self.assertLess(body.index("manager.validate_empty_primary_firmware_recovery(generation)?"), drain)
+        self.assertLess(drain, body.index("manager.acknowledge_primary_firmware_recovery(1, 2)?"))
+        probe = function(self.live, "probe_g17p_ktrace")
+        self.assertLess(probe.index("if !g17p_ktrace_enabled()"), probe.index("manager.drain_ktrace_ring"))
+
+    def test_irq_completion_keeps_ktrace_consumer_moving(self):
+        body = function(self.live, "service_primary_firmware_events")
+        drain = body.index("manager.drain_ktrace_ring(role, verbose, budget)")
+        sample = body.index("manager.read_compute_completion()")
+        self.assertLess(drain, sample)
+        self.assertLess(body.index("if g17p_ktrace_enabled()"), drain)
+        legacy_pending = body.index("if self.pending_compute.is_some()")
+        self.assertLess(legacy_pending, sample)
+        self.assertNotIn("read_compute_completion", body[drain:legacy_pending])
 
     def test_both_completion_paths_capture_before_flist_release(self):
         body = function(self.live, "wait_render_completion_servicing_events")
@@ -83,18 +119,21 @@ class CaptureLifecycle(unittest.TestCase):
         body = function(source, "capture_owned_trace")
         self.assertIn("let context = u32::from(self.descriptor_context_id)", body)
         self.assertNotIn("self._command_context.context_id()", body)
-        for owner in ("deflake", "rt_memory", "tpc", "aux_fb"):
+        for owner in ("deflake", "aux_fb"):
             self.assertIn("&self.render_user_aliases." + owner, body)
+        for owner in ("rt_memory", "tpc"):
+            self.assertIn("self.render_target_memory." + owner + ".capture_trace_range(", body)
+        self.assertIn(".record_offset(self.descriptor_ordinal)", body)
+        self.assertIn("self.render_target_memory.tpc_va()", body)
         self.assertIn("self.fragment_status_low.iova()", body)
         self.assertIn("G17P_RENDER_STATE_TA_STATUS", body)
         self.assertIn("self.render_state.capture_trace_range(", body)
         self.assertIn("map(|pm| &mut pm.backing), 0)", body)
 
     def test_render_submission_uses_the_logical_queue_execution_context(self):
-        # `submit` is now a thin wrapper that settles a lost client's
-        # outstanding jobs; the submission body it guards is
-        # `submit_guarded`.
-        body = function(self.drm, "submit_guarded")
+        # Render publication runs in the queue's scheduler backend after the
+        # ioctl has installed dependencies and returned.
+        body = function(self.drm, "publish")
         call = body[body.index(".submit_translated_render("):]
         self.assertRegex(call[:800], r"\.context\s*\.clone\(\)")
         self.assertNotIn("RENDER_APP_CONTEXT", call[:800])
@@ -111,7 +150,7 @@ class CaptureLifecycle(unittest.TestCase):
         self.assertIn("self.descriptor_context_id = descriptor_context_id", restage)
 
     def test_boot_capture_is_before_initdata_not_before_rtkit_boot(self):
-        start = self.live.index("let mut manager = g17_manager::G17PManagerConstruction::new_with_uat(")
+        start = self.live.index("g17_manager::G17PManagerConstruction::new_with_uat(")
         self.assertLess(start, self.live.index("let handoff = manager.handoff();", start))
         self.assertLess(self.live.index("let handoff = manager.handoff();", start),
                         self.live.index(".send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)", start))

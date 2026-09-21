@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Execute production role-ring reader with real initdata/record decoders."""
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import subprocess,tempfile
 p=Path(__file__).resolve().parents[1];s=(p/'g17_resources.rs').read_text()
 def item(needle):
@@ -36,5 +37,5 @@ struct Instance{main_config:u64,status_a:u64}struct Role{instance:Instance,state
 #[test]fn role_pointer_corruption_and_partial_record_never_advance_consumer(){let mut o=Owner::new();o.inject(InstanceRole::Secondary,1,1);let p=o.pair(InstanceRole::Secondary);let off=g17_initdata::channel_table_entry_range(13).unwrap().start as u64;o.resources.shared_cluster.write_u64(0x20000+off,o.pair(InstanceRole::Primary)[0]).unwrap();assert!(o.drain_firmware_event(InstanceRole::Secondary).is_err());assert_eq!(o.secondary.read_u32(p[0]).unwrap(),1);o.resources.shared_cluster.write_u64(0x20000+off,p[0]).unwrap();o.secondary.bytes.truncate((p[1]-o.secondary.base)as usize+72+20);assert!(o.drain_firmware_event(InstanceRole::Secondary).is_err());assert_eq!(o.secondary.read_u32(p[0]).unwrap(),1);}
 '''
 with tempfile.TemporaryDirectory() as t:
- f=Path(t)/'test.rs';f.write_text(code);exe=Path(t)/'test';subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True);subprocess.run([str(exe),'role_','--test-threads=1'],check=True)
+ f=Path(t)/'test.rs';f.write_text(with_g17_config(code));exe=Path(t)/'test';subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True);subprocess.run([str(exe),'role_','--test-threads=1'],check=True)
 print('PASS production role-ring reader + native initdata/decoders: separate cursors, wrap, unknown records, wrong-role pointer rejection, partial-copy safety')

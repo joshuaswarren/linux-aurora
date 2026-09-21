@@ -5,6 +5,7 @@ No hardware or Rust kernel mocks: only module parameter reads are fixed at
 their native DM defaults. Source-order checks cover the production handoff.
 """
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import re
 import subprocess
 import tempfile
@@ -153,7 +154,7 @@ fn retained_encoder_keeps_captured_token_independent_of_generations() {
 with tempfile.TemporaryDirectory(prefix="g17-pb-lease-") as tmp:
     binary = Path(tmp) / "tests"
     subprocess.run(["rustc", "--edition=2021", "--test", "-", "-o", str(binary)],
-                   input=body, text=True, check=True)
+                   input=with_g17_config(body), text=True, check=True)
     subprocess.run([str(binary)], check=True)
 
 outer = block(manager, r"^    pub\(crate\) fn begin_translated_render\(")
