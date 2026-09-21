@@ -2140,6 +2140,48 @@ impl SepData {
                 parsed.complete(),
                 parsed.has_template()
             );
+
+            // Which bytes actually moved since the previous frame.  A single
+            // dump cannot distinguish a counter from a nonce; across a
+            // nine-stage enrolment the progress byte and the completion flag
+            // are the ones that change monotonically, and that is what
+            // confirms or corrects ER_PROGRESS, ER_HAS_TEMPLATE and
+            // ER_COMPLETE.  Capped so a frame that differs everywhere (a new
+            // template blob) cannot flood the log.
+            {
+                let mut prev = self.enrol_prev.lock();
+                if prev.len() == result.len() {
+                    let mut shown = 0usize;
+                    let mut changed = 0usize;
+                    for (off, (a, b)) in prev.iter().zip(result.iter()).enumerate() {
+                        if a == b {
+                            continue;
+                        }
+                        changed += 1;
+                        if shown < 24 {
+                            shown += 1;
+                            dev_info!(
+                                self.dev,
+                                "enrol-diff[{}]: @{:#06x} {:#04x} -> {:#04x}\n",
+                                counter,
+                                off,
+                                *a,
+                                *b
+                            );
+                        }
+                    }
+                    dev_info!(
+                        self.dev,
+                        "enrol-diff[{}]: {} of {} bytes changed ({} shown)\n",
+                        counter,
+                        changed,
+                        result.len(),
+                        shown
+                    );
+                }
+                prev.clear();
+                let _ = prev.extend_from_slice(result.as_slice(), GFP_KERNEL);
+            }
         }
 
         if parsed.complete() {
