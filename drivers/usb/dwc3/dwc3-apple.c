@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/workqueue.h>
@@ -130,6 +131,8 @@ struct dwc3_apple {
 	struct mutex lock;
 
 	enum dwc3_apple_state state;
+	/* state to restore in resume, captured by suspend */
+	enum dwc3_apple_state pm_state;
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -936,12 +939,127 @@ static const struct of_device_id dwc3_apple_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dwc3_apple_of_match);
 
+/*
+ * System sleep.
+ *
+ * This controller does not survive s2idle on its own.  Without these
+ * callbacks the core is left untouched across the cycle and comes back dead:
+ * every xHCI command times out, "Host halt failed, -110", and the whole USB
+ * tree is disconnected during the post-resume settle.  Rebinding xhci-hcd
+ * does not help -- it fails with -110 too -- because the dwc3 core underneath
+ * it, not the xHCI glue, is what has lost its state.
+ *
+ * So tear the core down on the way into suspend and build it back up on the
+ * way out, which is what dwc3_suspend_common()/dwc3_resume_common() do for
+ * the host role on other platforms.  This deliberately stops short of
+ * dwc3_apple_exit()/dwc3_apple_init(): those also unregister and re-register
+ * the xHCI platform device, and adding or removing a device from inside a PM
+ * callback re-enters the PM core's device list.  The xHCI child stays
+ * registered; it suspends before us and resumes after us, so it meets a core
+ * that has already been re-initialised.
+ */
+static int dwc3_apple_suspend(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_apple *appledwc;
+	int ret;
+
+	if (!dwc)
+		return 0;
+	appledwc = to_dwc3_apple(dwc);
+
+	guard(mutex)(&appledwc->lock);
+
+	appledwc->pm_state = appledwc->state;
+	if (appledwc->state != DWC3_APPLE_HOST &&
+	    appledwc->state != DWC3_APPLE_DEVICE)
+		return 0;
+
+	/*
+	 * SUSPHY must be on for the PHY to power down properly, the same
+	 * requirement dwc3_apple_exit() documents.
+	 */
+	dwc3_enable_susphy(&appledwc->dwc, true);
+	dwc3_core_exit(&appledwc->dwc);
+	appledwc->state = DWC3_APPLE_NO_CABLE;
+
+	ret = dwc3_apple_reset_assert(appledwc);
+	if (ret)
+		dev_err(appledwc->dev, "Failed to assert reset, err=%d\n", ret);
+
+	return ret;
+}
+
+static int dwc3_apple_resume(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_apple *appledwc;
+	int ret;
+
+	if (!dwc)
+		return 0;
+	appledwc = to_dwc3_apple(dwc);
+
+	guard(mutex)(&appledwc->lock);
+
+	if (appledwc->pm_state != DWC3_APPLE_HOST &&
+	    appledwc->pm_state != DWC3_APPLE_DEVICE)
+		return 0;
+
+	/*
+	 * The USB2 PHY mode has to be set while the PHY is still powered off,
+	 * before dwc3 touches it -- see dwc3_apple_init().
+	 */
+	phy_set_mode(appledwc->dwc.usb2_generic_phy[0],
+		     appledwc->pm_state == DWC3_APPLE_HOST ? PHY_MODE_USB_HOST
+							   : PHY_MODE_USB_DEVICE);
+
+	ret = dwc3_apple_reset_deassert(appledwc);
+	if (ret) {
+		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
+		return ret;
+	}
+
+	/* state is NO_CABLE here, so this takes the dwc3_core_init() path */
+	ret = dwc3_apple_core_init(appledwc);
+	if (ret)
+		goto reset_assert;
+
+	dwc3_apple_setup_cio(appledwc);
+
+	if (appledwc->pm_state == DWC3_APPLE_HOST) {
+		appledwc->dwc.dr_mode = USB_DR_MODE_HOST;
+		dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_HOST);
+		dwc3_enable_susphy(&appledwc->dwc, true);
+		phy_set_mode(appledwc->dwc.usb3_generic_phy[0],
+			     PHY_MODE_USB_HOST);
+	} else {
+		appledwc->dwc.dr_mode = USB_DR_MODE_PERIPHERAL;
+		dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_DEVICE);
+		dwc3_enable_susphy(&appledwc->dwc, true);
+		phy_set_mode(appledwc->dwc.usb3_generic_phy[0],
+			     PHY_MODE_USB_DEVICE);
+	}
+
+	appledwc->state = appledwc->pm_state;
+	dwc3_apple_dump_usb2_state(appledwc, "pm-resume");
+	return 0;
+
+reset_assert:
+	dwc3_apple_reset_assert(appledwc);
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dwc3_apple_pm_ops, dwc3_apple_suspend,
+				dwc3_apple_resume);
+
 static struct platform_driver dwc3_apple_driver = {
 	.probe		= dwc3_apple_probe,
 	.remove		= dwc3_apple_remove,
 	.driver		= {
 		.name	= "dwc3-apple",
 		.of_match_table	= dwc3_apple_of_match,
+		.pm	= pm_sleep_ptr(&dwc3_apple_pm_ops),
 	},
 };
 
