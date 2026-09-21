@@ -607,6 +607,21 @@ int asix_set_wol(struct net_device *net, struct ethtool_wolinfo *wolinfo)
 			      opt, 0, 0, NULL, 0) < 0)
 		return -EINVAL;
 
+	/*
+	 * Arming the chip is not enough.  Unless the USB device is also
+	 * enabled for remote wakeup, usbcore suspends it with wakeup off and
+	 * the resume signalling the part raises on a magic packet is simply
+	 * ignored, so the system never wakes however the monitor-mode
+	 * register is set.  lan78xx and r8152 both do this from their own
+	 * set_wol; asix never did.
+	 *
+	 * Measured on a J700 (A18): with WAKE_MAGIC armed and the chip
+	 * reporting "Wake-on: pg", the device still sat at
+	 * power/wakeup = disabled, and a magic packet did not wake the
+	 * machine from s2idle.
+	 */
+	device_set_wakeup_enable(&dev->udev->dev, !!wolinfo->wolopts);
+
 	return 0;
 }
 
