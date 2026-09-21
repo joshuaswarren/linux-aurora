@@ -15,6 +15,7 @@
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/pm_wakeup.h>
 #include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/workqueue.h>
@@ -133,6 +134,8 @@ struct dwc3_apple {
 	enum dwc3_apple_state state;
 	/* state to restore in resume, captured by suspend */
 	enum dwc3_apple_state pm_state;
+	/* suspend left the core powered because something below can wake us */
+	bool pm_kept_powered;
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -980,6 +983,27 @@ static int dwc3_apple_suspend(struct device *dev)
 	 * requirement dwc3_apple_exit() documents.
 	 */
 	dwc3_enable_susphy(&appledwc->dwc, true);
+
+	/*
+	 * If anything below us is supposed to wake the system -- a USB device
+	 * with remote wakeup armed, which is how Wake-on-LAN reaches the
+	 * Ethernet adapter on this board -- the controller has to stay
+	 * powered.  Tearing the core down would drop the port and the
+	 * device's wake path with it, so stop at parking the PHY, as
+	 * dwc3_suspend_common() does for a wakeup-capable host.
+	 *
+	 * device_wakeup_path() rather than device_may_wakeup(): the wakeup
+	 * flag lives on the xHCI child and its devices, not on this node, and
+	 * the PM core propagates it up to us as children suspend first.
+	 */
+	appledwc->pm_kept_powered = device_may_wakeup(dev) ||
+				    device_wakeup_path(dev);
+	if (appledwc->pm_kept_powered) {
+		dev_dbg(appledwc->dev,
+			"keeping the core powered for a wakeup source below\n");
+		return 0;
+	}
+
 	dwc3_core_exit(&appledwc->dwc);
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 
@@ -1005,6 +1029,13 @@ static int dwc3_apple_resume(struct device *dev)
 	if (appledwc->pm_state != DWC3_APPLE_HOST &&
 	    appledwc->pm_state != DWC3_APPLE_DEVICE)
 		return 0;
+
+	if (appledwc->pm_kept_powered) {
+		/* the core was never torn down, so there is nothing to rebuild */
+		appledwc->pm_kept_powered = false;
+		dwc3_apple_dump_usb2_state(appledwc, "pm-resume-kept");
+		return 0;
+	}
 
 	/*
 	 * The USB2 PHY mode has to be set while the PHY is still powered off,
