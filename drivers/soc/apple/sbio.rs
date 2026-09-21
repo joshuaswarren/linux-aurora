@@ -2080,6 +2080,20 @@ impl SepData {
         if assessment.len() < crate::sbio::ASSESS_MIN_LEN {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
+        // A no-finger frame must not be judged usable.  On J700 enrolment
+        // reports "stage passed" without the sensor being touched at all,
+        // which means this gate is reading the wrong byte: dump the whole
+        // assessment so the real usable/quality field can be identified by
+        // comparing a touched frame with an untouched one.
+        if *module_parameters::sbio_trace.value() != 0 {
+            dev_info!(
+                self.dev,
+                "assessment[{}]: len={} bytes={:02x?}\n",
+                counter,
+                assessment.len(),
+                &assessment[..core::cmp::min(64, assessment.len())]
+            );
+        }
         let usable = assessment[crate::sbio::ASSESS_USABLE_ENROL] != 0;
         if !usable {
             return ImageOutcome::Retry;
@@ -2091,6 +2105,42 @@ impl SepData {
         let Some(parsed) = crate::sbio::EnrolmentResult::parse(&result) else {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
+
+        // The three field offsets in EnrolmentResult were read off firmware and
+        // have never been checked against a live multi-frame enrolment.  If
+        // `complete` never flips, enrolment reports "stage passed" forever and
+        // never finishes, which is exactly what a J700 does today.  Dump the
+        // regions that should carry the counters so the offsets can be
+        // confirmed or corrected from a real capture sequence.
+        if *module_parameters::sbio_trace.value() != 0 {
+            let head = &result[..core::cmp::min(32, result.len())];
+            dev_info!(
+                self.dev,
+                "enrol-result[{}]: len={} head={:02x?}\n",
+                counter,
+                result.len(),
+                head
+            );
+            let tail_from = crate::sbio::SBIO_ENROL_RESULT_LEN.saturating_sub(0x60);
+            if result.len() >= crate::sbio::SBIO_ENROL_RESULT_LEN {
+                dev_info!(
+                    self.dev,
+                    "enrol-result[{}]: @{:#x}={:02x?}\n",
+                    counter,
+                    tail_from,
+                    &result[tail_from..crate::sbio::SBIO_ENROL_RESULT_LEN]
+                );
+            }
+            dev_info!(
+                self.dev,
+                "enrol-result[{}]: parsed progress={} percent={} complete={} has_template={}\n",
+                counter,
+                parsed.progress_raw_value(),
+                parsed.progress_percent(),
+                parsed.complete(),
+                parsed.has_template()
+            );
+        }
 
         if parsed.complete() {
             self.stash_enrol_identity(&result);
@@ -3176,6 +3226,10 @@ impl EnrolmentResult {
                 bytes[ER_COMPLETE + 3],
             ]),
         })
+    }
+
+    pub(crate) fn progress_raw_value(&self) -> u8 {
+        self.progress_raw
     }
 
     pub(crate) fn progress_percent(&self) -> u32 {

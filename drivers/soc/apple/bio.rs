@@ -415,6 +415,18 @@ pub(crate) struct Session {
     op: Op,
     unseen: bool,
     token: Option<ResultToken>,
+    /// Highest enrolment stage already handed to userspace.
+    ///
+    /// `unseen` means "something in this session changed", and guidance is
+    /// part of the session, so a bare `unseen` cannot distinguish "the finger
+    /// advanced the enrolment" from "tell the user where to put their finger".
+    /// libfprint treats every `Progress` as a completed stage, so publishing
+    /// guidance as progress makes enrolment report `enroll-stage-passed` for
+    /// each sensor state transition -- once when the sensor arms with no
+    /// finger at all, and three times for a single press (arm, read, and arm
+    /// again on release). Enrolment then never finishes, because none of
+    /// those stages came from an image.
+    reported_stage: u32,
 }
 
 impl Session {
@@ -424,6 +436,7 @@ impl Session {
             op: Op::Idle,
             unseen: false,
             token: None,
+            reported_stage: 0,
         }
     }
 
@@ -432,6 +445,7 @@ impl Session {
         self.op = Op::Idle;
         self.unseen = false;
         self.token = None;
+        self.reported_stage = 0;
     }
 
     pub(crate) fn ready(&self) -> bool {
@@ -557,6 +571,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         guidance: Guidance::Place,
         percent: 0,
     };
+    ctx.session.reported_stage = 0;
     Ok(Handled {
         ret: 0,
         wake: false,
@@ -645,6 +660,8 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         stages_total: ENROL_STAGES,
         ..EnrolPoll::default()
     };
+    // Applied after the match: `ctx.session.op` is borrowed for its duration.
+    let mut advanced_to: Option<u32> = None;
 
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
@@ -661,10 +678,16 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
             out.progress_percent = *percent;
             match terminal {
                 None => {
-                    out.state = if ctx.session.unseen {
-                        State::Progress
+                    // Only an advance in the stage counter is progress; a
+                    // guidance change is not. Stage 0 is the starting value,
+                    // so it is never reported -- otherwise the very first poll
+                    // would announce a completed stage before the sensor has
+                    // been touched.
+                    if *stage > ctx.session.reported_stage {
+                        advanced_to = Some(*stage);
+                        out.state = State::Progress;
                     } else {
-                        State::Pending
+                        out.state = State::Pending;
                     }
                 }
                 Some(EnrolOutcome::Failed(status)) => {
@@ -677,6 +700,10 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
                 }
             }
         }
+    }
+
+    if let Some(stage) = advanced_to {
+        ctx.session.reported_stage = stage;
     }
 
     UserSlice::new(user, core::mem::size_of::<EnrolPoll>())
