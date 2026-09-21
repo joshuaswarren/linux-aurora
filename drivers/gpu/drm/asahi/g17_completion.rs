@@ -64,12 +64,12 @@ pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
 /// late event is ignored rather than signalling or releasing twice.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RenderFenceState {
-    pending: u8,
+    pending: u64,
 }
 
 impl RenderFenceState {
-    const fn bit(slot: u8) -> Option<u8> {
-        if slot < 8 { Some(1u8 << slot) } else { None }
+    const fn bit(slot: u8) -> Option<u64> {
+        if slot < 64 { Some(1u64 << slot) } else { None }
     }
 
     pub(crate) fn arm(&mut self, slot: u8) -> bool {
@@ -384,7 +384,7 @@ pub(crate) struct G17PKtracePrintBudget {
 impl G17PKtracePrintBudget {
     pub(crate) fn allow(&mut self, key: u16, ordinary_limit: u32) -> bool {
         if g17p_ktrace_key_is_dm_monitor(key) {
-            if self.monitor_printed >= 64 {
+            if ordinary_limit != 0 && self.monitor_printed >= 64 {
                 self.monitor_dropped = self.monitor_dropped.saturating_add(1);
                 return false;
             }
@@ -392,7 +392,7 @@ impl G17PKtracePrintBudget {
             return true;
         }
         if key < 0x100 {
-            if self.submission_printed >= 64 {
+            if ordinary_limit != 0 && self.submission_printed >= 64 {
                 self.submission_dropped = self.submission_dropped.saturating_add(1);
                 return false;
             }
@@ -1470,8 +1470,7 @@ pub(crate) struct RenderExecutionState {
 
 impl RenderExecutionState {
     pub(crate) fn observed(self) -> bool {
-        self.job_list_empty
-            && self.tiling_timestamps.iter().all(|value| *value != 0)
+        self.tiling_timestamps.iter().all(|value| *value != 0)
             && self.fragment_timestamps.iter().all(|value| *value != 0)
     }
 }
@@ -1488,8 +1487,7 @@ pub(crate) const fn render_gpu_interval(
 ) -> Option<[u64; 2]> {
     let start = execution.tiling_timestamps[0];
     let end = execution.fragment_timestamps[1];
-    if execution.job_list_empty
-        && start != 0
+    if start != 0
         && execution.tiling_timestamps[1] == start
         && execution.fragment_timestamps[0] == start
         && start < end
@@ -1549,13 +1547,24 @@ impl RenderQueueWindow {
     }
 
     fn normalize(self, indices: QueueIndices) -> Result<QueueIndices, CompletionDecodeError> {
+        self.normalize_with_limit(indices, self.count)
+    }
+
+    fn normalize_with_limit(
+        self,
+        indices: QueueIndices,
+        limit: u32,
+    ) -> Result<QueueIndices, CompletionDecodeError> {
+        if limit < self.count || limit >= self.capacity {
+            return Err(CompletionDecodeError::RenderWindow);
+        }
         let distance = |value: u32| {
             if value >= self.capacity {
                 return Err(CompletionDecodeError::RenderCursorOutsideWindow);
             }
             let distance = ((u64::from(value) + u64::from(self.capacity)
                 - u64::from(self.base)) % u64::from(self.capacity)) as u32;
-            if distance > self.count {
+            if distance > limit {
                 return Err(CompletionDecodeError::RenderCursorOutsideWindow);
             }
             Ok(distance)
@@ -1581,6 +1590,36 @@ pub(crate) fn observe_paired_render_window(
     let mut result = observe_paired_render_completion(
         window.normalize(tiling_previous)?, window.normalize(tiling_current)?, window.count,
         window.normalize(fragment_previous)?, window.normalize(fragment_current)?, window.count,
+        execution,
+    )?;
+    result.tiling.indices = tiling_current;
+    result.fragment.indices = fragment_current;
+    result.tiling.published_prefix = window.target();
+    result.fragment.published_prefix = window.target();
+    Ok(result)
+}
+
+/// Observe one prefix while later groups are already appended to the same
+/// physical ring. `max_groups` is the host publication bound, so modular
+/// cursor progress remains unambiguous across wrap.
+pub(crate) fn observe_paired_render_window_depth(
+    window: RenderQueueWindow,
+    max_groups: u32,
+    tiling_previous: QueueIndices,
+    tiling_current: QueueIndices,
+    fragment_previous: QueueIndices,
+    fragment_current: QueueIndices,
+    execution: RenderExecutionState,
+) -> Result<PairedRenderCompletion, CompletionDecodeError> {
+    let limit = window.count.checked_mul(max_groups)
+        .ok_or(CompletionDecodeError::RenderWindow)?;
+    let mut result = observe_paired_render_completion(
+        window.normalize(tiling_previous)?,
+        window.normalize_with_limit(tiling_current, limit)?,
+        window.count,
+        window.normalize(fragment_previous)?,
+        window.normalize_with_limit(fragment_current, limit)?,
+        window.count,
         execution,
     )?;
     result.tiling.indices = tiling_current;
@@ -1638,14 +1677,15 @@ mod tests {
         assert!(complete.complete && complete.idle);
         assert_eq!(complete.tiling.indices, current);
         assert_eq!(complete.fragment.published_prefix, 1);
-        for pending in [
+        let linked_successor = observe_paired_render_window(
+            window, previous, current, previous, current,
             RenderExecutionState { job_list_empty: false, ..execution },
+        ).unwrap();
+        assert!(linked_successor.complete && !linked_successor.idle);
+        assert!(!observe_paired_render_window(
+            window, previous, current, previous, current,
             RenderExecutionState { fragment_timestamps: [1, 0], ..execution },
-        ] {
-            assert!(!observe_paired_render_window(
-                window, previous, current, previous, current, pending,
-            ).unwrap().complete);
-        }
+        ).unwrap().complete);
         assert!(observe_compute_completion(previous, current, 1).is_err());
     }
 
@@ -1838,6 +1878,18 @@ mod tests {
         assert!(budget.allow(G17P_KTRACE_LOST_KEY, 32));
         assert!(!g17p_ktrace_key_is_dm_monitor(0x010f));
         assert!(!g17p_ktrace_key_is_dm_monitor(0x090a));
+    }
+
+    #[test]
+    fn ktrace_explicit_unlimited_budget_preserves_the_whole_ring() {
+        let mut budget = G17PKtracePrintBudget::default();
+        for _ in 0..G17P_KTRACE_CAPACITY {
+            assert!(budget.allow(0x0041, 0));
+            assert!(budget.allow(0x0903, 0));
+            assert!(budget.allow(0x0101, 0));
+        }
+        assert_eq!(budget.submission_dropped, 0);
+        assert_eq!(budget.monitor_dropped, 0);
     }
 
     #[test]

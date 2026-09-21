@@ -577,33 +577,6 @@ impl File {
             );
         }
 
-        let simplefb_iova = *module_parameters::g17p_simplefb_iova.value();
-        if simplefb_iova != 0 {
-            if gpu.params()?.chip_id != 0x8140 {
-                return Err(ENOTSUPP);
-            }
-            let (simplefb_phys, simplefb_size) = t8140_simplefb_phys_range()?;
-            let simplefb_end = simplefb_iova
-                .checked_add(simplefb_size as u64)
-                .ok_or(EOVERFLOW)?;
-            let simplefb_range = simplefb_iova..simplefb_end;
-            if simplefb_iova & mmu::UAT_PGMSK as u64 != 0
-                || !user_range.is_superset(simplefb_range.clone())
-                || kernel_range.overlaps(simplefb_range.clone())
-                || vm.driver_range_overlaps(simplefb_range)
-            {
-                return Err(EINVAL);
-            }
-            vm.install_simplefb_mapping(simplefb_iova, simplefb_phys, simplefb_size)?;
-            dev_info!(
-                device,
-                "G17P simplefb: retained GPU alias {:#x}:{:#x} -> phys {:#x}\n",
-                simplefb_iova,
-                simplefb_size,
-                simplefb_phys,
-            );
-        }
-
         let vm_xa = file.inner().vms();
         let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
         let id: u32 = resv.index().try_into()?;

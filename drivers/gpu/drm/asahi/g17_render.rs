@@ -232,6 +232,10 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) depth_clear_value_bits: u32,
     pub(crate) stencil_clear_value: u32,
     pub(crate) depth_flags: u64,
+    /// ZLS control used by every firmware partial-store/load/resume phase.
+    /// Unlike the pass-boundary control, an attached depth/stencil surface
+    /// must be both loaded and stored across an internal split.
+    pub(crate) partial_depth_flags: u64,
     pub(crate) depth_dimensions: u64,
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
@@ -373,6 +377,7 @@ impl G17pRenderParameters {
             depth_clear_value_bits: 0x3f80_0000,
             stencil_clear_value: 0,
             depth_flags: 0,
+            partial_depth_flags: 0,
             depth_dimensions: 0,
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
@@ -670,7 +675,7 @@ fn build_ta_registers_for_work_key(
 /// The tiler bins ~60 bytes of a 1.28 MB TVB with every input verified correct,
 /// so these are what is left that we demonstrably send differently.
 fn apply_g17p_ta_oracle(raw: &mut [u8]) {
-    let mask = *crate::module_parameters::g17p_ta_oracle.value();
+    let mask = crate::g17_config::TA_ORACLE;
     if mask == 0 {
         return;
     }
@@ -887,7 +892,7 @@ fn partial_store_registers(
         RegisterWrite::new(0x15439, p.stencil_aux_stride),
         RegisterWrite::new(0x15221, 0),
         RegisterWrite::new(0x15229, 0),
-        RegisterWrite::new(0x15319, p.depth_flags),
+        RegisterWrite::new(0x15319, p.partial_depth_flags),
         RegisterWrite::new(0x15349, 0x0404_0404),
     ]
 }
@@ -917,7 +922,7 @@ fn partial_resume_registers(
         RegisterWrite::new(0x153c1, p.depth_aux_buffer),
         RegisterWrite::new(0x15339, p.stencil_buffer),
         RegisterWrite::new(0x153d1, p.stencil_aux_buffer),
-        RegisterWrite::new(0x15319, p.depth_flags),
+        RegisterWrite::new(0x15319, p.partial_depth_flags),
         RegisterWrite::new(0x15349, 0x0404_0404),
     ]
 }
@@ -934,7 +939,7 @@ fn partial_load_registers(
         RegisterWrite::new(0x153c1, p.depth_aux_buffer),
         RegisterWrite::new(0x15339, p.stencil_buffer),
         RegisterWrite::new(0x153d1, p.stencil_aux_buffer),
-        RegisterWrite::new(0x15319, p.depth_flags),
+        RegisterWrite::new(0x15319, p.partial_depth_flags),
         RegisterWrite::new(0x15349, 0x0404_0404),
     ]
 }
@@ -1286,7 +1291,7 @@ pub(crate) fn build_fragment_descriptor(
     // rebuild each time. The fragment executes on DM0 and writes NO pixels, so
     // one of these is a candidate for the missing store.
     {
-        let oracle = *crate::module_parameters::g17p_frag_oracle.value();
+        let oracle = crate::g17_config::FRAG_ORACLE;
         if oracle & 0x01 != 0 {
             put_u64(raw, 0x158, 0x7007);
         }
@@ -1474,7 +1479,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             put_u32(
                 raw,
                 0x08ba,
-                if *crate::module_parameters::g17p_render_ta_qid_field.value() != 0 {
+                if crate::g17_config::RENDER_TA_QID_FIELD != 0 {
                     u32::from(queue_id)
                 } else {
                     0
@@ -1971,6 +1976,28 @@ mod tests {
     }
 
     #[test]
+    fn reused_cpu_staging_produces_identical_wire_descriptors() {
+        let parameters = G17pRenderParameters::source_rsrc8();
+        for dirty in [0x00, 0x55, 0xff] {
+            let mut staging = [dirty; 0x8000];
+            staging.fill(0);
+            let mut tiling = [0; TA_DESCRIPTOR_SIZE];
+            let mut fragment = [0; FRAGMENT_DESCRIPTOR_SIZE];
+            let ta_metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling);
+            let fragment_metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment);
+            build_ta_descriptor(&parameters, objects(), ta_metadata, &mut tiling).unwrap();
+            build_fragment_descriptor(&parameters, objects(), fragment_metadata, &mut fragment).unwrap();
+            let (ta, fr) = staging.split_at_mut(0x4000);
+            build_ta_descriptor(&parameters, objects(), ta_metadata, ta).unwrap();
+            build_fragment_descriptor(&parameters, objects(), fragment_metadata, fr).unwrap();
+            assert_eq!(&ta[..TA_DESCRIPTOR_SIZE], &tiling);
+            assert_eq!(&fr[..FRAGMENT_DESCRIPTOR_SIZE], &fragment);
+            assert!(ta[TA_DESCRIPTOR_SIZE..].iter().all(|v| *v == 0));
+            assert!(fr[FRAGMENT_DESCRIPTOR_SIZE..].iter().all(|v| *v == 0));
+        }
+    }
+
+    #[test]
     fn descriptors_match_m1n1_9165484_and_duplicate_pipeline_fields() {
         let parameters = G17pRenderParameters::source_rsrc8();
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
@@ -2183,6 +2210,30 @@ mod tests {
             .unwrap();
             assert_eq!(get_u32(&fragment, 0x50), samples, "first {samples}x");
             assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
+        }
+    }
+
+    #[test]
+    fn partial_render_uses_phase_specific_zls_control() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.depth_buffer = 0x5be8_2a00_00;
+        parameters.stencil_buffer = 0x5bea_4240_00;
+        parameters.depth_flags = 0x000c_0000;
+        parameters.partial_depth_flags = 0x000c_c000;
+
+        let main = build_fragment_registers(&parameters).unwrap();
+        assert_eq!(
+            main.iter().find(|reg| reg.number == 0x15319).unwrap().value,
+            0x000c_0000,
+        );
+        let store = partial_store_registers(&parameters);
+        let resume = partial_resume_registers(&parameters);
+        let load = partial_load_registers(&parameters);
+        for registers in [store.as_slice(), resume.as_slice(), load.as_slice()] {
+            assert_eq!(
+                registers.iter().find(|reg| reg.number == 0x15319).unwrap().value,
+                0x000c_c000,
+            );
         }
     }
 

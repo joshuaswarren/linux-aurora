@@ -513,6 +513,15 @@ impl FirmwareContextTableReader {
         self.context_root(0)
     }
 
+    /// Diagnostic read-only view of context 0's upper root. Addresses passed
+    /// to the walker are offsets within that root, not canonical high VAs.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn context0_upper_root(&self) -> Option<FirmwarePageTableRoot> {
+        let shared = self.inner.lock();
+        decode_firmware_ttb_root(shared.ttbs()[0].ttb1.load(Ordering::Acquire), self.cfg)
+            .map(|ttb| FirmwarePageTableRoot { ttb, cfg: self.cfg })
+    }
+
     /// Copy one T8140 crash buffer through the retained WC CPU alias. This is
     /// distinct from the raw physical walker used to diagnose the live UAT:
     /// the latter maps pages WB and can hide device writes behind a conflicting
@@ -1107,7 +1116,11 @@ impl VmInner {
         fence(Ordering::SeqCst);
         for context_id in 0..UAT_NUM_CTX {
             if contexts & (1u64 << context_id) != 0 {
-                mem::tlbi_range(context_id as u8, addr as usize, size as usize);
+                if self.uat_inner.t8140 {
+                    mem::tlbi_range_t8140(context_id as u8, addr as usize, size as usize);
+                } else {
+                    mem::tlbi_range(context_id as u8, addr as usize, size as usize);
+                }
             }
         }
         mem::sync();
@@ -1392,12 +1405,12 @@ impl Drop for T8140NativeContextAliases {
         self.mappings.clear();
         fence(Ordering::SeqCst);
         for view in T8140_NATIVE_CONTEXT_VIEWS {
-            mem::tlbi_range(0, view.context_address as usize, view.size);
-            mem::tlbi_range(1, view.context_address as usize, view.size);
+            mem::tlbi_range_t8140(0, view.context_address as usize, view.size);
+            mem::tlbi_range_t8140(1, view.context_address as usize, view.size);
         }
         for context_id in 0..UAT_NUM_CTX {
             if client_contexts & (1u64 << context_id) != 0 {
-                mem::tlbi_range(
+                mem::tlbi_range_t8140(
                     context_id as u8,
                     T8140_CLIENT_NULL_VIEW_START as usize,
                     T8140_CLIENT_NULL_VIEW_SIZE,
@@ -1412,7 +1425,7 @@ struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
     simplefb: Option<KernelMapping>,
-    render_pools: [Option<VmRenderPoolMappings>; 2],
+    render_pools: [Option<VmRenderPoolMappings>; 64],
     compute_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
@@ -2573,7 +2586,7 @@ impl Vm {
             mappings,
             reserved_ranges,
             simplefb: None,
-            render_pools: [None, None],
+            render_pools: [const { None }; 64],
             compute_pool: None,
         });
         Ok(())
@@ -2625,7 +2638,7 @@ impl Vm {
         tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || render_slot as usize >= 2 {
+        if pool_id == 0 || render_slot as usize >= 64 {
             return Err(EINVAL);
         }
         let mut retained = self.driver_mappings.lock();
@@ -2651,7 +2664,7 @@ impl Vm {
         &self, render_slot: u8, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || render_slot as usize >= 2 || tvb_blocks <= previous_blocks
+        if pool_id == 0 || render_slot as usize >= 64 || tvb_blocks <= previous_blocks
             || mappings.len() != tvb_blocks - previous_blocks { return Err(EINVAL); }
         let mut retained = self.driver_mappings.lock();
         let pool = Option::as_mut(&mut *retained)
@@ -4087,17 +4100,24 @@ impl Uat {
         // presentation page-for-page before adding the sole missing view 0.
         for (index, (gem, object_offset)) in snapshot.iter().enumerate().skip(1) {
             let view = T8140_NATIVE_CONTEXT_VIEWS[index];
-            if !source.covers_range(
+            let source_covered = source.covers_range(
                 view.source_address,
                 view.size as u64,
                 true,
                 view.requires_source_write,
-            ) || !source.covers_range(
+            );
+            let context_covered = source.covers_range(
                 view.context_address,
                 view.size as u64,
                 true,
                 view.requires_source_write,
-            ) {
+            );
+            if !source_covered || !context_covered {
+                dev_err!(self.dev.as_ref(),
+                    "MMU: T8140 job context VM {} view {} incomplete: source={:#x} covered={} low={:#x} covered={} size={:#x} write={}\n",
+                    source.id, index, view.source_address, source_covered,
+                    view.context_address, context_covered, view.size,
+                    view.requires_source_write);
                 return Err(EFAULT);
             }
             let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
@@ -4130,6 +4150,9 @@ impl Uat {
             true,
             view.requires_source_write,
         ) {
+            dev_err!(self.dev.as_ref(),
+                "MMU: T8140 job context VM {} null source={:#x}+{:#x} lacks required permissions (write={})\n",
+                source.id, view.source_address, view.size, view.requires_source_write);
             return Err(EFAULT);
         }
         let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
@@ -4190,13 +4213,15 @@ impl Uat {
             {
                 return Err(EAGAIN);
             }
-            dev_info!(
-                self.dev.as_ref(),
-                "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
-                T8140_NATIVE_CONTEXT_VIEW_COUNT,
-                source.id,
-                source_generation,
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    self.dev.as_ref(),
+                    "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
+                    T8140_NATIVE_CONTEXT_VIEW_COUNT,
+                    source.id,
+                    source_generation,
+                );
+            }
             return Ok(mappings);
         }
         let mapping = source.map_in_range(
@@ -4228,13 +4253,15 @@ impl Uat {
         {
             return Err(EAGAIN);
         }
-        dev_info!(
-            self.dev.as_ref(),
-            "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
-            T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
-            source.id,
-            source_generation,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.dev.as_ref(),
+                "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
+                T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
+                source.id,
+                source_generation,
+            );
+        }
         Ok(mappings)
     }
 
@@ -4986,7 +5013,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
-        let mask = *module_parameters::g17p_ctx2_root.value();
+        let mask = crate::g17_config::CTX2_ROOT;
         if mask == 0 {
             dev_info!(
                 self.dev.as_ref(),
@@ -5082,7 +5109,7 @@ impl Uat {
         }
 
         let low_root = bind.0.ttb();
-        let high_root = if *module_parameters::g17p_render_populated_high_root.value() != 0 {
+        let high_root = if crate::g17_config::RENDER_POPULATED_HIGH_ROOT != 0 {
             self.kernel_vm.ttb()
         } else {
             self.t8140_empty_high_roots.as_ref().ok_or(EIO)?[1].ttb()
@@ -5261,7 +5288,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 {
             return Ok(());
         }
-        if *module_parameters::g17p_ctx2_root.value() == 0 {
+        if crate::g17_config::CTX2_ROOT == 0 {
             return Ok(());
         }
         if self.t8140_compute_context_alias_ready(bind) {
@@ -5352,7 +5379,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
             return false;
         }
-        let mask = *module_parameters::g17p_ctx2_root.value();
+        let mask = crate::g17_config::CTX2_ROOT;
         if mask == 0 {
             return false;
         }
@@ -5447,7 +5474,7 @@ impl Uat {
                 let uat_inner = self.inner.lock();
 
                 let ttb1 = if self.cfg == UatConfig::T8140 {
-                    let high_root = if *module_parameters::g17p_render_populated_high_root.value()
+                    let high_root = if crate::g17_config::RENDER_POPULATED_HIGH_ROOT
                         != 0
                     {
                         // Diagnostic only: native gives each app GART a distinct,
@@ -5493,7 +5520,7 @@ impl Uat {
                 if self.cfg == UatConfig::T8140 && idx == 1 {
                     self.t8140_context_phase
                         .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
-                    if *module_parameters::g17p_render_populated_high_root.value() != 0 {
+                    if crate::g17_config::RENDER_POPULATED_HIGH_ROOT != 0 {
                         dev_warn!(
                             self.dev.as_ref(),
                             "MMU: DIAGNOSTIC render context 1 exposes populated high root {:#x}\n",

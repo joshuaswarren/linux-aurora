@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::{g17_submission, hw, identity, module_parameters};
+use crate::{g17_submission, hw, identity};
 use kernel::{
     c_str,
     device::Core,
@@ -957,11 +957,11 @@ impl Resources {
         // firmware reaches the same registers through its own mapping of
         // PA 0x480000000. Gated off by default until the correct host aperture
         // is proven or the KSM programming moves to firmware channel commands.
-        if *module_parameters::g17p_sksm_mmio.value() == 0 || !self.g17p_sksm_port_powered() {
+        if crate::g17_config::SKSM_MMIO == 0 || !self.g17p_sksm_port_powered() {
             dev_info!(
                 self.dev.as_ref(),
                 "G17P SKSM port MMIO suppressed (enabled={}, powered={}): {:#x}@{:#x} / {:#x}@{:#x}\n",
-                *module_parameters::g17p_sksm_mmio.value(),
+                crate::g17_config::SKSM_MMIO,
                 self.g17p_sksm_port_powered(),
                 pair.word0, pair.word0_offset, pair.word1, pair.word1_offset
             );
@@ -989,11 +989,11 @@ impl Resources {
             return Err(EINVAL);
         }
 
-        if *module_parameters::g17p_sksm_mmio.value() == 0 || !self.g17p_sksm_port_powered() {
+        if crate::g17_config::SKSM_MMIO == 0 || !self.g17p_sksm_port_powered() {
             dev_info!(
                 self.dev.as_ref(),
                 "G17P QID configure suppressed (enabled={}, powered={}, tag={:#x}@{:#x} payload={:#x}@{:#x} maskHi={:#x} maskLo={:#x})\n",
-                *module_parameters::g17p_sksm_mmio.value(),
+                crate::g17_config::SKSM_MMIO,
                 self.g17p_sksm_port_powered(),
                 pair.word0, pair.word0_offset, pair.word1, pair.word1_offset,
                 enable_pair.word0, enable_pair.word1
