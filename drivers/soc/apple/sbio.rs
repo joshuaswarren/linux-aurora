@@ -392,12 +392,97 @@ impl SepData {
         match self.sbio_call(&op) {
             SbioOutcome::Ok(_payload) => {
                 self.enrol_open.store(true, Relaxed);
+                self.probe_enrol_result_length();
                 Some(OpenEnrolment {
                     sep: self,
                     armed: true,
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Ask the enclave for an ENROLMENT_RESULT immediately after BEGIN_ENROL,
+    /// before any image has been captured.  Off by default.
+    ///
+    /// SBIO_ENROL_RESULT_LEN is reverse-engineered, and a wrong value fails the
+    /// first usable frame of a real enrolment.  The normal path only reaches
+    /// ENROLMENT_RESULT after a frame the enclave judged usable, which needs a
+    /// fingertip.  If the enclave is willing to answer here -- even with a
+    /// zeroed structure -- its reply length settles that constant with no
+    /// finger on the sensor.  A refusal is equally informative and harmless:
+    /// it says the length can only be learned from a real enrolment.
+    fn probe_enrol_result_length(&self) {
+        if *module_parameters::probe_enrol_result.value() == 0 {
+            return;
+        }
+        match self.sbio_call(&crate::sbio::sbio_enrolment_result()) {
+            SbioOutcome::Ok(payload) => {
+                // Hoisted: the kernel print macros do not accept an inline
+                // if/else as a format argument.
+                let verdict = if payload.len() == crate::sbio::SBIO_ENROL_RESULT_LEN {
+                    " -- CONFIRMED"
+                } else {
+                    " -- MISMATCH, set the constant to the answered length"
+                };
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: ENROLMENT_RESULT before any frame answered {} bytes; SBIO_ENROL_RESULT_LEN is {}{}\n",
+                    payload.len(),
+                    crate::sbio::SBIO_ENROL_RESULT_LEN,
+                    verdict
+                );
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: head={:02x?}\n",
+                    &payload[..core::cmp::min(48, payload.len())]
+                );
+                // Map every non-zero byte.  A fresh enrolment result is almost
+                // entirely zero, so this is short, and it shows which offsets
+                // carry live fields -- the check the three parsed offsets have
+                // never had.  Capped so a surprise cannot flood the log.
+                let mut shown = 0usize;
+                let mut nonzero = 0usize;
+                for (off, b) in payload.iter().enumerate() {
+                    if *b == 0 {
+                        continue;
+                    }
+                    nonzero += 1;
+                    if shown < 40 {
+                        shown += 1;
+                        dev_info!(self.dev, "enrol-probe: nonzero @{:#06x} = {:#04x}\n", off, *b);
+                    }
+                }
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: {} non-zero bytes of {} ({} shown)\n",
+                    nonzero,
+                    payload.len(),
+                    shown
+                );
+                // The three parsed offsets, read directly, whatever they hold.
+                if payload.len() >= crate::sbio::SBIO_ENROL_RESULT_LEN {
+                    dev_info!(
+                        self.dev,
+                        "enrol-probe: at ER_PROGRESS 0x004={:#04x}  ER_HAS_TEMPLATE 0x006={:02x?}  ER_COMPLETE 0xbfe={:02x?}\n",
+                        payload[0x004],
+                        &payload[0x006..0x00a],
+                        &payload[0xbfe..0xc02]
+                    );
+                }
+            }
+            SbioOutcome::PrerequisiteMissing => {
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: ENROLMENT_RESULT refused before a frame (prerequisite missing); the reply length can only be learned from a real enrolment\n"
+                );
+            }
+            _ => {
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: ENROLMENT_RESULT answered a non-OK status before a frame; no length learned\n"
+                );
+            }
         }
     }
 
