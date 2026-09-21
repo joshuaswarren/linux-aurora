@@ -136,6 +136,9 @@ struct dwc3_apple {
 	enum dwc3_apple_state pm_state;
 	/* suspend left the core powered because something below can wake us */
 	bool pm_kept_powered;
+	/* Whether we armed the xHCI interrupt as a wake source; see suspend. */
+	bool pm_wake_irq_armed;
+	int pm_wake_irq;
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -1018,6 +1021,28 @@ static int dwc3_apple_suspend(struct device *dev)
 	if (appledwc->pm_kept_powered) {
 		dev_dbg(appledwc->dev,
 			"keeping the core powered for a wakeup source below\n");
+
+		/*
+		 * Keeping the controller powered is not enough on its own: in
+		 * s2idle suspend_device_irqs() masks every interrupt that has
+		 * not been marked a wake source, so the xHCI interrupt raised
+		 * by a port event -- a Wake-on-LAN packet reaching the USB
+		 * Ethernet adapter -- would never be delivered and nothing
+		 * could end the suspend.  Arm it explicitly and remember that
+		 * we did, so resume disarms exactly once.
+		 */
+		if (!appledwc->pm_wake_irq_armed && appledwc->dwc.xhci) {
+			int wake_irq = platform_get_irq(appledwc->dwc.xhci, 0);
+
+			if (wake_irq >= 0 && !enable_irq_wake(wake_irq)) {
+				appledwc->pm_wake_irq = wake_irq;
+				appledwc->pm_wake_irq_armed = true;
+			} else {
+				dev_dbg(appledwc->dev,
+					"no wake irq for the host controller (%d)\n",
+					wake_irq);
+			}
+		}
 		return 0;
 	}
 
@@ -1046,6 +1071,11 @@ static int dwc3_apple_resume(struct device *dev)
 	if (appledwc->pm_state != DWC3_APPLE_HOST &&
 	    appledwc->pm_state != DWC3_APPLE_DEVICE)
 		return 0;
+
+	if (appledwc->pm_wake_irq_armed) {
+		disable_irq_wake(appledwc->pm_wake_irq);
+		appledwc->pm_wake_irq_armed = false;
+	}
 
 	if (appledwc->pm_kept_powered) {
 		/* the core was never torn down, so there is nothing to rebuild */
