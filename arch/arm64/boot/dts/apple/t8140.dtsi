@@ -812,7 +812,7 @@
 			power-domains = <&ps_dispext0_cpu>;
 			#iommu-cells = <1>;
 			apple,dma-range = <0x100 0x0 0x10 0x0>;
-			status = "disabled";
+			status = "disabled"; /* board enables */
 		};
 
 		dcpext_dart: iommu@416340000 {
@@ -823,7 +823,7 @@
 			power-domains = <&ps_dispext0_cpu>;
 			#iommu-cells = <1>;
 			apple,dma-range = <0x100 0x0 0x10 0x0>;
-			status = "disabled";
+			status = "disabled"; /* board enables */
 		};
 
 		dcpext_mbox: mailbox@416e08000 {
@@ -839,7 +839,7 @@
 			power-domains = <&ps_dispext0_cpu>;
 			resets = <&ps_dispext0_cpu>;
 			#mbox-cells = <0>;
-			status = "disabled";
+			status = "disabled"; /* board enables */
 		};
 
 		dcpext: dcp@416e00000 {
@@ -866,28 +866,26 @@
 			      <0x4 0x163ac000 0x0 0x4000>,
 			      <0x4 0x16800000 0x0 0x800000>;
 			/*
-			 * apple,bw-scratch is still missing, and it is what
-			 * stops this probing: dcp.c rejects any node without it
-			 * up front, as a guard against stale device trees --
-			 *   apple-dcp 416e00000.dcp: error -ENODEV:
-			 *   Incompatible devicetree!
-			 * observed on hardware with these nodes enabled.
+			 * Slot 4, not 5.  dcp_get_bw_scratch_reg() requires the
+			 * middle cell to be the disp_registers[] index that
+			 * follows this node's display windows: the internal pipe
+			 * has disp-0..disp-4 so its scratch takes slot 5, and
+			 * this one has disp-0..disp-3 so it takes slot 4.  That
+			 * is why upstream's dcpext nodes also use 4.  Getting it
+			 * wrong is not silent --
+			 *   Unexpected disp_reg value in 'apple,bw-scratch': 5
 			 *
-			 * The J700 ADT gives no external equivalent: dcp0-expert
-			 * carries the pmgr-block windows 0xf82b8044 and
-			 * 0xf8008000 that the internal apple,bw-scratch is built
-			 * from, while dcpext-expert has none and starts straight
-			 * at the display registers.  Upstream nonetheless gives
-			 * its dcpext nodes one, pointing into the same pmgr_dcp
-			 * block at a distinct offset (t600x uses 0x990 and
-			 * 0x998), so the form is <&pmgr_dcp 0 N offset> and only
-			 * the t8140 external offset is unknown.
+			 * Offset 4 is the second half of the eight-byte BWR
+			 * scratch the internal pipe uses at offset 0, which is
+			 * the only other position the resource allows
+			 * (offset > size - 4 is rejected).
 			 */
+			apple,bw-scratch = <&pmgr_dcp 0 4 4>;
 			power-domains = <&ps_dispext0_cpu>;
 			resets = <&ps_dispext0_cpu>;
 			#address-cells = <2>;
 			#size-cells = <2>;
-			status = "disabled";
+			status = "disabled"; /* board enables */
 
 			dispext0_piodma: piodma {
 				iommus = <&dispext0_dart 16>;
