@@ -1173,6 +1173,25 @@
 	apple,iomfb-surfaces = <0>;
 
 	/*
+	 * Without a "dp-phy" the entire DisplayPort path is absent, and
+	 * silently: dcp_start_rtkit() gates ibootep_init() and dptxep_init()
+	 * on dcp->phy, and the NULL arm of that test prints nothing at all.
+	 * With no dptxep the 0x2a AFK endpoint never starts, no
+	 * "dcpdptx-port-epic" service appears, dptxport[0].enabled stays
+	 * false, and dcp_dptx_connect() would bail at "missing phy" even if a
+	 * hotplug reached it.  One missing property, three blockers.
+	 *
+	 * Deliberately no "mux-index": that property is what makes dcp_probe()
+	 * claim the DP xbar and force the ATC PHY to DP-only at probe, which
+	 * is right for the MacBook Pro DP-to-HDMI socket and wrong for a real
+	 * Type-C port, where typec_displayport must own the mux.  apple,dptx-phy
+	 * and apple,dptx-die are likewise left out: both default to 0, which is
+	 * correct for a single-PHY, single-die part.
+	 */
+	phys = <&atcphy0 PHY_TYPE_DP>;
+	phy-names = "dp-phy";
+
+	/*
 	 * The J700 has no HDMI socket: this DCP's only output is the DP-Alt
 	 * path on the rear Type-C connector, so the connector is a USB-C one.
 	 * Without this property dcp_probe() falls through to

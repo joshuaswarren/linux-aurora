@@ -447,12 +447,21 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 					  void *reply_, size_t reply_size)
 {
 	struct dptxport_apcall_get_support *reply = reply_;
+	struct apple_dcp *dcp = service->ep->dcp;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(0);
+	/*
+	 * This was hardcoded to 0, which tells the firmware that this output
+	 * has no hotplug detect.  That is right for the soldered panel and
+	 * wrong for a Type-C port, where HPD is the whole mechanism: the
+	 * firmware gates its mode export on it ("HPD not present, skipping
+	 * mode export").  Answer for what the output actually is.
+	 */
+	reply->supported =
+		cpu_to_le32(dcp->connector_type == DRM_MODE_CONNECTOR_USB);
 	return 0;
 }
 
@@ -553,6 +562,23 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEACTIVATE:
 		return dptxport_call_deactivate(service, data, data_size,
 						reply, reply_size);
+	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
+	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
+	case DPTX_APCALL_DEVICE_NOT_STARTED:
+		/*
+		 * These three are the firmware telling us the link failed.
+		 * They were reaching the default arm and being logged as
+		 * "acking unhandled call 22" at info level, which reads like
+		 * an unimplemented opcode rather than a dead display.
+		 */
+		dev_warn(service->ep->dcp->dev,
+			 "DPTXPort: firmware reports link fault %u on %u:%u\n",
+			 idx, service->ep->dcp->dptx_die,
+			 service->ep->dcp->dptx_phy);
+		memcpy(reply, data, min(reply_size, data_size));
+		if (reply_size >= 4)
+			memset(reply, 0, 4);
+		return 0;
 	default:
 		/* just try to ACK and hope for the best... */
 		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",
@@ -571,10 +597,23 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
 
-	if (strcmp(name, "dcpdptx-port-epic"))
+	/*
+	 * Both mismatches used to return silently, and the only symptom was
+	 * dptxep_init() timing out a second later on a port that never
+	 * enabled.  Say which string did not match.
+	 */
+	if (strcmp(name, "dcpdptx-port-epic")) {
+		dev_warn(service->ep->dcp->dev,
+			 "DPTXPort: ignoring service named '%s', expected 'dcpdptx-port-epic'\n",
+			 name);
 		return;
-	if (strcmp(class, "AppleDCPDPTXRemotePort"))
+	}
+	if (strcmp(class, "AppleDCPDPTXRemotePort")) {
+		dev_warn(service->ep->dcp->dev,
+			 "DPTXPort: service '%s' has class '%s', expected 'AppleDCPDPTXRemotePort'\n",
+			 name, class);
 		return;
+	}
 
 	trace_dptxport_init(service->ep->dcp, unit);
 
