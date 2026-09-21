@@ -619,16 +619,33 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
 		enable_irq(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = true;
 		reinit_completion(&mbox->tx_empty);
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
+		if (t <= 0) {
+			/*
+			 * Nothing drained the FIFO, so the send-empty handler
+			 * never ran and never masked the interrupt again.
+			 * Leaving it unmasked makes the next enable_irq() here
+			 * unbalanced, which the IRQ core warns about and which
+			 * eventually leaves the line masked for good:
+			 *   Unbalanced enable for IRQ 40
+			 *   WARNING: kernel/irq/manage.c:775 at enable_irq
+			 *   apple_mbox_send / SepData::get_entropy_word
+			 * once every timeout, from the SEP hwrng kthread.
+			 */
+			spin_lock_irqsave(&mbox->tx_lock, flags);
+			if (mbox->tx_irq_unmasked) {
+				disable_irq_nosync(mbox->irq_send_empty);
+				mbox->tx_irq_unmasked = false;
+			}
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			return t < 0 ? t : -ETIMEDOUT;
+		}
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
 		if (unlikely(READ_ONCE(mbox->removing))) {
@@ -658,7 +675,10 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
+	if (mbox->tx_irq_unmasked) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = false;
+	}
 	complete(&mbox->tx_empty);
 	spin_unlock(&mbox->tx_lock);
 
@@ -952,8 +972,8 @@ static void apple_mbox_quiesce(void *data)
 		cancel_delayed_work_sync(&apple_mbox_to_priv(mbox)->rx_poll_work);
 
 	/* The TX IRQ is normally disabled; force and synchronize that state. */
-	if (!mbox->hw->rx_poll_required)
-		disable_irq(mbox->irq_send_empty);
+	disable_irq(mbox->irq_send_empty);
+	mbox->tx_irq_unmasked = false;
 	complete_all(&mbox->tx_empty);
 	if (!mbox->hw->rx_poll_required)
 		synchronize_irq(mbox->irq_recv_not_empty);

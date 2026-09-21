@@ -824,6 +824,23 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->usb2_retry_reset =
 		device_property_read_bool(dev, "apple,j700-usb2-retry-reset");
 
+	/*
+	 * Declare this controller wakeup-capable before the dwc3 core probes.
+	 *
+	 * dwc3 core latches dwc->sys_wakeup = device_may_wakeup(dwc->sysdev)
+	 * once, and dwc3_host_init() only propagates wakeup to the xHCI child
+	 * when that flag is set.  Without it the child never becomes a wakeup
+	 * device, its interrupt is never armed with enable_irq_wake(), and
+	 * s2idle has nothing that can end it: /sys/kernel/irq/<xhci>/wakeup
+	 * reads "disabled" and a Wake-on-LAN magic packet to a USB Ethernet
+	 * adapter is simply ignored -- measured on J700, where the machine
+	 * suspended correctly and then had to be recovered with a VDM reset.
+	 *
+	 * The core probe is deferred here until the first cable event, so this
+	 * has to happen in the glue probe rather than alongside it.
+	 */
+	device_init_wakeup(dev, true);
+
 	appledwc->reset = devm_reset_control_get_optional_exclusive(dev, NULL);
 	if (IS_ERR(appledwc->reset))
 		return dev_err_probe(&pdev->dev, PTR_ERR(appledwc->reset),
