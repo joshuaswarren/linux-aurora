@@ -781,6 +781,100 @@
 			};
 		};
 
+		/*
+		 * External display pipe (DCPEXT0), read out of the J700 ADT.
+		 *
+		 * Addresses use the ADT-to-DT translation proven against the
+		 * internal pipe: every one of dcp's and disp0's ADT addresses
+		 * plus 0x210000000 equals the address already used above.
+		 *
+		 * Left disabled like the internal pipe; a board enables it.
+		 * It has never been probed -- nothing was plugged into a
+		 * Type-C port when it was written -- so treat the reg-names
+		 * mapping below as the one open question:
+		 *
+		 *   disp0    windows: afc000, 10000, a8000(4k), ac000(4k), 800000
+		 *   dispext0 windows: afc000, 10000,            ac000(4k), 800000
+		 *
+		 * The external pipe has no counterpart to the internal
+		 * "disp-2" (0x4123a8000).  The names here keep the *address
+		 * order* contiguous, so external "disp-2" is the ...ac000
+		 * window that the internal node calls "disp-3".  If the driver
+		 * keys off a name rather than an index this needs revisiting
+		 * with a display attached and the probe watched.
+		 */
+		dispext0_dart: iommu@416300000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x16300000 0x0 0xc000>,
+			      <0x4 0x16314000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_dispext0_cpu>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		dcpext_dart: iommu@416340000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x16340000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_dispext0_cpu>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		dcpext_mbox: mailbox@416e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x16e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 751 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 753 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 754 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			power-domains = <&ps_dispext0_cpu>;
+			resets = <&ps_dispext0_cpu>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		dcpext: dcp@416e00000 {
+			compatible = "apple,t8140-dcp", "apple,dcp";
+			phandle = <&dcpext>;
+			mboxes = <&dcpext_mbox>;
+			mbox-names = "mbox";
+			iommus = <&dcpext_dart 23>;
+
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+				    "disp-3", "iop-vbar";
+			reg = <0x4 0x16e00000 0x0 0x4000>,
+			      <0x4 0x14000000 0x0 0xafc000>,
+			      <0x4 0x16240000 0x0 0x10000>,
+			      <0x4 0x163ac000 0x0 0x4000>,
+			      <0x4 0x16800000 0x0 0x800000>,
+			      <0x4 0x16850000 0x0 0x4000>;
+			/*
+			 * apple,bw-scratch / apple,bw-doorbell are deliberately
+			 * absent: the internal pipe takes them from
+			 * pmgr_dcp@3082a0000, and the equivalent windows for the
+			 * external pipe have not been located in the ADT.
+			 */
+			power-domains = <&ps_dispext0_cpu>;
+			resets = <&ps_dispext0_cpu>;
+			#address-cells = <2>;
+			#size-cells = <2>;
+			status = "disabled";
+
+			dispext0_piodma: piodma {
+				iommus = <&dispext0_dart 16>;
+				phandle = <&dispext0_piodma>;
+			};
+		};
+
 		display: display-subsystem {
 			compatible = "apple,display-subsystem";
 			iommus = <&disp0_dart 0>;
