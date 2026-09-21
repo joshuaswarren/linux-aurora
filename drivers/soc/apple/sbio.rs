@@ -1137,8 +1137,52 @@ impl SepData {
         let prepared = self.cold_match_continue(handle, uuid);
         self.ensure_restored_after(prepared);
         self.attach_bringup();
+        self.probe_save_catacombs();
         self.touchid_started.store(true, Relaxed);
         Ok(())
+    }
+
+    /// Diagnostic, off by default: exercise the post-enrolment persistence
+    /// path without an enrolment.
+    ///
+    /// save_all_components() has never run on this board -- no catacomb file
+    /// exists on disk -- so a first successful enrolment would be its first
+    /// execution, and three reverse-engineered constants sit in it. The master
+    /// and owner catacombs exist from bring-up, independently of any enrolment,
+    /// so saving those two exercises the same code and settles
+    /// SBIO_SAVED_USER_ID_AT: the master blob must carry -1 and the owner blob
+    /// 501 at that offset.
+    ///
+    /// This performs the complete operation including CONFIRM_SAVE, so it does
+    /// not leave the enclave holding a half-finished save. The user catacomb is
+    /// deliberately skipped: it does not exist until something is enrolled, and
+    /// a failure there would be expected rather than informative.
+    fn probe_save_catacombs(&self) {
+        if *module_parameters::probe_save_catacombs.value() == 0 {
+            return;
+        }
+        dev_info!(
+            self.dev,
+            "save-probe: exercising the post-enrolment persistence path on the master and owner catacombs\n"
+        );
+        let master = self.save_catacomb(
+            crate::sbio::CatacombUser::MASTER,
+            PRIVATE_TYPE_CATACOMB_MASTER,
+            c"master catacomb (user -1)",
+        );
+        let owner = self.save_catacomb(
+            crate::sbio::CatacombUser::OWNER,
+            PRIVATE_TYPE_CATACOMB_OWNER,
+            c"owner catacomb (user 501)",
+        );
+        let lockout = self.save_lockout();
+        dev_info!(
+            self.dev,
+            "save-probe: master={} owner={} lockout={}; if all three are true the post-enrolment save path works and SBIO_SAVED_USER_ID_AT is right\n",
+            master,
+            owner,
+            lockout
+        );
     }
 
     fn prepare_bio_open(&self) -> Result<()> {
