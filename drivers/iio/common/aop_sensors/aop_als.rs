@@ -18,43 +18,39 @@ use kernel::{
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
 const EPIC_SUBTYPE_SET_ALS_PROPERTY: u16 = 0x4;
-/// The HID report descriptor.  macOS asks for this before anything else
-/// (hypervisor trace, 2026-09-20); Linux never has, and deliberately does not
-/// -- see the note in probe().  Retained as the identifier for that call.
-#[allow(dead_code)]
-const EPIC_SUBTYPE_GET_HID_DESCRIPTOR: u16 = 0x1;
-/* The EPIC sub-header's `subtype` at +0x06 is macOS's SpuPacketType: Linux's
- * EPICHeaderV4 and macOS's _AOPSubPacket are the same 0x18-byte structure, and
- * the AFK ring is the same transport (Linux's QE_MAGIC2 " POA" is the "AOP "
- * magic of iop_ringbuffer_enqueue_msg_vec).  So the SPU is reachable with the
- * calls we already have -- only the payload differs.  macOS's
- * _spuGetPropertyGated sends the bare property id as the whole inline payload
- * (mov w2,#0xa; mov w4,#0x4), where the AOP `als` service takes a
- * [u32 zero, u32 tag] envelope.  That 4-byte prefix is why the earlier 256-tag
- * sweep of endpoint 0x20 was silent. */
+
+/* ALS properties, in the order the sensor expects them. */
+const ALS_PROP_INTERVAL: u32 = 0x00;
+const ALS_PROP_CALIBRATION: u32 = 0x0b;
+const ALS_PROP_BATCH_INTERVAL: u32 = 0x16;
+const ALS_PROP_RAW_INTERVAL: u32 = 0x5c;
+const ALS_PROP_VERBOSITY: u32 = 0xe1;
+
+/*
+ * The sensor only starts reporting on the zero to non-zero transition of the
+ * report interval, and it only accepts that transition once the batch and raw
+ * intervals have been written.  Writing the same non-zero interval again does
+ * nothing, so the interval is written as zero first to guarantee the edge.
+ *
+ * The batch and raw values are not intervals despite their names; these are
+ * the values the sensor is configured with on this generation.  The sensor
+ * rejects all three writes with a not-permitted status and arms regardless,
+ * so the return codes are logged but not treated as failures.
+ */
+const ALS_BATCH_INTERVAL: u32 = 1;
+const ALS_RAW_INTERVAL: u32 = 0;
+const ALS_VERBOSITY: u32 = 6;
+/// Reporting interval in microseconds.  The sensor delivers reports at this
+/// rate once armed.
+const ALS_INTERVAL_US: u32 = 200000;
 const LUX_OFFSET_CT720: usize = 0x1d;
 const LUX_OFFSET_VD6286: usize = 0x28;
-/* CT817's report is exactly 32 bytes and the lux float sits at +0x1c, read off
- * AppleSPUCT817::handleInterruptReport (0xfffffe0008e417a8):
- *
- *     cmp  x0, #0x20 ; b.ne drop      ; length must be exactly 32
- *     ldp  q0, q1, [x22] ; stp q0, q1, [sp]
- *     ldr  s8,  [sp, #0x1c]           ; lux
- *     ldp  s0, s1, [sp, #0x8]         ; rawChannel0, rawChannel1
- *
- * This is one byte below the CT720's 0x1d, which CT817 was borrowing on the
- * assumption that the same family shares a layout. */
+/*
+ * The CT817 sends a fixed 32-byte report: two raw channel floats at +0x08 and
+ * +0x0c and the lux float at +0x1c.  Note this is one byte below the CT720's
+ * 0x1d -- the parts do not share a layout despite being the same family.
+ */
 const LUX_OFFSET_CT817: usize = 0x1c;
-/// The CT817's two raw channels.  Nothing reads them: they are kept because
-/// together with LUX_OFFSET_CT817 and CT817_REPORT_LEN they are the complete
-/// report layout of the part, established from real light, and that is the
-/// thing to check a suspect reading against.
-#[allow(dead_code)]
-const RAW_CH0_OFFSET_CT817: usize = 0x08;
-#[allow(dead_code)]
-const RAW_CH1_OFFSET_CT817: usize = 0x0c;
-#[allow(dead_code)]
-const CT817_REPORT_LEN: usize = 0x20;
 
 fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<usize> {
     let name = get_aop_property(aop, svc, 0xf, 16)?.1;
@@ -77,74 +73,63 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     }
 }
 
-
 fn enable_als(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> Result<()> {
-
-    // The calibration is per-device factory data that the installer extracts
-    // from a running macOS.  The J700's ADT sets `als-new-calibration-path = 1`
-    // and carries no blob of its own, which suggests the AOP already holds its
-    // calibration on this generation -- so a missing file is a warning and the
-    // sensor is still enabled, rather than failing probe outright.  A machine
-    // that does need the blob simply reports uncalibrated lux until it is
-    // supplied, which is visible and recoverable.
+    // The calibration is per-device factory data extracted from the machine's
+    // own macOS installation.  Devices whose ADT sets `als-new-calibration-path`
+    // carry no blob of their own and the AOP holds the calibration itself, so a
+    // missing file is a warning and the sensor is still enabled: it then reports
+    // uncalibrated lux, which is visible and recoverable, rather than failing
+    // probe outright.
     if let Ok(fw) = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
-        let rc = set_als_property(aop, svc, 0xb, fw.data())?;
-        dev_info!(dev.as_ref(), "als: CALIBRATION (0xb) {} bytes -> rc {:#x}\n", fw.data().len(), rc);
+        let rc = set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+        dev_dbg!(
+            dev.as_ref(),
+            "pushed {} bytes of calibration, status {:#x}\n",
+            fw.data().len(),
+            rc
+        );
     } else {
         dev_warn!(
             dev.as_ref(),
-            "apple/aop-als-cal.bin is absent; enabling the sensor without pushing a calibration (the AOP may hold its own)\n"
+            "apple/aop-als-cal.bin is absent; the sensor will report uncalibrated lux unless the AOP holds its own calibration\n"
         );
     }
-    // Verbosity is written the way macOS writes it.  MODE (0xd7) and 0xe4 used
-    // to be written here as well, on the theory that one of them armed a part on
-    // the `als-new-calibration-path` generation.  Neither does, and both are
-    // actively harmful: each wedges the AOP outright (measured 2026-09-21 -- the
-    // call never answers and every later call on the endpoint times out).  What
-    // actually arms this part is the calibration the AOP driver pushes on
-    // setup-port endpoint 0x21; see soc/apple/aop.rs.  u32::MAX means "leave
-    // alone", and a rejected write is logged rather than failing the probe.
-    let try_prop = |tag: u32, val: u32, name: &'static str| {
-        if val == u32::MAX {
-            return;
-        }
-        match set_als_property(aop, svc, tag, &val.to_le_bytes()) {
-            Ok(rc) => dev_info!(dev.as_ref(), "als: {} ({:#x}) = {:#x} -> rc {:#x}\n", name, tag, val, rc),
-            Err(e) => dev_info!(dev.as_ref(), "als: {} ({:#x}) = {:#x} -> error {:?}\n", name, tag, val, e),
-        }
+
+    // Every one of these writes is answered with a not-permitted status and
+    // takes effect anyway, so a rejection is logged rather than failing probe.
+    // Do not add MODE (0xd7) or 0xe4 here: both wedge the AOP outright, and the
+    // endpoint -- along with every other sensor behind it -- stays dead for the
+    // rest of the boot.  What actually arms the part is the calibration the AOP
+    // driver pushes on the setup port; see soc/apple/aop.rs.
+    let set = |tag: u32, val: u32, what: &'static str| match set_als_property(
+        aop,
+        svc,
+        tag,
+        &val.to_le_bytes(),
+    ) {
+        Ok(rc) => dev_dbg!(dev.as_ref(), "{} = {:#x}, status {:#x}\n", what, val, rc),
+        Err(e) => dev_dbg!(dev.as_ref(), "{} = {:#x} rejected: {:?}\n", what, val, e),
     };
 
-    try_prop(0xe1, *module_parameters::set_verbosity.value(), "VERBOSITY");
+    set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity");
+    // Order matters: the batch and raw values must be in place before the
+    // report interval, and the sensor starts reporting on the zero to
+    // non-zero transition of the interval.  It is zero at probe, so writing
+    // it once here is the transition.
+    set(
+        ALS_PROP_BATCH_INTERVAL,
+        ALS_BATCH_INTERVAL,
+        "batch interval",
+    );
+    set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval");
 
-    // macOS never writes the report interval on its own.  
-    // AppleSPUHIDDriver::setPropertiesGated (0xfffffe00096cfb80..0xfffffe00096cfbac)
-    // writes three rate properties in a fixed order every time:
-    //
-    //     SetProperty(0x16, batchInterval, 4)   ; BatchInterval
-    //     SetProperty(0x5c, rawInterval,   4)   ; RawInterval
-    //     SetProperty(0x00, reportInterval,4)   ; ReportInterval
-    //
-    // and it is the 0 -> non-zero transition of 0x00 that calls
-    // startSensorWatchdog() (0xfffffe00096cfb5c) -- writing the same non-zero
-    // value again does nothing.  We had only ever written 0x00, once, which the
-    // AOP acks with rc 0 and then sends nothing.  Write zero first so the
-    // transition is guaranteed, then the full triple in macOS's order.
-    // CT817's own tables (0xfffffe000738e420) pair report 200000 us with batch
-    // 500000 us at the slow rate.
-    let ivl = *module_parameters::interval_us.value();
-    let batch = *module_parameters::batch_interval_us.value();
-    let raw = *module_parameters::raw_interval_us.value();
-
-    match set_als_property(aop, svc, 0x16, &batch.to_le_bytes()) {
-        Ok(rc) => dev_info!(dev.as_ref(), "als: BATCH_INTERVAL (0x16) = {} us -> rc {:#x}\n", batch, rc),
-        Err(e) => dev_info!(dev.as_ref(), "als: BATCH_INTERVAL (0x16) = {} us -> error {:?}\n", batch, e),
-    }
-    match set_als_property(aop, svc, 0x5c, &raw.to_le_bytes()) {
-        Ok(rc) => dev_info!(dev.as_ref(), "als: RAW_INTERVAL (0x5c) = {} us -> rc {:#x}\n", raw, rc),
-        Err(e) => dev_info!(dev.as_ref(), "als: RAW_INTERVAL (0x5c) = {} us -> error {:?}\n", raw, e),
-    }
-    let rc = set_als_property(aop, svc, 0, &ivl.to_le_bytes())?;
-    dev_info!(dev.as_ref(), "als: INTERVAL (0x0) = {} us -> rc {:#x}\n", ivl, rc);
+    let rc = set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
+    dev_dbg!(
+        dev.as_ref(),
+        "reporting every {} us, status {:#x}\n",
+        ALS_INTERVAL_US,
+        rc
+    );
 
     Ok(())
 }
@@ -160,8 +145,6 @@ fn get_aop_property(
     buf[4..8].copy_from_slice(&tag.to_le_bytes());
     aop.epic_call_ret(svc, EPIC_SUBTYPE_GET_AOP_PROPERTY, &buf, data_len)
 }
-
-
 
 fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> Result<u32> {
     let mut buf = KVec::new();
@@ -197,10 +180,6 @@ struct MsgProc(usize);
 impl MessageProcessor for MsgProc {
     fn process(&self, message: &[u8]) -> u32 {
         let offset = self.0;
-        let offset = match *module_parameters::lux_offset.value() {
-            0 => offset,
-            v => v as usize,
-        };
         if offset + 4 > message.len() {
             return 0;
         }
@@ -233,16 +212,10 @@ impl platform::Driver for IIOAopAlsDriver {
         // SAFETY: AOP sets the platform data correctly
         let service = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
         let ty = bindings::BINDINGS_IIO_LIGHT;
-        // Recorded from the 2026-09-20 hypervisor trace, and deliberately NOT
-        // replayed: macOS sends subtype 0x01, the HID report descriptor fetch,
-        // as the very first call on this channel, where this driver sends the
-        // 0x0f name query that picks the lux offset.  Every other byte of the
-        // two 0x01 calls matched -- same channel (0x1000000a), EPIC type,
-        // category, subtype, payload (4 bytes) and reply capacity (0xe4) --
-        // so ordering was the only difference.  It is not the gate: the
-        // calibration on setup-port endpoint 0x21 is, and the AOP never
-        // answers 0x01 on the untrusted side, where an unanswered EPIC call
-        // wedges the endpoint's call slot and costs the iio device entirely.
+        // Query the part name first: it selects the report layout below.  Do
+        // not fetch the HID report descriptor (subtype 0x01) here.  The AOP
+        // never answers it on this endpoint, and an unanswered EPIC call
+        // wedges the endpoint's only call slot, losing the device entirely.
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
         adata.add_fakehid_listener(service, data.clone())?;
@@ -265,26 +238,4 @@ module_platform_driver! {
     license: "Dual MIT/GPL",
     alias: ["platform:iio_aop_als"],
     firmware: ["apple/aop-als-cal.bin"],
-    params: {
-        lux_offset: u32 {
-            default: 0,
-            description: "Override the byte offset of the little-endian f32 lux value in the AOP report (0 = the part's known offset)",
-        },
-        batch_interval_us: u32 {
-            default: 1,
-            description: "ALS property 0x16, written before the report interval. Default is what macOS writes on this machine (1, not an interval at all) as traced under the hypervisor 2026-09-20; the AOP answers kIOReturnNotPermitted to macOS too and arms anyway",
-        },
-        raw_interval_us: u32 {
-            default: 0,
-            description: "ALS property 0x5c, written between 0x16 and the report interval. Default is what macOS writes on this machine (0), traced 2026-09-20; also answered NotPermitted for macOS",
-        },
-        set_verbosity: u32 {
-            default: 6,
-            description: "Write the ALS VERBOSITY property (0xe1). macOS writes 6 here on this machine (traced 2026-09-20, answered NotPermitted); 0xffffffff means leave it alone",
-        },
-        interval_us: u32 {
-            default: 200000,
-            description: "Reporting interval in microseconds written to ALS property 0. macOS writes 200000 on this machine and the 0xc4 reports follow at that rate",
-        },
-    },
 }

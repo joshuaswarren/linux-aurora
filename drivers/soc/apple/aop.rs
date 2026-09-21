@@ -33,6 +33,7 @@ use kernel::{
     module_platform_driver,
     new_condvar,
     new_mutex,
+    new_spinlock,
     of,
     platform,
     prelude::*,
@@ -56,7 +57,6 @@ use kernel::{
         MutexGuard,
         SpinLock, //
     },
-    new_spinlock,
     time::msecs_to_jiffies,
     types::ForeignOwnable,
     workqueue::{
@@ -146,16 +146,11 @@ const SETUP_ALS_EP: u8 = 0x21;
 /// (1, gain, ?, max) triplets.  These are this part's numbers; they come from
 /// the machine, not from us, which is why they are carried verbatim.
 const SETUP_ALS_CALIBRATION: [u8; 80] = [
-    0x31, 0x2e, 0x15, 0x65, 0xd6, 0xb8, 0x46, 0x07,
-    0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xe4, 0x9e, 0xe3, 0x3e, 0xaf, 0xc0, 0xae, 0x3f,
-    0xb7, 0xe8, 0x36, 0x3e, 0x96, 0xc0, 0x95, 0x3e,
-    0x84, 0x89, 0x03, 0x3f, 0x00, 0x00, 0x80, 0x3f,
-    0x00, 0x00, 0x80, 0x3f, 0x9d, 0x9c, 0xfc, 0x40,
-    0xb1, 0xb0, 0x80, 0x41, 0x72, 0x72, 0xfa, 0x42,
-    0x00, 0x00, 0x80, 0x3f, 0x9e, 0x9d, 0xfd, 0x40,
-    0xe2, 0xe1, 0x81, 0x41, 0x78, 0x78, 0xfe, 0x42,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x31, 0x2e, 0x15, 0x65, 0xd6, 0xb8, 0x46, 0x07, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xe4, 0x9e, 0xe3, 0x3e, 0xaf, 0xc0, 0xae, 0x3f, 0xb7, 0xe8, 0x36, 0x3e, 0x96, 0xc0, 0x95, 0x3e,
+    0x84, 0x89, 0x03, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f, 0x9d, 0x9c, 0xfc, 0x40,
+    0xb1, 0xb0, 0x80, 0x41, 0x72, 0x72, 0xfa, 0x42, 0x00, 0x00, 0x80, 0x3f, 0x9e, 0x9d, 0xfd, 0x40,
+    0xe2, 0xe1, 0x81, 0x41, 0x78, 0x78, 0xfe, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 /// The AOP answers the calibration with 0x2000000000000004 rather than the
 /// 0x2000000000000001 the source bind gets.
@@ -308,7 +303,8 @@ impl<T> FutureValue<T> {
         while ret_guard.is_none() {
             match self.completion.wait_timeout(&mut ret_guard, left) {
                 CondVarTimeoutResult::Timeout => return ret_guard.take(),
-                CondVarTimeoutResult::Woken { jiffies } | CondVarTimeoutResult::Signal { jiffies } => {
+                CondVarTimeoutResult::Woken { jiffies }
+                | CondVarTimeoutResult::Signal { jiffies } => {
                     left = jiffies;
                 }
             }
@@ -836,7 +832,7 @@ impl AFKEndpoint {
         };
         self.call_returns[tag - 1] = ret;
         // macOS speaks v2 to this firmware; see the epic_tx_v2 parameter.
-        let tx_v4 = client.epic_v4 && *module_parameters::epic_tx_v2.value() == 0;
+        let tx_v4 = client.epic_v4;
         let hdr_bytes = if tx_v4 {
             // SAFETY: `hdr_v4` is a packed, plain-data header that lives
             // for the whole call; the slice covers exactly its bytes.
@@ -855,35 +851,6 @@ impl AFKEndpoint {
             }
         };
 
-        // Dump exactly what goes on the wire, so a call the firmware refuses to
-        // answer can be diffed against the same call from macOS rather than
-        // reasoned about.  The 2026-09-20 capture gives the reference bytes;
-        // three guesses at the difference (payload length, reply capacity,
-        // framing version) have each cost a boot cycle.
-        if *module_parameters::epic_tx_dump.value() != 0 {
-            let mut line: [u8; 3 * 48 + 1] = [0; 3 * 48 + 1];
-            let n = core::cmp::min(hdr_bytes.len(), 48);
-            for (k, b) in hdr_bytes[..n].iter().enumerate() {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                line[k * 3] = HEX[(b >> 4) as usize];
-                line[k * 3 + 1] = HEX[(b & 0xf) as usize];
-                line[k * 3 + 2] = b' ';
-            }
-            let hdr_hex = core::str::from_utf8(&line[..n * 3]).unwrap_or("?");
-            let mut pline: [u8; 3 * 32 + 1] = [0; 3 * 32 + 1];
-            let pn = core::cmp::min(data.len(), 32);
-            for (k, b) in data[..pn].iter().enumerate() {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                pline[k * 3] = HEX[(b >> 4) as usize];
-                pline[k * 3 + 1] = HEX[(b & 0xf) as usize];
-                pline[k * 3 + 2] = b' ';
-            }
-            let pay_hex = core::str::from_utf8(&pline[..pn * 3]).unwrap_or("?");
-            dev_info!(client.dev,
-                      "aop: TX ep {:#04x} chan {:#x} sub {:#06x} cat {:#04x} hdr[{}] {}| payload[{}] {}\n",
-                      self.index, channel, subtype, category, hdr_bytes.len(), hdr_hex,
-                      data.len(), pay_hex);
-        }
         self.send_rb(client, rtkit, channel, EPIC_TYPE_NOTIFY, hdr_bytes, data)?;
         self.seq = self.seq.wrapping_add(1);
         self.calls[tag - 1] = Some(call.clone());
@@ -956,7 +923,11 @@ impl SetupState {
     }
 
     fn endpoint(&self, ep: u8) -> Option<SetupEndpoint> {
-        self.endpoints.iter().flatten().find(|e| e.ep == ep).copied()
+        self.endpoints
+            .iter()
+            .flatten()
+            .find(|e| e.ep == ep)
+            .copied()
     }
 
     fn arena_offset(&self, iova: u64) -> Option<usize> {
@@ -969,7 +940,10 @@ impl SetupState {
     }
 
     fn arena_iova(&self) -> u64 {
-        self.arena.as_ref().map(|a| a.dma_handle() as u64).unwrap_or(0)
+        self.arena
+            .as_ref()
+            .map(|a| a.dma_handle() as u64)
+            .unwrap_or(0)
     }
 
     fn endpoint_count(&self) -> usize {
@@ -1183,8 +1157,12 @@ impl AopData {
                 if required {
                     return Err(e);
                 }
-                dev_warn!(self.dev, "AFK: endpoint {:#04x} did not start ({:?}), skipping\n",
-                          rtk_ep_num, e);
+                dev_warn!(
+                    self.dev,
+                    "AFK: endpoint {:#04x} did not start ({:?}), skipping\n",
+                    rtk_ep_num,
+                    e
+                );
                 continue;
             }
             let ep_guard = self.endpoints[ep as usize].lock();
@@ -1192,8 +1170,12 @@ impl AopData {
                 if required {
                     return Err(e);
                 }
-                dev_warn!(self.dev, "AFK: endpoint {:#04x} AFK init failed ({:?}), skipping\n",
-                          rtk_ep_num, e);
+                dev_warn!(
+                    self.dev,
+                    "AFK: endpoint {:#04x} AFK init failed ({:?}), skipping\n",
+                    rtk_ep_num,
+                    e
+                );
             }
         }
         Ok(())
@@ -1247,7 +1229,8 @@ impl AopData {
     fn process_report(&self, ep: &AFKEndpoint, ch: u32, subtype: u16, data: &[u8]) -> Result<bool> {
         let guard = self.report_listeners.lock();
         for entry in &*guard {
-            if entry.svc.endpoint == ep.index && entry.svc.channel == ch && entry.subtype == subtype {
+            if entry.svc.endpoint == ep.index && entry.svc.channel == ch && entry.subtype == subtype
+            {
                 entry.listener.process_report(subtype, data)?;
                 return Ok(true);
             }
@@ -1260,27 +1243,6 @@ impl AopData {
         for entry in &*guard {
             if entry.svc.endpoint == ep.index && entry.svc.channel == ch {
                 return entry.listener.process_fakehid_report(data);
-            }
-        }
-        // A report that matches no listener is invisible otherwise, which is
-        // indistinguishable from the AOP sending nothing at all.  On the J700
-        // the ALS registers but never produces a reading; log the unmatched
-        // reports so "no data" can be told apart from "data on another
-        // endpoint/channel".
-        if *module_parameters::report_trace.value() != 0 {
-            pr_info!(
-                "aop: unmatched fakehid report on endpoint {} channel {} ({} bytes); {} listener(s) registered\n",
-                ep.index,
-                ch,
-                data.len(),
-                guard.len()
-            );
-            for entry in &*guard {
-                pr_info!(
-                    "aop:   listener wants endpoint {} channel {}\n",
-                    entry.svc.endpoint,
-                    entry.svc.channel
-                );
             }
         }
         Ok(())
@@ -1304,43 +1266,6 @@ impl AopData {
             }
             self.ep_shutdown.wait();
             self.ep_shutdown.reset();
-        }
-        Ok(())
-    }
-
-    /// Log every key the AOP's bootargs arena holds, with its size and value.
-    /// Read-only: the arena is copied out and never written back.
-    fn dump_bootargs(&self, aop_mmio: &IoMem<AOP_MMIO_SIZE>) -> Result<()> {
-        let aop_mmio = aop_mmio.relaxed();
-        let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
-        let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
-        dev_info!(self.dev, "aop bootargs arena: offset {:#x} size {:#x}\n", offset, size);
-        if size == 0 || size > 0x10000 {
-            dev_info!(self.dev, "aop bootargs: arena not exposed at this MMIO layout\n");
-            return Ok(());
-        }
-        let mut arg_bytes = KVec::<u8>::from_elem(0, size, GFP_KERNEL)?;
-        aop_mmio.try_memcpy_fromio(&mut arg_bytes, offset)?;
-        let mut idx = 0;
-        while idx + 8 <= size {
-            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
-            let vsize = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
-            idx += 8;
-            if vsize == 0 || idx + vsize > size {
-                break;
-            }
-            let mut val = [0u8; 8];
-            let n = core::cmp::min(vsize, 8);
-            val[..n].copy_from_slice(&arg_bytes[idx..idx + n]);
-            let k = key.to_le_bytes();
-            dev_info!(
-                self.dev,
-                "aop bootarg {}{}{}{} size {} = {:#x}\n",
-                k[3] as char, k[2] as char, k[1] as char, k[0] as char,
-                vsize,
-                u64::from_le_bytes(val),
-            );
-            idx += vsize;
         }
         Ok(())
     }
@@ -1380,9 +1305,16 @@ impl AopData {
             match ty {
                 SETUP_TYPE_HELLO => {
                     if word & 0xffffffff != SETUP_HELLO_VERSION {
-                        dev_warn!(self.dev, "setup port: HELLO version {:#x}", word & 0xffffffff);
+                        dev_warn!(
+                            self.dev,
+                            "setup port: HELLO version {:#x}",
+                            word & 0xffffffff
+                        );
                     }
-                    st.send(SETUP_MGMT_EP, (SETUP_TYPE_HELLO_REPLY << 52) | SETUP_HELLO_VERSION)
+                    st.send(
+                        SETUP_MGMT_EP,
+                        (SETUP_TYPE_HELLO_REPLY << 52) | SETUP_HELLO_VERSION,
+                    )
                 }
                 SETUP_TYPE_EPMAP => {
                     // The firmware advertises its endpoint set here, and the
@@ -1464,7 +1396,11 @@ impl AopData {
         }
         let reply = st.reply.take().unwrap();
         if reply != SETUP_REPLY_READY {
-            dev_err!(self.dev, "setup port: unexpected source bind reply {:#x}\n", reply);
+            dev_err!(
+                self.dev,
+                "setup port: unexpected source bind reply {:#x}\n",
+                reply
+            );
             return Err(EIO);
         }
         mem_sync();
@@ -1478,7 +1414,12 @@ impl AopData {
             dev_err!(self.dev, "setup port: source bind status {:#x}\n", status);
             return Err(EIO);
         }
-        dev_info!(self.dev, "setup port: source ring {:#x} ({} bytes) bound\n", iova, size);
+        dev_info!(
+            self.dev,
+            "setup port: source ring {:#x} ({} bytes) bound\n",
+            iova,
+            size
+        );
         Ok(())
     }
 
@@ -1495,8 +1436,11 @@ impl AopData {
         let ep = match st.endpoint(SETUP_ALS_EP) {
             Some(ep) => ep,
             None => {
-                dev_warn!(self.dev, "setup port: no endpoint {:#04x}; ALS uncalibrated\n",
-                          SETUP_ALS_EP);
+                dev_warn!(
+                    self.dev,
+                    "setup port: no endpoint {:#04x}; ALS uncalibrated\n",
+                    SETUP_ALS_EP
+                );
                 return Ok(());
             }
         };
@@ -1513,7 +1457,10 @@ impl AopData {
         }
         mem_sync();
         st.reply = None;
-        st.send(SETUP_ALS_EP, SETUP_REQUEST_TYPE | SETUP_ALS_CALIBRATION.len() as u64)?;
+        st.send(
+            SETUP_ALS_EP,
+            SETUP_REQUEST_TYPE | SETUP_ALS_CALIBRATION.len() as u64,
+        )?;
         let mut waited = 0i64;
         while st.reply.is_none() {
             let _ = self
@@ -1527,7 +1474,11 @@ impl AopData {
         }
         let reply = st.reply.take().unwrap();
         if reply != SETUP_REPLY_READY && reply != SETUP_REPLY_READY_ALT {
-            dev_err!(self.dev, "setup port: unexpected ALS calibration reply {:#x}\n", reply);
+            dev_err!(
+                self.dev,
+                "setup port: unexpected ALS calibration reply {:#x}\n",
+                reply
+            );
             return Err(EIO);
         }
         mem_sync();
@@ -1537,8 +1488,12 @@ impl AopData {
             unsafe { arena.as_ref()[rx_off] }
         };
         st.send(SETUP_ALS_EP, SETUP_REQUEST_DONE)?;
-        dev_info!(self.dev, "setup port: ALS calibration pushed (reply {:#x}, status {:#x})\n",
-                  reply, status);
+        dev_info!(
+            self.dev,
+            "setup port: ALS calibration pushed (reply {:#x}, status {:#x})\n",
+            reply,
+            status
+        );
         Ok(())
     }
 
@@ -1583,7 +1538,10 @@ impl AopData {
     fn setup_finish_boot(&self) -> Result<()> {
         let mut st = self.setup.lock();
         if !st.map_done {
-            dev_warn!(self.dev, "setup port: EPMAP not complete before AP power request\n");
+            dev_warn!(
+                self.dev,
+                "setup port: EPMAP not complete before AP power request\n"
+            );
         }
         if !st.power_sent {
             st.send(SETUP_MGMT_EP, (SETUP_TYPE_AP_PWR << 52) | SETUP_AP_PWR_INIT)?;
@@ -1712,8 +1670,15 @@ impl AOP for AopData {
             let mut rtk_guard = self.rtkit.lock();
             let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
             let mut ep_guard = self.endpoints[ep_idx as usize].lock();
-            ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype,
-                                 EPIC_CATEGORY_NOTIFY, msg_bytes, None)?
+            ep_guard.epic_notify(
+                self,
+                rtk.as_mut(),
+                svc.channel,
+                subtype,
+                EPIC_CATEGORY_NOTIFY,
+                msg_bytes,
+                None,
+            )?
         };
         Ok(self.wait_call(ep_idx, svc, subtype, call)?.retcode)
     }
@@ -1797,7 +1762,11 @@ impl AOP for AopData {
         let mut guard = self.source_ring.lock();
         if let Some(ring) = guard.as_ref() {
             if ring.size() < size {
-                dev_err!(self.dev, "source ring already bound with {} bytes\n", ring.size());
+                dev_err!(
+                    self.dev,
+                    "source ring already bound with {} bytes\n",
+                    ring.size()
+                );
                 return Err(EBUSY);
             }
             return Ok(ring.clone());
@@ -1937,23 +1906,6 @@ impl platform::Driver for AopDriver {
                 ],
             )?;
         } else {
-            // T8140 has never had its AOP bootargs touched, so the firmware runs
-            // with whatever iBoot left -- including `nCal`, the flag the ADT
-            // mirrors as `als-new-calibration-path = 1`.  On the older parts the
-            // driver forces `nCal = 0`, which is the path that takes a
-            // host-supplied ALS calibration; here the ALS accepts a calibration
-            // and an interval with rc 0 and then never reports, which is what a
-            // firmware on the *other* path would do.  Dumping the arena and
-            // patching that one key are both opt-in, because this AOP also owns
-            // the speakers and the microphones.
-            if *module_parameters::dump_bootargs.value() != 0 {
-                let _ = data.dump_bootargs(aop_mmio);
-            }
-            let ncal = *module_parameters::t8140_ncal.value();
-            if ncal != u32::MAX {
-                dev_info!(pdev.as_ref(), "aop: patching T8140 bootarg nCal = {:#x}\n", ncal);
-                data.patch_bootargs(aop_mmio, &[(from_fourcc(b"nCal"), ncal as u64)])?;
-            }
         }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
         *data.rtkit.lock() = Some(rtkit);
@@ -1977,7 +1929,8 @@ impl platform::Driver for AopDriver {
             // SAFETY: the mailbox provider is bound for as long as we hold the
             // mailbox client.
             let bound = unsafe { setup_dev.as_bound() };
-            let arena = Coherent::<u8>::zeroed_slice(bound, SETUP_ARENA_PAGES * SETUP_PAGE, GFP_KERNEL)?;
+            let arena =
+                Coherent::<u8>::zeroed_slice(bound, SETUP_ARENA_PAGES * SETUP_PAGE, GFP_KERNEL)?;
             dev_info!(
                 pdev.as_ref(),
                 "setup port: arena {} pages at iova {:#x}\n",
@@ -2004,9 +1957,16 @@ impl platform::Driver for AopDriver {
             // Before any EPIC client opens the ALS: the trusted side wants the
             // calibration first, and a failure here must not cost us the AOP.
             if let Err(e) = data.setup_push_als_calibration() {
-                dev_warn!(pdev.as_ref(), "t8140 AOP: ALS calibration failed ({:?})\n", e);
+                dev_warn!(
+                    pdev.as_ref(),
+                    "t8140 AOP: ALS calibration failed ({:?})\n",
+                    e
+                );
             }
-            dev_info!(pdev.as_ref(), "t8140 AOP: both ports up, starting AFK endpoints\n");
+            dev_info!(
+                pdev.as_ref(),
+                "t8140 AOP: both ports up, starting AFK endpoints\n"
+            );
             data.start_afk()?;
         } else {
             data.start()?;
@@ -2029,26 +1989,4 @@ module_platform_driver! {
     name: "apple_aop",
     description: "AOP driver",
     license: "Dual MIT/GPL",
-    params: {
-        epic_tx_dump: u8 {
-            default: 0,
-            description: "Hex-dump every EPIC sub-header and payload this driver transmits, so a call the firmware never answers can be diffed byte for byte against the same call captured from macOS under the hypervisor",
-        },
-        epic_tx_v2: u8 {
-            default: 0,
-            description: "Transmit EPIC sub-headers in v2 form (sub_version 2, tag at +0x08) instead of t8140's v4 (sub_version 4, sub_timestamp at +0x08, tag at +0x10). macOS uses v2 on this AOP -- every packet of the 2026-09-20 hypervisor capture has sub_version 2 and echoes the request tag, which is why this driver believes the firmware does not echo tags: it reads the tag from the v4 offset, where the firmware put a timestamp whose low 16 bits are the tag. Reply parsing already handles both layouts (epic_decode reads sub_version off the packet), so this only changes what is sent",
-        },
-        report_trace: u8 {
-            default: 0,
-            description: "Log fakehid reports that match no registered listener, so a sensor that produces nothing can be told from one reporting on another endpoint or channel",
-        },
-        dump_bootargs: u8 {
-            default: 0,
-            description: "Log every key in the AOP's bootargs arena at probe (read-only); T8140 only, where the driver otherwise never reads them",
-        },
-        t8140_ncal: u32 {
-            default: 0xffffffff,
-            description: "Patch the T8140 AOP bootarg nCal to this value before the AOP CPU starts; 0 selects the host-supplied ALS calibration path the older parts use, 0xffffffff leaves iBoot's value alone",
-        },
-    },
 }
