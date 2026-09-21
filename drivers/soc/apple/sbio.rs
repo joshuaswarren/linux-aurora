@@ -799,23 +799,60 @@ impl SepData {
         true
     }
 
-    fn save_catacomb(&self, who: crate::sbio::CatacombUser, kind: u8, _what: &CStr) -> bool {
+    /// Persist one catacomb.  Every failure path says which component and why.
+    ///
+    /// This runs immediately after a successful enrolment and has never
+    /// executed on this machine -- no catacomb file exists on disk.  Three of
+    /// the values it checks (SBIO_SAVED_MIN, SBIO_SAVED_MAX and especially
+    /// SBIO_SAVED_USER_ID_AT) are reverse-engineered, and a wrong one makes an
+    /// otherwise successful enrolment fail to persist.  Silent `return false`
+    /// would leave that indistinguishable from a disk error, so each arm
+    /// reports what it actually saw.
+    fn save_catacomb(&self, who: crate::sbio::CatacombUser, kind: u8, what: &CStr) -> bool {
         let selector = crate::sbio::SaveSelector::new(who);
 
         let Some(blob) = self.sbio_expect_ok(&crate::sbio::sbio_save_catacomb(&selector)) else {
+            dev_err!(
+                self.dev,
+                "save: {}: the enclave refused SAVE_CATACOMB\n",
+                what
+            );
             return false;
         };
         if blob.len() < crate::sbio::SBIO_SAVED_MIN || blob.len() > crate::sbio::SBIO_SAVED_MAX {
+            dev_err!(
+                self.dev,
+                "save: {}: SAVE_CATACOMB returned {} bytes, outside the expected {}..={}; those bounds are reverse-engineered, so widen them to the answered length if the blob looks sane\n",
+                what,
+                blob.len(),
+                crate::sbio::SBIO_SAVED_MIN,
+                crate::sbio::SBIO_SAVED_MAX
+            );
             return false;
         }
 
         let at = crate::sbio::SBIO_SAVED_USER_ID_AT;
         let carried = i32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
         if carried != who.value() {
+            dev_err!(
+                self.dev,
+                "save: {}: the user id at offset {} reads {}, expected {}. SBIO_SAVED_USER_ID_AT is reverse-engineered and is the likely fault; head={:02x?}\n",
+                what,
+                at,
+                carried,
+                who.value(),
+                &blob[..core::cmp::min(24, blob.len())]
+            );
             return false;
         }
 
         if crate::catacomb::write(kind, &blob).is_err() {
+            dev_err!(
+                self.dev,
+                "save: {}: writing the {} byte blob to disk failed\n",
+                what,
+                blob.len()
+            );
             return false;
         }
 
@@ -823,24 +860,64 @@ impl SepData {
             .sbio_expect_ok(&crate::sbio::sbio_confirm_save(&selector))
             .is_none()
         {
+            dev_err!(
+                self.dev,
+                "save: {}: written to disk but the enclave refused CONFIRM_SAVE; the AP and SEP now disagree about what is persisted\n",
+                what
+            );
             return false;
         }
+        dev_info!(
+            self.dev,
+            "save: {}: persisted, {} bytes\n",
+            what,
+            blob.len()
+        );
         true
     }
 
     fn save_lockout(&self) -> bool {
         let Some(blob) = self.sbio_expect_ok(&crate::sbio::sbio_save_lockout()) else {
+            dev_err!(
+                self.dev,
+                "save: bio lockout record: the enclave refused SAVE_LOCKOUT\n"
+            );
             return false;
         };
         if blob.is_empty() {
+            dev_err!(
+                self.dev,
+                "save: bio lockout record: the enclave returned an empty blob\n"
+            );
             return false;
         }
         match self
             .with_host_store(|store| store.write(&store::Key::root(PRIVATE_TYPE_LOCKOUT), &blob))
         {
-            Some(Ok(())) => true,
-            Some(Err(_)) => false,
-            None => false,
+            Some(Ok(())) => {
+                dev_info!(
+                    self.dev,
+                    "save: bio lockout record: persisted, {} bytes\n",
+                    blob.len()
+                );
+                true
+            }
+            Some(Err(e)) => {
+                dev_err!(
+                    self.dev,
+                    "save: bio lockout record: writing {} bytes failed: {:?}\n",
+                    blob.len(),
+                    e
+                );
+                false
+            }
+            None => {
+                dev_err!(
+                    self.dev,
+                    "save: bio lockout record: the host store is not open\n"
+                );
+                false
+            }
         }
     }
 
