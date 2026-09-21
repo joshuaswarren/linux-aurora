@@ -55,8 +55,6 @@ macro_rules! dev_info{($($t:tt)*)=>{()}}
 macro_rules! dev_err{($($t:tt)*)=>{()}}
 struct Delta;impl Delta{fn from_micros(_:u64)->Self{Self}}fn fsleep(_:Delta){}
 mod util { pub fn g17p_verbose() -> bool { false } }
-mod g17_manager { pub fn g17p_compute_trace_enabled(_submission:u32)->bool { false } }
-static G17P_COMPLETIONS_SEEN:AtomicU64=AtomicU64::new(0);
 #[derive(Copy,Clone)]struct Geometry;
 impl Geometry{fn stamp_count(&self)->u32{8}fn entry_stride(&self)->u32{0x170}}
 #[derive(Copy,Clone)]struct Producer{submitted:u32,previous_valid:bool,previous_timestamp:u32,geometry:Geometry}
@@ -116,7 +114,7 @@ struct Packet{id:u64,context:Context,completion:Arc<Completion>}
 impl Packet{fn submission_id(&self)->u64{self.id}fn context(&self)->&Context{&self.context}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
 #[derive(Clone)]struct Hold(Arc<AtomicUsize>);impl Hold{fn quarantine(&self){}fn retarget_logical_context(&mut self,_context:Hold)->Result{Ok(())}}impl Drop for Hold{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
 #[derive(Debug,Copy,Clone,PartialEq,Eq)]struct G17PAsyncComputeRetirementTicket{owner:u64,submission:u64,context:u32,recovery_epoch:u64,firmware:G17PComputeRetirementTicket}
-struct Active{packet:Packet,_lease:Hold,retirement:Option<G17PAsyncComputeRetirementTicket>,completions_at_publish:u64}
+struct Active{packet:Packet,_lease:Hold,retirement:Option<G17PAsyncComputeRetirementTicket>}
 struct Previous{_binding:Option<Hold>,_context:Hold,publication:Option<(u64,u64)>}
 struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,previous_binding:Option<Previous>,active:Option<Active>,released:bool,retirement_ready:bool,quarantined:bool,retired_by_teardown:bool,terminal_fanout:Option<(Arc<g17_status::VmStatus>,Error)>}
 struct G17PLiveRuntime{pdev:Option<()>,manager:Option<Manager>,async_compute_queues:Vec<Queue>,session_recovery_pending:bool}
@@ -126,7 +124,7 @@ impl G17PLiveRuntime {
  fn fail_outstanding_jobs_for_vm(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}
 '''+methods+r'''
 }
-fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus)});let firmware=G17PComputeRetirementTicket{queue_id:owner as u8,descriptor,submitted_target:1,item_producer:1,item_count:8};let retirement=G17PAsyncComputeRetirementTicket{owner,submission:owner,context:owner as u32,recovery_epoch:0,firmware};(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:Producer{submitted:1,previous_valid:true,previous_timestamp:1,geometry:Geometry},storage:Storage},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),previous_binding:None,active:Some(Active{packet:Packet{id:owner,context:Context{context_id:owner as u32},completion:c.clone()},_lease:Hold(d.clone()),retirement:Some(retirement),completions_at_publish:0}),released:false,retirement_ready:false,quarantined:false,retired_by_teardown:false,terminal_fanout:None},c)}
+fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus)});let firmware=G17PComputeRetirementTicket{queue_id:owner as u8,descriptor,submitted_target:1,item_producer:1,item_count:8};let retirement=G17PAsyncComputeRetirementTicket{owner,submission:owner,context:owner as u32,recovery_epoch:0,firmware};(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:Producer{submitted:1,previous_valid:true,previous_timestamp:1,geometry:Geometry},storage:Storage},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),previous_binding:None,active:Some(Active{packet:Packet{id:owner,context:Context{context_id:owner as u32},completion:c.clone()},_lease:Hold(d.clone()),retirement:Some(retirement)}),released:false,retirement_ready:false,quarantined:false,retired_by_teardown:false,terminal_fanout:None},c)}
 #[test]fn out_of_order_requires_matching_descriptor_and_final_visibility(){
  let drops=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&drops);let(b,cb)=q(2,0x200,&drops);
  let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(2,0x200,[10,20])])),async_compute_queues:vec![a,b],session_recovery_pending:false};

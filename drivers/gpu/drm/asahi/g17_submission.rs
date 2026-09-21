@@ -2707,6 +2707,7 @@ pub(crate) fn encode_g17p_compute_optional_event(
 pub(crate) fn prepare_g17p_compute_cl_command_state(
     descriptor_low: u64,
     submission_ordinal: u64,
+    primary_checkpoint: u8,
 ) -> Result<G17PComputeClCommandState, SubmissionError> {
     let next = submission_ordinal
         .checked_add(1)

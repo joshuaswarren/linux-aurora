@@ -1264,34 +1264,6 @@ struct drm_asahi_cmd_compute {
 	__u64 scs_layout;
 };
 
-/* G18 per-dispatch metadata. Counts are compiler halfwords or bytes as named;
- * the kernel converts them to native units. Version 1 is exactly 64 bytes.
- * Flags: bit0 main staging known, bit1 constant program present, bit2 constant
- * staging known, bit3 local geometry unknown (local_size must then be zero).
- * All other flag bits and reserved must be zero. */
-struct drm_asahi_g18_compute_resources {
-	__u32 version;
-	__u32 flags;
-	__u32 registers_16;
-	__u32 scratch_bytes;
-	__u32 spectpr_scratch_bytes;
-	__u32 staging_16;
-	__u32 constant_registers_16;
-	__u32 constant_scratch_bytes;
-	__u32 constant_staging_16;
-	__u32 local_bytes;
-	__u32 imageblock_stride;
-	__u32 variable_shared_bytes;
-	__u32 local_size[3];
-	__u32 reserved;
-};
-
-/* Flagged G18-only extension; base includes ScsLayout at offset0x40. */
-struct drm_asahi_cmd_compute_g18 {
-	struct drm_asahi_cmd_compute base;
-	struct drm_asahi_g18_compute_resources resources;
-};
-
 /**
  * enum drm_asahi_compute_flags - Compute command flags
  */

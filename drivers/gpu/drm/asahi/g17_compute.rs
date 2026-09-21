@@ -73,6 +73,70 @@ pub(crate) enum ComputeBuildError {
     RegisterProgramShape,
 }
 
+/// Low and high GPU aliases of one retained SKSM entry backing.
+///
+/// Native tag-15 ConfigUpdate reads these from the same KSM queue object at
+/// `+0x80/+0x88`. Keeping them typed prevents the classic CL2 queue-context
+/// allocation from being substituted for either address.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeSksmEntryAliases {
+    low: u64,
+    high: u64,
+    extent: usize,
+}
+
+impl ComputeSksmEntryAliases {
+    pub(crate) const fn new(
+        low: u64,
+        high: u64,
+        extent: usize,
+        alignment: u64,
+    ) -> Result<Self, ComputeBuildError> {
+        if low == 0
+            || high == 0
+            || low == high
+            || extent == 0
+            || alignment == 0
+            || alignment & (alignment - 1) != 0
+            || low & (alignment - 1) != 0
+            || high & (alignment - 1) != 0
+            || low.checked_add(extent as u64).is_none()
+            || high.checked_add(extent as u64).is_none()
+        {
+            return Err(ComputeBuildError::InvalidSksmEntryAliases);
+        }
+        Ok(Self { low, high, extent })
+    }
+
+    pub(crate) const fn low(self) -> u64 {
+        self.low
+    }
+
+    pub(crate) const fn high(self) -> u64 {
+        self.high
+    }
+
+    pub(crate) const fn extent(self) -> usize {
+        self.extent
+    }
+
+    /// Return corresponding addresses within both aliases of the one backing.
+    pub(crate) const fn range_at(
+        self,
+        offset: usize,
+        size: usize,
+    ) -> Result<[u64; 2], ComputeBuildError> {
+        let end = match offset.checked_add(size) {
+            Some(end) => end,
+            None => return Err(ComputeBuildError::InvalidSksmEntryAliases),
+        };
+        if end > self.extent {
+            return Err(ComputeBuildError::InvalidSksmEntryAliases);
+        }
+        Ok([self.low + offset as u64, self.high + offset as u64])
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct ComputeRegister {
     pub(crate) number: u32,

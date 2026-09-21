@@ -56,6 +56,7 @@ impl G17PQueueRegistry{fn new()->Arc<Self>{Arc::new(Self{lease:Mutex(std::sync::
  let render=r.acquire_lease(7).unwrap();drop(render);
 }
 '''
+code += f'\n#[path = "{Path(__file__).resolve().parents[1] / "g17_queue_limits.rs"}"] mod g17_queue_limits;\n'
 with tempfile.TemporaryDirectory() as d:
  f=Path(d)/'test.rs';f.write_text(code);exe=Path(d)/'test';subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True);subprocess.run([str(exe),'--test-threads=1'],check=True,timeout=10)
 print('PASS bounded queue gate with host threads: retained compute overlap, independent render owners, per-owner backpressure and fault wake')

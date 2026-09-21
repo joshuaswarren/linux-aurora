@@ -36,11 +36,10 @@ predicates = "\n".join(item(limits, "pub(crate) const fn " + name + "(") for nam
 
 rust = r'''
 #![allow(dead_code, unused_variables)]
-use std::{pin::Pin,sync::{Arc,atomic::{AtomicU32,AtomicU64,AtomicUsize,Ordering,fence}}};
+use std::{pin::Pin,sync::{Arc,atomic::{AtomicU32,AtomicUsize,Ordering,fence}}};
 type Error=i32;type Result<T=()>=std::result::Result<T,Error>;
 const EIO:i32=5;const ENODEV:i32=19;const EINVAL:i32=22;const EFAULT:i32=14;const EBUSY:i32=16;const EOVERFLOW:i32=75;const ENOSPC:i32=28;const GFP_KERNEL:u32=0;
 macro_rules! dev_info {($($t:tt)*)=>{()}}
-static G17P_COMPLETIONS_SEEN:AtomicU64=AtomicU64::new(0);
 mod util {pub fn g17p_verbose()->bool{false}}
 mod g17_status {pub struct VmStatus;}
 mod g17_queue_limits {''' + predicates + r'''}
@@ -70,7 +69,6 @@ struct Rtkit{fail:bool}impl Rtkit{fn send_message(self:Pin<&mut Self>,_ep:u32,_m
 mod g17_manager {
  use super::*;
  pub const G17P_SUBMIT_PHASE_IDLE:u32=0;
- pub fn g17p_compute_trace_enabled(_submission:u32)->bool{false}
  #[derive(Debug,Copy,Clone,PartialEq,Eq)]pub struct G17PComputeRetirementTicket;
  pub struct G17PSksmQueue{pub id:u8,pub installed:bool,pub scheduler_owner:u32,pub fail_retarget:bool}
  impl G17PSksmQueue{pub fn queue_id(&self)->u8{self.id}pub fn requires_first_install(&self)->bool{!self.installed}

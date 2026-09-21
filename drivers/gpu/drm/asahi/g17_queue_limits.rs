@@ -24,12 +24,6 @@ pub(crate) const MAX_QUEUES: u32 = COMPUTE_CONTEXT_MASK.count_ones();
 /// command queue. Concurrency comes from rotating those pairs, not publishing
 /// a second live command onto one physical pair.
 pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 2;
-/// Keep one host packet waiting for a physical pair while both native work
-/// queues are active. This is scheduler look-ahead, not a third firmware
-/// admission: `G17PQueueRegistry::acquire_lease` still limits the logical
-/// queue to [`MAX_IN_FLIGHT_PER_QUEUE`] live TA/3D pairs and wakes the waiter
-/// only after exact retirement releases one of them.
-pub(crate) const RENDER_SCHEDULER_CREDITS: u32 = MAX_IN_FLIGHT_PER_QUEUE + 1;
 pub(crate) const MAX_COMPUTE_IN_FLIGHT_PER_QUEUE: u32 = 1;
 /// Two GiB boundary inside the existing four GiB runtime reservation. In
 /// addition to descriptor arrays, each independently executing CL graph owns

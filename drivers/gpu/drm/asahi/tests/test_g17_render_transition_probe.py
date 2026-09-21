@@ -104,7 +104,6 @@ mod g17_resources {
   (*p!=usize::MAX).then_some(*p)
  }
 }
-mod g17_queue_limits { pub const MAX_IN_FLIGHT_PER_QUEUE:u32=2; }
 struct Bind(u32);impl Bind {fn matches(&self,vm:&mmu::Vm)->bool {self.0==vm.0}}
 struct Queue {registered:bool}
 struct Queues {tiling:Queue,fragment:Queue}
@@ -145,6 +144,8 @@ impl Manager {
 struct Runtime {crashed:bool,manager:Option<Manager>}
 impl Runtime {fn is_crashed(&self)->bool{self.crashed}}
 '''
+
+preamble += f'\n#[path = "{ROOT / "g17_queue_limits.rs"}"] mod g17_queue_limits;\n'
 
 production = item(manager, 'pub(crate) mod render_transition {')
 production += 'mod g17_manager {pub(crate) use super::render_transition;}\n'

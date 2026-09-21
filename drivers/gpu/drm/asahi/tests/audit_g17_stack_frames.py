@@ -49,10 +49,12 @@ def audit(path):
         'G17ResourceOwner>::new_with_uat': 8192,
         'G17PManagerConstruction>::select_render_slot': 256,
     }
+    violations = []
     for name, limit in limits.items():
         _, (_, frame, _) = find(name)
         print(f'{name}: {frame} bytes (budget {limit})')
-        assert frame <= limit, (name, frame, limit)
+        if frame > limit:
+            violations.append((name, frame, limit))
 
     # Finite simple-path estimate; cycles are cut, not certified safe.
     cache = {}
@@ -76,7 +78,9 @@ def audit(path):
     print(f'Module-internal direct-call estimate: {total} bytes')
     for name, frame in chain:
         print(f'  {frame:5d} {name}')
-    assert total <= 18432, (total, 'leave at least 14 KiB of the 32 KiB stack')
+    if total > 18432:
+        violations.append(('module-internal direct-call estimate', total, 18432))
+    assert not violations, violations
     print('PASS frame budgets; external/indirect/recursive paths are unmeasured')
 
 

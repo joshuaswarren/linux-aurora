@@ -49,8 +49,8 @@ mod mmu{
  impl Uat{pub fn allocate_t8140_compute_execution_context(&self,_:&Vm)->Result<Arc<T8140ComputeExecutionContext>>{Arc::new(T8140ComputeExecutionContext,())}}
 }
 static LIVE_PAGES:AtomicU32=AtomicU32::new(0);
-static NEXT_OBJECT_ID:AtomicU32=AtomicU32::new(1);
-fn g17p_allocate_object_id()->Result<u32>{Ok(NEXT_OBJECT_ID.fetch_add(1,Ordering::SeqCst))}
+static G17P_RENDER_GID_COUNTER:AtomicU32=AtomicU32::new(1);
+''' + item(resources, 'fn g17p_render_gid_add(') + '\n' + item(resources, 'fn g17p_allocate_object_id(') + r'''
 struct MappedObject;
 impl MappedObject{
  fn new_wc(_:&AsahiDevice,_:&mmu::Uat,size:usize,_:u64,_:())->Result<Self>{assert_eq!(size,0x4000);LIVE_PAGES.fetch_add(1,Ordering::SeqCst);Ok(Self)}

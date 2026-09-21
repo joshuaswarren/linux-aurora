@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Logical render queues retain affinity to their physical render pairs.
-
-Fixed render-pool storage belongs to the VM and pair; its selected descriptor
-context belongs to the current logical queue. Avoiding unnecessary pair moves
-reduces context retargets and cross-VM cached-graph handoffs. Cache reuse must
-still find the VM-owned storage when a sibling queue has a different context.
-
-This compiles the driver's real lease state machine and drives two clients
-alternating frames through it, counting how often a slot changes owner. It also
-compiles the historical "lowest free slot" policy in the same harness, so the
-count is shown to discriminate rather than being asserted in a vacuum.
-"""
+"""Execute stable render-owner admission, contention and stopped reclamation."""
 from pathlib import Path
 import subprocess, tempfile
 

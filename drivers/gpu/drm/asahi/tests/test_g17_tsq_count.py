@@ -25,23 +25,12 @@ with tempfile.TemporaryDirectory() as d:
  subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(Path(d)/'test')],check=True)
  subprocess.run([str(Path(d)/'test')],check=True)
 # Execute the decisive compare/conditional-compare instructions from the saved
-# firmware image. Disassemble the repository artifact so this test does not
-# depend on an investigator's temporary directory.
-firmware=p.parents[4]/'.gpu-handoff/gfx-text-9b110520.bin'
-assert hashlib.sha256(firmware.read_bytes()).hexdigest()=='cf352729699211decba77bea2499501b3df3b02665ac0a12316090e6cf5741fb'
-raw=subprocess.run([
-    'aarch64-linux-gnu-objdump','-D','-b','binary','-m','aarch64',
-    '--adjust-vma=0xfffffc0000000000',
-    '--start-address=0xfffffc0000016a30',
-    '--stop-address=0xfffffc0000016a5c',str(firmware),
-],check=True,text=True,stdout=subprocess.PIPE).stdout.splitlines()
+# firmware disassembly. This is a predicate test, not a GPU/firmware run.
+raw=Path(__file__).with_name('fixtures').joinpath('b1-retirement-predicate.txt').read_text().splitlines()
 lines=[l for l in raw if re.match(r'fffffc0000016a(?:3[048c]|4[048c]|5[048]):',l)]
 assert len(lines)==11,lines
-compare=[]
-for line in lines:
-    match=re.search(r'\t(cmp|ccmp|cset)\t([^/]+?)(?:\s*//|$)',line)
-    if match:
-        compare.append(f'{match.group(1)} {match.group(2).strip()}')
+decoded=[l.split(':',1)[1].strip().split(None,1)[1] for l in lines]
+compare=[l for l in decoded if l.split()[0] in ('cmp','ccmp','cset')]
 assert len(compare)==5,compare
 # LDP/loads establish these registers. Each later CCMP reads the post-LDP
 # engine1/2 counts (CMP at16a40 uses engine0 before that LDP).
@@ -49,7 +38,7 @@ def native_gate(completed,target,batches=(1,0,0),threshold=80):
  regs={'w3':completed,'w9':target,'w10':batches[0],'w11':threshold,'w12':batches[2]};flags=0
  def sub(a,b):
   r=(a-b)&0xffffffff;return ((r>>31)<<3)|((r==0)<<2)|((a>=b)<<1)|(((a^b)&(a^r))>>31)
- def condition(c):return {'lo':not(flags&2),'cc':not(flags&2),'ne':not(flags&4),'hs':bool(flags&2),'cs':bool(flags&2)}[c]
+ def condition(c):return {'cc':not(flags&2),'ne':not(flags&4),'cs':bool(flags&2)}[c]
  for i,line in enumerate(compare):
   op,args=line.split(None,1);args=[x.strip() for x in args.split(',')]
   if op=='cmp':flags=sub(regs[args[0]],regs[args[1]]);regs['w10']=batches[1]

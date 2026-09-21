@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two native physical render pairs with two exact generations per pair."""
+"""Two native physical render pairs, each with alternating descriptor generations."""
 
 from pathlib import Path
 
@@ -41,7 +41,7 @@ class Queue:
         self.hwpb_refs = 0
 
     def publish(self, ordinal):
-        assert len(self.trackers) < 4
+        assert len(self.trackers) < 2
         slot = ordinal % 2
         generation = (ordinal // 2) % 2
         assert self.generations[slot][generation] is None
@@ -69,8 +69,8 @@ class Queue:
 queue = Queue()
 for ordinal in range(1, 12_289):
     queue.publish(ordinal)
-    if len(queue.trackers) == 4:
-        queue.retire(ordinal - 3)
+    if len(queue.trackers) == 2:
+        queue.retire(ordinal - 1)
 while queue.trackers:
     queue.retire(queue.trackers[0]["ordinal"])
 

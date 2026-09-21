@@ -33,8 +33,6 @@ use g17_submission::{
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
 pub(crate) const UAPI_RENDER_SIZE: usize = 256;
 pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;
-pub(crate) const UAPI_G18_COMPUTE_SIZE: usize = 136;
-pub(crate) const COMPUTE_G18_RESOURCES: u32 = 1 << 2;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
@@ -364,7 +362,6 @@ pub(crate) struct UapiComputeCommand {
     pub(crate) helper: UapiHelperProgram,
     pub(crate) timestamps: UapiTimestamps,
     pub(crate) scs_layout: u64,
-    pub(crate) g18_resources: [u32; 16],
 }
 
 impl UapiComputeCommand {
@@ -395,7 +392,6 @@ impl UapiComputeCommand {
             helper: helper(&raw, 0x20),
             timestamps: timestamps(&raw, 0x30),
             scs_layout: get_u64(&raw, 0x40),
-            g18_resources,
         })
     }
 }
@@ -928,14 +924,6 @@ pub(crate) struct TranslatedComputeCommand {
     pub(crate) g17p_add3_buffers: Option<[u64; 3]>,
     pub(crate) timestamps: UapiTimestamps,
     pub(crate) scs_layout: u64,
-    /// G18 only: the command carried `DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE`.
-    /// [`translate_compute_command`] refuses that bit like any other unknown
-    /// one and leaves this false; the G18 adapter admits the bit, strips it
-    /// before translation and sets this afterwards.
-    pub(crate) g18_texture_state: bool,
-    /// Validated native descriptor inputs; resource/launch integration is
-    /// separate, so this field does not by itself authorize scratch use.
-    pub(crate) g18_resource_descriptor: Option<[u32; 23]>,
 }
 
 pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
@@ -1016,8 +1004,6 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         g17p_add3_buffers,
         timestamps: command.timestamps,
         scs_layout: command.scs_layout,
-        g18_texture_state: false,
-        g18_resource_descriptor: None,
     })
 }
 
@@ -1666,7 +1652,6 @@ mod tests {
                             },
                         },
                         scs_layout: 0,
-                        g18_resources: [0; 16],
                     }
                 );
             }

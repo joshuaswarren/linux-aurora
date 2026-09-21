@@ -31,17 +31,6 @@ const T8140_UNKNOWN_PAGE: u64 = T8140_USER_TOP - 2 * mmu::UAT_PGSZ as u64;
 const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> =
     crate::g17_queue_limits::CLIENT_LOW_VA_START..0x71_0000_0000;
 
-/// How long to wait for the firmware to report a compute submission complete.
-/// Generous relative to the ~170 GPU ticks a first add3 actually takes; this is
-/// a stuck-firmware backstop, not a pacing knob.
-pub(crate) const G17P_COMPUTE_COMPLETION_TIMEOUT_MS: u32 = 2000;
-
-/// Most mapped VA runs one submit-time audit will report before it truncates.
-const G17P_VM_AUDIT_MAX_RANGES: usize = 64;
-/// Hardware context-table entries the audit snapshots: the retained kernel
-/// context 0, the single bindable user context 1, and the two contexts a
-/// compute kick declares (`T8140_COMPUTE_CTXS` = [2, 3]).
-const G17P_VM_AUDIT_CTXS: usize = 4;
 /// Bounded opt-in render timing trace. `g17p_completion_trace` enables it and
 /// `g17p_trace_depth` caps the number of records for the whole module lifetime.
 static G17P_RENDER_TIMING_RECORDS: AtomicU32 = AtomicU32::new(0);
@@ -629,42 +618,14 @@ impl G17PQueueRegistry {
     ///
     /// `owner` is the logical queue id. Retained descriptors name that queue's
     /// independently allocated application-GART descriptor context, so two
-    /// queues in one VM cannot share one graph. Waiting here is interruptible and
-    /// unbounded by design -- a client that has to wait loses latency, whereas
-    /// an EBUSY from this path reaches Mesa as VK_ERROR_DEVICE_LOST and takes
-    /// the client's whole context with it.
-    /// Does the compute poison still reach clients that are not the owner?
-    ///
-    /// `compute_faulted` is set by `G17PComputeLeaseGuard::quarantine()` on
-    /// every compute quarantine and is only ever cleared by
-    /// `rehabilitate_after_processor_stop`, i.e. by a session rebuild. It is
-    /// read in three places: `acquire_compute`, `acquire_lease` -- the RENDER
-    /// path -- and `submission_error`. That third and second reader are why a
-    /// single lost compute submission takes the whole device down: measured on
-    /// G17P 2026-09-18, a scoped quarantine on qid=8 was followed 27s later by
-    /// an unrelated client failing `stage=acquire-lease errno=-5`, and a
-    /// freshly launched render-only client reported DEVICE_LOST.
-    ///
-    /// `g17p_quarantine_scope` bit 0 already skips `session_recovery_pending`
-    /// and narrows the compute submission gate to the owning client, but it
-    /// never reached this latch, so setting it did not do what its own
-    /// description says. Under bit 0 the poison stops reaching the render path
-    /// and the device-wide submission error.
-    ///
-    /// `acquire_compute` keeps reading it unscoped on purpose: it is what wakes
-    /// and fails a client parked in `lease_free.wait_interruptible` waiting for
-    /// a compute install that is never going to complete. Removing it there
-    /// would trade a dead device for a stuck one.
-    fn compute_poison_is_device_wide(&self) -> bool {
-        *module_parameters::g17p_quarantine_scope.value() & 1 == 0
-    }
+    /// queues in one VM cannot share one graph. Waiting here is interruptible
+    /// for temporary contention. Exhaustion of retained owners
+    /// returns ENOSPC because waiting cannot reclaim an installed channel.
     fn acquire_lease(self: &Arc<Self>, owner: u64) -> Result<G17PLeaseGuard> {
         if owner == 0 { return Err(EINVAL); }
         let mut held = self.lease.lock();
         let slot = loop {
-            if self.compute_faulted.load(Ordering::Acquire) != 0
-                && self.compute_poison_is_device_wide()
-            {
+            if self.compute_faulted.load(Ordering::Acquire) != 0 {
                 return Err(EIO);
             }
             // Every slot retired: no wait can ever succeed, so report the dead
@@ -820,8 +781,6 @@ pub(crate) struct G17PRenderCompletion {
     lease: Arc<Mutex<Option<G17PLeaseGuard>>>,
     vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
     created: Instant<Monotonic>,
-    scheduler_entered_ns: AtomicU64,
-    inputs_ready_ns: AtomicU64,
     attached_ns: AtomicU64,
     published_ns: AtomicU64,
     signalled: AtomicU32,
@@ -854,8 +813,6 @@ impl G17PRenderCompletion {
             lease,
             vm_job,
             created: Instant::now(),
-            scheduler_entered_ns: AtomicU64::new(0),
-            inputs_ready_ns: AtomicU64::new(0),
             attached_ns: AtomicU64::new(0),
             published_ns: AtomicU64::new(0),
             signalled: AtomicU32::new(0),
@@ -863,20 +820,6 @@ impl G17PRenderCompletion {
     }
 
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
-
-    fn mark_scheduler_entered(&self) {
-        self.scheduler_entered_ns.store(
-            self.created.elapsed().as_nanos().max(0) as u64,
-            Ordering::Release,
-        );
-    }
-
-    fn mark_inputs_ready(&self) {
-        self.inputs_ready_ns.store(
-            self.created.elapsed().as_nanos().max(0) as u64,
-            Ordering::Release,
-        );
-    }
 
     /// Attach the physical lease only when the scheduler has resolved every
     /// dependency and is ready to publish. The VM job was retained at ioctl
@@ -1006,7 +949,29 @@ impl G17PRenderCompletion {
             }
             Ok(())
         });
-        let result_ok = result.is_ok();
+        let trace_limit = *module_parameters::g17p_trace_depth.value();
+        if *module_parameters::g17p_completion_trace.value() != 0
+            && trace_limit != 0
+            && G17P_RENDER_TIMING_RECORDS.fetch_add(1, Ordering::Relaxed) < trace_limit
+        {
+            let attached_ns = self.attached_ns.load(Ordering::Acquire);
+            let published_ns = self.published_ns.load(Ordering::Acquire);
+            let durations = gpu_durations.unwrap_or([0; 2]);
+            pr_info!(
+                "G17P render timing: submission={} slot={} attach={}ns publish={}ns complete={}ns dependency={}ns publication={}ns retirement={}ns gpu-ta={} gpu-3d={} ok={}\n",
+                self.submission_id,
+                self.render_slot.load(Ordering::Acquire),
+                attached_ns,
+                published_ns,
+                completed_ns,
+                attached_ns,
+                published_ns.saturating_sub(attached_ns),
+                completed_ns.saturating_sub(published_ns),
+                durations[0],
+                durations[1],
+                result.is_ok(),
+            );
+        }
         if let Err(error) = result {
             self.status.record(error.to_errno());
             self.fence.set_error(error);
@@ -1161,13 +1126,7 @@ impl DrmGpu for G17PDrmGpu {
     }
 
     fn submission_error(&self) -> i32 {
-        if self.registry.compute_faulted.load(Ordering::Acquire) != 0
-            && self.registry.compute_poison_is_device_wide()
-        {
-            EIO.to_errno()
-        } else {
-            0
-        }
+        if self.registry.compute_faulted.load(Ordering::Acquire) != 0 { EIO.to_errno() } else { 0 }
     }
 
     fn update_globals(&self) {}
@@ -1400,7 +1359,6 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
 
     fn publish(&self, packet: Arc<g17_job::G17PRenderJobPacket>) -> Result<Fence> {
         let completion = packet.completion();
-        completion.mark_scheduler_entered();
         let submission_id = packet.submission_id();
         if !packet.begin_publication() {
             completion.fail_unpublished(ECANCELED);
@@ -1413,7 +1371,6 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
             for fence in packet.input_fences() {
                 G17PQueue::wait_fence(fence)?;
             }
-            completion.mark_inputs_ready();
             if packet.cancel_requested() { return Err(ECANCELED); }
 
             // Dependencies are retired before this potentially sleeping slot
@@ -1676,9 +1633,7 @@ impl G17PQueue {
             context: context.clone(),
         }, GFP_KERNEL)?;
         let render_scheduler = g17_job::G17PRenderScheduler::new(
-            dev,
-            render_backend.clone(),
-            crate::g17_queue_limits::RENDER_SCHEDULER_CREDITS,
+            dev, render_backend.clone(), crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE,
         )?;
         Ok(Self {
             dev: dev.into(),

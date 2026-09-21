@@ -82,7 +82,7 @@ assert "default: 0" in perf_param
 # sufficient.
 guarded = block(drm, "    fn submit_guarded(")
 assert "let perf_enabled = *module_parameters::g17p_perf_window.value() != 0;" in guarded
-assert "let entered = if perf_enabled" in guarded
+assert "let mut entered = if perf_enabled" in guarded
 assert "entered: Option<Instant<Monotonic>>" in async_submit
 render_async = block(drm, "    fn submit_render_async(")
 assert "entered: Option<Instant<Monotonic>>" in render_async

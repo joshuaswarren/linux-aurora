@@ -76,13 +76,6 @@ mod identity;
 use g17_initdata::InstanceRole;
 use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, SubmissionTransport};
 
-/// Free-function form of the per-submission trace gate, so paths outside this
-/// file's impl block honour the same `g17p_trace_depth` policy.
-pub(crate) fn g17p_compute_trace_enabled(ordinal: u32) -> bool {
-    let depth = *module_parameters::g17p_trace_depth.value();
-    depth == 0 || ordinal <= depth
-}
-
 static G17P_STATE_DUMPED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -1564,6 +1557,7 @@ struct G17PRenderSlotState {
     storage: Option<g17_resources::G17PUserRenderStorage>,
     sksm: Option<G17PRenderSksmQueues>,
     tracker: Option<G17PPartialOpeningRenderTracker>,
+    queued_tracker: Option<G17PPartialOpeningRenderTracker>,
     submission_ordinal: u64,
     auxiliary_timestamp: u64,
     hardware_buffer_id: Option<u32>,
@@ -4159,10 +4153,66 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
+    fn reactivate_recycled_render_graph(
+        &mut self,
+        mut cached: G17PRetiredRenderGraph,
+        vm: &mmu::Vm,
+        execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
+    ) -> Result {
+        let cached_vm = cached.bind.vm_id();
+        let mut stage = "retarget-command-context";
+        let prepared = (|| -> Result {
+            // The old root remains owned by cached.bind through the entire
+            // transaction. Retargeting first additionally retains the new
+            // root if a later alias allocation fails.
+            cached.storage.retarget_command_context(vm, execution_context.clone())?;
+            cached.bind.vm().clear_render_pool_mappings(cached.storage.queue_pair().slot());
+            drop(cached.context_aliases.take());
+            stage = "queue-backing";
+            let backing = self.render_sksm.as_mut()
+                .and_then(|queues| queues.backing.as_mut()).ok_or(EIO)?;
+            stage = "client-vm-aliases";
+            self.resources.rebind_cached_render_vm(&mut cached.storage, vm, backing)?;
+            stage = "reactivate-rings";
+            cached.storage.prepare_cached_reactivation(self.render_submission_ordinal)?;
+            stage = "claim-queue-backing";
+            cached.storage.claim_sksm_backing(
+                &mut self.render_sksm.as_mut().ok_or(EIO)?.backing,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            // This graph has already been firmware-visible. A failed alias
+            // transaction must not drop its descriptors, support or PM data.
+            // Its old bind and new command context retain both roots.
+            if let Err(full) = self.retired_render_handoff_graphs.push_within_capacity(cached) {
+                core::mem::forget(full.0);
+            }
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P graph rebind failed from vm={} to vm={} stage={} ({:?}); retaining complete graph\n",
+                cached_vm, vm.id(), stage, error,
+            );
+            return Err(error);
+        }
+        drop(cached.bind);
+        self.render_bind = Some(G17PRenderRootOwner::Job { context: execution_context });
+        self.render_context_aliases = None;
+        self.render_storage = Some(cached.storage);
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P render VM handoff: rebound complete cached graph from vm={} to vm={} on pair {} at ordinal {}\n",
+                cached_vm, vm.id(), self.active_render_slot, self.render_submission_ordinal,
+            );
+        }
+        Ok(())
+    }
+
     fn retarget_retained_render_context(
         &mut self,
         vm: &mmu::Vm,
-        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
+        execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
     ) -> Result<bool> {
         let descriptor_context_id =
             u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
@@ -4231,11 +4281,18 @@ impl G17PManagerConstruction {
     pub(crate) fn handoff_retained_render_vm(
         &mut self,
         vm: &mmu::Vm,
-        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
+        execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
     ) -> Result {
+        if !execution_context.matches(vm) || !execution_context.is_current() {
+            return Err(EFAULT);
+        }
+        self.retain_logical_channel_control(&execution_context.channel_control)
+            .map_err(|error| Self::render_stage_fail("handoff-retain-channel-control", error))?;
         let descriptor_context_id =
             u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
-        if self.retarget_retained_render_context(vm, execution_context.clone())? {
+        if self.retarget_retained_render_context(vm, execution_context.clone())
+            .map_err(|error| Self::render_stage_fail("handoff-retarget-current", error))?
+        {
             return Ok(());
         }
         // A pre-publication failure can leave this slot with no selected graph
@@ -4311,8 +4368,10 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
-            self.retarget_retained_render_context(vm, execution_context)?;
-            self.prune_unreferenced_retired_render_graphs()?;
+            self.retarget_retained_render_context(vm, execution_context)
+                .map_err(|error| Self::render_stage_fail("handoff-retarget-restored-cache", error))?;
+            self.prune_unreferenced_retired_render_graphs()
+                .map_err(|error| Self::render_stage_fail("handoff-prune-restored-cache", error))?;
             dev_info!(
                 self.resources.dev().as_ref(),
                 "G17P render VM handoff: restored cached graph vm={} into empty slot {} at ordinal {}\n",
@@ -4427,8 +4486,10 @@ impl G17PManagerConstruction {
             self.render_bind = Some(cached.bind);
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
-            self.retarget_retained_render_context(vm, execution_context)?;
-            self.prune_unreferenced_retired_render_graphs()?;
+            self.retarget_retained_render_context(vm, execution_context)
+                .map_err(|error| Self::render_stage_fail("handoff-retarget-replacement", error))?;
+            self.prune_unreferenced_retired_render_graphs()
+                .map_err(|error| Self::render_stage_fail("handoff-prune-replacement", error))?;
             if crate::util::g17p_verbose() {
                 dev_info!(self.resources.dev().as_ref(),
                     "G17P render VM handoff: reactivated retained graph vm={} at ordinal {} without clearing its render-pool mappings\n",
@@ -5638,7 +5699,7 @@ impl G17PManagerConstruction {
             // pass; suppressing the dependency asks only whether that missing
             // lifecycle is what stalls the fragment group.
             let suppress_barrier =
-                *crate::module_parameters::g17p_render_no_barrier.value() != 0;
+                crate::g17_config::RENDER_NO_BARRIER != 0;
             let barrier_slice: &[g17_submission::G17PClBarrierDependency] =
                 if suppress_barrier { &[] } else { &barrier };
             if suppress_barrier {
@@ -7181,29 +7242,6 @@ impl G17PManagerConstruction {
             root,
             fault_vm_slot,
         );
-        // reason=3 is ReadOnly, so the leaf's write permission IS the
-        // diagnosis. Name the exclusive alias the address lands in and say
-        // whether this driver maps it read-only; several of them are RO by
-        // construction, and a firmware write into one of those is the answer.
-        if let Some(storage) = self.render_storage.as_ref() {
-            for (name, candidate) in [
-                ("raw", addr_word),
-                ("shift6", (addr_word & ((1u64 << 42) - 1)) << 6),
-                ("shift6-masked", (addr_word << 6) & ((1u64 << 42) - 1)),
-            ] {
-                if let Some((alias, read_only)) = storage.name_alias_containing(candidate) {
-                    dev_err!(
-                        dev.as_ref(),
-                        "G17PMARK fault alias[{}]: {} candidate {:#x} lands in alias {} mapped {} -- a reason=3 fault here means the firmware WROTE through it\n",
-                        label,
-                        name,
-                        candidate,
-                        alias,
-                        if read_only { "READ-ONLY" } else { "read-write" },
-                    );
-                }
-            }
-        }
         let candidates = [
             ("raw", addr_word),
             ("shift6", (addr_word & ((1u64 << 42) - 1)) << 6),
@@ -7658,7 +7696,7 @@ impl G17PManagerConstruction {
         ).map_err(|_| EINVAL)?];
         let event_word = barrier[0].event_word;
         let suppress_barrier =
-            *crate::module_parameters::g17p_render_no_barrier.value() != 0;
+            crate::g17_config::RENDER_NO_BARRIER != 0;
         let barrier_slice: &[g17_submission::G17PClBarrierDependency] =
             if suppress_barrier { &[] } else { &barrier };
         if suppress_barrier {
@@ -8002,12 +8040,13 @@ impl G17PManagerConstruction {
                 // the previous completed value differs even across zero.
                 // Require this exact generation, never a stale nonzero stamp.
                 let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
-                let expected_stamp = self.render_submission_ordinal
+                let expected_stamp = ordinal
                     .checked_add(1)
                     .map(|value| (value as u32).wrapping_shl(8))
                     .ok_or(EOVERFLOW)?;
                 let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
-                if fragment_stamp != expected_stamp {
+                let stamp_delta = fragment_stamp.wrapping_sub(expected_stamp);
+                if stamp_delta & 0xff != 0 || stamp_delta >= 0x8000_0000 {
                     if crate::util::g17p_verbose() {
                         dev_info!(
                             self.resources.dev().as_ref(),
@@ -9225,6 +9264,7 @@ impl G17PManagerConstruction {
         let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
             descriptor_low,
             u64::from(queue.submission_ordinal),
+            primary_checkpoint,
         )
         .map_err(|_| EINVAL)?;
         let prepared_entry = g17_submission::prepare_g17p_cl_kick_entry(
@@ -10050,6 +10090,7 @@ impl G17PManagerConstruction {
         let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
             descriptor_low,
             u64::from(queue.submission_ordinal),
+            primary_checkpoint,
         )
         .map_err(|_| EINVAL)?;
         let payload = [descriptor_high, queue.compute.queue_record_gpu_va()];

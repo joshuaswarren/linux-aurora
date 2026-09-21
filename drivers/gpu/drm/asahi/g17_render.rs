@@ -1780,6 +1780,30 @@ mod tests {
     }
 
     #[test]
+    fn partial_render_uses_phase_specific_zls_control() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.depth_buffer = 0x5be8_2a00_00;
+        parameters.stencil_buffer = 0x5bea_4240_00;
+        parameters.depth_flags = 0x000c_0000;
+        parameters.partial_depth_flags = 0x000c_c000;
+
+        let main = build_fragment_registers(&parameters).unwrap();
+        assert_eq!(
+            main.iter().find(|reg| reg.number == 0x15319).unwrap().value,
+            0x000c_0000,
+        );
+        let store = partial_store_registers(&parameters);
+        let resume = partial_resume_registers(&parameters);
+        let load = partial_load_registers(&parameters);
+        for registers in [store.as_slice(), resume.as_slice(), load.as_slice()] {
+            assert_eq!(
+                registers.iter().find(|reg| reg.number == 0x15319).unwrap().value,
+                0x000c_c000,
+            );
+        }
+    }
+
+    #[test]
     fn cold_opening_descriptors_apply_only_the_native_first_work_overrides() {
         let parameters = G17pRenderParameters::source_rsrc8();
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];

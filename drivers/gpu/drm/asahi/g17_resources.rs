@@ -538,7 +538,11 @@ pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize =
 /// Physical rings, 40-bit kick timestamps and 32-bit event values wrap
 /// independently; none requires restarting a live firmware session.
 pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u64 = u64::MAX;
-pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0x14000;
+/// Keep the full native 128-entry QID record namespace disjoint from the
+/// channel's rings and metadata. Four records happened to fit the old prefix;
+/// QID 21 already overlaps its former pointer block at 0x1000.
+const G17P_RENDER_QUEUE_METADATA_BASE: usize = 0x8000;
+pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = G17P_RENDER_QUEUE_METADATA_BASE + 0x14000;
 pub(crate) const G17P_RENDER_SUPPORT_SIZE: usize = 0x40000;
 const G17P_PAGE_SIZE: usize = 0x4000;
 const G17P_RENDER_SECONDARY_INDEX: usize = 0x00000;
@@ -1855,6 +1859,99 @@ impl G17PRenderTargetMemory {
 
     fn tpc_va(&self) -> u64 {
         self.tpc.iova()
+    }
+
+    fn record_offset(&self, submission_ordinal: u64) -> usize {
+        g17p_render_rt_record_slot(submission_ordinal) * self.record_stride
+    }
+
+    /// Grow the tail-pointer cache and the rotating TMAP/HMTA records to what
+    /// `layout` needs, in place, at the addresses this graph already owns.
+    ///
+    /// Both sizes scale with framebuffer area, so a retained graph whose next
+    /// command has a larger render target must resize rather than refuse: the
+    /// previous refusal was a bare `ERANGE` that reached Mesa as
+    /// `VK_ERROR_DEVICE_LOST` for every target above 4096x4096.
+    ///
+    /// `restage_command` has already proved the previous group is complete --
+    /// empty job list, both queues done == read == write -- before it calls
+    /// this, so no firmware work refers to either object while it is replaced.
+    /// Each replacement allocates its new backing BEFORE releasing the old
+    /// aperture, so a failed allocation leaves the graph exactly as it was.
+    fn ensure_capacity(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        layout: &G17PRenderStateLayout,
+    ) -> Result<bool> {
+        let tpc_size = g17p_render_tpc_capacity(layout)?;
+        let record_stride = g17p_render_rt_region_stride(layout)?;
+        let mut grew = false;
+        if tpc_size > self.tpc.logical_size {
+            if tpc_size > G17P_RENDER_TPC_MAX_SIZE {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render: tail-pointer cache needs {:#x} bytes, above the {:#x} ceiling (tiles-per-mtile x utiles-per-tile x layers x clusters); refusing this render target\n",
+                    tpc_size,
+                    G17P_RENDER_TPC_MAX_SIZE,
+                );
+                return Err(ERANGE);
+            }
+            let address = self.tpc.iova();
+            let previous = self.tpc.logical_size;
+            if self.queue_pair.dynamic_placement {
+                self.tpc = MappedObject::new_wc_render_owned(
+                    dev, vm, self.queue_pair, Some(address), tpc_size, mmu::PROT_GPU_FW_SHARED_RW,
+                )?;
+            } else {
+                self.tpc.regrow_wc_at(dev, vm, address, tpc_size)?;
+            }
+            dev_info!(
+                dev.as_ref(),
+                "G17P render TPC grew: {:#x} -> {:#x} bytes at {:#x}\n",
+                previous,
+                tpc_size,
+                self.tpc.iova(),
+            );
+            grew = true;
+        }
+        if record_stride > self.record_stride {
+            if record_stride > G17P_RENDER_RT_REGION_MAX_STRIDE {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render: TMAP/HMTA record needs {:#x} bytes, above the {:#x} ceiling; refusing this render target\n",
+                    record_stride,
+                    G17P_RENDER_RT_REGION_MAX_STRIDE,
+                );
+                return Err(ERANGE);
+            }
+            let address = self.rt_memory.iova();
+            let size = record_stride
+                .checked_mul(G17P_RENDER_RT_EVENT_RECORD_COUNT)
+                .ok_or(EOVERFLOW)?;
+            let previous = self.record_stride;
+            if self.queue_pair.dynamic_placement {
+                self.rt_memory = MappedObject::new_wc_render_owned(
+                    dev, vm, self.queue_pair, Some(address), size, mmu::PROT_GPU_FW_SHARED_RW,
+                )?;
+            } else {
+                self.rt_memory.regrow_wc_at(dev, vm, address, size)?;
+            }
+            self.record_stride = record_stride;
+            // Every record moved to fresh, zeroed backing, so no ordinal owns
+            // one any more; the reuse guard must start again from empty.
+            self.rt_slot_ordinals = [None; G17P_RENDER_RT_EVENT_RECORD_COUNT];
+            dev_info!(
+                dev.as_ref(),
+                "G17P render RT records grew: stride {:#x} -> {:#x}, {:#x} bytes at {:#x}\n",
+                previous,
+                record_stride,
+                size,
+                self.rt_memory.iova(),
+            );
+            grew = true;
+        }
+        Ok(grew)
     }
 
     fn tilemap_va(&self, submission_ordinal: u64) -> Result<u64> {
@@ -7761,37 +7858,6 @@ impl G17PUserRenderStorage {
         Ok(aliases)
     }
 
-    /// Name the exclusive alias that contains `address`, and say whether this
-    /// driver maps it read-only.
-    ///
-    /// A `reason=3` GMMU fault is ReadOnly, not Unmapped -- the firmware wrote
-    /// through a leaf we mapped without write permission -- so the leaf's
-    /// permission is the whole diagnosis, and the fault line previously named
-    /// only the owning VM. Several of these aliases ARE read-only by
-    /// construction (`fragment_rce`, the 3D descriptor), so a write landing in
-    /// one of those is the answer rather than a coincidence.
-    pub(crate) fn name_alias_containing(&self, address: u64) -> Option<(&'static str, bool)> {
-        let hit = |base: u64, size: u64| address >= base && address < base.saturating_add(size);
-        let entries: [(&'static str, u64, u64, bool); 10] = [
-            ("render-state", self.render_state.iova(), self.render_state.logical_size as u64, false),
-            ("deflake", self.render_user_aliases.deflake.iova(), self.render_user_aliases.deflake.size() as u64, false),
-            ("aux-fb", self.render_user_aliases.aux_fb.iova(), self.render_user_aliases.aux_fb.size() as u64, false),
-            ("rt-memory", self.render_target_memory.rt_memory.iova(), self.render_target_memory.rt_memory.logical_size as u64, false),
-            ("tpc", self.render_target_memory.tpc.iova(), self.render_target_memory.tpc.logical_size as u64, false),
-            ("descriptor-ta", self.descriptor_ta_low.iova(), self.descriptor_ta_low.size() as u64, false),
-            ("descriptor-3d", self.descriptor_3d_low.iova(), self.descriptor_3d_low.size() as u64, false),
-            ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.logical_size as u64, true),
-            ("descriptor-3d-diagnostic", self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64, true),
-            ("fragment-status", self.fragment_status_low.iova(), self.fragment_status_low.size() as u64, false),
-        ];
-        for (name, base, size, read_only) in entries {
-            if hit(base, size) {
-                return Some((name, read_only));
-            }
-        }
-        None
-    }
-
     /// Cross-VM reuse preserves embedded GPU addresses. Check the complete
     /// exclusive alias set before selecting a cached graph; a different VM
     /// may already use those addresses for its other render pair or compute.
@@ -10505,6 +10571,28 @@ impl G17PClRuntimeStorage {
             let mut words = [0u32; 28];
             for (word, raw) in words.iter_mut().zip(prefix.chunks_exact(4)) {
                 *word = u32::from_le_bytes(raw.try_into().map_err(|_| EINVAL)?);
+            }
+            Ok(words)
+        })
+    }
+
+    /// Read back the head of a compute SKSM entry slot.
+    ///
+    /// The CONTROL for the render readback. Render's entry region is
+    /// bit-identical before the doorbell and after the timeout, and that was
+    /// read as "never consumed" -- but nothing had ever sampled the same region
+    /// on the path that provably completes. If compute's entries are also
+    /// unchanged across a successful submit, then "unchanged" says nothing
+    /// about consumption and the render reading is void.
+    pub(crate) fn snapshot_compute_entry(&mut self, offset: usize) -> Result<[u64; 48]> {
+        let end = offset.checked_add(g17_submission::G17P_CL_KICK_ENTRY_SIZE).ok_or(ERANGE)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        self.entries.with_bytes_mut(|bytes| {
+            let raw = bytes.get(offset..end).ok_or(ERANGE)?;
+            let mut words = [0; 48];
+            for (index, word) in words.iter_mut().enumerate() {
+                *word = u64::from_le_bytes(raw[index * 8..index * 8 + 8]
+                    .try_into().map_err(|_| ERANGE)?);
             }
             Ok(words)
         })
