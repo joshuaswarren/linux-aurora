@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Make an offline DCP analysis copy with format-7 pointer chains resolved.
 
 Uses VM-to-file mappings for chains; firmware __chain_starts contains VM

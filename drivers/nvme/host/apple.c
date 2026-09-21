@@ -2126,6 +2126,38 @@ static int apple_nvme_suspend(struct device *dev)
 
 	apple_nvme_disable(anv, true);
 
+	if (anv->hw->needs_ioq_registers) {
+		/*
+		 * Post-M4 must keep the ANS running across suspend.
+		 *
+		 * Stopping it is one-way here.  The pre-M4 resume path gets
+		 * the coprocessor back with reset_control_assert() +
+		 * apple_rtkit_reinit() + deassert, which reloads firmware;
+		 * post-M4 cannot, because asserting the ANS reset raises an
+		 * SError.  Measured on J700: once CPU_CONTROL.RUN has been
+		 * cleared, setting it again and running a fresh handshake
+		 * fails with "ANS did not boot" about a second later --
+		 * with or without a preceding apple_rtkit_shutdown().  The
+		 * controller then never returns, the 120 s reset timeout
+		 * expires, and the root filesystem goes read-only mid-resume.
+		 *
+		 * So leave RTKit running and RUN set, and hand the live
+		 * session back through the adoption path that already exists
+		 * for exactly this case (a post-M4 firmware that cannot
+		 * renegotiate HELLO/EPMAP).  Clearing owns_rtkit is what
+		 * arms it: on resume apple_nvme_reset_work() re-checks
+		 * apple_nvme_can_adopt_rtkit() -- RUN, BOOT_STATUS_OK,
+		 * CC.EN and CSTS.RDY, all of which apple_nvme_disable()
+		 * deliberately leaves intact on post-M4 -- adopts the
+		 * running session and rebuilds the queues under it.
+		 *
+		 * s2idle keeps the ANS powered, so this costs standby power
+		 * but is the only state it can return from.
+		 */
+		anv->owns_rtkit = false;
+		return 0;
+	}
+
 	if (apple_rtkit_is_running(anv->rtk)) {
 		ret = apple_rtkit_shutdown(anv->rtk);
 

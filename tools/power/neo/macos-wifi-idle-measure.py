@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Measure native macOS idle with Wi-Fi available and display-off verified.
 
 Requires an existing display-off notification. Temporarily inhibits only idle
