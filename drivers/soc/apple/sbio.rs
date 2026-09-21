@@ -43,7 +43,11 @@ impl SepData {
         match err as u16 {
             crate::sbio::SBIO_STATUS_OK => SbioOutcome::Ok(done.payload),
             crate::sbio::SBIO_STATUS_PREREQUISITE => {
-                dev_warn!(self.dev, "sbio: {} answered status {:#x} (prerequisite missing)\n", op.name(), err);
+                // Not a fault: every caller answers this by establishing the
+                // missing prerequisite and retrying, and the sbio-trace line
+                // above already carries the status. At warn level it reads as
+                // a failure in a log whose next lines are the recovery.
+                dev_info!(self.dev, "sbio: {} answered status {:#x} (prerequisite missing; establishing it and retrying)\n", op.name(), err);
                 SbioOutcome::PrerequisiteMissing
             }
             crate::sbio::SBIO_STATUS_16 => {
