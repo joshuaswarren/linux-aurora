@@ -2106,23 +2106,26 @@ impl SepData {
         let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_enrolment_result()) else {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
-        let Some(parsed) = crate::sbio::EnrolmentResult::parse(&result) else {
-            return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
-        };
-
         // The three field offsets in EnrolmentResult were read off firmware and
         // have never been checked against a live multi-frame enrolment.  If
         // `complete` never flips, enrolment reports "stage passed" forever and
         // never finishes, which is exactly what a J700 does today.  Dump the
         // regions that should carry the counters so the offsets can be
         // confirmed or corrected from a real capture sequence.
+        //
+        // This runs BEFORE the parse on purpose.  parse() returns None when the
+        // reply is shorter than SBIO_ENROL_RESULT_LEN, and that length is itself
+        // reverse-engineered: if it is wrong, the first usable frame fails and
+        // the one line that reveals the enclave's real length must already have
+        // been printed, or the attempt teaches us nothing.
         if *module_parameters::sbio_trace.value() != 0 {
             let head = &result[..core::cmp::min(32, result.len())];
             dev_info!(
                 self.dev,
-                "enrol-result[{}]: len={} head={:02x?}\n",
+                "enrol-result[{}]: len={} (expected {}) head={:02x?}\n",
                 counter,
                 result.len(),
+                crate::sbio::SBIO_ENROL_RESULT_LEN,
                 head
             );
             let tail_from = crate::sbio::SBIO_ENROL_RESULT_LEN.saturating_sub(0x60);
@@ -2134,7 +2137,34 @@ impl SepData {
                     tail_from,
                     &result[tail_from..crate::sbio::SBIO_ENROL_RESULT_LEN]
                 );
+            } else if result.len() > 0x20 {
+                // Short reply: show its own tail instead, so the real layout is
+                // still visible when the length constant is the thing that is wrong.
+                let from = result.len().saturating_sub(0x60);
+                dev_info!(
+                    self.dev,
+                    "enrol-result[{}]: short reply, own tail @{:#x}={:02x?}\n",
+                    counter,
+                    from,
+                    &result[from..]
+                );
             }
+        }
+
+        let Some(parsed) = crate::sbio::EnrolmentResult::parse(&result) else {
+            dev_err!(
+                self.dev,
+                "enrol-result[{}]: enclave returned {} bytes but SBIO_ENROL_RESULT_LEN is {}; \
+                 that constant is reverse-engineered and is wrong. Set it to the length \
+                 printed above and re-check ER_PROGRESS/ER_HAS_TEMPLATE/ER_COMPLETE against it.\n",
+                counter,
+                result.len(),
+                crate::sbio::SBIO_ENROL_RESULT_LEN
+            );
+            return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        };
+
+        if *module_parameters::sbio_trace.value() != 0 {
             dev_info!(
                 self.dev,
                 "enrol-result[{}]: parsed progress={} percent={} complete={} has_template={}\n",
