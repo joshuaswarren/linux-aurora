@@ -2323,6 +2323,11 @@ impl SepData {
             .sbio_expect_ok(&crate::sbio::sbio_prepare_image_processing())
             .is_none()
         {
+            dev_err!(
+                self.dev,
+                "enrol[{}]: the enclave refused PREPARE_IMAGE_PROCESSING; the frame was captured but never handed over\n",
+                counter
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
         let _image = ImageContext { sep: self };
@@ -2336,11 +2341,25 @@ impl SepData {
             crate::shim::monotonic_ns(),
         );
         if self.sbio_expect_ok(&init).is_none() {
+            // Hoisted: the kernel print macros do not take a comparison as a
+            // format argument, the same way they reject an inline if/else.
+            let first = counter == 0;
+            dev_err!(
+                self.dev,
+                "enrol[{}]: the enclave refused IMAGE_PROCESSING_INIT (purpose=enrolment, first={})\n",
+                counter,
+                first
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
         let relay = crate::sbio::SbioRelay::new(&capture);
         if self.sbio_relay(&relay).is_none() {
+            dev_err!(
+                self.dev,
+                "enrol[{}]: relaying the captured image to the enclave failed\n",
+                counter
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
         drop(capture);
@@ -2423,6 +2442,11 @@ impl SepData {
         }
 
         let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_enrolment_result()) else {
+            dev_err!(
+                self.dev,
+                "enrol[{}]: the enclave refused ENROLMENT_RESULT after judging the frame usable\n",
+                counter
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         // The three field offsets in EnrolmentResult were read off firmware and
