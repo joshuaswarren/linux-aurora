@@ -425,6 +425,45 @@ impl SepData {
         if *module_parameters::probe_enrol_result.value() == 0 {
             return;
         }
+        // ASSESS_MIN_LEN is the guard that every captured frame must clear
+        // before the usability byte is even read.  If it is too large the guard
+        // rejects every frame and enrolment silently never progresses, so its
+        // value is worth learning the same way -- ask for an assessment with
+        // nothing captured and see how long the reply is.
+        match self.sbio_call(&crate::sbio::sbio_image_assessment()) {
+            SbioOutcome::Ok(a) => {
+                let verdict = if a.len() >= crate::sbio::ASSESS_MIN_LEN {
+                    " -- clears ASSESS_MIN_LEN"
+                } else {
+                    " -- SHORTER than ASSESS_MIN_LEN, which would reject every frame at the guard"
+                };
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: IMAGE_ASSESSMENT with nothing captured answered {} bytes; ASSESS_MIN_LEN is {}{}\n",
+                    a.len(),
+                    crate::sbio::ASSESS_MIN_LEN,
+                    verdict
+                );
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: assessment head={:02x?}\n",
+                    &a[..core::cmp::min(32, a.len())]
+                );
+            }
+            SbioOutcome::PrerequisiteMissing => {
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: IMAGE_ASSESSMENT refused with nothing captured; its length can only be learned from a real frame\n"
+                );
+            }
+            _ => {
+                dev_info!(
+                    self.dev,
+                    "enrol-probe: IMAGE_ASSESSMENT answered a non-OK status with nothing captured\n"
+                );
+            }
+        }
+
         match self.sbio_call(&crate::sbio::sbio_enrolment_result()) {
             SbioOutcome::Ok(payload) => {
                 // Hoisted: the kernel print macros do not accept an inline
