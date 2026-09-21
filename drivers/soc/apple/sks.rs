@@ -44,7 +44,11 @@ impl<'a> KeybagCreateIntent<'a> {
             return false;
         }
         if let Err(e) = keybag::write_intent(self.slot) {
-            dev_err!(self.dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
+            dev_err!(
+                self.dev,
+                "sks: cannot persist keybag-create intent: {:?}\n",
+                e
+            );
             return false;
         }
         self.sent = false;
