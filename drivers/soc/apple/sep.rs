@@ -2371,6 +2371,10 @@ module! {
             default: 0,
             description: "Additional status[8] value to treat as 'sensor patch already accepted' (0 = only the built-in 0x29). For a sensor revision that reports a different ack.",
         },
+        probe_enrol_result: u8 {
+            default: 0,
+            description: "Diagnostic only: after BEGIN_ENROL, ask the enclave for an ENROLMENT_RESULT before any image is captured, purely to learn its reply length. SBIO_ENROL_RESULT_LEN is reverse-engineered and a wrong value fails the first usable frame of a real enrolment; this settles it without a fingertip when the enclave is willing to answer. Off by default and never needed for normal operation.",
+        },
         sbio_trace: u8 {
             default: 0,
             description: "Log every SBIO opcode and the status the enclave answers, not only the failures. Bring-up diagnostic.",
