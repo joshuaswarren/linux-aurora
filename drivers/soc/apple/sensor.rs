@@ -600,6 +600,10 @@ static_assert!(SENSOR_NONCE_AT + SENSOR_NONCE_LEN <= SENSOR_NONCE_REPLY_LEN - CR
 /// Accept and reject are both 11 bytes, so the status byte is the only
 /// discriminator.
 pub(crate) const NONCE_CMD: u8 = 0x35;
+/// Retained though nothing reads it: it records that accept and reject are
+/// both 11 bytes, which is why the status byte above is the only
+/// discriminator.  The constant is the evidence for the branch, not dead code.
+#[allow(dead_code)]
 pub(crate) const NONCE_ACK_LEN: usize = 0xb;
 pub(crate) const STATUS_RESULT_AT: usize = 10;
 

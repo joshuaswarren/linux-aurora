@@ -2969,6 +2969,12 @@ pub(crate) fn sbio_register_nonce(nonce: &[u8; 32]) -> SbioOp {
 pub(crate) const OP_SBIO_SET_MSRK: u16 = 0x86;
 /// The decoded key material is 72 bytes; what we send is the signed IMG4 that
 /// decodes to it.
+///
+/// Retained deliberately though nothing reads it: it is the length the
+/// enclave's 0x86 handler requires of the decoded plaintext, established by
+/// firmware RE, and it is the number to check a candidate MSRk against when
+/// the enclave answers 0x12e.  Deleting it would drop the fact, not dead code.
+#[allow(dead_code)]
 pub(crate) const SBIO_MSRK_PLAIN_LEN: usize = 72;
 
 /// macOS sends the machine's IOPlatformSerialNumber to the biometric endpoint
@@ -3740,9 +3746,6 @@ pub(crate) fn sbio_request_session_share_mode(mode: u32) -> SbioOp {
         payload_len: 4,
         name: c"SESSION_SHARE",
     }
-}
-pub(crate) fn sbio_request_session_share() -> SbioOp {
-    sbio_request_session_share_mode(SBIO_SESSION_MODE)
 }
 
 const OP_SBIO_COMMIT_SESSION: u16 = 0x16;
