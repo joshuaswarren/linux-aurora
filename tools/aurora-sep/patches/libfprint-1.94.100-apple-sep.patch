@@ -960,12 +960,12 @@ index 0000000..55f3311
 +
 +  /* DUPLICATES_CHECK is deliberately NOT advertised.
 +   *
-+   * It tells libfprint the device can say whether a finger being enrolled is
-+   * already enrolled, and libfprint implements that by running a full IDENTIFY
-+   * pass immediately before every enrol. Matching is implemented, but the
-+   * enclave's enrol result does not identify an already-enrolled finger in a
-+   * way that satisfies libfprint's pre-enrol duplicate-check contract. Keep
-+   * the feature unset until that narrower contract is implemented.
++   * libfprint never reads this flag; fprintd does. Left unset, fprintd runs
++   * its own IDENTIFY before each enrol, and because aurora_match answers an
++   * empty gallery instantly without touching the sensor, fprintd credits the
++   * reply as one enrol stage -- a stage reported before the finger is ever
++   * pressed (measured 2026-09-22: raw libfprint reports none in the same
++   * state). Setting the flag requires native duplicate detection first.
 +   */
 +}
 diff --git a/libfprint/fp-context.c b/libfprint/fp-context.c
