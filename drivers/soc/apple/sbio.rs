@@ -2346,9 +2346,41 @@ impl SepData {
         drop(capture);
 
         let Some(assessment) = self.sbio_expect_ok(&crate::sbio::sbio_image_assessment()) else {
+            dev_err!(
+                self.dev,
+                "assessment[{}]: the enclave refused IMAGE_ASSESSMENT for a captured frame\n",
+                counter
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
+        // The length dump has to come before the length gate, not after.
+        //
+        // ASSESS_MIN_LEN is reverse-engineered and, unlike the ENROLMENT_RESULT
+        // constants, could not be checked offline: the enclave refuses
+        // IMAGE_ASSESSMENT when nothing has been captured, so its reply length
+        // is only observable from a real frame. If the value is too large this
+        // gate rejects every frame -- and because it runs first, it would mask
+        // every downstream diagnostic too, including the enrolment-result
+        // dumps. Print what arrived before deciding anything about it.
+        if *module_parameters::sbio_trace.value() != 0 {
+            dev_info!(
+                self.dev,
+                "assessment[{}]: len={} (minimum {})\n",
+                counter,
+                assessment.len(),
+                crate::sbio::ASSESS_MIN_LEN
+            );
+        }
         if assessment.len() < crate::sbio::ASSESS_MIN_LEN {
+            dev_err!(
+                self.dev,
+                "assessment[{}]: the enclave returned {} bytes but ASSESS_MIN_LEN is {}; that constant is reverse-engineered and could not be verified offline. If every frame stops here, lower it to the length above and re-check ASSESS_USABLE_ENROL ({:#04x}) against it. head={:02x?}\n",
+                counter,
+                assessment.len(),
+                crate::sbio::ASSESS_MIN_LEN,
+                crate::sbio::ASSESS_USABLE_ENROL,
+                &assessment[..core::cmp::min(32, assessment.len())]
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
         // Dump the whole assessment before the usability gate below.
