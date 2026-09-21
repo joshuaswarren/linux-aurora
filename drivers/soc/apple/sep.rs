@@ -178,9 +178,7 @@ struct Endpoint {
 
 impl Endpoint {
     fn new(id: u8) -> Self {
-        Endpoint {
-            id,
-        }
+        Endpoint { id }
     }
 }
 
@@ -417,7 +415,6 @@ static_assert!(SBIO_PROBE_USER_ID > 0);
 const SKS_LOAD_REPLY_LEN: usize = 8;
 
 #[derive(Clone, Copy)]
-
 #[must_use]
 struct Healthy(());
 
@@ -514,9 +511,7 @@ struct EndpointTable {
 
 impl EndpointTable {
     fn new() -> Self {
-        EndpointTable {
-            eps: KVec::new(),
-        }
+        EndpointTable { eps: KVec::new() }
     }
 
     fn slot(&mut self, id: u8) -> Result<usize> {
@@ -530,7 +525,6 @@ impl EndpointTable {
         Ok(self.eps.len() - 1)
     }
 }
-
 
 struct MachineRefKey {
     blob: KVec<u8>,
@@ -896,7 +890,6 @@ impl SepData {
 
         let msg = proto::shmem_registration(iova, size)?;
 
-
         if dt::registration_already_sent(sep_node) {
             return Err(EBUSY);
         }
@@ -1052,7 +1045,6 @@ impl SepData {
         self.mbox.lock().as_ref().ok_or(ENODEV)?.send(msg, false)
     }
 
-
     fn control_request(&self, op: &proto::ControlOp) -> Result<Option<proto::ControlReply>> {
         let (idx, tag) = self.control.lock().alloc()?;
         let msg = proto::encode_control(op, tag);
@@ -1142,7 +1134,6 @@ impl SepData {
     }
 
     fn control_survey(&self) {
-
         for param in [0x00u8, 0x01, 0xff] {
             let _ = self.control_request(&proto::op_nop(param));
         }
@@ -1165,7 +1156,7 @@ impl SepData {
 
         if got == words.len() {
             match self.register_hwrng() {
-                Ok(()) => {},
+                Ok(()) => {}
                 Err(e) => dev_err!(self.dev, "hwrng: registration failed: {:?}\n", e),
             }
         } else {
@@ -1177,7 +1168,6 @@ impl SepData {
 
         let _state = self.control.lock();
     }
-
 
     fn alloc_ool(
         dev: &device::Device<device::Core>,
@@ -1374,7 +1364,10 @@ impl SepData {
         };
 
         if done.reply_bytes > 0 {
-            if self.ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes]).is_err() {
+            if self
+                .ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes])
+                .is_err()
+            {
                 self.fail_xarm_because(req.tag, "could not write the reply buffer");
                 return;
             }
@@ -1430,7 +1423,9 @@ impl SepData {
                     return true;
                 }
             }
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(OOL_WRITE_POLL_MS)));
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
+                OOL_WRITE_POLL_MS,
+            )));
         }
         false
     }
@@ -1483,7 +1478,6 @@ impl SepData {
         reply.args[0] = u8::from(PROTECTED_DATA_AVAILABLE);
         self.send_xarm_reply(&reply);
     }
-
 
     fn on_scrd(&self, msg: Message) {
         let mut probe = self.scrd_probe.lock();
@@ -1649,7 +1643,8 @@ impl SepData {
             return None;
         }
 
-        let (status, out) = self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value()))?;
+        let (status, out) =
+            self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value()))?;
         if status != 0 || out.len() < crate::scrd::SCRD_ACM_HANDLE_LEN {
             return None;
         }
@@ -1666,9 +1661,9 @@ impl SepData {
             return None;
         }
 
-        let (status, out) = self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
-        let satisfied = out.len() >= 4
-            && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
+        let (status, out) =
+            self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+        let satisfied = out.len() >= 4 && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
         if status != 0 || !satisfied {
             return None;
         }
@@ -1707,11 +1702,13 @@ impl SepData {
             }
             let mut acm_handle = [0u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
             acm_handle.copy_from_slice(&out[..crate::scrd::SCRD_ACM_HANDLE_LEN]);
-            let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&acm_handle))?;
+            let (status, _) =
+                self.scrd_command(&crate::scrd::scrd_context_externalize(&acm_handle))?;
             if status != 0 {
                 return None;
             }
-            let out = self.sks_send(self.sks_req_verify_secret(special, stored.secret(), &acm_handle))?;
+            let out =
+                self.sks_send(self.sks_req_verify_secret(special, stored.secret(), &acm_handle))?;
             if out.reply.status != 0 {
                 return None;
             }
@@ -1719,7 +1716,11 @@ impl SepData {
             Some(acm_handle)
         })();
         if acm.is_some() {
-            dev_info!(self.dev, "scrd: match context established for user {}\n", user.value());
+            dev_info!(
+                self.dev,
+                "scrd: match context established for user {}\n",
+                user.value()
+            );
         } else {
             dev_warn!(
                 self.dev,
@@ -1728,7 +1729,6 @@ impl SepData {
             );
         }
     }
-
 
     fn hwrng_fill(&self, buf: *mut u8, max: usize, wait: bool) -> c_int {
         if !wait {
@@ -1796,7 +1796,6 @@ impl SepData {
         Ok(())
     }
 
-
     fn drain(&self) -> u32 {
         let mut n: u32 = 0;
         while let Some(msg) = self.rx.pop() {
@@ -1810,7 +1809,6 @@ impl SepData {
         }
         n
     }
-
 
     fn arm_settle(this: &Arc<SepData>) {
         if this.shutting_down.load(Relaxed) {
@@ -1920,7 +1918,7 @@ impl SepData {
         match f.ep {
             proto::EP_DISCOVER => self.on_discovery(msg, f),
 
-            proto::EP_SHMEM => {},
+            proto::EP_SHMEM => {}
 
             proto::EP_CONTROL => self.on_control(msg, f),
 
@@ -1934,7 +1932,7 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            _ep => {},
+            _ep => {}
         }
     }
 
@@ -1995,7 +1993,6 @@ impl SepData {
             let _ = table.slot(f.param);
         }
     }
-
 
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
@@ -2203,7 +2200,6 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     }
 }
 
-
 struct SepDriver(Arc<SepData>);
 
 const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
@@ -2248,7 +2244,11 @@ impl platform::Driver for SepDriver {
         data.attach(&sep_node)?;
 
         if let Err(e) = data.register_fv_kernel() {
-            dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+            dev_err!(
+                dev,
+                "could not register the FileVault kernel API: {:?}\n",
+                e
+            );
         }
 
         if let Err(e) = trusted::register(data.clone()) {
@@ -2268,7 +2268,6 @@ impl Drop for SepDriver {
         self.0.remove();
     }
 }
-
 
 #[pin_data]
 struct SepModule {

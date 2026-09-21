@@ -27,7 +27,12 @@ impl SepData {
         };
 
         let Some(err) = done.status.answered() else {
-            dev_warn!(self.dev, "sbio: {} not answered ({})\n", op.name(), done.status);
+            dev_warn!(
+                self.dev,
+                "sbio: {} not answered ({})\n",
+                op.name(),
+                done.status
+            );
             return SbioOutcome::Other;
         };
 
@@ -280,7 +285,11 @@ impl SepData {
                 sensor::power_source().name()
             );
         } else if bound {
-            dev_info!(self.dev, "sensor: power via {}\n", sensor::power_source().name());
+            dev_info!(
+                self.dev,
+                "sensor: power via {}\n",
+                sensor::power_source().name()
+            );
         }
     }
 
@@ -450,7 +459,12 @@ impl SepData {
                     nonzero += 1;
                     if shown < 40 {
                         shown += 1;
-                        dev_info!(self.dev, "enrol-probe: nonzero @{:#06x} = {:#04x}\n", off, *b);
+                        dev_info!(
+                            self.dev,
+                            "enrol-probe: nonzero @{:#06x} = {:#04x}\n",
+                            off,
+                            *b
+                        );
                     }
                 }
                 dev_info!(
@@ -1333,16 +1347,12 @@ impl SepData {
         if *module_parameters::platform_serial.value() != 0 {
             let mut serial = [0u8; crate::sbio::SBIO_PLATFORM_SERIAL_LEN];
             match shim::platform_serial(&mut serial) {
-                Ok(n) => {
-                    match self.sbio_call(&crate::sbio::sbio_platform_serial(&serial)) {
-                        SbioOutcome::Ok(_) => dev_info!(
-                            self.dev,
-                            "sbio: platform serial registered ({} chars)\n",
-                            n
-                        ),
-                        _ => dev_warn!(self.dev, "sbio: PLATFORM_SERIAL (0x48) was refused\n"),
+                Ok(n) => match self.sbio_call(&crate::sbio::sbio_platform_serial(&serial)) {
+                    SbioOutcome::Ok(_) => {
+                        dev_info!(self.dev, "sbio: platform serial registered ({} chars)\n", n)
                     }
-                }
+                    _ => dev_warn!(self.dev, "sbio: PLATFORM_SERIAL (0x48) was refused\n"),
+                },
                 Err(e) => dev_warn!(
                     self.dev,
                     "sbio: could not read the platform serial ({:?})\n",
@@ -1382,7 +1392,11 @@ impl SepData {
         let serial = match sensor::read_sensor_serial() {
             Ok(serial) => serial,
             Err(e) => {
-                dev_err!(self.dev, "sensor: reading the sensor serial failed ({:?})\n", e);
+                dev_err!(
+                    self.dev,
+                    "sensor: reading the sensor serial failed ({:?})\n",
+                    e
+                );
                 return false;
             }
         };
@@ -1427,7 +1441,10 @@ impl SepData {
                 Ok(fw) => {
                     let mut body = KVec::new();
                     if body
-                        .extend_from_slice(&crate::sbio::calibration_source().to_le_bytes(), GFP_KERNEL)
+                        .extend_from_slice(
+                            &crate::sbio::calibration_source().to_le_bytes(),
+                            GFP_KERNEL,
+                        )
                         .is_ok()
                         && body.extend_from_slice(fw.data(), GFP_KERNEL).is_ok()
                     {
@@ -1442,7 +1459,11 @@ impl SepData {
                         }
                     }
                 }
-                Err(e) => dev_info!(self.dev, "calib-probe: no comb calibration file ({:?})\n", e),
+                Err(e) => dev_info!(
+                    self.dev,
+                    "calib-probe: no comb calibration file ({:?})\n",
+                    e
+                ),
             }
         }
 
@@ -1582,9 +1603,7 @@ impl SepData {
             // patch/challenge/session chain, which is what a sensor that has
             // nothing to patch would do.
             let extra = *module_parameters::patch_ack_accept.value();
-            if st.patch_ack() == sensor::PATCH_ACCEPTED
-                || (extra != 0 && st.patch_ack() == extra)
-            {
+            if st.patch_ack() == sensor::PATCH_ACCEPTED || (extra != 0 && st.patch_ack() == extra) {
                 dev_info!(
                     self.dev,
                     "sensor: patch ack {:#x} accepted (state {:#x}); no patch needed\n",
@@ -1713,8 +1732,11 @@ impl SepData {
             // Report the status the enclave answered, not just "failed": the
             // difference between a refused container and a refused source word
             // is only visible here.
-            let ok = match self.sbio_transfer_raw(request.opcode(), request.name(), request.payload())
-            {
+            let ok = match self.sbio_transfer_raw(
+                request.opcode(),
+                request.name(),
+                request.payload(),
+            ) {
                 Ok(done) if done.status.is_ok() => true,
                 Ok(done) => {
                     dev_err!(
@@ -1938,9 +1960,9 @@ impl SepData {
                 // enclave answers 0x16 to one mode word and 0x2d to another, so
                 // walk the whole enumeration and let the summary say what each
                 // value did.
-                SbioOutcome::Status16
-                | SbioOutcome::PrerequisiteMissing
-                | SbioOutcome::Other => continue,
+                SbioOutcome::Status16 | SbioOutcome::PrerequisiteMissing | SbioOutcome::Other => {
+                    continue
+                }
             }
         }
         let Some(share) = share else {
@@ -2338,9 +2360,8 @@ impl SepData {
         // attempt budget would then be spent in milliseconds and time the
         // capture out before the frame lands. Time-bounding degrades, at worst,
         // to the same duration as the poll path.
-        let deadline_ns = crate::shim::monotonic_ns().saturating_add(
-            u64::from(ENROL_POLL_ATTEMPTS) * u64::from(ENROL_POLL_MS) * 1_000_000,
-        );
+        let deadline_ns = crate::shim::monotonic_ns()
+            .saturating_add(u64::from(ENROL_POLL_ATTEMPTS) * u64::from(ENROL_POLL_MS) * 1_000_000);
         let mut attempt: u32 = 0;
         loop {
             if !bio::capture_is_live(&self.bio_session.lock()) {
@@ -2395,7 +2416,9 @@ impl SepData {
                 let _ = sensor::irq_wait(ENROL_IRQ_WAIT_MS);
                 sensor::irq_arm();
             } else {
-                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ENROL_POLL_MS)));
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
+                    ENROL_POLL_MS,
+                )));
             }
             attempt = attempt.saturating_add(1);
         }
