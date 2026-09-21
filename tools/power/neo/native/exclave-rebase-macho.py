@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Resolve a saved ExclaveCore __chain_fixups section for offline analysis only.
 
 Supports unbound ARM64E_USERLAND24 chains (format 12), including zero-fill

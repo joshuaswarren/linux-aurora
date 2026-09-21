@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Summarize a macos-sleep-measure capture without treating cached data as fresh.
 
 PackCurrentAccumulator is treated as a sum of mA samples and SystemLoad as a

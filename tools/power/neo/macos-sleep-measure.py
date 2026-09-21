@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Capture native macOS battery counters around one scheduled timed sleep.
 
 Counters are retained verbatim (with signed 64-bit decoding), not assumed to

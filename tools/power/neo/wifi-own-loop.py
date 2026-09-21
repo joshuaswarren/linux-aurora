@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Bounded measurement controller for qualified associated-ownership sysfs trials."""
 from pathlib import Path
 import argparse,errno,json,signal,time,subprocess
