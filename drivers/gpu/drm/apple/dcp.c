@@ -2279,6 +2279,25 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	 */
 };
 
+/*
+ * The J700's two DCPs share one compatible, so they shared one hw_data and
+ * with it num_dptx_ports = 0 -- which silently disabled DisplayPort on the
+ * external pipe.  dptxep_init()'s port loop runs num_dptx_ports times, so at
+ * zero it never waits for a port to enable, dptxport[0].enabled stays false
+ * for ever, and dcp_dptx_connect() bails at "dptx service for port 0 not
+ * enabled".  Everywhere else the split is by compatible: "apple,dcp" has 0
+ * ports and "apple,dcpext" has 2.
+ *
+ * One port, not two: this machine has a single ATC PHY and a single
+ * DP-capable connector (the front connector has no ATC endpoint at all), so
+ * there is one DisplayPort to enable.  adopt_running_coprocessor stays on --
+ * m1n1 hands this DCP over running and stopping the ASC kills the firmware.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140_ext = {
+	.num_dptx_ports = 1,
+	.adopt_running_coprocessor = true,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -2290,6 +2309,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
+	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_ext, },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },

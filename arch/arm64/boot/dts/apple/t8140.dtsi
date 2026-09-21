@@ -841,7 +841,8 @@
 		};
 
 		dcpext: dcp@416e00000 {
-			compatible = "apple,t8140-dcp", "apple,dcp";
+			compatible = "apple,t8140-dcpext", "apple,t8140-dcp",
+				     "apple,dcp";
 			phandle = <&dcpext>;
 			mboxes = <&dcpext_mbox>;
 			mbox-names = "mbox";
