@@ -510,6 +510,29 @@
 			power-role = "dual";
 			data-role = "host";
 
+			/*
+			 * How a DP-Alt hotplug reaches the external DCP, and
+			 * why this property is not optional here.
+			 *
+			 * typec_displayport dispatches hotplug through
+			 * drm_connector_oob_hotplug_event(), which looks the
+			 * DRM connector up *by fwnode*.  With no "displayport"
+			 * property it falls back to the Type-C port's own
+			 * fwnode (displayport.c, "embedded DP"), i.e. this
+			 * node.  But apple_drv.c registers the external
+			 * connector with the dcpext device's fwnode, so the
+			 * lookup would miss, apple_connector_oob_hotplug()
+			 * would never run, dcp_dptx_connect_oob() would never
+			 * fire, and the DCP would sit at nr_modes:0 with a
+			 * display plugged in -- looking exactly like the
+			 * no-display case.
+			 *
+			 * Naming dcpext here makes fwnode_find_reference()
+			 * return the very node the connector registered with,
+			 * so the lookup matches by construction.
+			 */
+			displayport = <&dcpext>;
+
 			ports {
 				#address-cells = <1>;
 				#size-cells = <0>;
