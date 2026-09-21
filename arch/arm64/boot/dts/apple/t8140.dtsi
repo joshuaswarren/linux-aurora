@@ -847,19 +847,39 @@
 			mbox-names = "mbox";
 			iommus = <&dcpext_dart 23>;
 
+			/*
+			 * Five windows and no "iop-vbar", matching the dcpext
+			 * nodes in t600x-dieX.dtsi.  The external pipe has four
+			 * display windows where the internal one has five: it
+			 * has no counterpart to the internal "disp-2"
+			 * (0x4123a8000), so the names stay contiguous in
+			 * address order and external "disp-2" is the ...ac000
+			 * window the internal node calls "disp-3".
+			 */
 			reg-names = "coproc", "disp-0", "disp-1", "disp-2",
-				    "disp-3", "iop-vbar";
+				    "disp-3";
 			reg = <0x4 0x16e00000 0x0 0x4000>,
 			      <0x4 0x14000000 0x0 0xafc000>,
 			      <0x4 0x16240000 0x0 0x10000>,
 			      <0x4 0x163ac000 0x0 0x4000>,
-			      <0x4 0x16800000 0x0 0x800000>,
-			      <0x4 0x16850000 0x0 0x4000>;
+			      <0x4 0x16800000 0x0 0x800000>;
 			/*
-			 * apple,bw-scratch / apple,bw-doorbell are deliberately
-			 * absent: the internal pipe takes them from
-			 * pmgr_dcp@3082a0000, and the equivalent windows for the
-			 * external pipe have not been located in the ADT.
+			 * apple,bw-scratch is still missing, and it is what
+			 * stops this probing: dcp.c rejects any node without it
+			 * up front, as a guard against stale device trees --
+			 *   apple-dcp 416e00000.dcp: error -ENODEV:
+			 *   Incompatible devicetree!
+			 * observed on hardware with these nodes enabled.
+			 *
+			 * The J700 ADT gives no external equivalent: dcp0-expert
+			 * carries the pmgr-block windows 0xf82b8044 and
+			 * 0xf8008000 that the internal apple,bw-scratch is built
+			 * from, while dcpext-expert has none and starts straight
+			 * at the display registers.  Upstream nonetheless gives
+			 * its dcpext nodes one, pointing into the same pmgr_dcp
+			 * block at a distinct offset (t600x uses 0x990 and
+			 * 0x998), so the form is <&pmgr_dcp 0 N offset> and only
+			 * the t8140 external offset is unknown.
 			 */
 			power-domains = <&ps_dispext0_cpu>;
 			resets = <&ps_dispext0_cpu>;
