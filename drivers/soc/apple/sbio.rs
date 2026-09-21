@@ -3982,6 +3982,35 @@ pub(crate) fn sbio_match_result() -> SbioOp {
 
 pub(crate) const SBIO_MATCH_RESULT_LEN: usize = 0xca2;
 
+// All three verified against com.apple.driver.AppleMesaSEPDriver in the J700's
+// own kernelcache (25G83, mac17p), which ships unstripped.  The reply opens
+// with an identity_v1_t -- Apple has a type of that name and passes a pointer
+// to it around -- and that is what fixes both offsets at once:
+//
+//   handleMatch:                 cmp x8, #0xca2 / b.ne   reply length
+//                                ldr q0, [x25]           16 bytes @0x000
+//                                ldr w8, [x25, #0x10]    u32     @0x010
+//                                str q0, [x20] / str w8, [x20, #0x10]
+//                                ... mov x1, x20
+//                                bl  sendMatchEventToClients(identity_v1_t *)
+//
+//   sendMatchEventToClients:     ldr w9, [x1]            u32 @0x000
+//                                cmn w9, #0x1            compare with -1
+//                                cset w9, ne             -> the "matched" flag
+//
+// So the leading u32 is the user id (-1 meaning no match, which is why ours is
+// a signed i32), the record is 16+4 = 20 bytes, and the 16 bytes that are not
+// the user id are the ones at 0x004.  Independently, the u32 at 0x000 is passed
+// as the `unsigned int` argument of
+// IOBiometricService::getCachedContextForUser(unsigned int, bool).
+//
+// The length tiles the same way ENROLMENT_RESULT does: the last field is a
+// second 20-byte record at 0xc8e, and 0xc8e + 0x14 = 0xca2 exactly.
+//
+// Not implemented here, and worth knowing: u32 @0x014 is a retry request.  When
+// it is non-zero Apple runs retryMatchAfterHomeButtonPress() and may parse a
+// *different* reply instead of this one.  We ignore it, so a match the enclave
+// wants re-pressed reads to us as a plain non-match.
 const MR_USER_ID: usize = 0x000;
 const MR_IDENTITY: usize = 0x004;
 static_assert!(MR_USER_ID + 4 <= SBIO_MATCH_RESULT_LEN);
