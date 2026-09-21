@@ -675,6 +675,17 @@ struct SepData {
     #[pin]
     fv_volumes: Mutex<KVec<fv::VolumeMap>>,
 
+    /// The previous ENROLMENT_RESULT payload, for a per-frame diff.
+    ///
+    /// The three field offsets EnrolmentResult parses were read off firmware
+    /// and have never been checked against a live multi-frame enrolment.  If
+    /// they are wrong, enrolment reports stages forever and never completes,
+    /// and a single dump cannot say which bytes are the real counters.
+    /// Diffing successive frames does: across nine stages the progress byte
+    /// and the completion flag are the ones that move.
+    #[pin]
+    enrol_prev: Mutex<KVec<u8>>,
+
     rng_shutdown: Atomic<bool>,
 
     rng_failures: Atomic<u64>,
@@ -850,6 +861,7 @@ impl SepData {
                 fv_volumes <- new_mutex!(KVec::new()),
                 rng_shutdown: Atomic::new(false),
                 rng_failures: Atomic::new(0),
+                enrol_prev <- new_mutex!(KVec::new()),
                 rx: rxring::RxRing::new(),
                 rx_count: Atomic::new(0),
                 settle_mark: Atomic::new(0),
