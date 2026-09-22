@@ -272,6 +272,7 @@ impl SepData {
                 // supported configuration, not a fault: say so once, at info
                 // level, and leave the rest of the SEP -- hwrng, the key store,
                 // trusted keys, FileVault -- running normally.
+                self.sensor_absent.store(true, Relaxed);
                 dev_info!(
                     self.dev,
                     "sensor: this machine has no fingerprint sensor; Touch ID is unavailable and every other SEP service is unaffected\n"
@@ -412,7 +413,7 @@ impl SepData {
         match self.sbio_call(&op) {
             SbioOutcome::Ok(_payload) => {
                 self.enrol_open.store(true, Relaxed);
-                        Some(OpenEnrolment {
+                Some(OpenEnrolment {
                     sep: self,
                     armed: true,
                 })
@@ -1099,6 +1100,21 @@ impl SepData {
                 );
                 return;
             }
+        }
+        // A machine with no sensor must not publish a biometric device: fprintd
+        // would advertise a fingerprint reader that cannot ever enrol, and the
+        // desktop would offer Touch ID on a Neo that does not have it. This is
+        // deliberately keyed on "no such hardware", not on `sensor_present`,
+        // which is also false when a sensor that IS fitted failed to bind --
+        // that case still publishes, so the failure is visible and retryable.
+        if !dt::sensor_hardware_present(sensor::CONTROLLER_BASE) {
+            self.sensor_absent.store(true, Relaxed);
+            dev_info!(
+                self.dev,
+                "bringup: no fingerprint sensor, so /dev/{} is not published; hwrng, the key store and trusted keys are unaffected\n",
+                bio::DEVICE_NAME
+            );
+            return;
         }
         if let Err(e) = self.register_bio() {
             dev_err!(
@@ -2539,9 +2555,7 @@ impl SepData {
         let stage = if parsed.complete() {
             bio::ENROL_STAGES
         } else {
-            accepted
-                .max(from_coverage)
-                .clamp(1, bio::ENROL_STAGES - 1)
+            accepted.max(from_coverage).clamp(1, bio::ENROL_STAGES - 1)
         };
 
         ImageOutcome::Progress {

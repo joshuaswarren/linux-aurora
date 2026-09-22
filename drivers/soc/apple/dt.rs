@@ -397,6 +397,21 @@ unsafe fn add_u32(
     }
 }
 
+/// Whether this machine has fingerprint-sensor hardware at all, without
+/// touching the tree.
+///
+/// `enable_spi_sensor()` answers the same question but has side effects: it
+/// creates the sensor node when the bus exists. The bringup path has to decide
+/// whether to publish a biometric device *before* it gets that far, so it needs
+/// a read-only answer. The two must agree -- this mirrors the checks
+/// `enable_spi_sensor()` makes, in the same order.
+pub(crate) fn sensor_hardware_present(base: u64) -> bool {
+    if DtNode::find_compatible(SENSOR_COMPATIBLE).is_some() {
+        return true;
+    }
+    node_at_address(base).is_some()
+}
+
 pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
     // A machine that describes the sensor in its own device tree (compatible
     // apple,mesa-fingerprint) is handled machine-agnostically: enable that node

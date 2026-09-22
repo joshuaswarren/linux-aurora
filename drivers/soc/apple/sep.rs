@@ -654,6 +654,10 @@ struct SepData {
     scrd_wq: CondVar,
 
     sensor_present: Atomic<bool>,
+    /// True only when the machine has no fingerprint sensor at all, as opposed
+    /// to one that is present but did not bind. A Neo built without Touch ID
+    /// must not advertise a biometric device that can never work.
+    sensor_absent: Atomic<bool>,
 
     #[pin]
     bio_session: Mutex<bio::Session>,
@@ -865,6 +869,7 @@ impl SepData {
                 session_established: Atomic::new(false),
                 msrk_loaded: Atomic::new(false),
                 sensor_present: Atomic::new(false),
+                sensor_absent: Atomic::new(false),
                 bio_session <- new_mutex!(bio::Session::new()),
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
