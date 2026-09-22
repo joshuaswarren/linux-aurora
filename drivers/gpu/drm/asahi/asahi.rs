@@ -25,6 +25,7 @@ mod g17_boot;
 mod g17_completion;
 mod g17_compute;
 mod g17_drm;
+mod m5_drm;
 mod g17_firmware;
 mod g17_initdata;
 mod g17_job;
@@ -47,6 +48,15 @@ mod hw;
 mod identity;
 mod initdata;
 mod mem;
+mod m5_channel;
+mod m5_compute;
+mod m5_compute_program;
+mod m5_graphics_bundle;
+mod m5_render;
+mod m5_completion;
+mod m5_sksm;
+mod m5_vm;
+mod m5_render_target;
 mod microseq;
 mod mmu;
 mod object;
@@ -66,6 +76,22 @@ kernel::module_platform_driver! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
     params: {
+        m5_fw_trace: u32 {
+            default: 0,
+            description: "M5 primary trace classes: power bit 0, submission bit 1, recovery classifier bit 9",
+        },
+        m5_initdata_test: u32 {
+            default: 0,
+            description: "M5 fresh RAM boot: 1=initdata ACKs, 2=openings, 3=queue, 4=scheduler, 5=context, 6=one compute, 7=setup without kick, 8=request stop after admission, 9=live status, 10=live firmware monitors, 11=compute triangle, 12=TA/fragment triangle; 1..12 request stop; 13=retained session, 14=experimental DRM first-job adapter",
+        },
+        m5_graphics_frames: u32 {
+            default: 1,
+            description: "Number of sequential mode12 renders on a fresh RAM boot (1..64); reset pixels between completed frames",
+        },
+        m5_graphics_context: u32 {
+            default: 3,
+            description: "Application root slot for the mode12 regression (3..63); ordinary application queues allocate their own slots",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,
@@ -414,6 +440,22 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Maximum event-ring records logged per drain call (0: unlimited). Records over budget are still counted.",
         },
+        g17p_render_recovery_retire: u32 {
+            default: 0,
+            description: "PROBE, and SELF-GATING -- it cannot act unless the evidence that justifies it is present. `retire_abandoned_render_if_firmware_retired` reaches its `true` through `!completion.retired || !state.job_list_empty || execution.observed()`, and `observed()` CONTAINS `job_list_empty`, so the guard demands job_list_empty true and observed() false at once -- satisfiable only when a timestamp is zero. It is a nop-retire classifier and its own `g17p_render_nop_retire` documentation says so: it answers `true` only for a group the firmware retired WITHOUT executing. The recovery-blamed settle asks it a question it is structurally incapable of answering: a stamp-blamed recovery serviced with a live render scheduler deliberately SKIPS the generation-0 timestamp wipe so the render's progress markers survive, so the timestamps are non-zero by design, `observed()` is true, and `firmware-retired=false` is arithmetic rather than evidence. The caller reads that as `still owned by firmware`, poisons the client's VM, raises `session_recovery_pending` and arms a rebuild that is itself known to fail -- and the quarantine protects nothing, because releasing the blamed group is exactly what a recovery IS. 0 (default): unchanged. 1: on the RECOVERY-BLAMED settle path only, accept a group that executed -- drop the `observed()` term and keep BOTH real proofs that the firmware is finished, `completion.retired` (both queue cursors at the published target) and `state.job_list_empty` (the job unlinked from the firmware completion list). Those two are what make the host bookkeeping safe; `observed()` only ever described whether the GPU did any work, which does not bear on ownership. Because the `job_list_empty` term is retained, this parameter is INERT on exactly the outcome that would refute the diagnosis: if the wedge turns out to show `job-list-empty false`, the firmware really does still hold the group and this changes nothing. Read the `settle-reason recovery-blamed` line first; promote to default only once that line has shown job-list-empty true with four non-zero timestamps on a real wedge.",
+        },
+        g17p_compute_config_context: u32 {
+            default: 1,
+            description: "Select the hardware context declared by the compute tag-15 ConfigUpdate at record +0x32. 1 (default) declares the submitting queue\'s independently leased application context, matching the context word and TTBAT roots used by the same kick. 0 retains the historical fixed context 2 for diagnosis only. Contexts 2/3 are global aliases whose roots are repointed between clients; declaring 2 from every queue lets a later client detach an earlier queue from its VM. The production path therefore uses the queue context and relies on range-scoped VM_BIND invalidation to make mappings added after context allocation visible to that ASID.",
+        },
+        g17p_quarantine_scope: u32 {
+            default: 0,
+            description: "PROBE. How far a single quarantined compute queue is allowed to reach. One lost submission on one QID currently kills the whole device twice over: `quarantine_async_compute` raises `session_recovery_pending`, which makes `is_crashed()` true so every new client gets ENODEV and every existing one EIO and the (known-broken) session rebuild is armed; and `check_async_compute_submission` refuses EVERY client's compute submit while `async_compute_queues.iter().any(|q| q.quarantined)`. Neither is needed to keep firmware-referenced memory safe: a quarantined queue is permanently retired -- `release_async_compute_queue` will not strip it, `reusable_idle_compute_graph` and `rebindable_released_compute_graph` both exclude it, and `prepare_async_compute_queue` skips it -- so nothing it owns is ever freed or reused, with or without a session rebuild. The cost of scoping is one leaked QID per quarantine, bounded by MAX_QUEUES (58); the cost of not scoping is a desktop that dies for two minutes of idle. The render side has the same shape and the same escalation: a render submission the driver cannot prove the firmware finished with raises `session_recovery_pending` through `render-submission-lost`, which is the route that killed the desktop on the 236s soak. There the device-wide flag buys something real -- there are only two render slots, and the processor-stop boundary it reaches is what rehabilitates a quarantined one, so scoping trades a permanently halved (or, twice, exhausted) render capacity for a session that stays up. That trade is only worth taking because the rebuild the flag arms is itself known broken: it ends in `apple_rtkit_boot` ETIME and ENODEV for the rest of the boot, so today the escalation costs the device immediately and returns nothing. BITMASK. 0 (default): the device-wide behaviour, byte-identical to the previous driver. Bit 0 (1): scope the COMPUTE quarantine -- the submission gate refuses only the owner whose own queue is quarantined, and the quarantine does not raise `session_recovery_pending`. Bit 1 (2): scope the RENDER loss -- the losing client still has its VM status poisoned and its slot quarantined, which is correct and stays, but the session is not marked crashed for everyone else. 3: both. UNTESTED ON HARDWARE at the time of writing: run it against the bare-desktop reproducer and compare how long the session survives, and read the `G17PMARK quarantine-scoped` lines to confirm the path was taken. Do not promote any value to default on a single green run.",
+        },
+        g17p_recovery_snapshot: u32 {
+            default: 0,
+            description: "Recovery-only G17P diagnostic. While firmware is already halted at the pre-ACK state, log the selected hardware slot's common c020 state and c078 key for DM0 or DM1; retain the eight additional native progress reads only for DM1. Also read, without advancing, up to eight channel-13 firmware-event records immediately preceding the producer so a type-7 GrowTilingBuffer request can be ordered against the type-4 restart. 0: off (default); non-zero: enabled. The successful submission path is unchanged.",
+        },
         // 2026-09-01 follow-up: descriptor +0x789=0x10 was also hardware-null
         // (same fault-free TA timeout and recovery as the 0x08 baseline).
         g17p_render_native_regs: u32 {
@@ -531,6 +573,18 @@ kernel::module_platform_driver! {
         g17p_recovery_resync: u32 {
             default: 1,
             description: "Bitmask. What to resynchronise on the RETAINED compute queue after the driver services a firmware recovery, instead of assuming the queue and the firmware still agree. A recovery is raised by a GMMU fault, and after one every later kick on the retained graph is accepted, retired, and never executed -- while a boot with no fault runs any number of sequential clients. bit0 (1, default): mark the queue's predecessor UNKNOWN, i.e. clear producer.previous_valid, so the next kick encodes its implicit self-dependency as the no-predecessor form (converted_command_timestamp - 1 = 0, dependency on QID stamp 0) that a proven first bind sends, rather than depending on a stamp the firmware's event machine may no longer acknowledge across a recovery. That single dependency qword is the only difference between a post-recovery repeat and a working first bind. bit1 (2): additionally align producer.current_timestamp/base_timestamp FORWARD to the firmware's per-QID last-submitted HW timestamp (primary main-config +0x274, bundle view 4, QID 4 at table offset 0x40) when that entry reads valid; never backwards, and a no-op while the entry reads invalid, which is what it read the last time it was sampled. bit2 (4): additionally clear the cached channel identity so the next submission re-sends the priority-2 CL activation (EP 0x21 0x0a) as well as the direct kick -- it only affects the notification predicate, never the tag-15 queue-install flag. 0 disables all of it and restores the previous behaviour, where the graph marches on across a recovery. Bisect ladder: 0, 1, 3, 5, 7.",
+        },
+        g17p_asc_restart: u32 {
+            default: 0,
+            description: "How a session REBUILD tries to make the restarted GFX ASC re-run its RTKit handshake. 0 (default, and the only behaviour this driver has ever had): set CPU_RUN and call apple_rtkit_boot, which is PASSIVE -- it waits up to 1.00s for the IOP to volunteer a HELLO/EPMAP and never sends anything. That is correct for a cold ASC coming out of reset, which is why probe works, and is exactly the wait that times out at ~1.02s on every rebuild. 1: call apple_rtkit_wake instead, which sends SET_IOP_PWR_STATE(INIT) on the management endpoint first and then performs the same wait. m1n1's rtkit_boot_internal does precisely this on every boot, unconditionally, with the comment that it wakes a possibly sleeping IOP, and Linux's own DCP resume path uses apple_rtkit_wake for the same reason. This costs one management message and cannot make a passive wait worse: if the ASC was going to volunteer HELLO it still does. 2: additionally power-gate the whole gfx domain across the rebuild before starting the CPUs again, which is the only thing on this SoC that has ever been observed to make an ASC re-run its handshake -- the domain is gated before probe on every boot (the PMGR value read back reads PS_TARGET and PS_ACTUAL zero with WAS_PWRGATED and WAS_CLKGATED set) and the ASC that comes out of that gate volunteers HELLO in about 1.2ms with no firmware upload and no reset-vector write from Linux. Mode 2 takes over runtime PM for 482600000.gpu to do it, because that device shares the gfx genpd with both mailbox providers and, never having enabled runtime PM, makes genpd refuse every power-off for as long as asahi is bound. 3: additionally restore each role's firmware __DATA segment from a copy taken at probe before either processor ever ran. A power-cycled ASC re-enters at IORVBAR, which is the __TEXT base -- the code is pristine, but every global the previous firmware instance wrote is still there, and measured on J700 a power-cycled processor does execute and then immediately sends on the CRASHLOG endpoint instead of HELLO, which is what re-entering over dirty globals looks like. Modes 2 and 3 both log a G17PMARK fw-drift line saying how many __DATA bytes differ from the pristine copy, so the reading is measured and not assumed. Every mode logs a G17PMARK asc-state line for both roles at rebuild entry, around the CPU stop, after CPU_RUN and after the wait, so the CPU control/status pair, the FIFO control words and the IOP reset vector say whether the processor was reset at all.",
+        },
+        g17p_asc_gate_settle_ms: u32 {
+            default: 10,
+            description: "Milliseconds to wait between powering the gfx domain down and asking it back on, at restart modes 2 and 3. The GFX PMGR register at 0x3007001f0 latches BUSY (bit 11) across a power-down and clears it on its own some time afterwards. apple_pmgr_ps_set rebuilds the word it writes from a fresh read, and its clear-mask covers DEV_DISABLE, PS_RESET, AUTO_ENABLE, the WAS_ flags and PS_TARGET -- but not BUSY. An ON issued while BUSY is still set therefore writes BUSY back, and measured on J700 that write is ignored outright: requested PS_TARGET=0xf, register unmoved at 0x0f002b00, post-ON handshake -110, and every later target write returns -22 for the rest of the boot. The control is in the same boot: the boot-time power-down also left BUSY set, nothing wrote the register for fifteen seconds, BUSY cleared by itself, and probe's ON then succeeded. The old fixed 10ms was losing that race, which is what made mode 2 look intermittent. This parameter measures how long BUSY actually needs; it is not the fix. The fix belongs in pmgr-pwrstate.c, which should mask BUSY out of the value it writes and poll BUSY clear before the ON exactly as apple_pmgr_finish_gfx_on already polls it after.",
+        },
+        g17p_asc_teardown: u32 {
+            default: 0,
+            description: "Bitmask. What an UNBIND does to the ASC pair beyond clearing CPU_RUN, so that a later `modprobe asahi` can still find a GPU. 0 (default, and the only behaviour this driver has ever had): clear RUN on both roles and return immediately, which is what leaves the GFX PMGR register latched BUSY with PS_ACTUAL=0 and deaf to every later target write, costing the GPU for the rest of the boot. Bit 0: after the pair stops, poll each wrapper's IDLE_STATUS for up to 10ms and log what it reached. AppleASCWrapV6::stopCPU waits for IDLE_STATUS & 3 before anything downstream gates the domain; the provider here does not, so the gate that follows unbind can land while the block still has AXI traffic in flight, which is exactly what a power-state machine stuck mid-transition looks like. Bit 1: put both roles' firmware __DATA back to the copy taken at probe, so the carveout an unbind leaves behind is the one iBoot placed rather than one a running firmware instance scribbled on. The next probe starts its ASC over pristine globals for the same reason a cold boot does, which a reload otherwise cannot have.",
         },
         g17p_abandon_recovery: u32 {
             default: 1,

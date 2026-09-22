@@ -43,6 +43,30 @@ pub(crate) const fn reusable_idle_compute_graph(
     owner_free && active_free && binding_free && context_free && !quarantined
 }
 
+/// An idle graph whose client has gone but whose binding is deliberately still
+/// held, because the firmware has not been told to forget its QID.
+///
+/// The firmware keeps the installed slot pointer for a queue until something
+/// clears it, and the only clearing transaction the driver has --
+/// `unregister_compute_sksm_queue`'s disable pair -- is a suppressed no-op
+/// whenever `g17p_sksm_mmio` is 0, which is its default because the SKSM port
+/// raises an SError on this SoC. So a released queue's SKSM entry mapping and
+/// context root must outlive the client and be dropped only where the
+/// synchronous path already drops them: immediately before the next bind
+/// reinstalls those roots, or after both firmware CPUs have stopped.
+///
+/// Such a graph is still reusable -- rebinding is exactly the boundary that
+/// makes dropping the old binding safe -- so it must be found by the same
+/// search, which is what this predicate is for.
+pub(crate) const fn rebindable_released_compute_graph(
+    owner_free: bool,
+    active_free: bool,
+    released: bool,
+    quarantined: bool,
+) -> bool {
+    owner_free && active_free && released && !quarantined
+}
+
 pub(crate) fn encode_limits() -> [u8; QUEUE_LIMITS_SIZE] {
     let mut bytes = [0; QUEUE_LIMITS_SIZE];
     bytes[0..4].copy_from_slice(&MAX_QUEUES.to_ne_bytes());

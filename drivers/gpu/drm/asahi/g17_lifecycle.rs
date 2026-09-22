@@ -137,6 +137,11 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
     pub(crate) fn gfx(&self) -> &P {
         &self.gfx
     }
+
+    /// Borrow the retained secondary provider under the same rules.
+    pub(crate) fn gfx1(&self) -> &P {
+        &self.gfx1
+    }
 }
 
 /// An in-progress firmware boot whose complete owner graph can be retained.

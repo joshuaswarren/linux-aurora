@@ -1199,7 +1199,7 @@ impl G17PQueue {
         entered: Instant<Monotonic>,
     ) -> Result {
         self.ensure_async_compute_queue()?;
-        self.runtime.mutex().lock().check_async_compute_submission()?;
+        self.runtime.mutex().lock().check_async_compute_submission(self.id)?;
         let destinations = [
             Self::timestamp_destination(objects, translated.timestamps.start)?,
             Self::timestamp_destination(objects, translated.timestamps.end)?,
@@ -1389,7 +1389,16 @@ impl G17PQueue {
         Self::wait_fence(fence)
             .map_err(|error| Self::stage_fail(submission_id, "wait-queue-timeline", error))?;
         self.last_submission = None;
-        if self.vm.status().get() != 0 { return Err(EIO); }
+        // A poisoned VM status is how a settled-lost render tells every later
+        // submission on this VM that the device is gone. It used to return a
+        // bare EIO: every other failure in this function goes through
+        // stage_fail, so a client whose VM had been poisoned by a recovery
+        // stopped submitting with no kernel message at all, which is what made
+        // a wedge look like a hang with an empty log.
+        let status = self.vm.status().get();
+        if status != 0 {
+            return Err(Self::stage_fail(submission_id, "vm-status-poisoned", EIO));
+        }
         Ok(())
     }
 

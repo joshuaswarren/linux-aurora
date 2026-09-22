@@ -73,6 +73,11 @@ impl G17PLiveRuntime {
                 q.binding.is_none(),
                 q.context.is_none(),
                 q.quarantined,
+            ) || crate::g17_queue_limits::rebindable_released_compute_graph(
+                q.owner.is_none(),
+                q.active.is_none(),
+                q.released,
+                q.quarantined,
             ));
         let index = if let Some(index) = free { index } else {
             self.async_compute_queues.reserve(1, GFP_KERNEL)?;
@@ -93,6 +98,12 @@ impl G17PLiveRuntime {
             index
         };
         let q = &mut self.async_compute_queues[index];
+        // The one lawful boundary for a departed client's binding: the rebind
+        // below reinstalls the QID's roots, so nothing the firmware can name
+        // survives unmapped across this point. Dropping these at queue-destroy
+        // time instead is what left the firmware sweeping a freed record.
+        drop(q.binding.take());
+        drop(q.context.take());
         let reused_installed = !q.queue.requires_first_install();
         let binding = manager.bind_independent_compute_user_vm(
             &mut q.queue, vm, context.clone(),
@@ -147,10 +158,22 @@ impl G17PLiveRuntime {
     /// A signaled error fence is still signaled to DRM syncobj waiters. Surface
     /// device failure at the next submit instead of accepting work whose
     /// hardware owner is quarantined and can never make queue progress.
-    pub(crate) fn check_async_compute_submission(&self) -> Result {
-        if !self.accepting_submissions || self.is_crashed()
-            || self.async_compute_queues.iter().any(|q| q.quarantined)
-        { return Err(EIO); }
+    pub(crate) fn check_async_compute_submission(&self, owner: u64) -> Result {
+        if !self.accepting_submissions || self.is_crashed() {
+            return Err(EIO);
+        }
+        // A quarantined queue can never make progress, so its own client must
+        // be told. Whether every OTHER client is told too is the question:
+        // quarantine retires the queue permanently -- nothing it owns is freed
+        // or reused -- so the device-wide refusal protects nothing that the
+        // retirement does not already protect. See `g17p_quarantine_scope`.
+        let scoped = *crate::module_parameters::g17p_quarantine_scope.value() & 1 != 0;
+        let blocked = self.async_compute_queues.iter().any(|q| {
+            q.quarantined && (!scoped || q.owner == Some(owner))
+        });
+        if blocked {
+            return Err(EIO);
+        }
         Ok(())
     }
 
@@ -294,7 +317,11 @@ impl G17PLiveRuntime {
                     active.packet.completion()?.complete(Ok(timestamps));
                     drop(active);
                     if q.released {
-                        q.binding = None; q.context = None; q.owner = None;
+                        // Retain `binding` and `context`. The firmware still has
+                        // this QID installed, so its SKSM entry mapping and
+                        // context root may not be dropped here -- see
+                        // `rebindable_released_compute_graph`.
+                        q.owner = None;
                     }
                 }
                 // An RTKit edge may precede the final descriptor/stamp cache
@@ -306,7 +333,26 @@ impl G17PLiveRuntime {
                     // This queue is still firmware-owned and cannot be made
                     // reusable from an error fence. Make the proven
                     // processor-stop recovery reachable by the next client.
-                    self.session_recovery_pending = true;
+                    //
+                    // Measured 2026-09-11: this killed a device 90s into a boot
+                    // whose recovery had just reported sources=0, dm-slot-mask=0,
+                    // both render queues at 1057/1057/1057, job list empty, both
+                    // fwctl pointers matching and `final clear acknowledged;
+                    // state=0 epoch=1`. The hardware was fine. `g17p_quarantine_scope`
+                    // bit 0 already means "retire this queue and fail its client,
+                    // leave the session up for everyone else"; that is the same
+                    // judgement this route needs, so let the one flag cover both.
+                    if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
+                        crate::g17_live_boot::note_session_recovery_pending(
+                            &mut self.session_recovery_pending,
+                            self.pdev.as_ref(),
+                            "async-compute-completion-unclassifiable",
+                        );
+                    } else if let Some(pdev) = &self.pdev {
+                        dev_err!(pdev.as_ref(),
+                            "G17PMARK quarantine-scoped unclassifiable-completion qid={} ({:?}) -- queue retired, client fails, session stays up\n",
+                            q.queue.queue_id(), error);
+                    }
                     q.quarantined = true;
                     q.active.as_ref().ok_or(EIO)?._lease.quarantine();
                     let completion = q.active.as_ref().ok_or(EIO)?.packet.completion()?;
@@ -358,7 +404,11 @@ impl G17PLiveRuntime {
             if !matches {
                 continue;
             }
-            self.session_recovery_pending = true;
+            crate::g17_live_boot::note_session_recovery_pending(
+                &mut self.session_recovery_pending,
+                self.pdev.as_ref(),
+                "render-completion-failed-with-vm",
+            );
             let newly_failed = self.pending_render[slot as usize]
                 .as_ref()
                 .is_some_and(|completion| completion.fail_while_owned(error));
@@ -397,7 +447,11 @@ impl G17PLiveRuntime {
             };
             let Some((submission, queue_id, context)) = identity else { continue };
             {
-                self.session_recovery_pending = true;
+                crate::g17_live_boot::note_session_recovery_pending(
+                    &mut self.session_recovery_pending,
+                    self.pdev.as_ref(),
+                    "async-compute-vm-fanout-quarantine",
+                );
                 let q = &mut self.async_compute_queues[index];
                 q.quarantined = true;
                 let Some(active) = q.active.as_ref() else { continue };
@@ -463,11 +517,31 @@ impl G17PLiveRuntime {
         self.fail_outstanding_jobs_for_vm_after_compute_observation(status, error)
     }
 
+    /// Give up a client's claim on its compute graph.
+    ///
+    /// Reached from `G17PQueue::drop`, i.e. ordinary `queue_destroy` and file
+    /// close -- no processor stop, no session rebuild. This used to drop
+    /// `binding` and `context` here, which released the client's SKSM entry
+    /// `KernelMapping` and, through `T8140ContextRootLease::drop`, retracted its
+    /// TTB root pair out of the UAT context table. The firmware, meanwhile,
+    /// still had the QID installed: `unregister_compute_sksm_queue` is not even
+    /// called on this path, and would be a suppressed no-op if it were, because
+    /// `g17p_sksm_mmio` defaults to 0. Its periodic per-slot sweep then read
+    /// byte 0 of a record whose page had just been unmapped, which is a data
+    /// abort inside the GFX firmware and the end of the session.
+    ///
+    /// `g17_live_boot::release_compute_owner` states the rule for the
+    /// synchronous path in as many words -- "freeing the page tables here would
+    /// leave the firmware's compute context pointing at memory the allocator
+    /// has taken back" -- and releases the binding immediately before the next
+    /// bind reinstalls those roots, or after both CPUs have stopped. This path
+    /// now obeys the same rule: give up the claim, keep everything the firmware
+    /// can still name.
     pub(crate) fn release_async_compute_queue(&mut self, owner: u64) {
         if let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) {
             q.released = true;
             if q.active.is_none() && !q.quarantined {
-                q.binding = None; q.context = None; q.owner = None;
+                q.owner = None;
             }
         }
     }
@@ -484,7 +558,17 @@ impl G17PLiveRuntime {
                 if active.packet.submission_id() == submission {
                     matched = true;
                     if !q.quarantined {
-                        self.session_recovery_pending = true;
+                        if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
+                            crate::g17_live_boot::note_session_recovery_pending(
+                                &mut self.session_recovery_pending,
+                                self.pdev.as_ref(),
+                                "async-compute-submission-quarantined",
+                            );
+                        } else if let Some(pdev) = &self.pdev {
+                            dev_err!(pdev.as_ref(),
+                                "G17PMARK quarantine-scoped owner={} qid={} -- this queue is retired and its client fails, but the session stays up for every other client\n",
+                                owner, q.queue.queue_id());
+                        }
                         q.quarantined = true;
                         active._lease.quarantine();
                         if let Some(pdev) = &self.pdev {

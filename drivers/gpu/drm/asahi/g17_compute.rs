@@ -360,7 +360,30 @@ pub(crate) fn encode_compute_config_update(
     channel_control: u64,
     queue_id: u8,
     install_queue: bool,
+    context_id: Option<u16>,
 ) -> Result<(), ComputeBuildError> {
+    // Record +0x32 is the hardware context this queue's work is declared to run
+    // in. It has always been the literal 2, from when every compute client ran
+    // in the fixed pair `T8140_COMPUTE_CTXS = [2, 3]`.
+    //
+    // Those two contexts are a SINGLE GLOBAL alias pair:
+    // `install_t8140_compute_context_alias` publishes the current client's VM
+    // root into both and records one `t8140_alias_owner`. With one compute
+    // client that is correct. With a second, the alias is re-pointed and the
+    // loser's kicks -- still declaring 2 -- no longer name their own root,
+    // while their real root lives in the app context the execution context
+    // allocated (5..62). The kick already declares that real context at
+    // `sgx+0x10428`; only this record still says 2.
+    //
+    // Probe-gated and default-off: 0 sends the historical constant, byte
+    // identical to the previous driver; 1 sends the client's real context when
+    // one is known. See `g17p_compute_config_context`.
+    let declared_context = match context_id {
+        Some(context) if *crate::module_parameters::g17p_compute_config_context.value() != 0 => {
+            context
+        }
+        _ => 2u16,
+    };
     let flushid_fix = *crate::module_parameters::g17p_flushid_fix.value() != 0;
     let (flushid_object, flushid_slot, flushid_index) = if flushid_fix {
         (0u64, 0xffffu16, 0xffffu16)
@@ -396,7 +419,7 @@ pub(crate) fn encode_compute_config_update(
         (0x1a, if install_queue { 1 } else { 0 }),
         (0x1e, 2),
         (0x22, 2),
-        (0x32, 2),
+        (0x32, declared_context),
         (0x3e, flushid_slot),
         (0x46, flushid_index),
         (0x52, 1),
@@ -473,6 +496,7 @@ pub(crate) fn build_initial_compute_channel_group(
     graph: &mut [u8],
     queue_context: &mut [u8],
     install_queue: bool,
+    context_id: Option<u16>,
 ) -> Result<ComputeChannelGroupAddresses, ComputeBuildError> {
     if graph.len() < COMPUTE_QUEUE_GRAPH_SIZE
         || queue_context.len() < COMPUTE_QUEUE_CONTEXT_SIZE
@@ -514,6 +538,7 @@ pub(crate) fn build_initial_compute_channel_group(
         channel_control,
         queue_id,
         install_queue,
+        context_id,
     )?;
 
     let event_raw = &mut graph[COMPUTE_EVENT..COMPUTE_EVENT + COMPUTE_EVENT_SIZE];
@@ -863,6 +888,7 @@ mod tests {
             &mut graph,
             &mut context,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(

@@ -148,6 +148,24 @@ impl ObjectRef {
 
         vm.map_at(addr, self.gem.size(), self.gem.clone(), prot, guard)
     }
+
+    /// Map at a specific address, reserving `guard_pages` unmapped pages
+    /// after the object in that Vm's allocator.
+    pub(crate) fn map_at_with_guards(
+        &mut self,
+        vm: &crate::mmu::Vm,
+        addr: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<crate::mmu::KernelMapping> {
+        if self.gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
+            && vm.is_extobj(&*self.gem)
+        {
+            return Err(EINVAL);
+        }
+
+        vm.map_at_with_guards(addr, self.gem.size(), self.gem.clone(), prot, guard_pages)
+    }
 }
 
 pub(crate) struct AsahiObjConfig {

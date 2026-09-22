@@ -65,8 +65,12 @@ assert complete.index("self.render_context_retirement = None") < complete.index(
 )
 assert "*epoch >= graph.retire_after_context_epoch" in reclaimable
 assert "retired_render_handoff_graphs.remove(index)" in reclaim
-assert release.index("ids.unreserve(id)") < release.index("drop(retired)")
-assert "take_retired_parameter_management" not in release
+assert "storage.into_retired_parameter_management()" in release
+assert "retired_parameter_managers" in release
+assert release.index("into_retired_parameter_management") < release.index(
+    "ids.unreserve(id)"
+)
+assert release.index("ids.unreserve(id)") < release.index("drop(bind)")
 assert "complete_render_context_update_retirement" not in abandoned
 assert "self.render_context_retirement = None" in stop
 assert "self.render_context_epochs = [0; 2]" in stop

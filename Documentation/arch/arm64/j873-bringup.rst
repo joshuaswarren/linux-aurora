@@ -62,6 +62,22 @@ validates software control flow only. Linux CPU ``reg`` properties must use
 measured MPIDR affinity fields, not the static ADT's logical CPU IDs. In
 particular, do not reuse J813's measured performance-core affinity-2 bit.
 
+AGX source sync
+---------------
+
+The ``j873`` branch carries the committed ``drivers/gpu/drm/asahi`` changes
+from Linux ``j813`` commit ``2596a20e31f810c24c88999d163027cbf9277f20``.
+The sync covers the AGX driver and its focused tests, while retaining the
+J873 firmware and identity work. Mesa's matching ``j873`` branch starts from
+its published J813 AGX tip ``658dee6c3c2df664d7e7598e3bfc989fdd6d3a39``.
+
+These sources describe tested M5/G17G and related G17P paths. The J873g
+firmware advertises ``gpu,t8152`` and an ASCWrap-v8 GPU mailbox, but the
+current driver has no T8152 GPU match or J873 boot DT. Do not use an M5
+compatible string to enable it. The GPU generation, firmware contract, DMA
+translation, power sequencing, and command submission require target evidence
+and validation before J873 runtime support can be claimed.
+
 Remaining work order
 --------------------
 
