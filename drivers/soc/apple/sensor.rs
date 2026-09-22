@@ -659,25 +659,6 @@ pub(crate) fn read_sensor_nonce(cmd_byte: u8) -> Result<NonceRead> {
     })
 }
 
-/// Send one 7-byte command and report the reply length the sensor then
-/// advertises, so the command that produces the nonce frame can be identified
-/// by its 143-byte signature rather than guessed.
-pub(crate) fn probe_command(cmd_byte: u8) -> Option<usize> {
-    let frame: [u8; CMD_LEN] = [0x80, cmd_byte, 0x00, 0x07, 0x00, 0x00, 0x00];
-    if command(&frame).is_err() {
-        return None;
-    }
-    for _ in 0..6 {
-        if let Ok(st) = status() {
-            if let Offset12::Available(count) = st.offset12() {
-                return Some(count as usize);
-            }
-        }
-        fsleep(Delta::from_millis(READ_POLL_MS));
-    }
-    None
-}
-
 pub(crate) fn read_session_reply() -> Result<[u8; SESSION_SHARE_LEN]> {
     let mut share = [0u8; SESSION_SHARE_LEN];
     read_framed(SESSION_REPLY_LEN, SESSION_REPLY_AT, &mut share)?;

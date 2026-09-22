@@ -2348,10 +2348,6 @@ module! {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
         },
-        calib_probe: u8 {
-            default: 0,
-            description: "Control experiment: send a comb-wrapped calibration through 0x5b, which shares the container decoder with 0x86, to tell a bad trust bundle from an MSRk-specific problem.",
-        },
         calibration_source: u32 {
             default: 6,
             description: "The little-endian u32 that prefixes the 0x5b LOAD_CALIBRATION container on the wire. macOS sends 6, captured from the wire under the hypervisor; we sent 3 for a long time and the enclave refused the load even with macOS's own container.",
@@ -2376,10 +2372,6 @@ module! {
             default: 0,
             description: "SPI command byte that asks the sensor for its 32-byte nonce (0 = do not read or register one).",
         },
-        nonce_cmd_probe: u8 {
-            default: 0,
-            description: "Sweep candidate SPI command bytes and log the reply length each makes available; the nonce frame is 143 bytes.",
-        },
         calibration_before_challenge: u8 {
             default: 0,
             description: "Send 0x5b LOAD_CALIBRATION before the module challenge instead of after the commit.",
@@ -2391,14 +2383,6 @@ module! {
         patch_ack_accept: u8 {
             default: 0,
             description: "Additional status[8] value to treat as 'sensor patch already accepted' (0 = only the built-in 0x29). For a sensor revision that reports a different ack.",
-        },
-        probe_save_catacombs: u8 {
-            default: 0,
-            description: "Diagnostic only: after Touch ID activation, save the master and owner catacombs to disk to exercise the post-enrolment persistence path without an enrolment. That path has never run on a board with no enrolment, and it carries three reverse-engineered constants; the master blob must carry -1 and the owner blob 501 at SBIO_SAVED_USER_ID_AT. Performs the full operation including CONFIRM_SAVE. Off by default.",
-        },
-        probe_enrol_result: u8 {
-            default: 0,
-            description: "Diagnostic only: after BEGIN_ENROL, ask the enclave for an ENROLMENT_RESULT before any image is captured, purely to learn its reply length. SBIO_ENROL_RESULT_LEN is reverse-engineered and a wrong value fails the first usable frame of a real enrolment; this settles it without a fingertip when the enclave is willing to answer. Off by default and never needed for normal operation.",
         },
         sbio_trace: u8 {
             default: 0,

@@ -425,12 +425,17 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
         });
     }
 
+    // No sensor node and no SPI controller to hang one off: this machine has no
+    // fingerprint sensor. That is a normal configuration -- not every Neo ships
+    // Touch ID -- so it is reported as a fact, not a failure, and answered with
+    // ENOENT so the caller can tell "no such hardware" from "the hardware is
+    // there and something went wrong".
     let controller = node_at_address(base).ok_or_else(|| {
-        pr_err!(
-            "apple_sep: no device-tree node with reg base 0x{:x}; the sensor's SPI bus is not in this tree\n",
+        pr_info!(
+            "apple_sep: no fingerprint sensor on this machine (no apple,mesa-fingerprint node and no SPI bus at 0x{:x}); Touch ID unavailable, the rest of the SEP is unaffected\n",
             base
         );
-        ENODEV
+        ENOENT
     })?;
 
     let controller_ok = controller.is_available();

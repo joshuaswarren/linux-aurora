@@ -267,12 +267,23 @@ impl SepData {
 
         if let Err(e) = dt::enable_spi_sensor(sensor::CONTROLLER_BASE, sensor::CHIP_SELECT) {
             self.sensor_present.store(false, Relaxed);
-            dev_warn!(
-                self.dev,
-                "sensor: could not enable the SPI bus at 0x{:x} or create the sensor node ({:?}); no sensor\n",
-                sensor::CONTROLLER_BASE,
-                e
-            );
+            if e == ENOENT {
+                // Not every Neo ships Touch ID. A machine with no sensor is a
+                // supported configuration, not a fault: say so once, at info
+                // level, and leave the rest of the SEP -- hwrng, the key store,
+                // trusted keys, FileVault -- running normally.
+                dev_info!(
+                    self.dev,
+                    "sensor: this machine has no fingerprint sensor; Touch ID is unavailable and every other SEP service is unaffected\n"
+                );
+            } else {
+                dev_warn!(
+                    self.dev,
+                    "sensor: could not enable the SPI bus at 0x{:x} or create the sensor node ({:?}); no sensor\n",
+                    sensor::CONTROLLER_BASE,
+                    e
+                );
+            }
             return;
         }
 
@@ -401,141 +412,12 @@ impl SepData {
         match self.sbio_call(&op) {
             SbioOutcome::Ok(_payload) => {
                 self.enrol_open.store(true, Relaxed);
-                self.probe_enrol_result_length();
-                Some(OpenEnrolment {
+                        Some(OpenEnrolment {
                     sep: self,
                     armed: true,
                 })
             }
             _ => None,
-        }
-    }
-
-    /// Ask the enclave for an ENROLMENT_RESULT immediately after BEGIN_ENROL,
-    /// before any image has been captured.  Off by default.
-    ///
-    /// SBIO_ENROL_RESULT_LEN is reverse-engineered, and a wrong value fails the
-    /// first usable frame of a real enrolment.  The normal path only reaches
-    /// ENROLMENT_RESULT after a frame the enclave judged usable, which needs a
-    /// fingertip.  If the enclave is willing to answer here -- even with a
-    /// zeroed structure -- its reply length settles that constant with no
-    /// finger on the sensor.  A refusal is equally informative and harmless:
-    /// it says the length can only be learned from a real enrolment.
-    fn probe_enrol_result_length(&self) {
-        if *module_parameters::probe_enrol_result.value() == 0 {
-            return;
-        }
-        // ASSESS_MIN_LEN is the guard that every captured frame must clear
-        // before the usability byte is even read.  If it is too large the guard
-        // rejects every frame and enrolment silently never progresses, so its
-        // value is worth learning the same way -- ask for an assessment with
-        // nothing captured and see how long the reply is.
-        match self.sbio_call(&crate::sbio::sbio_image_assessment()) {
-            SbioOutcome::Ok(a) => {
-                let verdict = if a.len() >= crate::sbio::ASSESS_MIN_LEN {
-                    " -- clears ASSESS_MIN_LEN"
-                } else {
-                    " -- SHORTER than ASSESS_MIN_LEN, which would reject every frame at the guard"
-                };
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: IMAGE_ASSESSMENT with nothing captured answered {} bytes; ASSESS_MIN_LEN is {}{}\n",
-                    a.len(),
-                    crate::sbio::ASSESS_MIN_LEN,
-                    verdict
-                );
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: assessment head={:02x?}\n",
-                    &a[..core::cmp::min(32, a.len())]
-                );
-            }
-            SbioOutcome::PrerequisiteMissing => {
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: IMAGE_ASSESSMENT refused with nothing captured; its length can only be learned from a real frame\n"
-                );
-            }
-            _ => {
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: IMAGE_ASSESSMENT answered a non-OK status with nothing captured\n"
-                );
-            }
-        }
-
-        match self.sbio_call(&crate::sbio::sbio_enrolment_result()) {
-            SbioOutcome::Ok(payload) => {
-                // Hoisted: the kernel print macros do not accept an inline
-                // if/else as a format argument.
-                let verdict = if payload.len() == crate::sbio::SBIO_ENROL_RESULT_LEN {
-                    " -- CONFIRMED"
-                } else {
-                    " -- MISMATCH, set the constant to the answered length"
-                };
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: ENROLMENT_RESULT before any frame answered {} bytes; SBIO_ENROL_RESULT_LEN is {}{}\n",
-                    payload.len(),
-                    crate::sbio::SBIO_ENROL_RESULT_LEN,
-                    verdict
-                );
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: head={:02x?}\n",
-                    &payload[..core::cmp::min(48, payload.len())]
-                );
-                // Map every non-zero byte.  A fresh enrolment result is almost
-                // entirely zero, so this is short, and it shows which offsets
-                // carry live fields -- the check the three parsed offsets have
-                // never had.  Capped so a surprise cannot flood the log.
-                let mut shown = 0usize;
-                let mut nonzero = 0usize;
-                for (off, b) in payload.iter().enumerate() {
-                    if *b == 0 {
-                        continue;
-                    }
-                    nonzero += 1;
-                    if shown < 40 {
-                        shown += 1;
-                        dev_info!(
-                            self.dev,
-                            "enrol-probe: nonzero @{:#06x} = {:#04x}\n",
-                            off,
-                            *b
-                        );
-                    }
-                }
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: {} non-zero bytes of {} ({} shown)\n",
-                    nonzero,
-                    payload.len(),
-                    shown
-                );
-                // The three parsed offsets, read directly, whatever they hold.
-                if payload.len() >= crate::sbio::SBIO_ENROL_RESULT_LEN {
-                    dev_info!(
-                        self.dev,
-                        "enrol-probe: at ER_PROGRESS 0x004={:#04x}  ER_HAS_TEMPLATE 0x006={:02x?}  ER_COMPLETE 0xbfe={:02x?}\n",
-                        payload[0x004],
-                        &payload[0x006..0x00a],
-                        &payload[0xbfe..0xc02]
-                    );
-                }
-            }
-            SbioOutcome::PrerequisiteMissing => {
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: ENROLMENT_RESULT refused before a frame (prerequisite missing); the reply length can only be learned from a real enrolment\n"
-                );
-            }
-            _ => {
-                dev_info!(
-                    self.dev,
-                    "enrol-probe: ENROLMENT_RESULT answered a non-OK status before a frame; no length learned\n"
-                );
-            }
         }
     }
 
@@ -1308,52 +1190,8 @@ impl SepData {
         let prepared = self.cold_match_continue(handle, uuid);
         self.ensure_restored_after(prepared);
         self.attach_bringup();
-        self.probe_save_catacombs();
         self.touchid_started.store(true, Relaxed);
         Ok(())
-    }
-
-    /// Diagnostic, off by default: exercise the post-enrolment persistence
-    /// path without an enrolment.
-    ///
-    /// save_all_components() has never run on this board -- no catacomb file
-    /// exists on disk -- so a first successful enrolment would be its first
-    /// execution, and three reverse-engineered constants sit in it. The master
-    /// and owner catacombs exist from bring-up, independently of any enrolment,
-    /// so saving those two exercises the same code and settles
-    /// SBIO_SAVED_USER_ID_AT: the master blob must carry -1 and the owner blob
-    /// 501 at that offset.
-    ///
-    /// This performs the complete operation including CONFIRM_SAVE, so it does
-    /// not leave the enclave holding a half-finished save. The user catacomb is
-    /// deliberately skipped: it does not exist until something is enrolled, and
-    /// a failure there would be expected rather than informative.
-    fn probe_save_catacombs(&self) {
-        if *module_parameters::probe_save_catacombs.value() == 0 {
-            return;
-        }
-        dev_info!(
-            self.dev,
-            "save-probe: exercising the post-enrolment persistence path on the master and owner catacombs\n"
-        );
-        let master = self.save_catacomb(
-            crate::sbio::CatacombUser::MASTER,
-            PRIVATE_TYPE_CATACOMB_MASTER,
-            c"master catacomb (user -1)",
-        );
-        let owner = self.save_catacomb(
-            crate::sbio::CatacombUser::OWNER,
-            PRIVATE_TYPE_CATACOMB_OWNER,
-            c"owner catacomb (user 501)",
-        );
-        let lockout = self.save_lockout();
-        dev_info!(
-            self.dev,
-            "save-probe: master={} owner={} lockout={}; if all three are true the post-enrolment save path works and SBIO_SAVED_USER_ID_AT is right\n",
-            master,
-            owner,
-            lockout
-        );
     }
 
     fn prepare_bio_open(&self) -> Result<()> {
@@ -1748,48 +1586,18 @@ impl SepData {
         // container decoder as 0x86, with the same arg7 and the same status
         // pass-through.  Sending a comb-wrapped calibration here separates "the
         // trust bundle and anchor are good, the problem is MSRk-specific" (0x0)
-        // from "the assembled bundle is not the one the anchor digests" (0x12e)
-        // from "the container is malformed" (0x1c).
+        // 0x5b (calibration, CA1) shares the container decoder with 0x86 (MSRk,
+        // CA2), so sending a comb-wrapped calibration looked like a way to tell
+        // "the anchor does not digest this bundle" (0x12e) apart from "the
+        // container is malformed" (0x1c).
         //
-        // Measured 2026-09-21: this does not work, either way round.  Run
-        // after the MSRk send, a failed MSRk has already put the enclave into
-        // session-refused and 0x5b answers 0x16 like everything else.  Moved
-        // to run first, on a clean enclave, it *still* answers 0x16 -- so 0x5b
-        // is gated behind the same session the MSRk unlocks, not merely behind
-        // the shared container decoder.  The premise of the experiment is
-        // wrong and it cannot separate the three cases.  Kept, ordered
-        // correctly, because the 0x16-before-any-MSRk result is itself the
-        // fact worth having.
-        if *module_parameters::calib_probe.value() != 0 {
-            match kernel::firmware::Firmware::request(c"apple/calib-comb-j700.bin", &self.dev) {
-                Ok(fw) => {
-                    let mut body = KVec::new();
-                    if body
-                        .extend_from_slice(
-                            &crate::sbio::calibration_source().to_le_bytes(),
-                            GFP_KERNEL,
-                        )
-                        .is_ok()
-                        && body.extend_from_slice(fw.data(), GFP_KERNEL).is_ok()
-                    {
-                        match self.sbio_transfer_raw(0x5b, c"CALIB_PROBE", &body) {
-                            Ok(done) => dev_info!(
-                                self.dev,
-                                "calib-probe: 0x5b with a comb-wrapped calibration ({} B) -> {}\n",
-                                body.len(),
-                                done.status
-                            ),
-                            Err(e) => dev_info!(self.dev, "calib-probe: transfer failed {:?}\n", e),
-                        }
-                    }
-                }
-                Err(e) => dev_info!(
-                    self.dev,
-                    "calib-probe: no comb calibration file ({:?})\n",
-                    e
-                ),
-            }
-        }
+        // Measured 2026-09-21: it cannot. Run after the MSRk send, a failed MSRk
+        // has already put the enclave into session-refused and 0x5b answers 0x16
+        // like everything else; run first, on a clean enclave, it STILL answers
+        // 0x16. So 0x5b is gated behind the same session the MSRk unlocks, not
+        // merely behind the shared decoder, and the experiment cannot separate
+        // the cases. The probe that established this is gone; the fact is the
+        // part worth keeping.
 
         // The enclave will not open a session until the Mesa Secure Root Key is
         // loaded, and it must follow 0x80 + 0x17 because the decryption label is
@@ -1907,9 +1715,6 @@ impl SepData {
                 answered_without_identifier = true;
                 continue;
             };
-            if *module_parameters::nonce_cmd_probe.value() != 0 {
-                self.probe_nonce_command();
-            }
             if !self.register_sensor(&id) {
                 dev_err!(
                     self.dev,
@@ -1950,36 +1755,6 @@ impl SepData {
             return None;
         }
         None
-    }
-
-    /// Identify the SPI command that asks the sensor for its nonce: the right
-    /// one makes a 143-byte reply available.  The command byte is not in the
-    /// kernelcache for this sensor class, so it is found by its signature.
-    fn probe_nonce_command(&self) {
-        const CANDIDATES: [u8; 14] = [
-            0x20, 0x50, 0x71, 0x72, 0x73, 0x74, 0x75, 0x78, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0,
-        ];
-        for cmd in CANDIDATES {
-            match sensor::probe_command(cmd) {
-                Some(len) if len == sensor::SENSOR_NONCE_REPLY_LEN => dev_info!(
-                    self.dev,
-                    "sensor: nonce-probe cmd {:#04x} -> {} bytes available *** MATCHES THE NONCE FRAME ***\n",
-                    cmd,
-                    len
-                ),
-                Some(len) => dev_info!(
-                    self.dev,
-                    "sensor: nonce-probe cmd {:#04x} -> {} bytes available\n",
-                    cmd,
-                    len
-                ),
-                None => dev_info!(
-                    self.dev,
-                    "sensor: nonce-probe cmd {:#04x} -> no reply\n",
-                    cmd
-                ),
-            }
-        }
     }
 
     /// Register the sensor nonce with the enclave (macOS's second identifier
@@ -2744,14 +2519,29 @@ impl SepData {
         // first attempt was abandoned because of it.
         //
         // One frame the enclave accepted is one thing the user did, so that is
-        // what a stage should be. The final stage is reserved for completion,
-        // so a run that needs more frames than we advertise stalls the counter
-        // rather than claiming to have finished.
+        // the FLOOR for a stage: the bar must move every time the user does
+        // something, or the enrolment looks hung.
+        //
+        // It is a poor *ceiling*, though. The enclave decides when it has
+        // enough coverage, and real runs completed after 8, 9 and 10 accepted
+        // frames against the 16 stages we advertise -- so counting frames alone
+        // walks the bar to roughly half and then jumps straight to done.
+        //
+        // The enclave's own coverage percentage is the honest measure of how
+        // far along the enrolment is, so let that drive the bar and keep the
+        // frame count only as a floor. `bio.rs` reports a stage only when it
+        // advances, so taking the max of the two keeps it monotonic while
+        // guaranteeing feedback on every accepted frame. The final stage stays
+        // reserved for completion, so a longer-than-advertised run stalls one
+        // short rather than claiming to have finished.
         let accepted = self.enrol_frames_accepted.fetch_add(1, Relaxed) + 1;
+        let from_coverage = (percent * (bio::ENROL_STAGES - 1)).div_ceil(100);
         let stage = if parsed.complete() {
             bio::ENROL_STAGES
         } else {
-            accepted.min(bio::ENROL_STAGES - 1)
+            accepted
+                .max(from_coverage)
+                .clamp(1, bio::ENROL_STAGES - 1)
         };
 
         ImageOutcome::Progress {
