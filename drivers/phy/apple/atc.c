@@ -2514,11 +2514,37 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		return 0;
 
 	/*
-	 * If the pipehandler is still/already up here there's a bug somewhere so make sure to
-	 * complain loudly. We can still try to switch modes and hope for the best though,
-	 * in the worst case the hardware will fall back to USB2-only.
+	 * A live PIPE mux blocks the reconfigure below: atcphy_configure() cannot
+	 * move the lanes while the pipehandler still points at USB3, and the
+	 * hardware falls back to USB2-only -- which is exactly what the comment
+	 * that used to live here predicted, and exactly what a DP-Alt dock then
+	 * reports by enumerating a USB Billboard device instead of a display.
+	 *
+	 * Measured on J700, 2026-09-22, with a DisplayLink UD-ULTC4K on the rear
+	 * connector: the CD321x asked for a mode change, this function warned
+	 * that pipehandler_up was set, atcphy_configure() ran anyway, the link
+	 * came up USB2-only and the dock published a Billboard.  DP was never
+	 * entered and the external DCP stayed at nr_modes:0.
+	 *
+	 * Every mode whose pipehandler_state is not USB3 -- DP among them --
+	 * needs the PIPE back on the dummy backend first.
+	 * atcphy_dwc3_reset_assert() already does precisely this before a reset;
+	 * warning about the same condition here and continuing regardless was
+	 * the bug.  Both callers hold atcphy->lock.
 	 */
-	WARN_ON_ONCE(atcphy->pipehandler_up);
+	if (atcphy->pipehandler_up &&
+	    atcphy_modes[target_mode].pipehandler_state !=
+		    ATCPHY_PIPEHANDLER_STATE_USB3) {
+		int ret = atcphy_configure_pipehandler_dummy(atcphy);
+
+		if (ret)
+			dev_warn(atcphy->dev,
+				 "Failed to park PIPE on the dummy backend before switching to mode %d: %d; the link will fall back to USB2-only\n",
+				 target_mode, ret);
+		else
+			atcphy->pipehandler_up = false;
+	}
+
 	return atcphy_configure(atcphy, target_mode);
 }
 
