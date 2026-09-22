@@ -380,6 +380,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 			goto unbacked;
 		return;
 	case DPTX_ENDPOINT:
+	case DPTX_PORT_ENDPOINT_H17P:
 		if (dcp->dptxep)
 			afk_receive_message(dcp->dptxep, message);
 		else

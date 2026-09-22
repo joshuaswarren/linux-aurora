@@ -56,6 +56,7 @@ static bool afk_endpoint_is_v2(struct apple_dcp_afkep *ep)
 	case DPTX_CONTROL_ENDPOINT:
 	case DPAVSERV_ENDPOINT:
 	case DPTX_ENDPOINT:
+	case DPTX_PORT_ENDPOINT_H17P:
 		return true;
 	default:
 		return false;
