@@ -303,9 +303,17 @@ int dcp_backlight_update(struct apple_dcp *dcp)
  * One step of the H17P fade.  The level in flight is interpolated on the
  * clock between the anchor and the target so a slow swap (or a compositor
  * that is already flipping at full rate) stretches nothing: the fade ends
- * ramp_ms after it started, give or take one frame.  Each step goes out
- * as its own swap carrying the current surface (see
- * drm_crtc_set_brightness), exactly as a single-step change did.
+ * ramp_ms after it started, give or take one frame.
+ *
+ * A step does not submit a swap of its own.  It only updates the level the
+ * next swap will carry, and a compositor that is drawing picks it up within
+ * a frame at no extra cost.  Pushing a full swap per step from here made
+ * every fade a second client fighting the compositor for the CRTC lock and
+ * the DCP swap channel, and the session stuttered for as long as the level
+ * was moving (auto-brightness keeps it moving).  Only when the previous
+ * step is still unconsumed a frame later -- nobody is drawing (swaylock,
+ * an idle desktop) -- does the worker submit the swap itself, carrying the
+ * current surface exactly as a single-step change did.
  */
 static void dcp_backlight_ramp_work(struct work_struct *work)
 {
@@ -315,6 +323,7 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 	struct drm_modeset_acquire_ctx ctx;
 	int from, target, level;
 	unsigned int duration;
+	bool unconsumed;
 	s64 elapsed;
 	int ret;
 
@@ -327,8 +336,21 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 		return;
 	}
 
+	/* the previous step is still waiting for a swap to carry it */
+	unconsumed = dcp->brightness.update;
+
 	from = dcp->brightness.ramp_from;
 	target = dcp->brightness.target_nits;
+
+	if (dcp->brightness.nits == target) {
+		/* fade finished; make sure the last level actually went out */
+		drm_modeset_drop_locks(&ctx);
+		drm_modeset_acquire_fini(&ctx);
+		if (unconsumed && dcp->valid_mode)
+			drm_crtc_set_brightness(dcp);
+		return;
+	}
+
 	duration = dcp->brightness.ramp_duration_ms;
 	elapsed = ktime_ms_delta(ktime_get(), dcp->brightness.ramp_start);
 
@@ -338,7 +360,7 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 		level = from + (int)(((s64)(target - from) * elapsed) / duration);
 
 	/* never stall on rounding: always move at least one nit per step */
-	if (level == dcp->brightness.nits && level != target)
+	if (level == dcp->brightness.nits)
 		level += target > level ? 1 : -1;
 
 	dcp->brightness.nits = level;
@@ -348,12 +370,11 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
 
-	if (dcp->valid_mode)
+	if (unconsumed && dcp->valid_mode)
 		drm_crtc_set_brightness(dcp);
 
-	if (level != target)
-		schedule_delayed_work(&dcp->brightness.ramp_work,
-				      msecs_to_jiffies(RAMP_STEP_MS));
+	schedule_delayed_work(&dcp->brightness.ramp_work,
+			      msecs_to_jiffies(RAMP_STEP_MS));
 }
 
 static void dcp_backlight_ramp_cancel(void *data)
