@@ -28,8 +28,8 @@ def block(pattern, text=source):
 
 
 constants = "\n".join(
-    re.search(r"(?:pub\(crate\) )?const " + name + r": (?:usize|u32) = .*?;", source).group()
-    for name in ["G17P_RENDER_POOL_A_SLOTS", "G17P_RENDER_POOL_A",
+    re.search(r"(?:pub\(crate\) )?const " + name + r": (?:usize|u32|u64) = .*?;", source).group()
+    for name in ["G17P_RENDER_QUEUE_METADATA_BASE", "G17P_RENDER_POOL_A_SLOTS", "G17P_RENDER_POOL_A",
                  "G17P_RENDER_SHARED_CONTROL_INNER", "G17P_RETAINED_RENDER_ORDINALS",
                  "G17P_USER_TILING_RING", "G17P_USER_TILING_POINTERS",
                  "G17P_USER_TILING_OPTIONAL", "G17P_USER_TILING_EVENT",
@@ -73,7 +73,7 @@ fn support() -> Vec<u8> {
     }
     bytes
 }
-fn late(kick: G17PEventControlKick, ordinal: u32) -> G17PLateTilingBytes {
+fn late(kick: G17PEventControlKick, ordinal: u64) -> G17PLateTilingBytes {
     G17PLateTilingBytes {
         item_group: [0; 32], items: G17PRenderItemPlan::new(ordinal, false).unwrap(),
         entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
@@ -82,7 +82,7 @@ fn late(kick: G17PEventControlKick, ordinal: u32) -> G17PLateTilingBytes {
         optional_offset: 0x1000,
         event_offset: 0x2000,
         pool_a_slot_offset: kick.slot_offset, pool_a_slot_value: kick.next,
-        shared_inner_value: 2 * (ordinal + 1),
+        shared_inner_value: (ordinal as u32).wrapping_add(1).wrapping_mul(2),
     }
 }
 #[test]
@@ -135,7 +135,7 @@ fn captured_late_value_is_identical_for_both_publication_paths() {
         let publication = late(kick, 0);
         let original = support.clone();
         let mut atomic = support.clone();
-        publication.apply(&mut vec![0; 0xc000], &mut atomic);
+        publication.apply(&mut vec![0; G17P_RENDER_QUEUE_METADATA_BASE + 0xc000], &mut atomic);
         publication.apply_native_pool_transition(&mut support);
         assert_eq!(support, atomic);
         assert_eq!(read32(&support, slot), previous.wrapping_add(1));

@@ -873,7 +873,8 @@ static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 	 * syslog: "[BrightnessLCD.cpp:743][AFK]nitsToDBV: iDAC out of range"
 	 */
 	dcp->brightness.update = true;
-	schedule_work(&dcp->bl_update_wq);
+	mod_delayed_work(system_wq, &dcp->bl_update_wq,
+			 msecs_to_jiffies(DIV_ROUND_UP(1000, 24)));
 }
 
 /* Chunked data transfer for property dictionaries */
@@ -1146,13 +1147,6 @@ static bool dcpep_cb_d000_h17p(struct apple_dcp *dcp, int tag, void *out, void *
 	trace_iomfb_callback(dcp, tag, __func__);
 	dcp_dfb_query(dcp, false, d000_done, NULL);
 	return false;
-}
-#endif
-
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-static void boot_1_after_park(struct apple_dcp *dcp, void *out, void *cookie)
-{
-	dcp_set_create_dfb(dcp, false, boot_1_5, NULL);
 }
 #endif
 
@@ -1688,7 +1682,7 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		dcp->valid_mode = false;
 		/* after unplug swap will not complete until the next
 		 * set_digital_out_mode */
-		schedule_work(&dcp->vblank_wq);
+		schedule_delayed_work(&dcp->vblank_wq, msecs_to_jiffies(5));
 	}
 
 	if (connector && connector->connected != !!(*connected)) {
@@ -1929,13 +1923,11 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * already running at its native 2408x1506, so skip the modeset and let
 	 * that timing stand.
 	 */
-	if (!dcp_send_modeset) {
-		dev_info(dcp->dev, "inheriting the bootloader's display mode\n");
-		complete_set_digital_out_mode(dcp, NULL, cookie);
-	} else
-#endif
+	complete_set_digital_out_mode(dcp, NULL, cookie);
+#else
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
 				 complete_set_digital_out_mode, cookie);
+#endif
 
 	/*
 	 * The DCP firmware has an internal timeout of ~8 seconds for
@@ -2012,14 +2004,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		l = apple_plane->iomfb_surface;
 		req->swap.swap_enabled |= BIT(l);
 
-		if (old_state->fb && new_state->fb != old_state->fb) {
+		if (old_state->crtc == crtc && old_state->fb &&
+		    new_state->fb != old_state->fb) {
 			/* Retain the old framebuffer until its replacement is stable. */
-			struct dcp_fb_reference *entry =
-				kzalloc(sizeof(*entry), GFP_KERNEL);
+			struct dcp_fb_reference *entry = apple_state->retiring_fb;
 			unsigned long flags;
 
 			if (entry) {
+				apple_state->retiring_fb = NULL;
 				entry->fb = old_state->fb;
+				drm_framebuffer_get(entry->fb);
 				/*
 				 * Left unarmed: the id of the swap that
 				 * unbinds this framebuffer is not known until
@@ -2032,7 +2026,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 				spin_unlock_irqrestore(&dcp->swapped_out_lock,
 						       flags);
 			}
-			drm_framebuffer_get(old_state->fb);
 		}
 
 		if (!new_state->fb || !new_state->visible) {
@@ -2063,7 +2056,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
 		if (crtc_state->enable && crtc_state->active &&
 		    !crtc_state->planes_changed) {
-			schedule_work(&dcp->vblank_wq);
+			schedule_delayed_work(&dcp->vblank_wq,
+					      msecs_to_jiffies(5));
 			return;
 		}
 
@@ -2283,7 +2277,7 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 		 * it parks the internal pipe (power_down_M3) and never scans
 		 * out even though the panel and backlight are on.
 		 */
-		u32 state = dcp_clamshell_state;
+		u32 state = DCP_CLAMSHELL_STATE;
 
 		dcp_pipe_set_476(dcp, false, &state, next, ncookie);
 		break;

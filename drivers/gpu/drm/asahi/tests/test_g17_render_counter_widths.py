@@ -5,6 +5,7 @@ Only module-parameter reads are mocked. --native-blobs optionally verifies the
 SHA-identified valid 092506 retained TA records; it does not label them executing.
 """
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import argparse
 import hashlib
 import re
@@ -51,6 +52,7 @@ mod module_parameters {
     "mod g17_submission {",
     *[constant(n) for n in [
         "G17P_COLD_OPENING_OPTIONAL_SIZE", "G17P_COLD_OPENING_EVENT_SIZE",
+        "KICK_TS_BITS", "KICK_TS_MASK",
         "G17P_NATIVE_RENDER_DOORBELL_PRIORITY", "G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID",
         "G17P_NATIVE_RENDER_POLICY"]],
     *["#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n" + block(sub, n) for n in [
@@ -67,7 +69,7 @@ use g17_render::*;
 use g17_submission::*;
 fn u32_at(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at+4].try_into().unwrap()) }
 fn u64_at(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at+8].try_into().unwrap()) }
-fn refresh(kind: RenderDescriptorKind, ordinal: u32, raw: &mut [u8]) -> Result<(), RenderBuildError> {
+fn refresh(kind: RenderDescriptorKind, ordinal: u64, raw: &mut [u8]) -> Result<(), RenderBuildError> {
     apply_g17p_retained_descriptor_fields(kind, 0x7000098000, 0xfffffc20c0828000,
         if kind == RenderDescriptorKind::Tiling { 0 } else { 1 }, 1,
         ordinal, ordinal == 0, true, raw)
@@ -82,21 +84,23 @@ fn addresses() -> G17PColdOpeningOptionalAddresses {
 
 #[test]
 fn long_width_native_255_256_257_and_high_ordinal_fields() {
-    for ordinal in [0, 1, 2, 253, 254, 255, 256, 999, 65535, 65536, 0x00fffffe] {
-        let n = ordinal + 1;
+    for ordinal in [0, 1, 2, 253, 254, 255, 256, 999, 65535, 65536,
+                    0x00fffffe, 0x00ffffff, 0x01000000, 0xffffffff,
+                    0x100000000, 0xffffffffff, 0x10000000000] {
+        let n = (ordinal + 1) & 0xffffffffff;
         let mut ta = [0xa5; TA_DESCRIPTOR_SIZE];
         let mut fragment = [0xa5; FRAGMENT_DESCRIPTOR_SIZE];
         refresh(RenderDescriptorKind::Tiling, ordinal, &mut ta).unwrap();
         refresh(RenderDescriptorKind::Fragment, ordinal, &mut fragment).unwrap();
-        assert_eq!(u32_at(&ta, 0x7a0), n << 8);
+        assert_eq!(u32_at(&ta, 0x7a0), (n as u32).wrapping_shl(8));
         assert_eq!(u64_at(&ta, 0x7a8), n as u64);
         assert_eq!(&ta[0x7b0..0x7b2], &[n as u8; 2]);
-        assert_eq!(u32_at(&ta, 0x8b6), n << 8);
+        assert_eq!(u32_at(&ta, 0x8b6), (n as u32).wrapping_shl(8));
         assert_eq!(u64_at(&ta, 0x8c6), ((n as u8 as u64) << 40) | n as u64);
-        assert_eq!(u32_at(&ta, 0x8d6), ordinal);
-        assert_eq!(u32_at(&fragment, 0x2150), n << 8);
+        assert_eq!(u32_at(&ta, 0x8d6), ordinal as u32);
+        assert_eq!(u32_at(&fragment, 0x2150), (n as u32).wrapping_shl(8));
         assert_eq!(u32_at(&fragment, 0x215c), u32::from(ordinal == 0));
-        assert_eq!(u32_at(&fragment, 0x2170), ordinal);
+        assert_eq!(u32_at(&fragment, 0x2170), ordinal as u32);
         // These are adjacent independently owned pointer/lifecycle bytes.
         for span in [0x7b2..0x7b4, 0x8ae..0x8b6, 0x8ce..0x8d6] {
             assert!(ta[span].iter().all(|b| *b == 0xa5));
@@ -114,7 +118,7 @@ fn long_width_first_255_payloads_keep_the_original_encoded_values() {
         // The old splice fabricated these pointer bytes; real owner supplies
         // them. Seed that native high pointer word to compare cold bytes.
         ta[0x8b4..0x8b6].fill(0xff);
-        refresh(RenderDescriptorKind::Tiling, ordinal, &mut ta).unwrap();
+        refresh(RenderDescriptorKind::Tiling, u64::from(ordinal), &mut ta).unwrap();
         let n = ordinal + 1;
         assert_eq!(u32_at(&ta, 0x7a8), n);
         assert_eq!(u32_at(&ta, 0x7b0), n | (n << 8));
@@ -146,7 +150,7 @@ fn long_width_actual_linked_timestamp_and_payload_are_independent() {
 
 #[test]
 fn long_width_invalid_input_is_transactional() {
-    for ordinal in [0x00ffffff, 0x01000000, u32::MAX] {
+    for ordinal in [u64::MAX] {
         for kind in [RenderDescriptorKind::Tiling, RenderDescriptorKind::Fragment] {
             let mut raw = [0xa5; FRAGMENT_DESCRIPTOR_SIZE];
             let before = raw;
@@ -171,7 +175,8 @@ fn long_width_invalid_input_is_transactional() {
 #[test]
 fn long_width_flist_generation_retains_all_counter_bits_and_neighbors() {
     for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
-        for ordinal in [0, 1, 254, 255, 256, 999, 65535, 65536, 0x00fffffe] {
+        for ordinal in [0, 1, 254, 255, 256, 999, 65535, 65536, 0x00fffffe,
+                        0x00ffffff, 0x01000000, 0xffffffff, 0x100000000] {
             let mut raw = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
             apply_g17p_retained_optional(stage, addresses(), ordinal, false, 0, 1, 1, 1, 1, &mut raw).unwrap();
             assert_eq!(u64_at(&raw, 0x3e), ordinal as u64);
@@ -183,25 +188,21 @@ fn long_width_flist_generation_retains_all_counter_bits_and_neighbors() {
                 assert_eq!(u32_at(&raw, 0x7e), addresses().ta_hardware_buffer_id);
             }
         }
-        for ordinal in [0x00ffffff, u32::MAX] {
-            let mut raw = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            let before = raw;
-            assert!(apply_g17p_retained_optional(stage, addresses(), ordinal, false, 0, 1, 1, 1, 1, &mut raw).is_err());
-            assert_eq!(raw, before);
-        }
     }
-    assert_eq!(g17p_render_flist_generation(u32::MAX), u32::MAX as u64);
+    assert_eq!(g17p_render_flist_generation(u64::MAX), u64::MAX);
 }
 
 #[test]
-fn long_width_event_stamp_retains_explicit_24_bit_boundary() {
+fn long_width_event_stamp_retains_native_forty_bit_boundary() {
     for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
-        for stamp in [1, 255, 256, 257, 65536, 0x00ffffff] {
+        for stamp in [0, 1, 255, 256, 257, 65536, 0x00ffffff,
+                      0x01000000, 0x100000000, 0xffffffffff] {
             let mut raw = [0xa5; G17P_COLD_OPENING_EVENT_SIZE];
             apply_g17p_retained_event_with_stamp(stage, stamp, 1, &mut raw).unwrap();
-            assert_eq!(u32_at(&raw, 8), stamp << 8);
+            assert_eq!(u64_at(&raw, 9), stamp);
+            assert_eq!(raw[8], G17P_NATIVE_RENDER_DOORBELL_PRIORITY);
         }
-        for stamp in [0, 0x01000000, u32::MAX] {
+        for stamp in [1u64 << 40, u64::MAX] {
             let mut raw = [0xa5; G17P_COLD_OPENING_EVENT_SIZE];
             let before = raw;
             assert!(apply_g17p_retained_event_with_stamp(stage, stamp, 1, &mut raw).is_err());
@@ -214,7 +215,7 @@ fn long_width_event_stamp_retains_explicit_24_bit_boundary() {
 with tempfile.TemporaryDirectory(prefix="g17-render-counter-widths-") as temp:
     binary = Path(temp) / "tests"
     subprocess.run(["rustc", "--edition=2021", "--test", "-", "-o", str(binary)],
-                   input=body, text=True, check=True)
+                   input=with_g17_config(body), text=True, check=True)
     subprocess.run([str(binary), "long_width_"], check=True)
 
 if args.native_blobs:

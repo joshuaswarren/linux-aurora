@@ -7,6 +7,8 @@
 #include "../mt792x.h"
 #include "regs.h"
 
+struct firmware;
+
 #define MT7921_MAX_AID                  20
 
 #define MT7921_TX_RING_SIZE		2048
@@ -17,13 +19,20 @@
 #define MT7921_RX_MCU_RING_SIZE		8
 #define MT7921_RX_MCU_WA_RING_SIZE	512
 
-#define MT7932_TX_MCU_RING_SIZE		512
-#define MT7932_TX_FWDL_RING_SIZE	512
+/* Live 25G83 Run 191 WFDMA programming: TX17=24, TX16=256. */
+#define MT7932_TX_MCU_RING_SIZE		24
+#define MT7932_TX_FWDL_RING_SIZE	256
+#define MT7932_TX_AUX_RING_SIZE		16
 #define MT7932_TX_RING_SIZE		512
 #define MT7932_RX_RING_SIZE		512
 #define MT7932_RX_MCU_RING_SIZE		32
 #define MT7932_RX_MCU_WA_RING_SIZE	32
 #define MT7932_RX_BUF_SIZE		0x930
+#define MT7932_RX_RING3_SIZE		32
+#define MT7932_RX_RING5_SIZE		224
+#define MT7932_RX_RING6_SIZE		128
+#define MT7932_RX_RING7_SIZE		512
+#define MT7932_RX_RING8_SIZE		64
 
 /* MT7902 Rx Ring0 is for both Rx Event and Tx Done Event */
 #define MT7902_RX_MCU_RING_SIZE		512
@@ -135,6 +144,14 @@ enum mt7902_txq_id {
 	MT7902_TXQ_MCU_WM = 15,
 };
 
+/* Run 191 programs this queue before firmware start, initializes CIDX to
+ * zero, and never advances it during the retained startup window.  It is not
+ * the FW_START response queue; keep it allocated but deliberately unrouted.
+ */
+enum mt7932_txq_id {
+	MT7932_TXQ_AUX = 18,
+};
+
 struct mt7921_dma_layout {
 	u8 mcu_wm_txq;
 	u16 data_tx_ring_size;
@@ -228,8 +245,24 @@ int mt7921_mcu_sta_update(struct mt792x_dev *dev, struct ieee80211_sta *sta,
 int mt7921_mcu_set_chan_info(struct mt792x_phy *phy, int cmd);
 int mt7921_mcu_set_tx(struct mt792x_dev *dev, struct ieee80211_vif *vif);
 int mt7921_mcu_set_eeprom(struct mt792x_dev *dev);
+int mt7932_mcu_init_dbdc(struct mt792x_dev *dev);
+int mt7932_mcu_load_customer_cfg(struct mt792x_dev *dev);
+int mt7932_mcu_load_power_transcript(struct mt792x_dev *dev);
+
+enum mt7932_live_start_phase {
+	MT7932_LIVE_PHASE_PRE_CAL = 1,
+	MT7932_LIVE_PHASE_AU_UPDATE,
+};
+
+int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase);
+extern bool mt7932_replay_au_policy;
+bool mt7932_j700_us(void);
+int mt7932_mcu_set_6g_scan(struct mt792x_dev *dev, bool enable);
 int mt7932_mcu_load_wcal(struct mt792x_dev *dev);
 int mt7932_mcu_load_one_time_cal(struct mt792x_dev *dev);
+int mt7932_validate_cal_stream(const struct firmware *fw, u16 *countp);
+int mt7932_mcu_drain_tx17(struct mt792x_dev *dev, const char *phase,
+			  bool reset_bounce);
 int mt7921_mcu_get_rx_rate(struct mt792x_phy *phy, struct ieee80211_vif *vif,
 			   struct ieee80211_sta *sta, struct rate_info *rate);
 int mt7921_mcu_fw_log_2_host(struct mt792x_dev *dev, u8 ctrl);
@@ -278,6 +311,12 @@ mt7921_l1_rmw(struct mt792x_dev *dev, u32 addr, u32 mask, u32 val)
 
 void mt7921_regd_update(struct mt792x_dev *dev);
 int mt7921_mac_init(struct mt792x_dev *dev);
+int mt7921_reset_hardware(struct mt792x_dev *dev);
+int mt7932_apply_manufacture_policy(struct mt792x_dev *dev);
+int mt7921_add_driver_internal_vif(struct mt792x_dev *dev,
+				    struct ieee80211_vif *vif);
+void mt7921_remove_driver_internal_vif(struct mt792x_dev *dev,
+				       struct ieee80211_vif *vif);
 bool mt7921_mac_wtbl_update(struct mt792x_dev *dev, int idx, u32 mask);
 int mt7921_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 		       struct ieee80211_sta *sta);

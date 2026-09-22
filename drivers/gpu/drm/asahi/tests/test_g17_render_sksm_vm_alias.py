@@ -47,7 +47,9 @@ assert "ta_context_low: G17PRenderClientAlias" in storage
 assert "fragment_context_low: G17PRenderClientAlias" in storage
 assert "sksm_vm_aliases: KVec<mmu::KernelMapping>" in storage
 assert "existing_pages != expected_pages" in prepare
-assert "vm.translate_iova(low)? != uat.kernel_vm().translate_iova(high)?" in prepare
+assert "let client_pa = vm.translate_iova(low)?;" in prepare
+assert "let backing_pa = uat.kernel_vm().translate_iova(high)?;" in prepare
+assert "if client_pa != backing_pa" in prepare
 assert "G17PRenderClientAlias::from_range(address, size), None" in prepare
 assert "object.map_alias_at(vm, address, prot)?" in prepare
 assert new.count("prepare_render_sksm_vm_alias(") == 2
@@ -55,7 +57,8 @@ assert "skSM_vm_aliases" not in resources  # typo guard
 assert finish.index("stage_render_parameter_buffer_descriptor") < finish.index(
     "vm.append_driver_mappings(storage.take_sksm_vm_aliases())?"
 )
-assert "prepare_cached_reactivation(self.render_submission_ordinal)?" in handoff
+assert "prepare_cached_reactivation(self.render_submission_ordinal)" in handoff
+assert '"handoff-prepare-immediate-cache"' in handoff
 assert "cached.storage.claim_sksm_backing(" in handoff
 assert handoff.index("cached.storage.claim_sksm_backing(") < handoff.index(
     "self.render_storage = Some(cached.storage)"

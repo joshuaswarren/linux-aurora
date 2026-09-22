@@ -19,6 +19,7 @@ use kernel::{
         aref::ARef,
         Arc, //
     },
+    time::{delay::fsleep, Delta},
     workqueue::{self, HasWork, impl_has_work, new_work, Work, WorkItem}, //
 };
 
@@ -81,10 +82,16 @@ impl WorkItem<1> for AsahiData {
             );
             return;
         }
+        if runtime.primary_device_control_backpressured() {
+            // Full-ring backpressure is exceptional. Release the runtime
+            // mutex before yielding so submissions and firmware progress are
+            // never serialized behind this retry.
+            fsleep(Delta::from_millis(1));
+        }
         if runtime.primary_recovery_pending() {
             queue_g17p_recovery_worker(dev);
-        } else if runtime.primary_firmware_event_pending() {
-            queue_g17p_firmware_event_worker(dev);
+        } else {
+            requeue_g17p_firmware_event_worker_if_pending(dev);
         }
     }
 }
@@ -105,7 +112,7 @@ impl WorkItem<2> for AsahiData {
             return;
         }
         if runtime.primary_firmware_event_pending() {
-            queue_g17p_firmware_event_worker(dev);
+            requeue_g17p_firmware_event_worker_if_pending(dev);
         } else if runtime.primary_recovery_pending() {
             queue_g17p_recovery_worker(dev);
         }
@@ -114,6 +121,19 @@ impl WorkItem<2> for AsahiData {
 
 pub(crate) fn queue_g17p_firmware_event_worker(dev: ARef<AsahiDevice>) {
     let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 1>(dev);
+}
+
+fn requeue_g17p_firmware_event_worker_if_pending(dev: ARef<AsahiDevice>) {
+    let Some(runtime) = dev.g17_runtime else {
+        return;
+    };
+    let runtime = runtime.mutex().lock();
+    if runtime.firmware_event_worker_armed() && runtime.primary_firmware_event_pending() {
+        // Hold the same mutex used by disarm before queueing. Unbind therefore
+        // either observes this work in cancel_work_sync, or disarms first and
+        // makes this final self-requeue impossible.
+        let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 1>(dev);
+    }
 }
 
 pub(crate) fn queue_g17p_recovery_worker(dev: ARef<AsahiDevice>) {
@@ -166,7 +186,6 @@ enum AsahiRuntime {
 }
 
 pub(crate) struct AsahiDriver {
-    #[expect(unused)]
     runtime: AsahiRuntime,
 }
 

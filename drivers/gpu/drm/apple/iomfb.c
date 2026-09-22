@@ -33,22 +33,6 @@
 
 
 /*
- * A476 payload.  macOS sends 1 (dcp-calls.log line 1648); we sent 0 on the
- * theory that A476 is set_dcp_clamshellstate and 1 meant "lid shut".  That
- * attribution is unverified -- A476's shape (in 4, out 0) equally fits
- * set_has_frame_swap_function(bool) -- and the black panel it appeared to fix
- * was really the surf_iova misalignment, so the evidence for 0 was
- * coincidental.  Follow the capture.
- */
-u32 dcp_clamshell_state = 1;
-module_param_named(clamshell_state, dcp_clamshell_state, uint, 0644);
-
-bool dcp_send_modeset;   /* macOS never issues A413 */
-module_param_named(send_modeset, dcp_send_modeset, bool, 0644);
-
-
-
-/*
  * A353 / A352(0x70,0) / A438 x5 / A352(0x70,1) form one bracket: the A352 pair
  * parks and resumes the APT timing sequencer around the A438 config push
  * ("apt_normal_mode_changed: requesting transtition to auto mode" ->
@@ -95,10 +79,6 @@ static void dcp_start_extra_eps(struct apple_dcp *dcp)
 	}
 }
 
-
-bool dcp_park_display = true;
-module_param_named(park_display, dcp_park_display, bool, 0644);
-MODULE_PARM_DESC(park_display, "H17P: power the display down after boot until a modeset");
 
 bool dcp_defer_client_open;
 module_param_named(defer_client_open, dcp_defer_client_open, bool, 0644);
@@ -173,8 +153,10 @@ static inline u64 dcpep_ack(enum dcp_context_id id)
  */
 static bool dcp_channel_busy(struct dcp_channel *ch)
 {
-	return (ch->depth != 0);
+	return READ_ONCE(ch->depth) != 0;
 }
+
+static void dcp_dispatch_pending_flushes(struct apple_dcp *dcp);
 
 /*
  * Get the context ID passed to the DCP for a command we push. The rule is
@@ -521,6 +503,29 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		return;
 	}
 
+	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
+	    !dcp->cb_handlers[tag]) {
+		dev_warn(dev, "received unknown callback %c%c%c%c\n",
+			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+		/*
+		 * Leaving a callback unanswered wedges the coprocessor: it
+		 * waits for the ack forever and the outer call never returns.
+		 * On H17P answer it with a zeroed output instead, so the
+		 * warning above names the tag we still have to implement
+		 * rather than costing a reboot to discover one tag at a time.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			if (hdr->out_len)
+				memset(out, 0, hdr->out_len);
+			depth = dcp_push_depth(&ch->depth);
+			ch->output[depth] = out;
+			ch->end[depth] = offset +
+					 ALIGN(length, DCP_PACKET_ALIGNMENT);
+			dcp_ack(dcp, context);
+		}
+		return;
+	}
+
 	// TODO: verify that in_len and out_len match our prototypes
 	// for now just clear the out data to have at least consistent results
 	if (hdr->out_len)
@@ -577,6 +582,13 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 
 	if (cb)
 		cb(dcp, out, cookie);
+
+	if (context == DCP_CONTEXT_CMD) {
+		mutex_lock(&dcp->pending_flush_lock);
+		if (!dcp_channel_busy(ch))
+			dcp_dispatch_pending_flushes(dcp);
+		mutex_unlock(&dcp->pending_flush_lock);
+	}
 }
 
 static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
@@ -730,33 +742,9 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	return lookup_mode(dcp, mode) != NULL;
 }
 
-void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
+static void dcp_dispatch_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			       struct drm_atomic_state *state)
 {
-	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-	if (dcp_channel_busy(&dcp->ch_cmd))
-	{
-		if (!dcp->ch_cmd.warned_busy) {
-			u8 d = dcp->ch_cmd.depth;
-
-			dev_err(dcp->dev,
-				"unexpected busy command channel: depth %u, oldest outstanding %.4s pushed %u ms ago\n",
-				d, d ? dcp->ch_cmd.tag[d - 1] : "----",
-				d ? jiffies_to_msecs(jiffies -
-						     dcp->ch_cmd.pushed_at[d - 1])
-				  : 0);
-			dcp->ch_cmd.warned_busy = true;
-		}
-		/* HACK: issue a delayed vblank event to avoid timeouts in
-		 * drm_atomic_helper_wait_for_vblanks().
-		 */
-		schedule_work(&dcp->vblank_wq);
-		return;
-	} else if (dcp->ch_cmd.warned_busy) {
-		dcp->ch_cmd.warned_busy = false;
-	}
-
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
 		iomfb_flush_v12_3(dcp, crtc, state);
@@ -770,6 +758,64 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
+	}
+}
+
+static void dcp_dispatch_pending_flushes(struct apple_dcp *dcp)
+{
+	struct apple_crtc_state *apple_state;
+	struct drm_atomic_state *state;
+
+again:
+	lockdep_assert_held(&dcp->pending_flush_lock);
+	if (dcp_channel_busy(&dcp->ch_cmd) ||
+	    list_empty(&dcp->pending_flushes))
+		return;
+
+	apple_state = list_first_entry(&dcp->pending_flushes,
+				       struct apple_crtc_state, pending_flush);
+	list_del_init(&apple_state->pending_flush);
+	state = apple_state->base.state;
+
+	dcp_dispatch_flush(dcp, apple_state->base.crtc, state);
+	drm_atomic_state_put(state);
+
+	if (!dcp_channel_busy(&dcp->ch_cmd))
+		goto again;
+}
+
+void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
+{
+	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct drm_crtc_state *base;
+	struct apple_crtc_state *apple_state;
+
+	base = drm_atomic_get_new_crtc_state(state, crtc);
+	apple_state = to_apple_crtc_state(base);
+	drm_atomic_state_get(state);
+
+	mutex_lock(&dcp->pending_flush_lock);
+	WARN_ON(!list_empty(&apple_state->pending_flush));
+	list_add_tail(&apple_state->pending_flush, &dcp->pending_flushes);
+	dcp_dispatch_pending_flushes(dcp);
+	mutex_unlock(&dcp->pending_flush_lock);
+}
+
+void dcp_flush_shutdown(struct apple_dcp *dcp)
+{
+	struct apple_crtc_state *apple_state, *tmp;
+	LIST_HEAD(pending);
+
+	mutex_lock(&dcp->pending_flush_lock);
+	list_splice_init(&dcp->pending_flushes, &pending);
+	mutex_unlock(&dcp->pending_flush_lock);
+
+	list_for_each_entry_safe(apple_state, tmp, &pending, pending_flush) {
+		struct drm_atomic_state *state = apple_state->base.state;
+
+		list_del_init(&apple_state->pending_flush);
+		drm_atomic_state_put(state);
 	}
 }
 

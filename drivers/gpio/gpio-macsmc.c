@@ -13,6 +13,7 @@
 #include <linux/hex.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
+#include <linux/of.h>
 
 #define MAX_GPIO 64
 
@@ -76,7 +77,16 @@ struct macsmc_gpio {
 
 	int first_index;
 	smc_key base_key;
+	bool j700_pcio_pin8;
+	bool j700_pcio_pin19;
+	unsigned long pcio_values;
 };
+
+static bool macsmc_gpio_is_pcio(struct macsmc_gpio *smcgp, unsigned int offset)
+{
+	return (smcgp->j700_pcio_pin8 && offset == 8) ||
+	       (smcgp->j700_pcio_pin19 && offset == 19);
+}
 
 static int macsmc_gpio_nr(smc_key key)
 {
@@ -148,6 +158,9 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	u32 val;
 	int ret;
 
+	if (macsmc_gpio_is_pcio(smcgp, offset))
+		return GPIO_LINE_DIRECTION_OUT;
+
 	/* First try reading the explicit pin mode register */
 	ret = apple_smc_rw_u32(smcgp->smc, key, CMD_PINMODE, &val);
 	if (!ret)
@@ -167,6 +180,9 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
 	u32 cmd, val;
 	int ret;
+
+	if (macsmc_gpio_is_pcio(smcgp, offset))
+		return test_bit(offset, &smcgp->pcio_values);
 
 	ret = macsmc_gpio_get_direction(gc, offset);
 	if (ret < 0)
@@ -190,6 +206,36 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
 	int ret;
 
+	/*
+	 * J700 /amfm-sunrise function-reg_on is not encoded as a gP08
+	 * command.  It is pKW8("pcIO", 0x800000, 0x80000): the platform
+	 * function replaces payload bits 15:0 with the requested value and
+	 * writes the resulting eight bytes to pcIO.  Keep this exact path
+	 * opt-in so established gPxx behavior on every other machine remains
+	 * unchanged.
+	 */
+	if (macsmc_gpio_is_pcio(smcgp, offset)) {
+		/* AFE reset is pKW8("pcIO", 0x10000, 0x130000). */
+		u64 payload = (offset == 8 ? BIT_ULL(23) : BIT_ULL(16)) |
+			      ((u64)offset << 48) | !!value;
+
+		ret = apple_smc_write_u64(smcgp->smc, SMC_KEY(pcIO), payload);
+		if (ret < 0) {
+			dev_err(smcgp->dev,
+				"J700_SMC_PCIO_GPIO_WRITE_FAIL: pin=%u value=%u payload=0x%016llx err=%d\n",
+				offset, !!value, payload, ret);
+			return ret;
+		}
+		if (value)
+			set_bit(offset, &smcgp->pcio_values);
+		else
+			clear_bit(offset, &smcgp->pcio_values);
+		dev_info(smcgp->dev,
+			 "J700_SMC_PCIO_GPIO_WRITE_PASS: pin=%u value=%u payload=0x%016llx\n",
+			 offset, !!value, payload);
+		return 0;
+	}
+
 	value |= CMD_OUTPUT;
 	ret = apple_smc_write_u32(smcgp->smc, key, CMD_OUTPUT | value);
 	if (ret < 0)
@@ -209,6 +255,8 @@ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
 	count = min(smcgp->smc->key_count, MAX_GPIO);
 
 	bitmap_zero(valid_mask, ngpios);
+	if (smcgp->j700_pcio_pin19)
+		set_bit(19, valid_mask);
 
 	for (i = 0; i < count; i++) {
 		int ret, gpio_nr;
@@ -252,6 +300,10 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->dev = &pdev->dev;
 	smcgp->smc = smc;
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
+	smcgp->j700_pcio_pin8 = of_property_read_bool(
+		pdev->dev.of_node, "apple,j700-pcio-pin8");
+	smcgp->j700_pcio_pin19 = of_machine_is_compatible("apple,j700") &&
+		device_is_compatible(&pdev->dev, "apple,smc-gpio");
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
 	if (smcgp->first_index < 0)
@@ -265,6 +317,9 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	dev_info(smcgp->dev, "First GPIO key: %p4ch\n", &key);
+	if (smcgp->j700_pcio_pin8)
+		dev_info(smcgp->dev,
+			 "J700_SMC_PCIO_GPIO_ARMED: pin=8 key=pcIO template=0x0008000000800000 source=function-reg_on\n");
 
 	if (device_is_compatible(&pdev->dev, "apple,smc-low-gpio"))
 		smcgp->gc.label = "macsmc-pmu-low-gpio";

@@ -18,6 +18,7 @@ unit=r'''
 #![allow(dead_code)]
 type Result<T=(),E=i32> = std::result::Result<T,E>;
 const EINVAL:i32=22;const EOVERFLOW:i32=75;
+mod util {pub fn g17p_verbose()->bool{false}}
 macro_rules! pr_info{($($arg:tt)*)=>{}}
 mod g17_uapi {
  pub const UAPI_MAX_ATTACHMENTS:usize=16;
@@ -44,7 +45,7 @@ const BASE:u64=0x7000098000;
 const INTERNAL:u64=0xeeee0000;
 const INTERNAL_BYTES:u64=0x4d000*128;
 fn run(a:&[A],mode:u32,fragment:&mut[u8])->Result<Option<G17PClMcacheAperture>>{
- encode_g17p_fragment_mcache(a,INTERNAL,INTERNAL_BYTES,BASE,0x6a0,24,mode,3,fragment)
+ encode_g17p_fragment_mcache(a,INTERNAL,INTERNAL_BYTES,BASE,0x6a0,24,mode,3,1,fragment)
 }
 fn att(i:u64)->A{A{address:0x1000e838000+i*0x10000000,size:0x26a80*128}}
 const GOLDEN_INTERNAL:[u8;16]=[0x00,0xdc,0xdd,0x01,0x00,0x06,0x8c,0x00,0x00,0xac,0xe2,0x01,0x00,0x12,0x00,0x00];
@@ -84,9 +85,9 @@ fn assert_unchanged_except(raw:&[u8],range:std::ops::Range<usize>){for(i,b)in ra
 #[test]fn errors_are_atomic_even_after_valid_predecessors(){
  for bad in [A{address:1,size:0},A{address:u64::MAX-2,size:4},A{address:0,size:(u32::MAX as u64+1)*128},A{address:1u64<<48,size:128}]{
  let mut raw=[0xa5;0x4000];assert!(run(&[att(0),bad],1,&mut raw).is_err());assert_eq!(raw,[0xa5;0x4000]);}
- let mut raw=[0xa5;0x4000];assert!(encode_g17p_fragment_mcache(&[att(0)],INTERNAL,0,BASE,0x6a0,24,1,3,&mut raw).is_err());assert_eq!(raw,[0xa5;0x4000]);
+ let mut raw=[0xa5;0x4000];assert!(encode_g17p_fragment_mcache(&[att(0)],INTERNAL,0,BASE,0x6a0,24,1,3,1,&mut raw).is_err());assert_eq!(raw,[0xa5;0x4000]);
  for (base,offset,hwsid,mode,selector) in [(u64::MAX,0x6a0,24,1,3),(BASE+1,0x6a0,24,1,3),(BASE,usize::MAX,24,1,3),(BASE,0x6a0,256,1,3),(BASE,0x6a0,24,3,3),(BASE,0x6a0,24,1,65),((1u64<<43)-0x6a0,0x6a0,24,1,3)]{
- let mut raw=[0xa5;0x4000];assert!(encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,base,offset,hwsid,mode,selector,&mut raw).is_err());assert_eq!(raw,[0xa5;0x4000]);}
+ let mut raw=[0xa5;0x4000];assert!(encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,base,offset,hwsid,mode,selector,1,&mut raw).is_err());assert_eq!(raw,[0xa5;0x4000]);}
 }
 #[test]fn exact_capacity_checks_precede_writes(){
  for (n,len) in [(2,0x6cf),(15,0x79f),(16,0x234f),(16,0x2240)]{let attachments:Vec<_>=(0..n).map(att).collect();let mut raw=vec![0xa5;len];assert_eq!(run(&attachments,1,&mut raw),Err(EINVAL));assert!(raw.iter().all(|b|*b==0xa5));}
@@ -95,15 +96,15 @@ fn assert_unchanged_except(raw:&[u8],range:std::ops::Range<usize>){for(i,b)in ra
 }
 #[test]fn disabled_empty_and_default_selector(){
  let mut raw=[0xa5;0x4000];assert_eq!(run(&[],1,&mut raw),Ok(None));
- assert_eq!(encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,BASE,0x6a0,0,1,3,&mut raw),Ok(None));assert_eq!(raw,[0xa5;0x4000]);
- let a=encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,BASE,0x6a0,24,1,64,&mut raw).unwrap().unwrap();assert_eq!(a.count,2);assert_eq!((u64::from_le_bytes(raw[0x6a0..0x6a8].try_into().unwrap())>>41)&63,1);
+ assert_eq!(encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,BASE,0x6a0,0,1,3,1,&mut raw),Ok(None));assert_eq!(raw,[0xa5;0x4000]);
+ let a=encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,BASE,0x6a0,24,1,64,1,&mut raw).unwrap().unwrap();assert_eq!(a.count,2);assert_eq!((u64::from_le_bytes(raw[0x6a0..0x6a8].try_into().unwrap())>>41)&63,1);
 }
 '''
 # The support overlays are explicitly a different BO from descriptor storage.
 assert 'const G17P_RENDER_PACKED_SHARED: usize = 0x1c000;' in resources
 assert 'support_va + G17P_RENDER_PACKED_SHARED as u64' in resources
 assert 'support.with_bytes_mut' in resources
-assert 'let (tiling, fragment) = raw.split_at_mut(0x4000);' in resources
+assert 'let (tiling, fragment) = next_descriptors.split_at_mut(0x4000);' in resources
 assert 'raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);' in render
 assert 'const G17P_RENDER_DESCRIPTOR_SLOT_COUNT: usize = 32;' in resources
 assert 'G17P_RENDER_TA_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT' in resources

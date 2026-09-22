@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run production per-QID completion/retirement methods against firmware witnesses."""
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import subprocess,tempfile
 p=Path(__file__).resolve().parents[1]
 def item(s,needle):
@@ -46,29 +47,52 @@ quarantine = item(r, '    pub(crate) fn quarantine_async_compute(')
 assert quarantine.index('self.service_async_compute_completions()') < quarantine.index('q.quarantined = true')
 source=r'''
 #![allow(dead_code,unused_variables)]
-use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+use std::sync::{Arc,atomic::{AtomicU64,AtomicUsize,Ordering}};
 type Error=i32;type Result<T=()>=std::result::Result<T,Error>;
 const EIO:i32=5;const EINVAL:i32=22;const EAGAIN:i32=11;const ENODEV:i32=19;const EBUSY:i32=16;const ERANGE:i32=34;
+const ENODATA:i32=61;const ECANCELED:i32=125;
 macro_rules! dev_info{($($t:tt)*)=>{()}}
 macro_rules! dev_err{($($t:tt)*)=>{()}}
 struct Delta;impl Delta{fn from_micros(_:u64)->Self{Self}}fn fsleep(_:Delta){}
 mod util { pub fn g17p_verbose() -> bool { false } }
-mod g17_submission {pub fn complete_g17p_cl_kicks(p:u32,n:u32)->Result<u32,()>{p.checked_sub(n).ok_or(())}}
+mod g17_manager { pub fn g17p_compute_trace_enabled(_submission:u32)->bool { false } }
+static G17P_COMPLETIONS_SEEN:AtomicU64=AtomicU64::new(0);
+#[derive(Copy,Clone)]struct Geometry;
+impl Geometry{fn stamp_count(&self)->u32{8}fn entry_stride(&self)->u32{0x170}}
+#[derive(Copy,Clone)]struct Producer{submitted:u32,previous_valid:bool,previous_timestamp:u32,geometry:Geometry}
+mod g17_submission {
+ use super::Producer;
+ pub struct Prepared{pub entry_offset:u32}
+ pub fn prepare_kick_submission(_:u32,_:u8,_:u32,_:u32)->Result<Prepared,()>{Ok(Prepared{entry_offset:0})}
+ pub fn complete_g17p_cl_kicks(mut p:Producer,n:u32)->Result<Producer,()>{p.submitted=p.submitted.checked_sub(n).ok_or(())?;Ok(p)}
+}
 mod g17_completion{pub const fn g17p_ksm_completion_queue_id(control:u64)->u8{((control>>9)as u8)&0x7f}}
 const G17P_COMPUTE_COMPLETION_RECORD_SIZE:usize=0x40;const G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK:u64=0x003f_ffff_ffff_ffff;const G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK:u64=!1u64;const G17P_COMPUTE_COMPLETION_QID_COUNT:usize=128;
 '''+batch_code+r'''
 thread_local! { static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! { static QOS_COMPLETIONS: std::cell::RefCell<Vec<(u8,u8,u8)>> = const { std::cell::RefCell::new(Vec::new()) }; }
 type Record=(u8,u64,[u64;2]);
 struct Resources{records:Vec<Record>,publish_after_scan:Option<Record>}
+impl Resources{fn complete_qos_queue_records(&mut self,owners:&[(u8,u8,u8)])->Result{QOS_COMPLETIONS.with(|rows|rows.borrow_mut().extend_from_slice(owners));Ok(())}}
 impl Resources{fn scan_compute_completion_batch(&mut self,batch:&mut G17PComputeCompletionBatch)->Result{SCANS.with(|p|p.set(p.get()+1));for(qid,descriptor,timestamps)in &self.records{let mut raw=[0u8;0x40];raw[0..8].copy_from_slice(&((*qid as u64)<<9|0x10).to_le_bytes());raw[0x10..0x18].copy_from_slice(&timestamps[0].to_le_bytes());raw[0x20..0x28].copy_from_slice(&timestamps[0].to_le_bytes());raw[0x28..0x30].copy_from_slice(&timestamps[1].to_le_bytes());raw[0x30..0x38].copy_from_slice(&descriptor.to_le_bytes());raw[0x38..0x40].copy_from_slice(&1u64.to_le_bytes());batch.fold_record(&raw)?;}if let Some(record)=self.publish_after_scan.take(){self.records.push(record);}Ok(())}}
-struct Stamp(u64);impl Stamp{fn read_compute_stamp(&self)->Result<u64>{Ok(self.0)}}
-struct G17PSksmQueue{queue_id:u8,independent_context:bool,completion_descriptor:u64,completion_last_end:u64,completion_stamp_armed:bool,compute:Stamp,producer:u32}
-impl G17PSksmQueue{fn queue_id(&self)->u8{self.queue_id}}
+struct RingState{consumer:u32,producer:u32,count:u32}
+struct Stamp(u64);impl Stamp{fn read_compute_stamp(&self)->Result<u64>{Ok(self.0)}fn read_compute_submitted_counters(&mut self)->Result<[u32;2]>{Ok([1,1])}fn read_compute_ring_state(&mut self)->Result<RingState>{Ok(RingState{consumer:1,producer:1,count:8})}}
+struct Storage;impl Storage{fn snapshot_compute_entry(&mut self,_:usize)->Result<[u64;46]>{Ok([0;46])}}
+struct G17PSksmQueue{queue_id:u8,independent_context:bool,completion_descriptor:u64,completion_last_end:u64,completion_stamp_armed:bool,compute:Stamp,producer:Producer,storage:Storage}
+impl G17PSksmQueue{fn queue_id(&self)->u8{self.queue_id}fn qos_hardware_buffer_id(&self)->u8{self.queue_id+20}fn bind_logical_channel_control(&mut self,_context:&Hold)->Result{Ok(())}}
+#[derive(Debug,Copy,Clone,PartialEq,Eq)]struct G17PComputeRetirementTicket{queue_id:u8,descriptor:u64,submitted_target:u32,item_producer:u32,item_count:u32}
 struct Manager{resources:Resources,compute_completion_batch:G17PComputeCompletionBatch}
 fn manager(records:Vec<Record>)->Manager{Manager{resources:Resources{records,publish_after_scan:None},compute_completion_batch:G17PComputeCompletionBatch::new()}}
 thread_local! { static TIMEOUTS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) }; }
+thread_local! { static RECOVERY: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) }; }
+struct Handshake { epoch:u64, state:u64 }
 impl Manager {
+ // This harness starts with installed queues; none is an unpublished close.
+ fn cancel_unpublished_compute_queue(&mut self,_q:&G17PSksmQueue)->bool{false}
+ fn firmware_recovery_handshake_snapshot(&mut self)->Result<Handshake>{let(epoch,state)=RECOVERY.with(|r|r.get());Ok(Handshake{epoch,state})}
  fn log_async_compute_timeout(&mut self,q:&mut G17PSksmQueue){TIMEOUTS.with(|t|t.borrow_mut().push(q.completion_descriptor));}
+ // Opt-in diagnostic: reads driver-owned DRAM and logs it, never a register.
+ fn log_compute_usage_slot(&mut self,_q:&mut G17PSksmQueue,_phase:&str){}
  fn dump_compute_completion_records(&mut self,_label:&str)->Result{Ok(())}
 '''+manager_batch+r'''
 }
@@ -82,15 +106,19 @@ static G17P_MARK_ZERO_DURATION: core::sync::atomic::AtomicU32 =
 // assertions below read.
 // Probe parameter; 0 is the default and the behaviour these tests assert.
 mod module_parameters { pub struct P; impl P { pub fn value(&self)->&'static u32 { &0 } }
-  pub static g17p_quarantine_scope: P = P; }
+  pub static g17p_quarantine_scope: P = P;
+  pub static g17p_quarantine_selftest: P = P; }
 mod g17_live_boot { pub fn note_session_recovery_pending(pending:&mut bool,_pdev:Option<&()>,_reason:&'static str){ *pending = true; } }
 struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>}
 impl Completion{fn complete(&self,r:Result<[u64;2]>){self.signals.fetch_add(1,Ordering::SeqCst);if r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}}
-struct Packet{id:u64,completion:Arc<Completion>}
-impl Packet{fn submission_id(&self)->u64{self.id}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
-struct Hold(Arc<AtomicUsize>);impl Hold{fn quarantine(&self){}}impl Drop for Hold{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
-struct Active{packet:Packet,_lease:Hold}
-struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,active:Option<Active>,released:bool,quarantined:bool,terminal_fanout:Option<(Arc<g17_status::VmStatus>,Error)>}
+struct Context{context_id:u32}impl Context{fn context_id(&self)->u32{self.context_id}}
+struct Packet{id:u64,context:Context,completion:Arc<Completion>}
+impl Packet{fn submission_id(&self)->u64{self.id}fn context(&self)->&Context{&self.context}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
+#[derive(Clone)]struct Hold(Arc<AtomicUsize>);impl Hold{fn quarantine(&self){}fn retarget_logical_context(&mut self,_context:Hold)->Result{Ok(())}}impl Drop for Hold{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
+#[derive(Debug,Copy,Clone,PartialEq,Eq)]struct G17PAsyncComputeRetirementTicket{owner:u64,submission:u64,context:u32,recovery_epoch:u64,firmware:G17PComputeRetirementTicket}
+struct Active{packet:Packet,_lease:Hold,retirement:Option<G17PAsyncComputeRetirementTicket>,completions_at_publish:u64}
+struct Previous{_binding:Option<Hold>,_context:Hold,publication:Option<(u64,u64)>}
+struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,previous_binding:Option<Previous>,active:Option<Active>,released:bool,retirement_ready:bool,quarantined:bool,retired_by_teardown:bool,terminal_fanout:Option<(Arc<g17_status::VmStatus>,Error)>}
 struct G17PLiveRuntime{pdev:Option<()>,manager:Option<Manager>,async_compute_queues:Vec<Queue>,session_recovery_pending:bool}
 '''+mask_helper+r'''
 impl G17PLiveRuntime {
@@ -98,12 +126,12 @@ impl G17PLiveRuntime {
  fn fail_outstanding_jobs_for_vm(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}
 '''+methods+r'''
 }
-fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus)});(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:1},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),active:Some(Active{packet:Packet{id:owner,completion:c.clone()},_lease:Hold(d.clone())}),released:false,quarantined:false,terminal_fanout:None},c)}
+fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus)});let firmware=G17PComputeRetirementTicket{queue_id:owner as u8,descriptor,submitted_target:1,item_producer:1,item_count:8};let retirement=G17PAsyncComputeRetirementTicket{owner,submission:owner,context:owner as u32,recovery_epoch:0,firmware};(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:Producer{submitted:1,previous_valid:true,previous_timestamp:1,geometry:Geometry},storage:Storage},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),previous_binding:None,active:Some(Active{packet:Packet{id:owner,context:Context{context_id:owner as u32},completion:c.clone()},_lease:Hold(d.clone()),retirement:Some(retirement),completions_at_publish:0}),released:false,retirement_ready:false,quarantined:false,retired_by_teardown:false,terminal_fanout:None},c)}
 #[test]fn out_of_order_requires_matching_descriptor_and_final_visibility(){
  let drops=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&drops);let(b,cb)=q(2,0x200,&drops);
  let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(2,0x200,[10,20])])),async_compute_queues:vec![a,b],session_recovery_pending:false};
  r.service_async_compute_completions().unwrap();assert_eq!(ca.signals.load(Ordering::SeqCst),0);assert_eq!(cb.signals.load(Ordering::SeqCst),0);assert_eq!(drops.load(Ordering::SeqCst),0);
- r.async_compute_queues[1].queue.compute.0=7;r.service_async_compute_completions().unwrap();assert_eq!(cb.signals.load(Ordering::SeqCst),1);assert_eq!(ca.signals.load(Ordering::SeqCst),0);assert_eq!(r.async_compute_queues[1].queue.producer,0);assert_eq!(drops.load(Ordering::SeqCst),1);
+ r.async_compute_queues[1].queue.compute.0=7;r.service_async_compute_completions().unwrap();assert_eq!(cb.signals.load(Ordering::SeqCst),1);assert_eq!(ca.signals.load(Ordering::SeqCst),0);assert_eq!(r.async_compute_queues[1].queue.producer.submitted,0);assert_eq!(drops.load(Ordering::SeqCst),1);
  r.service_async_compute_completions().unwrap();assert_eq!(cb.signals.load(Ordering::SeqCst),1);
  r.manager.as_mut().unwrap().resources.records.push((1,0x100,[5,25]));r.async_compute_queues[0].queue.compute.0=8;r.service_async_compute_completions().unwrap();assert_eq!(ca.signals.load(Ordering::SeqCst),1);assert_eq!(drops.load(Ordering::SeqCst),2);
 }
@@ -126,6 +154,16 @@ fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let 
 '''
 source += r'''
 fn qid_mask(qid:u8)->[u64;2]{let mut mask=[0;2];mask[qid as usize/64]|=1u64<<(qid as usize%64);mask}
+#[test]fn qos_retires_exactly_once_only_after_executed_final_completion(){
+ QOS_COMPLETIONS.with(|rows|rows.borrow_mut().clear());
+ let d=Arc::new(AtomicUsize::new(0));let(a,_)=q(4,0x400,&d);let(b,_)=q(5,0x500,&d);
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(4,0x400,[2,8]),(5,0x500,[9,9])])),async_compute_queues:vec![a,b],session_recovery_pending:false};
+ r.service_async_compute_completions().unwrap();
+ assert!(QOS_COMPLETIONS.with(|rows|rows.borrow().is_empty()));
+ r.async_compute_queues[0].queue.compute.0=1;
+ r.service_async_compute_completions().unwrap();r.service_async_compute_completions().unwrap();
+ assert_eq!(QOS_COMPLETIONS.with(|rows|rows.borrow().clone()),vec![(4,24,2)]);
+}
 #[test]fn completion_mask_selects_every_exact_qid_and_rejects_out_of_range(){
  for qid in 0u8..=127 {
   let mask=qid_mask(qid);
@@ -214,8 +252,47 @@ fn qid_mask(qid:u8)->[u64;2]{let mut mask=[0;2];mask[qid as usize/64]|=1u64<<(qi
  assert!(r.async_compute_queues[1].active.is_some());
 }
 '''
+source += r'''
+fn previous(q:&mut Queue,d:&Arc<AtomicUsize>,publication:Option<(u64,u64)>){
+ let epoch=publication.map(|(_,epoch)|epoch).unwrap_or_else(||RECOVERY.with(|r|r.get().0));
+ if let Some(active)=q.active.as_mut(){active.retirement.as_mut().unwrap().recovery_epoch=epoch;}
+ q.previous_binding=Some(Previous{_binding:Some(Hold(d.clone())),_context:Hold(d.clone()),publication});
+}
+#[test]fn rebind_waits_for_exact_submission_and_final_stamp_without_blocking_other_queue(){
+ RECOVERY.with(|r|r.set((7,0)));
+ let current=Arc::new(AtomicUsize::new(0));let old=Arc::new(AtomicUsize::new(0));
+ let(mut a,ca)=q(4,0x400,&current);let(mut b,cb)=q(5,0x500,&current);
+ previous(&mut a,&old,Some((4,7)));b.queue.compute.0=1;
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(4,0x4010,[2,8]),(5,0x500,[3,9])])),async_compute_queues:vec![a,b],session_recovery_pending:false};
+ r.service_async_compute_completions().unwrap();assert_eq!(old.load(Ordering::SeqCst),0);assert_eq!(cb.signals.load(Ordering::SeqCst),1);assert_eq!(ca.signals.load(Ordering::SeqCst),0);
+ r.manager.as_mut().unwrap().resources.records.push((4,0x400,[4,10]));
+ r.service_async_compute_completions().unwrap();assert_eq!(old.load(Ordering::SeqCst),0);
+ r.async_compute_queues[0].queue.compute.0=1;r.service_async_compute_completions().unwrap();
+ assert_eq!(old.load(Ordering::SeqCst),2);assert_eq!(current.load(Ordering::SeqCst),1);assert!(r.async_compute_queues[0].binding.is_some());assert_eq!(ca.signals.load(Ordering::SeqCst),1);
+ RECOVERY.with(|r|r.set((0,0)));
+}
+#[test]fn rebind_rejects_wrong_publication_recovery_epoch_and_active_recovery(){
+ for (publication,handshake) in [(Some((99,7)),(7,0)),(Some((4,7)),(8,0)),(Some((4,7)),(7,1)),(None,(7,0))] {
+  RECOVERY.with(|r|r.set(handshake));let current=Arc::new(AtomicUsize::new(0));let old=Arc::new(AtomicUsize::new(0));let(mut a,c)=q(4,0x400,&current);a.queue.compute.0=1;previous(&mut a,&old,publication);
+  let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(4,0x400,[2,8])])),async_compute_queues:vec![a],session_recovery_pending:false};
+  r.service_async_compute_completions().unwrap();assert_eq!(old.load(Ordering::SeqCst),0);assert_eq!(current.load(Ordering::SeqCst),0);assert!(r.async_compute_queues[0].quarantined);assert_eq!(c.error.load(Ordering::SeqCst),1);
+  r.async_compute_queues.clear();assert_eq!(old.load(Ordering::SeqCst),2);assert_eq!(current.load(Ordering::SeqCst),3);
+ }
+ RECOVERY.with(|r|r.set((0,0)));
+}
+#[test]fn zero_duration_rebind_keeps_both_bindings(){
+ let current=Arc::new(AtomicUsize::new(0));let old=Arc::new(AtomicUsize::new(0));let(mut a,_)=q(4,0x400,&current);a.queue.compute.0=1;previous(&mut a,&old,Some((4,0)));
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(4,0x400,[8,8])])),async_compute_queues:vec![a],session_recovery_pending:false};
+ r.service_async_compute_completions().unwrap();assert_eq!(old.load(Ordering::SeqCst),0);assert_eq!(current.load(Ordering::SeqCst),0);assert!(r.async_compute_queues[0].previous_binding.is_some());
+}
+#[test]fn released_unpublished_rebind_restores_old_binding(){
+ let current=Arc::new(AtomicUsize::new(0));let old=Arc::new(AtomicUsize::new(0));let(mut a,_)=q(4,0x400,&current);a.active=None;previous(&mut a,&old,None);
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![])),async_compute_queues:vec![a],session_recovery_pending:false};
+ r.release_async_compute_queue(4);assert_eq!(current.load(Ordering::SeqCst),3);assert_eq!(old.load(Ordering::SeqCst),0);assert!(r.async_compute_queues[0].previous_binding.is_none());assert!(r.async_compute_queues[0].owner.is_none());assert!(r.async_compute_queues[0].binding.is_some());
+}
+'''
 with tempfile.TemporaryDirectory() as d:
- f=Path(d)/'test.rs';f.write_text(source);exe=Path(d)/'test'
+ f=Path(d)/'test.rs';f.write_text(with_g17_config(source));exe=Path(d)/'test'
  subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True)
  subprocess.run([str(exe),'--test-threads=1'],check=True)
 print('PASS production async retirement: per-descriptor routing, final stamp, out-of-order completion, close during execution, timeout/invalid timestamp quarantine; no hardware claim')

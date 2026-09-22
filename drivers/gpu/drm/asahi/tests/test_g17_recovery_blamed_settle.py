@@ -2,10 +2,9 @@
 """A recovery-blamed settle must be explained, and must not be asked the wrong question.
 
 `retire_abandoned_render_if_firmware_retired` reaches its `true` through
-`!completion.retired || !state.job_list_empty || execution.observed()`, and
-`observed()` CONTAINS `job_list_empty`. The guard therefore demands
-`job_list_empty == true` and `observed() == false` simultaneously, which is
-satisfiable only when at least one timestamp is zero. It is a nop-retire
+`!completion.retired || !state.job_list_empty || execution.observed()`. The
+guard therefore separately demands an unlinked list and no exact timestamps,
+which is satisfiable only when at least one timestamp is zero. It is a nop-retire
 classifier -- it can only ever answer `true` for a group that did NOT execute.
 
 The recovery-blamed settle asks it anyway. A stamp-blamed recovery serviced with
@@ -61,12 +60,40 @@ assert "if timed_out {\n            self.manager" not in retire
 assert "|| (execution.observed() && !accept_executed)" in decide
 assert "!completion.retired" in decide          # cursors at the published target
 assert "|| !state.job_list_empty" in decide     # unlinked from the firmware list
-# only the recovery-blamed path may pass it, and only under the probe
+# The recovery relaxation remains disabled in the qualified configuration.
 assert "!timed_out" in retire
-assert "g17p_render_recovery_retire" in retire
+assert "crate::g17_config::RENDER_RECOVERY_RETIRE" in retire
+assert "const RENDER_RECOVERY_RETIRE: u32 = 0;" in (root / "g17_config.rs").read_text()
+
+# A delayed copy of an already-serviced recovery event from the other RTKit
+# role must be discarded before its numeric stamp/QID can be attributed to the
+# new owner that reused that slot.
+drain = item(live, "fn drain_primary_firmware_event_batch(")
+stale = item(drain, "if recovery.generation < accepted {")
+assert "continue;" in stale
+assert "batch.blamed_stamp" not in stale
+assert drain.index("if recovery.generation < accepted {") < drain.index(
+    "if recovery.stamp_index != -1 {"
+)
+
+
+def attribute(accepted, generation, stamp, owners):
+    if generation < accepted:
+        return None
+    if generation != accepted:
+        raise ValueError("future recovery generation")
+    return owners[stamp]
+
+
+owners = {17: "old-owner"}
+assert attribute(4, 4, 17, owners) == "old-owner"
+# The first role's callback completed recovery and the physical QID was reused.
+owners[17] = "new-owner"
+# The second role's delayed generation-4 callback cannot blame that new owner.
+assert attribute(5, 4, 17, owners) is None
 
 # --- the premise the whole argument rests on -----------------------------
-assert "job_list_empty" in observed
+assert "job_list_empty" not in observed
 assert "tiling_timestamps" in observed and "fragment_timestamps" in observed
 
 rust = r'''
@@ -75,8 +102,7 @@ struct Execution { job_list_empty: bool, tiling: [u64; 2], fragment: [u64; 2] }
 
 impl Execution {
     fn observed(self) -> bool {
-        self.job_list_empty
-            && self.tiling.iter().all(|v| *v != 0)
+        self.tiling.iter().all(|v| *v != 0)
             && self.fragment.iter().all(|v| *v != 0)
     }
 }
@@ -95,8 +121,7 @@ const STILL_LINKED: Execution =
 
 #[test]
 fn strict_mode_can_only_ever_accept_a_group_that_did_not_execute() {
-    // The proof: observed() contains job_list_empty, so the guard needs
-    // job_list_empty true AND observed() false at once.
+    // The guard independently requires list unlink and no exact execution.
     assert!(!retires(true, true, EXECUTED, false));
     assert!(retires(true, true, NOP_RETIRED, false));
 }

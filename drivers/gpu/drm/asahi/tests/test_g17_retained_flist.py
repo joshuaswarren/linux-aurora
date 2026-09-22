@@ -50,7 +50,9 @@ initdata_part = "\n".join([
     *[constant(initdata, n) for n in [
         "CONTROL_SHARED_ADDRESS", "CONTROL_OPERAND_TABLE_ADDRESS",
         "PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID", "CONTROL_SHARED_INNER_PRESENTED",
-        "CONTROL_RECORD_SIZE", "CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE"]],
+        "CONTROL_RECORD_SIZE", "CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE",
+        "CONTROL_RING_ENTRIES",
+        "CONTROL_RING_INDEX_MASK"]],
     block(initdata, r"^pub\(crate\) fn encode_bootstrap_uma_release_record\("),
     block(initdata, r"^fn put_u32\("), block(initdata, r"^fn put_u64\("),
     # Used solely by the actual staging method tests below.
@@ -64,11 +66,15 @@ lease_part = "\n".join([
     *[derive + block(manager, r"^(?:pub\(crate\) )?(?:struct|enum) " + n + r"\s*(?=\{)") for n in [
         "G17PBootstrapUmaCompletion", "G17PBootstrapUmaRelease", "G17PBootstrapUmaRequestState",
         "G17PBootstrapUmaLifecycleError", "G17PBootstrapUmaLifecycle"]],
+    block(manager, r"^fn g17p_control_ring_target_consumed\("),
     block(manager, r"^impl G17PBootstrapUmaLifecycle\s*"),
     *["#[test]\n" + block(manager, r"^    fn " + n + r"\(\)\s*") for n in [
         "bootstrap_async_flist_releases_only_after_type13_and_paired_render",
         "bootstrap_async_flist_rejects_raw_or_duplicate_type13_records",
-        "retained_flist_leases_grow_once_and_release_every_captured_generation"]],
+        "retained_flist_leases_grow_once_and_release_every_captured_generation",
+        "private_render_flist_owner_grows_once_then_reacquires_warm",
+        "private_render_flist_replacement_waits_for_exact_old_owner_retirement",
+        "private_render_flist_same_owner_overlap_keeps_identity_until_last_pair"]],
 ])
 pool_methods = "\n".join(block(resources, r"^    pub\(crate\) fn " + n + r"\(") for n in [
     "stage_render_flist_state", "render_flist_owned"])
@@ -171,12 +177,19 @@ with tempfile.TemporaryDirectory(prefix="g17-retained-flist-") as temp:
 
 # Production caller/ordering checks accompany, but do not replace, real methods.
 begin = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\(")
-assert begin.index("G17PBootstrapUmaLifecycle::acquire") < begin.index(".stage_render_flist_state()")
+assert "G17PBootstrapUmaLifecycle::acquire_owner" in begin
+assert ".stage_render_flist_state()" not in begin
+assert "storage.render_flist_id()" in begin
+assert "storage.render_flist_pointer()" in begin
+assert "storage.render_flist_operand_table()" in begin
+assert "storage.render_flist_cookie()" in begin
 assert "g17_submission::g17p_render_flist_generation(self.render_submission_ordinal)" in begin
 publish = block(manager, r"^    pub\(crate\) fn publish_render_usc_freelist_request\(")
 assert "self.bootstrap_uma.is_some()" not in publish
 assert "self.prepared_render_flist.ok_or(EIO)?" in publish
 assert publish.index("lifecycle.request.is_none()") < publish.index("encode_g17p_usc_freelist_control")
+for identity in ["lifecycle.shared_control", "lifecycle.operand_table", "lifecycle.cookie"]:
+    assert identity in publish
 alias = block(resources, r"^    pub\(crate\) fn install_user_vm_aliases\(")
 assert "with_bytes_mut" not in alias
 assert "stage_render_flist_state" not in alias

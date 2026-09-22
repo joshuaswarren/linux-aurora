@@ -8,6 +8,7 @@
 #include <net/ipv6.h>
 #include "mt7921.h"
 #include "mcu.h"
+#include "mt7932_mcu_lab.h"
 
 static int
 mt7921_init_he_caps(struct mt792x_phy *phy, enum nl80211_band band,
@@ -231,10 +232,31 @@ int __mt7921_start(struct mt792x_phy *phy)
 	err = mt76_connac_mcu_set_mac_enable(mphy->dev, 0, true, false);
 	if (err)
 		return err;
-
-	err = mt76_connac_mcu_set_channel_domain(mphy);
-	if (err)
-		return err;
+	/* J700 publishes typed domain/power/DBDC state once before network
+	 * registration.  Other chips retain the generic per-start domain update.
+	 */
+	if (!is_mt7932(mphy->dev)) {
+		err = mt76_connac_mcu_set_channel_domain(mphy);
+		if (err)
+			return err;
+	}
+	if (is_mt7932(mphy->dev)) {
+		/* Apple sends CID d7 once from wlanOnWhenProbeSuccess(), directly
+		 * after its one-shot domain command.  Repeating it on mac80211's
+		 * second start left CID d7 live at TX17 DIDX in Cycle 479.
+		 */
+		if (!phy->dev->mt7932_6g_scan_policy_enabled) {
+			err = mt7932_mcu_set_6g_scan(phy->dev, !mt7932_j700_us());
+			if (err)
+				return err;
+			phy->dev->mt7932_6g_scan_policy_enabled = true;
+		}
+		if (!phy->dev->mt7932_scan_fwlog_enabled) {
+			phy->dev->mt7932_scan_fwlog_enabled = true;
+			dev_info(mphy->dev->dev,
+				 "J700_MT7932_FW_LOG_MODE_INHERITED: cid=c5 source=exact-ordinal134 extra-command=0 interface=160-199-pending\n");
+		}
+	}
 
 	err = mt7921_mcu_set_chan_info(phy, MCU_EXT_CMD(SET_RX_PATH));
 	if (err)
@@ -318,6 +340,7 @@ mt7921_add_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 	mvif->bss_conf.vif = mvif;
 	mvif->bss_conf.mt76.band_idx = 0;
 	mvif->bss_conf.mt76.wmm_idx = mvif->bss_conf.mt76.idx % MT76_CONNAC_MAX_WMM_SETS;
+	idx = MT792x_WTBL_RESERVED - mvif->bss_conf.mt76.idx;
 
 	ret = mt76_connac_mcu_uni_add_dev(&dev->mphy, &vif->bss_conf,
 					  &mvif->bss_conf.mt76,
@@ -327,8 +350,6 @@ mt7921_add_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 
 	dev->mt76.vif_mask |= BIT_ULL(mvif->bss_conf.mt76.idx);
 	phy->omac_mask |= BIT_ULL(mvif->bss_conf.mt76.omac_idx);
-
-	idx = MT792x_WTBL_RESERVED - mvif->bss_conf.mt76.idx;
 
 	INIT_LIST_HEAD(&mvif->sta.deflink.wcid.poll_list);
 	mvif->sta.deflink.wcid.idx = idx;
@@ -356,6 +377,18 @@ out:
 	mt792x_mutex_release(dev);
 
 	return ret;
+}
+
+int mt7921_add_driver_internal_vif(struct mt792x_dev *dev,
+				    struct ieee80211_vif *vif)
+{
+	return mt7921_add_interface(mt76_hw(dev), vif);
+}
+
+void mt7921_remove_driver_internal_vif(struct mt792x_dev *dev,
+				       struct ieee80211_vif *vif)
+{
+	mt792x_remove_interface(mt76_hw(dev), vif);
 }
 
 static void mt7921_roc_iter(void *priv, u8 *mac,
@@ -1016,6 +1049,7 @@ void mt7921_scan_work(struct work_struct *work)
 	while (true) {
 		struct mt76_connac2_mcu_rxd *rxd;
 		struct sk_buff *skb;
+		int next = 0;
 
 		spin_lock_bh(&phy->dev->mt76.lock);
 		skb = __skb_dequeue(&phy->scan_event_list);
@@ -1027,6 +1061,40 @@ void mt7921_scan_work(struct work_struct *work)
 		rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
 		if (rxd->eid == MCU_EVENT_SCHED_SCAN_DONE) {
 			ieee80211_sched_scan_results(phy->mt76->hw);
+		} else if (is_mt7932(&phy->dev->mt76) &&
+			   rxd->eid == MCU_EVENT_SCAN_DONE) {
+			u8 event_seq = 0;
+			u8 active_seq = READ_ONCE(phy->mt76->scan_active_seq);
+
+			if (skb->len > offsetof(struct mt76_connac2_mcu_rxd, tlv))
+				event_seq = rxd->tlv[0];
+			if (skb->len <= offsetof(struct mt76_connac2_mcu_rxd, tlv) ||
+			    !active_seq || event_seq != active_seq) {
+				dev_info(phy->dev->mt76.dev,
+					 "J700_MT7932_SCAN_DONE_STALE: event_seq=%u active_seq=%u ignored=1\n",
+					 event_seq, active_seq);
+				dev_kfree_skb(skb);
+				continue;
+			}
+			mt792x_mutex_acquire(phy->dev);
+			next = mt76_connac_mcu_hw_scan_next(phy->mt76);
+			mt792x_mutex_release(phy->dev);
+			if (next > 0) {
+				dev_kfree_skb(skb);
+				continue;
+			}
+			WRITE_ONCE(phy->mt76->scan_active_seq, 0);
+			if (test_and_clear_bit(MT76_HW_SCANNING,
+					       &phy->mt76->state)) {
+				struct cfg80211_scan_info info = {
+					.aborted = next < 0,
+				};
+
+				if (!mt7932_mcu_lab_scan_done(phy->dev,
+							  info.aborted))
+					ieee80211_scan_completed(phy->mt76->hw,
+								&info);
+			}
 		} else if (test_and_clear_bit(MT76_HW_SCANNING,
 					      &phy->mt76->state)) {
 			struct cfg80211_scan_info info = {
@@ -1048,7 +1116,28 @@ mt7921_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	int err;
 
 	mt792x_mutex_acquire(dev);
+	/* Exact startup already emitted Apple's only pre-interface CID c5 at
+	 * ordinal 134. Never insert another c5 immediately before scan: the sealed
+	 * Apple 160..199 window has none.
+	 */
+	if (is_mt7932(&dev->mt76) && !dev->mt7932_scan_fwlog_enabled) {
+		dev->mt7932_scan_fwlog_enabled = true;
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_FW_LOG_MODE_INHERITED: cid=c5 source=exact-ordinal134 extra-command=0 fallback=scan\n");
+	}
+	/* Apple serializes the pre-scan interface command burst on its workloop.
+	 * Linux can reach hw_scan while an older MT7932 command still owns TX17;
+	 * in Cycle 477 that left CID3 queued behind DIDX 17 forever.  Drain only
+	 * descriptors whose hardware DDONE bit is visible, with a bounded wait,
+	 * before submitting the otherwise byte-identical scan request.
+	 */
+	if (is_mt7932(&dev->mt76)) {
+		err = mt7932_mcu_drain_tx17(dev, "scan-pre", false);
+		if (err)
+			goto out;
+	}
 	err = mt76_connac_mcu_hw_scan(mphy, vif, req);
+out:
 	mt792x_mutex_release(dev);
 
 	return err;

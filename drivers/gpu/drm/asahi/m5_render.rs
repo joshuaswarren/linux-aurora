@@ -234,7 +234,11 @@ pub(crate) fn build_ta_registers(
     p: &G17pRenderParameters,
     controls: &M5RenderControls,
 ) -> Result<[RegisterWrite; TA_REGISTER_COUNT], M5RenderBuildError> {
-    let common = g17_render::build_ta_registers(p)?;
+    // M5's captured register program addresses heap metadata directly.
+    // G17P's layered path now uses a separate layer table in these slots.
+    let mut common_parameters = *p;
+    common_parameters.layermeta = p.heapmeta;
+    let common = g17_render::build_ta_registers(&common_parameters)?;
     if controls.ta_dispatch_control & 1 != 0 {
         return Err(M5RenderBuildError::DispatchBitAlreadySet);
     }
@@ -288,7 +292,11 @@ pub(crate) fn build_fragment_registers(
     p: &G17pRenderParameters,
     controls: &M5RenderControls,
 ) -> Result<[RegisterWrite; FRAGMENT_REGISTER_COUNT], M5RenderBuildError> {
-    let common = g17_render::build_fragment_registers(p)?;
+    // M5's captured register program addresses heap metadata directly.
+    // G17P's layered path now uses a separate layer table in these slots.
+    let mut common_parameters = *p;
+    common_parameters.layermeta = p.heapmeta;
+    let common = g17_render::build_fragment_registers(&common_parameters)?;
     let geometry = tile_state(p, controls.fragment_tile_flags)?;
     let mut out = RegisterList::new();
     let mut dispatch_writes = 0;

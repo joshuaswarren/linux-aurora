@@ -48,21 +48,24 @@ properties:
     maxItems: 1
 
   power-domains:
-    # two domains for t8103, three for t6000
+    # two domains for t8103, three for t6000 and t8140
     minItems: 2
     items:
       - description: power domain for the NVMe controller.
       - description: power domain for the first PCIe bus connecting the NVMe
           controller to the storage modules.
-      - description: optional power domain for the second PCIe bus
-          connecting the NVMe controller to the storage modules.
+      - description: optional power domain for either the second PCIe bus
+          connecting the NVMe controller to the storage modules or the ANS
+          PCIe PHY.
 
   power-domain-names:
     minItems: 2
     items:
       - const: ans
       - const: apcie0
-      - const: apcie1
+      - enum:
+          - apcie1
+          - apcie_phy
 
   mboxes:
     maxItems: 1
@@ -86,6 +89,7 @@ allOf:
             enum:
               - apple,t6000-nvme-ans2
               - apple,t6020-nvme-ans2
+              - apple,t8140-nvme-ans2
     then:
       properties:
         power-domains:

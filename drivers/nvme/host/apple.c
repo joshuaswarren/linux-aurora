@@ -254,6 +254,18 @@ static inline struct apple_nvme *ctrl_to_apple_nvme(struct nvme_ctrl *ctrl)
 	return container_of(ctrl, struct apple_nvme, ctrl);
 }
 
+static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
+{
+	/* CPU_RUN and BOOT_STATUS survive an inactive firmware session. */
+	return anv->hw->needs_ioq_registers &&
+		(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+		 APPLE_ANS_COPROC_CPU_CONTROL_RUN) &&
+		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
+		 APPLE_ANS_BOOT_STATUS_OK &&
+		(readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE) &&
+		(readl(anv->mmio_nvme + NVME_REG_CSTS) & NVME_CSTS_RDY);
+}
+
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
 {
 	if (q->is_adminq)
@@ -1233,11 +1245,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	 * and EPMAP across boot stages. Adopt the first healthy inherited session;
 	 * subsequent resets use the normal RTKit shutdown/reset path below.
 	 */
-	if (!anv->owns_rtkit && anv->hw->needs_ioq_registers &&
-	    (readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
-	     APPLE_ANS_COPROC_CPU_CONTROL_RUN) &&
-	    readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
-	     APPLE_ANS_BOOT_STATUS_OK) {
+	if (!anv->owns_rtkit && apple_nvme_can_adopt_rtkit(anv)) {
 		ret = apple_rtkit_adopt_running(anv->rtk);
 		if (ret)
 			goto out;
@@ -1883,11 +1891,11 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	 * system endpoints before mailbox RX starts, otherwise inherited syslog
 	 * traffic can race the later reset work and be dropped as undiscovered.
 	 */
-	inherited_rtkit = anv->hw->needs_ioq_registers &&
-		(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
-		 APPLE_ANS_COPROC_CPU_CONTROL_RUN) &&
-		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
-		 APPLE_ANS_BOOT_STATUS_OK;
+	inherited_rtkit = apple_nvme_can_adopt_rtkit(anv);
+	if (anv->hw->needs_ioq_registers)
+		dev_info(dev, "post-M4 firmware handoff: CC=%#x CSTS=%#x adopt=%d\n",
+			 readl(anv->mmio_nvme + NVME_REG_CC),
+			 readl(anv->mmio_nvme + NVME_REG_CSTS), inherited_rtkit);
 	if (inherited_rtkit)
 		anv->rtk = devm_apple_rtkit_init_adopted(
 			dev, anv, NULL, 0, &apple_nvme_rtkit_ops);
@@ -1901,7 +1909,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	}
 
 	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops,
-			     NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS);
+			     NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
+			     NVME_QUIRK_ADMIN_PAGE_ALIGN);
 	if (ret) {
 		dev_err_probe(dev, ret, "Failed to initialize nvme_ctrl");
 		goto put_dev;
@@ -1964,6 +1973,15 @@ static void apple_nvme_remove(struct platform_device *pdev)
 	nvme_stop_ctrl(&anv->ctrl);
 	nvme_remove_namespaces(&anv->ctrl);
 	apple_nvme_disable(anv, true);
+	if (anv->ctrl.admin_q && !blk_queue_dying(anv->ctrl.admin_q)) {
+		/*
+		 * If the controller was reset during removal, it's possible
+		 * user requests may be waiting on a stopped queue. Start the
+		 * queue to flush these to completion.
+		 */
+		nvme_unquiesce_admin_queue(&anv->ctrl);
+		blk_mq_destroy_queue(anv->ctrl.admin_q);
+	}
 	nvme_uninit_ctrl(&anv->ctrl);
 
 	if (apple_rtkit_is_running(anv->rtk)) {

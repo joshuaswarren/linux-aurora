@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Retired client graphs keep firmware-high PM managers, not VM roots."""
+"""PM/support quarantine is immutable; ordinary reuse transfers a whole graph."""
 from pathlib import Path
-
 
 root = Path(__file__).resolve().parents[1]
 manager = (root / "g17_manager.rs").read_text()
@@ -18,56 +17,47 @@ def function(text, marker):
     return text[start:pos]
 
 
-take = function(resources, "    pub(crate) fn take_retired_parameter_management(")
-consume = function(resources, "    pub(crate) fn into_retired_parameter_management(")
-release = function(manager, "    fn release_retired_handoff_graph(")
-superseded = function(manager, "    fn release_superseded_render_graph(")
-quarantine = function(manager, "    fn quarantine_retired_parameter_management(")
-desync = function(manager, "    fn recycle_desynced_render_storage(")
-stop = function(manager, "    pub(crate) fn release_runtime_objects_after_processor_stop(")
+retired = resources[resources.index("pub(crate) struct G17PRetiredParameterManagement {"):]
+retired = retired[:retired.index("}\n")]
+for field in ("_backing: MappedObject", "_support: Option<MappedObject>", "hardware_buffer_id: u32"):
+    assert field in retired
 
-assert "self.parameter_management" in take and ".take()" in take
-assert take.index("drop(_page_list_low)") < take.index("_support: None")
-assert "_support: None" in take
-assert consume.index("_support: Some(support)") > consume.index("drop(_page_list_low)")
-assert release.index("take_retired_parameter_management()") < release.index(
-    "ids.unreserve(id)"
-)
-assert "quarantine_retired_parameter_management" in release
-assert superseded.index("into_retired_parameter_management()") < superseded.index(
-    "ids.unreserve(id)"
-)
-assert "quarantine_retired_parameter_management" in superseded
+# The rejected partial reset must not be reachable from either constructor.
+for source in (manager, resources):
+    assert "recycled_firmware_state" not in source
+    assert "G17PPreparedParameterManagement" not in source
+begin = function(manager, "pub(crate) fn begin_translated_render(")
+assert "retired_parameter_managers" not in begin
+
+consume = function(resources, "pub(crate) fn into_retired_parameter_management(")
+assert "_backing: backing" in consume
+assert "_support: Some(support)" in consume
+assert "hardware_buffer_id: manager.hardware_buffer_id" in consume
+for marker in ("fn release_retired_handoff_graph(", "fn release_superseded_render_graph("):
+    release = function(manager, marker)
+    assert "into_retired_parameter_management()" in release
+    assert release.index("if !retained_firmware_state") < release.index("ids.unreserve(id)")
+
+quarantine = function(manager, "fn quarantine_retired_parameter_management(")
 assert "retired_parameter_managers.push_within_capacity(manager)" in quarantine
 assert "core::mem::forget(error.0)" in quarantine
-assert desync.index("take_retired_parameter_management") < desync.index(
-    "self.render_storage = None"
+
+stop = function(manager, "pub(crate) fn release_runtime_objects_after_processor_stop(")
+assert stop.index("unreserve(manager.hardware_buffer_id())") < stop.index(
+    "self.retired_parameter_managers.clear()"
 )
-assert "self.retired_parameter_managers.clear()" in stop
 
+# Real cache-selection and injected-failure behavior are compiled directly from
+# the driver by the adjacent cache_selection and rebind_failure tests.
+rebind = function(manager, "fn reactivate_recycled_render_graph(")
+for forbidden in ("into_retired_parameter_management", "new_user_render_storage", ".fill(0)"):
+    assert forbidden not in rebind
+assert "self.render_storage = Some(cached.storage)" in rebind
+assert "push_within_capacity(cached)" in rebind
+assert rebind.index("push_within_capacity(cached)") < rebind.index("return Err(error)")
+aliases = function(resources, "pub(crate) fn rebind_client_vm_aliases(")
+assert ".fill(0)" not in aliases
+assert "self.support =" not in aliases
+assert "self.parameter_management =" not in aliases
 
-class Graph:
-    def __init__(self, context, pm):
-        self.context = context
-        self.pm = pm
-        self.vm_aliases = True
-
-
-quarantine = []
-free_contexts = [1, 60, 61, 62]
-for generation in range(127):
-    context = free_contexts.pop(0)
-    graph = Graph(context, f"pm-{generation}")
-    # Paired completion + queue drain authorizes the client mapping/root drop,
-    # but the firmware's background PB walk can still name the high PM object.
-    graph.vm_aliases = False
-    quarantine.append(graph.pm)
-    free_contexts.append(context)
-    assert len(free_contexts) == 4
-    assert quarantine[generation] == f"pm-{generation}"
-
-# Processor stop is the first global firmware-reference drain.
-quarantine.clear()
-assert not quarantine
-
-print("PASS retired PM lifetime: 127 queue graphs recycle all four VM roots while high PM backings survive until processor stop")
+print("PASS immutable PM quarantine, reserved hardware IDs, and whole-graph reuse boundaries")

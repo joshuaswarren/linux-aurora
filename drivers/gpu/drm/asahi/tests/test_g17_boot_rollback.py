@@ -51,12 +51,15 @@ for marker, minimum_rollbacks in (
 ):
     body = item(live, marker)
     assert "start_staged_in_place" in body
-    assert body.count("rollback_starting_session") >= minimum_rollbacks
+    assert (
+        body.count("rollback_starting_session")
+        + body.count("rollback_boxed_starting_session")
+    ) >= minimum_rollbacks
 
 # Initial boot has no persistent outer runtime to retain its manager, while a
 # failed rebuild records the same condition for final teardown.
 initial = item(live, "fn boot_initial_session(")
-assert "if !rollback_starting_session(pdev, session)" in initial
+assert "if !rollback_boxed_starting_session(pdev, session)" in initial
 assert "core::mem::forget(manager);" in initial
 assert "&mut stop_unproven" in rebuild
 assert "self.boot_stop_unproven = true;" in rebuild

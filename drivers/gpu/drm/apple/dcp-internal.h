@@ -90,8 +90,6 @@ struct dcp_channel {
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
-	/* Already warned about busy channel */
-	bool warned_busy;
 };
 
 struct dcp_fb_reference {
@@ -242,6 +240,11 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
+	/* Atomic flushes waiting for the single-flight command channel. */
+	struct list_head pending_flushes;
+	/* Serializes the queue with command-channel dispatch. */
+	struct mutex pending_flush_lock;
+
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
@@ -282,7 +285,7 @@ struct apple_dcp {
 	unsigned notch_height;
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
-	struct work_struct vblank_wq;
+	struct delayed_work vblank_wq;
 
 	/* Names a command the firmware has stopped answering */
 	struct delayed_work stall_wq;
@@ -308,7 +311,7 @@ struct apple_dcp {
 	struct work_struct bl_register_wq;
 	struct mutex bl_register_mutex;
 	/* Workqueue for updating the brightness */
-	struct work_struct bl_update_wq;
+	struct delayed_work bl_update_wq;
 
 	/* integrated panel if present */
 	struct dcp_panel panel;

@@ -1126,6 +1126,7 @@ int mt792x_load_firmware(struct mt792x_dev *dev)
 {
 	int ret;
 	bool mt7932 = is_mt7932(&dev->mt76);
+	u32 top_hvr = 0, top_fvr = 0;
 	u8 otp[64] = {};
 	u8 otp_mode = 0, otp_format = 0;
 	int i;
@@ -1148,6 +1149,23 @@ int mt792x_load_firmware(struct mt792x_dev *dev)
 				ret);
 			return ret;
 		}
+
+		/* AppleSunriseWLAN's wlanSetChipEcoInfo() performs these two
+		 * acknowledged INIT_CMD_ID_ACCESS_REG reads after WFDMA/share-info
+		 * setup and before wlanDownloadFW().  Run 191 records both TX17
+		 * submissions; Linux previously started at the patch semaphore.
+		 */
+		ret = mt76_connac_mcu_read_init_reg(&dev->mt76, 0x70010204,
+						  &top_hvr);
+		if (ret)
+			return ret;
+		ret = mt76_connac_mcu_read_init_reg(&dev->mt76, 0x88000004,
+						  &top_fvr);
+		if (ret)
+			return ret;
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_CHIP_ECO_TRANSCRIPT_PASS: hvr=0x%08x fvr=0x%08x\n",
+			 top_hvr, top_fvr);
 	}
 
 	if (mt7932)

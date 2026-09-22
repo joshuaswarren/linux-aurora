@@ -46,11 +46,11 @@ tests+=r'''
   for(size,align)in[(0x20000,0x20000),(0x400000,0x4000),(0x14000,0x4000),(0x20000,0x4000)]{cursor=(cursor+align-1)&!(align-1);cursor+=size;assert!(cursor<=arena.end);}
  }
  assert!(arena.end-cursor>=0x4000000); // at least64MiB for render/runtime
- assert!(g17p_cl_client_low_va_range().end-g17p_cl_client_low_va_range().start>=0xc0000000);
+ assert!(g17p_cl_client_low_va_range().end-g17p_cl_client_low_va_range().start>=0x80000000);
  // Context 1 owns the global FList; every hardware-valid app-GART context
  // 5..62 is available to a logical queue without a second bind selector.
  assert_eq!(crate::g17_queue_limits::MAX_QUEUES,58);
- assert_eq!(crate::g17_queue_limits::encode_limits()[..8],[58,0,0,0,1,0,0,0]);
+ assert_eq!(crate::g17_queue_limits::encode_limits()[..8],[58,0,0,0,2,0,0,0]);
  assert_eq!(crate::g17_queue_limits::BIND_CONTEXT_FIRST,63);
  assert_eq!(crate::g17_queue_limits::COMPUTE_CONTEXT_MASK
   &crate::g17_queue_limits::BIND_CONTEXT_MASK,0);

@@ -23,7 +23,8 @@ def function(source, marker):
 
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
 preserve = function(manager, "fn preserve_immediate_retired_render_graph(")
-assert handoff.index("self.require_retired_render_owner()?") < handoff.index("G17PRetiredRenderGraph {")
+assert handoff.index("self.require_retired_render_owner()") < handoff.index("G17PRetiredRenderGraph {")
+assert '"handoff-require-retired-owner"' in handoff
 assert "self.render_bind.take().ok_or(EIO)?" in handoff
 assert "self.render_context_aliases.take()" in handoff
 assert "self.render_storage.take().ok_or(ENODEV)?" in handoff
@@ -43,7 +44,10 @@ assert retired_graph.index("context_aliases: Option<mmu::T8140NativeContextAlias
     "storage: g17_resources::G17PUserRenderStorage"
 )
 release_retired = function(manager, "fn release_retired_handoff_graph(")
-assert release_retired.index("ids.unreserve(id)") < release_retired.index("drop(retired)")
+assert "storage.into_retired_parameter_management()" in release_retired
+assert release_retired.index("if !retained_firmware_state") < release_retired.index(
+    "ids.unreserve(id)"
+)
 
 retired = function(manager, "fn require_retired_render_owner(")
 assert "snapshot.job_list_empty" in retired
@@ -59,13 +63,15 @@ for owner in (
     "render_submission_ordinal", "render_auxiliary_timestamp",
     "render_hardware_buffer_id", "render_hardware_buffer_published", "render_sksm",
 ):
-    assert owner in take
-    assert owner in install
+    assert owner in function(manager, "fn swap_active_render_slot_state(")
 
 select = function(manager, "pub(crate) fn select_render_slot(")
 assert "G17PRenderQueuePair::SLOT_COUNT" in select
 assert "self.parked_render_slots[current_slot] = Some(current)" in select
-assert ".unwrap_or_default()" in select
+assert "G17PRenderSlotState::new()?" in select
+assert select.index("G17PRenderSlotState::new()?") < select.index("take_active_render_slot_state()")
+assert "self.swap_active_render_slot_state(&mut state)" in take
+assert "self.render_slot_scratch = Some(state)" in install
 
 # The manager contains the active render owner and two complete parked state
 # images. It must be initialized directly in its KBox: building `Self` by
@@ -84,21 +90,35 @@ assert "g17p_render_queue_id(" not in outer
 late_tiling = function(resources, "fn build_g17p_late_tiling_bytes(")
 assert "queue_pair.tiling" in late_tiling
 assert "queue_pair.fragment" in late_tiling
-assert "queue_pair.qos_hardware_buffer_id()" in late_tiling
+assert "hardware_buffer_id," in late_tiling
+assert "queue_pair.qos_hardware_buffer_id()" not in late_tiling
 assert "g17p_render_queue_id(" not in late_tiling
 
 stage_fragment = function(resources, "pub(crate) fn stage_fragment(")
-assert "self.queue_pair.qos_hardware_buffer_id()" in stage_fragment
+assert "self.qos_hardware_buffer_id()?" in stage_fragment
+optional_addresses = function(resources, "fn optional_addresses(")
+assert "self.ta_hardware_buffer_id," in optional_addresses
+assert "addresses.channel_control = control.gpu_va()" in optional_addresses
 new_sksm = function(manager, "fn new_render_sksm_queues(")
-assert "pair.qos_hardware_buffer_id()" in new_sksm
+assert "_ => hardware_buffer_id" in new_sksm
+assert "pair.qos_hardware_buffer_id()" not in new_sksm
 assert "G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID" not in new_sksm
+
+stage_sksm = function(manager, "fn stage_render_groups_with_sksm(")
+assert "qos_hardware_buffer_id" in stage_sksm
+assert "retained_hardware_buffer_id" not in stage_sksm
+assert stage_sksm.count("producer.qos.queue_byte_32 = hardware_buffer_id") == 2
 
 submit = function(runtime, "pub(crate) fn submit_translated_render(")
 assert "select_render_slot(render_slot)?" in submit
+settle_at = submit.index("self.settle_open_recovery_before_publication()?")
+restore_at = submit.index("select_render_slot(render_slot)?", settle_at)
+handoff_at = submit.index(".handoff_retained_render_vm(", settle_at)
+assert settle_at < restore_at < handoff_at
 assert "if defer_completion" in submit
-watch = function(drm, "impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend")
-assert watch.count("packet.render_slot()") >= 2
-assert watch.count("timeout_deferred_render(") == 2
+watch = function(drm, "impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend")
+assert watch.count("packet.completion().render_slot()") >= 2
+assert watch.count("timeout_deferred_render(") == 3
 assert "quarantine_render_slot(" not in watch
 assert "poll_deferred_render_completion" not in watch
 # Ordinary completion is event-driven with the runtime mutex released. Only

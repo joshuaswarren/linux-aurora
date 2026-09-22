@@ -227,8 +227,7 @@ static void dcp_delayed_vblank(struct work_struct *work)
 {
 	struct apple_dcp *dcp;
 
-	dcp = container_of(work, struct apple_dcp, vblank_wq);
-	mdelay(5);
+	dcp = container_of(to_delayed_work(work), struct apple_dcp, vblank_wq);
 	dcp_drm_crtc_vblank(dcp->crtc);
 }
 
@@ -872,7 +871,8 @@ static void dcp_work_update_backlight(struct work_struct *work)
 {
 	struct apple_dcp *dcp;
 
-	dcp = container_of(work, struct apple_dcp, bl_update_wq);
+	dcp = container_of(to_delayed_work(work), struct apple_dcp,
+			   bl_update_wq);
 
 	dcp_backlight_update(dcp);
 }
@@ -1323,6 +1323,29 @@ static int dcp_asc_restart(struct apple_dcp *dcp)
 
 
 
+static int dcp_restart_inherited_session(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return apple_rtkit_quiesce(dcp->rtk);
+
+	/*
+	 * J700's inherited DCP rejects AP QUIESCED. The dcp-neo m1n1
+	 * bring-up established IOP OFF and its exact state-zero ACK instead
+	 * (4a927cdcae729f1b12b2173117e7f96b3271dca9). OFF is not a normal
+	 * sleep state: stop and restart the ASC before negotiating a new
+	 * RTKit session. Never reset a session whose OFF request timed out.
+	 */
+	ret = apple_rtkit_poweroff_adopted(dcp->rtk);
+	if (ret)
+		return dev_err_probe(dcp->dev, ret,
+				     "Inherited DCP IOP OFF not acknowledged\n");
+
+	dev_info(dcp->dev, "inherited DCP acknowledged IOP OFF\n");
+	return dcp_asc_restart(dcp);
+}
+
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -1438,7 +1461,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 		INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
 		mutex_init(&dcp->bl_register_mutex);
-		INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
+		INIT_DELAYED_WORK(&dcp->bl_update_wq,
+				  dcp_work_update_backlight);
 	} else if (of_property_match_string(dev->of_node, "apple,connector-type", "HDMI-A") >= 0)
 		dcp->connector_type = DRM_MODE_CONNECTOR_HDMIA;
 	else if (of_property_match_string(dev->of_node, "apple,connector-type", "DP") >= 0)
@@ -1472,8 +1496,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
 	set_bit(0, dcp->memdesc_map);
 
-	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_DELAYED_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->stall_wq, dcp_stall_check);
+	INIT_LIST_HEAD(&dcp->pending_flushes);
+	mutex_init(&dcp->pending_flush_lock);
 	spin_lock_init(&dcp->callback_trace_lock);
 	dcp->callback_trace_count = 0;
 
@@ -1498,7 +1524,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					     "Failed to adopt RTKit\n");
 		}
 
-		ret = apple_rtkit_quiesce(dcp->rtk);
+		ret = dcp_restart_inherited_session(dcp);
 		dcp->adopting_session = false;
 		if (ret)
 			return dev_err_probe(dev, ret,
@@ -1568,8 +1594,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					     "Failed to adopt running RTKit\n");
 		}
 
-		ret = apple_rtkit_quiesce(dcp->rtk);
+		ret = dcp_restart_inherited_session(dcp);
 		dcp->adopting_session = false;
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_H17P)
+			return ret;
 		if (!ret)
 			ret = apple_rtkit_wake(dcp->rtk);
 
@@ -1648,6 +1676,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		dcp->dcpavservep = NULL;
 	}
 
+	dcp_flush_shutdown(dcp);
+
 	if (dcp->shmem)
 		iomfb_shutdown(dcp);
 
@@ -1659,9 +1689,9 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		cancel_work_sync(&dcp->bl_register_wq);
-		cancel_work_sync(&dcp->bl_update_wq);
+		cancel_delayed_work_sync(&dcp->bl_update_wq);
 	}
-	cancel_work_sync(&dcp->vblank_wq);
+	cancel_delayed_work_sync(&dcp->vblank_wq);
 
 	/* The component framework releases the bind's devres group after
 	 * unbind, including optional clocks whose managed value can be NULL.
