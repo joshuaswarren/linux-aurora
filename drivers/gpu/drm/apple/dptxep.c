@@ -134,7 +134,12 @@ int dptxport_request_display(struct apple_epic_service *service)
 
 int dptxport_release_display(struct apple_epic_service *service)
 {
-	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
+	/*
+	 * Native RemotePortProxy::displayRelease uses service group 8 (command
+	 * 7), unlike the older Linux group 0.  Matched to the J713 25G83
+	 * capture; displayRequest stays group 0.
+	 */
+	return afk_service_call(service, 8, 7, NULL, 0, 16, NULL, 0, 16);
 }
 
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
@@ -596,6 +601,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
+	struct apple_dcp *dcp = service->ep->dcp;
+	s64 port;
 
 	/*
 	 * Both mismatches used to return silently, and the only symptom was
@@ -603,37 +610,53 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 	 * enabled.  Say which string did not match.
 	 */
 	if (strcmp(name, "dcpdptx-port-epic")) {
-		dev_warn(service->ep->dcp->dev,
+		dev_warn(dcp->dev,
 			 "DPTXPort: ignoring service named '%s', expected 'dcpdptx-port-epic'\n",
 			 name);
 		return;
 	}
 	if (strcmp(class, "AppleDCPDPTXRemotePort")) {
-		dev_warn(service->ep->dcp->dev,
+		dev_warn(dcp->dev,
 			 "DPTXPort: service '%s' has class '%s', expected 'AppleDCPDPTXRemotePort'\n",
 			 name, class);
 		return;
 	}
 
-	trace_dptxport_init(service->ep->dcp, unit);
+	trace_dptxport_init(dcp, unit);
 
-	switch (unit) {
+	/*
+	 * On H17P the announced "unit" is the dynamic EPIC interface id, not a
+	 * zero-based port index (the two 0x24 controllers announce as 1 and 3).
+	 * The connect path only ever uses dptxport[0..num_dptx_ports); on this
+	 * single-port controller map the sole RemotePort to index 0 so a
+	 * nonzero interface id does not make it miss dptxport[0].  Classic
+	 * firmware keeps its 0/1 unit semantics.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.num_dptx_ports == 1)
+		port = 0;
+	else
+		port = unit;
+
+	switch (port) {
 	case 0:
 	case 1:
-		if (service->ep->dcp->dptxport[unit].enabled) {
-			dev_err(service->ep->dcp->dev,
-				"DPTXPort: unit %lld already exists\n", unit);
+		if (dcp->dptxport[port].enabled) {
+			dev_err(dcp->dev,
+				"DPTXPort: unit %lld (port %lld) already exists\n",
+				unit, port);
 			return;
 		}
-		service->ep->dcp->dptxport[unit].unit = unit;
-		service->ep->dcp->dptxport[unit].service = service;
-		service->ep->dcp->dptxport[unit].enabled = true;
-		service->cookie = (void *)&service->ep->dcp->dptxport[unit];
-		complete(&service->ep->dcp->dptxport[unit].enable_completion);
+		dcp->dptxport[port].unit = port;
+		dcp->dptxport[port].service = service;
+		dcp->dptxport[port].enabled = true;
+		service->cookie = (void *)&dcp->dptxport[port];
+		complete(&dcp->dptxport[port].enable_completion);
+		dev_info(dcp->dev,
+			 "DPTXPort: enabled port %lld from announced unit %lld\n",
+			 port, unit);
 		break;
 	default:
-		dev_err(service->ep->dcp->dev, "DPTXPort: invalid unit %lld\n",
-			unit);
+		dev_err(dcp->dev, "DPTXPort: invalid unit %lld\n", unit);
 	}
 }
 
@@ -648,22 +671,85 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 static void dp_control_init(struct apple_epic_service *service,
 			    const char *name, const char *class, s64 unit)
 {
-	dev_info(service->ep->dcp->dev,
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	dev_info(dcp->dev,
 		 "J700_DP_CONTROL: ep:%02x service '%s' class '%s' unit %lld\n",
 		 service->ep->endpoint, name, class, unit);
+
+	/*
+	 * Keep them apart by EPIC name: both announce as AppleDCPDPTXController,
+	 * on units 1 ("dcpav-controller-epic") and 3 ("dcpdp-controller-epic").
+	 * Do not call into them from here -- this runs on the AFK work queue
+	 * that would have to deliver the reply.
+	 */
+	if (!strcmp(name, "dcpav-controller-epic"))
+		dcp->dptxctl_av = service;
+	else if (!strcmp(name, "dcpdp-controller-epic"))
+		dcp->dptxctl_dp = service;
 }
 
-static const struct apple_epic_service_ops dptx_control_ops[] = {
-	{ .name = "dcpav-controller-epic", .init = dp_control_init },
-	{ .name = "dcpdp-controller-epic", .init = dp_control_init },
-	{ .name = "DCPAVController", .init = dp_control_init },
-	{ .name = "DCPDPController", .init = dp_control_init },
-	{}
-};
+/*
+ * Command numbers on the controller service, from m1n1's
+ * DCPAVControllerService (proxyclient/m1n1/fw/dcp/dcpav.py): group 8, with
+ * setPower=0x8, getPower=0x9, wakeDisplay=0xa, sleepDisplay=0xb,
+ * forceHotPlugDetect=0xc, setVirtualDeviceMode=0xd.  The payload shape is the
+ * same <16xI12x> that dcpdptx_hotplug_cmd already describes.
+ */
+#define DPTXCTL_SET_POWER		0x8
+#define DPTXCTL_WAKE_DISPLAY		0xa
+#define DPTXCTL_FORCE_HPD		0xc
 
-static const struct apple_epic_service_ops dpavdev_ops[] = {
-	{ .name = "dcpav-device-epic", .init = dp_control_init },
-	{ .name = "DCPAVDevice", .init = dp_control_init },
+static int dptxctl_call(struct apple_dcp *dcp, struct apple_epic_service *svc,
+			const char *what, u32 command, u32 arg)
+{
+	struct dcpdptx_hotplug_cmd cmd, resp;
+	int ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.unk = cpu_to_le32(arg);
+
+	ret = afk_service_call(svc, 8, command, &cmd, sizeof(cmd), 12, &resp,
+			       sizeof(resp), 12);
+	dev_info(dcp->dev, "J700_DPTXCTL: %s(cmd=%#x arg=%u) -> %d resp=%#x\n",
+		 what, command, arg, ret, le32_to_cpu(resp.unk));
+	return ret;
+}
+
+/*
+ * Nudge the DisplayPort controller after IOMFB is up.  Binding the controller
+ * services is not on its own enough to make the firmware publish
+ * "dcpdptx-port-epic" on 0x2a: it powers the external pipe straight back down
+ * ("HPD not present, skipping mode export" -> "IOMFB: power on -> off").  Ask
+ * it to power up and re-run hotplug detection.
+ */
+void dptx_control_kick(struct apple_dcp *dcp)
+{
+	if (dcp->dptxctl_av) {
+		dptxctl_call(dcp, dcp->dptxctl_av, "av.setPower",
+			     DPTXCTL_SET_POWER, 1);
+		dptxctl_call(dcp, dcp->dptxctl_av, "av.wakeDisplay",
+			     DPTXCTL_WAKE_DISPLAY, 0);
+		dptxctl_call(dcp, dcp->dptxctl_av, "av.forceHotPlugDetect",
+			     DPTXCTL_FORCE_HPD, 0);
+	} else {
+		dev_info(dcp->dev, "J700_DPTXCTL: no dcpav controller bound\n");
+	}
+
+	if (dcp->dptxctl_dp)
+		dptxctl_call(dcp, dcp->dptxctl_dp, "dp.setPower",
+			     DPTXCTL_SET_POWER, 1);
+	else
+		dev_info(dcp->dev, "J700_DPTXCTL: no dcpdp controller bound\n");
+}
+
+/*
+ * Matching is by EPICProviderClass, not by the EPIC service name.  On J700
+ * endpoint 0x24 announces two services, both of class "AppleDCPDPTXController",
+ * on channels 1 and 3.
+ */
+static const struct apple_epic_service_ops dptx_control_ops[] = {
+	{ .name = "AppleDCPDPTXController", .init = dp_control_init },
 	{}
 };
 
@@ -684,17 +770,6 @@ int dptx_control_init(struct apple_dcp *dcp)
 	ret = afk_start(dcp->dptxcontrolep);
 	if (ret) {
 		dev_warn(dcp->dev, "Failed to start DPTX control endpoint: %d\n",
-			 ret);
-		return ret;
-	}
-
-	dcp->dpavdevep = afk_init(dcp, DPAVDEV_ENDPOINT, dpavdev_ops);
-	if (IS_ERR(dcp->dpavdevep))
-		return PTR_ERR(dcp->dpavdevep);
-
-	ret = afk_start(dcp->dpavdevep);
-	if (ret) {
-		dev_warn(dcp->dev, "Failed to start DPAV device endpoint: %d\n",
 			 ret);
 		return ret;
 	}

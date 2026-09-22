@@ -48,6 +48,14 @@ struct apple_epic_service {
 	bool enabled;
 	bool torndown;
 
+	/*
+	 * H17P/AFKEP-V2 only: a service must be explicitly OPENed before the
+	 * firmware accepts commands on it, and every V2 packet carries a
+	 * per-service sequence byte.  Unused on the classic (V1) path.
+	 */
+	bool opened;
+	u8 seq;
+
 	void *cookie;
 
     struct {
@@ -167,6 +175,42 @@ enum epic_subtype {
 	EPIC_SUBTYPE_TEARDOWN = 0x32,
 	EPIC_SUBTYPE_STD_SERVICE = 0xc0,
 };
+
+/*
+ * H17P / AFKEP-V2 command transport.
+ *
+ * The publication and report *decode* is already shared with the classic
+ * path: struct epic_sub_hdr_h17p above is, byte for byte, the V2 common
+ * header (interface id at +2, type at +16, category at +17, report flags at
+ * +18).  What the classic path cannot do is the command/response exchange,
+ * which uses a different envelope and inline (non-DMA) payloads.  A V2 packet
+ * on the wire is:
+ *
+ *   [0]      sequence byte (per service)
+ *   [2..3]   interface id (LE16)            == apple_epic_service.channel
+ *   [4..7]   following length (LE32)        == total bytes - 8
+ *   [8..15]  identifier (LE64, 0 for AP-originated commands)
+ *   [16]     type   (0x11 publish, 0x12 open, 0x13 close, 0xc0 command)
+ *   [17]     category (0 report, 1 command, 2 response)
+ *   [18]     report flag (open/close reports set 1)
+ *   [24]     command flags (bit0 = out-of-band buffers; we only do inline)
+ *   [25]     tag (matches a response to its command)
+ *   [28..31] capacity (command) or status (response), LE32
+ *   [32..95] struct epic_service_call (group@2, command@4, data_len@8, magic@12)
+ *   [96..]   inline service payload
+ */
+#define EPIC_V2_TYPE_PUBLISH		0x11
+#define EPIC_V2_TYPE_OPEN		0x12
+#define EPIC_V2_TYPE_CLOSE		0x13
+#define EPIC_V2_TYPE_COMMAND		0xc0
+#define EPIC_V2_CAT_REPORT		0
+#define EPIC_V2_CAT_COMMAND		1
+#define EPIC_V2_CAT_RESPONSE		2
+#define EPIC_V2_STATUS_UNSUPPORTED	0xe00002c7	/* kIOReturnUnsupported */
+#define EPIC_V2_REPORT_HDR		24	/* transport(8) + common(16) */
+#define EPIC_V2_HDR			32	/* + command/response(8) */
+#define EPIC_V2_CALL			64	/* struct epic_service_call */
+#define EPIC_V2_BODY			(EPIC_V2_HDR + EPIC_V2_CALL) /* = 96 */
 
 struct afk_ringbuffer {
 	bool ready;

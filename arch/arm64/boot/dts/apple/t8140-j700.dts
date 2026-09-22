@@ -1215,6 +1215,15 @@
 	phys = <&atcphy0 PHY_TYPE_DP>;
 	phy-names = "dp-phy";
 
+	/*
+	 * No "mux-index" on purpose: that property makes dcp_probe()
+	 * select the crossbar and force the ATC PHY to DP-only at probe,
+	 * which is wrong for a real Type-C port.  The select happens on the
+	 * DP-Alt event instead, in dcp_typec_mux_set().
+	 */
+	mux-controls = <&dpxbar0 0>;
+	mux-control-names = "dp-xbar";
+
 
 	/*
 	 * The J700 has no HDMI socket: this DCP's only output is the DP-Alt
