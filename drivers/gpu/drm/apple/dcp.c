@@ -385,6 +385,12 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		else
 			goto unbacked;
 		return;
+	case DPTX_CONTROL_ENDPOINT:
+		if (dcp->dptxcontrolep)
+			afk_receive_message(dcp->dptxcontrolep, message);
+		else
+			goto unbacked;
+		return;
 	default:
 		goto unbacked;
 	}
@@ -800,6 +806,21 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
  * one does not: the J700 has one external DCP, one ATC PHY and exactly one
  * DP-capable connector.
  */
+/*
+ * Which display crossbar input feeds the ATC0 DisplayPort output.
+ *
+ * From the J700 ADT, display-crossbar0:
+ *   dp-switch-ufp-endpoint = 1   (dispext1)
+ *   dp-switch-ufp-port     = 0
+ *   dp-switch-dfp-endpoint = 0   (atc0)
+ * and the crossbar selector is (ufp_endpoint << 1) | (ufp_port & 1) = 2.
+ *
+ * Selector 0 is NOT "the first input" -- it is the idle/disconnected value,
+ * which is why routing 0 looked like it worked (the mux logged a state
+ * change) while connecting the DCP's real DP stream to nothing at all.
+ */
+#define DCP_DPXBAR_SELECTOR 2
+
 static int dcp_typec_mux_set(struct typec_mux_dev *mux,
 			     struct typec_mux_state *state)
 {
@@ -810,10 +831,60 @@ static int dcp_typec_mux_set(struct typec_mux_dev *mux,
 		 state->mode, state->alt ? state->alt->svid : 0,
 		 is_dp ? "connect" : "disconnect");
 
-	if (is_dp)
-		return dcp_dptx_connect_oob(to_platform_device(dcp->dev), 0);
+	/*
+	 * Deliberately do NOT deselect the crossbar here.  The Type-C mux
+	 * delivers idle/registration events with mode=0 svid=0 right after
+	 * probe, and treating those as "unplugged" tore the route down again
+	 * immediately -- the probe-time select lasted microseconds.  This
+	 * machine has one external DCP and one DP-capable connector, so the
+	 * dispext0 -> DP route is static; leaving it up costs nothing and
+	 * keeps the firmware's view of the core stable across unplugs.
+	 */
+	if (!is_dp)
+		return dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 
-	return dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+	/*
+	 * Route dispext0 onto the ATC0 DP lanes.  Until this happens the DCP's
+	 * detection on the external core never leaves "noconnect", so the
+	 * firmware never creates an AppleDCPDPTXVirtualPort, never starts
+	 * AppleDCPDPTXRemotePort, and never announces "dcpdptx-port-epic".
+	 */
+	if (!IS_ERR_OR_NULL(dcp->xbar) && !dcp->xbar_selected) {
+		int xret = mux_control_select(dcp->xbar, DCP_DPXBAR_SELECTOR);
+
+		if (xret)
+			dev_warn(dcp->dev, "J700_DPXBAR: select failed: %d\n",
+				 xret);
+		else {
+			dcp->xbar_selected = true;
+			dev_info(dcp->dev, "J700_DPXBAR: selected dispext0 -> DP\n");
+		}
+	}
+
+	/*
+	 * The firmware only creates the AppleDCPDPTXRemotePort object -- and so
+	 * only announces "dcpdptx-port-epic" on 0x2a -- once its DisplayPort
+	 * controller has powered the rails and seen a device arrive.  Its own
+	 * log says so: "No device added after powering on the rails. HPD=%d",
+	 * then "HPD not present, skipping mode export" and a power-down.
+	 *
+	 * Driving the controller at DCP start cannot work on this machine: the
+	 * rear connector carries the debug cable at boot, so there is no sink
+	 * to find.  A DP-Alt event is the first moment a sink actually exists,
+	 * so kick the controller here and give the port a chance to appear
+	 * before asking for the connection.
+	 */
+	if (!IS_ERR_OR_NULL(dcp->dptxcontrolep) && !dcp->dptxport[0].enabled) {
+		dptx_control_kick(dcp);
+
+		if (dptxep_wait_ports(dcp))
+			dev_warn(dcp->dev,
+				 "DPTX port still absent after the hotplug kick; the connect below will fail\n");
+		else
+			dev_info(dcp->dev, "J700_DPTX_PORTS_READY (after hotplug kick)\n");
+	}
+
+	return dcp_dptx_connect_oob(to_platform_device(dcp->dev), 0);
 }
 
 static void dcp_typec_mux_unregister(void *data)
@@ -1104,6 +1175,9 @@ int dcp_start(struct platform_device *pdev)
 	 * dptxep_init() above deadlocked the two against each other -- see the
 	 * comment on dptxep_wait_ports().
 	 */
+	if (dcp->phy && !IS_ERR_OR_NULL(dcp->dptxcontrolep))
+		dptx_control_kick(dcp);
+
 	if (dcp->phy && !IS_ERR_OR_NULL(dcp->dptxep)) {
 		int dret = dptxep_wait_ports(dcp);
 
@@ -2282,6 +2356,41 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dcp->dp2hdmi_pwren = devm_gpiod_get_optional(dev, "dp2hdmi-pwren", GPIOD_OUT_HIGH);
 		if (IS_ERR(dcp->dp2hdmi_pwren))
 			return PTR_ERR(dcp->dp2hdmi_pwren);
+
+		/*
+		 * Acquire the display crossbar even when there is no
+		 * "mux-index".  On J700 the crossbar that routes dispext0 to
+		 * the ATC0 DP lanes must be selected when a DP-Alt sink
+		 * arrives, not at probe: selecting it here would force the ATC
+		 * PHY to DP-only while the rear connector still carries the
+		 * debug cable.  dcp_typec_mux_set() does the select instead.
+		 */
+		if (of_property_present(dev->of_node, "mux-controls") &&
+		    !of_property_present(dev->of_node, "mux-index")) {
+			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
+			if (IS_ERR(dcp->xbar)) {
+				dev_err(dev, "Failed to get dp-xbar: %ld\n",
+					PTR_ERR(dcp->xbar));
+				return PTR_ERR(dcp->xbar);
+			}
+			/*
+			 * Also route it now, before the DCP runs its own
+			 * external-core detection.  With the crossbar left
+			 * "disconnected" at init the firmware latches that core
+			 * as noconnect and never looks again: routing it later,
+			 * on the DP-Alt event, produced no firmware reaction at
+			 * all.  This is a display-side mux, so selecting it does
+			 * not disturb USB or the debug cable on the connector.
+			 */
+			ret = mux_control_select(dcp->xbar, DCP_DPXBAR_SELECTOR);
+			if (ret) {
+				dev_warn(dev, "J700_DPXBAR: probe select failed: %d\n",
+					 ret);
+			} else {
+				dcp->xbar_selected = true;
+				dev_info(dev, "J700_DPXBAR: selected at probe\n");
+			}
+		}
 
 		ret = of_property_read_u32(dev->of_node, "mux-index", &mux_index);
 		if (!ret) {
