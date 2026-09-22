@@ -10,8 +10,10 @@
 #include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/ktime.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/workqueue.h>
 #include "linux/jiffies.h"
 
 #include "dcp.h"
@@ -26,6 +28,19 @@ static unsigned int initial_brightness = 210;
 module_param(initial_brightness, uint, 0644);
 MODULE_PARM_DESC(initial_brightness,
 		 "Brightness in nits to apply at power-on when the firmware cannot report the current one (H17P)");
+
+/*
+ * H17P: a brightness change is ramped, one swap per frame, over this many
+ * milliseconds rather than applied in a single step.  macOS fades the panel
+ * the same way; the firmware itself does not (the swap carries the target
+ * nits and the DAC follows it immediately).  0 disables the ramp.
+ */
+static unsigned int ramp_ms = 250;
+module_param(ramp_ms, uint, 0644);
+MODULE_PARM_DESC(ramp_ms,
+		 "Milliseconds to fade the panel between brightness levels on H17P (0 = step)");
+
+#define RAMP_STEP_MS	16
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -271,6 +286,68 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	return drm_crtc_set_brightness(dcp);
 }
 
+/*
+ * One step of the H17P fade.  The level in flight is interpolated on the
+ * clock between the anchor and the target so a slow swap (or a compositor
+ * that is already flipping at full rate) stretches nothing: the fade ends
+ * ramp_ms after it started, give or take one frame.  Each step goes out
+ * as its own swap carrying the current surface (see
+ * drm_crtc_set_brightness), exactly as a single-step change did.
+ */
+static void dcp_backlight_ramp_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp,
+					     brightness.ramp_work);
+	struct drm_modeset_acquire_ctx ctx;
+	int from, target, level;
+	s64 elapsed;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	ret = drm_modeset_lock(&dcp->crtc->base.mutex, &ctx);
+	if (ret) {
+		drm_modeset_acquire_fini(&ctx);
+		schedule_delayed_work(&dcp->brightness.ramp_work,
+				      msecs_to_jiffies(RAMP_STEP_MS));
+		return;
+	}
+
+	from = dcp->brightness.ramp_from;
+	target = dcp->brightness.target_nits;
+	elapsed = ktime_ms_delta(ktime_get(), dcp->brightness.ramp_start);
+
+	if (!ramp_ms || !dcp->valid_mode || elapsed >= ramp_ms)
+		level = target;
+	else
+		level = from + (int)(((s64)(target - from) * elapsed) / ramp_ms);
+
+	/* never stall on rounding: always move at least one nit per step */
+	if (level == dcp->brightness.nits && level != target)
+		level += target > level ? 1 : -1;
+
+	dcp->brightness.nits = level;
+	dcp->brightness.dac = calculate_dac(dcp, level);
+	dcp->brightness.update = true;
+
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	if (dcp->valid_mode)
+		drm_crtc_set_brightness(dcp);
+
+	if (level != target)
+		schedule_delayed_work(&dcp->brightness.ramp_work,
+				      msecs_to_jiffies(RAMP_STEP_MS));
+}
+
+static void dcp_backlight_ramp_cancel(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	cancel_delayed_work_sync(&dcp->brightness.ramp_work);
+}
+
 static int dcp_set_brightness(struct backlight_device *bd)
 {
 	int ret = 0;
@@ -287,13 +364,29 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		return -ERESTARTSYS;
 	}
 
-	dcp->brightness.dac = calculate_dac(dcp, brightness);
 	/*
 	 * H17P takes the level in nits and does the DAC mapping itself; on the
 	 * older firmware nits is only ever what the DCP reported back.
+	 *
+	 * On H17P the new level is not applied here: the ramp worker walks
+	 * brightness.nits from wherever it is now to the target, and the
+	 * backlight core keeps reporting the target in `brightness` while
+	 * `actual_brightness` (dcp_get_brightness) follows the fade.  A
+	 * request arriving mid-fade simply re-anchors the ramp at the
+	 * current level, so a burst of sysfs writes (a slider drag, gsd's
+	 * ambient updates) never snaps or overshoots.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
-		dcp->brightness.nits = brightness;
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		dcp->brightness.target_nits = brightness;
+		dcp->brightness.ramp_from = dcp->brightness.nits;
+		dcp->brightness.ramp_start = ktime_get();
+		drm_modeset_drop_locks(&ctx);
+
+		mod_delayed_work(system_wq, &dcp->brightness.ramp_work, 0);
+		return 0;
+	}
+
+	dcp->brightness.dac = calculate_dac(dcp, brightness);
 	dcp->brightness.update = true;
 
 	drm_modeset_drop_locks(&ctx);
@@ -311,12 +404,19 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 	struct backlight_device *bl_dev;
+	int ret;
 	struct backlight_properties props = {
 		.type = BACKLIGHT_PLATFORM,
 		.brightness = dcp->brightness.nits,
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+
+	INIT_DELAYED_WORK(&dcp->brightness.ramp_work, dcp_backlight_ramp_work);
+	dcp->brightness.target_nits = dcp->brightness.nits;
+	ret = devm_add_action_or_reset(dev, dcp_backlight_ramp_cancel, dcp);
+	if (ret)
+		return ret;
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);

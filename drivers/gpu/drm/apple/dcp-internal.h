@@ -120,6 +120,16 @@ struct dcp_brightness {
 	u32 h17p_reported_millinits;
 	/* H17P: DPMS off leaves the pipe (and the level) alone */
 	bool soft_off;
+	/*
+	 * H17P: the level is ramped toward the requested one over ramp_ms
+	 * (dcp_backlight.c) instead of jumping there in one swap.  nits is
+	 * the level in flight, target_nits where it is heading, ramp_from/
+	 * ramp_start the anchor the interpolation runs from.
+	 */
+	int target_nits;
+	int ramp_from;
+	ktime_t ramp_start;
+	struct delayed_work ramp_work;
 };
 
 struct audiosrv_data;
