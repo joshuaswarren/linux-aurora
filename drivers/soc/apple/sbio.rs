@@ -877,14 +877,26 @@ impl SepData {
         true
     }
 
+    /// Persist all four artefacts after a first enrolment.
+    ///
+    /// The master catacomb is a snapshot of the *system* material, so it has to
+    /// be taken LAST. Every other save here is itself an enclave operation that
+    /// advances the anti-replay state, so a master snapshot taken first
+    /// describes a state that no longer exists by the time this returns. The
+    /// next boot then restores that older system material, and the user blob --
+    /// which belongs to the newer state -- is answered `0x8002` (cold
+    /// transition) instead of loading. `save_after_match()` already orders it
+    /// this way, and its own error text spells the failure out: "next boot may
+    /// reinstall pre-match material and the user load could cold-transition
+    /// (0x8002)".
+    ///
+    /// Measured: enrolling and rebooting without matching first left
+    /// `restore: user catacomb ... 0x8002` on every boot, while the master and
+    /// owner components restored fine. A successful match in between hid the
+    /// bug, because `save_after_match()` rewrote both in the right order.
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
         let mut all = true;
         for (who, kind, what) in [
-            (
-                crate::sbio::CatacombUser::MASTER,
-                PRIVATE_TYPE_CATACOMB_MASTER,
-                c"master catacomb (user -1)",
-            ),
             (
                 crate::sbio::CatacombUser::OWNER,
                 PRIVATE_TYPE_CATACOMB_OWNER,
@@ -901,6 +913,14 @@ impl SepData {
             }
         }
         if !self.save_lockout() {
+            all = false;
+        }
+        // Last, so it describes the state the three saves above left behind.
+        if !self.save_catacomb(
+            crate::sbio::CatacombUser::MASTER,
+            PRIVATE_TYPE_CATACOMB_MASTER,
+            c"master catacomb (user -1)",
+        ) {
             all = false;
         }
         all
