@@ -40,7 +40,20 @@ module_param(ramp_ms, uint, 0644);
 MODULE_PARM_DESC(ramp_ms,
 		 "Milliseconds to fade the panel between brightness levels on H17P (0 = step)");
 
+/*
+ * A stream of requests (gsd-power's ambient-light loop, paced by
+ * iio-sensor-proxy's 0.8 s ALS poll; a slider drag at 20-60 Hz) is faded at
+ * the rate it arrives, so consecutive fades join up instead of each one
+ * finishing early and holding until the next.  Anything slower than this
+ * is treated as isolated requests again.
+ */
+static unsigned int ramp_max_ms = 1500;
+module_param(ramp_max_ms, uint, 0644);
+MODULE_PARM_DESC(ramp_max_ms,
+		 "Longest fade used when brightness requests arrive as a stream (H17P)");
+
 #define RAMP_STEP_MS	16
+#define RAMP_STREAM_GAP_MS	3000
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -295,6 +308,7 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 					     brightness.ramp_work);
 	struct drm_modeset_acquire_ctx ctx;
 	int from, target, level;
+	unsigned int duration;
 	s64 elapsed;
 	int ret;
 
@@ -309,12 +323,13 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 
 	from = dcp->brightness.ramp_from;
 	target = dcp->brightness.target_nits;
+	duration = dcp->brightness.ramp_duration_ms;
 	elapsed = ktime_ms_delta(ktime_get(), dcp->brightness.ramp_start);
 
-	if (!ramp_ms || !dcp->valid_mode || elapsed >= ramp_ms)
+	if (!duration || !dcp->valid_mode || elapsed >= duration)
 		level = target;
 	else
-		level = from + (int)(((s64)(target - from) * elapsed) / ramp_ms);
+		level = from + (int)(((s64)(target - from) * elapsed) / duration);
 
 	/* never stall on rounding: always move at least one nit per step */
 	if (level == dcp->brightness.nits && level != target)
@@ -371,9 +386,26 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	 * ambient updates) never snaps or overshoots.
 	 */
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		ktime_t now = ktime_get();
+		s64 gap = ktime_ms_delta(now, dcp->brightness.last_request);
+		unsigned int duration = ramp_ms;
+
+		/*
+		 * Pace a stream at its own cadence: a request that follows
+		 * another within RAMP_STREAM_GAP_MS fades over the interval
+		 * between them (never shorter than ramp_ms, never longer than
+		 * ramp_max_ms), so the fade ends about when the next request
+		 * lands and the motion is continuous.
+		 */
+		if (ramp_ms && dcp->brightness.last_request &&
+		    gap < RAMP_STREAM_GAP_MS)
+			duration = clamp_t(s64, gap, ramp_ms, ramp_max_ms);
+
+		dcp->brightness.last_request = now;
+		dcp->brightness.ramp_duration_ms = duration;
 		dcp->brightness.target_nits = brightness;
 		dcp->brightness.ramp_from = dcp->brightness.nits;
-		dcp->brightness.ramp_start = ktime_get();
+		dcp->brightness.ramp_start = now;
 		drm_modeset_drop_locks(&ctx);
 
 		mod_delayed_work(system_wq, &dcp->brightness.ramp_work, 0);
