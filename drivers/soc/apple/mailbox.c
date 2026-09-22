@@ -111,7 +111,7 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
 
 	while (mbox_ctrl & mbox->hw->control_full) {
-		if (atomic) {
+		if (atomic || mbox->irq_send_empty < 0) {
 			ret = readl_poll_timeout_atomic(
 				mbox->regs + mbox->hw->a2i_control, mbox_ctrl,
 				!(mbox_ctrl & mbox->hw->control_full), 100,
@@ -356,9 +356,29 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	if (mbox->irq_recv_not_empty < 0)
 		return -ENODEV;
 
-	mbox->irq_send_empty = platform_get_irq_byname(pdev, "send-empty");
-	if (mbox->irq_send_empty < 0)
-		return -ENODEV;
+	mbox->irq_send_empty = platform_get_irq_byname_optional(pdev,
+							       "send-empty");
+	if (mbox->irq_send_empty < 0) {
+		if (mbox->irq_send_empty != -ENXIO &&
+		    mbox->irq_send_empty != -EINVAL)
+			return mbox->irq_send_empty;
+		/* No send-empty line in DT (single-IRQ coprocessors
+		 * like the T6021 ANE ASC): apple_mbox_send polls the
+		 * a2i control register instead of waiting on the
+		 * completion. */
+	} else {
+		irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-send",
+					 dev_name(dev));
+		if (!irqname)
+			return -ENOMEM;
+
+		ret = devm_request_irq(dev, mbox->irq_send_empty,
+				       apple_mbox_send_empty_irq,
+				       IRQF_NO_AUTOEN | IRQF_NO_SUSPEND,
+				       irqname, mbox);
+		if (ret)
+			return ret;
+	}
 
 	spin_lock_init(&mbox->rx_lock);
 	spin_lock_init(&mbox->tx_lock);
@@ -370,16 +390,6 @@ static int apple_mbox_probe(struct platform_device *pdev)
 
 	ret = devm_request_irq(dev, mbox->irq_recv_not_empty,
 			       apple_mbox_recv_irq,
-			       IRQF_NO_AUTOEN | IRQF_NO_SUSPEND, irqname, mbox);
-	if (ret)
-		return ret;
-
-	irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-send", dev_name(dev));
-	if (!irqname)
-		return -ENOMEM;
-
-	ret = devm_request_irq(dev, mbox->irq_send_empty,
-			       apple_mbox_send_empty_irq,
 			       IRQF_NO_AUTOEN | IRQF_NO_SUSPEND, irqname, mbox);
 	if (ret)
 		return ret;

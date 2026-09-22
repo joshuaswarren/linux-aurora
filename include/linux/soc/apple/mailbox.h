@@ -34,6 +34,13 @@ struct apple_mbox {
 	/** Receive callback for incoming messages */
 	void (*rx)(struct apple_mbox *mbox, struct apple_mbox_msg msg, void *cookie);
 	void *cookie;
+
+	/* Some coprocessors (e.g. the T6021 ANE ASC) expose only one
+	 * AIC line. Without a send-empty interrupt the TX full-FIFO wait
+	 * must poll the control register instead of sleeping on the
+	 * completion. Kept LAST so builtin consumers compiled against
+	 * the previous header keep a stable layout. */
+	bool poll_tx;
 };
 
 struct apple_mbox *apple_mbox_get(struct device *dev, int index);
