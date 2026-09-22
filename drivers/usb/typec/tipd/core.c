@@ -478,6 +478,26 @@ static bool cd321x_read_data_status(struct tps6598x *tps)
 	if (!ret)
 		return false;
 
+	/*
+	 * Whether the controller ever reports a DP connection is the whole
+	 * question on a machine where DP-Alt does not come up: everything below
+	 * -- the DP SID read, the pin assignment, the typec_set_mode() that
+	 * finally reaches the ATC PHY -- is gated on this one bit, and there is
+	 * no debugfs or sysfs path to it.  Measured on J700 2026-09-22 with a
+	 * DisplayLink UD-ULTC4K on the rear connector: DP never entered, the
+	 * dock published a USB Billboard instead, and from userspace it was
+	 * impossible to tell whether the controller had offered DP at all.
+	 * One line per data-status change answers that.
+	 */
+	dev_info(tps->dev,
+		 "J700_PD_DATA_STATUS: %#010x dp=%u tbt=%u usb2=%u usb3=%u role=%u\n",
+		 tps->data_status,
+		 !!(tps->data_status & TPS_DATA_STATUS_DP_CONNECTION),
+		 !!(tps->data_status & TPS_DATA_STATUS_TBT_CONNECTION),
+		 !!(tps->data_status & TPS_DATA_STATUS_USB2_CONNECTION),
+		 !!(tps->data_status & TPS_DATA_STATUS_USB3_CONNECTION),
+		 !!(tps->data_status & TPS_DATA_STATUS_USB_DATA_ROLE));
+
 	if (tps->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		ret = tps6598x_block_read(tps, TPS_REG_DP_SID_STATUS,
 				&cd321x->dp_sid_status, sizeof(cd321x->dp_sid_status));
