@@ -2,6 +2,7 @@
 """Exercise native G17P render work-key and Shared state allocation invariants."""
 
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import subprocess
 import tempfile
 
@@ -15,7 +16,7 @@ allocator = manager[start:end]
 
 for required in [
     "render_command_buffer_states: G17PCommandBufferStateAllocator",
-    "render_command_buffer_state_pairs: [Option<u32>; 2]",
+    "render_command_buffer_state_pairs: [Option<u32>; 64]",
     "allocate_active_render_command_buffer_state()",
     "release_active_render_command_buffer_states()?",
     "command_buffer_state_words",
@@ -70,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="g17-render-work-key-") as tmp:
     binary = Path(tmp) / "tests"
     subprocess.run(
         ["rustc", "--edition=2021", "--test", "-", "-o", str(binary)],
-        input=source,
+        input=with_g17_config(source),
         text=True,
         check=True,
     )

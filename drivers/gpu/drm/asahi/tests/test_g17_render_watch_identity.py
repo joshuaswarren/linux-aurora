@@ -32,6 +32,7 @@ mod g17_drm { pub struct G17PRenderCompletion; }
 use g17_drm::G17PRenderCompletion;
 struct Runtime {
     pending_render: [Option<Arc<G17PRenderCompletion>>; 2],
+    pending_render_queued: [Option<Arc<G17PRenderCompletion>>; 2],
     settled: Vec<(u8, Option<u64>, Error)>,
 }
 impl Runtime {
@@ -47,7 +48,7 @@ METHOD
 fn completed_watch_cannot_cancel_a_reused_slot() {
     let old = Arc::new(G17PRenderCompletion);
     let next = Arc::new(G17PRenderCompletion);
-    let mut r = Runtime {pending_render: [Some(next.clone()), None], settled: vec![]};
+    let mut r = Runtime {pending_render: [Some(next.clone()), None], pending_render_queued: [None, None], settled: vec![]};
     // The callback must validate the actual object, not just a log identifier.
     r.timeout_deferred_render(0, 7, &old, -125);
     r.timeout_deferred_render(0, 7, &old, -110);
@@ -59,7 +60,7 @@ fn completed_watch_cannot_cancel_a_reused_slot() {
 #[test]
 fn duplicate_and_invalid_callbacks_do_not_settle_anything() {
     let c = Arc::new(G17PRenderCompletion);
-    let mut r = Runtime {pending_render: [None, Some(c.clone())], settled: vec![]};
+    let mut r = Runtime {pending_render: [None, Some(c.clone())], pending_render_queued: [None, None], settled: vec![]};
     r.timeout_deferred_render(0, 9, &c, -125);
     r.timeout_deferred_render(255, 9, &c, -125);
     assert!(r.settled.is_empty());
@@ -77,5 +78,6 @@ with tempfile.TemporaryDirectory(prefix='g17-watch-identity-') as directory:
 if not args.baseline_ref:
     drm = (root / 'g17_drm.rs').read_text()
     assert drm.count('packet.submission_id(), packet.completion(),') == 2
-    assert drm.count('render_slot, submission_id, &completion, error,') == 3
+    assert drm.count('render_slot, submission_id, completion, error,') == 1
+    assert drm.count('render_slot, packet.submission_id(), packet.completion(), ETIMEDOUT,') == 2
 print('PASS exact completion identity on every deferred-render failure entry')

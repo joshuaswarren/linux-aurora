@@ -103,6 +103,10 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) depth_clear_value_bits: u32,
     pub(crate) stencil_clear_value: u32,
     pub(crate) depth_flags: u64,
+    /// ZLS control used by every firmware partial-store/load/resume phase.
+    /// Unlike the pass-boundary control, an attached depth/stencil surface
+    /// must be both loaded and stored across an internal split.
+    pub(crate) partial_depth_flags: u64,
     pub(crate) depth_dimensions: u64,
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
@@ -241,6 +245,7 @@ impl G17pRenderParameters {
             depth_clear_value_bits: 0x3f80_0000,
             stencil_clear_value: 0,
             depth_flags: 0,
+            partial_depth_flags: 0,
             depth_dimensions: 0,
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
@@ -454,6 +459,32 @@ pub(crate) fn build_ta_registers(
     ])
 }
 
+/// DIAGNOSTIC. Write native's value into TA-descriptor fields where ours differs
+/// structurally at MATCHED 256x256 geometry (recs3.txt TA record, stride 0x9c0).
+/// The tiler bins ~60 bytes of a 1.28 MB TVB with every input verified correct,
+/// so these are what is left that we demonstrably send differently.
+fn apply_g17p_ta_oracle(raw: &mut [u8]) {
+    let mask = crate::g17_config::TA_ORACLE;
+    if mask == 0 {
+        return;
+    }
+    if mask & 0x01 != 0 {
+        put_u64(raw, 0x370, 0x500);
+        put_u64(raw, 0x388, 0x500);
+        put_u64(raw, 0x8d0, 0x500);
+    }
+    if mask & 0x02 != 0 {
+        put_u64(raw, 0x018, 3);
+    }
+    if mask & 0x04 != 0 {
+        put_u32(raw, 0x33c, 0xa9);
+    }
+    if mask & 0x08 != 0 {
+        put_u64(raw, 0x7d8, 0x6);
+        put_u32(raw, 0x798, 0xa);
+    }
+}
+
 pub(crate) fn build_fragment_registers(
     p: &G17pRenderParameters,
 ) -> Result<[RegisterWrite; FRAGMENT_REGISTER_COUNT], RenderBuildError> {
@@ -576,7 +607,7 @@ fn partial_store_registers(
         RegisterWrite::new(0x15439, p.stencil_aux_stride),
         RegisterWrite::new(0x15221, 0),
         RegisterWrite::new(0x15229, 0),
-        RegisterWrite::new(0x15319, p.depth_flags),
+        RegisterWrite::new(0x15319, p.partial_depth_flags),
         RegisterWrite::new(0x15349, 0x0404_0404),
     ]
 }
@@ -606,7 +637,7 @@ fn partial_resume_registers(
         RegisterWrite::new(0x153c1, p.depth_aux_buffer),
         RegisterWrite::new(0x15339, p.stencil_buffer),
         RegisterWrite::new(0x153d1, p.stencil_aux_buffer),
-        RegisterWrite::new(0x15319, p.depth_flags),
+        RegisterWrite::new(0x15319, p.partial_depth_flags),
         RegisterWrite::new(0x15349, 0x0404_0404),
     ]
 }
@@ -623,7 +654,7 @@ fn partial_load_registers(
         RegisterWrite::new(0x153c1, p.depth_aux_buffer),
         RegisterWrite::new(0x15339, p.stencil_buffer),
         RegisterWrite::new(0x153d1, p.stencil_aux_buffer),
-        RegisterWrite::new(0x15319, p.depth_flags),
+        RegisterWrite::new(0x15319, p.partial_depth_flags),
         RegisterWrite::new(0x15349, 0x0404_0404),
     ]
 }
@@ -929,10 +960,73 @@ pub(crate) fn build_fragment_descriptor(
     put_u64(raw, 0x1f9c, parameters.partial_store_pipeline);
     put_u32(raw, 0x1fa8, parameters.depth_clear_value_bits);
     put_u64(raw, 0x1fac, (parameters.tib_blocks << 33) | 0x300);
-    put_u8(raw, 0x2100, (!parameters.process_empty_tiles) as u8);
-    put_u32(raw, 0x2110, u32::MAX);
-    put_u64(raw, 0x2114, parameters.sampler_array);
-    put_u32(raw, 0x211c, parameters.sampler_count);
+    // ORACLE BISECT. Native's 3D command record (recs3.txt, 0x2240 stride, so
+    // this is the record itself and not the next one) differs from ours in 73
+    // of 1096 qwords; all but a dozen are allocation addresses. These are the
+    // STRUCTURAL ones -- values we leave zero or set differently, that are not
+    // pointers -- gathered behind one bitmask so they can be bisected without a
+    // rebuild each time. The fragment executes on DM0 and writes NO pixels, so
+    // one of these is a candidate for the missing store.
+    {
+        let oracle = crate::g17_config::FRAG_ORACLE;
+        if oracle & 0x01 != 0 {
+            put_u64(raw, 0x158, 0x7007);
+        }
+        if oracle & 0x02 != 0 {
+            put_u64(raw, 0x488, 1);
+        }
+        if oracle & 0x04 != 0 {
+            // native 0x8000005300000000 against our 0x0000005300000000
+            let mut cur = [0u8; 8];
+            cur.copy_from_slice(&raw[0x21c8..0x21d0]);
+            put_u64(raw, 0x21c8, u64::from_le_bytes(cur) | (1u64 << 63));
+        }
+        if oracle & 0x08 != 0 {
+            put_u64(raw, 0x78, 0x40);
+        }
+        if oracle & 0x10 != 0 {
+            put_u64(raw, 0x458, 3);
+            put_u64(raw, 0x470, 0x500);
+        }
+        if oracle & 0x20 != 0 {
+            put_u64(raw, 0x1f48, 0x0000_0100_0000_0100);
+        }
+        if oracle & 0x40 != 0 {
+            // fields native leaves ZERO and we populate
+            put_u64(raw, 0x1d0, 0);
+            put_u64(raw, 0x1f0, 0);
+            put_u64(raw, 0x1f8, 0);
+        }
+        if oracle & 0x80 != 0 {
+            put_u32(raw, 0x1d8 + 4, 0x3f80_0000);
+        }
+    }
+    // Native copies isMemorylessRender through the UMD render record +0x240,
+    // parsed record +0x1b8, and host descriptor +0x8bf into this byte. It is
+    // not a TIB-size predicate: native's memoryless policy also selects the
+    // shortened SPM phase programs. The admitted render UAPI represents
+    // memory-backed resources and has no memoryless-render policy or matching
+    // SPM-program construction. Keep that policy clear even for >8 TIB
+    // blocks; supporting memoryless renders requires modeling both together.
+    // Empty-tile processing remains independent in register 0x10039 bit 16.
+    put_u8(raw, 0x2100, 0);
+    // Exact G17P tail copied by AGX3DChannelSKSM::submitBuffer. +0x2104 is the
+    // accelerator control snapshot and +0x210c its low map nibble. +0x2110 is
+    // a separate render-setup field: prepare copies descriptor +0xc00 to setup
+    // +0x818, processRenderSetup carries it to +0x89c, and submitBuffer emits
+    // it here. Working Metal commands carry the invariant all-ones value.
+    put_u32(raw, 0x2104, parameters.gpc_perf_state_control);
+    // AGX3DChannelSKSM::submitBuffer mirrors the same dependency/current pair
+    // consumed by the fragment RCE program into the firmware command.
+    put_u32(raw, 0x2108, (parameters.fragment_lifecycle >> 32) as u32);
+    put_u32(raw, 0x210c, parameters.gpc_perf_state_map_low);
+    put_u32(raw, 0x2110, G17P_FRAGMENT_TAIL_SETUP_WORD);
+    // Native submitBuffer zeros +0x2114..+0x2123. Sampler state reaches the
+    // GPU through its real register/program path, not these command-tail
+    // lanes. The first two following flag lanes reproduce the working Neo
+    // shared-runtime snapshot; the final two come from per-command descriptor
+    // bytes and retain their constructor-zero values until those inputs are
+    // modeled.
     put_u32(
         raw,
         0x2120,
@@ -1030,7 +1124,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             put_u32(
                 raw,
                 0x08ba,
-                if *crate::module_parameters::g17p_render_ta_qid_field.value() != 0 {
+                if crate::g17_config::RENDER_TA_QID_FIELD != 0 {
                     u32::from(queue_id)
                 } else {
                     0
@@ -1448,6 +1542,28 @@ mod tests {
     }
 
     #[test]
+    fn reused_cpu_staging_produces_identical_wire_descriptors() {
+        let parameters = G17pRenderParameters::source_rsrc8();
+        for dirty in [0x00, 0x55, 0xff] {
+            let mut staging = [dirty; 0x8000];
+            staging.fill(0);
+            let mut tiling = [0; TA_DESCRIPTOR_SIZE];
+            let mut fragment = [0; FRAGMENT_DESCRIPTOR_SIZE];
+            let ta_metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling);
+            let fragment_metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment);
+            build_ta_descriptor(&parameters, objects(), ta_metadata, &mut tiling).unwrap();
+            build_fragment_descriptor(&parameters, objects(), fragment_metadata, &mut fragment).unwrap();
+            let (ta, fr) = staging.split_at_mut(0x4000);
+            build_ta_descriptor(&parameters, objects(), ta_metadata, ta).unwrap();
+            build_fragment_descriptor(&parameters, objects(), fragment_metadata, fr).unwrap();
+            assert_eq!(&ta[..TA_DESCRIPTOR_SIZE], &tiling);
+            assert_eq!(&fr[..FRAGMENT_DESCRIPTOR_SIZE], &fragment);
+            assert!(ta[TA_DESCRIPTOR_SIZE..].iter().all(|v| *v == 0));
+            assert!(fr[FRAGMENT_DESCRIPTOR_SIZE..].iter().all(|v| *v == 0));
+        }
+    }
+
+    #[test]
     fn descriptors_match_m1n1_9165484_and_duplicate_pipeline_fields() {
         let parameters = G17pRenderParameters::source_rsrc8();
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
@@ -1660,6 +1776,30 @@ mod tests {
             .unwrap();
             assert_eq!(get_u32(&fragment, 0x50), samples, "first {samples}x");
             assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
+        }
+    }
+
+    #[test]
+    fn partial_render_uses_phase_specific_zls_control() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.depth_buffer = 0x5be8_2a00_00;
+        parameters.stencil_buffer = 0x5bea_4240_00;
+        parameters.depth_flags = 0x000c_0000;
+        parameters.partial_depth_flags = 0x000c_c000;
+
+        let main = build_fragment_registers(&parameters).unwrap();
+        assert_eq!(
+            main.iter().find(|reg| reg.number == 0x15319).unwrap().value,
+            0x000c_0000,
+        );
+        let store = partial_store_registers(&parameters);
+        let resume = partial_resume_registers(&parameters);
+        let load = partial_load_registers(&parameters);
+        for registers in [store.as_slice(), resume.as_slice(), load.as_slice()] {
+            assert_eq!(
+                registers.iter().find(|reg| reg.number == 0x15319).unwrap().value,
+                0x000c_c000,
+            );
         }
     }
 

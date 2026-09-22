@@ -50,7 +50,7 @@ struct G17PRetiredRenderGraph {
 }
 struct Manager {
     active_render_slot: u8,
-    render_context_epochs: [u64; 2],
+    render_context_epochs: [u64; 64],
     released_render_contexts: u64,
     retired_render_handoff_graph: Option<G17PRetiredRenderGraph>,
     retired_render_handoff_graphs: Vec<G17PRetiredRenderGraph>,
@@ -70,7 +70,7 @@ fn graph(vm: u64, context: u16, pair: u8, epoch: u64) -> G17PRetiredRenderGraph 
 }
 fn manager() -> Manager {
     Manager {
-        active_render_slot: 0, render_context_epochs: [10, 10],
+        active_render_slot: 0, render_context_epochs: [10; 64],
         released_render_contexts: 1 << 4,
         retired_render_handoff_graph: None, retired_render_handoff_graphs: vec![],
     }

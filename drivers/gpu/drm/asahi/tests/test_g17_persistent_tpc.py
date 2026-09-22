@@ -30,7 +30,7 @@ assert "render_target_memory: KBox<G17PRenderTargetMemory>" in storage
 heap_constructor = block("fn new_g17p_render_target_memory(")
 assert "#[inline(never)]" in source[source.rfind("#[", 0, source.index("fn new_g17p_render_target_memory(")):source.index("fn new_g17p_render_target_memory(")]
 assert "KBox::new(" in heap_constructor
-assert "MappedObject::new_wc_at(" in heap_constructor
+assert heap_constructor.count("MappedObject::new_wc_render_owned(") == 2
 assert "g17p_render_tpc_va(queue_pair)" in heap_constructor
 assert "g17p_render_rt_memory_va(queue_pair)" in heap_constructor
 target_owner = block("struct G17PRenderTargetMemory {")
@@ -39,7 +39,7 @@ assert "rt_slot_ordinals: [Option<u64>; G17P_RENDER_RT_EVENT_RECORD_COUNT]" in t
 assert ".checked_sub(previous)" in prepare_slot
 assert "distance != 0 && distance < G17P_RENDER_RT_EVENT_RECORD_COUNT as u64" in prepare_slot
 assert '"persistent render-target-memory allocation"' in constructor
-assert "new_g17p_render_target_memory(dev, vm, queue_pair)" in constructor
+assert "new_g17p_render_target_memory(dev, vm, queue_pair, &render_layout)" in constructor
 assert "translated.parameters.tpc = render_target_memory.tpc_va();" in constructor
 assert "translated.parameters.tpc = self.render_target_memory.tpc_va();" in restage
 assert ".prepare_rt_slot(submission_ordinal, &render_layout)" in constructor

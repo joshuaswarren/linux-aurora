@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """RCE bindings must resolve through each render job's own command GART."""
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import subprocess
 import tempfile
 
@@ -62,7 +63,7 @@ fn mcache_pointer_uses_the_same_job_low_descriptor() {
 
 with tempfile.TemporaryDirectory(prefix="g17-rce-job-root-") as tmp:
     test = Path(tmp) / "test.rs"
-    test.write_text(unit + encoder + mcache_encoder)
+    test.write_text(with_g17_config(unit + encoder + mcache_encoder))
     exe = Path(tmp) / "test"
     subprocess.run(["rustc", "-Awarnings", "--edition=2021", "--test", str(test), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

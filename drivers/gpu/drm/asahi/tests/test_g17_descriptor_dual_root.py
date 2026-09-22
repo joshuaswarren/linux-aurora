@@ -5,7 +5,10 @@ from pathlib import Path
 
 
 source = (Path(__file__).resolve().parents[1] / "g17_resources.rs").read_text()
-start = source.index("fn map_shared_render_descriptor_range(")
+wrapper = source[source.index("fn map_shared_render_descriptor_range("):source.index("fn map_shared_render_sksm_range(")]
+assert "object, client_vm, global_vm, object_range," in wrapper
+assert "g17p_cl_client_low_va_range(), mmu::PROT_GPU_SHARED_RO," in wrapper
+start = source.index("fn map_shared_render_range(")
 pos = source.index("{", start) + 1
 depth = 1
 while depth:
@@ -13,8 +16,8 @@ while depth:
     pos += 1
 mapper = source[start:pos]
 
-global_map = mapper.index("            global_vm,")
-client_map = mapper.index("            client_vm,", global_map)
+global_map = mapper.index("global_vm,", mapper.index("let global ="))
+client_map = mapper.index("client_vm,", global_map)
 assert global_map < client_map
 assert "let start = global.iova();" in mapper
 assert "Ok(client) => return Ok((client, global))" in mapper

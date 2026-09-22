@@ -41,7 +41,22 @@ assert "cached_reactivation_pending" not in storage
 assert "cached_reactivation_pending" not in prepare
 assert "render_layout.total_size > self.render_state.logical_size" in restage
 assert "render_layout.aux_fb != self.render_layout.aux_fb" in restage
-assert "!self.render_user_aliases.all_reachable_from(vm)" in restage
+# Retained driver-owned mappings are validated when the graph is created,
+# grown, or rebound. Rewalking their PTEs on every restage is both redundant
+# and catastrophically expensive once the TVB contains hundreds of blocks.
+assert "|| !self.render_user_aliases.all_reachable_from(vm)" not in restage
+assert "|| !tvb.all_reachable_from(vm)" not in restage
+constructor = resources[
+    resources.index("let render_user_aliases = bootstrap_stage!(") :
+    resources.index("let mut render_command_ordinals =", resources.index("let render_user_aliases = bootstrap_stage!("))
+]
+assert "G17PRenderUserAliases::new(" in constructor
+assert "!tvb.all_reachable_from(vm)" in constructor
+rebind = function("fn prepare_vm_rebind(")
+assert "render_user_aliases.remap(" in rebind
+full_rebind = function("pub(crate) fn rebind_client_vm_aliases(")
+assert "self.render_user_aliases.remap(" in full_rebind
+assert "tvb.map_cached_blocks(vm)" in full_rebind
 assert "G17PRenderUserAliases::new(" not in restage
 assert "MappedObject::new_wc_in_range(" not in restage
 assert "let render_state_va = self.render_state.iova()" in restage

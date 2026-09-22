@@ -1273,8 +1273,8 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     // running, with an identically shaped descriptor, a satisfied barrier and
     // geometry already tiled. Overriding this isolates the data master itself.
     let override_dm = match stage {
-        G17PColdOpeningStage::Fragment => *crate::module_parameters::g17p_render_3d_dm.value(),
-        G17PColdOpeningStage::Tiling => *crate::module_parameters::g17p_render_ta_dm.value(),
+        G17PColdOpeningStage::Fragment => crate::g17_config::RENDER_3D_DM,
+        G17PColdOpeningStage::Tiling => crate::g17_config::RENDER_TA_DM,
     };
     if override_dm != 0xff {
         put_u16_le(out, 0x22, override_dm as u16);
@@ -2707,6 +2707,7 @@ pub(crate) fn encode_g17p_compute_optional_event(
 pub(crate) fn prepare_g17p_compute_cl_command_state(
     descriptor_low: u64,
     submission_ordinal: u64,
+    primary_checkpoint: u8,
 ) -> Result<G17PComputeClCommandState, SubmissionError> {
     let next = submission_ordinal
         .checked_add(1)
@@ -2729,7 +2730,7 @@ pub(crate) fn prepare_g17p_compute_cl_command_state(
         rce_bindings: [
             G17PClRceBinding {
                 address: rce_a,
-                tag: 0x22,
+                tag: primary_checkpoint,
             },
             G17PClRceBinding {
                 address: rce_b,
@@ -2776,7 +2777,7 @@ pub(crate) fn prepare_g17p_render_cl_command_state(
             external_binding(2, 0x17)?,
             external_binding(3, 0x0a)?,
         ];
-        match *crate::module_parameters::g17p_render_3d_rce.value() {
+        match crate::g17_config::RENDER_3D_RCE {
             0 => [empty, empty, empty, empty],
             1 => [full[0], empty, empty, empty],
             2 => [full[0], full[1], empty, empty],
@@ -3099,7 +3100,7 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     // unsatisfiable from cold. Omitting it isolates whether the SKSM front-end
     // is waiting on it.
     let omit_implicit = !queue.previous_valid
-        && *crate::module_parameters::g17p_no_implicit_dep.value() != 0;
+        && crate::g17_config::NO_IMPLICIT_DEP != 0;
     if !omit_implicit {
         put_u64_le(
             &mut entry,
@@ -3248,21 +3249,57 @@ pub(crate) const fn g17p_cl_full_support_initialization_allowed(registered: bool
     !registered
 }
 
-/// Initialize the queue-owned pages exactly once, before SKSM registration.
-pub(crate) fn apply_g17p_cl_retained_static_state(
+/// The one compute private-memory pool, distinct from render's pool ID zero.
+/// B1 indexes the same registration table with tag15 +0x46 and FList +0x08.
+pub(crate) const G17P_COMPUTE_FLIST_ID: u16 = crate::g17_config::COMPUTE_FLIST_ID;
+
+/// Initialize pool-owned state before its first firmware registration.
+pub(crate) fn apply_g17p_cl_flist_static_state(
+    shared_support: &mut [u8],
+    support_state: &mut [u8],
+    page_list_gpu_va: u64,
+    run_table_gpu_va: u64,
+    support_state_gpu_va: u64,
+    pool_id: u16,
+) -> Result<(), SubmissionError> {
+    if shared_support.len() < 0x4000 || support_state.len() < 0x4000 {
+        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
+    }
+    shared_support.fill(0);
+    support_state.fill(0);
+    put_u64_le(shared_support, 0x00, 2);
+    put_u64_le(shared_support, 0x08, u64::from(pool_id));
+    put_u64_le(shared_support, 0x10, 2);
+    put_u64_le(shared_support, 0x14, page_list_gpu_va);
+    put_u32_le(shared_support, 0x1c, 0x4_0000);
+    put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
+    put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
+    put_u64_le(shared_support, 0x30, run_table_gpu_va);
+    put_u64_le(shared_support, 0x40, 4);
+    put_u32_le(shared_support, 0x48, 0xa8);
+    put_u64_le(shared_support, 0x4c, support_state_gpu_va);
+    // B1 compares *FList[+0x4c] (submitted) with FList[+0x54]
+    // (completed). Both are pool-wide u64 counters, initially zero.
+    put_u64_le(shared_support, 0x54, 0);
+    put_u32_le(shared_support, 0x5c, 1);
+    put_u32_le(shared_support, 0x60, 2);
+    Ok(())
+}
+
+/// Historical captured per-queue fixture initializer. Production pool creation
+/// uses `apply_g17p_cl_flist_static_state`; never call this on its shared pages.
+pub(crate) fn apply_g17p_cl_queue_static_state(
     shared_support: &mut [u8],
     support_state: &mut [u8],
     scheduler_state: &mut [u8],
-    channel_control: &mut [u8],
     page_list_gpu_va: u64,
-    operand_table_gpu_va: u64,
+    run_table_gpu_va: u64,
     support_state_gpu_va: u64,
     scheduler_state_gpu_va: u64,
 ) -> Result<(), SubmissionError> {
     if shared_support.len() < 0x4000
         || support_state.len() < 0x4000
         || scheduler_state.len() < 0x4000
-        || channel_control.len() < 0x40
     {
         return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
     }
@@ -3270,9 +3307,12 @@ pub(crate) fn apply_g17p_cl_retained_static_state(
     shared_support.fill(0);
     support_state.fill(0);
     scheduler_state.fill(0);
-    channel_control.fill(0);
 
     put_u64_le(shared_support, 0x00, 2);
+    // AGXUSCPrivMemFList+0x08 is the pool ID copied into the firmware's
+    // internal allocator entry and ultimately written to gUPM's pool-select
+    // operation. All compute queues share this pool and UMA slot; QoS
+    // HardwareBufferIDs remain per queue.
     put_u64_le(shared_support, 0x08, 1);
     put_u64_le(shared_support, 0x10, 2);
     // _AGFIUMAPagePoolState stores the full VA at unaligned +0x14.
@@ -3281,7 +3321,10 @@ pub(crate) fn apply_g17p_cl_retained_static_state(
     put_u32_le(shared_support, 0x1c, 0x4_0000);
     put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
     put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
-    put_u64_le(shared_support, 0x30, operand_table_gpu_va);
+    // Every queue names the run table that describes the shared backing.
+    // A private empty table here is incoherent with the shared pool and leaves
+    // overlapping spill allocation without the pool's initialized run map.
+    put_u64_le(shared_support, 0x30, run_table_gpu_va);
     put_u64_le(shared_support, 0x40, 4);
     put_u32_le(shared_support, 0x48, 0xa8);
     put_u64_le(shared_support, 0x4c, support_state_gpu_va);
@@ -3297,10 +3340,46 @@ pub(crate) fn apply_g17p_cl_retained_static_state(
     put_u32_le(support_state, 0, 1);
     put_u32_le(scheduler_state, 8, 1);
 
+    Ok(())
+}
+
+/// Initialize the one channel-control page retained by physical CL_2.
+pub(crate) fn apply_g17p_cl_channel_control_static_state(
+    channel_control: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if channel_control.len() < 0x40 {
+        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
+    }
+    channel_control.fill(0);
+
     put_u64_le(channel_control, 0x00, 0x0000_0100_0000_ffff);
     put_u64_le(channel_control, 0x20, 0x0002_0000_0000_0000);
     put_u64_le(channel_control, 0x30, 0x0000_0000_ff00_0000);
     Ok(())
+}
+
+/// Compatibility helper for byte-layout tests covering both ownership
+/// domains. Production initializes the queue pages and CL_2 page separately.
+pub(crate) fn apply_g17p_cl_retained_static_state(
+    shared_support: &mut [u8],
+    support_state: &mut [u8],
+    scheduler_state: &mut [u8],
+    channel_control: &mut [u8],
+    page_list_gpu_va: u64,
+    run_table_gpu_va: u64,
+    support_state_gpu_va: u64,
+    scheduler_state_gpu_va: u64,
+) -> Result<(), SubmissionError> {
+    apply_g17p_cl_queue_static_state(
+        shared_support,
+        support_state,
+        scheduler_state,
+        page_list_gpu_va,
+        run_table_gpu_va,
+        support_state_gpu_va,
+        scheduler_state_gpu_va,
+    )?;
+    apply_g17p_cl_channel_control_static_state(channel_control)
 }
 
 /// Apply the exact host-owned pre-B2 values to three provider-owned pages.
@@ -3339,8 +3418,10 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     Ok(activation)
 }
 
-/// Apply the queue-local half of B2 activation. The channel-control pointer
-/// changes with the compute work queue; the PBDesc and UMA tables do not.
+/// Apply the session-wide CL_2 half of B2 activation. The pointer is pinned to
+/// a dedicated bootstrap owner; logical queues have separate scheduler pages.
+/// The exact consumer of this firmware-private slot remains unresolved. Never
+/// retarget it during ordinary queue switching. PBDesc/UMA are separate state.
 pub(crate) fn apply_g17p_cl_b2_computed_state(
     activation: G17PClB2ActivationState,
     computed: &mut [u8],
@@ -4120,6 +4201,169 @@ pub(crate) const G17P_REPEATED_DIRECT_CL2_PROXY_EVIDENCE: G17PDirectCl2ProxyEvid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Witnessed against the macOS capture: a real Metal render leaves the
+    /// parameter-buffer ring state at {7, 7, 0, 0}, and `PBState[+0x28]`
+    /// holds the full tagged address `0x1000190000`. The encode and decode
+    /// must be exact inverses -- that is what makes the field map from the two
+    /// kernelcache functions trustworthy.
+    #[test]
+    fn g17p_pbdesc_round_trips_the_witnessed_ring_state() {
+        assert_eq!(g17p_pbdesc_segment(0x10_0019_0000), 0);
+        assert_eq!(
+            g17p_pbdesc_reconstructed_address(0x10_0019_0000),
+            0x10_0019_0000
+        );
+        assert_eq!(
+            g17p_pbdesc_reconstructed_address(0x70_0247_8000),
+            0x70_0247_8000
+        );
+        assert_eq!(
+            g17p_pbdesc_reconstructed_address(0x0247_8000),
+            0x80_0247_8000
+        );
+        let state = G17PPbDescRingState {
+            counter_a: 7,
+            counter_b: 7,
+            flag_high: 0,
+            flag_low: 0,
+        };
+        let descriptor = encode_g17p_pbdesc([0; 4], 0x10_0019_0000, 0, state);
+        // dword0 carries the address >> 4; dword1 the segment >> 8 up top.
+        assert_eq!(descriptor[0], 0x0001_9000);
+        assert_eq!(descriptor[1] >> 28, 0x0);
+        assert_eq!(decode_g17p_pbdesc(descriptor), state);
+
+        // Bits the firmware owns survive a re-encode.
+        let previous = [0x0000_0005u32, 0x0abc_defu32, 0xf000_0000u32, 0x4000_0000u32];
+        let again = encode_g17p_pbdesc(previous, 0x10_0019_0000, 0x0012_3456, state);
+        assert_eq!(again[0] & 0x6, previous[0] & 0x6);
+        assert_eq!(again[1] & 0x003f_ffff, 0x0012_3456);
+        assert_eq!(again[2] & !0x003f_ffff, previous[2] & !0x003f_ffff);
+        assert_eq!(decode_g17p_pbdesc(again), state);
+
+        assert_eq!(g17p_pbdesc_offset(2), 2 * G17P_PBDESC_ENTRY_SIZE);
+    }
+
+    fn get_u64_le(raw: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn get_u32_le(raw: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn get_u16_le(raw: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(raw[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn source_fixture_fingerprint(raw: &[u8]) -> u64 {
+        raw.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    fn rce_binding_from_packed(word: u64) -> G17PClRceBinding {
+        G17PClRceBinding {
+            address: (word & G17P_CL_PACKED_ADDRESS_MASK) << 5,
+            tag: ((word >> 43) & KICK_QID_MASK as u64) as u8,
+        }
+    }
+
+    fn native_add3_compute_operands(
+        descriptor: u64,
+        queue: u64,
+        converted_command_timestamp: u64,
+        event_mask: [u64; 4],
+        rce_words: [u64; 2],
+    ) -> G17PClKickEntryOperands<'static> {
+        let empty = G17PClRceBinding { address: 0, tag: 0 };
+        G17PClKickEntryOperands {
+            descriptor_flag_4c: false,
+            descriptor_flag_5c8: false,
+            converted_command_timestamp,
+            barriers: &[],
+            mcache: None,
+            payload: [descriptor, queue],
+            event_mask,
+            rce_kind: 0,
+            rce_bindings: [
+                rce_binding_from_packed(rce_words[0]),
+                rce_binding_from_packed(rce_words[1]),
+                empty,
+                empty,
+            ],
+            auxiliary: 0x003f_ffff_ffff_ffff,
+        }
+    }
+
+    #[test]
+    fn compute_command_state_tracks_each_descriptor_slot() {
+        let first = prepare_g17p_compute_cl_command_state(0x70_0034_0000, 0, 0x26).unwrap();
+        assert_eq!(first.event_mask, [0, 0, 4, 0]);
+        assert_eq!(
+            first.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: 0x70_0034_0040,
+                    tag: 0x26,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0034_0760,
+                    tag: 0x04,
+                },
+                G17PClRceBinding { address: 0, tag: 0 },
+                G17PClRceBinding { address: 0, tag: 0 },
+            ]
+        );
+
+        let second = prepare_g17p_compute_cl_command_state(0x70_0034_4000, 1, 0x26).unwrap();
+        assert_eq!(second.event_mask, [0, 2, 8, 0]);
+        assert_eq!(second.rce_bindings[0].address, 0x70_0034_4040);
+        assert_eq!(second.rce_bindings[1].address, 0x70_0034_4760);
+    }
+
+    #[test]
+    fn render_command_state_selects_native_descriptor_register_arrays() {
+        let ta = prepare_g17p_render_cl_command_state(0x70_0001_0740, true).unwrap();
+        assert_eq!(ta.event_mask, [0; 4]);
+        assert_eq!(
+            ta.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: 0x70_0001_07a0,
+                    tag: 0x47,
+                },
+                G17PClRceBinding { address: 0, tag: 0 },
+                G17PClRceBinding { address: 0, tag: 0 },
+                G17PClRceBinding { address: 0, tag: 0 },
+            ]
+        );
+
+        let fragment =
+            prepare_g17p_render_cl_command_state(0x70_0016_5800, false).unwrap();
+        assert_eq!(
+            fragment.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: 0x70_0016_58a0,
+                    tag: 0x56,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0016_5fc0,
+                    tag: 0x10,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0016_66e0,
+                    tag: 0x17,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0016_6e00,
+                    tag: 0x0a,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn tx_doorbell_matches_the_shipping_agx2_wire_form() {
@@ -5186,6 +5430,47 @@ mod tests {
     }
 
     #[test]
+    fn g17p_3d_completion_scratch_matches_native_full_command() {
+        assert_eq!(
+            encode_g17p_3d_completion_scratch(
+                0xf76,
+                1,
+            ),
+            Ok(0x0000_0100_0000_0f76),
+        );
+        assert_eq!(
+            encode_g17p_3d_completion_scratch(
+                KICK_TS_MASK + 1,
+                1,
+            ),
+            Err(SubmissionError::KickTimestampOutOfRange),
+        );
+    }
+
+    #[test]
+    fn g17p_serialized_render_scratch_payload_advances_and_wraps_independently() {
+        for (ordinal, timestamp, expected) in [
+            (0, 1, 0x0000_0100_0000_0001),
+            (1, 2, 0x0000_0200_0000_0002),
+            (2, 3, 0x0000_0300_0000_0003),
+            (254, 255, 0x0000_ff00_0000_00ff),
+            (255, 256, 0x0000_0000_0000_0100),
+            (256, 257, 0x0000_0100_0000_0101),
+            // A channel payload is not inferred from the physical queue's
+            // slot or timestamp: distinct valid values must remain distinct.
+            (1, 0x1234_5678_9a, 0x0000_0212_3456_789a),
+        ] {
+            assert_eq!(
+                encode_g17p_3d_completion_scratch(
+                    timestamp, g17p_serialized_render_scratch_payload(ordinal),
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(g17p_serialized_render_scratch_payload(u64::from(u32::MAX)), 0);
+    }
+
+    #[test]
     fn kick_queue_preparation_couples_slot_queue_and_next_timestamp() {
         let timestamp = encode_kick_timestamp(KickTimestamp {
             stamp: 0x1234_5678,
@@ -5303,6 +5588,973 @@ mod tests {
         assert_eq!(
             prepare_kick_submission(0, 0x80, 1, 0x180),
             Err(SubmissionError::QueueIdOutOfRange)
+        );
+    }
+
+    #[test]
+    fn g17p_cl_kick_layout_and_publication_order_are_exact() {
+        assert_eq!(G17P_CL_KICK_ENTRY_SIZE, 0x180);
+        assert_eq!(G17P_CL_DEPENDENCIES_MAX, 32);
+        assert_eq!(G17P_CL_EXPLICIT_DEPENDENCIES_MAX, 31);
+        assert_eq!(
+            G17P_CL_KICK_QUEUE_STATE_LAYOUT,
+            G17PClKickQueueStateLayout {
+                queue_id: 0x0c,
+                num_stamps: 0x10,
+                entry_stride: 0x14,
+                completion_selector: 0x1c,
+                submitted: 0x44,
+                current_timestamp: 0x48,
+                last_add_kicks_timestamp: 0x50,
+                entry_cpu_base: 0x78,
+                entry_gpu_base: 0x80,
+                base_timestamp: 0x90,
+                previous_valid: 0x98,
+                previous_timestamp: 0xa0,
+            }
+        );
+        assert_eq!(
+            G17P_CL_KICK_ENTRY_LAYOUT,
+            G17PClKickEntryLayout {
+                header: 0x00,
+                mcache: 0x08,
+                payload: [0x10, 0x18],
+                dependency_control: 0x20,
+                dependencies: 0x28,
+                event_mask: [0x128, 0x130, 0x138, 0x140],
+                rce_kind: 0x148,
+                rce_bindings: [0x150, 0x158, 0x160, 0x168],
+                zero_170: 0x170,
+                auxiliary: 0x178,
+            }
+        );
+        assert_eq!(
+            G17P_CL_KICK_PUBLICATION_ORDER,
+            [
+                G17PClKickPublicationStep::ZeroEntryStride,
+                G17PClKickPublicationStep::EntryBody,
+                G17PClKickPublicationStep::InnerShareableBarrier,
+                G17PClKickPublicationStep::NextTimestamp,
+                G17PClKickPublicationStep::SubmittedAtomicAdd,
+                G17PClKickPublicationStep::PreviousValid,
+                G17PClKickPublicationStep::PreviousTimestamp,
+            ]
+        );
+        assert_eq!(
+            G17P_FIRST_SUBMIT_PUBLICATION_ORDER,
+            [
+                G17PFirstSubmitPublicationStep::AcquireGfx1RunningPower,
+                G17PFirstSubmitPublicationStep::PublishB2,
+                G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
+                G17PFirstSubmitPublicationStep::ConfigureQid4Hardware,
+                G17PFirstSubmitPublicationStep::ZeroSksmStride,
+                G17PFirstSubmitPublicationStep::WriteSksmEntry,
+                G17PFirstSubmitPublicationStep::EntryBarrier,
+                G17PFirstSubmitPublicationStep::PublishSksmProducer,
+                G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
+                G17PFirstSubmitPublicationStep::RecordHostCorrelationToken,
+                G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
+                G17PFirstSubmitPublicationStep::AddKicks,
+                G17PFirstSubmitPublicationStep::PublishCl2,
+                G17PFirstSubmitPublicationStep::SendActivation,
+                G17PFirstSubmitPublicationStep::DirectKickBarrier,
+                G17PFirstSubmitPublicationStep::SendDirectKick,
+            ]
+        );
+    }
+
+    #[test]
+    fn g17p_conditional_transport_events_match_the_independent_fixtures() {
+        const PRIMARY: &[u8; G17P_COMPUTE_PRIMARY_EVENT_SIZE] =
+            include_bytes!("fixtures/g17p_first_submit/channel-event-primary.bin");
+        const OPTIONAL: &[u8; G17P_COMPUTE_OPTIONAL_EVENT_SIZE] =
+            include_bytes!("fixtures/g17p_first_submit/channel-event-optional.bin");
+
+        let primary = prepare_g17p_compute_primary_event(0, 0, 4, 2, 1).unwrap();
+        assert_eq!(primary.descriptor_generation, 1);
+        assert_eq!(primary.bytes, *PRIMARY);
+        assert_eq!(advance_g17p_compute_descriptor_generation(0, 0), Ok(1));
+        assert_eq!(advance_g17p_compute_descriptor_generation(2, 3), Ok(6));
+
+        let mut optional = [0u8; G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        encode_g17p_compute_optional_event(
+            G17PComputeOptionalEvent {
+                queue_id: 4,
+                old_timestamp: 1,
+            },
+            &mut optional,
+        )
+        .unwrap();
+        assert_eq!(optional, *OPTIONAL);
+
+        assert_eq!(
+            prepare_g17p_compute_primary_event(u32::MAX, 0, 4, 2, 1),
+            Err(SubmissionError::ComputeEventCounterOverflow)
+        );
+        assert_eq!(
+            prepare_g17p_compute_primary_event(u16::MAX as u32, 0, 4, 2, 1),
+            Err(SubmissionError::ComputeEventCounterOverflow)
+        );
+
+        // The tag-14 transport builder reproduces the same captured record.
+        // mac17p 0xfffffe00089fa39c writes type 14, QID 4, one kick, the queue
+        // QoS priority 2, the pre-increment entry stamp 1, and data master 2.
+        let add_kicks = prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+            queue_id: 4,
+            add_count: 1,
+            queue_priority: 2,
+            entry_stamp: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.timestamp_seed(),
+        })
+        .unwrap();
+        assert_eq!(add_kicks.bytes, *PRIMARY);
+        assert_eq!(add_kicks.bytes.len(), G17P_KSM_ADD_KICKS_COMMAND_SIZE);
+        assert!(G17P_KSM_ADD_KICKS_COMMAND_SIZE <= G17P_KSM_ADD_KICKS_COMMAND_FETCH_SIZE);
+        assert_eq!(add_kicks.bytes[0x08], 2);
+        assert_eq!(
+            u32::from_le_bytes(add_kicks.bytes[0x11..0x15].try_into().unwrap()),
+            G17P_COMPUTE_DATA_MASTER
+        );
+
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: 0,
+                queue_priority: 2,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::KsmAddKicksCountZero)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: KICK_QID_MASK + 1,
+                add_count: 1,
+                queue_priority: 2,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::QueueIdOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: 1,
+                queue_priority: 4,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::KickQueueCompletionSelectorOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: 1,
+                queue_priority: 2,
+                entry_stamp: 1 << KICK_TS_BITS,
+            }),
+            Err(SubmissionError::KickTimestampOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: u16::MAX as u32 + 1,
+                queue_priority: 2,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::KsmAddKicksCountOutOfRange)
+        );
+    }
+
+    #[test]
+    fn g17p_cl_hardware_positive_retained_items_are_exact() {
+        const QUEUE: u64 = 0xffff_fc20_c000_0300;
+        const DESCRIPTOR: u64 = 0xffff_fc20_c035_8000;
+        const DESCRIPTOR_STRIDE: u64 = 0x1040;
+        let item0_queue = G17PClKickProducerState {
+            queue_id: 4,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 1,
+                class_40: 8,
+                word_48: 0xffff,
+            },
+            submitted: 0,
+            current_timestamp: 1,
+            last_add_kicks_timestamp: 1,
+            base_timestamp: 1,
+            previous_valid: false,
+            previous_timestamp: 0,
+        };
+        let item0 = prepare_g17p_cl_kick_entry(
+            item0_queue,
+            native_add3_compute_operands(
+                DESCRIPTOR,
+                QUEUE,
+                1,
+                [0, 0, 4, 0],
+                [0x0001_1003_8001_a002, 0x0000_2003_8001_a03b],
+            ),
+        )
+        .unwrap();
+        let mut expected0 = [0u8; G17P_CL_KICK_ENTRY_SIZE];
+        for (offset, value) in [
+            (0x00, 0x1000_1000_0000_0004),
+            (0x10, DESCRIPTOR),
+            (0x18, QUEUE),
+            (0x20, 0xffff_0801_0000_0001),
+            (0x28, 0x0000_0400_0000_0000),
+            (0x138, 4),
+            (0x150, 0x0001_1003_8001_a002),
+            (0x158, 0x0000_2003_8001_a03b),
+            (0x178, 0x003f_ffff_ffff_ffff),
+        ] {
+            put_u64_le(&mut expected0, offset, value);
+        }
+        assert_eq!(item0.entry, expected0);
+        assert_eq!(item0.zero_length, 0x200);
+        assert_eq!(item0.entry_index, 1);
+        assert_eq!(item0.entry_offset, 0x200);
+        assert_eq!(item0.current_timestamp, 1);
+        assert_eq!(item0.next_timestamp, 2);
+        assert_eq!(item0.submitted_before, 0);
+        assert_eq!(item0.submitted_after, 1);
+        assert_eq!(item0.previous_timestamp_after, 1);
+        assert_eq!(item0.producer_after.current_timestamp, 2);
+        assert_eq!(item0.producer_after.submitted, 1);
+        assert!(item0.producer_after.previous_valid);
+        assert_eq!(item0.producer_after.previous_timestamp, 1);
+        assert_eq!(item0.producer_after.qos, item0_queue.qos);
+
+        let item1 = prepare_g17p_cl_kick_entry(
+            item0.producer_after,
+            native_add3_compute_operands(
+                DESCRIPTOR + DESCRIPTOR_STRIDE,
+                QUEUE,
+                0,
+                [0, 2, 8, 0],
+                [0x0001_1003_8001_a084, 0x0000_2003_8001_a0bd],
+            ),
+        )
+        .unwrap();
+        let mut expected1 = [0u8; G17P_CL_KICK_ENTRY_SIZE];
+        for (offset, value) in [
+            (0x00, 0x1000_1000_0000_0008),
+            (0x10, DESCRIPTOR + DESCRIPTOR_STRIDE),
+            (0x18, QUEUE),
+            (0x20, 0xffff_0801_0000_0001),
+            (0x28, 0x0000_0400_0000_0001),
+            (0x130, 2),
+            (0x138, 8),
+            (0x150, 0x0001_1003_8001_a084),
+            (0x158, 0x0000_2003_8001_a0bd),
+            (0x178, 0x003f_ffff_ffff_ffff),
+        ] {
+            put_u64_le(&mut expected1, offset, value);
+        }
+        assert_eq!(item1.entry, expected1);
+        assert_eq!(item1.zero_length, 0x200);
+        assert_eq!(item1.entry_index, 2);
+        assert_eq!(item1.entry_offset, 0x400);
+        assert_eq!(item1.current_timestamp, 2);
+        assert_eq!(item1.next_timestamp, 3);
+        assert_eq!(item1.submitted_before, 1);
+        assert_eq!(item1.submitted_after, 2);
+        assert_eq!(item1.previous_timestamp_after, 2);
+        assert_eq!(item1.producer_after.current_timestamp, 3);
+        assert_eq!(item1.producer_after.submitted, 2);
+        assert_eq!(item1.producer_after.previous_timestamp, 2);
+        assert_eq!(item1.producer_after.qos, item0_queue.qos);
+
+        // Command two keeps physical queue 0's QoS word while advancing its
+        // command-owned event mask from 4 to 8.
+        assert_eq!(get_u64_le(&item1.entry, 0x00), 0x1000_1000_0000_0008);
+        assert_eq!(get_u64_le(&item1.entry, 0x28), 0x0000_0400_0000_0001);
+        assert_eq!(
+            get_u64_le(&item1.entry, 0x20),
+            get_u64_le(&item0.entry, 0x20)
+        );
+        assert_eq!(get_u64_le(&item0.entry, 0x138), 4);
+        assert_eq!(get_u64_le(&item1.entry, 0x138), 8);
+        assert_eq!(
+            get_u64_le(&item1.entry, 0x178),
+            get_u64_le(&item0.entry, 0x178)
+        );
+    }
+
+    #[test]
+    fn g17p_first_submit_matches_the_independent_full_stride_fixture() {
+        const BEFORE: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-before.bin");
+        const AFTER: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-after.bin");
+        const RELOCATION_MASK: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-relocation-mask.bin");
+        const DESCRIPTOR_HIGH: u64 = 0xffff_fc20_c035_8000;
+        const DESCRIPTOR_LOW: u64 = 0x70_0034_0000;
+        const QUEUE: u64 = 0xffff_fc20_c000_0300;
+
+        assert!(BEFORE.iter().all(|byte| *byte == 0));
+        assert_eq!(G17P_FIRST_BIND_COMMAND_PLAN.fallback_logical_flush_id, 0);
+        assert!(!G17P_FIRST_BIND_COMMAND_PLAN.flush_id_serialized_in_tag15);
+        assert!(!G17P_FIRST_BIND_COMMAND_PLAN.flush_id_completion_release_required);
+        assert_eq!(
+            RELOCATION_MASK
+                .iter()
+                .map(|byte| byte.count_ones())
+                .sum::<u32>(),
+            204
+        );
+
+        let command = prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW, 0, 0x26).unwrap();
+        let empty = G17PClRceBinding { address: 0, tag: 0 };
+        assert_eq!(
+            command.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: DESCRIPTOR_LOW + 0x40,
+                    tag: 0x26,
+                },
+                G17PClRceBinding {
+                    address: DESCRIPTOR_LOW + 0x760,
+                    tag: 0x04,
+                },
+                empty,
+                empty,
+            ]
+        );
+        let before = G17PClKickProducerState {
+            queue_id: 4,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 1,
+                class_40: 8,
+                word_48: 0xffff,
+            },
+            submitted: 0,
+            current_timestamp: 1,
+            last_add_kicks_timestamp: 1,
+            base_timestamp: 1,
+            previous_valid: false,
+            previous_timestamp: 0,
+        };
+        let prepared = prepare_g17p_cl_kick_entry(
+            before,
+            G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 1,
+                barriers: &[],
+                mcache: None,
+                payload: [DESCRIPTOR_HIGH, QUEUE],
+                event_mask: command.event_mask,
+                rce_kind: 0,
+                rce_bindings: command.rce_bindings,
+                auxiliary: 0x003f_ffff_ffff_ffff,
+            },
+        )
+        .unwrap();
+        let mut actual = [0u8; 0x200];
+        actual[..G17P_CL_KICK_ENTRY_SIZE].copy_from_slice(&prepared.entry);
+
+        for index in 0..actual.len() {
+            assert_eq!(
+                actual[index] & !RELOCATION_MASK[index],
+                AFTER[index] & !RELOCATION_MASK[index],
+                "normalized fixture mismatch at offset {:#x}",
+                index
+            );
+        }
+        // The fixture uses the same captured addresses as this test, so the
+        // relocation-bearing fields must also agree without normalization.
+        assert_eq!(actual, *AFTER);
+        assert_eq!(prepared.zero_length, 0x200);
+        assert_eq!(prepared.entry_index, 1);
+        assert_eq!(prepared.entry_offset, 0x200);
+        assert_eq!(prepared.current_timestamp, 1);
+        assert_eq!(prepared.next_timestamp, 2);
+        assert_eq!(prepared.submitted_before, 0);
+        assert_eq!(prepared.submitted_after, 1);
+        assert_eq!(
+            prepared.producer_after,
+            G17PClKickProducerState {
+                submitted: 1,
+                current_timestamp: 2,
+                previous_valid: true,
+                previous_timestamp: 1,
+                ..before
+            }
+        );
+
+        const SECOND_AFTER: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-second-after.bin");
+        let second_command =
+            prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW + 0x1040, 1, 0x26).unwrap();
+        let second = prepare_g17p_cl_kick_entry(
+            prepared.producer_after,
+            G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 0,
+                barriers: &[],
+                mcache: None,
+                payload: [DESCRIPTOR_HIGH + 0x1040, QUEUE],
+                event_mask: second_command.event_mask,
+                rce_kind: 0,
+                rce_bindings: second_command.rce_bindings,
+                auxiliary: 0x003f_ffff_ffff_ffff,
+            },
+        )
+        .unwrap();
+        let mut second_actual = [0u8; 0x200];
+        second_actual[..G17P_CL_KICK_ENTRY_SIZE].copy_from_slice(&second.entry);
+        assert_eq!(second_actual, *SECOND_AFTER);
+        assert_eq!(second.entry_index, 2);
+        assert_eq!(second.entry_offset, 0x400);
+        assert_eq!(second.current_timestamp, 2);
+        assert_eq!(second.next_timestamp, 3);
+        assert_eq!(second.submitted_before, 1);
+        assert_eq!(second.submitted_after, 2);
+        assert_eq!(second.producer_after.current_timestamp, 3);
+        assert_eq!(second.producer_after.previous_timestamp, 2);
+        assert_eq!(second.producer_after.last_add_kicks_timestamp, 1);
+    }
+
+    #[test]
+    fn g17p_cl_descriptor_flags_map_directly_to_header_bits() {
+        let empty = G17PClRceBinding { address: 0, tag: 0 };
+        let producer = G17PClKickProducerState {
+            queue_id: 4,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 1,
+                class_40: 8,
+                word_48: 0xffff,
+            },
+            submitted: 0,
+            current_timestamp: 1,
+            last_add_kicks_timestamp: 1,
+            base_timestamp: 1,
+            previous_valid: false,
+            previous_timestamp: 0,
+        };
+        let flag_mask = (1u64 << 1) | (1u64 << 61);
+
+        for (flag_4c, flag_5c8, expected) in [
+            (false, false, 0),
+            (true, false, 1u64 << 1),
+            (false, true, 1u64 << 61),
+            (true, true, flag_mask),
+        ] {
+            let prepared = prepare_g17p_cl_kick_entry(
+                producer,
+                G17PClKickEntryOperands {
+                    descriptor_flag_4c: flag_4c,
+                    descriptor_flag_5c8: flag_5c8,
+                    converted_command_timestamp: 1,
+                    barriers: &[],
+                    mcache: None,
+                    payload: [0; 2],
+                    event_mask: [0; 4],
+                    rce_kind: 0,
+                    rce_bindings: [empty; 4],
+                    auxiliary: 0,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(get_u64_le(&prepared.entry, 0) & flag_mask, expected);
+        }
+    }
+
+    #[test]
+    fn g17p_cl_completion_updates_only_the_submitted_count() {
+        let producer = G17PClKickProducerState {
+            queue_id: 4,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 1,
+                class_40: 8,
+                word_48: 0xffff,
+            },
+            submitted: 2,
+            current_timestamp: 3,
+            last_add_kicks_timestamp: 2,
+            base_timestamp: 1,
+            previous_valid: true,
+            previous_timestamp: 2,
+        };
+
+        assert_eq!(complete_g17p_cl_kicks(producer, 0), Ok(producer));
+        let after_one = complete_g17p_cl_kicks(producer, 1).unwrap();
+        assert_eq!(
+            after_one,
+            G17PClKickProducerState {
+                submitted: 1,
+                ..producer
+            }
+        );
+        let empty = complete_g17p_cl_kicks(producer, 2).unwrap();
+        assert_eq!(empty.submitted, 0);
+        assert_eq!(complete_g17p_cl_kicks(empty, 0), Ok(empty));
+        assert_eq!(
+            complete_g17p_cl_kicks(empty, 1),
+            Err(SubmissionError::KickCompletionUnderflow)
+        );
+        assert_eq!(
+            complete_g17p_cl_kicks(producer, 3),
+            Err(SubmissionError::KickCompletionUnderflow)
+        );
+    }
+
+    #[test]
+    fn g17p_cl_retained_storage_overlap_and_order_are_exact() {
+        let layout = G17P_CL_RETAINED_STORAGE_LAYOUT;
+        assert_eq!(
+            layout,
+            G17PClRetainedStorageLayout {
+                shared_support: G17PClStorageRange {
+                    offset: 0,
+                    size: 0x4000,
+                },
+                scheduler: G17PClStorageRange {
+                    offset: 0x200,
+                    size: 0x100,
+                },
+            }
+        );
+        assert_eq!(
+            layout.scheduler.offset - layout.shared_support.offset,
+            0x200
+        );
+        assert!(g17p_cl_range_contains(
+            layout.shared_support,
+            layout.scheduler
+        ));
+        assert!(g17p_cl_ranges_overlap(
+            layout.shared_support,
+            layout.scheduler
+        ));
+        assert!(g17p_cl_full_support_initialization_allowed(false));
+        assert!(!g17p_cl_full_support_initialization_allowed(true));
+
+        assert_eq!(
+            G17P_CL_RETAINED_REGISTRATION_ORDER,
+            [
+                G17PClRetainedPublicationStep::InitializeSharedSupport,
+                G17PClRetainedPublicationStep::WriteSchedulerRecord,
+                G17PClRetainedPublicationStep::RegisterPhysicalQueue,
+            ]
+        );
+        assert_eq!(
+            G17P_CL_RETAINED_ACTIVATION_ORDER,
+            [
+                G17PClRetainedPublicationStep::PublishCommandOwnedState,
+                G17PClRetainedPublicationStep::CleanCommandOwnedState,
+                G17PClRetainedPublicationStep::WriteB2PrimaryState,
+                G17PClRetainedPublicationStep::CleanB2PrimaryState,
+                G17PClRetainedPublicationStep::SystemBarrierBeforeInnerPayload,
+                G17PClRetainedPublicationStep::PublishInnerQueuePayload,
+                G17PClRetainedPublicationStep::SystemBarrierBeforeInnerProducer,
+                G17PClRetainedPublicationStep::PublishInnerQueueProducer,
+                G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
+            ]
+        );
+        assert_eq!(
+            G17P_CL_RETAINED_SUBMISSION_ORDER,
+            [
+                G17PClRetainedPublicationStep::PublishCommandOwnedState,
+                G17PClRetainedPublicationStep::CleanCommandOwnedState,
+                G17PClRetainedPublicationStep::PublishInnerQueuePayload,
+                G17PClRetainedPublicationStep::SystemBarrierBeforeInnerProducer,
+                G17PClRetainedPublicationStep::PublishInnerQueueProducer,
+                G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
+            ]
+        );
+        assert_eq!(
+            g17p_cl_retained_submission_order(G17PClB2ActivationState::Pending),
+            G17P_CL_RETAINED_ACTIVATION_ORDER
+        );
+        assert_eq!(
+            g17p_cl_retained_submission_order(G17PClB2ActivationState::Published),
+            G17P_CL_RETAINED_SUBMISSION_ORDER
+        );
+    }
+
+    #[test]
+    fn g17p_cl_b2_primary_state_builder_is_byte_exact() {
+        const FILL: u8 = 0xa5;
+        const CHANNEL_CONTROL: u64 = 0xffff_fc20_1234_8000;
+        let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
+        assert_eq!(
+            layout,
+            G17PClB2PrimaryStateLayout {
+                object_size: 0x4000,
+                computed_write_extent: 0xe30,
+                region_1_write_extent: 0x20,
+                region_2_write_extent: 0x18,
+            }
+        );
+
+        let mut computed = [FILL; 0x4000];
+        let mut region_1 = [FILL; 0x4000];
+        let mut region_2 = [FILL; 0x4000];
+        let activation = apply_g17p_cl_b2_primary_state(
+            G17PClB2ActivationState::Pending,
+            &mut computed,
+            &mut region_1,
+            &mut region_2,
+            CHANNEL_CONTROL,
+        )
+        .unwrap();
+        assert_eq!(activation, G17PClB2ActivationState::Published);
+
+        let mut expected_computed = [FILL; 0x4000];
+        expected_computed[0x000] = 0xff;
+        expected_computed[0x008] = 0xff;
+        expected_computed[0x010..0x012].copy_from_slice(&0x0f01u16.to_le_bytes());
+        expected_computed[0x018..0x01a].copy_from_slice(&0x0f01u16.to_le_bytes());
+        for (offset, value) in [(0x408, 2), (0x40c, 2), (0x604, 4), (0xc04, 0x1000)] {
+            put_u32_le(&mut expected_computed, offset, value);
+        }
+        for (offset, value) in [
+            (0x808, CHANNEL_CONTROL),
+            (0xe00, 7),
+            (0xe08, 0x0000_0001_0e22_618a),
+            (0xe20, 4),
+            (0xe28, 4),
+        ] {
+            put_u64_le(&mut expected_computed, offset, value);
+        }
+
+        let mut expected_region_1 = [FILL; 0x4000];
+        put_u64_le(&mut expected_region_1, 0x10, 0x0000_0080_0007_7000);
+        put_u32_le(&mut expected_region_1, 0x18, 0x17);
+        put_u32_le(&mut expected_region_1, 0x1c, 0x17);
+
+        let mut expected_region_2 = [FILL; 0x4000];
+        put_u64_le(&mut expected_region_2, 0x00, 0x0800_0000_e000_0000);
+        put_u64_le(&mut expected_region_2, 0x08, 0x0000_3d40_0000_3400);
+        put_u64_le(&mut expected_region_2, 0x10, 0x0000_0000_0000_1d00);
+
+        assert_eq!(computed, expected_computed);
+        assert_eq!(region_1, expected_region_1);
+        assert_eq!(region_2, expected_region_2);
+        assert_eq!(
+            apply_g17p_cl_b2_primary_state(
+                activation,
+                &mut computed,
+                &mut region_1,
+                &mut region_2,
+                CHANNEL_CONTROL,
+            ),
+            Err(SubmissionError::KickB2PrimaryStateAlreadyPublished)
+        );
+        assert_eq!(computed, expected_computed);
+        assert_eq!(region_1, expected_region_1);
+        assert_eq!(region_2, expected_region_2);
+
+        let mut short = [0u8; 1];
+        assert_eq!(
+            apply_g17p_cl_b2_primary_state(
+                G17PClB2ActivationState::Pending,
+                &mut short,
+                &mut region_1,
+                &mut region_2,
+                CHANNEL_CONTROL,
+            ),
+            Err(SubmissionError::KickB2PrimaryStateBufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn g17p_cl_entry_encodes_every_optional_section() {
+        let barriers = [G17PClBarrierDependency {
+            event_word: 0x100,
+            shared_stamp: 0,
+            queue_id: 3,
+        }];
+        let rce_bindings = [
+            G17PClRceBinding {
+                address: 0x2000,
+                tag: 1,
+            },
+            G17PClRceBinding {
+                address: 0x4000,
+                tag: 2,
+            },
+            G17PClRceBinding {
+                address: 0x6000,
+                tag: 3,
+            },
+            G17PClRceBinding {
+                address: 0x8000,
+                tag: 4,
+            },
+        ];
+        let queue = G17PClKickProducerState {
+            queue_id: 4,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 0x12,
+                class_40: 0x1b,
+                word_48: 0x3456,
+            },
+            submitted: 2,
+            current_timestamp: 2,
+            last_add_kicks_timestamp: 1,
+            base_timestamp: 1,
+            previous_valid: true,
+            previous_timestamp: 7,
+        };
+        let prepared = prepare_g17p_cl_kick_entry(
+            queue,
+            G17PClKickEntryOperands {
+                descriptor_flag_4c: true,
+                descriptor_flag_5c8: true,
+                converted_command_timestamp: 0,
+                barriers: &barriers,
+                mcache: Some(G17PClMcacheAperture {
+                    address: 0x12340,
+                    index: 5,
+                    count: 3,
+                }),
+                payload: [0x1111_2222_3333_4444, 0x5555_6666_7777_8888],
+                event_mask: [0x10, 0x20, 0x30, 0x40],
+                rce_kind: 2,
+                rce_bindings,
+                auxiliary: 0xa5a5_5a5a_1234_5678,
+            },
+        )
+        .unwrap();
+        let header =
+            (2u64 << 2) | (4u64 << 42) | (1u64 << 58) | (2u64 << 59) | (1u64 << 1) | (1u64 << 61);
+        assert_eq!(get_u64_le(&prepared.entry, 0x00), header);
+        assert_eq!(
+            get_u64_le(&prepared.entry, 0x08),
+            5 | ((0x12340u64 >> 5) << 6) | (2u64 << 54)
+        );
+        assert_eq!(get_u64_le(&prepared.entry, 0x10), 0x1111_2222_3333_4444);
+        assert_eq!(get_u64_le(&prepared.entry, 0x18), 0x5555_6666_7777_8888);
+        assert_eq!(get_u64_le(&prepared.entry, 0x20), 0x3456_1b12_0000_0003);
+        assert_eq!(get_u64_le(&prepared.entry, 0x28), (3u64 << 40) | 1);
+        assert_eq!(get_u64_le(&prepared.entry, 0x30), (4u64 << 40) | 7);
+        assert_eq!(
+            [
+                get_u64_le(&prepared.entry, 0x128),
+                get_u64_le(&prepared.entry, 0x130),
+                get_u64_le(&prepared.entry, 0x138),
+                get_u64_le(&prepared.entry, 0x140),
+            ],
+            [0x10, 0x20, 0x30, 0x40]
+        );
+        assert_eq!(prepared.entry[0x148], 2);
+        for (index, binding) in rce_bindings.into_iter().enumerate() {
+            assert_eq!(
+                get_u64_le(&prepared.entry, 0x150 + index * 8),
+                (binding.address >> 5) | ((binding.tag as u64) << 43)
+            );
+        }
+        assert_eq!(get_u64_le(&prepared.entry, 0x170), 0);
+        assert_eq!(get_u64_le(&prepared.entry, 0x178), 0xa5a5_5a5a_1234_5678);
+        assert_eq!(prepared.submitted_after, 3);
+        assert_eq!(prepared.previous_timestamp_after, 2);
+    }
+
+    /// G17P's native graphics wrappers select stage-specific launch classes,
+    /// while direct entry-ring captures show the same 0xffff word for both
+    /// ordinary TA and 3D kicks. Keep those exact +0x20 qwords pinned
+    /// independently of the CL profile.
+    #[test]
+    fn g17p_native_render_dependency_control_words_are_exact() {
+        fn operands(barriers: &[G17PClBarrierDependency]) -> G17PClKickEntryOperands<'_> {
+            let empty = G17PClRceBinding { address: 0, tag: 0 };
+            G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 1,
+                barriers,
+                mcache: None,
+                payload: [0; 2],
+                event_mask: [0; 4],
+                rce_kind: 0,
+                rce_bindings: [empty; 4],
+                auxiliary: 0,
+            }
+        }
+
+        let ta = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+            .initial_producer_state(
+                0,
+                2,
+                G17PClQosConfig {
+                    queue_byte_32: 2,
+                    class_40: 0x0c,
+                    word_48: 0xffff,
+                },
+            )
+            .unwrap();
+        let ta = prepare_g17p_cl_kick_entry(ta, operands(&[])).unwrap();
+        assert_eq!(get_u64_le(&ta.entry, 0x20), 0xffff_0c02_0000_0001);
+
+        let fragment_barrier = [G17PClBarrierDependency {
+            event_word: 0x100,
+            shared_stamp: 0,
+            queue_id: 0,
+        }];
+        let fragment = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+            .initial_producer_state(
+                1,
+                2,
+                G17PClQosConfig {
+                    queue_byte_32: 2,
+                    class_40: 0x18,
+                    word_48: 0xffff,
+                },
+            )
+            .unwrap();
+        let fragment =
+            prepare_g17p_cl_kick_entry(fragment, operands(&fragment_barrier)).unwrap();
+        assert_eq!(
+            get_u64_le(&fragment.entry, 0x20),
+            0xffff_1802_0000_0003
+        );
+    }
+
+    #[test]
+    fn g17p_cl_entry_reports_invalid_geometry_and_fields() {
+        let empty = G17PClRceBinding { address: 0, tag: 0 };
+        let queue = G17PClKickProducerState {
+            queue_id: 0,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
+            completion_selector: 0,
+            qos: G17PClQosConfig {
+                queue_byte_32: 0,
+                class_40: 0,
+                word_48: 0,
+            },
+            submitted: 0,
+            current_timestamp: 1,
+            last_add_kicks_timestamp: 0,
+            base_timestamp: 1,
+            previous_valid: false,
+            previous_timestamp: 0,
+        };
+        let operands = G17PClKickEntryOperands {
+            descriptor_flag_4c: true,
+            descriptor_flag_5c8: true,
+            converted_command_timestamp: 1,
+            barriers: &[],
+            mcache: None,
+            payload: [0; 2],
+            event_mask: [0; 4],
+            rce_kind: 0,
+            rce_bindings: [empty; 4],
+            auxiliary: 0,
+        };
+
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                G17PClKickProducerState {
+                    geometry: G17SksmQueueGeometry {
+                        entry_stride: 0,
+                        ..T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+                    },
+                    ..queue
+                },
+                operands,
+            ),
+            Err(SubmissionError::KickQueueGeometryInvalid)
+        );
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                G17PClKickProducerState {
+                    geometry: G17SksmQueueGeometry {
+                        entry_stride: 0x17f,
+                        ..T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+                    },
+                    ..queue
+                },
+                operands,
+            ),
+            Err(SubmissionError::KickQueueGeometryInvalid)
+        );
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                G17PClKickProducerState {
+                    geometry: G17SksmQueueGeometry {
+                        stamp_count: 0,
+                        ..T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+                    },
+                    ..queue
+                },
+                operands,
+            ),
+            Err(SubmissionError::KickQueueGeometryInvalid)
+        );
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                G17PClKickProducerState {
+                    submitted: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.stamp_count() as u32,
+                    ..queue
+                },
+                operands,
+            ),
+            Err(SubmissionError::KickQueueSubmittedFull)
+        );
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                G17PClKickProducerState {
+                    qos: G17PClQosConfig {
+                        class_40: 0x20,
+                        ..queue.qos
+                    },
+                    ..queue
+                },
+                operands,
+            ),
+            Err(SubmissionError::KickQosClassOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                queue,
+                G17PClKickEntryOperands {
+                    mcache: Some(G17PClMcacheAperture {
+                        address: 0x20,
+                        index: 0x40,
+                        count: 1,
+                    }),
+                    ..operands
+                },
+            ),
+            Err(SubmissionError::KickMcacheFieldOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                queue,
+                G17PClKickEntryOperands {
+                    rce_bindings: [G17PClRceBinding { address: 1, tag: 0 }, empty, empty, empty,],
+                    ..operands
+                },
+            ),
+            Err(SubmissionError::KickRceAddressUnencodable)
+        );
+
+        let too_many = [G17PClBarrierDependency {
+            event_word: 0,
+            shared_stamp: 0,
+            queue_id: 0,
+        }; G17P_CL_DEPENDENCIES_MAX];
+        assert_eq!(
+            prepare_g17p_cl_kick_entry(
+                queue,
+                G17PClKickEntryOperands {
+                    barriers: &too_many,
+                    ..operands
+                },
+            ),
+            Err(SubmissionError::KickDependencyCountOutOfRange)
         );
     }
 

@@ -5,6 +5,7 @@ Some old m1n1 fixture tests already fail at HEAD. --all reports those failures
 unchanged rather than refreshing expected hashes or silently excluding them.
 """
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import argparse
 import subprocess
 import tempfile
@@ -66,7 +67,7 @@ fn changing_pb_owner_changes_only_the_fragment_rce_owner_value() {
 }
 '''
     subprocess.run(["rustc", "-Awarnings", "--edition=2021", "--test", "-", "-o", exe],
-                   input=source, text=True, check=True)
+                   input=with_g17_config(source), text=True, check=True)
     listing = subprocess.check_output([exe, "--list"], text=True)
     for name in names:
         qualified = "g17_render::tests::" + name

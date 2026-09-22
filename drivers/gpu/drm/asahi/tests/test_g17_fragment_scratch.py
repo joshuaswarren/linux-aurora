@@ -30,7 +30,8 @@ constants = "\n".join(
 body = "\n".join([
     "#![allow(dead_code)]",
     "type Result<T = ()> = core::result::Result<T, i32>;",
-    "const EINVAL: i32 = 22; const EIO: i32 = 5;",
+    "const EINVAL: i32 = 22; const EIO: i32 = 5; const ERANGE:i32=34;",
+    "mod mmu {pub const UAT_PGSZ:usize=0x4000;}",
     "mod g17_submission {",
     constants,
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
@@ -44,6 +45,7 @@ body = "\n".join([
     "}",
     "mod g17_render {",
     re.search(r"^pub\(crate\) const TA_DESCRIPTOR_SIZE: .*?;", render, re.M).group(),
+    re.search(r"^pub\(crate\) const FRAGMENT_DESCRIPTOR_SIZE: .*?;", render, re.M).group(),
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
     block(render, r"^pub\(crate\) enum RenderBuildError\s+"),
     block(render, r"^fn put_u8\("),
@@ -51,9 +53,16 @@ body = "\n".join([
     block(render, r"^pub\(crate\) fn apply_g17p_ta_linked_completion_scratch\("),
     "}",
     block(resources, r"^fn put_u64\("),
+    "\n".join(re.search(r"^const " + name + r": [^;]+;", resources, re.M).group()
+        for name in ["G17P_RENDER_DESCRIPTOR_SLOT_COUNT", "G17P_RENDER_TA_DESCRIPTOR_STRIDE",
+                     "G17P_RENDER_3D_DESCRIPTOR_STRIDE", "G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE",
+                     "G17P_RENDER_3D_DESCRIPTOR_OFFSET"]),
+    block(resources, r"^fn g17p_render_descriptor_slot\("),
+    block(resources, r"^fn g17p_render_ta_descriptor_offset\("),
+    block(resources, r"^fn g17p_render_3d_descriptor_offset\("),
     # The production method is verbatim; the test harness supplies only the
     # descriptor field it accesses, backed by a fallible mapped-byte adapter.
-    "struct G17PUserRenderStorage { descriptors: MappedObject }",
+    "struct G17PUserRenderStorage { descriptors: MappedObject, descriptor_ordinal:u64 }",
     "impl G17PUserRenderStorage {",
     block(resources, r"^    pub\(crate\) fn stage_fragment_completion_scratch\("),
     "}",
@@ -67,25 +76,27 @@ impl MappedObject {
     }
 }
 fn storage(size: usize) -> G17PUserRenderStorage {
-    G17PUserRenderStorage { descriptors: MappedObject { bytes: vec![0xa5; size], accesses: 0, fail: false } }
+    G17PUserRenderStorage { descriptor_ordinal:0, descriptors: MappedObject { bytes: vec![0xa5; size], accesses: 0, fail: false } }
 }
 #[test]
 fn actual_staging_changes_only_owned_ta_fields_and_fragment_scratch() {
-    let mut s = storage(0x9000);
+    let mut s = storage(G17P_RENDER_3D_DESCRIPTOR_OFFSET + G17P_RENDER_3D_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT);
     for ordinal in [0, 1, 2, 254, 255, 256, 999] {
+        s.descriptor_ordinal = ordinal;
         let before = s.descriptors.bytes.clone();
         let stamp = ordinal as u64 + 1;
         let payload = g17_submission::g17p_serialized_render_scratch_payload(ordinal);
         let value = s.stage_fragment_completion_scratch(stamp, stamp, payload).unwrap();
         assert_eq!(value & g17_submission::KICK_TS_MASK, stamp);
         assert_eq!(value >> 40, payload as u64);
-        let at = 0x4000 + 0x2160;
+        let ta = g17p_render_ta_descriptor_offset(ordinal);
+        let at = g17p_render_3d_descriptor_offset(ordinal) + 0x2160;
         assert_eq!(&s.descriptors.bytes[at..at + 8], &value.to_le_bytes());
-        assert_eq!(&s.descriptors.bytes[0x7a8..0x7b0], &stamp.to_le_bytes());
-        assert_eq!(&s.descriptors.bytes[0x7b0..0x7b2], &[payload; 2]);
-        assert_eq!(&s.descriptors.bytes[0x8c6..0x8ce], &value.to_le_bytes());
+        assert_eq!(&s.descriptors.bytes[ta+0x7a8..ta+0x7b0], &stamp.to_le_bytes());
+        assert_eq!(&s.descriptors.bytes[ta+0x7b0..ta+0x7b2], &[payload; 2]);
+        assert_eq!(&s.descriptors.bytes[ta+0x8c6..ta+0x8ce], &value.to_le_bytes());
         for byte in 0..before.len() {
-            if !(0x7a8..0x7b2).contains(&byte) && !(0x8c6..0x8ce).contains(&byte)
+            if !(ta+0x7a8..ta+0x7b2).contains(&byte) && !(ta+0x8c6..ta+0x8ce).contains(&byte)
                 && !(at..at + 8).contains(&byte) {
                 assert_eq!(s.descriptors.bytes[byte], before[byte], "unexpected write at {byte:#x}");
             }
@@ -94,7 +105,7 @@ fn actual_staging_changes_only_owned_ta_fields_and_fragment_scratch() {
 }
 #[test]
 fn actual_staging_preserves_distinct_physical_timestamps_and_payload() {
-    let mut s = storage(0x8000);
+    let mut s = storage(G17P_RENDER_3D_DESCRIPTOR_OFFSET + g17_render::FRAGMENT_DESCRIPTOR_SIZE);
     let ta = 0x12_3456_789au64;
     let fragment = 0x98_7654_3210u64;
     let payload = 7;
@@ -103,11 +114,12 @@ fn actual_staging_preserves_distinct_physical_timestamps_and_payload() {
     assert_eq!(&s.descriptors.bytes[0x7a8..0x7b0], &fragment.to_le_bytes());
     assert_eq!(&s.descriptors.bytes[0x7b0..0x7b2], &[payload; 2]);
     assert_eq!(&s.descriptors.bytes[0x8c6..0x8ce], &(ta | ((payload as u64) << 40)).to_le_bytes());
-    assert_eq!(&s.descriptors.bytes[0x6160..0x6168], &value.to_le_bytes());
+    let at = G17P_RENDER_3D_DESCRIPTOR_OFFSET + 0x2160;
+    assert_eq!(&s.descriptors.bytes[at..at+8], &value.to_le_bytes());
 }
 #[test]
 fn staging_rejects_bad_timestamp_or_backing_without_partial_writes() {
-    let mut s = storage(0x8000);
+    let mut s = storage(G17P_RENDER_3D_DESCRIPTOR_OFFSET + g17_render::FRAGMENT_DESCRIPTOR_SIZE);
     let before = s.descriptors.bytes.clone();
     assert_eq!(s.stage_fragment_completion_scratch(1, 1 << 40, 1), Err(EINVAL));
     assert_eq!(s.descriptors.accesses, 0);
@@ -120,11 +132,11 @@ fn staging_rejects_bad_timestamp_or_backing_without_partial_writes() {
     s.descriptors.fail = true;
     assert_eq!(s.stage_fragment_completion_scratch(1, 2, 3), Err(EIO));
     assert_eq!(s.descriptors.bytes, before);
-    for size in [0, 0x4000, 0x7fff] {
+    for size in [0, g17_render::TA_DESCRIPTOR_SIZE-1, G17P_RENDER_3D_DESCRIPTOR_OFFSET + g17_render::FRAGMENT_DESCRIPTOR_SIZE - 1] {
         let mut short = storage(size);
         let before = short.descriptors.bytes.clone();
-        assert_eq!(short.stage_fragment_completion_scratch(1, 2, 3), Err(EINVAL));
-        assert_eq!(short.descriptors.bytes, before);
+        assert_eq!(short.stage_fragment_completion_scratch(1, 2, 3), Err(ERANGE));
+        assert!(short.descriptors.bytes == before, "short backing changed descriptor bytes");
     }
 }
 ''',

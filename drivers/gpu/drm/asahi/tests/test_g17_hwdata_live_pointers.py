@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile actual HWData serialization; verify live pointers cannot be fixture bytes."""
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import subprocess
 import tempfile
 
@@ -17,7 +18,7 @@ mod module_parameters {
 '''
 with tempfile.TemporaryDirectory(prefix="g17-hwdata-live-") as tmp:
     test = Path(tmp) / "test.rs"
-    test.write_text(source + '#[path = "' + str(root / "g17_initdata.rs") + '"] mod g17_initdata;\n')
+    test.write_text(with_g17_config(source + '#[path = "' + str(root / "g17_initdata.rs") + '"] mod g17_initdata;\n'))
     exe = Path(tmp) / "test"
     subprocess.run(["rustc", "-Awarnings", "--edition=2021", "--test", str(test), "-o", str(exe)], check=True)
     listing = subprocess.check_output([str(exe), "--list"], text=True)

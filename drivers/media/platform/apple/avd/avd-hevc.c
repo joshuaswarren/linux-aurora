@@ -750,8 +750,6 @@ static int avd_wait_submission_queue(struct avd_ctx *ctx)
 				avd->variant->submit_queue_status_offset +
 				(ctx->vp_slot) * 4);
 
-	/* pr_info("%d/%d\n", cur, max); */
-
 	if (cur == max) {
 		dev_err(avd->dev, "instruction que full! %d/%d",
 				    cur, max);

@@ -1569,11 +1569,198 @@ pub(crate) fn encode_grounded_subset(
         perf_state_clock_mhz.len() as u32 - 1,
     );
 
+    // Recorded platform constants. Descriptor *acceptance* survives without
+    // them, but the device-control phase that follows does not. +0x2630 is
+    // deliberately absent from the runs: it is firmware state and must start
+    // zero (the fill above guarantees it).
+    write_runs(out, HW_DATA_OPAQUE_RUNS);
+    // The host->firmware transport selector.
+    //
+    // `AGXFirmware::initFirmwareData` @0xfffffe0008a20940 exports
+    // `initdata[0x26f8] = accel[0x4f8] & 1`. That same bit decides, in
+    // `AGX{TA,3D,CL}ChannelSKSM::submitBuffer`, whether the host publishes the
+    // command record and the tag-14 AddKicks as CHANNEL COMMANDS through
+    // `writeChannelCommandPointer` (bit set, `accel[0x10769] & 1 == 0`) or
+    // instead pushes onto the host kick-trace ring and drives
+    // `configureHardware`/`addKicks` over MMIO (bit clear).
+    //
+    // A live SKSM capture on this target shows tag-15 and tag-14 published as
+    // channel commands for both render queues, so native runs with the bit
+    // SET and this byte at 1. This driver uses the same channel-command
+    // transport but left the byte at 0 -- it is outside every
+    // `HW_DATA_OPAQUE_RUNS` extent and nothing else wrote it -- so the
+    // firmware was told the host drives the MMIO bridge while the host in
+    // fact speaks channel commands. Declare the transport we actually use.
+    // MEASURED 2026-09-02, and it contradicts the reasoning above. Native's
+    // complete hardware-data block (hwdata-gfx.txt, captured from
+    // accel+0x5b0 -> +0x2b8 at submit3DChannel ENTRY, i.e. long after init)
+    // carries ZERO at 0x26f8. The "native runs with the bit SET" conclusion was
+    // inferred from seeing channel commands on the wire, not read off the
+    // block, and the block disagrees. Publish what native publishes.
+    if let Some(byte) = out.get_mut(HW_DATA_TRANSPORT_SELECTOR_OFFSET) {
+        *byte = 0;
+    }
+    // The measured performance tables were encoded above. Their values are
+    // target-scoped observations rather than a complete ADT derivation; see
+    // [`PERF_TABLE_VALUES_ENCODED`].
     Ok(())
 }
 
-/// Reproduce the two firmware acceptance checks made while parsing a root.
-/// Passing this does not mean the rest of init-data is complete.
+/// Encode the shared 0x1000-byte region C. Both roots point at the same
+/// object; giving the secondary a private copy is a difference from what a
+/// working host does.
+pub(crate) fn encode_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != REGION_C_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    write_runs(out, REGION_C_RUNS);
+    // regionC+0x9cc is the KSM progress-watchdog threshold for data master 2
+    // (compute); the firmware copies it to 0x1778d0 and its handler starts
+    // `cbz w20 -> ret`, so 0 disables the watchdog. We ship 0x32 (50) here and
+    // leave the other data master's slot at 0 -- i.e. we arm the watchdog on
+    // exactly the queue we submit to. When work cannot progress for any other
+    // reason this turns a stall into a self-sustaining recovery loop.
+    if crate::g17_config::PROGRESS_WATCHDOG == 0 {
+        put_u32(out, 0x9cc, 0);
+    }
+    // Native initializes the idle-descent selector to zero. Keep the old
+    // alternate predicate only as an explicit diagnostic override.
+    if crate::g17_config::IDLE_SELECTOR != 0 {
+        out[0xe21] = 1;
+    }
+    for (offset, value) in [
+        (0x7c, 1),
+        (0x80, 1),
+        (0x9c, 0x3000_001d),
+        (0xa0, 0x3100_0002),
+    ] {
+        put_u32(out, offset, value);
+    }
+    Ok(())
+}
+
+/// Overlay the target-scoped static third-page bytes and its one live state
+/// pointer without disturbing hardware-data or overlapping view content.
+pub(crate) fn encode_bundle_static(
+    state_ptr: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() < HW_DATA_BUNDLE_MIN_ALLOC {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(state_ptr)?;
+    write_runs(out, BUNDLE_STATIC_RUNS);
+    for (index, runs) in BUNDLE_VIEW_RUNS.iter().enumerate() {
+        let base = BUNDLE_VIEW_OFFSETS[index];
+        let valid = BUNDLE_VIEW_EXTENTS[index];
+        for (offset, data) in *runs {
+            if offset + data.len() > valid {
+                continue;
+            }
+            let start = base + offset;
+            out[start..start + data.len()].copy_from_slice(data);
+        }
+    }
+    for (view, offset, count, trailing_ff) in BUNDLE_VIEW_U16_REPEATS {
+        let base = BUNDLE_VIEW_OFFSETS[*view] + offset;
+        let end = base + *count * 2 + usize::from(*trailing_ff);
+        if end > BUNDLE_VIEW_OFFSETS[*view] + BUNDLE_VIEW_EXTENTS[*view] {
+            return Err(InitdataError::BundleAllocationTooSmall);
+        }
+        for index in 0..*count {
+            out[base + index * 2..base + index * 2 + 2].copy_from_slice(&[0xff, 0x7f]);
+        }
+        if *trailing_ff {
+            out[base + *count * 2] = 0xff;
+        }
+    }
+    put_u64(out, 0x8ed8, state_ptr);
+    Ok(())
+}
+
+/// Encode one 0x80-byte status block in its pre-init state: u32 1 at `+0x04`,
+/// everything else zero. `+0x10`/`+0x14` are post-acknowledgement firmware
+/// state and must be zero at handoff.
+pub(crate) fn encode_status_block(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != STATUS_BLOCK_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, STATUS_BLOCK_ONE_OFFSET, 1);
+    Ok(())
+}
+
+/// Encode the complete pre-init primary status/config object.
+pub(crate) fn encode_primary_status_b(
+    fwctl_state: u64,
+    fwctl_ring: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != PRIMARY_STATUS_B_OBJECT_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(fwctl_state)?;
+    required_address(fwctl_ring)?;
+    out.fill(0);
+    encode_status_block(&mut out[..STATUS_BLOCK_SIZE])?;
+    put_u64(out, PRIMARY_STATUS_B_FWCTL_STATE, fwctl_state);
+    put_u64(out, PRIMARY_STATUS_B_FWCTL_RING, fwctl_ring);
+    put_u32(out, PRIMARY_STATUS_B_CONFIG_HEADER, 1);
+    for (offset, data) in PRIMARY_STATUS_B_CONFIG_RUNS {
+        let start = PRIMARY_STATUS_B_CONFIG_OFFSET + offset;
+        out[start..start + data.len()].copy_from_slice(data);
+    }
+    Ok(())
+}
+
+/// Encode the secondary root's independent `+0xc0` target.
+pub(crate) fn encode_secondary_root_extra_1(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != STATUS_BLOCK_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    write_runs(out, SECONDARY_ROOT_EXTRA_1_RUNS);
+    Ok(())
+}
+
+/// Validate the cross-instance invariants established before either ASC is
+/// kicked. The two roots are not placed freely: the secondary's sits exactly
+/// [`SECONDARY_ROOT_DELTA`] above the primary's.
+pub(crate) fn validate_pair(
+    primary: &InstanceAddresses,
+    secondary: &InstanceAddresses,
+) -> Result<(), InitdataError> {
+    if secondary.root != primary.root + SECONDARY_ROOT_DELTA {
+        return Err(InitdataError::PairRootSeparation);
+    }
+    if primary.main_config == secondary.main_config || primary.status_a == secondary.status_a {
+        return Err(InitdataError::PairAliasedObject);
+    }
+    Ok(())
+}
+
+/// Validate the per-instance halves of the ADT shared region: the secondary
+/// maps it from the primary's base plus [`SECONDARY_SHARED_REGION_DELTA`].
+pub(crate) fn validate_shared_region_bases(
+    primary_base: u64,
+    secondary_base: u64,
+) -> Result<(), InitdataError> {
+    if secondary_base != primary_base + SECONDARY_SHARED_REGION_DELTA {
+        return Err(InitdataError::SharedRegionSeparation);
+    }
+    Ok(())
+}
+
+/// Reproduce the firmware's root acceptance checks.
+///
+/// The version-word gate is re-derived from our own J700 image
+/// (`__TEXT+0x1e8a8`); a mismatch is answered with "Host and FW Interface is
+/// mismatched" on the crashlog endpoint. The `+0x2c` nonzero gate was proven
+/// on the M5 parser and the field is constant 1 in every T8140 capture; its
+/// T8140 parse-gate status has not been independently re-derived, but a host
+/// must write 1 there regardless. Passing this does not mean the rest of the
+/// descriptor is complete.
 pub(crate) fn check_firmware_root_gates(root: &[u8]) -> Result<(), InitdataError> {
     if root.len() != ROOT_SIZE {
         return Err(InitdataError::BufferSize);

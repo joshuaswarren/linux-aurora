@@ -23,6 +23,474 @@ pub(crate) const REPORT_CHANNEL_EVENT: u8 = 13;
 pub(crate) const REPORT_CHANNEL_TRACE: u8 = 14;
 pub(crate) const G17P_COMPUTE_COMPLETION_SELECTOR: u8 = 2;
 pub(crate) const KSM_COMPLETION_ENTRY_SIZE: usize = 0x40;
+pub(crate) const D93AP_G17P_COMPLETION_IRQ: u32 = 1001;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_IRQ_BIT: u8 = 21;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_ORDINAL: u8 = 0;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_CAPACITY: u32 = 0x800;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_DESCRIPTOR_TABLE_OFFSET: u32 = 0x2614;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_DESCRIPTOR_STRIDE: u32 = 0x20;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_PROCESSED_OFFSET: u32 = 0x1c;
+pub(crate) const G17P_KSM_COMPLETION_NOTIFY_BASE: u32 = 0x21168;
+pub(crate) const G17P_KSM_COMPLETION_ACK_BASE: u32 = 0x21188;
+pub(crate) const G17P_KSM_COMPLETION_MMIO_STRIDE: u32 = 8;
+pub(crate) const G17P_FIRMWARE_EVENT_ENDPOINT: u8 = 0x20;
+pub(crate) const G17P_FIRMWARE_EVENT_MESSAGE: u64 = 0x0042_0000_0000_0000;
+pub(crate) const G17P_FIRMWARE_EVENT_HOST_TYPE: u8 = 2;
+pub(crate) const G17P_FIRMWARE_EVENT_HOST_TYPE_MASK: u8 = 0x3f;
+pub(crate) const G17P_FIRMWARE_EVENT_ENTRY_SIZE: usize = 0x48;
+pub(crate) const G17P_FIRMWARE_EVENT_CAPACITY: u32 = 0x100;
+pub(crate) const G17P_FIRMWARE_EVENT_CONSUMER_OFFSET: u32 = 0;
+pub(crate) const G17P_FIRMWARE_EVENT_PRODUCER_OFFSET: u32 = 0x20;
+/// Work-completion record. The firmware publishes one of these when a
+/// submission retires, carrying the event stamp (which advances by 0x100 per
+/// completion, as on M1/M2), the queue index, the command UUID and the context.
+pub(crate) const G17P_FIRMWARE_EVENT_COMPLETION_TYPE: u32 = 1;
+/// `kAGFIFirmwareEventTypeStampSignal`: a bitmask of the stamp indices the
+/// firmware has just signalled, in the same 128-bit space the completion
+/// records index. Both the working compute path and the failing render path
+/// emit one, so it is the firmware's own account of which stamps moved.
+pub(crate) const G17P_FIRMWARE_EVENT_STAMP_TYPE: u32 = 1;
+pub(crate) const G17P_FIRMWARE_EVENT_RECOVERY_TYPE: u32 = 4;
+pub(crate) const G17P_FIRMWARE_EVENT_TVB_GROW_TYPE: u32 = 6;
+pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
+pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
+pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
+
+/// Pure ownership state for event-driven render fences. A slot is settled by
+/// exactly one of firmware retirement or watchdog loss; a later duplicate or
+/// late event is ignored rather than signalling or releasing twice.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenderFenceState {
+    pending: u64,
+}
+
+impl RenderFenceState {
+    const fn bit(slot: u8) -> Option<u64> {
+        if slot < 64 { Some(1u64 << slot) } else { None }
+    }
+
+    pub(crate) fn arm(&mut self, slot: u8) -> bool {
+        let Some(bit) = Self::bit(slot) else { return false; };
+        if self.pending & bit != 0 { return false; }
+        self.pending |= bit;
+        true
+    }
+
+    pub(crate) const fn pending(&self, slot: u8) -> bool {
+        match Self::bit(slot) {
+            Some(bit) => self.pending & bit != 0,
+            None => false,
+        }
+    }
+
+    pub(crate) fn settle(&mut self, slot: u8) -> bool {
+        let Some(bit) = Self::bit(slot) else { return false; };
+        if self.pending & bit == 0 { return false; }
+        self.pending &= !bit;
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Firmware event ring -- channel-table entry 13, states[0]/states[1].
+//
+// A channel-table entry is four u64s, and on the two report entries those are
+// *two* (state, ring) pairs rather than three states plus one ring. Entry 14
+// proves the shape empirically: `drain_ktrace_ring` reads its state at
+// `status_a + 0x240` (entry[0]) and its ring at `status_a + 0xa6ac0`
+// (entry[1]) and returns real records, while entry[2]/entry[3]
+// (`0x280`/`0xafac0`) belong to the Stats channel that shares the entry.
+//
+// Entry 13 is `[0x40, 0x2c0, 0x80, 0x4ac0]`, so by the same shape the firmware
+// *event* channel is state `status_a + 0x40`, ring `status_a + 0x2c0`, and the
+// second pair is the firmware log. That second reading is independently
+// confirmed: `dump_firmware_log` walks nine 0x30-stride control blocks from
+// `status_a + 0x80` -- exactly entry[2] -- with a read pointer at +0x00 and a
+// write pointer at +0x20.
+//
+// This matters because `status_a + 0x80` is therefore the firmware *log*
+// ring-0 write pointer, not the event producer. It is expected to be non-zero
+// on every boot, for reasons that have nothing to do with tiler-buffer growth,
+// so reading it as evidence of a pending event would be a false positive. The
+// event producer is `status_a + 0x60` (state + 0x20).
+//
+// ENTRY SIZE IS 0x48, NOT `REPORT_ENTRY_SIZE` (0x40). `REPORT_ENTRY_SIZE` is
+// the AGX2 shape and does not apply here. Three independent confirmations:
+//
+//   * `AGXFirmware::drainFirmwareEventRing` (kext 0xfffffe0008a18bb0) zeroes
+//     exactly 0x48 bytes of stack (`stp q0,q0` at +0x50 and +0x70 plus
+//     `str xzr` at +0x90 = 0x50..0x98) as the destination for one entry;
+//   * the arithmetic closes exactly -- 0x100 x 0x48 = 0x4800, so the ring runs
+//     status_a + 0x2c0 .. 0x4ac0 and ends precisely where the log ring begins,
+//     where 0x100 x 0x40 would leave an unexplained 0x800 hole;
+//   * `G17P_FIRMWARE_EVENT_ENTRY_SIZE` (0x48) was already RE'd from J700 A000
+//     for THIS RING -- `read_primary_firmware_event` walks channel 13 through
+//     `PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX`, with the same entry, the same
+//     `states[0]`/`states[1]`, and the same 0x100 capacity.
+//
+// That last point also means this ring is NOT unread by the driver: the
+// firmware-event worker services it. A separate reader here exists only to
+// witness, without consuming, what the worker has or has not taken.
+// ---------------------------------------------------------------------------
+
+/// Channel-table index carrying the event state/ring pointer pair.
+pub(crate) const G17P_EVENT_CHANNEL_TABLE_INDEX: usize = 13;
+pub(crate) const G17P_EVENT_STATE_STATUS_A_OFFSET: u64 = 0x0_0040;
+pub(crate) const G17P_EVENT_RING_STATUS_A_OFFSET: u64 = 0x0_02c0;
+/// Firmware-log ring-0 control block. Read only to show, in the same line,
+/// that it is *not* the event producer.
+pub(crate) const G17P_FWLOG_CONTROL_STATUS_A_OFFSET: u64 = 0x0_0080;
+/// 0x100 entries. Same capacity as `G17P_FIRMWARE_EVENT_CAPACITY`, which
+/// describes this same ring.
+pub(crate) const G17P_EVENT_CAPACITY: u32 = G17P_FIRMWARE_EVENT_CAPACITY;
+/// 0x48 bytes per entry -- see the block comment above. Deliberately NOT
+/// `REPORT_ENTRY_SIZE`.
+pub(crate) const G17P_EVENT_ENTRY_SIZE: usize = G17P_FIRMWARE_EVENT_ENTRY_SIZE;
+pub(crate) const G17P_REPORT_HISTORY_MAX: u32 = 8;
+
+/// Bound a recovery-history request independently of the event-ring cursors.
+/// Budget zero retains the historical "unlimited" spelling, but recovery
+/// diagnostics still cap it at eight records.
+pub(crate) const fn g17p_report_history_count(print_budget: u32) -> u32 {
+    if print_budget == 0 || print_budget > G17P_REPORT_HISTORY_MAX {
+        G17P_REPORT_HISTORY_MAX
+    } else {
+        print_budget
+    }
+}
+
+/// Return history slots oldest-to-newest, including wrap at slot zero.
+pub(crate) const fn g17p_report_history_slot(
+    producer: u32,
+    count: u32,
+    index: u32,
+) -> Option<u32> {
+    if producer >= G17P_EVENT_CAPACITY || count > G17P_EVENT_CAPACITY || index >= count {
+        None
+    } else {
+        Some((producer + G17P_EVENT_CAPACITY - count + index) & (G17P_EVENT_CAPACITY - 1))
+    }
+}
+/// Firmware event type names, for logging. Type 4 is the one that matters:
+/// the firmware halted and is asking the host to run the restart handshake.
+pub(crate) fn g17p_firmware_event_name(event_type: u32) -> &'static str {
+    match event_type {
+        0 => "fault",
+        1 => "stamp-flags",
+        4 => "gpu-restart",
+        6 => "tvb-grow-request",
+        7 => "uma-grow-request",
+        8 => "channel-error",
+        13 => "uma-async-grow-complete",
+        _ => "unmodelled",
+    }
+}
+/// Host-written read pointer, `state + 0x00`.
+pub(crate) const G17P_EVENT_CONSUMER_OFFSET: u64 = 0x00;
+/// Firmware-written write pointer, `state + 0x20`.
+pub(crate) const G17P_EVENT_PRODUCER_OFFSET: u64 = 0x20;
+
+impl Channel13EventRecord {
+    /// Short stable name for logging.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Channel13EventRecord::Fault(_) => "fault",
+            Channel13EventRecord::Flag(_) => "flag",
+            Channel13EventRecord::Timeout(_) => "timeout",
+            Channel13EventRecord::GrowTilingBuffer(_) => "grow-tiling-buffer",
+            Channel13EventRecord::ChannelError => "channel-error",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KTrace ring -- channel-table entry 14, states[0]/states[1].
+//
+// `main_config + 0x1e0` is the KTrace state block (`status_a + 0x240`) and
+// `main_config + 0x1e8` is the 0x200 x 0x48 KTrace ring (`status_a + 0xa6ac0`).
+// The Stats channel shares the same table entry through `states[2]` and
+// `ring`, which is why `REPORT_ENTRY_SIZE` / `REPORT_CURSOR_MASK` /
+// `SplitReportCursor` must not be reused here: this ring has 0x200 entries of
+// 0x48 bytes and cursors that run to 0x1ff.
+//
+// The firmware emitter writes every u64 field with `stur`, so all of them are
+// unaligned; the byte-copy `get_u64` helper below already handles that. Bytes
+// 0x34..0x47 of a record are never written by the firmware and must not be
+// read.
+// ---------------------------------------------------------------------------
+
+/// Channel-table index carrying the KTrace state/ring pointer pair.
+pub(crate) const G17P_KTRACE_CHANNEL_TABLE_INDEX: usize = 14;
+pub(crate) const G17P_KTRACE_STATE_STATUS_A_OFFSET: u64 = 0x0_0240;
+pub(crate) const G17P_KTRACE_RING_STATUS_A_OFFSET: u64 = 0xa_6ac0;
+pub(crate) const G17P_KTRACE_ENTRY_SIZE: usize = 0x48;
+pub(crate) const G17P_KTRACE_CAPACITY: u32 = 0x200;
+/// Host-written read pointer, `state + 0x00`.
+pub(crate) const G17P_KTRACE_CONSUMER_OFFSET: u64 = 0x00;
+/// Firmware-written write pointer, `state + 0x20`.
+pub(crate) const G17P_KTRACE_PRODUCER_OFFSET: u64 = 0x20;
+/// `kAGFIFirmwareEventTypeFWTrace`.
+pub(crate) const G17P_KTRACE_RECORD_TYPE: u32 = 5;
+/// Channel 1 code 0x1c: records-lost marker. Emitted from inside the emitter
+/// itself with no class-mask test, so it appears whatever the mask is.
+pub(crate) const G17P_KTRACE_LOST_KEY: u16 = 0x011c;
+/// Channel 0 code 0x41: tag-14 `KsmKickQueueAddKicks`. No branch separates the
+/// trace call from the `sgx+0x1_03a8` / `sgx+0x2_1018` stores, so one of these
+/// records proves the KSM was programmed.
+pub(crate) const G17P_KTRACE_ADD_KICKS_KEY: u16 = 0x0041;
+/// Channel 0 code 0x46: KSM scheduling-pause reason-mask change,
+/// `(set?, reason_bit, resulting_mask)`.
+pub(crate) const G17P_KTRACE_PAUSE_REASON_KEY: u16 = 0x0046;
+
+/// B1's DM progress sampler only selects registers for this exact c020
+/// predicate. A zero result must not be called an idle shader or completion.
+pub(crate) const fn g17p_slot_has_progress_selector(state: u64) -> bool {
+    state & 1 != 0 && state & 0x3c == 0x0c && (state >> 24) & 3 != 0
+}
+
+/// Exact DM1 sample ranges in B1 tables45580/4558c. The second tuple member
+/// is the extended read namespace, not a value to write to a PDM selector.
+pub(crate) const G17P_DM1_MONITOR_READS: [(u64, u64); 8] = [
+    (0x1668, 0),
+    (0x13020, (1u64 << 42) | (2u64 << 40)),
+    (0x15150, (1u64 << 42) | (2u64 << 40)),
+    (0x15388, (1u64 << 42) | (2u64 << 40)),
+    (0x15390, (1u64 << 42) | (2u64 << 40)),
+    (0x15510, (1u64 << 42) | (2u64 << 40)),
+    (0x15518, (1u64 << 42) | (2u64 << 40)),
+    (0xa068, (1u64 << 42) | (1u64 << 40)),
+];
+
+pub(crate) const fn g17p_dm1_monitor_selector_index(state: u64) -> Option<u64> {
+    if g17p_slot_has_progress_selector(state) {
+        Some(((state >> 24) & 3) - 1)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PHaltedSlot0Gate {
+    pub(crate) handshake_state: u32,
+    pub(crate) epoch: u64,
+    pub(crate) expected_epoch: u64,
+    pub(crate) report_state: u32,
+    pub(crate) host_requested: u32,
+    pub(crate) slot_present: u32,
+    pub(crate) slot: u32,
+    pub(crate) data_master_present: u32,
+    pub(crate) data_master: u32,
+}
+
+/// A reason-3 report is independent of the copied hardware-slot mask. B1
+/// selects its first valid GMMU requestor before the state-1 host handshake.
+pub(crate) const fn g17p_halted_gmmu_sample_allowed(
+    handshake_state: u32,
+    epoch: u64,
+    expected_epoch: u64,
+    report_state: u32,
+    host_requested: u32,
+    reason: u32,
+) -> bool {
+    handshake_state == 1 && epoch == expected_epoch && report_state == 2
+        && host_requested == 0 && reason == 3
+}
+
+impl G17PHaltedSlot0Gate {
+    /// c020/c078 are common scheduler-slot records for both render data
+    /// masters.  They are safe to sample while either DM0 (TA) or DM1 (3D)
+    /// is explicitly selected by the halted firmware report.
+    pub(crate) const fn allows_generic_sample(self) -> bool {
+        self.handshake_state == 1 && self.epoch == self.expected_epoch
+            && self.report_state == 2 && self.host_requested == 0
+            && self.slot_present == 1 && self.slot == 0
+            && self.data_master_present == 1 && self.data_master <= 1
+    }
+
+    /// B1's additional eight selected-progress reads are specific to DM1.
+    pub(crate) const fn allows_dm1_progress_sample(self) -> bool {
+        self.allows_generic_sample() && self.data_master == 1
+    }
+}
+
+/// Submission-path keys printed by default (`channel << 8 | code`).
+pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 20] = [
+    // Code 0x02 is emitted by the new-work IRQ handler (b1 `FUN_23004` at
+    // 0x232dc) exactly where it creates the per-DM job state machine, which
+    // is the only path to the DM0 launch strobe `sgx+0x1_c998 = 1`. It was
+    // never in this list, so every capture reported it absent and the render
+    // path was analysed on the false premise that firmware never creates a
+    // job. Absence of 0x02 from a drain said only that nobody looked.
+    0x0002, // firmware job creation (new-work IRQ)
+    // The 3D is launched by the TILING job's state machine, not on its own:
+    // new-work (code 2) -> FUN_15a48 strobes 0x1c998 -> IRQ bit 3 (code 3,
+    // tiling done) -> FUN_15608 -> FUN_162f8 patches the fragment's kick
+    // entry and sets descriptor bit 62 (code 0x58) -> state 4 strobes
+    // 0x1c9a0 = 2, the actual 3D launch (code 0x1c with a2=1). Every one of
+    // those was filtered out, so the sequence could not be followed and the
+    // point where it stops -- which names the gate -- was invisible.
+    0x0003, // tiling done (IRQ bit 3)
+    0x001c, // DM launch strobe: a2=0 phase 1, a2=1 the 3D launch
+    0x001f, // job waiting on a host reply to message type 6
+    0x0045, // queue resume request
+    0x0058, // FUN_162f8 released the 3D kick entry
+    0x0060, // job freed via the flist fast path
+    0x000a, // stamp update / retire
+    0x000c, // stamp update / retire
+    0x000e, // stamp update / retire
+    0x0020, // device-control command retired
+    0x0040, // tag 15 queue programmed (emitted at b1 0x11a84)
+    0x0041, // tag 14 KsmKickQueueAddKicks
+    // 0x42/0x43/0x47 are the completion half. `FUN_12a84` emits 0x42 when a
+    // queue is stopped with kicks pending and re-adds them; `FUN_0ab64` emits
+    // 0x43 on completion processing and is the sole writer of the barrier
+    // table the 3D waits on; `FUN_0d550` emits 0x47 draining the classic
+    // work channel. A render that is admitted but never launches is decided
+    // entirely in these three, so none of them may stay filtered.
+    0x0042, // queue stopped with pending kicks -> re-add
+    0x0043, // completion processing entry
+    0x0046, // KSM scheduling-pause reason-mask change
+    0x0047, // classic work-channel drain
+    0x004b, // kick-queue config value change (tag 15)
+    0x0057, // tag 16 KsmKickQueueEntrySignal
+    0x011c, // records lost
+];
+
+pub(crate) fn g17p_ktrace_key_is_interesting(key: u16) -> bool {
+    key < 0x100 || G17P_KTRACE_INTEREST_KEYS.contains(&key)
+        || g17p_ktrace_key_is_dm_monitor(key)
+}
+
+/// Native B1 progress-monitor records: sample threshold (class1), then
+/// elapsed time, state changes and recovery scan decisions (class9).
+pub(crate) const fn g17p_ktrace_key_is_dm_monitor(key: u16) -> bool {
+    matches!(key, 0x0110 | 0x0900..=0x0909)
+}
+
+/// A separate bounded allowance keeps monitor evidence independent of a
+/// full ordinary print budget. Ring acknowledgement is never budget-gated.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PKtracePrintBudget {
+    pub(crate) ordinary_printed: u32,
+    pub(crate) submission_printed: u32,
+    pub(crate) submission_dropped: u32,
+    pub(crate) monitor_printed: u32,
+    pub(crate) monitor_dropped: u32,
+}
+
+impl G17PKtracePrintBudget {
+    pub(crate) fn allow(&mut self, key: u16, ordinary_limit: u32) -> bool {
+        if g17p_ktrace_key_is_dm_monitor(key) {
+            if ordinary_limit != 0 && self.monitor_printed >= 64 {
+                self.monitor_dropped = self.monitor_dropped.saturating_add(1);
+                return false;
+            }
+            self.monitor_printed += 1;
+            return true;
+        }
+        if key < 0x100 {
+            if ordinary_limit != 0 && self.submission_printed >= 64 {
+                self.submission_dropped = self.submission_dropped.saturating_add(1);
+                return false;
+            }
+            self.submission_printed += 1;
+            return true;
+        }
+        if key == G17P_KTRACE_LOST_KEY
+            || ordinary_limit == 0
+            || self.ordinary_printed < ordinary_limit
+        {
+            self.ordinary_printed = self.ordinary_printed.saturating_add(1);
+            return true;
+        }
+        false
+    }
+}
+
+/// Short human tail naming the argument shape of the fixed-shape records.
+pub(crate) const fn g17p_ktrace_key_name(key: u16) -> &'static str {
+    match key {
+        0x0040 => "tag15-programmed qid/base/dm/prio",
+        0x0041 => "tag14-addkicks qid/stamp/slot/kicks",
+        0x0046 => "pause-reason set/bit/mask",
+        0x004b => "cfg qid/old/new",
+        0x0057 => "tag16-signal qid/stamp/value",
+        0x000a | 0x000c | 0x000e => "stamp-update value/index/uuid/ctx",
+        0x0020 => "devctl-retired",
+        0x011c => "RECORDS-LOST count/window",
+        0x0110 => "monitor-sample dm/slot/threshold",
+        0x0900 => "monitor-time delta/now/last-completion-drain (ticks/24)",
+        0x0901 => "monitor-classify state1",
+        0x0902 => "monitor-classify state2",
+        0x0903 => "monitor-state-change dm/slot/state",
+        0x0904 => "monitor-key-changed dm/slot/previous-key",
+        0x0909 => "monitor-recovery-scan total/state1/state2/raw-flags",
+        _ => "",
+    }
+}
+
+/// One decoded KTrace record.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PKtraceRecord {
+    pub(crate) timestamp: u64,
+    pub(crate) args: [u64; 4],
+    pub(crate) code: u8,
+    pub(crate) channel: u8,
+    pub(crate) thread: u8,
+    pub(crate) flag: u32,
+}
+
+impl G17PKtraceRecord {
+    /// `channel << 8 | code`, the key used by the interest filter.
+    pub(crate) const fn key(&self) -> u16 {
+        ((self.channel as u16) << 8) | self.code as u16
+    }
+}
+
+pub(crate) fn decode_g17p_ktrace(raw: &[u8]) -> Result<G17PKtraceRecord, CompletionDecodeError> {
+    if raw.len() != G17P_KTRACE_ENTRY_SIZE {
+        return Err(CompletionDecodeError::RecordSize);
+    }
+    if get_u32(raw, 0x00) != G17P_KTRACE_RECORD_TYPE {
+        return Err(CompletionDecodeError::TraceShape);
+    }
+    let code_thread = get_u32(raw, 0x2c);
+    Ok(G17PKtraceRecord {
+        timestamp: get_u64(raw, 0x04),
+        args: [
+            get_u64(raw, 0x0c),
+            get_u64(raw, 0x14),
+            get_u64(raw, 0x1c),
+            get_u64(raw, 0x24),
+        ],
+        code: (code_thread & 0xff) as u8,
+        channel: ((code_thread >> 8) & 0xff) as u8,
+        thread: (code_thread >> 24) as u8,
+        flag: get_u32(raw, 0x30),
+    })
+}
+
+/// Wrap/empty logic for the trace ring. Returns the byte offset of the record
+/// at `consumer` and the read pointer to publish once it has been copied.
+///
+/// Both cursors are indices already reduced mod 0x200; the firmware publishes
+/// `(producer + 1) & 0x1ff`, so a difference must never be re-masked before
+/// being used as a count.
+pub(crate) const fn prepare_g17p_ktrace_read(
+    consumer: u32,
+    producer: u32,
+) -> Result<(u32, u32), CompletionDecodeError> {
+    if consumer >= G17P_KTRACE_CAPACITY || producer >= G17P_KTRACE_CAPACITY {
+        return Err(CompletionDecodeError::FirmwareEventCursor);
+    }
+    if consumer == producer {
+        return Err(CompletionDecodeError::FirmwareEventEmpty);
+    }
+    Ok((
+        consumer * G17P_KTRACE_ENTRY_SIZE as u32,
+        (consumer + 1) & (G17P_KTRACE_CAPACITY - 1),
+    ))
+}
 
 const REPORT_CURSOR_MASK: u32 = 0xff;
 const KSM_TIMESTAMP_MASK: u64 = 0x00ff_ffff_ffff;
@@ -476,9 +944,31 @@ pub(crate) struct RenderExecutionState {
 
 impl RenderExecutionState {
     pub(crate) fn observed(self) -> bool {
-        self.job_list_empty
-            && self.tiling_timestamps.iter().all(|value| *value != 0)
+        self.tiling_timestamps.iter().all(|value| *value != 0)
             && self.fragment_timestamps.iter().all(|value| *value != 0)
+    }
+}
+
+/// Return the native pass-wide GPU interval suitable for overlap evidence.
+///
+/// G17P publishes one pair for a render pass: TA owns the start word and 3D
+/// owns the end word.  `G17PUserRenderQueueState::snapshot` exposes those as
+/// `[start, start]` for TA and `[start, end]` for 3D because native does not
+/// give TA a separate end pointer.  Require that exact mirrored layout so a
+/// retirement-only or partially written record can never become telemetry.
+pub(crate) const fn render_gpu_interval(
+    execution: RenderExecutionState,
+) -> Option<[u64; 2]> {
+    let start = execution.tiling_timestamps[0];
+    let end = execution.fragment_timestamps[1];
+    if start != 0
+        && execution.tiling_timestamps[1] == start
+        && execution.fragment_timestamps[0] == start
+        && start < end
+    {
+        Some([start, end])
+    } else {
+        None
     }
 }
 
@@ -506,9 +996,405 @@ pub(crate) fn observe_paired_render_completion(
     })
 }
 
+/// One serialized render group's bounded window in the native modular ring.
+/// Anchor once at the previously idle producer, never at a new poll's cursor:
+/// otherwise a backward or stale observation could masquerade as a wrap.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct RenderQueueWindow {
+    base: u32,
+    count: u32,
+    capacity: u32,
+}
+
+impl RenderQueueWindow {
+    pub(crate) fn new(base: u32, count: u32, capacity: u32)
+        -> Result<Self, CompletionDecodeError>
+    {
+        if base >= capacity || !matches!(count, 3 | 4) || count >= capacity {
+            return Err(CompletionDecodeError::RenderWindow);
+        }
+        Ok(Self { base, count, capacity })
+    }
+
+    pub(crate) fn target(self) -> u32 {
+        ((u64::from(self.base) + u64::from(self.count)) % u64::from(self.capacity)) as u32
+    }
+
+    fn normalize(self, indices: QueueIndices) -> Result<QueueIndices, CompletionDecodeError> {
+        self.normalize_with_limit(indices, self.count)
+    }
+
+    fn normalize_with_limit(
+        self,
+        indices: QueueIndices,
+        limit: u32,
+    ) -> Result<QueueIndices, CompletionDecodeError> {
+        if limit < self.count || limit >= self.capacity {
+            return Err(CompletionDecodeError::RenderWindow);
+        }
+        let distance = |value: u32| {
+            if value >= self.capacity {
+                return Err(CompletionDecodeError::RenderCursorOutsideWindow);
+            }
+            let distance = ((u64::from(value) + u64::from(self.capacity)
+                - u64::from(self.base)) % u64::from(self.capacity)) as u32;
+            if distance > limit {
+                return Err(CompletionDecodeError::RenderCursorOutsideWindow);
+            }
+            Ok(distance)
+        };
+        Ok(QueueIndices {
+            done: distance(indices.done)?,
+            read: distance(indices.read)?,
+            write: distance(indices.write)?,
+        })
+    }
+}
+
+/// Render-only normalization: the generic observer and proven compute path
+/// retain their strict linear semantics. Reports retain raw native cursors.
+pub(crate) fn observe_paired_render_window(
+    window: RenderQueueWindow,
+    tiling_previous: QueueIndices,
+    tiling_current: QueueIndices,
+    fragment_previous: QueueIndices,
+    fragment_current: QueueIndices,
+    execution: RenderExecutionState,
+) -> Result<PairedRenderCompletion, CompletionDecodeError> {
+    let mut result = observe_paired_render_completion(
+        window.normalize(tiling_previous)?, window.normalize(tiling_current)?, window.count,
+        window.normalize(fragment_previous)?, window.normalize(fragment_current)?, window.count,
+        execution,
+    )?;
+    result.tiling.indices = tiling_current;
+    result.fragment.indices = fragment_current;
+    result.tiling.published_prefix = window.target();
+    result.fragment.published_prefix = window.target();
+    Ok(result)
+}
+
+/// Observe one prefix while later groups are already appended to the same
+/// physical ring. `max_groups` is the host publication bound, so modular
+/// cursor progress remains unambiguous across wrap.
+pub(crate) fn observe_paired_render_window_depth(
+    window: RenderQueueWindow,
+    max_groups: u32,
+    tiling_previous: QueueIndices,
+    tiling_current: QueueIndices,
+    fragment_previous: QueueIndices,
+    fragment_current: QueueIndices,
+    execution: RenderExecutionState,
+) -> Result<PairedRenderCompletion, CompletionDecodeError> {
+    let limit = window.count.checked_mul(max_groups)
+        .ok_or(CompletionDecodeError::RenderWindow)?;
+    let mut result = observe_paired_render_completion(
+        window.normalize(tiling_previous)?,
+        window.normalize_with_limit(tiling_current, limit)?,
+        window.count,
+        window.normalize(fragment_previous)?,
+        window.normalize_with_limit(fragment_current, limit)?,
+        window.count,
+        execution,
+    )?;
+    result.tiling.indices = tiling_current;
+    result.fragment.indices = fragment_current;
+    result.tiling.published_prefix = window.target();
+    result.fragment.published_prefix = window.target();
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_fences_retire_out_of_order_once() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(0));
+        assert!(state.arm(1));
+        assert!(state.settle(1));
+        assert!(state.pending(0));
+        assert!(!state.pending(1));
+        assert!(state.settle(0));
+    }
+
+    #[test]
+    fn duplicate_render_completion_is_ignored() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(0));
+        assert!(state.settle(0));
+        assert!(!state.settle(0));
+    }
+
+    #[test]
+    fn lost_render_settlement_rejects_late_firmware_event() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(1));
+        // The watchdog and firmware event share the same settlement gate.
+        assert!(state.settle(1));
+        assert!(!state.settle(1));
+        assert!(state.arm(1));
+    }
+
+    #[test]
+    fn render_window_wrap_preserves_raw_report_and_execution_gates() {
+        let window = RenderQueueWindow::new(1278, 3, 1280).unwrap();
+        let previous = QueueIndices { done: 1278, read: 1278, write: 0 };
+        let current = QueueIndices { done: 1, read: 1, write: 1 };
+        let execution = RenderExecutionState {
+            job_list_empty: true, tiling_timestamps: [1, 2], fragment_timestamps: [1, 2],
+        };
+        assert_eq!(window.target(), 1);
+        let complete = observe_paired_render_window(
+            window, previous, current, previous, current, execution,
+        ).unwrap();
+        assert!(complete.complete && complete.idle);
+        assert_eq!(complete.tiling.indices, current);
+        assert_eq!(complete.fragment.published_prefix, 1);
+        let linked_successor = observe_paired_render_window(
+            window, previous, current, previous, current,
+            RenderExecutionState { job_list_empty: false, ..execution },
+        ).unwrap();
+        assert!(linked_successor.complete && !linked_successor.idle);
+        assert!(!observe_paired_render_window(
+            window, previous, current, previous, current,
+            RenderExecutionState { fragment_timestamps: [1, 0], ..execution },
+        ).unwrap().complete);
+        assert!(observe_compute_completion(previous, current, 1).is_err());
+    }
+
+    #[test]
+    fn render_window_base_253_accepts_exact_target_256() {
+        let execution = RenderExecutionState {
+            job_list_empty: true,
+            tiling_timestamps: [11, 11],
+            fragment_timestamps: [11, 17],
+        };
+        for (base, target) in [(253, 256), (1021, 1024)] {
+            let window = RenderQueueWindow::new(base, 3, 1280).unwrap();
+            let previous = QueueIndices { done: base, read: base, write: base };
+            let completed = QueueIndices { done: target, read: target, write: target };
+            let completion = observe_paired_render_window(
+                window, previous, completed, previous, completed, execution,
+            ).unwrap();
+            assert_eq!(window.target(), target);
+            assert!(completion.complete && completion.idle);
+        }
+    }
+
+    #[test]
+    fn render_window_transient_invalid_snapshot_can_be_resampled_complete() {
+        let window = RenderQueueWindow::new(253, 3, 1280).unwrap();
+        let previous = QueueIndices { done: 253, read: 253, write: 253 };
+        // A split firmware publication can expose a cursor from outside this
+        // group's bounded window on the first edge-side observation.
+        let transient = QueueIndices { done: 257, read: 256, write: 256 };
+        let completed = QueueIndices { done: 256, read: 256, write: 256 };
+        let execution = RenderExecutionState {
+            job_list_empty: true,
+            tiling_timestamps: [23, 23],
+            fragment_timestamps: [23, 29],
+        };
+        assert_eq!(
+            observe_paired_render_window(
+                window, previous, transient, previous, completed, execution,
+            ),
+            Err(CompletionDecodeError::RenderCursorOutsideWindow),
+        );
+        let retry = observe_paired_render_window(
+            window, previous, completed, previous, completed, execution,
+        ).unwrap();
+        assert!(retry.complete && retry.idle);
+    }
+
+    #[test]
+    fn render_window_rejects_stale_backward_and_out_of_window_cursors() {
+        let window = RenderQueueWindow::new(1278, 3, 1280).unwrap();
+        let previous = QueueIndices { done: 0, read: 0, write: 1 };
+        let execution = RenderExecutionState {
+            job_list_empty: true, tiling_timestamps: [1, 2], fragment_timestamps: [1, 2],
+        };
+        for done in [1277, 1279, 2, 1280, u32::MAX] {
+            let current = QueueIndices { done, read: 1, write: 1 };
+            assert!(observe_paired_render_window(
+                window, previous, current, previous, current, execution,
+            ).is_err(), "invalid done={done}");
+        }
+        for (base, count, capacity) in [(0, 3, 0), (0, 3, 3), (1280, 3, 1280),
+                                       (0, 2, 1280), (0, 5, 1280)] {
+            assert!(RenderQueueWindow::new(base, count, capacity).is_err());
+        }
+    }
+
+    #[test]
+    fn render_window_thousand_groups_for_both_native_profiles() {
+        let execution = RenderExecutionState {
+            job_list_empty: true, tiling_timestamps: [1, 2], fragment_timestamps: [1, 2],
+        };
+        for count in [3, 4] {
+            for ordinal in 0..1000 {
+                let base = ordinal * count % 1280;
+                let window = RenderQueueWindow::new(base, count, 1280).unwrap();
+                let start = QueueIndices { done: base, read: base, write: window.target() };
+                let done = QueueIndices {
+                    done: window.target(), read: window.target(), write: window.target(),
+                };
+                assert!(observe_paired_render_window(
+                    window, start, done, start, done, execution,
+                ).unwrap().complete);
+            }
+        }
+    }
+
+    #[test]
+    fn halted_gmmu_gate_requires_current_nonhost_reason3_report() {
+        assert!(g17p_halted_gmmu_sample_allowed(1, 7, 7, 2, 0, 3));
+        for (state, epoch, expected, report, host, reason) in [
+            (0, 7, 7, 2, 0, 3), (2, 7, 7, 2, 0, 3),
+            (1, 8, 7, 2, 0, 3), (1, 7, 8, 2, 0, 3),
+            (1, 7, 7, 0, 0, 3), (1, 7, 7, 2, 1, 3),
+            (1, 7, 7, 2, 0, 0), (1, 7, 7, 2, 0, 4),
+        ] {
+            assert!(!g17p_halted_gmmu_sample_allowed(state, epoch, expected, report, host, reason));
+        }
+    }
+
+    #[test]
+    fn dm1_monitor_reads_match_native_tables_and_selector_index() {
+        assert_eq!(g17p_dm1_monitor_selector_index(0x0302_000d), Some(2));
+        assert_eq!(g17p_dm1_monitor_selector_index(0), None);
+        assert_eq!(g17p_dm1_monitor_selector_index(0x0002_000d), None);
+        let registers: Vec<_> = G17P_DM1_MONITOR_READS.iter().map(|entry| entry.0).collect();
+        assert_eq!(registers, [0x1668, 0x13020, 0x15150, 0x15388, 0x15390, 0x15510, 0x15518, 0xa068]);
+        assert_eq!(G17P_DM1_MONITOR_READS[0].1, 0);
+        assert!(G17P_DM1_MONITOR_READS[1..7].iter().all(|entry| entry.1 == 0x600_0000_0000));
+        assert_eq!(G17P_DM1_MONITOR_READS[7].1, 0x500_0000_0000);
+        let tags: Vec<_> = G17P_DM1_MONITOR_READS.iter()
+            .map(|(register, flags)| register | flags | (2u64 << 43)).collect();
+        assert_eq!(tags[0], 0x1000_0000_1668);
+        assert_eq!(tags[1], 0x1600_0001_3020);
+        assert_eq!(tags[7], 0x1500_0000_a068);
+    }
+
+    #[test]
+    fn halted_slot_gate_rejects_every_wrong_state_or_identity() {
+        let valid = G17PHaltedSlot0Gate {
+            handshake_state: 1, epoch: 7, expected_epoch: 7,
+            report_state: 2, host_requested: 0, slot_present: 1, slot: 0,
+            data_master_present: 1, data_master: 1,
+        };
+        assert!(valid.allows_generic_sample());
+        assert!(valid.allows_dm1_progress_sample());
+        let dm0 = G17PHaltedSlot0Gate { data_master: 0, ..valid };
+        assert!(dm0.allows_generic_sample());
+        assert!(!dm0.allows_dm1_progress_sample());
+        for wrong in [
+            G17PHaltedSlot0Gate { handshake_state: 0, ..valid },
+            G17PHaltedSlot0Gate { handshake_state: 2, ..valid },
+            G17PHaltedSlot0Gate { epoch: 8, ..valid },
+            G17PHaltedSlot0Gate { report_state: 0, ..valid },
+            G17PHaltedSlot0Gate { host_requested: 1, ..valid },
+            G17PHaltedSlot0Gate { slot_present: 0, ..valid },
+            G17PHaltedSlot0Gate { slot: 1, ..valid },
+            G17PHaltedSlot0Gate { data_master_present: 0, ..valid },
+            G17PHaltedSlot0Gate { data_master: 2, ..valid },
+        ] {
+            assert!(!wrong.allows_generic_sample());
+            assert!(!wrong.allows_dm1_progress_sample());
+        }
+    }
+
+    #[test]
+    fn report_history_is_bounded_and_ordered_across_wrap() {
+        assert_eq!(g17p_report_history_count(0), 8);
+        assert_eq!(g17p_report_history_count(1), 1);
+        assert_eq!(g17p_report_history_count(8), 8);
+        assert_eq!(g17p_report_history_count(64), 8);
+        let count = g17p_report_history_count(8);
+        let slots: Vec<_> = (0..count)
+            .map(|index| g17p_report_history_slot(3, count, index).unwrap())
+            .collect();
+        assert_eq!(slots, [251, 252, 253, 254, 255, 0, 1, 2]);
+        assert_eq!(g17p_report_history_slot(G17P_EVENT_CAPACITY, count, 0), None);
+        assert_eq!(g17p_report_history_slot(3, count, count), None);
+    }
+
+    #[test]
+    fn slot_progress_selection_matches_b1_c020_predicate() {
+        assert!(!g17p_slot_has_progress_selector(0));
+        assert!(!g17p_slot_has_progress_selector(0x0d));
+        for selector in 1..=3u64 {
+            let active = (selector << 24) | 0x0d;
+            assert!(g17p_slot_has_progress_selector(active));
+            assert!(!g17p_slot_has_progress_selector(active & !1));
+            assert!(!g17p_slot_has_progress_selector((selector << 24) | 0x19));
+        }
+    }
+
+    #[test]
+    fn ktrace_monitor_keys_have_an_independent_bounded_print_budget() {
+        let mut budget = G17PKtracePrintBudget::default();
+        for _ in 0..32 {
+            assert!(budget.allow(0x0101, 32));
+        }
+        assert!(!budget.allow(0x0101, 32));
+        for key in [0x0110, 0x0900, 0x0901, 0x0902, 0x0903, 0x0904, 0x0909] {
+            assert!(g17p_ktrace_key_is_interesting(key));
+            assert!(budget.allow(key, 32));
+        }
+        for _ in budget.monitor_printed..64 {
+            assert!(budget.allow(0x0900, 32));
+        }
+        assert!(!budget.allow(0x0903, 32));
+        assert_eq!(budget.monitor_printed, 64);
+        assert_eq!(budget.monitor_dropped, 1);
+        assert_eq!(budget.ordinary_printed, 32);
+        assert!(budget.allow(G17P_KTRACE_LOST_KEY, 32));
+        assert!(!g17p_ktrace_key_is_dm_monitor(0x010f));
+        assert!(!g17p_ktrace_key_is_dm_monitor(0x090a));
+    }
+
+    #[test]
+    fn ktrace_explicit_unlimited_budget_preserves_the_whole_ring() {
+        let mut budget = G17PKtracePrintBudget::default();
+        for _ in 0..G17P_KTRACE_CAPACITY {
+            assert!(budget.allow(0x0041, 0));
+            assert!(budget.allow(0x0903, 0));
+            assert!(budget.allow(0x0101, 0));
+        }
+        assert_eq!(budget.submission_dropped, 0);
+        assert_eq!(budget.monitor_dropped, 0);
+    }
+
+    #[test]
+    fn ktrace_monitor_prints_do_not_spend_the_ordinary_allowance() {
+        let mut budget = G17PKtracePrintBudget::default();
+        assert!(budget.allow(0x0903, 1));
+        assert!(budget.allow(0x0101, 1));
+        assert!(!budget.allow(0x0101, 1));
+        assert!(budget.allow(0x0101, 0));
+    }
+
+    #[test]
+    fn ktrace_class0_is_not_buried_by_verbose_or_monitor_records() {
+        let mut budget = G17PKtracePrintBudget::default();
+        for _ in 0..32 {
+            assert!(budget.allow(0x0101, 32));
+        }
+        for _ in 0..64 {
+            assert!(budget.allow(0x0900, 32));
+        }
+        for key in [0x002a, 0x002b, 0x0028, 0x0043, 0x0048, 0x0056] {
+            assert!(g17p_ktrace_key_is_interesting(key));
+            assert!(budget.allow(key, 32));
+        }
+        for _ in budget.submission_printed..64 {
+            assert!(budget.allow(0x0041, 32));
+        }
+        assert!(!budget.allow(0x0043, 32));
+        assert_eq!(budget.submission_dropped, 1);
+        assert!(budget.allow(G17P_KTRACE_LOST_KEY, 32));
+    }
 
     // J700 hardware capture from
     // neo-bringup/logs/20260827-g17p-compact-contract-queue-live12/run.log.

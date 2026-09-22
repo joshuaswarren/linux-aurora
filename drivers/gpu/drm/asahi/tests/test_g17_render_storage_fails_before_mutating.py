@@ -49,7 +49,7 @@ ctor = item(resources, "    pub(crate) fn new_user_render_storage(")
 guard = ctor.index("require_t8140_vm_context(vm)")
 for mutation in (
     "vm.clear_render_pool_mappings(",
-    "stage_user_render_flist(vm)",
+    "stage_user_render_flist(",
     "install_t8140_job_context_aliases(vm)",
     "vm.append_driver_mappings(",
     "flush_t8140_vm_contexts(vm)",

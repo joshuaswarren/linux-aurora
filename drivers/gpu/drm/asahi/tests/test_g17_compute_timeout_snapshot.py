@@ -30,7 +30,7 @@ assert "registers" not in diagnostic and "fsleep" not in diagnostic
 assert "snapshot_initial_channel_group" not in diagnostic  # fixed slot zero is wrong
 assert "compute_b2_channel_control" in diagnostic
 assert "qos_queue_record" in diagnostic
-assert diagnostic.index("read_compute_ring_state") < diagnostic.index("dev_err!")
+assert diagnostic.index("read_compute_ring_state") < diagnostic.index('"G17P async-timeout outer')
 
 source = r'''
 #![allow(dead_code)]

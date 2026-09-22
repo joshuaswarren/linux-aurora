@@ -24,10 +24,10 @@ live = (root / 'g17_live_boot.rs').read_text()
 compute = (root / 'g17_async_compute.rs').read_text()
 render_impl = item(drm, 'impl G17PRenderCompletion {')
 compute_impl = item(job, 'impl G17PJobCompletion {')
-timeout = item(live, '    pub(crate) fn timeout_deferred_render(')
+timeout = item(live, '    fn settle_failed_deferred_render(')
 assert 'if retired {\n                signal.complete(Err(EIO));\n            } else {' in timeout
 assert 'signal.fail_while_owned(error);' in timeout
-assert timeout.index('self.session_recovery_pending = true') < timeout.index(
+assert timeout.index('note_session_recovery_pending(') < timeout.index(
     'signal.fail_while_owned(error)'
 )
 release_quarantine = item(live, '    fn release_quarantined_render_after_processor_stop(')
@@ -42,7 +42,7 @@ for marker in ('    fn service_async_compute_completions_matching(',
     body = item(compute, marker)
     assert '.complete(Err(' not in body, marker
     assert '.fail_while_owned(error)' in body, marker
-    assert body.index('self.session_recovery_pending = true') < body.index(
+    assert body.index('note_session_recovery_pending(') < body.index(
         '.fail_while_owned(error)'
     ), marker
 
@@ -81,14 +81,18 @@ impl Fence {
  fn signal(&self){self.status_at_signal.store(self.status.0.load(Ordering::SeqCst),Ordering::SeqCst);self.active_at_signal.store(self.memory.active.load(Ordering::SeqCst),Ordering::SeqCst);self.quarantined_at_signal.store(self.memory.quarantined.load(Ordering::SeqCst),Ordering::SeqCst);self.count.fetch_add(1,Ordering::SeqCst);}
 }
 fn fence(status:&Arc<Status>,memory:&Arc<Memory>)->Fence {Fence{count:AtomicUsize::new(0),error:AtomicI32::new(0),status:status.clone(),status_at_signal:AtomicI32::new(0),active_at_signal:AtomicUsize::new(99),quarantined_at_signal:AtomicBool::new(false),memory:memory.clone()}}
-mod g17_completion {pub struct PairedRenderCompletion {pub complete:bool}}
+mod g17_completion {
+ #[derive(Default)]pub struct Execution{pub tiling_timestamps:[u64;2],pub fragment_timestamps:[u64;2]}
+ pub struct PairedRenderCompletion {pub complete:bool,pub execution:Execution}
+}
 struct Mapping;
 impl Mapping {fn with_cpu_bytes<F:FnOnce(&mut [u8])->Result>(&self,f:F)->Result{f(&mut [0;16])}}
 struct Destination {mapping:Mapping,offset:usize}
+impl Destination {fn write(&self,_timestamp:u64)->Result{Ok(())}}
 '''
 
 for name, impl, extra in [
-    ('Render', render_impl, 'lease:Mutex<Option<Lease>>,'),
+    ('Render', render_impl, 'lease:Mutex<Option<Lease>>,timestamps:[Option<Destination>;4],'),
     ('Compute', compute_impl, 'destinations:[Option<Destination>;2],'),
 ]:
     source += f'''struct {name} {{ fence:Fence,status:Arc<Status>,vm_job:Mutex<Option<VmGuard>>,signalled:AtomicU32,{extra}}}
@@ -105,7 +109,7 @@ impl {name} {{
 
 source += r'''
 fn render(m:&Arc<Memory>,released:&Arc<AtomicUsize>)->Arc<Render>{
- let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0})))})
+ let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),timestamps:[None,None,None,None],lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0})))})
 }
 fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::new(Compute{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),destinations:[None,None]})}
 #[test] fn render_error_keeps_mapping_and_slot_through_file_and_scheduler_close(){
@@ -132,7 +136,7 @@ fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::
 }
 #[test] fn retired_render_releases_before_success_fence_despite_scheduler_arc(){
  let m=Arc::new(Memory::default());let released=Arc::new(AtomicUsize::new(0));let c=render(&m,&released);m.close();
- c.complete(Ok(g17_completion::PairedRenderCompletion{complete:true}));
+ c.complete(Ok(g17_completion::PairedRenderCompletion{complete:true,execution:Default::default()}));
  assert!(m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),1);
  assert_eq!(c.fence.active_at_signal.load(Ordering::SeqCst),0);
  c.fail_while_owned(EIO);assert_eq!(c.fence.count.load(Ordering::SeqCst),1);assert_eq!(c.fence.error.load(Ordering::SeqCst),0);

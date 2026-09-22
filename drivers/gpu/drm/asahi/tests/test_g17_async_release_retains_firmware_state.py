@@ -9,10 +9,9 @@ port raises an SError on this SoC. So nothing tells the firmware to forget a
 queue, and a released client's SKSM entry mapping and context root have to
 outlive it.
 
-`g17_live_boot::release_compute_owner` already states the rule for the
-synchronous path: release the binding immediately before the next bind
-reinstalls the roots, or after both CPUs have stopped. The async path must obey
-the same rule.
+Preparing aliases does not reinstall firmware roots. A replacement must retain
+the previous binding until its exact successful publication completes in the
+same recovery epoch, or until both CPUs have stopped.
 """
 
 from pathlib import Path
@@ -52,15 +51,20 @@ for name, body in (("release", release), ("completions", completions)):
     assert "q.owner = None;" in body, name
 
 # --- the two lawful boundaries still free it ------------------------------
-# 1. immediately before the rebind reinstalls the roots
-drop_binding = prepare.index("q.binding.take()")
-assert prepare.index("q.context.take()", drop_binding) < prepare.index(
-    "bind_independent_compute_user_vm", drop_binding)
+# 1. prepare replacement aliases before moving old ownership, then retain it
+assert prepare.index("bind_independent_compute_user_vm") < prepare.index("q.binding.take()")
+assert "q.previous_binding = Some(G17PAsyncComputePreviousBinding" in prepare
+assert "drop(q.binding.take())" not in prepare
+assert "drop(q.previous_binding.take())" in completions
+assert "handshake.epoch != ticket.recovery_epoch" in completions
+assert "previous.publication" in completions
+assert "ticket.submission, ticket.recovery_epoch" in completions
 # 2. after both firmware CPUs have stopped
 assert "async_compute_queues.clear()" in post_stop
 
 # --- a retained graph must still be findable for reuse --------------------
 assert "rebindable_released_compute_graph(" in prepare
+assert "q.queue.requires_first_install()" in prepare
 assert "rebindable_released_compute_graph(" in limits
 
 # --- the rule this mirrors is still written down where it came from -------
@@ -96,13 +100,14 @@ impl Driver {
     fn new() -> Self { Driver { fw: Fw { slot: None }, live: None, retained: None, next: 1 } }
 
     fn open(&mut self) -> u32 {
-        // A rebind is the boundary at which the previous client's record may
-        // finally be dropped: the install that follows replaces the slot.
-        self.retained = None;
+        // The replacement becomes visible and completes before old ownership
+        // is released. Production transition gaps/failure paths are exercised
+        // by test_g17_async_compute_rebind and test_g17_async_retirement.
         let record = self.next;
         self.next += 1;
         self.live = Some(record);
         self.fw.slot = Some(record);   // install; never cleared by the driver
+        self.retained = None;          // successful superseding completion
         record
     }
 

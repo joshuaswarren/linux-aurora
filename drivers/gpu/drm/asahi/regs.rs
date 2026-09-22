@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::{hw, identity};
+use crate::{g17_submission, hw, identity};
 use kernel::{
     c_str,
     device::Core,
@@ -257,6 +257,25 @@ impl Resources {
             return Err(EINVAL);
         }
 
+        // Host writes to the SKSM tag/data port take an asynchronous SError on
+        // J700: bisection showed that suppressing every one of them (the QID
+        // configure pair AND addKicks, which uses the same port) removes the
+        // fault entirely, while suppressing only one still panics. The whole
+        // sgx 0x0..0x2ffff range is unreachable from the AP even though the
+        // firmware reaches the same registers through its own mapping of
+        // PA 0x480000000. Gated off by default until the correct host aperture
+        // is proven or the KSM programming moves to firmware channel commands.
+        if crate::g17_config::SKSM_MMIO == 0 || !self.g17p_sksm_port_powered() {
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P SKSM port MMIO suppressed (enabled={}, powered={}): {:#x}@{:#x} / {:#x}@{:#x}\n",
+                crate::g17_config::SKSM_MMIO,
+                self.g17p_sksm_port_powered(),
+                pair.word0, pair.word0_offset, pair.word1, pair.word1_offset
+            );
+            self.stash_deferred_sksm_pair(pair);
+            return Ok(());
+        }
         let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         Self::g17p_sksm_publish_locked(&sgx, pair)
@@ -278,6 +297,18 @@ impl Resources {
             return Err(EINVAL);
         }
 
+        if crate::g17_config::SKSM_MMIO == 0 || !self.g17p_sksm_port_powered() {
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P QID configure suppressed (enabled={}, powered={}, tag={:#x}@{:#x} payload={:#x}@{:#x} maskHi={:#x} maskLo={:#x})\n",
+                crate::g17_config::SKSM_MMIO,
+                self.g17p_sksm_port_powered(),
+                pair.word0, pair.word0_offset, pair.word1, pair.word1_offset,
+                enable_pair.word0, enable_pair.word1
+            );
+            self.stash_deferred_sksm_registration(pair, enable_pair)?;
+            return Ok(false);
+        }
         let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         Self::g17p_sksm_publish_locked(&sgx, pair)?;

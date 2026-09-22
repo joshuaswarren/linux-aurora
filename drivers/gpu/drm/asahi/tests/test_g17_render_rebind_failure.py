@@ -19,9 +19,11 @@ type Result<T = ()> = std::result::Result<T, i32>;
 const EIO: i32 = 5;
 macro_rules! dev_info { ($($arg:tt)*) => {}; }
 macro_rules! dev_err { ($($arg:tt)*) => {}; }
+mod util { pub fn g17p_verbose() -> bool { false } }
 #[derive(Default)]
 struct Trace { fail: u8, dropped_storage: usize, dropped_roots: Vec<u64> }
 type Shared = Rc<RefCell<Trace>>;
+mod g17_resources{pub use crate::mmu::T8140ComputeExecutionContext as G17PLogicalQueueContext;}
 mod mmu {
     use super::*;
     pub struct Vm(pub u64);

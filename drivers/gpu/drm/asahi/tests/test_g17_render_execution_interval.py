@@ -35,7 +35,7 @@ fn valid_native_pair_preserves_pass_envelope() {
 }
 
 #[test]
-fn incomplete_nonmoving_or_non_native_pairs_never_publish() {
+fn exact_timestamp_pairs_publish_even_while_a_successor_remains_linked() {
     let good = RenderExecutionState {
         job_list_empty: true,
         tiling_timestamps: [10, 10],
@@ -43,7 +43,7 @@ fn incomplete_nonmoving_or_non_native_pairs_never_publish() {
     };
     assert_eq!(render_gpu_interval(RenderExecutionState {
         job_list_empty: false, ..good
-    }), None);
+    }), Some([10, 40]));
     for execution in [
         RenderExecutionState { tiling_timestamps: [0, 0], fragment_timestamps: [0, 40], ..good },
         RenderExecutionState { tiling_timestamps: [10, 11], ..good },
@@ -66,9 +66,8 @@ with tempfile.TemporaryDirectory() as directory:
 
 poll = block(manager, "    pub(crate) fn poll_translated_render_completion(")
 log = poll.index('"G17P render: GPU-INTERVAL')
-clear_tracker = poll.index("self.render_tracker = None")
-increment = poll.index("self.render_submission_ordinal = next_ordinal")
-assert log < clear_tracker < increment
+promote_tracker = poll.index("self.render_tracker = self.render_queued_tracker.take()")
+assert log < promote_tracker
 assert "render_gpu_interval" in poll
 assert "binding.vm_id()" in poll and "binding.root()" in poll
 assert "queues.tiling.queue_id" in poll and "queues.fragment.queue_id" in poll

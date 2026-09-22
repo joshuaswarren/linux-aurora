@@ -335,8 +335,7 @@ static void dcp_delayed_vblank(struct work_struct *work)
 {
 	struct apple_dcp *dcp;
 
-	dcp = container_of(work, struct apple_dcp, vblank_wq);
-	mdelay(5);
+	dcp = container_of(to_delayed_work(work), struct apple_dcp, vblank_wq);
 	dcp_drm_crtc_vblank(dcp->crtc);
 }
 
@@ -1173,7 +1172,8 @@ static void dcp_work_update_backlight(struct work_struct *work)
 {
 	struct apple_dcp *dcp;
 
-	dcp = container_of(work, struct apple_dcp, bl_update_wq);
+	dcp = container_of(to_delayed_work(work), struct apple_dcp,
+			   bl_update_wq);
 
 	dcp_backlight_update(dcp);
 }
@@ -1800,7 +1800,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 		INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
 		mutex_init(&dcp->bl_register_mutex);
-		INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
+		INIT_DELAYED_WORK(&dcp->bl_update_wq,
+				  dcp_work_update_backlight);
 	} else if (of_property_match_string(dev->of_node, "apple,connector-type", "HDMI-A") >= 0)
 		dcp->connector_type = DRM_MODE_CONNECTOR_HDMIA;
 	else if (of_property_match_string(dev->of_node, "apple,connector-type", "DP") >= 0)
@@ -1852,8 +1853,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
 	set_bit(0, dcp->memdesc_map);
 
-	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_DELAYED_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->stall_wq, dcp_stall_check);
+	INIT_LIST_HEAD(&dcp->pending_flushes);
+	mutex_init(&dcp->pending_flush_lock);
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
@@ -2032,6 +2035,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		dcp->dcpavservep = NULL;
 	}
 
+	dcp_flush_shutdown(dcp);
+
 	if (dcp->shmem)
 		iomfb_shutdown(dcp);
 
@@ -2045,9 +2050,9 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		cancel_work_sync(&dcp->bl_register_wq);
-		cancel_work_sync(&dcp->bl_update_wq);
+		cancel_delayed_work_sync(&dcp->bl_update_wq);
 	}
-	cancel_work_sync(&dcp->vblank_wq);
+	cancel_delayed_work_sync(&dcp->vblank_wq);
 
 	/* The component framework releases the bind's devres group after
 	 * unbind, including optional clocks whose managed value can be NULL.

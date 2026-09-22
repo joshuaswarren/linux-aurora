@@ -27,12 +27,14 @@ constant = re.search(
     r"pub\(crate\) const G17P_RETAINED_RENDER_ORDINALS: u64 = .*?;", source
 ).group()
 names = [
+    "G17P_RENDER_QUEUE_METADATA_BASE",
+    "G17P_RENDER_QUEUE_GRAPH_SIZE",
     "G17P_USER_TILING_RING", "G17P_USER_TILING_POINTERS",
     "G17P_USER_TILING_OPTIONAL", "G17P_USER_TILING_EVENT",
     "G17P_USER_TILING_ENTRY_SIGNAL", "G17P_RENDER_SHARED_CONTROL_INNER",
 ]
 constants = "\n".join(
-    re.search(r"const " + name + r": usize = .*?;", source).group()
+    re.search(r"(?:pub\(crate\) )?const " + name + r": usize = .*?;", source).group()
     for name in names
 )
 submission = (source_dir / "g17_submission.rs").read_text()
