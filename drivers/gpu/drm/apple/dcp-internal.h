@@ -52,7 +52,6 @@ enum {
 	 * saw a GETBUF on 0x2a and then silence for ever.
 	 */
 	DPTX_CONTROL_ENDPOINT = 0x24,
-	DPAVDEV_ENDPOINT = 0x27,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
@@ -142,6 +141,8 @@ struct dcp_brightness {
 	/* when the previous request arrived, and how long this fade runs */
 	ktime_t last_request;
 	unsigned int ramp_duration_ms;
+	/* consecutive fade steps no compositor swap has carried */
+	unsigned int idle_frames;
 };
 
 struct audiosrv_data;
@@ -331,9 +332,11 @@ struct apple_dcp {
 
 	struct apple_dcp_afkep *dptxep;
 
-	/* DisplayPort controller endpoints; see DPTX_CONTROL_ENDPOINT above */
+	/* DisplayPort controller endpoint; see DPTX_CONTROL_ENDPOINT above */
 	struct apple_dcp_afkep *dptxcontrolep;
-	struct apple_dcp_afkep *dpavdevep;
+	/* the two AppleDCPDPTXController services it announces, units 1 and 3 */
+	struct apple_epic_service *dptxctl_av;
+	struct apple_epic_service *dptxctl_dp;
 
 	struct dptx_port dptxport[2];
 
@@ -343,6 +346,7 @@ struct apple_dcp {
 	/* these fields are output port specific */
 	struct phy *phy;
 	struct mux_control *xbar;
+	bool xbar_selected;
 	struct typec_mux *typec_mux;
 
 	struct gpio_desc *hdmi_hpd;
