@@ -56,6 +56,32 @@ enum {
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
 	HDCP_ENDPOINT = 0x2b,
+	/*
+	 * T8140/H17P puts the DisplayPort port service somewhere else.
+	 *
+	 * Traced on this machine's own macOS (build 25G83, the same DCP
+	 * firmware Linux talks to): AppleDCPDPTXRemotePortProxy -- the object
+	 * matching EPICName "dcpdptx-port-epic" -- hangs off DCPEXTEndpoint13,
+	 * i.e. 0x2c, and its sibling HDCP interface off 14 = 0x2d.  Endpoint
+	 * numbering is confirmed by DCPAVControllerProxy on 5 = 0x24, which is
+	 * exactly where we independently saw the two AppleDCPDPTXController
+	 * services announce from Linux.
+	 *
+	 * 0x2a is a real endpoint here and completes the whole AFK handshake
+	 * (INIT_ACK, GETBUF, INIT_TX, INIT_RX, START_ACK) -- it simply never
+	 * publishes anything, on macOS either.  Waiting on it is why the port
+	 * never appeared.
+	 */
+	DPTX_PORT_ENDPOINT_H17P = 0x2c,
+	/*
+	 * Same trace puts the DPTX HDCP interface on 14 = 0x2d, which is the
+	 * value upstream already uses for REMOTE_ALLOC_ENDPOINT -- and iomfb.c
+	 * unconditionally starts that one.  Unused so far, and deliberately
+	 * kept: it records that on H17P the endpoint we start as "remotealloc"
+	 * is what macOS drives as HDCP.  Anything that grows a dispatch on 0x2d
+	 * has to resolve that first.
+	 */
+	HDCP_ENDPOINT_H17P = 0x2d,
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };

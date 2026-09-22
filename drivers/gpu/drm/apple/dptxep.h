@@ -30,6 +30,17 @@ enum dptx_apcall {
 	DPTX_APCALL_DEVICE_NOT_RESPONDING = 22,
 	DPTX_APCALL_DEVICE_BUSY_TIMEOUT = 23,
 	DPTX_APCALL_DEVICE_NOT_STARTED = 24,
+	/*
+	 * 25G83 sends this one on connect and it is not in the classic table.
+	 * Eryk's M4 client (m4_dcpext_dptx.c, transcribed from the 25G83
+	 * RemotePortProxy command table) accepts it exactly like 18:
+	 *   else if ((command == 18 || command == 26) && data_size == 32)
+	 *           ret = 0;
+	 * -- accepted with success and no reply payload; only 18 carries the
+	 * HPD boolean.  Left unhandled it falls to the default arm, which
+	 * ACKs with whatever is in the reply buffer.
+	 */
+	DPTX_APCALL_SINK_QUERY_25G83 = 26,
 };
 
 #define DCPDPTX_REMOTE_PORT_CORE GENMASK(3, 0)

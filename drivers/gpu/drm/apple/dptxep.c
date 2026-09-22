@@ -584,6 +584,15 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		if (reply_size >= 4)
 			memset(reply, 0, 4);
 		return 0;
+	case DPTX_APCALL_SINK_QUERY_25G83:
+		/*
+		 * Accepted with success and a zeroed retcode, as the native
+		 * client does.  See the comment on the enum.
+		 */
+		memcpy(reply, data, min(reply_size, data_size));
+		if (reply_size >= 4)
+			memset(reply, 0, 4);
+		return 0;
 	default:
 		/* just try to ACK and hope for the best... */
 		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",
@@ -795,7 +804,16 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	dcp->dptxep = afk_init(dcp, DPTX_ENDPOINT, dptxep_ops);
+	/*
+	 * H17P publishes "dcpdptx-port-epic" on 0x2c, not 0x2a -- see the
+	 * comment on DPTX_PORT_ENDPOINT_H17P.  Traced against this machine's
+	 * own macOS on the same firmware build.
+	 */
+	dcp->dptxep = afk_init(dcp,
+			       dcp->fw_compat == DCP_FIRMWARE_H17P ?
+				       DPTX_PORT_ENDPOINT_H17P :
+				       DPTX_ENDPOINT,
+			       dptxep_ops);
 	if (IS_ERR(dcp->dptxep))
 		return PTR_ERR(dcp->dptxep);
 
