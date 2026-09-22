@@ -1051,6 +1051,18 @@ int dcp_start(struct platform_device *pdev)
 		 * must still happen first so the service announcement has
 		 * somewhere to land; only the wait is deferred.
 		 */
+		/*
+		 * Start the DP controller endpoints before the port endpoint.
+		 * The firmware does not bring its DisplayPort stack up until
+		 * they exist, and until it does, 0x2a answers a GETBUF and
+		 * then never announces "dcpdptx-port-epic".
+		 */
+		ret = dptx_control_init(dcp);
+		if (ret)
+			dev_warn(dcp->dev,
+				 "Failed to start DP control endpoints: %d\n",
+				 ret);
+
 		ret = dptxep_init(dcp);
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
