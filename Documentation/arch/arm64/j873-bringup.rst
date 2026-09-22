@@ -3,7 +3,8 @@ J873g M6 Mac mini firmware preparation
 
 The local ``j873`` branch starts from M5/J813 commit
 ``a4faee845ed1890a0d4bafa9f155ebbbe5f0715a``. Its publication remote is
-``aurora`` (``aurora-silicon/linux-aurora``). No physical M6 is available.
+``aurora`` (``aurora-silicon/linux-aurora``). No J873 hardware validation has
+been recorded in this workbench.
 
 Apple's macOS 27.0 RC ``26A428`` restore firmware confirms ``Mac18,5``,
 ``J873gAP``, ``T8152``, and board ID ``0x24``. The J873g IM4P device tree
