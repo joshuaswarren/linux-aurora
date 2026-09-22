@@ -2457,6 +2457,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 {
 	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	enum atcphy_mode target_mode;
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
@@ -2532,6 +2533,18 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	 * warning about the same condition here and continuing regardless was
 	 * the bug.  Both callers hold atcphy->lock.
 	 */
+	/*
+	 * This path has no other visibility and it is easy to draw the wrong
+	 * conclusion from its absence: the WARN_ON_ONCE that used to sit here
+	 * was the only signal it had ever produced, and removing it made "no
+	 * output" look like "never called".  One line per transition says what
+	 * was asked for and what state the PIPE was in when it was asked.
+	 */
+	dev_info(atcphy->dev,
+		 "J700_ATCPHY_MUX_SET: target_mode=%d cur_mode=%d pipehandler_up=%u target_ph=%d\n",
+		 target_mode, atcphy->mode, atcphy->pipehandler_up,
+		 atcphy_modes[target_mode].pipehandler_state);
+
 	if (atcphy->pipehandler_up &&
 	    atcphy_modes[target_mode].pipehandler_state !=
 		    ATCPHY_PIPEHANDLER_STATE_USB3) {
@@ -2545,7 +2558,10 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 			atcphy->pipehandler_up = false;
 	}
 
-	return atcphy_configure(atcphy, target_mode);
+	ret = atcphy_configure(atcphy, target_mode);
+	dev_info(atcphy->dev, "J700_ATCPHY_MUX_SET: configure(%d) returned %d, mode now %d\n",
+		 target_mode, ret, atcphy->mode);
+	return ret;
 }
 
 static void atcphy_typec_mux_unregister(void *data)
