@@ -649,8 +649,6 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 int dptxep_init(struct apple_dcp *dcp)
 {
 	int ret;
-	u32 port;
-	unsigned long timeout = msecs_to_jiffies(1000);
 
 	init_completion(&dcp->dptxport[0].enable_completion);
 	init_completion(&dcp->dptxport[1].enable_completion);
@@ -665,7 +663,41 @@ int dptxep_init(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 
+	return 0;
+}
+
+/*
+ * Wait for the firmware to publish its DisplayPort port service.
+ *
+ * This used to sit at the end of dptxep_init(), which runs before
+ * iomfb_start_rtkit().  On T8140 that inverts the dependency: the firmware
+ * does not announce "dcpdptx-port-epic" until IOMFB is running, and IOMFB
+ * cannot start while this wait holds the caller.  Measured on J700
+ * 2026-09-22, the two events are 3 ms apart in exactly the wrong order:
+ *
+ *   [4.390] AFK[ep:2a]: getbuf size 0x4000 tag 0xcafe
+ *   [5.411] Failed to start DPTX endpoint: -110     <- 1 s wait gives up
+ *   [5.414] IOMFB: init complete (version 64)       <- 3 ms later
+ *
+ * dptxport[0].enabled therefore stayed false for the rest of the boot, and
+ * every later dcp_dptx_connect() refused with "dptx service for port 0 not
+ * enabled" -- including the one raised by a real DisplayPort hotplug.
+ *
+ * Starting the endpoint is still done early, so a service announcement always
+ * has somewhere to land; only the wait moves after IOMFB.
+ */
+int dptxep_wait_ports(struct apple_dcp *dcp)
+{
+	unsigned long timeout = msecs_to_jiffies(1000);
+	u32 port;
+	int ret;
+
+	if (IS_ERR_OR_NULL(dcp->dptxep))
+		return -ENODEV;
+
 	for (port = 0; port < dcp->hw.num_dptx_ports; port++) {
+		if (dcp->dptxport[port].enabled)
+			continue;
 		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
 						timeout);
 		if (!ret)
