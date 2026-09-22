@@ -637,6 +637,71 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 	}
 }
 
+/*
+ * The DisplayPort controller services.  We do not drive them yet -- starting
+ * their endpoints at all is the point, because the firmware will not bring up
+ * the DP stack (and so never announces "dcpdptx-port-epic" on 0x2a) until
+ * they are up.  Log whatever turns up so the set can be confirmed on real
+ * hardware; matching is by EPICProviderClass, so both the class and the
+ * service name are listed for each.
+ */
+static void dp_control_init(struct apple_epic_service *service,
+			    const char *name, const char *class, s64 unit)
+{
+	dev_info(service->ep->dcp->dev,
+		 "J700_DP_CONTROL: ep:%02x service '%s' class '%s' unit %lld\n",
+		 service->ep->endpoint, name, class, unit);
+}
+
+static const struct apple_epic_service_ops dptx_control_ops[] = {
+	{ .name = "dcpav-controller-epic", .init = dp_control_init },
+	{ .name = "dcpdp-controller-epic", .init = dp_control_init },
+	{ .name = "DCPAVController", .init = dp_control_init },
+	{ .name = "DCPDPController", .init = dp_control_init },
+	{}
+};
+
+static const struct apple_epic_service_ops dpavdev_ops[] = {
+	{ .name = "dcpav-device-epic", .init = dp_control_init },
+	{ .name = "DCPAVDevice", .init = dp_control_init },
+	{}
+};
+
+/*
+ * Start the two DisplayPort controller endpoints.  Errors are not fatal: the
+ * caller carries on to dptxep_init() either way, so a machine whose firmware
+ * does not have these endpoints behaves exactly as before.
+ */
+int dptx_control_init(struct apple_dcp *dcp)
+{
+	int ret;
+
+	dcp->dptxcontrolep = afk_init(dcp, DPTX_CONTROL_ENDPOINT,
+				      dptx_control_ops);
+	if (IS_ERR(dcp->dptxcontrolep))
+		return PTR_ERR(dcp->dptxcontrolep);
+
+	ret = afk_start(dcp->dptxcontrolep);
+	if (ret) {
+		dev_warn(dcp->dev, "Failed to start DPTX control endpoint: %d\n",
+			 ret);
+		return ret;
+	}
+
+	dcp->dpavdevep = afk_init(dcp, DPAVDEV_ENDPOINT, dpavdev_ops);
+	if (IS_ERR(dcp->dpavdevep))
+		return PTR_ERR(dcp->dpavdevep);
+
+	ret = afk_start(dcp->dpavdevep);
+	if (ret) {
+		dev_warn(dcp->dev, "Failed to start DPAV device endpoint: %d\n",
+			 ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",

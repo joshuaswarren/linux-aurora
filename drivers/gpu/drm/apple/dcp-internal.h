@@ -44,6 +44,15 @@ enum {
 	TEST_ENDPOINT = 0x21,
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
+	/*
+	 * The DisplayPort control endpoints.  m1n1's working dcpext bring-up
+	 * (proxyclient/experiments/dcpext_iboot.py) starts 0x24 and 0x27 and
+	 * waits for their dcpav/dcpdp controller services *before* the port
+	 * service on 0x2a appears.  Leaving them unstarted is why this driver
+	 * saw a GETBUF on 0x2a and then silence for ever.
+	 */
+	DPTX_CONTROL_ENDPOINT = 0x24,
+	DPAVDEV_ENDPOINT = 0x27,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
@@ -318,6 +327,10 @@ struct apple_dcp {
 	struct audiosrv_data *audiosrv;
 
 	struct apple_dcp_afkep *dptxep;
+
+	/* DisplayPort controller endpoints; see DPTX_CONTROL_ENDPOINT above */
+	struct apple_dcp_afkep *dptxcontrolep;
+	struct apple_dcp_afkep *dpavdevep;
 
 	struct dptx_port dptxport[2];
 

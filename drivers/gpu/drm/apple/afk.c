@@ -144,6 +144,10 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 	reply = FIELD_PREP(RBEP_TYPE, RBEP_GETBUF_ACK);
 	reply |= FIELD_PREP(GETBUF_ACK_DVA, ep->bfr_dma);
 	afk_send(ep, reply);
+
+	dev_info(ep->dcp->dev,
+		 "J700_AFK_GETBUF_ACK: ep:%02x dva=%pad size=%#zx tag=%#x reply=%#llx\n",
+		 ep->endpoint, &ep->bfr_dma, ep->bfr_size, ep->bfr_tag, reply);
 }
 
 static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
@@ -813,6 +817,10 @@ int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 
 	work->ep = ep;
 	work->message = message;
+
+	dev_info(ep->dcp->dev, "J700_AFK_RX: ep:%02x message=%#llx type=%#llx\n",
+		 ep->endpoint, message, (u64)FIELD_GET(RBEP_TYPE, message));
+
 	INIT_WORK(&work->work, afk_receive_message_worker);
 	queue_work(ep->wq, &work->work);
 
