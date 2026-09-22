@@ -775,6 +775,87 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 	return 0;
 }
 
+/*
+ * A Type-C mux provided by the DCP itself, so that a DisplayPort alt-mode
+ * event reaches it.
+ *
+ * The obvious route -- typec_displayport -> drm_connector_oob_hotplug_event()
+ * -> apple_connector_oob_hotplug() -> dcp_dptx_connect_oob() -- cannot work on
+ * this machine.  typec_displayport binds a *partner* alt mode, and the CD321x
+ * firmware owns alt-mode negotiation here: the PD driver registers the port's
+ * own alt modes but never calls typec_partner_register_altmode(), so there is
+ * no partner alt mode, the module never binds, and that entire chain is inert.
+ *
+ * Measured on J700 2026-09-22 with a DisplayLink UD-ULTC4K: the CD321x
+ * negotiates DP (dp=1, pin assignment D) and the ATC PHY enters
+ * APPLE_ATCPHY_MODE_USB3_DP successfully, while the external DCP sits powered
+ * down from boot ("HPD not present, skipping mode export") and is never told a
+ * display arrived.
+ *
+ * Registering the DCP as a second mux on the same connector means the
+ * typec_mux_set() that already drives the ATC PHY drives the DCP too, with no
+ * partner alt mode and no DRM out-of-band hotplug involved.  This is the
+ * notification half of the Type-C route fabric in DJ's linux-aurora
+ * b486dc811e58, without the multi-DCP arbitration that machine needs and this
+ * one does not: the J700 has one external DCP, one ATC PHY and exactly one
+ * DP-capable connector.
+ */
+static int dcp_typec_mux_set(struct typec_mux_dev *mux,
+			     struct typec_mux_state *state)
+{
+	struct apple_dcp *dcp = typec_mux_get_drvdata(mux);
+	bool is_dp = state->alt && state->alt->svid == USB_TYPEC_DP_SID;
+
+	dev_info(dcp->dev, "J700_DCP_TYPEC_MUX: mode=%lu svid=%#x -> %s\n",
+		 state->mode, state->alt ? state->alt->svid : 0,
+		 is_dp ? "connect" : "disconnect");
+
+	if (is_dp)
+		return dcp_dptx_connect_oob(to_platform_device(dcp->dev), 0);
+
+	return dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+}
+
+static void dcp_typec_mux_unregister(void *data)
+{
+	typec_mux_unregister(data);
+}
+
+static int dcp_register_typec_mux(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	struct typec_mux_desc desc = {};
+	struct device_node *route_np;
+	struct typec_mux_dev *mux;
+	int ret;
+
+	/*
+	 * Optional: only a board whose DT wires a "typec-route" child with
+	 * mode-switch and a graph endpoint to the connector gets one.
+	 */
+	route_np = of_get_child_by_name(dev->of_node, "typec-route");
+	if (!route_np)
+		return 0;
+
+	desc.fwnode = of_fwnode_handle(route_np);
+	desc.set = dcp_typec_mux_set;
+	desc.name = "dcp-dp";
+	desc.drvdata = dcp;
+
+	mux = typec_mux_register(dev, &desc);
+	of_node_put(route_np);
+	if (IS_ERR(mux))
+		return dev_err_probe(dev, PTR_ERR(mux),
+				     "failed to register the DCP Type-C mux\n");
+
+	ret = devm_add_action_or_reset(dev, dcp_typec_mux_unregister, mux);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "J700_DCP_TYPEC_MUX: registered\n");
+	return 0;
+}
+
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -2200,6 +2281,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			}
 		}
 	}
+
+	ret = dcp_register_typec_mux(dcp);
+	if (ret)
+		return ret;
 
 	return component_add(&pdev->dev, &dcp_comp_ops);
 }

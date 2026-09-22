@@ -552,6 +552,30 @@
 						remote-endpoint = <&atcphy0_typec_lanes>;
 					};
 				};
+
+				/*
+				 * The external DCP is a second mux on this
+				 * connector.  It does not move lanes -- the ATC
+				 * PHY on port@1 does that -- it is how a
+				 * DisplayPort alt-mode event reaches the DCP at
+				 * all.  The usual route through
+				 * typec_displayport cannot work here: that
+				 * module binds a *partner* alt mode, and the
+				 * CD321x firmware owns alt-mode negotiation on
+				 * this machine, so no partner alt mode is ever
+				 * registered and the DRM out-of-band hotplug
+				 * chain is inert.  Without this the PHY enters
+				 * DP mode and the DCP, powered down since boot
+				 * for want of HPD, never learns a display is
+				 * there.
+				 */
+				port@2 {
+					reg = <2>;
+
+					typec0_connector_dcp: endpoint {
+						remote-endpoint = <&dcpext_typec0>;
+					};
+				};
 			};
 		};
 	};
@@ -1194,6 +1218,7 @@
 	phys = <&atcphy0 PHY_TYPE_DP>;
 	phy-names = "dp-phy";
 
+
 	/*
 	 * The J700 has no HDMI socket: this DCP's only output is the DP-Alt
 	 * path on the rear Type-C connector, so the connector is a USB-C one.
@@ -1206,4 +1231,21 @@
 	 */
 	apple,connector-type = "USB-C";
 	status = "okay";
+
+	/*
+	 * mode-switch makes the Type-C class treat this node as a mux for the
+	 * connector it is linked to, so dcp_register_typec_mux() can hang a
+	 * typec_mux off it and be called from the same typec_mux_set() that
+	 * drives the ATC PHY.  Properties must precede subnodes, so this sits
+	 * at the end of the block.
+	 */
+	typec-route {
+		mode-switch;
+
+		port {
+			dcpext_typec0: endpoint {
+				remote-endpoint = <&typec0_connector_dcp>;
+			};
+		};
+	};
 };
