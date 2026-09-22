@@ -139,6 +139,9 @@ struct dcp_brightness {
 	int ramp_from;
 	ktime_t ramp_start;
 	struct delayed_work ramp_work;
+	/* when the previous request arrived, and how long this fade runs */
+	ktime_t last_request;
+	unsigned int ramp_duration_ms;
 };
 
 struct audiosrv_data;
