@@ -432,7 +432,8 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			genpd->name);
 
 	if (pstate != APPLE_PMGR_PS_ACTIVE && (ps->force_disable || ps->force_reset)) {
-		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS);
+		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS |
+				      APPLE_PMGR_BUSY);
 
 		if (ps->force_disable)
 			reg_pre |= APPLE_PMGR_DEV_DISABLE;
@@ -454,8 +455,30 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 				genpd->name, reg);
 	}
 
+	/*
+	 * BUSY is hardware-owned status, so never write it back. This is the
+	 * only site that composes a whole word and writes all 32 bits; every
+	 * other write here goes through regmap_update_bits() with an explicit
+	 * mask and so cannot touch it. m1n1's pmgr_set_mode() is the reference
+	 * and writes PS_TARGET alone, via mask32(), polling PS_ACTUAL for
+	 * completion -- it puts no status bit back.
+	 *
+	 * Measured on J700 (T8140): a gfx power-down leaves 0x3007001f0 at
+	 * 0x0f002b00, PS_TARGET=0 PS_ACTUAL=0 with BUSY set, and BUSY clears on
+	 * its own a while later. An ON issued before then read that word back,
+	 * re-wrote BUSY=1 with it (requested=0x0f00280f), and the register did
+	 * not move -- PS_TARGET stayed 0, the post-ON handshake returned -110,
+	 * and every later write returned -22 for the rest of the boot. The
+	 * control is in the same boot: the identical power-down at t=0.8s also
+	 * set BUSY, nothing wrote the register, BUSY cleared by itself, and the
+	 * ON at t=16s succeeded.
+	 *
+	 * Whenever BUSY reads 0 -- which is every domain in the normal case --
+	 * the composed word is bit-for-bit what it was before this change.
+	 */
 	reg &= ~(APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_RESET |
-		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_PS_TARGET);
+		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
+		 APPLE_PMGR_PS_TARGET);
 	reg |= FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate);
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
