@@ -50,13 +50,12 @@ assert retarget.index(".retarget_command_context(vm, execution_context.clone())"
     ".render_bind\n                .replace"
 )
 assert "render_context_retirement = Some(G17PRenderContextRetirement" in retarget
-assert "self.next_render_context_epoch(self.active_render_slot)?" in handoff
+assert ".next_render_context_epoch(self.active_render_slot)" in handoff
+assert '"handoff-next-context-epoch"' in handoff
 assert poll.index("if !event_control.unlinked()") < poll.index(
-    "self.complete_render_context_update_retirement()?"
+    "self.complete_render_context_update_retirement(true)?"
 )
-assert complete.index(".context_update_pending()") < complete.index(
-    ".complete_context_update()"
-)
+assert complete.index("if !context_update") < complete.index(".complete_context_update()")
 assert complete.index("self.render_context_epochs[slot] = next") < complete.index(
     "self.render_context_retirement = None"
 )
@@ -79,7 +78,7 @@ assert release.index("into_retired_parameter_management") < release.index(
 assert release.index("ids.unreserve(id)") < release.index("drop(bind)")
 assert "complete_render_context_update_retirement" not in abandoned
 assert "self.render_context_retirement = None" in stop
-assert "self.render_context_epochs = [0; 2]" in stop
+assert "self.render_context_epochs = [0; 64]" in stop
 assert "retired_firmware_render_graphs" not in manager
 
 

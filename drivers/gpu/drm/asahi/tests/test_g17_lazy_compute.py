@@ -64,10 +64,11 @@ struct Runtime {
     manager: Option<Manager>,
     queue_setup_pending: bool,
     accepting_submissions: bool,
+    session_recovery_pending: bool,
 }
 impl Runtime {
     fn new(stage: G17PTestStage) -> Self {
-        Self { test_stage: stage, queue: None, drm: Some(1),
+        Self { test_stage: stage, queue: None, drm: Some(1), session_recovery_pending: false,
                manager: Some(Manager::default()),
                queue_setup_pending: stage.prepares_qid4_at_startup(),
                accepting_submissions: stage.enables_compute_uapi() }

@@ -26,9 +26,11 @@ stop = function(manager, "pub(crate) fn release_runtime_objects_after_processor_
 
 assert ".push_within_capacity(previous)" in preserve
 assert "completion_references_descriptor_range" not in preserve
-assert handoff.index("self.preserve_immediate_retired_render_graph()?") < handoff.index(
-    "self.park_render_sksm_backing_for_graph_rebuild()?"
+assert handoff.index("self.preserve_immediate_retired_render_graph()") < handoff.index(
+    "self.park_render_sksm_backing_for_graph_rebuild()"
 )
+assert '"handoff-preserve-before-fresh"' in handoff
+assert '"handoff-park-sksm-backing"' in handoff
 assert "G17P_TA_HARDWARE_BUFFER_ID_COUNT" in manager[
     manager.index("let retired_render_handoff_graphs =") :
     manager.index("let retired_render_handoff_graphs =") + 180

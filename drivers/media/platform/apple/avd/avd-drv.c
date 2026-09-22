@@ -62,6 +62,8 @@ int alloc_slots(struct avd_dev *avd, struct avd_ctx *ctx, enum avd_codec codec) 
 	u32 offset = 0;
 	for (int i = 0; i < codec; i++)
 		offset += avd->variant->vp_slots[i];
+	if (avd->variant->vp_slot_base[codec])
+		offset = avd->variant->vp_slot_base[codec];
 
 	free = find_next_zero_bit(&avd->vp_slots,
 			offset + avd->variant->vp_slots[codec],
@@ -161,6 +163,7 @@ static void avd_watchdog_func(struct work_struct *work)
 
 	dev_err(avd->dev, "Frame processing timed out! Vp: %d (%02d)",
 		ctx->vp_slot, ctx->fifo_idx);
+	avd_status(avd, ctx->vp_slot);
 
 	free_vp_slot(avd, ctx);
 	free_inst_slot(avd, ctx);
@@ -529,16 +532,22 @@ static const struct avd_variant avd_t8122_variant = {
 	.vp_slot_offset = 0xc,
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
-	.submit_queue_status_offset = 0x78, /* v4 and never have fixed offsets */
+	.submit_queue_status_offset = 0x7c, /* v4 and newer have fixed offsets */
 };
 
 static const struct avd_variant avd_t8140_variant = {
-	/* This is filled in using the tunables, what vp/pp to use? */
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2,
 		[AVD_CODEC_H264] = 1,
 		[AVD_CODEC_VP9] = 1,
 		[AVD_CODEC_AV1] = 1,
+	},
+	/* Tier 0 has holes between the codec-specific VP blocks. */
+	.vp_slot_base = {
+		[AVD_CODEC_HEVC] = 0,
+		[AVD_CODEC_H264] = 4,
+		[AVD_CODEC_VP9] = 8,
+		[AVD_CODEC_AV1] = 9,
 	},
 	.fifo_slots = 7,
 	.configure_stream = t8122_configure_stream,
@@ -551,7 +560,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.vp_slot_offset = 0xc,
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
-	.submit_queue_status_offset = 0x78,
+	.submit_queue_status_offset = 0x7c,
 };
 
 static const struct avd_variant avd_t8132_variant = {
@@ -572,7 +581,7 @@ static const struct avd_variant avd_t8132_variant = {
 	.vp_slot_offset = 0xc,
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
-	.submit_queue_status_offset = 0x78,
+	.submit_queue_status_offset = 0x7c,
 };
 
 /* can also be derived from a version register */
@@ -744,3 +753,9 @@ module_platform_driver(avd_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Apple avd v4l2 sl m2m");
+MODULE_FIRMWARE("apple/avd-fw-v2-t0.bin");
+MODULE_FIRMWARE("apple/avd-fw-v3-t0.bin");
+MODULE_FIRMWARE("apple/avd-fw-v3-t1.bin");
+MODULE_FIRMWARE("apple/avd-fw-v4-t0.bin");
+MODULE_FIRMWARE("apple/avd-fw-v5-t0.bin");
+MODULE_FIRMWARE("apple/avd-fw-v5-t1.bin");

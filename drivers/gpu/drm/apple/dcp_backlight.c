@@ -7,9 +7,6 @@
 #include <drm/drm_modeset_lock.h>
 
 #include <linux/backlight.h>
-#include <linux/completion.h>
-#include <linux/delay.h>
-#include "linux/jiffies.h"
 
 #include "dcp.h"
 #include "dcp-internal.h"
@@ -19,9 +16,7 @@
 #define MIN_BRIGHTNESS_PART2	103U
 #define MAX_BRIGHTNESS_PART2	510U
 
-/*
- * lookup for display brightness 2 to 99 nits
- * */
+/* Lookup for display brightness 2 to 99 nits. */
 static u32 brightness_part1[] = {
 	0x0000000, 0x0810038, 0x0f000bd, 0x143011c,
 	0x1850165, 0x1bc01a1, 0x1eb01d4, 0x2140200,
@@ -191,10 +186,6 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	 */
 	if (!dcp->valid_mode)
 		return 0;
-
-	/* Wait 1 vblank cycle in the hope an atomic swap has already updated
-	 * the brightness */
-	msleep((1001 + 23) / 24); // 42ms for 23.976 fps
 
 	return drm_crtc_set_brightness(dcp);
 }

@@ -24,6 +24,7 @@ vm_context_mask = function(mmu, "pub(crate) fn t8140_vm_context_mask(")
 flush = function(mmu, "pub(crate) fn flush_t8140_vm_contexts(")
 live_range_flush = function(mmu, "fn tlbi_live_contexts(")
 step_map = function(mmu, "    fn step_map(")
+private_map = function(mmu, "    fn map_node(")
 assert "owner.page_table.ttb()" in vm_context_mask
 assert "context_mask_for_root(root, inner.ttbs())" in vm_context_mask
 assert "ttb.ttb0.load(Ordering::Acquire)" in context_mask
@@ -44,6 +45,9 @@ assert live_range_flush.index("fence(Ordering::SeqCst)") < live_range_flush.inde
 assert live_range_flush.index("mem::tlbi_range(") < live_range_flush.index("mem::sync()")
 assert step_map.index("map_and_link_va(") < step_map.index(
     "self.tlbi_live_contexts(op.addr(), op.range())"
+)
+assert private_map.index("self.page_table.map_pages(") < private_map.index(
+    "self.tlbi_live_contexts(node.start(), node.mapped_size as u64)"
 )
 
 new_storage = function(resources, "pub(crate) fn new_user_render_storage(")
@@ -85,6 +89,21 @@ page_table[parity_even_tpc] = "ordinal-14"
 assert tlb.translate(9, page_table, parity_even_tpc) == "cold"
 tlb.flush({1, 9})
 assert tlb.translate(9, page_table, parity_even_tpc) == "ordinal-14"
+
+# Dynamic TVB blocks use the private fixed-map path rather than GPUVM
+# step_map.  A published fragment context can cache the reserved VA as absent
+# before firmware asks the host to grow.  Invalidating only the bind context
+# leaves that negative entry live; matching-root invalidation exposes the new
+# block before the opcode-8 acknowledgement publishes it to firmware.
+tvb_growth_block = 0x1004000000
+page_table = {}
+tlb = ContextTlb()
+assert tlb.translate(10, page_table, tvb_growth_block) is None
+page_table[tvb_growth_block] = "grown-block"
+tlb.flush({1})
+assert tlb.translate(10, page_table, tvb_growth_block) is None
+tlb.flush({1, 10})
+assert tlb.translate(10, page_table, tvb_growth_block) == "grown-block"
 
 
 def contexts_for_root(entries, root):

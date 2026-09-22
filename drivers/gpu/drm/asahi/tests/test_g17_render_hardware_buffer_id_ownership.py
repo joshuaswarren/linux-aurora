@@ -87,8 +87,9 @@ assert "pm.hardware_buffer_id" in getter
 # --- a firmware-retired timeout keeps the slot -------------------------------
 retire = block(manager, r"^    pub\(crate\) fn retire_abandoned_render_if_firmware_retired\(")
 for needle in ["completion.retired", "state.job_list_empty", "execution.observed()",
-               ".release(hardware_buffer_id)", "self.render_tracker = None;",
-               "self.render_submission_ordinal = next_ordinal;"]:
+               ".release(hardware_buffer_id)",
+               "self.render_tracker = self.render_queued_tracker.take();",
+               ".retire_command_generation(ordinal)?"]:
     assert needle in retire, needle
 assert retire.index("return Ok(false)") < retire.index("complete_g17p_cl_kicks("), \
     "bookkeeping must not run for a group the firmware still holds"
@@ -181,12 +182,13 @@ fn a_reserved_id_returns_to_the_free_list_only_when_its_storage_drops() {
 }
 
 #[test]
-fn acquire_reserved_refuses_an_unreserved_or_held_id() {
+fn acquire_reserved_refcounts_an_already_held_retained_id() {
     let mut ids = G17PHardwareBufferIdAllocator::new();
     assert_eq!(ids.acquire_reserved(5), Err(NotReserved));
     let (id, _) = ids.allocate_with_token().unwrap();
     ids.reserve(id).unwrap();
-    assert_eq!(ids.acquire_reserved(id), Err(DoubleFree), "held by the in-flight render");
+    assert_eq!(ids.acquire_reserved(id), Ok(id), "a second ordered render shares the retained owner");
+    ids.release(id).unwrap();
     ids.release(id).unwrap();
     assert_eq!(ids.acquire_reserved(id), Ok(id));
     assert_eq!(ids.reserve(G17P_TA_HARDWARE_BUFFER_ID_COUNT as u32), Err(InvalidId));
@@ -210,16 +212,17 @@ fn reservations_neither_duplicate_nor_lose_ids() {
 }
 
 #[test]
-fn a_retained_reacquire_takes_a_fresh_lease_token_like_a_fresh_id() {
+fn overlapping_retained_reacquires_share_the_owner_token() {
     let mut ids = G17PHardwareBufferIdAllocator::new();
     assert_eq!(ids.allocate_with_token(), Ok((0, 0)));
     ids.reserve(0).unwrap();
+    assert_eq!(ids.acquire_reserved_with_token(0), Ok((0, 0)));
+    assert_eq!(ids.acquire_reserved_with_token(0), Ok((0, 0)));
+    ids.release(0).unwrap();
+    ids.release(0).unwrap();
     ids.release(0).unwrap();
     assert_eq!(ids.acquire_reserved_with_token(0), Ok((0, 1)));
-    ids.release(0).unwrap();
-    assert_eq!(ids.acquire_reserved_with_token(0), Ok((0, 2)));
-    assert_eq!(ids.acquire_reserved_with_token(0), Err(DoubleFree));
-    assert_eq!(ids.next_parameter_buffer_token, 3, "a refused acquire consumes no token");
+    assert_eq!(ids.next_parameter_buffer_token, 2);
 }
 """,
 ])

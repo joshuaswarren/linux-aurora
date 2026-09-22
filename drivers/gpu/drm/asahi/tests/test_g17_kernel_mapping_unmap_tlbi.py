@@ -51,7 +51,14 @@ assert "t8140: cfg == UatConfig::T8140," in make_inner
 # The descriptor aliases that exposed this are KernelMappings in
 # kernel_lower_vm, owned by the render storage and dropped with it.
 dual_root = block(resources, "fn map_shared_render_descriptor_range(")
-assert "global_vm," in dual_root and "object.map_range_into_range(" in dual_root
+dual_root_compact = " ".join(dual_root.split())
+assert (
+    "map_shared_render_range( object, client_vm, global_vm, object_range, "
+    "g17p_cl_client_low_va_range(), mmu::PROT_GPU_SHARED_RO, )"
+    in dual_root_compact
+)
+shared_mapper = block(resources, "fn map_shared_render_range(")
+assert "global_vm," in shared_mapper and "object.map_range_into_range(" in shared_mapper
 storage = block(resources, "pub(crate) struct G17PUserRenderStorage {")
 assert "_descriptor_ta_global: mmu::KernelMapping," in storage
 assert "_descriptor_3d_global: mmu::KernelMapping," in storage

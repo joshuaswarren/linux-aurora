@@ -28,14 +28,16 @@ def block(text, pattern):
 poll = block(manager, r"^    pub\(crate\) fn poll_translated_render_completion\(")
 complete = block(poll, r"^            if completion\.complete\s*")
 start = complete.index("let retired_sksm =")
-end = complete.index("self.render_hardware_buffer_id = None;")
+end = complete.index("self.render_tracker = self.render_queued_tracker.take();")
 transaction = complete[start:end]
 # The real observer establishes queue retirement, timestamps and native list
 # unlink before entering this transaction. Pending does not retire occupancy.
-assert poll.index("observe_paired_render_window(") < poll.index("if completion.complete")
+assert poll.index("observe_paired_render_window_depth(") < poll.index("if completion.complete")
 assert poll.count("complete_g17p_cl_kicks(") == complete.count("complete_g17p_cl_kicks(") == 2
 assert transaction.index("queues.fragment.producer, 1)?") < transaction.index("queues.tiling.producer = ta;")
-assert complete.index("queues.fragment.producer = fragment;") < complete.index("self.render_tracker = None;")
+assert complete.index("queues.fragment.producer = fragment;") < complete.index(
+    "self.render_tracker = self.render_queued_tracker.take();"
+)
 
 derive = "#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n"
 body = "\n".join([
@@ -52,6 +54,24 @@ use g17_submission::*;
 type Result<T = ()> = core::result::Result<T, i32>;
 const EIO: i32 = 5;
 const EOVERFLOW: i32 = 75;
+const ENODEV: i32 = 19;
+const EINVAL: i32 = 22;
+struct Pair {tiling:u8,fragment:u8}
+struct Storage { retired: bool }
+impl Storage {
+    fn queue_pair(&self)->Pair{Pair{tiling:0,fragment:1}}
+    fn qos_hardware_buffer_id(&self)->Result<u32>{Ok(0)}
+    fn retire_command_generation(&mut self,_ordinal:u64)->Result {
+        if self.retired { return Err(EIO); }
+        self.retired=true;Ok(())
+    }
+}
+struct Resources;
+impl Resources {
+    fn complete_qos_queue_records(&mut self,records:&[(u8,u8,u8)])->Result {
+        assert_eq!(records,&[(0,0,0),(1,0,1)]);Ok(())
+    }
+}
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct Queue { producer: G17PClKickProducerState }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -65,15 +85,19 @@ impl Ids {
     }
 }
 struct Manager {
+    render_storage:Option<Storage>,resources:Resources,
     render_sksm: Option<Queues>, render_submission_ordinal: u32,
     render_hardware_buffer_id: Option<u32>, render_hardware_buffer_ids: Ids,
 }
 impl Manager {
-    fn release_active_render_command_buffer_states(&mut self) -> Result {
+    fn release_render_command_buffer_state(&mut self,_word:u32) -> Result {
         Ok(())
     }
 
     fn actual_retirement_transaction(&mut self) -> Result {
+        let hardware_buffer_id=self.render_hardware_buffer_id.ok_or(EIO)?;
+        let command_buffer_state_word=0;
+        let ordinal=u64::from(self.render_submission_ordinal);
 ''',
     transaction,
     "Ok(())\n}\n}",
@@ -87,7 +111,8 @@ fn producer(qid: u8, submitted: u32) -> G17PClKickProducerState {
         previous_valid: true, previous_timestamp: 0x2233445566 }
 }
 fn manager(ta: u32, fragment: u32) -> Manager {
-    Manager { render_sksm: Some(Queues { tiling: Queue { producer: producer(0, ta) },
+    Manager { render_storage:Some(Storage{retired:false}),resources:Resources,
+        render_sksm: Some(Queues { tiling: Queue { producer: producer(0, ta) },
         fragment: Queue { producer: producer(1, fragment) } }),
         render_submission_ordinal: 999, render_hardware_buffer_id: Some(0),
         render_hardware_buffer_ids: Ids { fail: false, releases: 0 } }
@@ -119,15 +144,14 @@ fn either_queue_underflow_aborts_before_both_mutations_and_id_release() {
 
 #[test]
 fn failed_prerequisites_do_not_partially_retire_prepared_queue_states() {
-    for failure in 0..3 {
+    for failure in 0..2 {
         let mut m = manager(1, 1);
         match failure {
-            0 => m.render_submission_ordinal = u32::MAX,
-            1 => m.render_hardware_buffer_id = None,
+            0 => m.render_hardware_buffer_id = None,
             _ => m.render_hardware_buffer_ids.fail = true,
         }
         let before = m.render_sksm;
-        assert_eq!(m.actual_retirement_transaction(), Err(if failure == 0 { EOVERFLOW } else { EIO }));
+        assert_eq!(m.actual_retirement_transaction(), Err(EIO));
         assert_eq!(m.render_sksm, before);
         assert_eq!(m.render_hardware_buffer_ids.releases, 0);
     }

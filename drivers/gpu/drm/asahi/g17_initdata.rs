@@ -2263,7 +2263,8 @@ pub(crate) fn encode_hw_data(
     if let Some(byte) = out.get_mut(HW_DATA_TRANSPORT_SELECTOR_OFFSET) {
         *byte = 0;
     }
-    // Performance tables intentionally left zero; see
+    // The measured performance tables were encoded above. Their values are
+    // target-scoped observations rather than a complete ADT derivation; see
     // [`PERF_TABLE_VALUES_ENCODED`].
     Ok(())
 }
@@ -2283,12 +2284,12 @@ pub(crate) fn encode_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
     // leave the other data master's slot at 0 -- i.e. we arm the watchdog on
     // exactly the queue we submit to. When work cannot progress for any other
     // reason this turns a stall into a self-sustaining recovery loop.
-    if *crate::module_parameters::g17p_progress_watchdog.value() == 0 {
+    if crate::g17_config::PROGRESS_WATCHDOG == 0 {
         put_u32(out, 0x9cc, 0);
     }
     // Native initializes the idle-descent selector to zero. Keep the old
     // alternate predicate only as an explicit diagnostic override.
-    if *crate::module_parameters::g17p_idle_selector.value() != 0 {
+    if crate::g17_config::IDLE_SELECTOR != 0 {
         out[0xe21] = 1;
     }
     for (offset, value) in [

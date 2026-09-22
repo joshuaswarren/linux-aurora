@@ -83,10 +83,9 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
 #define DCP_POWER_OOB	true
 #else
 #define DCP_POWER_OOB	false
-#endif
-
 DCP_THUNK_INOUT(dcp_set_digital_out_mode, dcpep_set_digital_out_mode,
 		struct dcp_set_digital_out_mode_req, u32);
+#endif
 
 DCP_THUNK_INOUT(dcp_set_display_device, dcpep_set_display_device, u32, u32);
 
@@ -158,8 +157,6 @@ struct dcp_pipe_cfg_031 {
 } __packed;
 static_assert(sizeof(struct dcp_pipe_cfg_031) == 0x6c);
 
-DCP_THUNK_OUT(dcp_pipe_query_353, dcpep_pipe_query_353, u64);
-DCP_THUNK_INOUT(dcp_pipe_set_352, dcpep_pipe_set_352, u64, u32);
 DCP_THUNK_INOUT(dcp_pipe_cfg_415, dcpep_pipe_cfg_415,
 		struct dcp_pipe_cfg_415, struct dcp_pipe_cfg_415);
 DCP_THUNK_IN(dcp_pipe_cfg_031, dcpep_pipe_cfg_031, struct dcp_pipe_cfg_031);
@@ -168,23 +165,6 @@ DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
 DCP_THUNK_INOUT(dcp_pipe_set_428, dcpep_pipe_set_428, u32, u32);
-
-/*
- * A352 and the five A438 pushes macOS runs between A353 and the client-open
- * sequence.  Every byte is taken from the 25G83 capture; the 8-byte host
- * leading 8 bytes are sent
- * verbatim: zeroing them made the firmware take a CPU exception
- * (exception.c:59) on the third push.
- */
-struct dcp_pipe_cfg_438 {
-	u8 data[0x106c];
-} __packed;
-
-DCP_THUNK_INOUT(dcp_pipe_cfg_438, dcpep_pipe_cfg_438,
-		struct dcp_pipe_cfg_438, u32);
-
-/* Generated from the macOS 25G83 capture: five A438 pushes, 0x106c each,
- * byte-exact including the leading 8 bytes. */
 
 #endif
 DCP_THUNK_VOID(dcp_first_client_open, dcpep_first_client_open);
@@ -386,8 +366,9 @@ static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_ack_dfb_surface(dcp);
 }
 
-static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
-					  void *out, void *in)
+static bool __maybe_unused
+iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag, void *out,
+			      void *in)
 {
 	struct dcp_h17p_dfb_surface_req *req;
 
@@ -861,7 +842,8 @@ static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 	 * syslog: "[BrightnessLCD.cpp:743][AFK]nitsToDBV: iDAC out of range"
 	 */
 	dcp->brightness.update = true;
-	schedule_work(&dcp->bl_update_wq);
+	mod_delayed_work(system_wq, &dcp->bl_update_wq,
+			 msecs_to_jiffies(DIV_ROUND_UP(1000, 24)));
 }
 
 /* Chunked data transfer for property dictionaries */
@@ -1141,37 +1123,10 @@ static bool dcpep_cb_d000_h17p(struct apple_dcp *dcp, int tag, void *out, void *
 }
 #endif
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-static void boot_1_after_park(struct apple_dcp *dcp, void *out, void *cookie)
-{
-	dcp_set_create_dfb(dcp, false, boot_1_5, NULL);
-}
-#endif
-
 /* Use special function signature to defer the ACK */
 static bool dcpep_cb_boot_1(struct apple_dcp *dcp, int tag, void *out, void *in)
 {
 	trace_iomfb_callback(dcp, tag, __func__);
-
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/*
-	 * Park the display before the firmware configures the pipe, not after.
-	 *
-	 * m1n1 stops the ASC, so our firmware boots with no surface (macOS
-	 * adopts the live generation and always has one).  It enables the pipe
-	 * anyway while finishing start_hardware_boot and fetches from a null
-	 * base -- an address below the DART's window, so it cannot be mapped,
-	 * only prevented.  The reject becomes an AXI error and NMIs the
-	 * coprocessor before a modeset can ever run.  Powering the display down
-	 * first keeps the pipe quiet until we drive a real mode.
-	 */
-	/*
-	 * Do not park here.  macOS never powers the display down at all --
-	 * start_hardware_boot has no blank or pipe-disable step, and its only
-	 * A473 in a full capture is unklong=1 (power on).  Parking at the head
-	 * of the boot chain stops the firmware booting outright.
-	 */
-#endif
 
 	dcp_set_create_dfb(dcp, false, boot_1_5, NULL);
 	return false;
@@ -1680,7 +1635,7 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		dcp->valid_mode = false;
 		/* after unplug swap will not complete until the next
 		 * set_digital_out_mode */
-		schedule_work(&dcp->vblank_wq);
+		schedule_delayed_work(&dcp->vblank_wq, msecs_to_jiffies(5));
 	}
 
 	if (connector && connector->connected != !!(*connected)) {
@@ -1921,13 +1876,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * already running at its native 2408x1506, so skip the modeset and let
 	 * that timing stand.
 	 */
-	if (!dcp_send_modeset) {
-		dev_info(dcp->dev, "inheriting the bootloader's display mode\n");
-		complete_set_digital_out_mode(dcp, NULL, cookie);
-	} else
-#endif
+	dev_info(dcp->dev, "inheriting the bootloader's display mode\n");
+	complete_set_digital_out_mode(dcp, NULL, cookie);
+#else
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
 				 complete_set_digital_out_mode, cookie);
+#endif
 
 	/*
 	 * The DCP firmware has an internal timeout of ~8 seconds for
@@ -2004,14 +1958,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		l = apple_plane->iomfb_surface;
 		req->swap.swap_enabled |= BIT(l);
 
-		if (old_state->fb && new_state->fb != old_state->fb) {
+		if (old_state->crtc == crtc && old_state->fb &&
+		    new_state->fb != old_state->fb) {
 			/* Retain the old framebuffer until its replacement is stable. */
-			struct dcp_fb_reference *entry =
-				kzalloc(sizeof(*entry), GFP_KERNEL);
+			struct dcp_fb_reference *entry = apple_state->retiring_fb;
 			unsigned long flags;
 
 			if (entry) {
+				apple_state->retiring_fb = NULL;
 				entry->fb = old_state->fb;
+				drm_framebuffer_get(entry->fb);
 				/*
 				 * Left unarmed: the id of the swap that
 				 * unbinds this framebuffer is not known until
@@ -2024,7 +1980,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 				spin_unlock_irqrestore(&dcp->swapped_out_lock,
 						       flags);
 			}
-			drm_framebuffer_get(old_state->fb);
 		}
 
 		if (!new_state->fb || !new_state->visible) {
@@ -2055,7 +2010,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
 		if (crtc_state->enable && crtc_state->active &&
 		    !crtc_state->planes_changed) {
-			schedule_work(&dcp->vblank_wq);
+			schedule_delayed_work(&dcp->vblank_wq,
+					      msecs_to_jiffies(5));
 			return;
 		}
 
@@ -2268,14 +2224,7 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 		dcp_pipe_query_474(dcp, false, next, ncookie);
 		break;
 	case DCP_STEP_A476: {
-		/*
-		 * A476 is IOMobileFramebufferAP::set_dcp_clamshellstate(uint).
-		 * We were sending 1 -- copied from the capture without knowing
-		 * what it was -- which tells the firmware the lid is shut, so
-		 * it parks the internal pipe (power_down_M3) and never scans
-		 * out even though the panel and backlight are on.
-		 */
-		u32 state = dcp_clamshell_state;
+		u32 state = DCP_CLAMSHELL_STATE;
 
 		dcp_pipe_set_476(dcp, false, &state, next, ncookie);
 		break;
@@ -2289,7 +2238,8 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 }
 #endif
 
-static void init_1b(struct apple_dcp *dcp, void *out, void *cookie)
+static void __maybe_unused init_1b(struct apple_dcp *dcp, void *out,
+				   void *cookie)
 {
 	u32 val = 0;
 	dcp_enable_disable_video_power_savings(dcp, false, &val, init_2, NULL);

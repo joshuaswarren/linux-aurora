@@ -25,17 +25,20 @@ poll_manager = function(manager, "    pub(crate) fn poll_translated_render_compl
 poll_runtime = function(live, "    pub(crate) fn poll_deferred_render_completion(")
 settle = function(live, "    fn settle_deferred_render_completion(")
 service = function(live, "    fn service_async_render_completions(")
-timeout = function(live, "    pub(crate) fn timeout_deferred_render(")
+timeout = function(live, "    fn settle_failed_deferred_render(")
 
 # Manager completion is a one-way commit: a cleanup failure cannot re-poll it.
-assert poll_manager.index("self.render_tracker = None;") < poll_manager.index(
+assert poll_manager.index("self.render_tracker = self.render_queued_tracker.take();") < poll_manager.index(
     "return Ok(G17PRenderPollOutcome::Complete(completion));"
 )
 assert "retire_render_usc_freelist_at_completion" not in poll_runtime
 assert "service_render_usc_freelist_release" not in poll_runtime
 
 # Both event and watchdog completion paths share the same exact-once boundary.
-assert "self.settle_deferred_render_completion(slot, observed)?;" in service
+assert "self.settle_deferred_render_completion(slot, observed)?" in service
+assert service.index("self.settle_deferred_render_completion(slot, observed)?") < service.rindex(
+    "if !self.render_fence_state.pending(slot)"
+)
 assert "self.settle_deferred_render_completion(render_slot, observed)" in timeout
 assert settle.index("self.pending_render.get(index)") < settle.index(
     "self.render_fence_state.settle(render_slot)"

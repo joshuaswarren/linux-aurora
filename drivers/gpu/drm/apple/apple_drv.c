@@ -211,12 +211,61 @@ static const char *const * apple_crtc_get_crc_sources(struct drm_crtc *crtc,
 	return apple_crtc_crc_sources;
 }
 
+static void apple_crtc_reset(struct drm_crtc *crtc)
+{
+	struct apple_crtc_state *state;
+
+	if (crtc->state) {
+		state = to_apple_crtc_state(crtc->state);
+		WARN_ON(!list_empty(&state->pending_flush));
+		__drm_atomic_helper_crtc_destroy_state(crtc->state);
+		kfree(state);
+	}
+
+	state = kzalloc_obj(*state);
+	if (!state) {
+		__drm_atomic_helper_crtc_reset(crtc, NULL);
+		return;
+	}
+
+	INIT_LIST_HEAD(&state->pending_flush);
+	__drm_atomic_helper_crtc_reset(crtc, &state->base);
+}
+
+static struct drm_crtc_state *
+apple_crtc_duplicate_state(struct drm_crtc *crtc)
+{
+	struct apple_crtc_state *state;
+
+	if (WARN_ON(!crtc->state))
+		return NULL;
+
+	state = kzalloc_obj(*state);
+	if (!state)
+		return NULL;
+
+	__drm_atomic_helper_crtc_duplicate_state(crtc, &state->base);
+	INIT_LIST_HEAD(&state->pending_flush);
+
+	return &state->base;
+}
+
+static void apple_crtc_destroy_state(struct drm_crtc *crtc,
+				     struct drm_crtc_state *base)
+{
+	struct apple_crtc_state *state = to_apple_crtc_state(base);
+
+	WARN_ON(!list_empty(&state->pending_flush));
+	__drm_atomic_helper_crtc_destroy_state(base);
+	kfree(state);
+}
+
 static const struct drm_crtc_funcs apple_crtc_funcs = {
-	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
-	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state	= apple_crtc_destroy_state,
+	.atomic_duplicate_state = apple_crtc_duplicate_state,
 	.destroy		= apple_crtc_cleanup,
 	.page_flip		= drm_atomic_helper_page_flip,
-	.reset			= drm_atomic_helper_crtc_reset,
+	.reset			= apple_crtc_reset,
 	.set_config             = drm_atomic_helper_set_config,
 	.set_crc_source		= apple_crtc_set_crc_source,
 	.verify_crc_source	= apple_crtc_verify_crc_source,

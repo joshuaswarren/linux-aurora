@@ -99,7 +99,7 @@ struct G17PUserRenderQueueState{
 
 struct Storage{state:G17PUserRenderQueueState}
 impl Storage{
- fn snapshot(&mut self)->Result<G17PUserRenderQueueState>{Ok(self.state)}
+ fn snapshot(&mut self,_ordinal:u64)->Result<G17PUserRenderQueueState>{Ok(self.state)}
 ''' + predicate + r'''
 }
 

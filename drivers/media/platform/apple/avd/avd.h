@@ -155,6 +155,7 @@ struct avd_coded_fmt_desc {
 
 struct avd_variant {
 	unsigned int vp_slots[4];
+	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
 	unsigned int capabilities;
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,

@@ -28,6 +28,13 @@ runtime_release = function(runtime, "pub(crate) fn release_render_owner(")
 assert drop.index("drop(self.render_scheduler.take())") < drop.index(
     ".release_render_owner(self.id, self.context.context_id() as u16)"
 )
+# Cross-owner slot visibility is the commit point: the manager must first mark
+# the drained descriptor context released while the old owner still excludes
+# registry acquisition.  Publishing the registry bit first lets a new queue
+# hand off the same physical QIDs against the old firmware context.
+assert drop.index(
+    ".release_render_owner(self.id, self.context.context_id() as u16)"
+) < drop.index("self.registry.release_render_owner(self.id)")
 assert "released_render_contexts |= 1u64 << context" in release
 assert "reclaim_released_superseded_render_graphs()" in release
 assert "take_active_render_slot_state()" in release

@@ -24,6 +24,9 @@ combined = block(submission, "pub(crate) fn apply_g17p_cl_b2_primary_state(")
 computed = block(submission, "pub(crate) fn apply_g17p_cl_b2_computed_state(")
 tables = block(submission, "pub(crate) fn apply_g17p_cl_b2_descriptor_tables(")
 publish = block(manager, "    fn publish_compute_b2_once(")
+prepare = block(manager, "    pub(crate) fn prepare_g17p_compute_queue(")
+initial = block(manager, "    fn submit_translated_first_bind_channel(")
+repeat = block(manager, "    fn submit_translated_repeat_channel(")
 reset = block(resources, "    pub(crate) fn reset_session_after_processor_stop(")
 live_rewrite = block(resources, "    pub(crate) fn rewrite_compute_dispatch_record(")
 
@@ -36,6 +39,21 @@ assert "with_b2_computed_mut" in publish
 assert "apply_g17p_cl_b2_computed_state" in publish
 assert "apply_g17p_cl_b2_primary_state" not in publish
 assert "apply_g17p_cl_b2_descriptor_tables" not in publish
+assert "compute_b2_activation" in publish
+assert "queue.b2_activation" not in publish
+assert "compute_channel_control" in prepare
+logical_prepare = block(manager, "    pub(crate) fn prepare_logical_queue_context(")
+assert "G17PClChannelControl::new" in logical_prepare
+assert "logical_channel_controls" not in logical_prepare
+retain = block(manager, "    pub(crate) fn retain_logical_channel_control(")
+assert "self.logical_channel_controls.push(control.clone(), GFP_KERNEL)?" in retain
+assert retain.index(".push(control.clone()") < retain.index("control.set_session_retained(true)")
+assert "bootstrap_control" in publish
+assert "queue.channel_control_gpu_va" not in publish
+assert "channel_control_gpu_va," in prepare
+assert "queue.channel_control_gpu_va" in initial
+assert "queue.channel_control_gpu_va" in repeat
+assert "queue.storage.channel_control_gpu_va()" not in manager
 assert resources.count("apply_g17p_cl_b2_descriptor_tables(pbdesc, uma)") == 2
 assert "apply_g17p_cl_b2_descriptor_tables" in reset
 assert "apply_g17p_cl_b2_descriptor_tables" not in live_rewrite
@@ -61,12 +79,21 @@ live_uma = bytes(range(0x20))
 uma[:0x20] = live_uma
 before_compute_uma = bytes(uma)
 
-# Multiple fresh queue activations change only the separate computed page.
-for channel in [0xFFFF_FC20_1234_8000, 0xFFFF_FC20_5678_C000]:
-    computed_page = bytearray(0x4000)
-    computed_page[0x808:0x810] = channel.to_bytes(8, "little")
-    assert int.from_bytes(computed_page[0x808:0x810], "little") == channel
+# B2 pins its dedicated bootstrap owner. Logical queues retain distinct pages;
+# queue switching must not change the bootstrap pointer or live PB/UMA tables.
+local_channels = [0xFFFF_FC20_1234_8000, 0xFFFF_FC20_5678_C000]
+session_channel = 0xFFFF_FC20_9000_0000
+computed_page = bytearray(0x4000)
+b2_publications = 0
+for local_channel in local_channels:
+    queue_channel = local_channel
+    if b2_publications == 0:
+        computed_page[0x808:0x810] = session_channel.to_bytes(8, "little")
+        b2_publications += 1
+    assert queue_channel != session_channel
+    assert int.from_bytes(computed_page[0x808:0x810], "little") == session_channel
     assert bytes(pbdesc) == before_compute_b2
     assert bytes(uma) == before_compute_uma
+assert b2_publications == 1
 
-print("PASS compute B2 preserves live PBDesc/UMA ownership after static initialization")
+print("PASS dedicated bootstrap B2 is isolated from logical scheduler pages and live PB/UMA")

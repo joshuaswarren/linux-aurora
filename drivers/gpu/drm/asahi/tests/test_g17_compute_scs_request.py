@@ -69,6 +69,24 @@ assert "pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;" in uapi
 assert "scs_layout: get_u64(&raw, 0x40)" in uapi
 assert "build_compute_registers_for_layout(" in uapi
 assert "command.scs_layout," in uapi
+assert "pub(crate) const fn scs_enabled(&self) -> bool" in uapi
+assert "self.scs_layout >> 32 != 0" in uapi
+assert "descriptor_flag_5c8: self.scs_enabled()" in uapi
+assert "pub(crate) descriptor_flag_5c8: bool" not in block(
+    uapi, "pub(crate) struct ComputeEntryContext<'a> {"
+)
+
+# Native passes descriptor +0x18's first boundary into the primary RCE binding.
+# The descriptor and authored SKSM entry must consume the same derived value;
+# fixed 0x22 would recreate the four-entry skew.
+submission = (root / "g17_submission.rs").read_text()
+command_state = block(submission, "pub(crate) fn prepare_g17p_compute_cl_command_state(")
+assert "primary_checkpoint: u8" in command_state
+assert "tag: primary_checkpoint" in command_state
+manager = (root / "g17_manager.rs").read_text()
+assert manager.count("u8::try_from(resume_checkpoints[0])") == 3
+assert manager.count("descriptor_flag_5c8: command.scs_enabled()") == 2
+assert "context.descriptor_flag_5c8" not in manager
 
 # Compile the actual complete module, including its historical 40-register
 # hash test. Stub only module-parameter access, using the real defaults.
@@ -125,7 +143,7 @@ rust += r'''
   usc_exec_base: 0x1_0000_0000, helper_binary: 0, helper_data: 0,
   helper_config: 0, dispatch_identity: 1, context_id: 3, work_ordinal: 7,
   robustness: 0x100_0430_0000, operand_state_base: 0x70_0022_8000,
-  execution_gate: 2,
+  usc_flist_id: 2,
  };
  let off = build_compute_registers(parameters).unwrap();
  assert_eq!(off.len(), COMPUTE_REGISTER_COUNT);
@@ -153,7 +171,7 @@ rust += r'''
   usc_exec_base: 0x1_0000_0000, helper_binary: 0, helper_data: 0,
   helper_config: 0, dispatch_identity: 1, context_id: 3, work_ordinal: 7,
   robustness: 0x100_0430_0000, operand_state_base: 0x70_0022_8000,
-  execution_gate: 2,
+  usc_flist_id: 2,
  };
  let layout = 0x70u64 | (96u64 << 24) | (0x48u64 << 48);
  let on = build_compute_registers_for_layout(parameters, layout).unwrap();

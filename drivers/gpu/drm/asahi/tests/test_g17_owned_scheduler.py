@@ -29,7 +29,7 @@ pub mod dma_fence{
  impl Fence{pub fn new()->Self{Self(Arc::new(AtomicBool::new(false)))}pub fn from_fence<T>(f:&UserFence<T>)->Self{f.0.clone()}pub fn done(&self)->bool{self.0.load(Ordering::Acquire)}pub fn signal(&self){self.0.store(true,Ordering::Release)}}
 }
 pub mod g17_status{pub struct VmStatus;impl VmStatus{pub fn record(&self,_e:i32){}}}
-pub mod g17_resources{pub struct G17PRenderQueuePair;impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}}
+pub mod g17_resources{pub use crate::mmu::T8140ComputeExecutionContext as G17PLogicalQueueContext;pub struct G17PRenderQueuePair;impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}}
 pub mod g17_drm{
  use crate::dma_fence::Fence;
  pub struct G17PSubmissionFence;
@@ -37,7 +37,7 @@ pub mod g17_drm{
  impl G17PRenderCompletion{pub fn fence(&self)->Fence{self.0.clone()}}
 }
 pub mod driver{pub struct AsahiDevice;impl AsRef<()> for AsahiDevice{fn as_ref(&self)->&(){&()}}}
-pub mod g17_uapi{#[derive(Clone,Copy)]pub struct TranslatedComputeCommand{pub value:u64}}
+pub mod g17_uapi{#[derive(Clone,Copy)]pub struct TranslatedComputeCommand{pub value:u64}#[derive(Clone,Copy)]pub struct TranslatedRenderCommand{pub value:u64}}
 pub mod mmu{
  pub struct T8140VmJobGuard;
  impl T8140VmJobGuard{pub fn quarantine(&self){}}
@@ -105,6 +105,13 @@ tests=r'''
  #[test]fn invalid_sealing_drops_unpublished_resources(){
   let d=StdArc::new(AtomicUsize::new(0));let bytes=StdArc::new(Mutex::new(vec![0xa5;4]));
   assert!(G17PSealedCommand::new(mmu::KernelMapping{address:0,bytes:bytes.clone(),drops:d.clone()},&[1;5]).is_err());assert_eq!(*bytes.lock().unwrap(),vec![0xa5;4]);assert_eq!(d.load(Ordering::SeqCst),1);
+ }
+ #[test]fn compute_packets_accept_every_nonbootstrap_qid(){
+  for qid in 0..=255u8 {
+   let context=Arc::new(mmu::T8140ComputeExecutionContext{id:5,drops:StdArc::new(AtomicUsize::new(0))},0).unwrap();
+   let packet=G17PComputeJobPacket::new(1,qid,context,g17_uapi::TranslatedComputeCommand{value:1},vec![],vec![],vec![],None);
+   assert_eq!(packet.is_ok(),(2..128).contains(&qid),"qid {qid}");
+  }
  }
 }
 '''

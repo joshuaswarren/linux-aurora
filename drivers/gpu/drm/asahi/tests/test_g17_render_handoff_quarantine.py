@@ -28,9 +28,10 @@ assert graph.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < 
 
 handoff = function("pub(crate) fn handoff_retained_render_vm(")
 preserve = function("fn preserve_immediate_retired_render_graph(")
-assert handoff.index("self.require_retired_render_owner()?") < handoff.index(
+assert handoff.index("self.require_retired_render_owner()") < handoff.index(
     "G17PRetiredRenderGraph {"
 )
+assert '"handoff-require-retired-owner"' in handoff
 for owner in (
     "self.render_bind.take().ok_or(EIO)?",
     "self.render_context_aliases.take()",

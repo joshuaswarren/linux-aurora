@@ -73,6 +73,7 @@ pub(crate) enum ComputeBuildError {
     SamplerPair,
     SamplerAlignment,
     ScsRequestOutOfRange,
+    RegisterProgramShape,
 }
 
 /// Low and high GPU aliases of one retained SKSM entry backing.
@@ -164,7 +165,9 @@ pub(crate) struct ComputeRegisterParameters {
     pub(crate) work_ordinal: u32,
     pub(crate) robustness: u64,
     pub(crate) operand_state_base: u64,
-    pub(crate) execution_gate: u64,
+    /// Native CL prepare stores the allocated FList ID at descriptor+0x798;
+    /// generateRegisterList emits it at 0x14028. This is not an enable gate.
+    pub(crate) usc_flist_id: u32,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -176,7 +179,7 @@ pub(crate) struct ComputeDescriptorObjects {
     pub(crate) status_a: u64,
     pub(crate) status_b: u64,
     pub(crate) shared_control: u64,
-    pub(crate) zero_page: u64,
+    pub(crate) usage_record: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -449,7 +452,7 @@ pub(crate) fn build_compute_registers_with_scs(
         ComputeRegister::new(0x0a351, p.dispatch_identity),
         ComputeRegister::new(0x10201, context_word),
         ComputeRegister::new(0x10428, context_word),
-        ComputeRegister::new(0x14028, p.execution_gate),
+        ComputeRegister::new(0x14028, u64::from(p.usc_flist_id)),
         ComputeRegister::new(0x14070, p.robustness | 1),
         ComputeRegister::new(0x10229, add(p.operand_state_base, 0x12800)?),
         ComputeRegister::new(0x140a8, add(p.operand_state_base, 0x13000)?),
@@ -540,7 +543,8 @@ pub(crate) fn build_compute_queue_graph(
     raw[0x36..0x38].fill(0xff);
     put_u32(raw, 0x40, 2);
     put_u32(raw, 0x44, u32::MAX);
-    put_u32(raw, 0x48, 0x1aa);
+    // Bootstrap/unowned graph. A logical bind supplies the creator's TGID.
+    put_u32(raw, 0x48, 0);
     put_u64(raw, 0x9c, channel_control);
     put_u32(raw, 0x100 + 0x50, u32::MAX);
     put_u32(raw, 0x100 + 0x60, compute_item_ring_entries());
@@ -573,17 +577,48 @@ pub(crate) fn compute_item_ring_entries() -> u32 {
     clamped - (clamped % COMPUTE_REPEAT_RING_RECORD_COUNT as u32)
 }
 
+/// Identity of the configuration last published on one physical CL QID.
+///
+/// Logical scheduler pages are unique and retained until processor stop.
+/// Their address therefore also distinguishes two root leases that reuse the
+/// same numeric context ID, including queues sharing one VM. The root lease
+/// is immutable while current; submit validates that before using this key.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeConfigIdentity {
+    pub(crate) channel_control: u64,
+    pub(crate) qos_id: u8,
+    pub(crate) context_id: Option<u16>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeConfigUpdates {
+    pub(crate) qos: bool,
+    pub(crate) context: bool,
+}
+
+impl ComputeConfigIdentity {
+    pub(crate) fn updates_from(self, published: Option<Self>) -> ComputeConfigUpdates {
+        match published {
+            None => ComputeConfigUpdates { qos: true, context: true },
+            Some(previous) => ComputeConfigUpdates {
+                // QID membership is scoped to its logical scheduler page.
+                // Policy is currently immutable for this logical lease.
+                qos: self.channel_control != previous.channel_control
+                    || self.qos_id != previous.qos_id,
+                context: self.channel_control != previous.channel_control
+                    || self.context_id != previous.context_id,
+            },
+        }
+    }
+}
+
 /// Encode the tag-15 `KSMKickQueueConfigUpdate` record inside a retained
 /// queue graph.
 ///
-/// Split out of the first-bind builder because macOS republishes this record
-/// on EVERY submission -- both live captures (QID 0x11 and QID 0x16) are of
-/// already-installed queues and both still carry a tag-15 ConfigUpdate. The
-/// only field that differs between a first bind and a repeat is the
-/// queue-install flag at `+0x1a`. Nothing outside the optional-record window
-/// is touched, so a repeat submission can call this without resetting the
-/// item-ring producer or rewriting the queue header the way the first-bind
-/// builder does.
+/// A retained submission may carry this record without reinstalling the QID
+/// or changing its QoS/context. Native computes +0x52 from QoS ID, QID
+/// membership and policy changes, and +0x62 from the channel's cached GART
+/// allocation generation. See audit_g17_native_scheduler_owner.py.
 pub(crate) fn encode_compute_config_update(
     graph: &mut [u8],
     sksm_entries: ComputeSksmEntryAliases,
@@ -592,6 +627,7 @@ pub(crate) fn encode_compute_config_update(
     queue_id: u8,
     hardware_buffer_id: u8,
     install_queue: bool,
+    updates: ComputeConfigUpdates,
     context_id: Option<u16>,
 ) -> Result<(), ComputeBuildError> {
     // Record +0x32 is the hardware context this queue's work is declared to run
@@ -620,8 +656,15 @@ pub(crate) fn encode_compute_config_update(
     let (flushid_object, flushid_slot, flushid_index) = if flushid_fix {
         (0u64, 0xffffu16, 0xffffu16)
     } else {
-        (shared_control, 0x3fu16, 0u16)
+        (shared_control, 0x3fu16, crate::g17_config::compute_flist_id(queue_id))
     };
+    // AGXChannel::getPid supplies a full u32 at tag15 +0x5a. The queue's
+    // logical-owner bind populates the same PID at record +0x48; reading that
+    // retained identity avoids capturing a workqueue PID during submission.
+    let owner_pid = u32::from_le_bytes(
+        graph.get(0x48..0x4c).ok_or(ComputeBuildError::BufferTooSmall)?
+            .try_into().map_err(|_| ComputeBuildError::BufferTooSmall)?,
+    );
     let optional_raw = graph
         .get_mut(COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE)
         .ok_or(ComputeBuildError::BufferTooSmall)?;
@@ -654,22 +697,22 @@ pub(crate) fn encode_compute_config_update(
         (0x32, declared_context),
         (0x3e, flushid_slot),
         (0x46, flushid_index),
-        (0x52, 1),
+        (0x52, u16::from(updates.qos)),
         // AGXCLChannelSKSM::submitBuffer copies AGXQOSQueue +0x10 here.
         // Native retained CL queues receive distinct HardwareBufferIDs in
         // allocation order (1, 2, 3 in the captured QID 4/5/7 sequence).
         // This field is therefore queue identity, not the literal 1 from the
         // first output-positive queue.
         (0x56, u16::from(hardware_buffer_id)),
-        (0x5a, 0x170),
         (0x5e, 2),
-        (0x62, 1),
+        (0x62, u16::from(updates.context)),
         (0x66, 1),
     ] {
         put_u16(optional_raw, offset, value);
     }
     put_u64(optional_raw, 0x36, flushid_object);
     put_u64(optional_raw, 0x4a, channel_control);
+    put_u32(optional_raw, 0x5a, owner_pid);
     optional_raw[0x76..0x86].fill(0xff);
     Ok(())
 }
@@ -745,9 +788,8 @@ pub(crate) fn build_initial_compute_channel_group(
     let optional = add(base, COMPUTE_OPTIONAL as u64)?;
     let event = add(base, COMPUTE_EVENT as u64)?;
 
-    // The initial channel queue has UUID 0x170. The retained SKSM fixture
-    // uses 0x1aa, so set this only when the proven channel path is staged.
-    put_u32(graph, 0x48, 0x170);
+    // Record +0x48 is the process PID, not a UUID. Preserve the logical
+    // owner's value installed when this physical graph was bound.
     for (index, address) in [descriptor, optional, event].into_iter().enumerate() {
         put_u64(graph, COMPUTE_ITEM_RING + index * 8, address);
     }
@@ -757,18 +799,11 @@ pub(crate) fn build_initial_compute_channel_group(
         COMPUTE_CHANNEL_WRITE_INDEX,
     );
 
-    // Tag-15 FlushID triple. Ours (shared_control / 0x3f / 1) is inferred, and
-    // because +0x36 is non-zero the firmware runs its FlushID bind path, which
-    // indexes `0x5b778 + rec[0x46]*0xe8` unbounded. The kext writes 0 / -1 / -1
-    // for a non-first bind, which makes the firmware skip the block, and
-    // PROVENANCE.md records that T8140 leaves the AGXSKSMFlushID bit clear.
-    // The non-fix tuple's third element lands at +0x46. Native writes 0 there:
-    // both compute-queue tag-15 records captured live on macOS 26.6.2 (QID 0x11
-    // and QID 0x16) have +0x46 = 0, so it is a constant. The +0x3e slot is NOT a
-    // constant -- native carries a live per-queue counter there (0x719 / 0x770,
-    // copied from AGXKSMKickQueueG16 +0x28), so 0x3f stays until that counter's
-    // provenance is known. Do not substitute the kext's 0/-1/-1 non-first-bind
-    // constants; those have hard-killed the machine twice.
+    // B1 registers an exact pointer/cookie at table[record+0x46]; later
+    // descriptor processing selects that same table with FList+0x08. Both
+    // IDs must identify our canonical compute pool, not render's ID zero.
+    // The cookie is stable for this retained session incarnation. All queues
+    // register the same pointer/cookie; their scheduler identity is separate.
     encode_compute_config_update(
         graph,
         sksm_entries,
@@ -777,6 +812,7 @@ pub(crate) fn build_initial_compute_channel_group(
         queue_id,
         hardware_buffer_id,
         install_queue,
+        ComputeConfigUpdates { qos: true, context: true },
         context_id,
     )?;
 
@@ -818,6 +854,38 @@ fn register_value(registers: &[ComputeRegister], number: u32, occurrence: usize)
         .value
 }
 
+fn register_count_through(
+    registers: &[ComputeRegister],
+    number: u32,
+    occurrence: usize,
+) -> Result<u16, ComputeBuildError> {
+    let index = registers
+        .iter()
+        .enumerate()
+        .filter(|(_, register)| register.number == number)
+        .nth(occurrence)
+        .map(|(index, _)| index)
+        .ok_or(ComputeBuildError::RegisterProgramShape)?;
+    u16::try_from(index + 1).map_err(|_| ComputeBuildError::RegisterProgramShape)
+}
+
+/// Resume checkpoints consumed by B1 after a nonterminal CL completion.
+///
+/// The no-extra G16 common producer records the current register count after
+/// the first 0x0a5c9, the final 0x1a440 (twice), and the final 0x0a599.  B1
+/// reads descriptor +0x1a/+0x1c on status 2 and copies the selected low seven
+/// bits into the selected SKSM kick-ring entry at +0x150.  Derive the counts from the
+/// actual program so an SCS 0x17d9 prefix, or a later list edit, cannot leave
+/// stale resume indices in the descriptor.
+pub(crate) fn compute_resume_checkpoints(
+    registers: &[ComputeRegister],
+) -> Result<[u16; 4], ComputeBuildError> {
+    let first_tail = register_count_through(registers, 0x0a5c9, 0)?;
+    let final_control = register_count_through(registers, 0x1a440, 1)?;
+    let final_tail = register_count_through(registers, 0x0a599, 1)?;
+    Ok([first_tail, final_control, final_control, final_tail])
+}
+
 /// Encode a selector-3 descriptor without dropping sampler, timestamp, or CDM
 /// command state.
 pub(crate) fn build_compute_descriptor(
@@ -826,7 +894,7 @@ pub(crate) fn build_compute_descriptor(
     metadata: ComputeDescriptorMetadata,
     command: ComputeDescriptorCommand,
     raw: &mut [u8],
-) -> Result<(), ComputeBuildError> {
+) -> Result<[u16; 4], ComputeBuildError> {
     let registers = program.as_slice();
     if raw.len() < COMPUTE_DESCRIPTOR_SIZE {
         return Err(ComputeBuildError::BufferTooSmall);
@@ -856,7 +924,8 @@ pub(crate) fn build_compute_descriptor(
     put_u64(raw, 0x04, metadata.submit_sequence);
     put_u32(raw, 0x0c, metadata.context_id);
     put_u64(raw, 0x10, objects.scheduler_record);
-    for (index, value) in [0x22u16, 0x23, 0x23, 0x24].into_iter().enumerate() {
+    let resume_checkpoints = compute_resume_checkpoints(registers)?;
+    for (index, value) in resume_checkpoints.into_iter().enumerate() {
         put_u16(raw, 0x18 + index * 2, value);
     }
 
@@ -936,9 +1005,9 @@ pub(crate) fn build_compute_descriptor(
     put_u32(raw, 0x0fbe, metadata.support_flags);
     put_u8(raw, 0x0fc5, 0x9f);
     put_u32(raw, 0x0fc8, (metadata.work_ordinal & 3) << 30);
-    put_u64(raw, 0x0fcb, objects.zero_page);
+    put_u64(raw, 0x0fcb, objects.usage_record);
     put_u8(raw, 0x0fd3, 1);
-    Ok(())
+    Ok(resume_checkpoints)
 }
 
 #[cfg(test)]
@@ -967,7 +1036,7 @@ mod tests {
             work_ordinal: 7,
             robustness: 0x100_0430_0000,
             operand_state_base: 0x70_0022_8000,
-            execution_gate: 2,
+            usc_flist_id: 2,
         }
     }
 
@@ -1030,6 +1099,10 @@ mod tests {
         // The three request registers still carry the request itself.
         assert_eq!(register_value(program.as_slice(), 0x101d1, 0), 0x0001_0059);
         assert_eq!(register_value(program.as_slice(), 0x107a1, 0), 0x0100_0000);
+        assert_eq!(
+            compute_resume_checkpoints(program.as_slice()).unwrap(),
+            [39, 40, 40, 41]
+        );
     }
 
     #[test]
@@ -1130,7 +1203,7 @@ mod tests {
                 status_a: 0xffff_fc20_0002_4c68,
                 status_b: 0xffff_fc20_0002_4c70,
                 shared_control: 0xffff_fc20_c095_0000,
-                zero_page: 0xffff_fc20_0171_0000,
+                usage_record: 0xffff_fc20_0171_0000,
             },
             ComputeDescriptorMetadata {
                 submit_sequence: 5,
@@ -1154,13 +1227,22 @@ mod tests {
         )
         .unwrap();
 
-        // Re-pinned with the corrected 0x0a599 first emission.
-        assert_eq!(fnv1a64(&raw), 0x8913_dca2_ae5b_2133);
+        // Re-pinned with the register-derived B1 resume checkpoints.
+        assert_eq!(fnv1a64(&raw), 0xfc26_4ad8_26d7_270b);
         assert_eq!(u64::from_le_bytes(raw[0x0ee0..0x0ee8].try_into().unwrap()), 0x100_0410_002c);
         assert_eq!(u64::from_le_bytes(raw[COMPUTE_SAMPLER_ARRAY..COMPUTE_SAMPLER_ARRAY + 8].try_into().unwrap()), 0x100_0800_0000);
         assert_eq!(u32::from_le_bytes(raw[COMPUTE_SAMPLER_COUNT..COMPUTE_SAMPLER_COUNT + 4].try_into().unwrap()), 4);
         assert_eq!(u64::from_le_bytes(raw[0x0f8c..0x0f94].try_into().unwrap()), 0x200_0000_4000);
         assert_eq!(u32::from_le_bytes(raw[0x0f50..0x0f54].try_into().unwrap()), 8 << 8);
+        assert_eq!(
+            [
+                u16::from_le_bytes(raw[0x18..0x1a].try_into().unwrap()),
+                u16::from_le_bytes(raw[0x1a..0x1c].try_into().unwrap()),
+                u16::from_le_bytes(raw[0x1c..0x1e].try_into().unwrap()),
+                u16::from_le_bytes(raw[0x1e..0x20].try_into().unwrap()),
+            ],
+            [38, 39, 39, 40]
+        );
     }
 
     #[test]
@@ -1174,7 +1256,7 @@ mod tests {
             status_a: 4,
             status_b: 5,
             shared_control: 6,
-            zero_page: 7,
+            usage_record: 7,
         };
         let metadata = ComputeDescriptorMetadata {
             submit_sequence: 1,
@@ -1240,7 +1322,9 @@ mod tests {
                 item_ring: 0xffff_fc20_c100_4000,
             }
         );
-        assert_eq!(u32::from_le_bytes(raw[0x48..0x4c].try_into().unwrap()), 0x1aa);
+        assert_eq!(u32::from_le_bytes(raw[0x48..0x4c].try_into().unwrap()), 0);
+        // Normalize only the captured process identity for the historical hash.
+        put_u32(&mut raw, 0x48, 0x1aa);
         assert_eq!(fnv1a64(&raw), 0x3490_ef31_add0_ac88);
     }
 
@@ -1250,6 +1334,7 @@ mod tests {
         let descriptor = 0xffff_fc20_c200_0000;
         let mut graph = [0u8; COMPUTE_QUEUE_GRAPH_SIZE];
         build_compute_queue_graph(base, 0xffff_fc20_c500_0000, &mut graph).unwrap();
+        put_u32(&mut graph, 0x48, 0x1234_5678);
         let mut context = vec![0u8; COMPUTE_QUEUE_CONTEXT_EXTENT];
         let addresses = build_initial_compute_channel_group(
             base,
@@ -1280,14 +1365,44 @@ mod tests {
                 write_index: 3,
             }
         );
-        // The original add3 fixture used FlushID index 1. The retained-queue
-        // builder switched that index to 0 in fcc1b7dfc8847. Check that field
-        // explicitly, then normalize only it to retain the original whole-
-        // graph golden instead of silently replacing the historical hash.
-        assert_eq!(&graph[COMPUTE_OPTIONAL + 0x46..COMPUTE_OPTIONAL + 0x48], &[0, 0]);
-        put_u16(&mut graph, COMPUTE_OPTIONAL + 0x46, 1);
-        assert_eq!(fnv1a64(&graph), 0xc8d6_b367_6415_8da7);
+        // The compute pool uses ID 1 consistently in registration and FList.
+        // Normalize only the captured PID for the original whole-graph golden.
+        assert_eq!(&graph[COMPUTE_OPTIONAL + 0x46..COMPUTE_OPTIONAL + 0x48], &[5, 0]);
+        assert_eq!(&graph[0x48..0x4c], &0x1234_5678u32.to_le_bytes());
+        assert_eq!(&graph[COMPUTE_OPTIONAL + 0x5a..COMPUTE_OPTIONAL + 0x5e], &0x1234_5678u32.to_le_bytes());
+        put_u32(&mut graph, 0x48, 0x170);
+        put_u32(&mut graph, COMPUTE_OPTIONAL + 0x5a, 0x170);
+        assert_eq!(fnv1a64(&graph), 0x66c2_81b4_ef4e_f1db);
         assert_eq!(fnv1a64(&context), 0x5ba5_b355_8c90_0783);
+    }
+
+    #[test]
+    fn config_update_uses_physical_graph_flist_index_not_qos() {
+        let mut graph = [0u8; COMPUTE_QUEUE_GRAPH_SIZE];
+        let aliases = ComputeSksmEntryAliases::new(
+            0x70_0040_0000,
+            0xffff_fc20_c300_0000,
+            0x8000,
+            0x100,
+        )
+        .unwrap();
+        encode_compute_config_update(
+            &mut graph,
+            aliases,
+            0xffff_fc20_c400_0000,
+            0xffff_fc20_c500_0000,
+            5,
+            2,
+            true,
+            ComputeConfigUpdates { qos: true, context: true },
+            None,
+        )
+        .unwrap();
+        assert_eq!(&graph[COMPUTE_OPTIONAL + 0x46..COMPUTE_OPTIONAL + 0x48], &[6, 0]);
+        assert_eq!(
+            &graph[COMPUTE_OPTIONAL + 0x56..COMPUTE_OPTIONAL + 0x58],
+            &[2, 0]
+        );
     }
 
     #[test]

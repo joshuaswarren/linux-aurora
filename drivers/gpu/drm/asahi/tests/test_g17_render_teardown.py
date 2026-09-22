@@ -1,123 +1,54 @@
 #!/usr/bin/env python3
-"""Run the production render cancellation callback with a mocked fence wait."""
+"""Queued cancellation and published teardown keep exact render ownership."""
 from pathlib import Path
-import argparse
-import subprocess
-import tempfile
 
-root = Path(__file__).resolve().parents[1]
-parser = argparse.ArgumentParser()
-parser.add_argument('--baseline-ref')
-args = parser.parse_args()
-current = (root / 'g17_drm.rs').read_text()
-source = subprocess.check_output(['git', '-C', str(root), 'show',
-    args.baseline_ref + ':drivers/gpu/drm/asahi/g17_drm.rs'], text=True) if args.baseline_ref else current
+source = (Path(__file__).resolve().parents[1] / "g17_drm.rs").read_text()
 
-def item(source, marker):
-    start = source.index(marker)
-    end = source.index('{', start) + 1
+
+def item(text, marker):
+    start = text.index(marker)
+    pos = text.index("{", start) + 1
     depth = 1
     while depth:
-        depth += (source[end] == '{') - (source[end] == '}')
-        end += 1
-    return source[start:end]
+        depth += (text[pos] == "{") - (text[pos] == "}")
+        pos += 1
+    return text[start:pos]
 
-wait = item(current, 'fn wait_for_render_teardown(')
-backend = item(source, 'impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {')
-if args.baseline_ref:
-    # Adapt only the old timeout signature to the identity-aware mock sink.
-    backend = backend.replace('packet.submission_id(), ETIMEDOUT,',
-                              'packet.submission_id(), packet.completion(), ETIMEDOUT,')
-    backend = backend.replace('packet.submission_id(), ECANCELED,',
-                              'packet.submission_id(), packet.completion(), ECANCELED,')
 
-body = r'''
-#![allow(dead_code)]
-use std::cell::RefCell;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-static HELD: AtomicBool = AtomicBool::new(false);
-static WAIT_RESULT: AtomicI64 = AtomicI64::new(1);
-static WAITS: AtomicUsize = AtomicUsize::new(0);
-const ETIMEDOUT: i32 = -110;
-const ECANCELED: i32 = -125;
-struct Fence;
-impl Fence {fn raw(&self) -> usize {1}}
-mod kernel {
-    pub mod time {pub fn msecs_to_jiffies(ms: u32) -> u64 {ms.into()}}
-    pub mod drm {pub mod sched {pub enum Status {Nominal}}}
-}
-mod bindings {
-    pub unsafe fn dma_fence_wait_timeout(raw: usize, interruptible: bool, timeout: i64) -> i64 {
-        assert_eq!(raw, 1);
-        assert!(!interruptible, "fatal process signal must not cancel the retirement wait");
-        assert_eq!(timeout, 2000);
-        assert!(!super::HELD.load(super::Ordering::SeqCst), "RTKit completion worker needs this lock");
-        super::WAITS.fetch_add(1, super::Ordering::SeqCst);
-        super::WAIT_RESULT.load(super::Ordering::SeqCst)
-    }
-}
-struct Completion;
-mod g17_job {
-    use super::*;
-    pub struct G17PRenderWatchPacket(pub Arc<Completion>);
-    impl G17PRenderWatchPacket {
-        pub fn render_slot(&self) -> u8 {1}
-        pub fn submission_id(&self) -> u64 {42}
-        pub fn completion(&self) -> &Arc<Completion> {&self.0}
-        pub fn fence(&self) -> Fence {Fence}
-    }
-    pub trait G17PRenderWatchBackend {
-        fn timed_out(&self, packet: Arc<G17PRenderWatchPacket>) -> kernel::drm::sched::Status;
-        fn cancel(&self, packet: Arc<G17PRenderWatchPacket>);
-    }
-}
-#[derive(Default)] struct Runtime {calls: RefCell<Vec<i32>>}
-struct Guard<'a>(&'a Runtime);
-impl Runtime {
-    fn mutex(&self) -> &Self {self}
-    fn lock(&self) -> Guard<'_> {
-        assert!(!HELD.swap(true, Ordering::SeqCst));
-        Guard(self)
-    }
-}
-impl Guard<'_> {
-    fn timeout_deferred_render(&mut self, slot:u8, id:u64, _: &Arc<Completion>, error:i32) {
-        assert_eq!((slot,id),(1,42));
-        self.0.calls.borrow_mut().push(error);
-    }
-}
-impl Drop for Guard<'_> {fn drop(&mut self) {HELD.store(false,Ordering::SeqCst);}}
-struct G17PRenderWatchBackend {runtime: Runtime}
-WAIT
-BACKEND
-fn setup(result: i64) -> (G17PRenderWatchBackend, Arc<g17_job::G17PRenderWatchPacket>) {
-    WAIT_RESULT.store(result, Ordering::SeqCst);
-    WAITS.store(0, Ordering::SeqCst);
-    (G17PRenderWatchBackend {runtime: Runtime::default()},
-     Arc::new(g17_job::G17PRenderWatchPacket(Arc::new(Completion))))
-}
-#[test] fn completed_teardown_never_becomes_device_loss() {
-    let (b,p) = setup(1);
-    g17_job::G17PRenderWatchBackend::cancel(&b,p);
-    assert_eq!(WAITS.load(Ordering::SeqCst),1);
-    assert!(b.runtime.calls.borrow().is_empty());
-}
-#[test] fn genuinely_stuck_teardown_still_uses_bounded_failure_path() {
-    let (b,p) = setup(0);
-    g17_job::G17PRenderWatchBackend::cancel(&b,p);
-    assert_eq!(WAITS.load(Ordering::SeqCst),1);
-    assert_eq!(*b.runtime.calls.borrow(),[-110]);
-}
-#[test] fn normal_watchdog_does_not_add_a_second_wait() {
-    let (b,p) = setup(0);
-    g17_job::G17PRenderWatchBackend::timed_out(&b,p);
-    assert_eq!(WAITS.load(Ordering::SeqCst),0);
-    assert_eq!(*b.runtime.calls.borrow(),[-110]);
-}
-'''.replace('WAIT\n', wait + '\n').replace('BACKEND\n', backend + '\n')
-with tempfile.TemporaryDirectory(prefix='g17-render-teardown-') as directory:
-    exe = str(Path(directory) / 'test')
-    subprocess.run(['rustc', '--edition=2021', '--test', '-', '-o', exe], input=body, text=True, check=True)
-    subprocess.run([exe, '--test-threads=1'], check=True)
-print('PASS render teardown waits outside the runtime lock; normal watchdog unchanged')
+wait = item(source, "fn wait_for_render_teardown(")
+backend = item(source, "impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {")
+timed_out = item(backend, "    fn timed_out(")
+cancel = item(backend, "    fn cancel(")
+
+assert "false" in wait and "msecs_to_jiffies(2000)" in wait
+assert cancel.index("packet.request_cancel()") < cancel.index("wait_for_render_teardown")
+assert cancel.index("wait_for_render_teardown") < cancel.index("timeout_deferred_render")
+assert "packet.completion().fail_unpublished(ECANCELED)" in cancel
+assert "packet.is_published()" in cancel
+assert "packet.request_cancel()" in timed_out
+assert "packet.is_published()" in timed_out
+assert "timeout_deferred_render" in timed_out
+
+completion = item(source, "impl G17PRenderCompletion {")
+fail_unpublished = item(completion, "    pub(crate) fn fail_unpublished(")
+assert fail_unpublished.index("drop(self.lease.lock().take())") < fail_unpublished.index(
+    "drop(self.vm_job.lock().take())"
+)
+assert fail_unpublished.index("drop(self.vm_job.lock().take())") < fail_unpublished.index(
+    "self.fence.signal()"
+)
+
+job = (Path(__file__).resolve().parents[1] / "g17_job.rs").read_text()
+packet = item(job, "impl G17PRenderJobPacket {")
+assert "compare_exchange(0, 3" in packet
+assert packet.index("cancel_requested.store(1") < packet.index("compare_exchange(0, 3")
+assert "compare_exchange(0, 1" in packet
+assert "publication_state.store(2" in packet
+
+scheduler = item(job, "impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {")
+enqueue = item(scheduler, "    pub(crate) fn enqueue(")
+assert enqueue.index("let hardware = packet.fence();") < enqueue.index("self.entity.new_job")
+assert "Ok(hardware)" in enqueue
+assert "job.fences().finished()" not in enqueue
+
+print("PASS async render teardown: queued cancellation releases unpublished ownership; published cancellation waits before exact timeout/quarantine")
