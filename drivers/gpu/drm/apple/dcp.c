@@ -732,6 +732,12 @@ int dcp_start(struct platform_device *pdev)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
 				 ret);
 
+		/*
+		 * Deliberately after iomfb_start_rtkit() below on this SoC --
+		 * see the comment there.  Starting the endpoint is cheap and
+		 * must still happen first so the service announcement has
+		 * somewhere to land; only the wait is deferred.
+		 */
 		ret = dptxep_init(dcp);
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
@@ -766,6 +772,23 @@ int dcp_start(struct platform_device *pdev)
 	ret = iomfb_start_rtkit(dcp);
 	if (ret)
 		dev_err(dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);
+
+	/*
+	 * Only now can the DisplayPort port service turn up: the firmware does
+	 * not announce it until IOMFB is running.  Waiting for it inside
+	 * dptxep_init() above deadlocked the two against each other -- see the
+	 * comment on dptxep_wait_ports().
+	 */
+	if (dcp->phy && !IS_ERR_OR_NULL(dcp->dptxep)) {
+		int dret = dptxep_wait_ports(dcp);
+
+		if (dret)
+			dev_warn(dcp->dev,
+				 "DPTX port service did not appear after IOMFB start: %d\n",
+				 dret);
+		else
+			dev_info(dcp->dev, "J700_DPTX_PORTS_READY\n");
+	}
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	if (hdmi_audio) {
