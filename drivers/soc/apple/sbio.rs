@@ -570,6 +570,13 @@ impl SepData {
             };
             let states = crate::sbio::ComponentStates::new(&reply);
             let outcome = self.restore_catacomb(states.state_for(id), id, kind, what, cold_ok);
+            dev_info!(
+                self.dev,
+                "restore: {} (user {}): {}\n",
+                what,
+                id,
+                outcome.describe()
+            );
             match outcome {
                 RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => any = true,
                 RestoreOutcome::NoStoredFile => missing_files = true,
@@ -584,7 +591,13 @@ impl SepData {
             user_outcome,
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive
         );
-        let lockout = match self.restore_lockout() {
+        let lockout_outcome = self.restore_lockout();
+        dev_info!(
+            self.dev,
+            "restore: bio lockout record: {}\n",
+            lockout_outcome.describe()
+        );
+        let lockout = match lockout_outcome {
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => true,
             RestoreOutcome::EmptyTolerated => true,
             RestoreOutcome::NoStoredFile => {
@@ -637,11 +650,25 @@ impl SepData {
         cold_ok: bool,
     ) -> RestoreOutcome {
         let Some(state) = state else {
+            dev_err!(
+                self.dev,
+                "restore: {}: 0x6b lists no component for user {}; the enclave does not know this component\n",
+                what,
+                id
+            );
             return RestoreOutcome::Failed;
         };
         match crate::sbio::component_action(state) {
             crate::sbio::ComponentAction::AlreadyActive => RestoreOutcome::AlreadyActive,
-            crate::sbio::ComponentAction::Unsupported => RestoreOutcome::Failed,
+            crate::sbio::ComponentAction::Unsupported => {
+                dev_err!(
+                    self.dev,
+                    "restore: {}: component state {:#x} is neither ACTIVE nor COLD, so there is no load to attempt\n",
+                    what,
+                    state
+                );
+                RestoreOutcome::Failed
+            }
             crate::sbio::ComponentAction::Load => {
                 let Some(blob) = self.read_stored(kind, what) else {
                     return RestoreOutcome::NoStoredFile;
@@ -649,15 +676,35 @@ impl SepData {
 
                 let at = crate::sbio::SBIO_SAVED_USER_ID_AT;
                 if blob.len() < at + 4 {
+                    dev_err!(
+                        self.dev,
+                        "restore: {}: the stored blob is {} bytes, too short to carry a user id at offset {}\n",
+                        what,
+                        blob.len(),
+                        at
+                    );
                     return RestoreOutcome::Failed;
                 }
                 let carried =
                     i32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
                 if carried != id {
+                    dev_err!(
+                        self.dev,
+                        "restore: {}: the stored blob carries user id {}, but this component is user {}\n",
+                        what,
+                        carried,
+                        id
+                    );
                     return RestoreOutcome::Failed;
                 }
 
                 let Some(request) = crate::sbio::SbioLoadCatacomb::new(&blob) else {
+                    dev_err!(
+                        self.dev,
+                        "restore: {}: the {}-byte stored blob is not a well-formed LOAD_CATACOMB payload\n",
+                        what,
+                        blob.len()
+                    );
                     return RestoreOutcome::Failed;
                 };
 
@@ -676,6 +723,12 @@ impl SepData {
                         if done.status.answered()
                             == Some(crate::sbio::SBIO_STATUS_COLD_TRANSITION) =>
                     {
+                        dev_err!(
+                            self.dev,
+                            "restore: {}: LOAD_CATACOMB answered the cold-transition status {}, which counts as a success only on the owner component\n",
+                            what,
+                            done.status
+                        );
                         RestoreOutcome::Failed
                     }
                     // 0x101 ALREADY_ACTIVE is a success
@@ -685,7 +738,25 @@ impl SepData {
                     {
                         self.confirm_active(id, what, LoadAnswer::AlreadyActive)
                     }
-                    _ => RestoreOutcome::Failed,
+                    Ok(done) => {
+                        dev_err!(
+                            self.dev,
+                            "restore: {}: the enclave REFUSED the {}-byte stored blob with status {}; the file on disk is intact and well-formed, the enclave will not accept it\n",
+                            what,
+                            blob.len(),
+                            done.status
+                        );
+                        RestoreOutcome::Failed
+                    }
+                    Err(e) => {
+                        dev_err!(
+                            self.dev,
+                            "restore: {}: LOAD_CATACOMB did not complete a transfer ({:?})\n",
+                            what,
+                            e
+                        );
+                        RestoreOutcome::Failed
+                    }
                 }
             }
         }
@@ -707,9 +778,36 @@ impl SepData {
             Some(state) if state & crate::sbio::COMPONENT_STATE_ACTIVE != 0 => {
                 RestoreOutcome::Restored
             }
-            Some(state) if state & crate::sbio::COMPONENT_STATE_COLD != 0 => RestoreOutcome::Failed,
-            Some(_) => RestoreOutcome::Failed,
-            None => RestoreOutcome::Failed,
+            Some(state) if state & crate::sbio::COMPONENT_STATE_COLD != 0 => {
+                dev_err!(
+                    self.dev,
+                    "restore: {}: the enclave answered {} but 0x6b still reports the component COLD (state {:#x}); the load was accepted and then discarded\n",
+                    what,
+                    answer.describe(),
+                    state
+                );
+                RestoreOutcome::Failed
+            }
+            Some(state) => {
+                dev_err!(
+                    self.dev,
+                    "restore: {}: the enclave answered {} but 0x6b reports neither ACTIVE nor COLD (state {:#x})\n",
+                    what,
+                    answer.describe(),
+                    state
+                );
+                RestoreOutcome::Failed
+            }
+            None => {
+                dev_err!(
+                    self.dev,
+                    "restore: {}: the enclave answered {} but 0x6b no longer lists user {} at all\n",
+                    what,
+                    answer.describe(),
+                    id
+                );
+                RestoreOutcome::Failed
+            }
         }
     }
 
@@ -730,8 +828,22 @@ impl SepData {
             {
                 RestoreOutcome::EmptyTolerated
             }
-            Ok(_) => RestoreOutcome::Failed,
-            Err(_) => RestoreOutcome::Failed,
+            Ok(done) => {
+                dev_err!(
+                    self.dev,
+                    "restore: bio lockout record: the enclave refused the stored record with status {}\n",
+                    done.status
+                );
+                RestoreOutcome::Failed
+            }
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "restore: bio lockout record: LOAD_LOCKOUT did not complete a transfer ({:?})\n",
+                    e
+                );
+                RestoreOutcome::Failed
+            }
         }
     }
 

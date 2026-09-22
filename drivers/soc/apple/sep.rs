@@ -341,6 +341,7 @@ impl LoadAnswer {
     }
 }
 
+#[derive(Clone, Copy)]
 enum RestoreOutcome {
     Restored,
     AlreadyActive,
@@ -348,6 +349,18 @@ enum RestoreOutcome {
     Failed,
     // 0x8002 cold-transition; tolerated only for the lockout record, never a catacomb
     EmptyTolerated,
+}
+
+impl RestoreOutcome {
+    fn describe(self) -> &'static CStr {
+        match self {
+            RestoreOutcome::Restored => c"restored",
+            RestoreOutcome::AlreadyActive => c"already active",
+            RestoreOutcome::NoStoredFile => c"no stored file",
+            RestoreOutcome::Failed => c"FAILED",
+            RestoreOutcome::EmptyTolerated => c"empty (tolerated)",
+        }
+    }
 }
 
 /// What a restore pass found. `never_enrolled` separates a machine that has no
