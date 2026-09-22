@@ -54,6 +54,16 @@ MODULE_PARM_DESC(ramp_max_ms,
 
 #define RAMP_STEP_MS	16
 #define RAMP_STREAM_GAP_MS	3000
+/*
+ * Frames a step may sit unconsumed before the worker submits a swap of its
+ * own.  A driver-issued commit holds the CRTC's flip_done until the DCP
+ * finishes the swap, and a compositor page flip that lands in that window
+ * is refused with EBUSY ("Page flip failed: drmModeAtomicCommit: Device or
+ * resource busy" in mutter's log, 18 of them in one session on the 16:29
+ * build).  Waiting several frames means we only ever push while the
+ * compositor is genuinely idle.
+ */
+#define RAMP_IDLE_FRAMES	3
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -330,18 +340,34 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 		return;
 	}
 
-	/* the previous step is still waiting for a swap to carry it */
-	unconsumed = dcp->brightness.update;
+	/*
+	 * Count frames the previous step has sat unconsumed; a compositor
+	 * that is drawing resets it every frame.
+	 */
+	if (dcp->brightness.update)
+		dcp->brightness.idle_frames++;
+	else
+		dcp->brightness.idle_frames = 0;
+	unconsumed = dcp->brightness.idle_frames >= RAMP_IDLE_FRAMES;
+	if (unconsumed)
+		dcp->brightness.idle_frames = 0;
 
 	from = dcp->brightness.ramp_from;
 	target = dcp->brightness.target_nits;
 
 	if (dcp->brightness.nits == target) {
-		/* fade finished; make sure the last level actually went out */
+		/* fade finished; make sure the last level actually goes out */
+		bool pending = dcp->brightness.update;
+
 		drm_modeset_drop_locks(&ctx);
 		drm_modeset_acquire_fini(&ctx);
+		if (!pending)
+			return;
 		if (unconsumed && dcp->valid_mode)
 			drm_crtc_set_brightness(dcp);
+		else
+			schedule_delayed_work(&dcp->brightness.ramp_work,
+					      msecs_to_jiffies(RAMP_STEP_MS));
 		return;
 	}
 
