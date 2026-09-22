@@ -9,10 +9,13 @@ mock=r'''
 #![allow(dead_code,unused_variables)]
 extern crate self as kernel;
 #[macro_export]macro_rules! c_str{($s:literal)=>{$s}}
-pub mod prelude{pub trait Errno{fn to_errno(&self)->i32;}impl Errno for i32{fn to_errno(&self)->i32{-self.abs()}}pub type Result<T=()> = std::result::Result<T,i32>;pub type KVec<T>=Vec<T>;pub const EINVAL:i32=22;pub const GFP_KERNEL:u32=0;}
+#[macro_export]macro_rules! new_mutex{($value:expr,$name:expr)=>{crate::sync::Mutex(std::sync::Mutex::new($value))}}
+pub mod prelude{pub type Error=i32;pub trait Errno{fn to_errno(&self)->i32;}impl Errno for i32{fn to_errno(&self)->i32{-self.abs()}}pub type Result<T=()> = std::result::Result<T,i32>;pub type KVec<T>=Vec<T>;pub const EINVAL:i32=22;pub const GFP_KERNEL:u32=0;}
 pub mod sync{
+ pub struct Mutex<T>(pub std::sync::Mutex<T>);
+ impl<T>Mutex<T>{pub fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}
  pub struct Arc<T>(pub std::sync::Arc<T>);
- impl<T>Arc<T>{pub fn new(v:T,_flags:u32)->Result<Self,i32>{Ok(Self(std::sync::Arc::new(v)))}}
+ impl<T>Arc<T>{pub fn new(v:T,_flags:u32)->Result<Self,i32>{Ok(Self(std::sync::Arc::new(v)))}pub fn pin_init(v:T,flags:u32)->Result<Self,i32>{Self::new(v,flags)}}
  impl<T>Clone for Arc<T>{fn clone(&self)->Self{Self(self.0.clone())}}
  impl<T>std::ops::Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 }
@@ -26,7 +29,7 @@ pub mod dma_fence{
  impl Fence{pub fn new()->Self{Self(Arc::new(AtomicBool::new(false)))}pub fn from_fence<T>(f:&UserFence<T>)->Self{f.0.clone()}pub fn done(&self)->bool{self.0.load(Ordering::Acquire)}pub fn signal(&self){self.0.store(true,Ordering::Release)}}
 }
 pub mod g17_status{pub struct VmStatus;impl VmStatus{pub fn record(&self,_e:i32){}}}
-pub mod g17_resources{pub struct G17PRenderQueuePair;impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}}
+pub mod g17_resources{pub use crate::mmu::T8140ComputeExecutionContext as G17PLogicalQueueContext;pub struct G17PRenderQueuePair;impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}}
 pub mod g17_drm{
  use crate::dma_fence::Fence;
  pub struct G17PSubmissionFence;
@@ -34,9 +37,10 @@ pub mod g17_drm{
  impl G17PRenderCompletion{pub fn fence(&self)->Fence{self.0.clone()}}
 }
 pub mod driver{pub struct AsahiDevice;impl AsRef<()> for AsahiDevice{fn as_ref(&self)->&(){&()}}}
-pub mod g17_uapi{#[derive(Clone,Copy)]pub struct TranslatedComputeCommand{pub value:u64}}
+pub mod g17_uapi{#[derive(Clone,Copy)]pub struct TranslatedComputeCommand{pub value:u64}#[derive(Clone,Copy)]pub struct TranslatedRenderCommand{pub value:u64}}
 pub mod mmu{
  pub struct T8140VmJobGuard;
+ impl T8140VmJobGuard{pub fn quarantine(&self){}}
  use std::sync::{Arc,Mutex,atomic::{AtomicUsize,Ordering}};
  pub struct KernelMapping{pub address:u64,pub bytes:Arc<Mutex<Vec<u8>>>,pub drops:Arc<AtomicUsize>}
  impl KernelMapping{pub fn iova(&self)->u64{self.address}pub fn size(&self)->usize{self.bytes.lock().unwrap().len()}pub fn with_cpu_bytes<R>(&self,f:impl FnOnce(&mut[u8])->Result<R,i32>)->Result<R,i32>{f(&mut self.bytes.lock().unwrap())}}
@@ -81,7 +85,7 @@ tests=r'''
   let bytes=StdArc::new(Mutex::new(vec![0xa5;64]));let mut source=vec![id as u8;16];
   let sealed=G17PSealedCommand::new(mmu::KernelMapping{address:id*0x10000,bytes:bytes.clone(),drops:drops.clone()},&source).unwrap();
   source.fill(0xff);assert_eq!(&bytes.lock().unwrap()[..16],&[id as u8;16]);assert!(bytes.lock().unwrap()[16..].iter().all(|v|*v==0));
-  G17PComputeJobPacket::new(id,id as u8+4,context,g17_uapi::TranslatedComputeCommand{value:id},vec![sealed],vec![],vec![],None,None).unwrap()
+  G17PComputeJobPacket::new(id,id as u8+4,context,g17_uapi::TranslatedComputeCommand{value:id},vec![sealed],vec![],vec![],None).unwrap()
  }
  #[test]fn two_published_jobs_outlive_submitters_and_complete_out_of_order(){
   let d=StdArc::new(AtomicUsize::new(0));let r=StdArc::new(AtomicUsize::new(0));let b=Arc::new(Backend::default(),0).unwrap();
@@ -101,6 +105,13 @@ tests=r'''
  #[test]fn invalid_sealing_drops_unpublished_resources(){
   let d=StdArc::new(AtomicUsize::new(0));let bytes=StdArc::new(Mutex::new(vec![0xa5;4]));
   assert!(G17PSealedCommand::new(mmu::KernelMapping{address:0,bytes:bytes.clone(),drops:d.clone()},&[1;5]).is_err());assert_eq!(*bytes.lock().unwrap(),vec![0xa5;4]);assert_eq!(d.load(Ordering::SeqCst),1);
+ }
+ #[test]fn compute_packets_accept_every_nonbootstrap_qid(){
+  for qid in 0..=255u8 {
+   let context=Arc::new(mmu::T8140ComputeExecutionContext{id:5,drops:StdArc::new(AtomicUsize::new(0))},0).unwrap();
+   let packet=G17PComputeJobPacket::new(1,qid,context,g17_uapi::TranslatedComputeCommand{value:1},vec![],vec![],vec![],None);
+   assert_eq!(packet.is_ok(),(2..128).contains(&qid),"qid {qid}");
+  }
  }
 }
 '''

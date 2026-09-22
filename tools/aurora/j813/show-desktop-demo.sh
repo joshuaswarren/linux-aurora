@@ -5,7 +5,15 @@ case "${1-}" in
     fastfetch)
         fastfetch --logo arch --structure OS:Host:Kernel:Uptime:Packages:Shell:Display:DE:WM:Terminal:CPU:Memory:Swap
         printf '\n  Online CPUs: %s (current RAM boot)\n' "$(getconf _NPROCESSORS_ONLN)"
-        printf '\n  Display: XFCE on SimpleDRM; GPU acceleration is not enabled.\n'
+        task_display=SimpleDRM
+        for task_node in /sys/class/drm/card[0-9]*; do
+            [ -f "$task_node/dev" ] || continue
+            if [ "$(basename "$(readlink "$task_node/device/driver/module")")" = appledrm ]; then
+                task_display='Apple DCP / KMS'
+                break
+            fi
+        done
+        printf '\n  Display: XFCE on %s; GPU acceleration is not enabled.\n' "$task_display"
         exec bash --noprofile --norc
         ;;
     wifi)
@@ -46,7 +54,7 @@ cpu_single_graph = true
 graph_symbol_cpu = "block"
 EOF
         fi
-        exec btop --config "$task_config"
+        exec btop --force-utf --config "$task_config"
         ;;
     '') ;;
     *) exit 2 ;;

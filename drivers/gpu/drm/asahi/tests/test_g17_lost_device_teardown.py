@@ -64,7 +64,9 @@ sweep_after_observation = item(
     async_compute, '    fn fail_outstanding_jobs_for_vm_after_compute_observation(')
 completion_service = item(async_compute, '    fn service_async_compute_completions_matching(')
 quarantine_compute = item(async_compute, '    pub(crate) fn quarantine_async_compute(')
-timeout_render = item(live, '    pub(crate) fn timeout_deferred_render(')
+timeout_wrapper = item(live, '    pub(crate) fn timeout_deferred_render(')
+assert 'self.settle_failed_deferred_render(' in timeout_wrapper
+timeout_render = item(live, '    fn settle_failed_deferred_render(')
 publish_compute = item(drm, '    fn publish(&self, packet: Arc<g17_job::G17PComputeJobPacket>)')
 # The packet stays retained: firmware may still be executing it.
 assert 'active = None' not in sweep_after_observation and \
@@ -161,6 +163,9 @@ mod g17_resources{
  impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}
 }
 struct Pdev;
+mod g17_live_boot {
+ pub fn note_session_recovery_pending(pending:&mut bool,_pdev:Option<&super::Pdev>,_reason:&str){*pending=true;}
+}
 impl Pdev{fn as_ref(&self)->&Self{self}}
 #[derive(Default)]
 struct Serviced(u32);

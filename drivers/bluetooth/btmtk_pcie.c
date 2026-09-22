@@ -19,6 +19,7 @@
 #include <linux/timer.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -28,14 +29,15 @@
 #define MTK_PCIE_DEVICE_MT7923_BT	0x792b
 #define MTK_PCIE_DEVICE_MT7932_BT	0x793b
 
-/* AppleSunriseBluetooth 25G83 _btmtk_read_mmio_addr() first programs the
- * connection-to-PCIe selector for 0x70010000, then its generic fallback remap
- * selector for logical window 0x1890, before reading 0x70010200 through BAR0.
+/* The chip ID and FWDL semaphore use the direct connection-window fallback.
+ * Apple's _btmtk_read_mmio_addr_halt() does not translate 0x7001xxxx or
+ * 0x1807xxxx through the level-1 selector at 0x23014. Its PCI remapper writes
+ * 0x188d0000 | (address >> 16) to 0xfe3b8, then accesses BAR0 + 0xc0000 +
+ * (address & 0xffff). Recovered from AppleSunriseBluetooth 26A5425a.
  */
-#define MTK_PCIE_BAR0_REMAP_SEL		0x23014
 #define MTK_PCIE_BAR0_DYNAMIC_WINDOW	0xc0000
 #define MTK_PCIE_BAR0_FALLBACK_SEL	0xfe3b8
-#define MTK_PCIE_DYNAMIC_REMAP_1890	0x188d1890
+#define MTK_PCIE_DYNAMIC_REMAP_CHIP_ID	0x188d7001
 #define MTK_PCIE_CONN_CHIP_ID		0x70010200
 #define MTK_PCIE_CHIP_ID_WINDOW		(MTK_PCIE_BAR0_DYNAMIC_WINDOW + \
 					 (MTK_PCIE_CONN_CHIP_ID & 0xffff))
@@ -80,7 +82,7 @@
 #define MTK_PCIE_BAR0_FWDL_SEMAPHORE	0xc1060
 #define MTK_PCIE_BAR0_FWDL_RELEASE	0xc1260
 #define MTK_PCIE_BAR0_TRANSPORT_REMAP	0xfe3b4
-#define MTK_PCIE_FWDL_REMAP		0x18070000
+#define MTK_PCIE_FWDL_REMAP		0x188d1807
 #define MTK_PCIE_TRANSPORT_REMAP		0x7000188a
 
 #define MTK_PCIE_IPC_CONTEXT_SIZE	0x68
@@ -221,6 +223,7 @@ struct btmtk_pcie_dev {
 	struct mutex sleep_lock; /* Serialize wake and system-power transitions. */
 	wait_queue_head_t ipc_wait;
 	struct timer_list ipc_timer;
+	struct work_struct firmware_work;
 	struct hci_dev *hdev;
 	u8 ipc_state;
 	u8 remote_status;
@@ -244,6 +247,17 @@ struct btmtk_pcie_dev {
 	bool system_suspended;
 	bool stopping;
 };
+
+/* Firmware activation normally waits synchronously for the image response.
+ * On J700 macOS starts both halves of the shared Sunrise package concurrently;
+ * this mode schedules the selected lifecycle before the WLAN driver binds so the
+ * package can reach its joint post-boot state instead of serializing two
+ * mutually dependent firmware starts.
+ */
+static bool shared;
+module_param(shared, bool, 0444);
+MODULE_PARM_DESC(shared,
+		 "Start gates 4..8 asynchronously alongside the WLAN firmware");
 
 static bool probe_remap;
 module_param(probe_remap, bool, 0444);
@@ -587,8 +601,6 @@ static void btmtk_pcie_free_firmware_image(struct btmtk_pcie_dev *bdev)
 static void btmtk_pcie_select_fwdl_window(struct btmtk_pcie_dev *bdev)
 {
 	writel(MTK_PCIE_FWDL_REMAP,
-	       bdev->bar0 + MTK_PCIE_BAR0_REMAP_SEL);
-	writel(MTK_PCIE_DYNAMIC_REMAP_1890,
 	       bdev->bar0 + MTK_PCIE_BAR0_FALLBACK_SEL);
 }
 
@@ -653,6 +665,9 @@ static int btmtk_pcie_activate_firmware(struct btmtk_pcie_dev *bdev)
 		udelay(1000);
 	}
 	if (!(semaphore & 1)) {
+		dev_err(&bdev->pdev->dev,
+			"J700_MT793B_FWDL_FAIL: stage=semaphore firmware=%s value=%08x attempts=%d doorbell_sent=0\n",
+			firmware_name, semaphore, attempt);
 		err = -ETIMEDOUT;
 		goto out_clear_master;
 	}
@@ -674,6 +689,9 @@ static int btmtk_pcie_activate_firmware(struct btmtk_pcie_dev *bdev)
 		udelay(1000);
 	}
 	if (response != 1 || (boot_config & 0xf) != 2) {
+		dev_err(&bdev->pdev->dev,
+			"J700_MT793B_FWDL_FAIL: stage=image-response firmware=%s response=%08x config48c=%08x attempts=%d doorbell_sent=1\n",
+			firmware_name, response, boot_config, attempt);
 		err = -ETIMEDOUT;
 		goto out_clear_master;
 	}
@@ -1988,18 +2006,72 @@ static const struct dev_pm_ops btmtk_pcie_pm_ops = {
 static int btmtk_pcie_read_chip_id(struct btmtk_pcie_dev *bdev, u32 *chip_id)
 {
 	resource_size_t bar0_len = pci_resource_len(bdev->pdev, 0);
-	u32 remap_base = MTK_PCIE_CONN_CHIP_ID & 0xffff0000;
 
 	if (bar0_len < MTK_PCIE_CHIP_ID_WINDOW + sizeof(*chip_id) ||
 	    bar0_len < MTK_PCIE_BAR0_FALLBACK_SEL + sizeof(u32))
 		return -ENXIO;
 
-	writel(remap_base, bdev->bar0 + MTK_PCIE_BAR0_REMAP_SEL);
-	writel(MTK_PCIE_DYNAMIC_REMAP_1890,
+	writel(MTK_PCIE_DYNAMIC_REMAP_CHIP_ID,
 	       bdev->bar0 + MTK_PCIE_BAR0_FALLBACK_SEL);
 	*chip_id = readl(bdev->bar0 + MTK_PCIE_CHIP_ID_WINDOW);
 
 	return 0;
+}
+
+static int btmtk_pcie_start_lifecycle(struct btmtk_pcie_dev *bdev)
+{
+	const char *stage;
+	int err;
+
+	if (activate_firmware) {
+		stage = "firmware-activation";
+		err = btmtk_pcie_activate_firmware(bdev);
+		if (err)
+			goto fail;
+	}
+	if (start_ipc) {
+		stage = "ipc-start";
+		err = btmtk_pcie_start_ipc(bdev);
+		if (err)
+			goto fail;
+	}
+	if (prepare_rings) {
+		stage = "ring-prepare";
+		err = btmtk_pcie_prepare_rings(bdev);
+		if (err)
+			goto fail;
+	}
+	if (enable_hci) {
+		stage = "hci-register";
+		err = btmtk_pcie_register_hci(bdev);
+		if (err)
+			goto fail;
+	}
+
+	return 0;
+
+fail:
+	dev_err(&bdev->pdev->dev,
+		"J700_MT793B_PCIE_GATE_FAIL: stage=%s ret=%d shared=%u\n",
+		stage, err, shared);
+	btmtk_pcie_quiesce(bdev);
+	return err;
+}
+
+static void btmtk_pcie_firmware_work(struct work_struct *work)
+{
+	struct btmtk_pcie_dev *bdev =
+		container_of(work, struct btmtk_pcie_dev, firmware_work);
+	int err;
+
+	if (READ_ONCE(bdev->stopping))
+		return;
+	err = btmtk_pcie_start_lifecycle(bdev);
+	if (!err) {
+		dev_info(&bdev->pdev->dev,
+			 "J700_MT793B_SHARED_PACKAGE_PASS: firmware_active=1 concurrent_wlan=1 gate=%u hci=%u\n",
+			 gate, bdev->hci_registered);
+	}
 }
 
 static int btmtk_pcie_probe(struct pci_dev *pdev,
@@ -2049,6 +2121,7 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	mutex_init(&bdev->sleep_lock);
 	init_waitqueue_head(&bdev->ipc_wait);
 	timer_setup(&bdev->ipc_timer, btmtk_pcie_ipc_timer, 0);
+	INIT_WORK(&bdev->firmware_work, btmtk_pcie_firmware_work);
 	pci_set_drvdata(pdev, bdev);
 
 	pci_read_config_word(pdev, PCI_COMMAND, &command);
@@ -2091,6 +2164,11 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	if (load_radio_config && !enable_hci) {
 		dev_err(&pdev->dev,
 			"J700_MT793B_PCIE_GATE_FAIL: stage=radio-config-prerequisite require_hci=1\n");
+		return -EINVAL;
+	}
+	if (shared && (gate < 4 || gate > 8)) {
+		dev_err(&pdev->dev,
+			"J700_MT793B_PCIE_GATE_FAIL: stage=shared-prerequisite require_gate=4..8\n");
 		return -EINVAL;
 	}
 
@@ -2159,10 +2237,10 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 		if (!chip_id) {
 			if (apple_attach)
 				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=enabled pci_master=1 irq=1 hci=0\n");
+					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 fallback_selector=fe3b8 fallback=188d7001 dma=enabled pci_master=1 irq=1 hci=0\n");
 			else
 				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=0 hci=0\n");
+					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 fallback_selector=fe3b8 fallback=188d7001 dma=0 hci=0\n");
 		} else {
 			if ((chip_id & 0xffff) != 0x7922 &&
 			    (chip_id & 0xffff) != 0x7923 &&
@@ -2176,11 +2254,11 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			}
 			if (apple_attach)
 				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=enabled pci_master=1 irq=1 hci=0\n",
+					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x fallback_selector=fe3b8 fallback=188d7001 bar0_window=c0200 dma=enabled pci_master=1 irq=1 hci=0\n",
 					 chip_id, chip_id & 0xffff);
 			else
 				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=0 hci=0\n",
+					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x fallback_selector=fe3b8 fallback=188d7001 bar0_window=c0200 dma=0 hci=0\n",
 					 chip_id, chip_id & 0xffff);
 		}
 	}
@@ -2206,48 +2284,15 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 		if (!activate_firmware)
 			return 0;
 	}
-	if (activate_firmware) {
-		err = btmtk_pcie_activate_firmware(bdev);
-		if (err) {
-			dev_err(&pdev->dev,
-				"J700_MT793B_PCIE_GATE_FAIL: stage=firmware-activation ret=%d\n",
-				err);
-			if (apple_attach)
-				btmtk_pcie_quiesce(bdev);
-			return err;
-		}
-	}
-	if (start_ipc) {
-		err = btmtk_pcie_start_ipc(bdev);
-		if (err) {
-			dev_err(&pdev->dev,
-				"J700_MT793B_PCIE_GATE_FAIL: stage=ipc-start ret=%d\n",
-				err);
-			return err;
-		}
-	}
-	if (prepare_rings) {
-		err = btmtk_pcie_prepare_rings(bdev);
-		if (err) {
-			dev_err(&pdev->dev,
-				"J700_MT793B_PCIE_GATE_FAIL: stage=ring-prepare ret=%d\n",
-				err);
-			btmtk_pcie_quiesce(bdev);
-			return err;
-		}
-	}
-	if (enable_hci) {
-		err = btmtk_pcie_register_hci(bdev);
-		if (err) {
-			dev_err(&pdev->dev,
-				"J700_MT793B_PCIE_GATE_FAIL: stage=hci-register ret=%d\n",
-				err);
-			btmtk_pcie_quiesce(bdev);
-			return err;
-		}
+	if (shared) {
+		dev_info(&pdev->dev,
+			 "J700_MT793B_SHARED_PACKAGE_BEGIN: gate=%u async=1 wlan_can_bind=1\n",
+			 gate);
+		schedule_work(&bdev->firmware_work);
+		return 0;
 	}
 
-	return 0;
+	return btmtk_pcie_start_lifecycle(bdev);
 }
 
 static void btmtk_pcie_remove(struct pci_dev *pdev)
@@ -2256,6 +2301,7 @@ static void btmtk_pcie_remove(struct pci_dev *pdev)
 	struct hci_dev *hdev;
 
 	if (bdev) {
+		cancel_work_sync(&bdev->firmware_work);
 		/* Keep transport live through HCI unregister, as Sunrise does. */
 		hdev = btmtk_pcie_detach_hci(bdev);
 		btmtk_pcie_quiesce(bdev);

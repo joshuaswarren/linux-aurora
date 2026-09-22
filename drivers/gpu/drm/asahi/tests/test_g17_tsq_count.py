@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Actual host count publisher plus saved B1 AArch64 retirement predicate."""
 from pathlib import Path
-import subprocess,tempfile,re
+import hashlib,subprocess,tempfile,re
 p=Path(__file__).resolve().parents[1]
 s=(p/'g17_resources.rs').read_text();start=s.index('    pub(crate) fn publish_compute_submitted_count(');end=s.index('\n    /// Zero the completion stamp',start);method=s[start:end]
 mock=r'''
@@ -25,11 +25,23 @@ with tempfile.TemporaryDirectory() as d:
  subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(Path(d)/'test')],check=True)
  subprocess.run([str(Path(d)/'test')],check=True)
 # Execute the decisive compare/conditional-compare instructions from the saved
-# firmware disassembly. This is a predicate test, not a GPU/firmware run.
-raw=Path('/tmp/g17p-re/fwb1/b1_raw.txt').read_text().splitlines()
+# firmware image. Disassemble the repository artifact so this test does not
+# depend on an investigator's temporary directory.
+firmware=p.parents[4]/'.gpu-handoff/gfx-text-9b110520.bin'
+assert hashlib.sha256(firmware.read_bytes()).hexdigest()=='cf352729699211decba77bea2499501b3df3b02665ac0a12316090e6cf5741fb'
+raw=subprocess.run([
+    'aarch64-linux-gnu-objdump','-D','-b','binary','-m','aarch64',
+    '--adjust-vma=0xfffffc0000000000',
+    '--start-address=0xfffffc0000016a30',
+    '--stop-address=0xfffffc0000016a5c',str(firmware),
+],check=True,text=True,stdout=subprocess.PIPE).stdout.splitlines()
 lines=[l for l in raw if re.match(r'fffffc0000016a(?:3[048c]|4[048c]|5[048]):',l)]
 assert len(lines)==11,lines
-compare=[l.split(':',1)[1].strip().split(';')[0].strip() for l in lines if '\tcmp\t' in l or '\tccmp\t' in l or '\tcset\t' in l]
+compare=[]
+for line in lines:
+    match=re.search(r'\t(cmp|ccmp|cset)\t([^/]+?)(?:\s*//|$)',line)
+    if match:
+        compare.append(f'{match.group(1)} {match.group(2).strip()}')
 assert len(compare)==5,compare
 # LDP/loads establish these registers. Each later CCMP reads the post-LDP
 # engine1/2 counts (CMP at16a40 uses engine0 before that LDP).
@@ -37,7 +49,7 @@ def native_gate(completed,target,batches=(1,0,0),threshold=80):
  regs={'w3':completed,'w9':target,'w10':batches[0],'w11':threshold,'w12':batches[2]};flags=0
  def sub(a,b):
   r=(a-b)&0xffffffff;return ((r>>31)<<3)|((r==0)<<2)|((a>=b)<<1)|(((a^b)&(a^r))>>31)
- def condition(c):return {'lo':not(flags&2),'ne':not(flags&4),'hs':bool(flags&2)}[c]
+ def condition(c):return {'lo':not(flags&2),'cc':not(flags&2),'ne':not(flags&4),'hs':bool(flags&2),'cs':bool(flags&2)}[c]
  for i,line in enumerate(compare):
   op,args=line.split(None,1);args=[x.strip() for x in args.split(',')]
   if op=='cmp':flags=sub(regs[args[0]],regs[args[1]]);regs['w10']=batches[1]

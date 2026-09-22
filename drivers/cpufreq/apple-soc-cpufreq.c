@@ -112,7 +112,24 @@ static const struct apple_soc_cpufreq_info soc_default_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+/* T8142 retains PS1 in bits 4:0 and SET in bit 25, as used by its
+ * firmware command journal. Its P-cluster has 19 ADT operating points.
+ * The status-register layout is not established: report the commanded
+ * frequency through the existing fallback, without claiming measured MHz.
+ */
+static const struct apple_soc_cpufreq_info soc_t8142_info = {
+	.has_ps2 = false,
+	.max_pstate = 31,
+	.cur_pstate_mask = 0,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
+	{
+		.compatible = "apple,t8142-cluster-cpufreq",
+		.data = &soc_t8142_info,
+	},
 	{
 		.compatible = "apple,s5l8960x-cluster-cpufreq",
 		.data = &soc_s5l8960x_info,

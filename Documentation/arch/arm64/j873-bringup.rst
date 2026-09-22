@@ -66,11 +66,11 @@ particular, do not reuse J813's measured performance-core affinity-2 bit.
 AGX source sync
 ---------------
 
-The ``j873`` branch carries the committed ``drivers/gpu/drm/asahi`` changes
+The ``j873`` branch first copied the committed ``drivers/gpu/drm/asahi`` changes
 from Linux ``j813`` commit ``2596a20e31f810c24c88999d163027cbf9277f20``.
-The sync covers the AGX driver and its focused tests, while retaining the
-J873 firmware and identity work. Mesa's matching ``j873`` branch starts from
-its published J813 AGX tip ``658dee6c3c2df664d7e7598e3bfc989fdd6d3a39``.
+It then merged the newer J813 tip ``78828af3d927``. The AGX driver tree now
+matches that tip, while the J873 firmware and identity work remains present.
+Mesa's matching ``j873`` branch has merged its J813 tip ``7fbab581d3bc``.
 The J813 mailbox CPU-state API, its Rust wrapper, related T8142 mailbox
 binding, and the PMGR power-state correction are also carried because the
 AGX driver uses that API and power path. They add no T8152 match.
@@ -81,6 +81,12 @@ current driver has no T8152 GPU match or J873 boot DT. Do not use an M5
 compatible string to enable it. The GPU generation, firmware contract, DMA
 translation, power sequencing, and command submission require target evidence
 and validation before J873 runtime support can be claimed.
+
+For this merge, 101 of 110 selected standalone AGX scripts passed. Six Rust
+test harnesses failed to compile, two Python assertions failed, and one test
+requires a local ``gfx-text`` binary fixture absent from this workbench.
+All four focused M5 render checks passed. These are host checks of the J813
+source; no full J873 kernel build or M6 GPU execution was performed.
 
 Remaining work order
 --------------------

@@ -5,4 +5,4 @@ TEST_GEN_PROGS := asahi_g17p_add3
 
 CFLAGS += -O2 -Wall -Wextra -I../../../../../include/uapi
 
-include ../../../lib.mk
+include ../../lib.mk

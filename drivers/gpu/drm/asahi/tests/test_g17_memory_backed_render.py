@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile the real render builder and run its focused memory-backed policy test."""
 from pathlib import Path
+from g17_config_test_support import with_g17_config
 import subprocess
 import tempfile
 
@@ -20,7 +21,7 @@ mod g17_submission {
 '''
 with tempfile.TemporaryDirectory(prefix="g17-memory-backed-") as tmp:
     test = Path(tmp) / "test.rs"
-    test.write_text(source + '#[path = "' + str(root / "g17_render.rs") + '"] mod g17_render;\n')
+    test.write_text(with_g17_config(source + '#[path = "' + str(root / "g17_render.rs") + '"] mod g17_render;\n'))
     exe = Path(tmp) / "test"
     subprocess.run(["rustc", "-Awarnings", "--edition=2021", "--test", str(test), "-o", str(exe)], check=True)
     # Qualified name is required for Rust's exact filter; assert a real test

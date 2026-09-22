@@ -3,7 +3,12 @@
 # Networking and the native driver instances remain owned by the running kernel.
 set -eu
 [ "$(id -u)" = 0 ]
-case "$(uname -r)" in *-aurora-j813-desktop-v[0-9]*) ;; *) exit 1 ;; esac
+case "$(uname -r)" in
+    *-aurora-j813-desktop-v[0-9]*) display_backend=fbdev ;;
+    7.1.6-aurora-j813-dcp-v1) display_backend=dcp ;;
+    *) exit 1 ;;
+esac
+grep -aq 'apple,j813' /proc/device-tree/compatible
 grep -q '^tmpfs /desktop tmpfs ' /proc/mounts
 [ -x /desktop/usr/bin/xfce4-session ]
 [ -c /dev/fb0 ]
@@ -40,7 +45,22 @@ chmod 1777 /desktop/tmp/.ICE-unix
 chown 0:0 /desktop/tmp/.ICE-unix
 sh /bin/j813-desktop-root-exec /usr/sbin/runuser -u aurora -- \
     /usr/bin/python3 -c 'import os,pty; a,b=pty.openpty(); os.close(a); os.close(b)'
-cp /opt/j813/desktop-fbdev.conf /desktop/etc/X11/j813-fbdev.conf
+if [ "$display_backend" = dcp ]; then
+    # Select the Apple display driver explicitly; card numbers can change
+    # when simpledrm relinquishes the boot framebuffer.
+    kms_device=
+    for node in /sys/class/drm/card[0-9]*; do
+        [ -f "$node/dev" ] || continue
+        [ "$(basename "$(readlink "$node/device/driver/module")")" = appledrm ] || continue
+        [ -z "$kms_device" ] || { echo 'Multiple Apple KMS devices; refusing ambiguous selection.'; exit 1; }
+        kms_device="/dev/dri/$(basename "$node")"
+    done
+    [ -n "$kms_device" ] && [ -c "$kms_device" ]
+    sed "s|@KMS_DEVICE@|$kms_device|g" /opt/j813/desktop-dcp.conf \
+        >/desktop/etc/X11/j813-display.conf
+else
+    cp /opt/j813/desktop-fbdev.conf /desktop/etc/X11/j813-display.conf
+fi
 chroot /desktop /usr/bin/dbus-uuidgen --ensure
 if [ ! -S /run/dbus/system_bus_socket ]; then
     chroot /desktop /usr/bin/dbus-daemon --system --fork --nopidfile
@@ -55,7 +75,7 @@ chroot /desktop /usr/bin/xauth -q -f /home/aurora/.Xauthority add :0 . "$cookie"
 unset cookie
 chown 1000:1000 /desktop/home/aurora/.Xauthority
 chmod 600 /desktop/home/aurora/.Xauthority
-setsid chroot /desktop /usr/lib/xorg/Xorg :0 vt7 -config /etc/X11/j813-fbdev.conf \
+setsid chroot /desktop /usr/lib/xorg/Xorg :0 vt7 -config /etc/X11/j813-display.conf \
     -auth /home/aurora/.Xauthority -nolisten tcp -noreset -logfile /run/j813-Xorg.log \
     >/run/j813-Xorg-console.log 2>&1 &
 echo $! >/run/j813-Xorg.pid

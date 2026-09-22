@@ -960,6 +960,26 @@ pub(crate) fn encode_compute_runtime_page_inventory(
     Ok(())
 }
 
+/// Populate the 21-block pool advertised by the compute UMA descriptor.
+/// Like render's initial page list, this contains 4-KiB addresses, not compact
+/// run descriptors. Publishing nonzero UMA counters over a zero-filled list
+/// makes the allocator return address zero on its first consumption.
+pub(crate) fn encode_compute_flist_page_list(out: &mut [u8]) -> Result<(), InitdataError> {
+    let pages_per_buffer = (CONTROL_OPERAND_BUFFER_SIZE / 0x1000) as usize;
+    let count = COMPUTE_READINESS_OPERAND_ENTRY_COUNT * pages_per_buffer;
+    if out.len() < count * 8 {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for buffer in 0..COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
+        let base = COMPUTE_FLIST_BUFFER_BASE + buffer as u64 * CONTROL_OPERAND_BUFFER_STRIDE;
+        for page in 0..pages_per_buffer {
+            put_u64(out, (buffer * pages_per_buffer + page) * 8, base + page as u64 * 0x1000);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_compute_dispatch_record(
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
@@ -967,18 +987,12 @@ pub(crate) fn encode_compute_dispatch_record(
         return Err(InitdataError::BufferSize);
     }
     out.fill(0);
-    for (index, value) in [
-        0xe000_0000u32,
-        0x0800_0000,
-        0x0000_0000,
-        0x0000_2a00,
-        0x0000_1500,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        put_u32(out, index * 4, value);
-    }
+    // halLoadUMADesc packs the page-list VA in units of 128 bytes below
+    // unit_pages << 41. The native literal names render's unrelocated pool;
+    // slot 1 must instead name the independently backed compute page list.
+    put_u64(out, 0x00, (0x4_0000u64 << 41) | (COMPUTE_FLIST_PAGE_LIST_ADDRESS >> 7));
+    put_u64(out, 0x08, 0x1500u64 << 33);
+    put_u64(out, 0x10, 0x1500);
     Ok(())
 }
 
@@ -2768,7 +2782,8 @@ pub(crate) fn encode_hw_data(
     if let Some(byte) = out.get_mut(HW_DATA_TRANSPORT_SELECTOR_OFFSET) {
         *byte = 0;
     }
-    // Performance tables intentionally left zero; see
+    // The measured performance tables were encoded above. Their values are
+    // target-scoped observations rather than a complete ADT derivation; see
     // [`PERF_TABLE_VALUES_ENCODED`].
     Ok(())
 }
@@ -2820,12 +2835,12 @@ pub(crate) fn encode_region_c_for_profile(
     // leave the other data master's slot at 0 -- i.e. we arm the watchdog on
     // exactly the queue we submit to. When work cannot progress for any other
     // reason this turns a stall into a self-sustaining recovery loop.
-    if *crate::module_parameters::g17p_progress_watchdog.value() == 0 {
+    if crate::g17_config::PROGRESS_WATCHDOG == 0 {
         put_u32(out, 0x9cc, 0);
     }
     // Native initializes the idle-descent selector to zero. Keep the old
     // alternate predicate only as an explicit diagnostic override.
-    if *crate::module_parameters::g17p_idle_selector.value() != 0 {
+    if crate::g17_config::IDLE_SELECTOR != 0 {
         out[0xe21] = 1;
     }
     for (offset, value) in [
@@ -4118,6 +4133,10 @@ mod tests {
 
         let mut dispatch = [0u8; COMPUTE_DISPATCH_RECORD_SIZE];
         encode_compute_dispatch_record(&mut dispatch).unwrap();
+        let packed = get_u64(&dispatch, 0);
+        assert_eq!((packed & ((1 << 41) - 1)) << 7, COMPUTE_FLIST_PAGE_LIST_ADDRESS);
+        // Compare the capture only after undoing the packed VA relocation.
+        put_u64(&mut dispatch, 0, packed - (COMPUTE_FLIST_RELOCATION >> 7));
         assert_eq!(fnv1a64(&dispatch), 0x12a0_cf17_a88d_a788);
     }
 

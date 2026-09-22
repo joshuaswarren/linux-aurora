@@ -1252,6 +1252,16 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
+
+	/**
+	 * @scs_layout: Packed G17P ScsLayoutGen1 word for ray-traversal scratch.
+	 *
+	 * Zero requests no shader-context-state scratch and preserves the legacy
+	 * compute path. Nonzero values are sized by the kernel because the backing
+	 * store and firmware register ABI are kernel-owned. Older userspace command
+	 * payloads are accepted with this field zero-filled.
+	 */
+	__u64 scs_layout;
 };
 
 /**

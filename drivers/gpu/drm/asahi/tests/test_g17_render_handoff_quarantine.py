@@ -28,9 +28,10 @@ assert graph.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < 
 
 handoff = function("pub(crate) fn handoff_retained_render_vm(")
 preserve = function("fn preserve_immediate_retired_render_graph(")
-assert handoff.index("self.require_retired_render_owner()?") < handoff.index(
+assert handoff.index("self.require_retired_render_owner()") < handoff.index(
     "G17PRetiredRenderGraph {"
 )
+assert '"handoff-require-retired-owner"' in handoff
 for owner in (
     "self.render_bind.take().ok_or(EIO)?",
     "self.render_context_aliases.take()",
@@ -42,15 +43,16 @@ assert "unreserve_render_storage_hardware_buffer_id" not in handoff
 assert ".push_within_capacity(previous)" in preserve
 assert "completion_references_descriptor_range" not in preserve
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
-# Queue destruction alone does not release the graph. The later per-pair
-# context-update epoch is the release witness.
-assert "Self::retired_render_graph_reclaimable(" in preserve
-assert preserve.index("Self::retired_render_graph_reclaimable(") < preserve.index(
-    "Self::release_superseded_render_graph("
-)
+# Queue destruction and context supersession permit reuse of the complete
+# graph. They must not split it into separately recycled PM/support objects.
+assert "release_superseded_render_graph" not in preserve
+select = function("fn select_cached_render_graph(")
+assert "Self::retired_render_graph_reclaimable(" in select
+assert "client_rebind_addresses_available(vm)" in select
 
 release = function("fn release_retired_handoff_graph(")
-assert release.index("ids.unreserve(id)") < release.index("drop(retired)")
+assert "storage.into_retired_parameter_management()" in release
+assert release.index("if !retained_firmware_state") < release.index("ids.unreserve(id)")
 
 stop = function("pub(crate) fn release_runtime_objects_after_processor_stop(")
 assert "state.retired_handoff_graph.take()" in stop
@@ -64,72 +66,8 @@ superseded = function("fn release_superseded_render_graph(")
 assert superseded.index("into_retired_parameter_management") < superseded.index(
     "ids.unreserve(id)"
 )
+assert superseded.index("if !retained_firmware_state") < superseded.index("ids.unreserve(id)")
 assert superseded.index("ids.unreserve(id)") < superseded.index("drop(bind)")
 
 
-class Quarantine:
-    def __init__(self):
-        self.active = None
-        self.retired = None
-        self.completion_quarantine = []
-        self.reserved = set()
-        self.epoch = 0
-
-    def build(self, generation):
-        assert generation not in self.reserved
-        self.active = generation
-        self.reserved.add(generation)
-
-    def handoff(self):
-        previous = self.retired
-        self.retired = (self.active, self.epoch + 1)
-        self.active = None
-        if previous is not None:
-            self.completion_quarantine.append(previous)
-
-    def overwrite_completion(self, generation):
-        assert any(owner == generation for owner, _target in self.completion_quarantine)
-
-    def complete_context_update(self):
-        self.epoch += 1
-
-    def release_owner(self, generation):
-        kept = []
-        for owner, target in self.completion_quarantine:
-            if owner == generation and target <= self.epoch:
-                self.reserved.remove(generation)
-            else:
-                kept.append((owner, target))
-        self.completion_quarantine = kept
-        if self.retired is not None and self.retired[0] == generation:
-            if self.retired[1] <= self.epoch:
-                self.retired = None
-                self.reserved.remove(generation)
-
-    def stop_processors(self):
-        self.active = None
-        self.retired = None
-        self.completion_quarantine.clear()
-        self.reserved.clear()
-
-
-state = Quarantine()
-state.build(1)
-state.handoff()
-assert state.retired == (1, 1) and state.reserved == {1}
-state.build(2)
-assert state.reserved == {1, 2}
-state.handoff()
-assert state.retired == (2, 1) and state.completion_quarantine == [(1, 1)]
-assert state.reserved == {1, 2}
-state.build(3)
-assert state.reserved == {1, 2, 3}
-state.overwrite_completion(1)
-assert state.reserved == {1, 2, 3}
-state.complete_context_update()
-state.release_owner(1)
-assert state.reserved == {2, 3}
-state.stop_processors()
-assert not state.reserved
-
-print("PASS render graph quarantine requires later per-pair context-update completion")
+print("PASS firmware-visible graphs remain cached through queue close and context supersession")

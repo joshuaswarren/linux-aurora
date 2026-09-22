@@ -1,0 +1,1 @@
+{"pipelines":{"compute_pipelines":[{"compute_function":"m5_half_compare_zero"},{"compute_function":"m5_half_compare_reg"},{"compute_function":"m5_half_compare_select32"},{"compute_function":"m5_half_compare_one_select32"}]}}

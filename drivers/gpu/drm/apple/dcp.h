@@ -23,6 +23,14 @@ struct apple_crtc {
 
 #define to_apple_crtc(x) container_of(x, struct apple_crtc, base)
 
+struct apple_crtc_state {
+	struct drm_crtc_state base;
+	struct list_head pending_flush;
+};
+
+#define to_apple_crtc_state(x) \
+	container_of(x, struct apple_crtc_state, base)
+
 struct apple_encoder {
 	struct drm_encoder base;
 };
@@ -41,6 +49,7 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
 int dcp_start(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state);
+void dcp_flush_shutdown(struct apple_dcp *dcp);
 bool dcp_is_initialized(struct platform_device *pdev);
 void apple_crtc_vblank(struct apple_crtc *apple);
 void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
@@ -53,8 +62,8 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 const struct drm_display_mode *mode,
 			 struct drm_display_mode *adjusted_mode);
 void dcp_set_dimensions(struct apple_dcp *dcp);
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint);
+void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);

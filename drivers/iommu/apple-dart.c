@@ -76,6 +76,18 @@
 
 #define DART_STREAM_COMMAND_BUSY_TIMEOUT 100
 
+/*
+ * A FLUSH_SID on a live display stream has to drain that stream's in-flight
+ * translations, and on T8140 disp0 that measurably exceeds the 100us upstream
+ * allows -- always the post-write poll, never a busy engine beforehand
+ * (TLB_CMD reads back 0x87008100: our own command with BUSY still set).  Giving
+ * up early does not stop the flush, it just means we stop waiting for it and
+ * tell the caller the invalidate failed, so a device read can race the
+ * still-running invalidate.  Wait long enough for it to finish instead, and
+ * report how long it really took.
+ */
+#define DART_T8110_FLUSH_BUSY_TIMEOUT 2000
+
 #define DART_T8020_ERROR_ADDR_HI 0x54
 #define DART_T8020_ERROR_ADDR_LO 0x50
 
@@ -109,8 +121,13 @@
 #define DART_T8110_TLB_CMD_OP           GENMASK(10, 8)
 #define DART_T8110_TLB_CMD_OP_FLUSH_ALL 0
 #define DART_T8110_TLB_CMD_OP_FLUSH_SID 1
+#define DART_T8110_TLB_CMD_OP_FLUSH_UNLOCK 4
 #define DART_T8110_TLB_CMD_STREAM       GENMASK(7, 0)
 #define DART_T8110_TLB_CMD_V2           BIT(15)
+#define DART_T8110_TLB_CMD_RANGE        BIT(14)
+#define DART_T8110_TLB_CMD_STT          BIT(13)
+#define DART_T8110_TLB_START            0x98
+#define DART_T8110_TLB_END              0xa0
 
 #define DART_T8110_ERROR 0x100
 #define DART_T8110_ERROR_STREAM GENMASK(27, 20)
@@ -132,7 +149,27 @@
 #define DART_T8110_ERROR_STREAMS 0x1c0
 
 /* DART v2.2 and later expose one exception record per SID. */
-#define DART_T8110_EXCEPTION(sid) (0x4000 + 4 * (sid))
+/*
+ * T8110 v2 (version >= 0x202) exception reporting, from AppleT8110DART and the
+ * SPTM firmware that performs its register writes.
+ *
+ * 0x4000 + 4*i is a *pending bitmap*, one word per 32 SIDs: bit (sid % 32) set
+ * means SID sid has an exception.  It is NOT a per-SID code word -- reading it
+ * as one made every "exception:0x00000001" in our logs mean "SID 0 pending",
+ * which we misreported as code 1 "write protect".  The real code lives in the
+ * per-SID record at 0x8000 + 0x40*sid.
+ *
+ * The bitmap is write-1-to-clear (SPTM: ldr w12,[x14,x13]; str w12,[x14,x13];
+ * dsb sy). Nothing acked it before, so one latched bit re-fired indefinitely.
+ *
+ * The legacy ERROR register at 0x100 is deliberately unused on v2 hardware --
+ * AppleT8110DART only consults it when version <= 0x201 -- which is why it
+ * reads zero while these registers are live.
+ */
+#define DART_T8110_EXCEPTION(i) (0x4000 + 4 * (i))
+#define DART_T8110_ERR_SID(sid) (0x8000 + 0x40 * (sid))
+#define DART_T8110_ERR_SID_STATUS(sid) (DART_T8110_ERR_SID(sid) + 0x00)
+#define DART_T8110_ERR_SID_STATUS_WRITE BIT(8)
 #define DART_T8110_EXCEPTION_CODE GENMASK(3, 0)
 #define DART_T8110_EXCEPTION_LEVEL GENMASK(13, 12)
 
@@ -141,13 +178,15 @@
 #define DART_T8110_BLOCK_ERROR_MASK 0x777
 
 #define DART_T8110_EXCEPTION_INFO(sid) (0x8000 + 0x40 * (sid))
-#define DART_T8110_EXCEPTION_ADDR_LO(sid) (DART_T8110_EXCEPTION_INFO(sid) + 0x8)
-#define DART_T8110_EXCEPTION_ADDR_HI(sid) (DART_T8110_EXCEPTION_INFO(sid) + 0xc)
+#define DART_T8110_EXCEPTION_ADDR_LO(sid) (DART_T8110_ERR_SID(sid) + 0x8)
+#define DART_T8110_EXCEPTION_ADDR_HI(sid) (DART_T8110_ERR_SID(sid) + 0xc)
 
 #define DART_T8110_PROTECT 0x200
 #define DART_T8110_UNPROTECT 0x204
 #define DART_T8110_PROTECT_LOCK 0x208
 #define DART_T8110_PROTECT_TTBR_TCR BIT(0)
+#define DART_T8110_DIAG_LOCK 0x210
+#define DART_T8110_DIAG_LOCK_ON_ERR BIT(1)
 
 #define DART_T8110_ENABLE_STREAMS  0xc00
 #define DART_T8110_DISABLE_STREAMS 0xc20
@@ -255,6 +294,9 @@ struct apple_dart {
 
 	struct iommu_group *sid2group[DART_MAX_STREAMS];
 	struct iommu_device iommu;
+	DECLARE_BITMAP(static_bypass, DART_MAX_STREAMS);
+	DECLARE_BITMAP(static_enabled, DART_MAX_STREAMS);
+	bool has_static_enabled;
 
 	u32 save_tcr[DART_MAX_STREAMS];
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
@@ -301,6 +343,7 @@ struct apple_dart_domain {
 
 	bool finalized;
 	u64 mask;
+	dma_addr_t dma_max;
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 
@@ -338,6 +381,11 @@ struct apple_dart_master_cfg {
 
 static struct platform_driver apple_dart_driver;
 static const struct iommu_ops apple_dart_iommu_ops;
+static bool j700_deferred_probe_ready;
+module_param_named(j700_deferred_probe_ready, j700_deferred_probe_ready,
+		   bool, 0644);
+MODULE_PARM_DESC(j700_deferred_probe_ready,
+		 "Allow a J700 APCIe DART marked for deferred probe to bind");
 
 static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
 {
@@ -512,6 +560,61 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map,
 	return 0;
 }
 
+/* Mirrors APPLE_DART_PTE_VALID in io-pgtable-dart.c. */
+#define APPLE_DART_L1E_VALID	BIT(0)
+
+/*
+ * Publish Linux's L1 entries into a live inherited L1 without clobbering the
+ * firmware's.
+ *
+ * This used to be a blanket memcpy of our cloned L1 over the hardware's, run
+ * again on every IOTLB sync.  On a locked DART that is wrong: we are not the
+ * only writer of these tables.  The DCP firmware remaps disp0 PTEs itself (the
+ * ADT marks the DART "allow-pte-remap") and keeps editing the *original* L2s
+ * after we have cloned them, so the copy froze the firmware's tables at attach
+ * time and then re-stamped that stale snapshot over the live L1 forever after.
+ * A page the firmware had promoted to writable but whose snapshot still said
+ * NO_WRITE then faulted on the firmware's next write -- a write-protect
+ * exception inside the display carveout, at whatever address the firmware
+ * happened to have reached, on roughly one boot in four (whenever probe won the
+ * race against the firmware's remap sequence).  The coprocessor took the AXI
+ * reject, panicked, and never answered RTKit INIT.
+ *
+ * The two owners do not overlap: the firmware's mappings live in the low L1
+ * slots (the carveout at DVA 0x1ea0000 is slot 0..3) while our DMA window sits
+ * at the top (0x10fff000000 masked to ias=36 lands in slot 2040+).  So publish
+ * an entry only where the live L1 has none, and leave every slot the firmware
+ * owns pointing at the firmware's own L2s.
+ */
+static void apple_dart_publish_locked_ttbr(u64 *live, const u64 *ours,
+					   size_t size)
+{
+	size_t i, n = size / sizeof(u64);
+	unsigned int published = 0;
+
+	for (i = 0; i < n; i++) {
+		u64 mine = READ_ONCE(ours[i]);
+
+		if (!(mine & APPLE_DART_L1E_VALID))
+			continue;
+		if (READ_ONCE(live[i]) & APPLE_DART_L1E_VALID)
+			continue;	/* firmware owns this slot; hands off */
+
+		WRITE_ONCE(live[i], mine);
+		published++;
+	}
+
+	/*
+	 * Unconditional: the steady-state case publishes nothing (our slots are
+	 * install-once), but the caller issues a TLB invalidate straight after,
+	 * and the leaf PTE writes still have to be visible to the DART first.
+	 * The blanket-memcpy version this replaced always executed a dma_wmb(),
+	 * so making it conditional would have quietly dropped that barrier.
+	 */
+	(void)published;
+	dma_wmb();
+}
+
 static int
 apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			  struct apple_dart_stream_map *stream_map)
@@ -525,7 +628,15 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			u64 *ptep = cfg->apple_dart_cfg.ttbr[idx];
 			if (!ttbrep || !ptep)
 				continue;
-			apple_dart_copy_locked_ttbr(ttbrep, ptep, dart->pgsize);
+			/*
+			 * Publish, never blanket-copy.  This runs from
+			 * apple_dart_domain_flush_tlb() on *every* DMA map, so a
+			 * memcpy here re-stamps the attach-time snapshot over all
+			 * 2048 L1 entries of a table the DCP firmware is still
+			 * walking and editing, reverting every L2 pointer it has
+			 * installed since attach.
+			 */
+			apple_dart_publish_locked_ttbr(ttbrep, ptep, dart->pgsize);
 		}
 	}
 
@@ -565,11 +676,16 @@ apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 }
 
 static int
-apple_dart_t8110_hw_tlb_command(struct apple_dart_stream_map *stream_map,
-				u32 command)
+apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
+				u32 command, bool range, u64 first, u64 last)
 {
 	struct apple_dart *dart = stream_map->dart;
+	bool busy_before = false;
+	s64 slowest_us = 0, us = 0;
+	int slowest_sid = -1, bad_sid = -1;
+	u32 last_val = 0;
 	unsigned long flags;
+	ktime_t start;
 	int ret = 0;
 	int sid;
 
@@ -578,29 +694,79 @@ apple_dart_t8110_hw_tlb_command(struct apple_dart_stream_map *stream_map,
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u32 val = FIELD_PREP(DART_T8110_TLB_CMD_OP, command) |
 			FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid);
+		u32 pre;
 
 		if (command == DART_T8110_TLB_CMD_OP_FLUSH_SID && dart->tlb_cmd_v2)
 			val |= DART_T8110_TLB_CMD_V2;
+
+		/*
+		 * Wait for the engine before stamping the command.  TLB_CMD is a
+		 * single shared command port: writing it while BUSY is set drops
+		 * the write, so the invalidate silently never happens and the
+		 * next access through the freshly mapped IOVA hits a stale
+		 * negative TLB entry.  On disp0 the DCP firmware takes that
+		 * reject as an AXI error and panics.  A dropped command also
+		 * leaves BUSY set, so the next caller's command is dropped too --
+		 * which is why these arrive in bursts of dozens rather than
+		 * singly.
+		 */
+		ret = readl_poll_timeout_atomic(
+			dart->regs + DART_T8110_TLB_CMD, pre,
+			!(pre & DART_T8110_TLB_CMD_BUSY), 1,
+			DART_STREAM_COMMAND_BUSY_TIMEOUT);
+		if (ret) {
+			last_val = pre;
+			busy_before = true;
+			bad_sid = sid;
+			break;
+		}
+
+		if (range) {
+			val |= DART_T8110_TLB_CMD_RANGE | DART_T8110_TLB_CMD_STT;
+			writel((first >> 14) << 2, dart->regs + DART_T8110_TLB_START);
+			writel((last >> 14) << 2, dart->regs + DART_T8110_TLB_END);
+		}
+
+		/* Page-table writes must land before the DART is told to flush. */
+		dma_wmb();
 		writel(val, dart->regs + DART_T8110_TLB_CMD);
 
+		start = ktime_get();
 		ret = readl_poll_timeout_atomic(
 			dart->regs + DART_T8110_TLB_CMD, val,
 			!(val & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_STREAM_COMMAND_BUSY_TIMEOUT);
+			DART_T8110_FLUSH_BUSY_TIMEOUT);
+		us = ktime_to_us(ktime_sub(ktime_get(), start));
 
-		if (ret)
+		last_val = val;
+		if (us > slowest_us) {
+			slowest_us = us;
+			slowest_sid = sid;
+		}
+		if (ret) {
+			bad_sid = sid;
 			break;
+		}
 
 	}
 
 	spin_unlock_irqrestore(&dart->lock, flags);
 
 	if (ret) {
-		dev_err(stream_map->dart->dev,
-			"busy bit did not clear after command %x for stream %d\n",
-			command, sid);
+		dev_err_ratelimited(stream_map->dart->dev,
+			"TLB engine %s for command %x stream %d after %lldus (TLB_CMD %#010x)\n",
+			busy_before ? "still busy BEFORE the command" :
+				      "busy bit did not clear",
+			command, bad_sid, slowest_us, last_val);
 		return ret;
 	}
+
+	/* Learn the real distribution: anything past the old budget is notable. */
+	if (slowest_us > DART_STREAM_COMMAND_BUSY_TIMEOUT)
+		dev_warn_ratelimited(stream_map->dart->dev,
+			"TLB command %x stream %d took %lldus (over the %dus budget) but completed\n",
+			command, slowest_sid, slowest_us,
+			DART_STREAM_COMMAND_BUSY_TIMEOUT);
 
 	return 0;
 }
@@ -615,14 +781,114 @@ apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 static int
 apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
-	return apple_dart_t8110_hw_tlb_command(
-		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID);
+	return apple_dart_t8110_hw_tlb_command_range(
+		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID, false, 0, 0);
+}
+
+static const char *apple_dart_t8110_v2_fault_name(u32 exception);
+
+/*
+ * Drain exceptions latched before Linux took the DART over.
+ *
+ * apple_dart_hw_reset() clears pending errors only for unlocked DARTs. Drain
+ * firmware-era records before enabling the interrupt on a locked DART so the
+ * handler starts with live faults only.
+ */
+static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
+{
+	unsigned int i, drained = 0;
+
+	if (dart->hw->type != DART_T8110 || dart->version < 0x0202)
+		return;
+
+	for (i = 0; i < DIV_ROUND_UP(dart->num_streams, 32) && i < 8; i++) {
+		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
+		unsigned long bits = pending;
+		unsigned int bit;
+
+		if (!pending)
+			continue;
+
+		for_each_set_bit(bit, &bits, 32) {
+			unsigned int sid = i * 32 + bit;
+			u32 status;
+			u64 addr;
+
+			if (sid >= dart->num_streams)
+				break;
+
+			status = readl(dart->regs +
+				       DART_T8110_ERR_SID_STATUS(sid));
+			addr = readl(dart->regs +
+				     DART_T8110_EXCEPTION_ADDR_LO(sid)) |
+			       (u64)readl(dart->regs +
+					  DART_T8110_EXCEPTION_ADDR_HI(sid)) << 32;
+			dev_info(dart->dev,
+				 "stale exception latched before probe: SID:%u %s %s at %#llx (status %#010x)\n",
+				 sid,
+				 status & DART_T8110_ERR_SID_STATUS_WRITE ?
+					 "write" : "read",
+				 apple_dart_t8110_v2_fault_name(status),
+				 addr, status);
+			drained++;
+		}
+
+		writel(pending, dart->regs + DART_T8110_EXCEPTION(i));
+	}
+
+	if (drained) {
+		dsb(sy);
+		readl(dart->regs + DART_T8110_EXCEPTION(0));
+	}
+
+	if (dart->version >= 0x0203)
+		readl(dart->regs + DART_T8110_BLOCK_ERROR);
+
+	if (drained)
+		dev_info(dart->dev,
+			 "%u stale exception(s) drained; these predate Linux\n",
+			 drained);
+}
+
+static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
+{
+	for (int word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
+		u32 mask = U32_MAX;
+
+		if (dart->has_static_enabled) {
+			mask = 0;
+			for (int bit = 0; bit < 32; bit++) {
+				int stream = word * 32 + bit;
+
+				if (stream < dart->num_streams &&
+				    test_bit(stream, dart->static_enabled))
+					mask |= BIT(bit);
+			}
+		}
+		writel(mask, dart->regs + dart->hw->enable_streams + 4 * word);
+	}
+}
+
+static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map stream_map = { .dart = dart };
+
+	if (!(readl(dart->regs + DART_T8110_DIAG_LOCK) & DART_T8110_DIAG_LOCK_ON_ERR))
+		return 0;
+
+	/* gen3dart_clear_exception follows bitmap acknowledgement with the
+	 * global FLUSH_UNLOCK command when lock-on-error is configured.
+	 */
+	__set_bit(0, stream_map.sidmap);
+	return apple_dart_t8110_hw_tlb_command_range(&stream_map,
+					    DART_T8110_TLB_CMD_OP_FLUSH_UNLOCK,
+					    false, 0, 0);
 }
 
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
-	int i;
+	int ret;
 
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
@@ -630,32 +896,21 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
+	apple_dart_hw_enable_global_streams(dart);
 
-	/* Clear any pending errors before the interrupt is unmasked. */
+	/* Clear pending records using the v2 SID bitmap before unmasking. */
 	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
-		unsigned int sid;
-
-		/*
-		 * AppleT8110DART reads the exception record before its detail
-		 * registers and never writes the record back. Preserve that order.
-		 */
-		for (sid = 0; sid < dart->num_streams; sid++) {
-			if (!readl(dart->regs + DART_T8110_EXCEPTION(sid)))
-				continue;
-
-			readl(dart->regs + DART_T8110_EXCEPTION_ADDR_LO(sid));
-			readl(dart->regs + DART_T8110_EXCEPTION_ADDR_HI(sid));
-		}
-
+		apple_dart_drain_stale_exceptions(dart);
 		if (dart->version >= 0x0203)
-			readl(dart->regs + DART_T8110_BLOCK_ERROR);
-	} else {
+			writel(readl(dart->regs + DART_T8110_BLOCK_ERROR) &
+			       DART_T8110_BLOCK_ERROR_MASK,
+			       dart->regs + DART_T8110_BLOCK_ERROR);
+		ret = apple_dart_t8110_v2_unlock(dart);
+		if (ret)
+			return ret;
+	} else
 		writel(readl(dart->regs + dart->hw->error),
 		       dart->regs + dart->hw->error);
-	}
 
 	if (dart->hw->type == DART_T8110)
 		writel(0,  dart->regs + DART_T8110_ERROR_MASK);
@@ -663,15 +918,24 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	return dart->hw->invalidate_tlb(&stream_map);
 }
 
-static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
+/*
+ * A full SID invalidate disturbs active T8140 display translations even when
+ * only an unrelated buffer changes. Native SPTM uses DVA-range invalidation
+ * with STT flushing for these streams. Keep the full command for lifecycle
+ * synchronization; ordinary map/unmap only invalidate their changed range.
+ */
+static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
+					    bool range, u64 first, u64 last)
 {
-	int i, j;
+	int i, j, ret = 0;
 	struct apple_dart_atomic_stream_map *domain_stream_map;
 	struct apple_dart_stream_map stream_map;
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
 	for_each_stream_map(i, domain, domain_stream_map) {
+		int err;
+
 		stream_map.dart = domain_stream_map->dart;
 
 		for (j = 0; j < BITS_TO_LONGS(stream_map.dart->num_streams); j++)
@@ -682,9 +946,25 @@ static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
 		if (stream_map.dart->locked)
 			apple_dart_hw_sync_locked(pgtbl_cfg, &stream_map);
 
-		stream_map.dart->hw->invalidate_tlb(&stream_map);
+		if (range && stream_map.dart->locked &&
+		    stream_map.dart->pgsize == SZ_16K &&
+		    stream_map.dart->tlb_cmd_v2 && first <= last && last < BIT_ULL(42)) {
+			err = apple_dart_t8110_hw_tlb_command_range(&stream_map,
+				DART_T8110_TLB_CMD_OP_FLUSH_SID, true, first, last);
+		} else {
+			err = stream_map.dart->hw->invalidate_tlb(&stream_map);
+		}
+		if (err && !ret)
+			ret = err;
 		pm_runtime_put(stream_map.dart->dev);
 	}
+
+	return ret;
+}
+
+static int apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
+{
+	return apple_dart_domain_flush_tlb_range(domain, false, 0, 0);
 }
 
 static void apple_dart_domain_restore_locked(struct apple_dart_domain *domain)
@@ -712,20 +992,23 @@ static void apple_dart_domain_restore_locked(struct apple_dart_domain *domain)
 
 static void apple_dart_flush_iotlb_all(struct iommu_domain *domain)
 {
-	apple_dart_domain_flush_tlb(to_dart_domain(domain));
+	(void)apple_dart_domain_flush_tlb(to_dart_domain(domain));
 }
 
 static void apple_dart_iotlb_sync(struct iommu_domain *domain,
 				  struct iommu_iotlb_gather *gather)
 {
-	apple_dart_domain_flush_tlb(to_dart_domain(domain));
+	(void)apple_dart_domain_flush_tlb_range(to_dart_domain(domain),
+					       gather->start <= gather->end,
+					       gather->start, gather->end);
 }
 
 static int apple_dart_iotlb_sync_map(struct iommu_domain *domain,
 				     unsigned long iova, size_t size)
 {
-	apple_dart_domain_flush_tlb(to_dart_domain(domain));
-	return 0;
+	return apple_dart_domain_flush_tlb_range(to_dart_domain(domain),
+					       size && iova + size - 1 >= iova,
+					       iova, iova + size - 1);
 }
 
 static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
@@ -747,9 +1030,27 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 {
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
+	struct apple_dart *dart = dart_domain->stream_maps[0].dart;
 
 	if (!ops)
 		return -ENODEV;
+
+	/*
+	 * A locked DART's page tables are shared with hardware we do not fully
+	 * drive.  The display pipe writes into buffers the DMA layer only ever
+	 * declares DMA_TO_DEVICE, and a read-only PTE there does not produce a
+	 * recoverable error: the DART raises a write-protect exception per
+	 * access, tens of thousands a second, until the CPUs starve.  Nothing
+	 * on these DARTs relies on write protection, so never install it.
+	 */
+	if (dart && dart->locked && !(prot & IOMMU_WRITE)) {
+		dev_info_ratelimited(
+			dart->dev,
+			"forcing writable mapping at %#llx (%zu x %#zx, prot %#x)\n",
+			(unsigned long long)(iova & dart_domain->mask),
+			pgcount, pgsize, prot);
+		prot |= IOMMU_WRITE;
+	}
 
 	return ops->map_pages(ops, iova & dart_domain->mask, paddr, pgsize,
 			      pgcount, prot, gfp, mapped);
@@ -762,9 +1063,13 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
 {
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
+	size_t unmapped;
 
-	return ops->unmap_pages(ops, iova & dart_domain->mask, pgsize, pgcount,
-				gather);
+	unmapped = ops->unmap_pages(ops, iova & dart_domain->mask, pgsize,
+				   pgcount, gather);
+	if (unmapped)
+		iommu_iotlb_gather_add_range(gather, iova, unmapped);
+	return unmapped;
 }
 
 static void
@@ -776,9 +1081,7 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
+	apple_dart_hw_enable_global_streams(dart);
 
 	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i) {
 		u64 ttbr = virt_to_phys(pgtbl_cfg->apple_dart_cfg.ttbr[i]);
@@ -815,7 +1118,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
-	dma_addr_t dma_max = dart->dma_max;
+	dma_addr_t dma_max = dart_domain->dma_max ?: dart->dma_max;
 	u32 ias = min_t(u32, dart->ias, fls64(dma_max));
 	int locked_sid = -1;
 	int ret = 0;
@@ -995,6 +1298,7 @@ apple_dart_reconcile_locked_translated(struct apple_dart_domain *dart_domain,
 			 result.first_pte_after, result.changed);
 	}
 	iommu_put_resv_regions(dev, &regions);
+
 	return ret;
 }
 
@@ -1175,6 +1479,7 @@ static void apple_dart_release_device(struct device *dev)
 static struct iommu_domain *apple_dart_domain_alloc_paging(struct device *dev)
 {
 	struct apple_dart_domain *dart_domain;
+	u32 iova_bits;
 
 	dart_domain = kzalloc_obj(*dart_domain);
 	if (!dart_domain)
@@ -1184,7 +1489,32 @@ static struct iommu_domain *apple_dart_domain_alloc_paging(struct device *dev)
 
 	if (dev) {
 		struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+		struct device_node *iova_node = dev->of_node;
 		int ret;
+
+		if (dev_is_pci(dev)) {
+			struct pci_host_bridge *bridge;
+			struct device_node *bridge_node;
+
+			bridge = pci_find_host_bridge(to_pci_dev(dev)->bus);
+			bridge_node = bridge && bridge->dev.parent ?
+				bridge->dev.parent->of_node : NULL;
+			if (bridge_node &&
+			    of_property_read_bool(bridge_node,
+						  "apple,endpoint-iova-address-bits"))
+				iova_node = bridge_node;
+		}
+		if (!of_property_read_u32(iova_node,
+					  dev_is_pci(dev) ?
+					  "apple,endpoint-iova-address-bits" :
+					  "apple,iova-address-bits",
+					  &iova_bits)) {
+			if (!iova_bits || iova_bits >= 64) {
+				kfree(dart_domain);
+				return ERR_PTR(-EINVAL);
+			}
+			dart_domain->dma_max = DMA_BIT_MASK(iova_bits);
+		}
 
 		ret = apple_dart_finalize_domain(dart_domain, cfg);
 		if (ret) {
@@ -1395,6 +1725,16 @@ static int apple_dart_def_domain_type(struct device *dev)
 #endif
 #define DOORBELL_ADDR	(CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR & PAGE_MASK)
 
+/*
+ * No scanout-window reservation here.
+ *
+ * A 256 MB reservation at the top of this stream's window was added so that
+ * apple-dcp could mirror DCP-allocated buffers into the scanout domain without
+ * colliding with the DMA API.  The mirror itself turned out to be destructive
+ * -- every iommu_map() on this domain flushes SID 0 while the display pipe is
+ * mid-frame, which kills the firmware -- so the mirror was reverted and the
+ * reservation has no user.  Do not re-add one without the mirror.
+ */
 static void apple_dart_get_resv_regions(struct device *dev,
 					struct list_head *head)
 {
@@ -1574,31 +1914,60 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
 	irqreturn_t ret = IRQ_NONE;
-	unsigned int sid;
-	u32 block_error = 0;
+	unsigned int words = DIV_ROUND_UP(dart->num_streams, 32);
+	unsigned int i;
+	u32 block_error;
 
 	/*
-	 * AppleT8110DART reads each exception once, saves it, then reads the
-	 * matching detail registers. It never writes the exception back. Keep
-	 * the same ordering here.
+	 * 0x4000 + 4*i is a bitmap of SIDs with a pending exception, one word
+	 * per 32 SIDs -- not a per-SID code.  Iterating it per SID (as this
+	 * used to) runs off the end of the array into the register arrays at
+	 * 0x4020/0x4040 for every sid >= ceil(nsid/32).
 	 */
-	for (sid = 0; sid < dart->num_streams; sid++) {
-		u32 exception = readl(dart->regs + DART_T8110_EXCEPTION(sid));
-		u32 addr_lo, addr_hi;
-		u64 addr;
+	for (i = 0; i < words && i < 8; i++) {
+		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
+		unsigned long bits = pending;
+		unsigned int bit;
 
-		if (!exception)
+		if (!pending)
 			continue;
 
-		addr_lo = readl(dart->regs + DART_T8110_EXCEPTION_ADDR_LO(sid));
-		addr_hi = readl(dart->regs + DART_T8110_EXCEPTION_ADDR_HI(sid));
-		addr = addr_lo | (u64)addr_hi << 32;
+		for_each_set_bit(bit, &bits, 32) {
+			unsigned int sid = i * 32 + bit;
+			u32 status;
+			u64 addr;
 
-		dev_err_ratelimited(dart->dev,
-				    "translation fault: SID:%u exception:0x%08x (%s) at 0x%llx\n",
-				    sid, exception,
-				    apple_dart_t8110_v2_fault_name(exception), addr);
+			if (sid >= dart->num_streams)
+				break;
+
+			status = readl(dart->regs +
+				       DART_T8110_ERR_SID_STATUS(sid));
+			addr = readl(dart->regs +
+				     DART_T8110_EXCEPTION_ADDR_LO(sid)) |
+			       (u64)readl(dart->regs +
+					  DART_T8110_EXCEPTION_ADDR_HI(sid)) << 32;
+
+			dev_err_ratelimited(dart->dev,
+					    "translation fault: SID:%u %s %s at %#llx (status %#010x)\n",
+					    sid,
+					    status & DART_T8110_ERR_SID_STATUS_WRITE ?
+						    "write" : "read",
+						    apple_dart_t8110_v2_fault_name(status),
+						    addr, status);
+		}
+
+		/*
+		 * Acknowledge: the bitmap is write-1-to-clear.  Without this the
+		 * same latched bit re-fires immediately and one historical
+		 * exception looks like a fault storm.
+		 */
+		writel(pending, dart->regs + DART_T8110_EXCEPTION(i));
 		ret = IRQ_HANDLED;
+	}
+
+	if (ret == IRQ_HANDLED) {
+		dsb(sy);
+		readl(dart->regs + DART_T8110_EXCEPTION(0));
 	}
 
 	if (dart->version >= 0x0203) {
@@ -1607,9 +1976,13 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 			dev_err_ratelimited(dart->dev,
 					    "block exception: status:0x%08x\n",
 					    block_error);
+			writel(block_error & DART_T8110_BLOCK_ERROR_MASK,
+			       dart->regs + DART_T8110_BLOCK_ERROR);
 			ret = IRQ_HANDLED;
 		}
 	}
+	if (ret == IRQ_HANDLED)
+		apple_dart_t8110_v2_unlock(dart);
 
 	return ret;
 }
@@ -1642,12 +2015,21 @@ static bool apple_dart_is_locked(struct apple_dart *dart)
 
 static int apple_dart_probe(struct platform_device *pdev)
 {
-	int ret;
-	u32 dart_params[4];
+	int bypass_count, enabled_count, ret;
+	u32 dart_params[4], sid;
 	struct resource *res;
 	struct apple_dart *dart;
+	struct apple_dart_stream_map bypass_map = {};
 	struct device *dev = &pdev->dev;
 	u64 dma_range[2];
+
+	if (of_property_read_bool(dev->of_node,
+				  "apple,j700-defer-probe") &&
+	    !j700_deferred_probe_ready) {
+		dev_info(dev,
+			 "J700_APCIE_DART_DEFERRED: waiting for post-NVMe-root release\n");
+		return -EPROBE_DEFER;
+	}
 
 	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
 	if (!dart)
@@ -1745,12 +2127,67 @@ static int apple_dart_probe(struct platform_device *pdev)
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}
+	bypass_count = of_property_count_u32_elems(dev->of_node,
+						    "apple,bypass-streams");
+	if (bypass_count > 0) {
+		if (!dart->supports_bypass) {
+			ret = -EOPNOTSUPP;
+			goto err_clk_disable;
+		}
+		for (int i = 0; i < bypass_count; i++) {
+			ret = of_property_read_u32_index(dev->of_node,
+							 "apple,bypass-streams",
+							 i, &sid);
+			if (ret || sid >= dart->num_streams) {
+				ret = ret ?: -ERANGE;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->static_bypass);
+		}
+	} else if (bypass_count != -EINVAL) {
+		ret = bypass_count;
+		goto err_clk_disable;
+	}
+	enabled_count = of_property_count_u32_elems(dev->of_node,
+						     "apple,enabled-streams");
+	if (enabled_count > 0) {
+		dart->has_static_enabled = true;
+		for (int i = 0; i < enabled_count; i++) {
+			ret = of_property_read_u32_index(dev->of_node,
+							 "apple,enabled-streams",
+							 i, &sid);
+			if (ret || sid >= dart->num_streams) {
+				ret = ret ?: -ERANGE;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->static_enabled);
+		}
+	} else if (enabled_count != -EINVAL) {
+		ret = enabled_count;
+		goto err_clk_disable;
+	}
 
 	dart->locked = apple_dart_is_locked(dart);
+
+	/*
+	 * A locked DART is one the bootloader handed over still translating for
+	 * hardware we do not drive -- on J700 the display pipe scans out
+	 * through stream 0 of dart-disp0 the whole time Linux is booting.
+	 * Letting runtime PM suspend it drops the TTBRs underneath that
+	 * traffic, and the engine then faults "TTBR invalid" forever.  Hold the
+	 * reference for the DART's lifetime, as apple,force-available does.
+	 */
+	if (dart->locked && !dart->force_available) {
+		dev_info(dev, "locked DART: holding it available for its lifetime\n");
+		dart->force_available = 1;
+	}
+
 	if (!dart->locked) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
+	} else {
+		apple_dart_drain_stale_exceptions(dart);
 	}
 
 	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,

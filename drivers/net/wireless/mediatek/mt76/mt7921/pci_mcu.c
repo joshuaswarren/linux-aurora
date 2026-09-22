@@ -3,6 +3,7 @@
 
 #include "mt7921.h"
 #include "mcu.h"
+#include "../dma.h"
 
 int mt7921e_driver_own(struct mt792x_dev *dev)
 {
@@ -49,9 +50,68 @@ mt7921_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
 	if (cmd == MCU_CMD(FW_SCATTER))
 		txq = MT_MCUQ_FWDL;
 	q = mdev->q_mcu[txq];
+	/*
+	 * Apple 25G83 kalDevPortWrite() does not enlarge the 24-entry TX17
+	 * command ring.  When used + 1 reaches the ring depth it first calls
+	 * halWpdmaProcessCmdDmaDone(), which reclaims the completed prefix, and
+	 * only rejects the new command if the ring remains full afterwards.
+	 *
+	 * The generic raw mt76 path checks capacity before doing any cleanup.
+	 * That made the earlier exact-depth experiment stop at the first wrap,
+	 * while Run 191 proves Apple wraps the same 24 slots thousands of times.
+	 * Keep ordinary interrupt-driven cleanup, but reproduce Apple's bounded
+	 * pressure fallback before the generic capacity check.
+	 */
+	if (is_mt7932(mdev) && txq == MT_MCUQ_WM &&
+	    READ_ONCE(q->queued) + 1 >= q->ndesc &&
+	    mdev->queue_ops->tx_cleanup) {
+		u32 before = READ_ONCE(q->queued);
+		u32 tail_ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].ctrl));
+		u32 didx = readl(&q->regs->dma_idx);
+		unsigned int polls = 0;
+
+		mdev->queue_ops->tx_cleanup(mdev, q, false);
+		/* Linux can issue the post-registration command burst faster than
+		 * AppleSunriseWLAN's workloop.  Do not silently lose a channel or
+		 * interface command while DIDX is one scheduling quantum behind.
+		 * This only waits for hardware-owned descriptors to retire; it never
+		 * overwrites a full ring or fabricates completion.
+		 */
+		while (READ_ONCE(q->queued) + 1 >= q->ndesc &&
+		       polls++ < 50) {
+			udelay(100);
+			mdev->queue_ops->tx_cleanup(mdev, q, false);
+		}
+		dev_info(mdev->dev,
+			 "J700_MT7932_TX17_PRESSURE_RECLAIM: before=%u after=%u head=%u tail=%u didx=%u tail_ctrl=0x%08x depth=%u wait_us=%u\n",
+			 before, READ_ONCE(q->queued), q->head, q->tail,
+			 didx, tail_ctrl, q->ndesc, polls * 100);
+		if (READ_ONCE(q->queued) + 1 >= q->ndesc &&
+		    q->tx_bounce_buf && q->tx_bounce_stride) {
+			struct mt76_queue_entry *entry = &q->entry[q->tail];
+			dma_addr_t dma = entry->dma_addr[0];
+			u64 bounce_bytes = (u64)q->tx_bounce_entries *
+					   q->tx_bounce_stride;
+
+			if (dma >= q->tx_bounce_dma &&
+			    dma - q->tx_bounce_dma < bounce_bytes) {
+				u32 slot = div_u64(dma - q->tx_bounce_dma,
+						   q->tx_bounce_stride);
+				const u8 *payload = q->tx_bounce_buf +
+						    slot * q->tx_bounce_stride;
+				u16 bytes = min_t(u16, entry->dma_len[0], 64);
+
+				dev_info_ratelimited(mdev->dev,
+					 "J700_MT7932_TX17_STALL_TAIL: tail=%u slot=%u dma_len=%u desc_ctrl=0x%08x desc_info=0x%08x payload=%*ph\n",
+					 q->tail, slot, entry->dma_len[0],
+					 le32_to_cpu(READ_ONCE(q->desc[q->tail].ctrl)),
+					 le32_to_cpu(READ_ONCE(q->desc[q->tail].info)),
+					 bytes, payload);
+			}
+		}
+	}
 
 	ret = mt76_tx_queue_skb_raw(dev, q, skb, 0);
-
 	return ret;
 }
 

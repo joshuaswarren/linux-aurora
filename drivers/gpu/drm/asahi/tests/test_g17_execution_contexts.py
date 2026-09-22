@@ -56,6 +56,7 @@ impl Uat{
 '''
 tests=r'''
 #[test]fn simultaneous_roots_and_job_references_do_not_touch_slot1(){
+ mem::TLBIS.lock().unwrap().clear();
  let u=Uat::new();{let s=u.inner.lock();s.ttbs()[1].ttb0.store(0x12340001,Ordering::Release);s.ttbs()[1].ttb1.store(0x56780001,Ordering::Release);}
  let a=u.allocate_t8140_compute_execution_context(&u.vm(1)).unwrap();
  let b=u.allocate_t8140_compute_execution_context(&u.vm(2)).unwrap();
@@ -64,8 +65,19 @@ tests=r'''
  let job_a=a.clone();drop(a);assert_ne!(u.roots(5),(0,0));
  drop(b);assert_eq!(u.roots(6),(0,0));assert_ne!(u.roots(5),(0,0));
  let c=u.allocate_t8140_compute_execution_context(&u.vm(3)).unwrap();assert_eq!(c.context_id(),6);
- drop(job_a);assert_eq!(u.roots(5),(0,0));assert!(mem::TLBIS.lock().unwrap().contains(&5));
+ let before=mem::TLBIS.lock().unwrap().len();drop(job_a);assert_eq!(u.roots(5),(0,0));assert_eq!(mem::TLBIS.lock().unwrap().len(),before+1);
  assert_eq!(u.roots(1),(0x12340001,0x56780001));drop(c);
+ assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);
+}
+#[test]fn context_id_reuse_stays_ordered_beyond_the_shared_namespace(){
+ mem::TLBIS.lock().unwrap().clear();
+ let u=Uat::new();
+ for generation in 0..10_001u64{
+  let c=u.allocate_t8140_compute_execution_context(&u.vm(generation+1)).unwrap();
+  assert_eq!(c.context_id(),5);assert!(c.is_current());drop(c);
+  assert_eq!(u.roots(5),(0,0));
+ }
+ assert_eq!(mem::TLBIS.lock().unwrap().iter().filter(|&&id|id==5).count(),20_002);
  assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);
 }
 #[test]fn exhaustion_and_failed_host_allocation_do_not_publish_or_leak(){

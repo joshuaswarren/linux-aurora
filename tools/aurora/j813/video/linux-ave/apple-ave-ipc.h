@@ -219,29 +219,23 @@ static int ave_ring_receive(struct apple_ave *ave, struct ave_channel *c, u64 *a
  * coherent memory; timeout pins the command too and forbids reuse this boot.
  * Firmware command success is established by decoding replies, not this API.
  */
-static ssize_t ave_command_write(struct file *file, const char __user *data, size_t len, loff_t *pos)
+static int ave_submit_locked(struct apple_ave *ave, const u8 *data, size_t len)
 {
-	struct apple_ave *ave = file->private_data;
 	u8 *cmd = ave->ipc.cpu + AVE_COMMAND_OFF;
 	u64 deadline, addr;
 	u32 bytes, flags, offset;
 	bool ack = false;
 	int ret = 0;
 
-	if (!capable(CAP_SYS_RAWIO))
-		return -EPERM;
+	lockdep_assert_held(&ave->lock);
 	static_assert(AVE_COMMAND_OFF + AVE_COMMAND_BYTES <= AVE_ARENA_OFF);
 	if (len < 0x48 || len > AVE_COMMAND_BYTES)
 		return -EINVAL;
-	mutex_lock(&ave->lock);
 	if (!ave->ipc_ready || ave->command_failed) {
 		ret = -EBUSY;
 		goto out;
 	}
-	if (copy_from_user(cmd, data, len)) {
-		ret = -EFAULT;
-		goto out;
-	}
+	memcpy(cmd, data, len);
 	/* The common command timeout is {duration_us, creation_time_us}.
 	 * Stamp it in the same Linux monotonic clock synchronized at startup;
 	 * captured macOS absolute times cannot be replayed on this boot.
@@ -306,7 +300,27 @@ static ssize_t ave_command_write(struct file *file, const char __user *data, siz
 failed:
 	ave->command_failed = true;
 out:
+	return ret;
+}
+
+static ssize_t ave_command_write(struct file *file, const char __user *data,
+				 size_t len, loff_t *pos)
+{
+	struct apple_ave *ave = file->private_data;
+	u8 *packet;
+	int ret;
+
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+	if (len < 0x48 || len > AVE_COMMAND_BYTES)
+		return -EINVAL;
+	packet = memdup_user(data, len);
+	if (IS_ERR(packet))
+		return PTR_ERR(packet);
+	mutex_lock(&ave->lock);
+	ret = ave->encoder_owned ? -EBUSY : ave_submit_locked(ave, packet, len);
 	mutex_unlock(&ave->lock);
+	kfree(packet);
 	return ret ?: len;
 }
 
@@ -346,7 +360,7 @@ static ssize_t ave_poll_write(struct file *file, const char __user *data, size_t
 	if (ret || !requested)
 		return ret ?: -EINVAL;
 	mutex_lock(&ave->lock);
-	if (!ave->ipc_ready || ave->command_failed) {
+	if (!ave->ipc_ready || ave->command_failed || ave->encoder_owned) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -422,7 +436,7 @@ static ssize_t ave_arena_write(struct file *file, const char __user *data, size_
 	if (!capable(CAP_SYS_RAWIO))
 		return -EPERM;
 	mutex_lock(&ave->lock);
-	if (!ave->ipc_ready || ave->command_failed)
+	if (!ave->ipc_ready || ave->command_failed || ave->encoder_owned)
 		ret = -EBUSY;
 	else
 		ret = simple_write_to_buffer(ave->ipc.cpu + AVE_ARENA_OFF,

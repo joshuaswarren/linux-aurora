@@ -211,7 +211,7 @@ fn descriptor_rejects_wrong_owner_context_overflow_and_short_storage() {
             RenderBuildError::ArithmeticOverflow
         ))
     );
-    metadata.submission_ordinal = u32::MAX;
+    metadata.submission_ordinal = u64::MAX;
     assert_eq!(
         build_ta_descriptor_base(&p, &controls, objects(), metadata, 0x70_0040_0000, &mut raw),
         Err(M5RenderBuildError::Common(

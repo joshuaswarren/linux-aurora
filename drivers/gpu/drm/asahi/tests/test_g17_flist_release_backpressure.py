@@ -10,6 +10,7 @@ manager = (src / "g17_manager.rs").read_text()
 submission = (src / "g17_submission.rs").read_text()
 initdata = (src / "g17_initdata.rs").read_text()
 runtime = (src / "g17_live_boot.rs").read_text()
+drm = (src / "g17_drm.rs").read_text()
 
 
 def block(source, pattern):
@@ -39,6 +40,8 @@ submission_part = "\n".join([
 initdata_part = "\n".join(constant(initdata, name) for name in [
     "CONTROL_SHARED_ADDRESS", "CONTROL_OPERAND_TABLE_ADDRESS",
     "PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID",
+    "CONTROL_RING_ENTRIES",
+    "CONTROL_RING_INDEX_MASK",
 ])
 lease_part = "\n".join([
     *[constant(manager, name) for name in [
@@ -50,10 +53,12 @@ lease_part = "\n".join([
       for name in ["G17PBootstrapUmaCompletion", "G17PBootstrapUmaRelease",
                    "G17PBootstrapUmaRequestState", "G17PBootstrapUmaLifecycleError",
                    "G17PBootstrapUmaLifecycle"]],
+    block(manager, r"^fn g17p_control_ring_target_consumed\("),
     block(manager, r"^impl G17PBootstrapUmaLifecycle\s*"),
     *["#[test]\n" + block(manager, r"^    fn " + name + r"\(\)\s*") for name in [
         "bootstrap_async_flist_releases_only_after_type13_and_paired_render",
         "bootstrap_async_flist_release_backpressure_tracks_exact_producer",
+        "bootstrap_release_stays_ready_until_backpressure_clears",
         "shared_flist_holds_both_render_pairs_until_the_last_retirement",
         "retained_flist_leases_grow_once_and_release_every_captured_generation",
     ]],
@@ -67,10 +72,34 @@ with tempfile.TemporaryDirectory(prefix="g17-flist-backpressure-") as temp:
     subprocess.run([str(binary)], check=True)
 
 settle = block(runtime, r"^    fn settle_render_usc_freelist_release_before_submission\(")
-assert "pending_render_usc_freelist_release_producer" in settle
-assert "complete_render_usc_freelist_release_if_consumed(target)?" in settle
-assert "for poll in 0..CONTROL_COUNTER_POLLS" in settle
+assert "settle_consumed_render_usc_freelist_releases()?" in settle
+assert "fsleep" not in settle
+slot_pending = block(runtime, r"^    pub\(crate\) fn render_usc_freelist_release_pending_for_slot\(")
+assert "render_slot_flist_release_sent(slot)" in slot_pending
 submit = block(runtime, r"^    pub\(crate\) fn submit_translated_render\(")
-assert submit.index("settle_render_usc_freelist_release_before_submission()?") < submit.index("settle_open_recovery_before_publication()?")
-assert submit.index("settle_render_usc_freelist_release_before_submission()?") < submit.index(".begin_translated_render(")
-print("retained FList release target and bounded next-admission backpressure PASS")
+assert "settle_render_usc_freelist_release_before_submission()?" not in submit
+completion = block(runtime, r"^    fn settle_deferred_render_completion\(")
+assert "Err(error) if error == EAGAIN" in completion
+assert completion.index("Err(error) if error == EAGAIN") < completion.index("recover_persistent_runtime")
+worker = block(runtime, r"^    pub\(crate\) fn service_primary_firmware_events\(")
+assert worker.index("flush_pending_primary_device_control()?") < worker.index("flush_pending_render_usc_freelist_release()?")
+assert worker.index("flush_pending_render_usc_freelist_release()?") < worker.index("notifications_pending")
+inline = block(runtime, r"^    fn service_firmware_events_inline\(")
+assert "pending_release && !self.flush_pending_render_usc_freelist_release()?" in inline
+flush = block(runtime, r"^    fn flush_pending_primary_device_control\(")
+assert flush.index("send_message") < flush.index("note_state_crashed")
+reset = block(manager, r"^    pub\(crate\) fn reset_session_after_processor_stop\(")
+assert "self.pending_primary_control = None;" in reset
+assert "self.pending_flist_release_worker_attempts = 0;" in reset
+request = block(manager, r"^    pub\(crate\) fn publish_render_usc_freelist_request\(")
+assert request.index("if lifecycle.request.is_none()") < request.index("primary_device_control_backpressured()")
+release_service = block(runtime, r"^    fn service_render_usc_freelist_release\(")
+assert release_service.index("Err(error) if error == EAGAIN") < release_service.index("queue_primary_control_continuation")
+assert "settle_consumed_render_usc_freelist_releases()?" in release_service
+assert "fsleep" not in release_service
+publish = block(drm, r"^    fn publish\(&self, packet: Arc<g17_job::G17PRenderJobPacket>\)")
+pressure = publish.index("runtime.primary_device_control_backpressured()")
+assert pressure < publish.index("drop(runtime);", pressure) < publish.index("fsleep(Delta::from_millis(1))", pressure)
+slot_pressure = publish.index("runtime.render_usc_freelist_release_pending_for_slot(render_slot)?")
+assert slot_pressure < pressure
+print("retained FList release target, wrap-safe settlement and owner-local backpressure PASS")

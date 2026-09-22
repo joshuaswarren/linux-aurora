@@ -1,0 +1,31 @@
+#sessionInfo releaseName unknown
+#sessionInfo releaseId 0xcafebabe
+#sessionInfo targetName "Surfaceless"
+#sessionInfo logFormatVersion "0.3.4"
+#sessionInfo vendor "Mesa"
+#sessionInfo renderer "Apple M5 (G17G C0)"
+#sessionInfo commandLineParameters "--deqp-case=dEQP-GLES3.functional.color_clear.single_rgba --deqp-surface-type=pbuffer --deqp-surface-width=64 --deqp-surface-height=64 --deqp-gl-config-name=rgba8888d0s0ms0 --deqp-log-filename=/run/m5-native-cts/gles3-single-rgba-v10/results.qpa --deqp-log-images=enable --deqp-watchdog=enable"
+
+#beginSession
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.single_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.single_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QMRHA
+   IADAQGBgRBKiqxAZPzSvIJd5v33Gjy0doDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFa
+   A3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA
+   1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA9gCU
+   EwGEXpF0igAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">287136</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+Run took 0.39 seconds
+
+#endSession

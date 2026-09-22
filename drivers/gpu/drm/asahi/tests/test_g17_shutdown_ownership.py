@@ -52,7 +52,7 @@ assert recovery.index('owner.release_runtime_objects()') < recovery.index('disab
 failed_stop = item(live, '    fn fail_outstanding_jobs_while_owned(')
 assert 'self.pending_render.iter().flatten()' in failed_stop
 assert 'for queue in &mut self.async_compute_queues' in failed_stop
-assert failed_stop.count('fail_while_owned(EIO)') == 2
+assert failed_stop.count('fail_while_owned(EIO)') == 3
 assert 'queue.quarantined = true;' in failed_stop
 assert 'active._lease.quarantine();' in failed_stop
 for premature_release in ('.take()', 'release_after_processor_stop', '= None'):
@@ -65,12 +65,13 @@ assert teardown.index('owner.stop_cpu_pair()') < teardown.index('owner.drop_queu
 # its failed-stop lifetime, rather than silently escaping the retention test.
 fields = re.findall(r'^    (\w+):', item(live, 'pub(crate) struct G17PLiveRuntime {'), re.M)
 host_only = set('completion_indices render_tracker test_stage accepting_submissions queue_setup_pending compute_owner compute_recycle_pending compute_abandoned crash_recoveries compute_gate_suspect completion_signal render_event_masks render_fence_state boot_stop_unproven session_recovery_pending runtime_pm_armed'.split())
-# These are ordinary host-owned byte copies, never published as DMA owners.
-snapshot = item(live, 'struct G17PFirmwareDataSnapshot {')
-assert re.findall(r'^    (\w+): KVVec<u8>,', snapshot, re.M) == ['gfx', 'gfx1']
+# G17PFirmwareDataSnapshot owns CPU-side KVVec copies of the firmware bytes,
+# not firmware-visible mappings. Dropping that diagnostic copy is safe even
+# when the processor stop fails; the live DMA owners below must remain held.
 host_only.add('firmware_data')
+host_only.add('queue_registry')
 options = 'pdev drm registers manager cpus gfx_state gfx_rtkit gfx1_state gfx1_rtkit queue compute_binding compute_timestamps pending_compute'.split()
-vectors = 'retired_queues quarantined_bindings pending_render quarantined_render_completions'.split()
+vectors = 'retired_queues quarantined_bindings pending_render pending_render_queued quarantined_render_completions'.split()
 assert set(fields) == host_only | set(options) | set(vectors) | {'async_compute_queues'}, set(fields)
 
 if '--negative-control' in sys.argv:
@@ -93,14 +94,16 @@ struct Packet {completion:Arc<Completion>,_mapping:Probe}
 impl Packet {fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
 struct Active {packet:Arc<Packet>,_lease:Probe}
 struct Queue {active:Option<Active>,_graph:Probe,_root:Probe}
+struct Registry;impl Registry {fn release_retained_owners_after_processor_stop(&self){}}
 struct Runtime {
+ queue_registry:Option<Registry>,
  accepting_submissions:bool,
  async_compute_queues:Vec<Queue>,
 '''
 source += ''.join(f'{name}:Option<Probe>,\n' for name in options)
 source += ''.join(f'{name}:Vec<Probe>,\n' for name in vectors)
 source += '}\nimpl Runtime {\n' + retain + '\n' + release + '\n}\n'
-source += '''fn runtime(drops:&Arc<AtomicUsize>)->Runtime {Runtime {accepting_submissions:true,async_compute_queues:vec![],
+source += '''fn runtime(drops:&Arc<AtomicUsize>)->Runtime {Runtime {queue_registry:None,accepting_submissions:true,async_compute_queues:vec![],
 '''
 source += ''.join(f'{name}:Some(Probe(drops.clone())),\n' for name in options)
 source += ''.join(f'{name}:vec![Probe(drops.clone())],\n' for name in vectors)

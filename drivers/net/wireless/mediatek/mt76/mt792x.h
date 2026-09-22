@@ -194,6 +194,7 @@ struct mt792x_phy {
 	wait_queue_head_t roc_wait;
 	u8 roc_token_id;
 	bool roc_grant;
+	bool has_single_sku;
 };
 
 struct mt792x_irq_map {
@@ -245,6 +246,10 @@ struct mt792x_dev {
 	bool hif_idle:1;
 	bool hif_resumed:1;
 	bool regd_change:1;
+	/* Select the measured post-download MT7932 WFDMA enable sequence. */
+	bool mt7932_runtime_dma_epoch:1;
+	bool mt7932_6g_scan_policy_enabled:1;
+	bool mt7932_scan_fwlog_enabled:1;
 	wait_queue_head_t wait;
 
 	struct work_struct init_work;
@@ -269,6 +274,8 @@ struct mt792x_dev {
 	dma_addr_t mt7932_ipc_dma;
 	void *mt7932_aux_buf;
 	dma_addr_t mt7932_aux_dma;
+	/* Run 191 publishes otherwise-idle WFDMA TX1..TX14 before FW_START. */
+	struct mt76_queue *mt7932_idle_tx[14];
 
 	struct ieee80211_chanctx_conf *new_ctx;
 };
