@@ -69,6 +69,13 @@ struct dptx_port {
 	u32 lane_count;
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
+	/*
+	 * Bitmask of AP-call indices already reported as unhandled, so each one
+	 * is named once per port instead of on every repetition. The firmware
+	 * repeats these during link training, and an unhandled call is a real
+	 * gap worth seeing exactly once.
+	 */
+	u32 unhandled_logged;
 };
 
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,

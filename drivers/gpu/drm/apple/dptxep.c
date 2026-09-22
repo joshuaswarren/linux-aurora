@@ -594,9 +594,22 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			memset(reply, 0, 4);
 		return 0;
 	default:
-		/* just try to ACK and hope for the best... */
-		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",
-			idx);
+		/*
+		 * Not implemented here. The reply echoes the request with a zero
+		 * retcode, which is what the native client does for the calls it
+		 * accepts without a payload -- but for a call that genuinely
+		 * wants an answer this is a guess, so say which one it was.
+		 *
+		 * Reported once per index per port: the firmware repeats these
+		 * throughout link training, and the useful artefact is the set of
+		 * calls we do not implement, not one line per repetition.
+		 */
+		if (idx < 32 && !(dptx->unhandled_logged & BIT(idx))) {
+			dptx->unhandled_logged |= BIT(idx);
+			dev_warn(service->ep->dcp->dev,
+				 "DPTXPort: AP call %u is not implemented; echoing the request with a zero retcode\n",
+				 idx);
+		}
 		fallthrough;
 	case DPTX_APCALL_GET_DOWN_SPREAD:
 	case DPTX_APCALL_SET_DOWN_SPREAD:
