@@ -28,6 +28,7 @@ prepare_map = block(MMU, "    pub(crate) fn prepare_bind_object(")
 commit_batch = block(MMU, "    pub(crate) fn commit_prepared_user_bind_batch(")
 enter_commit = block(MMU, "    fn enter_user_mapping_commit(")
 defer_blocked = block(MMU, "    fn defer_blocked_user_bind_batch(")
+step_map = block(MMU, "    fn step_map(")
 
 # The whole userspace array is copied, validated, and prepared before commit.
 assert vm_bind.index("ops.push(bind") < vm_bind.index("for op in ops")
@@ -79,6 +80,14 @@ assert "inner.sm_map(" in commit_batch
 assert "sm_unmap" in commit_batch
 assert "enter_user_mapping_commit" in commit_batch
 assert commit_batch.count("defer_blocked_user_bind_batch(batch)?") == 2
+
+# A queue may acquire an independent T8140 execution context before later
+# buffer/scratch VM_BINDs. Fresh mappings must evict that context's negative
+# translation just as replacement and unmap paths evict stale positive ones.
+assert "self.tlbi_live_contexts(op.addr(), op.range())" in step_map
+assert step_map.index("map_and_link_va(") < step_map.index(
+    "self.tlbi_live_contexts(op.addr(), op.range())"
+)
 assert "T8140VmMappingCommitGuard" in enter_commit
 assert "gate.blocked" in enter_commit
 assert defer_blocked.index("mapping_gate.state.lock()") < defer_blocked.index(

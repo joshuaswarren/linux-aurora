@@ -46,6 +46,10 @@ use core::{
 
 use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 
+#[cfg(not(test))]
+#[path = "m5_resources.rs"]
+pub(crate) mod m5;
+
 /// Linux counterpart of IOGPUFamily's `___globalObjectIDCounter`.
 ///
 /// The native render path uses this one counter for userspace GID-group
@@ -119,7 +123,12 @@ const PRIMARY_STATUS_B_RECOVERY_ZERO_1_OFFSET: u64 = 0x48c4;
 const PRIMARY_STATUS_B_RECOVERY_COMMAND_WORD_OFFSET: u64 = 0x48c8;
 const PRIMARY_STATUS_B_RECOVERY_RAW_48CC_OFFSET: u64 = 0x48cc;
 const PRIMARY_STATUS_B_RECOVERY_RAW_48D0_OFFSET: u64 = 0x48d0;
-const PRIMARY_STATUS_B_RECOVERY_FAULT_STATUS_OFFSET: u64 = 0x48d8;
+/// NOT an MMU fault status. B1 copies `(c0d8|c0b0|c0c8)` here, i.e. the
+/// hardware-SLOT fault mask that `FUN_5450` scans; the blamed slot in the
+/// fault report is its lowest set bit and `detected-source-count` is its
+/// population count. Three live samples agree: mask 0x1/slot 0, mask 0x2/
+/// slot 1, mask 0x3/slot 0 with source counts 1, 1 and 2.
+const PRIMARY_STATUS_B_RECOVERY_SLOT_MASK_OFFSET: u64 = 0x48d8;
 const PRIMARY_STATUS_B_RECOVERY_OBJECT_ACTIVE_OFFSET: u64 = 0x4910;
 const PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX: usize = 13;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
@@ -1835,31 +1844,50 @@ const DM1_WATCHDOG_VIEW_INDEX: usize = 1;
 const DM1_WATCHDOG_SLOT0_OFFSET: usize = 0xa40;
 const DM1_WATCHDOG_RECORD_SIZE: usize = 0x18;
 
+/// Records that fit between the array base and the end of bundle view 1.
+///
+/// `FUN_5450` blames `slot = <first set bit of the DM fault mask>`, which is
+/// **not** always 0. Reading only slot 0 reported an all-zero record for two
+/// different live faults whose blamed slots were 1 and 0 respectively, so the
+/// zeros said nothing about either fault. Size the scan from the view instead.
+pub(crate) const DM1_WATCHDOG_SLOT_COUNT: usize =
+    (g17_initdata::BUNDLE_VIEW_EXTENTS[DM1_WATCHDOG_VIEW_INDEX] - DM1_WATCHDOG_SLOT0_OFFSET)
+        / DM1_WATCHDOG_RECORD_SIZE;
+
 /// Validate the entire read against the expected host-owned view before
 /// following the serialized pointer. Reject overflow at either end.
-fn g17p_dm1_slot0_address(
+fn g17p_dm1_slot_address(
     view_pointer: u64,
     expected_view: u64,
     view_extent: usize,
+    slot: usize,
 ) -> Option<u64> {
-    let end = DM1_WATCHDOG_SLOT0_OFFSET.checked_add(DM1_WATCHDOG_RECORD_SIZE)?;
+    let base = DM1_WATCHDOG_SLOT0_OFFSET
+        .checked_add(slot.checked_mul(DM1_WATCHDOG_RECORD_SIZE)?)?;
+    let end = base.checked_add(DM1_WATCHDOG_RECORD_SIZE)?;
     if view_pointer != expected_view || end > view_extent {
         return None;
     }
     view_pointer.checked_add(end as u64)?;
-    view_pointer.checked_add(DM1_WATCHDOG_SLOT0_OFFSET as u64)
+    view_pointer.checked_add(base as u64)
 }
 
 /// Raw host-memory sample, not an atomic firmware snapshot. Only word 0
 /// (progress-monitor state) and the unaligned timestamp at +0x0c are named:
 /// B1 keeps its unchanged-sample counter elsewhere, not at record +0x08.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PFirmwareDm1Slot0Snapshot {
+pub(crate) struct G17PFirmwareDm1SlotSnapshot {
+    pub(crate) slot: usize,
     pub(crate) address: u64,
     pub(crate) raw: [u32; 6],
 }
 
-impl G17PFirmwareDm1Slot0Snapshot {
+impl G17PFirmwareDm1SlotSnapshot {
+    /// True when every word is zero, i.e. the firmware never wrote this slot.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.raw.iter().all(|word| *word == 0)
+    }
+
     pub(crate) fn state(&self) -> u32 {
         self.raw[0]
     }
@@ -1904,6 +1932,12 @@ pub(crate) struct G17PReportDrainStats {
     /// Count of type-4 `kAGFIFirmwareEventTypeGPURestart` records seen: the
     /// firmware halted and is asking the host to run the restart handshake.
     pub(crate) restart_requests: u32,
+    /// Non-zero history records read immediately before the producer cursor.
+    pub(crate) history_records: u32,
+    /// Type-7 grow requests found in that bounded history window.
+    pub(crate) history_grow_requests: u32,
+    /// Type-4 recovery requests found in that bounded history window.
+    pub(crate) history_restart_requests: u32,
     /// Set when a cursor was outside `G17P_EVENT_CAPACITY`.
     pub(crate) cursor_out_of_range: bool,
 }
@@ -1939,7 +1973,7 @@ pub(crate) struct G17PFirmwareRecoveryCauseSnapshot {
     pub(crate) command_word: u32,
     pub(crate) raw_48cc: u32,
     pub(crate) raw_48d0: u64,
-    pub(crate) fault_status: u64,
+    pub(crate) slot_mask: u64,
     pub(crate) host_recovery: u32,
 }
 
@@ -2648,6 +2682,27 @@ fn new_g17p_render_target_memory(
 
 #[cfg(not(test))]
 impl MappedObject {
+    fn new_wc_in_range_with_guards(
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        range: Range<u64>,
+        size: usize,
+        alignment: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<Self> {
+        let mut object = gem::new_kernel_object_wc(dev, size)?;
+        object.vmap()?.memset(0);
+        let mapping = vm.map_in_range_with_guards(
+            &object.gem, 0..object.size(), alignment, range, prot, guard_pages,
+        )?;
+        let iova = mapping.iova();
+        Ok(Self {
+            mapping: Some(mapping), object, iova, object_offset: 0,
+            logical_size: size, cpu_wc: true,
+        })
+    }
+
     fn new_wc_in_range(
         dev: &AsahiDevice,
         vm: &mmu::Vm,
@@ -2889,6 +2944,21 @@ impl MappedObject {
             return Err(EINVAL);
         }
         self.object.map_at(vm, address, prot, false)
+    }
+
+    /// Alias this object into another Vm at a fixed address while reserving
+    /// the same trailing guard pages as the original allocation.
+    fn map_alias_at_with_guards(
+        &mut self,
+        vm: &mmu::Vm,
+        address: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<mmu::KernelMapping> {
+        if self.object_offset != 0 {
+            return Err(EINVAL);
+        }
+        self.object.map_at_with_guards(vm, address, prot, guard_pages)
     }
 
     fn map_alias_in_range(
@@ -3644,6 +3714,18 @@ pub(crate) struct G17PUserRenderQueueState {
     pub(crate) tiling: g17_completion::QueueIndices,
     pub(crate) fragment: g17_completion::QueueIndices,
     pub(crate) job_list_empty: bool,
+    /// The raw job-list head, `[first, last]`.
+    ///
+    /// `job_list_empty` is `first == 0 && last == &head`, i.e. it needs BOTH
+    /// halves of a doubly-linked list head to read empty. A group the firmware
+    /// half-unlinked -- head cleared, tail left naming the stale node, or the
+    /// reverse -- reads non-empty while holding nothing, and the boolean alone
+    /// cannot tell that apart from a job the firmware genuinely still has
+    /// linked. Those two want opposite fixes, so keep the words.
+    pub(crate) job_list: [u64; 2],
+    /// The address `last` must hold for the list to be empty, so a reader does
+    /// not have to reconstruct `graph_va + JOB_LIST` to interpret the pair.
+    pub(crate) job_list_head_va: u64,
     pub(crate) tiling_timestamps: [u64; 2],
     pub(crate) fragment_timestamps: [u64; 2],
 }
@@ -3791,6 +3873,11 @@ impl G17PRenderItemPlan {
 /// a line per frame while the condition stays visible.
 static G17P_POOL_A_FALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
 
+/// Highest number of consecutive unusable Pool-A records seen ahead of the
+/// preferred index. Rises only when records stop being reusable, so a rising
+/// value IS the burn, reported without waiting for a wedge.
+static G17P_POOL_A_MAX_SKIP: AtomicU32 = AtomicU32::new(0);
+
 /// One host increment of an EventControl's own submitted-kick counter.
 /// Native incrementSubmittedKicks (89fc2a0) adds to the u32 reached through
 /// host descriptor +1a8; it is not assigned from a global render ordinal.
@@ -3803,7 +3890,17 @@ struct G17PEventControlKick {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PRenderEventControlState {
     pub(crate) record_index: u8,
+    /// The HOST's mirror of the submitted-kick target (`pool_a_submitted`).
     pub(crate) submitted: u32,
+    /// The submitted-kick counter as it actually reads in shared memory, at
+    /// `G17P_RENDER_POOL_A_SLOTS + record_index * 4`.
+    ///
+    /// `unlinked()` compares a host-side Rust field against a firmware-written
+    /// word, so the two can drift with nothing to say so. Carry the shared word
+    /// as well: `submitted != slot_word` means the comparison is being made
+    /// against a stale mirror, which is a different bug from the firmware being
+    /// behind.
+    pub(crate) slot_word: u32,
     pub(crate) completed: u32,
     pub(crate) membership: u32,
 }
@@ -4315,6 +4412,19 @@ impl G17PComputeDescriptorStorage {
     /// firmware-owned record, its completed counter, or the final stamp.
     /// A pre-publication retry writes the same absolute count, not another
     /// increment. Logical VM/queue changes keep the physical queue ordinal.
+    /// Read the submitted-count target word and the firmware's completed
+    /// counter without publishing anything.
+    ///
+    /// The same two words `publish_compute_submitted_count` returns, so a
+    /// failure path can sample them at the moment of the timeout rather than
+    /// only at the next publication.
+    pub(crate) fn read_compute_submitted_counters(&mut self) -> Result<[u32; 2]> {
+        let base = self.support.iova();
+        let target = self.support.read_u32(base + mmu::UAT_PGSZ as u64 + 4)?;
+        let completed = self.support.read_u32(base + 0x10c)?;
+        Ok([target, completed])
+    }
+
     pub(crate) fn publish_compute_submitted_count(&mut self, count: u32) -> Result<[u32; 2]> {
         let base = self.support.iova();
         let target = base + mmu::UAT_PGSZ as u64 + 4;
@@ -4385,6 +4495,7 @@ impl G17PComputeDescriptorStorage {
         channel_control: u64,
         queue_id: u8,
         install_queue: bool,
+        context_id: Option<u16>,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
         let graph_vmap = self.queue_graph.object.vmap()?;
@@ -4410,6 +4521,7 @@ impl G17PComputeDescriptorStorage {
             graph,
             queue_context,
             install_queue,
+            context_id,
         )
         .map_err(|_| EINVAL)?;
 
@@ -4649,6 +4761,7 @@ impl G17PComputeDescriptorStorage {
         channel_control: u64,
         queue_id: u8,
         rewind: bool,
+        context_id: Option<u16>,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
         let optional = queue
@@ -4668,6 +4781,7 @@ impl G17PComputeDescriptorStorage {
                 // flag is clear -- which is also what every captured macOS
                 // steady-state submission sends.
                 false,
+                context_id,
             )
             .map_err(|_| EINVAL)
         })?;
@@ -5262,6 +5376,13 @@ const G17P_PM_MAX_BLOCKS: usize = 0xd1a;
 const G17P_PM_MAX_OWNED_BLOCKS: usize = G17P_PM_MAX_BLOCKS - 1;
 const G17P_PM_MAX_BLOCKS_NOMEMLESS: usize = 0x45e;
 
+/// Native growImmediately requests ten blocks, including a partial final
+/// increment at the allocation limit. Saturation also makes overflow inert.
+fn g17p_tvb_grow_target(current: usize, maximum: usize) -> usize {
+    current.saturating_add(10).min(maximum)
+}
+
+
 const G17P_PM_HWPB_STATE_SIZE: usize = 0xc0;
 const G17P_PM_PAGE_LIST_SIZE: usize =
     G17P_PM_MAX_BLOCKS * G17P_PM_PAGES_PER_BLOCK * core::mem::size_of::<u32>();
@@ -5671,14 +5792,16 @@ struct G17PParameterManagement {
     manager_generation: u64,
 }
 
-/// Firmware may retain a parameter-buffer manager pointer after the owning
-/// userspace queue has drained and its TA/3D pair has completed. Keep the
-/// opaque high mapping alive without retaining the client VM, bind context or
-/// fixed low aliases. The stopped-processor boundary is currently the first
-/// proven point at which these background firmware references are gone.
+/// Firmware may retain parameter-buffer manager and workqueue-support pointers
+/// after the owning userspace queue has drained and its TA/3D pair has
+/// completed. Keep those opaque high mappings alive without retaining the
+/// client VM, bind context or fixed low aliases. The stopped-processor boundary
+/// is currently the first proven point at which these background firmware
+/// references are gone.
 #[cfg(not(test))]
 pub(crate) struct G17PRetiredParameterManagement {
     _backing: MappedObject,
+    _support: Option<MappedObject>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -7780,14 +7903,56 @@ impl G17PUserRenderStorage {
     /// Read the exact EventControl record owned by the current TA command.
     /// The matching firmware type-1 edge orders these host-DRAM fields; no
     /// MMIO or periodic polling is needed to decide whether it is reusable.
+    /// How many of the 35 Pool-A EventControl records are currently reusable.
+    ///
+    /// The burn question in one number. A record is reusable only while
+    /// `completed == submitted && membership == 0`; a render whose pair
+    /// half-completes leaves it short by one forever, and `prepare_reuse` then
+    /// refuses it for the rest of the boot.
+    ///
+    /// That refusal is invisible in the log as things stand. Selection SKIPS an
+    /// unusable record silently -- `(0..35).map(...).find(...)` -- the fallback
+    /// line is gated on `G17P_POOL_A_FALLBACK_LOGGED == 0` so it fires once per
+    /// boot and never again, the `became unusable` EBUSY needs a record to pass
+    /// selection and then fail at restage (a race, and rightly rare), and the
+    /// 35-way audit only runs when EVERY record is gone. So a boot can burn
+    /// records steadily and print nothing. Counting them on the witness path --
+    /// which only runs on a wedge, plus once on a healthy completion -- makes
+    /// the trend observable without adding a line per frame.
+    pub(crate) fn pool_a_reusable_count(&mut self) -> Result<u32> {
+        let support_va = self.support.iova();
+        let view = self.support.object.vmap()?;
+        let support_ro = unsafe {
+            // SAFETY: the VMap covers the complete support object; the reuse
+            // predicate bounds-checks every record it reads.
+            core::slice::from_raw_parts(view.as_ptr(), G17P_RENDER_SUPPORT_SIZE)
+        };
+        Ok((0..35usize)
+            .filter(|&index| {
+                G17PEventControlKick::prepare_reuse(support_ro, support_va, index).is_some()
+            })
+            .count() as u32)
+    }
+
     pub(crate) fn render_event_control_state(&mut self) -> Result<G17PRenderEventControlState> {
         let index = usize::from(self.pool_a_record_index);
         let record = G17P_RENDER_POOL_A
             .checked_add(index.checked_mul(0x100).ok_or(EOVERFLOW)?)
             .ok_or(EOVERFLOW)?;
+        let slot_offset = G17P_RENDER_POOL_A_SLOTS
+            .checked_add(index.checked_mul(4).ok_or(EOVERFLOW)?)
+            .ok_or(EOVERFLOW)?;
         let mut completed = 0;
         let mut membership = 0;
+        let mut slot_word = 0;
         self.support.with_bytes_mut(|support| {
+            slot_word = u32::from_le_bytes(
+                support
+                    .get(slot_offset..slot_offset + 4)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            );
             completed = u32::from_le_bytes(
                 support
                     .get(record + 0x0c..record + 0x10)
@@ -7807,6 +7972,7 @@ impl G17PUserRenderStorage {
         Ok(G17PRenderEventControlState {
             record_index: self.pool_a_record_index,
             submitted: self.pool_a_submitted,
+            slot_word,
             completed,
             membership,
         })
@@ -7860,7 +8026,36 @@ impl G17PUserRenderStorage {
                 ..
             } = manager;
             drop(_page_list_low);
-            G17PRetiredParameterManagement { _backing: backing }
+            G17PRetiredParameterManagement {
+                _backing: backing,
+                _support: None,
+            }
+        })
+    }
+
+    /// Split the firmware-retained portion out of a graph whose client roots
+    /// have a positive context-update retirement witness. GFX PC 0x24144
+    /// faulted inside `support` after that witness, while the earlier PC 0x95f0
+    /// fault named the PM backing. Both therefore outlive the VM-facing graph.
+    pub(crate) fn into_retired_parameter_management(
+        self,
+    ) -> Option<G17PRetiredParameterManagement> {
+        let G17PUserRenderStorage {
+            support,
+            parameter_management,
+            ..
+        } = self;
+        parameter_management.map(|manager| {
+            let G17PParameterManagement {
+                _page_list_low,
+                backing,
+                ..
+            } = manager;
+            drop(_page_list_low);
+            G17PRetiredParameterManagement {
+                _backing: backing,
+                _support: Some(support),
+            }
         })
     }
 
@@ -8351,12 +8546,36 @@ impl G17PUserRenderStorage {
             };
             let preferred = (submission_ordinal as usize * 2) % 35;
             let selected = (0..35)
-                .map(|step| (preferred + step) % 35)
-                .find(|&index| {
+                .map(|step| (step, (preferred + step) % 35))
+                .find(|&(_, index)| {
                     G17PEventControlKick::prepare_reuse(support_ro, support_va, index).is_some()
                 });
             match selected {
-                Some(index) => {
+                Some((skipped, index)) => {
+                    // High-water mark of records skipped before a reusable one
+                    // was found, logged only when it GROWS.
+                    //
+                    // The once-per-boot fallback line below cannot show a trend,
+                    // and the 35-way audit only runs at total exhaustion, so a
+                    // boot that burns records steadily prints nothing until it
+                    // has burned all of them. `skipped` is free -- it is the
+                    // step the search stopped at -- and a monotonically rising
+                    // high-water mark is the burn happening, visible without
+                    // waiting for a wedge. Stable means no burn. Bounded at 35
+                    // lines per boot, and silent on a healthy machine.
+                    if skipped as u32
+                        > G17P_POOL_A_MAX_SKIP.fetch_max(skipped as u32, Ordering::Relaxed)
+                    {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17P render restage: pool-A skip high-water {} (preferred={} used={} ordinal={}) -- {} record(s) ahead of the preferred index are not reusable\n",
+                            skipped,
+                            preferred,
+                            index,
+                            submission_ordinal,
+                            skipped,
+                        );
+                    }
                     if index != preferred
                         && G17P_POOL_A_FALLBACK_LOGGED
                             .fetch_add(1, Ordering::Relaxed)
@@ -10194,6 +10413,8 @@ impl G17PUserRenderStorage {
                 write: 0,
             },
             job_list_empty: false,
+            job_list: [0; 2],
+            job_list_head_va: 0,
             tiling_timestamps: [0; 2],
             fragment_timestamps: [0; 2],
         };
@@ -10224,7 +10445,9 @@ impl G17PUserRenderStorage {
                     .try_into()
                     .map_err(|_| EINVAL)?,
             );
-            state.job_list_empty = first == 0 && last == graph_va + Self::JOB_LIST as u64;
+            state.job_list = [first, last];
+            state.job_list_head_va = graph_va + Self::JOB_LIST as u64;
+            state.job_list_empty = first == 0 && last == state.job_list_head_va;
             Ok(())
         })?;
         self.timestamps.with_bytes_mut(|raw| {
@@ -12653,9 +12876,13 @@ impl G17ResourceOwner {
     /// Sample DM1 hardware slot 0's progress record through the retained WC
     /// shared object. This does not read SGX registers or firmware-private
     /// cached memory, and it cannot follow a pointer outside bundle view 1.
-    pub(crate) fn firmware_dm1_slot0_snapshot(
+    pub(crate) fn firmware_dm1_slot_snapshot(
         &mut self,
-    ) -> Result<G17PFirmwareDm1Slot0Snapshot> {
+        slot: usize,
+    ) -> Result<G17PFirmwareDm1SlotSnapshot> {
+        if slot >= DM1_WATCHDOG_SLOT_COUNT {
+            return Err(EINVAL);
+        }
         let pointer_address = self
             .handoff
             .primary
@@ -12671,10 +12898,11 @@ impl G17ResourceOwner {
             .ok_or(EINVAL)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let view_pointer = self.resources.shared_cluster.read_u64(pointer_address)?;
-        let address = g17p_dm1_slot0_address(
+        let address = g17p_dm1_slot_address(
             view_pointer,
             expected_view,
             g17_initdata::BUNDLE_VIEW_EXTENTS[DM1_WATCHDOG_VIEW_INDEX],
+            slot,
         )
         .ok_or(EINVAL)?;
         let mut raw = [0u32; 6];
@@ -12684,7 +12912,7 @@ impl G17ResourceOwner {
                 .shared_cluster
                 .read_u32(address.checked_add(index as u64 * 4).ok_or(EINVAL)?)?;
         }
-        Ok(G17PFirmwareDm1Slot0Snapshot { address, raw })
+        Ok(G17PFirmwareDm1SlotSnapshot { slot, address, raw })
     }
 
     pub(crate) fn firmware_recovery_handshake_snapshot(
@@ -12849,6 +13077,9 @@ impl G17ResourceOwner {
                     Err(error) => Err(error),
                 }
             }
+            g17_completion::G17P_FIRMWARE_EVENT_TVB_GROW_TYPE => {
+                g17_completion::G17PFirmwareTvbGrowEvent::decode(&raw).map(|_| ())
+            }
             g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE => {
                 g17_completion::decode_g17p_firmware_recovery_event(&raw).map(|_| ())
             }
@@ -12922,9 +13153,9 @@ impl G17ResourceOwner {
                 .checked_add(PRIMARY_STATUS_B_RECOVERY_RAW_48D0_OFFSET)
                 .ok_or(EINVAL)?,
         )?;
-        let fault_status = self.resources.primary_state.read_u64(
+        let slot_mask = self.resources.primary_state.read_u64(
             status_b
-                .checked_add(PRIMARY_STATUS_B_RECOVERY_FAULT_STATUS_OFFSET)
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_SLOT_MASK_OFFSET)
                 .ok_or(EINVAL)?,
         )?;
         Ok(G17PFirmwareRecoveryCauseSnapshot {
@@ -12934,7 +13165,7 @@ impl G17ResourceOwner {
             command_word,
             raw_48cc,
             raw_48d0,
-            fault_status,
+            slot_mask,
             host_recovery,
         })
     }
@@ -13732,11 +13963,11 @@ impl G17ResourceOwner {
         // producer regardless of the cursor, so a stalled render can be read
         // after the fact.
         {
-            let capacity = g17_completion::G17P_EVENT_CAPACITY;
             let size = g17_completion::G17P_EVENT_ENTRY_SIZE;
-            let history = if capacity < 8 { capacity } else { 8 };
-            for back in (1..=history).rev() {
-                let slot = (producer + capacity - back) & (capacity - 1);
+            let history = g17_completion::g17p_report_history_count(print_budget);
+            for index in 0..history {
+                let slot = g17_completion::g17p_report_history_slot(producer, history, index)
+                    .ok_or(EINVAL)?;
                 let record_address = ring
                     .checked_add((slot as usize * size) as u64)
                     .ok_or(EINVAL)?;
@@ -13758,12 +13989,22 @@ impl G17ResourceOwner {
                 if raw.iter().all(|byte| *byte == 0) {
                     continue;
                 }
+                let event_type = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                stats.history_records = stats.history_records.saturating_add(1);
+                if event_type == G17P_EVENT_GROW_REQUEST_TYPE {
+                    stats.history_grow_requests = stats.history_grow_requests.saturating_add(1);
+                }
+                if event_type == g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE {
+                    stats.history_restart_requests =
+                        stats.history_restart_requests.saturating_add(1);
+                }
                 dev_info!(
                     self.dev().as_ref(),
-                    "G17P report[{}] history slot {} type={:#04x}: {:02x?}\n",
+                    "G17P report[{}] history slot {} type={} ({}): {:02x?}\n",
                     role_name,
                     slot,
-                    raw[0],
+                    event_type,
+                    g17_completion::g17p_firmware_event_name(event_type),
                     &raw[..],
                 );
             }
@@ -14105,53 +14346,36 @@ impl G17ResourceOwner {
             entries[0], entries[1], entries[2], entries[3],
             entries[4], entries[5], entries[6], entries[7]
         );
-        // The block carries two 64-bit firmware VAs at +0x48e0 and +0x48e8,
-        // exactly 0x40 apart. Follow them: this is the most concrete lead on
-        // what the firmware is actually asking for.
-        for slot in [0x48e0u64, 0x48e8] {
-            let target = self.resources.primary_state.read_u64(
-                status_b.checked_add(slot).ok_or(EINVAL)?,
-            )?;
-            if target == 0 {
-                continue;
-            }
-            let mut words = [0u32; 16];
-            let mut ok = true;
-            for (i, word) in words.iter_mut().enumerate() {
-                match target
-                    .checked_add((i as u64).checked_mul(4).ok_or(EINVAL)?)
-                    .ok_or(EINVAL)
-                    .and_then(|a| self.resources.primary_state.read_u32(a))
-                {
-                    Ok(value) => *word = value,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if !ok {
-                dev_info!(
-                    self.dev().as_ref(),
-                    "G17P recovery ptr +{:#06x} = {:#x}: unreadable\n",
-                    slot,
-                    target
-                );
-                continue;
-            }
+        // +0x48e0 and +0x48e8 are NOT firmware fault output and are not a
+        // lead. They are `PRIMARY_STATUS_B_FWCTL_STATE` / `..._FWCTL_RING`,
+        // which *this driver* writes at init via `encode_primary_status_b(
+        // fwctl.iova(), fwctl.iova() + CONTROL_RECORD_SIZE)`. They are the
+        // same two constants on every boot and every fault, and they read
+        // back "unreadable" only because the loop below probes them through
+        // `primary_state`, whose subview ends long before the fwctl object.
+        // Check them against what we published instead: a mismatch would mean
+        // the firmware moved our own pointers, which is worth knowing; equality
+        // is the expected, uninteresting answer.
+        let published_state = self.resources.fwctl.iova();
+        let published_ring = published_state
+            .checked_add(g17_initdata::CONTROL_RECORD_SIZE as u64)
+            .ok_or(EINVAL)?;
+        for (slot, published) in [
+            (g17_initdata::PRIMARY_STATUS_B_FWCTL_STATE as u64, published_state),
+            (g17_initdata::PRIMARY_STATUS_B_FWCTL_RING as u64, published_ring),
+        ] {
+            let found = self
+                .resources
+                .primary_state
+                .read_u64(status_b.checked_add(slot).ok_or(EINVAL)?)?;
+            let matches = found == published;
             dev_info!(
                 self.dev().as_ref(),
-                "G17P recovery ptr +{:#06x} = {:#x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
-                slot, target,
-                words[0], words[1], words[2], words[3],
-                words[4], words[5], words[6], words[7]
-            );
-            dev_info!(
-                self.dev().as_ref(),
-                "G17P recovery ptr +{:#06x} cont: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                "G17P recovery fwctl pointer +{:#06x} found={:#x} published={:#x} match={}\n",
                 slot,
-                words[8], words[9], words[10], words[11],
-                words[12], words[13], words[14], words[15]
+                found,
+                published,
+                matches,
             );
         }
         Ok(())
@@ -15554,6 +15778,37 @@ impl G17ResourceOwner {
             "G17P render channel owner: process pid={}\n",
             owner_pid
         );
+        // Nothing above this line has touched the VM. Prove the TTBAT lookup
+        // this constructor will need while that is still true.
+        //
+        // `flush_t8140_vm_contexts` used to be the first place the condition
+        // was tested, deep inside `finish` -- by which point the render pool
+        // had been cleared unconditionally and the job-context aliases had been
+        // appended to the VM. Its failure path cannot undo either: its idea of
+        // undoing the pool is to clear it a second time, and it removes no
+        // aliases. So a VM with no TTBAT context holding its root was left
+        // worse off by every attempt, and a client retrying went round that
+        // loop once per try.
+        //
+        // The lookup reads only, so running it here costs one scan of 64 words
+        // and turns the whole stage into a clean refusal.
+        if let Err(error) = self.address_space.uat.require_t8140_vm_context(vm) {
+            // Sticky, and deliberately recorded on the VM rather than returned
+            // alone: with no context holding this VM's root, every later
+            // submission against it is undispatchable -- the firmware accepts
+            // the kick, the GPU never runs it, no completion record is ever
+            // written, and the client waits out a full timeout before the
+            // session is quarantined. Failing those submissions honestly turns
+            // a desktop-wide wedge into one application failing to start.
+            vm.status().record(error.to_errno());
+            dev_err!(
+                dev.as_ref(),
+                "G17P render: VM {} has no TTBAT context holding its root ({:?}); refusing render storage before any mapping is touched, and failing this VM's later submissions\n",
+                vm.id(),
+                error,
+            );
+            return Err(error);
+        }
         vm.clear_render_pool_mappings(queue_pair.slot());
         let mut render_operand_aliases = self.stage_user_render_flist(vm)?;
         let job_context_aliases = self
@@ -15564,7 +15819,6 @@ impl G17ResourceOwner {
             render_operand_aliases.push(mapping, GFP_KERNEL)?;
         }
         vm.append_driver_mappings(render_operand_aliases)?;
-        self.stage_render_uma_page_pool_descriptor()?;
         let (command_context, render_root_slot) = if let Some(context) = execution_context {
             if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
                 return Err(EINVAL);
@@ -15639,6 +15893,14 @@ impl G17ResourceOwner {
             // neither a PBDesc pointing at freed PM memory nor an occupied
             // render-pool generation. The append above allocates before it
             // consumes its mappings, so an append failure left no VM aliases.
+            //
+            // ENOENT here can now only mean the VM's root left the TTBAT table
+            // between the precondition above and this point, which is the same
+            // permanent condition and not something a retry can improve. Record
+            // it so this VM's later submissions fail instead of hanging.
+            if error == ENOENT {
+                vm.status().record(error.to_errno());
+            }
             let restore = self.restore_render_parameter_buffer_descriptor(staged_descriptor);
             vm.clear_render_pool_mappings(queue_pair.slot());
             restore?;
@@ -15657,6 +15919,25 @@ impl G17ResourceOwner {
     /// PM inventory; a failed allocation leaves the previous capacity intact.
     pub(crate) fn grow_render_tvb(
         &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm, blocks: usize,
+    ) -> Result {
+        self.grow_render_tvb_inner(storage, vm, blocks, false)
+    }
+
+    /// Firmware event 6 suspends allocation until the new block inventory is
+    /// committed. PBDesc, PBState and the live page list remain firmware-owned.
+    pub(crate) fn grow_render_tvb_synchronously(
+        &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm,
+    ) -> Result<bool> {
+        let before = storage.tvb_capacity();
+        let target = g17p_tvb_grow_target(before, G17P_PM_MAX_OWNED_BLOCKS);
+        if target <= before { return Ok(false); }
+        self.grow_render_tvb_inner(storage, vm, target, true)?;
+        Ok(storage.tvb_capacity() > before)
+    }
+
+    fn grow_render_tvb_inner(
+        &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm, blocks: usize,
+        synchronous: bool,
     ) -> Result {
         let pool_id=storage.render_pool_id();
         let render_slot=storage.queue_pair.slot();
@@ -15690,79 +15971,81 @@ impl G17ResourceOwner {
             first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
             added_page_bases.push((slot,first),GFP_KERNEL)?;
         }
-        let mut rebuilt_page_list=KVec::with_capacity(available_pages,GFP_KERNEL)?;
-        pm.backing.with_bytes_mut(|pm_raw| {
-            if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
-                return Err(EAGAIN);
-            }
-            for ordinal in 0..ring.available_blocks() {
-                let slot=ring.available_slot(ordinal).ok_or(EIO)?;
-                let first=if ordinal<ring.retained_blocks {
-                    let at=pm_layout.block_page_bases+slot*8;
-                    u32::from_le_bytes(pm_raw.get(at..at+4).ok_or(ERANGE)?
-                        .try_into().map_err(|_| ERANGE)?)
-                } else {
-                    let added=ordinal-ring.retained_blocks;
-                    added_page_bases[added].1
-                };
-                first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
-                for page in 0..G17P_PM_PAGES_PER_BLOCK {
-                    rebuilt_page_list.push(first+page as u32,GFP_KERNEL)?;
+        let mut rebuilt_page_list=KVec::with_capacity(
+            if synchronous { 0 } else { available_pages },GFP_KERNEL)?;
+        if !synchronous {
+            pm.backing.with_bytes_mut(|pm_raw| {
+                if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
+                    return Err(EAGAIN);
                 }
-            }
-            Ok(())
-        })?;
+                for ordinal in 0..ring.available_blocks() {
+                    let slot=ring.available_slot(ordinal).ok_or(EIO)?;
+                    let first=if ordinal<ring.retained_blocks {
+                        let at=pm_layout.block_page_bases+slot*8;
+                        u32::from_le_bytes(pm_raw.get(at..at+4).ok_or(ERANGE)?
+                            .try_into().map_err(|_| ERANGE)?)
+                    } else {
+                        let added=ordinal-ring.retained_blocks;
+                        added_page_bases[added].1
+                    };
+                    first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
+                    for page in 0..G17P_PM_PAGES_PER_BLOCK {
+                        rebuilt_page_list.push(first+page as u32,GFP_KERNEL)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
         let descriptor_offset=g17_submission::g17p_pbdesc_offset(pm.hardware_buffer_id);
         let page_list_address=pm.page_list_low_va();
         let descriptor=&mut self.resources.pb_descriptor_table;
         pm.backing.with_bytes_mut(|pm_raw| {
-            descriptor.with_bytes_mut(|desc_raw| {
-                    let descriptor_end=descriptor_offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EOVERFLOW)?;
+            let commit = |desc_raw: Option<&mut [u8]>| {
                     if pm_raw.len()<pm_layout.total_size
-                        || descriptor_end>desc_raw.len() || tvb.extensions.len()==tvb.extensions.capacity()
+                        || tvb.extensions.len()==tvb.extensions.capacity()
                     { return Err(ERANGE); }
                     if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
                         return Err(EAGAIN);
                     }
-                    let mut previous=[0u32;4];
-                    for (word,value) in previous.iter_mut().enumerate() {
-                        let at=descriptor_offset+word*4;
-                        *value=u32::from_le_bytes(desc_raw[at..at+4].try_into().map_err(|_| EINVAL)?);
-                    }
-                    // buildPageList resets the host PBDesc ring state before
-                    // loadPBDesc. This growth-only reset is intentionally
-                    // distinct from an ordinary retained-owner switch.
-                    let encoded=g17_submission::encode_g17p_pbdesc(previous,page_list_address,page_count,
-                        g17_submission::G17PPbDescRingState::default());
-                    // This is the last fallible step. Alias allocation/count
-                    // and the complete circular page list are ready before
-                    // any firmware-visible write.
+                    // Only a retired scene may rebuild PBDesc. A synchronous
+                    // request leaves its current firmware-owned words alone.
+                    let descriptor_update = if let Some(desc_raw) = desc_raw {
+                        let descriptor_end=descriptor_offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EOVERFLOW)?;
+                        if descriptor_end>desc_raw.len() { return Err(ERANGE); }
+                        let mut previous=[0u32;4];
+                        for (word,value) in previous.iter_mut().enumerate() {
+                            let at=descriptor_offset+word*4;
+                            *value=u32::from_le_bytes(desc_raw[at..at+4].try_into().map_err(|_| EINVAL)?);
+                        }
+                        let encoded=g17_submission::encode_g17p_pbdesc(previous,page_list_address,page_count,
+                            g17_submission::G17PPbDescRingState::default());
+                        Some((desc_raw, encoded))
+                    } else {
+                        None
+                    };
+                    // This is the last fallible step. New aliases and the
+                    // chosen publication are ready before any visible write.
                     vm.append_render_pool_mappings(render_slot,pool_id,previous_blocks,blocks,growth.mappings)?;
                     for (slot,first) in added_page_bases.into_iter() {
                         put_u32(pm_raw,pm_layout.block_page_bases+slot*8,first);
                         put_u32(pm_raw,pm_layout.block_page_bases+slot*8+4,0);
                     }
-                    for (entry,value) in rebuilt_page_list.into_iter().enumerate() {
-                        put_u32(pm_raw,pm_layout.page_list+entry*4,value);
-                    }
-                    // buildPageList (25G83 0xfffffe0008a71908) walks the block
-                    // ring from shared +0x08 to the staged target, wrapping at
-                    // 0xd1a, then publishes those exact cursors at PBState
-                    // +0x40/+0x3c. It does not clear the unused page-list tail.
-                    let state=pm_layout.hwpb_state;
-                    put_u32(pm_raw,state+0x34,page_count);
-                    put_u32(pm_raw,state+0x3c,ring.target_cursor as u32);
-                    put_u32(pm_raw,state+0x40,ring.read_cursor as u32);
-                    put_u32(pm_raw,state+0x54,page_count-1);
-                    // Native createParameterBufferBlock advances total;
-                    // commitStagedUpdates publishes the same committed end.
-                    // Firmware alone owns +0x08, which remains unchanged.
-                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_TOTAL_CURSOR,
-                        ring.target_cursor as u32);
-                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_COMMITTED_CURSOR,
-                        ring.target_cursor as u32);
-                    for (word,value) in encoded.into_iter().enumerate() {
-                        put_u32(desc_raw,descriptor_offset+word*4,value);
+                    if let Some((desc_raw, encoded)) = descriptor_update {
+                        for (entry,value) in rebuilt_page_list.into_iter().enumerate() {
+                            put_u32(pm_raw,pm_layout.page_list+entry*4,value);
+                        }
+                        // buildPageList (25G83 0xfffffe0008a71908) walks the block
+                        // ring from shared +0x08 to the staged target, wrapping at
+                        // 0xd1a, then publishes those exact cursors at PBState
+                        // +0x40/+0x3c. It does not clear the unused page-list tail.
+                        let state=pm_layout.hwpb_state;
+                        put_u32(pm_raw,state+0x34,page_count);
+                        put_u32(pm_raw,state+0x3c,ring.target_cursor as u32);
+                        put_u32(pm_raw,state+0x40,ring.read_cursor as u32);
+                        put_u32(pm_raw,state+0x54,page_count-1);
+                        for (word,value) in encoded.into_iter().enumerate() {
+                            put_u32(desc_raw,descriptor_offset+word*4,value);
+                        }
                     }
                     let length=tvb.extensions.len();
                     tvb.extensions.spare_capacity_mut()[0].write(growth.extension);
@@ -15771,8 +16054,22 @@ impl G17ResourceOwner {
                     unsafe { tvb.extensions.set_len(length+1); }
                     tvb.block_count=blocks;
                     tvb.logical_size=logical_size;
+                    // Publish the completed block entries after their backing
+                    // and aliases have been retained. Firmware alone owns +8.
+                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_TOTAL_CURSOR,
+                        ring.target_cursor as u32);
+                    core::sync::atomic::fence(Ordering::SeqCst);
+                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_COMMITTED_CURSOR,
+                        ring.target_cursor as u32);
                     Ok(())
-            })
+            };
+            if synchronous {
+                // growImmediately does not load or map PBDesc. A missing
+                // descriptor CPU view must not prevent a live TVB allocation.
+                commit(None)
+            } else {
+                descriptor.with_bytes_mut(|desc_raw| commit(Some(desc_raw)))
+            }
         })?;
         pm.page_count=page_count;
         core::sync::atomic::fence(Ordering::SeqCst);
@@ -15910,6 +16207,13 @@ impl G17ResourceOwner {
                 bytes[..8].copy_from_slice(&g17_initdata::CONTROL_SHARED_INNER_PRESENTED.to_le_bytes());
                 Ok(())
             })?;
+        // The UMA descriptor is live pool state, not per-client command
+        // state. Native pairs halLoadUMADesc with halStoreUMADesc so firmware
+        // updates to its counters survive later clients. Publish it only at
+        // the same cold-pool boundary as the FList objects above; replaying it
+        // from new_user_render_storage overwrote those live counters whenever
+        // another client first rendered.
+        self.stage_render_uma_page_pool_descriptor()?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.flist_backing_owner = G17PFListBackingOwner::Render;
         Ok(())
@@ -17118,23 +17422,28 @@ mod tests {
     #[test]
     fn dm1_watchdog_slot0_validates_pointer_identity_and_complete_extent() {
         let view = 0xffff_fc20_c078_b380;
-        assert_eq!(g17p_dm1_slot0_address(view, view, 0xc80), Some(view + 0xa40));
-        assert_eq!(g17p_dm1_slot0_address(view, view, 0xa58), Some(view + 0xa40));
-        assert_eq!(g17p_dm1_slot0_address(view, view, 0xa57), None);
-        assert_eq!(g17p_dm1_slot0_address(view + 4, view, 0xc80), None);
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, 0), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, 1), Some(view + 0xa58));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, DM1_WATCHDOG_SLOT_COUNT - 1), Some(view + 0xc68));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, DM1_WATCHDOG_SLOT_COUNT), None);
+        assert_eq!(DM1_WATCHDOG_SLOT_COUNT, 24);
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xa58, 0), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xa57, 0), None);
+        assert_eq!(g17p_dm1_slot_address(view + 4, view, 0xc80, 0), None);
     }
 
     #[test]
     fn dm1_watchdog_slot0_rejects_start_and_end_overflow() {
         let start_overflow = u64::MAX - 0xa3f;
-        assert_eq!(g17p_dm1_slot0_address(start_overflow, start_overflow, 0xc80), None);
+        assert_eq!(g17p_dm1_slot_address(start_overflow, start_overflow, 0xc80, 0), None);
         let end_overflow = u64::MAX - 0xa40;
-        assert_eq!(g17p_dm1_slot0_address(end_overflow, end_overflow, 0xc80), None);
+        assert_eq!(g17p_dm1_slot_address(end_overflow, end_overflow, 0xc80, 0), None);
     }
 
     #[test]
     fn dm1_watchdog_slot0_timestamp_uses_unaligned_words_three_and_four() {
-        let snapshot = G17PFirmwareDm1Slot0Snapshot {
+        let snapshot = G17PFirmwareDm1SlotSnapshot {
+            slot: 0,
             address: 0,
             raw: [2, 0x1111_1111, 0x2222_2222, 0x89ab_cdef, 0x0123_4567, 0x5555_5555],
         };
@@ -17903,6 +18212,7 @@ mod tests {
             &mut graph,
             &mut context,
             true,
+            None,
         )
         .unwrap();
         let actual = &graph
@@ -17950,6 +18260,7 @@ mod tests {
             &mut relocated_graph,
             &mut relocated_context,
             true,
+            None,
         )
         .unwrap();
         let relocated_actual = &relocated_graph

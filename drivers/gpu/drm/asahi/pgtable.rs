@@ -1079,6 +1079,36 @@ impl UatPageTable {
         Ok(data)
     }
 
+    /// Write a bounded range back into a firmware carveout identified by
+    /// physical address, cleaning the AP cache behind every page.
+    ///
+    /// This is the one path in the driver that writes firmware-owned memory.
+    /// It exists so a restarted ASC can be given back the `__DATA` segment
+    /// iBoot placed for it, which the previous firmware instance has been
+    /// running out of: an ASC coming out of a real block reset re-enters at
+    /// `IORVBAR` with whatever its predecessor left in its own globals.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn restore_firmware_physical_range(
+        physical: PhysicalAddr,
+        data: &[u8],
+    ) -> Result {
+        if data.is_empty() || (physical | data.len() as u64) & 7 != 0 {
+            return Err(EINVAL);
+        }
+        physical.checked_add(data.len() as u64).ok_or(EOVERFLOW)?;
+        let page_mask = UAT_PGMSK as u64;
+        let mut written = 0usize;
+        while written < data.len() {
+            let address = physical.checked_add(written as u64).ok_or(EOVERFLOW)?;
+            let page = PhysPageMapping::new(address & !page_mask)?;
+            let offset = (address & page_mask) as usize;
+            let length = (UAT_PGSZ - offset).min(data.len() - written);
+            page.write_atomic(offset, &data[written..written + length])?;
+            written = written.checked_add(length).ok_or(EOVERFLOW)?;
+        }
+        Ok(())
+    }
+
     /// Copy a live firmware-data range after invalidating the AP cache alias.
     ///
     /// Unlike crashlog storage, scheduler state can change between two host
@@ -1305,6 +1335,73 @@ impl PhysPageMapping {
         cell.store(before | bits, Ordering::Release);
         let after = cell.load(Ordering::Acquire);
         Ok((before, after))
+    }
+
+    /// Clean AP cachelines covering a range this mapping has just written.
+    ///
+    /// The mapping is write-back, so a store can sit in an AP cacheline the
+    /// coprocessor's fetch path will not see. `invalidate_live_range()` above
+    /// is the read-side mirror of this; keep the two symmetric.
+    fn clean_written_range(&self, offset: usize, size: usize) -> Result {
+        let end = offset.checked_add(size).ok_or(EOVERFLOW)?;
+        if size == 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        let ctr_el0: u64;
+        unsafe {
+            // SAFETY: CTR_EL0 is readable at EL1 and reports DminLine as
+            // log2(words); the value bounds cache maintenance only.
+            core::arch::asm!(
+                "mrs {ctr}, ctr_el0",
+                ctr = out(reg) ctr_el0,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let line_size = 4usize
+            .checked_shl(((ctr_el0 >> 16) & 0xf) as u32)
+            .ok_or(EOVERFLOW)?;
+        if !line_size.is_power_of_two() {
+            return Err(EINVAL);
+        }
+        let start_address = self.ptr.as_ptr() as usize + offset;
+        let end_address = self.ptr.as_ptr() as usize + end;
+        let mut address = start_address & !(line_size - 1);
+        unsafe {
+            // SAFETY: the page stays mapped for the whole loop. `dc cvac`
+            // cleans AP cachelines to the point of coherency; the barriers
+            // order the preceding stores before the clean and the clean before
+            // anything the coprocessor is subsequently told to do.
+            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
+            while address < end_address {
+                core::arch::asm!(
+                    "dc cvac, {address}",
+                    address = in(reg) address,
+                    options(nostack, preserves_flags),
+                );
+                address = address.checked_add(line_size).ok_or(EOVERFLOW)?;
+            }
+            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
+        }
+        Ok(())
+    }
+
+    fn write_atomic(&self, offset: usize, data: &[u8]) -> Result {
+        let end = offset.checked_add(data.len()).ok_or(EOVERFLOW)?;
+        if (offset | data.len()) & 7 != 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        for (index, source) in data.chunks_exact(size_of::<u64>()).enumerate() {
+            let at = offset + index * size_of::<u64>();
+            let pointer = unsafe {
+                // SAFETY: `at` is qword-aligned and bounded to the mapped page
+                // by the check above.
+                self.ptr.as_ptr().cast::<u8>().add(at).cast::<AtomicU64>()
+            };
+            let mut qword = [0u8; size_of::<u64>()];
+            qword.copy_from_slice(source);
+            unsafe { &*pointer }.store(u64::from_le_bytes(qword), Ordering::Release);
+        }
+        self.clean_written_range(offset, data.len())
     }
 
     fn copy_atomic(&self, offset: usize, out: &mut [u8]) -> Result {

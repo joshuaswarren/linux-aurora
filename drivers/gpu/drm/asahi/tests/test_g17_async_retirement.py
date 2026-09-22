@@ -73,6 +73,17 @@ impl Manager {
 '''+manager_batch+r'''
 }
 mod g17_status { pub struct VmStatus; }
+// Counter for retired-without-executing completions; the poller bumps it
+// on the zero-duration arm so a boot's total is readable without a wedge.
+static G17P_MARK_ZERO_DURATION: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+// Every route into is_crashed() is raised through this helper so the
+// transition names itself in the log; the flag itself is still what the
+// assertions below read.
+// Probe parameter; 0 is the default and the behaviour these tests assert.
+mod module_parameters { pub struct P; impl P { pub fn value(&self)->&'static u32 { &0 } }
+  pub static g17p_quarantine_scope: P = P; }
+mod g17_live_boot { pub fn note_session_recovery_pending(pending:&mut bool,_pdev:Option<&()>,_reason:&'static str){ *pending = true; } }
 struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>}
 impl Completion{fn complete(&self,r:Result<[u64;2]>){self.signals.fetch_add(1,Ordering::SeqCst);if r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}}
 struct Packet{id:u64,completion:Arc<Completion>}
@@ -99,7 +110,12 @@ fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let 
 #[test]fn close_during_execution_defers_context_and_mapping_release(){
  let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![])),async_compute_queues:vec![q],session_recovery_pending:false};
  r.release_async_compute_queue(1);assert_eq!(d.load(Ordering::SeqCst),0);assert_eq!(r.async_compute_queues[0].owner,Some(1));
- r.manager.as_mut().unwrap().resources.records.push((1,0x100,[2,3]));r.async_compute_queues[0].queue.compute.0=1;r.service_async_compute_completions().unwrap();assert_eq!(c.signals.load(Ordering::SeqCst),1);assert_eq!(d.load(Ordering::SeqCst),3);assert_eq!(r.async_compute_queues[0].owner,None);
+ r.manager.as_mut().unwrap().resources.records.push((1,0x100,[2,3]));r.async_compute_queues[0].queue.compute.0=1;r.service_async_compute_completions().unwrap();assert_eq!(c.signals.load(Ordering::SeqCst),1);assert_eq!(d.load(Ordering::SeqCst),1);assert_eq!(r.async_compute_queues[0].owner,None);
+ // Only the completed packet's lease drops. The binding and context are what
+ // the firmware still names through its installed QID, so they are retained
+ // until a rebind reinstalls the roots or both CPUs stop -- see
+ // test_g17_async_release_retains_firmware_state.
+ assert!(r.async_compute_queues[0].binding.is_some()&&r.async_compute_queues[0].context.is_some());
 }
 #[test]fn timeout_and_zero_duration_quarantine_until_proven_stop(){
  let d=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&d);let(b,cb)=q(2,0x200,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(2,0x200,[8,8])])),async_compute_queues:vec![a,b],session_recovery_pending:false};

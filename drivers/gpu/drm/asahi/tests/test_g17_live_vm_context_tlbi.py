@@ -19,14 +19,32 @@ def function(source, marker):
     return source[start:pos]
 
 
+context_mask = function(mmu, "fn context_mask_for_root(")
+vm_context_mask = function(mmu, "pub(crate) fn t8140_vm_context_mask(")
 flush = function(mmu, "pub(crate) fn flush_t8140_vm_contexts(")
-assert "owner.page_table.ttb()" in flush
-assert "ttbs[context_id].ttb0.load(Ordering::Acquire)" in flush
-assert "== t8140_tagged_root(root, context_id)" in flush
+live_range_flush = function(mmu, "fn tlbi_live_contexts(")
+step_map = function(mmu, "    fn step_map(")
+assert "owner.page_table.ttb()" in vm_context_mask
+assert "context_mask_for_root(root, inner.ttbs())" in vm_context_mask
+assert "ttb.ttb0.load(Ordering::Acquire)" in context_mask
+assert "== t8140_tagged_root(root, context_id)" in context_mask
+assert "self.t8140_vm_context_mask(vm)?" in flush
 assert flush.index("fence(Ordering::SeqCst)") < flush.index("mem::tlbi_asid(")
 assert flush.index("mem::tlbi_asid(") < flush.index("mem::sync()")
 assert "T8140_COMPUTE_CTXS" not in flush
 assert "RENDER_APP_CONTEXT" not in flush
+
+# User VM_BIND maps use the same root-identity rule, but invalidate only the
+# changed range. This is required for negative translations cached after an
+# independent execution context is installed and before its buffers are bound.
+assert "context_mask_for_root(self.ttb(), shared.ttbs())" in live_range_flush
+assert live_range_flush.index("fence(Ordering::SeqCst)") < live_range_flush.index(
+    "mem::tlbi_range("
+)
+assert live_range_flush.index("mem::tlbi_range(") < live_range_flush.index("mem::sync()")
+assert step_map.index("map_and_link_va(") < step_map.index(
+    "self.tlbi_live_contexts(op.addr(), op.range())"
+)
 
 new_storage = function(resources, "pub(crate) fn new_user_render_storage(")
 assert new_storage.index("vm.install_render_pool_mappings(") < new_storage.index(
@@ -35,15 +53,6 @@ assert new_storage.index("vm.install_render_pool_mappings(") < new_storage.index
 assert new_storage.index("self.address_space.uat.flush_t8140_vm_contexts(vm)?") < new_storage.index(
     "self.stage_render_parameter_buffer_page_list(&mut storage)?"
 )
-
-restage = function(resources, "pub(crate) fn restage_command(")
-old_alias_drop = restage.index("drop(old_render_user_aliases);")
-old_state_drop = restage.index("drop(old_render_state);")
-restage_flush = restage.index("uat.flush_t8140_vm_contexts(vm)")
-assert old_alias_drop < restage_flush
-assert old_state_drop < restage_flush
-assert restage_flush < restage.index("self.staging_descriptors = Some(next_descriptors)")
-
 
 class ContextTlb:
     def __init__(self):

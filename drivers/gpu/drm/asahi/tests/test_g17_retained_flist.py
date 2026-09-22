@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile actual FList lease/staging methods with memory-backed mapping mocks.
+"""Compile actual render FList lease/staging methods with mapping mocks.
 
 Wire encoders and lifecycle are real source. Pool initializer bodies are stubbed
 only in the mapping-mock test: its assertion is that warm paths invoke none and
@@ -71,12 +71,10 @@ lease_part = "\n".join([
         "retained_flist_leases_grow_once_and_release_every_captured_generation"]],
 ])
 pool_methods = "\n".join(block(resources, r"^    pub\(crate\) fn " + n + r"\(") for n in [
-    "stage_render_flist_state", "stage_compute_flist_state", "render_flist_owned"])
-alias_guard = block(resources, r"^        if !bootstrap_vdm && !self.render_flist_owned\(\)\s*")
+    "stage_render_flist_state", "render_flist_owned"])
 pool_part = r"""
 type Result<T = ()> = std::result::Result<T, i32>;
 const EINVAL: i32 = 22;
-const EBUSY: i32 = 16;
 #[derive(Clone, Debug, PartialEq, Eq)] struct Bytes(Vec<u8>);
 impl Bytes {
     fn with_bytes_mut<T>(&mut self, f: impl FnOnce(&mut [u8]) -> Result<T>) -> Result<T> {
@@ -86,23 +84,32 @@ impl Bytes {
 #[derive(Clone, Debug, PartialEq, Eq)] struct Backings {
     control_operand_page_lists: Bytes, control_operand_table: Bytes,
     control_shared: Bytes, control_shared_inner: Bytes,
-    partial_opening_control_shared: Bytes, partial_opening_control_shared_inner: Bytes,
+    uma_page_pool_descriptor_table: Bytes,
 }
 fn encode_g17p_initial_flist_page_list(b: &mut [u8]) -> bool { b.fill(0x17); true }
 fn encode_g17p_pre_qid_flist_runs(b: &mut [u8]) -> bool { b.fill(0x22); true }
 fn encode_g17p_compute_flist_runs(b: &mut [u8]) -> bool { b.fill(0x21); true }
 struct Owner { resources: Backings, flist_backing_owner: G17PFListBackingOwner }
-""" + derive + block(resources, r"^enum G17PFListBackingOwner\s*") + "\nimpl Owner {\n" + pool_methods + r"""
+""" + derive + block(resources, r"^enum G17PFListBackingOwner\s*") + r"""
+impl Owner {
+fn stage_render_uma_page_pool_descriptor(&mut self) -> Result {
+    self.resources.uma_page_pool_descriptor_table.0.fill(0x33);
+    Ok(())
+}
+""" + pool_methods + r"""
 fn alias_creation(&mut self, bootstrap_vdm: bool) -> Result {
-""" + alias_guard + "\nOk(())\n}\n}\n" + r"""
+let _ = bootstrap_vdm;
+Ok(())
+}
+}
+""" + r"""
 #[test]
 fn actual_staging_preserves_all_grown_backings_and_other_vm_creation() {
     let b = Bytes(vec![0xa5; 0x4000]);
     let mut owner = Owner {
         resources: Backings { control_operand_page_lists: b.clone(),
             control_operand_table: b.clone(), control_shared: b.clone(),
-            control_shared_inner: b.clone(), partial_opening_control_shared: b.clone(),
-            partial_opening_control_shared_inner: b },
+            control_shared_inner: b.clone(), uma_page_pool_descriptor_table: b },
         flist_backing_owner: G17PFListBackingOwner::Opening,
     };
     owner.stage_render_flist_state().unwrap();
@@ -124,20 +131,10 @@ fn actual_staging_preserves_all_grown_backings_and_other_vm_creation() {
         owner.alias_creation(true).unwrap();
         assert_eq!(owner.resources, grown);
     }
-    assert_eq!(owner.stage_compute_flist_state(), Err(EBUSY));
-    assert_eq!(owner.resources, grown);
     // This state transition is made only by the real stopped-processor reset.
     owner.flist_backing_owner = G17PFListBackingOwner::Opening;
     owner.stage_render_flist_state().unwrap();
     assert_eq!(owner.resources, cold);
-    owner.flist_backing_owner = G17PFListBackingOwner::Opening;
-    owner.stage_compute_flist_state().unwrap();
-    assert!(owner.resources.control_operand_page_lists.0.iter().all(|b| *b == 0));
-    owner.resources.control_operand_page_lists.0[0x3fff] = 9;
-    let compute = owner.resources.clone();
-    owner.alias_creation(false).unwrap();
-    owner.stage_compute_flist_state().unwrap();
-    assert_eq!(owner.resources, compute);
 }
 
 #[test]
@@ -175,17 +172,17 @@ with tempfile.TemporaryDirectory(prefix="g17-retained-flist-") as temp:
 # Production caller/ordering checks accompany, but do not replace, real methods.
 begin = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\(")
 assert begin.index("G17PBootstrapUmaLifecycle::acquire") < begin.index(".stage_render_flist_state()")
-assert "g17p_render_flist_generation(\n                        self.render_submission_ordinal" in begin
+assert "g17_submission::g17p_render_flist_generation(self.render_submission_ordinal)" in begin
 publish = block(manager, r"^    pub\(crate\) fn publish_render_usc_freelist_request\(")
 assert "self.bootstrap_uma.is_some()" not in publish
 assert "self.prepared_render_flist.ok_or(EIO)?" in publish
 assert publish.index("lifecycle.request.is_none()") < publish.index("encode_g17p_usc_freelist_control")
 alias = block(resources, r"^    pub\(crate\) fn install_user_vm_aliases\(")
 assert "with_bytes_mut" not in alias
-assert alias_guard in alias
+assert "stage_render_flist_state" not in alias
+assert "stage_compute_flist_state" not in alias
 reset = block(resources, r"^    pub\(crate\) fn reset_session_after_processor_stop\(")
 assert "self.flist_backing_owner = G17PFListBackingOwner::Opening" in reset
 compute = block(runtime, r"^    pub\(crate\) fn submit_translated_compute\(")
-assert compute.index(".render_flist_owned()") < compute.index("self.ensure_compute_queue()")
-assert compute.index("recover_persistent_runtime(self)?") < compute.index(".stage_compute_flist_state()")
+assert compute.index(".stage_compute_flist_state()?") < compute.index("self.ensure_compute_queue()?")
 print("actual FList lifecycle, wire, retained mapping bytes and publication/handoff checks PASS")

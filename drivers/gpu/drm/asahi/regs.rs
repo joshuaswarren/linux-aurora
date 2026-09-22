@@ -1275,9 +1275,13 @@ impl Resources {
     }
 
     /// Caller must own the runtime mutex and have just verified the firmware
-    /// is stopped at the pre-ACK recovery handshake with DM1 slot0 blamed.
-    /// This is not an admission probe and must never run before that halt.
-    pub(crate) fn g17p_halted_slot0_snapshot(&self) -> Result<Option<G17PHaltedSlot0Snapshot>> {
+    /// is stopped at the pre-ACK recovery handshake with DM0 or DM1 slot0
+    /// selected. This is not an admission probe and must never run before
+    /// that halt. `read_dm1_progress` must only be true for a DM1 report.
+    pub(crate) fn g17p_halted_slot0_snapshot(
+        &self,
+        read_dm1_progress: bool,
+    ) -> Result<Option<G17PHaltedSlot0Snapshot>> {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let _guard = self.sksm_fifo.lock();
         // The GPC summary is in the always-on range. A halted firmware need
@@ -1295,21 +1299,25 @@ impl Resources {
         let mut progress = [0u64; 8];
         let mut progress_count = 0;
         let mut progress_errno = 0;
-        if let Some(selector) = crate::g17_completion::g17p_dm1_monitor_selector_index(state_before) {
-            // These are the eight reads B1 FUN_6a20 performs for DM1, through
-            // the selected progress port. Do not write10400/10408 or touch
-            // any bank absent from the native sample table.
-            for (index, (register, flags)) in crate::g17_completion::G17P_DM1_MONITOR_READS
-                .iter().enumerate()
+        if read_dm1_progress {
+            if let Some(selector) =
+                crate::g17_completion::g17p_dm1_monitor_selector_index(state_before)
             {
-                match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
-                    Ok(value) => {
-                        progress[index] = value;
-                        progress_count += 1;
-                    }
-                    Err(error) => {
-                        progress_errno = error.to_errno();
-                        break;
+                // These are the eight reads B1 FUN_6a20 performs for DM1,
+                // through the selected progress port. Do not write10400/10408
+                // or touch any bank absent from the native sample table.
+                for (index, (register, flags)) in crate::g17_completion::G17P_DM1_MONITOR_READS
+                    .iter().enumerate()
+                {
+                    match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
+                        Ok(value) => {
+                            progress[index] = value;
+                            progress_count += 1;
+                        }
+                        Err(error) => {
+                            progress_errno = error.to_errno();
+                            break;
+                        }
                     }
                 }
             }
@@ -2153,6 +2161,127 @@ impl Resources {
                     observed
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Observe a live M5 compute slot without changing any hardware selector.
+    /// Values are sequential observations, not an atomic frozen snapshot.
+    pub(crate) fn m5_live_sksm_state(&self)
+        -> Result<([u64; 4], [u64; 12], Option<[u64; 3]>)> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        let powered = || -> Result<bool> {
+            Ok(res.try_read32(0xe80000)? & 0xff == 0xff
+                && res.try_read32(0xe80110)? & 0xff == 0xff)
+        };
+        if !powered()? { return Err(EAGAIN); }
+        if res.try_read32(0x10398)? != 0 { return Err(EBUSY); }
+        let mut events = [0; 4];
+        for (ordinal, word) in events.iter_mut().enumerate() {
+            *word = res.try_read64(0x21168 + ordinal * 8)?;
+        }
+        let mut slot = [0; 12];
+        for (word, offset) in slot.iter_mut().zip([
+            0xc0b0, 0xc0c8, 0xc0d8, 0xc128, 0xc160, 0xc168, 0xc170,
+            0xc0f0, 0xc0f8, 0xc020, 0xc028, 0xc078]) {
+            *word = res.try_read64(offset)?;
+        }
+        let queue = if res.try_read64(0x103a8)? == 11 {
+            let values = [res.try_read64(0x21008)?, res.try_read64(0x21020)?,
+                          res.try_read64(0x21028)?];
+            if res.try_read64(0x103a8)? == 11 { Some(values) } else { None }
+        } else { None };
+        if !powered()? || res.try_read32(0x10398)? != 0 { return Err(EAGAIN); }
+        Ok((events, slot, queue))
+    }
+
+    /// Read the M5 firmware's DM2 progress monitors through the unused AP port.
+    /// This issues read tags, not selector changes or register-data writes.
+    pub(crate) fn m5_live_compute_monitor(&self) -> Result<([u64; 6], u8, bool)> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let _guard = self.sksm_fifo.lock();
+        let powered = || -> Result<bool> {
+            Ok(sgx.try_read32(0xe80000)? & 0xff == 0xff
+                && sgx.try_read32(0xe80110)? & 0xff == 0xff)
+        };
+        if !powered()? { return Err(EAGAIN); }
+        let read = |tag| -> Result<u64> {
+            // Native host geometry is slot9/stride16. Firmware's own eight
+            // ports at text44fd8 exclude slot9. Preserve ordered STR/LDR.
+            sgx.try_write64(tag, 0x4090)?;
+            sgx.try_read64(0x4098)
+        };
+        // M5 text7144..7174: slot index<<44, namespace bit43, pipe mask
+        // in state[18:16]. Neo's index<<43 / namespace bit42 is different.
+        let before = read(0xc020 | (1u64 << 43))?;
+        if before & 0x3d != 0xd || (before >> 16) & 7 != 1 {
+            return Ok(([before, 0, 0, 0, 0, 0], 1, false));
+        }
+        // M5 text68f0..6918 reads this view directly after selecting slot0.
+        // Reuse the already selected slot; do not infer a port namespace.
+        if sgx.try_read32(0x10398)? != 0 {
+            return Ok(([before, 0, 0, 0, 0, 0], 1, false));
+        }
+        let progress = sgx.try_read64(0xc078)?;
+        if progress & ((1u64 << 47) - 1) != ((11u64 << 40) | 1) {
+            return Ok(([before, progress, 0, 0, 0, 0], 2, false));
+        }
+        // Pipe0 only: M5 DM2 table44984 names1688, read at7b6c..7b90.
+        // text7114/table44bb0 and7190..71a4 also read DM2's a730.
+        // Both use pipe index<<44 without the KSM namespace bit43.
+        let counter = read(0x1688)?;
+        let monitor = read(0xa730)?;
+        // M5 DM2 table44990: selector a010/value3, register a0a8.
+        // Firmware7c68..7c94 packs namespace43 and selector<<40 into
+        // the read tag. No selector register is written. Qualified on
+        // native M5 while compute ran and later verified its output.
+        let indexed_monitor = read((1u64 << 43) | (3u64 << 40) | 0xa0a8)?;
+        let after = read(0xc020 | (1u64 << 43))?;
+        let stable = powered()? && before == after && sgx.try_read32(0x10398)? == 0;
+        Ok(([before, progress, counter, monitor, indexed_monitor, after], 6, stable))
+    }
+
+    /// Match the measured M5 native AP setup before starting firmware CPUs.
+    ///
+    /// The broad 25G76 AP trace writes 0x30001 at physical 0x580e90000;
+    /// Linux's prior stopped probe reads 0x30000. This diagnostic accepts
+    /// only those two observed states and changes only bit zero. The bit's
+    /// precise hardware role remains unqualified; do not generalize it.
+    pub(crate) fn m5_match_pmgr_boot_control(&self) -> Result {
+        const OFFSET: usize = 0xe90000;
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        let before = res.try_read32(OFFSET)?;
+        if before != 0x30000 && before != 0x30001 {
+            dev_err!(self.dev.as_ref(), "M5_INIT unexpected PMGR control {:#x}\n", before);
+            return Err(EIO);
+        }
+        res.try_write32(before | 1, OFFSET)?;
+        let after = res.try_read32(OFFSET)?;
+        dev_info!(self.dev.as_ref(), "M5_INIT native PMGR control: {:#x} -> {:#x}\n",
+            before, after);
+        if after != 0x30001 {
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
+    /// M5: arm Fender dynamic gating before either role's initdata.
+    ///
+    /// Native 25G76 AGXG17G masks with 0xfffffff9 at 0xfffffe00089e0408.
+    /// The M5 AP write trace records zero at SGX+0xd06030 before the first
+    /// GFX1 initialization publication. Preserve unrelated register bits.
+    pub(crate) fn m5_pre_initdata_clear(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        let before = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+        res.try_write32(before & !0x6, T8140_FENDER_DYNAMIC_GATING)?;
+        let after = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+        dev_info!(self.dev.as_ref(), "M5_INIT Fender dynamic gating: {:#x} -> {:#x}\n",
+            before, after);
+        if after & 0x6 != 0 {
+            return Err(EIO);
         }
         Ok(())
     }

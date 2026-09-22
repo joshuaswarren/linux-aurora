@@ -61,7 +61,10 @@ assert "retired_firmware_render_graphs" not in source
 reclaimable = function("fn retired_render_graph_reclaimable(")
 assert "*epoch >= graph.retire_after_context_epoch" in reclaimable
 superseded = function("fn release_superseded_render_graph(")
-assert superseded.index("ids.unreserve(id)") < superseded.index("drop(retired)")
+assert superseded.index("into_retired_parameter_management") < superseded.index(
+    "ids.unreserve(id)"
+)
+assert superseded.index("ids.unreserve(id)") < superseded.index("drop(bind)")
 
 
 class Quarantine:
