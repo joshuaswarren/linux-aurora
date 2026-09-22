@@ -70,6 +70,9 @@ from Linux ``j813`` commit ``2596a20e31f810c24c88999d163027cbf9277f20``.
 The sync covers the AGX driver and its focused tests, while retaining the
 J873 firmware and identity work. Mesa's matching ``j873`` branch starts from
 its published J813 AGX tip ``658dee6c3c2df664d7e7598e3bfc989fdd6d3a39``.
+The J813 mailbox CPU-state API, its Rust wrapper, related T8142 mailbox
+binding, and the PMGR power-state correction are also carried because the
+AGX driver uses that API and power path. They add no T8152 match.
 
 These sources describe tested M5/G17G and related G17P paths. The J873g
 firmware advertises ``gpu,t8152`` and an ASCWrap-v8 GPU mailbox, but the
