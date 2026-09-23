@@ -106,6 +106,8 @@ struct EnrolPoll {
     state: State,
     stage: u32,
     stages_total: u32,
+    /// While the enrolment is running: captures rejected so far. Once FAILED:
+    /// the enclave status. See `enrol_poll()`.
     status: u32,
     uuid: [u8; UUID_LEN],
     guidance: Guidance,
@@ -388,6 +390,10 @@ enum Op {
         terminal: Option<EnrolOutcome>,
         guidance: Guidance,
         percent: u32,
+        /// Captures the enclave rejected during this enrolment. Exposed through
+        /// the poll so userspace can tell the user to try again on every
+        /// rejection, not just the first one after an accepted frame.
+        rejected: u32,
     },
     Verify {
         nonce: [u8; NONCE_LEN],
@@ -574,6 +580,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         terminal: None,
         guidance: Guidance::Place,
         percent: 0,
+        rejected: 0,
     };
     ctx.session.reported_stage = 0;
     Ok(Handled {
@@ -604,6 +611,29 @@ pub(crate) fn enrol_advance(
             *stage = completed;
             *percent = percent_now;
             *guidance = guide;
+            session.unseen = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// Record that the enclave rejected a capture, and always wake userspace.
+///
+/// `enrol_guide()` only wakes on a guidance CHANGE, so after the first rejection
+/// every consecutive one was silent -- the user pressed into a UI that showed
+/// nothing at all. Counting rejections lets the poll report each one.
+pub(crate) fn enrol_reject(session: &mut Session) -> bool {
+    if let Op::Enrol {
+        terminal,
+        guidance,
+        rejected,
+        ..
+    } = &mut session.op
+    {
+        if terminal.is_none() {
+            *rejected = rejected.saturating_add(1);
+            *guidance = Guidance::HoldStill;
             session.unseen = true;
             return true;
         }
@@ -675,6 +705,7 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
             terminal,
             guidance,
             percent,
+            rejected,
             ..
         } => {
             out.stage = *stage;
@@ -682,6 +713,13 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
             out.progress_percent = *percent;
             match terminal {
                 None => {
+                    // While the enrolment is running, `status` carries the
+                    // number of captures rejected so far; it only means an
+                    // enclave status once the enrolment has FAILED. Reusing it
+                    // keeps the 40-byte ABI (the ioctl number encodes the size),
+                    // and an older driver, which reads `status` only on FAILED,
+                    // is unaffected.
+                    out.status = *rejected;
                     // Only an advance in the stage counter is progress; a
                     // guidance change is not. Stage 0 is the starting value,
                     // so it is never reported -- otherwise the very first poll

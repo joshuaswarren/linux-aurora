@@ -1437,6 +1437,7 @@ impl SepData {
     pub(crate) fn run_enrolment(&self) {
         // A retry must start from stage one, not continue the abandoned run.
         self.enrol_frames_accepted.store(0, Relaxed);
+        self.enrol_stage.store(0, Relaxed);
 
         if !self.bring_sensor_online() {
             self.finish_enrolment(Err(ENROL_STATUS_SENSOR));
@@ -1490,10 +1491,11 @@ impl SepData {
                 }
                 ImageOutcome::Retry => {
                     counter = counter.saturating_add(1);
-                    // The capture did not take (partial/unusable contact). Nudge
-                    // the person to hold still and press again rather than
-                    // silently re-capturing with no feedback.
-                    if bio::enrol_guide(&mut self.bio_session.lock(), bio::Guidance::HoldStill) {
+                    // The capture did not take (partial/unusable contact). Tell
+                    // the person on EVERY rejection, not only the first: a
+                    // guidance-change wake went silent from the second
+                    // consecutive rejection on.
+                    if bio::enrol_reject(&mut self.bio_session.lock()) {
                         self.bio_wake();
                     }
                 }
@@ -2567,29 +2569,48 @@ impl SepData {
         // still happily taking frames. It looks exactly like a hang, and the
         // first attempt was abandoned because of it.
         //
-        // One frame the enclave accepted is one thing the user did, so that is
-        // the FLOOR for a stage: the bar must move every time the user does
-        // something, or the enrolment looks hung.
+        // Coverage drives the bar; every accepted frame moves it at least one step.
         //
-        // It is a poor *ceiling*, though. The enclave decides when it has
-        // enough coverage, and real runs completed after 8, 9 and 10 accepted
-        // frames against the 16 stages we advertise -- so counting frames alone
-        // walks the bar to roughly half and then jumps straight to done.
+        // The enclave decides when it has enough coverage -- real runs completed
+        // after 8, 9 and 10 accepted frames against the 16 stages advertised --
+        // so a pure frame count walks the bar to about half and then jumps to
+        // done. Coverage is the honest measure of how far along it is.
         //
-        // The enclave's own coverage percentage is the honest measure of how
-        // far along the enrolment is, so let that drive the bar and keep the
-        // frame count only as a floor. `bio.rs` reports a stage only when it
-        // advances, so taking the max of the two keeps it monotonic while
-        // guaranteeing feedback on every accepted frame. The final stage stays
-        // reserved for completion, so a longer-than-advertised run stalls one
-        // short rather than claiming to have finished.
+        // But coverage alone, or max(frames, coverage), freezes the bar: bio.rs
+        // only wakes userspace when the stage CHANGES, so while coverage is
+        // ahead of the frame count a new accepted frame changes neither term,
+        // nothing is reported, and the user presses into a bar that does not
+        // move. Measured 2026-09-23: the bar sat at about a quarter while the
+        // enrolment kept accepting frames, then jumped to done.
+        //
+        // So step from the LAST reported stage: follow the enclave's coverage
+        // across the full range, and never fall behind an accepted touch (at
+        // least +1 per accepted frame). The final stage stays reserved for
+        // completion, so the bar reaches the top only when the enclave says the
+        // enrolment is done. Near the end the enclave's coverage plateaus in the
+        // high 90s for a few frames before completing, so the bar pauses near
+        // full -- which is the honest picture: almost done, keep going.
+        //
+        // Userspace sees only a count of progress callbacks, so the libfprint
+        // driver emits one per stage gained; see aurora.c.
         let accepted = self.enrol_frames_accepted.fetch_add(1, Relaxed) + 1;
         let from_coverage = (percent * (bio::ENROL_STAGES - 1)).div_ceil(100);
         let stage = if parsed.complete() {
             bio::ENROL_STAGES
         } else {
-            accepted.max(from_coverage).clamp(1, bio::ENROL_STAGES - 1)
+            let previous = self.enrol_stage.load(Relaxed);
+            (previous + 1).max(from_coverage).min(bio::ENROL_STAGES - 1)
         };
+        self.enrol_stage.store(stage, Relaxed);
+        dev_info!(
+            self.dev,
+            "enrol: frame {} accepted, coverage {}%, stage {}/{}{}\n",
+            accepted,
+            percent,
+            stage,
+            bio::ENROL_STAGES,
+            if parsed.complete() { " (complete)" } else { "" }
+        );
 
         ImageOutcome::Progress {
             stage,
