@@ -317,6 +317,11 @@ static const struct aic_info aic3_t8142_info __initconst = {
 
 static const struct of_device_id aic_info_match[] = {
 	{
+		/* T8152 has the AIC3 geometry and writable guest timer masks. */
+		.compatible = "apple,t8152-aic3",
+		.data = &aic3_info,
+	},
+	{
 		.compatible = "apple,t8142-aic3",
 		.data = &aic3_t8142_info,
 	},
@@ -1169,3 +1174,4 @@ err_unmap:
 IRQCHIP_DECLARE(apple_aic, "apple,aic", aic_of_ic_init);
 IRQCHIP_DECLARE(apple_aic2, "apple,aic2", aic_of_ic_init);
 IRQCHIP_DECLARE(apple_aic3, "apple,t8122-aic3", aic_of_ic_init);
+IRQCHIP_DECLARE(apple_t8152_aic3, "apple,t8152-aic3", aic_of_ic_init);
