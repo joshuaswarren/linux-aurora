@@ -1372,9 +1372,35 @@ impl SepData {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
         }
 
-        let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_match_result()) else {
-            dev_err!(self.dev, "verify: the enclave refused MATCH_RESULT\n");
-            return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        let result = match self.sbio_call(&crate::sbio::sbio_match_result()) {
+            SbioOutcome::Ok(result) => result,
+            SbioOutcome::PrerequisiteMissing => {
+                // The match context no longer vouches for the current
+                // enrollment -- a finger was enrolled or deleted since it was
+                // made (see establish_scrd_match_context). Make a fresh one and
+                // ask once more. If this capture is already spent, a retry
+                // costs the user one more touch; failing here instead left
+                // every finger dead until a reboot.
+                dev_info!(
+                    self.dev,
+                    "verify: MATCH_RESULT needs a fresh match context (the enrollment changed since it was made); re-establishing\n"
+                );
+                if !self.establish_scrd_match_context(user) {
+                    dev_err!(
+                        self.dev,
+                        "verify: could not re-establish the match context; matching is unavailable until the next boot\n"
+                    );
+                    return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                }
+                match self.sbio_call(&crate::sbio::sbio_match_result()) {
+                    SbioOutcome::Ok(result) => result,
+                    _ => return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY),
+                }
+            }
+            _ => {
+                dev_err!(self.dev, "verify: the enclave refused MATCH_RESULT\n");
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+            }
         };
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
             // Same shape as the enrolment-result parse: a short reply fails the
@@ -1503,6 +1529,13 @@ impl SepData {
             identity = self.identity_just_enrolled();
 
             self.reconcile_identities();
+
+            // The enrollment just changed, so the boot-time match context no
+            // longer vouches for it. Refresh it now rather than leaving the
+            // first match to discover it.
+            if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
+                self.establish_scrd_match_context(user);
+            }
         }
 
         let _ = sensor::idle();
@@ -3200,6 +3233,12 @@ impl SepData {
         }
 
         self.forget_identity(identity.uuid(), c"removed from the enclave");
+
+        // Deleting a finger changes the enrollment the match context vouches
+        // for, exactly as enrolling one does.
+        if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
+            self.establish_scrd_match_context(user);
+        }
         Ok(())
     }
 
