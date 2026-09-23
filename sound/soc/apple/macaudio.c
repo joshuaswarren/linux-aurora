@@ -1198,15 +1198,15 @@ static int macaudio_probe(struct snd_soc_card *card)
 	}
 
 	/*
-	 * Map the codec's four headset button functions to media keys.
-	 * Apple remote volume buttons also require codec protocol support.
+	 * Apple remotes use BTN_0..2; CS42L83's analogue fallback can also
+	 * report BTN_3 for the fourth button of other headsets.
 	 */
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
 	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
 
-	return 0;
+	return ret;
 }
 
 static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_soc_dai *dai,
