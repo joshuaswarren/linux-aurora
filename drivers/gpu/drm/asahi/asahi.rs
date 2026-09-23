@@ -205,5 +205,9 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Completion logging level: 0 off, 1 summary, 2 detailed",
         },
+        g17p_flist_fast_poll: u32 {
+            default: 1,
+            description: "Poll the first eight pending render FList releases at 100us; 0 restores 1ms polling",
+        },
     },
 }

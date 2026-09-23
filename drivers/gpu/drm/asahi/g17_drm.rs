@@ -35,6 +35,7 @@ const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> =
 /// Bounded opt-in render timing trace. `g17p_completion_trace` enables it and
 /// `g17p_trace_depth` caps the number of records for the whole module lifetime.
 static G17P_RENDER_TIMING_RECORDS: AtomicU32 = AtomicU32::new(0);
+static G17P_RENDER_POLL_RECORDS: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) type SharedG17PRuntime = Arc<Mutex<g17_live_boot::G17PLiveRuntime>>;
 
@@ -1355,6 +1356,8 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
             let mut transition = None;
             let mut transition_attempted = false;
             let mut control_backpressure_polls = 0usize;
+            let mut flist_release_polls = 0usize;
+            let mut device_control_polls = 0usize;
             let submit = loop {
                 if packet.cancel_requested() { break Err(ECANCELED); }
                 let mut runtime = self.runtime.mutex().lock();
@@ -1365,7 +1368,17 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
                     transition_attempted = false;
                     if control_backpressure_polls >= 1000 { break Err(ETIMEDOUT); }
                     control_backpressure_polls += 1;
-                    fsleep(Delta::from_millis(1));
+                    flist_release_polls += 1;
+                    // A consumed release usually arrives before the old 1 ms
+                    // sleep ends. Bound the short-poll phase, then preserve
+                    // the coarse wait for delayed firmware and recovery.
+                    if *module_parameters::g17p_flist_fast_poll.value() != 0
+                        && flist_release_polls <= 8
+                    {
+                        fsleep(Delta::from_micros(100));
+                    } else {
+                        fsleep(Delta::from_millis(1));
+                    }
                     continue;
                 }
                 if runtime.primary_device_control_backpressured() {
@@ -1374,6 +1387,7 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
                     transition_attempted = false;
                     if control_backpressure_polls >= 1000 { break Err(ETIMEDOUT); }
                     control_backpressure_polls += 1;
+                    device_control_polls += 1;
                     fsleep(Delta::from_millis(1));
                     continue;
                 }
@@ -1410,6 +1424,18 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
                     completion.clone(),
                 );
             };
+            let trace_limit = *module_parameters::g17p_trace_depth.value();
+            if *module_parameters::g17p_completion_trace.value() != 0
+                && trace_limit != 0
+                && G17P_RENDER_POLL_RECORDS.fetch_add(1, Ordering::Relaxed) < trace_limit
+            {
+                pr_info!(
+                    "G17P render admission: submission={} slot={} flist-polls={} control-polls={} fast-poll={}\n",
+                    submission_id, render_slot, flist_release_polls,
+                    device_control_polls,
+                    *module_parameters::g17p_flist_fast_poll.value(),
+                );
+            }
             drop(transition);
             match submit {
                 Ok(()) => {
