@@ -29,6 +29,9 @@
 
 #define H264_TRANSFORM_8X8_MODE(v)		FIELD_PREP(BIT(7), !!(v))
 
+/* not a hardware constraint */
+#define MAX_SLICES	4096
+
 struct avd_h264_run {
 	struct avd_run base;
 
@@ -41,7 +44,7 @@ struct avd_h264_run {
 	const struct v4l2_ctrl_h264_pred_weights *pred_weights;
 
 	struct run_addr {
-		dma_addr_t sps;
+		dma_addr_t mv_color;
 	} addresses;
 
 	s32 cur_poc;
@@ -88,7 +91,7 @@ static const u32 default_8x8_inter[] = {
 	0x191b1c1e, 0x1b1c1e20, 0x1c1e2021, 0x1e202123,
 };
 
-static inline u32 sps_size(u32 w, u32 h)
+static inline u32 mv_color_size(u32 w, u32 h)
 {
 	return (DIV_ROUND_UP(w, 16) + 1) * (DIV_ROUND_UP(h, 16) + 1) * 64;
 }
@@ -100,15 +103,14 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 	const struct v4l2_ctrl_h264_decode_params *decode = run->decode_params;
 	const struct v4l2_h264_dpb_entry *dpb = decode->dpb;
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
-	struct avd_dev *avd = ctx->dev;
 	struct avd_decoded_buffer *dst, *ref;
 	dma_addr_t addr;
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
 	push(0, "");
-	pusha(h264_ctx->bufs.pps_tile[4].addr, "hdr_9c_pps_tile_addr_lsb8", 7);
-	pusha(run->addresses.sps, "hdr_bc_sps_tile_addr_lsb8", 0);
+	pusha(h264_ctx->bufs.mv_above_info.addr, "mv_above_info", 7);
+	pusha(run->addresses.mv_color, "mv_color", 0);
 
 	push(0, "");
 	push(0, "");
@@ -132,7 +134,7 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 					       dpb[i].top_field_order_cnt),
 		     "hdr_d0_ref_hdr");
 
-		push_comp(avd, ctx, addr, ctx->comp.offsets);
+		push_comp(ctx, addr, ctx->comp.offsets);
 	}
 }
 
@@ -141,7 +143,6 @@ static void stream_scaling(struct avd_ctx *ctx, struct avd_h264_run *run)
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
 	const struct v4l2_ctrl_h264_scaling_matrix *scaling =
 		run->scaling_matrix;
-	struct avd_dev *avd = ctx->dev;
 
 	push(H264_SCL_DIMS, "hdr_4c_pic_scaling_list_dims");
 
@@ -202,11 +203,6 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	u32 bytesperline;
 	u32 width = (sps->pic_width_in_mbs_minus1 + 1) * 16;
 	u32 height = (sps->pic_height_in_map_units_minus1 + 1) * 16;
-
-	push(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
-		     AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3) |
-		     AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4),
-	     "inst_fifo_start");
 
 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_INTRA(
@@ -277,12 +273,12 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	else if (!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE))
 		pusha(h264_ctx->bufs.pipe_state.addr, "pipe_state", 0);
 
-	pusha(h264_ctx->bufs.pps_tile[1].addr, "hdr_9c_pps_tile_addr_lsb8", 1);
-	pusha(h264_ctx->bufs.pps_tile[2].addr, "hdr_9c_pps_tile_addr_lsb8", 2);
-	pusha(h264_ctx->bufs.pps_tile[3].addr, "hdr_9c_pps_tile_addr_lsb8", 3);
+	pusha(h264_ctx->bufs.ip_above.addr, "ip_above", 1);
+	pusha(h264_ctx->bufs.lf_above.addr, "lf_above", 2);
+	pusha(h264_ctx->bufs.lf_above_info.addr, "lf_above_info", 3);
 	push(0, "");
 
-	push_comp(avd, ctx, run->base.comp_out, ctx->comp.offsets);
+	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
 
 	bytesperline = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 	if (avd->variant->quirks & AVD_QUIRK_LSR)
@@ -418,7 +414,7 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 		off++;
 	}
 
-	dma_addr_t slc_a84 = run->base.coded_in + off;
+	dma_addr_t slc_a84 = h264_ctx->active_slice->addr + off;
 
 	push(AVD_OP_CODED_DATA |
 		     AVD_OP_CODED_DATA_BIT_OFF(
@@ -503,23 +499,15 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 			&ctx->fh.m2m_ctx->cap_q_ctx.q,
 			decode->dpb[sl->ref_pic_list1[0].index].reference_ts);
 
-		dma_addr_t sps_tile_addr =
+		dma_addr_t mv_color_addr =
 			vb ? vb2_dma_contig_plane_dma_addr(vb, 0) +
 					(vb->planes[0].length -
-					 sps_size(fmt_width(ctx),
-						  fmt_height(ctx))) :
-			     run->addresses.sps;
+					 mv_color_size(fmt_width(ctx),
+						       fmt_height(ctx))) :
+			     run->addresses.mv_color;
 
 		pusha(mv_color_addr, "slc_a78_sps_tile_addr2_lsb8", 0);
 	}
-
-	/* only submit if this is the last slice */
-	push(AVD_OP_EXEC |
-		     AVD_OP_EXEC_FLAG_END(!(
-			     src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)),
-	     "cm3_cmd_inst_fifo_end");
-
-	return payload_len - off;
 }
 
 static int avd_h264_alloc_bufs(struct avd_ctx *ctx)
@@ -547,46 +535,28 @@ static int avd_h264_alloc_bufs(struct avd_ctx *ctx)
 
 	mb = DIV_ROUND_UP(w, 16);
 
-	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[0], mb * 20);
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.above_info, mb * 20);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[1],
-			    bit_depth * 4 * mb);
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.ip_above, bit_depth * 4 * mb);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[2],
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.lf_above,
 			    bit_depth * 4 * 4 * mb);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[3], 32 * mb);
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.lf_above_info, 32 * mb);
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[4], 32 * mb);
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.mv_above_info, 32 * mb);
 	if (ret)
 		return ret;
 
 	return 0;
-}
-
-static void avd_h264_free_bufs(struct avd_ctx *ctx)
-{
-	struct avd_h264_ctx *h264_ctx = ctx->priv;
-	struct avd_dev *dev = ctx->dev;
-
-	if (!h264_ctx)
-		return;
-
-	avd_buf_free(dev, &h264_ctx->bufs.pipe_state);
-	avd_buf_free(dev, &h264_ctx->bufs.inst);
-
-	for (int i = 0; i < 5; i++)
-		avd_buf_free(dev, &h264_ctx->bufs.pps_tile[i]);
-
-	kfree(h264_ctx);
 }
 
 static int avd_h264_validate_pps(struct avd_ctx *ctx,
@@ -703,9 +673,57 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
-	sps_len = sps_size(fmt_width(ctx), fmt_height(ctx));
+	mv_color_len = mv_color_size(fmt_width(ctx), fmt_height(ctx));
 
-	run->addresses.sps = run->base.y_out + (dst_len - sps_len);
+	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
+}
+
+/*
+ * Check that every reference in the slice's ref lists points at a DPB entry
+ * that is VALID. stream_refs() only pushes a reference header (and its RVRA
+ * addresses) for VALID entries and the slice command indexes those by DPB
+ * index, so a reference to any other entry makes the VP dereference an
+ * uninitialised reference slot: that ends in a DART translation fault, a
+ * frame that never completes and a watchdog reset of the VP, which also
+ * disturbs the other contexts. It happens whenever a client starts decoding
+ * on a non-IDR frame (joining a live RTSP stream mid-GOP): ffmpeg's
+ * v4l2request hwaccel leaves the index of a missing reference at 0 and the
+ * DPB is empty. Refuse such slices before anything is pushed; the client gets
+ * the capture buffer back with V4L2_BUF_FLAG_ERROR, as for corrupt input.
+ */
+static bool avd_h264_refs_valid(const struct avd_h264_run *run)
+{
+	const struct v4l2_ctrl_h264_slice_params *sl = run->slice_params;
+	const struct v4l2_h264_dpb_entry *dpb = run->decode_params->dpb;
+	const struct v4l2_h264_reference *lists[2] = {
+		sl->ref_pic_list0, sl->ref_pic_list1
+	};
+	u32 num[2] = {
+		sl->num_ref_idx_l0_active_minus1 + 1,
+		sl->num_ref_idx_l1_active_minus1 + 1
+	};
+	int nlists;
+
+	if (sl->slice_type == V4L2_H264_SLICE_TYPE_P)
+		nlists = 1;
+	else if (sl->slice_type == V4L2_H264_SLICE_TYPE_B)
+		nlists = 2;
+	else
+		return true;
+
+	for (int l = 0; l < nlists; l++) {
+		if (num[l] > V4L2_H264_REF_LIST_LEN)
+			return false;
+		for (u32 i = 0; i < num[l]; i++) {
+			u8 idx = lists[l][i].index;
+
+			if (idx >= V4L2_H264_NUM_DPB_ENTRIES ||
+			    !(dpb[idx].flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
+				return false;
+		}
+	}
+
+	return true;
 }
 
 static int avd_h264_run(struct avd_ctx *ctx)
@@ -761,45 +779,18 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		ret = avd_init_job(ctx, AVD_CODEC_H264, MAX_SLICES + 1);
 		if (ret)
 			return ret;
-		}
-		avd->variant->configure_stream(ctx->dev,
-					       h264_ctx->bufs.inst.addr,
-					       ctx->fifo_idx, ctx->vp_slot);
 		stream_hdr(ctx, &run);
 	}
 
-	if (ctx->vp_slot == VP_SLOT_NONE) {
-		/* Only happens if its a multi slice frame and there was an error */
-		dev_err_ratelimited(avd->dev, "no assigned VP slots: %04lx",
-				    avd->vp_slots);
-		return -ENOMEM;
-	}
+	if (!ctx->job.segments)
+		return -EINVAL;
 
 	ctx->job.num++;
 	stream_slice(ctx, &run);
 
 	if (run.base.bufs.src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) {
-		if (avd->variant->revision == 3)
-			reg = (0x18 | ctx->vp_slot << 12);
-		else
-			reg = (0x1018 | ctx->vp_slot << 8);
-
-		/* seems to be take ~ slice_size / 16 us */
-		ret = readl_poll_timeout(
-			avd->ctrl + reg, slice_parsed,
-			slice_parsed >= round_down(slice_size, 8), 5, 1000);
-
-		if (ret) {
-			dev_err(avd->dev,
-				"VP%d: timed out (%02d)! size: %08x parsed: %08x",
-				ctx->vp_slot, ctx->fifo_idx, slice_size,
-				slice_parsed);
-			avd_status(avd, ctx->vp_slot);
-			return 0;
-		}
-
-		if (cancel_delayed_work(&ctx->watchdog_work))
-			avd_job_finish(ctx, VB2_BUF_STATE_DONE);
+		avd_job_finish(ctx, VB2_BUF_STATE_DONE);
+		return 0;
 	}
 
 	return avd_submit_job(ctx);
@@ -860,7 +851,7 @@ static void avd_h264_adjust_decoded_fmt(struct avd_ctx *ctx,
 					struct v4l2_pix_format_mplane *pix_mp)
 {
 	pix_mp->plane_fmt[0].sizeimage +=
-		sps_size(pix_mp->width, pix_mp->height);
+		mv_color_size(pix_mp->width, pix_mp->height);
 }
 
 static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
@@ -876,9 +867,13 @@ static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 static void avd_h264_submit(struct avd_ctx *ctx)
 {
 	writel_relaxed(
-		0x2b000000 |
-			(ctx->dev->variant->revision == 3 ? 0x100 : 0x200) |
-			(ctx->fifo_idx << 4) | ctx->dev->variant->fifo_slots,
+		AVD_OP_EXEC |
+			AVD_OP_EXEC_FLAG_START_REV4(
+				ctx->dev->variant->revision == 4) |
+			AVD_OP_EXEC_FLAG_START_REV3(
+				ctx->dev->variant->revision == 3) |
+			AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+			AVD_OP_EXEC_FIFO_MASK(ctx->dev->variant->fifo_slots),
 		ctx->dev->ctrl + ctx->dev->variant->submit_offset);
 }
 

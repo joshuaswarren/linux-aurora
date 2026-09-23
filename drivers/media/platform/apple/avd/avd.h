@@ -38,9 +38,14 @@
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
 
-/* AVD needs most addresses to be aligned to 256 */
+/*
+ * AVD needs most addresses to be aligned to 256
+ * the only exception are the compressed buffers, they are aligned to 128
+ * instead
+ */
 #define AVD_ALIGN	256
-
+/* hevc, with a b slice where all references are active and weights are sent */
+#define AVD_MAX_INST	512
 
 struct avd_ctx;
 struct avd_dev;
@@ -91,14 +96,13 @@ struct avd_av1_decoded_buffer_info {
 	u32 order_hints[V4L2_AV1_TOTAL_REFS_PER_FRAME];
 	u8 ref_frame_idx[V4L2_AV1_REFS_PER_FRAME];
 	bool intrabc;
-	size_t priv_tlb_size;
+	size_t color_size;
 };
 
 struct avd_hevc_decoded_buffer_info {
 	/* Info needed when the decoded frame serves as a reference frame. */
 	bool is_intra;
 };
-
 
 struct avd_comp {
 	u32 size;
@@ -113,6 +117,9 @@ struct avd_decoded_buffer {
 	struct v4l2_m2m_buffer base;
 
 	struct avd_comp comp;
+	/* Pending CPU fill, retained with the buffer until dequeue. */
+	size_t grey_chroma_offset;
+	bool grey_chroma_10bit;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
@@ -263,9 +270,9 @@ struct avd_ctx {
 	void *priv;
 
 	struct avd_comp comp;
-
-	u8 fifo_idx;
-	u8 vp_slot;
+	int fifo_idx;
+	struct avd_job job;
+	struct avd_buf inst;
 };
 
 int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments);
