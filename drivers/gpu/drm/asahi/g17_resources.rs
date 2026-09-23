@@ -3121,14 +3121,22 @@ impl G17PRenderCommandGeneration {
             render_state_iova,
             mmu::PROT_GPU_FW_SHARED_RW,
             false,
-        )?;
+        ).map_err(|error| {
+            pr_err!("G17P render rebind: vm={} alias=alternate-render-state addr={:#x} size={:#x} failed ({:?})\n",
+                vm.id(), render_state_iova, render_state.object.size(), error);
+            error
+        })?;
         let aliases = render_user_aliases.remap(render_state, vm, render_layout)?;
         let status_iova = fragment_status_low.iova();
         let status_mapping = fragment_status.map_alias_at(
             vm,
             status_iova,
             mmu::PROT_GPU_SHARED_RW,
-        )?;
+        ).map_err(|error| {
+            pr_err!("G17P render rebind: vm={} alias=alternate-fragment-status addr={:#x} size={:#x} failed ({:?})\n",
+                vm.id(), status_iova, fragment_status.object.size(), error);
+            error
+        })?;
         Ok((render_state_mapping, aliases, status_mapping))
     }
 }
@@ -3219,7 +3227,11 @@ impl G17PRenderUserAliases {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
             false,
-        )?;
+        ).map_err(|error| {
+            pr_err!("G17P render rebind: vm={} alias=deflake addr={:#x} size={:#x} failed ({:?})\n",
+                vm.id(), self.deflake.iova(), self.deflake.size(), error);
+            error
+        })?;
         let aux_fb = render_state.object.map_range_into_range(
             vm,
             render_layout.aux_fb
@@ -3229,7 +3241,11 @@ impl G17PRenderUserAliases {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
             false,
-        )?;
+        ).map_err(|error| {
+            pr_err!("G17P render rebind: vm={} alias=aux-fb addr={:#x} size={:#x} failed ({:?})\n",
+                vm.id(), self.aux_fb.iova(), self.aux_fb.size(), error);
+            error
+        })?;
         Ok(Self { deflake, aux_fb })
     }
 }
@@ -7869,14 +7885,13 @@ impl G17PUserRenderStorage {
                 .and_then(|end| end.checked_add(mask))
                 .map(|end| end & !mask)
             else { return false; };
-            let mut ranges = [crate::pgtable::MappedRange::default(); 1];
-            match vm.mapped_ranges(start..end, &mut ranges) {
-                Ok((0, false)) => true,
-                Ok(_) => {
+            match vm.first_occupied_alias_range(start..end) {
+                Ok(None) => true,
+                Ok(Some(occupied)) => {
                     pr_info!(
                         "G17P graph cache: vm={} pair={} cannot reuse {} at {:#x}+{:#x}; occupied {:#x}..{:#x}\n",
                         vm.id(), self.queue_pair.slot(), name, address, size,
-                        ranges[0].start, ranges[0].end,
+                        occupied.start, occupied.end,
                     );
                     false
                 }
@@ -7884,18 +7899,18 @@ impl G17PUserRenderStorage {
             }
         };
         for (name, address, size) in [
-            ("render-state", self.render_state.iova(), self.render_state.logical_size as u64),
+            ("render-state", self.render_state.iova(), self.render_state.object.size() as u64),
             ("deflake", self.render_user_aliases.deflake.iova(), self.render_user_aliases.deflake.size() as u64),
             ("aux-fb", self.render_user_aliases.aux_fb.iova(), self.render_user_aliases.aux_fb.size() as u64),
-            ("rt-memory", self.render_target_memory.rt_memory.iova(), self.render_target_memory.rt_memory.logical_size as u64),
-            ("tpc", self.render_target_memory.tpc.iova(), self.render_target_memory.tpc.logical_size as u64),
+            ("rt-memory", self.render_target_memory.rt_memory.iova(), self.render_target_memory.rt_memory.object.size() as u64),
+            ("tpc", self.render_target_memory.tpc.iova(), self.render_target_memory.tpc.object.size() as u64),
             ("descriptor-ta", self.descriptor_ta_low.iova(), self.descriptor_ta_low.size() as u64),
             ("descriptor-3d", self.descriptor_3d_low.iova(), self.descriptor_3d_low.size() as u64),
-            ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.logical_size as u64),
+            ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.object.size() as u64),
             ("descriptor-3d-diagnostic", self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64),
             ("fragment-status", self.fragment_status_low.iova(), self.fragment_status_low.size() as u64),
             ("alternate-render-state", self.alternate_render_command.render_state.iova(),
-                self.alternate_render_command.render_state.logical_size as u64),
+                self.alternate_render_command.render_state.object.size() as u64),
             ("alternate-deflake", self.alternate_render_command.render_user_aliases.deflake.iova(),
                 self.alternate_render_command.render_user_aliases.deflake.size() as u64),
             ("alternate-aux-fb", self.alternate_render_command.render_user_aliases.aux_fb.iova(),
@@ -7906,7 +7921,7 @@ impl G17PUserRenderStorage {
             if !available(name, address, size) { return false; }
         }
         for object in [self.scene_scratch.as_ref(), self.discard.as_ref()].into_iter().flatten() {
-            if !available("scene/discard", object.iova(), object.logical_size as u64) {
+            if !available("scene/discard", object.iova(), object.object.size() as u64) {
                 return false;
             }
         }
@@ -7938,6 +7953,21 @@ impl G17PUserRenderStorage {
         vm: &mmu::Vm,
         sksm_backing: &mut G17PRenderSksmBacking,
     ) -> Result<(KVec<mmu::KernelMapping>, KVec<mmu::KernelMapping>)> {
+        let pair = self.queue_pair.slot();
+        // A failed cross-VM rebind is pre-publication, but the caller must
+        // know which exact alias refused admission before considering reuse.
+        // Log only on error; successful handoffs retain their existing path.
+        macro_rules! rebind_step {
+            ($stage:literal, $operation:expr) => {
+                $operation.map_err(|error| {
+                    pr_err!(
+                        "G17P render rebind: vm={} pair={} alias={} failed ({:?})\n",
+                        vm.id(), pair, $stage, error,
+                    );
+                    error
+                })?
+            };
+        }
         if !sksm_backing.matches_queue_pair(self.queue_pair) {
             pr_err!(
                 "G17P render rebind: vm={} graph pair={} backing pair={} TA={:#x} 3D={:#x}\n",
@@ -7947,32 +7977,32 @@ impl G17PUserRenderStorage {
             return Err(EFAULT);
         }
 
-        let render_state_mapping = self.render_state.object.map_at(
+        let render_state_mapping = rebind_step!("render-state", self.render_state.object.map_at(
             vm, self.render_state.iova(), mmu::PROT_GPU_FW_SHARED_RW, false,
-        )?;
-        let render_user_aliases = self.render_user_aliases.remap(
+        ));
+        let render_user_aliases = rebind_step!("render-user-aliases", self.render_user_aliases.remap(
             &mut self.render_state, vm, &self.render_layout,
-        )?;
+        ));
         let (
             alternate_render_state_mapping,
             alternate_render_user_aliases,
             alternate_fragment_status_mapping,
-        ) = self.alternate_render_command.prepare_vm_rebind(vm)?;
+        ) = rebind_step!("alternate-render-command", self.alternate_render_command.prepare_vm_rebind(vm));
         let rt_memory_iova = self.render_target_memory.rt_memory.iova();
-        let rt_memory_mapping = self.render_target_memory.rt_memory.object.map_at(
+        let rt_memory_mapping = rebind_step!("rt-memory", self.render_target_memory.rt_memory.object.map_at(
             vm,
             rt_memory_iova,
             mmu::PROT_GPU_FW_SHARED_RW,
             false,
-        )?;
+        ));
         let tpc_iova = self.render_target_memory.tpc.iova();
-        let tpc_mapping = self.render_target_memory.tpc.object.map_at(
+        let tpc_mapping = rebind_step!("tpc", self.render_target_memory.tpc.object.map_at(
             vm,
             tpc_iova,
             mmu::PROT_GPU_FW_SHARED_RW,
             false,
-        )?;
-        let descriptor_ta_low = self.descriptors.object.map_range_into_range(
+        ));
+        let descriptor_ta_low = rebind_step!("descriptor-ta", self.descriptors.object.map_range_into_range(
             vm,
             0..G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
             self.descriptor_ta_low.iova()
@@ -7980,8 +8010,8 @@ impl G17PUserRenderStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RO,
             false,
-        )?;
-        let descriptor_3d_low = self.descriptors.object.map_range_into_range(
+        ));
+        let descriptor_3d_low = rebind_step!("descriptor-3d", self.descriptors.object.map_range_into_range(
             vm,
             G17P_RENDER_3D_DESCRIPTOR_OFFSET
                 ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
@@ -7990,14 +8020,14 @@ impl G17PUserRenderStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RO,
             false,
-        )?;
-        let scene_mapping = self.scene_scratch.as_mut().map(|object| {
+        ));
+        let scene_mapping = rebind_step!("scene-scratch", self.scene_scratch.as_mut().map(|object| {
             object.map_alias_at(vm, object.iova(), mmu::PROT_GPU_SHARED_RW)
-        }).transpose()?;
-        let discard_mapping = self.discard.as_mut().map(|object| {
+        }).transpose());
+        let discard_mapping = rebind_step!("discard", self.discard.as_mut().map(|object| {
             object.map_alias_at(vm, object.iova(), mmu::PROT_GPU_SHARED_RW)
-        }).transpose()?;
-        let page_list_mapping = self.parameter_management.as_mut().map(|pm| {
+        }).transpose());
+        let page_list_mapping = rebind_step!("page-list", self.parameter_management.as_mut().map(|pm| {
             let size = page_align(G17P_PM_PAGE_LIST_SIZE).ok_or(EINVAL)?;
             pm.backing.object.map_range_into_range(
                 vm,
@@ -8008,15 +8038,15 @@ impl G17PUserRenderStorage {
                 mmu::PROT_GPU_FW_SHARED_RW,
                 false,
             )
-        }).transpose()?;
-        let tvb_mappings = self.render_tvb.as_mut()
+        }).transpose());
+        let tvb_mappings = rebind_step!("tvb", self.render_tvb.as_mut()
             .map(|tvb| tvb.map_cached_blocks(vm))
-            .transpose()?
+            .transpose())
             .unwrap_or_else(KVec::new);
-        let fragment_rce_mapping = self.fragment_rce.map_alias_at(
+        let fragment_rce_mapping = rebind_step!("fragment-rce", self.fragment_rce.map_alias_at(
             vm, self.fragment_rce.iova(), mmu::PROT_GPU_SHARED_RO,
-        )?;
-        let descriptor_3d_render_mapping = self.descriptors.object.map_range_into_range(
+        ));
+        let descriptor_3d_render_mapping = rebind_step!("descriptor-3d-diagnostic", self.descriptors.object.map_range_into_range(
             vm,
             G17P_RENDER_3D_DESCRIPTOR_OFFSET
                 ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + mmu::UAT_PGSZ,
@@ -8025,23 +8055,23 @@ impl G17PUserRenderStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RO,
             false,
-        )?;
-        let fragment_status_mapping = self.fragment_status.map_alias_at(
+        ));
+        let fragment_status_mapping = rebind_step!("fragment-status", self.fragment_status.map_alias_at(
             vm, self.fragment_status_low.iova(), mmu::PROT_GPU_SHARED_RW,
-        )?;
+        ));
         let render_peer_prot = if crate::g17_config::RENDER_SKSM != 0 {
             mmu::PROT_GPU_SHARED_RW
         } else {
             mmu::PROT_GPU_SHARED_RO
         };
-        let (ta_context_low, ta_context_mapping) = prepare_render_sksm_vm_alias(
+        let (ta_context_low, ta_context_mapping) = rebind_step!("ta-sksm", prepare_render_sksm_vm_alias(
             uat, vm, &mut sksm_backing.ta_context, sksm_backing._ta_context_global.iova(),
             render_peer_prot, crate::g17_config::RENDER_SKSM != 0,
-        )?;
-        let (fragment_context_low, fragment_context_mapping) = prepare_render_sksm_vm_alias(
+        ));
+        let (fragment_context_low, fragment_context_mapping) = rebind_step!("fragment-sksm", prepare_render_sksm_vm_alias(
             uat, vm, &mut sksm_backing.fragment_context, sksm_backing._fragment_context_global.iova(),
             render_peer_prot, crate::g17_config::RENDER_SKSM != 0,
-        )?;
+        ));
 
         self.render_state.mapping = Some(render_state_mapping);
         self.render_user_aliases = render_user_aliases;
@@ -16010,14 +16040,22 @@ impl G17ResourceOwner {
         self.address_space.uat.require_t8140_vm_context(vm)?;
         let render_slot = storage.queue_pair.slot();
         vm.clear_render_pool_mappings(render_slot);
-        let (pool_mappings, sksm_mappings) = storage.rebind_client_vm_aliases(
+        let (pool_mappings, sksm_mappings) = match storage.rebind_client_vm_aliases(
             &self.address_space.uat, vm, sksm_backing,
-        ).map_err(|error| {
-            dev_err!(self.dev().as_ref(),
-                "G17P render rebind: vm={} pair={} stage=graph-aliases ({:?})\n",
-                vm.id(), render_slot, error);
-            error
-        })?;
+        ) {
+            Ok(mappings) => mappings,
+            Err(error) => {
+                // Successful local mappings have dropped on the error path.
+                // If this is still clear, the refusal came from an alias the
+                // cache preflight does not cover rather than an old graph's
+                // fixed address which was occupied before this transaction.
+                let preflight_clear = storage.client_rebind_addresses_available(vm);
+                dev_err!(self.dev().as_ref(),
+                    "G17P render rebind: vm={} pair={} stage=graph-aliases preflight-clear-after-failure={} ({:?})\n",
+                    vm.id(), render_slot, preflight_clear, error);
+                return Err(error);
+            }
+        };
         let job_context_mappings = self
             .address_space
             .uat

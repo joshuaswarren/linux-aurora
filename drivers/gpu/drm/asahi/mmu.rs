@@ -2485,6 +2485,152 @@ impl Vm {
             .unwrap_or(false)
     }
 
+    /// Resolve an IOVA through this VM's current page table. Callers use this
+    /// for mapping-identity checks only; it does not read the mapped page.
+    pub(crate) fn translate_iova(&self, address: u64) -> Result<PhysicalAddr> {
+        let mut inner = self.inner.exec_lock(None, false)?;
+        inner.page_table.translate_iova(address)
+    }
+
+    /// Resolve one offset of native's low view 0 through this VM's own root
+    /// and through the canonical GART address, so a caller can prove -- before
+    /// arming hardware -- that the client regime reaches the same physical
+    /// resource the GPU is about to write there.
+    pub(crate) fn t8140_client_null_view_probe(
+        &self,
+        offset: u64,
+    ) -> Result<(PhysicalAddr, PhysicalAddr)> {
+        if offset >= T8140_CLIENT_NULL_VIEW_SIZE as u64 {
+            return Err(EINVAL);
+        }
+        let canonical = self.translate_iova(
+            T8140_CLIENT_NULL_VIEW
+                .source_address
+                .checked_add(offset)
+                .ok_or(EOVERFLOW)?,
+        )?;
+        let client = self.translate_iova(
+            T8140_CLIENT_NULL_VIEW_START
+                .checked_add(offset)
+                .ok_or(EOVERFLOW)?,
+        )?;
+        Ok((canonical, client))
+    }
+
+    /// Collect this VM's GPU-visible mappings inside `range`.
+    ///
+    /// Page-table memory only: this walks ordinary DRAM and never touches GPU
+    /// MMIO, so it is safe to call after a faulted submission has let the
+    /// cores power-gate.  Returns the number of runs written and whether
+    /// `out` was too small to hold them all.
+    pub(crate) fn mapped_ranges(
+        &self,
+        range: Range<u64>,
+        out: &mut [pgtable::MappedRange],
+    ) -> Result<(usize, bool)> {
+        let mut inner = self.inner.exec_lock(None, false)?;
+        inner.page_table.collect_mapped_ranges(range, out)
+    }
+
+    /// Test a fixed-address kernel alias against both translated pages and
+    /// GPUVA reservations. A mapped-range census alone misses the unmapped
+    /// guard at the end of a `map_in_range(..., guard=true)` allocation, while
+    /// `map_at` still rejects that guard through drm_mm with ENOSPC.
+    pub(crate) fn first_occupied_alias_range(
+        &self,
+        range: Range<u64>,
+    ) -> Result<Option<Range<u64>>> {
+        let mut inner = self.inner.exec_lock(None, false)?;
+        let mut mapped = [pgtable::MappedRange::default(); 1];
+        let (count, _) = inner.page_table.collect_mapped_ranges(range.clone(), &mut mapped)?;
+        if count != 0 {
+            return Ok(Some(mapped[0].start..mapped[0].end));
+        }
+        inner.mm.first_overlap(range)
+    }
+
+    /// Read GPU-visible bytes out of this VM.
+    ///
+    /// Fail-closed: the whole span must first pass `covers_range` with GPU
+    /// read permission, and every page is then translated and borrowed
+    /// individually.  This only ever touches ordinary DRAM backing a GEM
+    /// object that is mapped into this VM, never GPU MMIO, so it is safe with
+    /// the cores gated.
+    ///
+    /// It exists so the driver can enumerate the pointers a submission
+    /// actually dereferences.  A GMMU page fault names no address on G17P (the
+    /// MMIO fault bank is a reset-default phantom), and the UAPI carries only
+    /// the control-stream range -- every other pointer the GPU follows lives
+    /// *inside* the command stream and the Ioto program, where only a reader
+    /// like this can find it.
+    pub(crate) fn read_bytes(&self, iova: u64, out: &mut [u8]) -> Result {
+        if out.is_empty() {
+            return Err(EINVAL);
+        }
+        if !self.covers_range(iova, out.len() as u64, true, false) {
+            return Err(EFAULT);
+        }
+        let total = out.len();
+        let mut done = 0usize;
+        while done < total {
+            let addr = iova.checked_add(done as u64).ok_or(EOVERFLOW)?;
+            let phys = self.translate_iova(addr)?;
+            let page_mask = (kernel::page::PAGE_SIZE as PhysicalAddr) - 1;
+            let page_phys = phys & !page_mask;
+            let offset = (phys - page_phys) as usize;
+            let chunk = cmp::min(kernel::page::PAGE_SIZE - offset, total - done);
+            // SAFETY: `translate_iova` resolved this address through a leaf
+            // PTE of this VM, so it names a page of a GEM object that is
+            // mapped here and therefore pinned for the duration of the
+            // mapping. `borrow_phys` additionally rejects anything without a
+            // struct page.
+            let page = unsafe { Page::borrow_phys(&page_phys) }.ok_or(EFAULT)?;
+            let dst = &mut out[done..done + chunk];
+            page.with_pointer_into_page(offset, chunk, |ptr| {
+                // SAFETY: `with_pointer_into_page` bounds-checked
+                // `offset..offset + chunk` inside the page.
+                let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, chunk) };
+                dst.copy_from_slice(src);
+                Ok(())
+            })?;
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    /// Physical base of this VM's page-table root.
+    ///
+    /// This is what a hardware context's TTB0 has to name for the GPU to see
+    /// any of this VM's mappings, so it is the other half of a reachability
+    /// check that `covers_range` alone cannot make.
+    pub(crate) fn page_table_root(&self) -> u64 {
+        self.binding.lock().ttb
+    }
+
+    /// Snapshot the first `out.len()` hardware context-table (TTBAT) entries
+    /// as `(ttb0, ttb1)` pairs.
+    ///
+    /// The TTBAT is an ordinary host DRAM region, so this reads no GPU MMIO
+    /// and is safe with the cores gated.  A G17P compute kick declares
+    /// hardware context 2 or 3, so comparing those entries against
+    /// [`Vm::page_table_root`] is the direct test of whether the GPU is
+    /// walking this VM's tables at all -- something `covers_range` cannot see.
+    pub(crate) fn context_roots(&self, out: &mut [(u64, u64)]) -> Result {
+        let inner = self.inner.exec_lock(None, false)?;
+        let shared = inner.uat_inner.lock();
+        let ttbs = shared.ttbs();
+        for (slot, entry) in out.iter_mut().enumerate() {
+            if slot >= UAT_NUM_CTX {
+                break;
+            }
+            *entry = (
+                ttbs[slot].ttb0.load(Ordering::Acquire),
+                ttbs[slot].ttb1.load(Ordering::Acquire),
+            );
+        }
+        Ok(())
+    }
+
     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_in_range(
