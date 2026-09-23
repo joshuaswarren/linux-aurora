@@ -208,10 +208,16 @@
 	};
 
 	/*
-	 * The full P ladder to P17 = 4.044 GHz (macOS's ceiling).  The cleanroom tree only
-	 * releases P7..P17 under its fast PMP thermal controller; here the SMC step-wise policy
-	 * (65 C passive trip, minimum frequency on stale telemetry, 105/95 C backup) is the
-	 * only software throttle, so it stays enabled whenever this table is present.
+	 * The full P ladder to P17 = 4.044 GHz (macOS's ceiling).  apple-soc-cpufreq will not
+	 * register a T8140 ladder above state 2 unless the SMC CPU thermal policy attaches
+	 * (drivers/thermal/apple-smc-cpu-thermal.c, fed by the smc-hwmon node's
+	 * apple,cpu-thermal-policy sensors), and that policy holds both clusters at their
+	 * minimum until it has three fresh readings, and again whenever telemetry goes stale.
+	 * Its band is a 95 C passive trip released at 85 C, then a 103/98 C hard tier at minimum
+	 * frequency; the old 80/70 C band sat inside the die's idle range and latched the P
+	 * cluster at 1.26-2.20 GHz.  The PMP-v2 fast policy (CONFIG_APPLE_PMP_V2_THERMAL) takes
+	 * over when pmp_v2.thermal_policy=1, but it needs idle=nop, which costs ~47 C at idle;
+	 * J700 boots idle=wfi pmp_v2.thermal_policy=0, so the SMC policy governs.
 	 */
 	pcpu_opp: opp-table-pcpu {
 		compatible = "operating-points-v2";
