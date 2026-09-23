@@ -704,6 +704,9 @@ struct SepData {
     /// sbio.rs. Reset when an enrolment begins, so a second attempt starts
     /// from stage one rather than continuing the first.
     enrol_frames_accepted: Atomic<u32>,
+    /// Last stage reported for the running enrolment, so each accepted frame
+    /// can be guaranteed to move the bar at least one step.
+    enrol_stage: Atomic<u32>,
 
     rng_shutdown: Atomic<bool>,
 
@@ -883,6 +886,7 @@ impl SepData {
                 rng_failures: Atomic::new(0),
                 enrol_prev <- new_mutex!(KVec::new()),
                 enrol_frames_accepted: Atomic::new(0),
+                enrol_stage: Atomic::new(0),
                 rx: rxring::RxRing::new(),
                 rx_count: Atomic::new(0),
                 settle_mark: Atomic::new(0),
