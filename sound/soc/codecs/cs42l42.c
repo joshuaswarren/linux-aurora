@@ -13,6 +13,7 @@
 #include <linux/moduleparam.h>
 #include <linux/types.h>
 #include <linux/init.h>
+#include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/regmap.h>
@@ -1344,20 +1345,43 @@ static void cs42l42_manual_hs_type_detect(struct cs42l42_private *cs42l42)
  * The receiver operates on the internal oscillator, including while audio
  * is idle. These control values and status bits are specific to CS42L83.
  */
+
+/* MISC_DET_CTL */
 #define CS42L83_REMOTE_TX_START		BIT(7)
-#define CS42L83_REMOTE_RX_ACK		BIT(3)
-#define CS42L83_REMOTE_BUTTON_IRQ		BIT(5)
+/* Upper HSBIAS_CTL bit: set for the 2.7 V setting, clear when grounded. */
+#define CS42L83_HSBIAS_CTL_ON		(2 << CS42L42_HSBIAS_CTL_SHIFT)
+
+/* HS_BIAS_CTL: undocumented field cleared before a bias transition */
+#define CS42L83_HS_BIAS_CTL_TRANSITION	GENMASK(3, 2)
+
+/* DET_INT_STATUS1: volume pulses, outside the CS42L42 interrupt masks */
 #define CS42L83_REMOTE_BUTTONS		GENMASK(4, 0)
 #define CS42L83_REMOTE_VOLUME_DOWN	BIT(0)
-#define CS42L83_REMOTE_VOLUME_UP		BIT(1)
+#define CS42L83_REMOTE_VOLUME_UP	BIT(1)
+
+/* DET_INT_STATUS2 / DET_INT2_MASK */
+#define CS42L83_REMOTE_RX_ACK		BIT(3)
+#define CS42L83_REMOTE_BUTTON_IRQ	BIT(5)
+
+/* Identifier: three 3-bit symbols in DET_STATUS1[4:0]:DET_STATUS2[7:4] */
+#define CS42L83_REMOTE_ID_LO		GENMASK(7, 4)
+#define CS42L83_REMOTE_ID_HI		GENMASK(4, 0)
+#define CS42L83_REMOTE_ID_SYMBOLS	3
+#define CS42L83_REMOTE_ID_SYMBOL	GENMASK(2, 0)
 
 /* Complete receiver control values; these are not CS42L42 detect modes. */
-#define CS42L83_REMOTE_BIAS_RESET		0x03
+#define CS42L83_REMOTE_BIAS_RESET	0x03
 #define CS42L83_REMOTE_BIAS_IDENTIFY	0x9e
 #define CS42L83_REMOTE_BIAS_BUTTONS	0x5f
-#define CS42L83_REMOTE_RX_CONFIG		0x8f
+#define CS42L83_REMOTE_RX_CONFIG	0x8f
 #define CS42L83_REMOTE_LEVEL_IDENTIFY	0x36
 #define CS42L83_REMOTE_LEVEL_BUTTONS	0x3c
+#define CS42L83_REMOTE_SENSE_TRIP	(3 << CS42L42_HSBIAS_SENSE_TRIP_SHIFT)
+
+#define CS42L83_REMOTE_BIAS_SETTLE_US	10000
+#define CS42L83_REMOTE_SETTLE_MS	35
+#define CS42L83_REMOTE_RX_POLL_US	5000
+#define CS42L83_REMOTE_RX_TIMEOUT_US	500000
 
 static const unsigned int cs42l83_remote_regs[] = {
 	[CS42L83_REMOTE_SAVED_HSBIAS_SC_AUTOCTL] = CS42L42_HSBIAS_SC_AUTOCTL,
@@ -1365,23 +1389,51 @@ static const unsigned int cs42l83_remote_regs[] = {
 	[CS42L83_REMOTE_SAVED_MISC_DET_CTL] = CS42L42_MISC_DET_CTL,
 	[CS42L83_REMOTE_SAVED_MIC_DET_CTL1] = CS42L42_MIC_DET_CTL1,
 	[CS42L83_REMOTE_SAVED_MIC_DET_CTL2] = CS42L42_MIC_DET_CTL2,
-	[CS42L83_REMOTE_SAVED_DET_INT1_MASK] = CS42L42_DET_INT1_MASK,
-	[CS42L83_REMOTE_SAVED_DET_INT2_MASK] = CS42L42_DET_INT2_MASK,
 	[CS42L83_REMOTE_SAVED_HS_BIAS_CTL] = CS42L42_HS_BIAS_CTL,
 	[CS42L83_REMOTE_SAVED_HSDET_CTL2] = CS42L42_HSDET_CTL2,
+	[CS42L83_REMOTE_SAVED_DET_INT1_MASK] = CS42L42_DET_INT1_MASK,
+	[CS42L83_REMOTE_SAVED_DET_INT2_MASK] = CS42L42_DET_INT2_MASK,
 };
 
-static void cs42l83_remote_restore(struct cs42l42_private *cs42l42)
-{
-	int i, ret;
+static_assert(ARRAY_SIZE(cs42l83_remote_regs) == CS42L83_REMOTE_NUM_SAVED_REGS);
 
-	for (i = 0; i < ARRAY_SIZE(cs42l83_remote_regs); i++) {
-		ret = regmap_write(cs42l42->regmap, cs42l83_remote_regs[i],
-				   cs42l42->remote_saved[i]);
-		if (ret)
-			dev_warn(cs42l42->dev, "Failed to restore headset detection register %#x: %d\n",
-				 cs42l83_remote_regs[i], ret);
-	}
+static void cs42l83_remote_restore_reg(struct cs42l42_private *cs42l42, int i)
+{
+	int ret;
+
+	ret = regmap_write(cs42l42->regmap, cs42l83_remote_regs[i],
+			   cs42l42->remote_saved[i]);
+	if (ret)
+		dev_warn(cs42l42->dev, "Failed to restore headset detection register %#x: %d\n",
+			 cs42l83_remote_regs[i], ret);
+}
+
+/*
+ * Restore the analogue detector. @settle lets the level detector settle
+ * before its button interrupts are unmasked again, for when it stays in use.
+ */
+static void cs42l83_remote_restore(struct cs42l42_private *cs42l42, bool settle)
+{
+	unsigned int int_status;
+	int i;
+
+	/* Nothing reports a release for a held remote button once disabled. */
+	snd_soc_jack_report(cs42l42->jack, 0,
+			    SND_JACK_BTN_0 | SND_JACK_BTN_1 | SND_JACK_BTN_2);
+
+	for (i = 0; i < CS42L83_REMOTE_SAVED_DET_INT1_MASK; i++)
+		cs42l83_remote_restore_reg(cs42l42, i);
+
+	if (settle)
+		msleep(cs42l42->btn_det_init_dbnce);
+
+	/* Discard events latched while the detector was reconfigured. */
+	regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
+	regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int_status);
+
+	for (; i < CS42L83_REMOTE_NUM_SAVED_REGS; i++)
+		cs42l83_remote_restore_reg(cs42l42, i);
+
 	cs42l42->remote_active = false;
 }
 
@@ -1400,8 +1452,8 @@ static int cs42l83_remote_set_detect(struct cs42l42_private *cs42l42, unsigned i
 		return ret;
 	changed = (old & CS42L42_HSBIAS_CTL_MASK) != (value & CS42L42_HSBIAS_CTL_MASK);
 	if (changed) {
-		/* CS42L83 bias transitions require clearing this undocumented field. */
-		ret = regmap_update_bits(cs42l42->regmap, CS42L42_HS_BIAS_CTL, GENMASK(3, 2), 0);
+		ret = regmap_update_bits(cs42l42->regmap, CS42L42_HS_BIAS_CTL,
+					 CS42L83_HS_BIAS_CTL_TRANSITION, 0);
 		if (ret)
 			return ret;
 		ret = regmap_update_bits(cs42l42->regmap, CS42L42_HSDET_CTL2,
@@ -1410,11 +1462,12 @@ static int cs42l83_remote_set_detect(struct cs42l42_private *cs42l42, unsigned i
 			return ret;
 	}
 	ret = regmap_update_bits(cs42l42->regmap, CS42L42_MISC_DET_CTL,
-				 value & CS42L83_REMOTE_TX_START ? 0x7f : 0xff, value);
+				 0xff & ~(value & CS42L83_REMOTE_TX_START), value);
 	if (ret)
 		return ret;
-	if (!!(old & BIT(2)) != !!(value & BIT(2)))
-		usleep_range(10000, 11000);
+	if ((old ^ value) & CS42L83_HSBIAS_CTL_ON)
+		usleep_range(CS42L83_REMOTE_BIAS_SETTLE_US,
+			     CS42L83_REMOTE_BIAS_SETTLE_US + 1000);
 	if (value & CS42L83_REMOTE_TX_START) {
 		ret = regmap_write(cs42l42->regmap, CS42L42_MISC_DET_CTL, value);
 		if (ret)
@@ -1431,12 +1484,11 @@ static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
 {
 	static const struct reg_sequence identify[] = {
 		{ CS42L42_DET_INT2_MASK, 0xff },
-		{ CS42L42_HSBIAS_SC_AUTOCTL, 0x03 },
+		{ CS42L42_HSBIAS_SC_AUTOCTL, CS42L83_REMOTE_SENSE_TRIP },
 		{ CS42L42_WAKE_CTL, CS42L42_M_HP_WAKE_MASK | CS42L42_M_MIC_WAKE_MASK },
 		{ CS42L42_MIC_DET_CTL2, CS42L83_REMOTE_RX_CONFIG },
 	};
-	unsigned int int1, int2, status1, status2, symbols, symbol[3];
-	unsigned long deadline;
+	unsigned int int_status, status1, status2, id;
 	int i, ret;
 
 	if (cs42l42->devid != CS42L83_CHIP_ID ||
@@ -1447,8 +1499,10 @@ static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
 	for (i = 0; i < ARRAY_SIZE(cs42l83_remote_regs); i++) {
 		ret = regmap_read(cs42l42->regmap, cs42l83_remote_regs[i],
 				  &cs42l42->remote_saved[i]);
-		if (ret)
+		if (ret) {
+			dev_dbg(cs42l42->dev, "Failed to save headset detection state: %d\n", ret);
 			return;
+		}
 	}
 
 	ret = regmap_multi_reg_write(cs42l42->regmap, identify, ARRAY_SIZE(identify));
@@ -1458,15 +1512,16 @@ static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
 	ret = cs42l83_remote_set_detect(cs42l42, CS42L83_REMOTE_BIAS_RESET);
 	if (ret)
 		goto fallback;
-	usleep_range(10000, 11000);
+	usleep_range(CS42L83_REMOTE_BIAS_SETTLE_US, CS42L83_REMOTE_BIAS_SETTLE_US + 1000);
 	ret = regmap_update_bits(cs42l42->regmap, CS42L42_MIC_DET_CTL1,
 				 CS42L42_HS_DET_LEVEL_MASK, CS42L83_REMOTE_LEVEL_IDENTIFY);
 	if (ret)
 		goto fallback;
-	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int1);
+	/* Discard stale sticky events before identification starts. */
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
 	if (ret)
 		goto fallback;
-	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int2);
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int_status);
 	if (ret)
 		goto fallback;
 	/* Start identification after the controlled bias rise. */
@@ -1475,24 +1530,17 @@ static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
 		goto fallback;
 
 	/*
-	 * Bit 4 signals TX completion, before the remote reply is ready. Wait
-	 * for RX acknowledgment (bit 3), with a bounded analogue fallback.
+	 * DET_INT_STATUS2 bit 4 signals TX completion, before the remote reply
+	 * is ready. Wait for RX acknowledgment instead, with a bounded timeout.
 	 */
-	msleep(35);
-	deadline = jiffies + msecs_to_jiffies(500);
-	do {
-		ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int2);
-		if (ret)
-			goto fallback;
-		if (int2 & CS42L83_REMOTE_RX_ACK)
-			break;
-		usleep_range(5000, 6000);
-	} while (time_before(jiffies, deadline));
-	if (!(int2 & CS42L83_REMOTE_RX_ACK)) {
-		ret = -ETIMEDOUT;
+	msleep(CS42L83_REMOTE_SETTLE_MS);
+	ret = regmap_read_poll_timeout(cs42l42->regmap, CS42L42_DET_INT_STATUS2,
+				       int_status, int_status & CS42L83_REMOTE_RX_ACK,
+				       CS42L83_REMOTE_RX_POLL_US,
+				       CS42L83_REMOTE_RX_TIMEOUT_US);
+	if (ret)
 		goto fallback;
-	}
-	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int1);
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
 	if (ret)
 		goto fallback;
 	ret = regmap_read(cs42l42->regmap, CS42L42_DET_STATUS1, &status1);
@@ -1501,16 +1549,18 @@ static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
 	ret = regmap_read(cs42l42->regmap, CS42L42_DET_STATUS2, &status2);
 	if (ret)
 		goto fallback;
-	symbols = (status2 >> 4) | ((status1 & 0x1f) << 4);
-	for (i = 0; i < ARRAY_SIZE(symbol); i++)
-		symbol[i] = (symbols >> (i * 3)) & 7;
 	/* A short or an invalid identifier must retain the analogue detector. */
 	if (status2 & CS42L42_SHORT_TRUE_MASK) {
 		ret = -ENODEV;
 		goto fallback;
 	}
-	for (i = 0; i < ARRAY_SIZE(symbol); i++) {
-		if (symbol[i] < 1 || symbol[i] > 4) {
+	id = FIELD_GET(CS42L83_REMOTE_ID_LO, status2) |
+	     FIELD_GET(CS42L83_REMOTE_ID_HI, status1) << 4;
+	for (i = 0; i < CS42L83_REMOTE_ID_SYMBOLS; i++) {
+		unsigned int symbol = (id >> (i * 3)) & CS42L83_REMOTE_ID_SYMBOL;
+
+		/* Valid identifier symbols are 1 to 4. */
+		if (symbol < 1 || symbol > 4) {
 			ret = -ENODEV;
 			goto fallback;
 		}
@@ -1526,9 +1576,17 @@ static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
 	ret = cs42l83_remote_set_detect(cs42l42, CS42L83_REMOTE_BIAS_BUTTONS);
 	if (ret)
 		goto fallback;
-	msleep(35);
+	msleep(CS42L83_REMOTE_SETTLE_MS);
 	ret = regmap_write(cs42l42->regmap, CS42L42_HSBIAS_SC_AUTOCTL,
-			   (cs42l42->hs_bias_sense_en << CS42L42_HSBIAS_SENSE_EN_SHIFT) | 3);
+			   (cs42l42->hs_bias_sense_en << CS42L42_HSBIAS_SENSE_EN_SHIFT) |
+			   CS42L83_REMOTE_SENSE_TRIP);
+	if (ret)
+		goto fallback;
+	/* Discard events latched while switching to button reception. */
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS1, &int_status);
+	if (ret)
+		goto fallback;
+	ret = regmap_read(cs42l42->regmap, CS42L42_DET_INT_STATUS2, &int_status);
 	if (ret)
 		goto fallback;
 	ret = regmap_write(cs42l42->regmap, CS42L42_DET_INT1_MASK,
@@ -1547,11 +1605,11 @@ static void cs42l83_remote_start(struct cs42l42_private *cs42l42)
 
 fallback:
 	dev_dbg(cs42l42->dev, "Headset remote identification failed: %d\n", ret);
-	cs42l83_remote_restore(cs42l42);
+	cs42l83_remote_restore(cs42l42, true);
 }
 
 static void cs42l83_remote_buttons(struct cs42l42_private *cs42l42,
-				 unsigned int int1, unsigned int int2)
+				   unsigned int int1, unsigned int int2)
 {
 	unsigned int buttons = 0;
 
@@ -1565,7 +1623,7 @@ static void cs42l83_remote_buttons(struct cs42l42_private *cs42l42,
 			snd_soc_jack_report(cs42l42->jack, buttons,
 					    SND_JACK_BTN_1 | SND_JACK_BTN_2);
 		snd_soc_jack_report(cs42l42->jack, 0,
-					    SND_JACK_BTN_1 | SND_JACK_BTN_2);
+				    SND_JACK_BTN_1 | SND_JACK_BTN_2);
 	}
 	if (int2 & CS42L42_M_SHORT_DET_MASK)
 		snd_soc_jack_report(cs42l42->jack, SND_JACK_BTN_0, SND_JACK_BTN_0);
@@ -1715,7 +1773,7 @@ static void cs42l42_process_hs_type_detect(struct cs42l42_private *cs42l42)
 static void cs42l42_init_hs_type_detect(struct cs42l42_private *cs42l42)
 {
 	if (cs42l42->remote_active)
-		cs42l83_remote_restore(cs42l42);
+		cs42l83_remote_restore(cs42l42, false);
 
 	/* Mask tip sense interrupts */
 	regmap_update_bits(cs42l42->regmap,
@@ -1805,7 +1863,7 @@ static void cs42l42_init_hs_type_detect(struct cs42l42_private *cs42l42)
 static void cs42l42_cancel_hs_type_detect(struct cs42l42_private *cs42l42)
 {
 	if (cs42l42->remote_active)
-		cs42l83_remote_restore(cs42l42);
+		cs42l83_remote_restore(cs42l42, false);
 
 	/* Mask button detect interrupts */
 	regmap_update_bits(cs42l42->regmap,
@@ -2014,6 +2072,10 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 				  &masks[i]);
 		if (ret)
 			goto out_error;
+		/* Capture remote volume pulses before the CS42L42 masks drop them. */
+		if (cs42l42->remote_active &&
+		    irq_params_table[i].status_addr == CS42L42_DET_INT_STATUS1)
+			raw_remote_buttons = stickies[i] & CS42L83_REMOTE_BUTTONS;
 		stickies[i] = stickies[i] & (~masks[i]) &
 				irq_params_table[i].mask;
 	}
@@ -2041,7 +2103,11 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 			cs42l42_process_hs_type_detect(cs42l42);
 			if (cs42l42->devid == CS42L83_CHIP_ID) {
 				cs42l83_remote_start(cs42l42);
-				/* Do not interpret pre-identification events as keys. */
+				/*
+				 * Identification toggles the mic bias, so button events
+				 * latched until now are not key presses, even if the
+				 * analogue detector is retained.
+				 */
 				current_button_status = 0;
 				stickies[7] = 0;
 				raw_remote_buttons = 0;
@@ -2120,7 +2186,9 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 		}
 	}
 
-	goto out_unlock;
+out_unlock:
+	mutex_unlock(&cs42l42->irq_lock);
+	pm_runtime_put_autosuspend(cs42l42->dev);
 
 	return IRQ_HANDLED;
 
@@ -2516,7 +2584,7 @@ int cs42l42_suspend(struct device *dev)
 	 */
 	mutex_lock(&cs42l42->irq_lock);
 	if (cs42l42->remote_active)
-		cs42l83_remote_restore(cs42l42);
+		cs42l83_remote_restore(cs42l42, false);
 	cs42l42->suspended = true;
 
 	/* Save register values that will be overwritten by shutdown sequence */
