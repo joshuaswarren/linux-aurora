@@ -1698,22 +1698,37 @@ impl SepData {
         Some(acm_handle)
     }
 
-    fn establish_scrd_match_context(&self, user: crate::sbio::UserId) {
+    /// Create the ACM context the enclave's match arm requires, and bind it to the
+    /// Touch ID enrollment.
+    ///
+    /// The binding is to the enrollment *as it stands now*: the final step,
+    /// `scrd_verify_touchid_enrollment`, vouches for the current identity set.
+    /// Once that set changes -- a finger enrolled or deleted -- and the change is
+    /// persisted, the enclave answers MATCH_RESULT with "prerequisite missing"
+    /// against the old context. Measured 2026-09-23: after enrolling a second
+    /// finger, one match still succeeded, its post-match save committed the new
+    /// set, and every match after that was refused, for both fingers, until a
+    /// reboot re-ran this at restore.
+    ///
+    /// So this must run again whenever the enrollment changes, not only at
+    /// boot. It creates a fresh tracked context each time, so it is safe to call
+    /// repeatedly. Returns whether a context was established.
+    fn establish_scrd_match_context(&self, user: crate::sbio::UserId) -> bool {
         if !self.scrd_ready() {
             dev_warn!(
                 self.dev,
                 "scrd: endpoint unavailable; no match context can be established\n"
             );
-            return;
+            return false;
         }
         let Some(du) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) else {
-            return;
+            return false;
         };
         let special = du.special_handle();
         let stored = match keybag::read(keybag::Slot::Identity) {
             Ok(keybag::State::Present(s)) => s,
             _ => {
-                return;
+                return false;
             }
         };
 
@@ -1748,12 +1763,14 @@ impl SepData {
                 "scrd: match context established for user {}\n",
                 user.value()
             );
+            true
         } else {
             dev_warn!(
                 self.dev,
                 "scrd: no match context for user {} (a step answered non-zero or the endpoint is absent); the enclave's match arm asserts one\n",
                 user.value()
             );
+            false
         }
     }
 
