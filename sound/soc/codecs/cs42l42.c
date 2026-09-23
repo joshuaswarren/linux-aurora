@@ -1990,16 +1990,12 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	unsigned int current_plug_status;
 	unsigned int current_button_status;
 	unsigned int i;
-	irqreturn_t result = IRQ_NONE;
-	bool use_runtime_pm = pm_runtime_enabled(cs42l42->dev);
 	int ret;
 
-	/* SoundWire uses runtime PM; the I2C transport stays powered. */
-	if (use_runtime_pm) {
-		ret = pm_runtime_resume_and_get(cs42l42->dev);
-		if (ret < 0)
-			return IRQ_NONE;
-	}
+	/* The I2C transport never enables runtime PM; treat it as powered. */
+	ret = pm_runtime_get_active(cs42l42->dev, RPM_TRANSPARENT);
+	if (ret < 0)
+		return IRQ_NONE;
 	mutex_lock(&cs42l42->irq_lock);
 	if (cs42l42->suspended || !cs42l42->init_done) {
 		mutex_unlock(&cs42l42->irq_lock);
@@ -2018,11 +2014,8 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 				  &masks[i]);
 		if (ret)
 			goto out_error;
-		if (cs42l42->remote_active && i == 6)
-			raw_remote_buttons = stickies[i] & CS42L83_REMOTE_BUTTONS;
-		stickies[i] &= ~masks[i];
-		if (!(cs42l42->remote_active && i == 7))
-			stickies[i] &= irq_params_table[i].mask;
+		stickies[i] = stickies[i] & (~masks[i]) &
+				irq_params_table[i].mask;
 	}
 
 	result = IRQ_HANDLED;
@@ -2129,14 +2122,13 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 
 	goto out_unlock;
 
-out_error:
-	dev_err_ratelimited(cs42l42->dev, "Failed to read jack interrupt state: %d\n", ret);
-out_unlock:
-	mutex_unlock(&cs42l42->irq_lock);
-	if (use_runtime_pm)
-		pm_runtime_put_autosuspend(cs42l42->dev);
+	return IRQ_HANDLED;
 
-	return result;
+out_error:
+	mutex_unlock(&cs42l42->irq_lock);
+	pm_runtime_put_autosuspend(cs42l42->dev);
+	dev_err_ratelimited(cs42l42->dev, "Failed to read jack interrupt state: %d\n", ret);
+	return IRQ_NONE;
 }
 EXPORT_SYMBOL_NS_GPL(cs42l42_irq_thread, "SND_SOC_CS42L42_CORE");
 
