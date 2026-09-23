@@ -350,6 +350,8 @@ struct SndSocT8140AopData {
     hpai_want_run: Atomic<u32>,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
     spkr_volume: Atomic<u32>,
+    /// User-facing linear gain within the speaker-protection volume ceiling.
+    spkr_user_volume: Atomic<u32>,
     /// DMA channels of the front-end PCMs, [FE DAI id][stream] (raw dma_chan pointers).
     #[pin]
     fe_chans: SpinLock<[[usize; 2]; FE_COUNT]>,
@@ -1194,8 +1196,9 @@ const SPKR_VOLUME_Q31: [u32; 128] = [
     677485290, 717628817, 760150998, 805192776, 852903448, 903441154, 956973408, 1013677647,
     1073741824,
 ];
-/// The component's only "register": the speaker volume.
+/// The component's software registers for protected and user speaker gain.
 const REG_SPKR_VOLUME: u32 = 0;
+const REG_SPKR_USER_VOLUME: u32 = 1;
 /// SNDRV_CTL_ELEM_IFACE_MIXER (a __force-cast macro bindgen cannot import).
 const SNDRV_CTL_ELEM_IFACE_MIXER: bindings::snd_ctl_elem_iface_t = 2;
 /// DECLARE_TLV_DB_SCALE(-6350, 50, 1): SNDRV_CTL_TLVT_DB_SCALE, 8 bytes,
@@ -1644,7 +1647,8 @@ unsafe extern "C" fn asoc_pcm_copy(
     // driver.
     let data = unsafe { component_data(_component) };
     let volume = core::cmp::min(data.spkr_volume.load(Relaxed), SPKR_VOLUME_MAX) as usize;
-    let gain = SPKR_VOLUME_Q31[volume];
+    let user_volume = core::cmp::min(data.spkr_user_volume.load(Relaxed), 100);
+    let gain = ((SPKR_VOLUME_Q31[volume] as u64 * user_volume as u64) / 100) as u32;
     let mut chunk = [0u8; 512];
     let mut off = 0;
     while off < bytes {
@@ -1708,6 +1712,7 @@ unsafe extern "C" fn asoc_component_read(
     let data = unsafe { component_data(component) };
     match reg {
         REG_SPKR_VOLUME => data.spkr_volume.load(Relaxed),
+        REG_SPKR_USER_VOLUME => data.spkr_user_volume.load(Relaxed),
         _ => 0,
     }
 }
@@ -1724,6 +1729,10 @@ unsafe extern "C" fn asoc_component_write(
         REG_SPKR_VOLUME => {
             data.spkr_volume
                 .store(core::cmp::min(val, SPKR_VOLUME_MAX), Relaxed);
+            0
+        }
+        REG_SPKR_USER_VOLUME => {
+            data.spkr_user_volume.store(core::cmp::min(val, 100), Relaxed);
             0
         }
         _ => EINVAL.to_errno(),
@@ -1745,10 +1754,22 @@ static mut SPKR_VOLUME_MC: bindings::soc_mixer_control = bindings::soc_mixer_con
     ..unsafe { core::mem::zeroed() }
 };
 
+/// A linear 0..100 gain within the raw speaker volume's safe ceiling.
+static mut SPKR_USER_VOLUME_MC: bindings::soc_mixer_control = bindings::soc_mixer_control {
+    min: 0,
+    max: 100,
+    platform_max: 100,
+    reg: REG_SPKR_USER_VOLUME as i32,
+    rreg: REG_SPKR_USER_VOLUME as i32,
+    shift: 0,
+    rshift: 0,
+    ..unsafe { core::mem::zeroed() }
+};
+
 /// SOC_SINGLE_TLV("Speaker Playback Volume", REG_SPKR_VOLUME, 0, 127, 0, tlv);
 /// `private_value` (the mixer control's address) is filled in at probe, as
 /// const evaluation cannot cast a pointer.
-static mut ASOC_CONTROLS: [bindings::snd_kcontrol_new; 1] = [bindings::snd_kcontrol_new {
+static mut ASOC_CONTROLS: [bindings::snd_kcontrol_new; 2] = [bindings::snd_kcontrol_new {
     iface: SNDRV_CTL_ELEM_IFACE_MIXER,
     name: c"Speaker Playback Volume".as_ptr(),
     access: bindings::SNDRV_CTL_ELEM_ACCESS_TLV_READ | bindings::SNDRV_CTL_ELEM_ACCESS_READWRITE,
@@ -1762,6 +1783,15 @@ static mut ASOC_CONTROLS: [bindings::snd_kcontrol_new; 1] = [bindings::snd_kcont
     // SAFETY: zero is a valid value for the remaining fields (device, subdevice,
     // index, count, lock, unlock).
     ..unsafe { core::mem::zeroed() }
+}, bindings::snd_kcontrol_new {
+    iface: SNDRV_CTL_ELEM_IFACE_MIXER,
+    name: c"Speaker User Playback Volume".as_ptr(),
+    access: bindings::SNDRV_CTL_ELEM_ACCESS_READWRITE,
+    info: Some(bindings::snd_soc_info_volsw),
+    get: Some(bindings::snd_soc_get_volsw),
+    put: Some(bindings::snd_soc_put_volsw),
+    private_value: 0,
+    ..unsafe { core::mem::zeroed() }
 }];
 
 static mut ASOC_COMPONENT: bindings::snd_soc_component_driver =
@@ -1770,7 +1800,7 @@ static mut ASOC_COMPONENT: bindings::snd_soc_component_driver =
         read: Some(asoc_component_read),
         write: Some(asoc_component_write),
         controls: ptr::null(),
-        num_controls: 1,
+        num_controls: 2,
         open: Some(asoc_pcm_open),
         close: Some(asoc_pcm_close),
         hw_params: Some(asoc_pcm_hw_params),
@@ -2320,6 +2350,7 @@ impl SndSocT8140AopDriver {
         let ret = unsafe {
             let controls = &raw mut ASOC_CONTROLS;
             (*controls)[0].private_value = (&raw mut SPKR_VOLUME_MC) as usize as _;
+            (*controls)[1].private_value = (&raw mut SPKR_USER_VOLUME_MC) as usize as _;
             let component = &raw mut ASOC_COMPONENT;
             (*component).controls = (*controls).as_ptr();
             bindings::snd_soc_register_component(
@@ -2462,6 +2493,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 spkr_want_run: Atomic::new(0),
                 hpai_want_run: Atomic::new(0),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
+                spkr_user_volume: Atomic::new(100),
                 fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
                 stream <- new_spinlock!(StreamState {
                     substream: ptr::null_mut(),
