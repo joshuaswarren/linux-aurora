@@ -2890,6 +2890,23 @@ impl Vm {
         inner.page_table.collect_mapped_ranges(range, out)
     }
 
+    /// Test a fixed-address kernel alias against both translated pages and
+    /// GPUVA reservations. A mapped-range census alone misses the unmapped
+    /// guard at the end of a `map_in_range(..., guard=true)` allocation, while
+    /// `map_at` still rejects that guard through drm_mm with ENOSPC.
+    pub(crate) fn first_occupied_alias_range(
+        &self,
+        range: Range<u64>,
+    ) -> Result<Option<Range<u64>>> {
+        let mut inner = self.inner.exec_lock(None, false)?;
+        let mut mapped = [pgtable::MappedRange::default(); 1];
+        let (count, _) = inner.page_table.collect_mapped_ranges(range.clone(), &mut mapped)?;
+        if count != 0 {
+            return Ok(Some(mapped[0].start..mapped[0].end));
+        }
+        inner.mm.first_overlap(range)
+    }
+
     /// Read GPU-visible bytes out of this VM.
     ///
     /// Fail-closed: the whole span must first pass `covers_range` with GPU
