@@ -2165,6 +2165,10 @@ pub(crate) struct G17PPartialOpeningRenderTracker {
     ordinal: u64,
     hardware_buffer_id: u32,
     command_buffer_state_word: u32,
+    // Only translated renders publish the paired QoS rows. Keep retirement
+    // with this command generation so a later cleanup failure cannot make a
+    // retry subtract the same QoS references twice.
+    qos_pending: bool,
     pool_a_record_index: u8,
     pool_a_submitted: u32,
     context_update: bool,
@@ -3243,6 +3247,7 @@ impl G17PManagerConstruction {
             ordinal: 0,
             hardware_buffer_id: 0,
             command_buffer_state_word: 0,
+            qos_pending: false,
             pool_a_record_index: self.render_storage.as_ref().ok_or(ENODEV)?
                 .current_pool_a_ticket().0,
             pool_a_submitted: self.render_storage.as_ref().ok_or(ENODEV)?
@@ -3859,6 +3864,7 @@ impl G17PManagerConstruction {
             ordinal: 0,
             hardware_buffer_id: 0,
             command_buffer_state_word: 0,
+            qos_pending: false,
             pool_a_record_index: 0,
             pool_a_submitted: 0,
             context_update: false,
@@ -4194,9 +4200,71 @@ impl G17PManagerConstruction {
         retained && !same_owner
     }
 
+    /// Failure-only DRAM census. A firmware-branch failure supplies the exact
+    /// snapshot that rejected handoff; a host-branch failure takes one diagnostic
+    /// snapshot. Never poll, select a queue, access registers, or change owners.
+    fn report_render_handoff_busy(
+        &mut self,
+        vm: &mmu::Vm,
+        descriptor_context_id: u16,
+        reason: &'static str,
+        snapshot: Option<Result<g17_resources::G17PUserRenderQueueState>>,
+    ) {
+        let retained_bind = self.render_bind.as_ref()
+            .map(|binding| (binding.vm_id(), binding.root()));
+        let retained_storage = self.render_storage.as_ref().map(|storage| (
+            storage.queue_pair().slot(),
+            storage.descriptor_context_id(),
+            storage.render_pool_id(),
+            storage.context_update_pending(),
+        ));
+        let matches = (
+            self.render_bind.as_ref().is_some_and(|binding| binding.matches(vm)),
+            self.render_storage.as_ref().is_some_and(|storage| {
+                storage.descriptor_context_id() == descriptor_context_id
+            }),
+            self.render_storage.as_ref().is_some_and(|storage| {
+                vm.render_pool_mappings_match(storage.queue_pair().slot(), storage.render_pool_id())
+            }),
+            self.render_context_aliases.as_ref().map_or(true, |aliases| aliases.matches(vm)),
+        );
+        let host_mask = u32::from(self.render_tracker.is_some())
+            | (u32::from(self.render_queued_tracker.is_some()) << 1)
+            | (u32::from(self.render_hardware_buffer_id.is_some()) << 2)
+            | (u32::from(self.render_hardware_buffer_published) << 3)
+            | (u32::from(self.prepared_render_flist.is_some()) << 4)
+            | (u32::from(self.render_submission_ordinal == 0) << 5);
+        let host = (
+            self.render_submission_ordinal,
+            self.render_tracker.as_ref().map(|tracker| tracker.ordinal),
+            self.render_queued_tracker.as_ref().map(|tracker| tracker.ordinal),
+            self.render_hardware_buffer_id,
+            self.render_hardware_buffer_published,
+            self.prepared_render_flist.is_some(),
+        );
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => self.render_storage.as_mut().ok_or(ENODEV)
+                .and_then(|storage| storage.snapshot(self.render_submission_ordinal)),
+        };
+        dev_warn!(
+            self.resources.dev().as_ref(),
+            "G17P render handoff busy: reason={} selected-slot={} incoming(vm,context)=({},{}) retained(vm,root)={:x?} storage(slot,context,pool,context-pending)={:x?} matches(vm,context,pool,aliases)={:?} host-mask={:#x} host(ordinal,tracker,queued,hbid,published,prepared-flist)={:?} dram={:x?}\n",
+            reason, self.active_render_slot, vm.id(), descriptor_context_id,
+            retained_bind, retained_storage, matches, host_mask, host, snapshot,
+        );
+    }
+
     /// Actual paired completion and FList release authorize root ownership
     /// changes. T8140's handoff page does not publish a live idle witness.
     fn require_retired_render_owner(&mut self) -> Result {
+        self.require_retired_render_owner_inner(None)
+    }
+
+    fn require_retired_render_owner_inner(
+        &mut self,
+        handoff: Option<(&mmu::Vm, u16)>,
+    ) -> Result {
         // Handoff.current_slot is a T8140 stand-in, not a firmware idle
         // witness. Use the actual paired retirement and FList acknowledgements.
         if self.render_tracker.is_some() || self.render_queued_tracker.is_some()
@@ -4204,14 +4272,31 @@ impl G17PManagerConstruction {
             || self.render_hardware_buffer_published || self.prepared_render_flist.is_some()
             || self.render_submission_ordinal == 0
         {
+            if let Some((vm, context)) = handoff {
+                self.report_render_handoff_busy(vm, context, "host-state", None);
+            }
             return Err(EBUSY);
         }
         // This slot's USC FList is retained with this graph. Other slots may
         // retain their independent pools after this slot's TA/3D pair is
         // complete; those references do not keep this job's graph or VM alive.
-        let snapshot = self.render_storage.as_mut().ok_or(ENODEV)?
-            .snapshot(self.render_submission_ordinal)?;
+        let snapshot = match self.render_storage.as_mut().ok_or(ENODEV)?
+            .snapshot(self.render_submission_ordinal)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if error == EBUSY {
+                    if let Some((vm, context)) = handoff {
+                        self.report_render_handoff_busy(vm, context, "snapshot-read", Some(Err(error)));
+                    }
+                }
+                return Err(error);
+            }
+        };
         if !snapshot.job_list_empty || !snapshot.tiling.idle() || !snapshot.fragment.idle() {
+            if let Some((vm, context)) = handoff {
+                self.report_render_handoff_busy(vm, context, "firmware-state", Some(Ok(snapshot)));
+            }
             return Err(EBUSY);
         }
         // Do not require the shared outer channels to be empty here.
@@ -4480,7 +4565,7 @@ impl G17PManagerConstruction {
         if !self.retained_render_has_other_owner(vm, descriptor_context_id) {
             return Ok(());
         }
-        self.require_retired_render_owner()
+        self.require_retired_render_owner_inner(Some((vm, descriptor_context_id)))
             .map_err(|error| Self::render_stage_fail("handoff-require-retired-owner", error))?;
         let old_root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
         let old_vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
@@ -6763,6 +6848,7 @@ impl G17PManagerConstruction {
             ordinal: self.render_submission_ordinal,
             hardware_buffer_id,
             command_buffer_state_word,
+            qos_pending: true,
             pool_a_record_index: pool_a_ticket.0,
             pool_a_submitted: pool_a_ticket.1,
             context_update,
@@ -8216,13 +8302,7 @@ impl G17PManagerConstruction {
                     let fragment = g17_submission::complete_g17p_cl_kicks(queues.fragment.producer, 1)?;
                     Ok::<_, g17_submission::SubmissionError>((ta, fragment))
                 }).transpose().map_err(|_| EIO)?;
-                let storage = self.render_storage.as_ref().ok_or(ENODEV)?;
-                let pair = storage.queue_pair();
-                let qos_id = u8::try_from(storage.qos_hardware_buffer_id()?).map_err(|_| EINVAL)?;
-                self.resources.complete_qos_queue_records(&[
-                    (pair.tiling as u8, qos_id, 0),
-                    (pair.fragment as u8, qos_id, 1),
-                ])?;
+                self.retire_tracked_render_qos()?;
                 self.render_hardware_buffer_ids
                     .release(hardware_buffer_id)
                     .map_err(|_| EIO)?;
@@ -8316,6 +8396,27 @@ impl G17PManagerConstruction {
         Err(ETIMEDOUT)
     }
 
+    /// Call only after this tracker's paired firmware retirement is proved.
+    /// complete_qos_queue_records validates both exact QID/HBID/DM owners before
+    /// changing either row. A successful call belongs to this tracker once,
+    /// even if a later HWPB/command-generation cleanup step fails and retries.
+    fn retire_tracked_render_qos(&mut self) -> Result {
+        if !self.render_tracker.as_ref().ok_or(ENODEV)?.qos_pending {
+            return Ok(());
+        }
+        let storage = self.render_storage.as_ref().ok_or(ENODEV)?;
+        let pair = storage.queue_pair();
+        let qos_id = u8::try_from(storage.qos_hardware_buffer_id()?).map_err(|_| EINVAL)?;
+        self.resources.complete_qos_queue_records(&[
+            (pair.tiling as u8, qos_id, 0),
+            (pair.fragment as u8, qos_id, 1),
+        ])?;
+        // The runtime lock keeps this exact tracker selected through the
+        // transaction; only the caller may promote its queued successor.
+        self.render_tracker.as_mut().ok_or(ENODEV)?.qos_pending = false;
+        Ok(())
+    }
+
     /// After a render wait has expired: if the firmware has provably retired
     /// this group without executing it, perform the host bookkeeping a paired
     /// completion performs and report `true`; otherwise touch nothing and
@@ -8388,6 +8489,7 @@ impl G17PManagerConstruction {
             let fragment = g17_submission::complete_g17p_cl_kicks(queues.fragment.producer, 1)?;
             Ok::<_, g17_submission::SubmissionError>((ta, fragment))
         }).transpose().map_err(|_| EIO)?;
+        self.retire_tracked_render_qos()?;
         self.render_hardware_buffer_ids
             .release(hardware_buffer_id)
             .map_err(|_| EIO)?;
