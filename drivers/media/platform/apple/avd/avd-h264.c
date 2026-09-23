@@ -13,9 +13,7 @@
  *	Tomasz Figa <tfiga@chromium.org>
  */
 
-#include "linux/dev_printk.h"
-#include <linux/types.h>
-#include <linux/iopoll.h>
+#include <linux/dev_printk.h>
 
 #include <media/v4l2-h264.h>
 #include <media/videobuf2-dma-contig.h>
@@ -23,12 +21,16 @@
 #include "avd.h"
 #include "avd-inst.h"
 
-#define H264_SCL_DIMS (0x1000000 | ((64 / 4) << 5) | (((16 / 4) << 5) - 1))
+#define H264_SCL_DIMS	(0x1000000 | ((64 / 4) << 5) | (((16 / 4) << 5) - 1))
 
 #define h264_FLAG_CI_PRED(v)			FIELD_PREP(BIT(19), !!(v))
 #define H264_FLAG_ENTROPY_CODING_MODE(v)	FIELD_PREP(BIT(20), !!(v))
 #define H264_FLAG_NOT_IDR(v)			FIELD_PREP(BIT(21), !!(v))
 
+#define H264_TRANSFORM_8X8_MODE(v)		FIELD_PREP(BIT(7), !!(v))
+
+/* not a hardware constraint */
+#define MAX_SLICES	4096
 
 struct avd_h264_run {
 	struct avd_run base;
@@ -42,11 +44,7 @@ struct avd_h264_run {
 	const struct v4l2_ctrl_h264_pred_weights *pred_weights;
 
 	struct run_addr {
-		dma_addr_t y;
-		dma_addr_t uv;
-		dma_addr_t sl;
-		dma_addr_t rvra;
-		dma_addr_t sps;
+		dma_addr_t mv_color;
 	} addresses;
 
 	s32 cur_poc;
@@ -55,22 +53,31 @@ struct avd_h264_run {
 
 /* state */
 struct avd_h264_ctx {
+	bool monochrome;
 	struct avd_h264_reflists {
 		struct v4l2_h264_reference p[V4L2_H264_REF_LIST_LEN];
 		struct v4l2_h264_reference b0[V4L2_H264_REF_LIST_LEN];
 		struct v4l2_h264_reference b1[V4L2_H264_REF_LIST_LEN];
 	} reflists;
 
+	struct avd_buf slices[MAX_SLICES];
+	struct avd_buf *active_slice;
+	size_t slice_num;
+
 	struct avd_h264_bufs {
-		struct avd_buf pps_tile[5];
 		struct avd_buf inst;
 		struct avd_buf pipe_state;
+		struct avd_buf above_info;
+		struct avd_buf lf_above_info;
+		struct avd_buf lf_above;
+		struct avd_buf ip_above;
+		struct avd_buf mv_above_info;
 	} bufs;
 };
 
 /* ffmpeg submits wrong timestamp, use first_mb_in_slice as a workaround */
-#define is_new_frame(sl) (sl->first_mb_in_slice == 0) /* (ctx->fh.m2m_ctx->new_frame) */
-
+#define is_new_frame(sl) \
+	(sl->first_mb_in_slice == 0) /* (ctx->fh.m2m_ctx->new_frame) */
 
 /* scaling matrix */
 static const u32 default_8x8_intra[] = {
@@ -84,95 +91,105 @@ static const u32 default_8x8_inter[] = {
 	0x191b1c1e, 0x1b1c1e20, 0x1c1e2021, 0x1e202123,
 };
 
-
-static inline u32 sps_size(u32 w, u32 h)
+static inline u32 mv_color_size(u32 w, u32 h)
 {
-	/* TODO: does it really need so much? */
-	return (((w - 1) * (h - 1) / 0x10000) + 2) * 0x4000;
+	return (DIV_ROUND_UP(w, 16) + 1) * (DIV_ROUND_UP(h, 16) + 1) * 64;
 }
 
 /* sorry for the formatting */
 
-/* clang-format off */
 static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
 	const struct v4l2_ctrl_h264_decode_params *decode = run->decode_params;
 	const struct v4l2_h264_dpb_entry *dpb = decode->dpb;
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
-	struct avd_dev *avd = ctx->dev;
+	struct avd_decoded_buffer *dst, *ref;
+	dma_addr_t addr;
 
-	push(INST_DMA2, "cm3_dma_config_6");
-	pusha(h264_ctx->bufs.pps_tile[4].addr, "hdr_9c_pps_tile_addr_lsb8", 7);
-	pusha(run->addresses.sps, "hdr_bc_sps_tile_addr_lsb8", 0);
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
-	push(INST_DMA3, "cm3_dma_config_7");
-	push(INST_DMA3, "cm3_dma_config_8");
-	push(INST_DMA3, "cm3_dma_config_9");
-	push(INST_DMA3, "cm3_dma_config_a");
+	push(0, "");
+	pusha(h264_ctx->bufs.mv_above_info.addr, "mv_above_info", 7);
+	pusha(run->addresses.mv_color, "mv_color", 0);
+
+	push(0, "");
+	push(0, "");
+	push(0, "");
+	push(0, "");
 
 	for (int i = 0; i < ARRAY_SIZE(decode->dpb); i++) {
 		if (!(dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
 			continue;
 
-		struct vb2_buffer *vb = vb2_find_buffer(
-			&ctx->fh.m2m_ctx->cap_q_ctx.q, dpb[i].reference_ts);
+		ref = avd_get_ref_buf(ctx, &dst->base.vb, dpb[i].reference_ts);
 
-		dma_addr_t rvra_addr = vb
-			? vb2_dma_contig_plane_dma_addr(vb, 0)
-				+ (vb->planes[0].length
-						- sps_size(fmt_width(ctx), fmt_height(ctx))
-						- ctx->rvra.size)
-			: run->addresses.rvra; /* safe fallback */
+		addr = vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
+		       ref->comp.start_offset;
 
-		push(AVD_REF_NUM(run->num_valid - 1)
-				| AVD_REF_FLAG_CONST
-				| AVD_REF_FLAG_LONG(dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
-				| AVD_REF_DELTA_POC(run->cur_poc - dpb[i].top_field_order_cnt),
-				"hdr_d0_ref_hdr");
+		push(AVD_REF_NUM(run->num_valid - 1) | AVD_REF_FLAG_CONST |
+			     AVD_REF_FLAG_LONG(
+				     dpb[i].flags &
+				     V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM) |
+			     AVD_REF_DELTA_POC(run->cur_poc -
+					       dpb[i].top_field_order_cnt),
+		     "hdr_d0_ref_hdr");
 
-		push_rvra(avd, ctx, rvra_addr, ctx->rvra.offsets);
+		push_comp(ctx, addr, ctx->comp.offsets);
 	}
 }
 
 static void stream_scaling(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
-	const struct v4l2_ctrl_h264_scaling_matrix *scaling = run->scaling_matrix;
-	struct avd_dev *avd = ctx->dev;
+	const struct v4l2_ctrl_h264_scaling_matrix *scaling =
+		run->scaling_matrix;
 
 	push(H264_SCL_DIMS, "hdr_4c_pic_scaling_list_dims");
 
 	for (int i = 0; i < 6; i++)
-		for (int j = 0; j < 16; j+=4)
-			push(AVD_SCALING_I3(scaling->scaling_list_4x4[i][j + 0])
-					| AVD_SCALING_I2(scaling->scaling_list_4x4[i][j + 1])
-					| AVD_SCALING_I1(scaling->scaling_list_4x4[i][j + 2])
-					| AVD_SCALING_I0(scaling->scaling_list_4x4[i][j + 3]),
-					"scl_46c_pic_scaling_matrix_4x4");
+		for (int j = 0; j < 16; j += 4)
+			push(AVD_SCALING_I3(
+				     scaling->scaling_list_4x4[i][j + 0]) |
+				     AVD_SCALING_I2(
+					     scaling->scaling_list_4x4[i][j + 1]) |
+				     AVD_SCALING_I1(
+					     scaling->scaling_list_4x4[i][j + 2]) |
+				     AVD_SCALING_I0(
+					     scaling->scaling_list_4x4[i][j + 3]),
+			     "scl_46c_pic_scaling_matrix_4x4");
 
 	/* Instead of 8x8 raster scan order avd expects 4 4x4 subblocks */
 	static const u8 map[16] = {
-		  0,  8, 16, 24, /* top left */
-		  4, 12, 20, 28, /* top right */
-		 32, 40, 48, 56, /* bottom left */
-		 36, 44, 52, 60, /* bottom right */
+		0,  8,	16, 24, /* top left */
+		4,  12, 20, 28, /* top right */
+		32, 40, 48, 56, /* bottom left */
+		36, 44, 52, 60, /* bottom right */
 	};
 
 	/* 7.3.2.2, only matrix 0 and 1 are used if chroma_format_idc < 3 */
 	if (pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) {
 		for (int i = 0; i < 2; i++)
 			for (int j = 0; j < 16; j++)
-				push(AVD_SCALING_I3(scaling->scaling_list_8x8[i][map[j] + 0])
-						| AVD_SCALING_I2(scaling->scaling_list_8x8[i][map[j] + 1])
-						| AVD_SCALING_I1(scaling->scaling_list_8x8[i][map[j] + 2])
-						| AVD_SCALING_I0(scaling->scaling_list_8x8[i][map[j] + 3]),
-						"scl_4cc_pic_scaling_matrix_8x8");
+				push(AVD_SCALING_I3(scaling->scaling_list_8x8
+							    [i][map[j] + 0]) |
+					     AVD_SCALING_I2(
+						     scaling->scaling_list_8x8
+							     [i][map[j] + 1]) |
+					     AVD_SCALING_I1(
+						     scaling->scaling_list_8x8
+							     [i][map[j] + 2]) |
+					     AVD_SCALING_I0(
+						     scaling->scaling_list_8x8
+							     [i][map[j] + 3]),
+				     "scl_4cc_pic_scaling_matrix_8x8");
 
 	} else {
 		for (int i = 0; i < ARRAY_SIZE(default_8x8_intra); i++)
-			push(default_8x8_intra[i], "scl_4cc_pic_scaling_matrix_8x8");
+			push(default_8x8_intra[i],
+			     "scl_4cc_pic_scaling_matrix_8x8");
 		for (int i = 0; i < ARRAY_SIZE(default_8x8_inter); i++)
-			push(default_8x8_inter[i], "scl_4cc_pic_scaling_matrix_8x8");
+			push(default_8x8_inter[i],
+			     "scl_4cc_pic_scaling_matrix_8x8");
 	}
 }
 
@@ -187,85 +204,89 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	u32 width = (sps->pic_width_in_mbs_minus1 + 1) * 16;
 	u32 height = (sps->pic_height_in_map_units_minus1 + 1) * 16;
 
-	push(AVD_OP_EXEC
-			| AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx)
-			| AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3)
-			| AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4),
-			"inst_fifo_start");
-
-	push(AVD_OP_HDR
-			| AVD_OP_HDR_FLAG0
-			| AVD_OP_HDR_FLAG_INTRA(decode->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC)
-			| AVD_OP_HDR_CONST
-			| AVD_OP_HDR_FLAG_PIPE_STATE(!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE))
-			, "hdr_34_start_hdr");
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
+		     AVD_OP_HDR_FLAG_INTRA(
+			     decode->flags &
+			     V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) |
+		     AVD_OP_HDR_CONST |
+		     AVD_OP_HDR_FLAG_PIPE_STATE(
+			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
+	     "hdr_34_start_hdr");
 
 	push(AVD_HDR_CODEC_MODE(AVD_CODEC_H264), "hdr_38_mode");
 
 	push(AVD_HDR_HEIGHT(height - 1) | AVD_HDR_WIDTH(width - 1),
-			"hdr_3c_height_width");
+	     "hdr_3c_height_width");
 
 	push(0, "hdr_40_zero");
 
-	push(AVD_HDR_HEIGHT((height - 1) >> 3) | AVD_HDR_WIDTH((width - 1) >> 3),
-			"hdr_28_height_width_shift3");
+	push(AVD_HDR_HEIGHT((height - 1) >> 3) |
+		     AVD_HDR_WIDTH((width - 1) >> 3),
+	     "hdr_28_height_width_shift3");
 
 	/* TODO: did i mix up luma/chroma in hevc or here? */
-	push(AVD_HDR_COMMON_CHROMA_FORMAT(sps->chroma_format_idc)
-		| AVD_HDR_COMMON_BIT_DEPTH_L(sps->bit_depth_luma_minus8)
-		| AVD_HDR_COMMON_BIT_DEPTH_C(sps->bit_depth_chroma_minus8)
-		| AVD_HDR_COMMON_MIN_LUMA_CBS(1)
-		| AVD_HDR_COMMON_LUMA_CBS(1)
-		| AVD_HDR_COMMON_LUMA_TBS(pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE)
-		| AVD_HDR_COMMON_FLAG0(sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE),
-		"hdr_2c_sps_param");
+	push(AVD_HDR_COMMON_CHROMA_FORMAT(sps->chroma_format_idc) |
+		     AVD_HDR_COMMON_BIT_DEPTH_L(sps->bit_depth_luma_minus8) |
+		     AVD_HDR_COMMON_BIT_DEPTH_C(sps->bit_depth_chroma_minus8) |
+		     AVD_HDR_COMMON_MIN_LUMA_CBS(1) |
+		     AVD_HDR_COMMON_LUMA_CBS(1) |
+		     H264_TRANSFORM_8X8_MODE(
+			     pps->flags &
+			     V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) |
+		     AVD_HDR_COMMON_FLAG0(
+			     sps->flags &
+			     V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE),
+	     "hdr_2c_sps_param");
 
-	push(H264_FLAG_ENTROPY_CODING_MODE(pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)
-		| H264_FLAG_NOT_IDR(!(decode->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC))
-		| h264_FLAG_CI_PRED(pps->flags & V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED),
-		"hdr_44_flags");
+	push(H264_FLAG_ENTROPY_CODING_MODE(
+		     pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) |
+		     H264_FLAG_NOT_IDR(!(decode->flags &
+					 V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC)) |
+		     h264_FLAG_CI_PRED(
+			     pps->flags &
+			     V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED),
+	     "hdr_44_flags");
 
+	push(AVD_HDR_H26X_QP_OFFSET_CB(pps->chroma_qp_index_offset) |
+		     AVD_HDR_H26X_QP_OFFSET_CR(
+			     pps->second_chroma_qp_index_offset),
+	     "hdr_48_chroma_qp_index_offset");
 
-	push(AVD_HDR_H26X_QP_OFFSET_CB(pps->chroma_qp_index_offset)
-		| AVD_HDR_H26X_QP_OFFSET_CR(pps->second_chroma_qp_index_offset)
-		, "hdr_48_chroma_qp_index_offset");
+	push(AVD_HDR_FEAT_H26X | AVD_HDR_FEAT_COMMON | AVD_HDR_FEAT_H264 |
+		     AVD_HDR_FEAT_PIPE_STATE_EN(
+			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
+	     "hdr_58_const_3a");
 
-	push(AVD_HDR_FEAT_H26X |
-			AVD_HDR_FEAT_COMMON |
-			AVD_HDR_FEAT_H264 |
-			AVD_HDR_FEAT_PIPE_STATE_EN(!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
-			"hdr_58_const_3a");
-
-	push(INST_DMA2, "cm3_dma_config_1");
-	push(INST_DMA1, "cm3_dma_config_2");
+	push(0, "");
+	push(0, "");
 
 	if (avd->variant->revision == 3)
 		push(0, "zero");
 
-	pusha(h264_ctx->bufs.pps_tile[0].addr, "hdr_9c_pps_tile_addr_lsb8", 0);
+	pusha(h264_ctx->bufs.above_info.addr, "hdr_9c_pps_tile_addr_lsb8", 0);
 
-	push(INST_DMA2, "cm3_dma_config_3");
-	push(INST_DMA2, "cm3_dma_config_4");
+	push(0, "");
+	push(0, "");
 
 	if (avd->variant->revision == 3)
 		push(0, "zero");
 	else if (!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE))
 		pusha(h264_ctx->bufs.pipe_state.addr, "pipe_state", 0);
 
-	pusha(h264_ctx->bufs.pps_tile[1].addr, "hdr_9c_pps_tile_addr_lsb8", 1);
-	pusha(h264_ctx->bufs.pps_tile[2].addr, "hdr_9c_pps_tile_addr_lsb8", 2);
-	pusha(h264_ctx->bufs.pps_tile[3].addr, "hdr_9c_pps_tile_addr_lsb8", 3);
-	push(INST_DMA3, "cm3_dma_config_5");
+	pusha(h264_ctx->bufs.ip_above.addr, "ip_above", 1);
+	pusha(h264_ctx->bufs.lf_above.addr, "lf_above", 2);
+	pusha(h264_ctx->bufs.lf_above_info.addr, "lf_above_info", 3);
+	push(0, "");
 
-	push_rvra(avd, ctx, run->addresses.rvra, ctx->rvra.offsets);
+	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
 
 	bytesperline = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 	if (avd->variant->quirks & AVD_QUIRK_LSR)
 		bytesperline = bytesperline >> 4;
 
-	pusha(run->addresses.y, "hdr_210_y_addr_lsb8", 0);
+	pusha(run->base.y_out, "hdr_210_y_addr_lsb8", 0);
 	push(bytesperline, "hdr_218_width_align");
-	pusha(run->addresses.uv,"hdr_214_uv_addr_lsb8", 0);
+	pusha(run->base.uv_out, "hdr_214_uv_addr_lsb8", 0);
 	push(bytesperline, "hdr_21c_width_align");
 
 	push(0, "cm3_mark_end_section");
@@ -280,7 +301,8 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 		push(0, "cm3_mark_end_section_scl");
 }
 
-#define DEFAULT_WEIGHT_DENOM (AVD_OP_WEIGHTS_HDR_LUMA(5) | AVD_OP_WEIGHTS_HDR_CHROMA(5))
+#define DEFAULT_WEIGHT_DENOM \
+	(AVD_OP_WEIGHTS_HDR_LUMA(5) | AVD_OP_WEIGHTS_HDR_CHROMA(5))
 
 static void stream_weights(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
@@ -289,90 +311,94 @@ static void stream_weights(struct avd_ctx *ctx, struct avd_h264_run *run)
 	const struct v4l2_ctrl_h264_pred_weights *weights = run->pred_weights;
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
 	const struct v4l2_ctrl_h264_slice_params *sl = run->slice_params;
-	struct avd_dev *avd = ctx->dev;
 
-	bool pred_weight = V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(pps, sl);
+	bool pred_weight_req = V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(pps, sl);
+	bool default_weights = pps->weighted_bipred_idc == 2 &&
+			       !pred_weight_req;
 
-	/* TODO: is there a better flag or something for the
-	 * pps->weighted_bipred_idc == 2 checks? */
-	push(AVD_OP_WEIGHTS_HDR
-		| AVD_OP_WEIGHTS_HDR_FLAG1(pps->weighted_bipred_idc == 2)
-		| AVD_OP_WEIGHTS_HDR_FLAG0(pred_weight)
-		| AVD_OP_WEIGHTS_HDR_LUMA(weights->luma_log2_weight_denom)
-		| AVD_OP_WEIGHTS_HDR_CHROMA(weights->chroma_log2_weight_denom)
-		/* default luma and chroma denom */
-		| (pps->weighted_bipred_idc == 2 ? DEFAULT_WEIGHT_DENOM : 0),
-		"slc_76c_cmd_weights_denom");
+	push(AVD_OP_WEIGHTS_HDR | AVD_OP_WEIGHTS_HDR_FLAG1(default_weights) |
+		     AVD_OP_WEIGHTS_HDR_FLAG0(pred_weight_req) |
+		     AVD_OP_WEIGHTS_HDR_LUMA(
+			     !default_weights ?
+				     weights->luma_log2_weight_denom :
+				     0) |
+		     AVD_OP_WEIGHTS_HDR_CHROMA(
+			     !default_weights ?
+				     weights->chroma_log2_weight_denom :
+				     0) |
+		     (default_weights ? DEFAULT_WEIGHT_DENOM : 0),
+	     "slc_76c_cmd_weights_denom");
 
-	if (!pred_weight)
+	if (!pred_weight_req)
 		return;
 
 	luma_denom = 1 << weights->luma_log2_weight_denom;
 	chroma_denom = 1 << weights->chroma_log2_weight_denom;
-
 
 	for (int y = 0; y < 2; y++) {
 		if (y == 1 && sl->slice_type != V4L2_H264_SLICE_TYPE_B)
 			break;
 
 		factors = weights->weight_factors[y];
-		int to = y == 0 ? sl->num_ref_idx_l0_active_minus1
-						: sl->num_ref_idx_l1_active_minus1;
+		int to = y == 0 ? sl->num_ref_idx_l0_active_minus1 :
+				  sl->num_ref_idx_l1_active_minus1;
 		for (int i = 0; i < to + 1; i++) {
 			/* Avd only expects offsets/weights if they are not the default
 			 * ones, otherwise we get artifacts */
-			if((factors.luma_weight[i] != luma_denom)
-					|| (factors.luma_offset[i] != 0)) {
-				push(AVD_OP_WEIGHTS
-						| AVD_OP_WEIGHTS_IDENT(1)
-						| AVD_OP_WEIGHTS_LIST_IDX(y)
-						| AVD_OP_WEIGHTS_INDEX(i)
-						| AVD_OP_WEIGHTS_WEIGHT(factors.luma_weight[i]),
-					"slc_luma_weights");
-				push(AVD_OP_OFFSETS
-						| AVD_OP_OFFSETS_OFFSET(factors.luma_offset[i]),
-						"slc_luma_offsets");
+			if ((factors.luma_weight[i] != luma_denom) ||
+			    (factors.luma_offset[i] != 0)) {
+				push(AVD_OP_WEIGHTS | AVD_OP_WEIGHTS_IDENT(1) |
+					     AVD_OP_WEIGHTS_LIST_IDX(y) |
+					     AVD_OP_WEIGHTS_INDEX(i) |
+					     AVD_OP_WEIGHTS_WEIGHT(
+						     factors.luma_weight[i]),
+				     "slc_luma_weights");
+				push(AVD_OP_OFFSETS |
+					     AVD_OP_OFFSETS_OFFSET(
+						     factors.luma_offset[i]),
+				     "slc_luma_offsets");
 			}
 
-			if ((factors.chroma_weight[i][0] != chroma_denom)
-					|| (factors.chroma_offset[i][0] != 0)
-					|| (factors.chroma_weight[i][1] != chroma_denom)
-					|| (factors.chroma_offset[i][1] != 0)) {
-				push(AVD_OP_WEIGHTS
-						| AVD_OP_WEIGHTS_IDENT(2)
-						| AVD_OP_WEIGHTS_LIST_IDX(y)
-						| AVD_OP_WEIGHTS_INDEX(i)
-						| AVD_OP_WEIGHTS_WEIGHT(factors.chroma_weight[i][0]),
-						"slc_chroma_weights[0]");
-				push(AVD_OP_OFFSETS
-						| AVD_OP_OFFSETS_OFFSET(factors.chroma_offset[i][0]),
-						"slc_chroma_offsets[0]");
-				push(AVD_OP_WEIGHTS
-						| AVD_OP_WEIGHTS_IDENT(3)
-						| AVD_OP_WEIGHTS_LIST_IDX(y)
-						| AVD_OP_WEIGHTS_INDEX(i)
-						| AVD_OP_WEIGHTS_WEIGHT(factors.chroma_weight[i][1]),
-						"slc_chroma_weights[1]");
-				push(AVD_OP_OFFSETS
-						| AVD_OP_OFFSETS_OFFSET(factors.chroma_offset[i][1]),
-						"slc_chroma_offsets[1]");
+			if ((factors.chroma_weight[i][0] != chroma_denom) ||
+			    (factors.chroma_offset[i][0] != 0) ||
+			    (factors.chroma_weight[i][1] != chroma_denom) ||
+			    (factors.chroma_offset[i][1] != 0)) {
+				push(AVD_OP_WEIGHTS | AVD_OP_WEIGHTS_IDENT(2) |
+					     AVD_OP_WEIGHTS_LIST_IDX(y) |
+					     AVD_OP_WEIGHTS_INDEX(i) |
+					     AVD_OP_WEIGHTS_WEIGHT(
+						     factors.chroma_weight[i][0]),
+				     "slc_chroma_weights[0]");
+				push(AVD_OP_OFFSETS |
+					     AVD_OP_OFFSETS_OFFSET(
+						     factors.chroma_offset[i][0]),
+				     "slc_chroma_offsets[0]");
+				push(AVD_OP_WEIGHTS | AVD_OP_WEIGHTS_IDENT(3) |
+					     AVD_OP_WEIGHTS_LIST_IDX(y) |
+					     AVD_OP_WEIGHTS_INDEX(i) |
+					     AVD_OP_WEIGHTS_WEIGHT(
+						     factors.chroma_weight[i][1]),
+				     "slc_chroma_weights[1]");
+				push(AVD_OP_OFFSETS |
+					     AVD_OP_OFFSETS_OFFSET(
+						     factors.chroma_offset[i][1]),
+				     "slc_chroma_offsets[1]");
 			}
 		}
 	}
 }
 
-static u32 stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
+static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
 	const struct v4l2_ctrl_h264_decode_params *decode = run->decode_params;
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
 	const struct v4l2_ctrl_h264_sps *sps = run->sps;
 	const struct v4l2_ctrl_h264_slice_params *sl = run->slice_params;
-	struct avd_dev *avd = ctx->dev;
-	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	u32 payload_len = vb2_get_plane_payload(&src->vb2_buf, 0);
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	u32 payload_len = h264_ctx->active_slice->size;
 	bool en_mode = (pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) ==
 		       0;
-	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
+	const u8 *data = h264_ctx->active_slice->cpu;
 
 	u32 min_off = (sl->header_bit_size + (en_mode ? 0 : 7)) / 8;
 
@@ -381,164 +407,156 @@ static u32 stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 	u32 off = 2;
 	u32 bytes_read = 2;
 
-	while (bytes_read < min_off) {
+	while (bytes_read < min_off && off < payload_len) {
 		if (data[off - 2] != 0x00 || data[off - 1] != 0x00 ||
 		    data[off] != 0x03)
 			bytes_read++;
 		off++;
 	}
 
+	dma_addr_t slc_a84 = h264_ctx->active_slice->addr + off;
 
-	dma_addr_t slc_a84 = run->addresses.sl + off;
-
-	push(AVD_OP_CODED_DATA
-			| AVD_OP_CODED_DATA_BIT_OFF(en_mode ?
-				(sl->header_bit_size % 8) : 0)
-			| AVD_OP_CODED_DATA_ADDR(slc_a84 >> 32), "slc_a7c_cmd_set_coded_slice");
+	push(AVD_OP_CODED_DATA |
+		     AVD_OP_CODED_DATA_BIT_OFF(
+			     en_mode ? (sl->header_bit_size % 8) : 0) |
+		     AVD_OP_CODED_DATA_ADDR(slc_a84 >> 32),
+	     "slc_a7c_cmd_set_coded_slice");
 	push((u32)(slc_a84 & 0xffffffff), "slc_a84_slice_addr_low");
 
 	/* should not include trailing 0? */
 	push(payload_len - off, "slc_a88_slice_hdr_size");
 
-	push(AVD_OP_SL_LOC
-			| AVD_OP_SL_LOC_Y(sl->first_mb_in_slice / (sps->pic_width_in_mbs_minus1 + 1))
-			| AVD_OP_SL_LOC_X(sl->first_mb_in_slice % (sps->pic_width_in_mbs_minus1 + 1)),
-			"cm3_cmd_exec_mb_vp");
+	push(AVD_OP_SL_LOC |
+		     AVD_OP_SL_LOC_Y(sl->first_mb_in_slice /
+				     (sps->pic_width_in_mbs_minus1 + 1)) |
+		     AVD_OP_SL_LOC_X(sl->first_mb_in_slice %
+				     (sps->pic_width_in_mbs_minus1 + 1)),
+	     "cm3_cmd_exec_mb_vp");
 
-	push(AVD_OP_QP
-		| AVD_OP_QP_VAL(26 + pps->pic_init_qp_minus26 + sl->slice_qp_delta),
-			"slc_a70_cmd_quant_param");
+	push(AVD_OP_QP | AVD_OP_QP_VAL(26 + pps->pic_init_qp_minus26 +
+				       sl->slice_qp_delta),
+	     "slc_a70_cmd_quant_param");
 
-	push(AVD_OP_DBLK
-			| AVD_OP_DBLK_FLAG_FULL_EN(sl->disable_deblocking_filter_idc == 0)
-			| AVD_OP_DBLK_FLAG_EN(sl->disable_deblocking_filter_idc != 1)
-			| AVD_OP_DBLK_OFF1(sl->slice_beta_offset_div2)
-			| AVD_OP_DBLK_OFF0(sl->slice_alpha_c0_offset_div2),
-			"slc_a74_cmd_deblocking_filter");
+	push(AVD_OP_DBLK |
+		     AVD_OP_DBLK_FLAG_FULL_EN(
+			     sl->disable_deblocking_filter_idc == 0) |
+		     AVD_OP_DBLK_FLAG_EN(sl->disable_deblocking_filter_idc !=
+					 1) |
+		     AVD_OP_DBLK_OFF1(sl->slice_beta_offset_div2) |
+		     AVD_OP_DBLK_OFF0(sl->slice_alpha_c0_offset_div2),
+	     "slc_a74_cmd_deblocking_filter");
 
-	if (sl->slice_type == V4L2_H264_SLICE_TYPE_P
-			|| sl->slice_type == V4L2_H264_SLICE_TYPE_B) {
-
+	if (sl->slice_type == V4L2_H264_SLICE_TYPE_P ||
+	    sl->slice_type == V4L2_H264_SLICE_TYPE_B) {
 		u32 num_ref_idx_active = sl->num_ref_idx_l0_active_minus1 + 1;
 		for (u32 i = 0; i < num_ref_idx_active; i++)
-			push(AVD_OP_REF
-			   | AVD_OP_REF_LIST_IDX(0)
-			   | AVD_OP_REF_LOOP_IDX(i)
-			   | AVD_OP_REF_DBP_IDX(sl->ref_pic_list0[i].index),
-			   "slc_6e8_cmd_ref_list_0");
+			push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(0) |
+				     AVD_OP_REF_LOOP_IDX(i) |
+				     AVD_OP_REF_DBP_IDX(
+					     sl->ref_pic_list0[i].index),
+			     "slc_6e8_cmd_ref_list_0");
 
 		if (sl->slice_type == V4L2_H264_SLICE_TYPE_B) {
-			u32 num_ref_idx_active = sl->num_ref_idx_l1_active_minus1 + 1;
+			u32 num_ref_idx_active =
+				sl->num_ref_idx_l1_active_minus1 + 1;
 			for (u32 i = 0; i < num_ref_idx_active; i++)
-				push(AVD_OP_REF
-						| AVD_OP_REF_LIST_IDX(1)
-						| AVD_OP_REF_LOOP_IDX(i)
-						| AVD_OP_REF_DBP_IDX(sl->ref_pic_list1[i].index),
-						"slc_6e8_cmd_ref_list_0");
+				push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(1) |
+					     AVD_OP_REF_LOOP_IDX(i) |
+					     AVD_OP_REF_DBP_IDX(
+						     sl->ref_pic_list1[i].index),
+				     "slc_6e8_cmd_ref_list_0");
 		}
 		stream_weights(ctx, run);
 	}
 
 	if (sl->first_mb_in_slice == 0) {
 		push(AVD_OP_SL_DIM_START, "cm3_cmd_set_mb_dims");
-		push(AVD_SL_DIM_END_Y(sps->pic_height_in_map_units_minus1)
-				| AVD_SL_DIM_END_X(sps->pic_width_in_mbs_minus1), "cm3_set_mb_dims");
+		push(AVD_SL_DIM_END_Y(sps->pic_height_in_map_units_minus1) |
+			     AVD_SL_DIM_END_X(sps->pic_width_in_mbs_minus1),
+		     "cm3_set_mb_dims");
 	}
 
-	push(AVD_OP_SL_REF |
-			AVD_OP_SL_REF_FLAG_CABAC(sl->cabac_init_idc == 1) |
-			AVD_OP_SL_REF_FLAG1(sl->cabac_init_idc == 2) |
-			AVD_OP_SL_REF_FLAG2(!(sl->flags &
-			      V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED)) |
-			AVD_OP_SL_REF_NUM_L0(sl->num_ref_idx_l0_active_minus1) |
-			AVD_OP_SL_REF_NUM_L1(sl->num_ref_idx_l1_active_minus1) |
-			AVD_OP_SL_REF_SLICE_P(sl->slice_type == V4L2_H264_SLICE_TYPE_P) |
-			AVD_OP_SL_REF_SLICE_I(sl->slice_type == V4L2_H264_SLICE_TYPE_I) |
-			AVD_OP_SL_REF_SLICE_B(sl->slice_type == V4L2_H264_SLICE_TYPE_B)
+	push(AVD_OP_SL_REF | AVD_OP_SL_REF_FLAG_CABAC(sl->cabac_init_idc == 1) |
+		     AVD_OP_SL_REF_FLAG1(sl->cabac_init_idc == 2) |
+		     AVD_OP_SL_REF_FLAG2(
+			     !(sl->flags &
+			       V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED)) |
+		     AVD_OP_SL_REF_NUM_L0(sl->num_ref_idx_l0_active_minus1) |
+		     AVD_OP_SL_REF_NUM_L1(sl->num_ref_idx_l1_active_minus1) |
+		     AVD_OP_SL_REF_SLICE_P(sl->slice_type ==
+					   V4L2_H264_SLICE_TYPE_P) |
+		     AVD_OP_SL_REF_SLICE_I(sl->slice_type ==
+					   V4L2_H264_SLICE_TYPE_I) |
+		     AVD_OP_SL_REF_SLICE_B(sl->slice_type ==
+					   V4L2_H264_SLICE_TYPE_B)
 
-			, "slc_6e4_cmd_ref_type");
+		     ,
+	     "slc_6e4_cmd_ref_type");
 
 	if (sl->slice_type == V4L2_H264_SLICE_TYPE_B) {
 		/* bidirectional reference of previous mv */
 		struct vb2_buffer *vb = vb2_find_buffer(
-				&ctx->fh.m2m_ctx->cap_q_ctx.q,
-				 decode->dpb[sl->ref_pic_list1[0].index].reference_ts);
+			&ctx->fh.m2m_ctx->cap_q_ctx.q,
+			decode->dpb[sl->ref_pic_list1[0].index].reference_ts);
 
-		dma_addr_t sps_tile_addr = vb
-			? vb2_dma_contig_plane_dma_addr(vb, 0)
-				+ (vb->planes[0].length - sps_size(fmt_width(ctx), fmt_height(ctx)))
-			: run->addresses.sps;
+		dma_addr_t mv_color_addr =
+			vb ? vb2_dma_contig_plane_dma_addr(vb, 0) +
+					(vb->planes[0].length -
+					 mv_color_size(fmt_width(ctx),
+						       fmt_height(ctx))) :
+			     run->addresses.mv_color;
 
-		pusha(sps_tile_addr, "slc_a78_sps_tile_addr2_lsb8", 0);
+		pusha(mv_color_addr, "slc_a78_sps_tile_addr2_lsb8", 0);
 	}
-
-	/* only submit if this is the last slice */
-	push(AVD_OP_EXEC
-			| AVD_OP_EXEC_FLAG_END(!(src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)),
-			"cm3_cmd_inst_fifo_end");
-
-	return payload_len - off;
 }
-/* clang-format on */
 
 static int avd_h264_alloc_bufs(struct avd_ctx *ctx)
 {
 	struct avd_dev *dev = ctx->dev;
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
-	int ret;
+	int ret, w, bit_depth, mb;
+	w = fmt_width(ctx);
+	bit_depth = (ctx->image_fmt == AVD_IMG_FMT_420_10BIT ||
+		     ctx->image_fmt == AVD_IMG_FMT_422_10BIT) ?
+			    10 :
+			    8;
 
 	ret = avd_buf_alloc(dev, &h264_ctx->bufs.inst, fifo_size());
 	if (ret) {
-		dev_err(dev->dev, "inst alloc failed\n");
 		return ret;
 	}
 
 	if (!(dev->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)) {
 		ret = avd_buf_alloc(dev, &h264_ctx->bufs.pipe_state, 0x200);
 		if (ret) {
-			dev_err(dev->dev, "pipe state alloc failed\n");
 			return ret;
 		}
 	}
 
-	/* TODO: VERY ugly
-	 * Does it actually need this much?
-	 * */
-	for (int i = 0; i < 5; i++) {
-		u32 mul = fmt_width(ctx) / 16;
-		u32 size = i == 0 ? 0x20000 :
-			   i == 1 ? (16 + 8 + 8) * mul :
-			   i == 2 ? ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline > 2048 ?
-				    0xc000 :
-				    (64 + 1 * 32 + 1 * 32) * mul :
-				    32 * mul;
-		ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[i],
-				    max(size, 0x8000));
-		if (ret) {
-			dev_err(dev->dev, "pps[%d] alloc failed\n", i);
-			return ret;
-		}
-	}
+	mb = DIV_ROUND_UP(w, 16);
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.above_info, mb * 20);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.ip_above, bit_depth * 4 * mb);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.lf_above,
+			    bit_depth * 4 * 4 * mb);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.lf_above_info, 32 * mb);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.mv_above_info, 32 * mb);
+	if (ret)
+		return ret;
 
 	return 0;
-}
-
-static void avd_h264_free_bufs(struct avd_ctx *ctx)
-{
-	struct avd_h264_ctx *h264_ctx = ctx->priv;
-	struct avd_dev *dev = ctx->dev;
-
-	if (!h264_ctx)
-		return;
-
-	if (!(dev->variant->quirks & AVD_QUIRK_NO_PIPE_STATE))
-		avd_buf_free(dev, &h264_ctx->bufs.pipe_state);
-	avd_buf_free(dev, &h264_ctx->bufs.inst);
-
-	for (int i = 0; i < 5; i++)
-		avd_buf_free(dev, &h264_ctx->bufs.pps_tile[i]);
-
-	kfree(h264_ctx);
 }
 
 static int avd_h264_validate_pps(struct avd_ctx *ctx,
@@ -561,11 +579,41 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
 		/* Luma and chroma bit depth mismatch */
 		return -EINVAL;
+	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
+		/* Only 8 and 10 bit have capture formats */
+		return -EINVAL;
+	if (sps->chroma_format_idc == 2 && sps->bit_depth_luma_minus8 == 2)
+		/* 4:2:2 10 bit would need P210; P010 is too small for its chroma */
+		return -EINVAL;
 	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
 		/* no interlaced support */
 		return -EINVAL;
 
 	return 0;
+}
+
+static void avd_h264_stop(struct avd_ctx *ctx)
+{
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	struct avd_dev *dev = ctx->dev;
+	int i;
+
+	if (!h264_ctx)
+		return;
+
+	avd_buf_free(dev, &h264_ctx->bufs.pipe_state);
+	avd_buf_free(dev, &h264_ctx->bufs.inst);
+	avd_buf_free(dev, &h264_ctx->bufs.above_info);
+	avd_buf_free(dev, &h264_ctx->bufs.lf_above_info);
+	avd_buf_free(dev, &h264_ctx->bufs.lf_above);
+	avd_buf_free(dev, &h264_ctx->bufs.ip_above);
+	avd_buf_free(dev, &h264_ctx->bufs.mv_above_info);
+
+	for (i = 0; i < h264_ctx->slice_num; i++)
+		avd_buf_free(dev, &h264_ctx->slices[i]);
+
+	kfree(h264_ctx);
+	ctx->priv = NULL;
 }
 
 static int avd_h264_start(struct avd_ctx *ctx)
@@ -595,80 +643,121 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	return 0;
 
 err_free_ctx:
-	kfree(h264_ctx);
-	ctx->priv = NULL;
+	avd_h264_stop(ctx);
 	return ret;
-}
-
-static void avd_h264_stop(struct avd_ctx *ctx)
-{
-	avd_h264_free_bufs(ctx);
-
-	/* needed for all so automatic? */
-	free_vp_slot(ctx->dev, ctx);
-	free_inst_slot(ctx->dev, ctx);
 }
 
 static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
 	struct v4l2_ctrl *ctrl;
-	u32 dst_len, sps_len;
+	u32 dst_len, mv_color_len;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			V4L2_CID_STATELESS_H264_DECODE_PARAMS);
+			      V4L2_CID_STATELESS_H264_DECODE_PARAMS);
 	run->decode_params = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			V4L2_CID_STATELESS_H264_SPS);
+	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_SPS);
 	run->sps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			V4L2_CID_STATELESS_H264_PPS);
+	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_PPS);
 	run->pps = ctrl ? ctrl->p_cur.p : NULL;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			V4L2_CID_STATELESS_H264_SLICE_PARAMS);
+			      V4L2_CID_STATELESS_H264_SLICE_PARAMS);
 	run->slice_params = ctrl ? ctrl->p_cur.p : NULL;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			V4L2_CID_STATELESS_H264_SCALING_MATRIX);
+			      V4L2_CID_STATELESS_H264_SCALING_MATRIX);
 	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
+			      V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
 	run->pred_weights = ctrl ? ctrl->p_cur.p : NULL;
 
 	avd_run_preamble(ctx, &run->base);
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
-	run->addresses.y =
-		vb2_dma_contig_plane_dma_addr(&run->base.bufs.dst->vb2_buf, 0);
+	mv_color_len = mv_color_size(fmt_width(ctx), fmt_height(ctx));
 
-	run->addresses.uv =
-		run->addresses.y +
-		ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
-			ALIGN(ctx->decoded_fmt.fmt.pix_mp.height, 16);
+	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
+}
 
-	run->addresses.sl =
-		vb2_dma_contig_plane_dma_addr(&run->base.bufs.src->vb2_buf, 0);
-	sps_len = sps_size(fmt_width(ctx), fmt_height(ctx));
+/*
+ * Check that every reference in the slice's ref lists points at a DPB entry
+ * that is VALID. stream_refs() only pushes a reference header (and its RVRA
+ * addresses) for VALID entries and the slice command indexes those by DPB
+ * index, so a reference to any other entry makes the VP dereference an
+ * uninitialised reference slot: that ends in a DART translation fault, a
+ * frame that never completes and a watchdog reset of the VP, which also
+ * disturbs the other contexts. It happens whenever a client starts decoding
+ * on a non-IDR frame (joining a live RTSP stream mid-GOP): ffmpeg's
+ * v4l2request hwaccel leaves the index of a missing reference at 0 and the
+ * DPB is empty. Refuse such slices before anything is pushed; the client gets
+ * the capture buffer back with V4L2_BUF_FLAG_ERROR, as for corrupt input.
+ */
+static bool avd_h264_refs_valid(const struct avd_h264_run *run)
+{
+	const struct v4l2_ctrl_h264_slice_params *sl = run->slice_params;
+	const struct v4l2_h264_dpb_entry *dpb = run->decode_params->dpb;
+	const struct v4l2_h264_reference *lists[2] = {
+		sl->ref_pic_list0, sl->ref_pic_list1
+	};
+	u32 num[2] = {
+		sl->num_ref_idx_l0_active_minus1 + 1,
+		sl->num_ref_idx_l1_active_minus1 + 1
+	};
+	int nlists;
 
-	run->addresses.rvra =
-		run->addresses.y + (dst_len - sps_len - ctx->rvra.size);
+	if (sl->slice_type == V4L2_H264_SLICE_TYPE_P)
+		nlists = 1;
+	else if (sl->slice_type == V4L2_H264_SLICE_TYPE_B)
+		nlists = 2;
+	else
+		return true;
 
-	run->addresses.sps = run->addresses.y + (dst_len - sps_len);
+	for (int l = 0; l < nlists; l++) {
+		if (num[l] > V4L2_H264_REF_LIST_LEN)
+			return false;
+		for (u32 i = 0; i < num[l]; i++) {
+			u8 idx = lists[l][i].index;
+
+			if (idx >= V4L2_H264_NUM_DPB_ENTRIES ||
+			    !(dpb[idx].flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
+				return false;
+		}
+	}
+
+	return true;
 }
 
 static int avd_h264_run(struct avd_ctx *ctx)
 {
-	struct avd_dev *avd = ctx->dev;
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	struct v4l2_h264_reflist_builder reflist_builder;
 	struct avd_h264_run run;
-	u32 slice_size, slice_parsed, reg;
 	int ret;
 
 	avd_h264_run_preamble(ctx, &run);
+	if (h264_ctx->slice_num >= MAX_SLICES) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "slice_num > %d, stream was rejected!",
+				    MAX_SLICES);
+		avd_run_postamble(ctx, &run.base);
+		return -EINVAL;
+	}
+
+	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	u32 payload_len = vb2_get_plane_payload(&src->vb2_buf, 0);
+	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
+	h264_ctx->active_slice = &h264_ctx->slices[h264_ctx->slice_num];
+	ret = avd_buf_alloc(ctx->dev, h264_ctx->active_slice, payload_len);
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
+		return ret;
+	}
+	memcpy(h264_ctx->active_slice->cpu, data, payload_len);
+	h264_ctx->slice_num++;
+	h264_ctx->monochrome = run.sps->chroma_format_idc == 0;
 
 	/* Build the P/B{0,1} ref lists. */
-	v4l2_h264_init_reflist_builder(&reflist_builder, run.decode_params, run.sps,
-				       run.decode_params->dpb);
+	v4l2_h264_init_reflist_builder(&reflist_builder, run.decode_params,
+				       run.sps, run.decode_params->dpb);
 
 	run.num_valid = reflist_builder.num_valid;
 	run.cur_poc = reflist_builder.cur_pic_order_count;
@@ -679,50 +768,60 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 	avd_run_postamble(ctx, &run.base);
 
+	if (!avd_h264_refs_valid(&run)) {
+		dev_dbg_ratelimited(ctx->dev->dev,
+				    "slice references an invalid DPB entry, dropping frame\n");
+		return -EINVAL;
+	}
+
 	if (is_new_frame(run.slice_params)) {
-		ret = alloc_slots(avd, ctx, AVD_CODEC_H264);
-		if (ret) {
-			dev_err_ratelimited(avd->dev, "no free slots: %d", ret);
+		/* the header segment plus one per slice */
+		ret = avd_init_job(ctx, AVD_CODEC_H264, MAX_SLICES + 1);
+		if (ret)
 			return ret;
-		}
-		avd->variant->configure_stream(ctx->dev, h264_ctx->bufs.inst.addr,
-				     ctx->fifo_idx, ctx->vp_slot);
 		stream_hdr(ctx, &run);
 	}
 
-	if (ctx->vp_slot == VP_SLOT_NONE) {
-		/* Only happens if its a multi slice frame and there was an error */
-		dev_err_ratelimited(avd->dev, "no assigned VP slots: %04lx", avd->vp_slots);
-		return -ENOMEM;
-	}
+	if (!ctx->job.segments)
+		return -EINVAL;
 
-	schedule_delayed_work(&ctx->watchdog_work, msecs_to_jiffies(2000));
-
-	slice_size = stream_slice(ctx, &run);
+	ctx->job.num++;
+	stream_slice(ctx, &run);
 
 	if (run.base.bufs.src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) {
-		if (avd->variant->revision == 3)
-			reg = (0x18 | ctx->vp_slot << 12);
-		else
-			reg = (0x1018 | ctx->vp_slot << 8);
-
-		/* seems to be take ~ slice_size / 16 us */
-		ret = readl_poll_timeout(
-			avd->ctrl + reg, slice_parsed,
-			slice_parsed >= round_down(slice_size, 8), 5, 1000);
-
-		if (ret) {
-			dev_err(avd->dev, "VP%d: timed out (%02d)! size: %08x parsed: %08x",
-					ctx->vp_slot, ctx->fifo_idx, slice_size, slice_parsed);
-			avd_status(avd, ctx->vp_slot);
-			return 0;
-		}
-
-		if (cancel_delayed_work(&ctx->watchdog_work))
-			avd_job_finish(ctx, VB2_BUF_STATE_DONE);
+		avd_job_finish(ctx, VB2_BUF_STATE_DONE);
+		return 0;
 	}
 
-	return 0;
+	return avd_submit_job(ctx);
+}
+
+static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
+			  struct vb2_v4l2_buffer *dst_buf,
+			  enum vb2_buffer_state result)
+{
+	struct avd_dev *avd = ctx->dev;
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	int i;
+
+	if (!(src_buf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)) {
+		for (i = 0; i < h264_ctx->slice_num; i++)
+			avd_buf_free(avd, &h264_ctx->slices[i]);
+		h264_ctx->slice_num = 0;
+
+		/* 4:0:0 has no chroma to decode; the picture is grey */
+		if (h264_ctx->monochrome && dst_buf && result == VB2_BUF_STATE_DONE) {
+			const struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
+			struct avd_decoded_buffer *dst =
+				vb2_to_avd_decoded_buf(&dst_buf->vb2_buf);
+
+			/* vb2 must return cache ownership before the CPU writes. */
+			dst->grey_chroma_offset =
+				(size_t)pix->plane_fmt[0].bytesperline * pix->height;
+			dst->grey_chroma_10bit =
+				ctx->image_fmt == AVD_IMG_FMT_420_10BIT;
+		}
+	}
 }
 
 static enum avd_image_fmt avd_h264_get_image_fmt(struct avd_ctx *ctx,
@@ -749,9 +848,10 @@ static enum avd_image_fmt avd_h264_get_image_fmt(struct avd_ctx *ctx,
 }
 
 static void avd_h264_adjust_decoded_fmt(struct avd_ctx *ctx,
-		struct v4l2_pix_format_mplane *pix_mp)
+					struct v4l2_pix_format_mplane *pix_mp)
 {
-	pix_mp->plane_fmt[0].sizeimage += sps_size(pix_mp->width, pix_mp->height);
+	pix_mp->plane_fmt[0].sizeimage +=
+		mv_color_size(pix_mp->width, pix_mp->height);
 }
 
 static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
@@ -766,17 +866,22 @@ static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 
 static void avd_h264_submit(struct avd_ctx *ctx)
 {
-	writel_relaxed(0x2b000000
-			| (ctx->dev->variant->revision == 3 ? 0x100 : 0x200)
-			| (ctx->fifo_idx << 4)
-			| ctx->dev->variant->fifo_slots,
-			ctx->dev->ctrl + ctx->dev->variant->submit_offset);
+	writel_relaxed(
+		AVD_OP_EXEC |
+			AVD_OP_EXEC_FLAG_START_REV4(
+				ctx->dev->variant->revision == 4) |
+			AVD_OP_EXEC_FLAG_START_REV3(
+				ctx->dev->variant->revision == 3) |
+			AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+			AVD_OP_EXEC_FIFO_MASK(ctx->dev->variant->fifo_slots),
+		ctx->dev->ctrl + ctx->dev->variant->submit_offset);
 }
 
 const struct avd_coded_fmt_ops avd_h264_fmt_ops = {
 	.adjust_decoded_fmt = avd_h264_adjust_decoded_fmt,
 	.start = avd_h264_start,
 	.stop = avd_h264_stop,
+	.done = avd_h264_done,
 	.run = avd_h264_run,
 	.submit = avd_h264_submit,
 	.try_ctrl = avd_h264_try_ctrl,
