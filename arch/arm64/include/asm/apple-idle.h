@@ -6,12 +6,17 @@
 
 static inline bool apple_m5_needs_wait_save(void)
 {
-	/* MIDRs measured on the T8142 E and P cores respectively. */
+	/* T8142 and T8152 can clear GPRs across an idle wait. M6 first Linux
+	 * boot reached do_idle with x19-x28 zero after WFI; retain the same
+	 * stack-based register save on the measured E and P/M CPU models.
+	 */
 	u32 model = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
 
 	return IS_ENABLED(CONFIG_ARCH_APPLE) &&
 	       (model == MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x062) ||
-		model == MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x063));
+		model == MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x063) ||
+		model == MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x072) ||
+		model == MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x073));
 }
 
 void apple_m5_cpu_wfi(void);

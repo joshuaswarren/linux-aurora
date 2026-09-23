@@ -62,6 +62,8 @@
 
 struct apple_soc_cpufreq_info {
 	bool has_ps2;
+	bool verify_completion;
+	unsigned int transition_timeout;
 	u64 max_pstate;
 	u64 cur_pstate_mask;
 	u64 cur_pstate_shift;
@@ -125,7 +127,24 @@ static const struct apple_soc_cpufreq_info soc_t8142_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+/* T8152 command completion/readback is qualified on both E and P/M domains.
+ * The status-register layout is not established; get_rate reports requests.
+ */
+static const struct apple_soc_cpufreq_info soc_t8152_info = {
+	.has_ps2 = false,
+	.verify_completion = true,
+	.transition_timeout = 2000,
+	.max_pstate = 31,
+	.cur_pstate_mask = 0,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
+	{
+		.compatible = "apple,t8152-cluster-cpufreq",
+		.data = &soc_t8152_info,
+	},
 	{
 		.compatible = "apple,t8142-cluster-cpufreq",
 		.data = &soc_t8142_info,
@@ -190,7 +209,12 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 {
 	struct apple_cpu_priv *priv = policy->driver_data;
 	unsigned int pstate = policy->freq_table[index].driver_data;
+	unsigned int timeout = priv->info->transition_timeout ?:
+			       APPLE_DVFS_TRANSITION_TIMEOUT;
 	u64 reg;
+
+	if (priv->info->verify_completion && pstate > priv->info->max_pstate)
+		return -EINVAL;
 
 	/* Fallback for newer SoCs */
 	if (index > priv->info->max_pstate)
@@ -198,7 +222,7 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 
 	if (readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
 				      !(reg & APPLE_DVFS_CMD_BUSY), 2,
-				      APPLE_DVFS_TRANSITION_TIMEOUT)) {
+				      timeout)) {
 		return -EIO;
 	}
 
@@ -211,6 +235,14 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 	reg |= APPLE_DVFS_CMD_SET;
 
 	writeq_relaxed(reg, priv->reg_base + APPLE_DVFS_CMD);
+	if (priv->info->verify_completion) {
+		if (readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
+					     !(reg & APPLE_DVFS_CMD_BUSY), 2,
+					     timeout))
+			return -ETIMEDOUT;
+		if (((reg & priv->info->ps1_mask) >> priv->info->ps1_shift) != pstate)
+			return -EIO;
+	}
 
 	return 0;
 }
