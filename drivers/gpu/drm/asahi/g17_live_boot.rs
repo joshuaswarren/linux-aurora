@@ -5650,6 +5650,7 @@ impl G17PLiveRuntime {
         execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
         command: &g17_uapi::TranslatedRenderCommand,
         completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+        stages: &mut crate::g17_perf::RenderStageTimes,
     ) -> Result {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
@@ -5700,10 +5701,15 @@ impl G17PLiveRuntime {
         // longer alias, so neither an idle nor an in-flight QID4 binding is a
         // reason to hand the compute graph back before render publication.
         let descriptor_context_id = execution_context.context_id() as u16;
+        let handoff_started = stages.enabled.then(
+            kernel::time::Instant::<kernel::time::Monotonic>::now);
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
             .handoff_retained_render_vm(vm, execution_context.clone())?;
+        if let Some(started) = handoff_started {
+            stages.handoff_ns = started.elapsed().as_nanos().max(0) as u64;
+        }
         let recycle = self
             .manager
             .as_ref()
@@ -5727,6 +5733,8 @@ impl G17PLiveRuntime {
         let mut manager = self.manager.take().ok_or(ENODEV)?;
         let registers = self.registers.take().ok_or(ENODEV)?;
         let mut registration_powered = false;
+        let prepare_started = stages.enabled.then(
+            kernel::time::Instant::<kernel::time::Monotonic>::now);
         let prepared = manager.begin_translated_render(
             &drm,
             vm,
@@ -5740,7 +5748,11 @@ impl G17PLiveRuntime {
                 registration_powered = true;
                 Ok(())
             },
+            stages,
         );
+        if let Some(started) = prepare_started {
+            stages.prepare_ns = started.elapsed().as_nanos().max(0) as u64;
+        }
         // `ensurePoweredHardware(true)` is a scoped native prerequisite. The
         // IdlePowerOff(0) disables firmware idle descent around the direct
         // KSMFE registration. Restore ordinary idle policy before any work
@@ -5781,11 +5793,16 @@ impl G17PLiveRuntime {
         // notification itself wakes the scheduler, so a merely staged final
         // work doorbell is not a visibility barrier: the old ordering let TA
         // run here against a half-grown FList and emit only an empty header.
+        let flist_started = stages.enabled.then(
+            kernel::time::Instant::<kernel::time::Monotonic>::now);
         if let Err(error) = self.publish_render_usc_freelist_request() {
             return match g17_lifecycle::recover_persistent_runtime(self) {
                 Ok(()) => Err(error),
                 Err(recovery_error) => Err(recovery_error),
             };
+        }
+        if let Some(started) = flist_started {
+            stages.flist_request_ns = started.elapsed().as_nanos().max(0) as u64;
         }
         // Working Metal traces publish no device-control record before their
         // render kicks.  Keep the RE-derived IdlePowerOff transaction strictly

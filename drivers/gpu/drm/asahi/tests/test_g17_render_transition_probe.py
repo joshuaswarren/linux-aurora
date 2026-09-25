@@ -55,7 +55,7 @@ impl<T> Instant<T> {
  fn now()->Self { Self(std::time::Instant::now(),std::marker::PhantomData) }
  fn elapsed(&self)->Duration { self.0.elapsed() }
 }
-struct Delta;impl Delta{fn from_millis(_:i64)->Self{Self}}
+struct Delta;impl Delta{fn from_millis(_:i64)->Self{Self} fn from_micros(_:i64)->Self{Self}}
 fn fsleep(_:Delta){}
 #[derive(Default)]struct Mutex<T>(StdMutex<T>);
 struct Guard<'a,T>(Option<std::sync::MutexGuard<'a,T>>);
@@ -173,6 +173,15 @@ publish_loop = publish_loop.replace('packet.cancel_requested()', 'false')
 publish_loop = publish_loop.replace('packet.command()', '&translated')
 publish_loop = publish_loop.replace('ECANCELED', 'EIO')
 production += '''
+mod g17_perf {
+ #[derive(Default)]pub struct RenderStageTimes {
+  pub enabled:bool,pub runtime_lock_ns:u64,pub handoff_ns:u64,
+  pub prepare_ns:u64,pub restage_ns:u64,pub reachability_ns:u64,
+  pub reachability_cache_hit:bool,pub flist_request_ns:u64,
+  pub tvb_blocks:u32,pub retained:bool,
+ }
+}
+static G17P_RENDER_POLL_RECORDS:AtomicU32=AtomicU32::new(0);
 mod module_parameters {
  pub struct Param(pub super::AtomicU32);
  impl Param {pub fn value(&self)->Box<u32>{Box::new(self.0.load(super::Ordering::SeqCst))}}
@@ -182,6 +191,12 @@ mod module_parameters {
  pub static g17p_render_transition_class:Param=Param(super::AtomicU32::new(0));
  #[allow(non_upper_case_globals)]
  pub static g17p_compute_burst_probe:Param=Param(super::AtomicU32::new(0));
+ #[allow(non_upper_case_globals)]
+ pub static g17p_trace_depth:Param=Param(super::AtomicU32::new(0));
+ #[allow(non_upper_case_globals)]
+ pub static g17p_completion_trace:Param=Param(super::AtomicU32::new(0));
+ #[allow(non_upper_case_globals)]
+ pub static g17p_flist_fast_poll:Param=Param(super::AtomicU32::new(0));
 }
 struct PublishRuntime {registry:Arc<G17PQueueRegistry>,query_count:u32,publish_count:u32,failure:bool,control_backpressured:bool,reasons:Result<u32>,after_drain:Option<Result<u32>>}
 impl PublishRuntime {
@@ -192,7 +207,7 @@ impl PublishRuntime {
   if self.query_count>1 {if let Some(next)=self.after_drain.take(){self.reasons=next;}}
   self.reasons
  }
- fn submit_translated_render(&mut self,_vm:&mmu::Vm,_slot:u8,_defer:bool,_ctx:Arc<mmu::T8140ComputeExecutionContext>,_cmd:&g17_uapi::TranslatedRenderCommand,_completion:())->Result {
+ fn submit_translated_render(&mut self,_vm:&mmu::Vm,_slot:u8,_defer:bool,_ctx:Arc<mmu::T8140ComputeExecutionContext>,_cmd:&g17_uapi::TranslatedRenderCommand,_completion:Completion,_stages:&mut g17_perf::RenderStageTimes)->Result {
   let enabled=*module_parameters::g17p_render_transition_probe.value()!=0 && render_transition::selected(self.reasons.unwrap_or(render_transition::UNKNOWN),*module_parameters::g17p_render_transition_class.value());
   assert_eq!(self.registry.lease.lock().render_transition,enabled);
   assert_eq!(self.registry.compute_readers.load(Ordering::Acquire),u32::from(self.query_count<2));
@@ -201,13 +216,14 @@ impl PublishRuntime {
 }
 struct RuntimeRef(Mutex<PublishRuntime>);
 impl RuntimeRef {fn mutex(&self)->&Mutex<PublishRuntime>{&self.0}}
-struct Submitter {runtime:RuntimeRef,registry:Arc<G17PQueueRegistry>,vm:mmu::Vm,context:Arc<mmu::T8140ComputeExecutionContext>}
+#[derive(Clone,Copy)]struct Completion {vdm_base:u64}
+struct Submitter {runtime:RuntimeRef,registry:Arc<G17PQueueRegistry>,vm:mmu::Vm,context:Arc<mmu::T8140ComputeExecutionContext>,owner:u64}
 impl Submitter {
  fn new(registry:Arc<G17PQueueRegistry>,failure:bool)->Self {
-  Self{runtime:RuntimeRef(Mutex(StdMutex::new(PublishRuntime{registry:registry.clone(),query_count:0,publish_count:0,failure,control_backpressured:false,reasons:Ok(2),after_drain:None}))),registry,vm:mmu::Vm(1),context:Arc::new(mmu::T8140ComputeExecutionContext(7))}
+  Self{runtime:RuntimeRef(Mutex(StdMutex::new(PublishRuntime{registry:registry.clone(),query_count:0,publish_count:0,failure,control_backpressured:false,reasons:Ok(2),after_drain:None}))),registry,vm:mmu::Vm(1),context:Arc::new(mmu::T8140ComputeExecutionContext(7)),owner:1}
  }
  fn publish(&self)->Result {
-  let translated=g17_uapi::TranslatedRenderCommand{parameters:8};let render_slot=1;let completion=();let submission_id=1;
+  let translated=g17_uapi::TranslatedRenderCommand{parameters:8};let render_slot=1;let completion=Completion{vdm_base:0x123};let submission_id=1;
 ''' + publish_loop + '\n submit\n}\n}\n'
 
 tests = r'''
