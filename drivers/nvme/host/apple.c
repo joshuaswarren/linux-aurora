@@ -193,12 +193,9 @@ struct apple_nvme_iod {
 
 struct apple_nvme_hw {
 	bool has_lsq_nvmmu;
-	bool has_linear_sq_ctrl;
-	bool has_prp_null_ctrl;
 	bool has_queue_count;
 	bool has_separate_nvmmu;
 	bool needs_ioq_registers;
-	bool requires_cold_start;
 	u32 max_queue_depth;
 };
 
@@ -249,10 +246,10 @@ static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
 				     void __iomem *addr)
 {
 	/*
-	 * Post-M4 ANS consumes the admin and NVMMU queue addresses as paired
-	 * 32-bit registers while the controller is disabled. Match the access
-	 * sequence used by Apple firmware, m1n1, and U-Boot; older ANS
-	 * generations retain their native 64-bit access.
+	 * Post-M4 ANS consumes the queue and NVMMU TCB base addresses as paired
+	 * 32-bit registers. Match the access sequence used by Apple firmware,
+	 * m1n1, and U-Boot; older ANS generations retain their native 64-bit
+	 * access.
 	 */
 	if (anv->hw->needs_ioq_registers)
 		lo_hi_writeq(value, addr);
@@ -1089,21 +1086,15 @@ static void apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
 	nvme_quiesce_io_queues(&anv->ctrl);
 
 	if (!dead) {
-		if (READ_ONCE(anv->ioq.enabled)) {
-			/*
-			 * Post-M4 firmware rejects Delete SQ and Delete CQ with
-			 * BAD_CMD during shutdown. The queues are registered through
-			 * the dedicated IOSQ/IOCQ aperture on these controllers and
-			 * are torn down by the following controller shutdown/disable.
-			 * Keep the explicit admin commands for legacy controllers.
-			 */
-			if (anv->hw->needs_ioq_registers) {
-				dev_info(anv->dev,
-					 "post-M4 shutdown: skipping unsupported I/O queue delete commands\n");
-			} else {
-				apple_nvme_remove_sq(anv);
-				apple_nvme_remove_cq(anv);
-			}
+		/*
+		 * Post-M4 firmware rejects Delete SQ and Delete CQ with BAD_CMD.
+		 * Its I/O queues are registered through the dedicated IOSQ/IOCQ
+		 * registers and are torn down by the controller disable below.
+		 */
+		if (apple_nvme_queue_enabled(&anv->ioq) &&
+		    !anv->hw->needs_ioq_registers) {
+			apple_nvme_remove_sq(anv);
+			apple_nvme_remove_cq(anv);
 		}
 
 		/*
@@ -1429,12 +1420,12 @@ rtkit_ready:
 		 * Enable NVMMU and linear submission queues which is required
 		 * since T6000.
 		 */
-		if (anv->hw->has_linear_sq_ctrl) {
-			u32 lsq_ctrl;
+		writel(APPLE_ANS_LINEAR_SQ_EN,
+			anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+		if (anv->hw->needs_ioq_registers) {
+			u32 lsq_ctrl = readl(anv->mmio_nvme +
+					     APPLE_ANS_LINEAR_SQ_CTRL);
 
-			writel(APPLE_ANS_LINEAR_SQ_EN,
-				anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
-			lsq_ctrl = readl(anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
 			if (!(lsq_ctrl & APPLE_ANS_LINEAR_SQ_EN)) {
 				dev_err(anv->dev,
 					"failed to enable linear submission queues: LSQ_CTRL=0x%08x\n",
@@ -1442,10 +1433,6 @@ rtkit_ready:
 				ret = -EIO;
 				goto out;
 			}
-			if (anv->hw->needs_ioq_registers)
-				dev_info(anv->dev,
-					 "post-M4 linear submission queues enabled: LSQ_CTRL=0x%08x\n",
-					 lsq_ctrl);
 		}
 
 		/*
@@ -1460,32 +1447,16 @@ rtkit_ready:
 			ioqa_depth--;
 		ioqa = ioqa_depth | (ioqa_depth << 16);
 		writel(ioqa, anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
-		if (readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL) !=
-		    ioqa) {
+		if (anv->hw->needs_ioq_registers &&
+		    readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL) != ioqa) {
 			dev_err(anv->dev, "failed to program I/O queue aperture\n");
 			ret = -EIO;
 			goto out;
 		}
-		if (anv->hw->needs_ioq_registers)
-			dev_info(anv->dev,
-				 "post-M4 I/O queues: entries=%u IOQA=0x%08x\n",
-				 anv->hw->max_queue_depth, ioqa);
 
 		/* Setup the NVMMU for the maximum admin and IO queue depth */
 		writel(anv->hw->max_queue_depth - 1,
 			anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS);
-
-		/*
-		 * This is probably a chicken bit: without it all commands
-		 * where any PRP is set to zero (including those that don't use
-		 * that field) fail and the co-processor complains about
-		 * "completed with err BAD_CMD-" or a "NULL_PRP_PTR_ERR" in the
-		 * syslog
-		 */
-		if (anv->hw->has_prp_null_ctrl)
-			writel(readl(anv->mmio_nvme + APPLE_ANS_UNKNOWN_CTRL) &
-				~APPLE_ANS_PRP_NULL_CHECK,
-				anv->mmio_nvme + APPLE_ANS_UNKNOWN_CTRL);
 	}
 
 	/* Setup the admin queue */
@@ -1496,7 +1467,6 @@ rtkit_ready:
 			  anv->mmio_nvme + NVME_REG_ASQ);
 	apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
 			  anv->mmio_nvme + NVME_REG_ACQ);
-	dev_dbg(anv->dev, "admin queue programmed\n");
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
@@ -1545,6 +1515,11 @@ rtkit_ready:
 
 	apple_nvme_init_queue(&anv->ioq);
 	if (anv->hw->needs_ioq_registers) {
+		/*
+		 * Post-M4 firmware also takes the I/O queue addresses through
+		 * dedicated registers. Without them it crashes and its crash log
+		 * reports null I/O SQ and CQ addresses.
+		 */
 		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr,
 				  anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER);
 		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr,
@@ -1581,9 +1556,11 @@ rtkit_ready:
 	return;
 
 out_remove_sq:
-	apple_nvme_remove_sq(anv);
+	if (!anv->hw->needs_ioq_registers)
+		apple_nvme_remove_sq(anv);
 out_remove_cq:
-	apple_nvme_remove_cq(anv);
+	if (!anv->hw->needs_ioq_registers)
+		apple_nvme_remove_cq(anv);
 out:
 	dev_warn(anv->ctrl.device, "Reset failure status: %d\n", ret);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
@@ -2184,31 +2161,14 @@ static const struct apple_nvme_hw apple_nvme_t8015_hw = {
 
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
-	.has_linear_sq_ctrl = true,
-	.has_prp_null_ctrl = true,
 	.has_queue_count = true,
 	.max_queue_depth = 64,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_lsq_nvmmu = true,
-	.has_linear_sq_ctrl = true,
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
-	.max_queue_depth = 64,
-};
-
-/*
- * J700's qualified boot chain shuts ANS down before entering Linux. Reset
- * that stopped controller and establish a fresh RTKit session, as required
- * by the working J700 driver, rather than only setting the CPU RUN bit.
- */
-static const struct apple_nvme_hw apple_nvme_t8140_hw = {
-	.has_lsq_nvmmu = true,
-	.has_linear_sq_ctrl = true,
-	.has_separate_nvmmu = true,
-	.needs_ioq_registers = true,
-	.requires_cold_start = true,
 	.max_queue_depth = 64,
 };
 
