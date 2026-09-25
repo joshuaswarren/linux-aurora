@@ -202,7 +202,7 @@ static void dcuart_stop_rx(struct uart_port *port)
 
 static const char *dcuart_type(struct uart_port *port)
 {
-	return port->type == PORT_APPLE_DOCKCHANNEL ?
+	return port->type == PORT_GENERIC ?
 		"Apple DockChannel UART" : NULL;
 }
 
@@ -264,7 +264,7 @@ static int dcuart_request_port(struct uart_port *port)
 static void dcuart_config_port(struct uart_port *port, int flags)
 {
 	if (flags & UART_CONFIG_TYPE)
-		port->type = PORT_APPLE_DOCKCHANNEL;
+		port->type = PORT_GENERIC;
 }
 
 static const struct uart_ops dcuart_ops = {
