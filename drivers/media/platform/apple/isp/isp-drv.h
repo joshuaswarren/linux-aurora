@@ -25,7 +25,6 @@
 #define ISP_META_SIZE_T8112  0x4840
 #define ISP_META_SIZE_T6031  0x4a40
 #define ISP_META_SIZE_T8140  0x4d00
-/* H17 (t8140) capture-metadata pool entry (CH_INFO_GET +0x78) */
 #define ISP_CAPTURE_META_SIZE_T8140 0x29fc0
 
 /* used to limit the user space buffers to the buffer_pool_config */

@@ -700,22 +700,18 @@ static const struct apple_isp_hw apple_isp_hw_t6031 = {
 };
 
 /*
- * J700 (T8140, ISP17a, macOS 26 H17 firmware).  DSID/PMP values are the ones
- * the matched 25G83 init passes (SET_DSID_CLR_MULTI_BC_REG_BASE 0x220114000
- * range 0x2fc, PMP_CTRL_SET clock scratch 0x3003d0ca0 / bandwidth scratch
- * 0x302824000, 8-byte fields); meta size 0x4d00 and the capture-meta record
- * 0x29fc0 come from CH_INFO_GET.  The ASC control/status block moved to
- * +0x1600040, the doorbell/ack block is at mbox+0x410.
+ * Registers the T8140 firmware accesses at their physical addresses: the
+ * bootloader's DART address filter ranges for the ISP, rounded out to
+ * 16 KiB pages.
  */
-/* dart-isp dapf-instance-0 slices, page-rounded (native host identity_ranges) */
-static const struct isp_identity_window apple_isp_identity_t8140[] = {
-	{ 0x220004000, 0x14000 },	/* DSID broadcast-clear windows 0..4 */
+static const struct isp_mmio_window apple_isp_fw_mmio_t8140[] = {
+	{ 0x220004000, 0x14000 },	/* DSID broadcast-clear windows */
 	{ 0x220044000, 0x14000 },
 	{ 0x220084000, 0x14000 },
 	{ 0x2200c4000, 0x14000 },
 	{ 0x220104000, 0x14000 },
-	{ 0x3003c0000, 0x28000 },	/* PMGR scratch (PMP clock/bandwidth) */
-	{ 0x300704000, 0x4000 },	/* ISP-local power domains */
+	{ 0x3003c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
+	{ 0x300704000, 0x4000 },	/* PMGR, ISP power states */
 	{ 0x300730000, 0x4000 },
 	{ 0x300e3c000, 0x4000 },
 	{ 0x302824000, 0x4000 },	/* PMP bandwidth scratch */
@@ -725,6 +721,7 @@ static const struct isp_identity_window apple_isp_identity_t8140[] = {
 
 static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.gen = ISP_GEN_T8140,
+	.fw_abi = ISP_FW_ABI_H17,
 	.pmu_base = 0x0,
 
 	.dsid_count = 1,
@@ -739,17 +736,21 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.bandwidth_base = 0x0,
 	.bandwidth_bit = 0x0,
 	.bandwidth_size = 0x8,
-	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T8140,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
 
 	.scl1 = false,
 	.lpdp = true,
 	.meta_size = ISP_META_SIZE_T8140,
 
+	.fw_iova_mask = GENMASK_ULL(35, 0),
 	.mbox2_offset = 0x410,
-	.asc_control = ISP_COPROC_CONTROL_T8140,
+	.mbox_irq_route = true,
+	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.fw_mmio = apple_isp_fw_mmio_t8140,
+	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8140),
+	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
-	.identity = apple_isp_identity_t8140,
-	.num_identity = ARRAY_SIZE(apple_isp_identity_t8140),
+	.resident_fw = true,
 };
 
 static const struct of_device_id apple_isp_of_match[] = {
