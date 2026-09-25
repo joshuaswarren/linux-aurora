@@ -207,7 +207,8 @@ MODULE_PARM_DESC(fwlog, "Copy the ISP firmware's terminal output to the kernel l
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
-	dma_addr_t iova = req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK;
+	dma_addr_t iova =
+		isp_fw_iova(isp, req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK);
 	size_t size = min_t(u64, req->arg1, ISP_IPC_TERMINAL_MAX_LEN);
 	const char *line;
 

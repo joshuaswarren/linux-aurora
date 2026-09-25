@@ -129,9 +129,7 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	if (!isp->domain)
 		return -ENODEV;
 	isp->shift = __ffs(isp->domain->pgsize_bitmap);
-	/* t8140: the H17 firmware answers with vm-base 0x10000000000 set */
-	isp->fw_iova_mask = isp->hw->gen == ISP_GEN_T8140 ? GENMASK_ULL(35, 0) :
-							   ~0ULL;
+	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
 
 	idx = of_property_match_string(dev->of_node, "memory-region-names",
 				       "heap");
