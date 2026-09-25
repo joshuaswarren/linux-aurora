@@ -1238,6 +1238,49 @@ struct G17PRenderStorageVaLayout {
     timestamps: u64,
 }
 
+/// Exact inputs from the two page tables used by the retained graph validator.
+/// An unavailable/overflowed epoch is represented by an absent key, never a hit.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PRenderReachabilityKey {
+    vm_id: u64,
+    kernel_vm_id: u64,
+    vm_epoch: u64,
+    kernel_epoch: u64,
+}
+
+/// Command-state generations have different mappings but remain allocated
+/// together. Keep both proofs so alternating generations does not redo a walk.
+struct G17PRenderReachabilityCache {
+    validated: [Option<G17PRenderReachabilityKey>; G17P_RENDER_MAX_IN_FLIGHT],
+}
+
+impl G17PRenderReachabilityCache {
+    const fn new() -> Self {
+        Self { validated: [None; G17P_RENDER_MAX_IN_FLIGHT] }
+    }
+
+    fn matches(&self, generation: usize, key: Option<G17PRenderReachabilityKey>) -> bool {
+        key.is_some() && self.validated.get(generation).copied().flatten() == key
+    }
+
+    /// Record only a successful walk whose page tables stayed unchanged from
+    /// before its first predicate until after its last predicate.
+    fn record_success(
+        &mut self,
+        generation: usize,
+        before: Option<G17PRenderReachabilityKey>,
+        after: Option<G17PRenderReachabilityKey>,
+    ) {
+        if let Some(entry) = self.validated.get_mut(generation) {
+            *entry = if before == after { before } else { None };
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.validated.fill(None);
+    }
+}
+
 impl G17PRenderStorageVaLayout {
     fn all_referenced_ranges_reachable(
         self,
@@ -2657,23 +2700,12 @@ impl G17PRenderTvb {
     fn all_reachable_from(&self, vm: &mmu::Vm) -> bool {
         self.block_count >= G17P_PM_BLOCK_COUNT && self.block_count <= G17P_PM_MAX_OWNED_BLOCKS
             && self.logical_size >= (self.block_count - 1) * G17P_RENDER_TVB_BLOCK_STRIDE + G17P_RENDER_TVB_BLOCK_SIZE
-            && (0..self.block_count).all(|index| {
-                self.block_addresses.get(index).copied().is_some_and(|address| {
-                    let guard = address + G17P_RENDER_TVB_BLOCK_SIZE as u64;
-                    vm.covers_range(
-                            address,
-                            G17P_RENDER_TVB_BLOCK_SIZE as u64,
-                            true,
-                            true,
-                        )
-                        && !vm.covers_range(
-                            guard,
-                            (G17P_RENDER_TVB_BLOCK_STRIDE - G17P_RENDER_TVB_BLOCK_SIZE) as u64,
-                            false,
-                            false,
-                        )
-                })
-            })
+            && self.block_addresses.len() >= self.block_count
+            && vm.covers_sparse_blocks_with_guards(
+                &self.block_addresses[..self.block_count],
+                G17P_RENDER_TVB_BLOCK_SIZE as u64,
+                G17P_RENDER_TVB_BLOCK_STRIDE as u64,
+            )
     }
 }
 
@@ -4545,6 +4577,8 @@ pub(crate) struct G17PUserRenderStorage {
     /// generation, so switching is a set of pointer/value swaps and never an
     /// allocation in the publication or retirement path.
     render_command_generation: u8,
+    reachability_cache: G17PRenderReachabilityCache,
+    last_reachability_cache_hit: bool,
     alternate_render_command: KBox<G17PRenderCommandGeneration>,
     render_command_ordinals: [Option<u64>; G17P_RENDER_MAX_IN_FLIGHT],
     render_tvb: Option<G17PRenderTvb>,
@@ -7169,6 +7203,7 @@ impl G17PUserRenderStorage {
     /// per-VM low mappings stay with this storage and disappear before the
     /// incoming VM maps the same addresses.
     pub(crate) fn take_sksm_backing(&mut self) -> Result<G17PRenderSksmBacking> {
+        self.reachability_cache.invalidate();
         self.sksm_backing.take().ok_or(EIO)
     }
 
@@ -7185,6 +7220,7 @@ impl G17PUserRenderStorage {
         {
             return Err(EIO);
         }
+        self.reachability_cache.invalidate();
         self.sksm_backing = backing.take();
         Ok(())
     }
@@ -8936,6 +8972,8 @@ impl G17PUserRenderStorage {
             render_state,
             render_layout,
             render_command_generation,
+            reachability_cache: G17PRenderReachabilityCache::new(),
+            last_reachability_cache_hit: false,
             alternate_render_command,
             render_command_ordinals,
             render_tvb,
@@ -9226,6 +9264,7 @@ impl G17PUserRenderStorage {
     pub(crate) fn take_retired_parameter_management(
         &mut self,
     ) -> Option<G17PRetiredParameterManagement> {
+        self.reachability_cache.invalidate();
         self.parameter_management.take().map(|manager| {
             // The client page-list presentation is rooted through the
             // retiring VmBind and is not what the firmware crash named.
@@ -9398,6 +9437,9 @@ impl G17PUserRenderStorage {
         vm: &mmu::Vm,
         sksm_backing: &mut G17PRenderSksmBacking,
     ) -> Result<(KVec<mmu::KernelMapping>, KVec<mmu::KernelMapping>)> {
+        // The transaction can fail after replacing some storage aliases.
+        // Never retain either command generation's proof across an attempt.
+        self.reachability_cache.invalidate();
         let pair = self.queue_pair.slot();
         // A failed cross-VM rebind is pre-publication, but the caller must
         // know which exact alias refused admission before considering reuse.
@@ -10937,6 +10979,50 @@ impl G17PUserRenderStorage {
                     false,
                 ),
         );
+    }
+
+    fn reachability_key(uat: &mmu::Uat, vm: &mmu::Vm) -> Option<G17PRenderReachabilityKey> {
+        Some(G17PRenderReachabilityKey {
+            vm_id: vm.id(),
+            kernel_vm_id: uat.kernel_vm().id(),
+            vm_epoch: vm.mapping_validation_epoch()?,
+            kernel_epoch: uat.kernel_vm().mapping_validation_epoch()?,
+        })
+    }
+
+    /// Reuse the exact mapping proof for an unchanged retained graph. Ordinary
+    /// descriptor staging changes GPU contents, not this validator's inputs.
+    /// Root/context ownership and completion admission remain separate checks.
+    pub(crate) fn first_unreachable_cached(
+        &mut self,
+        uat: &mmu::Uat,
+        vm: &mmu::Vm,
+    ) -> Option<&'static str> {
+        self.last_reachability_cache_hit = false;
+        let generation = usize::from(self.render_command_generation);
+        let before = Self::reachability_key(uat, vm);
+        // Double-collect the pair: a mutation between the app and kernel VM
+        // reads must not make a mixed snapshot reusable. As with the original
+        // per-range walk, ownership rules govern mutations after validation.
+        if self.reachability_cache.matches(generation, before)
+            && before == Self::reachability_key(uat, vm)
+        {
+            self.last_reachability_cache_hit = true;
+            return None;
+        }
+        let failed = self.first_unreachable(uat, vm);
+        if failed.is_none() {
+            self.reachability_cache.record_success(
+                generation, before, Self::reachability_key(uat, vm),
+            );
+        } else {
+            self.reachability_cache.invalidate();
+        }
+        failed
+    }
+
+    pub(crate) fn last_reachability_cache_hit(&self) -> bool {
+        self.last_reachability_cache_hit
     }
 
     /// Name the first mapping predicate a render submission fails, or `None`
@@ -17842,6 +17928,9 @@ impl G17ResourceOwner {
         let tvb=storage.render_tvb.as_mut().ok_or(EINVAL)?;
         let previous_blocks=tvb.block_count;
         if blocks <= previous_blocks { return Ok(()); }
+        // Growth changes the validated block list and can fail after mapping
+        // some blocks. Both retained command generations must be revalidated.
+        storage.reachability_cache.invalidate();
         if vm.render_pool_tvb_blocks(render_slot, pool_id) != Some(previous_blocks) || !tvb.all_reachable_from(vm) {
             return Err(EFAULT);
         }
@@ -19342,6 +19431,76 @@ impl G17ResourceOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reachability_test_key() -> G17PRenderReachabilityKey {
+        G17PRenderReachabilityKey {
+            vm_id: 17, kernel_vm_id: 1, vm_epoch: 23, kernel_epoch: 41,
+        }
+    }
+
+    #[test]
+    fn retained_reachability_keeps_both_command_generations() {
+        let mut cache = G17PRenderReachabilityCache::new();
+        let key = Some(reachability_test_key());
+        assert!(!cache.matches(0, key));
+        cache.record_success(0, key, key);
+        assert!(cache.matches(0, key));
+        assert!(!cache.matches(1, key));
+        cache.record_success(1, key, key);
+        for ordinal in 0..128 {
+            assert!(cache.matches(ordinal % G17P_RENDER_MAX_IN_FLIGHT, key));
+        }
+        assert!(!cache.matches(G17P_RENDER_MAX_IN_FLIGHT, key));
+    }
+
+    #[test]
+    fn retained_reachability_rejects_each_changed_vm_input() {
+        let mut cache = G17PRenderReachabilityCache::new();
+        let key = reachability_test_key();
+        cache.record_success(0, Some(key), Some(key));
+        for changed in [
+            G17PRenderReachabilityKey { vm_id: key.vm_id + 1, ..key },
+            G17PRenderReachabilityKey { kernel_vm_id: key.kernel_vm_id + 1, ..key },
+            G17PRenderReachabilityKey { vm_epoch: key.vm_epoch + 1, ..key },
+            G17PRenderReachabilityKey { kernel_epoch: key.kernel_epoch + 1, ..key },
+        ] {
+            assert!(!cache.matches(0, Some(changed)));
+        }
+        assert!(!cache.matches(0, None));
+    }
+
+    #[test]
+    fn retained_reachability_does_not_cache_overlapping_or_unavailable_epochs() {
+        let mut cache = G17PRenderReachabilityCache::new();
+        let key = reachability_test_key();
+        // Even if a map partially succeeds then returns an error, its epoch
+        // change prevents a successful non-atomic walk becoming a cache proof.
+        let changed = G17PRenderReachabilityKey { vm_epoch: key.vm_epoch + 1, ..key };
+        cache.record_success(0, Some(key), Some(changed));
+        assert!(!cache.matches(0, Some(key)));
+        assert!(!cache.matches(0, Some(changed)));
+        for (before, after) in [(None, None), (Some(key), None), (None, Some(key))] {
+            cache.record_success(0, before, after);
+            assert!(!cache.matches(0, Some(key)));
+            assert!(!cache.matches(0, None));
+        }
+    }
+
+    #[test]
+    fn retained_reachability_topology_invalidation_clears_both_generations() {
+        let mut cache = G17PRenderReachabilityCache::new();
+        let key = Some(reachability_test_key());
+        cache.record_success(0, key, key);
+        cache.record_success(1, key, key);
+        // SKSM detach/claim, PM extraction, TVB growth, and VM alias rebind
+        // invalidate before the mutation, including a failed rebind attempt.
+        cache.invalidate();
+        assert!(!cache.matches(0, key));
+        assert!(!cache.matches(1, key));
+        cache.record_success(1, key, key);
+        assert!(!cache.matches(0, key));
+        assert!(cache.matches(1, key));
+    }
 
     #[test]
     fn tvb_auto_growth_matches_high_water_policy_and_native_cap() {
