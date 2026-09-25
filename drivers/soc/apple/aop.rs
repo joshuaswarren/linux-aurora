@@ -47,7 +47,6 @@ use kernel::{
         EPICService,
         FakehidListener,
         ReportListener,
-        SourceRing,
         AOP, //
     },
     soc::apple::mailbox,
@@ -730,8 +729,11 @@ impl AFKEndpoint {
                 return Into::<Arc<_>>::into(client).register_service(self, chan, name);
             } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
                 return client.process_fakehid_report(self, qhdr.channel, data);
+            } else if client.process_report(self, qhdr.channel, subtype, data)? {
+                return Ok(());
             }
-            return Err(EINVAL);
+            // A report nobody listens for.
+            return Err(ENOENT);
         } else if ehdr.category == EPIC_CATEGORY_REPLY {
             if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
                 || subtype == EPIC_SUBTYPE_RETCODE
@@ -942,6 +944,12 @@ impl AFKEndpoint {
 struct ListenerEntry {
     svc: EPICService,
     listener: Arc<dyn FakehidListener>,
+}
+
+struct ReportListenerEntry {
+    svc: EPICService,
+    subtype: u16,
+    listener: Arc<dyn ReportListener>,
 }
 
 /// One of the setup port's service endpoints, once it has its buffers: a
@@ -1197,6 +1205,8 @@ struct AopData {
     #[pin]
     hid_listeners: Mutex<KVec<ListenerEntry>>,
     #[pin]
+    report_listeners: Mutex<KVec<ReportListenerEntry>>,
+    #[pin]
     subdevices: Mutex<KVec<ChildDevice>>,
 }
 
@@ -1428,7 +1438,7 @@ impl AopData {
         Ok(())
     }
 
-    /// Returns Ok(true) when a registered listener took the report.
+    /// Hands a report to its listener; `Ok(false)` when there is none.
     fn process_report(&self, ep: &AFKEndpoint, ch: u32, subtype: u16, data: &[u8]) -> Result<bool> {
         let guard = self.report_listeners.lock();
         for entry in &*guard {
@@ -1971,6 +1981,41 @@ impl AOP for AopData {
         }
         false
     }
+    fn add_report_listener(
+        &self,
+        svc: EPICService,
+        subtype: u16,
+        listener: Arc<dyn ReportListener>,
+    ) -> Result<()> {
+        let mut guard = self.report_listeners.lock();
+        if self.removing.load(Acquire) {
+            return Err(ENODEV);
+        }
+        if guard
+            .iter()
+            .any(|entry| entry.svc == svc && entry.subtype == subtype)
+        {
+            return Err(EBUSY);
+        }
+        Ok(guard.push(
+            ReportListenerEntry {
+                svc,
+                subtype,
+                listener,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+    fn remove_report_listener(&self, svc: &EPICService, subtype: u16) -> bool {
+        let mut guard = self.report_listeners.lock();
+        for i in 0..guard.len() {
+            if guard[i].svc == *svc && guard[i].subtype == subtype {
+                guard.swap_remove(i);
+                return true;
+            }
+        }
+        false
+    }
     /// Takes the AOP down: from unbind, from a failed probe, or as a fallback
     /// from Drop. Only the first call does anything.
     fn remove(&self) {
@@ -1991,6 +2036,7 @@ impl AOP for AopData {
             child.release_driver();
         }
         self.hid_listeners.lock().clear();
+        self.report_listeners.lock().clear();
         self.transport_closing.store(true, Release);
         if let Err(e) = self.stop() {
             dev_err!(self.dev, "Failed to stop AOP {:?}", e);

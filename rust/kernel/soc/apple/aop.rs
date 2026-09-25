@@ -26,34 +26,23 @@ pub struct EPICService {
 ///
 /// The AOP driver keeps the listener in an [`Arc`] shared with the child driver that registered
 /// it and invokes it from its own RTKit receive worker, so listeners have to be `Send + Sync`.
+/// The callback runs with the AOP's RTKit lock, the endpoint's lock and the listener list lock
+/// held: it must not sleep for long, must not call into the AOP (no [`AOP::epic_call`] and no
+/// listener registration), and it keeps running until the listener is removed.
 pub trait FakehidListener: Send + Sync {
     /// Process the event.
     fn process_fakehid_report(&self, data: &[u8]) -> Result<()>;
 }
 
-/// Listener for any other EPIC report subtype on a service (e.g. the T8140
-/// low-power microphone producer reports, subtype 0x20).
-pub trait ReportListener {
+/// Listener for the EPIC reports of a service other than the fake-HID ones, such as the producer
+/// reports (subtype 0x20) of the T8140 low-power microphone service.
+///
+/// The same rules as for [`FakehidListener`] apply: the callback runs from the AOP's RTKit
+/// receive worker with the RTKit lock, the endpoint's lock and the listener list lock held, so
+/// it must not sleep for long or call into the AOP, and it runs until the listener is removed.
+pub trait ReportListener: Send + Sync {
     /// Process the report payload (everything after the EPIC headers).
     fn process_report(&self, subtype: u16, data: &[u8]) -> Result<()>;
-}
-
-/// T8140: the low-power microphone source ring.  The firmware accepts one
-/// binding for its lifetime (a second bind on the same boot answers
-/// 0x2000000000000009), so the AOP driver owns the allocation and hands the
-/// same ring to every audio driver probe.
-pub struct SourceRing {
-    /// The ring, mapped through the audio child's IOMMU stream.
-    pub buf: Coherent<[u8]>,
-    /// IOVA the firmware produces into.
-    pub iova: u64,
-}
-
-impl SourceRing {
-    /// Size of the ring in bytes.
-    pub fn size(&self) -> usize {
-        self.buf.size()
-    }
 }
 
 /// AOP communications manager.
@@ -79,20 +68,17 @@ pub trait AOP: Send + Sync {
     /// Removes the listener for the specified service. Returns once no callback into the
     /// listener is running any more.
     fn remove_fakehid_listener(&self, svc: &EPICService) -> bool;
-    /// Adds a report listener for one subtype on the specified service
+    /// Adds a report listener for one report subtype of the specified service. A service and
+    /// subtype take one listener at a time; a second registration fails with `EBUSY`.
     fn add_report_listener(
         &self,
         svc: EPICService,
         subtype: u16,
         listener: Arc<dyn ReportListener>,
     ) -> Result<()>;
-    /// Remove the report listener for the specified service and subtype
+    /// Removes the report listener for the specified service and subtype. Returns once no
+    /// callback into the listener is running any more.
     fn remove_report_listener(&self, svc: &EPICService, subtype: u16) -> bool;
-    /// T8140: the low-power microphone source ring, `size` bytes mapped
-    /// through `dev` (the audio child).  Allocated and bound to the firmware
-    /// over the setup port on first use, then shared for the AOP's lifetime.
-    /// Returns ENODEV on other generations.
-    fn source_ring(&self, dev: &Device<Bound>, size: usize) -> Result<Arc<SourceRing>>;
     /// Internal method to detach the device.
     fn remove(&self);
 }
