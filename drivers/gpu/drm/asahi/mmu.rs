@@ -192,6 +192,16 @@ pub(crate) enum HandoffMode {
     /// Constructed by the T8140 resource owner before either role receives an
     /// init-data root.
     AbsentStandinT8140,
+    /// M5 25G76 bring-up mode. Native snapshots before/after exact GPU work
+    /// leave the entire handoff page zero. The explicit M5 startup path
+    /// tests this no-peer policy; it does not enable userspace or flushing.
+    NoPeerT8142,
+    /// T8152/G18G (J873, 26A428) bring-up mode: the same no-peer policy as
+    /// [`HandoffMode::NoPeerT8142`], kept separate because the G18G handoff
+    /// page has not been observed. [`Handoff::init`] refuses it when the
+    /// firmware half (magic or lock) is already non-zero, so a live peer is
+    /// detected rather than overwritten.
+    NoPeerT8152,
 }
 
 const T8140_SECONDARY_SHARED_ROOT_DELTA: u64 = 0x40000;
@@ -380,7 +390,71 @@ fn mirror_host_root_entries(primary: &[u64], secondary: &mut [u64]) -> usize {
 }
 
 /// Return the evidence-backed UAT root geometry for this SoC.
-fn uat_geometry(cfg: &hw::HwConfig) -> Result<UatGeometry> {
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct UatConfig {
+    chip_id: u32,
+    ias: u8,
+    oas: u32,
+}
+
+impl UatConfig {
+    const fn from_hw(cfg: &hw::HwConfig) -> Self {
+        Self {
+            chip_id: cfg.chip_id,
+            ias: cfg.uat_ias,
+            oas: cfg.uat_oas,
+        }
+    }
+
+    const T8140: Self = Self {
+        chip_id: 0x8140,
+        ias: 42,
+        oas: 42,
+    };
+
+    const T8142: Self = Self { chip_id: 0x8142, ias: 42, oas: 42 };
+
+    /// T8152 (J873, G18G). The ADT uat-vaddr-size is 43, as on T8142: 42
+    /// bits per root plus the TTBR-select bit. The ADT
+    /// agx-address-space-mgmt-mode is 1 on both. J873 DRAM ends at
+    /// 0x106_0000_0000, inside the 42-bit output space.
+    const T8152: Self = Self { chip_id: 0x8152, ias: 42, oas: 42 };
+
+    fn has_g17_private_roots(self) -> bool {
+        self == Self::T8140 || self == Self::T8142 || self == Self::T8152
+    }
+
+    /// Dual-role firmware whose native topology gives each role a private
+    /// upper root that shares one L2 page (M5 25G76 and J873 26A428).
+    fn has_m5_native_topology(self) -> bool {
+        self == Self::T8142 || self == Self::T8152
+    }
+}
+
+/// J873 (T8152) boot-local firmware reservations from the ADT /arm-io/sgx
+/// node, as a loader copies them into /reserved-memory.
+#[allow(dead_code)]
+const T8152_DRAM_BASE: u64 = 0x100_0000_0000;
+/// J873 DRAM end: /chosen dram-base 0x100_0000_0000 + dram-size 24 GiB.
+#[allow(dead_code)]
+const T8152_DRAM_END: u64 = 0x106_0000_0000;
+/// (memory-region name, exact size): 26A428 GFX/GFX1 __DATA, then the
+/// __DATA_SHARED_RO segments (firmware VA +0x10c000 / +0x108000).
+#[allow(dead_code)]
+const T8152_FIRMWARE_DATA: [(&CStr, u64); 2] = [
+    (c_str!("gfx-data"), 0xbc000),
+    (c_str!("gfx1-data"), 0xb4000),
+];
+#[allow(dead_code)]
+const T8152_FIRMWARE_SHARED_RO: [(&CStr, u64); 2] = [
+    (c_str!("gfx-data-shared-ro"), 0x8000),
+    (c_str!("gfx1-data-shared-ro"), 0x8000),
+];
+/// Size of one RTKit crash view (ADT iop-gfx(1)-nub coredump-copy-buffer).
+#[allow(dead_code)]
+const T8152_CRASH_VIEW_SIZE: u64 = 0x8000;
+
+fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
     // 39-bit (G13/G14) and 42-bit (G15+) roots are the two recovered
     // geometries; anything else is undefined.
     UatGeometry::new(cfg.uat_ias).ok_or(ENODEV)
@@ -1869,6 +1943,20 @@ impl Handoff {
     /// firmware never writes its half (hardware-verified), so the AP
     /// publishes its own state and proceeds without a peer.
     fn init(&self, mode: HandoffMode) -> Result {
+        if mode == HandoffMode::NoPeerT8142
+            && (self.magic_fw.load(Ordering::Acquire) != 0
+                || self.lock_fw.load(Ordering::Acquire) != 0)
+        {
+            pr_err!("M5 handoff: unexpected firmware peer; refusing no-peer mode\n");
+            return Err(ENODEV);
+        }
+        if mode == HandoffMode::NoPeerT8152
+            && (self.magic_fw.load(Ordering::Acquire) != 0
+                || self.lock_fw.load(Ordering::Acquire) != 0)
+        {
+            pr_err!("T8152 handoff: unexpected firmware peer; refusing no-peer mode\n");
+            return Err(ENODEV);
+        }
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(0, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
@@ -1942,7 +2030,9 @@ impl HandoffFlush {
         // it, so the state legitimately remains where begin_flush left it.
         let expected = match self.1 {
             HandoffMode::FirmwareDekker => 2,
-            HandoffMode::AbsentStandinT8140 => 1,
+            HandoffMode::AbsentStandinT8140
+            | HandoffMode::NoPeerT8142
+            | HandoffMode::NoPeerT8152 => 1,
         };
         if state != expected {
             pr_err!(
@@ -3097,6 +3187,20 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
+    /// A memory-layout consumer must not confuse identical root geometry
+    /// with target admission. This checks identity only; it does not create
+    /// an M5 UAT or authorize an absent firmware handoff protocol.
+    pub(crate) fn is_t8142_geometry(&self) -> bool {
+        self.cfg.chip_id == 0x8142 && self.cfg.ias == 42 && self.cfg.oas == 42
+    }
+
+    /// The T8152 counterpart of [`Uat::is_t8142_geometry`]; identity only.
+    /// Consumed by the G18 live-boot module.
+    #[allow(dead_code)]
+    pub(crate) fn is_t8152_geometry(&self) -> bool {
+        self.cfg == UatConfig::T8152
+    }
+
     pub(crate) fn t8140_render_global_vm(&self) -> Result<&Vm> {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
@@ -3729,6 +3833,30 @@ impl Uat {
                 )
             };
             secondary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            Ok(())
+        })?;
+        if self.cfg.has_m5_native_topology() {
+            let node = self.dev.as_ref().of_node().ok_or(EINVAL)?;
+            let shared_l2 = node.reserved_mem_region_to_resource_byname(c_str!("shared-l2"))?;
+            let mask = ((1u64 << self.cfg.oas) - 1) & !(UAT_PGMSK as u64);
+            if shared_l2.size() != UAT_PGSZ as u64
+                || Iterator::chain(primary_entries.iter(), secondary_entries.iter()).any(|pte| pte & 3 != 3)
+                || primary_entries[2] & mask != shared_l2.start()
+                || secondary_entries[2] & mask != shared_l2.start()
+                || primary_entries[0] & mask == secondary_entries[0] & mask
+            {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "{} firmware-private roots/shared L2 do not match the native topology\n",
+                    (if self.cfg == UatConfig::T8142 { "M5" } else { "T8152" })
+                );
+                return Err(EIO);
+            }
+        }
+        primary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe { core::slice::from_raw_parts_mut(
+                pointer as *mut u64, UAT_PGSZ / core::mem::size_of::<u64>()) };
+            clear_stale_host_root_entries(entries);
             Ok(())
         })?;
         fence(Ordering::SeqCst);
@@ -4643,7 +4771,7 @@ impl Uat {
         // M5 application slots require a private empty upper root and a
         // retained M5ExecutionContext. The legacy slot allocator must not
         // overwrite a slot claimed by that independent lease allocator.
-        if self.cfg == UatConfig::T8142 {
+        if self.cfg.has_m5_native_topology() {
             return Err(ENOTSUPP);
         }
         let mut binding = vm.binding.lock();
@@ -4906,6 +5034,101 @@ impl Uat {
         Ok(uat)
     }
 
+    /// J873/T8152 (G18G, 26A428) UAT owner for the staged live-boot module.
+    ///
+    /// This validates the loader-filled boot-local reservations before any
+    /// page-table state is touched:
+    /// - `gfx-data` is exactly 0xbc000 and `gfx1-data` exactly 0xb4000,
+    ///   i.e. the 26A428 __DATA segments;
+    /// - `gfx-data-shared-ro` and `gfx1-data-shared-ro` are 0x8000 each.
+    ///   They are validated so that Linux never reuses that memory, but they
+    ///   are never mapped: the firmware sees them at VA +0x10c000/+0x108000
+    ///   through its own roots;
+    /// - all four regions are 16 KiB aligned, lie inside J873 DRAM
+    ///   (0x100_0000_0000..0x106_0000_0000) and do not overlap.
+    ///
+    /// Firmware contexts 0..2 stay reserved (the shared UatInner lease mask
+    /// starts at 0b111) and application binding is refused, as on M5. The
+    /// handoff page runs in [`HandoffMode::NoPeerT8152`].
+    ///
+    /// `crash_views` gives the DATA-relative offsets of the GFX and GFX1
+    /// RTKit crash views. M5 uses +0xa0000; the G18G offset is not yet known,
+    /// so pass `None` until the EP1 crashlog request reports it. Each view is
+    /// 0x8000 bytes (ADT coredump-copy-buffer) and is mapped read-write into
+    /// context 0 at the M5 DVA rule (physical address truncated to 40 bits).
+    #[allow(dead_code)] // Called by the G18 live-boot module.
+    pub(crate) fn new_t8152(
+        dev: &driver::AsahiDevice,
+        crash_views: Option<[u64; 2]>,
+    ) -> Result<Self> {
+        let node = dev.as_ref().of_node().ok_or(EINVAL)?;
+        let mut data = [0u64; 2];
+        let mut regions = [(0u64, 0u64); 4];
+        for (index, (name, size)) in Iterator::chain(
+            T8152_FIRMWARE_DATA.into_iter(),
+            T8152_FIRMWARE_SHARED_RO,
+        )
+        .enumerate()
+        {
+            let region = node.reserved_mem_region_to_resource_byname(name)?;
+            let start = region.start();
+            let end = start.checked_add(region.size()).ok_or(EOVERFLOW)?;
+            if start < T8152_DRAM_BASE
+                || region.size() != size
+                || start & UAT_PGMSK as u64 != 0
+                || end > T8152_DRAM_END
+            {
+                dev_err!(
+                    dev.as_ref(),
+                    "MMU: T8152 {} reservation {:#x}+{:#x} does not match the 26A428 layout ({:#x} bytes in J873 DRAM)\n",
+                    name,
+                    start,
+                    region.size(),
+                    size
+                );
+                return Err(EINVAL);
+            }
+            if regions[..index].iter().any(|&(s, e)| start < e && s < end) {
+                dev_err!(dev.as_ref(), "MMU: T8152 {} overlaps another firmware reservation\n", name);
+                return Err(EINVAL);
+            }
+            regions[index] = (start, end);
+            if index < data.len() {
+                data[index] = start;
+            }
+        }
+
+        let mut uat = Self::new_with_config(dev, UatConfig::T8152, false, HandoffMode::NoPeerT8152)?;
+        if let Some(offsets) = crash_views {
+            let mut physical = [0u64; 2];
+            for (index, offset) in offsets.into_iter().enumerate() {
+                let (_, data_size) = T8152_FIRMWARE_DATA[index];
+                if offset & UAT_PGMSK as u64 != 0
+                    || offset.checked_add(T8152_CRASH_VIEW_SIZE).ok_or(EOVERFLOW)? > data_size
+                {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: T8152 crash view offset {:#x} is outside role {} __DATA\n",
+                        offset,
+                        index
+                    );
+                    return Err(EINVAL);
+                }
+                physical[index] = data[index] + offset;
+            }
+            let map = |pa: u64| {
+                uat.kernel_lower_vm.map_io(
+                    pa & ((1u64 << 40) - 1),
+                    pa.try_into()?,
+                    T8152_CRASH_VIEW_SIZE as usize,
+                    PROT_FW_SHARED_RW,
+                )
+            };
+            uat._t8142_firmware_crash_views = Some([map(physical[0])?, map(physical[1])?]);
+        }
+        Ok(uat)
+    }
+
     /// Back the two nonzero EP1 crash-buffer requests before either firmware
     /// processor starts. m1n1 treats these DVAs as preallocated context-0
     /// mappings and only echoes the request; Linux must provide the same
@@ -5064,13 +5287,40 @@ impl Uat {
         // kernel-half window are per-firmware-build ABI observed only on
         // AGX2. Fail closed on exactly that boundary.
         let kernel_range = iova_kern_range(cfg)?;
-        if cfg.uat_ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
-            dev_err!(
-                dev.as_ref(),
-                "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
-                cfg.uat_ias
-            );
-            return Err(ENODEV);
+        match handoff_mode {
+            HandoffMode::FirmwareDekker => {
+                if cfg.ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
+                        cfg.ias
+                    );
+                    return Err(ENODEV);
+                }
+            }
+            HandoffMode::AbsentStandinT8140 => {
+                // Hardware-verified on T8140 only. Never assume any other
+                // part ignores the handoff region.
+                if cfg.chip_id != 0x8140 || cfg.ias != 42 {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: absent-handoff stand-in is T8140-only evidence (chip {:#x}, {}-bit)\n",
+                        cfg.chip_id,
+                        cfg.ias
+                    );
+                    return Err(ENODEV);
+                }
+            }
+            HandoffMode::NoPeerT8142 => {
+                if cfg != UatConfig::T8142 {
+                    return Err(ENODEV);
+                }
+            }
+            HandoffMode::NoPeerT8152 => {
+                if cfg != UatConfig::T8152 {
+                    return Err(ENODEV);
+                }
+            }
         }
 
         let inner = Self::make_inner(dev, cfg, handoff_mode)?;

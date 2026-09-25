@@ -53,6 +53,181 @@ pub(crate) const HW_GLOBALS_SIZE: usize = 0x2828;
 pub(crate) const INITDATA_MAGIC: u64 = 0x0c8d_e339_0728_04c0;
 pub(crate) const PERF_STATE_MAX: usize = 16;
 
+/// Root size for the primary (`gfx-asc`) instance.
+pub(crate) const ROOT_SIZE_PRIMARY: usize = 0x0b8;
+/// Root size for the secondary (`gfx1-asc`) instance; the extra 0x10 bytes are
+/// the two secondary-only pointers at `+0xb8`/`+0xc0`.
+pub(crate) const ROOT_SIZE_SECONDARY: usize = 0x0c8;
+pub(crate) const MAIN_CONFIG_SIZE: usize = 0x600;
+pub(crate) const HW_DATA_SIZE: usize = 0x3db4;
+/// Native QoS manager block published through hardware data.
+pub(crate) const G17P_QOS_RESOURCE_OFFSET: usize = 0x27a4;
+/// The QoS table pointer as the LIVE 25G83 build reads it.
+///
+/// KEXT_PROVEN (25G83 decompile): the live initdata object is 0x2708 bytes and
+/// no instruction in that build references 0x27a4 or 0x27ac at all -- both of
+/// our writes land past its end, in space the firmware never reads. The real
+/// field is +0x26ac, written from `AGXQOSManager + 0x28`. The neighbouring
+/// live fields are +0x2614 (the 4 x 0x20 KSM completion table, which we do
+/// populate), +0x2694 (a 0x40-entry table fwva), +0x2604 (deferred-kick-mode
+/// selector) and the flags at +0x2600/+0x2608/+0x2610.
+///
+/// We keep writing 0x27a4 as well: if that offset really is dead space the
+/// extra store is inert, and leaving it in place keeps this a single-variable
+/// change.
+pub(crate) const G17P_QOS_RESOURCE_LIVE_OFFSET: usize = 0x26ac;
+pub(crate) const G17P_QOS_RESOURCE_SIZE: usize = 0xe40;
+/// Native global SKSM/QID configuration block in hardware data.
+pub(crate) const G17P_SKSM_QID_CONFIG_2700_OFFSET: usize = 0x2700;
+pub(crate) const G17P_SKSM_QID_CONFIG_2708_OFFSET: usize = 0x2708;
+pub(crate) const G17P_SKSM_QID_RESOURCE_OFFSET: usize = 0x27ac;
+/// Host->firmware transport selector, `initdata[0x26f8] = accel[0x4f8] & 1`
+/// (`AGXFirmware::initFirmwareData` @0xfffffe0008a20940). 1 = the host
+/// publishes channel commands; 0 = the host drives the MMIO kick bridge.
+const HW_DATA_TRANSPORT_SELECTOR_OFFSET: usize = 0x26f8;
+/// MEASURED, live 25G83 hardware-data block: native reads 0 here.
+/// initFirmwareData clears the u32 at +0x26fe, which covers +0x2700..+0x2701,
+/// and never sets it. Our 1 was a non-native write inside the live object --
+/// the last non-perf difference in the whole 0x2708-byte structure.
+pub(crate) const G17P_SKSM_QID_CONFIG_2700: u64 = 0;
+pub(crate) const G17P_SKSM_QID_CONFIG_2708: u32 = 0x100;
+/// Firmware log enable word inside main config.
+pub(crate) const MAIN_FIRMWARE_LOG_ENABLE: usize = 0x250;
+
+pub(crate) const G17P_SKSM_QID_RESOURCE_SIZE: usize = 0x2000;
+pub(crate) const REGION_A_SIZE: usize = 0x4000;
+pub(crate) const REGION_C_SIZE: usize = 0x1000;
+pub(crate) const STATUS_BLOCK_SIZE: usize = 0x80;
+
+/// The hardware-data bundle: one contiguous allocation with the hardware-data
+/// object at its base. Its principal content spans `0xc000`, but the repeated
+/// writable region at `+0xc500` (named by main `+0x08`/`+0x10`) lies past
+/// that, so the allocation must reach at least `0x10000`.
+pub(crate) const HW_DATA_BUNDLE_SIZE: usize = 0xc000;
+pub(crate) const HW_DATA_BUNDLE_MIN_ALLOC: usize = 0x10000;
+/// The native placement additionally hosts the twelve work rings and both main
+/// configuration objects inside the same cluster, which then spans this much
+/// (see [`WORK_RING_BUNDLE_OFFSETS`], [`NATIVE_PRIMARY_MAIN_BUNDLE_OFFSET`]).
+pub(crate) const NATIVE_SHARED_CLUSTER_SIZE: usize = 0x28000;
+/// Firmware-high base of the complete hardware-data/main-config/work-ring
+/// cluster in every output-positive G17P capture.
+pub(crate) const NATIVE_SHARED_CLUSTER_GPU_VA: u64 = 0xffff_fc20_c078_8000;
+
+// --- Version tuple ------------------------------------------------------------
+
+/// Root `+0x00`: four u16 version words, `{0x04c0, 0x0396, 0xa322, 0x0c8a}`.
+/// Grounded twice: read out of every live T8140 root, and independently
+/// re-derived from the MOVZ/MOVK chain at `__TEXT+0x1e8a8` of our own J700
+/// firmware image. A mismatch is rejected with "Host and FW Interface is
+/// mismatched" (the M5/G17S image wants 0x0c8d_e339_0728_04c0 instead — that
+/// value must never be sent to T8140 firmware).
+pub(crate) const INITDATA_VERSION: [u16; 4] = [0x04c0, 0x0396, 0xa322, 0x0c8a];
+/// The same tuple as the little-endian u64 the firmware compares in one go.
+pub(crate) const INITDATA_VERSION_WORD: u64 = 0x0c8a_a322_0396_04c0;
+
+/// Target/build-specific root encoding. This is a serialization choice, not
+/// permission to start firmware or reuse the other target's hardware tables.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RootProfile {
+    J700G17P,
+    /// J813 Mac17,3 / 25G76, RTKit-3255.160.4.release. Both roots were captured
+    /// before INBOX1 publication. Independently confirmed by the loaded GFX
+    /// version comparison at +0x1fa5c and GFX1 at +0x21140.
+    J813G17G25G76,
+    /// J873 Mac18,5 / T8152 / G18G / 26A428, RTKit_release-3514.0.15
+    /// (armfw_g18g-b000 on GFX, armfw1_g18g-b010 on GFX1). No capture of a
+    /// native root exists; the encoding is source-constructed from the 26A428
+    /// kext and firmware (see the "J873 / G18G" section below). Selecting it
+    /// changes nothing for the other two profiles.
+    J873G18G26A428,
+}
+
+impl RootProfile {
+    pub(crate) const fn version_word(self) -> u64 {
+        match self {
+            Self::J700G17P => INITDATA_VERSION_WORD,
+            Self::J813G17G25G76 => 0x0c8a_a322_039e_04c0,
+            Self::J873G18G26A428 => G18G_26A428_INITDATA_VERSION_WORD,
+        }
+    }
+
+    /// Bytes of the root object for `role`. J700/J813 keep the historical
+    /// 0xb8/0xc8 split. G18G sizes both roots to 0xc8 because both firmware
+    /// images copy 0xc8 bytes from each root (FW_PROVEN b000 0x21664-0x216a8).
+    pub(crate) const fn root_size(self, role: InstanceRole) -> usize {
+        match self {
+            Self::J873G18G26A428 => G18G_26A428_ROOT_SIZE,
+            Self::J700G17P | Self::J813G17G25G76 => root_size(role),
+        }
+    }
+
+    /// Opcode of the one opening device-control record staged at main
+    /// `+0x4c0`. G18G renumbered the opening handler: 0x16 is now an
+    /// unrelated handler and 0x15 reaches the opening (FW_PROVEN jump table
+    /// 0xfffffc0000006c60, handler b000 0x3ed0). The secondary keeps 0x2a.
+    pub(crate) const fn control_opening_opcode(self, role: InstanceRole) -> u32 {
+        match (self, role) {
+            (Self::J873G18G26A428, InstanceRole::Primary) => {
+                G18G_26A428_CONTROL_OPENING_OPCODE_PRIMARY
+            }
+            (Self::J873G18G26A428, InstanceRole::Secondary) => {
+                G18G_26A428_CONTROL_OPENING_OPCODE_SECONDARY
+            }
+            (_, InstanceRole::Primary) => CONTROL_OPENING_OPCODE_PRIMARY,
+            (_, InstanceRole::Secondary) => CONTROL_OPENING_OPCODE_SECONDARY,
+        }
+    }
+
+    /// The "primary register" device-control opcode (0x20 on J700/M5).
+    /// FW_PROVEN: G18G opcode 0x20 is in the invalid set of the 56-entry
+    /// jump table, so the profile has none and callers must not emit one.
+    pub(crate) const fn control_register_opcode(self) -> Option<u32> {
+        match self {
+            Self::J873G18G26A428 => None,
+            Self::J700G17P | Self::J813G17G25G76 => Some(CONTROL_OPENING_PRIMARY_REGISTER_OPCODE),
+        }
+    }
+
+    /// Bundle offsets of the five views published at main `+0x254`.
+    pub(crate) const fn bundle_view_offsets(self) -> [usize; 5] {
+        match self {
+            Self::J873G18G26A428 => G18G_26A428_BUNDLE_VIEW_OFFSETS,
+            Self::J700G17P | Self::J813G17G25G76 => BUNDLE_VIEW_OFFSETS,
+        }
+    }
+
+    /// Extents each view must fit inside the bundle allocation.
+    pub(crate) const fn bundle_view_extents(self) -> [usize; 5] {
+        match self {
+            Self::J873G18G26A428 => G18G_26A428_BUNDLE_VIEW_EXTENTS,
+            Self::J700G17P | Self::J813G17G25G76 => BUNDLE_VIEW_EXTENTS,
+        }
+    }
+
+    /// Bundle offset named twice by main `+0x08`/`+0x10` (the empty BRN
+    /// table and the 0x88 block, which the allocator places together).
+    pub(crate) const fn repeated_region_bundle_offset(self) -> usize {
+        match self {
+            Self::J873G18G26A428 => G18G_26A428_SHARED_LAYOUT.block_88,
+            Self::J700G17P | Self::J813G17G25G76 => MAIN_REPEATED_REGION_BUNDLE_OFFSET,
+        }
+    }
+
+    /// Bundle offsets of the twelve work rings in channel-table order.
+    pub(crate) const fn work_ring_bundle_offsets(self) -> [usize; WORK_CHANNEL_COUNT] {
+        match self {
+            Self::J873G18G26A428 => G18G_26A428_WORK_RING_BUNDLE_OFFSETS,
+            Self::J700G17P | Self::J813G17G25G76 => WORK_RING_BUNDLE_OFFSETS,
+        }
+    }
+}
+
+// --- Address representability --------------------------------------------------
+
+// The endpoint-0x20 doorbell carries the root address in a 44-bit field; the
+// J700 firmware rebuilds it as `msg | 0xfffff0_0000_0000_0000`. Every pointer
+// placed in the graph must therefore be either bare or carry exactly that
+// kernel-half prefix, or it silently truncates.
 const INITDATA_ADDR_MASK: u64 = 0x0000_0fff_ffff_ffff;
 const INITDATA_ADDR_PREFIX: u64 = 0xffff_f000_0000_0000;
 
@@ -684,6 +859,27 @@ pub(crate) fn encode_control_opening(
             }
         }
     }
+    Ok(())
+}
+
+/// [`encode_control_opening`] for an explicit firmware build. J700/J813 are
+/// byte-identical to [`encode_control_opening`]. G18G stages exactly one
+/// record per role, 0x15 (primary) or 0x2a (secondary), and never a
+/// continuation or register opcode: G18G 0x20 is invalid and 0x22 has not
+/// been re-derived.
+pub(crate) fn encode_control_opening_for_profile(
+    profile: RootProfile,
+    role: InstanceRole,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if profile != RootProfile::J873G18G26A428 {
+        return encode_control_opening(role, out);
+    }
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, profile.control_opening_opcode(role));
     Ok(())
 }
 
@@ -1522,22 +1718,260 @@ pub(crate) fn encode_grounded_subset(
     runtime_pointers.fill(0);
     hw_globals.fill(0);
 
-    put_u64(root, 0x00, INITDATA_MAGIC);
-    put_u64(
-        root,
-        ROOT_FW_SHARED_ALLOC,
-        addresses.firmware_shared_allocation,
-    );
-    put_u64(root, ROOT_RUNTIME_POINTERS, addresses.runtime_pointers);
-    put_u64(root, ROOT_SHARED, addresses.shared);
-    put_u32(root, ROOT_ROLE, role as u32);
-    put_u32(root, ROOT_HOST_MAPPED_ALLOCS, 1);
-    put_u64(root, ROOT_ROLE_POINTER, addresses.role);
-    match role {
-        FirmwareRole::Gfx => put_u64(root, ROOT_ROLE0_CROSS, addresses.cross_role),
-        FirmwareRole::Gfx1 => {
-            put_u64(root, ROOT_ROLE1_CROSS, addresses.cross_role);
-            put_u64(root, ROOT_ROLE1_CROSS_2, addresses.cross_role_2);
+/// Encode one instance's root.
+///
+/// The output is zeroed first, which makes unknown bytes deterministic and,
+/// critically, prevents stale host memory from becoming invented firmware
+/// ABI. Root `+0x10` stays zero: it is zero at handoff on both instances and
+/// its semantics are unknown.
+pub(crate) fn encode_root(
+    role: InstanceRole,
+    shared: &SharedAddresses,
+    inst: &InstanceAddresses,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    encode_root_for_profile(RootProfile::J700G17P, role, shared, inst, out)
+}
+
+/// Encode the common root layout with an explicitly selected firmware build.
+/// The existing runtime continues to call the J700-only wrapper above.
+pub(crate) fn encode_root_for_profile(
+    profile: RootProfile,
+    role: InstanceRole,
+    shared: &SharedAddresses,
+    inst: &InstanceAddresses,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    // Profile-sized: identical to root_size(role) for J700/J813.
+    if out.len() != profile.root_size(role) {
+        return Err(InitdataError::BufferSize);
+    }
+    validate_shared(shared)?;
+    validate_instance(role, inst)?;
+
+    out.fill(0);
+    put_u64(out, ROOT_VERSION, profile.version_word());
+    put_u64(out, ROOT_REGION_A, shared.region_a);
+    // ROOT_ZERO_10 deliberately left zero.
+    put_u64(out, ROOT_MAIN_CONFIG, inst.main_config);
+    put_u64(out, ROOT_REGION_C, shared.region_c);
+    put_u32(out, ROOT_INSTANCE_KIND, role as u32);
+    put_u32(out, ROOT_CONSTANT_2C, 1);
+    put_u16(out, ROOT_PAGE_SIZE, UAT_PAGE_SIZE);
+    out[ROOT_PAGE_BITS] = UAT_PAGE_BITS;
+    out[ROOT_LEVEL_COUNT] = UAT_LEVEL_COUNT as u8;
+    for (index, (shift, entries)) in UAT_LEVELS.iter().enumerate() {
+        encode_uat_level_descriptor(
+            out,
+            ROOT_LEVELS + index * UAT_LEVEL_DESC_SIZE,
+            *shift,
+            *entries,
+        );
+    }
+    put_u64(out, ROOT_STATUS_A, inst.status_a);
+    put_u64(out, ROOT_STATUS_B, inst.status_b);
+    if role == InstanceRole::Secondary {
+        put_u64(out, ROOT_SECONDARY_EXTRA_0, inst.secondary_extras[0]);
+        put_u64(out, ROOT_SECONDARY_EXTRA_1, inst.secondary_extras[1]);
+    }
+    Ok(())
+}
+
+/// Byte range of one channel-table entry inside the main configuration.
+pub(crate) fn channel_table_entry_range(index: usize) -> Option<Range<usize>> {
+    if index >= CHANNEL_TABLE_ENTRIES {
+        return None;
+    }
+    let start = MAIN_CHANNEL_TABLE + index * CHANNEL_ENTRY_SIZE;
+    Some(start..start + CHANNEL_ENTRY_SIZE)
+}
+
+/// Derive the native channel table for one instance.
+///
+/// `state_grid` is this instance's compact channel-state block (0x40-stride,
+/// permuted per [`WORK_STATE_GRID_OFFSETS`]); `status_a` anchors the trailing
+/// report/partial channels; the ring for entry 12 is `main_config + 0x4c0`;
+/// work rings for the primary sit in the bundle at
+/// [`WORK_RING_BUNDLE_OFFSETS`] (which requires the
+/// [`NATIVE_SHARED_CLUSTER_SIZE`] cluster). The secondary leaves entries
+/// 0..11 empty: it is a control-only peer with no work channels.
+pub(crate) fn derive_channel_table(
+    role: InstanceRole,
+    state_grid: u64,
+    status_a: u64,
+    main_config: u64,
+    bundle: u64,
+) -> [ChannelEntry; CHANNEL_TABLE_ENTRIES] {
+    let mut table = [ChannelEntry::EMPTY; CHANNEL_TABLE_ENTRIES];
+    let grid_states = |index: usize| {
+        let base = state_grid + WORK_STATE_GRID_OFFSETS[index] as u64;
+        [
+            base,
+            base + CHANNEL_STATE_SPACING as u64,
+            base + 2 * CHANNEL_STATE_SPACING as u64,
+        ]
+    };
+    if role == InstanceRole::Primary {
+        for index in 0..WORK_CHANNEL_COUNT {
+            table[index] = ChannelEntry {
+                states: grid_states(index),
+                ring: bundle + WORK_RING_BUNDLE_OFFSETS[index] as u64,
+            };
+        }
+    }
+    table[CONTROL_CHANNEL_INDEX] = ChannelEntry {
+        states: grid_states(CONTROL_CHANNEL_INDEX),
+        ring: main_config + MAIN_CONTROL_RING as u64,
+    };
+    for (slot, index) in REPORT_CHANNEL_INDICES.iter().enumerate() {
+        let mut states = [0u64; 3];
+        for (word, offset) in states.iter_mut().zip(REPORT_STATE_STATUS_A_OFFSETS[slot]) {
+            *word = status_a + offset as u64;
+        }
+        table[*index] = ChannelEntry {
+            states,
+            ring: status_a + REPORT_RING_STATUS_A_OFFSETS[slot] as u64,
+        };
+    }
+    table[PARTIAL_CHANNEL_INDEX] = ChannelEntry {
+        states: [status_a + PARTIAL_STATE_STATUS_A_OFFSET as u64, 0, 0],
+        ring: 0,
+    };
+    table
+}
+
+/// [`derive_channel_table`] with the profile's work-ring placement. For J700
+/// and J813 the result is identical to [`derive_channel_table`]. G18G keeps
+/// the same channel/ring permutation and status-A-relative report layout
+/// (FW_PROVEN consumers b000 0x84f0/0x27048/0x7f14/0x19984 match G17); only
+/// the ring bundle offsets move (+0xf00, from the 26A428 size table).
+pub(crate) fn derive_channel_table_for_profile(
+    profile: RootProfile,
+    role: InstanceRole,
+    state_grid: u64,
+    status_a: u64,
+    main_config: u64,
+    bundle: u64,
+) -> [ChannelEntry; CHANNEL_TABLE_ENTRIES] {
+    let mut table = derive_channel_table(role, state_grid, status_a, main_config, bundle);
+    if role == InstanceRole::Primary {
+        let rings = profile.work_ring_bundle_offsets();
+        for (index, entry) in table.iter_mut().take(WORK_CHANNEL_COUNT).enumerate() {
+            entry.ring = bundle + rings[index] as u64;
+        }
+    }
+    table
+}
+
+fn validate_populated_entry(entry: &ChannelEntry) -> Result<(), InitdataError> {
+    // A populated channel needs all three state-counter addresses — a null
+    // producer (state 2) on a populated entry makes firmware fault on address
+    // zero — and a real ring.
+    for state in entry.states {
+        if state == 0 {
+            return Err(InitdataError::ChannelTableShape);
+        }
+        if !address_representable(state) {
+            return Err(InitdataError::AddressOutOfRange);
+        }
+    }
+    required_address(entry.ring)
+}
+
+fn validate_channel_table(
+    role: InstanceRole,
+    main_config: u64,
+    channels: &[ChannelEntry; CHANNEL_TABLE_ENTRIES],
+) -> Result<(), InitdataError> {
+    for (index, entry) in channels.iter().enumerate() {
+        match index {
+            0..=11 => match role {
+                InstanceRole::Primary => validate_populated_entry(entry)?,
+                // The secondary has no work channels at all.
+                InstanceRole::Secondary => {
+                    if *entry != ChannelEntry::EMPTY {
+                        return Err(InitdataError::ChannelTableShape);
+                    }
+                }
+            },
+            12 => {
+                validate_populated_entry(entry)?;
+                // Device control is embedded in the main object, at exactly
+                // main + 0x4c0 on both instances.
+                if entry.ring != main_config + MAIN_CONTROL_RING as u64 {
+                    return Err(InitdataError::ChannelTableShape);
+                }
+            }
+            13 | 14 => validate_populated_entry(entry)?,
+            15 => {
+                // Partial: a first state address and nothing else.
+                required_address(entry.states[0])?;
+                if entry.states[1] != 0 || entry.states[2] != 0 || entry.ring != 0 {
+                    return Err(InitdataError::ChannelTableShape);
+                }
+            }
+            _ => {
+                if *entry != ChannelEntry::EMPTY {
+                    return Err(InitdataError::ChannelTableShape);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encode one instance's 0x600-byte main configuration object.
+///
+/// `region_views` must be `Some` for the primary and `None` for the
+/// secondary: the secondary's region views carry the two low context-0
+/// values with no addresses at all.
+pub(crate) fn encode_main_config(
+    role: InstanceRole,
+    shared: &SharedAddresses,
+    inst: &InstanceAddresses,
+    channels: &[ChannelEntry; CHANNEL_TABLE_ENTRIES],
+    region_views: Option<&PrimaryRegionViews>,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    encode_main_config_for_profile(RootProfile::J700G17P, role, shared, inst,
+                                   channels, region_views, out)
+}
+
+/// The two complete M5/25G76 pre-handoff main configurations match the common
+/// layout except primary +0x32c/+0x344 and secondary +0x300. Keep these
+/// measured scalars build-specific; their meanings are not inferred here.
+pub(crate) fn encode_main_config_for_profile(
+    profile: RootProfile,
+    role: InstanceRole,
+    shared: &SharedAddresses,
+    inst: &InstanceAddresses,
+    channels: &[ChannelEntry; CHANNEL_TABLE_ENTRIES],
+    region_views: Option<&PrimaryRegionViews>,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != MAIN_CONFIG_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    validate_shared(shared)?;
+    validate_instance(role, inst)?;
+    validate_channel_table(role, inst.main_config, channels)?;
+    match (role, region_views) {
+        (InstanceRole::Primary, Some(views)) => {
+            required_address(views.sentinel_high)?;
+            for high in views.alias_high {
+                required_address(high)?;
+            }
+        }
+        (InstanceRole::Secondary, None) => {}
+        _ => return Err(InitdataError::RoleSpecificAddress),
+    }
+    // Every view must fit inside the one bundle allocation. (The last two end
+    // exactly at 0xf000, inside the 0x10000 minimum.) The view table is the
+    // profile's: J700/J813 keep BUNDLE_VIEW_OFFSETS/EXTENTS unchanged.
+    let view_offsets = profile.bundle_view_offsets();
+    for (offset, extent) in view_offsets.iter().zip(profile.bundle_view_extents()) {
+        if offset + extent > shared.hw_data_bundle_alloc {
+            return Err(InitdataError::BundleAllocationTooSmall);
         }
     }
 
@@ -1550,9 +1984,223 @@ pub(crate) fn encode_grounded_subset(
     {
         put_u64(runtime_pointers, offset, address);
     }
-    if role == FirmwareRole::Gfx1 {
-        // Unaligned store at +0x481, matching the host builder.
-        put_u64(runtime_pointers, RT_GFX1_RUNTIME_BUFFER, addresses.gfx1_runtime_buffer);
+    let bundle = shared.hw_data_bundle;
+    put_u64(out, MAIN_HW_DATA, bundle);
+    let repeated = bundle + profile.repeated_region_bundle_offset() as u64;
+    put_u64(out, MAIN_REPEATED_0, repeated);
+    put_u64(out, MAIN_REPEATED_1, repeated);
+
+    for (index, entry) in channels.iter().enumerate() {
+        let base = MAIN_CHANNEL_TABLE + index * CHANNEL_ENTRY_SIZE;
+        for (word, state) in entry.states.iter().enumerate() {
+            put_u64(out, base + word * 8, *state);
+        }
+        put_u64(out, base + CHANNEL_ENTRY_STATE_COUNT * 8, entry.ring);
+    }
+
+    match (role, region_views) {
+        (InstanceRole::Primary, Some(views)) => {
+            // The five bare pointers are views into the one bundle
+            // allocation, at fixed offsets. Unaligned stores at +0x254.
+            for (index, offset) in view_offsets.iter().enumerate() {
+                put_u64(out, MAIN_BUNDLE_VIEWS + index * 8, bundle + *offset as u64);
+            }
+            // High-only sentinel followed by two low/high region-view pairs.
+            put_u64(out, MAIN_REGION_VIEWS, views.sentinel_high);
+            put_u64(out, MAIN_REGION_VIEWS + 0x08, REGION_VIEW_LOW_ADDRS[0]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x10, views.alias_high[0]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x18, REGION_VIEW_LOW_ADDRS[1]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x20, views.alias_high[1]);
+            if profile == RootProfile::J700G17P {
+                put_u32(out, MAIN_PRIMARY_SCALAR_32C, 1);
+                put_u32(out, MAIN_PRIMARY_SCALAR_344, 0xabcd_abcd);
+            }
+            // KEXT_PROVEN for G18G too (0xfffffe0008c31780: main+0x3e0=0xff).
+            put_u32(out, MAIN_PRIMARY_MASK, MAIN_PRIMARY_MASK_VALUE);
+            put_u32(out, MAIN_CONTROL_RING, profile.control_opening_opcode(role));
+        }
+        (InstanceRole::Secondary, _) => {
+            // The secondary keeps the two low context-0 values but carries no
+            // view or region addresses; the values are therefore not
+            // properties of any region the host allocates.
+            put_u64(out, MAIN_REGION_VIEWS + 0x08, REGION_VIEW_LOW_ADDRS[0]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x18, REGION_VIEW_LOW_ADDRS[1]);
+            put_u32(out, MAIN_SECONDARY_KIND, match profile {
+                RootProfile::J700G17P => MAIN_SECONDARY_KIND_VALUE,
+                RootProfile::J813G17G25G76 => 0xc,
+                // INFERRED: 26A428 stores accel+0x10a74 here (25G76:
+                // accel+0xed30, measured 0xc on J813). Value not read on J873.
+                RootProfile::J873G18G26A428 => G18G_26A428_MAIN_SECONDARY_KIND,
+            });
+            if profile == RootProfile::J873G18G26A428 {
+                // KEXT_PROVEN (26A428 initFirmwareSharedData, g18g_key.c:4464):
+                // role 1 main+0x481 = FW VA of the perf/policy allocation.
+                // 25G76 stored it at +0x471 and also wrote an accelerator
+                // pair at +0x479/+0x481, which 26A428 no longer writes.
+                put_u64(out, G18G_26A428_MAIN_SECONDARY_POLICY_PTR,
+                        bundle + G18G_26A428_SHARED_LAYOUT.policy as u64);
+            } else {
+                // One additional unaligned pointer *into* primary view 2, landing
+                // five bytes before that view's first populated run.
+                let extra = bundle
+                    + BUNDLE_VIEW_OFFSETS[SECONDARY_EXTRA_VIEW_INDEX] as u64
+                    + SECONDARY_EXTRA_VIEW_OFFSET as u64;
+                put_u64(out, MAIN_SECONDARY_EXTRA_PTR, extra);
+            }
+            put_u32(out, MAIN_CONTROL_RING, profile.control_opening_opcode(role));
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Encode the shared 0x3db4-byte hardware-data object (the base of the
+/// bundle). Both instances reference this one object; handing the secondary a
+/// private copy makes it fault.
+///
+/// `completion_aliases` are the low/high GPU mappings of the two retained
+/// completion-queue backings named by descriptor ordinals 0 and 2.
+pub(crate) fn encode_hw_data(
+    windows: &[RegisterWindow],
+    flag_only_slots: &[(usize, u32)],
+    completion_aliases: [G17PKsmCompletionAliases; 2],
+    qos_resource_high: u64,
+    sksm_qid_resource_high: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != HW_DATA_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    let mut used = [false; HW_REGISTER_MAP_SLOTS];
+    let mut claim = |slot: usize| -> Result<(), InitdataError> {
+        if slot >= HW_REGISTER_MAP_SLOTS || used[slot] {
+            return Err(InitdataError::RegisterWindow);
+        }
+        used[slot] = true;
+        Ok(())
+    };
+    for window in windows {
+        claim(window.slot)?;
+        if window.phys == 0 || window.size == 0 {
+            return Err(InitdataError::RegisterWindow);
+        }
+        // Firmware reaches its registers only through this table; the device
+        // VAs live in one fixed aperture.
+        if !HW_REGISTER_APERTURE.contains(&window.device_va) {
+            return Err(InitdataError::RegisterWindow);
+        }
+    }
+    for (slot, _flag) in flag_only_slots {
+        claim(*slot)?;
+    }
+    for aliases in completion_aliases {
+        required_address(aliases.low)?;
+        required_address(aliases.high)?;
+    }
+    required_address(qos_resource_high)?;
+    required_address(sksm_qid_resource_high)?;
+
+    out.fill(0);
+    // Native's `AGXFirmware::initFirmwareData` opens this object with five
+    // qwords that Linux has always left zero: the range-3 base and size, the
+    // architectural GART window base twice (Asahi's HwDataB calls the pair
+    // "USC start"), and the reserved page at the top of range 5. They are the
+    // only place the host tells the firmware side about 0x10_0000_0000, which
+    // is the base hardware folds into every compact TA/VDM pointer, so a zero
+    // here leaves USC-class units resolving bare offsets.
+    for (offset, value) in HW_FIRMWARE_RANGE_HEAD {
+        put_u64(out, *offset, *value);
+    }
+    for window in windows {
+        let base = HW_REGISTER_MAP_OFFSET + window.slot * HW_REGISTER_MAP_ENTRY_SIZE;
+        put_u64(out, base, window.phys);
+        put_u64(out, base + 0x08, window.device_va);
+        put_u32(out, base + 0x10, window.size);
+        put_u32(out, base + 0x14, window.size);
+        put_u64(out, base + 0x18, window.unk_18);
+        put_u32(out, base + 0x20, window.flag);
+    }
+    for (slot, flag) in flag_only_slots {
+        let base = HW_REGISTER_MAP_OFFSET + slot * HW_REGISTER_MAP_ENTRY_SIZE;
+        put_u32(out, base + 0x20, *flag);
+    }
+
+    put_u32(out, HW_CHIP_ID_OFFSET, HW_CHIP_ID_T8140);
+
+    for index in 0..HW_PERF_LADDER_ENTRIES {
+        put_u32(out, HW_PERF_GROUP_BASES[0] + index * 4, HW_PERF_FREQ_A[index]);
+        put_u32(out, HW_PERF_FREQ_LADDER_B + index * 4, HW_PERF_FREQ_B[index]);
+        put_u32(out, HW_PERF_SCALE_LADDER_B + index * 4, HW_PERF_SCALE_B[index]);
+        put_u32(
+            out,
+            HW_PERF_RELATIVE_LADDER_A + index * 4,
+            HW_PERF_RELATIVE_A_VALUES[index],
+        );
+        put_u32(
+            out,
+            HW_PERF_RELATIVE_LADDER_B + index * 4,
+            HW_PERF_RELATIVE_B_VALUES[index],
+        );
+        put_u32(out, HW_PERF_INDEX_MAP_A + index * 4, HW_PERF_INDEX_A_VALUES[index]);
+        put_u32(out, HW_PERF_INDEX_MAP_B + index * 4, HW_PERF_INDEX_B_VALUES[index]);
+        put_u32(out, HW_PERF_GROUP_BASES[1] + index * 4, HW_PERF_FREQ_B[index]);
+
+        for repeat in 0..HW_PERF_GROUP_REPEATS[0] {
+            put_u32(
+                out,
+                HW_PERF_GROUP_BASES[0]
+                    + HW_PERF_VOLTAGE_DELTA
+                    + index * HW_PERF_STATE_BLOCK_STRIDE
+                    + repeat * 4,
+                HW_PERF_CORE_VOLTAGE[index],
+            );
+            put_u32(
+                out,
+                HW_PERF_GROUP_BASES[0]
+                    + HW_PERF_MEMORY_VOLTAGE_DELTA
+                    + index * HW_PERF_STATE_BLOCK_STRIDE
+                    + repeat * 4,
+                HW_PERF_MEMORY_VOLTAGE[index],
+            );
+        }
+        put_u32(
+            out,
+            HW_PERF_GROUP_BASES[1]
+                + HW_PERF_VOLTAGE_DELTA
+                + index * HW_PERF_STATE_BLOCK_STRIDE,
+            HW_PERF_CORE_VOLTAGE[index],
+        );
+        put_u32(
+            out,
+            HW_PERF_GROUP_BASES[1]
+                + HW_PERF_MEMORY_VOLTAGE_DELTA
+                + index * HW_PERF_STATE_BLOCK_STRIDE,
+            HW_PERF_MEMORY_VOLTAGE[index],
+        );
+    }
+
+    // The acceptance block: derived from the work-channel count rather than
+    // copied, so a constructed descriptor needs nothing from a capture here.
+    put_u16(out, HW_ACCEPT_CHANNEL_COUNT, WORK_CHANNEL_COUNT as u16);
+    for group in HW_ACCEPT_FLAG_GROUPS {
+        for (index, value) in HW_ACCEPT_FLAG_PATTERN.iter().enumerate() {
+            put_u32(out, group + index * 4, *value);
+        }
+    }
+    for channel in 0..WORK_CHANNEL_COUNT {
+        put_u32(out, HW_ACCEPT_UNASSIGNED_TABLE + channel * 4, 0xffff_ffff);
+    }
+    for offset in HW_ACCEPT_TRAILING_ONES {
+        // NB +0x2600 is also DAT_178648, a firmware GATE: FUN_e004's per-DM
+        // KSM completion-block arm runs only when (a == 0 || DAT_178648 == 0).
+        // Writing 0 here to let that arm run was TESTED and the driver failed
+        // probe with -22. I first wrote that our own initdata validation
+        // rejected it; that was an invention -- nothing in the runtime path
+        // validates this field, and the cause of the -22 was never
+        // established. What settles it instead is the live 25G83 capture:
+        // native's hardware-data block reads 1 at +0x2600 and 1 at +0x2608,
+        // the same as ours, so this is not a divergence.
+        put_u32(out, offset, 1);
     }
 
     put_u32(
@@ -1612,6 +2260,10 @@ pub(crate) fn encode_grounded_subset(
 pub(crate) fn encode_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() != REGION_C_SIZE {
         return Err(InitdataError::BufferSize);
+    }
+    if profile == RootProfile::J873G18G26A428 {
+        // Derived from the J813 bytes below through the proven +4 shift.
+        return encode_g18g_26a428_region_c(out);
     }
     out.fill(0);
     write_runs(out, REGION_C_RUNS);
@@ -1721,6 +2373,12 @@ pub(crate) fn encode_secondary_root_extra_1(out: &mut [u8]) -> Result<(), Initda
     }
     out.fill(0);
     write_runs(out, SECONDARY_ROOT_EXTRA_1_RUNS);
+    // G18G: KEXT_PROVEN identical store geometry for this 0x60 object
+    // (26A428 vs 25G76 R_60 stores, all at the same offsets); the J813 values
+    // are carried unchanged (INFERRED, listed in G18G_26A428_UNPROVEN).
+    if matches!(profile, RootProfile::J813G17G25G76 | RootProfile::J873G18G26A428) {
+        put_u32(out, 0x10, 2);
+    }
     Ok(())
 }
 
@@ -1765,7 +2423,11 @@ pub(crate) fn check_firmware_root_gates(root: &[u8]) -> Result<(), InitdataError
     if root.len() != ROOT_SIZE {
         return Err(InitdataError::BufferSize);
     }
-    if get_u64(root, 0x00) != INITDATA_MAGIC {
+    // G18G: both roles are copied as 0xc8 bytes (FW_PROVEN b000 0x21664).
+    if profile == RootProfile::J873G18G26A428 && root.len() != G18G_26A428_ROOT_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    if get_u64(root, ROOT_VERSION) != profile.version_word() {
         return Err(InitdataError::InterfaceMismatch);
     }
     if get_u32(root, ROOT_HOST_MAPPED_ALLOCS) == 0 {
@@ -1784,6 +2446,1190 @@ pub(crate) fn channel_descriptor_range(index: usize) -> Option<core::ops::Range<
     let start = RT_CHANNEL_DESCRIPTORS + index * RT_CHANNEL_DESCRIPTOR_STRIDE;
     Some(start..start + RT_CHANNEL_DESCRIPTOR_STRIDE)
 }
+
+// =====================================================================================
+// J873 / T8152 / G18G / 26A428 (RTKit_release-3514.0.15)
+// =====================================================================================
+//
+// Plan M1 steps 1.1-1.7. Everything below is selected by
+// `RootProfile::J873G18G26A428` or carries a `G18G_26A428`/`g18g_26a428` name.
+// Nothing above changes its output for J700 or J813: the M5 constants stay
+// literal, and `g18_initdata_test.rs` proves that the layout functions below,
+// run over the 25G76 kext tables, reproduce those constants bit for bit, and
+// that every J700/J813 encoder output hash is unchanged.
+//
+// Evidence tags:
+//   FW_PROVEN   read off armfw_g18g-b000 / armfw1_g18g-b010 (J873 loads the B
+//               images; ADT iop nub UUIDs match them)
+//   KEXT_PROVEN read off the 26A428 AGXG18G kext in the kernelcache
+//   ADT_PROVEN  read off the J873 ADT (full38-live-adt.bin)
+//   INFERRED    carried from the measured J813/25G76 reference through a
+//               proven relocation, or matched by analogy; the value itself is
+//               not proven for 26A428
+//   GUESSED     no evidence for the value; a placeholder
+// A relocation band's tag qualifies the offset mapping, not the carried value.
+// Every INFERRED/GUESSED value is also a row of [`G18G_26A428_UNPROVEN`].
+
+/// Root `+0x00`: u16 {0x04c0, 0x83a0, 0x4339, 0x0c8b}. FW_PROVEN: b000
+/// 0x2164c-0x21660 and b010 0x294f0-0x29504 compare root+0 with this word and
+/// abort with "Host and FW Interface is mismatched" otherwise. KEXT_PROVEN:
+/// AGXArmFirmware::initFirmwareData (0xfffffe0008c31f6c) writes it to both
+/// roots.
+pub(crate) const G18G_26A428_INITDATA_VERSION_WORD: u64 = 0x0c8b_4339_83a0_04c0;
+/// Both roots are 0xc8 bytes. FW_PROVEN: each image copies 0xc8 bytes of its
+/// root (b000 0x21664-0x216a8) and requires root+0x2c != 0 (b000 0x216ac).
+/// Root field offsets are unchanged from 25G76 (KEXT_PROVEN g18g_key.c:3748).
+pub(crate) const G18G_26A428_ROOT_SIZE: usize = 0xc8;
+
+/// Provenance of one G18G relocation band or unproven field.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Evidence {
+    FirmwareProven,
+    KextProven,
+    AdtProven,
+    Inferred,
+    Guessed,
+}
+
+// --- Kext allocation tables and the packing rule -----------------------------------
+
+/// `AGXFirmware::allocFirmwareData` allocation-size table, 24 u64.
+/// KEXT_PROVEN: 25G76 __const 0xfffffe0007139820. Index names are the
+/// `KX_*` constants below.
+pub(crate) const KEXT_ALLOCATION_SIZES_25G76: [usize; 24] = [
+    0x2708, 0x0c18, 0x1048, 0x0e10, 0x6a30, 0x0068, 0x0800, 0x0088, 0x1800, 0x04c0, 0x4000, 0x0030,
+    0xe440, 0x06a8, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x0060, 0x0008, 0x0e78, 0x00e4,
+];
+/// KEXT_PROVEN: 26A428 __const 0xfffffe000714f0d8. Only entries 0 (hw_data),
+/// 4 (perf/policy), 12 (status B), 13 (status config) and 22 (region C)
+/// differ from 25G76.
+pub(crate) const KEXT_ALLOCATION_SIZES_26A428: [usize; 24] = [
+    0x2848, 0x0c18, 0x1048, 0x0e10, 0x7800, 0x0068, 0x0800, 0x0088, 0x1800, 0x04c0, 0x4000, 0x0030,
+    0xe730, 0x06d0, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x0060, 0x0008, 0x0e80, 0x00e4,
+];
+pub(crate) const KX_HW_DATA: usize = 0;
+pub(crate) const KX_BLOCK_C18: usize = 1;
+pub(crate) const KX_BLOCK_1048: usize = 2;
+pub(crate) const KX_BLOCK_E10: usize = 3;
+pub(crate) const KX_POLICY: usize = 4;
+pub(crate) const KX_BLOCK_68: usize = 5;
+pub(crate) const KX_BLOCK_800: usize = 6;
+pub(crate) const KX_BLOCK_88: usize = 7;
+pub(crate) const KX_DM_RING: usize = 8;
+pub(crate) const KX_MAIN_CONFIG: usize = 9;
+pub(crate) const KX_CONTROL_RING: usize = 10;
+pub(crate) const KX_RING_STATE: usize = 11;
+pub(crate) const KX_STATUS_B: usize = 12;
+pub(crate) const KX_STATUS_CONFIG: usize = 13;
+pub(crate) const KX_STATUS_A: usize = 14;
+pub(crate) const KX_LOG_STATE: usize = 15;
+pub(crate) const KX_RING_4800: usize = 16;
+pub(crate) const KX_BUFFER_28800: usize = 17;
+pub(crate) const KX_BUFFER_79800: usize = 18;
+pub(crate) const KX_RING_9000: usize = 19;
+pub(crate) const KX_SECONDARY_EXTRA_1: usize = 20;
+pub(crate) const KX_POLICY_STATE: usize = 21;
+pub(crate) const KX_REGION_C: usize = 22;
+pub(crate) const KX_AON_PTD: usize = 23;
+/// `getSizeOfFWBRNTable` returns 0 in both kexts (KEXT_PROVEN
+/// 0xfffffe00089ee74c / 0xfffffe0008c507e4).
+pub(crate) const KEXT_BRN_TABLE_SIZE: usize = 0;
+/// Both shared allocations are rounded to one 16 KiB page (allocateSharedData).
+pub(crate) const KEXT_ALLOCATION_PAGE: usize = 0x4000;
+pub(crate) const SHARED_ALLOCATION_ENTRIES: usize = 25;
+pub(crate) const PRIVATE_ALLOCATION_ENTRIES: usize = 38;
+const ROLE_SET_ENTRIES: usize = 10;
+
+const fn round_up_usize(value: usize, alignment: usize) -> usize {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+/// The allocateSharedData packing rule (KEXT_PROVEN 0xfffffe0008c038d8):
+/// each next entry starts at `(previous offset + previous size + 0x3f) & !0x3f`.
+pub(crate) const fn next_packed_allocation(offset: usize, size: usize) -> usize {
+    round_up_usize(offset + size, 0x40)
+}
+
+/// Offsets of `sizes` packed by [`next_packed_allocation`], the first at 0.
+pub(crate) const fn packed_allocation_offsets<const N: usize>(sizes: &[usize; N]) -> [usize; N] {
+    let mut out = [0usize; N];
+    let mut index = 1;
+    while index < N {
+        out[index] = next_packed_allocation(out[index - 1], sizes[index - 1]);
+        index += 1;
+    }
+    out
+}
+
+/// The 25 entries of shared allocation #1 in allocation order: hw_data, the
+/// 0xc18/0x1048/0xe10 blocks, perf/policy, the 0x68/0x800 blocks, the BRN
+/// table, the 0x88 block, twelve data-master rings, then main config and
+/// device-control ring for role 0 and for role 1 (KEXT_PROVEN descriptor
+/// build, 25G76 g17g_key.c:1224-1310 / 26A428 g18g_key.c:1236-1320).
+pub(crate) const fn shared_allocation_sizes(table: &[usize; 24]) -> [usize; SHARED_ALLOCATION_ENTRIES] {
+    let mut sizes = [0usize; SHARED_ALLOCATION_ENTRIES];
+    sizes[0] = table[KX_HW_DATA];
+    sizes[1] = table[KX_BLOCK_C18];
+    sizes[2] = table[KX_BLOCK_1048];
+    sizes[3] = table[KX_BLOCK_E10];
+    sizes[4] = table[KX_POLICY];
+    sizes[5] = table[KX_BLOCK_68];
+    sizes[6] = table[KX_BLOCK_800];
+    sizes[7] = KEXT_BRN_TABLE_SIZE;
+    sizes[8] = table[KX_BLOCK_88];
+    let mut ring = 0;
+    while ring < WORK_CHANNEL_COUNT {
+        sizes[9 + ring] = table[KX_DM_RING];
+        ring += 1;
+    }
+    sizes[21] = table[KX_MAIN_CONFIG];
+    sizes[22] = table[KX_CONTROL_RING];
+    sizes[23] = table[KX_MAIN_CONFIG];
+    sizes[24] = table[KX_CONTROL_RING];
+    sizes
+}
+
+/// The 38 entries of shared allocation #2 (the private cluster): twelve
+/// data-master ring states and the role-0 device-control state (0x30 each),
+/// status B, status config, the ten-entry per-role set for role 0 and role 1,
+/// the role-1 device-control state, the 0x60 secondary-root object and the
+/// 8-byte policy state (KEXT_PROVEN 25G76 g17g_key.c:1318-1450 / 26A428
+/// g18g_key.c:1330-1460).
+pub(crate) const fn private_allocation_sizes(table: &[usize; 24]) -> [usize; PRIVATE_ALLOCATION_ENTRIES] {
+    let mut sizes = [0usize; PRIVATE_ALLOCATION_ENTRIES];
+    let mut state = 0;
+    while state <= WORK_CHANNEL_COUNT {
+        sizes[state] = table[KX_RING_STATE];
+        state += 1;
+    }
+    sizes[13] = table[KX_STATUS_B];
+    sizes[14] = table[KX_STATUS_CONFIG];
+    let role_set = [
+        table[KX_STATUS_A], table[KX_RING_STATE], table[KX_LOG_STATE], table[KX_RING_STATE],
+        table[KX_RING_STATE], table[KX_RING_4800], table[KX_BUFFER_28800],
+        table[KX_BUFFER_79800], table[KX_RING_9000], table[KX_RING_4800],
+    ];
+    let mut role = 0;
+    while role < 2 {
+        let mut entry = 0;
+        while entry < ROLE_SET_ENTRIES {
+            sizes[15 + role * ROLE_SET_ENTRIES + entry] = role_set[entry];
+            entry += 1;
+        }
+        role += 1;
+    }
+    sizes[35] = table[KX_RING_STATE];
+    sizes[36] = table[KX_SECONDARY_EXTRA_1];
+    sizes[37] = table[KX_POLICY_STATE];
+    sizes
+}
+
+/// Offsets (from the start of the shared allocation #1 backing) of every
+/// object in it.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct SharedClusterLayout {
+    pub(crate) hw_data: usize,
+    pub(crate) block_c18: usize,
+    pub(crate) block_1048: usize,
+    pub(crate) block_e10: usize,
+    pub(crate) policy: usize,
+    pub(crate) block_68: usize,
+    pub(crate) block_800: usize,
+    pub(crate) brn_table: usize,
+    pub(crate) block_88: usize,
+    /// Data-master rings in allocation order (see [`WORK_CHANNEL_DM_INDEX`]).
+    pub(crate) dm_rings: [usize; WORK_CHANNEL_COUNT],
+    pub(crate) main_config: [usize; 2],
+    pub(crate) control_ring: [usize; 2],
+    pub(crate) end: usize,
+    pub(crate) total: usize,
+}
+
+/// One role's ten-entry set in the private cluster.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct RoleSetLayout {
+    /// Root `+0xa8` (0x20 bytes).
+    pub(crate) status_a: usize,
+    /// Event report state (report channel 13 state 0).
+    pub(crate) event_state: usize,
+    /// 0x1b0 firmware-log control block (report channel 13 state 2).
+    pub(crate) log_state: usize,
+    /// Trace report state (report channel 14 state 0).
+    pub(crate) trace_state: usize,
+    pub(crate) state_30: usize,
+    /// 256 x 0x48 event ring (report channel 13 state 1).
+    pub(crate) event_ring: usize,
+    pub(crate) buffer_28800: usize,
+    /// 0x79800 buffer (main +0x200 / channel 15 state 0).
+    pub(crate) buffer_79800: usize,
+    /// 512 x 0x48 trace ring (report channel 14 state 1).
+    pub(crate) trace_ring: usize,
+    pub(crate) buffer_4800: usize,
+}
+
+/// Offsets (from the start of shared allocation #2) of every object in it.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PrivateClusterLayout {
+    pub(crate) dm_ring_states: [usize; WORK_CHANNEL_COUNT],
+    /// Role-0 device-control state (0x30).
+    pub(crate) control_state: usize,
+    /// Primary root `+0xb0`.
+    pub(crate) status_b: usize,
+    /// Secondary root `+0xb8`.
+    pub(crate) status_config: usize,
+    pub(crate) roles: [RoleSetLayout; 2],
+    /// Role-1 device-control state (0x30).
+    pub(crate) secondary_control_state: usize,
+    /// Secondary root `+0xc0` (0x60 bytes).
+    pub(crate) secondary_extra_1: usize,
+    /// 8-byte state named by the policy block.
+    pub(crate) policy_state: usize,
+    pub(crate) end: usize,
+    pub(crate) total: usize,
+}
+
+pub(crate) const fn shared_cluster_layout(table: &[usize; 24]) -> SharedClusterLayout {
+    let sizes = shared_allocation_sizes(table);
+    let offsets = packed_allocation_offsets(&sizes);
+    let mut dm_rings = [0usize; WORK_CHANNEL_COUNT];
+    let mut ring = 0;
+    while ring < WORK_CHANNEL_COUNT {
+        dm_rings[ring] = offsets[9 + ring];
+        ring += 1;
+    }
+    let end = offsets[24] + sizes[24];
+    SharedClusterLayout {
+        hw_data: offsets[0],
+        block_c18: offsets[1],
+        block_1048: offsets[2],
+        block_e10: offsets[3],
+        policy: offsets[4],
+        block_68: offsets[5],
+        block_800: offsets[6],
+        brn_table: offsets[7],
+        block_88: offsets[8],
+        dm_rings,
+        main_config: [offsets[21], offsets[23]],
+        control_ring: [offsets[22], offsets[24]],
+        end,
+        total: round_up_usize(end, KEXT_ALLOCATION_PAGE),
+    }
+}
+
+const fn role_set_layout(offsets: &[usize; PRIVATE_ALLOCATION_ENTRIES], first: usize) -> RoleSetLayout {
+    RoleSetLayout {
+        status_a: offsets[first],
+        event_state: offsets[first + 1],
+        log_state: offsets[first + 2],
+        trace_state: offsets[first + 3],
+        state_30: offsets[first + 4],
+        event_ring: offsets[first + 5],
+        buffer_28800: offsets[first + 6],
+        buffer_79800: offsets[first + 7],
+        trace_ring: offsets[first + 8],
+        buffer_4800: offsets[first + 9],
+    }
+}
+
+pub(crate) const fn private_cluster_layout(table: &[usize; 24]) -> PrivateClusterLayout {
+    let sizes = private_allocation_sizes(table);
+    let offsets = packed_allocation_offsets(&sizes);
+    let mut dm_ring_states = [0usize; WORK_CHANNEL_COUNT];
+    let mut state = 0;
+    while state < WORK_CHANNEL_COUNT {
+        dm_ring_states[state] = offsets[state];
+        state += 1;
+    }
+    let end = offsets[37] + sizes[37];
+    PrivateClusterLayout {
+        dm_ring_states,
+        control_state: offsets[12],
+        status_b: offsets[13],
+        status_config: offsets[14],
+        roles: [role_set_layout(&offsets, 15), role_set_layout(&offsets, 25)],
+        secondary_control_state: offsets[35],
+        secondary_extra_1: offsets[36],
+        policy_state: offsets[37],
+        end,
+        total: round_up_usize(end, KEXT_ALLOCATION_PAGE),
+    }
+}
+
+/// Data-master allocation index of each channel-table work entry (TA_0, 3D_0,
+/// CL_0, TA_1, ...). A ring and its 0x30-byte state share the index, which is
+/// why the native state grid [`WORK_STATE_GRID_OFFSETS`] is `index * 0x40`.
+/// The host object order of both allocations is unchanged in 26A428 (the ring
+/// descriptors are this+0x448.. in 25G76 and this+0x438.. in 26A428, same
+/// sequence), so the permutation is INFERRED unchanged for G18G.
+pub(crate) const WORK_CHANNEL_DM_INDEX: [usize; WORK_CHANNEL_COUNT] =
+    [3, 7, 11, 2, 6, 10, 1, 5, 9, 0, 4, 8];
+
+/// Work-ring bundle offsets in channel-table order for a shared layout.
+pub(crate) const fn work_ring_offsets(layout: &SharedClusterLayout) -> [usize; WORK_CHANNEL_COUNT] {
+    let mut rings = [0usize; WORK_CHANNEL_COUNT];
+    let mut channel = 0;
+    while channel < WORK_CHANNEL_COUNT {
+        rings[channel] = layout.dm_rings[WORK_CHANNEL_DM_INDEX[channel]];
+        channel += 1;
+    }
+    rings
+}
+
+/// The 25G76 layouts. Not used by the M5 encoders above (which keep their
+/// literal constants); the regression tests prove they agree.
+pub(crate) const M5_25G76_SHARED_LAYOUT: SharedClusterLayout =
+    shared_cluster_layout(&KEXT_ALLOCATION_SIZES_25G76);
+pub(crate) const M5_25G76_PRIVATE_LAYOUT: PrivateClusterLayout =
+    private_cluster_layout(&KEXT_ALLOCATION_SIZES_25G76);
+/// The 26A428 layouts: hw_data 0x2848 at 0, blocks at 0x2880/0x34c0/0x4540,
+/// perf/policy 0x7800 at 0x5380, 0x68/0x800 at 0xcb80/0xcc00, BRN and 0x88 at
+/// 0xd400, rings from 0xd4c0, main r0 0x1f4c0, control r0 0x1f980, main r1
+/// 0x23980, control r1 0x23e40; status B 0x340, status config 0xea80, status
+/// A 0xf180/0xc3440, tail 0x177700/0x177740/0x1777c0. Totals 0x28000 and
+/// 0x178000, as in 25G76.
+pub(crate) const G18G_26A428_SHARED_LAYOUT: SharedClusterLayout =
+    shared_cluster_layout(&KEXT_ALLOCATION_SIZES_26A428);
+pub(crate) const G18G_26A428_PRIVATE_LAYOUT: PrivateClusterLayout =
+    private_cluster_layout(&KEXT_ALLOCATION_SIZES_26A428);
+
+pub(crate) const G18G_26A428_SHARED_CLUSTER_SIZE: usize = G18G_26A428_SHARED_LAYOUT.total;
+pub(crate) const G18G_26A428_PRIVATE_CLUSTER_SIZE: usize = G18G_26A428_PRIVATE_LAYOUT.total;
+pub(crate) const G18G_26A428_HW_DATA_SIZE: usize = KEXT_ALLOCATION_SIZES_26A428[KX_HW_DATA];
+pub(crate) const G18G_26A428_POLICY_SIZE: usize = KEXT_ALLOCATION_SIZES_26A428[KX_POLICY];
+pub(crate) const G18G_26A428_STATUS_B_SIZE: usize = KEXT_ALLOCATION_SIZES_26A428[KX_STATUS_B];
+pub(crate) const G18G_26A428_STATUS_CONFIG_SIZE: usize = KEXT_ALLOCATION_SIZES_26A428[KX_STATUS_CONFIG];
+/// The kext allocates 0xe80 bytes of region C (25G76: 0xe78). The host maps
+/// a whole page ([`REGION_C_SIZE`]) for both.
+pub(crate) const G18G_26A428_REGION_C_ALLOCATION: usize = KEXT_ALLOCATION_SIZES_26A428[KX_REGION_C];
+pub(crate) const G18G_26A428_AON_PTD_SIZE: usize = KEXT_ALLOCATION_SIZES_26A428[KX_AON_PTD];
+/// Bytes of shared allocation #1 before the BRN table: hw_data plus the six
+/// blocks the policy encoder owns (25G76 analog: [`M5_25G76_SHARED_PREFIX_SIZE`]).
+pub(crate) const G18G_26A428_SHARED_PREFIX_SIZE: usize = G18G_26A428_SHARED_LAYOUT.brn_table;
+/// Main `+0x254` views (KEXT_PROVEN 26A428 initFirmwareSharedData: the FW VAs
+/// of the 0xc18, 0x1048, 0xe10, 0x68 and 0x800 blocks, this+0x310..0x338).
+pub(crate) const G18G_26A428_BUNDLE_VIEW_OFFSETS: [usize; 5] = [
+    G18G_26A428_SHARED_LAYOUT.block_c18,
+    G18G_26A428_SHARED_LAYOUT.block_1048,
+    G18G_26A428_SHARED_LAYOUT.block_e10,
+    G18G_26A428_SHARED_LAYOUT.block_68,
+    G18G_26A428_SHARED_LAYOUT.block_800,
+];
+pub(crate) const G18G_26A428_BUNDLE_VIEW_EXTENTS: [usize; 5] = [
+    KEXT_ALLOCATION_SIZES_26A428[KX_BLOCK_C18],
+    KEXT_ALLOCATION_SIZES_26A428[KX_BLOCK_1048],
+    KEXT_ALLOCATION_SIZES_26A428[KX_BLOCK_E10],
+    KEXT_ALLOCATION_SIZES_26A428[KX_BLOCK_68],
+    KEXT_ALLOCATION_SIZES_26A428[KX_BLOCK_800],
+];
+pub(crate) const G18G_26A428_WORK_RING_BUNDLE_OFFSETS: [usize; WORK_CHANNEL_COUNT] =
+    work_ring_offsets(&G18G_26A428_SHARED_LAYOUT);
+pub(crate) const G18G_26A428_MAIN_BUNDLE_OFFSETS: [usize; 2] = G18G_26A428_SHARED_LAYOUT.main_config;
+pub(crate) const G18G_26A428_CONTROL_RING_BUNDLE_OFFSETS: [usize; 2] =
+    G18G_26A428_SHARED_LAYOUT.control_ring;
+/// Role-1 main `+0x481`: FW VA of the perf/policy allocation (KEXT_PROVEN).
+pub(crate) const G18G_26A428_MAIN_SECONDARY_POLICY_PTR: usize = 0x481;
+/// Role-1 main `+0x300`. INFERRED: the J813 value (26A428 source accel+0x10a74).
+pub(crate) const G18G_26A428_MAIN_SECONDARY_KIND: u32 = 0xc;
+
+/// Private-cluster offsets the resources module and live boot need.
+pub(crate) const G18G_26A428_PRIVATE_STATUS_A: [usize; 2] = [
+    G18G_26A428_PRIVATE_LAYOUT.roles[0].status_a,
+    G18G_26A428_PRIVATE_LAYOUT.roles[1].status_a,
+];
+/// Compact channel-state grid of each role: role 0 starts at the first ring
+/// state; role 1's device-control state is the tail 0x30 object, so its
+/// (control-only) grid base is that object minus the grid's control offset.
+pub(crate) const G18G_26A428_PRIVATE_STATE_GRIDS: [usize; 2] = [
+    G18G_26A428_PRIVATE_LAYOUT.dm_ring_states[0],
+    G18G_26A428_PRIVATE_LAYOUT.secondary_control_state - WORK_STATE_GRID_OFFSETS[CONTROL_CHANNEL_INDEX],
+];
+/// Status config inside the status-B span (primary status B .. status A).
+pub(crate) const G18G_26A428_STATUS_CONFIG_IN_STATUS_B: usize =
+    G18G_26A428_PRIVATE_LAYOUT.status_config - G18G_26A428_PRIVATE_LAYOUT.status_b;
+/// Bytes from primary status B to primary status A (the object M5 calls
+/// [`PRIMARY_STATUS_B_OBJECT_SIZE`], 0xeb00 there).
+pub(crate) const G18G_26A428_STATUS_B_SPAN: usize =
+    G18G_26A428_PRIVATE_LAYOUT.roles[0].status_a - G18G_26A428_PRIVATE_LAYOUT.status_b;
+/// The fwctl ring follows its 0x20-byte state in the ArmFirmware fwctl
+/// allocation (KEXT_PROVEN {0x20, 0x1800} entries, 64-byte packing).
+pub(crate) const G18G_26A428_FWCTL_RING_OFFSET: usize = 0x40;
+
+// --- Status B and status config (plan step 1.3) -----------------------------------
+
+/// KEXT_PROVEN (25G76 0x48e0/0x48e8 stores moved +0x1e0): FW-control state
+/// and ring pointers.
+pub(crate) const G18G_26A428_STATUS_B_FWCTL_STATE: usize = 0x4ac0;
+pub(crate) const G18G_26A428_STATUS_B_FWCTL_RING: usize = 0x4ac8;
+/// FW_PROVEN: EP 0x21 type 6 compares its payload with this word (b000
+/// 0x255b0-0x255dc; 25G76 +0x48f0). Firmware-owned; starts zero.
+pub(crate) const G18G_26A428_STATUS_B_FWCTL_HANDSHAKE: usize = 0x4ad0;
+/// FW_PROVEN (b000 0x7fd0/0x80f4; 25G76 +0x4900). Starts zero.
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_EPOCH: usize = 0x4ae0;
+/// FW_PROVEN: the region-C loader reads it (b000 0x36a0/0x377c); KEXT_PROVEN
+/// value 1 (25G76 +0xe434).
+pub(crate) const G18G_26A428_STATUS_B_CONFIG_HEADER: usize = 0xe714;
+/// KEXT_PROVEN new cross-link pair (g18g_key.c:813-816): u32 0 at +0xe71c and
+/// the FW VA of status config +0x6c4 at +0xe720.
+pub(crate) const G18G_26A428_STATUS_B_LINK_WORD: usize = 0xe71c;
+pub(crate) const G18G_26A428_STATUS_B_LINK_PTR: usize = 0xe720;
+/// KEXT_PROVEN: status config +0x6c4 = 1 and +0x6c8 = FW VA of status B +0xe71c.
+pub(crate) const G18G_26A428_STATUS_CONFIG_LINK_WORD: usize = 0x6c4;
+pub(crate) const G18G_26A428_STATUS_CONFIG_LINK_PTR: usize = 0x6c8;
+/// KEXT_PROVEN submit*Channel polls (25G76 +0x670/+0x678/+0x680). Written by
+/// firmware at run time; they must start zero.
+pub(crate) const G18G_26A428_STATUS_CONFIG_SUBMIT_POLLS: [usize; 3] = [0x68c, 0x694, 0x69c];
+
+// --- Relocation bands -------------------------------------------------------------
+
+/// Bytes `[start, end)` of a 25G76 object move to `[start + delta, end + delta)`
+/// of the 26A428 object.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct LayoutBand {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) delta: isize,
+    pub(crate) evidence: Evidence,
+}
+
+const fn band(start: usize, end: usize, delta: isize, evidence: Evidence) -> LayoutBand {
+    LayoutBand { start, end, delta, evidence }
+}
+
+/// The 26A428 offset of 25G76 byte `offset`, or None when no band carries it
+/// (the byte was removed or its new place is unknown).
+pub(crate) const fn relocate_by_bands(bands: &[LayoutBand], offset: usize) -> Option<usize> {
+    let mut index = 0;
+    while index < bands.len() {
+        let band = bands[index];
+        if band.start <= offset && offset < band.end {
+            return Some((offset as isize + band.delta) as usize);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// hw_data 25G76 -> 26A428. The offsets are FW_PROVEN by the init copier
+/// (b000 0x21708-0x21d94 vs G17 0x1fb18-0x20124: every G17 read relocates onto
+/// a b000 read, see `g18_initdata_test.rs`) and KEXT_PROVEN by the
+/// initFirmwareData store alignment. The carried J813 values are INFERRED.
+/// 0x640..0xe88 (the 53-slot 25G76 register map) is re-encoded per G18G slot,
+/// not relocated.
+pub(crate) const G18G_26A428_HW_DATA_BANDS: &[LayoutBand] = &[
+    // Host prefix: range head (KEXT_PROVEN same five qwords), +0x28/+0x30/+0x638
+    // qwords and the two 32 x 0x18 accelerator tables at +0x38/+0x338 (same
+    // geometry in both kexts). Not read by the copier; J813 values carried.
+    band(0x000, 0x640, 0, Evidence::Inferred),
+    // u64 FW VA of accel+0x1d40 (26A428 writes it at +0xfa0 = "4000").
+    band(0xe88, 0xe90, 0x118, Evidence::KextProven),
+    // Chip block: the copier's 16-byte read moved 0xe90 -> 0xfb0.
+    band(0xe90, 0xebc, 0x120, Evidence::FirmwareProven),
+    // 0xebc: 25G76 u32 0 with no 26A428 counterpart (4 bytes removed).
+    band(0xec0, 0xf5c, 0x11c, Evidence::FirmwareProven),
+    band(0xf5c, 0xf60, 0x124, Evidence::KextProven),
+    // 0xf60..0xf68: 25G76 u64 0 removed; 26A428 adds its own u64 0 at +0x1078.
+    band(0xf68, 0xf98, 0x11c, Evidence::FirmwareProven),
+    band(0xf98, 0xfac, 0x120, Evidence::FirmwareProven),
+    // 0xfac: 25G76 flag (G17 copier read 0x1ff60, J813 value 1) has neither a
+    // 26A428 store nor a b000 read: dropped.
+    band(0xfb0, 0x25f8, 0x11c, Evidence::FirmwareProven),
+    band(0x25f8, 0x26b4, 0x120, Evidence::FirmwareProven),
+    band(0x26b4, 0x26f0, 0x128, Evidence::FirmwareProven),
+    band(0x26f0, M5_25G76_HW_DATA_SIZE, 0x12c, Evidence::FirmwareProven),
+];
+
+/// Perf/policy block (relative to the block) 25G76 -> 26A428, from the
+/// AGXFirmware::initPowerAndPerformanceData store alignment (KEXT_PROVEN at
+/// the band ends; interior bytes without a matched store are INFERRED).
+/// 0x6468..0x651c is deliberately absent: 26A428 inserts 0x680 bytes
+/// somewhere between the AON PTD pointer (+0x6460 -> +0x64d8) and the boot
+/// timestamp (+0x651c -> +0x6c14), and the J813 words there are dropped.
+pub(crate) const G18G_26A428_POLICY_BANDS: &[LayoutBand] = &[
+    band(0x0000, 0x009c, 0, Evidence::KextProven),
+    // The 0x160-byte host-config memmove moved +0xa0 -> +0xb0.
+    band(0x00a0, 0x0200, 0x10, Evidence::KextProven),
+    band(0x09b8, 0x295c, 0x10, Evidence::KextProven),
+    band(0x2960, 0x29c1, 0x29, Evidence::KextProven),
+    band(0x2a01, 0x2a05, 0x8d, Evidence::KextProven),
+    band(0x2a08, 0x2e5c, 0x90, Evidence::KextProven),
+    band(0x2e6c, 0x2e70, 0x9c, Evidence::KextProven),
+    // this+0x216c -> this+0x211c (the host object moved by -0x50).
+    band(0x2e78, 0x2e7c, 0x74, Evidence::Inferred),
+    band(0x2f37, 0x2f43, -0x2b, Evidence::KextProven),
+    band(0x2f43, 0x2f53, 0x71, Evidence::KextProven),
+    band(0x2f58, 0x3260, 0x70, Evidence::KextProven),
+    // Policy state pointer and its neighbours (+0x3c98 -> +0x3d30).
+    band(0x3c98, 0x3cac, 0x98, Evidence::KextProven),
+    band(0x5cac, 0x5cb4, 0x98, Evidence::KextProven),
+    band(0x63a4, 0x63f4, 0xa0, Evidence::KextProven),
+    band(0x6458, 0x645c, 0x78, Evidence::KextProven),
+    // AON PTD FW VA (this+0xf78 in 26A428).
+    band(0x6460, 0x6468, 0x78, Evidence::KextProven),
+    // Boot mach_absolute_time (+0x651c -> +0x6c14) and what follows it.
+    band(0x651c, 0x66a8, 0x6f8, Evidence::KextProven),
+    band(0x6a18, 0x6a1c, 0x710, Evidence::KextProven),
+];
+
+/// Region C 25G76 -> 26A428. FW_PROVEN: every read of the G17 region-C loader
+/// (0x3068-0x330c) relocates onto a b000 loader read (0x3508-0x37c0) under
+/// this map, and the only extra b000 read is the new field at +0x38. The kext
+/// agrees: 26A428 stores 0x78 at +0x40 (25G76 +0x3c) and a feature bit at +0x38.
+pub(crate) const G18G_26A428_REGION_C_BANDS: &[LayoutBand] = &[
+    band(0x000, 0x038, 0, Evidence::FirmwareProven),
+    band(0x038, 0xe78, 4, Evidence::FirmwareProven),
+];
+
+/// Status config 25G76 -> 26A428 (KEXT_PROVEN initFirmwareSharedData store
+/// alignment). The J813 words live in the first, sixth and seventh bands.
+pub(crate) const G18G_26A428_STATUS_CONFIG_BANDS: &[LayoutBand] = &[
+    band(0x000, 0x1dc, 0, Evidence::KextProven),
+    band(0x4e0, 0x518, 0xc, Evidence::KextProven),
+    band(0x518, 0x528, 0x14, Evidence::KextProven),
+    band(0x530, 0x534, 0xc, Evidence::KextProven),
+    band(0x554, 0x584, 0xc, Evidence::KextProven),
+    band(0x584, 0x5a8, 0x1c, Evidence::KextProven),
+    band(0x5cc, 0x628, 0x18, Evidence::KextProven),
+];
+
+/// Copy every non-zero byte of `words` (u32 at `offset - source_base`) to its
+/// relocated place in `out`. Bytes without a band are dropped.
+fn write_relocated_words(
+    words: &[(usize, u32)],
+    source_base: usize,
+    bands: &[LayoutBand],
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    for &(offset, value) in words {
+        for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+            if byte == 0 {
+                continue;
+            }
+            let source = offset
+                .checked_sub(source_base)
+                .ok_or(InitdataError::BufferSize)?
+                + index;
+            if let Some(target) = relocate_by_bands(bands, source) {
+                *out.get_mut(target).ok_or(InitdataError::BufferSize)? = byte;
+            }
+        }
+    }
+    Ok(())
+}
+
+// --- hw_data (plan step 1.4) --------------------------------------------------------
+
+/// 60 register slots at `+0x640` (FW_PROVEN b000 0x236d8 walks 53 named slot
+/// IDs from DATA 0xfffffc0000078bb8; KEXT_PROVEN the 26A428 copy loop runs
+/// over 0x3c slots, 0x648..0xfa8).
+pub(crate) const G18G_26A428_HW_REGISTER_MAP_SLOTS: usize = 60;
+pub(crate) const G18G_26A428_HW_REGISTER_MAP_END: usize =
+    HW_REGISTER_MAP_OFFSET + G18G_26A428_HW_REGISTER_MAP_SLOTS * HW_REGISTER_MAP_ENTRY_SIZE;
+/// KEXT_PROVEN: initFirmwareData forces this slot's device VA (+0xcb0) to 0
+/// (25G76: slot 36, +0xbe8; FenderRegsDFenderPowerTransG16G in both).
+pub(crate) const G18G_26A428_ZEROED_REGISTER_SLOT: usize = 41;
+/// FW_PROVEN: the copier's 16-byte read of the chip block moved 0xe90 -> 0xfb0.
+pub(crate) const G18G_26A428_HW_CHIP_ID_OFFSET: usize = 0xfb0;
+pub(crate) const G18G_26A428_HW_CHIP_ID: u32 = 0x8152;
+/// KEXT_PROVEN: initPowerAndPerformanceData stores this+0xf10 (the number of
+/// performance states; J813 +0xfc4 = 12 = its gpu-num-perf-states) here.
+pub(crate) const G18G_26A428_HW_PERF_STATE_COUNT: usize = 0x10e0;
+/// KEXT_PROVEN: 16 frequencies in MHz (accel+0x1b8f8.. / 1e6).
+pub(crate) const G18G_26A428_HW_PERF_FREQUENCY: usize = 0x10e4;
+/// FW_PROVEN: 16 rows of 0x40 bytes; the b000 loop reads lanes 0 and 1 of
+/// each row (0x1124/0x1128 core, 0x1524/0x1528 SRAM; b000 0x218d0-0x219f0).
+pub(crate) const G18G_26A428_HW_PERF_CORE_VOLTAGE: usize = 0x1124;
+pub(crate) const G18G_26A428_HW_PERF_SRAM_VOLTAGE: usize = 0x1524;
+pub(crate) const G18G_26A428_HW_PERF_ROWS: usize = 16;
+pub(crate) const G18G_26A428_HW_PERF_ROW_STRIDE: usize = 0x40;
+pub(crate) const G18G_26A428_HW_PERF_LANES: usize = 16;
+pub(crate) const G18G_26A428_HW_PERF_SCALE: usize = 0x1964;
+pub(crate) const G18G_26A428_HW_PERF_RELATIVE_A: usize = 0x19e4;
+pub(crate) const G18G_26A428_HW_PERF_RELATIVE_B: usize = 0x1a24;
+pub(crate) const G18G_26A428_HW_PERF_INDEX_MAP: usize = 0x1ae4;
+/// FW_PROVEN: four 0x20-byte KSM completion descriptors (b000 0xf57c `mov
+/// w9,#0x2734`), firmware cursor at +0x1c of each (b000 0x1cbc0..0x1cc48).
+pub(crate) const G18G_26A428_KSM_COMPLETION_TABLE_OFFSET: usize = 0x2734;
+pub(crate) const G18G_26A428_KSM_COMPLETION_CURSOR: usize = 0x1c;
+/// FW_PROVEN: QoS pointer (b000 0xa0f0; firmware dereferences QoS+0xe00).
+pub(crate) const G18G_26A428_QOS_POINTER_OFFSET: usize = 0x27cc;
+/// KEXT_PROVEN new constant (26A428 initFirmwareData `hw+0x2714 = 0x96`).
+/// FW_PROVEN numeric use: b000 0x23220 compares it with -1 and scales it by 24;
+/// 0xbb90 logs it. (It is not the 25G76 +0x25f4 flag, which moves to +0x2710.)
+pub(crate) const G18G_26A428_HW_2714_OFFSET: usize = 0x2714;
+pub(crate) const G18G_26A428_HW_2714_VALUE: u32 = 0x96;
+/// Fields that exist only in 26A428 (KEXT_PROVEN stores), with their size.
+/// Only +0x2714 has a proven value; the others are left zero (GUESSED).
+pub(crate) const G18G_26A428_HW_NEW_FIELDS: [(usize, usize); 11] = [
+    (0x0fa8, 8), (0x1078, 8), (0x10b4, 4), (0x2714, 4), (0x27d4, 8), (0x2818, 4),
+    (0x281e, 4), (0x2822, 8), (0x2832, 4), (0x283a, 4), (0x283e, 4),
+];
+
+/// J873 ADT /arm-io/sgx perf-states: (MHz, core mV), 14 entries including
+/// state 0. ADT_PROVEN.
+pub(crate) const J873_GPU_PERF_STATES: [(u32, u32); 14] = [
+    (0, 125), (502, 675), (669, 700), (834, 720), (1002, 755), (1090, 770), (1178, 795),
+    (1266, 810), (1354, 840), (1442, 875), (1530, 915), (1620, 960), (1680, 975), (1735, 990),
+];
+/// J873 ADT perf-states-sram voltages (mV). ADT_PROVEN.
+pub(crate) const J873_GPU_PERF_STATES_SRAM_MV: [u32; 14] =
+    [775, 775, 775, 775, 775, 775, 795, 810, 840, 875, 915, 960, 975, 990];
+/// J873 ADT gpu-num-perf-states. ADT_PROVEN.
+pub(crate) const J873_GPU_NUM_PERF_STATES: u32 = 13;
+/// INFERRED: the J813 per-state scale word (1.02f), one per state.
+const G18G_26A428_PERF_SCALE_VALUE: u32 = 0x3f82_8f5c;
+/// GUESSED: the J813 relative-performance ladders re-sampled at the J873
+/// frequencies (linear in f / f_max). Their derivation is unknown on J813 too.
+const G18G_26A428_PERF_RELATIVE_A: [u32; 14] =
+    [0, 22, 29, 39, 52, 58, 69, 79, 84, 86, 90, 93, 97, 100];
+const G18G_26A428_PERF_RELATIVE_B: [u32; 14] =
+    [0, 9, 22, 33, 46, 52, 59, 66, 72, 78, 84, 91, 96, 100];
+
+/// The 26A428 slot of each 25G76 register slot (FW_PROVEN name tables: G17
+/// DATA 0xfffffc0000073488, 47 rows; b000 DATA 0xfffffc0000078bb8, 53 rows).
+/// None: 25G76 slot 8 (StreamingCodecRegisters) has no 26A428 slot. Unnamed
+/// slots 17 and 21 keep their numbers; 25 -> 28 and 44/45/46 -> 50/51/52 are
+/// INFERRED by position (44 -> 50 is confirmed by the identical die-1 PIO
+/// record 0xd24000/0x100 in both kexts).
+pub(crate) const G18G_26A428_SLOT_FROM_25G76: [Option<u8>; HW_REGISTER_MAP_SLOTS] = [
+    Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), None, Some(9),
+    Some(10), Some(11), Some(12), Some(13), Some(14), Some(15), Some(16), Some(17), Some(18),
+    Some(19), Some(20), Some(21), Some(22), Some(23), Some(24), Some(28), Some(31), Some(32),
+    Some(33), Some(34), Some(35), Some(36), Some(37), Some(38), Some(39), Some(40), Some(41),
+    Some(42), Some(43), Some(44), Some(45), Some(46), Some(47), Some(48), Some(50), Some(51),
+    Some(52), Some(53), Some(54), Some(55), Some(56), Some(57), Some(58),
+];
+
+/// J873 moved the always-on blocks the 25G76 map names (AIC, MCC telemetry,
+/// PMGR event log, AON PTD) down by this much (ADT_PROVEN); the SGX and GPU
+/// PMGR banks did not move.
+pub(crate) const J873_AON_REBASE: u64 = 0x8000_0000;
+
+/// A register window before its device VA is assigned.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct RegisterWindowSpec {
+    pub(crate) slot: usize,
+    pub(crate) phys: u64,
+    /// Instance count x instance size (hw_data slot +0x10).
+    pub(crate) size_10: u32,
+    /// Instance size (slot +0x14).
+    pub(crate) size_14: u32,
+    /// Offset from the GPU base for PIO-table windows (slot +0x18), else 0.
+    pub(crate) unk_18: u64,
+    /// accelerator entry flags & 2 (slot +0x20).
+    pub(crate) flag: u32,
+}
+
+const fn spec(slot: usize, phys: u64, size: u32, unk_18: u64, flag: u32) -> RegisterWindowSpec {
+    RegisterWindowSpec { slot, phys, size_10: size, size_14: size, unk_18, flag }
+}
+
+/// Assign firmware device VAs in slot order, from the register aperture base:
+/// each window starts at the next 32 KiB boundary at least one 16 KiB guard
+/// page past the previous window, plus its physical page offset. This rule
+/// reproduces all 22 native J813/25G76 device VAs exactly (regression test);
+/// for G18G the VAs are host-chosen (INFERRED: same rule), since firmware
+/// reaches its registers only through this table.
+pub(crate) const fn allocate_register_window_vas<const N: usize>(
+    specs: &[RegisterWindowSpec; N],
+) -> [M5RegisterWindow; N] {
+    let mask = UAT_PAGE_SIZE as u64 - 1;
+    let mut out = [M5RegisterWindow {
+        slot: 0, phys: 0, device_va: 0, size_10: 0, size_14: 0, unk_18: 0, flag: 0,
+    }; N];
+    let mut next: u64 = 0;
+    let mut index = 0;
+    while index < N {
+        let window = specs[index];
+        let va = next + (window.phys & mask);
+        out[index] = M5RegisterWindow {
+            slot: window.slot,
+            phys: window.phys,
+            device_va: HW_REGISTER_APERTURE.start + va,
+            size_10: window.size_10,
+            size_14: window.size_14,
+            unk_18: window.unk_18,
+            flag: window.flag,
+        };
+        let end = (va + window.size_10 as u64 + mask) & !mask;
+        next = (end + UAT_PAGE_SIZE as u64 + 0x7fff) & !0x7fff;
+        index += 1;
+    }
+    out
+}
+
+/// The 22 mapped G18G windows, in slot order. Sources (26A428 kext):
+/// - AcceleratorG::configureDevice (0xfffffe0008c490ac): slot 3 MCache
+///   0x220104000 (0x140fb rounded, count = popcount(active-mcc-bit-vector),
+///   absent on J873 -> 1), 9/10 telemetry at AON+0x3d0000/+0x3c0000, 14 PMS at
+///   AON+0x280000 size 0x14f54 (25G76: 0x8000), 15 AONPTDSpace AON+0xc840000
+///   0x24000, 29 DPEP 0x580001800/0x27f8 and 30 ADCLK 0x580ec2200/0xfc (both
+///   new), 46 ThrtlStatCntrs GPU+0xe33800. Slots 10/14/29/30 get flags 0.
+/// - PI_400 Accelerator::configureDevice (0xfffffe0008c45428): slot 22
+///   GPU+0x1000000/0x8000 and slot 44 MTR GPU+0xde0000, one 0x15000 instance
+///   (25G76: GPU+0xe08000, two 0x8000 instances).
+/// - AGFPIOGFXHALRelativeOffsetTableG18G (0xfffffe0007152228, 12 records):
+///   slot 17 GPU+0 size 0x36000 (25G76 0x21400), Fender slots 31..37/40 at the
+///   25G76 offsets, new 35 (KSMFE, 0xd28000) and 49 (FenderRegsHWL, 0xe18000);
+///   +0x18 is the table offset. 25G76 slot 50 (DpwrMXU, 0x14400) is gone.
+/// - AGXAccelerator::configureDevice (base): flags 2 for the named slots,
+///   0 for 49; slot 0 {flags 2, count 1} and the AIC SW-interrupt page (the
+///   ADT meta-sw-interrupt, 0x301014048 on J873: ADT_PROVEN).
+/// - Slot 24 (DVFMMgpu 0x580ec0000/0x10000): no 26A428 setter was found; the
+///   J813 window is carried (INFERRED). The J873 ADT has pmgr-child regs there.
+/// The GPU base is the SGX reg 0x580000000 (unchanged, ADT_PROVEN); the AON
+/// base moved 0x380000000 -> 0x300000000 ([`J873_AON_REBASE`]).
+pub(crate) const G18G_26A428_REGISTER_WINDOW_SPECS: [RegisterWindowSpec; 22] = [
+    spec(0, 0x3_0101_4000, 0x4000, 0, 2),
+    spec(3, 0x2_2010_4000, 0x18000, 0, 2),
+    spec(9, 0x3_003d_0000, 0x4000, 0, 2),
+    spec(10, 0x3_003c_0000, 0x4000, 0, 0),
+    spec(14, 0x3_0028_0000, 0x14f54, 0, 0),
+    spec(15, 0x3_0c84_0000, 0x24000, 0, 2),
+    spec(17, 0x5_8000_0000, 0x36000, 0, 2),
+    spec(22, 0x5_8100_0000, 0x8000, 0, 2),
+    spec(24, 0x5_80ec_0000, 0x10000, 0, 2),
+    spec(29, 0x5_8000_1800, 0x27f8, 0, 0),
+    spec(30, 0x5_80ec_2200, 0xfc, 0, 0),
+    spec(31, 0x5_80d0_4000, 0x8000, 0xd0_4000, 2),
+    spec(32, 0x5_80d0_d000, 0x1000, 0xd0_d000, 2),
+    spec(33, 0x5_80d5_0000, 0x10000, 0xd5_0000, 2),
+    spec(34, 0x5_80d1_0000, 0x4000, 0xd1_0000, 2),
+    spec(35, 0x5_80d2_8000, 0x4000, 0xd2_8000, 2),
+    spec(36, 0x5_80d4_0000, 0x4000, 0xd4_0000, 2),
+    spec(37, 0x5_80d6_0000, 0x8000, 0xd6_0000, 2),
+    spec(40, 0x5_80e0_0000, 0x4000, 0xe0_0000, 2),
+    spec(44, 0x5_80de_0000, 0x15000, 0, 2),
+    spec(46, 0x5_80e3_3800, 0x4000, 0, 2),
+    spec(49, 0x5_80e1_8000, 0x4000, 0xe1_8000, 0),
+];
+pub(crate) const G18G_26A428_REGISTER_WINDOWS: [M5RegisterWindow; 22] =
+    allocate_register_window_vas(&G18G_26A428_REGISTER_WINDOW_SPECS);
+/// Slots whose base-configured flags are 2 but which receive no physical
+/// window (KEXT_PROVEN by decoding AGXAccelerator::configureDevice; the same
+/// decode of the 25G76 function reproduces the J813 list exactly). Slot 47
+/// (AVMR) lost its G-variant window in 26A428; slot 8 keeps a flag although
+/// firmware no longer walks it.
+pub(crate) const G18G_26A428_REGISTER_FLAG_ONLY_SLOTS: [usize; 20] =
+    [2, 5, 6, 7, 8, 25, 26, 27, 38, 39, 42, 43, 45, 47, 48, 52, 53, 54, 55, 58];
+
+/// Encode the 60-slot, 0x960-byte G18G register map. Construction only:
+/// page tables for these windows are the caller's (see g18_resources.rs).
+pub(crate) fn encode_g18g_26a428_register_map(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != G18G_26A428_HW_REGISTER_MAP_SLOTS * HW_REGISTER_MAP_ENTRY_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for window in G18G_26A428_REGISTER_WINDOWS {
+        if window.slot >= G18G_26A428_HW_REGISTER_MAP_SLOTS
+            || window.slot == G18G_26A428_ZEROED_REGISTER_SLOT
+            || !HW_REGISTER_APERTURE.contains(&window.device_va)
+        {
+            return Err(InitdataError::RegisterWindow);
+        }
+        let base = window.slot * HW_REGISTER_MAP_ENTRY_SIZE;
+        put_u64(out, base, window.phys);
+        put_u64(out, base + 0x08, window.device_va);
+        put_u32(out, base + 0x10, window.size_10);
+        put_u32(out, base + 0x14, window.size_14);
+        put_u64(out, base + 0x18, window.unk_18);
+        put_u32(out, base + 0x20, window.flag);
+    }
+    for slot in G18G_26A428_REGISTER_FLAG_ONLY_SLOTS {
+        put_u32(out, slot * HW_REGISTER_MAP_ENTRY_SIZE + 0x20, 2);
+    }
+    Ok(())
+}
+
+/// Reconstruct the G18G hw_data object (0x2848 bytes) with caller-owned
+/// completion-queue and QoS bindings. The J813 platform words are relocated by
+/// [`G18G_26A428_HW_DATA_BANDS`]; the register map, chip id, perf tables,
+/// completion table and QoS pointer are G18G encodings. No MMIO access.
+pub(crate) fn encode_g18g_26a428_hw_data(
+    aliases: [G17PKsmCompletionAliases; M5_25G76_COMPLETION_QUEUE_COUNT],
+    qos_high: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != G18G_26A428_HW_DATA_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(qos_high)?;
+    let qos_end = qos_high
+        .checked_add(G17P_QOS_RESOURCE_SIZE as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(qos_end - 1)?;
+    let mut completion = [0; M5_25G76_COMPLETION_QUEUE_COUNT * G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE];
+    // INFERRED descriptor format: the J813 one (26A428 fills it through an
+    // accelerator virtual that was not decoded; the location is FW_PROVEN).
+    encode_m5_25g76_completion_table(aliases, &mut completion)?;
+    for alias in aliases {
+        if qos_high < alias.high + M5_25G76_COMPLETION_BACKING_SIZE as u64 && alias.high < qos_end {
+            return Err(InitdataError::PairAliasedObject);
+        }
+    }
+
+    out.fill(0);
+    write_relocated_words(M5_25G76_HW_PLATFORM_WORDS, 0, G18G_26A428_HW_DATA_BANDS, out)?;
+    encode_g18g_26a428_register_map(&mut out[HW_REGISTER_MAP_OFFSET..G18G_26A428_HW_REGISTER_MAP_END])?;
+    put_u32(out, G18G_26A428_HW_CHIP_ID_OFFSET, G18G_26A428_HW_CHIP_ID);
+    // INFERRED: this+0xf10 is the number of performance states (J813 12 =
+    // its gpu-num-perf-states); J873 ADT gpu-num-perf-states is 13.
+    put_u32(out, G18G_26A428_HW_PERF_STATE_COUNT, J873_GPU_NUM_PERF_STATES);
+    put_u32(out, G18G_26A428_HW_2714_OFFSET, G18G_26A428_HW_2714_VALUE);
+
+    // Performance ladder from the J873 ADT (values ADT_PROVEN, locations
+    // FW_PROVEN/KEXT_PROVEN). Each voltage fills all 16 lanes of its row as on
+    // J813 (INFERRED); b000 reads lanes 0 and 1. Rows 14 and 15 stay zero.
+    for (state, &(frequency, core)) in J873_GPU_PERF_STATES.iter().enumerate() {
+        put_u32(out, G18G_26A428_HW_PERF_FREQUENCY + state * 4, frequency);
+        put_u32(out, G18G_26A428_HW_PERF_SCALE + state * 4, G18G_26A428_PERF_SCALE_VALUE);
+        put_u32(out, G18G_26A428_HW_PERF_RELATIVE_A + state * 4, G18G_26A428_PERF_RELATIVE_A[state]);
+        put_u32(out, G18G_26A428_HW_PERF_RELATIVE_B + state * 4, G18G_26A428_PERF_RELATIVE_B[state]);
+        for lane in 0..G18G_26A428_HW_PERF_LANES {
+            let row = state * G18G_26A428_HW_PERF_ROW_STRIDE + lane * 4;
+            put_u32(out, G18G_26A428_HW_PERF_CORE_VOLTAGE + row, core);
+            put_u32(out, G18G_26A428_HW_PERF_SRAM_VOLTAGE + row, J873_GPU_PERF_STATES_SRAM_MV[state]);
+        }
+    }
+    // INFERRED: the J813 identity index map over all 16 rows.
+    for index in 0..G18G_26A428_HW_PERF_ROWS {
+        put_u32(out, G18G_26A428_HW_PERF_INDEX_MAP + index * 4, index as u32);
+    }
+    let table = G18G_26A428_KSM_COMPLETION_TABLE_OFFSET;
+    out[table..table + completion.len()].copy_from_slice(&completion);
+    put_u64(out, G18G_26A428_QOS_POINTER_OFFSET, qos_high);
+    Ok(())
+}
+
+// --- Perf/policy block and the blocks around it (plan step 1.6) -------------------
+
+/// KEXT_PROVEN (26A428 initPowerAndPerformanceData 0xfffffe0008c0807c): the
+/// host bzeros 0x7800 bytes, memmoves a 0x160-byte host config to +0xb0 and
+/// stores mach_absolute_time() at +0x6c14 (25G76: +0x651c).
+pub(crate) const G18G_26A428_POLICY_BOOT_TIMESTAMP: usize = 0x6c14;
+/// KEXT_PROVEN: FW VA of the 8-byte private-cluster tail (this+0x3a0) at
+/// +0x3d30 (25G76 +0x3c98).
+pub(crate) const G18G_26A428_POLICY_STATE_PTR: usize = 0x3d30;
+/// KEXT_PROVEN: FW VA of the AON PTD (this+0xf78) at +0x64d8 (25G76 +0x6460).
+pub(crate) const G18G_26A428_POLICY_AON_PTD_PTR: usize = 0x64d8;
+/// Policy-relative place of the J813 512-entry u16 0x7fff table that
+/// [`encode_m5_25g76_bundle_policy`] writes at bundle +0x6ed7.
+const M5_25G76_POLICY_U16_TABLE: usize = 0x1c97;
+const M5_25G76_POLICY_U16_TABLE_ENTRIES: usize = 512;
+/// ADT tunables at the places the 26A428 kext stores them. KEXT_PROVEN
+/// locations: +0xb38 = accel+0x11080 (gpu-perf-tgt-utilization), +0xb6c/+0xb70
+/// = getPerformanceControllerIntegralGain(0/1) = accel+0x110a8/0x110ac
+/// (gpu-perf-integral-gain/2), +0xb7c/+0xb80 = ProportionalGain(0/1) =
+/// accel+0x110b8/0x110bc; +0x22d4/+0x2928/+0x2e1c = this+0xf10 * 100.
+/// Values ADT_PROVEN (J873 sgx).
+pub(crate) const G18G_26A428_POLICY_ADT_WORDS: [(usize, u32); 8] = [
+    (0x0b38, 75),
+    (0x0b6c, 0x3f92_e148),
+    (0x0b70, 0x3f92_e148),
+    (0x0b7c, 0x4092_e148),
+    (0x0b80, 0x4092_e148),
+    (0x22d4, J873_GPU_NUM_PERF_STATES * 100),
+    (0x2928, J873_GPU_NUM_PERF_STATES * 100),
+    (0x2e1c, J873_GPU_NUM_PERF_STATES * 100),
+];
+/// Region-C ADT tunables. KEXT_PROVEN: +0x7c8 = accel+0x106b0
+/// (gpu-idleoff-standby-timer; J813 +0x7c4 carried its ADT 1250) and +0x7e4 =
+/// accel+0x106cc (gpu-idleoff-min_conf); ADT_PROVEN values 1500 and 0.8f.
+/// +0x9c = this+0xf14 * 100 (25G76 +0x98 = this+0xf40 * 100 = 1200 on J813):
+/// INFERRED to be the perf-state count again.
+pub(crate) const G18G_26A428_REGION_C_ADT_WORDS: [(usize, u32); 3] = [
+    (0x7c8, 1500),
+    (0x7e4, 0x3f4c_cccd),
+    (0x09c, J873_GPU_NUM_PERF_STATES * 100),
+];
+
+/// Initialize the six allocations following G18G hw_data (0x2880..0xd400)
+/// from the J813 policy words relocated by [`G18G_26A428_POLICY_BANDS`], plus
+/// the owned pointers, the boot timestamp and the J873 ADT tunables. Preserves
+/// hw_data and everything from the BRN table on. No firmware is started.
+pub(crate) fn encode_g18g_26a428_bundle_policy(
+    bindings: M5PolicyBindings,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    let layout = G18G_26A428_SHARED_LAYOUT;
+    if out.len() < G18G_26A428_SHARED_PREFIX_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(bindings.state)?;
+    required_address(bindings.aon_ptd)?;
+    let state_end = bindings.state.checked_add(STATUS_BLOCK_SIZE as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    let aon_end = bindings.aon_ptd.checked_add(G18G_26A428_AON_PTD_SIZE as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(state_end - 1)?;
+    required_address(aon_end - 1)?;
+    if bindings.state < aon_end && bindings.aon_ptd < state_end {
+        return Err(InitdataError::PairAliasedObject);
+    }
+    out[layout.block_c18..G18G_26A428_SHARED_PREFIX_SIZE].fill(0);
+    let m5 = M5_25G76_SHARED_LAYOUT;
+    let m5_policy_end = m5.policy + KEXT_ALLOCATION_SIZES_25G76[KX_POLICY];
+    for &(offset, value) in M5_25G76_POLICY_WORDS {
+        if (m5.block_1048..m5.block_e10).contains(&offset) {
+            // KEXT_PROVEN (R_1048 stores identical in both kexts): the two
+            // 0xffffffff words at +0xa18/+0xa30 of the 0x1048 block.
+            put_u32(out, layout.block_1048 + (offset - m5.block_1048), value);
+        } else if !(m5.policy..m5_policy_end).contains(&offset) {
+            return Err(InitdataError::BufferSize);
+        }
+    }
+    let policy = &mut out[layout.policy..layout.policy + G18G_26A428_POLICY_SIZE];
+    for &(offset, value) in M5_25G76_POLICY_WORDS {
+        if !(m5.policy..m5_policy_end).contains(&offset) {
+            continue;
+        }
+        write_relocated_words(&[(offset, value)], m5.policy, G18G_26A428_POLICY_BANDS, policy)?;
+    }
+    // The 512 x 0x7fff u16 table (J813 bundle +0x6ed7 = policy +0x1c97)
+    // moves with its band (INFERRED: no store is matched inside it).
+    for index in 0..M5_25G76_POLICY_U16_TABLE_ENTRIES {
+        for (byte_index, byte) in 0x7fffu16.to_le_bytes().into_iter().enumerate() {
+            let source = M5_25G76_POLICY_U16_TABLE + index * 2 + byte_index;
+            let target = relocate_by_bands(G18G_26A428_POLICY_BANDS, source)
+                .ok_or(InitdataError::BufferSize)?;
+            *policy.get_mut(target).ok_or(InitdataError::BufferSize)? = byte;
+        }
+    }
+    put_u64(policy, G18G_26A428_POLICY_STATE_PTR, bindings.state);
+    put_u64(policy, G18G_26A428_POLICY_AON_PTD_PTR, bindings.aon_ptd);
+    put_u64(policy, G18G_26A428_POLICY_BOOT_TIMESTAMP, bindings.boot_timestamp);
+    for (offset, value) in G18G_26A428_POLICY_ADT_WORDS {
+        put_u32(policy, offset, value);
+    }
+    Ok(())
+}
+
+// --- Region C (plan step 1.5) -------------------------------------------------------
+
+/// Encode the G18G region C: the J813 bytes, the 25G76 fields from +0x38 on
+/// moved up by 4 (FW_PROVEN), the new +0x38 left zero (GUESSED; 26A428 stores
+/// a feature bit, accel+0x6b9 bit 2) and the J873 ADT tunables.
+pub(crate) fn encode_g18g_26a428_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != REGION_C_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    encode_region_c_for_profile(RootProfile::J813G17G25G76, out)?;
+    // The J813 object never reaches its 0xe78 end; shifting in place keeps the
+    // tail zero and needs no second 4 KiB buffer on the kernel stack.
+    let shifted = KEXT_ALLOCATION_SIZES_25G76[KX_REGION_C];
+    if out[shifted..].iter().any(|byte| *byte != 0) {
+        return Err(InitdataError::BufferSize);
+    }
+    out.copy_within(0x38..shifted, 0x3c);
+    out[0x38..0x3c].fill(0);
+    for (offset, value) in G18G_26A428_REGION_C_ADT_WORDS {
+        put_u32(out, offset, value);
+    }
+    Ok(())
+}
+
+// --- Private cluster: status B, status config, status A (plan step 1.3) ----------
+
+/// Encode the G18G primary status-B span (status B, status config and the gap
+/// to status A; [`G18G_26A428_STATUS_B_SPAN`] bytes) before either role is
+/// started. `status_b` is the FW VA of the span, for the new cross-links.
+pub(crate) fn encode_g18g_26a428_primary_status_b(
+    fwctl_state: u64,
+    fwctl_ring: u64,
+    status_b: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != G18G_26A428_STATUS_B_SPAN {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(fwctl_state)?;
+    required_address(fwctl_ring)?;
+    required_address(status_b)?;
+    let status_b_end = status_b
+        .checked_add(G18G_26A428_STATUS_B_SPAN as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(status_b_end - 1)?;
+    let config = G18G_26A428_STATUS_CONFIG_IN_STATUS_B;
+    out.fill(0);
+    // +0x04 = 1: INFERRED from J813 (26A428 stores bit 2 of accel+0x6b0 there).
+    encode_status_block(&mut out[..STATUS_BLOCK_SIZE])?;
+    put_u64(out, G18G_26A428_STATUS_B_FWCTL_STATE, fwctl_state);
+    put_u64(out, G18G_26A428_STATUS_B_FWCTL_RING, fwctl_ring);
+    put_u32(out, G18G_26A428_STATUS_B_CONFIG_HEADER, 1);
+    put_u32(out, G18G_26A428_STATUS_B_LINK_WORD, 0);
+    put_u64(out, G18G_26A428_STATUS_B_LINK_PTR,
+            status_b + (config + G18G_26A428_STATUS_CONFIG_LINK_WORD) as u64);
+    write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, G18G_26A428_STATUS_CONFIG_BANDS,
+                          &mut out[config..config + G18G_26A428_STATUS_CONFIG_SIZE])?;
+    put_u32(out, config + G18G_26A428_STATUS_CONFIG_LINK_WORD, 1);
+    put_u64(out, config + G18G_26A428_STATUS_CONFIG_LINK_PTR,
+            status_b + G18G_26A428_STATUS_B_LINK_WORD as u64);
+    Ok(())
+}
+
+/// Encode the whole 0x178000-byte G18G private cluster mapped at
+/// `private_base`: status-B span, both status A blocks, the secondary root
+/// `+0xc0` object and exactly one opening-producer entry per control channel
+/// (plan 1.3: role 0 +0x320, role 1 +0x177720 = the J813 +0x1773e0 moved with
+/// the tail). Work and report counters stay zero.
+pub(crate) fn encode_g18g_26a428_private_cluster(
+    private_base: u64,
+    fwctl_state: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    let layout = G18G_26A428_PRIVATE_LAYOUT;
+    if out.len() != layout.total {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(private_base)?;
+    let private_end = private_base
+        .checked_add(layout.total as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(private_end - 1)?;
+    required_address(fwctl_state)?;
+    let fwctl_ring = fwctl_state
+        .checked_add(G18G_26A428_FWCTL_RING_OFFSET as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(fwctl_ring)?;
+    if fwctl_state < private_end && private_base < fwctl_ring + CONTROL_RECORD_SIZE as u64 {
+        return Err(InitdataError::PairAliasedObject);
+    }
+    out.fill(0);
+    let status_b = layout.status_b;
+    let status_a = layout.roles[0].status_a;
+    encode_g18g_26a428_primary_status_b(fwctl_state, fwctl_ring, private_base + status_b as u64,
+                                        &mut out[status_b..status_a])?;
+    for role in layout.roles {
+        encode_status_block(&mut out[role.status_a..role.status_a + STATUS_BLOCK_SIZE])?;
+    }
+    let extra = layout.secondary_extra_1;
+    encode_secondary_root_extra_1_for_profile(RootProfile::J873G18G26A428,
+        &mut out[extra..extra + STATUS_BLOCK_SIZE])?;
+    put_u32(out, layout.control_state + CHANNEL_STATE_PRODUCER * CHANNEL_STATE_SPACING,
+            CONTROL_OPENING_PRIMARY_PRODUCER);
+    put_u32(out, layout.secondary_control_state + CHANNEL_STATE_PRODUCER * CHANNEL_STATE_SPACING,
+            CONTROL_OPENING_SECONDARY_PRODUCER);
+    Ok(())
+}
+
+/// AON PTD (0xe4, KEXT_PROVEN size). INFERRED: the J813 header words.
+pub(crate) fn encode_g18g_26a428_aon_ptd(out: &mut [u8]) -> Result<(), InitdataError> {
+    encode_m5_25g76_aon_ptd(out)
+}
+
+// --- Device-control and endpoint vocabulary (plan step 1.7) -----------------------
+
+/// FW_PROVEN (jump table 0xfffffc0000006c60, 56 entries from opcode 4): the
+/// opening/region-C reload handler (b000 0x3ed0) is reached by 0x15, 0x2a
+/// and 0x30.
+pub(crate) const G18G_26A428_CONTROL_OPENING_OPCODE_PRIMARY: u32 = 0x15;
+pub(crate) const G18G_26A428_CONTROL_OPENING_OPCODE_SECONDARY: u32 = 0x2a;
+/// FW_PROVEN: IdlePowerOff keeps its opcode and behaviour (b000 0x4ef0).
+pub(crate) const G18G_26A428_DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF: u32 = 0x0a;
+pub(crate) const G18G_26A428_DEVICE_CONTROL_OPCODE_MIN: u32 = 4;
+pub(crate) const G18G_26A428_DEVICE_CONTROL_OPCODE_MAX: u32 = 0x3b;
+/// FW_PROVEN: jump-table entries routed to the default (invalid) handler.
+pub(crate) const G18G_26A428_DEVICE_CONTROL_INVALID_OPCODES: [u32; 9] =
+    [0x19, 0x1c, 0x20, 0x23, 0x26, 0x28, 0x31, 0x39, 0x3a];
+
+pub(crate) const fn g18g_26a428_device_control_opcode_valid(opcode: u32) -> bool {
+    if opcode < G18G_26A428_DEVICE_CONTROL_OPCODE_MIN || opcode > G18G_26A428_DEVICE_CONTROL_OPCODE_MAX {
+        return false;
+    }
+    let mut index = 0;
+    while index < G18G_26A428_DEVICE_CONTROL_INVALID_OPCODES.len() {
+        if G18G_26A428_DEVICE_CONTROL_INVALID_OPCODES[index] == opcode {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+// --- Unproven values ------------------------------------------------------------------
+
+/// One G18G value that is not proven for 26A428.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct UnprovenField {
+    /// "hw_data", "register_map" (offset = slot), "policy", "region_c",
+    /// "status_b", "status_config", "main_config", "aon_ptd",
+    /// "secondary_extra_1".
+    pub(crate) object: &'static str,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+    pub(crate) evidence: Evidence,
+    pub(crate) note: &'static str,
+}
+
+const fn unproven(object: &'static str, offset: usize, len: usize, evidence: Evidence,
+                  note: &'static str) -> UnprovenField {
+    UnprovenField { object, offset, len, evidence, note }
+}
+
+/// Every INFERRED or GUESSED G18G value, for review and for the hardware
+/// bring-up log. A crashlog assertion should be matched against this list
+/// first.
+pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
+    unproven("hw_data", 0x0000, 0x640, Evidence::Inferred,
+             "host prefix (+0x28 FW VA, two 32x0x18 accelerator tables) carried from J813"),
+    unproven("hw_data", 0x0fa0, 8, Evidence::Inferred, "u64 FW VA of accel+0x1d40; J813 0"),
+    unproven("hw_data", 0x0fa8, 8, Evidence::Guessed, "new u64 (vfn 0x1f8 & 0xffffffff); left 0"),
+    unproven("hw_data", 0x0fb4, 4, Evidence::Inferred, "u32 after the chip id; J813 2, meaning unknown"),
+    unproven("hw_data", 0x0fc0, 0x110, Evidence::Inferred,
+             "platform words relocated from J813 +0xea0..+0xfa8 (+0xfac dropped)"),
+    unproven("hw_data", 0x10b4, 4, Evidence::Guessed, "new u32 (accel byte & 1); left 0"),
+    unproven("hw_data", 0x10d4, 0xc, Evidence::Inferred,
+             "J813 0x20/5/0xa; 0x10d8/0x10dc may be num GPs/cores (J873 ioreg: 6/12)"),
+    unproven("hw_data", 0x10e0, 4, Evidence::Inferred, "13 = gpu-num-perf-states (J813 12 matched by value)"),
+    unproven("hw_data", 0x1124, 0x800, Evidence::Inferred,
+             "ADT voltages filled into all 16 lanes of each row; b000 reads lanes 0 and 1"),
+    unproven("hw_data", 0x1964, 0x38, Evidence::Inferred, "1.02f scale word per state (J813 value)"),
+    unproven("hw_data", 0x19e4, 0x38, Evidence::Guessed, "relative ladder A re-sampled from J813"),
+    unproven("hw_data", 0x1a24, 0x38, Evidence::Guessed, "relative ladder B re-sampled from J813"),
+    unproven("hw_data", 0x1ae4, 0x40, Evidence::Inferred, "identity index map 0..15 (J813)"),
+    unproven("hw_data", 0x2660, 0xd4, Evidence::Inferred,
+             "J813 +0x2544..+0x2614 words relocated (+0x2710 = the J813 +0x25f4 flag)"),
+    unproven("hw_data", 0x2734, 0x80, Evidence::Inferred,
+             "KSM completion descriptor format (capacity 0x800, entry 0x40) carried from J813"),
+    unproven("hw_data", 0x27d4, 8, Evidence::Guessed, "new u64 (accel+0x12338); left 0"),
+    unproven("hw_data", 0x27dc, 0x3c, Evidence::Inferred, "J813 +0x26b4..+0x26ec words relocated"),
+    unproven("hw_data", 0x2818, 4, Evidence::Guessed, "new u32 (accel+0x6c8); read as part of a u64 by b000"),
+    unproven("hw_data", 0x281e, 0xc, Evidence::Guessed, "new u32/u64 (accel+0x111b8/+0x111bc); left 0"),
+    unproven("hw_data", 0x2832, 4, Evidence::Guessed, "new mode word, compared with 3 at ~10 b000 sites; left 0"),
+    unproven("hw_data", 0x283a, 8, Evidence::Guessed, "new enables (accel+0x1165c/+0x1166c bit 0); left 0"),
+    unproven("register_map", 0, 1, Evidence::Inferred, "AIC SW-int page from ADT meta-sw-interrupt"),
+    unproven("register_map", 12, 1, Evidence::Inferred, "ANE0 doorbell left unmapped: 26A428 G variant no longer sets it"),
+    unproven("register_map", 24, 1, Evidence::Inferred, "DVFMMgpu window carried from J813 (no 26A428 setter found)"),
+    unproven("register_map", 29, 2, Evidence::Inferred, "DPEP/ADCLK +0x18 left 0; flags 0 mapped read-only like J813 slots 10/14"),
+    unproven("register_map", 49, 1, Evidence::Inferred, "FenderRegsHWL flags 0 (base sets none) mapped read-only"),
+    unproven("register_map", 0, 60, Evidence::Inferred, "device VAs assigned by the J813 allocation rule"),
+    unproven("policy", 0x0000, 0x7800, Evidence::Inferred,
+             "J813 policy words relocated by G18G_26A428_POLICY_BANDS; values not proven"),
+    unproven("policy", 0x00b0, 0x160, Evidence::Inferred, "0x160-byte host config copy carried from J813"),
+    unproven("policy", 0x1ca7, 0x400, Evidence::Inferred, "512 x 0x7fff u16 table moved with its +0x10 band"),
+    unproven("policy", 0x0b5c, 0x10, Evidence::Inferred,
+             "filter-time-constant terms: J813 defaults (J873 ADT has none)"),
+    unproven("policy", 0x0b9c, 0xc, Evidence::Inferred,
+             "tgt - dz and dz with dz = 1 carried from J813 (J873 ADT has no gpu-perf-dz)"),
+    unproven("policy", 0x64e0, 0x9c, Evidence::Guessed,
+             "J813 RT0g/LFCR/LFXG/LPXG words (+0x6468..+0x650b) dropped: insertion point unknown"),
+    unproven("region_c", 0x0000, 0xe80, Evidence::Inferred,
+             "J813 region C (T8140 runs + J813 scalars) with the proven +4 shift"),
+    unproven("region_c", 0x0038, 4, Evidence::Guessed, "new u32 (accel+0x6b9 bit 2); left 0"),
+    unproven("region_c", 0x008c, 8, Evidence::Inferred, "1200 carried; probably num-perf-states x 100 (1300)"),
+    unproven("region_c", 0x009c, 4, Evidence::Inferred, "1300 = this+0xf14 x 100 assumed equal to the state count"),
+    unproven("status_b", 0x0004, 4, Evidence::Inferred, "1 carried (26A428 stores accel+0x6b0 bit 2)"),
+    unproven("status_config", 0x0000, 0x640, Evidence::Inferred, "J813 status/config words relocated"),
+    unproven("status_config", 0x01dc, 8, Evidence::Guessed, "new words; left 0"),
+    unproven("status_config", 0x03e8, 0x104, Evidence::Guessed, "new 0x104-byte block; left 0"),
+    unproven("main_config", 0x0300, 4, Evidence::Inferred, "secondary kind 0xc carried (accel+0x10a74)"),
+    unproven("main_config", 0x02f8, 8, Evidence::Guessed, "third descriptor table (accel[0x235e]) absent: 0"),
+    unproven("aon_ptd", 0x0000, 0xc, Evidence::Inferred, "J813 PTD header words"),
+    unproven("secondary_extra_1", 0x0000, 0x60, Evidence::Inferred, "T8140/J813 content (same store geometry)"),
+];
+
+#[cfg(test)]
+#[path = "g18_initdata_test.rs"]
+mod g18_tests;
 
 #[cfg(test)]
 mod tests {

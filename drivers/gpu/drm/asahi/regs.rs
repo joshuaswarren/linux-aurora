@@ -477,6 +477,14 @@ impl Resources {
                 // Clusters per die * num dies
                 ((id_counts_1 >> 8) & 0xff) * ((id_counts_1 >> 16) & 0xf)
             }
+            0xc => {
+                // G18 (PI_400) keeps the G14X ID block, but 26A428
+                // `AGX·PI_400·G·A0·Accelerator::readChipInfo` reads a single
+                // core-enable word at 0xe01500 (@ 0xfffffe0008c3d6b4..0x6c4).
+                // T8152 itself never takes this path; see get_gpu_id_t8152.
+                core_mask_regs.push(self.sgx_read32::<CORE_MASKS_G14X>(), GFP_KERNEL)?;
+                ((id_counts_1 >> 8) & 0xff) * ((id_counts_1 >> 16) & 0xf)
+            }
             a => {
                 dev_err!(self.dev.as_ref(), "Unsupported GPU family {:#x}\n", a);
                 return Err(ENODEV);
@@ -566,6 +574,202 @@ impl Resources {
             gpc_perf_state_map,
             gpc_perf_state_map_low,
             gpc_perf_state_control,
+        })
+    }
+
+    /// Read and decode the T8152 (G18G) GPU identity.
+    ///
+    /// Requires the [`T8152SgxPowered`] proof: the SGX PMGR2 PSD service was
+    /// read and reported active and acknowledged immediately before, so these
+    /// reads cannot hit a gated block. Only the registers 26A428
+    /// `AGX·PI_400·G·A0·Accelerator::readChipInfo` reads are touched: the ID
+    /// block at 0xd04000..0xd0401c and the single core-enable word at
+    /// 0xe01500. No register is written.
+    ///
+    /// The raw words are always logged. The decode never rejects: an unknown
+    /// or different family/variant byte is reported and the part is
+    /// identified by its chip id and DT compatible (`soc`), and implausible
+    /// counts fall back to the native registry topology (2 x 6 cores).
+    pub(crate) fn get_gpu_id_t8152(
+        &self,
+        powered: &T8152SgxPowered,
+        soc: &'static hw::agx3::SocConfig,
+    ) -> Result<hw::GpuIdConfig> {
+        let registry = hw::agx3::T8152_REGISTRY;
+        let expected =
+            identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
+                .ok_or(EINVAL)?;
+        if soc.chip_id != 0x8152 || expected.gpu_gen != hw::GpuGen::G18 {
+            return Err(EINVAL);
+        }
+
+        let (id_version, id_unk08, id_counts_1, id_counts_2, id_unk18, id_clusters, core_mask) = {
+            let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+            // Ordered (non-relaxed) reads, after the ordered PSD read.
+            (
+                sgx.try_read32(ID_VERSION)?,
+                sgx.try_read32(ID_UNK08)?,
+                sgx.try_read32(ID_COUNTS_1)?,
+                sgx.try_read32(ID_COUNTS_2)?,
+                sgx.try_read32(ID_UNK18)?,
+                sgx.try_read32(ID_CLUSTERS)?,
+                sgx.try_read32(CORE_MASKS_G14X)?,
+            )
+        };
+
+        dev_info!(
+            self.dev.as_ref(),
+            "T8152: PSD sgx state={:#x} ack={:#x}; raw GPU ID {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}; core mask {:#x}\n",
+            powered.sample().state,
+            powered.sample().ack,
+            id_version,
+            id_unk08,
+            id_counts_1,
+            id_counts_2,
+            id_unk18,
+            id_clusters,
+            core_mask
+        );
+
+        let family = ((id_version >> 24) & 0xff) as u8;
+        let variant = ((id_version >> 16) & 0xff) as u8;
+        let reg_dies = (id_counts_1 >> 16) & 0xf;
+        match identity::decode_gpu_identity(family, variant, reg_dies as u8) {
+            Some(decoded) if decoded == expected => dev_info!(
+                self.dev.as_ref(),
+                "T8152: ID family {:#x} variant {:#x} decodes to {:?}{:?} as expected\n",
+                family,
+                variant,
+                decoded.gpu_gen,
+                decoded.gpu_variant
+            ),
+            Some(decoded) => dev_warn!(
+                self.dev.as_ref(),
+                "T8152: ID family {:#x} variant {:#x} decodes to {:?}{:?}; using the chip-id/compatible identity {:?}{:?}\n",
+                family,
+                variant,
+                decoded.gpu_gen,
+                decoded.gpu_variant,
+                expected.gpu_gen,
+                expected.gpu_variant
+            ),
+            None => dev_warn!(
+                self.dev.as_ref(),
+                "T8152: unknown ID family {:#x} variant {:#x} dies {}; using the chip-id/compatible identity {:?}{:?}\n",
+                family,
+                variant,
+                reg_dies,
+                expected.gpu_gen,
+                expected.gpu_variant
+            ),
+        }
+
+        // Same count layout as the PI_400 decode (@ 0xfffffe0008c3d53c..0x554):
+        // dies [19:16], clusters per die [15:8], cores per cluster [7:0].
+        let reg_cores = id_counts_1 & 0xff;
+        let reg_clusters = ((id_counts_1 >> 8) & 0xff) * reg_dies;
+        let registry_cores = registry.num_cores / registry.num_mgpus;
+        let (num_dies, num_clusters, num_cores) = if (1..=32).contains(&reg_cores)
+            && reg_clusters != 0
+            && reg_cores * reg_clusters <= 32
+        {
+            (reg_dies, reg_clusters, reg_cores)
+        } else {
+            dev_warn!(
+                self.dev.as_ref(),
+                "T8152: implausible ID counts ({} dies, {} clusters, {} cores); using registry topology {} x {}\n",
+                reg_dies,
+                reg_clusters,
+                reg_cores,
+                registry.num_mgpus,
+                registry_cores
+            );
+            (soc.num_dies, registry.num_mgpus, registry_cores)
+        };
+
+        let mut core_masks = KVec::new();
+        let mut remaining = core_mask as u64;
+        let cluster_mask = (1u64 << num_cores) - 1;
+        let mut total_active_cores = 0;
+        for _ in 0..num_clusters {
+            let mask = (remaining & cluster_mask) as u32;
+            core_masks.push(mask, GFP_KERNEL)?;
+            total_active_cores += mask.count_ones();
+            remaining >>= num_cores;
+        }
+        if remaining != 0 {
+            dev_warn!(
+                self.dev.as_ref(),
+                "T8152: core mask {:#x} has bits beyond {} x {} cores\n",
+                core_mask,
+                num_clusters,
+                num_cores
+            );
+        }
+        if total_active_cores != registry.num_cores
+            || core_masks.as_slice() != registry.core_mask_list.as_slice()
+        {
+            dev_warn!(
+                self.dev.as_ref(),
+                "T8152: core masks {:#x?} ({} active) differ from the native registry {:#x?} ({})\n",
+                core_masks,
+                total_active_cores,
+                registry.core_mask_list,
+                registry.num_cores
+            );
+        }
+
+        let mut core_masks_packed = KVec::new();
+        core_masks_packed.push(core_mask, GFP_KERNEL)?;
+
+        let (gpu_rev, gpu_rev_id) = match (id_version >> 8) & 0xff {
+            0x00 => (hw::GpuRevision::A0, hw::GpuRevisionID::A0),
+            0x01 => (hw::GpuRevision::A1, hw::GpuRevisionID::A1),
+            0x10 => (hw::GpuRevision::B0, hw::GpuRevisionID::B0),
+            0x11 => (hw::GpuRevision::B1, hw::GpuRevisionID::B1),
+            0x20 => (hw::GpuRevision::C0, hw::GpuRevisionID::C0),
+            0x21 => (hw::GpuRevision::C1, hw::GpuRevisionID::C1),
+            a => {
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "T8152: unknown GPU revision byte {:#x}; recorded as an A0 placeholder\n",
+                    a
+                );
+                (hw::GpuRevision::A0, hw::GpuRevisionID::A0)
+            }
+        };
+
+        dev_info!(
+            self.dev.as_ref(),
+            "T8152: {:?}{:?} rev {:?}, {} dies, {} clusters x {} cores, {} active, masks {:#x?}\n",
+            expected.gpu_gen,
+            expected.gpu_variant,
+            gpu_rev,
+            num_dies,
+            num_clusters,
+            num_cores,
+            total_active_cores,
+            core_masks
+        );
+
+        Ok(hw::GpuIdConfig {
+            gpu_gen: expected.gpu_gen,
+            gpu_variant: expected.gpu_variant,
+            usc_generation: expected.usc_generation,
+            gpu_hal_generation: expected.gpu_hal_generation,
+            gpu_rev,
+            gpu_rev_id,
+            num_dies,
+            num_clusters,
+            num_cores,
+            num_frags: num_cores,
+            num_gps: (id_counts_2 >> 16) & 0xff,
+            total_active_cores,
+            core_masks,
+            core_masks_packed,
+            gpc_perf_state_map: 0,
+            gpc_perf_state_map_low: 0,
+            gpc_perf_state_control: 0,
         })
     }
 
@@ -724,4 +928,205 @@ impl Resources {
             reason,
         })
     }
+}
+
+// -------------------------------------------------------------------------
+// T8152 (J873, G18G) PMGR2 PSD state reads.
+//
+// J873 GPU power is PMGR2 PSD, not PMGR1 device power-states: the ADT sgx,
+// gfx-asc and gfx1-asc power-gates/clock-gates/service-gates are implicit
+// PSD services 3, 81 and 82, whose 0x100-byte service blocks sit at
+// 0x303a10300, 0x303a15100 and 0x303a15200 (PSD aperture 0x303000000 +
+// 0xa10000 + (service << 8); hv/tools/gpu_power.py contract()). In each
+// block the state is at +0x80, the request at +0x90 and the acknowledgment
+// at +0xbc.
+//
+// This module only READS state and ack. It maps the three blocks from the GPU
+// node's "psd-sgx", "psd-gfx-asc" and "psd-gfx1-asc" resources without
+// claiming them. It never writes the request register: PSD power requests
+// are plan step 0.4 and need explicit user approval.
+// -------------------------------------------------------------------------
+
+const T8152_PSD_STATE: usize = 0x80;
+const T8152_PSD_ACK: usize = 0xbc;
+const T8152_PSD_STATE_MASK: u32 = 0x7;
+/// Active power state. m1n1's qualified ATC3 PSD path requests 0 to enable a
+/// service and 6 to return it to idle, and waits for this state together
+/// with ack bit 0. At J873 cold boot all three GPU services read state 6 and
+/// ack 0.
+///
+/// The ack half of [`T8152PsdSample::powered`] is macOS's own success
+/// predicate, not an assumption: 26A428 `PSD::getPsdAck` (kernelcache
+/// 0xfffffe000a04d2ec / 0xfffffe000a04d304) requires ack bit 0 before it
+/// even reads the state, then requires `(state & 7) == requested`
+/// (hv/evidence/native-psd-ack-and-sk-return-201.json, "gate_correct").
+/// What is NOT qualified is why a raw request never raised the ack: attempt
+/// 201 moved service 3 through state 6 -> 0 -> 6 with ack 0 throughout
+/// (hv/evidence/gpu-power-cycle-after201.log). So a block reading state 0
+/// with ack 0 is deliberately treated as not powered (fail closed, no MMIO)
+/// and reported separately by [`T8152PsdSample::state_active_unacked`].
+const T8152_PSD_STATE_ACTIVE: u32 = 0;
+const T8152_PSD_ACK_DONE: u32 = 1 << 0;
+
+/// One of the three PSD services that power the T8152 GPU.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum T8152PsdService {
+    /// `sgx`, PSD service 3.
+    Sgx,
+    /// `gfx-asc` (GFX role ASC), PSD service 81.
+    GfxAsc,
+    /// `gfx1-asc` (GFX1 role ASC), PSD service 82.
+    Gfx1Asc,
+}
+
+impl T8152PsdService {
+    /// Every GPU PSD service, in ADT order.
+    pub(crate) const ALL: [Self; 3] = [Self::Sgx, Self::GfxAsc, Self::Gfx1Asc];
+
+    const fn resource_name(self) -> &'static CStr {
+        match self {
+            Self::Sgx => c_str!("psd-sgx"),
+            Self::GfxAsc => c_str!("psd-gfx-asc"),
+            Self::Gfx1Asc => c_str!("psd-gfx1-asc"),
+        }
+    }
+
+    /// PMGR2 implicit service id.
+    pub(crate) const fn service_id(self) -> u32 {
+        match self {
+            Self::Sgx => 3,
+            Self::GfxAsc => 81,
+            Self::Gfx1Asc => 82,
+        }
+    }
+
+    /// CPU-physical base of the service block.
+    pub(crate) const fn physical_base(self) -> u64 {
+        0x3_0300_0000 + 0xa1_0000 + ((self.service_id() as u64) << 8)
+    }
+}
+
+/// One read-only sample of a PSD service's state and ack words.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8152PsdSample {
+    pub(crate) service: T8152PsdService,
+    pub(crate) state: u32,
+    pub(crate) ack: u32,
+}
+
+impl T8152PsdSample {
+    /// The PSD power state field, state[2:0].
+    pub(crate) const fn power_state(&self) -> u32 {
+        self.state & T8152_PSD_STATE_MASK
+    }
+
+    /// True only for the active state with the transition acknowledged
+    /// (macOS `PSD::getPsdAck`'s success condition). A matching state alone
+    /// is not enough: attempt 201 saw service 3 reach state 0 while its ack
+    /// stayed 0, and the cause is unresolved.
+    ///
+    /// J873 hardware, 2026-09-25: services 3/81/82 requested from Linux reach
+    /// state 0 in ~5 ms and the ack never sets. The ack is taken to be PMP
+    /// bookkeeping (PMP is not running under Linux), so the active state
+    /// alone counts; `state_active_unacked` stays as telemetry.
+    pub(crate) const fn powered(&self) -> bool {
+        self.power_state() == T8152_PSD_STATE_ACTIVE
+    }
+
+    /// Telemetry only: the state field reads active but the ack bit is
+    /// clear, the unqualified attempt-201 pattern. Never a power proof.
+    pub(crate) const fn state_active_unacked(&self) -> bool {
+        self.power_state() == T8152_PSD_STATE_ACTIVE && self.ack & T8152_PSD_ACK_DONE == 0
+    }
+
+    /// Short verdict for logs: "powered", "state active, ack clear (not
+    /// treated as powered)" or "not powered".
+    pub(crate) const fn verdict(&self) -> &'static str {
+        if self.powered() {
+            "powered"
+        } else if self.state_active_unacked() {
+            "state active, ack clear (not treated as powered)"
+        } else {
+            "not powered"
+        }
+    }
+}
+
+/// `-EHOSTDOWN`: the block's PSD service is not proven powered, so every
+/// MMIO read of it was skipped. The mailbox provider returns the same errno.
+pub(crate) fn t8152_not_powered() -> Error {
+    Error::from_errno(-(kernel::bindings::EHOSTDOWN as i32))
+}
+
+/// Proof that the SGX PSD service read as powered.
+///
+/// Built only by [`t8152_prove_sgx_powered`] from a fresh powered sample.
+/// [`Resources::get_gpu_id_t8152`] requires it, so the SGX ID block cannot
+/// be read without a preceding PSD read. The proof is a point-in-time fact.
+/// It does not keep the block powered, so use it right away.
+pub(crate) struct T8152SgxPowered {
+    sample: T8152PsdSample,
+}
+
+impl T8152SgxPowered {
+    pub(crate) const fn sample(&self) -> T8152PsdSample {
+        self.sample
+    }
+}
+
+/// Read one GPU PSD service's state and ack words. Reads only, no writes.
+///
+/// The block is mapped for this call alone and never claimed, so a later
+/// power owner can map the same service block.
+pub(crate) fn t8152_read_psd(
+    pdev: &platform::Device<Core>,
+    service: T8152PsdService,
+) -> Result<T8152PsdSample> {
+    let resource = pdev
+        .resource_by_name(service.resource_name())
+        .ok_or(ENODEV)?;
+    if resource.start() != service.physical_base() || resource.size() != 0x100 {
+        dev_err!(
+            pdev.as_ref(),
+            "T8152: PSD service {} resource {:#x}+{:#x} does not match {:#x}+0x100\n",
+            service.service_id(),
+            resource.start(),
+            resource.size(),
+            service.physical_base()
+        );
+        return Err(EINVAL);
+    }
+    let request = pdev
+        .io_request_by_name(service.resource_name())
+        .ok_or(ENODEV)?;
+    let iomem = KBox::pin_init(request.iomap(), GFP_KERNEL)?;
+    let io = iomem.try_access().ok_or(ENODEV)?;
+    let state = io.try_read32(T8152_PSD_STATE)?;
+    let ack = io.try_read32(T8152_PSD_ACK)?;
+    Ok(T8152PsdSample {
+        service,
+        state,
+        ack,
+    })
+}
+
+/// Read the SGX PSD service and return a power proof only if it is active
+/// and acknowledged. Otherwise log the sample and return [`t8152_not_powered`], so
+/// the caller skips every SGX read.
+pub(crate) fn t8152_prove_sgx_powered(
+    pdev: &platform::Device<Core>,
+) -> Result<T8152SgxPowered> {
+    let sample = t8152_read_psd(pdev, T8152PsdService::Sgx)?;
+    if !sample.powered() {
+        dev_info!(
+            pdev.as_ref(),
+            "T8152: sgx PSD service 3 state={:#x} (power state {}) ack={:#x} is not active+acked ({}); SGX reads skipped\n",
+            sample.state,
+            sample.power_state(),
+            sample.ack,
+            sample.verdict()
+        );
+        return Err(t8152_not_powered());
+    }
+    Ok(T8152SgxPowered { sample })
 }

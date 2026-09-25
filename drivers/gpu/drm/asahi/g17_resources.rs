@@ -41,8 +41,18 @@ use core::{
 
 use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 
-/// Nonzero object IDs shared by pool owners and render commands.
-/// Keep IDs unique across retained graphs, clients and firmware resets.
+#[cfg(not(test))]
+#[path = "m5_resources.rs"]
+pub(crate) mod m5;
+
+#[cfg(not(test))]
+#[path = "g18_resources.rs"]
+pub(crate) mod g18;
+
+/// Linux counterpart of IOGPUFamily's `___globalObjectIDCounter`.
+///
+/// The native render path uses this one counter for userspace GID-group
+/// reservations and for the kernel command IDs allocated after a reservation.
 #[cfg(not(test))]
 static G17P_RENDER_GID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
