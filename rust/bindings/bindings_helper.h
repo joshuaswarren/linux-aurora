@@ -109,7 +109,6 @@
 #include <linux/xarray.h>
 #include <sound/core.h>
 #include <sound/dmaengine_pcm.h>
-#include <linux/gpio/consumer.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <sound/pcm.h>
