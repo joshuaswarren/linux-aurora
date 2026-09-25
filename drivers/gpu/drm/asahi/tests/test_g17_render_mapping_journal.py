@@ -27,8 +27,9 @@ program = "\n".join([
          if line.startswith("const MAPPING_VALIDATION_HISTORY:")),
     "#[derive(Clone, Copy)]",
     item("struct MappingValidationChange"),
+    "type KBox<T> = Box<T>;",
     "struct VmInner { mapping_validation_epoch: Option<u64>, "
-    "mapping_validation_changes: [Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY] }",
+    "mapping_validation_changes: Option<KBox<[Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY]>> }",
     "impl VmInner {",
     item("fn note_mapping_validation_change("),
     "}",
@@ -43,7 +44,7 @@ program = "\n".join([
 fn fixture() -> Vm {
     Vm { inner: Lock(std::cell::RefCell::new(VmInner {
         mapping_validation_epoch: Some(0),
-        mapping_validation_changes: [None; MAPPING_VALIDATION_HISTORY],
+        mapping_validation_changes: Some(Box::new([None; MAPPING_VALIDATION_HISTORY])),
     })) }
 }
 #[test]
@@ -77,7 +78,7 @@ fn stale_or_corrupt_history_never_returns_clean() {
     }
     assert_eq!(vm.mapping_changes_since(0, |_| false), None);
     assert_eq!(vm.mapping_changes_since(1, |_| false), Some((129, false)));
-    vm.inner.0.borrow_mut().mapping_validation_changes[17] = None;
+    vm.inner.0.borrow_mut().mapping_validation_changes.as_mut().unwrap()[17] = None;
     assert_eq!(vm.mapping_changes_since(1, |_| false), None);
 }
 #[test]
