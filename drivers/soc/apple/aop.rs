@@ -1118,6 +1118,8 @@ struct AopData {
     /// Shut the co-processor down on removal, and if that cannot be
     /// confirmed, retain everything it may still DMA to.
     quiesce_on_unbind: bool,
+    /// The endpoints that have to start; empty means all advertised ones.
+    required_endpoints: &'static [u8],
     /// Runs the setup-port messages in order; only on firmware with a setup
     /// port.
     setup_queue: Option<OwnedQueue>,
@@ -1257,6 +1259,7 @@ impl AopData {
                     transport_closing: Atomic::new(false),
                     cpu_started: Atomic::new(false),
                     quiesce_on_unbind: cfg.quiesce_on_unbind,
+                    required_endpoints: cfg.required_endpoints,
                     setup_queue,
                     setup_lost: Atomic::new(false),
                     setup <- new_mutex!(SetupState::new()),
@@ -1286,7 +1289,8 @@ impl AopData {
         let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
         rtk.as_mut().wake()
     }
-    /// Starts the AFK handshake on every advertised endpoint.
+    /// Starts the AFK handshake on every advertised endpoint. An endpoint
+    /// the match data does not require may fail to start; it is skipped.
     fn start_afk(&self) -> Result<()> {
         for ep in 0..AFK_ENDPOINT_COUNT as usize {
             let rtk_ep_num = AFK_ENDPOINT_START + ep as u8;
@@ -1295,10 +1299,26 @@ impl AopData {
             if !rtk.as_mut().has_endpoint(rtk_ep_num) {
                 continue;
             }
-            rtk.as_mut().start_endpoint(rtk_ep_num)?;
-            let mut ep_guard = self.endpoints[ep].lock();
-            ep_guard.start(rtk.as_mut())?;
-            ep_guard.started = true;
+            let required =
+                self.required_endpoints.is_empty() || self.required_endpoints.contains(&rtk_ep_num);
+            let started = rtk.as_mut().start_endpoint(rtk_ep_num).and_then(|()| {
+                let mut ep_guard = self.endpoints[ep].lock();
+                ep_guard.start(rtk.as_mut())?;
+                ep_guard.started = true;
+                Ok(())
+            });
+            match started {
+                Ok(()) => {}
+                Err(e) if !required => {
+                    dev_warn!(
+                        self.dev,
+                        "Endpoint {:#04x} did not start ({:?}); skipping it",
+                        rtk_ep_num,
+                        e
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -2232,6 +2252,8 @@ struct AopHwConfig {
     ec0p: u64,
     alig: u64,
     aopt: u64,
+    /// Complete the firmware's boot arguments before starting it.
+    patch_bootargs: bool,
     /// The firmware speaks EPIC with version 4 sub-headers.
     epic_v4: bool,
     /// The firmware boots through a second, "setup", mailbox as well.
@@ -2239,39 +2261,64 @@ struct AopHwConfig {
     /// Shut the co-processor down on unbind and retain its buffers if the
     /// shutdown cannot be confirmed.
     quiesce_on_unbind: bool,
+    /// The endpoints that have to start; empty means all advertised ones.
+    required_endpoints: &'static [u8],
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 1,
     alig: 128,
+    patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
     quiesce_on_unbind: false,
+    required_endpoints: &[],
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 128,
+    patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
     quiesce_on_unbind: false,
+    required_endpoints: &[],
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     aopt: 0,
     alig: 64,
+    patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
     quiesce_on_unbind: false,
+    required_endpoints: &[],
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
     aopt: 0,
     alig: 64,
+    patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
     quiesce_on_unbind: false,
+    required_endpoints: &[],
+};
+/// T8140: the firmware is started with the boot arguments the bootloader
+/// left, boots through the setup port and speaks EPIC version 4. Of the
+/// advertised AFK endpoints, the application map is 0x20 misc, 0x21
+/// aop-audio, 0x22 aop-voicetrigger, 0x23 als and 0x2b aop-audprov, which
+/// are the ones macOS starts as well; the rest are started if they will.
+const HW_CFG_T8140: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    aopt: 0,
+    alig: 0,
+    patch_bootargs: false,
+    epic_v4: true,
+    setup_port: true,
+    quiesce_on_unbind: true,
+    required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
 };
 
 kernel::of_device_table!(
@@ -2314,7 +2361,7 @@ impl platform::Driver for AopDriver {
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
         let aop_mmio = aop_mmio.access(pdev.as_ref())?;
-        if !cfg.t8140 {
+        if cfg.patch_bootargs {
             data.patch_bootargs(
                 aop_mmio,
                 &[
@@ -2324,7 +2371,6 @@ impl platform::Driver for AopDriver {
                     (from_fourcc(b"AOPt"), cfg.aopt),
                 ],
             )?;
-        } else {
         }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
         *data.rtkit.lock() = Some(rtkit);
