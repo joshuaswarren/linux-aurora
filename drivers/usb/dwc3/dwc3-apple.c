@@ -75,6 +75,12 @@
  * in DWC3_APPLE_PROBE_PENDING.
  * Once a cable is connected we then keep track of the controller mode here by transitioning to
  * DWC3_APPLE_HOST or DWC3_APPLE_DEVICE.
+ *
+ * Some boards do not wire the controller's USB2 pairs to a connector but to a fixed USB2 hub on
+ * the board, whose downstream ports serve the Type-C connectors (Apple J700). Such a controller is
+ * a host whatever happens at the connectors and never sees a role change: it is brought up in
+ * DWC3_APPLE_HOST at probe and stays there. The Type-C port controllers only drive the PHY's
+ * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
  */
 enum dwc3_apple_state {
 	DWC3_APPLE_PROBE_PENDING, /* Before first cable connection, dwc3_core_probe not called */
@@ -109,6 +115,7 @@ struct dwc3_apple_role_input {
  * @usb2_phy: USB2 PHY, configured before the core is brought up
  * @usb3_phy: USB3 PHY, configured after the core is brought up
  * @role_sw: USB role switch
+ * @fixed_hub: A fixed hub sits on the controller's USB2 port, the controller stays in host mode
  * @lock: Mutex for synchronizing access
  * @state: Current state of the controller, see documentation for the enum for details
  */
@@ -125,16 +132,7 @@ struct dwc3_apple {
 	struct phy *usb2_phy;
 	struct phy *usb3_phy;
 	struct usb_role_switch *role_sw;
-	struct gpio_desc *hub_reset_gpio;
-	bool legacy_fixed_usb2;
-	struct phy *usb2_phy;
-	bool force_usb2_host;
-	bool usb2_hub_always_on;
-	bool usb2_retry_reset;
-	bool usb2_retry_done;
-	struct delayed_work usb2_retry_work;
-	struct dwc3_apple_role_input role_inputs[DWC3_APPLE_MAX_ROLE_INPUTS];
-	unsigned int num_role_inputs;
+	bool fixed_hub;
 
 	struct mutex lock;
 
@@ -528,59 +526,9 @@ static void dwc3_apple_usb2_retry_work(struct work_struct *work)
 
 	guard(mutex)(&appledwc->lock);
 
-	if (appledwc->usb2_retry_done ||
-	    appledwc->state != DWC3_APPLE_HOST)
-		return;
-
-	appledwc->usb2_retry_done = true;
-	dev_info(appledwc->dev,
-		 "J700 USB2 diagnostic: retrying DWC3 after shipping eUSB2 USBCTL settle\n");
-	dwc3_apple_dump_usb2_state(appledwc, "pre-retry");
-
-	/*
-	 * The first hub reset is followed by a five-second settle in probe.  The
-	 * late I2C worker then applies the ADT VLF0 and repeater tables and opens
-	 * the TICD2E22.  Reinitialize the controller once so the post-open PHY
-	 * power-on includes Apple's recovered 5-ms settle immediately before
-	 * USBCTL is enabled.  This is the cycle-35 full retry with only that
-	 * shipping delay added.
-	 */
-	dev_info(appledwc->dev,
-		 "J700_USB2_DWC_RETRY: post-repeater-open USBCTL settle enabled\n");
-
-	ret = dwc3_apple_exit(appledwc);
-	if (!ret)
-		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
-	dwc3_apple_dump_usb2_state(appledwc, "post-retry");
-
-	if (ret)
-		dev_err(appledwc->dev,
-			"J700_USB2_DWC_RETRY_FAIL: err=%d\n", ret);
-	else
-		dev_info(appledwc->dev, "J700_USB2_DWC_RETRY_PASS\n");
-}
-
-static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role role)
-{
-	struct dwc3_apple *appledwc = usb_role_switch_get_drvdata(sw);
-	enum usb_role requested_role = role;
-	int ret;
-
-	guard(mutex)(&appledwc->lock);
-
-	/*
-	 * Some machines put a fixed USB2 hub between DWC3 and multiple Type-C
-	 * connectors.  The hub is DWC3's permanently connected USB2 peer; an HPM
-	 * disconnect only describes one downstream connector and must not shut the
-	 * shared host down.  Device mode also needs a separate repeater bypass mux
-	 * which is not described yet, so retain host mode until that mux exists.
-	 */
-	if (appledwc->usb2_hub_always_on && role != USB_ROLE_HOST) {
-		role = USB_ROLE_HOST;
-		dev_info_ratelimited(appledwc->dev,
-			"J700_USB2_FAKE_MUX: requested=%d effective=%d state=%d\n",
-			requested_role, role, appledwc->state);
-	}
+	/* A controller behind a fixed hub is a host regardless of the connectors */
+	if (appledwc->fixed_hub)
+		return 0;
 
 	/*
 	 * Skip role switches if appledwc is already in the desired state. The
@@ -851,6 +799,14 @@ static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 	return 0;
 }
 
+static bool dwc3_apple_has_fixed_hub(struct device *dev)
+{
+	struct device_node *hub __free(device_node) =
+		of_get_available_child_by_name(dev->of_node, "hub");
+
+	return hub;
+}
+
 static int dwc3_apple_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -862,14 +818,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
-	appledwc->legacy_fixed_usb2 = of_machine_is_compatible("apple,j700") &&
-		device_property_read_bool(dev, "apple,usb2-fixed-host");
-	if (appledwc->legacy_fixed_usb2) {
-		appledwc->usb2_phy = devm_phy_get(dev, "usb2-phy");
-		if (IS_ERR(appledwc->usb2_phy))
-			return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
-					     "USB2 PHY unavailable\n");
-	}
+	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	mutex_init(&appledwc->lock);
 	INIT_DELAYED_WORK(&appledwc->usb2_retry_work,
 			  dwc3_apple_usb2_retry_work);
@@ -989,6 +938,24 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		else
 			dev_info(dev,
 				 "USB2-only host mode active; ATC/SuperSpeed disabled\n");
+	}
+
+	if (!appledwc->fixed_hub)
+		return 0;
+
+	/*
+	 * The hub is the controller's permanent USB2 peer, and the PHY has kept
+	 * its USB2 path up for it since its own probe, so there is nothing to
+	 * wait for: bring the host up now.
+	 */
+	scoped_guard(mutex, &appledwc->lock)
+		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+	if (ret) {
+		/* dwc3_apple_init() has already undone the core initialisation */
+		if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
+			dwc3_core_remove(&appledwc->dwc);
+		usb_role_switch_unregister(appledwc->role_sw);
+		return dev_err_probe(dev, ret, "Failed to start host mode\n");
 	}
 
 	return 0;
