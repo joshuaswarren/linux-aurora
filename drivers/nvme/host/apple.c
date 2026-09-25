@@ -24,6 +24,8 @@
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/mempool.h>
+#include <linux/mm.h>
+#include <linux/overflow.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -201,6 +203,10 @@ struct apple_nvme_hw {
 
 struct apple_nvme {
 	struct device *dev;
+	/* Protects reset_ready against RTKit crash callbacks. */
+	spinlock_t event_lock;
+	bool reset_ready;
+	bool handoff_disabled;
 
 	void __iomem *mmio_coproc;
 	void __iomem *mmio_nvme;
@@ -215,6 +221,7 @@ struct apple_nvme {
 	struct apple_rtkit *rtk;
 	struct reset_control *reset;
 	bool owns_rtkit;
+	bool inherited_rtkit;
 
 	struct dma_pool *prp_page_pool;
 	struct dma_pool *prp_small_pool;
@@ -274,15 +281,42 @@ static inline struct apple_nvme *ctrl_to_apple_nvme(struct nvme_ctrl *ctrl)
 
 static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 {
-	/* CPU_RUN and BOOT_STATUS survive an inactive firmware session. */
-	return !anv->hw->requires_cold_start &&
-		anv->hw->needs_ioq_registers &&
-		(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
-		 APPLE_ANS_COPROC_CPU_CONTROL_RUN) &&
-		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
-		 APPLE_ANS_BOOT_STATUS_OK &&
-		(readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE) &&
-		(readl(anv->mmio_nvme + NVME_REG_CSTS) & NVME_CSTS_RDY);
+	u32 cc, csts;
+
+	if (!anv->hw->needs_ioq_registers ||
+	    !(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+	      APPLE_ANS_COPROC_CPU_CONTROL_RUN) ||
+	    readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) != APPLE_ANS_BOOT_STATUS_OK)
+		return false;
+	cc = readl(anv->mmio_nvme + NVME_REG_CC);
+	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
+	if (csts & NVME_CSTS_CFS)
+		return false;
+
+	/*
+	 * CPU_RUN/BOOT_STATUS alone survive inactive sessions. A disabled
+	 * controller requires the producer's explicit live-session contract.
+	 * Borrowed buffers still require reserved RAM and protected SART ranges.
+	 */
+	if (anv->handoff_disabled)
+		return !(cc & NVME_CC_ENABLE) && !(csts & NVME_CSTS_RDY);
+	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY);
+}
+
+static int apple_nvme_read_handoff(struct apple_nvme *anv)
+{
+	const char *handoff;
+	int ret;
+
+	ret = of_property_read_string(anv->dev->of_node, "apple,rtkit-handoff",
+				      &handoff);
+	if (ret == -EINVAL)
+		return 0;
+	if (ret || !anv->hw->needs_ioq_registers ||
+	    strcmp(handoff, "nvme-disabled-v1"))
+		return -EINVAL;
+	anv->handoff_disabled = true;
+	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
 }
 
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
@@ -303,40 +337,73 @@ static unsigned int apple_nvme_queue_depth(struct apple_nvme_queue *q)
 	return anv->hw->max_queue_depth;
 }
 
+static void apple_nvme_set_reset_ready(struct apple_nvme *anv, bool ready)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&anv->event_lock, flags);
+	anv->reset_ready = ready;
+	spin_unlock_irqrestore(&anv->event_lock, flags);
+}
+
 static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_nvme *anv = cookie;
+	unsigned long flags;
 
 	dev_warn(anv->dev, "RTKit crashed; unable to recover without a reboot");
-	nvme_reset_ctrl(&anv->ctrl);
+	/*
+	 * RX may run inside RTKit initialization, before ctrl/admin_q exist.
+	 * Probe's initial reset observes RTKit's latched crash state. Serialize
+	 * callback scheduling with closing this gate before work cancellation.
+	 */
+	spin_lock_irqsave(&anv->event_lock, flags);
+	if (anv->reset_ready)
+		nvme_reset_ctrl(&anv->ctrl);
+	spin_unlock_irqrestore(&anv->event_lock, flags);
 }
 
 static bool apple_nvme_in_inherited_rtkit_range(struct apple_nvme *anv,
-						 struct apple_rtkit_shmem *bfr)
+						struct apple_rtkit_shmem *bfr)
 {
-	u64 ranges[APPLE_NVME_MAX_INHERITED_RTKIT_RANGES * 2];
-	int count;
+	phys_addr_t last;
+	unsigned long pfn, last_pfn;
 
-	count = of_property_count_u64_elems(anv->dev->of_node,
-					    APPLE_NVME_INHERITED_RTKIT_RANGES_PROP);
-	if (count < 2 || count > ARRAY_SIZE(ranges) || count % 2)
+	if (!anv->inherited_rtkit || !bfr->size ||
+	    check_add_overflow((phys_addr_t)bfr->iova,
+			       (phys_addr_t)bfr->size - 1, &last) ||
+	    !IS_ALIGNED(bfr->iova, dma_get_cache_alignment()) ||
+	    !IS_ALIGNED(bfr->size, dma_get_cache_alignment()) ||
+	    !apple_sart_is_inherited_region(anv->sart, bfr->iova, bfr->size))
 		return false;
-	if (of_property_read_u64_array(anv->dev->of_node,
-				       APPLE_NVME_INHERITED_RTKIT_RANGES_PROP,
-				       ranges, count))
+
+	/*
+	 * A range property or a partial System RAM intersection does not prove
+	 * ownership. Every page must be reserved and present in the linear map.
+	 * Native m1n1 reserves the predecessor's inherited allocation prefix.
+	 * RAM excluded by a resident EL2 stage needs a separate cache contract.
+	 */
+	if (region_intersects(bfr->iova, bfr->size, IORESOURCE_SYSTEM_RAM,
+			      IORES_DESC_NONE) != REGION_INTERSECTS)
 		return false;
+	last_pfn = PHYS_PFN(last);
+	for (pfn = PHYS_PFN(bfr->iova); pfn <= last_pfn; pfn++) {
+		struct page *page;
 
-	for (int i = 0; i < count; i += 2) {
-		u64 start = ranges[i];
-		u64 size = ranges[i + 1];
-
-		if (bfr->iova >= start && bfr->size <= size &&
-		    bfr->iova - start <= size - bfr->size)
-			return true;
+		if (!pfn_valid(pfn))
+			return false;
+		page = pfn_to_page(pfn);
+		if (!PageReserved(page) || PageHighMem(page) ||
+		    !virt_addr_valid(page_to_virt(page)))
+			return false;
 	}
-
-	return false;
+	return true;
 }
+
+/* A retained DMA mapping must also retain its device context. */
+struct apple_nvme_rtkit_mapping {
+	struct device *dev;
+};
 
 static int apple_nvme_sart_dma_setup(void *cookie,
 				     struct apple_rtkit_shmem *bfr)
@@ -348,39 +415,50 @@ static int apple_nvme_sart_dma_setup(void *cookie,
 	if (!bfr->size)
 		return -EINVAL;
 	if (bfr->iova) {
-		/*
-		 * A live post-M4 handoff retains the RTKit buffers allocated by
-		 * Stage 1.  Their identity IOVAs remain SART-authorized and the
-		 * firmware requests that the new owner map, rather than replace,
-		 * them.  Never accept this path for an ordinary Linux-owned session.
-		 *
-		 * A resident Stage 1 may deliberately live outside the RAM exposed
-		 * to its Linux guest.  Such a buffer is safe to retain only when the
-		 * resident owner explicitly grants its exact SART range in the DT and
-		 * maps that range into the guest.  Retained post-M4 firmware does not
-		 * reliably resume admin I/O after this buffer is replaced.
-		 */
-		if (!anv->owns_rtkit)
-			return -EINVAL;
+		struct apple_nvme_rtkit_mapping *mapping;
+		dma_addr_t dma;
+		void *buffer;
 
-		inherited_shared = apple_nvme_in_inherited_rtkit_range(anv, bfr);
-		if (region_intersects(bfr->iova, bfr->size,
-				      IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) ==
-			    REGION_INTERSECTS ||
-		    inherited_shared) {
-			bfr->buffer = memremap(bfr->iova, bfr->size, MEMREMAP_WB);
-			if (!bfr->buffer)
-				return -ENOMEM;
-			bfr->is_mapped = true;
-			bfr->private = anv;
-			if (inherited_shared)
-				dev_info(anv->dev,
-					 "mapping resident-EL2 inherited RTKit buffer: %pad+0x%zx\n",
-					 &bfr->iova, bfr->size);
-			return 0;
+		if (!apple_nvme_in_inherited_rtkit_range(anv, bfr))
+			return -EINVAL;
+		mapping = kzalloc_obj(*mapping);
+		if (!mapping)
+			return -ENOMEM;
+		buffer = memremap(bfr->iova, bfr->size, MEMREMAP_WB);
+		if (!buffer) {
+			kfree(mapping);
+			return -ENOMEM;
 		}
 
-		return -EINVAL;
+		/*
+		 * Firmware keeps the old identity IOVA. A bounce/remapped address
+		 * cannot replace it. Skip synchronization until that is verified,
+		 * and never copy a rejected bounce buffer over the live data.
+		 */
+		dma = dma_map_single_attrs(anv->dev, buffer, bfr->size,
+					   DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+		if (dma_mapping_error(anv->dev, dma)) {
+			ret = -ENOMEM;
+			goto unmap_buffer;
+		}
+		if (dma != bfr->iova) {
+			dma_unmap_single_attrs(anv->dev, dma, bfr->size,
+					       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+			ret = -EINVAL;
+			goto unmap_buffer;
+		}
+		dma_sync_single_for_device(anv->dev, dma, bfr->size, DMA_FROM_DEVICE);
+		mapping->dev = get_device(anv->dev);
+		bfr->buffer = buffer;
+		bfr->is_mapped = true;
+		bfr->needs_dma_sync = true;
+		bfr->private = mapping;
+		return 0;
+
+unmap_buffer:
+		memunmap(buffer);
+		kfree(mapping);
+		return ret;
 	}
 
 	bfr->buffer =
@@ -402,12 +480,15 @@ static void apple_nvme_sart_dma_destroy(void *cookie,
 					struct apple_rtkit_shmem *bfr)
 {
 	struct apple_nvme *anv = cookie;
+	struct apple_nvme_rtkit_mapping *mapping = bfr->private;
 
-	if (bfr->private == anv) {
+	if (mapping) {
+		dma_unmap_single(mapping->dev, bfr->iova, bfr->size, DMA_FROM_DEVICE);
 		memunmap(bfr->buffer);
+		put_device(mapping->dev);
+		kfree(mapping);
 		return;
 	}
-
 	apple_sart_remove_allowed_region(anv->sart, bfr->iova, bfr->size);
 	dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
 }
@@ -1296,19 +1377,20 @@ static void apple_nvme_reset_work(struct work_struct *work)
 
 	/*
 	 * Post-M4 firmware can be handed over live, but cannot renegotiate HELLO
-	 * and EPMAP across boot stages. Adopt the first healthy inherited session;
-	 * subsequent resets use the normal RTKit shutdown/reset path below.
+	 * and EPMAP across boot stages. Adopt the first healthy inherited session.
 	 */
 	if (!anv->owns_rtkit && apple_nvme_can_adopt_rtkit(anv)) {
 		ret = apple_rtkit_adopt_running(anv->rtk);
 		if (ret)
 			goto out;
-		dev_info(anv->dev, "adopted inherited post-M4 RTKit session\n");
+		dev_dbg(anv->dev, "adopted inherited post-M4 RTKit session\n");
 
 		/*
 		 * U-Boot keeps the controller enabled until the mailbox session has
-		 * an owner.  Disable it only after adoption, then replace every queue
-		 * pointer below while CC.EN is clear.
+		 * an owner. Disable it only after adoption, so that the admin queue
+		 * and NVMMU pointers below are replaced while CC.EN is clear. The
+		 * I/O queue registers are written after Create SQ, as on a cold
+		 * start.
 		 */
 		anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
 		anv->ctrl.ctrl_config =
@@ -1317,8 +1399,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			ret = nvme_disable_ctrl(&anv->ctrl, false);
 			if (ret)
 				goto out;
-			dev_info(anv->dev,
-				 "disabled inherited post-M4 controller after RTKit adoption\n");
+			dev_dbg(anv->dev,
+				"disabled inherited post-M4 controller after RTKit adoption\n");
 		}
 		goto rtkit_ready;
 	}
@@ -1390,7 +1472,6 @@ booted:
 
 rtkit_ready:
 	anv->owns_rtkit = true;
-	dev_dbg(anv->dev, "RTKit ownership established\n");
 
 	ret = readl_poll_timeout(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS,
 				 boot_status,
@@ -1787,6 +1868,14 @@ static void devm_apple_nvme_mempool_destroy(void *data)
 	mempool_destroy(data);
 }
 
+static void apple_nvme_free_rtkit(void *data)
+{
+	struct apple_nvme *anv = data;
+
+	apple_nvme_set_reset_ready(anv, false);
+	apple_rtkit_free(anv->rtk);
+}
+
 static void apple_nvme_flush_work(struct work_struct *work)
 {
 	struct nvme_command c = { };
@@ -1821,6 +1910,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		return ERR_PTR(-ENOMEM);
 
 	anv->dev = get_device(dev);
+	spin_lock_init(&anv->event_lock);
 	anv->adminq.is_adminq = true;
 	platform_set_drvdata(pdev, anv);
 
@@ -1869,6 +1959,12 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		}
 	} else {
 		anv->mmio_nvmmu = anv->mmio_nvme;
+	}
+
+	ret = apple_nvme_read_handoff(anv);
+	if (ret) {
+		dev_err_probe(dev, ret, "Invalid live firmware handoff\n");
+		goto put_dev;
 	}
 
 	if (anv->hw->has_lsq_nvmmu) {
@@ -1952,33 +2048,27 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	 * traffic can race the later reset work and be dropped as undiscovered.
 	 */
 	inherited_rtkit = apple_nvme_can_adopt_rtkit(anv);
+	/* Publish admission before the initializer enables mailbox RX. */
+	anv->inherited_rtkit = inherited_rtkit;
 	if (anv->hw->needs_ioq_registers)
-		dev_info(dev, "post-M4 firmware handoff: CC=%#x CSTS=%#x adopt=%d\n",
-			 readl(anv->mmio_nvme + NVME_REG_CC),
-			 readl(anv->mmio_nvme + NVME_REG_CSTS), inherited_rtkit);
+		dev_dbg(dev, "post-M4 firmware handoff: CC=%#x CSTS=%#x adopt=%d\n",
+			readl(anv->mmio_nvme + NVME_REG_CC),
+			readl(anv->mmio_nvme + NVME_REG_CSTS), inherited_rtkit);
 	if (inherited_rtkit)
-		anv->rtk = devm_apple_rtkit_init_adopted(
-			dev, anv, NULL, 0, &apple_nvme_rtkit_ops);
+		anv->rtk = apple_rtkit_init_adopted(dev, anv, NULL, 0,
+						    &apple_nvme_rtkit_ops);
 	else
-		anv->rtk = devm_apple_rtkit_init(
-			dev, anv, NULL, 0, &apple_nvme_rtkit_ops);
+		anv->rtk = apple_rtkit_init(dev, anv, NULL, 0,
+					    &apple_nvme_rtkit_ops);
 	if (IS_ERR(anv->rtk)) {
 		ret = dev_err_probe(dev, PTR_ERR(anv->rtk),
 				    "Failed to initialize RTKit");
 		goto put_dev;
 	}
 
-	if (anv->hw->has_lsq_nvmmu) {
-		ret = devm_blk_crypto_profile_init(dev, &anv->crypto_profile, 0);
-		if (ret)
-			goto put_dev;
-		anv->crypto_profile.max_dun_bytes_supported = sizeof(u64);
-		anv->crypto_profile.key_types_supported =
-			BLK_CRYPTO_KEY_TYPE_HW_WRAPPED;
-		anv->crypto_profile.modes_supported[BLK_ENCRYPTION_MODE_AES_256_XTS] =
-			BIT(ilog2(APPLE_NVME_CRYPTO_DATA_UNIT_SIZE));
-		anv->crypto_profile.dev = dev;
-	}
+	ret = devm_add_action_or_reset(dev, apple_nvme_free_rtkit, anv);
+	if (ret)
+		goto put_dev;
 
 	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops,
 			     NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
@@ -2026,6 +2116,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
 
+	apple_nvme_set_reset_ready(anv, true);
 	nvme_reset_ctrl(&anv->ctrl);
 	async_schedule(apple_nvme_async_probe, anv);
 
