@@ -119,14 +119,13 @@ static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 
 	mapped = iommu_map_sgtable(isp->domain, surf->iova, &surf->sgt,
 				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (mapped < 0 || mapped != surf->size) {
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
-		/* Negative errors already unwind their mappings in iommu_map_sg(). */
 		if (mapped > 0)
 			iommu_unmap(isp->domain, surf->iova, mapped);
 		sg_free_table(&surf->sgt);
-		return mapped < 0 ? (int)mapped : -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
 
 	return 0;
@@ -256,13 +255,13 @@ int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
 
 	mapped = iommu_map_sgtable(isp->domain, surf->iova, sgt,
 				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (mapped < 0 || mapped != surf->size) {
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
 		if (mapped > 0)
 			iommu_unmap(isp->domain, surf->iova, mapped);
 		isp_surf_unreserve_iova(isp, surf);
-		return mapped < 0 ? (int)mapped : -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
 
 	return 0;
