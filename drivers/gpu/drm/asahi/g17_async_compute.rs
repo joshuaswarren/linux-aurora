@@ -288,6 +288,33 @@ impl G17PLiveRuntime {
             .active.as_ref()?.packet.completion().ok().map(|c| c.fence())
     }
 
+    /// The runtime lock serializes this snapshot against publication and
+    /// retirement. Keep the published QID stamp, never predict the next kick.
+    pub(crate) fn async_compute_native_dependency(
+        &mut self, owner: u64, status: &Arc<crate::g17_status::VmStatus>,
+    ) -> Result<Option<g17_submission::G17PClBarrierDependency>> {
+        let handshake = self.manager.as_mut().ok_or(ENODEV)?
+            .firmware_recovery_handshake_snapshot()?;
+        let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) else {
+            return Ok(None);
+        };
+        let Some(active) = q.active.as_ref() else { return Ok(None); };
+        let completion = active.packet.completion()?;
+        if !Arc::ptr_eq(&completion.status, status) { return Err(EIO); }
+        let ticket = active.retirement.as_ref().ok_or(EIO)?;
+        if q.quarantined || handshake.state != 0 || ticket.recovery_epoch != handshake.epoch {
+            return Err(EIO);
+        }
+        // SAFETY: completion retains this hardware fence throughout the read.
+        let fence = completion.fence();
+        let state = unsafe { kernel::bindings::dma_fence_get_status(
+            kernel::dma_fence::RawDmaFence::raw(&fence),
+        ) };
+        if state < 0 { return Err(Error::from_errno(state)); }
+        if state > 0 { return Ok(None); }
+        Ok(Some(q.queue.published_compute_dependency()?))
+    }
+
     /// A burst experiment must not include first install or a newly rebound
     /// graph. These checks are diagnostic eligibility, not execution capacity.
     pub(crate) fn async_compute_burst_steady(&self, owner: u64) -> bool {
@@ -304,6 +331,21 @@ impl G17PLiveRuntime {
     ) -> Result {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
         self.settle_open_recovery_before_publication()?;
+        let mut dependencies = [g17_submission::G17PClBarrierDependency {
+            native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
+        }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
+        let mut dependency_count = 0;
+        for predecessor in Iterator::chain(
+            self.pending_render.iter(), self.pending_render_queued.iter(),
+        ).flatten() {
+            if let Some(dependency) = predecessor.compute_predecessor_dependency(
+                owner, &packet.completion()?.status,
+                packet.command().render_wait_through, packet.command().render_wait_last,
+            )? {
+                *dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)? = dependency;
+                dependency_count += 1;
+            }
+        }
         // Render jobs now retain independent application-GART roots and
         // job-private low views.  Compute QID4+ has no render context lease to
         // reclaim, so publication may proceed while either render slot runs.
@@ -337,7 +379,8 @@ impl G17PLiveRuntime {
                     dispatch_identity: 0x0100_01d7_0200_01dc,
                     timestamps: g17_uapi::ComputeTimestampAddresses { start: timestamp_start, end: timestamp_end },
                     descriptor_flag_4c: false,
-                    converted_command_timestamp: 1, barriers: &[], mcache: None,
+                    converted_command_timestamp: 1,
+                    barriers: &dependencies[..dependency_count], mcache: None,
                     rce_kind: 0, auxiliary: 0x003f_ffff_ffff_ffff,
                 },
             )?;
