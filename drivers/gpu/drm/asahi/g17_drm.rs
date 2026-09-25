@@ -774,6 +774,7 @@ pub(crate) struct G17PRenderCompletion {
     /// printk traffic while still joining a recovery to the exact UAPI work.
     submission_id: u64,
     vdm_base: u64,
+    owner: u64,
     /// 0xff until the scheduler worker acquires the exact physical slot.
     render_slot: AtomicU32,
     /// Vertex start/end and fragment start/end UAPI destinations.
@@ -795,6 +796,7 @@ impl G17PRenderCompletion {
         vm_job: mmu::T8140VmJobGuard,
         submission_id: u64,
         vdm_base: u64,
+        owner: u64,
     ) -> Result<Arc<Self>> {
         let lease = Arc::pin_init(
             new_mutex!(None, "G17PRenderCompletion::lease"),
@@ -808,6 +810,7 @@ impl G17PRenderCompletion {
             fence,
             submission_id,
             vdm_base,
+            owner,
             render_slot: AtomicU32::new(u8::MAX as u32),
             timestamps,
             status,
@@ -959,8 +962,10 @@ impl G17PRenderCompletion {
             let published_ns = self.published_ns.load(Ordering::Acquire);
             let durations = gpu_durations.unwrap_or([0; 2]);
             pr_info!(
-                "G17P render timing: submission={} slot={} attach={}ns publish={}ns complete={}ns dependency={}ns publication={}ns retirement={}ns gpu-ta={} gpu-3d={} ok={}\n",
+                "G17P render timing: owner={} submission={} vdm={:#x} slot={} attach={}ns publish={}ns complete={}ns dependency={}ns publication={}ns retirement={}ns gpu-ta={} gpu-3d={} ok={}\n",
+                self.owner,
                 self.submission_id,
+                self.vdm_base,
                 self.render_slot.load(Ordering::Acquire),
                 attached_ns,
                 published_ns,
@@ -1387,9 +1392,19 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
             let mut control_backpressure_polls = 0usize;
             let mut flist_release_polls = 0usize;
             let mut device_control_polls = 0usize;
+            let trace_limit = *module_parameters::g17p_trace_depth.value();
+            let mut stages = crate::g17_perf::RenderStageTimes::default();
+            stages.enabled = *module_parameters::g17p_completion_trace.value() != 0
+                && trace_limit != 0
+                && G17P_RENDER_POLL_RECORDS.load(Ordering::Relaxed) < trace_limit;
             let submit = loop {
                 if packet.cancel_requested() { break Err(ECANCELED); }
+                let lock_started = stages.enabled.then(Instant::<Monotonic>::now);
                 let mut runtime = self.runtime.mutex().lock();
+                if let Some(started) = lock_started {
+                    stages.runtime_lock_ns = stages.runtime_lock_ns.saturating_add(
+                        started.elapsed().as_nanos().max(0) as u64);
+                }
                 failure_stage = "render-query-freelist-release";
                 if runtime.render_usc_freelist_release_pending_for_slot(render_slot)? {
                     drop(runtime);
@@ -1451,18 +1466,22 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
                     self.context.clone(),
                     packet.command(),
                     completion.clone(),
+                    &mut stages,
                 );
             };
-            let trace_limit = *module_parameters::g17p_trace_depth.value();
             if *module_parameters::g17p_completion_trace.value() != 0
                 && trace_limit != 0
                 && G17P_RENDER_POLL_RECORDS.fetch_add(1, Ordering::Relaxed) < trace_limit
             {
                 pr_info!(
-                    "G17P render admission: submission={} slot={} flist-polls={} control-polls={} fast-poll={}\n",
-                    submission_id, render_slot, flist_release_polls,
+                    "G17P render admission: owner={} submission={} vdm={:#x} slot={} flist-polls={} control-polls={} fast-poll={} lock={}ns handoff={}ns prepare={}ns restage={}ns reachability={}ns cache-hit={} flist-request={}ns tvb-blocks={} retained={}\n",
+                    self.owner, submission_id, completion.vdm_base, render_slot, flist_release_polls,
                     device_control_polls,
                     *module_parameters::g17p_flist_fast_poll.value(),
+                    stages.runtime_lock_ns, stages.handoff_ns, stages.prepare_ns,
+                    stages.restage_ns, stages.reachability_ns,
+                    stages.reachability_cache_hit,
+                    stages.flist_request_ns, stages.tvb_blocks, stages.retained,
                 );
             }
             drop(transition);
@@ -2000,6 +2019,7 @@ impl G17PQueue {
             vm_job,
             submission_id,
             translated.vdm_base,
+            self.id,
         )?;
         let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
         let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
