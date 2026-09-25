@@ -197,7 +197,7 @@ struct cmd_set_dsid_clr_req_base {
 } __packed;
 static_assert(sizeof(struct cmd_set_dsid_clr_req_base) == 0x14);
 
-/* ISP17a (t8140): one broadcast-clear window in the multi-BC form */
+/* H17: a count of broadcast-clear windows and the first window */
 struct cmd_set_dsid_clr_multi_bc_reg_base {
 	u64 opcode;
 	u8 count;
@@ -260,8 +260,8 @@ int isp_cmd_config_get(struct apple_isp *isp, struct cmd_config_get *args);
 int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base);
 int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
 				  u32 dsid_clr_range);
-int isp_cmd_set_dsid_clr_multi_bc_reg_base(struct apple_isp *isp,
-					   u64 dsid_clr_base, u32 dsid_clr_range);
+int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
+				  u32 dsid_clr_range);
 int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
 				   u64 dsid_clr_base3, u32 dsid_clr_range0,
@@ -341,15 +341,15 @@ struct cmd_ch_info {
 static_assert(sizeof(struct cmd_ch_info) == 0x118);
 
 /*
- * t8140 (H17 firmware) CH_INFO_GET is a 0x190-byte in/out record whose first
- * 0x118 bytes match cmd_ch_info (version at +0x20, num_presets at +0x60, the
- * per-frame meta size 0x4d00 at +0x68).
+ * The H17 firmware exchanges a 0x190-byte CH_INFO_GET record whose first
+ * 0x118 bytes match struct cmd_ch_info; there unk_68 is the size of the
+ * per-frame metadata record.
  */
-struct cmd_ch_info_t8140 {
+struct cmd_ch_info_h17 {
 	struct cmd_ch_info info;
 	u32 unk_118[0x1e];
 } __packed;
-static_assert(sizeof(struct cmd_ch_info_t8140) == 0x190);
+static_assert(sizeof(struct cmd_ch_info_h17) == 0x190);
 
 struct cmd_ch_camera_config {
 	u64 opcode;
