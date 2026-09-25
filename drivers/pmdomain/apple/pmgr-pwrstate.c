@@ -527,14 +527,6 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		dev_err(ps->dev, "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
 			genpd->name, pstate, reg, cur);
 
-	if (ps->gfx_axi2af && pstate == APPLE_PMGR_PS_ACTIVE) {
-		/* The write wrapper already completed the native post-ON handshake. */
-		if (ret < 0)
-			return ret;
-		if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) != APPLE_PMGR_PS_ACTIVE)
-			return -EIO;
-	}
-
 	if (auto_enable) {
 		int write_ret;
 
