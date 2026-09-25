@@ -5985,6 +5985,7 @@ impl G17PManagerConstruction {
         command: &g17_uapi::TranslatedRenderCommand,
         registers: &regs::Resources,
         registration_power: &mut impl FnMut(&mut Self) -> Result,
+        stages: &mut crate::g17_perf::RenderStageTimes,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         if self.render_queue_pair(queue_pair.slot())? != queue_pair { return Err(EIO); }
         if let Some(leases) = self.render_channel_leases[usize::from(queue_pair.slot())] {
@@ -6110,6 +6111,7 @@ impl G17PManagerConstruction {
             [command_buffer_state_word; 2],
             registers,
             registration_power,
+            stages,
         );
         if result.is_err() && !self.render_hardware_buffer_published {
             // acquire() stages a copy of the completed FList owner. Until
@@ -6161,6 +6163,7 @@ impl G17PManagerConstruction {
         command_buffer_state_words: [u32; 2],
         registers: &regs::Resources,
         registration_power: &mut impl FnMut(&mut Self) -> Result,
+        stages: &mut crate::g17_perf::RenderStageTimes,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         let render_sksm = crate::g17_config::RENDER_SKSM;
         let native_doorbell_mode =
@@ -6206,6 +6209,9 @@ impl G17PManagerConstruction {
             return Err(Self::render_stage_fail("legacy-context0-alias-live", EBUSY));
         }
         let retained = self.render_storage.is_some();
+        if stages.enabled {
+            stages.retained = retained;
+        }
         // Context 1 is the stable firmware-service root. Each retained render
         // owner maps a distinct FList backing into it, while the queue's
         // independently allocated application-GART context owns command data
@@ -6264,6 +6270,8 @@ impl G17PManagerConstruction {
                 .as_ref()
                 .ok_or(ENODEV)?
                 .parameter_buffer_page_list_vas()?;
+            let restage_started = stages.enabled.then(
+                kernel::time::Instant::<kernel::time::Monotonic>::now);
             self.render_storage
                 .as_mut()
                 .ok_or(ENODEV)?
@@ -6278,6 +6286,9 @@ impl G17PManagerConstruction {
                     self.render_submission_ordinal,
                 )
                 .map_err(|error| Self::render_stage_fail("restage-command", error))?;
+            if let Some(started) = restage_started {
+                stages.restage_ns = started.elapsed().as_nanos().max(0) as u64;
+            }
             // The retained PM owner validates its unchanged PBDesc identity.
             // Firmware owns the live page-list/PBDesc cursors; do not reset
             // them to cold values when preparing another Scene. The cold
@@ -6420,7 +6431,15 @@ impl G17PManagerConstruction {
                     |lifecycle| lifecycle.sequence,
                 ));
             }
-            if let Some(failed) = storage.first_unreachable(self.resources.uat(), vm) {
+            let reachability_started = stages.enabled.then(
+                kernel::time::Instant::<kernel::time::Monotonic>::now);
+            let unreachable = storage.first_unreachable_cached(self.resources.uat(), vm);
+            if let Some(started) = reachability_started {
+                stages.reachability_ns = started.elapsed().as_nanos().max(0) as u64;
+                stages.reachability_cache_hit = storage.last_reachability_cache_hit();
+                stages.tvb_blocks = u32::try_from(storage.tvb_capacity()).unwrap_or(u32::MAX);
+            }
+            if let Some(failed) = unreachable {
                 storage.log_reachability(dev, self.resources.uat(), vm);
                 dev_err!(
                     dev.as_ref(),

@@ -18,6 +18,22 @@
 /// constant is visible instead of silent.
 pub(crate) const NOMINAL_TICK_KHZ: u64 = 24_000;
 
+/// Opt-in subdivisions of one G17P render publication. The bounded trace
+/// prints these after preparation, so its printk cannot inflate inner stages.
+#[derive(Default)]
+pub(crate) struct RenderStageTimes {
+    pub(crate) enabled: bool,
+    pub(crate) runtime_lock_ns: u64,
+    pub(crate) handoff_ns: u64,
+    pub(crate) prepare_ns: u64,
+    pub(crate) restage_ns: u64,
+    pub(crate) reachability_ns: u64,
+    pub(crate) reachability_cache_hit: bool,
+    pub(crate) flist_request_ns: u64,
+    pub(crate) tvb_blocks: u32,
+    pub(crate) retained: bool,
+}
+
 /// Backoff schedule for a completion poll loop.
 ///
 /// The render wait used to sleep a flat `fsleep(Delta::from_millis(1))`

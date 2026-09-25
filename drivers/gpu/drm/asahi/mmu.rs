@@ -704,10 +704,21 @@ struct VmInner {
     is_kernel: bool,
     va_range: Range<u64>,
     page_table: UatPageTable,
+    /// Changes before every attempted leaf or permission mutation while the
+    /// GPUVM exec lock is held. A failed attempt may invalidate a cached
+    /// reachability result conservatively. Overflow disables caching.
+    mapping_validation_epoch: Option<u64>,
     mm: mm::Allocator<(), KernelMappingInner>,
     uat_inner: Arc<UatInner>,
     binding: Arc<Mutex<VmBinding>>,
     id: u64,
+}
+
+impl VmInner {
+    fn note_mapping_validation_change(&mut self) {
+        self.mapping_validation_epoch = self.mapping_validation_epoch
+            .and_then(|epoch| epoch.checked_add(1));
+    }
 }
 
 /// Slot binding-related inner data for a Vm instance.
@@ -828,6 +839,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         // GPUVM cannot see driver-owned KernelMappings.  Preflight the full
         // object range in the authoritative page table and allocate every
         // intermediate table before the first scatterlist leaf is written.
+        self.note_mapping_validation_change();
         self.page_table
             .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
 
@@ -947,6 +959,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         let va = op.va().expect("step_unmap: missing VA");
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
 
+        self.note_mapping_validation_change();
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
@@ -991,6 +1004,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let unmap_range = unmap_end - unmap_start;
 
+        self.note_mapping_validation_change();
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
         self.tlbi_live_contexts(unmap_start, unmap_range);
@@ -1084,6 +1098,7 @@ impl VmInner {
             .ok_or(EOVERFLOW)?;
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
+        self.note_mapping_validation_change();
         self.page_table.prepare_map(iova..mapping_end)?;
         let guard = node.bo.as_ref().ok_or(EINVAL)?.get()?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
@@ -1785,6 +1800,7 @@ impl KernelMapping {
         // Remap in-place as uncached.
         // Do not try to unmap the guard page (-1)
         let prot = self.0.prot.as_uncached();
+        owner.note_mapping_validation_change();
         if owner
             .page_table
             .reprot_pages(self.iova_range(), prot)
@@ -1953,6 +1969,7 @@ impl Drop for KernelMapping {
             self.size()
         );
 
+        owner.note_mapping_validation_change();
         if owner.page_table.unmap_pages(self.iova_range()).is_err() {
             dev_err!(
                 owner.dev.as_ref(),
@@ -2330,6 +2347,7 @@ impl Vm {
                     va_range,
                     is_kernel,
                     page_table,
+                    mapping_validation_epoch: Some(0),
                     mm,
                     uat_inner,
                     binding: binding_clone,
@@ -2807,8 +2825,8 @@ impl Vm {
     }
 
     /// Check that a byte range is fully mapped with the requested GPU access.
-    pub(crate) fn covers_range(
-        &self,
+    fn covers_range_locked(
+        inner: &mut VmInner,
         address: u64,
         size: u64,
         need_read: bool,
@@ -2830,10 +2848,6 @@ impl Vm {
                 None => return false,
             }
         };
-        let mut inner = match self.inner.exec_lock(None, false) {
-            Ok(inner) => inner,
-            Err(_) => return false,
-        };
         if start < inner.va_range.start || aligned_end > inner.va_range.end {
             return false;
         }
@@ -2841,6 +2855,52 @@ impl Vm {
             .page_table
             .covers_range(start..aligned_end, need_read, need_write)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn covers_range(
+        &self,
+        address: u64,
+        size: u64,
+        need_read: bool,
+        need_write: bool,
+    ) -> bool {
+        let mut inner = match self.inner.exec_lock(None, false) {
+            Ok(inner) => inner,
+            Err(_) => return false,
+        };
+        Self::covers_range_locked(&mut inner, address, size, need_read, need_write)
+    }
+
+    /// Evaluate a sparse block/guard set against one consistent page-table
+    /// snapshot. The old loop acquired the GPUVM exec lock twice per block.
+    pub(crate) fn covers_sparse_blocks_with_guards(
+        &self,
+        addresses: &[u64],
+        block_size: u64,
+        stride: u64,
+    ) -> bool {
+        if stride <= block_size {
+            return false;
+        }
+        let mut inner = match self.inner.exec_lock(None, false) {
+            Ok(inner) => inner,
+            Err(_) => return false,
+        };
+        addresses.iter().all(|&address| {
+            let Some(guard) = address.checked_add(block_size) else {
+                return false;
+            };
+            Self::covers_range_locked(&mut inner, address, block_size, true, true)
+                && !Self::covers_range_locked(
+                    &mut inner, guard, stride - block_size, false, false)
+        })
+    }
+
+    /// A conservative stamp for cached reachability checks. Taking the exec
+    /// lock makes a lookup wait for any in-progress leaf transaction, including
+    /// one that partially failed. `None` means the caller must validate fully.
+    pub(crate) fn mapping_validation_epoch(&self) -> Option<u64> {
+        self.inner.exec_lock(None, false).ok()?.mapping_validation_epoch
     }
 
     /// Resolve an IOVA through this VM's current page table. Callers use this
@@ -3452,6 +3512,7 @@ impl Vm {
             0,
         )?;
 
+        inner.note_mapping_validation_change();
         let prepared = inner
             .page_table
             .prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
