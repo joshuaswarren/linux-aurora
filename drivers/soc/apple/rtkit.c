@@ -395,57 +395,65 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 					    struct apple_rtkit_shmem *buffer,
 					    u8 ep, u64 msg)
 {
+	struct apple_rtkit_shmem request = {};
 	u64 reply;
 	int err;
 
 	/* The different size vs. IOVA shifts look odd but are indeed correct this way */
 	if (ep == APPLE_RTKIT_EP_OSLOG) {
-		buffer->size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg);
-		buffer->iova = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg) << 12;
+		request.size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg);
+		request.iova = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg) << 12;
 	} else {
-		buffer->size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
-		buffer->iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
+		request.size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
+		request.iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
 	}
-
-	buffer->buffer = NULL;
-	buffer->iomem = NULL;
-	buffer->is_mapped = false;
-
-	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
-		buffer->size, &buffer->iova);
+	if (!request.size) {
+		err = -EINVAL;
+		goto error;
+	}
 
 	/*
-	 * G17P places its crash log in the GPU UAT and sends that DVA in the
-	 * request.  Linux cannot map it through the device DMA domain.  Retain the
-	 * DVA for diagnostics and echo the request exactly as firmware expects.
+	 * A repeated request must not retire a buffer the firmware may still be
+	 * using. Re-send the reply for an identical request and refuse a changed
+	 * one; a different geometry needs a confirmed firmware restart (reinit)
+	 * first.
 	 */
-	if (rtk->firmware_owned_crashlog &&
-	    ep == APPLE_RTKIT_EP_CRASHLOG && buffer->iova) {
-		buffer->is_mapped = true;
-		err = apple_rtkit_send_message(rtk, ep, msg, NULL, false);
-		if (err)
-			goto error;
-		return 0;
+	if (buffer->size) {
+		if (request.size != buffer->size ||
+		    (request.iova != buffer->iova &&
+		     (request.iova || buffer->is_mapped))) {
+			dev_err(rtk->dev,
+				"RTKit: buffer request for 0x%zx bytes at %pad while 0x%zx bytes at %pad are live\n",
+				request.size, &request.iova, buffer->size,
+				&buffer->iova);
+			return -EBUSY;
+		}
+		goto reply;
 	}
 
-	if (buffer->iova && !rtk->ops->shmem_setup) {
+	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
+		request.size, &request.iova);
+
+	if (request.iova && !rtk->ops->shmem_setup) {
 		err = -EINVAL;
 		goto error;
 	}
 
 	if (rtk->ops->shmem_setup) {
-		err = rtk->ops->shmem_setup(rtk->cookie, buffer);
+		err = rtk->ops->shmem_setup(rtk->cookie, &request);
 		if (err)
 			goto error;
 	} else {
-		buffer->buffer = dma_alloc_coherent(rtk->dev, buffer->size,
-						    &buffer->iova, GFP_KERNEL);
-		if (!buffer->buffer) {
+		request.buffer = dma_alloc_coherent(rtk->dev, request.size,
+						    &request.iova, GFP_KERNEL);
+		if (!request.buffer) {
 			err = -ENOMEM;
 			goto error;
 		}
 	}
+	*buffer = request;
 
+reply:
 	if (!buffer->is_mapped) {
 		/* oslog uses different fields and needs a shifted IOVA instead of size */
 		if (ep == APPLE_RTKIT_EP_OSLOG) {
@@ -470,13 +478,7 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 
 error:
 	dev_err(rtk->dev, "RTKit: failed buffer request for 0x%zx bytes (%d)\n",
-		buffer->size, err);
-
-	buffer->buffer = NULL;
-	buffer->iomem = NULL;
-	buffer->iova = 0;
-	buffer->size = 0;
-	buffer->is_mapped = false;
+		request.size, err);
 	return err;
 }
 
