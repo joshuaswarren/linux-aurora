@@ -99,30 +99,13 @@ pub trait Operations {
 pub struct RtKit<T: Operations> {
     rtk: *mut bindings::apple_rtkit,
     data: *mut core::ffi::c_void,
+    retain_shared_buffers: bool,
     _p: PhantomData<T>,
 }
 
-/// Exact result from a discovery-only HELLO/EPMAP exchange.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct EpmapSnapshot {
-    /// Unmodified endpoint-zero HELLO message received from firmware.
-    pub raw_hello: u64,
-    /// HELLO minimum protocol version.
-    pub hello_min_version: u16,
-    /// HELLO maximum protocol version.
-    pub hello_max_version: u16,
-    /// Raw 256-bit endpoint bitmap, little-endian by endpoint number.
-    pub endpoints: [u64; 4],
-}
-
-impl EpmapSnapshot {
-    /// Return whether firmware advertised an endpoint in its EPMAP.
-    pub fn has_endpoint(&self, endpoint: u8) -> bool {
-        let word = endpoint as usize / 64;
-        let bit = endpoint as usize % 64;
-        self.endpoints[word] & (1u64 << bit) != 0
-    }
-}
+// The wrapper owns opaque pointers. Neither the C allocation nor the foreign
+// callback context points back to this Rust wrapper, so moving it is safe.
+impl<T: Operations> Unpin for RtKit<T> {}
 
 unsafe extern "C" fn crashed_callback<T: Operations>(
     cookie: *mut core::ffi::c_void,
@@ -182,6 +165,10 @@ unsafe extern "C" fn shmem_setup_callback<T: Operations>(
         let iova = buf.iova()?;
         let iosys_map = buf.buf()?;
 
+        // The C transport accesses this pointer as normal system memory.
+        if iosys_map.is_iomem() {
+            return Err(EINVAL);
+        }
         if iosys_map.size() < bfr_mut.size {
             return Err(ENOMEM);
         }
@@ -325,8 +312,27 @@ impl<T: Operations> RtKit<T> {
         Ok(Self {
             rtk,
             data: ptr,
+            retain_shared_buffers: false,
             _p: PhantomData,
         })
+    }
+
+    /// Requests acknowledged RTKit shutdown using the C core's bounded waits.
+    ///
+    /// The caller must not hold a lock needed by its receive callbacks: the
+    /// shutdown path also drains the RTKit workqueue.
+    pub fn shutdown(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid and the mutable borrow excludes other callers.
+        to_result(unsafe { bindings::apple_rtkit_shutdown(self.rtk) })
+    }
+
+    /// Retains firmware-visible buffers when a shutdown cannot be confirmed.
+    ///
+    /// Drop will still close callbacks and drain the private RTKit queue, but
+    /// shared mappings/allocation contexts remain retained until reboot. The
+    /// owner must retain its own DMA buffers too. This does not permit reprobe.
+    pub fn retain_shared_buffers_on_drop(&mut self) {
+        self.retain_shared_buffers = true;
     }
 
     /// Boots (wakes up) the RTKit coprocessor.
@@ -390,7 +396,13 @@ unsafe impl<T: Operations> Send for RtKit<T> {}
 impl<T: Operations> Drop for RtKit<T> {
     fn drop(&mut self) {
         // SAFETY: The pointer is valid by the type invariant.
-        unsafe { bindings::apple_rtkit_free(self.rtk) };
+        unsafe {
+            if self.retain_shared_buffers {
+                bindings::apple_rtkit_free_retaining_buffers(self.rtk);
+            } else {
+                bindings::apple_rtkit_free(self.rtk);
+            }
+        }
 
         // Free context data.
         //
