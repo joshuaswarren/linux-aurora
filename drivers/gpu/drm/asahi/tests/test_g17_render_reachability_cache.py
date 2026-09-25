@@ -29,6 +29,7 @@ tests = [
 constant = next(line for line in source.splitlines()
                 if line.startswith("pub(crate) const G17P_RENDER_MAX_IN_FLIGHT:"))
 program = "\n".join([
+    "use core::ops::Range;",
     constant,
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
     item("struct G17PRenderReachabilityKey"),
@@ -48,11 +49,12 @@ mod mmu {
         pub epoch: Cell<Option<u64>>,
         pub reads: Cell<u64>,
         pub mutate_on_read: Cell<Option<u64>>,
+        pub mutation_intersects: Cell<bool>,
     }
     impl Vm {
         pub fn new(id: u64) -> Self {
             Self { id, epoch: Cell::new(Some(1)), reads: Cell::new(0),
-                   mutate_on_read: Cell::new(None) }
+                   mutate_on_read: Cell::new(None), mutation_intersects: Cell::new(true) }
         }
         pub fn id(&self) -> u64 { self.id }
         pub fn mapping_validation_epoch(&self) -> Option<u64> {
@@ -61,6 +63,17 @@ mod mmu {
             self.epoch.get()
         }
         pub fn bump(&self) { self.epoch.set(self.epoch.get().and_then(|v| v.checked_add(1))); }
+        pub fn bump_unrelated(&self) { self.mutation_intersects.set(false); self.bump(); }
+        pub fn mapping_changes_since(
+            &self, previous: u64, mut intersects: impl FnMut(core::ops::Range<u64>) -> bool,
+        ) -> Option<(u64, bool)> {
+            let now = self.epoch.get()?;
+            Some((now, now != previous && intersects(if self.mutation_intersects.get() {
+                1..2
+            } else {
+                100..101
+            })))
+        }
     }
     pub struct Uat { pub kernel: Vm }
     impl Uat { pub fn kernel_vm(&self) -> &Vm { &self.kernel } }
@@ -83,6 +96,9 @@ impl G17PUserRenderStorage {
         self.walks += 1;
         if self.mutate_during_walk { vm.bump(); }
         if self.fail { Some("missing-block") } else { None }
+    }
+    fn mapping_change_touches_graph(&self, range: Range<u64>, _: bool) -> bool {
+        range.start == 1
     }
 '''
 program += item("fn reachability_key(") + "\n"
@@ -116,6 +132,22 @@ fn wrapper_skips_walk_only_for_matching_vm_epochs_and_generation() {
     other_vm.epoch.set(vm.epoch.get());
     storage.first_unreachable_cached(&uat, &other_vm);
     assert_eq!(storage.walks, 5);
+}
+#[test]
+fn wrapper_keeps_proof_across_unrelated_app_and_kernel_maps() {
+    let (mut storage, uat, vm) = fixture();
+    storage.first_unreachable_cached(&uat, &vm);
+    vm.bump_unrelated();
+    storage.first_unreachable_cached(&uat, &vm);
+    assert_eq!(storage.walks, 1);
+    assert!(storage.last_reachability_cache_hit);
+    uat.kernel.bump_unrelated();
+    storage.first_unreachable_cached(&uat, &vm);
+    assert_eq!(storage.walks, 1);
+    vm.mutation_intersects.set(true);
+    vm.bump();
+    storage.first_unreachable_cached(&uat, &vm);
+    assert_eq!(storage.walks, 2);
 }
 #[test]
 fn wrapper_never_caches_failed_or_overlapping_walks() {
