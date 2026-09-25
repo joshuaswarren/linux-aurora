@@ -9,6 +9,8 @@
 #include "isp-fw.h"
 
 #define ISP_IPC_FLAG_TERMINAL_ACK	0x3
+/* longer firmware log lines are cut */
+#define ISP_IPC_TERMINAL_MAX_LEN	512
 #define ISP_IPC_BUFEXC_STAT_META_OFFSET 0x10
 
 struct isp_sm_deferred_work {
@@ -203,23 +205,16 @@ MODULE_PARM_DESC(fwlog, "Copy the ISP firmware's terminal output to the kernel l
 
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
-	struct isp_message *rsp = &chan->rsp;
-	struct isp_message *req = &chan->req;
-	char buf[512];
-	dma_addr_t iova = isp_fw_iova(isp, req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK);
-	u32 size = req->arg1;
+	struct isp_message *req = &chan->req, *rsp = &chan->rsp;
+	dma_addr_t iova = req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK;
+	size_t size = min_t(u64, req->arg1, ISP_IPC_TERMINAL_MAX_LEN);
+	const char *line;
 
-	if (fwlog && iova && size &&
-	    size < sizeof(buf) && isp->log_surf) {
-		void *p = apple_isp_translate(isp, isp->log_surf, iova, size);
-		if (p) {
-			size = min_t(u32, size, 512);
-			memcpy(buf, p, size);
-			while (size && (buf[size - 1] == '\n' || buf[size - 1] == '\r' ||
-					buf[size - 1] == '\0'))
-				size--;
-			dev_info(isp->dev, "ISPASC: %.*s\n", size, buf);
-		}
+	/* Firmware log output, available through dynamic debug */
+	if (iova && size && isp->log_surf) {
+		line = apple_isp_translate(isp, isp->log_surf, iova, size);
+		if (line)
+			dev_dbg(isp->dev, "ISPASC: %.*s", (int)size, line);
 	}
 
 	rsp->arg0 = ISP_IPC_FLAG_ACK;
