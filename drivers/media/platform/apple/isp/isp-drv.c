@@ -469,8 +469,6 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto halt_firmware;
 	}
 
-	dev_info(dev, "apple-isp probe!\n");
-
 	return 0;
 
 halt_firmware:
