@@ -1090,7 +1090,12 @@ impl G18Session {
             log_cpu_state(dev.as_ref(), role, "before-start", &slot.provider);
             // The provider re-reads the role's PSD block and refuses an
             // unpowered block; it refuses without the CPU-control approval.
-            slot.provider.start_cpu()?;
+            let (control, _) = slot.provider.cpu_state()?;
+            if control & ASCWRAP_V8_CPU_RUN == 0 {
+                slot.provider.start_cpu()?;
+            } else {
+                dev_info!(dev.as_ref(), "G18_ASC {} adopted: RUN already set, start skipped\n", role.name());
+            }
             slot.started = true;
             log_cpu_state(dev.as_ref(), role, "after-start", &slot.provider);
             let started = Instant::<Monotonic>::now();
@@ -1586,10 +1591,13 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
         let (control, status) = provider.cpu_state()?;
         dev_info!(dev, "G18_ASC {} before start CPU_CONTROL={:#x} CPU_STATUS={:#x}\n",
             role.name(), control, status);
+        // J873 hardware, 2026-09-25: after the PSD power-on both ASCs read
+        // RUN=1 with one message waiting in the post-office RX FIFO (the
+        // firmware booted on power-up and posted its HELLO). Adopt them:
+        // boot_rtkit skips the CPU start and the RTKit core reads that HELLO.
         if control & ASCWRAP_V8_CPU_RUN != 0 {
-            dev_err!(dev, "G18 {} ASC is already running (RUN set); adopting a live CPU is not supported\n",
+            dev_info!(dev, "G18_ASC {} already running (RUN set); adopting the live CPU\n",
                 role.name());
-            return Err(EBUSY);
         }
         providers.push(provider, GFP_KERNEL)?;
     }
