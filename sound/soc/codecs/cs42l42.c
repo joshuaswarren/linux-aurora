@@ -894,9 +894,26 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 						CS42L42_ASP_FSD_SHIFT));
 		cs42l42->dsp_a = true;
 		break;
+	case SND_SOC_DAIFMT_DSP_A:
+		/*
+		 * Pulse mode, frame starts on the rising edge of LRCLK,
+		 * data delayed by 1.0 SCLKs. Both channels sit in the same
+		 * LRCLK phase, one slot apart; hw_params places them.
+		 */
+		snd_soc_component_update_bits(component,
+					      CS42L42_ASP_FRM_CFG,
+					      CS42L42_ASP_STP_MASK |
+					      CS42L42_ASP_5050_MASK |
+					      CS42L42_ASP_FSD_MASK,
+					      CS42L42_ASP_STP_MASK |
+					      (CS42L42_ASP_FSD_1_0 <<
+						CS42L42_ASP_FSD_SHIFT));
+		break;
 	default:
 		return -EINVAL;
 	}
+
+	cs42l42->dai_format = fmt & SND_SOC_DAIFMT_FORMAT_MASK;
 
 	/* Bitclock/frame inversion */
 	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
@@ -960,6 +977,7 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 	unsigned int width = (params_width(params) / 8) - 1;
 	unsigned int sample_rate = params_rate(params);
 	unsigned int slot_width = 0;
+	unsigned int ch2_bit = 0;
 	unsigned int val = 0;
 	unsigned int bclk;
 	int ret;
@@ -982,30 +1000,32 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 		bclk = snd_soc_tdm_params_to_bclk(params, slot_width, 0, 2);
 	}
 
+	/*
+	 * In DSP_A both channels share the LRCLK phase and channel 2 starts
+	 * one slot after channel 1. In I2S each channel sits at the start of
+	 * its own LRCLK phase.
+	 */
+	if (cs42l42->dai_format == SND_SOC_DAIFMT_DSP_A)
+		ch2_bit = params_physical_width(params);
+
 	switch (substream->stream) {
 	case SNDRV_PCM_STREAM_CAPTURE:
-		if (cs42l42->dsp_a) {
-			/* Both channels in the frame phase, channel 2 one slot in */
-			unsigned int start = params_physical_width(params);
-
-			val = (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
-			      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
-			snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_MSB, 0);
-			snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_LSB, 0);
-			snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_MSB,
-						(start >> 8) & 0xff);
-			snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_LSB,
-						start & 0xff);
-		} else {
-			/* channel 2 on high LRCLK */
-			val = CS42L42_ASP_TX_CH2_AP_MASK |
-			      (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
-			      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
-		}
+		val = (width << CS42L42_ASP_TX_CH2_RES_SHIFT) |
+		      (width << CS42L42_ASP_TX_CH1_RES_SHIFT);
+		/* channel 2 on high LRCLK */
+		if (cs42l42->dai_format != SND_SOC_DAIFMT_DSP_A)
+			val |= CS42L42_ASP_TX_CH2_AP_MASK;
 
 		snd_soc_component_update_bits(component, CS42L42_ASP_TX_CH_AP_RES,
 				CS42L42_ASP_TX_CH1_AP_MASK | CS42L42_ASP_TX_CH2_AP_MASK |
 				CS42L42_ASP_TX_CH2_RES_MASK | CS42L42_ASP_TX_CH1_RES_MASK, val);
+
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_MSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH1_BIT_LSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_MSB,
+					ch2_bit >> 8);
+		snd_soc_component_write(component, CS42L42_ASP_TX_CH2_BIT_LSB,
+					ch2_bit & 0xff);
 		break;
 	case SNDRV_PCM_STREAM_PLAYBACK:
 		val |= width << CS42L42_ASP_RX_CH_RES_SHIFT;
@@ -1013,36 +1033,19 @@ static int cs42l42_pcm_hw_params(struct snd_pcm_substream *substream,
 		snd_soc_component_update_bits(component, CS42L42_ASP_RX_DAI0_CH1_AP_RES,
 							 CS42L42_ASP_RX_CH_AP_MASK |
 							 CS42L42_ASP_RX_CH_RES_MASK, val);
-		if (cs42l42->dsp_a) {
-			/*
-			 * Channel 2 follows channel 1 in the same phase, one
-			 * slot (the physical sample width) after the frame
-			 * start.
-			 */
-			unsigned int start = params_physical_width(params);
-
-			snd_soc_component_update_bits(component,
-						      CS42L42_ASP_RX_DAI0_CH2_AP_RES,
-						      CS42L42_ASP_RX_CH_AP_MASK |
-						      CS42L42_ASP_RX_CH_RES_MASK, val);
-			snd_soc_component_write(component,
-						CS42L42_ASP_RX_DAI0_CH1_BIT_MSB, 0);
-			snd_soc_component_write(component,
-						CS42L42_ASP_RX_DAI0_CH1_BIT_LSB, 0);
-			snd_soc_component_write(component,
-						CS42L42_ASP_RX_DAI0_CH2_BIT_MSB,
-						(start >> 8) & 0xff);
-			snd_soc_component_write(component,
-						CS42L42_ASP_RX_DAI0_CH2_BIT_LSB,
-						start & 0xff);
-		} else {
-			/* Channel 2 on high LRCLK */
+		/* Channel 2 on high LRCLK */
+		if (cs42l42->dai_format != SND_SOC_DAIFMT_DSP_A)
 			val |= CS42L42_ASP_RX_CH_AP_HI << CS42L42_ASP_RX_CH_AP_SHIFT;
-			snd_soc_component_update_bits(component,
-						      CS42L42_ASP_RX_DAI0_CH2_AP_RES,
-						      CS42L42_ASP_RX_CH_AP_MASK |
-						      CS42L42_ASP_RX_CH_RES_MASK, val);
-		}
+		snd_soc_component_update_bits(component, CS42L42_ASP_RX_DAI0_CH2_AP_RES,
+							 CS42L42_ASP_RX_CH_AP_MASK |
+							 CS42L42_ASP_RX_CH_RES_MASK, val);
+
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH1_BIT_MSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH1_BIT_LSB, 0);
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH2_BIT_MSB,
+					ch2_bit >> 8);
+		snd_soc_component_write(component, CS42L42_ASP_RX_DAI0_CH2_BIT_LSB,
+					ch2_bit & 0xff);
 
 		/* Channel B comes from the last active channel */
 		snd_soc_component_update_bits(component, CS42L42_SP_RX_CH_SEL,
