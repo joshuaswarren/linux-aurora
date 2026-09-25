@@ -338,6 +338,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_isp *isp;
+	struct resource *res;
 	int err;
 
 	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
@@ -390,7 +391,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
-	isp->mbox = devm_platform_ioremap_resource_byname(pdev, "mbox");
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mbox");
+	isp->mbox = devm_ioremap_resource(dev, res);
 	if (IS_ERR(isp->mbox)) {
 		err = PTR_ERR(isp->mbox);
 		goto detach_genpd;
@@ -403,24 +405,20 @@ static int apple_isp_probe(struct platform_device *pdev)
 	}
 
 	if (isp->hw->mbox2_offset) {
-		/* t8140: doorbell/ack sit inside the "mbox" window */
+		if (resource_size(res) <
+		    isp->hw->mbox2_offset + ISP_MBOX2_SIZE) {
+			dev_err(dev, "mbox window too small for the doorbells\n");
+			err = -EINVAL;
+			goto detach_genpd;
+		}
 		isp->mbox2 = isp->mbox + isp->hw->mbox2_offset;
 	} else {
-		isp->mbox2 = devm_platform_ioremap_resource_byname(pdev, "mbox2");
+		isp->mbox2 = devm_platform_ioremap_resource_byname(pdev,
+								   "mbox2");
 		if (IS_ERR(isp->mbox2)) {
 			err = PTR_ERR(isp->mbox2);
 			goto detach_genpd;
 		}
-	}
-
-	if (isp->hw->gen == ISP_GEN_T8140) {
-		/* the EIC's ISP watchdog window; the frames stay masked without it */
-		isp->wdt = devm_platform_ioremap_resource_byname(pdev, "wdt");
-		if (IS_ERR(isp->wdt)) {
-			err = PTR_ERR(isp->wdt);
-			goto detach_genpd;
-		}
-		apple_isp_wdt_init(isp);
 	}
 
 	isp->irq = platform_get_irq(pdev, 0);

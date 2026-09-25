@@ -45,6 +45,11 @@ static inline void isp_gpio_write32(struct apple_isp *isp, u32 reg, u32 val)
 	writel(val, isp->gpio + reg);
 }
 
+static inline u32 isp_coproc_control(struct apple_isp *isp)
+{
+	return isp->hw->coproc_control ?: ISP_COPROC_CONTROL;
+}
+
 /* Wait for the firmware to write @expected to a GPIO word. */
 static int isp_gpio_wait(struct apple_isp *isp, u32 reg, u32 expected)
 {
@@ -235,7 +240,7 @@ static irqreturn_t apple_isp_isr_thread(int irq, void *dev)
 static void isp_disable_irq(struct apple_isp *isp)
 {
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
-	if (isp->hw->gen == ISP_GEN_T8140) {
+	if (isp->hw->mbox_irq_route) {
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140, 0x0);
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
 	}
@@ -256,53 +261,14 @@ static int isp_enable_irq(struct apple_isp *isp)
 	isp_dbg(isp, "about to enable interrupts...\n");
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0xf);
-	if (isp->hw->gen == ISP_GEN_T8140) {
-		/* ISP17a: two more enable words and an IRQ steering write */
+	if (isp->hw->mbox_irq_route) {
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140,
 				 ISP_MBOX_IRQ_ENABLE1_T8140_VAL);
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140,
 				 ISP_MBOX_IRQ_ENABLE2_T8140_VAL);
-		isp_mbox_write32(isp, ISP_MBOX_IRQ_STEER_T8140,
-				 ISP_MBOX_IRQ_STEER_T8140_VAL);
+		isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140,
+				 ISP_MBOX_IRQ_ROUTE_T8140_VAL);
 	}
-
-	return 0;
-}
-
-/*
- * t8140: AppleH16CamIn's PerformPowerGatingDisabledReset as replayed by the
- * native J700 host (every successful native run, e.g. the 220 s stream of
- * attempt 1419): EDPRCR, four fabric words, four IRQ masks, then the two
- * reset-acknowledge words are read back.  The ASC status is not polled for
- * WFI on this generation.
- */
-static int isp_reset_coproc_t8140(struct apple_isp *isp)
-{
-	int retries;
-
-	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
-	for (retries = 0; retries < 100; retries++) {
-		if (!(isp_coproc_read32(isp, ISP_COPROC_EDPRCR) & 0x2))
-			break;
-		mdelay(1);
-	}
-	msleep(50);
-
-	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0_T8140, 0xffffffff);
-	isp_coproc_write32(isp, ISP_COPROC_FABRIC_1_T8140, 0xffffffff);
-	isp_coproc_write32(isp, ISP_COPROC_FABRIC_2_T8140, 0xffffffff);
-	isp_coproc_write32(isp, ISP_COPROC_FABRIC_3_T8140, 0xffffffff);
-
-	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_0_T8140, 0xffffffff);
-	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_1_T8140, 0xffffffff);
-	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_2_T8140, 0xffffffff);
-	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_3_T8140, 0xffffffff);
-
-	for (retries = 0; retries < 8; retries++) {
-		isp_coproc_read32(isp, ISP_COPROC_RESET_ACK_0_T8140);
-		isp_coproc_read32(isp, ISP_COPROC_RESET_ACK_1_T8140);
-	}
-	msleep(50);
 
 	return 0;
 }
@@ -355,7 +321,7 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 {
-	isp_coproc_write32(isp, isp_asc_control_reg(isp), 0x0);
+	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
 	apple_isp_power_down_domains(isp);
 }
@@ -401,8 +367,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
-	isp_coproc_write32(isp, isp_asc_control_reg(isp), 0x0);
-	isp_coproc_write32(isp, isp_asc_control_reg(isp), 0x10);
+	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
+	isp_coproc_write32(isp, isp_coproc_control(isp), 0x10);
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
