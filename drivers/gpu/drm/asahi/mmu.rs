@@ -723,7 +723,7 @@ struct VmInner {
     /// GPUVM exec lock is held. A failed attempt may invalidate a cached
     /// reachability result conservatively. Overflow disables caching.
     mapping_validation_epoch: Option<u64>,
-    mapping_validation_changes: [Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY],
+    mapping_validation_changes: Option<KBox<[Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY]>>,
     mm: mm::Allocator<(), KernelMappingInner>,
     uat_inner: Arc<UatInner>,
     binding: Arc<Mutex<VmBinding>>,
@@ -742,8 +742,11 @@ impl VmInner {
         if range.start >= range.end || end.is_none() {
             self.mapping_validation_epoch = None;
         }
-        if let Some(epoch) = self.mapping_validation_epoch {
-            self.mapping_validation_changes[epoch as usize % MAPPING_VALIDATION_HISTORY] =
+        if let (Some(epoch), Some(changes)) = (
+            self.mapping_validation_epoch,
+            self.mapping_validation_changes.as_mut(),
+        ) {
+            changes[epoch as usize % MAPPING_VALIDATION_HISTORY] =
                 Some(MappingValidationChange {
                     epoch,
                     start: range.start & !mask,
@@ -2391,7 +2394,7 @@ impl Vm {
                     is_kernel,
                     page_table,
                     mapping_validation_epoch: Some(0),
-                    mapping_validation_changes: [None; MAPPING_VALIDATION_HISTORY],
+                    mapping_validation_changes,
                     mm,
                     uat_inner,
                     binding: binding_clone,
@@ -2955,6 +2958,7 @@ impl Vm {
         mut intersects: impl FnMut(Range<u64>) -> bool,
     ) -> Option<(u64, bool)> {
         let inner = self.inner.exec_lock(None, false).ok()?;
+        let changes = inner.mapping_validation_changes.as_ref()?;
         let current = inner.mapping_validation_epoch?;
         let count = current.checked_sub(previous)?;
         if count > MAPPING_VALIDATION_HISTORY as u64 {
@@ -2964,8 +2968,7 @@ impl Vm {
             return Some((current, false));
         }
         for epoch in previous + 1..=current {
-            let change = inner.mapping_validation_changes
-                [epoch as usize % MAPPING_VALIDATION_HISTORY]?;
+            let change = changes[epoch as usize % MAPPING_VALIDATION_HISTORY]?;
             if change.epoch != epoch {
                 return None;
             }
