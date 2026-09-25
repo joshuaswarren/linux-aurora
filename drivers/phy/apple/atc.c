@@ -32,6 +32,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/of_graph.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/reset-controller.h>
@@ -630,6 +631,10 @@ struct atcphy_hw {
  * @tunables.usb2phy_reg_dflt: Defaults for the secondary eUSB2 register bank
  * @hw: SoC-specific PHY description
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
+ * @fixed_usb2: The USB2 pairs go to a fixed hub on the USB controller, which
+ *              stays in host mode; the PHY provides USB2 from probe on
+ * @typec_mode: Mode the Type-C mux last asked for; a fixed-hub port returns to
+ *              it when the PHY is brought back up after a power-off
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
@@ -671,6 +676,8 @@ struct apple_atcphy {
 
 	const struct atcphy_hw *hw;
 	bool ss_tunables;
+	bool fixed_usb2;
+	enum atcphy_mode typec_mode;
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool swap_lanes;
@@ -952,18 +959,13 @@ static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode 
 	const int lane1 = atcphy->swap_lanes ? 0 : 1;
 
 	/*
-	 * J700's fixed USB2 hub does not use the ATC SuperSpeed lanes.  Its
-	 * always-on USB2 bootstrap must therefore leave the common and AXI2AF
-	 * blocks untouched as well as the lane blocks; changing them here can
-	 * disturb the inherited post-M4 platform state before any SuperSpeed
-	 * cable exists.  A later real USB3 mode transition applies the complete
-	 * tunable set below.
+	 * A port behind a fixed hub runs USB2 with the SuperSpeed lanes off from
+	 * probe on. The T8140 bring-up left the common and AXI2AF tunables
+	 * unapplied in that state; they are applied together with the lane
+	 * tunables on the first SuperSpeed mode change.
 	 */
-	if (mode == APPLE_ATCPHY_MODE_USB2 && atcphy->force_usb2_on) {
-		dev_info_once(atcphy->dev,
-			      "J700_USB2_ATC_TUNABLES_DEFERRED: waiting for SuperSpeed mode\n");
+	if (mode == APPLE_ATCPHY_MODE_USB2 && atcphy->fixed_usb2)
 		return;
-	}
 
 	apple_tunable_apply(atcphy->regs.core, atcphy->tunables.common[0]);
 	apple_tunable_apply(atcphy->regs.axi2af, atcphy->tunables.axi2af);
@@ -2115,94 +2117,28 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	return 0;
 }
 
-static int atcphy_usb2_reset(struct phy *phy)
-{
-	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
-	u32 asserted, after, before;
-
-	guard(mutex)(&atcphy->lock);
-
-	/*
-	 * Apple's T8130 usb2PhyPortReset() sets PORT_RESET, sleeps for 5 ms,
-	 * then clears PORT_RESET.  This is deliberately narrower than cycling
-	 * the complete ATC PHY or DWC3 core: the stateful eUSB2 repeater needs
-	 * the partial reset while the fixed hub's xHCI session stays alive.
-	 */
-	before = readl(atcphy->regs.usb2phy + USB2PHY_CTL);
-	set32(atcphy->regs.usb2phy + USB2PHY_CTL,
-	      USB2PHY_CTL_PORT_RESET);
-	asserted = readl(atcphy->regs.usb2phy + USB2PHY_CTL);
-	msleep(5);
-	clear32(atcphy->regs.usb2phy + USB2PHY_CTL,
-		USB2PHY_CTL_PORT_RESET);
-	after = readl(atcphy->regs.usb2phy + USB2PHY_CTL);
-
-	if (!(asserted & USB2PHY_CTL_PORT_RESET) ||
-	    (after & USB2PHY_CTL_PORT_RESET)) {
-		dev_err(atcphy->dev,
-			"J700_USB2_PORT_RESET_FAIL: CTL=%08x->%08x->%08x\n",
-			before, asserted, after);
-		return -EIO;
-	}
-
-	dev_info(atcphy->dev,
-		 "J700_USB2_PORT_RESET_PASS: pulse_ms=5 CTL=%08x->%08x->%08x\n",
-		 before, asserted, after);
-	return 0;
-}
-
 static int atcphy_usb2_init(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
-	bool configured_atc = false;
-	int ret;
 
-	if (!atcphy->force_usb2_on)
+	if (!atcphy->fixed_usb2)
 		return 0;
 
 	guard(mutex)(&atcphy->lock);
 
 	/*
-	 * During the first DWC3 glue probe the generic PHY handles have not been
-	 * discovered yet, so its early phy_set_mode(HOST) call is necessarily a
-	 * no-op.  A fixed always-on hub still requires host mode to be selected
-	 * while this PHY is off; applying it after dwc3_host_init is one reset too
-	 * late on this hardware.
+	 * dwc3 initialises its PHYs after releasing its reset, and asserting that
+	 * reset powered the USB2 PHY off. A port behind a fixed hub gets no Type-C
+	 * event that would power it up again before the controller starts, so do
+	 * it here. The port is a host port by construction. When the USB3 PHY was
+	 * powered off as well the whole block is off; bring it back in the mode
+	 * the Type-C mux last asked for, USB2 until a cable event says otherwise.
 	 */
-	if (atcphy->force_usb2_host_preinit)
-		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_HOST_MASK(atcphy));
+	set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF)
+		return atcphy_configure(atcphy, atcphy->typec_mode);
 
-	/*
-	 * dwc3_core_exit() powers the USB3 generic PHY off, which also returns
-	 * the shared ATC block to APPLE_ATCPHY_MODE_OFF.  The fixed hub has no
-	 * Type-C mux event that would restore USB2 mode before a delayed DWC3
-	 * retry, so restore the complete state here when necessary.  On the
-	 * initial probe, probe_finalize() already established USB2 mode and the
-	 * DWC3 reset only powered off the discrete USB2 PHY.
-	 */
-	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF) {
-		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
-		if (ret)
-			return ret;
-		configured_atc = true;
-	} else {
-		/* DWC3 calls PHY init before its soft reset. */
-		atcphy_usb2_power_on(atcphy);
-	}
-
-	if (configured_atc)
-		dev_info(atcphy->dev,
-			 "J700_USB2_ATCPHY_RESTORED: mode=USB2 after DWC3 teardown\n");
-	dev_info(atcphy->dev,
-		 "pre-DWC USB2 state: USBCTL=%08x CTL=%08x SIG=%08x HOST=%u MISC=%08x PIPE=%08x AON=%08x OVERRIDE=%08x\n",
-		 readl(atcphy->regs.usb2phy + USB2PHY_USBCTL),
-		 readl(atcphy->regs.usb2phy + USB2PHY_CTL),
-		 readl(atcphy->regs.usb2phy + USB2PHY_SIG),
-		 !!(readl(atcphy->regs.usb2phy + USB2PHY_SIG) & USB2PHY_HOST_MASK(atcphy)),
-		 readl(atcphy->regs.usb2phy + USB2PHY_MISCTUNE),
-		 readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
-		 readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
-		 readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE));
+	atcphy_usb2_power_on(atcphy);
 
 	return 0;
 }
@@ -2210,7 +2146,6 @@ static int atcphy_usb2_init(struct phy *phy)
 static const struct phy_ops apple_atc_usb2_phy_ops = {
 	.owner = THIS_MODULE,
 	.init = atcphy_usb2_init,
-	.reset = atcphy_usb2_reset,
 	.set_mode = atcphy_usb2_set_mode,
 };
 
@@ -2544,6 +2479,15 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		target_mode = APPLE_ATCPHY_MODE_OFF;
 	}
 
+	/*
+	 * A port behind a fixed hub keeps its USB controller in host mode, and
+	 * the controller keeps using the USB2 PHY for the hub. Keep the block in
+	 * USB2 when the connector goes to its safe state instead of powering it
+	 * off underneath the hub.
+	 */
+	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
+		target_mode = APPLE_ATCPHY_MODE_USB2;
+
 	if (atcphy->mode == target_mode)
 		return 0;
 
@@ -2564,6 +2508,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	case APPLE_ATCPHY_MODE_USB2:
 		break;
 	}
+	atcphy->typec_mode = target_mode;
 
 	/*
 	 * A live PIPE mux blocks the reconfigure below: atcphy_configure() cannot
@@ -2724,6 +2669,25 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 	return 0;
 }
 
+/*
+ * The USB2 pairs of a port can go to a fixed hub on the USB controller instead
+ * of straight to the connector. Such a board describes the hub as a child of
+ * the controller our USB3 port is linked to. There is then no cable event
+ * that would bring the PHY up, and the controller is a host whatever happens
+ * at the connectors, so the PHY has to provide USB2 from probe on.
+ */
+static bool atcphy_usb2_behind_fixed_hub(struct apple_atcphy *atcphy)
+{
+	struct device_node *ep __free(device_node) =
+		of_graph_get_endpoint_by_regs(atcphy->np, 1, -1);
+	struct device_node *ctrl __free(device_node) =
+		ep ? of_graph_get_remote_port_parent(ep) : NULL;
+	struct device_node *hub __free(device_node) =
+		ctrl ? of_get_available_child_by_name(ctrl, "hub") : NULL;
+
+	return hub;
+}
+
 static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 {
 	int ret;
@@ -2739,47 +2703,46 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 	atcphy_setup_pipehandler(atcphy);
 
 	/*
-	 * A fixed USB2 hub has no Type-C mux event to move the ATC PHY out of
-	 * APPLE_ATCPHY_MODE_OFF before the DWC3 consumer probes.  Powering only
-	 * the discrete USB2 PHY later is not equivalent: the ATC common block,
-	 * clamps and lane-off crossbar state are normally established by
-	 * atcphy_mux_set() first.  Establish that complete USB2-only state here
-	 * while DWC3 is still held in reset.  A later DWC3 reset assertion only
-	 * powers the discrete USB2 PHY down; usb2_init powers it back up after
-	 * DWC3 deasserts reset.
+	 * Powering only the USB2 PHY when the controller initialises its PHYs is
+	 * not enough for a port behind a fixed hub: the common block, its clamps
+	 * and the crossbar are set up by the mode change a cable event would
+	 * bring. Establish the complete USB2 state now, while dwc3 is still held
+	 * in reset.
 	 */
-	if (atcphy->force_usb2_on) {
-		if (atcphy->force_usb2_host_preinit)
-			set32(atcphy->regs.usb2phy + USB2PHY_SIG,
-			      USB2PHY_HOST_MASK(atcphy));
-
+	if (atcphy->fixed_usb2) {
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
 		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
 		if (ret)
-			return dev_err_probe(atcphy->dev, ret,
-					     "Failed to establish always-on USB2 ATC PHY state");
-
-		dev_info(atcphy->dev,
-			 "J700_USB2_ATCPHY_ALWAYS_ON: mode=USB2 host=%u power=%08x/%08x\n",
-			 !!(readl(atcphy->regs.usb2phy + USB2PHY_SIG) &
-			    USB2PHY_HOST_MASK(atcphy)),
-			 readl(atcphy->regs.core + ATCPHY_POWER_CTRL),
-			 readl(atcphy->regs.core + ATCPHY_POWER_STAT));
+			return dev_err_probe(atcphy->dev, ret, "Failed to bring up USB2\n");
 	}
 
 	ret = atcphy_probe_rcdev(atcphy);
-	if (ret)
-		return dev_err_probe(atcphy->dev, ret, "Probing rcdev failed");
-	ret = atcphy->legacy_fixed_usb2 ? 0 : atcphy_probe_mux(atcphy);
-	if (ret)
-		return dev_err_probe(atcphy->dev, ret, "Probing mux failed");
-	ret = atcphy->legacy_fixed_usb2 ? 0 : atcphy_probe_switch(atcphy);
-	if (ret)
-		return dev_err_probe(atcphy->dev, ret, "Probing switch failed");
+	if (ret) {
+		ret = dev_err_probe(atcphy->dev, ret, "Probing rcdev failed");
+		goto power_off;
+	}
+	ret = atcphy_probe_mux(atcphy);
+	if (ret) {
+		ret = dev_err_probe(atcphy->dev, ret, "Probing mux failed");
+		goto power_off;
+	}
+	ret = atcphy_probe_switch(atcphy);
+	if (ret) {
+		ret = dev_err_probe(atcphy->dev, ret, "Probing switch failed");
+		goto power_off;
+	}
 	ret = atcphy_probe_phy(atcphy);
-	if (ret)
-		return dev_err_probe(atcphy->dev, ret, "Probing phy failed");
+	if (ret) {
+		ret = dev_err_probe(atcphy->dev, ret, "Probing phy failed");
+		goto power_off;
+	}
 
 	return 0;
+
+power_off:
+	if (atcphy->fixed_usb2)
+		atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
+	return ret;
 }
 
 static void atcphy_repeater_exit(void *data)
@@ -2840,6 +2803,8 @@ static int atcphy_probe(struct platform_device *pdev)
 	}
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	atcphy->fixed_usb2 = atcphy_usb2_behind_fixed_hub(atcphy);
+	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
 
 	return atcphy_probe_finalize(atcphy);
 }
