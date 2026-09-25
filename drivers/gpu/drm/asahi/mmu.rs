@@ -529,6 +529,17 @@ const SLOTS_SIZE: usize = UAT_NUM_CTX * size_of::<SlotTTBS>();
 // We need at least page 0 (ttb0)
 const PAGETABLES_SIZE: usize = UAT_PGSZ;
 
+// Retained renders can prove their mappings unchanged across unrelated BO
+// changes without walking every retained PTE on each submission.
+const MAPPING_VALIDATION_HISTORY: usize = 128;
+
+#[derive(Clone, Copy)]
+struct MappingValidationChange {
+    epoch: u64,
+    start: u64,
+    end: u64,
+}
+
 /// Inner data for a Vm instance. This is reference-counted by the outer Vm object.
 struct VmInner {
     dev: driver::AsahiDevRef,
@@ -539,6 +550,7 @@ struct VmInner {
     /// GPUVM exec lock is held. A failed attempt may invalidate a cached
     /// reachability result conservatively. Overflow disables caching.
     mapping_validation_epoch: Option<u64>,
+    mapping_validation_changes: [Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY],
     mm: mm::Allocator<(), KernelMappingInner>,
     uat_inner: Arc<UatInner>,
     binding: Arc<Mutex<VmBinding>>,
@@ -546,9 +558,16 @@ struct VmInner {
 }
 
 impl VmInner {
-    fn note_mapping_validation_change(&mut self) {
+    fn note_mapping_validation_change(&mut self, range: Range<u64>) {
         self.mapping_validation_epoch = self.mapping_validation_epoch
             .and_then(|epoch| epoch.checked_add(1));
+        if range.start >= range.end {
+            self.mapping_validation_epoch = None;
+        }
+        if let Some(epoch) = self.mapping_validation_epoch {
+            self.mapping_validation_changes[epoch as usize % MAPPING_VALIDATION_HISTORY] =
+                Some(MappingValidationChange { epoch, start: range.start, end: range.end });
+        }
     }
 }
 
@@ -670,7 +689,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         // GPUVM cannot see driver-owned KernelMappings.  Preflight the full
         // object range in the authoritative page table and allocate every
         // intermediate table before the first scatterlist leaf is written.
-        self.note_mapping_validation_change();
+        self.note_mapping_validation_change(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?);
         self.page_table
             .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
 
@@ -792,7 +811,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         let va = op.va().expect("step_unmap: missing VA");
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
 
-        self.note_mapping_validation_change();
+        self.note_mapping_validation_change(va.addr()..va.addr().checked_add(va.range()).ok_or(EOVERFLOW)?);
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
@@ -837,7 +856,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let unmap_range = unmap_end - unmap_start;
 
-        self.note_mapping_validation_change();
+        self.note_mapping_validation_change(unmap_start..unmap_end);
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
         self.tlbi_live_contexts(unmap_start, unmap_range);
@@ -931,7 +950,7 @@ impl VmInner {
             .ok_or(EOVERFLOW)?;
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
-        self.note_mapping_validation_change();
+        self.note_mapping_validation_change(iova..mapping_end);
         self.page_table.prepare_map(iova..mapping_end)?;
         let guard = node.bo.as_ref().ok_or(EINVAL)?.get()?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
@@ -1655,7 +1674,7 @@ impl KernelMapping {
         // Remap in-place as uncached.
         // Do not try to unmap the guard page (-1)
         let prot = self.0.prot.as_uncached();
-        owner.note_mapping_validation_change();
+        owner.note_mapping_validation_change(self.iova_range());
         if owner
             .page_table
             .reprot_pages(self.iova_range(), prot)
@@ -1824,7 +1843,7 @@ impl Drop for KernelMapping {
             self.size()
         );
 
-        owner.note_mapping_validation_change();
+        owner.note_mapping_validation_change(self.iova_range());
         if owner.page_table.unmap_pages(self.iova_range()).is_err() {
             dev_err!(
                 owner.dev.as_ref(),
@@ -2223,6 +2242,7 @@ impl Vm {
                     is_kernel,
                     page_table,
                     mapping_validation_epoch: Some(0),
+                    mapping_validation_changes: [None; MAPPING_VALIDATION_HISTORY],
                     mm,
                     uat_inner,
                     binding: binding_clone,
@@ -2543,6 +2563,35 @@ impl Vm {
     /// one that partially failed. `None` means the caller must validate fully.
     pub(crate) fn mapping_validation_epoch(&self) -> Option<u64> {
         self.inner.exec_lock(None, false).ok()?.mapping_validation_epoch
+    }
+
+    /// Report whether mutations since `previous` touched a dependency.
+    /// History loss or an unavailable lock refuses the proof.
+    pub(crate) fn mapping_changes_since(
+        &self,
+        previous: u64,
+        mut intersects: impl FnMut(Range<u64>) -> bool,
+    ) -> Option<(u64, bool)> {
+        let inner = self.inner.exec_lock(None, false).ok()?;
+        let current = inner.mapping_validation_epoch?;
+        let count = current.checked_sub(previous)?;
+        if count > MAPPING_VALIDATION_HISTORY as u64 {
+            return None;
+        }
+        if count == 0 {
+            return Some((current, false));
+        }
+        for epoch in previous + 1..=current {
+            let change = inner.mapping_validation_changes
+                [epoch as usize % MAPPING_VALIDATION_HISTORY]?;
+            if change.epoch != epoch {
+                return None;
+            }
+            if intersects(change.start..change.end) {
+                return Some((current, true));
+            }
+        }
+        Some((current, false))
     }
 
     /// Resolve an IOVA through this VM's current page table. Callers use this
@@ -3215,7 +3264,7 @@ impl Vm {
             0,
         )?;
 
-        inner.note_mapping_validation_change();
+        inner.note_mapping_validation_change(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
         let prepared = inner
             .page_table
             .prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);

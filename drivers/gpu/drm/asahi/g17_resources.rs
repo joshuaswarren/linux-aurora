@@ -9379,6 +9379,69 @@ impl G17PUserRenderStorage {
         );
     }
 
+    /// The page-table dependencies of every mapping predicate in
+    /// `first_unreachable`. Include the TVB's *unmapped* guard tails: a new
+    /// leaf there invalidates the proof just as an unmap of a data page does.
+    fn mapping_change_touches_graph(&self, change: Range<u64>, kernel: bool) -> bool {
+        let intersects = |address: u64, size: u64| {
+            address.checked_add(size).map_or(true, |end| {
+                size == 0 || change.start < end && address < change.end
+            })
+        };
+        if kernel {
+            return intersects(self.descriptors.iova(), G17P_RENDER_DESCRIPTOR_STORAGE_SIZE as u64)
+                || intersects(self.graph.iova(), G17P_RENDER_QUEUE_GRAPH_SIZE as u64)
+                || intersects(self.support.iova(), G17P_RENDER_SUPPORT_SIZE as u64)
+                || intersects(self.timestamps.iova(), G17P_PAGE_SIZE as u64)
+                || self.sksm_backing.as_ref().map_or(true, |backing| {
+                    intersects(backing.ta_context.iova(), G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64)
+                        || intersects(backing.fragment_context.iova(), G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64)
+                })
+                || intersects(self.fragment_status.iova(), mmu::UAT_PGSZ as u64);
+        }
+
+        if intersects(self.render_state.iova(), self.render_state.logical_size as u64)
+            || intersects(self.render_user_aliases.deflake.iova(), self.render_user_aliases.deflake.size() as u64)
+            || intersects(self.render_user_aliases.aux_fb.iova(), self.render_user_aliases.aux_fb.size() as u64)
+            || self.scene_scratch.as_ref().is_some_and(|scene| intersects(scene.iova(), scene.logical_size as u64))
+            || self.discard.as_ref().is_some_and(|discard| intersects(discard.iova(), discard.logical_size as u64))
+            || intersects(self.fragment_rce.iova(), self.fragment_rce.logical_size as u64)
+            || intersects(self.descriptor_ta_low.iova(), self.descriptor_ta_low.size() as u64)
+            || intersects(self.descriptor_3d_low.iova(), self.descriptor_3d_low.size() as u64)
+            || intersects(self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64)
+            || intersects(self.ta_context_low.iova(), self.ta_context_low.size() as u64)
+            || intersects(self.fragment_context_low.iova(), self.fragment_context_low.size() as u64)
+            || intersects(self.fragment_status_low.iova(), self.fragment_status_low.size() as u64)
+            || intersects(self.render_flist.page_list_va(), G17P_CONTROL_DIRECTORY_SIZE as u64)
+            || intersects(self.render_flist.run_table_va(), g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64)
+            || intersects(mmu::T8140_PARAMETER_METRICS_LOW_VA, mmu::T8140_PARAMETER_METRICS_SIZE as u64)
+            || self.parameter_management.as_ref().is_some_and(|pm| {
+                intersects(pm.page_list_low_va(), page_align(G17P_PM_PAGE_LIST_SIZE).unwrap_or(0) as u64)
+            })
+        {
+            return true;
+        }
+        for index in 0..G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT {
+            let address = self.render_flist.run_table_va()
+                + G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE as u64
+                + index as u64 * G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+            if intersects(address, G17P_CONTROL_OPERAND_BUFFER_SIZE as u64) {
+                return true;
+            }
+        }
+        if let Some(tvb) = self.render_tvb.as_ref() {
+            if tvb.block_addresses.len() < tvb.block_count {
+                return true;
+            }
+            for &address in tvb.block_addresses.iter().take(tvb.block_count) {
+                if intersects(address, G17P_RENDER_TVB_BLOCK_STRIDE as u64) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn reachability_key(uat: &mmu::Uat, vm: &mmu::Vm) -> Option<G17PRenderReachabilityKey> {
         Some(G17PRenderReachabilityKey {
             vm_id: vm.id(),
@@ -9407,6 +9470,27 @@ impl G17PUserRenderStorage {
         {
             self.last_reachability_cache_hit = true;
             return None;
+        }
+        if let (Some(previous), Some(current)) = (
+            self.reachability_cache.validated.get(generation).copied().flatten(),
+            before,
+        ) {
+            if previous.vm_id == current.vm_id && previous.kernel_vm_id == current.kernel_vm_id {
+                let app = vm.mapping_changes_since(previous.vm_epoch, |range| {
+                    self.mapping_change_touches_graph(range, false)
+                });
+                let kernel = uat.kernel_vm().mapping_changes_since(previous.kernel_epoch, |range| {
+                    self.mapping_change_touches_graph(range, true)
+                });
+                if matches!(app, Some((epoch, false)) if epoch == current.vm_epoch)
+                    && matches!(kernel, Some((epoch, false)) if epoch == current.kernel_epoch)
+                    && before == Self::reachability_key(uat, vm)
+                {
+                    self.reachability_cache.record_success(generation, before, before);
+                    self.last_reachability_cache_hit = true;
+                    return None;
+                }
+            }
         }
         let failed = self.first_unreachable(uat, vm);
         if failed.is_none() {
