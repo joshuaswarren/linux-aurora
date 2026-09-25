@@ -136,6 +136,28 @@ impl G17PJobCompletion {
         self.aggregate_member.complete(Err(error));
     }
 
+    /// Scheduler teardown cancels the waiter, not firmware ownership. Keep
+    /// mappings pinned and reject/defer their mutation until exact retirement,
+    /// but do not turn a destroyed queue into a hardware failure of its VM.
+    pub(crate) fn cancel_while_owned(&self) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        if let Some(vm_job) = self.vm_job.lock().as_ref() {
+            vm_job.quarantine();
+        }
+        self.fence.set_error(ECANCELED);
+        self.fence.signal();
+        self.aggregate_member.complete(Err(ECANCELED));
+    }
+
+    /// The exact descriptor, fresh completion, final stamp, ring cursors and
+    /// publication epoch have all passed. Cancellation may already have
+    /// signalled the fence, so `complete` cannot release this pin itself.
+    pub(crate) fn release_after_retirement(&self) {
+        drop(self.vm_job.lock().take());
+    }
+
     /// Only for retired work, proven processor stop, or unsubmitted packets.
     pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
         if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -152,7 +174,11 @@ impl G17PJobCompletion {
         if let Err(error) = result {
             // Publish sticky failure BEFORE the fence wakes userspace. A DRM
             // syncobj considers an error fence signaled, so waits query this.
-            self.status.record(error.to_errno());
+            // An unsubmitted job cancelled during scheduler destruction has
+            // no hardware failure to publish to sibling queues in this VM.
+            if error != ECANCELED {
+                self.status.record(error.to_errno());
+            }
             self.fence.set_error(error);
         }
         // Match render completion: once this fence wakes userspace, every

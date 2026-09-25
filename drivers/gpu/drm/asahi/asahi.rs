@@ -35,6 +35,7 @@ mod g17_lifecycle;
 mod g17_live_boot;
 mod g17_manager;
 mod g17_perf;
+mod g17_timing_buffer;
 mod g17_power_preflight;
 mod g17_rtkit;
 mod g17_submission;

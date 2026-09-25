@@ -860,6 +860,9 @@ pub(crate) struct G17PRenderCompletion {
     lease: Arc<Mutex<Option<G17PLeaseGuard>>>,
     vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
     created: Instant<Monotonic>,
+    trace_created_ns: u64,
+    trace_run_ns: AtomicU64,
+    trace_attach_ns: AtomicU64,
     attached_ns: AtomicU64,
     published_ns: AtomicU64,
     signalled: AtomicU32,
@@ -899,6 +902,9 @@ impl G17PRenderCompletion {
             lease,
             vm_job,
             created: Instant::now(),
+            trace_created_ns: if crate::g17_timing_buffer::enabled() { crate::g17_timing_buffer::now() } else { 0 },
+            trace_run_ns: AtomicU64::new(0),
+            trace_attach_ns: AtomicU64::new(0),
             attached_ns: AtomicU64::new(0),
             published_ns: AtomicU64::new(0),
             signalled: AtomicU32::new(0),
@@ -940,6 +946,9 @@ impl G17PRenderCompletion {
         }
         *held = Some(lease);
         self.render_slot.store(slot as u32, Ordering::Release);
+        if self.trace_created_ns != 0 {
+            self.trace_attach_ns.store(crate::g17_timing_buffer::now(), Ordering::Relaxed);
+        }
         self.attached_ns.store(
             self.created.elapsed().as_nanos().max(0) as u64,
             Ordering::Release,
@@ -1038,6 +1047,15 @@ impl G17PRenderCompletion {
                 .wrapping_sub(completion.execution.fragment_timestamps[0]),
         ]);
         let completed_ns = self.created.elapsed().as_nanos().max(0) as u64;
+        if self.trace_created_ns != 0 {
+            let mut words = [0; crate::g17_timing_buffer::WORDS];
+            words[..10].copy_from_slice(&[2, self.owner, self.submission_id, self.vdm_base,
+                self.trace_created_ns, crate::g17_timing_buffer::now(),
+                self.render_slot.load(Ordering::Relaxed) as u64,
+                gpu_durations.unwrap_or([0; 2])[0], gpu_durations.unwrap_or([0; 2])[1],
+                result.as_ref().map(|r| r.complete).unwrap_or(false) as u64]);
+            crate::g17_timing_buffer::record(words);
+        }
         let result = result.and_then(|completion| {
             if !completion.complete {
                 return Err(EIO);
@@ -1429,6 +1447,9 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
 
     fn publish(&self, packet: Arc<g17_job::G17PRenderJobPacket>) -> Result<Fence> {
         let completion = packet.completion();
+        if completion.trace_created_ns != 0 {
+            completion.trace_run_ns.store(crate::g17_timing_buffer::now(), Ordering::Relaxed);
+        }
         let submission_id = packet.submission_id();
         if !packet.begin_publication() {
             completion.fail_unpublished(ECANCELED);
@@ -1458,9 +1479,10 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
             let mut device_control_polls = 0usize;
             let trace_limit = *module_parameters::g17p_trace_depth.value();
             let mut stages = crate::g17_perf::RenderStageTimes::default();
-            stages.enabled = *module_parameters::g17p_completion_trace.value() != 0
+            stages.enabled = completion.trace_created_ns != 0 ||
+                (*module_parameters::g17p_completion_trace.value() != 0
                 && trace_limit != 0
-                && G17P_RENDER_POLL_RECORDS.load(Ordering::Relaxed) < trace_limit;
+                && G17P_RENDER_POLL_RECORDS.load(Ordering::Relaxed) < trace_limit);
             let submit = loop {
                 if packet.cancel_requested() { break Err(ECANCELED); }
                 let lock_started = stages.enabled.then(Instant::<Monotonic>::now);
@@ -1533,6 +1555,21 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
                     &mut stages,
                 );
             };
+            // Capture before optional legacy formatting; no completion-side copy.
+            // Completion may already be recorded: userspace joins immutable IDs.
+            if completion.trace_created_ns != 0 {
+                let mut words = [0; crate::g17_timing_buffer::WORDS];
+                words.copy_from_slice(&[1, self.owner, submission_id, completion.vdm_base,
+                    completion.trace_created_ns, crate::g17_timing_buffer::now(), render_slot as u64,
+                    completion.trace_run_ns.load(Ordering::Relaxed),
+                    completion.trace_attach_ns.load(Ordering::Relaxed),
+                    stages.runtime_lock_ns, stages.handoff_ns, stages.prepare_ns,
+                    stages.restage_ns, stages.reachability_ns, stages.flist_request_ns,
+                    flist_release_polls as u64, device_control_polls as u64,
+                    stages.tvb_blocks as u64, stages.retained as u64,
+                    stages.reachability_cache_hit as u64, submit.is_ok() as u64, 0, 0, 0]);
+                crate::g17_timing_buffer::record(words);
+            }
             if *module_parameters::g17p_completion_trace.value() != 0
                 && trace_limit != 0
                 && G17P_RENDER_POLL_RECORDS.fetch_add(1, Ordering::Relaxed) < trace_limit
@@ -1699,7 +1736,7 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
     }
     fn cancel(&self, packet: Arc<g17_job::G17PComputeJobPacket>) {
         let active = self.runtime.mutex().lock()
-            .quarantine_async_compute(self.owner, packet.submission_id(), ECANCELED);
+            .cancel_async_compute(self.owner, packet.submission_id());
         if !active {
             if let Ok(completion) = packet.completion() { completion.complete(Err(ECANCELED)); }
         }

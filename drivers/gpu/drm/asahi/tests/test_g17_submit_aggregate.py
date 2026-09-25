@@ -91,7 +91,8 @@ fn error(a:&G17PSubmitCompletion)->i32{a.fence.state.error.load(Ordering::Acquir
 render = block('impl G17PRenderCompletion {')
 assert render.count('self.aggregate_member.complete(') == 3
 compute = (root / 'g17_job.rs').read_text()
-assert compute.count('self.aggregate_member.complete(') == 2
+assert compute.count('self.aggregate_member.complete(') == 3
+assert 'self.aggregate_member.complete(Err(ECANCELED));' in compute
 guard = block("impl Drop for G17POutputFencePublication<'_> {")
 assert 'aggregate.finish_enqueue(if self.succeeded { Ok(()) } else { Err(self.failure) });' in guard
 dispatch = block('    fn submit_guarded(')
