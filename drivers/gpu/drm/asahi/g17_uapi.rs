@@ -669,10 +669,9 @@ pub(crate) struct RenderInternalState {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedRenderCommand {
-    /// UAPI VDM barrier carried by this command. With the current one-hardware-
-    /// command limit this is either NONE or zero (the preceding render's
-    /// fragment event). Keep it with the owned scheduler packet so publication
-    /// can encode the dependency in the TA kick rather than blocking the host.
+    /// Exact logical render prefix assigned by the DRM ioctl dispatcher.
+    pub(crate) render_order: g17_submission::G17PRenderOrder,
+    /// Original UAPI render index, retained through admission.
     pub(crate) render_barrier: u16,
     /// UAPI CDM barrier. Cross-engine ordering is currently enforced by the
     /// scheduler dependency, but retain the exact request with the packet.
@@ -949,6 +948,7 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.partial_store_pipeline = partial_end_of_tile;
 
     Ok(TranslatedRenderCommand {
+        render_order: g17_submission::G17PRenderOrder::default(),
         render_barrier: UAPI_BARRIER_NONE,
         compute_barrier: UAPI_BARRIER_NONE,
         flags: command.flags,
@@ -985,6 +985,7 @@ pub(crate) fn build_render_descriptors(
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedComputeCommand {
+    pub(crate) render_wait_through: Option<u64>,
     pub(crate) usc_exec_base: u64,
     pub(crate) control_stream_base: u64,
     pub(crate) control_stream_end: u64,
@@ -1062,6 +1063,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         None
     };
     Ok(TranslatedComputeCommand {
+        render_wait_through: None,
         usc_exec_base: queue.base,
         control_stream_base: command.control_stream_base,
         control_stream_end: command.control_stream_end,
