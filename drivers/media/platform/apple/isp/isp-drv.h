@@ -33,16 +33,15 @@
 #define ISP_MAX_BUFFERS 16
 
 /*
- * MMIO windows the firmware reaches through its DART (the DAPF slices of the
- * ADT dart-isp node), mapped 1:1 in the ISP domain as the native host did.
+ * The command area holds one command or one buffer batch at a time. A
+ * batch is a 16-byte header and a 64-byte descriptor per buffer, and
+ * carries at most every metadata buffer and one full rendered pool.
  */
-struct isp_identity_window {
-	u64 base;
-	u64 size;
-};
-/* t8140: capture-metadata pool entries the H17 receiver keeps queued */
-#define ISP_CAPMETA_BUFFERS 8
-#define ISP_POOL_TYPE_CAPMETA_SUBMIT 2
+#define ISP_BUFLIST_HDR_SIZE  0x10
+#define ISP_BUFLIST_DESC_SIZE 0x40
+#define ISP_CMD_AREA_SIZE \
+	(ISP_BUFLIST_HDR_SIZE + \
+	 ISP_BUFLIST_DESC_SIZE * (ISP_MAX_BUFFERS + ISP_MAX_BUFFERS))
 
 enum isp_generation {
 	ISP_GEN_T8103,
