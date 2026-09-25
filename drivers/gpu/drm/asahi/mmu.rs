@@ -734,12 +734,21 @@ impl VmInner {
     fn note_mapping_validation_change(&mut self, range: Range<u64>) {
         self.mapping_validation_epoch = self.mapping_validation_epoch
             .and_then(|epoch| epoch.checked_add(1));
-        if range.start >= range.end {
+        // A PTE covers the whole page. Record that leaf even if the caller's
+        // byte range is narrower, so an adjacent graph predicate cannot be
+        // incorrectly treated as untouched.
+        let mask = UAT_PGSZ as u64 - 1;
+        let end = range.end.checked_add(mask).map(|end| end & !mask);
+        if range.start >= range.end || end.is_none() {
             self.mapping_validation_epoch = None;
         }
         if let Some(epoch) = self.mapping_validation_epoch {
             self.mapping_validation_changes[epoch as usize % MAPPING_VALIDATION_HISTORY] =
-                Some(MappingValidationChange { epoch, start: range.start, end: range.end });
+                Some(MappingValidationChange {
+                    epoch,
+                    start: range.start & !mask,
+                    end: end.unwrap(),
+                });
         }
     }
 }
