@@ -22,13 +22,14 @@ def function(text, marker):
 
 assert "last_submission: Option<Fence>" in source
 assert "last_submission_engine: Option<G17PSubmissionEngine>" in source
+assert "last_publication: Option<Fence>" in source
 assert "last_async_compute" not in source
 
 compute = function(source, "    fn submit_compute_async(")
 assert compute.index("self.last_submission_engine != Some(G17PSubmissionEngine::Compute)") < compute.index(
     ".enqueue(packet, dependencies)?"
 )
-assert "self.last_submission = Some(finished.clone());" in compute
+assert "self.last_submission = Some(finished.completed.clone());" in compute
 assert "publication.publish_async(&finished);" not in compute
 assert "self.last_submission_engine = Some(G17PSubmissionEngine::Compute);" in compute
 
@@ -36,7 +37,7 @@ render = function(source, "    fn submit_render_async(")
 assert render.index("self.last_submission_engine != Some(G17PSubmissionEngine::Render)") < render.index(
     ".enqueue(packet, dependencies)?"
 )
-assert "self.last_submission = Some(finished.clone());" in render
+assert "self.last_submission = Some(finished.completed.clone());" in render
 assert "publication.publish_async(&finished);" not in render
 assert "self.last_submission_engine = Some(G17PSubmissionEngine::Render);" in render
 assert "translated.render_barrier = header.render_barrier;" in source

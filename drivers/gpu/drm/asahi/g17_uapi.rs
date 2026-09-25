@@ -915,6 +915,7 @@ pub(crate) fn build_render_descriptors(
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedComputeCommand {
     pub(crate) render_wait_through: Option<u64>,
+    pub(crate) render_wait_last: Option<u64>,
     pub(crate) usc_exec_base: u64,
     pub(crate) control_stream_base: u64,
     pub(crate) control_stream_end: u64,
@@ -996,6 +997,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     };
     Ok(TranslatedComputeCommand {
         render_wait_through: None,
+        render_wait_last: None,
         usc_exec_base: queue.base,
         control_stream_base: command.control_stream_base,
         control_stream_end: command.control_stream_end,

@@ -5573,6 +5573,15 @@ impl G17PLiveRuntime {
                 dependency_count += 1;
             }
         }
+        // Every render published while an earlier compute remains live must
+        // carry its token. With publication-only host edges, the second render
+        // can run on another physical pair before the first render retires.
+        if let Some(dependency) = self.async_compute_native_dependency(
+            completion.owner(), &completion.vm_status(),
+        )? {
+            *render_dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)? = dependency;
+            dependency_count += 1;
+        }
         // Diagnostic modes 2/3 construct TA later and do not accept this
         // dependency slice. Refuse an unresolved prefix instead of losing it.
         if dependency_count != 0 && (native_doorbell_mode == 2 || native_doorbell_mode == 3) {
