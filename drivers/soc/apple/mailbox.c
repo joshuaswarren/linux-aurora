@@ -618,26 +618,18 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
-		mbox->tx_irq_unmasked = true;
 		reinit_completion(&mbox->tx_empty);
+		if (!mbox->tx_irq_unmasked) {
+			mbox->tx_irq_unmasked = true;
+			enable_irq(mbox->irq_send_empty);
+		}
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
 		if (t <= 0) {
-			/*
-			 * Nothing drained the FIFO, so the send-empty handler
-			 * never ran and never masked the interrupt again.
-			 * Leaving it unmasked makes the next enable_irq() here
-			 * unbalanced, which the IRQ core warns about and which
-			 * eventually leaves the line masked for good:
-			 *   Unbalanced enable for IRQ 40
-			 *   WARNING: kernel/irq/manage.c:775 at enable_irq
-			 *   apple_mbox_send / SepData::get_entropy_word
-			 * once every timeout, from the SEP hwrng kthread.
-			 */
+			/* A late IRQ may already have masked this under tx_lock. */
 			spin_lock_irqsave(&mbox->tx_lock, flags);
 			if (mbox->tx_irq_unmasked) {
 				disable_irq_nosync(mbox->irq_send_empty);
