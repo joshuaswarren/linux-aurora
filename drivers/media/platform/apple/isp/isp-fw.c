@@ -10,6 +10,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
 
+#include "isp-cam.h"
 #include "isp-cmd.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
@@ -934,62 +935,28 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 }
 
 /*
- * t8140: the EIC exclave's ISP watchdog window.  On macOS the
- * ExclaveIndicatorController kicks it at 30 Hz while the camera indicator is
- * healthy; without the kicks the H17 firmware keeps running but every frame
- * is the diagnostic fill (LINUX-ISP-HOT-FRAMES-REQUIREMENTS-2026-09-16).
+ * Resident firmware (hw->resident_fw) is loaded by the bootloader and
+ * does not start again once it has been stopped: after CISP_CMD_SUSPEND,
+ * a coprocessor reset and a power cycle of its domains it never completes
+ * the first handshake. It is booted once, at probe, and runs until the
+ * driver is unbound, probe fails or the system goes to sleep; after that
+ * the device stays unusable until the next system boot.
  */
-static void apple_isp_wdt_kick(struct apple_isp *isp)
-{
-	/* exact EIC sequence: clear, reload value, kick, dsb sy */
-	writel(0, isp->wdt + ISP_WDT_CLEAR);
-	writel(ISP_WDT_RELOAD_VAL, isp->wdt + ISP_WDT_RELOAD);
-	writel(1, isp->wdt + ISP_WDT_KICK);
-	dsb(sy);
-}
-
-static enum hrtimer_restart apple_isp_wdt_pet(struct hrtimer *timer)
-{
-	struct apple_isp *isp = container_of(timer, struct apple_isp, wdt_timer);
-
-	apple_isp_wdt_kick(isp);
-	hrtimer_forward_now(timer, ns_to_ktime(ISP_WDT_PERIOD_NS));
-	return HRTIMER_RESTART;
-}
-
-void apple_isp_wdt_init(struct apple_isp *isp)
-{
-	hrtimer_setup(&isp->wdt_timer, apple_isp_wdt_pet, CLOCK_MONOTONIC,
-		      HRTIMER_MODE_REL_HARD);
-}
-
-void apple_isp_wdt_start(struct apple_isp *isp)
-{
-	if (!isp->wdt || isp->wdt_running)
-		return;
-
-	isp->wdt_running = true;
-	/* first kick right away, then every 33 ms for the life of the stream */
-	apple_isp_wdt_kick(isp);
-	hrtimer_start(&isp->wdt_timer, ns_to_ktime(ISP_WDT_PERIOD_NS),
-		      HRTIMER_MODE_REL_HARD);
-}
-
-void apple_isp_wdt_stop(struct apple_isp *isp)
-{
-	if (!isp->wdt_running)
-		return;
-
-	hrtimer_cancel(&isp->wdt_timer);
-	isp->wdt_running = false;
-}
-
 int apple_isp_firmware_boot(struct apple_isp *isp)
 {
 	int err;
 
-	if (isp->fw_persistent && isp->fw_booted)
+	switch (isp->fw_state) {
+	case ISP_FW_OFF:
+		break;
+	case ISP_FW_RUNNING:
+		/* Resident firmware keeps running between streams. */
 		return 0;
+	case ISP_FW_DEAD:
+		dev_err_ratelimited(isp->dev,
+				    "firmware was stopped and cannot be restarted before the next boot\n");
+		return -EIO;
+	}
 
 	/* Needs to be power cycled for IOMMU to behave correctly */
 	err = pm_runtime_resume_and_get(isp->dev);
@@ -1002,35 +969,36 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	if (err) {
 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
 		pm_runtime_put_sync(isp->dev);
+		if (isp->hw->resident_fw)
+			isp->fw_state = ISP_FW_DEAD;
 		return err;
 	}
 
-	isp->fw_booted = true;
+	isp->fw_state = ISP_FW_RUNNING;
 
 	return 0;
 }
 
-/* The end of a stream: resident firmware (t8140) keeps running. */
+/* The end of a stream or of the camera detection at probe */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
-	if (isp->fw_persistent)
+	if (isp->hw->resident_fw)
 		return;
 
 	apple_isp_firmware_halt(isp);
 }
 
-/*
- * The driver going away (or failing to probe): the firmware is stopped and
- * its power domains released whether or not it is kept resident between
- * streams.  On t8140 a gated ISP_CPU core does not come back until the
- * next cold boot, so a re-probe after this cannot boot the firmware.
- */
+/* Stop the firmware; resident firmware cannot be started again. */
 void apple_isp_firmware_halt(struct apple_isp *isp)
 {
-	if (!isp->fw_booted)
+	/* Only a capture services the watchdog, but be sure. */
+	apple_isp_wdt_stop(isp);
+
+	if (isp->fw_state != ISP_FW_RUNNING)
 		return;
 
 	isp_firmware_shutdown(isp);
 	isp->fw_booted = false;
 	pm_runtime_put_sync(isp->dev);
+	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
 }

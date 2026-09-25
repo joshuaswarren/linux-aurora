@@ -311,13 +311,14 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 		dev_err(isp->dev,
 			"failed to boot firmware for initial sensor detection: %d\n",
 			err);
-		return -EPROBE_DEFER;
+		/* Resident firmware would fail a deferred retry the same way. */
+		return isp->hw->resident_fw ? err : -EPROBE_DEFER;
 	}
 
 	err = isp_detect_camera(isp);
 
-	if (isp->fw_persistent) {
-		/* the firmware stays up; the channel is configured at first use */
+	/* Resident firmware stays up; the channel is set up per stream. */
+	if (isp->hw->resident_fw) {
 		if (err)
 			apple_isp_firmware_halt(isp);
 		return err;
