@@ -289,6 +289,16 @@ impl G18Role {
         }
     }
 
+    /// The `__DATA_SHARED_RO` reservation right after `__DATA`. On J873 the
+    /// RTKit crash callback reports the firmware-owned crash buffer here
+    /// (e.g. GFX1: 0x10003900000, 0x8000 bytes).
+    const fn shared_ro_region_name(self) -> &'static CStr {
+        match self {
+            Self::Gfx => c_str!("gfx-data-shared-ro"),
+            Self::Gfx1 => c_str!("gfx1-data-shared-ro"),
+        }
+    }
+
     /// 26A428 `__DATA` sizes (b000 / b010), as `Uat::new_t8152` checks.
     const fn data_size(self) -> u64 {
         match self {
@@ -824,6 +834,8 @@ struct G18RoleState {
     role: G18Role,
     /// The role's `__DATA` reservation (physical base, size).
     data: (u64, u64),
+    /// The role's `__DATA_SHARED_RO` reservation, (0, 0) when absent.
+    shared_ro: (u64, u64),
     acked: AtomicBool,
     crashed: AtomicBool,
     crash_dumped: AtomicBool,
@@ -843,18 +855,31 @@ impl G18RoleState {
         if self.crash_dumped.swap(true, Ordering::AcqRel) {
             return;
         }
+        let name = self.role.name();
+        let mut found = self.scan_crashlog("__DATA", self.data, reason);
+        if self.shared_ro.1 != 0 {
+            found += self.scan_crashlog("__DATA_SHARED_RO", self.shared_ro, reason);
+        }
+        if found == 0 {
+            dev_err!(self.dev.as_ref(), "G18_CRASHLOG {} no CLHE header in __DATA or __DATA_SHARED_RO\n", name);
+        }
+    }
+
+    /// Scan one reservation every CRASHLOG_SCAN_STEP for a `CLHE` crashlog
+    /// and dump what it finds. Read-only mapping. Returns the count found.
+    fn scan_crashlog(&self, label: &str, region: (u64, u64), reason: &str) -> u32 {
         let dev: &kernel::device::Device = self.dev.as_ref();
         let name = self.role.name();
-        let (base, size) = self.data;
+        let (base, size) = region;
         let Ok(size) = usize::try_from(size) else {
-            return;
+            return 0;
         };
-        dev_err!(dev, "G18_CRASHLOG {} scanning __DATA {:#x}+{:#x} ({})\n", name, base, size, reason);
+        dev_err!(dev, "G18_CRASHLOG {} scanning {} {:#x}+{:#x} ({})\n", name, label, base, size, reason);
         let map = match PhysMap::new(base, size) {
             Ok(map) => map,
             Err(error) => {
-                dev_err!(dev, "G18_CRASHLOG {} __DATA map failed ({:?})\n", name, error);
-                return;
+                dev_err!(dev, "G18_CRASHLOG {} {} map failed ({:?})\n", name, label, error);
+                return 0;
             }
         };
         let mut found = 0u32;
@@ -864,17 +889,17 @@ impl G18RoleState {
             if map.copy(offset, &mut head).is_ok() && le_u32(&head, 0) == Some(CRASHLOG_HEADER) {
                 let declared = le_u32(&head, 8).unwrap_or(0) as usize;
                 if declared < 0x20 || declared > size - offset {
-                    dev_err!(dev, "G18_CRASHLOG {} CLHE at __DATA+{:#x} declares {:#x} bytes; skipped\n",
-                        name, offset, declared);
+                    dev_err!(dev, "G18_CRASHLOG {} CLHE at {}+{:#x} declares {:#x} bytes; skipped\n",
+                        name, label, offset, declared);
                 } else {
                     let length = (declared.min(CRASHLOG_MAX_BYTES) + 3) & !3;
                     let length = length.min(size - offset);
                     match KVVec::from_elem(0u8, length, GFP_KERNEL) {
                         Ok(mut bytes) => {
                             if map.copy(offset, &mut bytes).is_ok() {
-                                dev_err!(dev, "G18_CRASHLOG {} found at __DATA+{:#x} (PA {:#x})\n",
-                                    name, offset, base + offset as u64);
-                                dump_crashlog(dev, name, "__DATA scan", &bytes);
+                                dev_err!(dev, "G18_CRASHLOG {} found at {}+{:#x} (PA {:#x})\n",
+                                    name, label, offset, base + offset as u64);
+                                dump_crashlog(dev, name, label, &bytes);
                                 found += 1;
                             }
                         }
@@ -884,9 +909,7 @@ impl G18RoleState {
             }
             offset += CRASHLOG_SCAN_STEP;
         }
-        if found == 0 {
-            dev_err!(dev, "G18_CRASHLOG {} no CLHE header anywhere in __DATA\n", name);
-        }
+        found
     }
 }
 
@@ -1622,6 +1645,12 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
         }
         data[role.index()] = (region.start(), region.size());
     }
+    let mut shared_ro = [(0u64, 0u64); 2];
+    for role in G18Role::ALL {
+        if let Ok(region) = node.reserved_mem_region_to_resource_byname(role.shared_ro_region_name()) {
+            shared_ro[role.index()] = (region.start(), region.size());
+        }
+    }
 
     let drm = probe.drm.clone();
     let uat = Arc::new(mmu::Uat::new_t8152(&drm, None)?, GFP_KERNEL)?;
@@ -1633,6 +1662,7 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
             dev: drm.clone(),
             role,
             data: data[role.index()],
+            shared_ro: shared_ro[role.index()],
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             crash_dumped: AtomicBool::new(false),
