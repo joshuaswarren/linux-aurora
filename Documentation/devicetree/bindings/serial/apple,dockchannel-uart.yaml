@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Apple DockChannel UART
 
 maintainers:
-  - Yureka Lilian <yureka@cyberchaos.dev>
+  - Ryan Murray <ryan@aurorasilicon.org>
 
 description: |
   Apple SoCs provide UART-compatible byte streams over DockChannel. Each
