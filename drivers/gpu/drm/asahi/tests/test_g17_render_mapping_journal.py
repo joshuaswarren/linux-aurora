@@ -22,6 +22,7 @@ def item(prefix):
 
 program = "\n".join([
     "use core::ops::Range;",
+    "const UAT_PGSZ: usize = 16384;",
     next(line for line in source.splitlines()
          if line.startswith("const MAPPING_VALIDATION_HISTORY:")),
     "#[derive(Clone, Copy)]",
@@ -49,21 +50,22 @@ fn fixture() -> Vm {
 fn empty_and_disjoint_changes_keep_the_proof() {
     let vm = fixture();
     assert_eq!(vm.mapping_changes_since(0, |_| true), Some((0, false)));
-    vm.inner.0.borrow_mut().note_mapping_validation_change(100..200);
-    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 20 && range.end > 10),
+    vm.inner.0.borrow_mut().note_mapping_validation_change(0x10001..0x10002);
+    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 0x2000 && range.end > 0x1000),
         Some((1, false)));
-    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 150 && range.end > 120),
+    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 0x10001 && range.end > 0x10000),
         Some((1, true)));
 }
 #[test]
 fn failed_attempt_and_guard_mapping_both_invalidate() {
     let vm = fixture();
     // A mutation is recorded before a page-table operation that may fail.
-    vm.inner.0.borrow_mut().note_mapping_validation_change(100..200);
-    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 200 && range.end > 128),
+    vm.inner.0.borrow_mut().note_mapping_validation_change(0x10001..0x10002);
+    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 0x10002 && range.end > 0x10001),
         Some((1, true)));
-    // A TVB guard is a negative predicate; mapping its tail must invalidate.
-    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 256 && range.end > 192),
+    // A TVB guard is a negative predicate; a leaf reaching its adjacent tail
+    // invalidates even when the caller's byte range ended before the tail.
+    assert_eq!(vm.mapping_changes_since(0, |range| range.start < 0x14000 && range.end > 0x10002),
         Some((1, true)));
 }
 #[test]
