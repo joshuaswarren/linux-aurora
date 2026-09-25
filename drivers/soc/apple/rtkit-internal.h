@@ -47,14 +47,6 @@ struct apple_rtkit {
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;
 	bool crashed;
-	bool adopted;
-	bool awaiting_iop_idle;
-	bool epmap_only;
-	bool firmware_owned_crashlog;
-	bool t8152_pmp;
-	bool crashlog_endpoint_started;
-	bool hello_seen;
-	bool epmap_finished;
 	bool shutting_down;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);

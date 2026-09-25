@@ -818,7 +818,7 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 	struct apple_rtkit *rtk = rtk_work->rtk;
 
 	if (READ_ONCE(rtk->shutting_down))
-		goto out_free;
+		goto out;
 
 	switch (rtk_work->ep) {
 	case APPLE_RTKIT_EP_MGMT:
@@ -855,7 +855,7 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 				 rtk_work->ep, rtk_work->msg);
 	}
 
-out_free:
+out:
 	kfree(rtk_work);
 }
 
@@ -865,6 +865,9 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	struct apple_rtkit *rtk = cookie;
 	struct apple_rtkit_rx_work *work;
 	u8 ep = msg.msg1;
+
+	if (READ_ONCE(rtk->shutting_down))
+		return;
 
 	/*
 	 * The message was read from a MMIO FIFO and we have to make
@@ -986,31 +989,56 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
-static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
+static void apple_rtkit_claim_rx(struct apple_rtkit *rtk)
 {
-	static const u8 system_endpoints[] = {
-		APPLE_RTKIT_EP_CRASHLOG,
-		APPLE_RTKIT_EP_SYSLOG,
-		APPLE_RTKIT_EP_DEBUG,
-		APPLE_RTKIT_EP_IOREPORT,
-		APPLE_RTKIT_EP_OSLOG,
-		APPLE_RTKIT_EP_TRACEKIT,
-	};
-	int i;
+	struct apple_mbox *mbox = rtk->mbox;
+	unsigned long flags;
 
-	/* The previous owner already completed and acknowledged this EPMAP. */
-	for (i = 0; i < ARRAY_SIZE(system_endpoints); i++)
-		set_bit(system_endpoints[i], rtk->endpoints);
-
-	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
-	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
-	rtk->adopted = true;
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (mbox->rx || mbox->cookie)
+		dev_warn(rtk->dev,
+			 "RTKit: mailbox receiver already claimed, taking it over\n");
+	mbox->cookie = rtk;
+	mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 }
 
-static struct apple_rtkit *__apple_rtkit_init(
-	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
-	const struct apple_rtkit_ops *ops, bool adopted, bool epmap_only,
-	bool firmware_owned_crashlog)
+static void apple_rtkit_detach_rx(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+
+	WRITE_ONCE(rtk->shutting_down, true);
+	apple_mbox_stop(rtk->mbox);
+	/*
+	 * IRQ receive and explicit polling both hold rx_lock. Detach before
+	 * draining the queue, but keep the cookie as an ownership reservation
+	 * until all host/buffer teardown is complete.
+	 */
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	if (rtk->mbox->cookie == rtk)
+		rtk->mbox->rx = NULL;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+}
+
+static void apple_rtkit_stop_rx(struct apple_rtkit *rtk)
+{
+	apple_rtkit_detach_rx(rtk);
+	destroy_workqueue(rtk->wq);
+}
+
+static void apple_rtkit_release_rx(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	if (rtk->mbox->cookie == rtk)
+		rtk->mbox->cookie = NULL;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+}
+
+struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
+					    const char *mbox_name, int mbox_idx,
+					    const struct apple_rtkit_ops *ops)
 {
 	struct apple_rtkit *rtk;
 	int ret;
@@ -1052,10 +1080,6 @@ static struct apple_rtkit *__apple_rtkit_init(
 		ret = PTR_ERR(rtk->mbox);
 		goto free_rtk;
 	}
-	if (rtk->mbox->rx) {
-		ret = -EBUSY;
-		goto free_rtk;
-	}
 
 	rtk->wq = alloc_ordered_workqueue("rtkit-%s", WQ_HIGHPRI | WQ_MEM_RECLAIM,
 					  dev_name(rtk->dev));
@@ -1064,21 +1088,17 @@ static struct apple_rtkit *__apple_rtkit_init(
 		goto free_rtk;
 	}
 
-	rtk->mbox->cookie = rtk;
-	rtk->mbox->rx = apple_rtkit_rx;
-	if (adopted)
-		apple_rtkit_mark_running(rtk);
+	apple_rtkit_claim_rx(rtk);
 
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret)
-		goto destroy_wq;
+		goto stop_rx;
 
 	return rtk;
 
-destroy_wq:
-	rtk->mbox->rx = NULL;
-	rtk->mbox->cookie = NULL;
-	destroy_workqueue(rtk->wq);
+stop_rx:
+	apple_rtkit_stop_rx(rtk);
+	apple_rtkit_release_rx(rtk);
 free_rtk:
 	kfree(rtk);
 	return ERR_PTR(ret);
@@ -1136,8 +1156,11 @@ static int apple_rtkit_wait_for_completion(struct completion *c)
 
 int apple_rtkit_reinit(struct apple_rtkit *rtk)
 {
+	unsigned long flags;
+	int ret;
+
 	/* make sure we don't handle any messages while reinitializing */
-	apple_mbox_stop(rtk->mbox);
+	apple_rtkit_detach_rx(rtk);
 	flush_workqueue(rtk->wq);
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
@@ -1178,7 +1201,17 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 
-	return apple_mbox_start(rtk->mbox);
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	WRITE_ONCE(rtk->shutting_down, false);
+	rtk->mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+
+	ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+	}
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
 
@@ -1469,20 +1502,7 @@ EXPORT_SYMBOL_GPL(apple_rtkit_wake_early_ap);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
-	/*
-	 * Let already-running callbacks finish while the transport is still
-	 * powered, but make every callback observed after this point a no-op.
-	 * Work queued by an IRQ racing the first flush is drained by
-	 * destroy_workqueue() after apple_mbox_stop() has synchronously disabled
-	 * that IRQ.
-	 */
-	WRITE_ONCE(rtk->shutting_down, true);
-	cancel_delayed_work_sync(&rtk->crashlog_probe);
-	flush_workqueue(rtk->wq);
-	apple_mbox_stop(rtk->mbox);
-	rtk->mbox->rx = NULL;
-	destroy_workqueue(rtk->wq);
-	rtk->mbox->cookie = NULL;
+	apple_rtkit_stop_rx(rtk);
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
@@ -1495,6 +1515,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
 
 	kfree(rtk->syslog_msg_buffer);
+	apple_rtkit_release_rx(rtk);
 	kfree(rtk);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_free);

@@ -691,9 +691,13 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 	int ret = 0;
 	u32 mbox_ctrl;
 
-	if (mbox->hw->is_ascwrap_v8) {
-		struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
-		u32 state, ack;
+	/*
+	 * A detached receiver (RTKit teardown in progress) leaves firmware
+	 * traffic in the FIFO; it is drained again once a receiver is attached.
+	 */
+	if (!mbox->rx)
+		return 0;
+	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
 
 		/* PSD proof before the post-office status read. */
 		ret = apple_mbox_ascwrap_v8_psd_powered(mbox, &state, &ack);
