@@ -633,8 +633,7 @@ struct atcphy_hw {
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
- * @pipehandler_up: True if the PIPE mux ("pipehandler") is set to USB3 or USB4 mode
- * @force_usb2_on: Power USB2 from set_mode when no Type-C controller is available
+ * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -675,12 +674,7 @@ struct apple_atcphy {
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool swap_lanes;
-	bool pipehandler_up;
-	bool legacy_fixed_usb2;
-	struct phy *repeater;
-	bool force_usb2_on;
-	bool force_usb2_host_preinit;
-	bool force_usb2_pipe_dummy;
+	enum atcphy_pipehandler_state pipe_state;
 
 	struct {
 		void __iomem *core;
@@ -1347,29 +1341,48 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+/*
+ * Route the PIPE to the backend the current mode needs. The state is recorded
+ * whether or not the sequence succeeded: the PIPE is configured once per mode,
+ * and a failed attempt is not retried on the next set_mode call.
+ */
 static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 {
+	enum atcphy_pipehandler_state state = atcphy_modes[atcphy->mode].pipehandler_state;
 	int ret = -EINVAL;
 
 	lockdep_assert_held(&atcphy->lock);
 
-	switch (atcphy_modes[atcphy->mode].pipehandler_state) {
+	switch (state) {
 	case ATCPHY_PIPEHANDLER_STATE_USB3:
 		ret = atcphy_configure_pipehandler_usb3(atcphy, host);
-		if (!ret)
-			atcphy->pipehandler_up = true;
 		break;
 	case ATCPHY_PIPEHANDLER_STATE_USB4:
 		ret = atcphy_configure_pipehandler_usb4(atcphy);
-		atcphy->pipehandler_up = true;
 		break;
 	case ATCPHY_PIPEHANDLER_STATE_DUMMY:
 		ret = atcphy_configure_pipehandler_dummy(atcphy);
-		atcphy->pipehandler_up = false;
 		break;
 	}
+	atcphy->pipe_state = state;
 
 	return ret;
+}
+
+/* Route the PIPE back to the dummy backend unless it is there already */
+static void atcphy_park_pipehandler(struct apple_atcphy *atcphy)
+{
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
+		return;
+
+	ret = atcphy_configure_pipehandler_dummy(atcphy);
+	if (ret)
+		dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 }
 
 static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
@@ -1378,6 +1391,7 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	if (!atcphy->hw->has_usb4)
 		atcphy_enable_dummy_phy(atcphy);
 }
@@ -2203,15 +2217,10 @@ static const struct phy_ops apple_atc_usb2_phy_ops = {
 static int atcphy_usb3_power_off(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
-	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
-	ret = atcphy_configure_pipehandler_dummy(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "Failed to switch pipe to dummy: %d", ret);
-
-	atcphy->pipehandler_up = false;
+	atcphy_park_pipehandler(atcphy);
 
 	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
 		atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
@@ -2233,22 +2242,12 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	}
 
 	/*
-	 * The fixed J700 USB2 hub keeps DWC3 in host mode independently of the
-	 * rear Type-C connector. CD321x updates the ATC mux before reporting the
-	 * (possibly unchanged) USB role, so a second set_mode call is the point at
-	 * which the live DWC PIPE must follow the newly selected lane mode.
-	 *
-	 * Make that operation idempotent in both directions. Re-selecting the
-	 * already active dummy backend used to run the lock/BIST workaround for no
-	 * reason and could print "Pipehandler lock not acked" during USB2-only
-	 * startup. Conversely, returning merely because pipehandler_up was true
-	 * left the PIPE on USB3 after a mux transition to a dummy-backed mode.
+	 * We may get multiple calls to set_mode (for host mode e.g. at least one from the dwc3 glue
+	 * driver and then another one from the generic xhci code) but must only configure the
+	 * PIPE handler once. Nothing needs to be done either when the PIPE is already routed to
+	 * the backend the current mode uses, which includes the dummy backend of the USB2 modes.
 	 */
-	target = atcphy_modes[atcphy->mode].pipehandler_state;
-	if ((target == ATCPHY_PIPEHANDLER_STATE_USB3 &&
-	     atcphy->pipehandler_up) ||
-	    (target != ATCPHY_PIPEHANDLER_STATE_USB3 &&
-	     !atcphy->pipehandler_up))
+	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state)
 		return 0;
 
 	switch (mode) {
@@ -2400,20 +2399,11 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy)
 static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
-	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
 	_atcphy_dwc3_reset_assert(atcphy);
-
-	if (atcphy->pipehandler_up) {
-		ret = atcphy_configure_pipehandler_dummy(atcphy);
-		if (ret)
-			dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
-		else
-			atcphy->pipehandler_up = false;
-	}
-
+	atcphy_park_pipehandler(atcphy);
 	atcphy_usb2_power_off(atcphy);
 
 	return 0;
@@ -2594,35 +2584,8 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	 * warning about the same condition here and continuing regardless was
 	 * the bug.  Both callers hold atcphy->lock.
 	 */
-	/*
-	 * This path has no other visibility and it is easy to draw the wrong
-	 * conclusion from its absence: the WARN_ON_ONCE that used to sit here
-	 * was the only signal it had ever produced, and removing it made "no
-	 * output" look like "never called".  One line per transition says what
-	 * was asked for and what state the PIPE was in when it was asked.
-	 */
-	dev_info(atcphy->dev,
-		 "J700_ATCPHY_MUX_SET: target_mode=%d cur_mode=%d pipehandler_up=%u target_ph=%d\n",
-		 target_mode, atcphy->mode, atcphy->pipehandler_up,
-		 atcphy_modes[target_mode].pipehandler_state);
-
-	if (atcphy->pipehandler_up &&
-	    atcphy_modes[target_mode].pipehandler_state !=
-		    ATCPHY_PIPEHANDLER_STATE_USB3) {
-		int ret = atcphy_configure_pipehandler_dummy(atcphy);
-
-		if (ret)
-			dev_warn(atcphy->dev,
-				 "Failed to park PIPE on the dummy backend before switching to mode %d: %d; the link will fall back to USB2-only\n",
-				 target_mode, ret);
-		else
-			atcphy->pipehandler_up = false;
-	}
-
-	ret = atcphy_configure(atcphy, target_mode);
-	dev_info(atcphy->dev, "J700_ATCPHY_MUX_SET: configure(%d) returned %d, mode now %d\n",
-		 target_mode, ret, atcphy->mode);
-	return ret;
+	WARN_ON_ONCE(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	return atcphy_configure(atcphy, target_mode);
 }
 
 static void atcphy_typec_mux_unregister(void *data)
@@ -2876,7 +2839,7 @@ static int atcphy_probe(struct platform_device *pdev)
 			return ret;
 	}
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
-	atcphy->pipehandler_up = false;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 
 	return atcphy_probe_finalize(atcphy);
 }
