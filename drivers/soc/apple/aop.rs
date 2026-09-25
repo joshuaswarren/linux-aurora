@@ -61,7 +61,10 @@ use kernel::{
         Mutex, //
     },
     time::msecs_to_jiffies,
-    types::ForeignOwnable,
+    types::{
+        ForeignOwnable,
+        ScopeGuard, //
+    },
     workqueue::{
         impl_has_work,
         new_work,
@@ -873,6 +876,14 @@ struct ChildDevice(NonNull<bindings::platform_device>);
 unsafe impl Send for ChildDevice {}
 
 impl ChildDevice {
+    /// Unbinds the child's driver while the child stays registered.
+    fn release_driver(&self) {
+        // SAFETY: The pointer came from a successful
+        // `platform_device_register_full()` and the device is still
+        // registered, so its embedded `struct device` is valid.
+        unsafe { bindings::device_release_driver(ptr::addr_of_mut!((*self.0.as_ptr()).dev)) };
+    }
+
     fn unregister(self) {
         // SAFETY: The pointer came from a successful
         // `platform_device_register_full()` and is unregistered exactly once,
@@ -890,7 +901,10 @@ struct AopData {
     /// nothing is queued once the queue drains. Never held across a drain.
     #[pin]
     registration_gate: Mutex<()>,
+    /// Set once by the first teardown; later teardowns return at once.
     removing: Atomic<bool>,
+    /// Set when the transport starts closing; no call is started after it.
+    transport_closing: Atomic<bool>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<AopData>>>,
     #[pin]
@@ -1011,6 +1025,7 @@ impl AopData {
                     registration_queue,
                     registration_gate <- new_mutex!(()),
                     removing: Atomic::new(false),
+                    transport_closing: Atomic::new(false),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
@@ -1545,10 +1560,13 @@ impl AopData {
 
 impl AOP for AopData {
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
+        if self.transport_closing.load(Acquire) {
+            return Err(ENODEV);
+        }
         let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
-            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
+            let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             let mut ep_guard = self.endpoints[ep_idx].lock();
             ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, None)?
         };
@@ -1561,10 +1579,13 @@ impl AOP for AopData {
         msg_bytes: &[u8],
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)> {
+        if self.transport_closing.load(Acquire) {
+            return Err(ENODEV);
+        }
         let ep_idx = afk_endpoint_index(svc.endpoint).ok_or(EINVAL)?;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
-            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
+            let mut rtk = rtk_guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
             let mut ep_guard = self.endpoints[ep_idx].lock();
             let mut ret_buf = KVec::new();
             ret_buf.resize(ret_len, 0, GFP_KERNEL)?;
@@ -1588,6 +1609,9 @@ impl AOP for AopData {
         listener: Arc<dyn FakehidListener>,
     ) -> Result<()> {
         let mut guard = self.hid_listeners.lock();
+        if self.removing.load(Acquire) {
+            return Err(ENODEV);
+        }
         Ok(guard.push(ListenerEntry { svc, listener }, GFP_KERNEL)?)
     }
     fn remove_fakehid_listener(&self, svc: &EPICService) -> bool {
@@ -1600,68 +1624,35 @@ impl AOP for AopData {
         }
         false
     }
-    fn add_report_listener(
-        &self,
-        svc: EPICService,
-        subtype: u16,
-        listener: Arc<dyn ReportListener>,
-    ) -> Result<()> {
-        let mut guard = self.report_listeners.lock();
-        Ok(guard.push(
-            ReportListenerEntry {
-                svc,
-                subtype,
-                listener,
-            },
-            GFP_KERNEL,
-        )?)
-    }
-    fn remove_report_listener(&self, svc: &EPICService, subtype: u16) -> bool {
-        let mut guard = self.report_listeners.lock();
-        for i in 0..guard.len() {
-            if guard[i].svc == *svc && guard[i].subtype == subtype {
-                guard.swap_remove(i);
-                return true;
-            }
-        }
-        false
-    }
-    fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
-        if !self.epic_v4 {
-            return Err(ENODEV);
-        }
-        let mut guard = self.source_ring.lock();
-        if let Some(ring) = guard.as_ref() {
-            if ring.size() < size {
-                dev_err!(
-                    self.dev,
-                    "source ring already bound with {} bytes\n",
-                    ring.size()
-                );
-                return Err(EBUSY);
-            }
-            return Ok(ring.clone());
-        }
-        let buf = Coherent::<u8>::zeroed_slice(dev, size, GFP_KERNEL)?;
-        let iova = buf.dma_handle() as u64;
-        self.setup_bind_source(iova, size as u64)?;
-        let ring = Arc::new(SourceRing { buf, iova }, GFP_KERNEL)?;
-        *guard = Some(ring.clone());
-        Ok(ring)
-    }
+    /// Takes the AOP down: from unbind, from a failed probe, or as a fallback
+    /// from Drop. Only the first call does anything.
     fn remove(&self) {
         {
             let _gate = self.registration_gate.lock();
-            self.removing.store(true, Release);
+            if self.removing.xchg(true, Acquire) {
+                return;
+            }
         }
         // No registration is queued after this point, so once the queue is
         // empty the list of children is complete.
         self.registration_queue.drain();
+        // Unbind the children while the transport still works, so that their
+        // unbind can talk to their services. Then drop any listener a child
+        // left behind: no report may reach a driver that is going away.
+        let children = mem::take(&mut *self.subdevices.lock());
+        for child in &children {
+            child.release_driver();
+        }
+        self.hid_listeners.lock().clear();
+        self.transport_closing.store(true, Release);
         if let Err(e) = self.stop() {
             dev_err!(self.dev, "Failed to stop AOP {:?}", e);
         }
-        *self.rtkit.lock() = None;
-        let children = mem::replace(&mut *self.subdevices.lock(), KVec::new());
+        // Take the handle out of the shared state before dropping it: the
+        // drop waits for the RTKit receive worker, which takes the same lock.
+        // After it, no callback runs and the device may be unbound.
+        let rtkit = self.rtkit.lock().take();
+        drop(rtkit);
         for child in children {
             child.unregister();
         }
@@ -1694,7 +1685,9 @@ impl rtkit::Operations for AopData {
             return;
         };
         let mut guard = data.rtkit.lock();
-        let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+        let Some(mut rtk) = guard.as_mut().as_pin_mut() else {
+            return;
+        };
         let mut ep_guard = data.endpoints[index].lock();
         let ret = ep_guard.recv_message(data, rtk.as_mut(), msg);
         if let Err(e) = ret {
@@ -1778,7 +1771,10 @@ impl platform::Driver for AopDriver {
         let aop_mmio = KBox::pin_init(aop_req.iomap_sized::<AOP_MMIO_SIZE>(), GFP_KERNEL)?;
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = KBox::pin_init(asc_req.iomap_sized::<ASC_MMIO_SIZE>(), GFP_KERNEL)?;
-        let data = AopData::new(pdev, cfg.t8140)?;
+        let data = AopData::new(pdev)?;
+        // Whatever fails below leaves the AOP running and its children
+        // registering; the same teardown as unbind's cleans that up.
+        let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
         let aop_mmio = aop_mmio.access(pdev.as_ref())?;
         if !cfg.t8140 {
             data.patch_bootargs(
@@ -1828,36 +1824,17 @@ impl platform::Driver for AopDriver {
             drop(st);
         }
         let asc_mmio = asc_mmio.access(pdev.as_ref())?.relaxed();
-        let _ = data.start_cpu(asc_mmio);
-        if cfg.t8140 {
-            // Primary port RTKit v12 handshake to AP power ON, with the setup
-            // port answered from interrupt context meanwhile; then the setup
-            // port's own AP power state and endpoint buffers.
-            {
-                let mut guard = data.rtkit.lock();
-                let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-                rtk.as_mut().wake()?;
-            }
-            data.setup_finish_boot()?;
-            // Before any EPIC client opens the ALS: the trusted side wants the
-            // calibration first, and a failure here must not cost us the AOP.
-            if let Err(e) = data.setup_push_als_calibration() {
-                dev_warn!(
-                    pdev.as_ref(),
-                    "t8140 AOP: ALS calibration failed ({:?})\n",
-                    e
-                );
-            }
-            dev_info!(
-                pdev.as_ref(),
-                "t8140 AOP: both ports up, starting AFK endpoints\n"
-            );
-            data.start_afk()?;
-        } else {
-            data.start()?;
-        }
+        data.start_cpu(asc_mmio)?;
+        data.start()?;
+        probe_guard.dismiss();
         let data = data as Arc<dyn AOP>;
         Ok(Self(data))
+    }
+
+    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+        // The device is still bound here, which the DMA allocations the
+        // teardown frees require. Drop only repeats it as a no-op.
+        this.0.remove();
     }
 }
 
