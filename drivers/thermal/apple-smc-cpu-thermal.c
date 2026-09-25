@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* J700 Linux policy over selected SMC telemetry, not a silicon safety limit. */
+/*
+ * Apple J700 CPU thermal policy over selected SMC telemetry
+ *
+ * Copyright (C) 2026 Eryk Wieliczko
+ */
 #include <linux/cpu_cooling.h>
 #include <linux/cpufreq.h>
 #include <linux/device.h>
@@ -13,29 +17,23 @@
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
-/* Linux operating policy, not an Apple threshold. SMC publication can lag
- * successful reads by roughly a second in observed load traces. Faster host
- * polling does not bound sensor age; higher OPP admission must remain limited.
- */
 /*
- * Two tiers: a passive trip that lets step_wise walk the cpufreq cooling
- * devices down state by state, and a hard tier that pins both clusters to
- * their minimum frequency through the QoS guard.  The SMC's own backup
- * remains at 105 C, which is Apple's own passive limit for this part.
+ * Two controls act on the hottest of the six selected sensors: a passive
+ * trip bound to maximum cpufreq cooling (95 C, released below 85 C), and a
+ * hard tier that pins both clusters to their minimum frequency through a
+ * frequency-QoS guard (from 103 C, released below 98 C).  The guard also
+ * holds the minimum while readings are missing, stale or failing, while the
+ * zone is disabled, and after a cpufreq DVFS fault.
  *
- * While the PMP fast policy (CONFIG_APPLE_PMP_V2_THERMAL) runs it retunes
- * this zone into the independent backup at 105 C, leaving these tiers to the
- * 25 ms PMP zone.
+ * The band sits above the idle temperature: the original 80 C trip with a
+ * 70 C release latched the throttle permanently while the die idled at
+ * 70-77 C with the spinning idle loop, because step_wise never saw it drop
+ * below the release point.
  *
- * The original qualification numbers were 80 C passive / 70 C release.  That
- * band is unusable on J700 silicon: the die sits at 70-77 C at idle and light
- * load (measured 2026-09-20, load average 0.4, one browser), i.e. permanently
- * inside the step_wise hold band.  The first excursion past 80 C latched the
- * throttle and it could never walk back out, because walking back out needs
- * < 70 C and the only way to get there was the minimum-frequency guard itself.
- * Observed result: P cluster held at 1.26-2.20 GHz of 4.044 GHz indefinitely.
- * The band is therefore moved above the idle temperature, keeping the same
- * 10 C hysteresis and staying under Apple's 105 C backup.
+ * The thresholds are Linux operating policy, not Apple or silicon limits.
+ * SMC readings can lag a successful read by about a second under load, so
+ * faster host polling does not bound the sensor age; the 200 ms limit only
+ * bounds the host transaction.
  */
 #define SMC_TRIP_MC 95000
 #define SMC_RELEASE_MC 85000
@@ -58,16 +56,12 @@ static DEFINE_MUTEX(smc_lock);
 static DEFINE_MUTEX(smc_provider_lock);
 static struct apple_smc_thermal_cpu *smc_cpus[2];
 static struct thermal_zone_device *smc_zone;
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-static struct thermal_zone_device *smc_aux_zone;
-#endif
 static int (*smc_read)(void *, int *);
 static void *smc_ctx;
 static unsigned long smc_sample_time;
 static unsigned int smc_good;
 static int smc_value, smc_error = -ENODATA;
 static bool smc_enabled, smc_hot;
-static int smc_hot_mc = SMC_HOT_MC, smc_hot_release_mc = SMC_HOT_RELEASE_MC;
 static void smc_sample_work(struct work_struct *work);
 static void smc_watch_work(struct work_struct *work);
 static DECLARE_DELAYED_WORK(smc_sample, smc_sample_work);
@@ -79,39 +73,6 @@ static bool smc_fresh(void)
 					 smc_sample_time + msecs_to_jiffies(SMC_MAX_AGE_MS));
 }
 
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-/* A nonblocking admission snapshot. Zero revokes; the deadline also expires
- * if the SMC workers stop. This is host freshness, not sensor publication age.
- */
-static u64 smc_until;
-static u64 smc_health_until;
-static u64 smc_sample_start;
-
-bool apple_smc_thermal_live(void)
-{
-	return ktime_get_boottime_ns() < READ_ONCE(smc_until);
-}
-
-bool apple_smc_thermal_healthy(void)
-{
-	return ktime_get_boottime_ns() < READ_ONCE(smc_health_until);
-}
-
-bool apple_smc_thermal_ready(void)
-{
-	unsigned int i;
-
-	guard(mutex)(&smc_lock);
-	if (!smc_zone || !smc_enabled || !smc_fresh() || smc_good < 3 || smc_hot ||
-	    smc_value >= smc_hot_release_mc)
-		return false;
-	for (i = 0; i < ARRAY_SIZE(smc_cpus); i++)
-		if (!smc_cpus[i] || READ_ONCE(smc_cpus[i]->failed))
-			return false;
-	return true;
-}
-#endif
-
 /* smc_lock held. QoS is independent of user limits and the thermal governor. */
 static void smc_update_guards(void)
 {
@@ -121,10 +82,8 @@ static void smc_update_guards(void)
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(smc_cpus); i++)
-		if (smc_cpus[i] && READ_ONCE(smc_cpus[i]->failed)) {
+		if (smc_cpus[i] && READ_ONCE(smc_cpus[i]->failed))
 			clamp = true;
-			healthy = false;
-		}
 	for (i = 0; i < ARRAY_SIZE(smc_cpus); i++) {
 		struct apple_smc_thermal_cpu *cpu = smc_cpus[i];
 		int ret;
@@ -145,13 +104,6 @@ static void smc_update_guards(void)
 		for (i = 0; i < ARRAY_SIZE(smc_cpus); i++)
 			if (smc_cpus[i])
 				freq_qos_update_request(&smc_cpus[i]->guard, smc_cpus[i]->min_freq);
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-	WRITE_ONCE(smc_health_until, healthy && !error && smc_cpus[0] && smc_cpus[1] ?
-		   smc_sample_start + SMC_MAX_AGE_MS * 1000000ULL : 0);
-	WRITE_ONCE(smc_until, !clamp && !error && smc_cpus[0] && smc_cpus[1] &&
-		   smc_value < smc_hot_release_mc ? smc_sample_start +
-		   SMC_MAX_AGE_MS * 1000000ULL : 0);
-#endif
 }
 
 static int smc_zone_temp(struct thermal_zone_device *zone, int *temp)
@@ -192,10 +144,12 @@ static const struct thermal_zone_device_ops smc_zone_ops = {
 	.change_mode = smc_zone_mode,
 	.should_bind = smc_zone_bind,
 };
+
 static const struct thermal_trip smc_trips[] = {
 	{ .temperature = SMC_TRIP_MC, .hysteresis = SMC_TRIP_MC - SMC_RELEASE_MC,
 	  .type = THERMAL_TRIP_PASSIVE },
 };
+
 static const struct thermal_zone_params smc_params = {
 	.governor_name = "step_wise",
 	.no_hwmon = true,
@@ -212,202 +166,6 @@ static int smc_check_binding(struct thermal_trip *trip, void *data)
 	return 0;
 }
 
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-
-struct smc_aux_trip_update {
-	struct thermal_zone_device *zone;
-	int temperature, hysteresis;
-};
-
-static int smc_aux_set_trip(struct thermal_trip *trip, void *data)
-{
-	struct smc_aux_trip_update *update = data;
-
-	/* Only retune the primary trip; preserve additional PMP cooling tiers. */
-	if (THERMAL_TRIP_PRIV_TO_INT(trip->priv) != 0)
-		return 0;
-	WRITE_ONCE(trip->hysteresis, update->hysteresis);
-	thermal_zone_set_trip_temp(update->zone, trip, update->temperature);
-	return 0;
-}
-
-bool apple_smc_thermal_aux_matches(struct thermal_cooling_device *cdev)
-{
-	unsigned int i;
-	bool found = false;
-
-	guard(mutex)(&smc_lock);
-	for (i = 0; i < ARRAY_SIZE(smc_cpus); i++)
-		if (smc_cpus[i] && smc_cpus[i]->cdev == cdev)
-			found = true;
-	return found;
-}
-
-int apple_smc_thermal_aux_cooling_floor(struct thermal_cooling_device *cdev,
-				      unsigned int max_khz, unsigned long *state)
-{
-	unsigned int i;
-
-	guard(mutex)(&smc_lock);
-	for (i = 0; i < ARRAY_SIZE(smc_cpus); i++) {
-		struct apple_smc_thermal_cpu *cpu = smc_cpus[i];
-		struct cpufreq_frequency_table *entry;
-		unsigned long count = 0, above = 0;
-
-		if (!cpu || cpu->cdev != cdev)
-			continue;
-		/* Neo's cooling devices use the pinned, sorted cpufreq table.
-		 * Cooling state zero is its highest frequency, not P-state zero.
-		 */
-		if (!cpu->policy || !cpu->policy->freq_table ||
-		    cpu->policy->freq_table_sorted == CPUFREQ_TABLE_UNSORTED)
-			return -EINVAL;
-		cpufreq_for_each_valid_entry(entry, cpu->policy->freq_table) {
-			count++;
-			if (entry->frequency > max_khz)
-				above++;
-		}
-		if (count < 2 || count - 1 != cdev->max_state)
-			return -EINVAL;
-		/* Also reduce the E cluster by at least one state at the trip. */
-		*state = clamp(above, 1UL, cdev->max_state);
-		return 0;
-	}
-	return -ENODEV;
-}
-
-int apple_smc_thermal_aux_register(const struct thermal_zone_device_ops *ops,
-				 const struct thermal_trip *trips, int count)
-{
-	struct thermal_zone_device *zone;
-	int ret;
-
-	guard(mutex)(&smc_provider_lock);
-	if (smc_aux_zone || !smc_zone || !smc_cpus[0] || !smc_cpus[1] ||
-	    !smc_cpus[0]->cdev || !smc_cpus[1]->cdev)
-		return -ENODEV;
-	/* Production sampling belongs to the normal thermal-core polling. */
-	zone = thermal_zone_device_register_with_trips("apple-pmp-selected", trips,
-		count, NULL, ops, &smc_params, 25, 25);
-	if (IS_ERR(zone))
-		return PTR_ERR(zone);
-	ret = for_each_thermal_trip(zone, smc_check_binding, zone);
-	if (ret) {
-		thermal_zone_device_unregister(zone);
-		return ret;
-	}
-	smc_aux_zone = zone;
-	ret = thermal_zone_device_enable(zone);
-	if (ret) {
-		smc_aux_zone = NULL;
-		thermal_zone_device_unregister(zone);
-	}
-	return ret;
-}
-
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-bool apple_smc_thermal_aux_cooling_ready(void)
-{
-	unsigned int i;
-	unsigned long state;
-
-	/* Called inside a zone update: never retake smc_provider_lock here. */
-	guard(mutex)(&smc_lock);
-	for (i = 0; i < ARRAY_SIZE(smc_cpus); i++) {
-		struct thermal_cooling_device *cdev = smc_cpus[i] ? smc_cpus[i]->cdev : NULL;
-
-		if (!cdev || cdev->ops->get_cur_state(cdev, &state) || !state)
-			return false;
-	}
-	return true;
-}
-#endif
-
-void apple_smc_thermal_aux_update(void)
-{
-	guard(mutex)(&smc_provider_lock);
-	if (smc_aux_zone)
-		thermal_zone_device_update(smc_aux_zone, THERMAL_EVENT_UNSPECIFIED);
-}
-
-/* Retune the auxiliary zone's primary trip and move this SMC zone, both its
- * passive trip and its hard QoS tier, to the backup thresholds.
- */
-int apple_smc_thermal_aux_set_policy(int temperature, int hysteresis,
-				     int backup_trip, int backup_release)
-{
-	struct smc_aux_trip_update update, backup;
-
-	guard(mutex)(&smc_provider_lock);
-	if (!smc_aux_zone || !smc_zone || temperature <= hysteresis || hysteresis < 0 ||
-	    backup_release <= 0 || backup_trip <= backup_release ||
-	    backup_trip <= temperature)
-		return -EINVAL;
-	mutex_lock(&smc_lock);
-	smc_hot_mc = backup_trip;
-	smc_hot_release_mc = backup_release;
-	if (smc_value >= smc_hot_mc)
-		smc_hot = true;
-	else if (smc_value < smc_hot_release_mc)
-		smc_hot = false;
-	smc_update_guards();
-	mutex_unlock(&smc_lock);
-	update = (struct smc_aux_trip_update){
-		.zone = smc_aux_zone,
-		.temperature = temperature,
-		.hysteresis = hysteresis,
-	};
-	backup = (struct smc_aux_trip_update){
-		.zone = smc_zone,
-		.temperature = backup_trip,
-		.hysteresis = backup_trip - backup_release,
-	};
-	thermal_zone_for_each_trip(smc_aux_zone, smc_aux_set_trip, &update);
-	thermal_zone_for_each_trip(smc_zone, smc_aux_set_trip, &backup);
-	thermal_zone_device_update(smc_aux_zone, THERMAL_TRIP_CHANGED);
-	thermal_zone_device_update(smc_zone, THERMAL_TRIP_CHANGED);
-	pr_info("apple-smc-thermal: backup policy: SMC passive trip %d mC, minimum from %d mC (release %d mC)\n",
-		backup_trip, backup_trip, backup_release);
-	return 0;
-}
-
-/* The auxiliary policy gave up: drop its zone and restore this zone's own
- * two-tier policy (95 C passive, 103 C minimum) as the sole throttle.
- */
-void apple_smc_thermal_aux_unregister(void)
-{
-	struct smc_aux_trip_update backup = {
-		.temperature = SMC_TRIP_MC,
-		.hysteresis = SMC_TRIP_MC - SMC_RELEASE_MC,
-	};
-	struct thermal_zone_device *zone;
-
-	guard(mutex)(&smc_provider_lock);
-	zone = smc_aux_zone;
-	smc_aux_zone = NULL;
-	if (zone) {
-		thermal_zone_device_disable(zone);
-		thermal_zone_device_unregister(zone);
-	}
-	mutex_lock(&smc_lock);
-	smc_hot_mc = SMC_HOT_MC;
-	smc_hot_release_mc = SMC_HOT_RELEASE_MC;
-	if (smc_value >= smc_hot_mc)
-		smc_hot = true;
-	else if (smc_value < smc_hot_release_mc)
-		smc_hot = false;
-	smc_update_guards();
-	mutex_unlock(&smc_lock);
-	if (!smc_zone)
-		return;
-	backup.zone = smc_zone;
-	thermal_zone_for_each_trip(smc_zone, smc_aux_set_trip, &backup);
-	thermal_zone_device_update(smc_zone, THERMAL_TRIP_CHANGED);
-	pr_info("apple-smc-thermal: two-tier policy restored: passive %d mC, minimum from %d mC\n",
-		SMC_TRIP_MC, SMC_HOT_MC);
-}
-#endif
-
 /* provider_lock held; never register/update a zone while holding smc_lock. */
 static void smc_start_zone(void)
 {
@@ -417,9 +175,13 @@ static void smc_start_zone(void)
 	if (smc_zone || !smc_read || !smc_cpus[0] || !smc_cpus[1] ||
 	    !smc_cpus[0]->cdev || !smc_cpus[1]->cdev)
 		return;
-	zone = thermal_zone_device_register_with_trips("apple-smc-selected", smc_trips,
-		ARRAY_SIZE(smc_trips), NULL, &smc_zone_ops, &smc_params,
-		SMC_SAMPLE_MS, SMC_SAMPLE_MS);
+	zone = thermal_zone_device_register_with_trips("apple-smc-selected",
+						       smc_trips,
+						       ARRAY_SIZE(smc_trips),
+						       NULL, &smc_zone_ops,
+						       &smc_params,
+						       SMC_SAMPLE_MS,
+						       SMC_SAMPLE_MS);
 	if (IS_ERR(zone)) {
 		pr_err("apple-smc-thermal: zone registration failed: %ld\n", PTR_ERR(zone));
 		return;
@@ -440,9 +202,6 @@ static void smc_start_zone(void)
 
 static void smc_sample_work(struct work_struct *work)
 {
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-	u64 sample_start = ktime_get_boottime_ns();
-#endif
 	unsigned long start = jiffies;
 	int value = 0, ret;
 
@@ -459,14 +218,11 @@ static void smc_sample_work(struct work_struct *work)
 	} else {
 		smc_value = value;
 		smc_sample_time = start; /* Bound the age of the oldest read in the round. */
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-		smc_sample_start = sample_start;
-#endif
 		if (smc_good < 3)
 			smc_good++;
-		if (value >= smc_hot_mc)
+		if (value >= SMC_HOT_MC)
 			smc_hot = true;
-		else if (value < smc_hot_release_mc)
+		else if (value < SMC_HOT_RELEASE_MC)
 			smc_hot = false;
 	}
 	smc_update_guards();
@@ -522,6 +278,7 @@ struct apple_smc_thermal_cpu *apple_smc_thermal_cpu_add(struct cpufreq_policy *p
 	queue_delayed_work(system_unbound_wq, &smc_watch, 0);
 	return cpu;
 }
+EXPORT_SYMBOL_GPL(apple_smc_thermal_cpu_add);
 
 void apple_smc_thermal_cpu_ready(struct apple_smc_thermal_cpu *cpu)
 {
@@ -536,6 +293,7 @@ void apple_smc_thermal_cpu_ready(struct apple_smc_thermal_cpu *cpu)
 	}
 	smc_start_zone();
 }
+EXPORT_SYMBOL_GPL(apple_smc_thermal_cpu_ready);
 
 void apple_smc_thermal_cpu_fault(struct apple_smc_thermal_cpu *cpu)
 {
@@ -543,12 +301,9 @@ void apple_smc_thermal_cpu_fault(struct apple_smc_thermal_cpu *cpu)
 		return;
 	/* Called inside target_index: do not recursively take the policy lock. */
 	WRITE_ONCE(cpu->failed, true);
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-	WRITE_ONCE(smc_until, 0);
-	WRITE_ONCE(smc_health_until, 0);
-#endif
 	mod_delayed_work(system_unbound_wq, &smc_watch, 0);
 }
+EXPORT_SYMBOL_GPL(apple_smc_thermal_cpu_fault);
 
 void apple_smc_thermal_cpu_remove(struct apple_smc_thermal_cpu *cpu)
 {
@@ -558,14 +313,6 @@ void apple_smc_thermal_cpu_remove(struct apple_smc_thermal_cpu *cpu)
 	if (!cpu)
 		return;
 	guard(mutex)(&smc_provider_lock);
-#ifdef CONFIG_APPLE_PMP_V2_THERMAL
-	/* Revoke the auxiliary consumer before its shared cooling devices vanish. */
-	if (smc_aux_zone) {
-		thermal_zone_device_disable(smc_aux_zone);
-		thermal_zone_device_unregister(smc_aux_zone);
-		smc_aux_zone = NULL;
-	}
-#endif
 	mutex_lock(&smc_lock);
 	zone = smc_zone;
 	smc_zone = NULL;
@@ -584,6 +331,7 @@ void apple_smc_thermal_cpu_remove(struct apple_smc_thermal_cpu *cpu)
 	mutex_unlock(&smc_lock);
 	kfree(cpu);
 }
+EXPORT_SYMBOL_GPL(apple_smc_thermal_cpu_remove);
 
 static void smc_provider_remove(void *unused)
 {
@@ -619,3 +367,4 @@ int devm_apple_smc_thermal_register(struct device *dev, int (*read)(void *, int 
 		queue_delayed_work(system_unbound_wq, &smc_sample, 0);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(devm_apple_smc_thermal_register);
