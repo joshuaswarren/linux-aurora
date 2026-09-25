@@ -1578,6 +1578,15 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
     let id = probe.registers.get_gpu_id_t8152(&powered, probe.soc)?;
     dev_info!(dev, "G18 SGX identity {:?}\n", id);
 
+    // J873 hardware, 2026-09-25: with SGX+0xe90000 left at 0x30000, the GFX1
+    // firmware accepts the init data but takes an async bus error on
+    // SGX+0xbc08 right after the 0x89 power-transition-end. The register
+    // reads 0x30000 here too, the state M5 native sets to 0x30001 before its
+    // firmware runs; apply the same checked bit-0 step before any init data.
+    if stage >= STAGE_INITDATA {
+        probe.registers.m5_match_pmgr_boot_control()?;
+    }
+
     // Providers: exact v8 resources, CPU control approved, CPUs stopped.
     let mut providers = KVec::new();
     for role in G18Role::ALL {
