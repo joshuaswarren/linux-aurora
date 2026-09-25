@@ -41,10 +41,9 @@ struct G17PAsyncComputeQueue {
     /// Consumed when ownership changes or another command is published.
     retirement_ready: bool,
     quarantined: bool,
-    /// Quarantined because `drm_sched_fini()` cancelled a pending job when the
-    /// client destroyed its queue -- not because anything faulted. The queue is
-    /// still permanently retired, so its memory stays safe, but it must not
-    /// refuse OTHER clients' submissions: the owner that tore it down is gone.
+    /// The client cancelled its pending waiter. Keep observing exact command
+    /// retirement; installed backing remains retained afterward. Also marks a
+    /// failed unpublished-owner restore, which remains quarantined separately.
     retired_by_teardown: bool,
     terminal_fanout: Option<(Arc<crate::g17_status::VmStatus>, Error)>,
 }
@@ -183,6 +182,7 @@ impl G17PLiveRuntime {
             q.owner = Some(owner);
             q.released = false;
             q.retirement_ready = false;
+            q.retired_by_teardown = false;
             return Ok((q.queue.queue_id(), context));
         }
         let reused_installed = !q.queue.requires_first_install();
@@ -204,6 +204,7 @@ impl G17PLiveRuntime {
         q.owner = Some(owner);
         q.released = false;
         q.retirement_ready = false;
+        q.retired_by_teardown = false;
         if reused_installed {
             if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
                 dev_info!(
@@ -428,7 +429,11 @@ impl G17PLiveRuntime {
         let mut requested = false;
         for q in &self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
-            if masks.is_some_and(|masks| {
+            // Its scheduler watchdog is gone after cancellation. Observe a
+            // retained teardown on later event batches even if its own edge
+            // preceded the final stamp's visibility. Healthy queues retain
+            // the normal QID-filtered scan.
+            if !q.retired_by_teardown && masks.is_some_and(|masks| {
                 !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
             }) {
                 continue;
@@ -441,7 +446,7 @@ impl G17PLiveRuntime {
         manager.scan_independent_compute_completion_batch()?;
         for q in &mut self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
-            if masks.is_some_and(|masks| {
+            if !q.retired_by_teardown && masks.is_some_and(|masks| {
                 !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
             }) {
                 continue;
@@ -486,7 +491,11 @@ impl G17PLiveRuntime {
                             active.packet.submission_id(), q.queue.queue_id(),
                             active.packet.context().context_id(), timestamps[0], timestamps[1]);
                     }
-                    active.packet.completion()?.complete(Ok(timestamps));
+                    let completion = active.packet.completion()?;
+                    if q.retired_by_teardown {
+                        completion.release_after_retirement();
+                    }
+                    completion.complete(Ok(timestamps));
                     drop(active);
                     if q.released {
                         // Retain `binding` and `context`. The firmware still has
@@ -552,6 +561,7 @@ impl G17PLiveRuntime {
                             "G17PMARK quarantine-scoped unclassifiable-completion qid={} ({:?}) -- queue retired, client fails, session stays up\n",
                             q.queue.queue_id(), error);
                     }
+                    q.retired_by_teardown = false;
                     q.quarantined = true;
                     q.active.as_ref().ok_or(EIO)?._lease.quarantine();
                     let completion = q.active.as_ref().ok_or(EIO)?.packet.completion()?;
@@ -790,7 +800,36 @@ impl G17PLiveRuntime {
         }
     }
 
+    /// Cancel only the scheduler waiter. A published command must remain in
+    /// the ordinary completion scan until its exact retirement is observed.
+    /// No global lease poison or hardware-failure fanout belongs on this path.
+    pub(crate) fn cancel_async_compute(&mut self, owner: u64, submission: u64) -> bool {
+        let _ = self.service_async_compute_completions();
+        let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) else {
+            return false;
+        };
+        let Some(active) = q.active.as_ref() else { return false; };
+        if active.packet.submission_id() != submission { return false; }
+        // A real hardware fault already owns its quarantine decision. Queue
+        // teardown must neither undo that nor signal the same fence twice.
+        if q.quarantined { return true; }
+        q.released = true;
+        q.retired_by_teardown = true;
+        if let Ok(completion) = active.packet.completion() {
+            completion.cancel_while_owned();
+        }
+        if let Some(pdev) = &self.pdev {
+            dev_info!(pdev.as_ref(),
+                "G17P async compute: client waiter cancelled owner={} qid={} submission={}; retaining resources until exact retirement\n",
+                owner, q.queue.queue_id(), submission);
+        }
+        true
+    }
+
     pub(crate) fn quarantine_async_compute(&mut self, owner: u64, submission: u64, error: Error) -> bool {
+        if error == ECANCELED {
+            return self.cancel_async_compute(owner, submission);
+        }
         // One final DRAM-only retirement attempt distinguishes an event-service
         // race from a job whose completion really is absent. Never throw away
         // a proven successful hardware completion merely because a timer ran.
@@ -808,54 +847,11 @@ impl G17PLiveRuntime {
                                 q.queue.queue_id(), submission,
                                 active._lease.admission_snapshot());
                         }
-                        // ECANCELED is not a fault. `drm_sched_fini()` is its
-                        // only source: `drm_sched_cancel_remaining_jobs()` walks
-                        // the pending list and calls `cancel_job` on each entry
-                        // purely so their fences are signalled before the
-                        // scheduler is torn down. So this errno means "the
-                        // client destroyed its queue while a submission was
-                        // still pending", which is ordinary lifecycle -- a
-                        // process exiting with work in flight -- and says
-                        // nothing about the firmware or the hardware.
-                        //
-                        // Measured on G17P, two boots, both ECANCELED:
-                        //   qid=7 submission=448    owner=6    PUBLISHED +271us
-                        //   qid=8 submission=297575 owner=1921 PUBLISHED +274us
-                        // Both carried `root-current=true`, so the VM root was
-                        // still live; neither was preceded by a `publishing
-                        // target=` lag line in any boot; and the scheduler's
-                        // timeout is 2000ms, three orders of magnitude away.
-                        // Nothing timed out and the firmware was never behind.
-                        //
-                        // Escalating it killed the device: `note_session_
-                        // recovery_pending` makes `is_crashed()` true, so every
-                        // new client gets ENODEV and every existing one EIO,
-                        // and it arms a firmware rebuild that is known to end in
-                        // `apple_rtkit_boot` ETIME and ENODEV for the rest of
-                        // the boot. A CTS sweep exits a deqp process thousands
-                        // of times, so one of them eventually races an unretired
-                        // submission and takes the whole GPU with it.
-                        //
-                        // The QUEUE still quarantines, which is what keeps
-                        // firmware-referenced memory safe: a quarantined queue
-                        // is permanently retired, `release_async_compute_queue`
-                        // will not strip it, `reusable_idle_compute_graph` and
-                        // `rebindable_released_compute_graph` exclude it, and
-                        // `prepare_async_compute_queue` skips it. The session
-                        // flag never contributed to that safety -- see the
-                        // `g17p_quarantine_scope` description in asahi.rs.
-                        //
-                        // Scope: ECANCELED only. ETIMEDOUT and EIO still
-                        // escalate exactly as before.
-                        let client_teardown = error == ECANCELED;
-                        q.retired_by_teardown = client_teardown;
-                        if client_teardown {
-                            if let Some(pdev) = &self.pdev {
-                                dev_info!(pdev.as_ref(),
-                                    "G17P async compute: queue retired after client teardown owner={} qid={} submission={} -- drm_sched_fini cancelled a pending job; the session stays up\n",
-                                    owner, q.queue.queue_id(), submission);
-                            }
-                        } else if crate::g17_config::QUARANTINE_SCOPE & 1 == 0 {
+                        // Client cancellation took the separate retention path
+                        // above. A real failure still poisons hardware admission
+                        // and retains everything firmware may reference.
+                        q.retired_by_teardown = false;
+                        if crate::g17_config::QUARANTINE_SCOPE & 1 == 0 {
                             crate::g17_live_boot::note_session_recovery_pending(
                                 &mut self.session_recovery_pending,
                                 self.pdev.as_ref(),
