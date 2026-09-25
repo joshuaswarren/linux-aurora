@@ -44,6 +44,7 @@ mod g17_rtkit;
 mod g17_submission;
 mod g17_trace_capture;
 mod g17_uapi;
+mod g18_live_boot;
 mod gem;
 mod gpu;
 mod hw;
@@ -85,6 +86,10 @@ kernel::module_platform_driver! {
         m5_initdata_test: u32 {
             default: 0,
             description: "M5 fresh RAM boot: 1=initdata ACKs, 2=openings, 3=queue, 4=scheduler, 5=context, 6=one compute, 7=setup without kick, 8=request stop after admission, 9=live status, 10=live firmware monitors, 11=compute triangle, 12=TA/fragment triangle; 1..12 request stop; 13=retained session, 14=experimental DRM first-job adapter",
+        },
+        g18_initdata_test: u32 {
+            default: 0,
+            description: "T8152/J873 G18G bring-up stage. 0 (default) refuses with ENODEV before any MMIO, DMA or processor access. 1 = read-only probe (PSD state, then only if powered: SGX ID, ASC CPU control/status, GFX/GFX1 post-office status), ENODEV. 2 = REQUIRES USER APPROVAL: GPU must already be powered; start GFX1+GFX ASC CPUs, RTKit HELLO/EPMAP with syslog+crashlog, stop, ENODEV. 3 = REQUIRES USER APPROVAL: 2 + init-data roots on EP 0x20 and both 0x0009 ACKs, stop, ENODEV. 4 = REQUIRES USER APPROVAL: 3 + 0x89 + idle-policy wake + passive 60 s event/trace drain, stop, owner retained. Stages 2-4 need the loader's G18G firmware receipt and apple_mailbox.ascwrap_v8_cpu_control=1. 90 = REQUIRES USER APPROVAL: PMGR2 PSD power-on of services 3/81/82 only (never implied by another stage), ENODEV. Other values are refused",
         },
         m5_graphics_frames: u32 {
             default: 1,

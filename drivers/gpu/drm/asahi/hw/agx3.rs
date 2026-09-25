@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! AGX3 (G15/G16/G17) SoC identification configuration.
+//! AGX3 (G15/G16/G17/G18) SoC identification configuration.
 //!
 //! Unlike the AGX2 [`super::HwConfig`] instances, these entries carry *only*
 //! the identification and UAT-geometry facts recovered from the pinned
@@ -104,6 +104,51 @@ pub(crate) const T8142: SocConfig = agx3(0x8142, GpuGen::G17, GpuVariant::G, 0xb
 pub(crate) const T6050: SocConfig = agx3(0x6050, GpuGen::G17, GpuVariant::S, 0xb, 3, 1);
 /// Apple M5 Max (G17C).
 pub(crate) const T6051: SocConfig = agx3(0x6051, GpuGen::G17, GpuVariant::C, 0xb, 4, 1);
+
+// G18 (M6 family). Family byte 0xc, variant 2: 26A428
+// `AGX·PI_400·G·A0·Accelerator::readChipInfo` @ 0xfffffe0008c3d3a0 compares
+// the family byte with 0xc @ 0xfffffe0008c3d49c and gives variant 2 the
+// 12-core G configuration @ 0xfffffe0008c3d4bc..0x4c8. Native J873 registry
+// (AGXAcceleratorG18G): gpu_gen=18, gpu_var=G, usc_gen=3, is_sksm=1,
+// num_cores=12, num_gps=6, num_mgpus=2, core_mask_list=(63,63),
+// num_frags=12, kickid_qid_shift=40, kickid_qid_mask=127. The live ID
+// registers have not been read yet (the GPU PSD reads idle at cold boot), so
+// the T8152 probe identifies the part by chip id and compatible, and only
+// logs a mismatching register decode. The ADT uat-vaddr-size is 43 on both
+// J813 and J873: 42 bits per root plus the TTBR-select bit, as on T8142.
+/// Apple M6 (G18G, J873 Mac mini).
+pub(crate) const T8152: SocConfig = agx3(0x8152, GpuGen::G18, GpuVariant::G, 0xc, 2, 1);
+
+/// Native J873 `AGXAcceleratorG18G` registry facts (macOS 26A428 ioreg).
+///
+/// These are identity facts, not firmware tuning: they size the core-mask
+/// decode and cross-check the live ID registers once the GPU is powered.
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G18RegistryFacts {
+    pub(crate) num_cores: u32,
+    pub(crate) num_gps: u32,
+    pub(crate) num_mgpus: u32,
+    /// Per-mGPU (cluster) core masks, `core_mask_list`.
+    pub(crate) core_mask_list: [u32; 2],
+    pub(crate) num_frags: u32,
+    pub(crate) usc_generation: u32,
+    pub(crate) kickid_qid_shift: u32,
+    pub(crate) kickid_qid_mask: u32,
+}
+
+/// J873 registry facts (PROVEN from the native ioreg).
+#[allow(dead_code)]
+pub(crate) const T8152_REGISTRY: G18RegistryFacts = G18RegistryFacts {
+    num_cores: 12,
+    num_gps: 6,
+    num_mgpus: 2,
+    core_mask_list: [0x3f, 0x3f],
+    num_frags: 12,
+    usc_generation: 3,
+    kickid_qid_shift: 40,
+    kickid_qid_mask: 127,
+};
 
 // t6034 and t6052 appear in the AGXG15C/AGXG17X kext match lists but map to
 // no distinct core identity in the readChipInfo decode; what silicon they
@@ -226,8 +271,9 @@ mod tests {
     };
     use super::*;
 
-    const ALL: [&SocConfig; 11] = [
+    const ALL: [&SocConfig; 12] = [
         &T8122, &T6030, &T6031, &T6032, &T8140, &T8132, &T6040, &T6041, &T8142, &T6050, &T6051,
+        &T8152,
     ];
 
     #[test]
@@ -258,7 +304,7 @@ mod tests {
         for soc in ALL {
             let identity =
                 decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8).unwrap();
-            let expected = if soc.gpu_gen == GpuGen::G17 {
+            let expected = if matches!(soc.gpu_gen, GpuGen::G17 | GpuGen::G18) {
                 FirmwareRoleTopology::Dual
             } else {
                 FirmwareRoleTopology::Single
@@ -312,6 +358,30 @@ mod tests {
             decode_gpu_identity(T8140.hw_family, T8140.hw_variant, T8140.num_dies as u8).unwrap();
         assert_eq!(identity.gpu_gen, GpuGen::G17);
         assert_eq!(identity.gpu_variant, GpuVariant::P);
+    }
+
+    #[test]
+    fn t8152_is_the_m6_g18g_identity_and_matches_the_registry() {
+        use super::identity::GpuHalGeneration;
+        assert_eq!(T8152.chip_id, 0x8152);
+        assert_eq!((T8152.hw_family, T8152.hw_variant, T8152.num_dies), (0xc, 2, 1));
+        let identity =
+            decode_gpu_identity(T8152.hw_family, T8152.hw_variant, T8152.num_dies as u8).unwrap();
+        assert_eq!(identity.gpu_gen, GpuGen::G18);
+        assert_eq!(identity.gpu_variant, GpuVariant::G);
+        assert_eq!(identity.gpu_hal_generation, GpuHalGeneration::Hal400);
+        assert_eq!(identity.submission_transport, SubmissionTransport::Sksm);
+        assert_eq!(identity.usc_generation, T8152_REGISTRY.usc_generation);
+        let total: u32 = T8152_REGISTRY
+            .core_mask_list
+            .iter()
+            .map(|mask| mask.count_ones())
+            .sum();
+        assert_eq!(total, T8152_REGISTRY.num_cores);
+        assert_eq!(T8152_REGISTRY.num_mgpus as usize, T8152_REGISTRY.core_mask_list.len());
+        assert_eq!(T8152_REGISTRY.num_frags, T8152_REGISTRY.num_cores);
+        assert_eq!((T8152_REGISTRY.kickid_qid_shift, T8152_REGISTRY.kickid_qid_mask), (40, 127));
+        assert_eq!((T8152.uat_ias, T8152.uat_oas), (42, 42));
     }
 
     #[test]

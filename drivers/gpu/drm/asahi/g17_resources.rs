@@ -50,6 +50,10 @@ use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 #[path = "m5_resources.rs"]
 pub(crate) mod m5;
 
+#[cfg(not(test))]
+#[path = "g18_resources.rs"]
+pub(crate) mod g18;
+
 /// Linux counterpart of IOGPUFamily's `___globalObjectIDCounter`.
 ///
 /// The native render path uses this one counter for userspace GID-group
