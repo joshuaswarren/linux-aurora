@@ -13,6 +13,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_wakeup.h>
@@ -105,6 +106,8 @@ struct dwc3_apple_role_input {
  * @mmio_resource: Resource to be passed to dwc3_core_probe
  * @apple_regs: Apple-specific DWC3 registers
  * @reset: Reset control
+ * @usb2_phy: USB2 PHY, configured before the core is brought up
+ * @usb3_phy: USB3 PHY, configured after the core is brought up
  * @role_sw: USB role switch
  * @lock: Mutex for synchronizing access
  * @state: Current state of the controller, see documentation for the enum for details
@@ -119,6 +122,8 @@ struct dwc3_apple {
 	void __iomem *xhci_regs;
 
 	struct reset_control *reset;
+	struct phy *usb2_phy;
+	struct phy *usb3_phy;
 	struct usb_role_switch *role_sw;
 	struct gpio_desc *hub_reset_gpio;
 	bool legacy_fixed_usb2;
@@ -374,21 +379,22 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 * will sometimes only take affect after the *next* time dwc3 is brought up which causes
 	 * the connected device to just not work.
 	 * The USB3 PHY must be configured later after dwc3 has already been initialized.
+	 * Both PHYs were looked up at probe, so this also covers the first bring-up, before
+	 * dwc3_core_probe() has looked them up itself.
 	 */
 	switch (state) {
 	case DWC3_APPLE_HOST:
-		ret = phy_set_mode(appledwc->legacy_fixed_usb2 ? appledwc->usb2_phy :
-				   appledwc->dwc.usb2_generic_phy[0], PHY_MODE_USB_HOST);
-		if (ret)
-			return ret;
+		ret = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_HOST);
 		break;
 	case DWC3_APPLE_DEVICE:
-		phy_set_mode(appledwc->dwc.usb2_generic_phy[0], PHY_MODE_USB_DEVICE);
+		ret = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_DEVICE);
 		break;
 	default:
 		/* Unreachable unless there's a bug in this driver */
 		return -EINVAL;
 	}
+	if (ret)
+		dev_warn(appledwc->dev, "Failed to set the USB2 PHY mode, err=%d\n", ret);
 
 	ret = dwc3_apple_reset_deassert(appledwc);
 	if (ret) {
@@ -417,7 +423,9 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 		 * has already been configured to the correct mode earlier.
 		 */
 		dwc3_enable_susphy(&appledwc->dwc, true);
-		phy_set_mode(appledwc->dwc.usb3_generic_phy[0], PHY_MODE_USB_HOST);
+		ret = phy_set_mode(appledwc->usb3_phy, PHY_MODE_USB_HOST);
+		if (ret)
+			dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 		ret = dwc3_host_init(&appledwc->dwc);
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize host, ret=%d\n", ret);
@@ -435,7 +443,9 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 		 * has already been configured to the correct mode earlier.
 		 */
 		dwc3_enable_susphy(&appledwc->dwc, true);
-		phy_set_mode(appledwc->dwc.usb3_generic_phy[0], PHY_MODE_USB_DEVICE);
+		ret = phy_set_mode(appledwc->usb3_phy, PHY_MODE_USB_DEVICE);
+		if (ret)
+			dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 		ret = dwc3_gadget_init(&appledwc->dwc);
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize gadget, ret=%d\n", ret);
@@ -898,14 +908,17 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		if (!appledwc->force_usb2_host && !appledwc->usb2_hub_always_on)
 			return dev_err_probe(dev, -ENODEV, "Missing reset control\n");
 
-		appledwc->dwc3_reset_regs =
-			devm_platform_ioremap_resource_byname(pdev, "dwc3-reset");
-		if (IS_ERR(appledwc->dwc3_reset_regs))
-			return dev_err_probe(dev, PTR_ERR(appledwc->dwc3_reset_regs),
-					     "Failed to map DWC3 reset registers\n");
-	}
+	appledwc->usb2_phy = devm_phy_get(dev, "usb2-phy");
+	if (IS_ERR(appledwc->usb2_phy))
+		return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
+				     "Failed to get the USB2 PHY\n");
 
-	ret = dwc3_apple_reset_assert(appledwc);
+	appledwc->usb3_phy = devm_phy_get(dev, "usb3-phy");
+	if (IS_ERR(appledwc->usb3_phy))
+		return dev_err_probe(dev, PTR_ERR(appledwc->usb3_phy),
+				     "Failed to get the USB3 PHY\n");
+
+	ret = reset_control_assert(appledwc->reset);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to assert reset, err=%d\n", ret);
 		return ret;
