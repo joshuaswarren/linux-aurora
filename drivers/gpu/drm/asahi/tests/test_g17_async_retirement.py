@@ -25,6 +25,7 @@ methods='\n'.join(item(r,n) for n in [
  '    fn service_async_compute_completions(',
  '    fn service_async_compute_completions_matching(',
  '    pub(crate) fn release_async_compute_queue(',
+ '    pub(crate) fn cancel_async_compute(',
  '    pub(crate) fn quarantine_async_compute('])
 publish = item(r, '    pub(crate) fn publish_async_compute(')
 service = item(r, '    fn service_async_compute_completions_matching(')
@@ -106,8 +107,8 @@ static G17P_MARK_ZERO_DURATION: core::sync::atomic::AtomicU32 =
 mod module_parameters { pub struct P; impl P { pub fn value(&self)->&'static u32 { &0 } }
   pub static g17p_quarantine_scope: P = P; }
 mod g17_live_boot { pub fn note_session_recovery_pending(pending:&mut bool,_pdev:Option<&()>,_reason:&'static str){ *pending = true; } }
-struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>}
-impl Completion{fn complete(&self,r:Result<[u64;2]>){self.signals.fetch_add(1,Ordering::SeqCst);if r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}}
+struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>,retired:AtomicUsize}
+impl Completion{fn complete(&self,r:Result<[u64;2]>){if self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst).is_ok() && r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}fn cancel_while_owned(&self){self.complete(Err(ECANCELED));}fn release_after_retirement(&self){self.retired.fetch_add(1,Ordering::SeqCst);}}
 struct Context{context_id:u32}impl Context{fn context_id(&self)->u32{self.context_id}}
 struct Packet{id:u64,context:Context,completion:Arc<Completion>}
 impl Packet{fn submission_id(&self)->u64{self.id}fn context(&self)->&Context{&self.context}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
@@ -123,7 +124,20 @@ impl G17PLiveRuntime {
  fn fail_outstanding_jobs_for_vm(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}
 '''+methods+r'''
 }
-fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus)});let firmware=G17PComputeRetirementTicket{queue_id:owner as u8,descriptor,submitted_target:1,item_producer:1,item_count:8};let retirement=G17PAsyncComputeRetirementTicket{owner,submission:owner,context:owner as u32,recovery_epoch:0,firmware};(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:Producer{submitted:1,previous_valid:true,previous_timestamp:1,geometry:Geometry},storage:Storage},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),previous_binding:None,active:Some(Active{packet:Packet{id:owner,context:Context{context_id:owner as u32},completion:c.clone()},_lease:Hold(d.clone()),retirement:Some(retirement)}),released:false,retirement_ready:false,quarantined:false,retired_by_teardown:false,terminal_fanout:None},c)}
+fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus),retired:AtomicUsize::new(0)});let firmware=G17PComputeRetirementTicket{queue_id:owner as u8,descriptor,submitted_target:1,item_producer:1,item_count:8};let retirement=G17PAsyncComputeRetirementTicket{owner,submission:owner,context:owner as u32,recovery_epoch:0,firmware};(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:Producer{submitted:1,previous_valid:true,previous_timestamp:1,geometry:Geometry},storage:Storage},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),previous_binding:None,active:Some(Active{packet:Packet{id:owner,context:Context{context_id:owner as u32},completion:c.clone()},_lease:Hold(d.clone()),retirement:Some(retirement)}),released:false,retirement_ready:false,quarantined:false,retired_by_teardown:false,terminal_fanout:None},c)}
+#[test]fn cancelled_job_retires_on_later_unrelated_event_only_with_exact_proof(){
+ let d=Arc::new(AtomicUsize::new(0));let(a,c)=q(1,0x100,&d);
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![])),async_compute_queues:vec![a],session_recovery_pending:false};
+ assert!(r.cancel_async_compute(1,1));assert_eq!(c.error.load(Ordering::SeqCst),1);assert_eq!(d.load(Ordering::SeqCst),0);assert!(!r.session_recovery_pending);
+ r.manager.as_mut().unwrap().resources.records.push((1,0x100,[2,3]));
+ r.service_async_compute_completion_masks([1<<2,0]).unwrap();
+ assert_eq!(c.retired.load(Ordering::SeqCst),0,"record without final stamp cannot release");assert!(r.async_compute_queues[0].active.is_some());
+ r.async_compute_queues[0].queue.compute.0=1;
+ r.service_async_compute_completion_masks([1<<2,0]).unwrap();
+ assert_eq!(c.retired.load(Ordering::SeqCst),1);assert_eq!(c.signals.load(Ordering::SeqCst),1);assert_eq!(d.load(Ordering::SeqCst),1);
+ assert!(r.async_compute_queues[0].active.is_none());assert!(r.async_compute_queues[0].owner.is_none());assert!(r.async_compute_queues[0].retirement_ready);assert!(!r.async_compute_queues[0].quarantined);
+ assert!(r.async_compute_queues[0].binding.is_some()&&r.async_compute_queues[0].context.is_some());
+}
 #[test]fn out_of_order_requires_matching_descriptor_and_final_visibility(){
  let drops=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&drops);let(b,cb)=q(2,0x200,&drops);
  let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(2,0x200,[10,20])])),async_compute_queues:vec![a,b],session_recovery_pending:false};
