@@ -30,7 +30,7 @@ assert "self.descriptor_3d_low" in getter
 assert "descriptor_3d_render" not in getter
 assert ".audit_fragment_rce_mapping(dev, vm)" in manager
 assert "let base = self.descriptor_low_va(false)?;" in audit
-assert "rce_vm.read_bytes(address" in audit
+assert "rce_vm.read_bytes_with_physical(address" in audit
 assert "return Ok(())" not in audit
 assert "install_t8140_job_context_aliases(vm)?" in resources
 assert "install_t8140_native_context_aliases(vm)" not in function(
