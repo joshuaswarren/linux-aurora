@@ -11610,9 +11610,8 @@ impl G17PUserRenderStorage {
 
         for (tag, offset) in [(56u8, 0xa0usize), (10, 0x7c0), (17, 0xee0), (10, 0x1600)] {
             let address = base.checked_add(offset as u64).ok_or(EOVERFLOW)?;
-            let physical = rce_vm.translate_iova(address)?;
             let mut gpu_bytes = [0u8; 16];
-            rce_vm.read_bytes(address, &mut gpu_bytes)?;
+            let physical = rce_vm.read_bytes_with_physical(address, &mut gpu_bytes)?;
             let mut cpu_bytes = [0u8; 16];
             self.descriptors.with_bytes_mut(|raw| {
                 cpu_bytes.copy_from_slice(
