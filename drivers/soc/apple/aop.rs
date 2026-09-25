@@ -58,9 +58,7 @@ use kernel::{
         ArcBorrow,
         CondVar,
         CondVarTimeoutResult,
-        Mutex,
-        MutexGuard,
-        SpinLock, //
+        Mutex, //
     },
     time::msecs_to_jiffies,
     types::ForeignOwnable,
@@ -117,6 +115,9 @@ const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
+/// Bound on the wait for the reply to an EPIC call. The firmware can stop
+/// answering, and a caller must not be left in D state forever.
+const EPIC_CALL_TIMEOUT_MS: u32 = 5000;
 
 // T8140 (J700) AOP "setup port": the second mailbox the firmware boots
 // through.  Everything below was measured by the native m1n1 microphone host
@@ -286,22 +287,19 @@ impl<T> FutureValue<T> {
         }
         ret_guard.take().unwrap()
     }
-    /// Waits at most `timeout_ms`; `None` when the value never arrived.
+    /// Waits at most `timeout_ms` for the value; `None` if it did not arrive.
     ///
     /// The wait is uninterruptible: a firmware transaction must not be
-    /// abandoned because the calling task has a signal pending (a daemon
-    /// closing its PCM on SIGTERM), or its prompt reply would arrive for a
-    /// call that no longer exists.
-    fn wait_timeout(&self, timeout_ms: i64) -> Option<T> {
+    /// abandoned because the calling task has a signal pending, or its reply
+    /// would arrive for a call that no longer exists.
+    fn wait_timeout(&self, timeout_ms: u32) -> Option<T> {
         let mut ret_guard = self.val.lock();
-        let mut left = msecs_to_jiffies(timeout_ms as u32);
+        let mut left = msecs_to_jiffies(timeout_ms);
         while ret_guard.is_none() {
             match self.completion.wait_timeout(&mut ret_guard, left) {
-                CondVarTimeoutResult::Timeout => return ret_guard.take(),
+                CondVarTimeoutResult::Timeout => break,
                 CondVarTimeoutResult::Woken { jiffies }
-                | CondVarTimeoutResult::Signal { jiffies } => {
-                    left = jiffies;
-                }
+                | CondVarTimeoutResult::Signal { jiffies } => left = jiffies,
             }
         }
         ret_guard.take()
@@ -322,17 +320,24 @@ struct CallResult {
     extra_data: Option<KVec<u8>>,
 }
 
+/// An EPIC call in flight on an endpoint. The slot index plus one is the tag
+/// the firmware echoes in the reply.
+enum CallSlot {
+    /// The caller waits for the reply; the buffer receives the reply payload.
+    Pending(Arc<FutureValue<CallResult>>, Option<KVec<u8>>),
+    /// The caller gave up waiting. The slot stays reserved, so that its tag is
+    /// not handed to a later call that the late reply would then complete,
+    /// until that reply arrives and is dropped.
+    Abandoned,
+}
+
 struct AFKEndpoint {
     index: u8,
     iomem: Option<Coherent<[u8]>>,
     txbuf: Option<AFKRingBuffer>,
     rxbuf: Option<AFKRingBuffer>,
     seq: u16,
-    calls: [Option<Arc<FutureValue<CallResult>>>; AOP_MAX_CALLS],
-    call_returns: [Option<KVec<u8>>; AOP_MAX_CALLS],
-    /// Reports seen on this endpoint, so the log records that they arrive
-    /// without one line every 200 ms for the life of the boot.
-    reports: u32,
+    calls: [Option<CallSlot>; AOP_MAX_CALLS],
 }
 
 impl AFKEndpoint {
@@ -344,8 +349,6 @@ impl AFKEndpoint {
             rxbuf: None,
             seq: 0,
             calls: [const { None }; AOP_MAX_CALLS],
-            call_returns: [const { None }; AOP_MAX_CALLS],
-            reports: 0,
         }
     }
 
@@ -672,7 +675,7 @@ impl AFKEndpoint {
                 }
                 let retcode = le_u32(data, 0);
                 let tag = ehdr.tag as usize;
-                if tag == 0 || tag > self.calls.len() || self.calls[tag - 1].is_none() {
+                if tag == 0 || tag > self.calls.len() {
                     dev_err!(
                         client.dev,
                         "Dropping a retcode with no call in flight (tag {:?}) on endpoint {}",
@@ -681,15 +684,35 @@ impl AFKEndpoint {
                     );
                     return Ok(());
                 }
-                let future = self.calls[tag - 1].take().unwrap();
-                let extra_data = if let Some(mut ret) = self.call_returns[tag - 1].take() {
+                let (future, ret) = match self.calls[tag - 1].take() {
+                    Some(CallSlot::Pending(future, ret)) => (future, ret),
+                    Some(CallSlot::Abandoned) => {
+                        // The late reply to a call that timed out; its slot
+                        // is free again.
+                        dev_warn!(
+                            client.dev,
+                            "Late reply for tag {} on endpoint {}",
+                            tag,
+                            self.index
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        dev_err!(
+                            client.dev,
+                            "Got a retcode with no call in flight (tag {}) on endpoint {}",
+                            tag,
+                            self.index
+                        );
+                        return Err(EIO);
+                    }
+                };
+                let extra_data = ret.map(|mut ret| {
                     let len = cmp::min(data.len() - 4, ret.len());
                     ret[..len].copy_from_slice(&data[4..(len + 4)]);
                     ret.truncate(len);
-                    Some(ret)
-                } else {
-                    None
-                };
+                    ret
+                });
                 future.complete(CallResult {
                     retcode,
                     extra_data,
@@ -714,15 +737,17 @@ impl AFKEndpoint {
         );
         Err(EIO)
     }
-    fn send_rb(
+    /// Writes one entry into the transmit ring and returns the doorbell
+    /// message that announces it. Nothing is visible to the firmware until
+    /// that message is sent.
+    fn write_entry(
         &mut self,
         client: &AopData,
-        rtkit: Pin<&mut rtkit::RtKit<AopData>>,
         channel: u32,
         ty: u32,
         header: &[u8],
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let (buf_offset, block_size, buf_size) = match self.txbuf.as_ref() {
             Some(b) => (b.offset, b.block_size, b.buf_size),
             None => {
@@ -765,8 +790,7 @@ impl AFKEndpoint {
         self.memcpy_to_iomem(base + wptr + QEH_SIZE + header.len(), data)?;
         wptr = align_up(wptr + QEH_SIZE + payload_len, block_size) % buf_size;
         self.iomem_write32(buf_offset + block_size * 2, wptr as u32)?;
-        let msg = wptr as u64 | (AFK_OPC_SEND << 48);
-        rtkit.send_message(self.index, msg)
+        Ok(wptr as u64 | (AFK_OPC_SEND << 48))
     }
     fn epic_notify(
         &mut self,
@@ -778,21 +802,14 @@ impl AFKEndpoint {
         data: &[u8],
         ret: Option<KVec<u8>>,
     ) -> Result<Arc<FutureValue<CallResult>>> {
-        let mut tag = 0;
-        for i in 0..self.calls.len() {
-            if self.calls[i].is_none() {
-                tag = i + 1;
-                break;
-            }
-        }
-        if tag == 0 {
+        let Some(slot) = self.calls.iter().position(|c| c.is_none()) else {
             dev_err!(
                 client.dev,
                 "Too many inflight calls on endpoint {}",
                 self.index
             );
             return Err(EIO);
-        }
+        };
         let call = Arc::pin_init(FutureValue::pin_init(), GFP_KERNEL)?;
         // 2026-09-20: this field was declared and never set, so every call this
         // driver has ever made advertised a reply capacity of zero.  macOS sets
@@ -809,54 +826,34 @@ impl AFKEndpoint {
             sub_version: 2,
             category,
             subtype,
-            tag: tag as u16,
-            inline_len,
+            tag: (slot + 1) as u16,
             ..EPICHeader::default()
         };
-        let hdr_v4 = EPICHeaderV4 {
-            version: 2,
-            seq: self.seq,
-            length: data.len() as u32,
-            sub_version: 4,
-            category,
-            subtype,
-            tag: tag as u16,
-            inline_len,
-            ..EPICHeaderV4::default()
+        // SAFETY: `hdr` is a packed plain-data struct that outlives the slice,
+        // which covers exactly its bytes.
+        let hdr_bytes = unsafe {
+            slice::from_raw_parts(
+                &hdr as *const EPICHeader as *const u8,
+                mem::size_of::<EPICHeader>(),
+            )
         };
-        self.call_returns[tag - 1] = ret;
-        // macOS speaks v2 to this firmware; see the epic_tx_v2 parameter.
-        let tx_v4 = client.epic_v4;
-        let hdr_bytes = if tx_v4 {
-            // SAFETY: `hdr_v4` is a packed, plain-data header that lives
-            // for the whole call; the slice covers exactly its bytes.
-            unsafe {
-                slice::from_raw_parts(
-                    &hdr_v4 as *const EPICHeaderV4 as *const u8,
-                    mem::size_of::<EPICHeaderV4>(),
-                )
-            }
-        } else {
-            unsafe {
-                slice::from_raw_parts(
-                    &hdr_v2 as *const EPICHeader as *const u8,
-                    mem::size_of::<EPICHeader>(),
-                )
-            }
-        };
-
-        self.send_rb(client, rtkit, channel, EPIC_TYPE_NOTIFY, hdr_bytes, data)?;
+        let doorbell = self.write_entry(client, channel, EPIC_TYPE_NOTIFY, hdr_bytes, data)?;
         self.seq = self.seq.wrapping_add(1);
-        self.calls[tag - 1] = Some(call.clone());
+        self.calls[slot] = Some(CallSlot::Pending(call.clone(), ret));
+        if let Err(e) = rtkit.send_message(self.index, doorbell) {
+            // The entry is in the ring and the next doorbell delivers it, so
+            // its reply still arrives; keep the tag reserved until it does.
+            self.calls[slot] = Some(CallSlot::Abandoned);
+            return Err(e);
+        }
         Ok(call)
     }
-    /// Drops a call that will never be waited on again (timed out).
-    fn cancel_call(&mut self, call: &Arc<FutureValue<CallResult>>) {
-        for i in 0..self.calls.len() {
-            if let Some(c) = &self.calls[i] {
-                if Arc::ptr_eq(c, call) {
-                    self.calls[i] = None;
-                    self.call_returns[i] = None;
+    /// Gives up on `call`: its slot stays reserved until the reply arrives.
+    fn abandon_call(&mut self, call: &Arc<FutureValue<CallResult>>) {
+        for slot in self.calls.iter_mut() {
+            if let Some(CallSlot::Pending(pending, _)) = slot {
+                if Arc::ptr_eq(pending, call) {
+                    *slot = Some(CallSlot::Abandoned);
                     return;
                 }
             }
@@ -1542,36 +1539,26 @@ impl AopData {
 }
 
 impl AopData {
-    /// Serializes the calls on an endpoint whose replies carry no tag; the
-    /// guard is held until the reply (or the timeout) so that a reply can
-    /// only belong to the one call in flight.
-    fn take_call_turn(&self, ep_idx: u8) -> Option<MutexGuard<'_, ()>> {
-        self.epic_v4.then(|| self.call_turn[ep_idx as usize].lock())
-    }
-    /// Waits for a call's reply with a bound; on timeout the call slot is
-    /// released so a late reply is dropped instead of completing a later call.
+    /// Waits a bounded time for the reply to `call` on endpoint `ep_idx`.
     fn wait_call(
         &self,
-        ep_idx: u8,
+        ep_idx: usize,
         svc: &EPICService,
         subtype: u16,
         call: Arc<FutureValue<CallResult>>,
     ) -> Result<CallResult> {
-        match call.wait_timeout(EPIC_CALL_TIMEOUT_MS) {
-            Some(res) => Ok(res),
-            None => {
-                let mut ep_guard = self.endpoints[ep_idx as usize].lock();
-                ep_guard.cancel_call(&call);
-                dev_err!(
-                    self.dev,
-                    "EPIC call {:#x} on channel {} timed out after {} ms\n",
-                    subtype,
-                    svc.channel,
-                    EPIC_CALL_TIMEOUT_MS
-                );
-                Err(ETIMEDOUT)
-            }
+        if let Some(res) = call.wait_timeout(EPIC_CALL_TIMEOUT_MS) {
+            return Ok(res);
         }
+        self.endpoints[ep_idx].lock().abandon_call(&call);
+        dev_err!(
+            self.dev,
+            "EPIC call {:#x} on channel {} timed out after {} ms",
+            subtype,
+            svc.channel,
+            EPIC_CALL_TIMEOUT_MS
+        );
+        Err(ETIMEDOUT)
     }
 }
 
@@ -1611,7 +1598,7 @@ impl AOP for AopData {
             )?
         };
         let res = self.wait_call(ep_idx, svc, subtype, call)?;
-        Ok((res.retcode, res.extra_data.unwrap()))
+        Ok((res.retcode, res.extra_data.ok_or(EIO)?))
     }
 
     fn add_fakehid_listener(
