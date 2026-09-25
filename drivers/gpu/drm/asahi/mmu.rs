@@ -2947,13 +2947,15 @@ impl Vm {
         if offset >= T8140_CLIENT_NULL_VIEW_SIZE as u64 {
             return Err(EINVAL);
         }
-        let canonical = self.translate_iova(
-            T8140_CLIENT_NULL_VIEW
-                .source_address
-                .checked_add(offset)
-                .ok_or(EOVERFLOW)?,
-        )?;
-        let client = self.translate_iova(
+        let canonical_address = T8140_CLIENT_NULL_VIEW
+            .source_address
+            .checked_add(offset)
+            .ok_or(EOVERFLOW)?;
+        // Compare both aliases from one page-table snapshot, without taking
+        // the GPUVM execution lock once per translation.
+        let mut inner = self.inner.exec_lock(None, false)?;
+        let canonical = inner.page_table.translate_iova(canonical_address)?;
+        let client = inner.page_table.translate_iova(
             T8140_CLIENT_NULL_VIEW_START
                 .checked_add(offset)
                 .ok_or(EOVERFLOW)?,
@@ -3040,6 +3042,48 @@ impl Vm {
             done += chunk;
         }
         Ok(())
+    }
+
+    /// Resolve and read one audit region under a single GPUVM execution lock.
+    /// Preserve the checks and error order of `translate_iova` followed by
+    /// `read_bytes`, including the explicit readable-range proof. The guard
+    /// ends here: callers may then compare against a GEM VMap without nesting
+    /// a GEM reservation lock inside this execution-lock transaction.
+    pub(crate) fn read_bytes_with_physical(
+        &self,
+        iova: u64,
+        out: &mut [u8],
+    ) -> Result<PhysicalAddr> {
+        let mut inner = self.inner.exec_lock(None, false)?;
+        let first_physical = inner.page_table.translate_iova(iova)?;
+        if out.is_empty() {
+            return Err(EINVAL);
+        }
+        if !Self::covers_range_locked(&mut inner, iova, out.len() as u64, true, false) {
+            return Err(EFAULT);
+        }
+        let total = out.len();
+        let mut done = 0usize;
+        while done < total {
+            let addr = iova.checked_add(done as u64).ok_or(EOVERFLOW)?;
+            let phys = inner.page_table.translate_iova(addr)?;
+            let page_mask = (kernel::page::PAGE_SIZE as PhysicalAddr) - 1;
+            let page_phys = phys & !page_mask;
+            let offset = (phys - page_phys) as usize;
+            let chunk = cmp::min(kernel::page::PAGE_SIZE - offset, total - done);
+            // SAFETY: The execution guard keeps the resolved GEM mapping
+            // stable through this read. borrow_phys also requires struct page.
+            let page = unsafe { Page::borrow_phys(&page_phys) }.ok_or(EFAULT)?;
+            let dst = &mut out[done..done + chunk];
+            page.with_pointer_into_page(offset, chunk, |ptr| {
+                // SAFETY: with_pointer_into_page bounds-checks this page span.
+                let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, chunk) };
+                dst.copy_from_slice(src);
+                Ok(())
+            })?;
+            done += chunk;
+        }
+        Ok(first_physical)
     }
 
     /// Physical base of this VM's page-table root.
