@@ -31,16 +31,20 @@
 /* used to limit the user space buffers to the buffer_pool_config */
 #define ISP_MAX_BUFFERS 16
 
+/* capture metadata buffers, for firmware that has that pool */
+#define ISP_CAPMETA_BUFFERS 8
+
 /*
  * The command area holds one command or one buffer batch at a time. A
  * batch is a 16-byte header and a 64-byte descriptor per buffer, and
- * carries at most every metadata buffer and one full rendered pool.
+ * carries at most every metadata buffer, the @capmeta capture metadata
+ * buffers and one full rendered pool.
  */
 #define ISP_BUFLIST_HDR_SIZE  0x10
 #define ISP_BUFLIST_DESC_SIZE 0x40
-#define ISP_CMD_AREA_SIZE \
-	(ISP_BUFLIST_HDR_SIZE + \
-	 ISP_BUFLIST_DESC_SIZE * (ISP_MAX_BUFFERS + ISP_MAX_BUFFERS))
+#define ISP_CMD_AREA_SIZE(capmeta) \
+	(ISP_BUFLIST_HDR_SIZE + ISP_BUFLIST_DESC_SIZE * \
+	 (ISP_MAX_BUFFERS + (capmeta) + ISP_MAX_BUFFERS))
 
 enum isp_generation {
 	ISP_GEN_T8103,
@@ -174,6 +178,9 @@ struct apple_isp_hw {
 
 	/* ISP_GPIO_6 boot mode */
 	u32 boot_mode;
+
+	/* size of a capture metadata buffer, 0 for no such pool */
+	u32 capture_meta_size;
 };
 
 enum isp_sensor_id {
@@ -360,6 +367,8 @@ enum {
  */
 #define isp_fw_iova(isp, x)	    ((x) & (isp)->fw_iova_mask)
 #define isp_get_format(isp, ch)	    (&(isp)->fmts[(ch)])
+#define isp_num_capmeta(isp) \
+	((isp)->hw->capture_meta_size ? ISP_CAPMETA_BUFFERS : 0)
 #define isp_get_current_format(isp) (isp_get_format(isp, isp->current_ch))
 
 #endif /* __ISP_DRV_H__ */

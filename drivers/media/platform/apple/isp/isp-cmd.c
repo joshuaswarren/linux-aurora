@@ -464,12 +464,10 @@ int isp_cmd_ch_buffer_recycle_start(struct apple_isp *isp, u32 chan)
 
 int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan, u16 type)
 {
-	u32 size = isp->hw->meta_size;
-
-	/* H17 keeps a distinct capture-metadata record size (CH_INFO_GET +0x78) */
-	if (type == CISP_POOL_TYPE_META_CAPTURE && isp->hw->capture_meta_size)
-		size = isp->hw->capture_meta_size;
-
+	u32 size = type == CISP_POOL_TYPE_META_CAPTURE &&
+		   isp->hw->capture_meta_size ?
+			   isp->hw->capture_meta_size :
+			   isp->hw->meta_size;
 	struct cmd_ch_buffer_pool_config_set args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
 		.chan = chan,
