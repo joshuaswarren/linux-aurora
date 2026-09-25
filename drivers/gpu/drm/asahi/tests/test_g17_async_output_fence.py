@@ -128,16 +128,12 @@ assert render_publish.index("completion.attach_lease(lease)?") < render_publish.
     "runtime.submit_translated_render("
 )
 
-# The submit path must hand the guard to the asynchronous compute path, and the
-# asynchronous path must publish through it only after the job is enqueued.
+# Counted per-command members feed one ioctl aggregate. The original guard
+# retains the enqueue gate even on partial failure.
 submit = source[source.index('impl queue::Queue for G17PQueue {'):]
-assert 'publication: &mut G17POutputFencePublication' in source, \
-    'submit_compute_async does not receive the output-fence guard'
-assert '&mut publication,' in submit, \
-    'submit() does not hand the guard to the asynchronous compute path'
-enqueue = source.index('.enqueue(packet, dependencies)?;')
-assert enqueue < source.index('publication.publish_async(&finished);', enqueue), \
-    'the completion fence is published before the job is enqueued'
+assert submit.count('G17PSubmitCompletionMember::new(aggregate.clone())') == 2
+assert 'publication.aggregate = Some(aggregate.clone());' in submit
+assert 'publication.publish_async(&aggregate.fence());' in submit
 
 # A queue can contain successors before an earlier asynchronous job fails.
 # DRM considers the predecessor's signalled error fence ready, so the backend
@@ -186,6 +182,9 @@ use std::sync::{Arc, Mutex};
 struct Error(i32);
 const ECANCELED: Error = Error(125);
 const EIO: Error = Error(5);
+type Result<T=()>=std::result::Result<T,Error>;
+struct G17PSubmitCompletion;
+impl G17PSubmitCompletion { fn finish_enqueue(&self,_result:Result) {} }
 
 /// One dma_fence: unsignalled until whoever owns the work signals it.
 #[derive(Default)]
@@ -281,7 +280,7 @@ fn arm<'a>(
         fence: early,
         outputs,
         failure: ECANCELED,
-        succeeded: false,
+        succeeded: false, aggregate: None,
     }
 }
 '''

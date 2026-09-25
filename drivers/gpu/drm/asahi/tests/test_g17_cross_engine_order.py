@@ -28,18 +28,16 @@ compute = function(source, "    fn submit_compute_async(")
 assert compute.index("self.last_submission_engine != Some(G17PSubmissionEngine::Compute)") < compute.index(
     ".enqueue(packet, dependencies)?"
 )
-assert compute.index("self.last_submission = Some(finished.clone());") < compute.index(
-    "publication.publish_async(&finished);"
-)
+assert "self.last_submission = Some(finished.clone());" in compute
+assert "publication.publish_async(&finished);" not in compute
 assert "self.last_submission_engine = Some(G17PSubmissionEngine::Compute);" in compute
 
 render = function(source, "    fn submit_render_async(")
 assert render.index("self.last_submission_engine != Some(G17PSubmissionEngine::Render)") < render.index(
     ".enqueue(packet, dependencies)?"
 )
-assert render.index("self.last_submission = Some(finished.clone());") < render.index(
-    "publication.publish_async(&finished);"
-)
+assert "self.last_submission = Some(finished.clone());" in render
+assert "publication.publish_async(&finished);" not in render
 assert "self.last_submission_engine = Some(G17PSubmissionEngine::Render);" in render
 assert "translated.render_barrier = header.render_barrier;" in source
 assert "translated.compute_barrier = header.compute_barrier;" in source
@@ -55,19 +53,30 @@ assert backend.index("for fence in packet.input_fences()") < backend.index(
     "self.registry.acquire_lease(self.owner)?"
 )
 
+# Two credits cannot bypass an unresolved head input dependency. This is the
+# production DRM entity code, so first-command input syncs cover later commands
+# through FIFO publication and the engine-change edges checked above.
+entity_source = (root.parent / "scheduler/sched_entity.c").read_text()
+pop = function(entity_source, "struct drm_sched_job *drm_sched_entity_pop_job(")
+peek = pop.index("drm_sched_entity_queue_peek(entity)")
+dependency = pop.index("drm_sched_job_dependency(sched_job, entity)")
+blocked = pop.index("return NULL;", dependency)
+dequeue = pop.index("spsc_queue_pop(&entity->job_queue)")
+assert peek < dependency < blocked < dequeue
+assert "for fence in packet.input_fences()" in backend
+
 # Same-engine host fences are intentionally absent, but a requested UAPI VDM
-# barrier must survive into the owned packet and become the previous 3D stamp
-# in the next TA kick. Per-engine predecessor history alone does not create
-# this cross-stage edge.
+# barrier resolves to the complete live logical prefix, including another
+# physical pair's native 3D token. The behavioral token regression is in
+# test_g17_indexed_render_barriers.py.
 stage = function(manager, "    fn stage_render_groups_with_sksm(")
-assert "wait_previous_fragment: bool" in stage
-assert "queues.fragment.producer.last_add_kicks_timestamp" in stage
-assert "g17p_render_barrier_from_timestamp" in stage
+assert "previous_fragment_barriers: &[g17_submission::G17PClBarrierDependency]" in stage
+assert "queues.fragment.producer.last_add_kicks_timestamp" not in stage
 assert stage.index("previous_fragment_barrier") < stage.index(
     "publish_render_sksm_group(dev, true, tiling_queue, previous_fragment_barriers)"
 )
 begin = function(manager, "    fn begin_translated_render_with_hardware_buffer(")
-assert "command.render_barrier != g17_uapi::UAPI_BARRIER_NONE" in begin
+assert "render_dependencies," in begin
 
 # Host model of exactly the state transition above. A logical queue carries a
 # single cross-engine predecessor; a different logical queue has no dependency

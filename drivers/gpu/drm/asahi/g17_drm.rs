@@ -4,7 +4,7 @@
 
 use core::ops::Range;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     bindings, c_str,
@@ -764,6 +764,79 @@ struct G17PLeaseGuard {
     slot: u8,
 }
 
+fn append_render_prefix_dependencies(
+    frontier: &[(u64, Fence)], prefix: Option<u64>,
+    dependencies: &mut KVec<Fence>, checked_dependencies: &mut KVec<Fence>,
+) -> Result {
+    for (sequence, fence) in frontier {
+        if crate::g17_submission::g17p_render_prefix_contains(prefix, *sequence) {
+            // DRM may coalesce equal-context scheduler dependencies. Retain
+            // every required fence for the existing pre-lease status/wait path.
+            checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
+            dependencies.push(fence.clone(), GFP_KERNEL)?;
+        }
+    }
+    Ok(())
+}
+
+/// Callback-driven completion of every hardware command in one ioctl. The
+/// initial member is held by the output-publication guard until enqueue ends.
+pub(crate) struct G17PSubmitCompletion {
+    fence: UserFence<G17PSubmissionFence>,
+    remaining: AtomicU32,
+    error: AtomicI32,
+}
+
+impl G17PSubmitCompletion {
+    fn new(fence: UserFence<G17PSubmissionFence>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self { fence, remaining: AtomicU32::new(1), error: AtomicI32::new(0) }, GFP_KERNEL)?)
+    }
+
+    fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
+
+    fn member_done(&self, result: Result) {
+        if let Err(error) = result {
+            let _ = self.error.compare_exchange(0, error.to_errno(), Ordering::AcqRel, Ordering::Acquire);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let error = self.error.load(Ordering::Acquire);
+            if error != 0 { self.fence.set_error(Error::from_errno(error)); }
+            self.fence.signal();
+        }
+    }
+
+    fn finish_enqueue(&self, result: Result) {
+        // Preserve the actual ioctl failure over a dropped unsubmitted member's
+        // ECANCELED status. Published members still own their completion pins.
+        if let Err(error) = result { self.error.store(error.to_errno(), Ordering::Release); }
+        self.member_done(result);
+    }
+}
+
+/// One counted command, including construction/enqueue failure. Dropping an
+/// uncompleted member contributes cancellation instead of stranding the fence.
+pub(crate) struct G17PSubmitCompletionMember {
+    aggregate: Arc<G17PSubmitCompletion>,
+    completed: AtomicU32,
+}
+
+impl G17PSubmitCompletionMember {
+    fn new(aggregate: Arc<G17PSubmitCompletion>) -> Self {
+        aggregate.remaining.fetch_add(1, Ordering::Relaxed);
+        Self { aggregate, completed: AtomicU32::new(0) }
+    }
+
+    pub(crate) fn complete(&self, result: Result) {
+        if self.completed.swap(1, Ordering::AcqRel) == 0 {
+            self.aggregate.member_done(result);
+        }
+    }
+}
+
+impl Drop for G17PSubmitCompletionMember {
+    fn drop(&mut self) { self.complete(Err(ECANCELED)); }
+}
+
 /// Exact hardware completion for one published render.  The lease is owned by
 /// the completion packet, not the submit ioctl, so neither file close nor a
 /// fast return can hand the physical slot to another client before retirement.
@@ -777,6 +850,10 @@ pub(crate) struct G17PRenderCompletion {
     owner: u64,
     /// 0xff until the scheduler worker acquires the exact physical slot.
     render_slot: AtomicU32,
+    render_order: crate::g17_submission::G17PRenderOrder,
+    /// Immutable native QID/stamp, assigned before this completion is installed.
+    fragment_dependency: AtomicU64,
+    aggregate_member: G17PSubmitCompletionMember,
     /// Vertex start/end and fragment start/end UAPI destinations.
     timestamps: [Option<TimestampDestination>; 4],
     status: Arc<crate::g17_status::VmStatus>,
@@ -797,6 +874,8 @@ impl G17PRenderCompletion {
         submission_id: u64,
         vdm_base: u64,
         owner: u64,
+        render_order: crate::g17_submission::G17PRenderOrder,
+        aggregate_member: G17PSubmitCompletionMember,
     ) -> Result<Arc<Self>> {
         let lease = Arc::pin_init(
             new_mutex!(None, "G17PRenderCompletion::lease"),
@@ -812,6 +891,9 @@ impl G17PRenderCompletion {
             vdm_base,
             owner,
             render_slot: AtomicU32::new(u8::MAX as u32),
+            render_order,
+            fragment_dependency: AtomicU64::new(u64::MAX),
+            aggregate_member,
             timestamps,
             status,
             lease,
@@ -824,6 +906,27 @@ impl G17PRenderCompletion {
     }
 
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
+
+    pub(crate) fn set_fragment_dependency(&self, word: u64) {
+        self.fragment_dependency.store(word, Ordering::Release);
+    }
+
+    /// Runtime publication and retirement share one mutex. Every preceding
+    /// render has either retired or is in the pending table with its native
+    /// token. Scheduler FIFO alone does not order different physical pairs.
+    pub(crate) fn predecessor_dependency(
+        &self, predecessor: &Self,
+    ) -> Result<Option<crate::g17_submission::G17PClBarrierDependency>> {
+        if self.owner != predecessor.owner || !Arc::ptr_eq(&self.status, &predecessor.status) {
+            return Ok(None);
+        }
+        // SAFETY: predecessor owns its fence throughout this read.
+        let status = unsafe { bindings::dma_fence_get_status(predecessor.fence().raw()) };
+        crate::g17_submission::g17p_live_render_dependency(
+            self.render_order, predecessor.render_order.sequence, status,
+            predecessor.fragment_dependency.load(Ordering::Acquire),
+        ).map_err(|_| EIO)
+    }
 
     /// Attach the physical lease only when the scheduler has resolved every
     /// dependency and is ready to publish. The VM job was retained at ioctl
@@ -888,6 +991,7 @@ impl G17PRenderCompletion {
         drop(self.lease.lock().take());
         drop(self.vm_job.lock().take());
         self.fence.signal();
+        self.aggregate_member.complete(Err(error));
         true
     }
 
@@ -913,6 +1017,7 @@ impl G17PRenderCompletion {
         // Retain BOTH guards: dropping the lease here also lets a waiter
         // reacquire this physical slot before quarantine is recorded.
         self.fence.signal();
+        self.aggregate_member.complete(Err(error));
         true
     }
 
@@ -999,53 +1104,7 @@ impl G17PRenderCompletion {
         drop(self.vm_job.lock().take());
         let vm_job_released_ns = self.created.elapsed().as_nanos().max(0) as u64;
         self.fence.signal();
-        let signalled_ns = self.created.elapsed().as_nanos().max(0) as u64;
-
-        // Diagnostics must never sit between proven retirement and the fence
-        // userspace waits on. Level 1 samples every 64th completion plus any
-        // cleanup tail over 5 ms; level 2 retains the exhaustive trace. The
-        // counter bounds completions, not printed lines, so a busy desktop
-        // cannot fill the journal before the workload under test starts.
-        let trace_level = *module_parameters::g17p_completion_trace.value();
-        let trace_limit = *module_parameters::g17p_trace_depth.value();
-        if trace_level != 0 && trace_limit != 0 {
-            let trace_index = G17P_RENDER_TIMING_RECORDS.fetch_add(1, Ordering::Relaxed);
-            let cleanup_ns = signalled_ns.saturating_sub(completed_ns);
-            if trace_index < trace_limit
-                && (trace_level > 1 || trace_index % 64 == 0 || cleanup_ns >= 5_000_000)
-            {
-                let attached_ns = self.attached_ns.load(Ordering::Acquire);
-                let published_ns = self.published_ns.load(Ordering::Acquire);
-                let scheduler_entered_ns =
-                    self.scheduler_entered_ns.load(Ordering::Acquire);
-                let inputs_ready_ns = self.inputs_ready_ns.load(Ordering::Acquire);
-                let durations = gpu_durations.unwrap_or([0; 2]);
-                pr_info!(
-                    "G17P render timing: sample={} submission={} slot={} scheduler-enter={}ns inputs-ready={}ns attach={}ns publish={}ns observed={}ns signalled={}ns scheduler-wait={}ns input-wait={}ns lease-wait={}ns publication={}ns retirement={}ns resolve={}ns lease-release={}ns vm-job-release={}ns signal={}ns gpu-ta={} gpu-3d={} ok={}\n",
-                    trace_index,
-                    self.submission_id,
-                    self.render_slot.load(Ordering::Acquire),
-                    scheduler_entered_ns,
-                    inputs_ready_ns,
-                    attached_ns,
-                    published_ns,
-                    completed_ns,
-                    signalled_ns,
-                    scheduler_entered_ns,
-                    inputs_ready_ns.saturating_sub(scheduler_entered_ns),
-                    attached_ns.saturating_sub(inputs_ready_ns),
-                    published_ns.saturating_sub(attached_ns),
-                    completed_ns.saturating_sub(published_ns),
-                    resolved_ns.saturating_sub(completed_ns),
-                    lease_released_ns.saturating_sub(resolved_ns),
-                    vm_job_released_ns.saturating_sub(lease_released_ns),
-                    signalled_ns.saturating_sub(vm_job_released_ns),
-                    durations[0],
-                    durations[1],
-                    result_ok,
-                );
-            }
-        }
+        self.aggregate_member.complete(result);
     }
 
     /// Release guards retained by `fail_while_owned` after both ASCs stop.
@@ -1285,10 +1344,15 @@ struct G17PQueue {
     /// just as a render following compute must not overtake it. Independent
     /// logical queues retain their own timelines and can still overlap.
     last_submission: Option<Fence>,
-    /// The hardware queue itself preserves same-engine FIFO order. Keep an
-    /// explicit dependency only when switching engines, because render and
-    /// compute use distinct DRM scheduler entities and hardware queues.
+    /// Preserve the existing cross-engine fence in addition to exact indexed
+    /// render-prefix coverage; same-engine FIFO alone orders publication, not
+    /// completion across two physical render pairs.
     last_submission_engine: Option<G17PSubmissionEngine>,
+    /// Monotonic logical render index; independent of physical pair rotation.
+    render_sequence: u64,
+    /// Only accepted renders which have not yet signalled. Queued work counts
+    /// until its real completion; physical-pair admission remains unchanged.
+    render_frontier: KVec<(u64, Fence)>,
     id: u64,
 }
 
@@ -1692,6 +1756,8 @@ impl G17PQueue {
             async_scheduler: None,
             render_scheduler: Some(render_scheduler),
             last_submission: None,
+            render_sequence: 0,
+            render_frontier: KVec::new(),
             last_submission_engine: None,
             id,
         })
@@ -1905,20 +1971,22 @@ impl G17PQueue {
         }
     }
 
-    /// Queue a compute command on this queue's DRM scheduler.
-    ///
-    /// `syncs` holds only the input syncobjs: `submit()` splits the outputs off
-    /// into `publication` before it knows whether the command is render or
-    /// compute. The scheduler's finished fence is therefore published through
-    /// that guard rather than installed from here, and only once the job is
-    /// actually enqueued -- every earlier failure leaves the guard armed so the
-    /// caller still learns the work will never run.
+    fn prune_render_frontier(&mut self) {
+        // All command failure paths publish sticky VM status before signalling;
+        // an errored render may be dropped here without treating it as success.
+        self.render_frontier.retain(|(_, fence)| {
+            // SAFETY: the retained Fence owns the pointer for this status read.
+            unsafe { bindings::dma_fence_get_status(fence.raw()) == 0 }
+        });
+    }
+
+    /// Queue a compute command with its required render prefix and an owned
+    /// member of the ioctl output aggregate. Input fence scope is unchanged.
     fn submit_compute_async(
         &mut self, submission_id: u64, translated: g17_uapi::TranslatedComputeCommand,
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
-        publication: &mut G17POutputFencePublication<'_>,
-        publish_output: bool,
+        aggregate_member: G17PSubmitCompletionMember,
         vm_job: mmu::T8140VmJobGuard,
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
@@ -1930,13 +1998,21 @@ impl G17PQueue {
         ];
         let timestamps = self.owned_compute_timestamps()?;
         let output = self.fence_contexts.new_fence(0, G17PSubmissionFence)?.into();
+        self.prune_render_frontier();
         let backend = self.async_backend.as_ref().ok_or(EIO)?;
         // One extra dependency carries this logical queue's preceding render
         // or compute completion. DRM entities serialize compute jobs with one
         // another, but render publication uses a separate watch entity; the
         // explicit fence is what preserves Vulkan queue order across engines.
-        let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
-        let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
+        let prefix_count = self.render_frontier.iter().filter(|(sequence, _)|
+            crate::g17_submission::g17p_render_prefix_contains(translated.render_wait_through, *sequence)
+        ).count();
+        let mut dependencies = KVec::with_capacity(in_sync_count + 1 + prefix_count, GFP_KERNEL)?;
+        let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1 + prefix_count, GFP_KERNEL)?;
+        append_render_prefix_dependencies(
+            &self.render_frontier, translated.render_wait_through,
+            &mut dependencies, &mut checked_dependencies,
+        )?;
         for sync in syncs.drain(0..in_sync_count) {
             if let Some(fence) = sync.fence {
                 checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
@@ -1955,6 +2031,7 @@ impl G17PQueue {
             destinations,
             self.vm.status().clone(),
             vm_job,
+            aggregate_member,
         )?;
         let packet = g17_job::G17PComputeJobPacket::new(
             submission_id, backend.hardware_queue, backend.context.clone(), translated,
@@ -1966,9 +2043,6 @@ impl G17PQueue {
         // the fence that signals when the GPU has actually run it.
         self.last_submission = Some(finished.clone());
         self.last_submission_engine = Some(G17PSubmissionEngine::Compute);
-        if publish_output {
-            publication.publish_async(&finished);
-        }
         if crate::util::g17p_verbose() {
             pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
                 submission_id, self.id, backend.hardware_queue, backend.context.context_id());
@@ -1992,11 +2066,12 @@ impl G17PQueue {
         &mut self, submission_id: u64, translated: g17_uapi::TranslatedRenderCommand,
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
-        publication: &mut G17POutputFencePublication<'_>,
-        publish_output: bool,
+        aggregate_member: G17PSubmitCompletionMember,
         vm_job: mmu::T8140VmJobGuard,
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
+        self.prune_render_frontier();
+        self.render_frontier.reserve(1, GFP_KERNEL)?;
         let timestamps = [
             Self::timestamp_destination(objects, translated.vertex_timestamps.start)
                 .map_err(|error| Self::stage_fail(submission_id, "ts-vtx-start", error))?,
@@ -2020,6 +2095,8 @@ impl G17PQueue {
             submission_id,
             translated.vdm_base,
             self.id,
+            translated.render_order,
+            aggregate_member,
         )?;
         let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
         let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
@@ -2042,9 +2119,9 @@ impl G17PQueue {
             .enqueue(packet, dependencies)?;
         self.last_submission = Some(finished.clone());
         self.last_submission_engine = Some(G17PSubmissionEngine::Render);
-        if publish_output {
-            publication.publish_async(&finished);
-        }
+        self.render_sequence = translated.render_order.sequence;
+        self.render_frontier.push_within_capacity((self.render_sequence, finished.clone()))
+            .map_err(|_| ENOMEM)?;
         if crate::util::g17p_verbose() {
             pr_info!("G17P render submit: QUEUED submission {} owner={} context={}\n",
                 submission_id, self.id, self.context.context_id());
@@ -2240,6 +2317,7 @@ struct G17POutputFencePublication<'a> {
     outputs: KVec<file::SyncItem>,
     failure: Error,
     succeeded: bool,
+    aggregate: Option<Arc<G17PSubmitCompletion>>,
 }
 
 impl G17POutputFencePublication<'_> {
@@ -2268,6 +2346,9 @@ impl G17POutputFencePublication<'_> {
 
 impl Drop for G17POutputFencePublication<'_> {
     fn drop(&mut self) {
+        if let Some(aggregate) = self.aggregate.take() {
+            aggregate.finish_enqueue(if self.succeeded { Ok(()) } else { Err(self.failure) });
+        }
         if !self.succeeded {
             self.fence.set_error(self.failure);
         }
@@ -2342,6 +2423,7 @@ impl queue::Queue for G17PQueue {
             outputs: deferred_outputs,
             failure: ECANCELED,
             succeeded: false,
+            aggregate: None,
         };
         while syncs.len() > in_sync_count {
             // Removing the first output keeps timeline points in userspace
@@ -2396,6 +2478,7 @@ impl queue::Queue for G17PQueue {
             user_end: self.user_range.end,
         };
         let mut parser = g17_uapi::UapiCommandParser::new(cmdbuf_raw);
+        let mut render_preceding = 0u64;
         let mut pending = KVec::with_capacity(
             file::MAX_COMMANDS_PER_SUBMISSION as usize,
             GFP_KERNEL,
@@ -2482,21 +2565,24 @@ impl queue::Queue for G17PQueue {
                         .map_err(|error| Self::reject_uapi(submission_id, "render", error))?;
                     translated.render_barrier = header.render_barrier;
                     translated.compute_barrier = header.compute_barrier;
+                    translated.render_order = crate::g17_submission::g17p_render_order(
+                        self.render_sequence, render_preceding, header.render_barrier,
+                    ).map_err(|_| Self::stage_fail(submission_id, "render-index", EOVERFLOW))?;
+                    render_preceding += 1;
                     G17PPendingCommand::Render(translated)
                 }
                 g17_uapi::ParsedHardwareCommand::Compute {
-                    payload,
-                    attachments,
-                    ..
-                } => G17PPendingCommand::Compute(
-                    g17_uapi::translate_compute_command(
-                        payload,
-                        attachments,
-                        window,
-                        &address_space,
-                    )
-                    .map_err(|_| EINVAL)?,
-                ),
+                    payload, attachments, header, ..
+                } => {
+                    let mut translated = g17_uapi::translate_compute_command(
+                        payload, attachments, window, &address_space,
+                    ).map_err(|error| Self::reject_uapi(submission_id, "compute", error))?;
+                    translated.render_wait_through = crate::g17_submission::g17p_render_order(
+                        self.render_sequence, render_preceding, header.render_barrier,
+                    ).map_err(|_| Self::stage_fail(submission_id, "compute-render-index", EOVERFLOW))?
+                        .wait_through;
+                    G17PPendingCommand::Compute(translated)
+                },
             };
             pending.push_within_capacity(command).map_err(|_| ENOMEM)?;
         }
@@ -2533,6 +2619,14 @@ impl queue::Queue for G17PQueue {
             vm_jobs.push_within_capacity(guard).map_err(|_| ENOMEM)?;
         }
 
+        let aggregate = G17PSubmitCompletion::new(
+            self.fence_contexts.new_fence(0, G17PSubmissionFence)?.into(),
+        )?;
+        // Export the aggregate before enqueue: partial failure still leaves a
+        // fence which covers every already queued command plus the enqueue gate.
+        Self::install_output_fences(publication.outputs.drain(..), &aggregate.fence());
+        publication.aggregate = Some(aggregate.clone());
+
         for (index, command) in pending.drain(..).enumerate() {
             let first = index == 0;
             let last = index + 1 == command_count;
@@ -2552,8 +2646,7 @@ impl queue::Queue for G17PQueue {
                     command_syncs,
                     command_in_sync_count,
                     objects,
-                    &mut publication,
-                    last,
+                    G17PSubmitCompletionMember::new(aggregate.clone()),
                     vm_job,
                     command_entered,
                 )?,
@@ -2563,13 +2656,13 @@ impl queue::Queue for G17PQueue {
                     command_syncs,
                     command_in_sync_count,
                     objects,
-                    &mut publication,
-                    last,
+                    G17PSubmitCompletionMember::new(aggregate.clone()),
                     vm_job,
                     command_entered,
                 )?,
             }
         }
+        publication.publish_async(&aggregate.fence());
         Ok(())
     }
 }
