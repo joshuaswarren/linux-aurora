@@ -228,3 +228,4 @@
 	};
 };
 #include "t8152-j873-thermal-sensors.dtsi"
+#include "t8152-j873-gpu.dtsi"
