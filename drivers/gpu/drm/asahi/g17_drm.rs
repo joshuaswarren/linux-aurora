@@ -766,15 +766,16 @@ struct G17PLeaseGuard {
 }
 
 fn append_render_prefix_dependencies(
-    frontier: &[(u64, Fence)], prefix: Option<u64>,
+    frontier: &[(u64, g17_job::G17PCommandFences)], prefix: Option<u64>,
     dependencies: &mut KVec<Fence>, checked_dependencies: &mut KVec<Fence>,
 ) -> Result {
     for (sequence, fence) in frontier {
         if crate::g17_submission::g17p_render_prefix_contains(prefix, *sequence) {
-            // DRM may coalesce equal-context scheduler dependencies. Retain
-            // every required fence for the existing pre-lease status/wait path.
-            checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
-            dependencies.push(fence.clone(), GFP_KERNEL)?;
+            // Queue publication is ordered by scheduled fences. Keep every
+            // hardware status separately: a scheduled fence does not propagate
+            // a failed run_job, and native tokens carry the actual GPU waits.
+            checked_dependencies.push(fence.completed.clone(), GFP_KERNEL)?;
+            dependencies.push(fence.published.clone(), GFP_KERNEL)?;
         }
     }
     Ok(())
@@ -916,6 +917,29 @@ impl G17PRenderCompletion {
 
     pub(crate) fn set_fragment_dependency(&self, word: u64) {
         self.fragment_dependency.store(word, Ordering::Release);
+    }
+
+    pub(crate) fn owner(&self) -> u64 { self.owner }
+
+    pub(crate) fn compute_predecessor_dependency(
+        &self, owner: u64, status: &Arc<crate::g17_status::VmStatus>,
+        prefix: Option<u64>, last: Option<u64>,
+    ) -> Result<Option<crate::g17_submission::G17PClBarrierDependency>> {
+        if self.owner != owner || !Arc::ptr_eq(&self.status, status) {
+            return Ok(None);
+        }
+        let sequence = self.render_order.sequence;
+        if !crate::g17_submission::g17p_render_prefix_contains(prefix, sequence)
+            && last != Some(sequence)
+        {
+            return Ok(None);
+        }
+        // SAFETY: this completion owns the queried hardware fence.
+        let status = unsafe { bindings::dma_fence_get_status(self.fence().raw()) };
+        crate::g17_submission::g17p_live_render_dependency(
+            crate::g17_submission::G17PRenderOrder { sequence: 0, wait_through: Some(sequence) },
+            sequence, status, self.fragment_dependency.load(Ordering::Acquire),
+        ).map_err(|_| EIO)
     }
 
     /// Runtime publication and retirement share one mutex. Every preceding
@@ -1380,6 +1404,7 @@ struct G17PQueue {
     /// just as a render following compute must not overtake it. Independent
     /// logical queues retain their own timelines and can still overlap.
     last_submission: Option<Fence>,
+    last_publication: Option<Fence>,
     /// Preserve the existing cross-engine fence in addition to exact indexed
     /// render-prefix coverage; same-engine FIFO alone orders publication, not
     /// completion across two physical render pairs.
@@ -1388,7 +1413,7 @@ struct G17PQueue {
     render_sequence: u64,
     /// Only accepted renders which have not yet signalled. Queued work counts
     /// until its real completion; physical-pair admission remains unchanged.
-    render_frontier: KVec<(u64, Fence)>,
+    render_frontier: KVec<(u64, g17_job::G17PCommandFences)>,
     id: u64,
 }
 
@@ -1479,6 +1504,9 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
             failure_stage = "render-input-fence";
             for fence in packet.input_fences() {
                 G17PQueue::wait_fence(fence)?;
+            }
+            for fence in packet.firmware_fences() {
+                G17PQueue::check_firmware_fence(fence)?;
             }
             if packet.cancel_requested() { return Err(ECANCELED); }
 
@@ -1706,6 +1734,9 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
             for fence in packet.input_fences() {
                 G17PQueue::wait_fence(fence)?;
             }
+            for fence in packet.firmware_fences() {
+                G17PQueue::check_firmware_fence(fence)?;
+            }
             let hardware_fence = completion.fence();
             let (first_install, burst_steady) = {
                 let runtime = self.runtime.mutex().lock();
@@ -1819,6 +1850,7 @@ impl G17PQueue {
             async_scheduler: None,
             render_scheduler: Some(render_scheduler),
             last_submission: None,
+            last_publication: None,
             render_sequence: 0,
             render_frontier: KVec::new(),
             last_submission_engine: None,
@@ -2039,14 +2071,14 @@ impl G17PQueue {
         // an errored render may be dropped here without treating it as success.
         self.render_frontier.retain(|(_, fence)| {
             // SAFETY: the retained Fence owns the pointer for this status read.
-            unsafe { bindings::dma_fence_get_status(fence.raw()) == 0 }
+            unsafe { bindings::dma_fence_get_status(fence.completed.raw()) == 0 }
         });
     }
 
     /// Queue a compute command with its required render prefix and an owned
     /// member of the ioctl output aggregate. Input fence scope is unchanged.
     fn submit_compute_async(
-        &mut self, submission_id: u64, translated: g17_uapi::TranslatedComputeCommand,
+        &mut self, submission_id: u64, mut translated: g17_uapi::TranslatedComputeCommand,
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         aggregate_member: G17PSubmitCompletionMember,
@@ -2063,18 +2095,19 @@ impl G17PQueue {
         let output = self.fence_contexts.new_fence(0, G17PSubmissionFence)?.into();
         self.prune_render_frontier();
         let backend = self.async_backend.as_ref().ok_or(EIO)?;
-        // One extra dependency carries this logical queue's preceding render
-        // or compute completion. DRM entities serialize compute jobs with one
-        // another, but render publication uses a separate watch entity; the
-        // explicit fence is what preserves Vulkan queue order across engines.
+        // Resolve cross-engine publication before taking native token snapshots.
+        // Compute capacity still uses its hardware retirement fence. Explicit
+        // user syncs remain completion dependencies; native CL dependencies
+        // carry the intra-queue render/compute execution order.
         let prefix_count = self.render_frontier.iter().filter(|(sequence, _)|
             crate::g17_submission::g17p_render_prefix_contains(translated.render_wait_through, *sequence)
         ).count();
         let mut dependencies = KVec::with_capacity(in_sync_count + 1 + prefix_count, GFP_KERNEL)?;
-        let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1 + prefix_count, GFP_KERNEL)?;
+        let mut checked_dependencies = KVec::with_capacity(in_sync_count, GFP_KERNEL)?;
+        let mut firmware_fences = KVec::with_capacity(1 + prefix_count, GFP_KERNEL)?;
         append_render_prefix_dependencies(
             &self.render_frontier, translated.render_wait_through,
-            &mut dependencies, &mut checked_dependencies,
+            &mut dependencies, &mut firmware_fences,
         )?;
         for sync in syncs.drain(0..in_sync_count) {
             if let Some(fence) = sync.fence {
@@ -2083,9 +2116,10 @@ impl G17PQueue {
             }
         }
         if self.last_submission_engine != Some(G17PSubmissionEngine::Compute) {
+            translated.render_wait_last = Some(self.render_sequence);
             if let Some(prior) = self.last_submission.as_ref() {
-                checked_dependencies.push(prior.clone(), GFP_KERNEL)?;
-                dependencies.push(prior.clone(), GFP_KERNEL)?;
+                firmware_fences.push(prior.clone(), GFP_KERNEL)?;
+                dependencies.push(self.last_publication.as_ref().ok_or(EIO)?.clone(), GFP_KERNEL)?;
             }
         }
         let completion = g17_job::G17PJobCompletion::new(
@@ -2098,13 +2132,14 @@ impl G17PQueue {
         )?;
         let packet = g17_job::G17PComputeJobPacket::new(
             submission_id, backend.hardware_queue, backend.context.clone(), translated,
-            KVec::new(), KVec::new(), checked_dependencies,
+            KVec::new(), KVec::new(), checked_dependencies, firmware_fences,
             Some(completion),
         )?;
         let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
         // The job is queued and owns its completion from here: give userspace
         // the fence that signals when the GPU has actually run it.
-        self.last_submission = Some(finished.clone());
+        self.last_submission = Some(finished.completed.clone());
+        self.last_publication = Some(finished.published.clone());
         self.last_submission_engine = Some(G17PSubmissionEngine::Compute);
         if crate::util::g17p_verbose() {
             pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
@@ -2121,10 +2156,9 @@ impl G17PQueue {
         Ok(())
     }
 
-    /// Queue render publication behind its explicit syncs and this Vulkan
-    /// queue's preceding engine work. No physical render slot is consumed by
-    /// the ioctl; the scheduler worker acquires the stable owner slot only
-    /// after every dependency has retired successfully.
+    /// Queue render behind user completion syncs and the preceding engine's
+    /// publication. The runtime resolves its live compute token while holding
+    /// the same lock used by compute publication and retirement.
     fn submit_render_async(
         &mut self, submission_id: u64, translated: g17_uapi::TranslatedRenderCommand,
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
@@ -2162,7 +2196,8 @@ impl G17PQueue {
             aggregate_member,
         )?;
         let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
-        let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
+        let mut checked_dependencies = KVec::with_capacity(in_sync_count, GFP_KERNEL)?;
+        let mut firmware_fences = KVec::with_capacity(1, GFP_KERNEL)?;
         for sync in syncs.drain(0..in_sync_count) {
             if let Some(fence) = sync.fence {
                 checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
@@ -2171,19 +2206,20 @@ impl G17PQueue {
         }
         if self.last_submission_engine != Some(G17PSubmissionEngine::Render) {
             if let Some(prior) = self.last_submission.as_ref() {
-                checked_dependencies.push(prior.clone(), GFP_KERNEL)?;
-                dependencies.push(prior.clone(), GFP_KERNEL)?;
+                firmware_fences.push(prior.clone(), GFP_KERNEL)?;
+                dependencies.push(self.last_publication.as_ref().ok_or(EIO)?.clone(), GFP_KERNEL)?;
             }
         }
         let packet = g17_job::G17PRenderJobPacket::new(
-            submission_id, translated, checked_dependencies, completion,
+            submission_id, translated, checked_dependencies, firmware_fences, completion,
         )?;
         let finished = self.render_scheduler.as_mut().ok_or(ENODEV)?
             .enqueue(packet, dependencies)?;
-        self.last_submission = Some(finished.clone());
+        self.last_submission = Some(finished.completed.clone());
+        self.last_publication = Some(finished.published.clone());
         self.last_submission_engine = Some(G17PSubmissionEngine::Render);
         self.render_sequence = translated.render_order.sequence;
-        self.render_frontier.push_within_capacity((self.render_sequence, finished.clone()))
+        self.render_frontier.push_within_capacity((self.render_sequence, finished))
             .map_err(|_| ENOMEM)?;
         if crate::util::g17p_verbose() {
             pr_info!("G17P render submit: QUEUED submission {} owner={} context={}\n",
@@ -2275,6 +2311,15 @@ impl G17PQueue {
                 payload.fragment_helper.data,
             );
         }
+    }
+
+    fn check_firmware_fence(fence: &Fence) -> Result {
+        // Publication readiness is supplied by the scheduler fence. A pending
+        // hardware fence is valid: the native dependency carries that wait.
+        // SAFETY: the owned Fence keeps this pointer alive for the status read.
+        let status = unsafe { bindings::dma_fence_get_status(fence.raw()) };
+        if status < 0 { return Err(Error::from_errno(status)); }
+        Ok(())
     }
 
     fn wait_fence(fence: &Fence) -> Result {
