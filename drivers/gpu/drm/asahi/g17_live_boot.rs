@@ -5788,6 +5788,31 @@ impl G17PLiveRuntime {
         // the exact configureHardware boundary.  The previous preamble did the
         // power transaction before graph construction; verbose construction
         // alone was long enough for firmware to close the aperture again.
+        // Render entity FIFO has published every earlier logical render by
+        // now. The runtime mutex excludes retirement while we snapshot the
+        // live prefix; successfully retired pairs need no dependency. Keep
+        // each remaining pair's exact native token, including independent
+        // earlier renders which the last render alone does not cover.
+        if completion.vm_status().get() != 0 { return Err(EIO); }
+        let mut render_dependencies = [g17_submission::G17PClBarrierDependency {
+            native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
+        }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
+        let mut dependency_count = 0;
+        for predecessor in Iterator::chain(
+            self.pending_render.iter(), self.pending_render_queued.iter(),
+        ).flatten()
+        {
+            if let Some(dependency) = completion.predecessor_dependency(predecessor)? {
+                let target = render_dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)?;
+                *target = dependency;
+                dependency_count += 1;
+            }
+        }
+        // Diagnostic modes 2/3 construct TA later and do not accept this
+        // dependency slice. Refuse an unresolved prefix instead of losing it.
+        if dependency_count != 0 && (native_doorbell_mode == 2 || native_doorbell_mode == 3) {
+            return Err(ENOTSUPP);
+        }
         let mut manager = self.manager.take().ok_or(ENODEV)?;
         let registers = self.registers.take().ok_or(ENODEV)?;
         let mut registration_powered = false;
@@ -5799,6 +5824,7 @@ impl G17PLiveRuntime {
             queue_pair,
             execution_context,
             command,
+            &render_dependencies[..dependency_count],
             &registers,
             &mut |manager| {
                 registration_powered = false;
@@ -5832,6 +5858,9 @@ impl G17PLiveRuntime {
         self.manager = Some(manager);
         self.registers = Some(registers);
         let prepared = prepared?;
+        completion.set_fragment_dependency(
+            self.manager.as_ref().ok_or(ENODEV)?.staged_render_fragment_dependency()?,
+        );
         // Arm the exact fence after the tracker has been reset for this group,
         // but before any control or work doorbell can report its retirement.
         self.install_render_completion(render_slot, completion)?;

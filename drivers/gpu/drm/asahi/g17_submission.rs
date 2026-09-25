@@ -111,6 +111,10 @@ pub(crate) enum PipeType {
 /// Errors from the submission codec.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionError {
+    RenderBarrierFuture,
+    RenderBarrierSequenceOverflow,
+    RenderBarrierMissingToken,
+    RenderBarrierPredecessorFailed,
     /// A doorbell index outside the 3-bit [4:2] field.
     DoorbellIndexOutOfRange,
     /// A doorbell whose type field is not the TX (channel-kick) type.
@@ -2830,6 +2834,9 @@ pub(crate) const G17P_CL_KICK_ENTRY_LAYOUT: G17PClKickEntryLayout = G17PClKickEn
 /// selects the shared-stamp source and has no independent wire field.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PClBarrierDependency {
+    /// Already converted native predecessor stamp. Never reinterpret it using
+    /// the consumer queue's base timestamp or ring geometry.
+    pub(crate) native_timestamp: Option<u64>,
     pub(crate) event_word: u32,
     pub(crate) shared_stamp: u64,
     pub(crate) queue_id: u8,
@@ -2850,10 +2857,69 @@ pub(crate) fn g17p_render_barrier_from_timestamp(
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
     }
     Ok(G17PClBarrierDependency {
+        native_timestamp: None,
         event_word: (timestamp as u32).wrapping_shl(8),
         shared_stamp: timestamp >> 24,
         queue_id,
     })
+}
+
+/// Logical render prefix, resolved at ioctl admission before asynchronous work.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub(crate) struct G17PRenderOrder {
+    pub(crate) sequence: u64,
+    pub(crate) wait_through: Option<u64>,
+}
+
+/// Zero snapshots all preceding ioctls; N adds the first N renders of this
+/// ioctl. NONE remains independent. Sequence zero is reserved for internal work.
+pub(crate) fn g17p_render_order(
+    ioctl_base: u64, preceding: u64, barrier: u16,
+) -> Result<G17PRenderOrder, SubmissionError> {
+    let sequence = ioctl_base.checked_add(preceding)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?;
+    let wait_through = if barrier == u16::MAX {
+        None
+    } else {
+        if u64::from(barrier) > preceding {
+            return Err(SubmissionError::RenderBarrierFuture);
+        }
+        Some(ioctl_base.checked_add(u64::from(barrier))
+            .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?)
+    };
+    Ok(G17PRenderOrder { sequence, wait_through })
+}
+
+/// Resolve a still-owned predecessor. A successful retirement needs no GPU
+/// dependency; errors and an unassigned token must never satisfy the prefix.
+/// The caller filters owner identity and supplies every live predecessor in
+/// the prefix under the same runtime lock as publication and retirement.
+pub(crate) fn g17p_live_render_dependency(
+    order: G17PRenderOrder, predecessor_sequence: u64,
+    predecessor_status: i32, native_word: u64,
+) -> Result<Option<G17PClBarrierDependency>, SubmissionError> {
+    if !g17p_render_prefix_contains(order.wait_through, predecessor_sequence) {
+        return Ok(None);
+    }
+    if predecessor_status < 0 {
+        return Err(SubmissionError::RenderBarrierPredecessorFailed);
+    }
+    if predecessor_status > 0 { return Ok(None); }
+    if native_word == u64::MAX {
+        return Err(SubmissionError::RenderBarrierMissingToken);
+    }
+    let token = decode_kick_word(native_word)?;
+    if token.mask_selector != 0 {
+        return Err(SubmissionError::KickWordUnmodeledBits);
+    }
+    let mut dependency = g17p_render_barrier_from_timestamp(token.timestamp, token.queue_id)?;
+    dependency.native_timestamp = Some(token.timestamp);
+    Ok(Some(dependency))
+}
+
+pub(crate) fn g17p_render_prefix_contains(prefix: Option<u64>, sequence: u64) -> bool {
+    sequence != 0 && prefix.is_some_and(|limit| sequence <= limit)
 }
 
 /// Optional MCache aperture descriptor copied into entry +0x08.
@@ -3333,6 +3399,10 @@ fn encode_g17p_cl_barrier_dependency(
 ) -> Result<u64, SubmissionError> {
     if barrier.queue_id > KICK_QID_MASK as u8 {
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
+    }
+
+    if let Some(timestamp) = barrier.native_timestamp {
+        return encode_g17p_cl_dependency(timestamp, barrier.queue_id);
     }
 
     let stamp_count = queue.geometry.stamp_count() as u64;
@@ -7370,6 +7440,7 @@ mod tests {
     #[test]
     fn g17p_cl_entry_encodes_every_optional_section() {
         let barriers = [G17PClBarrierDependency {
+            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 3,
@@ -7499,6 +7570,7 @@ mod tests {
         assert_eq!(get_u64_le(&ta.entry, 0x20), 0xffff_0c02_0000_0001);
 
         let fragment_barrier = [G17PClBarrierDependency {
+            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 0,
@@ -7642,6 +7714,7 @@ mod tests {
         );
 
         let too_many = [G17PClBarrierDependency {
+            native_timestamp: None,
             event_word: 0,
             shared_stamp: 0,
             queue_id: 0,
