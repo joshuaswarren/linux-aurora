@@ -486,29 +486,22 @@ int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan, u16 type)
 	return CISP_SEND_INOUT(isp, args);
 }
 
-/*
- * The macOS H17 receiver publishes the rendered (output) pool geometry too:
- * plane sizes/strides in the meta-size slots and the first two "zero" words,
- * two data blocks.  Not sent by the t8103..t8122 path.
- */
 int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
 					       u16 count, u32 plane0_size,
-					       u32 stride0, u32 plane1_size,
-					       u32 stride1)
+					       u32 plane0_stride,
+					       u32 plane1_size,
+					       u32 plane1_stride)
 {
-	struct cmd_ch_buffer_pool_config_set args = {
+	struct cmd_ch_buffer_pool_config_set_rendered args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
 		.chan = chan,
 		.type = CISP_POOL_TYPE_RENDERED,
 		.count = count,
-		.meta_size0 = plane0_size,
-		.meta_size1 = stride0,
-		.unk0 = 0,
-		.unk1 = 0,
-		.unk2 = 0,
-		.zero = { plane1_size, stride1 },
+		.plane0_size = plane0_size,
+		.plane0_stride = plane0_stride,
+		.plane1_size = plane1_size,
+		.plane1_stride = plane1_stride,
 		.data_blocks = 2,
-		.compress = 0,
 	};
 	return CISP_SEND_INOUT(isp, args);
 }

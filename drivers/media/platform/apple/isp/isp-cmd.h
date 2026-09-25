@@ -573,6 +573,29 @@ struct cmd_ch_buffer_pool_config_set {
 } __packed;
 static_assert(sizeof(struct cmd_ch_buffer_pool_config_set) == 0x9c);
 
+/*
+ * The H17 firmware takes the output geometry with the rendered pool: the
+ * plane sizes and strides in the places of the metadata sizes and the
+ * first two reserved words.
+ */
+struct cmd_ch_buffer_pool_config_set_rendered {
+	u64 opcode;
+	u32 chan;
+	u16 type;
+	u16 count;
+	u32 plane0_size;
+	u32 plane0_stride;
+	u64 unk0;
+	u64 unk1;
+	u64 unk2;
+	u32 plane1_size;
+	u32 plane1_stride;
+	u32 zero[0x17];
+	u32 data_blocks;
+	u32 compress;
+} __packed;
+static_assert(sizeof(struct cmd_ch_buffer_pool_config_set_rendered) == 0x9c);
+
 struct cmd_ch_buffer_pool_return {
 	u64 opcode;
 	u32 chan;
@@ -586,8 +609,9 @@ int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan,
 				      u16 type);
 int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
 					       u16 count, u32 plane0_size,
-					       u32 stride0, u32 plane1_size,
-					       u32 stride1);
+					       u32 plane0_stride,
+					       u32 plane1_size,
+					       u32 plane1_stride);
 int isp_cmd_ch_buffer_pool_config_get(struct apple_isp *isp, u32 chan,
 				      u16 type);
 int isp_cmd_ch_buffer_pool_return(struct apple_isp *isp, u32 chan);
