@@ -658,28 +658,9 @@ impl AFKEndpoint {
                     return Err(EIO);
                 }
                 let retcode = u32::from_ne_bytes(data[..4].try_into().unwrap());
-                let mut tag = ehdr.tag as usize;
-                if client.epic_v4 && (tag == 0 || tag > self.calls.len()) {
-                    // The t8140 firmware does not echo the request tag in its
-                    // replies; with one call in flight per endpoint (the native
-                    // host never had more) the reply is for that call.
-                    let inflight: KVec<usize> = {
-                        let mut v = KVec::new();
-                        for i in 0..self.calls.len() {
-                            if self.calls[i].is_some() {
-                                v.push(i + 1, GFP_KERNEL)?;
-                            }
-                        }
-                        v
-                    };
-                    if inflight.len() == 1 {
-                        tag = inflight[0];
-                    }
-                }
-                if tag == 0 || tag - 1 > self.calls.len() || self.calls[tag - 1].is_none() {
-                    // A reply for a call that timed out, or no call at all:
-                    // drop it, the rest of the ring is still good.
-                    dev_warn!(
+                let tag = ehdr.tag as usize;
+                if tag == 0 || tag > self.calls.len() || self.calls[tag - 1].is_none() {
+                    dev_err!(
                         client.dev,
                         "Dropping a retcode with no call in flight (tag {:?}) on endpoint {}",
                         tag,
