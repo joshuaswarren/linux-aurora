@@ -61,6 +61,7 @@ mod module_parameters {
 impl Error {fn to_errno(self)->i32 {self.0}}
 const EIO:Error=Error(-5); const EINVAL:Error=Error(-22);
 type Result<T=()> = std::result::Result<T,Error>;
+struct Aggregate; impl Aggregate {fn complete(&self,_result:Result){}}
 struct Mutex<T>(StdMutex<T>);
 impl<T> Mutex<T> {fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}
 #[derive(Default)] struct Memory {active:AtomicUsize,closed:AtomicBool,unmapped:AtomicBool,quarantined:AtomicBool}
@@ -102,7 +103,7 @@ for name, impl, extra in [
     ('Render', render_impl, 'lease:Mutex<Option<Lease>>,timestamps:[Option<Destination>;4],created:std::time::Instant,attached_ns:AtomicU64,published_ns:AtomicU64,submission_id:u64,vdm_base:u64,owner:u64,render_slot:AtomicU32,'),
     ('Compute', compute_impl, 'destinations:[Option<Destination>;2],'),
 ]:
-    source += f'''struct {name} {{ fence:Fence,status:Arc<Status>,vm_job:Mutex<Option<VmGuard>>,signalled:AtomicU32,{extra}}}
+    source += f'''struct {name} {{ fence:Fence,status:Arc<Status>,vm_job:Mutex<Option<VmGuard>>,signalled:AtomicU32,aggregate_member:Aggregate,{extra}}}
 impl {name} {{
 '''
     if '--negative-control' in sys.argv:
@@ -116,9 +117,9 @@ impl {name} {{
 
 source += r'''
 fn render(m:&Arc<Memory>,released:&Arc<AtomicUsize>)->Arc<Render>{
- let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),timestamps:[None,None,None,None],lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0}))),created:std::time::Instant::now(),attached_ns:AtomicU64::new(0),published_ns:AtomicU64::new(0),submission_id:1,vdm_base:0,owner:0,render_slot:AtomicU32::new(0)})
+ let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),aggregate_member:Aggregate,timestamps:[None,None,None,None],lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0}))),created:std::time::Instant::now(),attached_ns:AtomicU64::new(0),published_ns:AtomicU64::new(0),submission_id:1,vdm_base:0,owner:0,render_slot:AtomicU32::new(0)})
 }
-fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::new(Compute{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),destinations:[None,None]})}
+fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::new(Compute{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),aggregate_member:Aggregate,destinations:[None,None]})}
 #[test] fn render_error_keeps_mapping_and_slot_through_file_and_scheduler_close(){
  let m=Arc::new(Memory::default());let released=Arc::new(AtomicUsize::new(0));
  let runtime=render(&m,&released);let scheduler=runtime.clone();

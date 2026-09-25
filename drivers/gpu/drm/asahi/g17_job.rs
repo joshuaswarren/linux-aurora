@@ -78,6 +78,7 @@ pub(crate) struct G17PJobCompletion {
     destinations: [Option<TimestampDestination>; 2],
     vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
     signalled: AtomicU32,
+    aggregate_member: crate::g17_drm::G17PSubmitCompletionMember,
 }
 
 impl G17PJobCompletion {
@@ -87,6 +88,7 @@ impl G17PJobCompletion {
         destinations: [Option<TimestampDestination>; 2],
         status: Arc<crate::g17_status::VmStatus>,
         vm_job: mmu::T8140VmJobGuard,
+        aggregate_member: crate::g17_drm::G17PSubmitCompletionMember,
     ) -> Result<Self> {
         let vm_job = Arc::pin_init(
             new_mutex!(Some(vm_job), "G17PJobCompletion::vm_job"),
@@ -99,6 +101,7 @@ impl G17PJobCompletion {
             destinations,
             vm_job,
             signalled: AtomicU32::new(0),
+            aggregate_member,
         })
     }
 
@@ -130,6 +133,7 @@ impl G17PJobCompletion {
         self.status.record(error.to_errno());
         self.fence.set_error(error);
         self.fence.signal();
+        self.aggregate_member.complete(Err(error));
     }
 
     /// Only for retired work, proven processor stop, or unsubmitted packets.
@@ -155,6 +159,7 @@ impl G17PJobCompletion {
         // mapping named by the completed job must already be releasable.
         drop(self.vm_job.lock().take());
         self.fence.signal();
+        self.aggregate_member.complete(result);
     }
 
     /// Release the VM pin of an already-signalled error completion after both

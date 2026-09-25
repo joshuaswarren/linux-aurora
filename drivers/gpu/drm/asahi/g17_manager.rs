@@ -3111,6 +3111,7 @@ impl G17PManagerConstruction {
             offset: 0,
         };
         let command = g17_uapi::TranslatedRenderCommand {
+            render_order: g17_submission::G17PRenderOrder::default(),
             render_barrier: g17_uapi::UAPI_BARRIER_NONE,
             compute_barrier: g17_uapi::UAPI_BARRIER_NONE,
             flags: 0,
@@ -5735,6 +5736,19 @@ impl G17PManagerConstruction {
         Ok(stamp)
     }
 
+    /// Native QID/stamp of the exact staged fragment command. The completion
+    /// retains this token after another physical pair becomes selected.
+    pub(crate) fn staged_render_fragment_dependency(&self) -> Result<u64> {
+        let queues = self.render_sksm.as_ref().ok_or(ENODEV)?;
+        let timestamp = if crate::g17_config::RENDER_SPLIT_LAUNCH != 0 {
+            queues.fragment.producer.current_timestamp
+        } else {
+            queues.fragment.producer.last_add_kicks_timestamp
+        };
+        g17_submission::encode_kick_word(timestamp, queues.fragment.queue_id)
+            .map_err(|_| EINVAL)
+    }
+
     /// Stage both render groups with the SKSM half interleaved, in the
     /// publication order the captures show:
     ///
@@ -5745,17 +5759,15 @@ impl G17PManagerConstruction {
     ///
     /// The 3D kick carries the one explicit barrier every captured pass has:
     /// `{count 1, event_word = ta_stamp << 8, queue_id = qta}`, naming the
-    /// stamp the TA group is about to announce. When the UAPI VDM barrier is
-    /// zero, the TA kick also carries the preceding fragment stamp. This is
-    /// the native queue dependency that orders `3D[n] -> TA[n+1]` without a
-    /// host completion wait; the per-engine predecessor fields alone provide
-    /// only `TA[n] -> TA[n+1]` and `3D[n] -> 3D[n+1]`.
+    /// stamp the TA group is about to announce. The TA kick carries the exact
+    /// live logical-prefix dependencies supplied by the runtime, including
+    /// predecessors on another physical pair. No host completion wait is used.
     /// TA group's records are handed back as a `G17PLateTilingPublication`
     /// because the outer publisher applies them between the two ring slots.
     fn stage_render_groups_with_sksm(
         &mut self,
         dev: &AsahiDevice,
-        wait_previous_fragment: bool,
+        previous_fragment_barriers: &[g17_submission::G17PClBarrierDependency],
     ) -> Result<(
         u64,
         u64,
@@ -5763,19 +5775,6 @@ impl G17PManagerConstruction {
         Option<g17_resources::G17PLateTilingPublication>,
     )> {
         let ordinal = self.render_submission_ordinal;
-        let previous_fragment_barrier = {
-            let queues = self.render_sksm.as_ref().ok_or(ENODEV)?;
-            if wait_previous_fragment && queues.fragment.producer.submitted != 0 {
-                Some(g17_submission::g17p_render_barrier_from_timestamp(
-                    queues.fragment.producer.last_add_kicks_timestamp,
-                    queues.fragment.queue_id,
-                ).map_err(|_| Self::render_stage_fail(
-                    "sksm-previous-fragment-barrier", EINVAL,
-                ))?)
-            } else {
-                None
-            }
-        };
         let hardware_buffer_id = u8::try_from(
             self.render_storage
                 .as_ref()
@@ -5944,7 +5943,6 @@ impl G17PManagerConstruction {
                 dev_warn!(dev.as_ref(), "G17P render route: pre-TA snapshot failed ({:?})\n", error);
             }
         }
-        let previous_fragment_barriers = previous_fragment_barrier.as_slice();
         let tiling_stamp = self
             .publish_render_sksm_group(dev, true, tiling_queue, previous_fragment_barriers)
             .map_err(|error| Self::render_stage_fail("sksm-publish-tiling", error))?;
@@ -5980,6 +5978,7 @@ impl G17PManagerConstruction {
         queue_pair: g17_resources::G17PRenderQueuePair,
         execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
         command: &g17_uapi::TranslatedRenderCommand,
+        render_dependencies: &[g17_submission::G17PClBarrierDependency],
         registers: &regs::Resources,
         registration_power: &mut impl FnMut(&mut Self) -> Result,
         stages: &mut crate::g17_perf::RenderStageTimes,
@@ -6104,6 +6103,7 @@ impl G17PManagerConstruction {
             execution_context,
             descriptor_context_id,
             &command,
+            render_dependencies,
             parameter_buffer_token,
             [command_buffer_state_word; 2],
             registers,
@@ -6156,6 +6156,7 @@ impl G17PManagerConstruction {
         execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
         descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
+        render_dependencies: &[g17_submission::G17PClBarrierDependency],
         parameter_buffer_token: u64,
         command_buffer_state_words: [u32; 2],
         registers: &regs::Resources,
@@ -6473,7 +6474,7 @@ impl G17PManagerConstruction {
         let (fragment_queue, tiling_queue, previous, late_tiling) = if render_sksm != 0 {
             self.stage_render_groups_with_sksm(
                 dev,
-                command.render_barrier != g17_uapi::UAPI_BARRIER_NONE,
+                render_dependencies,
             )
                 .map_err(|error| Self::render_stage_fail("stage-render-groups-sksm", error))?
         } else {
