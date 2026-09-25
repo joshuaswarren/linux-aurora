@@ -25,6 +25,7 @@ use std::sync::{Arc,atomic::{AtomicI32,Ordering}};
 type Result<T=()>=std::result::Result<T,()>;const GFP_KERNEL:()=();
 #[derive(Clone)]struct Fence { id:u64, context:u64, status:Arc<AtomicI32> }
 impl Fence {fn raw(&self)->*const Self{self}}
+mod g17_job {#[derive(Clone)]pub struct G17PCommandFences{pub published:super::Fence,pub completed:super::Fence}}
 mod bindings{pub unsafe fn dma_fence_get_status(f:*const super::Fence)->i32{(*f).status.load(super::Ordering::Acquire)}}
 #[derive(Default)]struct KVec<T>(Vec<T>);
 impl<T>KVec<T>{fn push(&mut self,t:T,_f:())->Result{self.0.push(t);Ok(())}
@@ -32,18 +33,18 @@ impl<T>KVec<T>{fn push(&mut self,t:T,_f:())->Result{self.0.push(t);Ok(())}
 impl<T>std::ops::Deref for KVec<T>{type Target=[T];fn deref(&self)->&[T]{&self.0}}
 ''' + 'mod g17_submission {' + block(codec, 'pub(crate) fn g17p_render_prefix_contains(') + '}\n'
 program += block(source, 'fn append_render_prefix_dependencies(')
-program += '\nstruct G17PQueue { render_frontier: KVec<(u64,Fence)> }\nimpl G17PQueue {'
+program += '\nstruct G17PQueue { render_frontier: KVec<(u64,g17_job::G17PCommandFences)> }\nimpl G17PQueue {'
 program += block(source, '    fn prune_render_frontier(') + '}\n'
 program += r'''
-fn f(id:u64,status:i32)->Fence{Fence{id,context:99,status:Arc::new(AtomicI32::new(status))}}
+fn f(id:u64,status:i32)->g17_job::G17PCommandFences{g17_job::G17PCommandFences{published:Fence{id:id+100,context:98,status:Arc::new(AtomicI32::new(1))},completed:Fence{id,context:99,status:Arc::new(AtomicI32::new(status))}}}
 fn ids(fs:&KVec<Fence>)->Vec<u64>{fs.iter().map(|f|f.id).collect()}
 #[test]fn two_independent_same_context_renders_are_retained_in_both_lists(){
  let frontier=[(1,f(11,0)),(2,f(13,0))];let mut deps=KVec(Vec::new());let mut checked=KVec(Vec::new());
  append_render_prefix_dependencies(&frontier,Some(2),&mut deps,&mut checked).unwrap();
- assert_eq!(ids(&deps),vec![11,13]);assert_eq!(ids(&checked),vec![11,13]);
+ assert_eq!(ids(&deps),vec![111,113]);assert_eq!(ids(&checked),vec![11,13]);
  assert_eq!(checked[0].context,checked[1].context);
  // Simulate DRM coalescing equal-context dependencies: the checked list still
- // contains the unsignalled earlier render even if the newer one signals.
+ // contains both hardware states for error checks; firmware tokens carry waits.
  checked[1].status.store(1,Ordering::Release);assert_eq!(checked[0].status.load(Ordering::Acquire),0);
 }
 #[test]fn index_zero_snapshot_excludes_current_ioctl_and_none_adds_nothing(){

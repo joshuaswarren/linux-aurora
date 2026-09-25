@@ -2008,6 +2008,20 @@ impl G17PSksmQueue {
     pub(crate) fn queue_id(&self) -> u8 {
         self.queue_id
     }
+
+    pub(crate) fn published_compute_dependency(
+        &self,
+    ) -> Result<g17_submission::G17PClBarrierDependency> {
+        if self.producer.submitted != 1 || !self.producer.previous_valid {
+            return Err(EIO);
+        }
+        let timestamp = self.producer.last_add_kicks_timestamp;
+        let mut dependency = g17_submission::g17p_render_barrier_from_timestamp(
+            timestamp, self.queue_id,
+        ).map_err(|_| EIO)?;
+        dependency.native_timestamp = Some(timestamp);
+        Ok(dependency)
+    }
     pub(crate) fn requires_first_install(&self) -> bool {
         self.hardware_state == G17PSksmQueueHardwareState::PreparedMemory
             && self.submission_ordinal == 0

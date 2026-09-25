@@ -212,6 +212,9 @@ pub(crate) struct G17PComputeJobPacket {
     /// the same fences until run_job so the backend can consume their status
     /// before publishing any hardware-visible queue state.
     input_fences: KVec<Fence>,
+    /// Published predecessors whose native tokens carry the GPU wait. These
+    /// retained hardware fences are inspected for failure without waiting.
+    firmware_fences: KVec<Fence>,
     completion: Option<G17PJobCompletion>,
 }
 
@@ -224,6 +227,7 @@ impl G17PComputeJobPacket {
         command_images: KVec<G17PSealedCommand>,
         retained_mappings: KVec<mmu::KernelMapping>,
         input_fences: KVec<Fence>,
+        firmware_fences: KVec<Fence>,
         completion: Option<G17PJobCompletion>,
     ) -> Result<Arc<Self>> {
         // QIDs 0/1 belong to bootstrap render. All other IDs are shared by
@@ -232,7 +236,7 @@ impl G17PComputeJobPacket {
         { return Err(EINVAL); }
         Ok(Arc::new(Self {
             submission_id, hardware_queue_id, context, command, command_images,
-            _retained_mappings: retained_mappings, input_fences, completion,
+            _retained_mappings: retained_mappings, input_fences, firmware_fences, completion,
         }, GFP_KERNEL)?)
     }
 
@@ -242,6 +246,7 @@ impl G17PComputeJobPacket {
     pub(crate) fn command(&self) -> &g17_uapi::TranslatedComputeCommand { &self.command }
     pub(crate) fn command_images(&self) -> &[G17PSealedCommand] { &self.command_images }
     pub(crate) fn input_fences(&self) -> &[Fence] { &self.input_fences }
+    pub(crate) fn firmware_fences(&self) -> &[Fence] { &self.firmware_fences }
     pub(crate) fn completion(&self) -> Result<&G17PJobCompletion> { self.completion.as_ref().ok_or(EINVAL) }
 }
 
@@ -310,6 +315,8 @@ pub(crate) struct G17PRenderJobPacket {
     /// DRM sched treats a signalled error fence as dependency-ready. Retain
     /// the fences so the backend can consume their status before publication.
     input_fences: KVec<Fence>,
+    /// As above, distinct from user completion dependencies.
+    firmware_fences: KVec<Fence>,
     completion: Arc<crate::g17_drm::G17PRenderCompletion>,
     publication_state: AtomicU32,
     cancel_requested: AtomicU32,
@@ -320,11 +327,12 @@ impl G17PRenderJobPacket {
         submission_id: u64,
         command: g17_uapi::TranslatedRenderCommand,
         input_fences: KVec<Fence>,
+        firmware_fences: KVec<Fence>,
         completion: Arc<crate::g17_drm::G17PRenderCompletion>,
     ) -> Result<Arc<Self>> {
         if submission_id == 0 { return Err(EINVAL); }
         Ok(Arc::new(Self {
-            submission_id, command, input_fences, completion,
+            submission_id, command, input_fences, firmware_fences, completion,
             publication_state: AtomicU32::new(0),
             cancel_requested: AtomicU32::new(0),
         }, GFP_KERNEL)?)
@@ -333,6 +341,7 @@ impl G17PRenderJobPacket {
     pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
     pub(crate) fn command(&self) -> &g17_uapi::TranslatedRenderCommand { &self.command }
     pub(crate) fn input_fences(&self) -> &[Fence] { &self.input_fences }
+    pub(crate) fn firmware_fences(&self) -> &[Fence] { &self.firmware_fences }
     pub(crate) fn completion(&self) -> &Arc<crate::g17_drm::G17PRenderCompletion> {
         &self.completion
     }
@@ -415,7 +424,7 @@ impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {
 
     pub(crate) fn enqueue(
         &mut self, packet: Arc<G17PRenderJobPacket>, dependencies: KVec<Fence>,
-    ) -> Result<Fence> {
+    ) -> Result<G17PCommandFences> {
         // Userspace completion must follow the exact hardware retirement
         // fence, not drm_sched's secondary finished wrapper. The scheduler
         // wrapper is signalled only after its worker observes this parent
@@ -429,8 +438,9 @@ impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {
         })?;
         for dependency in dependencies { job.add_dependency(dependency)?; }
         let mut job = job.arm();
+        let published = job.fences().scheduled();
         job.push();
-        Ok(hardware)
+        Ok(G17PCommandFences { published, completed: hardware })
     }
 }
 
@@ -446,14 +456,23 @@ impl<B: G17PQueueBackend> G17PJobScheduler<B> {
 
     pub(crate) fn enqueue(
         &mut self, packet: Arc<G17PComputeJobPacket>, dependencies: KVec<Fence>,
-    ) -> Result<Fence> {
+    ) -> Result<G17PCommandFences> {
+        let hardware = packet.completion()?.fence();
         let mut job = self.entity.new_job(1, G17PScheduledJob {
             backend: self.backend.clone(), packet,
         })?;
         for dependency in dependencies { job.add_dependency(dependency)?; }
         let mut job = job.arm();
-        let finished = job.fences().finished();
+        let published = job.fences().scheduled();
         job.push();
-        Ok(finished)
+        Ok(G17PCommandFences { published, completed: hardware })
     }
+}
+
+/// Publication readiness is distinct from GPU retirement. The scheduler signals
+/// `published` after run_job returns; only `completed` may satisfy user output.
+#[derive(Clone)]
+pub(crate) struct G17PCommandFences {
+    pub(crate) published: Fence,
+    pub(crate) completed: Fence,
 }
