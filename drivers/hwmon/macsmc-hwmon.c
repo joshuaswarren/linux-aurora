@@ -29,7 +29,6 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/soc/apple/smc-thermal.h>
-#include <linux/sysfs.h>
 
 #define MAX_LABEL_LENGTH	32
 
@@ -96,53 +95,12 @@ struct macsmc_hwmon {
 	struct macsmc_hwmon_sensors curr;
 	struct macsmc_hwmon_sensors power;
 	struct macsmc_hwmon_fans fan;
-	struct macsmc_hwmon_sensor pressure;
-	bool register_thermal_zones;
 	bool cpu_thermal_policy;
+	/* Protects the thermal_cache fields below. */
 	struct mutex thermal_cache_lock;
 	long thermal_cache[APPLE_SMC_CPU_POLICY_SENSORS];
 	unsigned long thermal_cache_time;
 	int thermal_cache_error;
-};
-
-static ssize_t thermal_pressure_level_show(struct device *dev,
-					   struct device_attribute *attr,
-					   char *buf)
-{
-	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
-	s32 val;
-	int ret;
-
-	ret = apple_smc_read_s32(hwmon->smc, hwmon->pressure.macsmc_key, &val);
-	if (ret)
-		return ret;
-
-	return sysfs_emit(buf, "%d\n", val);
-}
-static DEVICE_ATTR_RO(thermal_pressure_level);
-
-static umode_t macsmc_hwmon_extra_is_visible(struct kobject *kobj,
-					     struct attribute *attr, int index)
-{
-	struct device *dev = kobj_to_dev(kobj);
-	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
-
-	return hwmon->pressure.macsmc_key ? 0444 : 0;
-}
-
-static struct attribute *macsmc_hwmon_extra_attrs[] = {
-	&dev_attr_thermal_pressure_level.attr,
-	NULL,
-};
-
-static const struct attribute_group macsmc_hwmon_extra_group = {
-	.attrs = macsmc_hwmon_extra_attrs,
-	.is_visible = macsmc_hwmon_extra_is_visible,
-};
-
-static const struct attribute_group *macsmc_hwmon_extra_groups[] = {
-	&macsmc_hwmon_extra_group,
-	NULL,
 };
 
 static int macsmc_hwmon_read_label(struct device *dev,
