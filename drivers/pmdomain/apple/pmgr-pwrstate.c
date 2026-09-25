@@ -448,7 +448,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	/* Resets are synchronous, and only work if the device is powered and clocked. */
 	if (reg & APPLE_PMGR_RESET && pstate != APPLE_PMGR_PS_ACTIVE)
-		dev_err(ps->dev, "PS %s: powering off with RESET active\n",
+		dev_err_ratelimited(ps->dev, "PS %s: powering off with RESET active\n",
 			genpd->name);
 
 	if (pstate != APPLE_PMGR_PS_ACTIVE && (ps->force_disable || ps->force_reset)) {
@@ -471,31 +471,11 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			APPLE_PMGR_PS_SET_TIMEOUT);
 
 		if (ret < 0)
-			dev_err(ps->dev, "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
+			dev_err_ratelimited(ps->dev, "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
 				genpd->name, reg);
 	}
 
-	/*
-	 * BUSY is hardware-owned status, so never write it back. This is the
-	 * only site that composes a whole word and writes all 32 bits; every
-	 * other write here goes through regmap_update_bits() with an explicit
-	 * mask and so cannot touch it. m1n1's pmgr_set_mode() is the reference
-	 * and writes PS_TARGET alone, via mask32(), polling PS_ACTUAL for
-	 * completion -- it puts no status bit back.
-	 *
-	 * Measured on J700 (T8140): a gfx power-down leaves 0x3007001f0 at
-	 * 0x0f002b00, PS_TARGET=0 PS_ACTUAL=0 with BUSY set, and BUSY clears on
-	 * its own a while later. An ON issued before then read that word back,
-	 * re-wrote BUSY=1 with it (requested=0x0f00280f), and the register did
-	 * not move -- PS_TARGET stayed 0, the post-ON handshake returned -110,
-	 * and every later write returned -22 for the rest of the boot. The
-	 * control is in the same boot: the identical power-down at t=0.8s also
-	 * set BUSY, nothing wrote the register, BUSY cleared by itself, and the
-	 * ON at t=16s succeeded.
-	 *
-	 * Whenever BUSY reads 0 -- which is every domain in the normal case --
-	 * the composed word is bit-for-bit what it was before this change.
-	 */
+	/* Do not replay the hardware-owned BUSY bit in this whole-word write. */
 	reg &= ~(APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_RESET |
 		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
 		 APPLE_PMGR_PS_TARGET);
@@ -524,7 +504,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	}
 
 	if (ret < 0)
-		dev_err(ps->dev, "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
+		dev_err_ratelimited(ps->dev, "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
 			genpd->name, pstate, reg, cur);
 
 	if (auto_enable) {
@@ -729,7 +709,8 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
-		dev_err(ps->dev, "PS 0x%x: asserting RESET while powered down\n", ps->offset);
+		dev_err_ratelimited(ps->dev,
+			"PS 0x%x: asserting RESET while powered down\n", ps->offset);
 
 	dev_dbg(ps->dev, "PS 0x%x: assert reset\n", ps->offset);
 	/* Quiesce device before asserting reset */
@@ -763,7 +744,8 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 				   "reset-deassert-enable");
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
-		dev_err(ps->dev, "PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
+		dev_err_ratelimited(ps->dev,
+			"PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
 
 out:
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
