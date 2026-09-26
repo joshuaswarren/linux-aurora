@@ -6431,6 +6431,7 @@ impl G17PManagerConstruction {
                 .map_err(|_| EBUSY)?,
             );
         }
+        let mut mapping_proof_reused = false;
         {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
             storage
@@ -6449,6 +6450,7 @@ impl G17PManagerConstruction {
             let reachability_started = stages.enabled.then(
                 kernel::time::Instant::<kernel::time::Monotonic>::now);
             let unreachable = storage.first_unreachable_cached(self.resources.uat(), vm);
+            mapping_proof_reused = storage.last_reachability_cache_hit();
             if let Some(started) = reachability_started {
                 stages.reachability_ns = started.elapsed().as_nanos().max(0) as u64;
                 stages.reachability_cache_hit = storage.last_reachability_cache_hit();
@@ -6784,7 +6786,12 @@ impl G17PManagerConstruction {
         // through this VM's own slot, and an unmapped write there is exactly
         // the fault this view exists to remove; a wrong or missing leaf must
         // fail here, on the host, rather than as another opaque dIPP miss.
-        for offset in [0x1e00u64, 0x1f80u64] {
+        // The null-view probe and the RCE readback below are mapping
+        // validations. When the retained graph's reachability proof was reused
+        // for this generation (same VM and kernel mapping epochs), neither can
+        // observe anything new, and each costs page-table walks under VM exec
+        // locks on every render.
+        for offset in [0x1e00u64, 0x1f80u64].into_iter().filter(|_| !mapping_proof_reused) {
             let (canonical, client) = vm
                 .t8140_client_null_view_probe(offset)
                 .map_err(|error| {
@@ -6817,11 +6824,13 @@ impl G17PManagerConstruction {
                 );
             }
         }
-        self.render_storage
-            .as_mut()
-            .ok_or(ENODEV)?
-            .audit_fragment_rce_mapping(dev, vm)
-            .map_err(|error| Self::render_stage_fail("fragment-rce-vm-audit", error))?;
+        if !mapping_proof_reused {
+            self.render_storage
+                .as_mut()
+                .ok_or(ENODEV)?
+                .audit_fragment_rce_mapping(dev, vm)
+                .map_err(|error| Self::render_stage_fail("fragment-rce-vm-audit", error))?;
+        }
         if g17p_native_fragment_first_mode(native_doorbell_mode) {
             fence(Ordering::Acquire);
             let current = self.render_storage.as_mut().ok_or(ENODEV)?
@@ -8381,6 +8390,26 @@ impl G17PManagerConstruction {
             tracker.fragment_previous = state.fragment;
         }
         Ok(G17PRenderPollOutcome::Pending)
+    }
+
+    /// Completion masks of any retained render slot, without selecting it.
+    /// Selecting swaps the whole slot state in and out, which event service
+    /// used to do for every pending slot on every firmware event.
+    pub(crate) fn render_completion_masks_for_slot(&self, slot: u8) -> Result<[u64; 2]> {
+        if slot == self.active_render_slot {
+            return self.render_completion_masks();
+        }
+        self.parked_render_slots
+            .get(usize::from(slot))
+            .ok_or(EINVAL)?
+            .as_ref()
+            .ok_or(ENODEV)?
+            .storage
+            .as_ref()
+            .ok_or(ENODEV)?
+            .queue_pair()
+            .completion_masks()
+            .ok_or(EINVAL)
     }
 
     pub(crate) fn render_completion_masks(&self) -> Result<[u64; 2]> {
