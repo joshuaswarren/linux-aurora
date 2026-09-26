@@ -700,7 +700,12 @@ const G17P_RENDER_DESCRIPTOR_SLOT_COUNT: usize = 32;
 /// physical pair.  This is independent of the 32 descriptor slots: the
 /// descriptor ring is deeper, while DEFLAKE/AXFB/status backing has two
 /// disjoint client aliases and therefore bounds safe host-side publication.
-pub(crate) const G17P_RENDER_MAX_IN_FLIGHT: usize = 2;
+pub(crate) const G17P_RENDER_MAX_IN_FLIGHT: usize = 4;
+/// Fixed-placement (bootstrap) pairs carry two alias generations per pair.
+const G17P_RENDER_LEGACY_GENERATIONS: usize = 2;
+/// Renders that may queue behind the front render of one pair.
+pub(crate) const G17P_RENDER_QUEUED_PER_PAIR: usize = G17P_RENDER_MAX_IN_FLIGHT - 1;
+const _: () = assert!(G17P_RENDER_RT_EVENT_RECORD_COUNT >= G17P_RENDER_MAX_IN_FLIGHT);
 const G17P_RENDER_TA_DESCRIPTOR_STRIDE: usize = g17_render::TA_DESCRIPTOR_SIZE;
 const G17P_RENDER_3D_DESCRIPTOR_STRIDE: usize = g17_render::FRAGMENT_DESCRIPTOR_SIZE;
 const G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE: usize =
@@ -4579,7 +4584,11 @@ pub(crate) struct G17PUserRenderStorage {
     render_command_generation: u8,
     reachability_cache: G17PRenderReachabilityCache,
     last_reachability_cache_hit: bool,
-    alternate_render_command: KBox<G17PRenderCommandGeneration>,
+    /// Every retained command generation other than the selected one. A
+    /// firmware-owned render keeps its render state, aliases and status page
+    /// while later kicks on the same pair are staged into other generations.
+    alternate_render_commands: KVec<KBox<G17PRenderCommandGeneration>>,
+    command_generation_count: usize,
     render_command_ordinals: [Option<u64>; G17P_RENDER_MAX_IN_FLIGHT],
     render_tvb: Option<G17PRenderTvb>,
     render_user_aliases: G17PRenderUserAliases,
@@ -8164,18 +8173,33 @@ impl G17PUserRenderStorage {
                 mmu::PROT_GPU_SHARED_RW,
             ) }
         );
-        let render_command_generation = (bootstrap_alias_ordinal as u8) & 1;
-        let alternate_render_command = bootstrap_stage!(
-            "alternate render command generation",
-            new_g17p_render_command_generation(
-                dev,
-                uat,
-                vm,
-                queue_pair,
-                render_layout,
-                render_command_generation ^ 1,
-            )
+        let command_generation_count = if queue_pair.dynamic_placement {
+            G17P_RENDER_MAX_IN_FLIGHT
+        } else {
+            G17P_RENDER_LEGACY_GENERATIONS
+        };
+        let render_command_generation =
+            (bootstrap_alias_ordinal as usize % command_generation_count) as u8;
+        let mut alternate_render_commands = bootstrap_stage!(
+            "alternate render command generation list",
+            KVec::with_capacity(command_generation_count - 1, GFP_KERNEL).map_err(|_| ENOMEM)
         );
+        for offset in 1..command_generation_count {
+            let generation = ((usize::from(render_command_generation) + offset)
+                % command_generation_count) as u8;
+            let alternate = bootstrap_stage!(
+                "alternate render command generation",
+                new_g17p_render_command_generation(
+                    dev,
+                    uat,
+                    vm,
+                    queue_pair,
+                    render_layout,
+                    generation,
+                )
+            );
+            alternate_render_commands.push(alternate, GFP_KERNEL).map_err(|_| ENOMEM)?;
+        }
         // The descriptor's private +0x8fe/+0x906 and +0x2198/+0x21a0
         // timestamp pointers are dereferenced directly by the firmware CPU
         // after TA/3D completion. Native uses firmware-high addresses here;
@@ -8974,7 +8998,8 @@ impl G17PUserRenderStorage {
             render_command_generation,
             reachability_cache: G17PRenderReachabilityCache::new(),
             last_reachability_cache_hit: false,
-            alternate_render_command,
+            alternate_render_commands,
+            command_generation_count,
             render_command_ordinals,
             render_tvb,
             render_user_aliases,
@@ -9393,16 +9418,22 @@ impl G17PUserRenderStorage {
             ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.object.size() as u64),
             ("descriptor-3d-diagnostic", self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64),
             ("fragment-status", self.fragment_status_low.iova(), self.fragment_status_low.size() as u64),
-            ("alternate-render-state", self.alternate_render_command.render_state.iova(),
-                self.alternate_render_command.render_state.object.size() as u64),
-            ("alternate-deflake", self.alternate_render_command.render_user_aliases.deflake.iova(),
-                self.alternate_render_command.render_user_aliases.deflake.size() as u64),
-            ("alternate-aux-fb", self.alternate_render_command.render_user_aliases.aux_fb.iova(),
-                self.alternate_render_command.render_user_aliases.aux_fb.size() as u64),
-            ("alternate-fragment-status", self.alternate_render_command.fragment_status_low.iova(),
-                self.alternate_render_command.fragment_status_low.size() as u64),
         ] {
             if !available(name, address, size) { return false; }
+        }
+        for alternate in self.alternate_render_commands.iter() {
+            for (name, address, size) in [
+                ("alternate-render-state", alternate.render_state.iova(),
+                    alternate.render_state.object.size() as u64),
+                ("alternate-deflake", alternate.render_user_aliases.deflake.iova(),
+                    alternate.render_user_aliases.deflake.size() as u64),
+                ("alternate-aux-fb", alternate.render_user_aliases.aux_fb.iova(),
+                    alternate.render_user_aliases.aux_fb.size() as u64),
+                ("alternate-fragment-status", alternate.fragment_status_low.iova(),
+                    alternate.fragment_status_low.size() as u64),
+            ] {
+                if !available(name, address, size) { return false; }
+            }
         }
         for object in [self.scene_scratch.as_ref(), self.discard.as_ref()].into_iter().flatten() {
             if !available("scene/discard", object.iova(), object.object.size() as u64) {
@@ -9470,11 +9501,13 @@ impl G17PUserRenderStorage {
         let render_user_aliases = rebind_step!("render-user-aliases", self.render_user_aliases.remap(
             &mut self.render_state, vm, &self.render_layout,
         ));
-        let (
-            alternate_render_state_mapping,
-            alternate_render_user_aliases,
-            alternate_fragment_status_mapping,
-        ) = rebind_step!("alternate-render-command", self.alternate_render_command.prepare_vm_rebind(vm));
+        let mut alternate_rebinds = rebind_step!("alternate-render-command-list",
+            KVec::with_capacity(self.alternate_render_commands.len(), GFP_KERNEL).map_err(|_| ENOMEM));
+        for alternate in self.alternate_render_commands.iter_mut() {
+            let rebound = rebind_step!("alternate-render-command", alternate.prepare_vm_rebind(vm));
+            rebind_step!("alternate-render-command-push",
+                alternate_rebinds.push(rebound, GFP_KERNEL).map_err(|_| ENOMEM));
+        }
         let rt_memory_iova = self.render_target_memory.rt_memory.iova();
         let rt_memory_mapping = rebind_step!("rt-memory", self.render_target_memory.rt_memory.object.map_at(
             vm,
@@ -9562,12 +9595,15 @@ impl G17PUserRenderStorage {
 
         self.render_state.mapping = Some(render_state_mapping);
         self.render_user_aliases = render_user_aliases;
-        self.alternate_render_command.render_state.mapping =
-            Some(alternate_render_state_mapping);
-        self.alternate_render_command.render_user_aliases =
-            alternate_render_user_aliases;
-        self.alternate_render_command._fragment_status_mapping =
-            alternate_fragment_status_mapping;
+        for (alternate, (state_mapping, user_aliases, status_mapping)) in self
+            .alternate_render_commands
+            .iter_mut()
+            .zip(alternate_rebinds.into_iter())
+        {
+            alternate.render_state.mapping = Some(state_mapping);
+            alternate.render_user_aliases = user_aliases;
+            alternate._fragment_status_mapping = status_mapping;
+        }
         self.render_target_memory.rt_memory.mapping = Some(rt_memory_mapping);
         self.render_target_memory.tpc.mapping = Some(tpc_mapping);
         self.descriptor_ta_low = descriptor_ta_low;
@@ -9746,37 +9782,21 @@ impl G17PUserRenderStorage {
     }
 
     fn select_render_command_generation(&mut self, submission_ordinal: u64) -> Result {
-        let generation = (submission_ordinal as usize % G17P_RENDER_MAX_IN_FLIGHT) as u8;
+        let generation = (submission_ordinal as usize % self.command_generation_count) as u8;
         if self.render_command_generation == generation {
             return Ok(());
         }
-        if self.alternate_render_command.generation != generation {
-            return Err(EIO);
-        }
-        core::mem::swap(
-            &mut self.render_command_generation,
-            &mut self.alternate_render_command.generation,
-        );
-        core::mem::swap(
-            &mut self.render_state,
-            &mut self.alternate_render_command.render_state,
-        );
-        core::mem::swap(
-            &mut self.render_layout,
-            &mut self.alternate_render_command.render_layout,
-        );
-        core::mem::swap(
-            &mut self.render_user_aliases,
-            &mut self.alternate_render_command.render_user_aliases,
-        );
-        core::mem::swap(
-            &mut self.fragment_status_low,
-            &mut self.alternate_render_command.fragment_status_low,
-        );
-        core::mem::swap(
-            &mut self.fragment_status,
-            &mut self.alternate_render_command.fragment_status,
-        );
+        let alternate = self
+            .alternate_render_commands
+            .iter_mut()
+            .find(|alternate| alternate.generation == generation)
+            .ok_or(EIO)?;
+        core::mem::swap(&mut self.render_command_generation, &mut alternate.generation);
+        core::mem::swap(&mut self.render_state, &mut alternate.render_state);
+        core::mem::swap(&mut self.render_layout, &mut alternate.render_layout);
+        core::mem::swap(&mut self.render_user_aliases, &mut alternate.render_user_aliases);
+        core::mem::swap(&mut self.fragment_status_low, &mut alternate.fragment_status_low);
+        core::mem::swap(&mut self.fragment_status, &mut alternate.fragment_status);
         Ok(())
     }
 
@@ -9785,7 +9805,7 @@ impl G17PUserRenderStorage {
     }
 
     pub(crate) fn retire_command_generation(&mut self, submission_ordinal: u64) -> Result {
-        let generation = submission_ordinal as usize % G17P_RENDER_MAX_IN_FLIGHT;
+        let generation = submission_ordinal as usize % self.command_generation_count;
         if self.render_command_ordinals[generation] != Some(submission_ordinal) {
             return Err(EIO);
         }
@@ -9833,7 +9853,7 @@ impl G17PUserRenderStorage {
         if !Self::descriptor_context_valid(descriptor_context_id) {
             return Err(EINVAL);
         }
-        let generation = submission_ordinal as usize % G17P_RENDER_MAX_IN_FLIGHT;
+        let generation = submission_ordinal as usize % self.command_generation_count;
         if self.render_command_ordinals[generation].is_some() {
             return Err(EBUSY);
         }
