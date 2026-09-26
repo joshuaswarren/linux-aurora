@@ -7296,6 +7296,294 @@ mod tests {
                     .sksm_hardware_kick_fifo_mmio_scratch_proven
             );
         }
+        .native_sksm_proven());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parameter-buffer descriptor handshake
+//
+// Metal performs this around every render submit and this driver has never
+// performed it at all. Decoded from the 25G83 host kernelcache, which carries
+// both halves symbolised:
+//
+//   AGXAcceleratorG16::halLoadPBDesc  @ 0xfffffe0008a52890   before submit
+//   AGXAcceleratorG16::halStorePBDesc @ 0xfffffe0008a527f0   on completion
+//
+// They are exact inverses, which is what makes the field map trustworthy: the
+// store reads back precisely the four quantities the load wrote. Confirmed on
+// hardware -- a real Metal render leaves the ring state {7, 7, 0, 0}.
+//
+// The ring lives at `[[accelerator + 0x11358] + 0x60]` with 16-byte entries
+// indexed by the `uint` third argument, and `halStorePBDesc` runs on
+// `kernel_task`, i.e. from the completion path rather than the submitting
+// thread.
+// ---------------------------------------------------------------------------
+
+/// One parameter-buffer descriptor ring entry.
+pub(crate) const G17P_PBDESC_ENTRY_SIZE: usize = 16;
+
+/// The four quantities the handshake exchanges: two 22-bit counters and two
+/// flags. This is `AGXSPBDescRingState`.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PPbDescRingState {
+    /// Descriptor dword2, low 22 bits.
+    pub(crate) counter_a: u32,
+    /// Descriptor dword3, low 22 bits.
+    pub(crate) counter_b: u32,
+    /// Descriptor dword3 bit 31.
+    pub(crate) flag_high: u32,
+    /// Descriptor dword0 bit 0.
+    pub(crate) flag_low: u32,
+}
+
+/// Encode the high segment of a parameter-buffer address.
+///
+/// `PBState[+0x28]` contains the full tagged address: native passes
+/// `0x1000190000`. Hardware adds an implicit `0x1000000000` bias when it
+/// rebuilds the address from this segment and dword0's low 36 bits. Bit 42
+/// selects between the two kext encoding forms.
+pub(crate) const fn g17p_pbdesc_segment(pb_address: u64) -> u64 {
+    let base: u64 = if pb_address & 0x400_0000_0000 == 0 {
+        0x70_0000_0000
+    } else {
+        0
+    };
+    let high = (pb_address >> 3) & 0x80_0000_0000;
+    ((base.wrapping_add(pb_address)) & 0x70_0000_0000) | high
+}
+
+/// Address reconstructed by the first G17P PB page-list read. This models the
+/// hardware bias witnessed by the exact `0x8002478000` fault when the host
+/// incorrectly encoded stripped address `0x2478000`.
+pub(crate) const fn g17p_pbdesc_reconstructed_address(pb_address: u64) -> u64 {
+    (g17p_pbdesc_segment(pb_address).wrapping_add(0x10_0000_0000))
+        | (pb_address & 0x0f_ffff_ffff)
+}
+
+/// `halLoadPBDesc`: fold the ring state and the parameter-buffer address into
+/// the descriptor, preserving every bit the firmware owns.
+pub(crate) const fn encode_g17p_pbdesc(
+    previous: [u32; 4],
+    pb_address: u64,
+    pb_state_word_34: u32,
+    state: G17PPbDescRingState,
+) -> [u32; 4] {
+    let segment = g17p_pbdesc_segment(pb_address);
+
+    // dword0: address >> 4, low 3 bits kept, then bit 0 = flag_low.
+    let mut dword0 = ((pb_address >> 4) as u32 & !0x7) | (previous[0] & 0x7);
+    dword0 = (dword0 & !1) | if state.flag_low != 0 { 1 } else { 0 };
+
+    // dword1: segment >> 8 in the top nibble, low 28 kept, then low 22 from
+    // PBState[+0x34].
+    let mut dword1 = ((segment >> 8) as u32 & !0x0fff_ffff) | (previous[1] & 0x0fff_ffff);
+    dword1 = (dword1 & !0x003f_ffff) | (pb_state_word_34 & 0x003f_ffff);
+
+    // dword2/dword3: the two 22-bit counters, plus bit 31.
+    let dword2 = (previous[2] & !0x003f_ffff) | (state.counter_a & 0x003f_ffff);
+    let mut dword3 = (previous[3] & !0x003f_ffff) | (state.counter_b & 0x003f_ffff);
+    dword3 = (dword3 & !0x8000_0000) | ((state.flag_high & 1) << 31);
+
+    [dword0, dword1, dword2, dword3]
+}
+
+/// `halStorePBDesc`: read the ring state back out. Exact inverse of the encode.
+pub(crate) const fn decode_g17p_pbdesc(descriptor: [u32; 4]) -> G17PPbDescRingState {
+    G17PPbDescRingState {
+        counter_a: descriptor[2] & 0x003f_ffff,
+        counter_b: descriptor[3] & 0x003f_ffff,
+        flag_high: descriptor[3] >> 31,
+        flag_low: descriptor[0] & 1,
+    }
+}
+
+/// Byte offset of one descriptor within the ring.
+pub(crate) const fn g17p_pbdesc_offset(index: u32) -> usize {
+    index as usize * G17P_PBDESC_ENTRY_SIZE
+}
+
+// ---------------------------------------------------------------------------
+// UMA page-pool descriptor handshake
+//
+// `AGXAcceleratorG16::halLoadUMADesc` publishes one 0x20-byte descriptor at
+// `[[accelerator + 0x11360] + 0x60] + HardwareBufferID * 0x20` before the
+// command descriptors become visible. `halStoreUMADesc` is the inverse on
+// completion. The fourth qword belongs to the firmware and is not touched by
+// either load or store.
+// ---------------------------------------------------------------------------
+
+pub(crate) const G17P_UMA_DESC_ENTRY_SIZE: usize = 0x20;
+pub(crate) const G17P_UMA_DESC_ENTRY_COUNT: u32 = 0x100;
+
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PUmaPagePoolState {
+    pub(crate) page_list: u64,
+    pub(crate) unit_pages: u32,
+    pub(crate) counter_a: u32,
+    pub(crate) counter_b: u32,
+    pub(crate) empty: u32,
+    pub(crate) total_pages: u32,
+}
+
+/// Exact `halLoadUMADesc` packing. The source fields live at unaligned
+/// offsets `+0x14/+0x1c/+0x20/+0x24/+0x28/+0x2c` in
+/// `_AGFIUMAPagePoolState`.
+pub(crate) const fn encode_g17p_umadesc(
+    previous: [u64; 4],
+    state: G17PUmaPagePoolState,
+) -> [u64; 4] {
+    [
+        ((state.unit_pages as u64) << 41) | (state.page_list >> 7),
+        ((state.counter_b as u64) << 33)
+            | ((state.counter_a as u64) << 5)
+            | ((state.empty as u64) << 61),
+        state.total_pages as u64,
+        previous[3],
+    ]
+}
+
+pub(crate) const fn g17p_umadesc_offset(hardware_buffer_id: u32) -> Option<usize> {
+    if hardware_buffer_id >= G17P_UMA_DESC_ENTRY_COUNT {
+        return None;
+    }
+    Some(hardware_buffer_id as usize * G17P_UMA_DESC_ENTRY_SIZE)
+}
+
+/// Recover the mutable pool state before its hardware slot changes owners.
+/// The address and allocation unit belong to the retained pool; word three
+/// is firmware-owned and is not part of the load/store handshake.
+pub(crate) const fn decode_g17p_umadesc(
+    descriptor: [u64; 4],
+    mut state: G17PUmaPagePoolState,
+) -> G17PUmaPagePoolState {
+    state.counter_a = ((descriptor[1] >> 5) & 0x0fff_ffff) as u32;
+    state.counter_b = ((descriptor[1] >> 33) & 0x0fff_ffff) as u32;
+    state.empty = (descriptor[1] >> 61) as u32;
+    state.total_pages = descriptor[2] as u32;
+    state
+}
+
+#[cfg(test)]
+mod uma_descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn first_render_uma_descriptor_matches_the_native_packer() {
+        let encoded = encode_g17p_umadesc(
+            [0, 0, 0, 0xfeed_face_dead_beef],
+            G17PUmaPagePoolState {
+                page_list: 0x70_0000_0000,
+                unit_pages: 0x4_0000,
+                counter_a: 0,
+                counter_b: 0x1600,
+                empty: 0,
+                total_pages: 0x1600,
+            },
+        );
+        assert_eq!(
+            encoded,
+            [
+                0x0800_0000_e000_0000,
+                0x0000_2c00_0000_0000,
+                0x0000_0000_0000_1600,
+                0xfeed_face_dead_beef,
+            ]
+        );
+        assert_eq!(g17p_umadesc_offset(0), Some(0));
+        assert_eq!(g17p_umadesc_offset(0xff), Some(0x1fe0));
+        assert_eq!(g17p_umadesc_offset(0x100), None);
+    }
+}
+
+/// Opcode of the USC private-memory free-list device-control record.
+///
+/// MISIDENTIFIED ONCE, corrected 2026-08-31. This was briefly taken for the
+/// parameter-buffer descriptor-ring publication because it is the only
+/// device-control record in a whole process lifetime that carries low VAs, and
+/// it appears once per queue right after `allocParameterManagement`. That is
+/// adjacency, not provenance. The record is built by
+/// `AGXUSCPrivMemFList::updateSubmitInfo(AGXUMADataRec*, int)`, which belongs
+/// to the USC/UMA page-pool family (`halLoadUMADesc`/`halStoreUMADesc`), not
+/// the parameter-buffer family (`halLoadPBDesc`/`halStorePBDesc`).
+///
+/// The real owner of the PBDesc ring is `AGXAccelerator::allocPBDescriptor`,
+/// which is the ONLY site in the image that stores to `accelerator + 0x11358`
+/// -- the pointer `halLoadPBDesc` dereferences. It allocates the object; it
+/// publishes no device-control record, so the ring reaches firmware by some
+/// other route we have not yet found.
+pub(crate) const G17P_DEVCTL_USC_FREELIST: u32 = 0x20;
+
+/// Span of the USC free-list ring, as published by the opcode-0x20 record.
+///
+/// Stable across four independent captures, so it is a fixed address rather
+/// than an allocation. It is NOT the parameter-buffer descriptor ring -- see
+/// `G17P_DEVCTL_USC_FREELIST`. Kept because if the USC free list is a third
+/// thing this driver does not maintain, this is where it lives.
+pub(crate) const G17P_USC_FREELIST_LOW_VA: u64 = 0x70_0020_8000;
+pub(crate) const G17P_USC_FREELIST_LOW_END: u64 = 0x70_0020_8440;
+pub(crate) const G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES: u32 = 0x28;
+
+/// The three fields that move between boots. 256x256 and 1024x1024 gave identical values for `word_04`, and
+/// `word_0c` moved by 2 between them, so none of these encode geometry -- they
+/// read as per-submission or per-boot sequence counters.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PUscFreelistSequence {
+    /// +0x04. Observed 1, 1, 6.
+    pub(crate) word_04: u32,
+    /// +0x0c. Observed 0x8df, 0x8e1, 0x65e.
+    pub(crate) word_0c: u32,
+    /// +0x30. Observed 2, 1, 3.
+    pub(crate) word_30: u32,
+}
+
+/// Build the opcode-0x20 (USC free-list) device-control record.
+///
+/// Only the first 0x40 bytes of an `AGFIAcceleratorDeviceControlEntry` ever
+/// reach firmware: `AGXFirmware::submitDeviceControl` copies exactly four
+/// 16-byte SIMD pairs (`ldp q0,q1` / `ldp q2,q3` then `stp`) into a ring whose
+/// stride is `1 << 6` and whose bound is `cmp w8, #0x100`. Our
+/// `CONTROL_RECORD_SIZE` (0x40) and `CONTROL_RING_ENTRIES` (0x100) already
+/// match, so the fields the capture shows at +0x40/+0x44/+0x4c are kext-side
+/// bookkeeping that never crosses the interface.
+pub(crate) fn encode_g17p_usc_freelist_control(
+    firmware_half_va: u64,
+    ring_low_va: u64,
+    ring_low_end: u64,
+    sequence: G17PUscFreelistSequence,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != 0x40 {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    if ring_low_end <= ring_low_va {
+        return Err(SubmissionError::PartialOpeningAddressOverflow);
+    }
+    out.fill(0);
+    put_u32_le(out, 0x00, G17P_DEVCTL_USC_FREELIST);
+    put_u32_le(out, 0x04, sequence.word_04);
+    put_u32_le(out, 0x08, 0x3f); // constant across all three captures
+    put_u32_le(out, 0x0c, sequence.word_0c);
+    put_u32_le(out, 0x10, 0);
+    put_u64_le(out, 0x14, firmware_half_va);
+    put_u64_le(out, 0x1c, ring_low_va);
+    put_u64_le(out, 0x24, ring_low_end);
+    put_u32_le(out, 0x2c, G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES);
+    put_u32_le(out, 0x30, sequence.word_30);
+    put_u32_le(out, 0x34, 1); // constant
+    Ok(())
+}
+
+#[cfg(test)]
+mod usc_freelist_tests {
+    use super::*;
+
+    fn u32_at(raw: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn u64_at(raw: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
     }
 
     #[test]

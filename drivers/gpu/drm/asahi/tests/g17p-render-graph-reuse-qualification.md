@@ -172,3 +172,63 @@ checks also passed.
 Partial PM/support reinitialization and the experimental blocking graph wait
 are absent. Quarantined PM/support objects retain their IDs until processor
 shutdown and cannot be used as constructor input.
+
+
+## UMA pool handoff regression, 2026-09-26
+
+Repeated native Vulkan 0 A.D. replay on J700 exposed missing UMA state save
+before a retained render graph relinquishes its physical pool slot. The GPU
+updates the UMA descriptor, while the graph's shared FList object retained its
+constructor counters. A captured idle pool had live descriptor words
+`08000000e0186200 00003bf00000ff00 0000000000001600 0`, but the shared object
+still contained counters `0/0x1100` and size `0x1100`. Reactivating that graph
+therefore reset its allocation cursors and discarded the five-block growth.
+
+The driver now saves the live counters, empty flag and page count into the
+retired graph's shared FList before detaching its SKSM backing. It verifies
+that the descriptor still names that pool. Existing UMA loading then restores
+the saved state when the graph is selected again. Queue/FList retirement,
+cross-VM reuse and firmware-owned descriptor word three remain unchanged.
+
+On kernel `7.1.6-AURORA-j700-783d4c8e` (source base `6d57e4db6`) with Mesa
+agx3 `1ec1b46` plus local indexed-draw fix `10081cd`:
+
+- Unmodified reuse failed after 6–8 fresh-process replay launches, including
+  with the desktop stopped, serialized Mesa submissions, and a larger TVB.
+- Diagnostic no-foreign-reuse passed 15 launches; re-enabling reuse failed on
+  launch 7. That diagnostic is not shipped: it retains too many graphs.
+- Clearing TPC at cross-VM handoff still failed on launch 8; that experiment
+  is not shipped either.
+- The UMA save candidate passed 25/25 headless replay launches. Median
+  measured time for the frozen 30-frame range was 1.2854 seconds, comparable
+  to the failing baseline's successful samples. Memory did not grow with
+  repeated launches.
+
+Evidence is retained in `neo-agx3-replay-2026.09.26/diagnosis`, including
+per-run boot IDs, Mesa/capture hashes, completed-frame counts, temperatures
+and kernel-log windows. Runs used the owner's authorized userspace monitoring
+and 120°C stop limit, without a hardware watchdog; they are not conformance
+qualification or public release approval.
+
+`test_g17_render_uma_handoff.py` executes the production save and codec paths
+against the captured live state, counter-width boundaries and wrong-pool
+rejection. Existing FList ownership/lifecycle, SKSM handoff, cache-selection,
+rebind-failure and retained-PBDesc tests pass. Two older source-text guards,
+`test_g17_render_vm_handoff.py` and `test_g17_render_handoff_quarantine.py`,
+fail because they search for the obsolete `require_retired_render_owner()`
+call spelling; both failures reproduce on the unchanged source base.
+
+
+The final build, with all experimental switches and logging removed, passed
+another 25/25 native Vulkan replay launches with the logged-in Hyprland desktop
+and Chromium Shadertoy Seascape running. The resident module build ID was
+`3799f0821a36f37efc3b4a9a22a26de812fd36c9`, SHA-256
+`942ab19fe284da67ceb4a3304d4b6a1bf6d3d68ba3b3bd7b55c7522d6d896fb8`, on boot
+`316a658d-a6a2-4d86-95b8-a96a2a36f30a`. Both Hyprland and Chromium loaded the
+agx3 Vulkan and Gallium libraries. Desktop replay timings include competing
+browser work and thermal throttling and are not used for speed comparison.
+
+Native Vulkan and Zink 0 A.D. screenshot replays subsequently completed on the
+same final boot without GPU faults, each producing the three requested
+frames. These completion checks do not certify image agreement with the
+M3/M4 reference corpus. The accelerated desktop was left running.
