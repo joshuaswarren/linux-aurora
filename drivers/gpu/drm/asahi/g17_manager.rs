@@ -762,7 +762,8 @@ impl G17PBootstrapUmaLifecycle {
         };
         let Some(previous) = previous else {
             if sequence != G17P_BOOTSTRAP_UMA_SEQUENCE { return Err(G17PBootstrapUmaLifecycleError::WrongOwner); }
-            if !needs_grow { return Err(G17PBootstrapUmaLifecycleError::WrongOwner); }
+            // A pre-populated pool has no async-grow reference: prepare, TA
+            // and 3D only, like the warm first CL kick in the 25G83 trace.
             return Ok(Self {
                 sequence,
                 hardware_buffer_id,
@@ -770,10 +771,10 @@ impl G17PBootstrapUmaLifecycle {
                 operand_table,
                 cookie,
                 hardware_buffer_owned: true,
-                hardware_buffer_references: 4,
+                hardware_buffer_references: if needs_grow { 4 } else { 3 },
                 pending_release_count: 2,
                 release_producer_after: None,
-                request: Some(new_request()),
+                request: needs_grow.then(new_request),
                 state: G17PBootstrapUmaRequestState::Submitted,
             });
         };
@@ -11821,6 +11822,27 @@ mod tests {
         warm.retire_prepare_reference().unwrap();
         assert_eq!(warm.state, G17PBootstrapUmaRequestState::Ready);
         assert!(warm.retire_render_references().unwrap().is_some());
+    }
+
+    #[test]
+    fn presized_render_flist_first_lease_is_warm() {
+        let owner = (129, 0xffff_fc20_1100_0000, 0x70_0410_0000, 0x70_0410_0580);
+        let mut first = G17PBootstrapUmaLifecycle::acquire_owner(
+            None, 0, owner.0, owner.1, owner.2, owner.3, false,
+        ).unwrap();
+        assert_eq!(first.request, None);
+        assert_eq!((first.hardware_buffer_references, first.pending_release_count), (3, 2));
+        first.retire_prepare_reference().unwrap();
+        assert_eq!(first.state, G17PBootstrapUmaRequestState::Ready);
+        // A second kick overlaps the warm first lease without a new sequence.
+        let mut both = G17PBootstrapUmaLifecycle::acquire_owner(
+            Some(&first), 1, owner.0, owner.1, owner.2, owner.3, false,
+        ).unwrap();
+        assert_eq!(both.sequence, 0);
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (5, 4));
+        both.retire_prepare_reference().unwrap();
+        assert!(both.retire_render_references().unwrap().is_none());
+        assert!(both.retire_render_references().unwrap().is_some());
     }
 
     #[test]
