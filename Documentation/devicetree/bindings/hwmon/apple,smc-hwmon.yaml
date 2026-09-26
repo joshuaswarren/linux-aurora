@@ -40,6 +40,12 @@ properties:
   compatible:
     const: apple,smc-hwmon
 
+  "#thermal-sensor-cells":
+    const: 1
+    description:
+      The cell is the zero-based index of a temperature channel, counting
+      the temperature-* child nodes in order.
+
   apple,cpu-thermal-policy:
     type: boolean
     description:
