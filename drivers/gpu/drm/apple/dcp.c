@@ -1720,6 +1720,13 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_12_3;
 }
 
+bool dcp_fw_compat_is_h17p(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_H17P;
+}
+
 const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
