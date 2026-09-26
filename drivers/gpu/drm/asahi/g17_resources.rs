@@ -584,6 +584,20 @@ const G17P_VDM_STREAM_TERMINATE: u32 = 6 << 29;
 const G17P_CONTROL_OPERAND_TABLE_VA: u64 = g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS;
 const G17P_CONTROL_OPERAND_BUFFER_BASE: u64 = g17_initdata::CONTROL_OPERAND_BUFFER_BASE;
 const G17P_CONTROL_OPERAND_BUFFER_COUNT: usize = 28;
+/// The complete 25G83 first-render trace resolves the split exactly: native
+/// publishes 17 initial one-MiB blocks, then opcode 0x20 appends five more.
+/// Each run owns an eight-qword slot even though only slot zero is populated.
+const G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT: usize = 17;
+const G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT: usize = 5;
+const G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT: usize =
+    G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT + G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT;
+/// A per-pair render FList starts at the size AGXUSCPrivMemFList::
+/// populateInitialFirmwareState gives the 3D pool (25G83 dtrace 2026-09-26:
+/// 0x1600 pages at +0x24/+0x2c and run cursor 0xb0, i.e. 22 one-MiB blocks),
+/// so its first lease needs no opcode-0x20 grow. That equals the old
+/// 17 + 5 capacity, which multi-kick already ran warm in steady state.
+const G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT: usize = G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT;
+const G17P_CONTROL_OPERAND_RUN_SLOT_SIZE: usize = 8 * core::mem::size_of::<u64>();
 const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_SIZE as usize;
 const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize =
@@ -2816,7 +2830,7 @@ impl G17PRenderFlist {
             dev,
             uat.kernel_lower_vm(),
             g17p_cl_dynamic_low_va_range(),
-            BUFFERS + G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT
+            BUFFERS + G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT
                 * G17P_CONTROL_OPERAND_BUFFER_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RW,
@@ -2825,7 +2839,7 @@ impl G17PRenderFlist {
         let run_table_va = page_list_va.checked_add(PAGE_LIST as u64).ok_or(EOVERFLOW)?;
         backing.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            for block in 0..G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT {
+            for block in 0..G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT {
                 let base = page_list_va
                     .checked_add((BUFFERS + block * G17P_CONTROL_OPERAND_BUFFER_SIZE) as u64)
                     .ok_or(EOVERFLOW)?;
@@ -2835,14 +2849,12 @@ impl G17PRenderFlist {
                     (base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
                         | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52),
                 );
-                if block < G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT {
-                    for page in 0..G17P_CONTROL_OPERAND_BUFFER_SIZE / 0x1000 {
-                        put_u64(
-                            bytes,
-                            (block * 0x100 + page) * 8,
-                            base + page as u64 * 0x1000,
-                        );
-                    }
+                for page in 0..G17P_CONTROL_OPERAND_BUFFER_SIZE / 0x1000 {
+                    put_u64(
+                        bytes,
+                        (block * 0x100 + page) * 8,
+                        base + page as u64 * 0x1000,
+                    );
                 }
             }
             Ok(())
@@ -2872,7 +2884,11 @@ impl G17PRenderFlist {
             mmu::UAT_PGSZ as u64, mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         control_shared.with_bytes_mut(|bytes| {
-            g17_initdata::encode_render_control_shared(bytes).map_err(|_| EINVAL)?;
+            g17_initdata::encode_presized_render_control_shared(
+                bytes,
+                G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT as u32,
+            )
+            .map_err(|_| EINVAL)?;
             put_u32(bytes, 0x08, u32::from(id));
             put_u64(bytes, 0x14, page_list_va);
             put_u64(bytes, 0x30, run_table_va);
@@ -2887,7 +2903,7 @@ impl G17PRenderFlist {
             _render_global_backing: render_global_backing,
             control_shared,
             _control_inner: control_inner,
-            grown: AtomicBool::new(false),
+            grown: AtomicBool::new(true),
         })
     }
 
@@ -2898,7 +2914,7 @@ impl G17PRenderFlist {
         self.backing.iova() + G17P_CONTROL_OPERAND_PAGE_LIST_SIZE as u64
     }
     pub(crate) fn grow_end_va(&self) -> u64 {
-        self.run_table_va() + G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT as u64
+        self.run_table_va() + G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT as u64
             * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE as u64
     }
     pub(crate) fn needs_grow(&self) -> bool { !self.grown.load(Ordering::Acquire) }
@@ -16303,11 +16319,10 @@ impl G17ResourceOwner {
         if crate::util::g17p_verbose() {
             dev_info!(
                 self.dev().as_ref(),
-                "G17P resources: client VM mapped private render FList id={} pointer={:#x} ({} initial blocks + {} first-grow blocks)\n",
+                "G17P resources: client VM mapped private render FList id={} pointer={:#x} ({} pre-populated blocks)\n",
                 render_flist.id(),
                 render_flist.control_shared_va(),
-                G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT,
-                G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT,
+                G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT,
             );
         }
         Ok(aliases)
