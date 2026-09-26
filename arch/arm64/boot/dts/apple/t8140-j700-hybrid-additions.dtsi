@@ -315,3 +315,11 @@
 		};
 	};
 };
+
+/*
+ * The SEP fingerprint sensor shim finds the SMC by the generic "apple,smc"
+ * compatible; the clean t8140.dtsi lists only the SoC-specific ones.
+ */
+&smc {
+	compatible = "apple,t8140-smc", "apple,t8103-smc", "apple,smc";
+};
