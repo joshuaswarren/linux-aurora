@@ -475,7 +475,7 @@ impl G17PQueueRegistry {
         }
         self.compute_readers.fetch_add(1, Ordering::AcqRel);
         drop(held);
-        Ok(G17PComputeLeaseGuard { registry: self.clone(), exclusive: first_install })
+        Ok(G17PComputeLeaseGuard { registry: self.clone(), exclusive: first_install, released: false })
     }
 
     /// Caller already owns this render slot and has waited all input fences.
@@ -623,11 +623,32 @@ impl G17PQueueRegistry {
     /// queues in one VM cannot share one graph. Waiting here is interruptible
     /// for temporary contention. Exhaustion of retained owners
     /// returns ENOSPC because waiting cannot reclaim an installed channel.
+    /// Whether the compute admission poison reaches clients other than the
+    /// quarantined queue's owner. A quarantined queue is retired permanently
+    /// and owns nothing that can be reused, so with the quarantine scoped the
+    /// latch must not fail unrelated render submissions or status queries.
+    /// `acquire_compute` still reads it unscoped to wake parked installers.
+    fn compute_poison_is_device_wide(&self) -> bool {
+        crate::g17_config::QUARANTINE_SCOPE & 1 == 0
+    }
+
+    /// Release the compute admission poison at a proven rehabilitation
+    /// boundary: a firmware recovery that acknowledged its final clear.
+    pub(crate) fn clear_compute_poison(&self) -> bool {
+        let held = self.lease.lock();
+        let was = self.compute_faulted.swap(0, Ordering::AcqRel) != 0;
+        drop(held);
+        self.lease_free.notify_all();
+        was
+    }
+
     fn acquire_lease(self: &Arc<Self>, owner: u64) -> Result<G17PLeaseGuard> {
         if owner == 0 { return Err(EINVAL); }
         let mut held = self.lease.lock();
         let slot = loop {
-            if self.compute_faulted.load(Ordering::Acquire) != 0 {
+            if self.compute_faulted.load(Ordering::Acquire) != 0
+                && self.compute_poison_is_device_wide()
+            {
                 return Err(EIO);
             }
             // Every slot retired: no wait can ever succeed, so report the dead
@@ -696,8 +717,27 @@ impl G17PQueueRegistry {
     }
 }
 
-pub(crate) struct G17PComputeLeaseGuard { registry: Arc<G17PQueueRegistry>, exclusive: bool }
+pub(crate) struct G17PComputeLeaseGuard {
+    registry: Arc<G17PQueueRegistry>,
+    exclusive: bool,
+    released: bool,
+}
 impl G17PComputeLeaseGuard {
+    /// Return this job's admission share once the firmware has provably
+    /// retired it (a zero-duration retire). The queue stays quarantined and
+    /// its packet, mappings and roots stay retained; only the reader count and
+    /// any install exclusivity go back, so later clients are not parked
+    /// forever behind a job that will never run.
+    pub(crate) fn release_retired_admission(&mut self) {
+        if self.released { return; }
+        let mut held = self.registry.lease.lock();
+        if self.exclusive { held.compute_install = false; }
+        self.registry.compute_readers.fetch_sub(1, Ordering::AcqRel);
+        self.released = true;
+        drop(held);
+        self.registry.lease_free.notify_all();
+    }
+
     /// Fault-only coherent host admission state. These are leases, not a
     /// hardware execution-slot count: admitted work may still be queued, and
     /// quarantined work retains its lease after userspace sees an error.
@@ -751,6 +791,7 @@ impl Drop for G17PRenderTransitionGuard {
 }
 impl Drop for G17PComputeLeaseGuard {
     fn drop(&mut self) {
+        if self.released { return; }
         let mut held = self.registry.lease.lock();
         if self.exclusive { held.compute_install = false; }
         self.registry.compute_readers.fetch_sub(1, Ordering::AcqRel);
@@ -1232,7 +1273,13 @@ impl DrmGpu for G17PDrmGpu {
     }
 
     fn submission_error(&self) -> i32 {
-        if self.registry.compute_faulted.load(Ordering::Acquire) != 0 { EIO.to_errno() } else { 0 }
+        if self.registry.compute_faulted.load(Ordering::Acquire) != 0
+            && self.registry.compute_poison_is_device_wide()
+        {
+            EIO.to_errno()
+        } else {
+            0
+        }
     }
 
     fn update_globals(&self) {}
