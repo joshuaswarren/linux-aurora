@@ -4079,6 +4079,16 @@ impl G17PLiveRuntime {
         if let Some(stamp) = blamed_stamp {
             self.settle_render_blamed_by_recovery(stamp, EIO);
         }
+        // The recovery acknowledged its final clear at state 0: the firmware
+        // is alive and reset. Release the compute admission poison here;
+        // otherwise only a session rebuild (which ends in rtkit-boot ETIME)
+        // could clear it and one fault locked every later client out.
+        if let Some(registry) = self.queue_registry.as_ref() {
+            if registry.clear_compute_poison() {
+                dev_info!(pdev.as_ref(),
+                    "G17PMARK recovery cleared the device-wide compute admission poison\n");
+            }
+        }
         // Compute completions observed while the recovery was open were left
         // armed. Their completion edges may already have been consumed, so
         // re-scan every active queue now rather than waiting for the watchdog.

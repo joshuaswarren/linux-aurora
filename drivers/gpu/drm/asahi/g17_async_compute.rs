@@ -653,7 +653,16 @@ impl G17PLiveRuntime {
                     }
                     q.retired_by_teardown = false;
                     q.quarantined = true;
-                    q.active.as_ref().ok_or(EIO)?._lease.quarantine();
+                    // A zero-duration retire is the documented outcome after a
+                    // firmware recovery on a live, reset firmware. Retire this
+                    // queue and fail its client, but do not raise the device
+                    // admission poison: nothing is stuck, and the latch would
+                    // outlive the recovery that already cleared it.
+                    if submission_scoped {
+                        q.active.as_mut().ok_or(EIO)?._lease.release_retired_admission();
+                    } else {
+                        q.active.as_ref().ok_or(EIO)?._lease.quarantine();
+                    }
                     let completion = q.active.as_ref().ok_or(EIO)?.packet.completion()?;
                     completion.fail_while_owned(error);
                     q.terminal_fanout = Some((completion.status.clone(), error));
