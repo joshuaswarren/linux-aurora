@@ -617,7 +617,14 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			u64 *owned = dart->locked_owned[sid][idx];
 			u64 *ours = cfg->apple_dart_cfg.ttbr[idx];
 
-			if (!live || !owned || !ours) {
+			/*
+			 * A stream whose firmware-owned root has not been mapped
+			 * yet is not translating through this domain; its attach
+			 * maps the root and publishes everything then.
+			 */
+			if (!live || !owned)
+				continue;
+			if (!ours) {
 				ret = -EIO;
 				goto out;
 			}
