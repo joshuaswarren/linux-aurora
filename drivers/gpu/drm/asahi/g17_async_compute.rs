@@ -302,7 +302,10 @@ impl G17PLiveRuntime {
         let completion = active.packet.completion()?;
         if !Arc::ptr_eq(&completion.status, status) { return Err(EIO); }
         let ticket = active.retirement.as_ref().ok_or(EIO)?;
-        if q.quarantined || handshake.state != 0 || ticket.recovery_epoch != handshake.epoch {
+        // Publication settles any open recovery first. A closed recovery since
+        // this compute's publication leaves its native stamp meaningful.
+        let _ = ticket;
+        if q.quarantined || handshake.state != 0 {
             return Err(EIO);
         }
         // SAFETY: completion retains this hardware fence throughout the read.
@@ -459,7 +462,7 @@ impl G17PLiveRuntime {
     /// Full-scan fallback for a final watchdog observation or an event batch
     /// whose record did not carry a usable QID mask. These paths deliberately
     /// preserve the old lost/coalesced-edge recovery behaviour.
-    fn service_async_compute_completions(&mut self) -> Result {
+    pub(crate) fn service_async_compute_completions(&mut self) -> Result {
         self.service_async_compute_completions_matching(None)
     }
 
@@ -467,6 +470,7 @@ impl G17PLiveRuntime {
         &mut self,
         masks: Option<[u64; 2]>,
     ) -> Result {
+        let pdev = self.pdev.as_ref();
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.begin_independent_compute_completion_batch();
         let mut requested = false;
@@ -495,27 +499,70 @@ impl G17PLiveRuntime {
                 continue;
             }
             let completion = q.active.as_ref().and_then(|active| active.retirement)
-                .ok_or(EIO)
+                .ok_or_else(|| {
+                    if let Some(pdev) = pdev {
+                        dev_err!(pdev.as_ref(),
+                            "G17P async compute: retirement-invariant qid={} cause=missing-ticket\n",
+                            q.queue.queue_id());
+                    }
+                    EIO
+                })
                 .and_then(|ticket| {
                     let active = q.active.as_ref().ok_or(EIO)?;
                     if q.owner != Some(ticket.owner)
                         || active.packet.submission_id() != ticket.submission
                         || active.packet.context().context_id() != ticket.context
                     {
+                        if let Some(pdev) = pdev {
+                            dev_err!(pdev.as_ref(),
+                                "G17P async compute: retirement-invariant qid={} cause=ticket-identity owner={:?}/{} submission={}/{} context={}/{}\n",
+                                q.queue.queue_id(), q.owner, ticket.owner,
+                                active.packet.submission_id(), ticket.submission,
+                                active.packet.context().context_id(), ticket.context);
+                        }
                         return Err(EIO);
                     }
+                    // J700 firmware routinely raises fault-free recoveries. An
+                    // open one says nothing about this job yet: keep it armed
+                    // and let the recovery settle first. Once the handshake is
+                    // closed, a changed epoch only means a recovery happened
+                    // while the job was live; the exact descriptor, stamp and
+                    // ring checks below still decide completed, zero-duration
+                    // or pending. Failing here killed healthy sessions.
                     let handshake = manager.firmware_recovery_handshake_snapshot()?;
-                    if handshake.state != 0 || handshake.epoch != ticket.recovery_epoch {
-                        return Err(EIO);
+                    if handshake.state != 0 {
+                        return Err(EAGAIN);
+                    }
+                    if handshake.epoch != ticket.recovery_epoch && crate::util::g17p_verbose() {
+                        if let Some(pdev) = pdev {
+                            dev_info!(pdev.as_ref(),
+                                "G17P async compute: qid={} retiring across recovery epoch {}/{}\n",
+                                q.queue.queue_id(), handshake.epoch, ticket.recovery_epoch);
+                        }
                     }
                     let completion = manager.poll_staged_independent_compute_completion(
                         &mut q.queue, &ticket.firmware,
-                    )?;
+                    ).map_err(|error| {
+                        if error != EAGAIN {
+                            if let Some(pdev) = pdev {
+                                dev_err!(pdev.as_ref(),
+                                    "G17P async compute: retirement-invariant qid={} cause=poll errno={}\n",
+                                    q.queue.queue_id(), error.to_errno());
+                            }
+                        }
+                        error
+                    })?;
                     if completion.is_some()
                         && q.previous_binding.as_ref().is_some_and(|previous|
                             previous.publication
                                 != Some((ticket.submission, ticket.recovery_epoch)))
                     {
+                        if let Some(pdev) = pdev {
+                            dev_err!(pdev.as_ref(),
+                                "G17P async compute: retirement-invariant qid={} cause=previous-binding-publication expected=({},{}) actual={:?}\n",
+                                q.queue.queue_id(), ticket.submission, ticket.recovery_epoch,
+                                q.previous_binding.as_ref().and_then(|previous| previous.publication));
+                        }
                         return Err(EIO);
                     }
                     Ok(completion)
