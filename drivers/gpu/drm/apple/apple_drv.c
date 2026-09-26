@@ -622,6 +622,35 @@ static int apple_drm_init_dcp(struct device *dev)
 	return 0;
 }
 
+/*
+ * True when any display coprocessor bound to this device runs the H17P
+ * firmware, whose compositor treats the X byte of XRGB surfaces as alpha.
+ */
+static bool apple_drm_fbdev_needs_alpha(struct device *dev)
+{
+	struct device_node *np;
+	bool needs_alpha = false;
+
+	for_each_matching_node(np, apple_dcp_id_tbl) {
+		struct platform_device *pdev;
+
+		if (!of_device_is_available(np))
+			continue;
+		pdev = of_find_device_by_node(np);
+		if (!pdev)
+			continue;
+		if (platform_get_drvdata(pdev) && dcp_fw_compat_is_h17p(pdev))
+			needs_alpha = true;
+		put_device(&pdev->dev);
+		if (needs_alpha) {
+			of_node_put(np);
+			break;
+		}
+	}
+
+	return needs_alpha;
+}
+
 static int apple_drm_init(struct device *dev)
 {
 	struct apple_drm_private *apple;
@@ -743,7 +772,21 @@ static int apple_drm_init(struct device *dev)
 	if (ret)
 		goto err_unbind;
 
-	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
+	/*
+	 * The H17P pipe (T8140) blends the fourth byte of a 32-bit surface as
+	 * straight alpha whatever the format says, and its firmware offers
+	 * no alpha-less 32-bit format (blend-CRC oracle, 2026-09-19).  An
+	 * XRGB8888 console therefore scans out fully transparent: fbcon
+	 * builds its pseudo-palette without the X byte, so text and
+	 * background both carry 0x00 there and the panel stays black.
+	 * Hand the fbdev client ARGB8888 instead; drm_fb_helper_setcolreg()
+	 * then fills the transp bits of every palette entry, so everything
+	 * the console draws is opaque.  Other firmware generations keep
+	 * XRGB8888, which they display as opaque.
+	 */
+	drm_client_setup_with_fourcc(&apple->drm,
+				     apple_drm_fbdev_needs_alpha(dev) ?
+				     DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888);
 
 	return 0;
 
