@@ -6332,6 +6332,11 @@ impl G17PManagerConstruction {
                 )
             });
             if !owner_matches {
+                // This pool takes over the pair's FList ID from another
+                // object. Any previous service ended with a consumed release,
+                // so restore its initial firmware image before staging it.
+                storage.repopulate_render_flist()
+                    .map_err(|error| Self::render_stage_fail("repopulate-render-flist", error))?;
                 self.resources.stage_user_render_uma(storage)
                     .map_err(|error| Self::render_stage_fail("stage-render-uma-owner", error))?;
             }

@@ -2816,6 +2816,8 @@ pub(crate) struct G17PRenderFlist {
     control_shared: MappedObject,
     _control_inner: MappedObject,
     grown: AtomicBool,
+    /// Set once the pool has been handed to an owner.
+    served: AtomicBool,
 }
 
 #[cfg(not(test))]
@@ -2839,25 +2841,7 @@ impl G17PRenderFlist {
         let run_table_va = page_list_va.checked_add(PAGE_LIST as u64).ok_or(EOVERFLOW)?;
         backing.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            for block in 0..G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT {
-                let base = page_list_va
-                    .checked_add((BUFFERS + block * G17P_CONTROL_OPERAND_BUFFER_SIZE) as u64)
-                    .ok_or(EOVERFLOW)?;
-                put_u64(
-                    bytes,
-                    PAGE_LIST + block * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE,
-                    (base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
-                        | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52),
-                );
-                for page in 0..G17P_CONTROL_OPERAND_BUFFER_SIZE / 0x1000 {
-                    put_u64(
-                        bytes,
-                        (block * 0x100 + page) * 8,
-                        base + page as u64 * 0x1000,
-                    );
-                }
-            }
-            Ok(())
+            Self::for_each_pool_word(page_list_va, |at, value| put_u64(bytes, at, value))
         })?;
         let render_global_backing = {
             let mapping = backing.mapping.as_ref().ok_or(EINVAL)?;
@@ -2879,21 +2863,13 @@ impl G17PRenderFlist {
             Ok(())
         })?;
         let inner_va = control_inner.iova();
+        let shared_image = Self::control_shared_image(id, page_list_va, run_table_va, inner_va)?;
         let mut control_shared = MappedObject::new_wc(
             dev, uat, g17_initdata::CONTROL_SHARED_OBJECT_SIZE,
             mmu::UAT_PGSZ as u64, mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         control_shared.with_bytes_mut(|bytes| {
-            g17_initdata::encode_presized_render_control_shared(
-                bytes,
-                G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT as u32,
-            )
-            .map_err(|_| EINVAL)?;
-            put_u32(bytes, 0x08, u32::from(id));
-            put_u64(bytes, 0x14, page_list_va);
-            put_u64(bytes, 0x30, run_table_va);
-            put_u64(bytes, 0x00, inner_va);
-            put_u64(bytes, 0x4c, inner_va);
+            bytes.get_mut(..shared_image.len()).ok_or(EINVAL)?.copy_from_slice(&shared_image);
             Ok(())
         })?;
         core::sync::atomic::fence(Ordering::SeqCst);
@@ -2904,7 +2880,118 @@ impl G17PRenderFlist {
             control_shared,
             _control_inner: control_inner,
             grown: AtomicBool::new(true),
+            served: AtomicBool::new(false),
         })
+    }
+
+    /// Every page-list entry and run slot of the pool's initial image, as
+    /// `(byte offset in backing, value)`.
+    fn for_each_pool_word(page_list_va: u64, mut put: impl FnMut(usize, u64)) -> Result {
+        const BUFFERS: usize =
+            G17P_CONTROL_OPERAND_PAGE_LIST_SIZE + G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE;
+        for block in 0..G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT {
+            let base = page_list_va
+                .checked_add((BUFFERS + block * G17P_CONTROL_OPERAND_BUFFER_SIZE) as u64)
+                .ok_or(EOVERFLOW)?;
+            put(
+                G17P_CONTROL_OPERAND_PAGE_LIST_SIZE + block * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE,
+                (base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
+                    | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52),
+            );
+            for page in 0..G17P_CONTROL_OPERAND_BUFFER_SIZE / 0x1000 {
+                put((block * 0x100 + page) * 8, base + page as u64 * 0x1000);
+            }
+        }
+        Ok(())
+    }
+
+    fn control_shared_image(
+        id: u16,
+        page_list_va: u64,
+        run_table_va: u64,
+        inner_va: u64,
+    ) -> Result<KVVec<u8>> {
+        // 16 KiB: never on the kernel stack.
+        let mut bytes = KVVec::from_elem(0u8, g17_initdata::CONTROL_SHARED_OBJECT_SIZE, GFP_KERNEL)?;
+        g17_initdata::encode_presized_render_control_shared(
+            &mut bytes,
+            G17P_RENDER_FLIST_INITIAL_BLOCK_COUNT as u32,
+        )
+        .map_err(|_| EINVAL)?;
+        put_u32(&mut bytes, 0x08, u32::from(id));
+        put_u64(&mut bytes, 0x14, page_list_va);
+        put_u64(&mut bytes, 0x30, run_table_va);
+        put_u64(&mut bytes, 0x00, inner_va);
+        put_u64(&mut bytes, 0x4c, inner_va);
+        Ok(bytes)
+    }
+
+    /// Rewrite this pool's complete firmware state to its constructor image.
+    ///
+    /// Firmware keeps the pool's free-page stack in the page list. Once the
+    /// pool has served an owner and been released (0x2e), the list is left
+    /// in firmware's used order; registering that released object for its
+    /// next owner through a warm tag-15 hung the new owner's first render
+    /// on Neo (recycled graphs failed 9/19 processes; a fresh FList object
+    /// failed 0/20). Apple writes the whole initial state whenever it
+    /// prepares a pool (AGXUSCPrivMemFList::populateInitialFirmwareState).
+    /// Call only after firmware has consumed this pool's release.
+    pub(crate) fn repopulate(&self) -> Result {
+        // A pool that never served an owner still holds its constructor image.
+        if !self.served.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let page_list_va = self.page_list_va();
+        let shared_image = Self::control_shared_image(
+            self.id,
+            page_list_va,
+            self.run_table_va(),
+            self._control_inner.iova(),
+        )?;
+        // One kernel mapping per object; every write is bounds- and
+        // alignment-checked against that object's logical size.
+        let write_all = |object: &MappedObject,
+                         fill: &mut dyn FnMut(&mut dyn FnMut(usize, u64) -> Result) -> Result|
+         -> Result {
+            let vmap = object.object.gem.vmap::<u8>()?;
+            let base = vmap.as_mut_ptr();
+            let size = object.logical_size;
+            let mut put = |at: usize, value: u64| -> Result {
+                if at % 8 != 0 || at.checked_add(8).is_none_or(|end| end > size) {
+                    return Err(ERANGE);
+                }
+                // SAFETY: checked above; the host alone writes a released
+                // pool, under the runtime mutex.
+                unsafe { core::ptr::write_volatile(base.add(at).cast::<u64>(), value) };
+                Ok(())
+            };
+            fill(&mut put)
+        };
+        write_all(&self.backing, &mut |put| {
+            let mut result = Ok(());
+            Self::for_each_pool_word(page_list_va, |at, value| {
+                if result.is_ok() {
+                    result = put(at, value);
+                }
+            })?;
+            result
+        })?;
+        write_all(&self._control_inner, &mut |put| {
+            for at in (0..mmu::UAT_PGSZ).step_by(8) {
+                put(at, if at == 0 { g17_initdata::CONTROL_SHARED_INNER_PRESENTED } else { 0 })?;
+            }
+            Ok(())
+        })?;
+        write_all(&self.control_shared, &mut |put| {
+            for (index, chunk) in shared_image.chunks(8).enumerate() {
+                let mut word = [0u8; 8];
+                word[..chunk.len()].copy_from_slice(chunk);
+                put(index * 8, u64::from_le_bytes(word))?;
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn id(&self) -> u16 { self.id }
@@ -7626,6 +7713,10 @@ impl G17PUserRenderStorage {
 
     pub(crate) fn render_flist_cookie(&self) -> u64 {
         self.render_flist.grow_end_va()
+    }
+
+    pub(crate) fn repopulate_render_flist(&self) -> Result {
+        self.render_flist.repopulate()
     }
 
     pub(crate) fn render_flist_needs_grow(&self) -> bool {
