@@ -1387,7 +1387,7 @@ pub(crate) struct G17PManagerConstruction {
     num_clusters: u32,
     render_storage: Option<g17_resources::G17PUserRenderStorage>,
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
-    render_queued_tracker: Option<G17PPartialOpeningRenderTracker>,
+    render_queued_tracker: g17_completion::PairFifo<G17PPartialOpeningRenderTracker, { g17_resources::G17P_RENDER_QUEUED_PER_PAIR }>,
     render_bind: Option<G17PRenderRootOwner>,
     /// Root replaced by an in-place same-VM context update. The replacement
     /// descriptor is not a release witness until the pair carrying that update
@@ -1557,7 +1557,7 @@ struct G17PRenderSlotState {
     storage: Option<g17_resources::G17PUserRenderStorage>,
     sksm: Option<G17PRenderSksmQueues>,
     tracker: Option<G17PPartialOpeningRenderTracker>,
-    queued_tracker: Option<G17PPartialOpeningRenderTracker>,
+    queued_tracker: g17_completion::PairFifo<G17PPartialOpeningRenderTracker, { g17_resources::G17P_RENDER_QUEUED_PER_PAIR }>,
     submission_ordinal: u64,
     auxiliary_timestamp: u64,
     hardware_buffer_id: Option<u32>,
@@ -1580,7 +1580,7 @@ impl G17PRenderSlotState {
             storage: None,
             sksm: None,
             tracker: None,
-            queued_tracker: None,
+            queued_tracker: g17_completion::PairFifo::new(),
             submission_ordinal: 0,
             auxiliary_timestamp: 0,
             hardware_buffer_id: None,
@@ -2398,7 +2398,7 @@ impl G17PManagerConstruction {
                 num_clusters,
                 render_storage: None,
                 render_tracker: None,
-                render_queued_tracker: None,
+                render_queued_tracker: g17_completion::PairFifo::new(),
                 render_bind: None,
                 render_context_retirement: None,
                 render_context_epochs: [0; 64],
@@ -3353,8 +3353,8 @@ impl G17PManagerConstruction {
         };
         let selected_published = self.render_tracker.as_ref()
             .is_some_and(|tracker| tracker.hardware_buffer_id == request.buffer_slot)
-            || self.render_queued_tracker.as_ref()
-                .is_some_and(|tracker| tracker.hardware_buffer_id == request.buffer_slot)
+            || self.render_queued_tracker.iter()
+                .any(|tracker| tracker.hardware_buffer_id == request.buffer_slot)
             || (self.render_hardware_buffer_published
                 && self.render_hardware_buffer_id == Some(request.buffer_slot));
         let result = if selected_published {
@@ -3364,8 +3364,8 @@ impl G17PManagerConstruction {
             .find(|owner| {
                 owner.tracker.as_ref()
                     .is_some_and(|tracker| tracker.hardware_buffer_id == request.buffer_slot)
-                    || owner.queued_tracker.as_ref()
-                        .is_some_and(|tracker| tracker.hardware_buffer_id == request.buffer_slot)
+                    || owner.queued_tracker.iter()
+                        .any(|tracker| tracker.hardware_buffer_id == request.buffer_slot)
                     || (owner.hardware_buffer_published
                         && owner.hardware_buffer_id == Some(request.buffer_slot))
             })
@@ -3927,7 +3927,7 @@ impl G17PManagerConstruction {
         self.render_context_epochs = [0; 64];
         self.render_bind = None;
         self.render_tracker = None;
-        self.render_queued_tracker = None;
+        self.render_queued_tracker.clear();
         self.unreserve_render_storage_hardware_buffer_id();
         self.render_storage = None;
         // Both CPUs are stopped at this boundary. The alias owner's Drop
@@ -4143,7 +4143,7 @@ impl G17PManagerConstruction {
         let host = (
             self.render_submission_ordinal,
             self.render_tracker.as_ref().map(|tracker| tracker.ordinal),
-            self.render_queued_tracker.as_ref().map(|tracker| tracker.ordinal),
+            self.render_queued_tracker.front().map(|tracker| tracker.ordinal),
             self.render_hardware_buffer_id,
             self.render_hardware_buffer_published,
             self.prepared_render_flist.is_some(),
@@ -5940,7 +5940,7 @@ impl G17PManagerConstruction {
         if self.render_hardware_buffer_id.is_some()
             || self.render_hardware_buffer_published
             || self.prepared_render_flist.is_some()
-            || self.render_queued_tracker.is_some()
+            || !self.render_queued_tracker.has_room()
         {
             return Err(EBUSY);
         }
@@ -6068,8 +6068,8 @@ impl G17PManagerConstruction {
         let ordinal = self.render_submission_ordinal;
         let tracker_matches = self.render_tracker.as_ref()
             .is_some_and(|tracker| tracker.ordinal == ordinal)
-            || self.render_queued_tracker.as_ref()
-                .is_some_and(|tracker| tracker.ordinal == ordinal);
+            || self.render_queued_tracker.iter()
+                .any(|tracker| tracker.ordinal == ordinal);
         if !tracker_matches
             || !self.render_hardware_buffer_published
             || self.render_hardware_buffer_id.is_none()
@@ -6117,7 +6117,7 @@ impl G17PManagerConstruction {
         // items. The same target feeds both outer slots and the tracker.
         let published_prefix =
             g17_resources::g17p_render_published_prefix(self.render_submission_ordinal)?;
-        if self.render_queued_tracker.is_some() {
+        if !self.render_queued_tracker.has_room() {
             return Err(EBUSY);
         }
         // Check the previous release BEFORE touching any retained graph or
@@ -6826,9 +6826,7 @@ impl G17PManagerConstruction {
         };
         if self.render_tracker.is_none() {
             self.render_tracker = Some(tracker);
-        } else if self.render_queued_tracker.is_none() {
-            self.render_queued_tracker = Some(tracker);
-        } else {
+        } else if self.render_queued_tracker.push(tracker).is_err() {
             return Err(EIO);
         }
         if context_update {

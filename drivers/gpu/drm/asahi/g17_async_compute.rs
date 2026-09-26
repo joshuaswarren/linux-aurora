@@ -339,8 +339,9 @@ impl G17PLiveRuntime {
         }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
         let mut dependency_count = 0;
         for predecessor in Iterator::chain(
-            self.pending_render.iter(), self.pending_render_queued.iter(),
-        ).flatten() {
+            self.pending_render.iter().flatten(),
+            self.pending_render_queued.iter().flatten(),
+        ) {
             if let Some(dependency) = predecessor.compute_predecessor_dependency(
                 owner, &packet.completion()?.status,
                 packet.command().render_wait_through, packet.command().render_wait_last,

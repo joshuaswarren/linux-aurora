@@ -3140,7 +3140,8 @@ pub(crate) struct G17PLiveRuntime {
     /// slots. Installed before the work doorbell and removed only by exact
     /// retirement or the DRM scheduler's bounded timeout recovery.
     pending_render: KVec<Option<Arc<crate::g17_drm::G17PRenderCompletion>>>,
-    pending_render_queued: KVec<Option<Arc<crate::g17_drm::G17PRenderCompletion>>>,
+    pending_render_queued: KVec<g17_completion::PairFifo<
+        Arc<crate::g17_drm::G17PRenderCompletion>, { g17_resources::G17P_RENDER_QUEUED_PER_PAIR }>>,
     queue_registry: Option<Arc<crate::g17_drm::G17PQueueRegistry>>,
     /// Lost render packets whose firmware retirement was not proven. Their
     /// VM job guards keep userspace mappings alive until both processors stop.
@@ -3816,8 +3817,9 @@ impl G17PLiveRuntime {
                 signalled,
             );
         }
-        for (pending_slot, completion) in self.pending_render_queued.iter().enumerate() {
-            let Some(completion) = completion.as_ref() else { continue };
+        for (pending_slot, completion) in self.pending_render_queued.iter().enumerate()
+            .flat_map(|(slot, queued)| queued.iter().map(move |completion| (slot, completion)))
+        {
             let (submission_id, vdm_base, lease_slot, signalled) =
                 completion.diagnostic_identity();
             dev_err!(
@@ -5072,11 +5074,7 @@ impl G17PLiveRuntime {
         let queued = self.pending_render_queued
             .get_mut(render_slot as usize)
             .ok_or(EINVAL)?;
-        if queued.is_some() {
-            return Err(EBUSY);
-        }
-        *queued = Some(completion);
-        Ok(())
+        queued.push(completion).map_err(|_| EBUSY)
     }
 
     /// Release error-fence owners only after both processors are stopped.
@@ -5111,8 +5109,7 @@ impl G17PLiveRuntime {
             };
         let queued_matches = self.pending_render_queued
             .get(usize::from(render_slot))
-            .and_then(Option::as_ref)
-            .is_some_and(|queued| Arc::ptr_eq(queued, completion));
+            .is_some_and(|queued| queued.iter().any(|queued| Arc::ptr_eq(queued, completion)));
         if !Arc::ptr_eq(current, completion) && !queued_matches {
             return;
         }
@@ -5235,8 +5232,14 @@ impl G17PLiveRuntime {
             let Some(signal) = self.pending_render
                 .get_mut(render_slot as usize)
                 .and_then(Option::take) else { return; };
-            let queued_signal = self.pending_render_queued[render_slot as usize].take();
-            let retired = queued_signal.is_none() && self
+            let mut queued_signals = g17_completion::PairFifo::<
+                Arc<crate::g17_drm::G17PRenderCompletion>,
+                { g17_resources::G17P_RENDER_QUEUED_PER_PAIR },
+            >::new();
+            while let Some(queued) = self.pending_render_queued[render_slot as usize].take() {
+                let _ = queued_signals.push(queued);
+            }
+            let retired = queued_signals.is_none() && self
                 .retire_failed_deferred_render(render_slot, submission_id.is_some())
                 .unwrap_or(false);
             if let Some(pdev) = self.pdev.as_ref() {
@@ -5286,7 +5289,7 @@ impl G17PLiveRuntime {
                         "G17P render: completion quarantine exhausted; retaining VM mappings permanently\n"
                     );
                 }
-                if let Some(queued) = queued_signal {
+                while let Some(queued) = queued_signals.take() {
                     queued.fail_while_owned(error);
                     if let Err(error) = self
                         .quarantined_render_completions
@@ -5578,8 +5581,9 @@ impl G17PLiveRuntime {
         }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
         let mut dependency_count = 0;
         for predecessor in Iterator::chain(
-            self.pending_render.iter(), self.pending_render_queued.iter(),
-        ).flatten()
+            self.pending_render.iter().flatten(),
+            self.pending_render_queued.iter().flatten(),
+        )
         {
             if let Some(dependency) = completion.predecessor_dependency(predecessor)? {
                 let target = render_dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)?;
@@ -8076,7 +8080,7 @@ impl G17PLiveRuntime {
         let mut render_event_masks = KVec::with_capacity(owner_count, GFP_KERNEL)?;
         for _ in 0..owner_count {
             pending_render.push(None, GFP_KERNEL)?;
-            pending_render_queued.push(None, GFP_KERNEL)?;
+            pending_render_queued.push(g17_completion::PairFifo::new(), GFP_KERNEL)?;
             render_event_masks.push([0; 2], GFP_KERNEL)?;
         }
         let quarantined_render_completions = KVec::with_capacity(
@@ -8298,9 +8302,11 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
             // successful stop is the independent release witness.
             completion.release_after_processor_stop();
         }
-        for completion in self.pending_render_queued.iter_mut().filter_map(Option::take) {
-            completion.complete(Err(EIO));
-            completion.release_after_processor_stop();
+        for queued in self.pending_render_queued.iter_mut() {
+            while let Some(completion) = queued.take() {
+                completion.complete(Err(EIO));
+                completion.release_after_processor_stop();
+            }
         }
         self.release_quarantined_render_after_processor_stop();
         self.render_event_masks.fill([0; 2]);
@@ -8459,9 +8465,11 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
             completion.complete(Err(EIO));
             completion.release_after_processor_stop();
         }
-        for completion in self.pending_render_queued.iter_mut().filter_map(Option::take) {
-            completion.complete(Err(EIO));
-            completion.release_after_processor_stop();
+        for queued in self.pending_render_queued.iter_mut() {
+            while let Some(completion) = queued.take() {
+                completion.complete(Err(EIO));
+                completion.release_after_processor_stop();
+            }
         }
         self.release_quarantined_render_after_processor_stop();
         self.render_event_masks.fill([0; 2]);

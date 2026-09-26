@@ -1051,6 +1051,66 @@ impl RenderQueueWindow {
     }
 }
 
+/// Bounded FIFO of work queued behind the front render of one physical pair,
+/// oldest first. Fixed capacity, so admission and retirement never allocate.
+pub(crate) struct PairFifo<T, const N: usize> {
+    slots: [Option<T>; N],
+    len: usize,
+}
+
+impl<T, const N: usize> PairFifo<T, N> {
+    pub(crate) const fn new() -> Self {
+        Self { slots: [const { None }; N], len: 0 }
+    }
+
+    /// True when anything is queued.
+    pub(crate) fn is_some(&self) -> bool { self.len != 0 }
+
+    pub(crate) fn is_none(&self) -> bool { self.len == 0 }
+
+    pub(crate) fn has_room(&self) -> bool { self.len < N }
+
+    pub(crate) fn front(&self) -> Option<&T> {
+        if self.len == 0 { None } else { self.slots[0].as_ref() }
+    }
+
+    pub(crate) fn push(&mut self, item: T) -> core::result::Result<(), T> {
+        if self.len >= N { return Err(item); }
+        self.slots[self.len] = Some(item);
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Remove and return the oldest queued item.
+    pub(crate) fn take(&mut self) -> Option<T> {
+        if self.len == 0 { return None; }
+        let item = self.slots[0].take();
+        for index in 1..self.len {
+            self.slots[index - 1] = self.slots[index].take();
+        }
+        self.len -= 1;
+        item
+    }
+
+    pub(crate) fn clear(&mut self) {
+        while self.take().is_some() {}
+    }
+
+    pub(crate) fn iter(&self) -> core::iter::Flatten<core::slice::Iter<'_, Option<T>>> {
+        self.slots[..self.len].iter().flatten()
+    }
+}
+
+impl<T, const N: usize> Default for PairFifo<T, N> {
+    fn default() -> Self { Self::new() }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a PairFifo<T, N> {
+    type Item = &'a T;
+    type IntoIter = core::iter::Flatten<core::slice::Iter<'a, Option<T>>>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+
 /// Render-only normalization: the generic observer and proven compute path
 /// retain their strict linear semantics. Reports retain raw native cursors.
 pub(crate) fn observe_paired_render_window(
@@ -1085,19 +1145,35 @@ pub(crate) fn observe_paired_render_window_depth(
     fragment_current: QueueIndices,
     execution: RenderExecutionState,
 ) -> Result<PairedRenderCompletion, CompletionDecodeError> {
-    let limit = window.count.checked_mul(max_groups)
+    // Up to max_groups groups share one physical pair. A queued render's
+    // previous snapshot can predate earlier groups still in flight (cursors
+    // behind this window's base), and either snapshot can include later
+    // groups (cursors past this target). Anchor the modular window that many
+    // groups before this base so every legal cursor is a small non-negative
+    // distance; completion is still done >= this group's own target.
+    let groups = max_groups.max(1);
+    let back = window.count.checked_mul(groups - 1)
         .ok_or(CompletionDecodeError::RenderWindow)?;
-    // Both snapshots may already include successors queued on the same
-    // pair: the previous observation can carry a later group's write
-    // pointer, and the current one its done/read cursors. Bound both by the
-    // same host publication depth; completion is still done >= this target.
+    let limit = window.count.checked_mul(groups)
+        .and_then(|ahead| ahead.checked_add(back))
+        .ok_or(CompletionDecodeError::RenderWindow)?;
+    if limit >= window.capacity {
+        return Err(CompletionDecodeError::RenderWindow);
+    }
+    let anchored = RenderQueueWindow {
+        base: ((u64::from(window.base) + u64::from(window.capacity) - u64::from(back))
+            % u64::from(window.capacity)) as u32,
+        count: window.count,
+        capacity: window.capacity,
+    };
+    let prefix = back + window.count;
     let mut result = observe_paired_render_completion(
-        window.normalize_with_limit(tiling_previous, limit)?,
-        window.normalize_with_limit(tiling_current, limit)?,
-        window.count,
-        window.normalize_with_limit(fragment_previous, limit)?,
-        window.normalize_with_limit(fragment_current, limit)?,
-        window.count,
+        anchored.normalize_with_limit(tiling_previous, limit)?,
+        anchored.normalize_with_limit(tiling_current, limit)?,
+        prefix,
+        anchored.normalize_with_limit(fragment_previous, limit)?,
+        anchored.normalize_with_limit(fragment_current, limit)?,
+        prefix,
         execution,
     )?;
     result.tiling.indices = tiling_current;
