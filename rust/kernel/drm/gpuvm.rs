@@ -588,11 +588,58 @@ impl<T: DriverGpuVm> GpuVm<T> {
                 }),
                 GFP_KERNEL,
             )?,
-            obj,
+            objects: LockedObjects::Single(obj),
         });
 
         // SAFETY: The object is valid and was initialized above
         to_result(unsafe { bindings::drm_gpuvm_exec_lock(&mut *guard.vm_exec) })?;
+
+        Ok(ManuallyDrop::into_inner(guard))
+    }
+
+    /// Lock the GPUVM and an array of additional GEM objects in one
+    /// wound/wait transaction.
+    pub fn exec_lock_array<'a, 'b>(
+        &'a self,
+        objects: &'b [ARef<Object<T>>],
+        interruptible: bool,
+    ) -> Result<LockedGpuVm<'a, 'b, T>> {
+        let count = u32::try_from(objects.len()).map_err(|_| EINVAL)?;
+        let mut raw_objects = KVec::with_capacity(objects.len(), GFP_KERNEL)?;
+        for object in objects {
+            raw_objects.push(object.as_raw(), GFP_KERNEL)?;
+        }
+
+        let mut guard = ManuallyDrop::new(LockedGpuVm {
+            gpuvm: self,
+            // vm_exec needs to be pinned, so stick it in a Box.
+            vm_exec: KBox::init(
+                init!(bindings::drm_gpuvm_exec {
+                    vm: self.gpuvm() as *mut _,
+                    flags: (if interruptible {
+                        bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
+                    } else {
+                        0
+                    }) | bindings::DRM_EXEC_IGNORE_DUPLICATES,
+                    exec: Default::default(),
+                    extra: Default::default(),
+                    num_fences: 0,
+                }),
+                GFP_KERNEL,
+            )?,
+            objects: LockedObjects::Array(objects),
+        });
+
+        // SAFETY: Every raw pointer is backed by an ARef in `objects`, which
+        // outlives the returned guard. The helper consumes the temporary
+        // pointer array before returning and keeps its own object references.
+        to_result(unsafe {
+            bindings::drm_gpuvm_exec_lock_array(
+                &mut *guard.vm_exec,
+                raw_objects.as_mut_ptr(),
+                count,
+            )
+        })?;
 
         Ok(ManuallyDrop::into_inner(guard))
     }
@@ -671,15 +718,36 @@ unsafe impl<T: DriverGpuVm> AlwaysRefCounted for GpuVm<T> {
     }
 }
 
+enum LockedObjects<'a, T: DriverGpuVm> {
+    Single(Option<&'a Object<T>>),
+    Array(&'a [ARef<Object<T>>]),
+}
+
+impl<T: DriverGpuVm> LockedObjects<'_, T> {
+    fn single(&self) -> Option<&Object<T>> {
+        match self {
+            Self::Single(object) => *object,
+            Self::Array(_) => None,
+        }
+    }
+
+    fn indexed(&self, index: usize) -> Option<&Object<T>> {
+        match self {
+            Self::Array(objects) => objects.get(index).map(|object| &**object),
+            Self::Single(_) => None,
+        }
+    }
+}
+
 pub struct LockedGpuVm<'a, 'b, T: DriverGpuVm> {
     gpuvm: &'a GpuVm<T>,
     vm_exec: KBox<bindings::drm_gpuvm_exec>,
-    obj: Option<&'b Object<T>>,
+    objects: LockedObjects<'b, T>,
 }
 
 impl<T: DriverGpuVm> LockedGpuVm<'_, '_, T> {
     pub fn find_bo(&mut self) -> Option<ARef<GpuVmBo<T>>> {
-        let obj = self.obj?;
+        let obj = self.objects.single()?;
         // SAFETY: LockedGpuVm implies the right locks are held.
         let p = unsafe {
             bindings::drm_gpuvm_bo_find(
@@ -699,7 +767,7 @@ impl<T: DriverGpuVm> LockedGpuVm<'_, '_, T> {
     }
 
     pub fn obtain_bo(&mut self) -> Result<ARef<GpuVmBo<T>>> {
-        let obj = self.obj.ok_or(EINVAL)?;
+        let obj = self.objects.single().ok_or(EINVAL)?;
         // SAFETY: LockedGpuVm implies the right locks are held.
         let p = unsafe {
             bindings::drm_gpuvm_bo_obtain_locked(
@@ -727,7 +795,55 @@ impl<T: DriverGpuVm> LockedGpuVm<'_, '_, T> {
         req_gem_range: u32,
         flags: GpuVaFlags,
     ) -> Result {
-        let obj = self.obj.ok_or(EINVAL)?;
+        let obj = self.objects.single().ok_or(EINVAL)?.as_raw();
+        self.sm_map_raw(
+            obj,
+            ctx,
+            req_addr,
+            req_range,
+            req_offset,
+            req_gem_range,
+            flags,
+        )
+    }
+
+    /// Map with an object acquired by [`GpuVm::exec_lock_array`].
+    pub fn sm_map_indexed(
+        &mut self,
+        object_index: usize,
+        ctx: &mut T::StepContext,
+        req_addr: u64,
+        req_range: u64,
+        req_offset: u64,
+        req_gem_range: u32,
+        flags: GpuVaFlags,
+    ) -> Result {
+        let obj = self
+            .objects
+            .indexed(object_index)
+            .ok_or(EINVAL)?
+            .as_raw();
+        self.sm_map_raw(
+            obj,
+            ctx,
+            req_addr,
+            req_range,
+            req_offset,
+            req_gem_range,
+            flags,
+        )
+    }
+
+    fn sm_map_raw(
+        &mut self,
+        obj: *mut bindings::drm_gem_object,
+        ctx: &mut T::StepContext,
+        req_addr: u64,
+        req_range: u64,
+        req_offset: u64,
+        req_gem_range: u32,
+        flags: GpuVaFlags,
+    ) -> Result {
         let mut ctx = StepContext {
             ctx,
             gpuvm: self.gpuvm,
@@ -742,13 +858,14 @@ impl<T: DriverGpuVm> LockedGpuVm<'_, '_, T> {
                 gem: bindings::drm_gpuva_op_map__bindgen_ty_2 {
                     offset: req_offset,
                     range: req_gem_range,
-                    obj: obj.as_raw(),
+                    obj,
                 },
                 flags: flags.as_raw(),
             },
         };
 
-        // SAFETY: LockedGpuVm implies the right locks are held.
+        // SAFETY: The object pointer came from the reference set retained by
+        // this guard, and LockedGpuVm implies the required locks are held.
         to_result(unsafe {
             bindings::drm_gpuvm_sm_map(
                 self.gpuvm.gpuvm() as *mut _,

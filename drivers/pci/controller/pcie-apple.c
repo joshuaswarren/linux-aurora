@@ -33,9 +33,39 @@
 #include <linux/pci-apple.h>
 #include <linux/pci-ecam.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/workqueue.h>
 
 #include "../pci.h"
 #include "pci-host-common.h"
+#include "pcie-apple-piodma.h"
+
+static bool piodma_config = true;
+module_param(piodma_config, bool, 0644);
+MODULE_PARM_DESC(piodma_config,
+		 "use PIODMA for downstream PCI configuration accesses");
+static bool piodma_config_writes;
+module_param(piodma_config_writes, bool, 0644);
+MODULE_PARM_DESC(piodma_config_writes,
+		 "use PIODMA for downstream PCI configuration writes");
+static int piodma_config_read_limit = 1;
+module_param(piodma_config_read_limit, int, 0644);
+MODULE_PARM_DESC(piodma_config_read_limit,
+		 "maximum downstream PIODMA config reads; negative is unlimited");
+
+static uint sunrise_power_off_ms = 2;
+module_param(sunrise_power_off_ms, uint, 0644);
+MODULE_PARM_DESC(sunrise_power_off_ms,
+		 "J700 RegOn low interval in milliseconds (default: Apple 2 ms)");
+
+static uint sunrise_power_on_ms = 150;
+module_param(sunrise_power_on_ms, uint, 0644);
+MODULE_PARM_DESC(sunrise_power_on_ms,
+		 "J700 RegOn high settle in milliseconds (default: Apple 150 ms)");
+
+static uint sunrise_link_retries;
+module_param(sunrise_link_retries, uint, 0644);
+MODULE_PARM_DESC(sunrise_link_retries,
+		 "bounded J700 RegOn/PERST link-recovery attempts (default: 0)");
 
 static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
@@ -119,6 +149,7 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PORT_PERST_OFF		BIT(0)
 #define PORT_RID2SID			0x00828
 #define   PORT_RID2SID_VALID		BIT(31)
+#define   PORT_RID2SID_SID		GENMASK(19, 16)
 #define   PORT_RID2SID_SID_SHIFT	16
 #define   PORT_RID2SID_BUS_SHIFT	8
 #define   PORT_RID2SID_DEV_SHIFT	3
@@ -169,6 +200,10 @@ struct hw_info {
 	u32 port_msimap;
 	u32 max_rid2sid;
 	bool tunneled;
+	bool rid2sid_index_is_sid;
+	bool clear_phy_refclk_cgen;
+	bool sunrise_power_sequence;
+	bool requires_piodma;
 };
 
 static const struct hw_info t8103_hw = {
@@ -202,6 +237,22 @@ static const struct hw_info t8103_pciec_hw = {
 	.tunneled		= true,
 };
 
+static const struct hw_info t8140_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	/* J700 ADT sid-count is 19. AppleT8140PCIe uses slot == SID. */
+	.max_rid2sid		= 19,
+	.rid2sid_index_is_sid = true,
+	.clear_phy_refclk_cgen = true,
+	.sunrise_power_sequence = true,
+	.requires_piodma = true,
+};
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
@@ -222,6 +273,11 @@ struct apple_pcie {
 	struct irq_fwspec	fwspec;
 	struct irq_domain	*msi_domain;
 	u32			nvecs;
+	bool			hide_bdf;
+	u16			hidden_bdf;
+	u8			valid_functions;
+	struct apple_pcie_piodma *piodma;
+	u32			piodma_config_reads;
 };
 
 struct apple_pcie_port {
@@ -230,6 +286,10 @@ struct apple_pcie_port {
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
+	struct gpio_desc	*reset_gpio;
+	struct gpio_desc	*pwren_gpio;
+	struct work_struct	link_down_work;
+	bool			link_retrain_attempted;
 	struct irq_domain	*domain;
 	struct list_head	entry;
 	unsigned long		*sid_map;
@@ -242,6 +302,50 @@ struct apple_pcie_port {
 	int			idx;
 	bool			started;
 };
+
+static void apple_pcie_link_down_work(struct work_struct *work)
+{
+	struct apple_pcie_port *port =
+		container_of(work, struct apple_pcie_port, link_down_work);
+	u32 before, after = 0;
+	int pwren = -ENODEV, reset = -ENODEV;
+	int ret;
+
+	if (port->pwren_gpio)
+		pwren = gpiod_get_value_cansleep(port->pwren_gpio);
+	if (port->reset_gpio)
+		reset = gpiod_get_value_cansleep(port->reset_gpio);
+
+	dev_info(port->pcie->dev,
+		 "J700_T8140_PCIE_LINK_DOWN_GPIOS: pwren=%d reset=%d\n",
+		 pwren, reset);
+
+	if (!port->pcie->hw->sunrise_power_sequence ||
+	    port->link_retrain_attempted)
+		return;
+	port->link_retrain_attempted = true;
+
+	/* The J700 endpoint leaves the link cleanly with RegOn asserted and
+	 * PERST# deasserted.  Restart only the surviving root-port LTSSM once;
+	 * never touch the post-drop PHY aperture, which is known to SError.
+	 */
+	before = readl_relaxed(port->base + PORT_LINKSTS);
+	writel_relaxed(0, port->base + PORT_LTSSMCTL);
+	readl_relaxed(port->base + PORT_LTSSMCTL);
+	writel_relaxed(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, after,
+					 after & PORT_LINKSTS_UP, 1000, 250000);
+	if (ret) {
+		dev_info(port->pcie->dev,
+			 "J700_T8140_PCIE_LINK_RETRAIN_FAIL: before=0x%08x after=0x%08x timeout_us=250000 phy_accesses=0 power_toggles=0\n",
+			 before, after);
+		return;
+	}
+
+	dev_info(port->pcie->dev,
+		 "J700_T8140_PCIE_LINK_RETRAIN_PASS: before=0x%08x after=0x%08x phy_accesses=0 power_toggles=0\n",
+		 before, after);
+}
 
 static void rmw_set(u32 set, void __iomem *addr)
 {
@@ -331,6 +435,39 @@ static void apple_pcie_tunnel_apply_tunable(void __iomem *base,
 			apple_pcie_tunnel_writel(base, value,
 						  tunable->values[i].offset);
 	}
+}
+
+static int apple_pcie_sunrise_recover_link(struct apple_pcie_port *port,
+					   unsigned int attempt)
+{
+	struct apple_pcie *pcie = port->pcie;
+	u32 stat;
+	int ret;
+
+	if (!port->pwren_gpio || !port->reset_gpio)
+		return -ENODEV;
+
+	writel_relaxed(0, port->base + PORT_LTSSMCTL);
+	readl_relaxed(port->base + PORT_LTSSMCTL);
+	rmw_clear(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	gpiod_set_value_cansleep(port->reset_gpio, 1);
+	gpiod_set_value_cansleep(port->pwren_gpio, 0);
+	if (sunrise_power_off_ms <= 20)
+		fsleep(sunrise_power_off_ms * 1000);
+	else
+		msleep(sunrise_power_off_ms);
+	gpiod_set_value_cansleep(port->pwren_gpio, 1);
+	msleep(sunrise_power_on_ms);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	gpiod_set_value_cansleep(port->reset_gpio, 0);
+	msleep(100);
+
+	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					 stat & PORT_STATUS_READY, 100, 250000);
+	dev_info(pcie->dev,
+		 "J700_T8140_PCIE_LINK_RECOVERY_CYCLE: attempt=%u off_ms=%u on_ms=%u port_status=0x%08x ret=%d\n",
+		 attempt, sunrise_power_off_ms, sunrise_power_on_ms, stat, ret);
+	return ret;
 }
 
 static void apple_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
@@ -584,6 +721,8 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 	case PORT_INT_LINK_DOWN:
 		dev_info_ratelimited(port->pcie->dev, "Link down on %pOF\n",
 				     port->np);
+		if (port->pcie->hw->sunrise_power_sequence)
+			schedule_work(&port->link_down_work);
 		break;
 	default:
 		return IRQ_NONE;
@@ -994,6 +1133,7 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 		irq_dispose_mapping(port->irq);
 		port->irq = 0;
 	}
+	cancel_work_sync(&port->link_down_work);
 
 	if (port->domain) {
 		irq_domain_remove(port->domain);
@@ -1071,6 +1211,15 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	u32 stat;
 	int ret;
 
+	if (pcie->hw->sunrise_power_sequence &&
+	    (!sunrise_power_off_ms || sunrise_power_off_ms > 5000 ||
+	     !sunrise_power_on_ms || sunrise_power_on_ms > 5000))
+		return dev_err_probe(pcie->dev, -EINVAL,
+				     "J700 RegOn timing outside 1..5000 ms\n");
+	if (pcie->hw->sunrise_power_sequence && sunrise_link_retries > 5)
+		return dev_err_probe(pcie->dev, -EINVAL,
+				     "J700 link retries outside 0..5\n");
+
 	/*
 	 * Assert PERST# and configure the pin as output.
 	 * The Aquantia AQC113 10GB nic used desktop macs is sensitive to
@@ -1106,29 +1255,64 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		else
 			return PTR_ERR(pwren);
 	}
+	port->reset_gpio = reset;
+	port->pwren_gpio = pwren;
 
 	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
 
 	/* Assert PERST# before setting up the clock */
+	if (pcie->hw->sunrise_power_sequence)
+		rmw_clear(PORT_PERST_OFF,
+			  port->base + pcie->hw->port_perst);
 	gpiod_set_value_cansleep(reset, 1);
 	for (u32 idx = 0; idx < num_aux_resets; idx++)
 		gpiod_set_value_cansleep(aux_reset[idx], 1);
 
+	/*
+	 * AppleSunriseHAL's J700 attach path performs an explicit RegOn power
+	 * cycle before enabling the PCIe port: low for 2 ms, high for 150 ms,
+	 * then port enable.  function-reg_on is this port's PWREN descriptor.
+	 */
+	if (pcie->hw->sunrise_power_sequence && pwren) {
+		gpiod_set_value_cansleep(pwren, 0);
+		if (sunrise_power_off_ms <= 20)
+			fsleep(sunrise_power_off_ms * 1000);
+		else
+			msleep(sunrise_power_off_ms);
+	}
+
 	/* Power on the device if required */
 	gpiod_set_value_cansleep(pwren, 1);
 
-	ret = apple_pcie_setup_refclk(pcie, port);
-	if (ret < 0)
-		return ret;
+	if (pcie->hw->sunrise_power_sequence) {
+		/*
+		 * Stage 2 initialized the T8140 port PHY before U-Boot.  Preserve
+		 * that inherited clock state in the post-root path: replaying the
+		 * request/ack handshake after Linux owns the live hierarchy makes
+		 * the root port disappear from config space.
+		 */
+		dev_info(pcie->dev,
+			 "J700_T8140_PCIE_REFCLK_INHERIT_PASS: source=stage2\n");
+	} else {
+		ret = apple_pcie_setup_refclk(pcie, port);
+		if (ret < 0)
+			return ret;
+	}
 
 	/*
 	 * The minimal Tperst-clk value is 100us (PCIe CEM r5.0, 2.9.2)
 	 * If powering up, the minimal Tpvperl is 100ms
 	 */
-	if (pwren)
+	if (pcie->hw->sunrise_power_sequence && pwren) {
+		msleep(sunrise_power_on_ms);
+		dev_info(pcie->dev,
+			 "J700_T8140_SUNRISE_POWER_SEQUENCE_PASS: pwren=0->1 off_ms=%u on_ms=%u\n",
+			 sunrise_power_off_ms, sunrise_power_on_ms);
+	} else if (pwren) {
 		msleep(100);
-	else
+	} else {
 		usleep_range(100, 200);
+	}
 
 	/* Deassert PERST# */
 	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
@@ -1162,6 +1346,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	port = devm_kzalloc(pcie->dev, sizeof(*port), GFP_KERNEL);
 	if (!port)
 		return -ENOMEM;
+	INIT_WORK(&port->link_down_work, apple_pcie_link_down_work);
 
 	port->sid_map = devm_bitmap_zalloc(pcie->dev, pcie->hw->max_rid2sid, GFP_KERNEL);
 	if (!port->sid_map)
@@ -1228,6 +1413,13 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			port->phy = NULL;
 			goto err_teardown;
 		}
+		/* J700 leaves this port cold until the post-root radio overlay. */
+		if (pcie->hw->sunrise_power_sequence) {
+			rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+			dev_info(pcie->dev,
+				 "J700_T8140_PCIE_APPCLK_PRELINK_PASS: port=%u\n",
+				 port->idx);
+		}
 	}
 	if (pcie->hw->tunneled) {
 		/*
@@ -1270,6 +1462,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	if (pcie->hw->port_refclk)
 		rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
+	else if (port->phy && pcie->hw->clear_phy_refclk_cgen)
+		rmw_clear(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
 	else if (port->phy)
 		rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
 
@@ -1301,7 +1495,9 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	link_stat = apple_pcie_port_readl(port, PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
-		unsigned long timeout, left;
+		unsigned long timeout, left = 0;
+		unsigned int attempt, retries = pcie->hw->sunrise_power_sequence ?
+						 sunrise_link_retries : 0;
 
 		if (pcie->hw->tunneled) {
 			ret = apple_pcie_tunnel_release_reset(port);
@@ -1309,16 +1505,27 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 				goto err_teardown;
 		}
 
-		/* start link training */
-		apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
-
 		timeout = link_up_timeout * HZ / 1000;
-		left = wait_for_completion_timeout(&pcie->event, timeout);
+		for (attempt = 0; attempt <= retries; attempt++) {
+			if (attempt) {
+				ret = apple_pcie_sunrise_recover_link(port, attempt);
+				if (ret)
+					continue;
+			}
+			reinit_completion(&pcie->event);
+			apple_pcie_port_writel(port, PORT_LTSSMCTL_START,
+					       PORT_LTSSMCTL);
+			left = wait_for_completion_timeout(&pcie->event, timeout);
+			if (left)
+				break;
+		}
 		if (!left)
-			dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
+			dev_warn(pcie->dev,
+				 "%pOF link didn't come up after %u attempt(s)\n",
+				 np, retries + 1);
 		else
-			dev_info(pcie->dev, "%pOF link up after %ldms\n", np,
-				 (timeout - left) * 1000 / HZ);
+			dev_info(pcie->dev, "%pOF link up after %ldms attempt=%u\n",
+				 np, (timeout - left) * 1000 / HZ, attempt);
 
 	}
 	if (pcie->hw->tunneled)
@@ -1408,6 +1615,165 @@ static struct apple_pcie *apple_pcie_lookup(struct device *dev)
 	return pci_host_bridge_priv(dev_get_drvdata(dev));
 }
 
+static bool apple_pcie_config_hidden(struct apple_pcie *pcie,
+				     struct pci_bus *bus, unsigned int devfn)
+{
+	struct pci_config_window *cfg = bus->sysdata;
+	u16 bdf = (bus->number << 8) | devfn;
+
+	if (pcie && pcie->hide_bdf && bdf == pcie->hidden_bdf)
+		return true;
+	if (pcie && pcie->valid_functions &&
+	    bus->number == cfg->busr.start + 1 && PCI_SLOT(devfn) == 0 &&
+	    !(pcie->valid_functions & BIT(PCI_FUNC(devfn))))
+		return true;
+
+	return false;
+}
+
+static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
+					unsigned int devfn, int where)
+{
+	struct pci_config_window *cfg = bus->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
+
+	if (apple_pcie_config_hidden(pcie, bus, devfn))
+		return NULL;
+	if (pcie && pcie->piodma && piodma_config &&
+	    bus->number != cfg->busr.start)
+		return NULL;
+
+	return pci_ecam_map_bus(bus, devfn, where);
+}
+
+static phys_addr_t apple_pcie_config_address(struct pci_config_window *cfg,
+					      struct pci_bus *bus,
+					      unsigned int devfn, int where)
+{
+	u32 busn = bus->number - cfg->busr.start;
+
+	return cfg->res.start + PCIE_ECAM_OFFSET(busn, devfn, where);
+}
+
+static int apple_pcie_direct_config_read(struct pci_bus *bus,
+					  unsigned int devfn, int where,
+					  int size, u32 *value)
+{
+	void __iomem *addr = pci_ecam_map_bus(bus, devfn, where);
+
+	if (!addr) {
+		*value = ~0U;
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	}
+	switch (size) {
+	case 1:
+		*value = readb(addr);
+		break;
+	case 2:
+		*value = readw(addr);
+		break;
+	case 4:
+		*value = readl(addr);
+		break;
+	default:
+		*value = ~0U;
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+	}
+
+	return PCIBIOS_SUCCESSFUL;
+}
+
+static int apple_pcie_config_read(struct pci_bus *bus, unsigned int devfn,
+				  int where, int size, u32 *value)
+{
+	struct pci_config_window *cfg = bus->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
+	u32 aligned_value, mask, shift;
+	phys_addr_t address;
+	int ret;
+
+	if (apple_pcie_config_hidden(pcie, bus, devfn))
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	if (!pcie || !pcie->piodma || !piodma_config ||
+	    bus->number == cfg->busr.start)
+		return pci_generic_config_read(bus, devfn, where, size, value);
+	if (piodma_config_read_limit >= 0 &&
+	    pcie->piodma_config_reads >= piodma_config_read_limit)
+		return apple_pcie_direct_config_read(bus, devfn, where, size,
+					     value);
+
+	address = apple_pcie_config_address(cfg, bus, devfn, where & ~3);
+	ret = apple_pcie_piodma_read(pcie->piodma, address, 4,
+				      &aligned_value, true);
+	if (ret) {
+		*value = ~0U;
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	}
+	shift = (where & 3) * 8;
+	mask = size == 1 ? U8_MAX : size == 2 ? U16_MAX : U32_MAX;
+	*value = (aligned_value >> shift) & mask;
+	pcie->piodma_config_reads++;
+
+	return PCIBIOS_SUCCESSFUL;
+}
+
+static int apple_pcie_direct_config_write(struct pci_bus *bus,
+					   unsigned int devfn, int where,
+					   int size, u32 value)
+{
+	void __iomem *addr = pci_ecam_map_bus(bus, devfn, where);
+
+	if (!addr)
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	switch (size) {
+	case 1:
+		writeb(value, addr);
+		break;
+	case 2:
+		writew(value, addr);
+		break;
+	case 4:
+		writel(value, addr);
+		break;
+	default:
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+	}
+
+	return PCIBIOS_SUCCESSFUL;
+}
+
+static int apple_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
+				   int where, int size, u32 value)
+{
+	struct pci_config_window *cfg = bus->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
+	u32 aligned_value, mask, shift;
+	phys_addr_t address;
+	int ret;
+
+	if (apple_pcie_config_hidden(pcie, bus, devfn))
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	if (!pcie || !pcie->piodma || !piodma_config ||
+	    bus->number == cfg->busr.start)
+		return pci_generic_config_write(bus, devfn, where, size, value);
+	if (!piodma_config_writes)
+		return apple_pcie_direct_config_write(bus, devfn, where, size,
+					      value);
+
+	address = apple_pcie_config_address(cfg, bus, devfn, where & ~3);
+	if (size != 4) {
+		ret = apple_pcie_piodma_read(pcie->piodma, address, 4,
+					      &aligned_value, true);
+		if (ret)
+			return PCIBIOS_SET_FAILED;
+		shift = (where & 3) * 8;
+		mask = (size == 1 ? U8_MAX : U16_MAX) << shift;
+		value = (aligned_value & ~mask) | ((value << shift) & mask);
+	}
+	ret = apple_pcie_piodma_write(pcie->piodma, address, 4, value, true);
+	return ret ? PCIBIOS_SET_FAILED : PCIBIOS_SUCCESSFUL;
+}
+
 static struct apple_pcie_port *apple_pcie_get_port(struct pci_dev *pdev)
 {
 	struct pci_config_window *cfg = pdev->sysdata;
@@ -1463,14 +1829,26 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 			"iommu-map-mask", NULL, &sid);
 	if (err)
 		return err;
+	if (!FIELD_FIT(PORT_RID2SID_SID, sid))
+		return -ERANGE;
 
 	mutex_lock(&port->pcie->lock);
 
-	idx = bitmap_find_free_region(port->sid_map, port->sid_map_sz, 0);
+	if (port->pcie->hw->rid2sid_index_is_sid) {
+		if (sid >= port->sid_map_sz || test_bit(sid, port->sid_map)) {
+			idx = -ENOSPC;
+		} else {
+			__set_bit(sid, port->sid_map);
+			idx = sid;
+		}
+	} else {
+		idx = bitmap_find_free_region(port->sid_map,
+					      port->sid_map_sz, 0);
+	}
 	if (idx >= 0) {
 		apple_pcie_rid2sid_write(port, idx,
 					 PORT_RID2SID_VALID |
-					 (sid << PORT_RID2SID_SID_SHIFT) | rid);
+					 FIELD_PREP(PORT_RID2SID_SID, sid) | rid);
 
 		dev_dbg(&pdev->dev, "mapping RID%x to SID%x (index %d)\n",
 			rid, sid, idx);
@@ -1520,6 +1898,29 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 		return -ENOENT;
 	pcie->cfg = cfg;
 
+	if (pcie->hw->requires_piodma && piodma_config) {
+		struct device_node *node;
+
+		node = of_parse_phandle(dev->of_node, "apple,piodma", 0);
+		if (!node)
+			return dev_err_probe(dev, -ENODEV,
+					     "T8140 requires apple,piodma\n");
+		pcie->piodma = apple_pcie_piodma_create(dev, node);
+		of_node_put(node);
+		if (IS_ERR(pcie->piodma)) {
+			ret = dev_err_probe(dev, PTR_ERR(pcie->piodma),
+					    "failed to initialize APCIe PIODMA\n");
+			pcie->piodma = NULL;
+			return ret;
+		}
+		dev_info(dev,
+			 "J700_PCIE_PIODMA_CONFIG: enabled=1 read_limit=%d writes=%u\n",
+			 piodma_config_read_limit, piodma_config_writes);
+	} else if (pcie->hw->requires_piodma) {
+		dev_info(dev,
+			 "J700_PCIE_PIODMA_CONFIG: enabled=0 provider=skipped diagnostic=1\n");
+	}
+
 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
 		ret = apple_pcie_setup_port(pcie, of_port);
 		if (ret) {
@@ -1536,9 +1937,9 @@ static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
 	.enable_device	= apple_pcie_enable_device,
 	.disable_device	= apple_pcie_disable_device,
 	.pci_ops	= {
-		.map_bus	= pci_ecam_map_bus,
-		.read		= pci_generic_config_read,
-		.write		= pci_generic_config_write,
+		.map_bus	= apple_pcie_map_bus,
+		.read		= apple_pcie_config_read,
+		.write		= apple_pcie_config_write,
 	}
 };
 
@@ -1789,6 +2190,36 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	{
+		u32 hidden_bdf;
+		u32 valid_functions;
+
+		if (!of_property_read_u32(dev->of_node,
+					  "apple,hide-pci-bdf", &hidden_bdf)) {
+			if (hidden_bdf > U16_MAX)
+				return dev_err_probe(dev, -EINVAL,
+						     "invalid hidden PCI BDF 0x%x\n",
+						     hidden_bdf);
+			pcie->hide_bdf = true;
+			pcie->hidden_bdf = hidden_bdf;
+			dev_info(dev,
+				 "J700_PCIE_HIDE_BDF_ARMED: bus=%02x dev=%02x fn=%u\n",
+				 hidden_bdf >> 8,
+				 PCI_SLOT(hidden_bdf & 0xff),
+				 PCI_FUNC(hidden_bdf & 0xff));
+		}
+		if (!of_property_read_u32(dev->of_node,
+					  "apple,valid-functions", &valid_functions)) {
+			if (!valid_functions || valid_functions > U8_MAX)
+				return dev_err_probe(dev, -EINVAL,
+						     "invalid function mask 0x%x\n",
+						     valid_functions);
+			pcie->valid_functions = valid_functions;
+			dev_info(dev,
+				 "J700_PCIE_VALID_FUNCTIONS: downstream-slot=0 mask=0x%02x\n",
+				 pcie->valid_functions);
+		}
+	}
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))
 		return PTR_ERR(pcie->base);
@@ -1993,6 +2424,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6000-pciec",	.data = &t8103_pciec_hw },
+	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }

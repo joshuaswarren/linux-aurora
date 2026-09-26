@@ -11,6 +11,7 @@
 #include <linux/component.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/of_address.h>
@@ -59,7 +60,7 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
                             struct drm_device *drm,
                             struct drm_mode_create_dumb *args)
 {
-        args->pitch = ALIGN(DIV_ROUND_UP(args->width * args->bpp, 8), 64);
+	args->pitch = apple_dcp_linear_pitch(args->width, args->bpp);
         args->size = round_up(args->pitch * args->height, DART_PAGE_SIZE);
 
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
@@ -126,6 +127,13 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	if (crtc_state->active_changed && !crtc_state->active) {
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+
+		/*
+		 * The ACTIVE_ONLY plane pass of commit_tail_rpm() skips this
+		 * CRTC's planes and flush, so hold its framebuffers here: the
+		 * coprocessor keeps scanning the last one out.
+		 */
+		dcp_retain_unbound_fbs_pdev(apple_crtc->dcp, crtc, state);
 		dcp_poweroff(apple_crtc->dcp);
 	}
 
@@ -356,26 +364,23 @@ static int apple_probe_per_dcp(struct device *dev,
 	struct apple_crtc *crtc;
 	struct apple_encoder *enc;
 	struct drm_plane *planes[DCP_MAX_PLANES];
-	unsigned long *iomfb_surfaces = dcp_get_iomfb_surfaces(dcp);
-	int ret;
-	int connector_type;
-	u32 surf;
-	int zpos = 0;
+	const u32 *iomfb_surfaces;
+	enum drm_plane_type type;
+	u32 num_surfaces;
+	int ret, zpos, connector_type;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
-	enum drm_plane_type plane_type;
 
-	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
-		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
-		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
-						supports_l10r, plane_type);
+	iomfb_surfaces = dcp_get_iomfb_surfaces(dcp, &num_surfaces);
+	for (zpos = 0; zpos < num_surfaces; zpos++) {
+		type = zpos ? DRM_PLANE_TYPE_OVERLAY : DRM_PLANE_TYPE_PRIMARY;
+		planes[zpos] = apple_plane_init(drm, 1U << num,
+						 iomfb_surfaces[zpos],
+						 supports_l10r, type);
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
-
 		ret = drm_plane_create_zpos_immutable_property(planes[zpos], zpos);
 		if (ret)
 			return ret;
-
-		zpos++;
 	}
 
 	/*
@@ -638,6 +643,59 @@ static int apple_drm_init(struct device *dev)
 		return PTR_ERR(apple);
 
 	dev_set_drvdata(dev, apple);
+
+	/*
+	 * The display engine scans out through this device's IOMMU stream, but
+	 * apple-dart only programs a translation table when something actually
+	 * maps through the domain.  With nothing mapped the stream has no TTBR
+	 * at all and every scanout access faults ("SID:0 ... TTBR invalid"),
+	 * which is fatal on this SoC.  Touch the domain once here so it is
+	 * populated before the coprocessor starts driving the display.
+	 *
+	 * Skip it when the bootloader already left translations behind.  On a
+	 * locked DART the stream has a table from the start, and mapping
+	 * through the domain instead makes apple-dart install our *clone* of
+	 * the inherited L1 over the hardware's.  If the session the loader left
+	 * running happens to touch the carveout inside that window it takes
+	 * DART rejects and wedges, and the DCP then never answers INIT --
+	 * an intermittent "Failed to boot RTKit: -62" on roughly one boot in
+	 * three, always preceded by a write-protect burst on the carveout
+	 * within a millisecond of this prime.
+	 */
+	{
+		struct iommu_domain *dom = iommu_get_domain_for_dev(dev);
+		struct iommu_resv_region *entry;
+		bool inherited = false;
+		LIST_HEAD(regions);
+
+		if (!IS_ERR_OR_NULL(dom)) {
+			iommu_get_resv_regions(dev, &regions);
+			list_for_each_entry(entry, &regions, list)
+				if (entry->type == IOMMU_RESV_TRANSLATED)
+					inherited = true;
+			iommu_put_resv_regions(dev, &regions);
+		}
+
+		if (inherited) {
+			dev_info(dev,
+				 "display DMA domain has inherited translations; not priming\n");
+		} else {
+			dma_addr_t probe_dva;
+			void *probe = dma_alloc_coherent(dev, PAGE_SIZE,
+							 &probe_dva, GFP_KERNEL);
+
+			if (probe) {
+				dev_info(dev,
+					 "display DMA domain primed, dva %pad\n",
+					 &probe_dva);
+				dma_free_coherent(dev, PAGE_SIZE, probe,
+						  probe_dva);
+			} else {
+				dev_warn(dev,
+					 "could not prime the display DMA domain\n");
+			}
+		}
+	}
 
 	ret = component_bind_all(dev, apple);
 	if (ret)

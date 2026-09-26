@@ -222,24 +222,48 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
+        Self::new_inner(dev, mbox_name, mbox_idx, data, false)
+    }
+
+    /// Creates a G17P client whose crash DVA belongs to the GPU UAT.
+    pub fn new_g17p(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+    ) -> Result<Self> {
+        Self::new_inner(dev, mbox_name, mbox_idx, data, true)
+    }
+
+    fn new_inner(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+        firmware_owned_crashlog: bool,
+    ) -> Result<Self> {
         let ptr: *mut crate::ffi::c_void = data.into_foreign().cast();
         let guard = ScopeGuard::new(|| {
             // SAFETY: `ptr` came from a previous call to `into_foreign`.
             unsafe { T::Data::from_foreign(ptr.cast()) };
         });
-        // SAFETY: `dev` is valid by its type invarants and otherwise his just
-        //          calls the C init function.
+        let name = match mbox_name {
+            Some(s) => s.as_char_ptr(),
+            None => ptr::null(),
+        };
+        let index = mbox_idx.try_into()?;
+        // SAFETY: `dev` is valid by its type invariant and both C initializers
+        // take the same borrowed pointers. The guard owns `ptr` on failure.
         let rtk = unsafe {
-            from_err_ptr(bindings::apple_rtkit_init(
-                dev.as_raw(),
-                ptr,
-                match mbox_name {
-                    Some(s) => s.as_char_ptr(),
-                    None => ptr::null(),
-                },
-                mbox_idx.try_into()?,
-                &Self::VTABLE,
-            ))
+            if firmware_owned_crashlog {
+                from_err_ptr(bindings::apple_rtkit_init_g17p(
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
+                ))
+            } else {
+                from_err_ptr(bindings::apple_rtkit_init(
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
+                ))
+            }
         }?;
 
         guard.dismiss();

@@ -10,6 +10,7 @@ appledrm-y += connector.o
 appledrm-y += ibootep.o
 appledrm-y += iomfb_v12_3.o
 appledrm-y += iomfb_v13_3.o
+appledrm-y += iomfb_h17p.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 
@@ -17,3 +18,6 @@ appledrm-y += plane.o
 appledrm-$(CONFIG_TRACING) += trace.o
 
 obj-$(CONFIG_DRM_APPLE) += appledrm.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-lifecycle-test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-link-test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb-surface-test.o

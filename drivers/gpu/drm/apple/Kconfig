@@ -28,3 +28,12 @@ config DRM_APPLE_DEBUG
 	bool "Enable additional driver debugging"
 	depends on DRM_APPLE
 	depends on EXPERT # only for developers
+
+config DRM_APPLE_KUNIT_TEST
+	tristate "KUnit tests for the Apple display driver" if !KUNIT_ALL_TESTS
+	depends on DRM_APPLE && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build focused unit tests for Apple display lifecycle helpers and DCPLink
+	  message encoders. The tests do not access display hardware. If in doubt,
+	  say "N".

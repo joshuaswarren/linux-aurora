@@ -11,6 +11,9 @@ struct apple_dcp;
 typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 
 
+extern u32 dcp_clamshell_state;
+extern bool dcp_send_modeset;
+
 #define DCP_THUNK_VOID(func, handle)                                         \
 	static void func(struct apple_dcp *dcp, bool oob, dcp_callback_t cb, \
 			 void *cookie)                                       \
@@ -98,6 +101,9 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 		*typed_out = handler(dcp);                                    \
 		return true;                                                  \
 	}
+
+extern bool dcp_defer_client_open;
+extern bool dcp_park_display;
 
 /* Call a DCP function given by a tag */
 void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,

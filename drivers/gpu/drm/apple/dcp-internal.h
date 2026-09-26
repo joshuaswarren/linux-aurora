@@ -9,22 +9,27 @@
 #include <linux/ioport.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
 
+#include "dcp-link.h"
 #include "dptxep.h"
 #include "iomfb.h"
+#include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
+#include "iomfb-surface.h"
 #include "epic/dpavservep.h"
 
-#define DCP_MAX_PLANES 4
+#define DCP_MAX_PLANES APPLE_DCP_MAX_SURFACES
 #define DCP_MAX_TYPEC_ROUTES 4
 
 struct apple_dcp;
+
 struct apple_dcp_afkep;
 struct apple_dcp_typec_port;
 
@@ -48,6 +53,7 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_UNKNOWN,
 	DCP_FIRMWARE_V_12_3,
 	DCP_FIRMWARE_V_13_5,
+	DCP_FIRMWARE_H17P,
 };
 
 enum {
@@ -55,10 +61,44 @@ enum {
 	TEST_ENDPOINT = 0x21,
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
+	/*
+	 * The DisplayPort control endpoints.  m1n1's working dcpext bring-up
+	 * (proxyclient/experiments/dcpext_iboot.py) starts 0x24 and 0x27 and
+	 * waits for their dcpav/dcpdp controller services *before* the port
+	 * service on 0x2a appears.  Leaving them unstarted is why this driver
+	 * saw a GETBUF on 0x2a and then silence for ever.
+	 */
+	DPTX_CONTROL_ENDPOINT = 0x24,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
 	HDCP_ENDPOINT = 0x2b,
+	/*
+	 * T8140/H17P puts the DisplayPort port service somewhere else.
+	 *
+	 * Traced on this machine's own macOS (build 25G83, the same DCP
+	 * firmware Linux talks to): AppleDCPDPTXRemotePortProxy -- the object
+	 * matching EPICName "dcpdptx-port-epic" -- hangs off DCPEXTEndpoint13,
+	 * i.e. 0x2c, and its sibling HDCP interface off 14 = 0x2d.  Endpoint
+	 * numbering is confirmed by DCPAVControllerProxy on 5 = 0x24, which is
+	 * exactly where we independently saw the two AppleDCPDPTXController
+	 * services announce from Linux.
+	 *
+	 * 0x2a is a real endpoint here and completes the whole AFK handshake
+	 * (INIT_ACK, GETBUF, INIT_TX, INIT_RX, START_ACK) -- it simply never
+	 * publishes anything, on macOS either.  Waiting on it is why the port
+	 * never appeared.
+	 */
+	DPTX_PORT_ENDPOINT_H17P = 0x2c,
+	/*
+	 * Same trace puts the DPTX HDCP interface on 14 = 0x2d, which is the
+	 * value upstream already uses for REMOTE_ALLOC_ENDPOINT -- and iomfb.c
+	 * unconditionally starts that one.  Unused so far, and deliberately
+	 * kept: it records that on H17P the endpoint we start as "remotealloc"
+	 * is what macOS drives as HDCP.  Anything that grows a dispatch on 0x2d
+	 * has to resolve that first.
+	 */
+	HDCP_ENDPOINT_H17P = 0x2d,
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };
@@ -78,6 +118,8 @@ struct dcp_mem_descriptor {
 	dma_addr_t dva;
 	struct sg_table map;
 	u64 reg;
+	/* live iommu mappings installed by dcpep_cb_map_piodma() */
+	bool piodma_mapped;
 };
 
 /* Limit on call stack depth (arbitrary). Some nesting is required */
@@ -90,6 +132,12 @@ struct dcp_channel {
 	void *cookies[DCP_MAX_CALL_DEPTH];
 	void *output[DCP_MAX_CALL_DEPTH];
 	u16 end[DCP_MAX_CALL_DEPTH];
+	u64 link_message[DCP_MAX_CALL_DEPTH];
+	u32 link_size[DCP_MAX_CALL_DEPTH];
+
+	/* Tag of each outstanding call, so a stall can name itself */
+	char tag[DCP_MAX_CALL_DEPTH][4];
+	unsigned long pushed_at[DCP_MAX_CALL_DEPTH];
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
@@ -100,7 +148,14 @@ struct dcp_channel {
 struct dcp_fb_reference {
 	struct list_head head;
 	struct drm_framebuffer *fb;
+	/*
+	 * Id of the swap that unbinds @fb, i.e. the one that puts its
+	 * replacement on screen.  Only meaningful once @armed is set: the
+	 * firmware assigns the id in the swap_start reply, which happens after
+	 * the atomic commit that displaced @fb has already queued this entry.
+	 */
 	u32 swap_id;
+	bool armed;
 };
 
 #define MAX_NOTCH_HEIGHT 160
@@ -112,6 +167,25 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
+	/* H17P: the level the firmware last reported in D006, in millinits */
+	u32 h17p_reported_millinits;
+	/* H17P: DPMS off leaves the pipe (and the level) alone */
+	bool soft_off;
+	/*
+	 * H17P: the level is ramped toward the requested one over ramp_ms
+	 * (dcp_backlight.c) instead of jumping there in one swap.  nits is
+	 * the level in flight, target_nits where it is heading, ramp_from/
+	 * ramp_start the anchor the interpolation runs from.
+	 */
+	int target_nits;
+	int ramp_from;
+	ktime_t ramp_start;
+	struct delayed_work ramp_work;
+	/* when the previous request arrived, and how long this fade runs */
+	ktime_t last_request;
+	unsigned int ramp_duration_ms;
+	/* consecutive fade steps no compositor swap has carried */
+	unsigned int idle_frames;
 };
 
 struct audiosrv_data;
@@ -128,6 +202,13 @@ struct dcp_panel {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
+	bool adopt_running_coprocessor;
+	/*
+	 * Attach to an existing RTKit session instead of restarting it.  This
+	 * requires the endpoint map to be recovered before the DCP services are
+	 * started; no current platform enables it.
+	 */
+	bool adopt_live_session;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -135,6 +216,12 @@ struct apple_dcp {
 	struct device *dev;
 	struct platform_device *piodma;
 	struct iommu_domain *iommu_dom;
+	/* domain of the display-subsystem device, which owns the scanout stream */
+	struct iommu_domain *disp_iommu_dom;
+	/* the display-subsystem device, whose DMA domain the pipe scans out of */
+	struct device *disp_dev;
+	/* which of the nine cumulative A031 notify-client states to send next */
+	unsigned int a031_step;
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
@@ -149,8 +236,10 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+	/* Ignore inherited application-endpoint traffic while quiescing RTKit. */
+	bool adopting_session;
+	struct apple_dcp_surface_order iomfb_surfaces;
 
-	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *
@@ -159,9 +248,15 @@ struct apple_dcp {
 
 	/* clock rate request by dcp in */
 	struct clk *clk;
+	struct clk *clk_194;
 
 	/* DCP shared memory */
 	void *shmem;
+	dma_addr_t shmem_iova;
+	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
+	u16 link_version;
+	u32 link_firmware_hash;
+	bool link_ready;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
@@ -195,10 +290,13 @@ struct apple_dcp {
 	union {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
+		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
+	/* last_swap_id is only meaningful after the first swap completes */
+	bool have_swap_complete;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
@@ -243,10 +341,24 @@ struct apple_dcp {
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
 
+	/* Names a command the firmware has stopped answering */
+	struct delayed_work stall_wq;
+	bool warned_stall;
+	bool dumped_crashlog;
+	/* the DCP crashlog region, so a stall can read the fresh record */
+	void *crashlog_buf;
+	size_t crashlog_size;
+
 	/* List of referenced drm_framebuffers which can be unreferenced
 	 * on the next successfully completed swap.
 	 */
 	struct list_head swapped_out_fbs;
+	/*
+	 * swapped_out_fbs is appended to from the DRM atomic commit thread
+	 * (dcp_flush -> .atomic_flush) and armed/drained from the RTKit
+	 * workqueue that runs the DCP callbacks.  Two different threads.
+	 */
+	spinlock_t swapped_out_lock;
 
 	struct dcp_brightness brightness;
 	/* Workqueue for updating the initial brightness */
@@ -270,6 +382,12 @@ struct apple_dcp {
 
 	struct apple_dcp_afkep *dptxep;
 
+	/* DisplayPort controller endpoint; see DPTX_CONTROL_ENDPOINT above */
+	struct apple_dcp_afkep *dptxcontrolep;
+	/* the two AppleDCPDPTXController services it announces, units 1 and 3 */
+	struct apple_epic_service *dptxctl_av;
+	struct apple_epic_service *dptxctl_dp;
+
 	struct dptx_port dptxport[2];
 
 	/* debugfs entries */
@@ -279,6 +397,7 @@ struct apple_dcp {
 	struct phy *phy;
 	struct phy *fixed_phy;
 	struct mux_control *xbar;
+	bool xbar_selected;
 	struct typec_mux *typec_mux;
 	struct apple_dcp_typec_route typec_routes[DCP_MAX_TYPEC_ROUTES];
 	struct apple_dcp_typec_route *active_typec_route;
@@ -309,8 +428,20 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+u64 dcp_nits_to_double_bits(u32 nits);
+extern bool dcp_swap_trace;
+extern unsigned int dcp_h17p_surf_flags;
+extern int dcp_blend_crc_reads;
+extern char dcp_h17p_swap_poke[128];
+extern char dcp_rtp_request[32];
+extern int dcp_dither_request;
+extern int dcp_pipe_crc_reads;
+extern unsigned int dcp_pipe_crc_idx;
+u32 dcp_h17p_initial_nits(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+void dcp_dump_crashlog(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

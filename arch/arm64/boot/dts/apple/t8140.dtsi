@@ -1052,4 +1052,5 @@
 		};
 };
 
+#include "t8140-hybrid-soc-additions.dtsi"
 #include "t8140-pmgr.dtsi"

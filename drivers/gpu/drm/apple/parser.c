@@ -583,8 +583,13 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	if (ret)
 		return ERR_PTR(ret);
 
-	/* Start with a worst case allocation */
-	modes = kmalloc_array(it.len, sizeof(*modes), GFP_KERNEL);
+	/*
+	 * Start with a worst case allocation.  Zeroed: parse_mode() only ever
+	 * sets ->vrr on the j314/j316 120 Hz modes, so the flag (and with it
+	 * use_timestamps) was stack garbage for every other mode -- one J700
+	 * boot logged "vrr:193" and drove the swaps with fake timestamps.
+	 */
+	modes = kcalloc(it.len, sizeof(*modes), GFP_KERNEL);
 	*count = 0;
 
 	if (!modes)
@@ -667,19 +672,30 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			break;
 		}
 
-		if (!strcmp(key, "EPICName")) {
+		/*
+		 * H17P advertises its system-service with lower-case keys --
+		 * "name", "compartment", "interface-id" -- where earlier
+		 * firmware uses EPICName/EPICProviderClass/EPICUnit.  Without
+		 * these the service never registers, the DCP has no system
+		 * service to ask, and it falls back to clamshell = 1 and idles
+		 * the panel (power_down_M3), so no vblank and no swap ever
+		 * completes.
+		 */
+		if (!strcmp(key, "EPICName") || !strcmp(key, "compartment")) {
 			*name = parse_string(it.handle);
 			if (IS_ERR(*name))
 				ret = PTR_ERR(*name);
 			else
 				parsed_name = true;
-		} else if (!strcmp(key, "EPICProviderClass")) {
+		} else if (!strcmp(key, "EPICProviderClass") ||
+			   !strcmp(key, "name")) {
 			*class = parse_string(it.handle);
 			if (IS_ERR(*class))
 				ret = PTR_ERR(*class);
 			else
 				parsed_class = true;
-		} else if (!strcmp(key, "EPICUnit")) {
+		} else if (!strcmp(key, "EPICUnit") ||
+			   !strcmp(key, "interface-id")) {
 			ret = parse_int(it.handle, unit);
 			if (!ret)
 				parsed_unit = true;

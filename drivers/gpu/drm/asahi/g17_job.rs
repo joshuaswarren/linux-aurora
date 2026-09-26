@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! Owned command packets and DRM scheduler boundary for independent G17P queues.
+//!
+//! This component is deliberately separate from the qualified synchronous
+//! frontend. Enabling it requires a backend with one retained hardware queue
+//! owner per DRM queue and completion-driven retirement; the current shared
+//! QID0/1/4 runtime does not satisfy that contract.
+
+use core::sync::atomic::{fence, AtomicU32, Ordering};
+use kernel::{
+    c_str,
+    dma_fence::{Fence, RawDmaFence, UserFence},
+    drm::sched,
+    new_mutex,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
+use crate::{driver::AsahiDevice, g17_uapi, mmu};
+
+/// Host-sealed bytes in a job-private command allocation. The builder consumes
+/// its owning mapping, copies the encoded command, and exposes only its GPU
+/// address afterward. Another job cannot restage this wrapper's allocation.
+/// Additional address-space aliases of the same job-private GEM belong in the
+/// packet's retained mappings, never in another queue's mutable command state.
+pub(crate) struct G17PSealedCommand {
+    mapping: mmu::KernelMapping,
+    encoded_size: usize,
+}
+
+impl G17PSealedCommand {
+    pub(crate) fn new(mapping: mmu::KernelMapping, encoded: &[u8]) -> Result<Self> {
+        if encoded.is_empty() || encoded.len() > mapping.size() { return Err(EINVAL); }
+        mapping.with_cpu_bytes(|bytes| {
+            bytes.fill(0);
+            bytes[..encoded.len()].copy_from_slice(encoded);
+            Ok(())
+        })?;
+        fence(Ordering::Release);
+        Ok(Self { mapping, encoded_size: encoded.len() })
+    }
+
+    pub(crate) fn gpu_address(&self) -> u64 { self.mapping.iova() }
+    pub(crate) fn encoded_size(&self) -> usize { self.encoded_size }
+}
+
+pub(crate) struct TimestampDestination {
+    pub(crate) mapping: Arc<mmu::KernelMapping>,
+    pub(crate) offset: usize,
+}
+
+/// Rate of the command completion timestamps firmware records: its 24 MHz
+/// command-time counter, the architectural counter scaled to 24 MHz.
+pub(crate) const G17P_COMMAND_TIMESTAMP_HZ: u64 = 24_000_000;
+
+impl TimestampDestination {
+    /// Publish one firmware completion timestamp. UAPI timestamps are
+    /// nanoseconds, the unit `DRM_IOCTL_ASAHI_GET_TIME` reports.
+    pub(crate) fn write(&self, ticks: u64) -> Result {
+        const NSEC_PER_SEC: u64 = 1_000_000_000;
+        let timestamp = ticks / G17P_COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC
+            + ticks % G17P_COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / G17P_COMMAND_TIMESTAMP_HZ;
+        self.mapping.with_cpu_bytes(|bytes| {
+            let end = self.offset.checked_add(8).ok_or(EINVAL)?;
+            bytes.get_mut(self.offset..end).ok_or(EINVAL)?
+                .copy_from_slice(&timestamp.to_le_bytes());
+            Ok(())
+        })?;
+        fence(Ordering::Release);
+        Ok(())
+    }
+}
+
+pub(crate) struct G17PJobCompletion {
+    pub(crate) status: Arc<crate::g17_status::VmStatus>,
+    fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
+    timestamps: mmu::KernelMapping,
+    destinations: [Option<TimestampDestination>; 2],
+    vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
+    signalled: AtomicU32,
+}
+
+impl G17PJobCompletion {
+    pub(crate) fn new(
+        fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
+        timestamps: mmu::KernelMapping,
+        destinations: [Option<TimestampDestination>; 2],
+        status: Arc<crate::g17_status::VmStatus>,
+        vm_job: mmu::T8140VmJobGuard,
+    ) -> Result<Self> {
+        let vm_job = Arc::pin_init(
+            new_mutex!(Some(vm_job), "G17PJobCompletion::vm_job"),
+            GFP_KERNEL,
+        )?;
+        Ok(Self {
+            status,
+            fence,
+            timestamps,
+            destinations,
+            vm_job,
+            signalled: AtomicU32::new(0),
+        })
+    }
+
+    pub(crate) fn gpu_address(&self) -> u64 { self.timestamps.iova() }
+    pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
+
+    /// Wake error waiters while retaining the VM-job pin in the quarantined
+    /// packet. Neither an error fence nor retaining an otherwise emptied Arc
+    /// proves that firmware has finished dereferencing userspace mappings.
+    pub(crate) fn fail_while_owned(&self, error: Error) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        if let Some(vm_job) = self.vm_job.lock().as_ref() {
+            vm_job.quarantine();
+        }
+        // The fence always carries the exact error to this client. The VM's
+        // sticky status is different: it retires the VM for every later
+        // submission, so a submission-scoped failure -- ENODATA from a
+        // zero-duration retire, which g17p_zero_duration exists to keep
+        // submission-scoped -- must not be written there.
+        self.status.record_if_device_loss(error.to_errno());
+        self.fence.set_error(error);
+        self.fence.signal();
+    }
+
+    /// Only for retired work, proven processor stop, or unsubmitted packets.
+    pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        let result = result.and_then(|timestamps| {
+            for (destination, timestamp) in self.destinations.iter().zip(timestamps) {
+                if let Some(destination) = destination {
+                    destination.write(timestamp)?;
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            // Publish sticky failure BEFORE the fence wakes userspace. A DRM
+            // syncobj considers an error fence signaled, so waits query this.
+            self.status.record(error.to_errno());
+            self.fence.set_error(error);
+        }
+        // Match render completion: once this fence wakes userspace, every
+        // mapping named by the completed job must already be releasable.
+        drop(self.vm_job.lock().take());
+        self.fence.signal();
+    }
+
+    /// Release the VM pin of an already-signalled error completion after both
+    /// firmware processors stop. `complete` deliberately returns early after
+    /// `fail_while_owned`, while DRM sched may retain the packet Arc beyond
+    /// that fence; processor stop is the independent ownership witness.
+    pub(crate) fn release_after_processor_stop(&self) {
+        drop(self.vm_job.lock().take());
+    }
+}
+
+/// Everything a prepared compute submission needs remains owned until its
+/// hardware fence retires, including when its userspace queue is destroyed.
+/// The context can be shared by jobs of one VM; different VMs own different
+/// independently rooted leases. Command images are immutable after sealing.
+pub(crate) struct G17PComputeJobPacket {
+    submission_id: u64,
+    hardware_queue_id: u8,
+    context: Arc<mmu::T8140ComputeExecutionContext>,
+    command: g17_uapi::TranslatedComputeCommand,
+    command_images: KVec<G17PSealedCommand>,
+    _retained_mappings: KVec<mmu::KernelMapping>,
+    /// DRM sched treats a signalled error fence as dependency-ready. Retain
+    /// the same fences until run_job so the backend can consume their status
+    /// before publishing any hardware-visible queue state.
+    input_fences: KVec<Fence>,
+    completion: Option<G17PJobCompletion>,
+}
+
+impl G17PComputeJobPacket {
+    pub(crate) fn new(
+        submission_id: u64,
+        hardware_queue_id: u8,
+        context: Arc<mmu::T8140ComputeExecutionContext>,
+        command: g17_uapi::TranslatedComputeCommand,
+        command_images: KVec<G17PSealedCommand>,
+        retained_mappings: KVec<mmu::KernelMapping>,
+        input_fences: KVec<Fence>,
+        completion: Option<G17PJobCompletion>,
+    ) -> Result<Arc<Self>> {
+        if submission_id == 0 || !(4..128).contains(&hardware_queue_id)
+        { return Err(EINVAL); }
+        Ok(Arc::new(Self {
+            submission_id, hardware_queue_id, context, command, command_images,
+            _retained_mappings: retained_mappings, input_fences, completion,
+        }, GFP_KERNEL)?)
+    }
+
+    pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
+    pub(crate) fn hardware_queue_id(&self) -> u8 { self.hardware_queue_id }
+    pub(crate) fn context(&self) -> &mmu::T8140ComputeExecutionContext { &self.context }
+    pub(crate) fn command(&self) -> &g17_uapi::TranslatedComputeCommand { &self.command }
+    pub(crate) fn command_images(&self) -> &[G17PSealedCommand] { &self.command_images }
+    pub(crate) fn input_fences(&self) -> &[Fence] { &self.input_fences }
+    pub(crate) fn completion(&self) -> Result<&G17PJobCompletion> { self.completion.as_ref().ok_or(EINVAL) }
+}
+
+/// The hardware owner supplies queue-capacity dependencies and nonblocking
+/// publication. It must retain `packet` before the first doorbell and until
+/// exact completion, or quarantine it through recovery if completion is lost.
+/// Publication errors are permitted only before firmware can see the packet.
+/// Timeout/cancel must never signal completion and release an active packet
+/// until that queue has retired or a proven device-stop boundary is reached.
+/// This follows the legacy driver's per-job VmBind/command/fence contract;
+/// it is not implemented by the single-graph synchronous G17P runtime.
+pub(crate) trait G17PQueueBackend: Send + Sync {
+    fn prepare(&self, packet: &G17PComputeJobPacket) -> Option<Fence>;
+    fn publish(&self, packet: Arc<G17PComputeJobPacket>) -> Result<Fence>;
+    fn timed_out(&self, packet: Arc<G17PComputeJobPacket>) -> sched::Status;
+    fn cancel(&self, packet: Arc<G17PComputeJobPacket>);
+}
+
+pub(crate) struct G17PScheduledJob<B: G17PQueueBackend> {
+    backend: Arc<B>,
+    packet: Arc<G17PComputeJobPacket>,
+}
+
+impl<B: G17PQueueBackend> sched::JobImpl for G17PScheduledJob<B> {
+    fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
+        job.backend.prepare(&job.packet)
+    }
+
+    fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+        // Return the unsignalled hardware fence immediately. DRM retains the
+        // job's immutable packet while other independent queues can publish.
+        job.backend.publish(job.packet.clone()).inspect_err(|error| {
+            // DRM also signals its finished fence when run_job fails before
+            // publication; that failure must be visible through the same API.
+            if let Ok(completion) = job.packet.completion() {
+                // A publish failure is often contention -- "firmware recovery
+                // still open after N polls; refusing to publish" returns EBUSY
+                // -- and this status is the VM's, so recording it retired the
+                // whole client for a transient condition.
+                completion.status.record_if_device_loss(error.to_errno());
+            }
+        }).map(Some)
+    }
+
+    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+        job.backend.timed_out(job.packet.clone())
+    }
+
+    fn cancel(job: &mut sched::Job<Self>) {
+        job.backend.cancel(job.packet.clone());
+    }
+}
+
+/// One scheduler/entity per DRM queue, as on M1/M2. Dependencies are handed to
+/// DRM instead of synchronously waited under a hardware lease. Queue hardware
+/// capacity is a credit limit plus backend prepare fences, not a global lock.
+pub(crate) struct G17PJobScheduler<B: G17PQueueBackend> {
+    entity: sched::Entity<G17PScheduledJob<B>>,
+    _scheduler: sched::Scheduler<G17PScheduledJob<B>>,
+    backend: Arc<B>,
+}
+
+/// A render has already been published when this scheduler job runs.  The
+/// job exists to put its exact firmware-driven hardware fence under DRM's
+/// timeout and dependency machinery without polling in the submit ioctl.
+pub(crate) struct G17PRenderWatchPacket {
+    submission_id: u64,
+    render_slot: u8,
+    completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+}
+
+impl G17PRenderWatchPacket {
+    pub(crate) fn new(
+        submission_id: u64,
+        render_slot: u8,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+    ) -> Result<Arc<Self>> {
+        if submission_id == 0 || render_slot >= crate::g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            return Err(EINVAL);
+        }
+        Ok(Arc::new(Self { submission_id, render_slot, completion }, GFP_KERNEL)?)
+    }
+
+    pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
+    pub(crate) fn render_slot(&self) -> u8 { self.render_slot }
+    pub(crate) fn completion(&self) -> &Arc<crate::g17_drm::G17PRenderCompletion> {
+        &self.completion
+    }
+    pub(crate) fn fence(&self) -> Fence { self.completion.fence() }
+}
+
+pub(crate) trait G17PRenderWatchBackend: Send + Sync {
+    fn timed_out(&self, packet: Arc<G17PRenderWatchPacket>) -> sched::Status;
+    fn cancel(&self, packet: Arc<G17PRenderWatchPacket>);
+}
+
+pub(crate) struct G17PRenderWatchJob<B: G17PRenderWatchBackend> {
+    backend: Arc<B>,
+    packet: Arc<G17PRenderWatchPacket>,
+}
+
+impl<B: G17PRenderWatchBackend> sched::JobImpl for G17PRenderWatchJob<B> {
+    fn prepare(_job: &mut sched::Job<Self>) -> Option<Fence> { None }
+
+    fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+        Ok(Some(job.packet.fence()))
+    }
+
+    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+        job.backend.timed_out(job.packet.clone())
+    }
+
+    fn cancel(job: &mut sched::Job<Self>) {
+        job.backend.cancel(job.packet.clone());
+    }
+}
+
+pub(crate) struct G17PRenderWatchScheduler<B: G17PRenderWatchBackend> {
+    entity: sched::Entity<G17PRenderWatchJob<B>>,
+    _scheduler: sched::Scheduler<G17PRenderWatchJob<B>>,
+    backend: Arc<B>,
+}
+
+impl<B: G17PRenderWatchBackend> G17PRenderWatchScheduler<B> {
+    pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>) -> Result<Self> {
+        let scheduler = sched::Scheduler::new(
+            dev.as_ref(), 1, 1, 0, 2000, c_str!("asahi_g17p_render"),
+        )?;
+        let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
+        Ok(Self { entity, _scheduler: scheduler, backend })
+    }
+
+    pub(crate) fn enqueue(&mut self, packet: Arc<G17PRenderWatchPacket>) -> Result<Fence> {
+        let job = self.entity.new_job(1, G17PRenderWatchJob {
+            backend: self.backend.clone(), packet,
+        })?;
+        let mut job = job.arm();
+        let finished = job.fences().finished();
+        job.push();
+        Ok(finished)
+    }
+}
+
+impl<B: G17PQueueBackend> G17PJobScheduler<B> {
+    pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>, credits: u32) -> Result<Self> {
+        if credits == 0 { return Err(EINVAL); }
+        let scheduler = sched::Scheduler::new(
+            dev.as_ref(), 1, credits, 0, 2000, c_str!("asahi_g17p_sched"),
+        )?;
+        let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
+        Ok(Self { entity, _scheduler: scheduler, backend })
+    }
+
+    pub(crate) fn enqueue(
+        &mut self, packet: Arc<G17PComputeJobPacket>, dependencies: KVec<Fence>,
+    ) -> Result<Fence> {
+        let mut job = self.entity.new_job(1, G17PScheduledJob {
+            backend: self.backend.clone(), packet,
+        })?;
+        for dependency in dependencies { job.add_dependency(dependency)?; }
+        let mut job = job.arm();
+        let finished = job.fences().finished();
+        job.push();
+        Ok(finished)
+    }
+}

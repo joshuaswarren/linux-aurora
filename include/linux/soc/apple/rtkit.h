@@ -85,6 +85,11 @@ struct apple_rtkit;
 struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
+
+/* Device-managed form of apple_rtkit_init_adopted(). */
+struct apple_rtkit *devm_apple_rtkit_init_adopted(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops);
 /*
  * Frees internal RTKit state allocated by devm_apple_rtkit_init().
  *
@@ -117,6 +122,14 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 					     const char *mbox_name, int mbox_idx,
 					     const struct apple_rtkit_ops *ops);
+
+/*
+ * G17P owns its crash buffer in the GPU UAT. Preserve the firmware DVA and
+ * echo the request without attempting to map it through the device DMA API.
+ */
+struct apple_rtkit *apple_rtkit_init_g17p(struct device *dev, void *cookie,
+					  const char *mbox_name, int mbox_idx,
+					  const struct apple_rtkit_ops *ops);
 
 /*
  * Free an instance of apple_rtkit.
@@ -159,6 +172,9 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
  * Quiesce the co-processor.
  */
 int apple_rtkit_quiesce(struct apple_rtkit *rtk);
+
+/* H17P only: wait for the separate idle fence after adopted IOP OFF. */
+int apple_rtkit_poweroff_adopted(struct apple_rtkit *rtk);
 
 /*
  * Wake the co-processor up from hibernation mode.

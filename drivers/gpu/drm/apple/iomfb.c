@@ -18,6 +18,7 @@
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -33,6 +34,166 @@
 #include "iomfb_internal.h"
 #include "parser.h"
 #include "trace.h"
+
+
+/*
+ * A476 payload.  macOS sends 1 (dcp-calls.log line 1648); we sent 0 on the
+ * theory that A476 is set_dcp_clamshellstate and 1 meant "lid shut".  That
+ * attribution is unverified -- A476's shape (in 4, out 0) equally fits
+ * set_has_frame_swap_function(bool) -- and the black panel it appeared to fix
+ * was really the surf_iova misalignment, so the evidence for 0 was
+ * coincidental.  Follow the capture.
+ */
+u32 dcp_clamshell_state = 1;
+module_param_named(clamshell_state, dcp_clamshell_state, uint, 0644);
+
+bool dcp_send_modeset;   /* macOS never issues A413 */
+module_param_named(send_modeset, dcp_send_modeset, bool, 0644);
+
+
+
+/*
+ * A353 / A352(0x70,0) / A438 x5 / A352(0x70,1) form one bracket: the A352 pair
+ * parks and resumes the APT timing sequencer around the A438 config push
+ * ("apt_normal_mode_changed: requesting transtition to auto mode" ->
+ * set_run_mode_safe 4 -> 2 -> power_down_M3).  A438 makes our firmware take a
+ * CPU exception, and opening the bracket without closing it leaves M3 powered
+ * down, so the swap is accepted but never scans out.  Off = skip all of it and
+ * leave the sequencer in normal mode.
+ */
+/*
+ * The scanout engine reads through disp0_dart stream 0 (display-subsystem),
+ * not through the DCP's own stream.  The only surface memory mapped in that
+ * stream is the display carveout: reserved-memory/framebuffer@101eb4b8000
+ * advertises iommu-addresses = <&dcp 0x1ea0000 ...>, <&display-subsystem
+ * 0x1ea0000 ...>.  A GEM buffer's DVA exists only in the DCP domain, so a swap
+ * naming one validates and retires while the scanout engine reads an address
+ * it cannot translate -- a black panel with no visible fault, because the
+ * DART's error IRQ is masked once the fault budget is spent.
+ */
+/*
+ * macOS's full StartEP set; see iomfb_start_rtkit().  Off: bringing all sixteen
+ * up made the firmware NMI (panic(app): app NMI, pidx: 1) before the first swap
+ * could retire, so the endpoints past 0x2d/0x37 need to be introduced one at a
+ * time rather than as a block.
+ */
+
+/*
+ * Bitmask of the endpoints in 0x20..0x3f to start beyond 0x20/0x2d/0x37, bit n
+ * meaning endpoint 0x20+n.  Starting macOS's whole set at once made the
+ * firmware NMI, so bring them up one at a time: disp0 (0x23) is extra_eps=0x8.
+ */
+static unsigned int dcp_extra_eps;
+module_param_named(extra_eps, dcp_extra_eps, uint, 0644);
+MODULE_PARM_DESC(extra_eps, "bitmask of extra endpoints to start, bit n = 0x20+n");
+
+static void dcp_start_extra_eps(struct apple_dcp *dcp)
+{
+	unsigned int n;
+
+	for (n = 0; n < 32; n++) {
+		if (!(dcp_extra_eps & BIT(n)))
+			continue;
+		dev_info(dcp->dev, "starting extra endpoint %#04x\n", 0x20 + n);
+		apple_rtkit_start_ep(dcp->rtk, 0x20 + n);
+	}
+}
+
+
+bool dcp_park_display = true;
+module_param_named(park_display, dcp_park_display, bool, 0644);
+MODULE_PARM_DESC(park_display, "H17P: power the display down after boot until a modeset");
+
+bool dcp_defer_client_open;
+module_param_named(defer_client_open, dcp_defer_client_open, bool, 0644);
+MODULE_PARM_DESC(defer_client_open, "H17P: do not send first_client_open during boot");
+
+static bool skip_hotplug;
+module_param(skip_hotplug, bool, 0644);
+MODULE_PARM_DESC(skip_hotplug, "do not raise the DRM hotplug event (bring-up bisect)");
+
+bool dcp_swap_trace;
+module_param_named(swap_trace, dcp_swap_trace, bool, 0644);
+MODULE_PARM_DESC(swap_trace, "log every swap start/submit/complete with its id and time (flicker diagnosis)");
+
+/*
+ * H17P per-layer swap flags.  macOS 25G83 carries surf_flags[0] = 1 in every
+ * captured A408 and m1n1's dcp experiment uses the same [1, 0, 0, 0]; the
+ * Linux driver has always sent 0 and relied on is_premultiplied, which the
+ * H17P surface no longer has (the firmware then blends the XRGB X byte as
+ * straight alpha: black wherever a Vulkan-rendered frame leaves it 0).
+ * Runtime knob so a Vulkan session can flip it without a reboot; 0 keeps
+ * today's behaviour until a capture proves what bit 0 does.
+ */
+unsigned int dcp_h17p_surf_flags;
+module_param_named(h17p_surf_flags, dcp_h17p_surf_flags, uint, 0644);
+MODULE_PARM_DESC(h17p_surf_flags, "value for the enabled layer's swap.surf_flags on H17P (macOS: 1; default 0)");
+
+/*
+ * Camera-free check of what the panel is fed: after each of the next N
+ * swap_complete callbacks read the blend-output CRC (A106,
+ * IOMFB::UPPipe2::read_blend_crc) and log it with the swap id.  Two frames
+ * that differ only in bytes the pipe should ignore (the XRGB X byte) must
+ * give the same CRC; a static desktop must give a constant one.
+ */
+int dcp_blend_crc_reads;
+module_param_named(blend_crc_reads, dcp_blend_crc_reads, int, 0644);
+MODULE_PARM_DESC(blend_crc_reads, "read and log the blend-output CRC after the next N completed swaps (H17P)");
+
+/*
+ * Byte pokes into the outgoing H17P swap record, applied after the layout
+ * fix-ups: "off=val[,off=val...]" with hex offsets into the 0xe9c A408
+ * request and hex byte values.  Together with blend_crc_reads this lets a
+ * script search the record for the bit that marks a layer opaque without
+ * a rebuild per guess.  Empty = no pokes.
+ */
+/*
+ * Panel dither control: A448 IOMobileFramebufferAP::enable_disable_dithering(u32)
+ * (in u32, out u32 status).  Writing 0 or 1 issues the call after the next
+ * completed swap and logs the status; the value then returns to -1.  The
+ * DCP's UPBlock_Dither_v3 temporally dithers the pipe's output to the panel
+ * depth ("IOMFB: dither, enabled: %s legacy: %s"), which is the first
+ * suspect for the CRT-like shimmer Ryan sees on 10-bit output and faintly
+ * on 8-bit.
+ */
+int dcp_dither_request = -1;
+module_param_named(dither, dcp_dither_request, int, 0644);
+MODULE_PARM_DESC(dither, "write 0/1 to disable/enable panel dithering after the next completed swap (H17P, A448)");
+
+/*
+ * A030 IOMFB::UPPipeAP_H17P::read_crc(Notify_Info_Index, u32): pipe CRCs
+ * at points other than the blend output (the index enum is unknown; probe
+ * it).  pipe_crc_reads=N reads index pipe_crc_idx after the next N
+ * completed swaps and logs the value.
+ */
+int dcp_pipe_crc_reads;
+module_param_named(pipe_crc_reads, dcp_pipe_crc_reads, int, 0644);
+MODULE_PARM_DESC(pipe_crc_reads, "read A030 read_crc(pipe_crc_idx, 0) after the next N completed swaps (H17P)");
+unsigned int dcp_pipe_crc_idx;
+module_param_named(pipe_crc_idx, dcp_pipe_crc_idx, uint, 0644);
+MODULE_PARM_DESC(pipe_crc_idx, "Notify_Info_Index for pipe_crc_reads");
+
+/*
+ * Runtime properties (IOMFB::PropRelay, A200 setBool / A201 setInt; the
+ * RuntimeProperty enum is the firmware's name table at 0x44ff980 in the
+ * 25G83 dcpf: 0x86 IOMFBBlendDisabledKey, 0x1e enableDither, 0x11
+ * brightnessCorrection, 0x10 enableGammaCorrection, 0x2e
+ * enablePartialUpdate ...).  rtp="b:<prop>=<val>" or "i:<prop>=<val>" (hex)
+ * issues one call after the next completed swap and logs the status.
+ */
+char dcp_rtp_request[32];
+module_param_string(rtp, dcp_rtp_request, sizeof(dcp_rtp_request), 0644);
+MODULE_PARM_DESC(rtp, "b:<prop>=<val> / i:<prop>=<val> (hex): set a DCP runtime property after the next completed swap (H17P)");
+
+char dcp_h17p_swap_poke[128];
+module_param_string(h17p_swap_poke, dcp_h17p_swap_poke, sizeof(dcp_h17p_swap_poke), 0644);
+MODULE_PARM_DESC(h17p_swap_poke, "hex off=val byte pokes into the fixed-up H17P swap record (debug)");
+
+static int dcp_trace_budget;
+module_param_named(trace_rpc, dcp_trace_budget, int, 0644);
+MODULE_PARM_DESC(trace_rpc,
+		 "log the first N DCP RPC messages (0 = off; the vblank callback\n"
+		 "\t\t alone is 60/s, so anything non-zero fills the kernel ring)");
 
 static int dcp_tx_offset(enum dcp_context_id id)
 {
@@ -103,6 +264,12 @@ static enum dcp_context_id dcp_call_context(struct apple_dcp *dcp, bool oob)
 {
 	u8 depth = oob ? dcp->ch_oobcmd.depth : dcp->ch_cmd.depth;
 
+	/*
+	 * A nested call goes on the callback channel, past the record we are
+	 * answering.  This matches macOS: its A401 carries context 2 in the
+	 * wire word while every call nested inside it carries context 0 with
+	 * offset 0x40, which is exactly what this produces.
+	 */
 	if (depth)
 		return oob ? DCP_CONTEXT_OOBCB : DCP_CONTEXT_CB;
 	else
@@ -188,7 +355,20 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		memcpy(out_data, data, in_len);
 
 	trace_iomfb_push(dcp, call, context, offset, depth);
+	if (dcp_trace_budget > 0) {
+		dcp_trace_budget--;
+		dev_info(dcp->dev, "CALL %.4s ctx=%x off=%#x in=%u out=%u\n",
+			 call->tag, context, offset, in_len, out_len);
+	}
 
+
+	memcpy(ch->tag[depth], call->tag, sizeof(ch->tag[depth]));
+	ch->pushed_at[depth] = jiffies;
+	if (context == DCP_CONTEXT_CMD && depth == 0) {
+		dcp->warned_stall = false;
+		mod_delayed_work(system_wq, &dcp->stall_wq,
+				 msecs_to_jiffies(1000));
+	}
 	ch->callbacks[depth] = cb;
 	ch->cookies[depth] = cookie;
 	ch->output[depth] = out + sizeof(header) + in_len;
@@ -215,6 +395,37 @@ int dcp_parse_tag(char tag[4])
 	}
 
 	return d[0] + (d[1] * 10) + (d[2] * 100);
+}
+
+/*
+ * The firmware silently stops answering a method it is not ready for, and the
+ * call then sits on the command channel forever -- every later push sees a busy
+ * channel and the whole bring-up stalls with no clue which call did it.  Name it.
+ */
+void dcp_stall_check(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, stall_wq);
+	struct dcp_channel *ch = &dcp->ch_cmd;
+	u8 d = ch->depth;
+
+	if (!d) {
+		dcp->warned_stall = false;
+		return;
+	}
+
+	if (!dcp->warned_stall &&
+	    time_after(jiffies, ch->pushed_at[d - 1] + msecs_to_jiffies(2000))) {
+		dcp->warned_stall = true;
+		dev_err(dcp->dev,
+			"DCP stopped answering %.4s (depth %u, %u ms outstanding)\n",
+			ch->tag[d - 1], d,
+			jiffies_to_msecs(jiffies - ch->pushed_at[d - 1]));
+		/* by now a fresh panic record has been written, if there is one */
+		dcp_dump_crashlog(dcp);
+	}
+
+	schedule_delayed_work(&dcp->stall_wq, msecs_to_jiffies(1000));
 }
 
 /* Ack a callback from the DCP */
@@ -283,6 +494,11 @@ void dcp_hotplug(struct work_struct *work)
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, dcp->valid_mode, dcp->nr_modes);
 
+	if (skip_hotplug) {
+		dev_info(dcp->dev, "skip_hotplug set; not notifying DRM\n");
+		return;
+	}
+
 	if (!connector->connected) {
 		drm_edid_free(connector->drm_edid);
 		connector->drm_edid = NULL;
@@ -324,14 +540,49 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
 
-	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers || !dcp->cb_handlers[tag]) {
-		dev_warn(dev, "received unknown callback %c%c%c%c\n",
-			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
-		return;
+	if (dcp_trace_budget > 0 && tag != 300) {
+		dcp_trace_budget--;
+		char nm[41] = "";
+		const char *ib = (const char *)(hdr + 1);
+		u32 k;
+
+		/* most property callbacks lead with a printable key */
+		for (k = 0; k < hdr->in_len && k < sizeof(nm) - 1; k++) {
+			if (ib[k] == '\0')
+				break;
+			nm[k] = (ib[k] >= 0x20 && ib[k] < 0x7f) ? ib[k] : '.';
+		}
+		nm[k] = '\0';
+		dev_info(dev, "CB %c%c%c%c ctx=%x in=%u out=%u %s\n",
+			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
+			 context, hdr->in_len, hdr->out_len, nm);
 	}
 
 	in = data + sizeof(*hdr);
 	out = in + hdr->in_len;
+
+	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
+	    !dcp->cb_handlers[tag]) {
+		dev_warn(dev, "received unknown callback %c%c%c%c\n",
+			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+		/*
+		 * Leaving a callback unanswered wedges the coprocessor: it
+		 * waits for the ack forever and the outer call never returns.
+		 * On H17P answer it with a zeroed output instead, so the
+		 * warning above names the tag we still have to implement
+		 * rather than costing a reboot to discover one tag at a time.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			if (hdr->out_len)
+				memset(out, 0, hdr->out_len);
+			depth = dcp_push_depth(&ch->depth);
+			ch->output[depth] = out;
+			ch->end[depth] = offset +
+					 ALIGN(length, DCP_PACKET_ALIGNMENT);
+			dcp_ack(dcp, context);
+		}
+		return;
+	}
 
 	// TODO: verify that in_len and out_len match our prototypes
 	// for now just clear the out data to have at least consistent results
@@ -342,8 +593,19 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	ch->output[depth] = out;
 	ch->end[depth] = offset + ALIGN(length, DCP_PACKET_ALIGNMENT);
 
-	if (dcp->cb_handlers[tag](dcp, tag, out, in))
-		dcp_ack(dcp, context);
+	{
+		bool acked = dcp->cb_handlers[tag](dcp, tag, out, in);
+
+		if (dcp_trace_budget > 0 && hdr->out_len && tag != 300) {
+			dcp_trace_budget--;
+			dev_info(dev, "RPL %c%c%c%c %*ph\n",
+				 hdr->tag[3], hdr->tag[2], hdr->tag[1],
+				 hdr->tag[0],
+				 (int)min_t(u32, hdr->out_len, 16), out);
+		}
+		if (acked)
+			dcp_ack(dcp, context);
+	}
 }
 
 static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
@@ -382,6 +644,13 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 	ctx_id = FIELD_GET(IOMFB_MSG_CONTEXT, message);
 	offset = FIELD_GET(IOMFB_MSG_OFFSET, message);
 	length = FIELD_GET(IOMFB_MSG_LENGTH, message);
+
+	if (dcp_trace_budget > 0) {
+		dcp_trace_budget--;
+		dev_info(dcp->dev, "RX %#018llx ctx=%x off=%#x len=%u ack=%d\n",
+			 message, ctx_id, offset, length,
+			 !!FIELD_GET(IOMFB_MSG_ACK, message));
+	}
 
 	channel_offset = dcp_channel_offset(ctx_id);
 
@@ -525,6 +794,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_13_5:
 		ret = iomfb_modeset_v13_3(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_H17P:
+		ret = iomfb_modeset_h17p(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -546,6 +818,63 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	return lookup_mode(dcp, mode) != NULL;
 }
 
+/*
+ * Retain every framebuffer this commit unbinds from the CRTC's planes until
+ * a later swap has replaced it on the panel.
+ *
+ * This has to happen for every commit, whether or not it results in a swap:
+ * the coprocessor keeps scanning out the previous surface until a swap
+ * replaces it, so a commit that is skipped -- the command channel busy, a
+ * plane disabled with nothing to show, the CRTC going off -- must not let
+ * the framebuffer (and with it the display DART mapping the firmware is
+ * still fetching through) go away.  The J700 showed what happens
+ * otherwise: on DPMS off the disp0 DART logged "read PTE invalid" faults
+ * across the whole old surface 400 us after the CRTC disable, and the
+ * firmware took an axi_rd_err NMI (hb100).
+ *
+ * Entries are queued unarmed; the swap that unbinds them stamps its id in
+ * dcp_arm_swapped_out_fbs(), and a commit without a swap leaves them held
+ * until the next swap does.
+ *
+ * The CRTC-disable commit never reaches dcp_flush(): the driver commits
+ * through drm_atomic_helper_commit_tail_rpm(), whose ACTIVE_ONLY plane pass
+ * skips the planes and the flush of a CRTC that is going inactive.  That
+ * commit calls this from the CRTC's atomic_disable instead.  An entry that
+ * is queued twice for the same framebuffer only holds one more reference,
+ * which the same release path drops.
+ */
+static void dcp_retain_unbound_fbs(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			    struct drm_atomic_state *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old_state, *new_state;
+	int i;
+
+	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, i) {
+		struct dcp_fb_reference *entry;
+		unsigned long flags;
+
+		if (old_state->crtc != crtc && new_state->crtc != crtc)
+			continue;
+		if (!old_state->fb || new_state->fb == old_state->fb)
+			continue;
+
+		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+		if (!entry)
+			continue;
+		entry->fb = old_state->fb;
+		drm_framebuffer_get(old_state->fb);
+		spin_lock_irqsave(&dcp->swapped_out_lock, flags);
+		list_add_tail(&entry->head, &dcp->swapped_out_fbs);
+		spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
+	}
+}
+
+void dcp_retain_unbound_fbs_pdev(struct platform_device *pdev, struct drm_crtc *crtc,
+				 struct drm_atomic_state *state)
+{
+	dcp_retain_unbound_fbs(platform_get_drvdata(pdev), crtc, state);
+}
 
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
@@ -566,11 +895,19 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	dcp_retain_unbound_fbs(dcp, crtc, state);
 
 	if (dcp_channel_busy(&dcp->ch_cmd))
 	{
 		if (!dcp->ch_cmd.warned_busy) {
-			dev_err(dcp->dev, "unexpected busy command channel\n");
+			u8 d = dcp->ch_cmd.depth;
+
+			dev_err(dcp->dev,
+				"unexpected busy command channel: depth %u, oldest outstanding %.4s pushed %u ms ago\n",
+				d, d ? dcp->ch_cmd.tag[d - 1] : "----",
+				d ? jiffies_to_msecs(jiffies -
+						     dcp->ch_cmd.pushed_at[d - 1])
+				  : 0);
 			dcp->ch_cmd.warned_busy = true;
 		}
 		/* HACK: issue a delayed vblank event to avoid timeouts in
@@ -589,6 +926,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_flush_v13_3(dcp, crtc, state);
 		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_flush_h17p(dcp, crtc, state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -603,6 +943,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_start_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_start_h17p(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -621,9 +964,19 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 {
 	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
 
-	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED)
+	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED) {
+		/*
+		 * H17P reports its firmware version and hash in the high half
+		 * of the same InitComplete word (macOS 25G83 sends e.g.
+		 * 0x004045bc9ef40101).  The transport below it is unchanged.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+			dev_info(dcp->dev,
+				 "IOMFB: init complete %#llx (version %llu)\n",
+				 message,
+				 FIELD_GET(GENMASK_ULL(63, 48), message));
 		iomfb_start(dcp);
-	else if (type == IOMFB_MESSAGE_TYPE_MSG)
+	} else if (type == IOMFB_MESSAGE_TYPE_MSG)
 		dcpep_got_msg(dcp, message);
 	else
 		dev_warn(dcp->dev, "Ignoring unknown message %llx\n", message);
@@ -632,7 +985,19 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
+
+	/*
+	 * macOS starts sixteen DCP endpoints; we started three.  Its StartEP
+	 * order, straight from the hv capture, is
+	 *   24 28 21 2c 31 25 2d 32 2b 2e 2a 37 29 20 23 22
+	 * with 0x20 (system) coming from systemep_init earlier.  A firmware
+	 * subsystem whose endpoint was never started has nothing answering it
+	 * on the AP side -- which is how 0x2d's absence used to produce DART
+	 * faults -- so bring the whole set up, in that order.
+	 */
+	apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
 	apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	dcp_start_extra_eps(dcp);
 
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
 					GFP_KERNEL);
@@ -654,6 +1019,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_shutdown_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_shutdown_h17p(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

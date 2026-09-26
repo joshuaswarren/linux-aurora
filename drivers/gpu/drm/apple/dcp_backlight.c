@@ -7,12 +7,63 @@
 #include <drm/drm_modeset_lock.h>
 
 #include <linux/backlight.h>
+#include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/minmax.h>
+#include <linux/module.h>
+#include <linux/workqueue.h>
 #include "linux/jiffies.h"
 
 #include "dcp.h"
 #include "dcp-internal.h"
+
+/*
+ * H17P (J700) does not tell us the level iBoot left the panel at (D006
+ * reports 0 nits until the AP sets one), so the first swap after power-on
+ * applies this.  40 % of the panel's 525 nits.
+ */
+static unsigned int initial_brightness = 210;
+module_param(initial_brightness, uint, 0644);
+MODULE_PARM_DESC(initial_brightness,
+		 "Brightness in nits to apply at power-on when the firmware cannot report the current one (H17P)");
+
+/*
+ * H17P: a brightness change is ramped, one swap per frame, over this many
+ * milliseconds rather than applied in a single step.  macOS fades the panel
+ * the same way; the firmware itself does not (the swap carries the target
+ * nits and the DAC follows it immediately).  0 disables the ramp.
+ */
+static unsigned int ramp_ms = 250;
+module_param(ramp_ms, uint, 0644);
+MODULE_PARM_DESC(ramp_ms,
+		 "Milliseconds to fade the panel between brightness levels on H17P (0 = step)");
+
+/*
+ * A stream of requests (gsd-power's ambient-light loop, paced by
+ * iio-sensor-proxy's 0.8 s ALS poll; a slider drag at 20-60 Hz) is faded at
+ * the rate it arrives, so consecutive fades join up instead of each one
+ * finishing early and holding until the next.  Anything slower than this
+ * is treated as isolated requests again.
+ */
+static unsigned int ramp_max_ms = 1500;
+module_param(ramp_max_ms, uint, 0644);
+MODULE_PARM_DESC(ramp_max_ms,
+		 "Longest fade used when brightness requests arrive as a stream (H17P)");
+
+#define RAMP_STEP_MS	16
+#define RAMP_STREAM_GAP_MS	3000
+/*
+ * Frames a step may sit unconsumed before the worker submits a swap of its
+ * own.  A driver-issued commit holds the CRTC's flip_done until the DCP
+ * finishes the swap, and a compositor page flip that lands in that window
+ * is refused with EBUSY ("Page flip failed: drmModeAtomicCommit: Device or
+ * resource busy" in mutter's log, 18 of them in one session on the 16:29
+ * build).  Waiting several frames means we only ever push while the
+ * compositor is genuinely idle.
+ */
+#define RAMP_IDLE_FRAMES	3
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -89,6 +140,32 @@ static int dcp_get_brightness(struct backlight_device *bd)
 	return dcp->brightness.nits;
 }
 
+/*
+ * IEEE-754 binary64 bit pattern of a small non-negative integer, built
+ * without touching the FPU: the H17P swap record carries the brightness as
+ * a double in nits.
+ */
+u64 dcp_nits_to_double_bits(u32 nits)
+{
+	unsigned int msb;
+	u64 mant;
+
+	if (!nits)
+		return 0;
+
+	msb = fls(nits) - 1;
+	mant = ((u64)nits << (52 - msb)) & ((1ULL << 52) - 1);
+
+	return ((u64)(1023 + msb) << 52) | mant;
+}
+
+u32 dcp_h17p_initial_nits(struct apple_dcp *dcp)
+{
+	u32 max = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+
+	return clamp_t(u32, initial_brightness, 1, max);
+}
+
 #define SCALE_FACTOR (1 << 10)
 
 static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
@@ -163,6 +240,7 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 	}
 
 	state->acquire_ctx = &ctx;
+retry:
 	crtc_state = drm_atomic_get_crtc_state(state, crtc);
 	if (IS_ERR(crtc_state)) {
 		ret = PTR_ERR(crtc_state);
@@ -171,9 +249,41 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 
 	crtc_state->color_mgmt_changed |= true;
 
+	/*
+	 * The brightness travels inside a swap, and on H17P a swap without a
+	 * surface is refused (iomfb_flush keeps the last surface on the panel
+	 * rather than risk the firmware's null-fetch NMI).  A commit that only
+	 * touches the CRTC therefore never reaches the firmware unless the
+	 * compositor happens to draw a frame -- which it does not under
+	 * swaylock: swayidle's dim to 0 went out on the lock screen's last
+	 * frame and the restore on the next touch sat in sysfs forever while
+	 * the panel stayed dark (hb118, 2026-09-19 18:58).  Carry the
+	 * primary plane's current state, so the flush re-submits the surface
+	 * that is already on the panel together with the new level.
+	 */
+	if (crtc->primary) {
+		struct drm_plane_state *plane_state =
+			drm_atomic_get_plane_state(state, crtc->primary);
+
+		if (IS_ERR(plane_state)) {
+			ret = PTR_ERR(plane_state);
+			goto fail;
+		}
+	}
+
 	ret = drm_atomic_commit(state);
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
 
 fail:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
 	drm_atomic_state_put(state);
 done:
 	drm_modeset_drop_locks(&ctx);
@@ -199,6 +309,107 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	return drm_crtc_set_brightness(dcp);
 }
 
+/*
+ * One step of the H17P fade.  The level in flight is interpolated on the
+ * clock between the anchor and the target so a slow swap (or a compositor
+ * that is already flipping at full rate) stretches nothing: the fade ends
+ * ramp_ms after it started, give or take one frame.
+ *
+ * A step does not submit a swap of its own.  It only updates the level the
+ * next swap will carry, and a compositor that is drawing picks it up within
+ * a frame at no extra cost.  Pushing a full swap per step from here made
+ * every fade a second client fighting the compositor for the CRTC lock and
+ * the DCP swap channel, and the session stuttered for as long as the level
+ * was moving (auto-brightness keeps it moving).  Only when the previous
+ * step is still unconsumed a frame later -- nobody is drawing (swaylock,
+ * an idle desktop) -- does the worker submit the swap itself, carrying the
+ * current surface exactly as a single-step change did.
+ */
+static void dcp_backlight_ramp_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp,
+					     brightness.ramp_work);
+	struct drm_modeset_acquire_ctx ctx;
+	int from, target, level;
+	unsigned int duration;
+	bool unconsumed;
+	s64 elapsed;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	ret = drm_modeset_lock(&dcp->crtc->base.mutex, &ctx);
+	if (ret) {
+		drm_modeset_acquire_fini(&ctx);
+		schedule_delayed_work(&dcp->brightness.ramp_work,
+				      msecs_to_jiffies(RAMP_STEP_MS));
+		return;
+	}
+
+	/*
+	 * Count frames the previous step has sat unconsumed; a compositor
+	 * that is drawing resets it every frame.
+	 */
+	if (dcp->brightness.update)
+		dcp->brightness.idle_frames++;
+	else
+		dcp->brightness.idle_frames = 0;
+	unconsumed = dcp->brightness.idle_frames >= RAMP_IDLE_FRAMES;
+	if (unconsumed)
+		dcp->brightness.idle_frames = 0;
+
+	from = dcp->brightness.ramp_from;
+	target = dcp->brightness.target_nits;
+
+	if (dcp->brightness.nits == target) {
+		/* fade finished; make sure the last level actually goes out */
+		bool pending = dcp->brightness.update;
+
+		drm_modeset_drop_locks(&ctx);
+		drm_modeset_acquire_fini(&ctx);
+		if (!pending)
+			return;
+		if (unconsumed && dcp->valid_mode)
+			drm_crtc_set_brightness(dcp);
+		else
+			schedule_delayed_work(&dcp->brightness.ramp_work,
+					      msecs_to_jiffies(RAMP_STEP_MS));
+		return;
+	}
+
+	duration = dcp->brightness.ramp_duration_ms;
+	elapsed = ktime_ms_delta(ktime_get(), dcp->brightness.ramp_start);
+
+	if (!duration || !dcp->valid_mode || elapsed >= duration)
+		level = target;
+	else
+		level = from + (int)(((s64)(target - from) * elapsed) / duration);
+
+	/* never stall on rounding: always move at least one nit per step */
+	if (level == dcp->brightness.nits)
+		level += target > level ? 1 : -1;
+
+	dcp->brightness.nits = level;
+	dcp->brightness.dac = calculate_dac(dcp, level);
+	dcp->brightness.update = true;
+
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	if (unconsumed && dcp->valid_mode)
+		drm_crtc_set_brightness(dcp);
+
+	schedule_delayed_work(&dcp->brightness.ramp_work,
+			      msecs_to_jiffies(RAMP_STEP_MS));
+}
+
+static void dcp_backlight_ramp_cancel(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	cancel_delayed_work_sync(&dcp->brightness.ramp_work);
+}
+
 static int dcp_set_brightness(struct backlight_device *bd)
 {
 	int ret = 0;
@@ -213,6 +424,45 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		return -EDEADLK;
 	} else if (ret == -ERESTARTSYS) {
 		return -ERESTARTSYS;
+	}
+
+	/*
+	 * H17P takes the level in nits and does the DAC mapping itself; on the
+	 * older firmware nits is only ever what the DCP reported back.
+	 *
+	 * On H17P the new level is not applied here: the ramp worker walks
+	 * brightness.nits from wherever it is now to the target, and the
+	 * backlight core keeps reporting the target in `brightness` while
+	 * `actual_brightness` (dcp_get_brightness) follows the fade.  A
+	 * request arriving mid-fade simply re-anchors the ramp at the
+	 * current level, so a burst of sysfs writes (a slider drag, gsd's
+	 * ambient updates) never snaps or overshoots.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		ktime_t now = ktime_get();
+		s64 gap = ktime_ms_delta(now, dcp->brightness.last_request);
+		unsigned int duration = ramp_ms;
+
+		/*
+		 * Pace a stream at its own cadence: a request that follows
+		 * another within RAMP_STREAM_GAP_MS fades over the interval
+		 * between them (never shorter than ramp_ms, never longer than
+		 * ramp_max_ms), so the fade ends about when the next request
+		 * lands and the motion is continuous.
+		 */
+		if (ramp_ms && dcp->brightness.last_request &&
+		    gap < RAMP_STREAM_GAP_MS)
+			duration = clamp_t(s64, gap, ramp_ms, ramp_max_ms);
+
+		dcp->brightness.last_request = now;
+		dcp->brightness.ramp_duration_ms = duration;
+		dcp->brightness.target_nits = brightness;
+		dcp->brightness.ramp_from = dcp->brightness.nits;
+		dcp->brightness.ramp_start = now;
+		drm_modeset_drop_locks(&ctx);
+
+		mod_delayed_work(system_wq, &dcp->brightness.ramp_work, 0);
+		return 0;
 	}
 
 	dcp->brightness.dac = calculate_dac(dcp, brightness);
@@ -233,12 +483,19 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 	struct backlight_device *bl_dev;
+	int ret;
 	struct backlight_properties props = {
 		.type = BACKLIGHT_PLATFORM,
 		.brightness = dcp->brightness.nits,
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+
+	INIT_DELAYED_WORK(&dcp->brightness.ramp_work, dcp_backlight_ramp_work);
+	dcp->brightness.target_nits = dcp->brightness.nits;
+	ret = devm_add_action_or_reset(dev, dcp_backlight_ramp_cancel, dcp);
+	if (ret)
+		return ret;
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);

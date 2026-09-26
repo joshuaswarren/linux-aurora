@@ -30,6 +30,17 @@ enum dptx_apcall {
 	DPTX_APCALL_DEVICE_NOT_RESPONDING = 22,
 	DPTX_APCALL_DEVICE_BUSY_TIMEOUT = 23,
 	DPTX_APCALL_DEVICE_NOT_STARTED = 24,
+	/*
+	 * 25G83 sends this one on connect and it is not in the classic table.
+	 * Eryk's M4 client (m4_dcpext_dptx.c, transcribed from the 25G83
+	 * RemotePortProxy command table) accepts it exactly like 18:
+	 *   else if ((command == 18 || command == 26) && data_size == 32)
+	 *           ret = 0;
+	 * -- accepted with success and no reply payload; only 18 carries the
+	 * HPD boolean.  Left unhandled it falls to the default arm, which
+	 * ACKs with whatever is in the reply buffer.
+	 */
+	DPTX_APCALL_SINK_QUERY_25G83 = 26,
 };
 
 #define DCPDPTX_REMOTE_PORT_CORE GENMASK(3, 0)
@@ -59,6 +70,13 @@ struct dptx_port {
 	u32 lane_count;
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
+	/*
+	 * Bitmask of AP-call indices already reported as unhandled, so each one
+	 * is named once per port instead of on every repetition. The firmware
+	 * repeats these during link training, and an unhandled call is a real
+	 * gap worth seeing exactly once.
+	 */
+	u32 unhandled_logged;
 };
 
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,

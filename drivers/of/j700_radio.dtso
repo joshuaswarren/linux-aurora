@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Phase 2 for the J700 radio: authorize DMA.
+ *
+ * The base DTB describes the APCIe host bridge well enough to train the link
+ * and enumerate both MT7932 functions, but gives it no IOMMU. Without one,
+ * dma_alloc_coherent() returns a raw physical address, and this machine has
+ * no RAM below 4 GiB at all, so the radio's DMA setup needs the translated
+ * aperture before its driver can claim the PCI functions.
+ *
+ * This overlay adds ONLY what the base DTB is missing. It deliberately does
+ * not restate reg, ranges, interrupts, interrupt-map, reset-gpios,
+ * pwren-gpios or power-domains: those already exist and are correct, and
+ * of_overlay would overwrite them. The exported J700 base-DTB symbols are
+ * the only phandle source for AIC and the existing APCIe DART.
+ *
+ * The DART is modified by a separate fragment so no overlay-local phandle
+ * collides with the base DART's existing phandle.
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc";
+
+		__overlay__ {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			piodma_radio: piodma@390030000 {
+				compatible = "apple,t8140-pcie-piodma";
+				reg = <0x3 0x90030000 0x0 0x4000
+				       0x3 0x90034000 0x0 0x4000
+				       0x3 0x90038000 0x0 0x4000>;
+				reg-names = "engine", "irq-aggregator", "fabric";
+				interrupt-parent = <&aic>;
+				interrupts = <0x0 0x4b7 0x4>;
+				iommus = <&pcie0_dart 17>;
+				apple,iova-address-bits = <36>;
+				apple,piodma-base-addresses =
+					<0x1c 0xb0000000>, <0xb 0xc0000000>,
+					<0xb 0x80000000>;
+				apple,piodma-aperture-sizes =
+					<0x0 0x10000000>, <0x0 0x20000000>,
+					<0x0 0x40000000>;
+			};
+
+			pcie@1cb0000000 {
+				iommu-map = <0x100 &pcie0_dart 0x1 0x1
+					     0x101 &pcie0_dart 0x2 0x1>;
+				iommu-map-mask = <0xffff>;
+				apple,valid-functions = <0x3>;
+				apple,endpoint-iova-address-bits = <32>;
+				apple,piodma = <&piodma_radio>;
+				dma-coherent;
+
+				pci@0,0 {
+					/* Identical to the live values; see above. */
+					#address-cells = <3>;
+					#size-cells = <2>;
+
+					wifi@0,0 {
+						compatible = "pci14c3,7932";
+						reg = <0x10000 0x0 0x0 0x0 0x0>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&pcie0_dart>;
+		__overlay__ {
+			#iommu-cells = <1>;
+			apple,force-available;
+		};
+	};
+};

@@ -113,6 +113,13 @@ config OF_OVERLAY
 	  While this option is selected automatically when needed, you can
 	  enable it manually to improve device tree unit test coverage.
 
+config J700_RADIO_OVERLAY
+	tristate "J700 post-root radio device-tree overlay"
+	depends on ARCH_APPLE && OF_OVERLAY
+	help
+	  Add the J700 radio's PCIe IOMMU and endpoint topology after the
+	  internal storage root has mounted. The loader supplies device identity.
+
 config OF_OVERLAY_KUNIT_TEST
 	tristate "Device Tree overlay KUnit tests" if !KUNIT_ALL_TESTS
 	depends on KUNIT

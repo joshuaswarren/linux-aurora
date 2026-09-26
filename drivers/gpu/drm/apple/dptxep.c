@@ -138,7 +138,12 @@ int dptxport_request_display(struct apple_epic_service *service)
 
 int dptxport_release_display(struct apple_epic_service *service)
 {
-	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
+	/*
+	 * Native RemotePortProxy::displayRelease uses service group 8 (command
+	 * 7), unlike the older Linux group 0.  Matched to the J713 25G83
+	 * capture; displayRequest stays group 0.
+	 */
+	return afk_service_call(service, 8, 7, NULL, 0, 16, NULL, 0, 16);
 }
 
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
@@ -558,15 +563,6 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS:
 		return dptxport_call_get_max_drive_settings(service, reply,
 							    reply_size);
-	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
-	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
-	case DPTX_APCALL_DEVICE_NOT_STARTED:
-		dev_warn(service->ep->dcp->dev,
-			 "DPTXPort: firmware reports link fault %u on target %u:%u\n",
-			 idx, service->ep->dcp->dptx_die,
-			 service->ep->dcp->dptx_phy);
-		memcpy(reply, data, min(reply_size, data_size));
-		return 0;
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
 		memcpy(reply, data, min(reply_size, data_size));
 		return dptxport_call_set_tiled_display_hint(reply, reply_size);
@@ -582,10 +578,49 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEACTIVATE:
 		return dptxport_call_deactivate(service, data, data_size,
 						reply, reply_size);
+	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
+	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
+	case DPTX_APCALL_DEVICE_NOT_STARTED:
+		/*
+		 * These three are the firmware telling us the link failed.
+		 * They were reaching the default arm and being logged as
+		 * "acking unhandled call 22" at info level, which reads like
+		 * an unimplemented opcode rather than a dead display.
+		 */
+		dev_warn(service->ep->dcp->dev,
+			 "DPTXPort: firmware reports link fault %u on %u:%u\n",
+			 idx, service->ep->dcp->dptx_die,
+			 service->ep->dcp->dptx_phy);
+		memcpy(reply, data, min(reply_size, data_size));
+		if (reply_size >= 4)
+			memset(reply, 0, 4);
+		return 0;
+	case DPTX_APCALL_SINK_QUERY_25G83:
+		/*
+		 * Accepted with success and a zeroed retcode, as the native
+		 * client does.  See the comment on the enum.
+		 */
+		memcpy(reply, data, min(reply_size, data_size));
+		if (reply_size >= 4)
+			memset(reply, 0, 4);
+		return 0;
 	default:
-		/* just try to ACK and hope for the best... */
-		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",
-			idx);
+		/*
+		 * Not implemented here. The reply echoes the request with a zero
+		 * retcode, which is what the native client does for the calls it
+		 * accepts without a payload -- but for a call that genuinely
+		 * wants an answer this is a guess, so say which one it was.
+		 *
+		 * Reported once per index per port: the firmware repeats these
+		 * throughout link training, and the useful artefact is the set of
+		 * calls we do not implement, not one line per repetition.
+		 */
+		if (idx < 32 && !(dptx->unhandled_logged & BIT(idx))) {
+			dptx->unhandled_logged |= BIT(idx);
+			dev_warn(service->ep->dcp->dev,
+				 "DPTXPort: AP call %u is not implemented; echoing the request with a zero retcode\n",
+				 idx);
+		}
 		fallthrough;
 	case DPTX_APCALL_GET_DOWN_SPREAD:
 	case DPTX_APCALL_SET_DOWN_SPREAD:
@@ -599,32 +634,180 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
+	struct apple_dcp *dcp = service->ep->dcp;
+	s64 port;
 
-	if (strcmp(name, "dcpdptx-port-epic"))
+	/*
+	 * Both mismatches used to return silently, and the only symptom was
+	 * dptxep_init() timing out a second later on a port that never
+	 * enabled.  Say which string did not match.
+	 */
+	if (strcmp(name, "dcpdptx-port-epic")) {
+		dev_warn(dcp->dev,
+			 "DPTXPort: ignoring service named '%s', expected 'dcpdptx-port-epic'\n",
+			 name);
 		return;
-	if (strcmp(class, "AppleDCPDPTXRemotePort"))
+	}
+	if (strcmp(class, "AppleDCPDPTXRemotePort")) {
+		dev_warn(dcp->dev,
+			 "DPTXPort: service '%s' has class '%s', expected 'AppleDCPDPTXRemotePort'\n",
+			 name, class);
 		return;
+	}
 
-	trace_dptxport_init(service->ep->dcp, unit);
+	trace_dptxport_init(dcp, unit);
 
-	switch (unit) {
+	/*
+	 * On H17P the announced "unit" is the dynamic EPIC interface id, not a
+	 * zero-based port index (the two 0x24 controllers announce as 1 and 3).
+	 * The connect path only ever uses dptxport[0..num_dptx_ports); on this
+	 * single-port controller map the sole RemotePort to index 0 so a
+	 * nonzero interface id does not make it miss dptxport[0].  Classic
+	 * firmware keeps its 0/1 unit semantics.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.num_dptx_ports == 1)
+		port = 0;
+	else
+		port = unit;
+
+	switch (port) {
 	case 0:
 	case 1:
-		if (service->ep->dcp->dptxport[unit].enabled) {
-			dev_err(service->ep->dcp->dev,
-				"DPTXPort: unit %lld already exists\n", unit);
+		if (dcp->dptxport[port].enabled) {
+			dev_err(dcp->dev,
+				"DPTXPort: unit %lld (port %lld) already exists\n",
+				unit, port);
 			return;
 		}
-		service->ep->dcp->dptxport[unit].unit = unit;
-		service->ep->dcp->dptxport[unit].service = service;
-		service->ep->dcp->dptxport[unit].enabled = true;
-		service->cookie = (void *)&service->ep->dcp->dptxport[unit];
-		complete(&service->ep->dcp->dptxport[unit].enable_completion);
+		dcp->dptxport[port].unit = port;
+		dcp->dptxport[port].service = service;
+		dcp->dptxport[port].enabled = true;
+		service->cookie = (void *)&dcp->dptxport[port];
+		complete(&dcp->dptxport[port].enable_completion);
+		dev_info(dcp->dev,
+			 "DPTXPort: enabled port %lld from announced unit %lld\n",
+			 port, unit);
 		break;
 	default:
-		dev_err(service->ep->dcp->dev, "DPTXPort: invalid unit %lld\n",
-			unit);
+		dev_err(dcp->dev, "DPTXPort: invalid unit %lld\n", unit);
 	}
+}
+
+/*
+ * The DisplayPort controller services.  We do not drive them yet -- starting
+ * their endpoints at all is the point, because the firmware will not bring up
+ * the DP stack (and so never announces "dcpdptx-port-epic" on 0x2a) until
+ * they are up.  Log whatever turns up so the set can be confirmed on real
+ * hardware; matching is by EPICProviderClass, so both the class and the
+ * service name are listed for each.
+ */
+static void dp_control_init(struct apple_epic_service *service,
+			    const char *name, const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	dev_info(dcp->dev,
+		 "J700_DP_CONTROL: ep:%02x service '%s' class '%s' unit %lld\n",
+		 service->ep->endpoint, name, class, unit);
+
+	/*
+	 * Keep them apart by EPIC name: both announce as AppleDCPDPTXController,
+	 * on units 1 ("dcpav-controller-epic") and 3 ("dcpdp-controller-epic").
+	 * Do not call into them from here -- this runs on the AFK work queue
+	 * that would have to deliver the reply.
+	 */
+	if (!strcmp(name, "dcpav-controller-epic"))
+		dcp->dptxctl_av = service;
+	else if (!strcmp(name, "dcpdp-controller-epic"))
+		dcp->dptxctl_dp = service;
+}
+
+/*
+ * Command numbers on the controller service, from m1n1's
+ * DCPAVControllerService (proxyclient/m1n1/fw/dcp/dcpav.py): group 8, with
+ * setPower=0x8, getPower=0x9, wakeDisplay=0xa, sleepDisplay=0xb,
+ * forceHotPlugDetect=0xc, setVirtualDeviceMode=0xd.  The payload shape is the
+ * same <16xI12x> that dcpdptx_hotplug_cmd already describes.
+ */
+#define DPTXCTL_SET_POWER		0x8
+#define DPTXCTL_WAKE_DISPLAY		0xa
+#define DPTXCTL_FORCE_HPD		0xc
+
+static int dptxctl_call(struct apple_dcp *dcp, struct apple_epic_service *svc,
+			const char *what, u32 command, u32 arg)
+{
+	struct dcpdptx_hotplug_cmd cmd, resp;
+	int ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.unk = cpu_to_le32(arg);
+
+	ret = afk_service_call(svc, 8, command, &cmd, sizeof(cmd), 12, &resp,
+			       sizeof(resp), 12);
+	dev_info(dcp->dev, "J700_DPTXCTL: %s(cmd=%#x arg=%u) -> %d resp=%#x\n",
+		 what, command, arg, ret, le32_to_cpu(resp.unk));
+	return ret;
+}
+
+/*
+ * Nudge the DisplayPort controller after IOMFB is up.  Binding the controller
+ * services is not on its own enough to make the firmware publish
+ * "dcpdptx-port-epic" on 0x2a: it powers the external pipe straight back down
+ * ("HPD not present, skipping mode export" -> "IOMFB: power on -> off").  Ask
+ * it to power up and re-run hotplug detection.
+ */
+void dptx_control_kick(struct apple_dcp *dcp)
+{
+	if (dcp->dptxctl_av) {
+		dptxctl_call(dcp, dcp->dptxctl_av, "av.setPower",
+			     DPTXCTL_SET_POWER, 1);
+		dptxctl_call(dcp, dcp->dptxctl_av, "av.wakeDisplay",
+			     DPTXCTL_WAKE_DISPLAY, 0);
+		dptxctl_call(dcp, dcp->dptxctl_av, "av.forceHotPlugDetect",
+			     DPTXCTL_FORCE_HPD, 0);
+	} else {
+		dev_info(dcp->dev, "J700_DPTXCTL: no dcpav controller bound\n");
+	}
+
+	if (dcp->dptxctl_dp)
+		dptxctl_call(dcp, dcp->dptxctl_dp, "dp.setPower",
+			     DPTXCTL_SET_POWER, 1);
+	else
+		dev_info(dcp->dev, "J700_DPTXCTL: no dcpdp controller bound\n");
+}
+
+/*
+ * Matching is by EPICProviderClass, not by the EPIC service name.  On J700
+ * endpoint 0x24 announces two services, both of class "AppleDCPDPTXController",
+ * on channels 1 and 3.
+ */
+static const struct apple_epic_service_ops dptx_control_ops[] = {
+	{ .name = "AppleDCPDPTXController", .init = dp_control_init },
+	{}
+};
+
+/*
+ * Start the two DisplayPort controller endpoints.  Errors are not fatal: the
+ * caller carries on to dptxep_init() either way, so a machine whose firmware
+ * does not have these endpoints behaves exactly as before.
+ */
+int dptx_control_init(struct apple_dcp *dcp)
+{
+	int ret;
+
+	dcp->dptxcontrolep = afk_init(dcp, DPTX_CONTROL_ENDPOINT,
+				      dptx_control_ops);
+	if (IS_ERR(dcp->dptxcontrolep))
+		return PTR_ERR(dcp->dptxcontrolep);
+
+	ret = afk_start(dcp->dptxcontrolep);
+	if (ret) {
+		dev_warn(dcp->dev, "Failed to start DPTX control endpoint: %d\n",
+			 ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 static const struct apple_epic_service_ops dptxep_ops[] = {
@@ -639,15 +822,22 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 int dptxep_init(struct apple_dcp *dcp)
 {
 	int ret;
-	u32 port;
-	unsigned long timeout = msecs_to_jiffies(1000);
 
 	init_completion(&dcp->dptxport[0].enable_completion);
 	init_completion(&dcp->dptxport[1].enable_completion);
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	dcp->dptxep = afk_init(dcp, DPTX_ENDPOINT, dptxep_ops);
+	/*
+	 * H17P publishes "dcpdptx-port-epic" on 0x2c, not 0x2a -- see the
+	 * comment on DPTX_PORT_ENDPOINT_H17P.  Traced against this machine's
+	 * own macOS on the same firmware build.
+	 */
+	dcp->dptxep = afk_init(dcp,
+			       dcp->fw_compat == DCP_FIRMWARE_H17P ?
+				       DPTX_PORT_ENDPOINT_H17P :
+				       DPTX_ENDPOINT,
+			       dptxep_ops);
 	if (IS_ERR(dcp->dptxep))
 		return PTR_ERR(dcp->dptxep);
 
@@ -655,7 +845,41 @@ int dptxep_init(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 
+	return 0;
+}
+
+/*
+ * Wait for the firmware to publish its DisplayPort port service.
+ *
+ * This used to sit at the end of dptxep_init(), which runs before
+ * iomfb_start_rtkit().  On T8140 that inverts the dependency: the firmware
+ * does not announce "dcpdptx-port-epic" until IOMFB is running, and IOMFB
+ * cannot start while this wait holds the caller.  Measured on J700
+ * 2026-09-22, the two events are 3 ms apart in exactly the wrong order:
+ *
+ *   [4.390] AFK[ep:2a]: getbuf size 0x4000 tag 0xcafe
+ *   [5.411] Failed to start DPTX endpoint: -110     <- 1 s wait gives up
+ *   [5.414] IOMFB: init complete (version 64)       <- 3 ms later
+ *
+ * dptxport[0].enabled therefore stayed false for the rest of the boot, and
+ * every later dcp_dptx_connect() refused with "dptx service for port 0 not
+ * enabled" -- including the one raised by a real DisplayPort hotplug.
+ *
+ * Starting the endpoint is still done early, so a service announcement always
+ * has somewhere to land; only the wait moves after IOMFB.
+ */
+int dptxep_wait_ports(struct apple_dcp *dcp)
+{
+	unsigned long timeout = msecs_to_jiffies(1000);
+	u32 port;
+	int ret;
+
+	if (IS_ERR_OR_NULL(dcp->dptxep))
+		return -ENODEV;
+
 	for (port = 0; port < dcp->hw.num_dptx_ports; port++) {
+		if (dcp->dptxport[port].enabled)
+			continue;
 		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
 						timeout);
 		if (!ret)

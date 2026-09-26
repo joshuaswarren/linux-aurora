@@ -311,6 +311,16 @@ config BT_HCIBCM4377
 	  Say Y here to compile support for HCI BCM4377 family devices into the
 	  kernel or say M to compile it as module (hci_bcm4377).
 
+config BT_HCIMT79XX_PCIE
+	tristate "MediaTek MT79xx HCI PCIe transport"
+	depends on PCI
+	select BT_MTK
+	select FW_LOADER
+	help
+	  Experimental PCIe transport for MediaTek MT79xx Bluetooth functions,
+	  including the MT7932 companion function on Apple J700 systems. It
+	  requires the matching local firmware and board calibration.
+
 config BT_HCIBPA10X
 	tristate "HCI BPA10x USB driver"
 	depends on BT_HCIUART

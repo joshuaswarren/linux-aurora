@@ -432,7 +432,7 @@ u64 apple_format_modifiers[] = {
 
 struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
-				   u32 iomfb_surf,
+				   u32 iomfb_surface,
 				   bool supports_l10r,
 				   enum drm_plane_type type)
 {
@@ -483,8 +483,8 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 		drm_plane_helper_add(&plane->base, &apple_primary_plane_helper_funcs);
 	else
 		drm_plane_helper_add(&plane->base, &apple_plane_helper_funcs);
+	plane->iomfb_surface = iomfb_surface;
 
-	plane->iomfb_surf = iomfb_surf;
 
 	return &plane->base;
 }

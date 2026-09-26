@@ -48,6 +48,14 @@ struct apple_epic_service {
 	bool enabled;
 	bool torndown;
 
+	/*
+	 * H17P/AFKEP-V2 only: a service must be explicitly OPENed before the
+	 * firmware accepts commands on it, and every V2 packet carries a
+	 * per-service sequence byte.  Unused on the classic (V1) path.
+	 */
+	bool opened;
+	u8 seq;
+
 	void *cookie;
 
     struct {
@@ -71,15 +79,17 @@ struct apple_epic_service_ops {
 	void (*teardown)(struct apple_epic_service *service);
 };
 
-struct afk_ringbuffer_header {
-	__le32 bufsz;
-	u32 unk;
-	u32 _pad1[14];
-	__le32 rptr;
-	u32 _pad2[15];
-	__le32 wptr;
-	u32 _pad3[15];
-};
+/*
+ * The ring header is three control blocks -- bufsz, rptr, wptr -- each padded
+ * out to the firmware's control-block size.  That block is 0x40 bytes up to
+ * v13.5 but 0x80 on H17P, making the header 0xc0 or 0x180.  The size is
+ * self-describing: the INITRB message gives the total ring size and the first
+ * word of block 0 gives the payload size, so the stride is (size - bufsz) / 3
+ * and no firmware-version test is needed.  Address the fields by stride rather
+ * than through a fixed struct.
+ */
+#define AFK_RB_BLOCK_MIN	0x40
+#define AFK_RB_BLOCKS		3
 
 struct afk_qe {
 #define QE_MAGIC 0x20504f49 // ' POI'
@@ -108,6 +118,22 @@ struct epic_sub_hdr {
 	__le16 unk;
 	__le32 inline_len;
 } __attribute__((packed));
+
+/*
+ * H17P compresses the EPIC sub-header from 24 bytes to 8 and drops the
+ * separate length/timestamp: the announce for the "system" service puts its
+ * name at data + 0x18, not data + 0x28.  Verified against live ring dumps on
+ * J700, where an announce carries type 0x11 and a standard-service report
+ * carries the usual 0xc0.
+ */
+struct epic_sub_hdr_h17p {
+	u8 type;
+	u8 category;
+	__le16 flags;
+	__le32 tag;
+} __packed;
+
+#define EPIC_SUBTYPE_ANNOUNCE_H17P 0x11
 
 struct epic_cmd {
 	__le32 retcode;
@@ -150,15 +176,64 @@ enum epic_subtype {
 	EPIC_SUBTYPE_STD_SERVICE = 0xc0,
 };
 
+/*
+ * H17P / AFKEP-V2 command transport.
+ *
+ * The publication and report *decode* is already shared with the classic
+ * path: struct epic_sub_hdr_h17p above is, byte for byte, the V2 common
+ * header (interface id at +2, type at +16, category at +17, report flags at
+ * +18).  What the classic path cannot do is the command/response exchange,
+ * which uses a different envelope and inline (non-DMA) payloads.  A V2 packet
+ * on the wire is:
+ *
+ *   [0]      sequence byte (per service)
+ *   [2..3]   interface id (LE16)            == apple_epic_service.channel
+ *   [4..7]   following length (LE32)        == total bytes - 8
+ *   [8..15]  identifier (LE64, 0 for AP-originated commands)
+ *   [16]     type   (0x11 publish, 0x12 open, 0x13 close, 0xc0 command)
+ *   [17]     category (0 report, 1 command, 2 response)
+ *   [18]     report flag (open/close reports set 1)
+ *   [24]     command flags (bit0 = out-of-band buffers; we only do inline)
+ *   [25]     tag (matches a response to its command)
+ *   [28..31] capacity (command) or status (response), LE32
+ *   [32..95] struct epic_service_call (group@2, command@4, data_len@8, magic@12)
+ *   [96..]   inline service payload
+ */
+#define EPIC_V2_TYPE_PUBLISH		0x11
+#define EPIC_V2_TYPE_OPEN		0x12
+#define EPIC_V2_TYPE_CLOSE		0x13
+#define EPIC_V2_TYPE_COMMAND		0xc0
+#define EPIC_V2_CAT_REPORT		0
+#define EPIC_V2_CAT_COMMAND		1
+#define EPIC_V2_CAT_RESPONSE		2
+#define EPIC_V2_STATUS_UNSUPPORTED	0xe00002c7	/* kIOReturnUnsupported */
+#define EPIC_V2_REPORT_HDR		24	/* transport(8) + common(16) */
+#define EPIC_V2_HDR			32	/* + command/response(8) */
+#define EPIC_V2_CALL			64	/* struct epic_service_call */
+#define EPIC_V2_BODY			(EPIC_V2_HDR + EPIC_V2_CALL) /* = 96 */
+
 struct afk_ringbuffer {
 	bool ready;
-	struct afk_ringbuffer_header *hdr;
+	void *hdr;
+	u32 block;			/* control-block stride, 0x40 or 0x80 */
 	u32 rptr;
 	void *buf;
 	size_t bufsz;
 };
 
+static inline __le32 *afk_rb_field(struct afk_ringbuffer *bfr, unsigned int idx)
+{
+	return (__le32 *)((u8 *)bfr->hdr + idx * bfr->block);
+}
+
+#define afk_rb_bufsz(bfr)	afk_rb_field(bfr, 0)
+#define afk_rb_rptr(bfr)	afk_rb_field(bfr, 1)
+#define afk_rb_wptr(bfr)	afk_rb_field(bfr, 2)
+#define afk_rb_hdrsz(bfr)	(AFK_RB_BLOCKS * (bfr)->block)
+
+
 struct apple_dcp_afkep {
+	bool dumped_hdr;
 	struct apple_dcp *dcp;
 
 	u32 endpoint;
