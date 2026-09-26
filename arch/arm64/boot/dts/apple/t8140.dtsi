@@ -434,9 +434,9 @@
 				#thermal-sensor-cells = <1>;
 
 				/*
-				 * CPU cluster die temperatures. Keep these
-				 * first: the J700 CPU thermal policy reads
-				 * the first six temperature channels.
+				 * CPU cluster die temperatures. Board thermal
+				 * zones refer to these by channel index, so
+				 * keep them first and in this order.
 				 */
 				temperature-Te05 {
 					apple,key-id = "Te05";
