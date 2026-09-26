@@ -33,10 +33,39 @@
 #include <linux/pci-apple.h>
 #include <linux/pci-ecam.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/workqueue.h>
 
 #include "../pci.h"
 #include "pci-host-common.h"
 #include "pcie-apple-piodma.h"
+
+static bool piodma_config = true;
+module_param(piodma_config, bool, 0644);
+MODULE_PARM_DESC(piodma_config,
+		 "use PIODMA for downstream PCI configuration accesses");
+static bool piodma_config_writes;
+module_param(piodma_config_writes, bool, 0644);
+MODULE_PARM_DESC(piodma_config_writes,
+		 "use PIODMA for downstream PCI configuration writes");
+static int piodma_config_read_limit = 1;
+module_param(piodma_config_read_limit, int, 0644);
+MODULE_PARM_DESC(piodma_config_read_limit,
+		 "maximum downstream PIODMA config reads; negative is unlimited");
+
+static uint sunrise_power_off_ms = 2;
+module_param(sunrise_power_off_ms, uint, 0644);
+MODULE_PARM_DESC(sunrise_power_off_ms,
+		 "J700 RegOn low interval in milliseconds (default: Apple 2 ms)");
+
+static uint sunrise_power_on_ms = 150;
+module_param(sunrise_power_on_ms, uint, 0644);
+MODULE_PARM_DESC(sunrise_power_on_ms,
+		 "J700 RegOn high settle in milliseconds (default: Apple 150 ms)");
+
+static uint sunrise_link_retries;
+module_param(sunrise_link_retries, uint, 0644);
+MODULE_PARM_DESC(sunrise_link_retries,
+		 "bounded J700 RegOn/PERST link-recovery attempts (default: 0)");
 
 static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
@@ -199,6 +228,10 @@ struct hw_info {
 	u32 port_msimap;
 	u32 max_rid2sid;
 	bool tunneled;
+	bool rid2sid_index_is_sid;
+	bool clear_phy_refclk_cgen;
+	bool sunrise_power_sequence;
+	bool requires_piodma;
 };
 
 static const struct hw_info t8103_hw = {
@@ -230,6 +263,22 @@ static const struct hw_info t8103_pciec_hw = {
 	.port_rid2sid		= PORT_RID2SID,
 	.max_rid2sid		= 64,
 	.tunneled		= true,
+};
+
+static const struct hw_info t8140_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	/* J700 ADT sid-count is 19. AppleT8140PCIe uses slot == SID. */
+	.max_rid2sid		= 19,
+	.rid2sid_index_is_sid = true,
+	.clear_phy_refclk_cgen = true,
+	.sunrise_power_sequence = true,
+	.requires_piodma = true,
 };
 
 struct apple_pcie {
@@ -415,6 +464,39 @@ static void apple_pcie_tunnel_apply_tunable(void __iomem *base,
 			apple_pcie_tunnel_writel(base, value,
 						  tunable->values[i].offset);
 	}
+}
+
+static int apple_pcie_sunrise_recover_link(struct apple_pcie_port *port,
+					   unsigned int attempt)
+{
+	struct apple_pcie *pcie = port->pcie;
+	u32 stat;
+	int ret;
+
+	if (!port->pwren_gpio || !port->reset_gpio)
+		return -ENODEV;
+
+	writel_relaxed(0, port->base + PORT_LTSSMCTL);
+	readl_relaxed(port->base + PORT_LTSSMCTL);
+	rmw_clear(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	gpiod_set_value_cansleep(port->reset_gpio, 1);
+	gpiod_set_value_cansleep(port->pwren_gpio, 0);
+	if (sunrise_power_off_ms <= 20)
+		fsleep(sunrise_power_off_ms * 1000);
+	else
+		msleep(sunrise_power_off_ms);
+	gpiod_set_value_cansleep(port->pwren_gpio, 1);
+	msleep(sunrise_power_on_ms);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	gpiod_set_value_cansleep(port->reset_gpio, 0);
+	msleep(100);
+
+	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					 stat & PORT_STATUS_READY, 100, 250000);
+	dev_info(pcie->dev,
+		 "J700_T8140_PCIE_LINK_RECOVERY_CYCLE: attempt=%u off_ms=%u on_ms=%u port_status=0x%08x ret=%d\n",
+		 attempt, sunrise_power_off_ms, sunrise_power_on_ms, stat, ret);
+	return ret;
 }
 
 static void apple_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
@@ -668,7 +750,8 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 	case PORT_INT_LINK_DOWN:
 		dev_info_ratelimited(port->pcie->dev, "Link down on %pOF\n",
 				     port->np);
-		schedule_work(&port->link_down_work);
+		if (port->pcie->hw->sunrise_power_sequence)
+			schedule_work(&port->link_down_work);
 		break;
 	default:
 		return IRQ_NONE;
@@ -1079,6 +1162,7 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 		irq_dispose_mapping(port->irq);
 		port->irq = 0;
 	}
+	cancel_work_sync(&port->link_down_work);
 
 	if (port->domain) {
 		irq_domain_remove(port->domain);
@@ -1360,6 +1444,13 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			port->phy = NULL;
 			goto err_teardown;
 		}
+		/* J700 leaves this port cold until the post-root radio overlay. */
+		if (pcie->hw->sunrise_power_sequence) {
+			rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+			dev_info(pcie->dev,
+				 "J700_T8140_PCIE_APPCLK_PRELINK_PASS: port=%u\n",
+				 port->idx);
+		}
 	}
 	if (pcie->hw->tunneled) {
 		/*
@@ -1402,6 +1493,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	if (pcie->hw->port_refclk)
 		rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
+	else if (port->phy && pcie->hw->clear_phy_refclk_cgen)
+		rmw_clear(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
 	else if (port->phy)
 		rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
 
@@ -1440,7 +1533,9 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	link_stat = apple_pcie_port_readl(port, PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
-		unsigned long timeout, left;
+		unsigned long timeout, left = 0;
+		unsigned int attempt, retries = pcie->hw->sunrise_power_sequence ?
+						 sunrise_link_retries : 0;
 
 		if (pcie->hw->tunneled) {
 			ret = apple_pcie_tunnel_release_reset(port);
@@ -1448,19 +1543,16 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 				goto err_teardown;
 		}
 
-		/* start link training */
-		apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
-
 		timeout = link_up_timeout * HZ / 1000;
-		for (attempt = 0; attempt <= sunrise_link_retries; attempt++) {
+		for (attempt = 0; attempt <= retries; attempt++) {
 			if (attempt) {
 				ret = apple_pcie_sunrise_recover_link(port, attempt);
 				if (ret)
 					continue;
 			}
 			reinit_completion(&pcie->event);
-			writel_relaxed(PORT_LTSSMCTL_START,
-				       port->base + PORT_LTSSMCTL);
+			apple_pcie_port_writel(port, PORT_LTSSMCTL_START,
+					       PORT_LTSSMCTL);
 			left = wait_for_completion_timeout(&pcie->event, timeout);
 			if (left)
 				break;
@@ -1468,11 +1560,10 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		if (!left)
 			dev_warn(pcie->dev,
 				 "%pOF link didn't come up after %u attempt(s)\n",
-				 np, sunrise_link_retries + 1);
+				 np, retries + 1);
 		else
-			dev_info(pcie->dev,
-				 "%pOF link up after %ldms attempt=%u\n", np,
-				 (timeout - left) * 1000 / HZ, attempt);
+			dev_info(pcie->dev, "%pOF link up after %ldms attempt=%u\n",
+				 np, (timeout - left) * 1000 / HZ, attempt);
 
 	}
 	if (pcie->hw->tunneled)
@@ -1568,8 +1659,6 @@ static bool apple_pcie_config_hidden(struct apple_pcie *pcie,
 	struct pci_config_window *cfg = bus->sysdata;
 	u16 bdf = (bus->number << 8) | devfn;
 
-	if (pcie && pcie->legacy_handoff && (bus->number > 1 || devfn != 0))
-		return true;
 	if (pcie && pcie->hide_bdf && bdf == pcie->hidden_bdf)
 		return true;
 	if (pcie && pcie->valid_functions &&
@@ -1786,11 +1875,7 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	mutex_lock(&port->pcie->lock);
 
 	if (port->pcie->hw->rid2sid_index_is_sid) {
-		if (port->pcie->legacy_handoff && sid < port->sid_map_sz &&
-		    readl_relaxed(port_rid2sid_addr(port, sid)) ==
-		    (PORT_RID2SID_VALID | FIELD_PREP(PORT_RID2SID_SID, sid) | rid)) {
-			idx = sid;
-		} else if (sid >= port->sid_map_sz || test_bit(sid, port->sid_map)) {
+		if (sid >= port->sid_map_sz || test_bit(sid, port->sid_map)) {
 			idx = -ENOSPC;
 		} else {
 			__set_bit(sid, port->sid_map);
@@ -1853,7 +1938,7 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 		return -ENOENT;
 	pcie->cfg = cfg;
 
-	if (pcie->hw->requires_piodma && piodma_config && !pcie->legacy_handoff) {
+	if (pcie->hw->requires_piodma && piodma_config) {
 		struct device_node *node;
 
 		node = of_parse_phandle(dev->of_node, "apple,piodma", 0);
@@ -1871,8 +1956,6 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 		dev_info(dev,
 			 "J700_PCIE_PIODMA_CONFIG: enabled=1 read_limit=%d writes=%u\n",
 			 piodma_config_read_limit, piodma_config_writes);
-	} else if (pcie->legacy_handoff) {
-		dev_info(dev, "Using retained J700 Wi-Fi ECAM handoff\n");
 	} else if (pcie->hw->requires_piodma) {
 		dev_info(dev,
 			 "J700_PCIE_PIODMA_CONFIG: enabled=0 provider=skipped diagnostic=1\n");
@@ -2147,6 +2230,36 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	{
+		u32 hidden_bdf;
+		u32 valid_functions;
+
+		if (!of_property_read_u32(dev->of_node,
+					  "apple,hide-pci-bdf", &hidden_bdf)) {
+			if (hidden_bdf > U16_MAX)
+				return dev_err_probe(dev, -EINVAL,
+						     "invalid hidden PCI BDF 0x%x\n",
+						     hidden_bdf);
+			pcie->hide_bdf = true;
+			pcie->hidden_bdf = hidden_bdf;
+			dev_info(dev,
+				 "J700_PCIE_HIDE_BDF_ARMED: bus=%02x dev=%02x fn=%u\n",
+				 hidden_bdf >> 8,
+				 PCI_SLOT(hidden_bdf & 0xff),
+				 PCI_FUNC(hidden_bdf & 0xff));
+		}
+		if (!of_property_read_u32(dev->of_node,
+					  "apple,valid-functions", &valid_functions)) {
+			if (!valid_functions || valid_functions > U8_MAX)
+				return dev_err_probe(dev, -EINVAL,
+						     "invalid function mask 0x%x\n",
+						     valid_functions);
+			pcie->valid_functions = valid_functions;
+			dev_info(dev,
+				 "J700_PCIE_VALID_FUNCTIONS: downstream-slot=0 mask=0x%02x\n",
+				 pcie->valid_functions);
+		}
+	}
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))
 		return PTR_ERR(pcie->base);
@@ -2351,6 +2464,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6000-pciec",	.data = &t8103_pciec_hw },
+	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }

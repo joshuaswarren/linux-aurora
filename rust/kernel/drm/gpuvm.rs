@@ -631,14 +631,8 @@ impl<T: DriverGpuVm> GpuVm<T> {
                     } else {
                         0
                     }) | bindings::DRM_EXEC_IGNORE_DUPLICATES,
-                    // SAFETY: both bindgen C structures are zero-valid; their generated
-                    // `Default` methods perform the same zero initialization but are not
-                    // exported from the kernel crate to loadable modules.
-                    exec: unsafe { MaybeUninit::<bindings::drm_exec>::zeroed().assume_init() },
-                    extra: unsafe {
-                        MaybeUninit::<bindings::drm_gpuvm_exec__bindgen_ty_1>::zeroed()
-                            .assume_init()
-                    },
+                    exec: Default::default(),
+                    extra: Default::default(),
                     num_fences: 0,
                 }),
                 GFP_KERNEL,

@@ -224,30 +224,17 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, false, false)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, false)
     }
 
-    /// Creates a G17P RTKit client with firmware-owned crash-DVA handling.
+    /// Creates a G17P client whose crash DVA belongs to the GPU UAT.
     pub fn new_g17p(
         dev: &device::Device,
         mbox_name: Option<&'static CStr>,
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, false, true)
-    }
-
-    /// Create a passive management client that answers only HELLO/EPMAP.
-    ///
-    /// This mode never starts crashlog or another endpoint and never performs
-    /// an AP/IOP power-state transition.
-    pub fn new_epmap_only(
-        dev: &device::Device,
-        mbox_name: Option<&'static CStr>,
-        mbox_idx: usize,
-        data: T::Data,
-    ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, true, false)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, true)
     }
 
     fn new_inner(
@@ -255,54 +242,28 @@ impl<T: Operations> RtKit<T> {
         mbox_name: Option<&'static CStr>,
         mbox_idx: usize,
         data: T::Data,
-        epmap_only: bool,
-        g17p: bool,
+        firmware_owned_crashlog: bool,
     ) -> Result<Self> {
         let ptr: *mut crate::ffi::c_void = data.into_foreign().cast();
         let guard = ScopeGuard::new(|| {
             // SAFETY: `ptr` came from a previous call to `into_foreign`.
             unsafe { T::Data::from_foreign(ptr.cast()) };
         });
-        // SAFETY: `dev` is valid by its type invarants and otherwise his just
-        //          calls the C init function.
-        let raw_name = match mbox_name {
+        let name = match mbox_name {
             Some(s) => s.as_char_ptr(),
             None => ptr::null(),
         };
-        let raw_index = mbox_idx.try_into()?;
-        let rtk = if epmap_only {
-            // SAFETY: arguments follow the C API contract and `ptr` remains
-            // owned by this wrapper until construction fails or Drop runs.
-            unsafe {
-                from_err_ptr(bindings::apple_rtkit_init_epmap_only(
-                    dev.as_raw(),
-                    ptr,
-                    raw_name,
-                    raw_index,
-                    &Self::VTABLE,
-                ))
-            }
-        } else if g17p {
-            // SAFETY: arguments follow the C API contract. This constructor
-            // changes only the crashlog handshake used by G17P firmware.
-            unsafe {
+        let index = mbox_idx.try_into()?;
+        // SAFETY: `dev` is valid by its type invariant and both C initializers
+        // take the same borrowed pointers. The guard owns `ptr` on failure.
+        let rtk = unsafe {
+            if firmware_owned_crashlog {
                 from_err_ptr(bindings::apple_rtkit_init_g17p(
-                    dev.as_raw(),
-                    ptr,
-                    raw_name,
-                    raw_index,
-                    &Self::VTABLE,
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
                 ))
-            }
-        } else {
-            // SAFETY: same invariants as the discovery-only constructor.
-            unsafe {
+            } else {
                 from_err_ptr(bindings::apple_rtkit_init(
-                    dev.as_raw(),
-                    ptr,
-                    raw_name,
-                    raw_index,
-                    &Self::VTABLE,
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
                 ))
             }
         }?;

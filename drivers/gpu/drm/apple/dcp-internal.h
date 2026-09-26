@@ -25,7 +25,7 @@
 #include "iomfb-surface.h"
 #include "epic/dpavservep.h"
 
-#define DCP_MAX_PLANES 4
+#define DCP_MAX_PLANES APPLE_DCP_MAX_SURFACES
 #define DCP_MAX_TYPEC_ROUTES 4
 
 struct apple_dcp;
@@ -251,7 +251,6 @@ struct apple_dcp {
 	bool adopting_session;
 	struct apple_dcp_surface_order iomfb_surfaces;
 
-	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *
@@ -265,26 +264,10 @@ struct apple_dcp {
 	/* DCP shared memory */
 	void *shmem;
 	dma_addr_t shmem_iova;
-	bool shmem_inherited;
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
-	enum apple_dcp_link_abi link_abi;
 	u32 link_firmware_hash;
-	u64 link_init_message;
-	u16 link_rx_log_count;
-	u16 link_reply_log_count;
-	u32 link_d563_a2i_before[5];
-	u32 link_d563_a2i_after[5];
-	u8 link_d563_a2i_count;
-	bool link_d563_a2i_ep1_observed;
-	/* Serializes firmware type0 with the inherited-session timed INIT. */
-	struct mutex link_init_lock;
-	enum apple_dcp_link_state link_state;
-	bool link_endpoint_started;
-	struct work_struct link_service_match_work;
-	unsigned long link_service_match_state;
-	__le32 *link_service_match_output;
-	int link_service_match_callback_tag;
+	bool link_ready;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
@@ -373,6 +356,14 @@ struct apple_dcp {
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct delayed_work vblank_wq;
+
+	/* Names a command the firmware has stopped answering */
+	struct delayed_work stall_wq;
+	bool warned_stall;
+	bool dumped_crashlog;
+	/* the DCP crashlog region, so a stall can read the fresh record */
+	void *crashlog_buf;
+	size_t crashlog_size;
 
 	/* Names a command the firmware has stopped answering */
 	struct delayed_work stall_wq;

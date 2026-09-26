@@ -427,10 +427,10 @@ impl File {
             gpu_revision: facts.gpu_revision,
             chip_id: facts.chip_id,
 
-            num_dies: gpu.get_dyncfg().id.num_dies,
-            num_clusters_total: gpu.get_dyncfg().id.num_clusters,
-            num_cores_per_cluster: gpu.get_dyncfg().id.num_cores,
-            core_masks: [0; uapi::DRM_ASAHI_MAX_CLUSTERS as usize],
+            num_dies: facts.num_dies,
+            num_clusters_total: facts.num_clusters_total,
+            num_cores_per_cluster: facts.num_cores_per_cluster,
+            core_masks: facts.core_masks.map(|mask| mask.into()),
 
             vm_start: gpu.user_range()?.start,
             vm_end: gpu.user_range()?.end,
@@ -442,14 +442,16 @@ impl File {
 
             command_timestamp_frequency_hz: 1_000_000_000, // User timestamps always in nanoseconds
 
-            usc_generation: gpu.get_dyncfg().id.usc_generation,
-            gpu_hal_generation: gpu.get_dyncfg().id.gpu_hal_generation as u32,
-        };
-
             usc_generation: facts.usc_generation,
             gpu_hal_generation: facts.gpu_hal_generation,
         };
 
+        if gpu.supports_vm_status() {
+            params.features |= crate::g17_status::FEATURE_VM_STATUS;
+        }
+        if gpu.independent_queue_limits().is_some() {
+            params.features |= crate::g17_queue_limits::FEATURE_INDEPENDENT_QUEUES;
+        }
         if *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
@@ -545,6 +547,33 @@ impl File {
                 vm.id(),
                 kernel::current!().group_leader().pid(),
                 file_id,
+            );
+        }
+
+        let simplefb_iova = *module_parameters::g17p_simplefb_iova.value();
+        if simplefb_iova != 0 {
+            if gpu.params()?.chip_id != 0x8140 {
+                return Err(ENOTSUPP);
+            }
+            let (simplefb_phys, simplefb_size) = t8140_simplefb_phys_range()?;
+            let simplefb_end = simplefb_iova
+                .checked_add(simplefb_size as u64)
+                .ok_or(EOVERFLOW)?;
+            let simplefb_range = simplefb_iova..simplefb_end;
+            if simplefb_iova & mmu::UAT_PGMSK as u64 != 0
+                || !user_range.is_superset(simplefb_range.clone())
+                || kernel_range.overlaps(simplefb_range.clone())
+                || vm.driver_range_overlaps(simplefb_range)
+            {
+                return Err(EINVAL);
+            }
+            vm.install_simplefb_mapping(simplefb_iova, simplefb_phys, simplefb_size)?;
+            dev_info!(
+                device,
+                "G17P simplefb: retained GPU alias {:#x}:{:#x} -> phys {:#x}\n",
+                simplefb_iova,
+                simplefb_size,
+                simplefb_phys,
             );
         }
 
@@ -766,78 +795,22 @@ impl File {
         let reader = UserSlice::new(UserPtr::from_addr(data.userptr as _), size).reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
         let mut reader = Reader::new(&vec);
-
-        for _i in 0..data.num_binds {
-            let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(data.stride as usize)?;
-            Self::do_gem_bind_unbind(vm_id, &bind, file)?;
-        }
-
-        Ok(0)
-    }
-
-    pub(crate) fn do_gem_bind_unbind(
-        vm_id: usize,
-        data: &uapi::drm_asahi_gem_bind_op,
-        file: &DrmFile,
-    ) -> Result<u32> {
-        if (data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND) != 0 {
-            Self::do_gem_unbind(vm_id, data, file)
-        } else {
-            Self::do_gem_bind(vm_id, data, file)
-        }
-    }
-
-    pub(crate) fn do_gem_bind(
-        vm_id: usize,
-        data: &uapi::drm_asahi_gem_bind_op,
-        file: &DrmFile,
-    ) -> Result<u32> {
-        if (data.addr | data.range | data.offset) as usize & mmu::UAT_PGMSK != 0 {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Addr/range/offset not page aligned: {:#x} {:#x}\n",
-                data.addr,
-                data.range
-            );
-            return Err(EINVAL); // Must be page aligned
-        }
-
-        if (data.flags
-            & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
-                | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
-                | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE))
-            != 0
-        {
-            cls_pr_debug!(Errors, "gem_bind: Invalid flags {:#x}\n", data.flags);
-            return Err(EINVAL);
-        }
-
-        let single_page = data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0;
-
-        let bo = gem::Object::lookup_handle(file, data.handle)?;
-
-        let start = data.addr;
-        let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
-        let range = start..end;
-
-        let bo_accessed_size = if single_page {
-            mmu::UAT_PGMSK as u64
-        } else {
-            data.range
-        };
-        let end_off = data.offset.checked_add(bo_accessed_size).ok_or(EINVAL)?;
-        if end_off as usize > bo.size() {
-            return Err(EINVAL);
-        }
-
-        // The user range is per-device geometry, so this check moves below
-        // the VM lookup (which is where the range is stored).
-
-        let prot = if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0 {
-            if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0 {
-                mmu::PROT_GPU_SHARED_RW
-            } else {
-                mmu::PROT_GPU_SHARED_RO
+        let mut ops = KVec::with_capacity(count, GFP_KERNEL)?;
+        for _i in 0..count {
+            let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(stride)?;
+            // Vulkan faults on an unmapped USC exec window. Log every bind so we
+            // can tell whether Mesa asks for that range and we drop it, or never
+            // asks at all.
+            if crate::util::g17p_verbose() {
+                pr_info!(
+                    "G17P bind: vm={} addr={:#x} range={:#x} offset={:#x} flags={:#x} handle={}\n",
+                    data.vm_id,
+                    bind.addr,
+                    bind.range,
+                    bind.offset,
+                    bind.flags,
+                    bind.handle,
+                );
             }
             ops.push(bind, GFP_KERNEL)?;
         }
@@ -886,31 +859,44 @@ impl File {
                 continue;
             }
 
-        // Clone it immediately so we aren't holding the XArray lock
-        let vm = guarded_vm.vm.clone();
-        let kernel_range = guarded_vm.kernel_range.clone();
-        let user_range = guarded_vm.user_range.clone();
-        let _ = guarded_vm;
-        core::mem::drop(guard);
-
-        if !user_range.is_superset(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL); // Invalid map range
-        }
-
-        if kernel_range.overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid map range {:#x}..{:#x} (intrudes in kernel range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
+            vm.wait_for_user_map_admission()?;
+            if op.flags
+                & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE)
+                != 0
+            {
+                return Err(EINVAL);
+            }
+            let read = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0;
+            let write = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0;
+            if !read && !write {
+                return Err(EINVAL);
+            }
+            let single_page =
+                op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0;
+            let bo = gem::Object::lookup_handle(file, op.handle)?;
+            let accessed_size = if single_page {
+                mmu::UAT_PGSZ as u64
+            } else {
+                op.range
+            };
+            let end_off = op.offset.checked_add(accessed_size).ok_or(EINVAL)?;
+            if end_off > u64::try_from(bo.size())? {
+                return Err(EINVAL);
+            }
+            vm.validate_t8140_native_context_binding(op.addr, op.range, single_page)?;
+            let prot = match (read, write) {
+                (true, true) => mmu::PROT_GPU_SHARED_RW,
+                (true, false) => mmu::PROT_GPU_SHARED_RO,
+                (false, true) => mmu::PROT_GPU_SHARED_WO,
+                (false, false) => unreachable!(),
+            };
+            let prepared = vm.prepare_bind_object(
+                &bo, op.addr, op.range, op.offset, prot, single_page,
+            )?;
+            batch.push_map(prepared)?;
+            plans.push(PreparedGemBindOp::Map { op, bo }, GFP_KERNEL)?;
         }
         if vm.driver_range_overlaps(range.clone()) {
             cls_pr_debug!(
@@ -939,81 +925,6 @@ impl File {
             }
         }
         vm.bo_deferred_cleanup();
-
-        Ok(0)
-    }
-
-    pub(crate) fn do_gem_unbind(
-        vm_id: usize,
-        data: &uapi::drm_asahi_gem_bind_op,
-        file: &DrmFile,
-    ) -> Result<u32> {
-        if data.offset != 0
-            || data.flags != uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND
-            || data.handle != 0
-        {
-            cls_pr_debug!(Errors, "gem_unbind: offset/flags/handle not zero\n");
-            return Err(EINVAL);
-        }
-
-        if (data.addr | data.range) as usize & mmu::UAT_PGMSK != 0 {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Addr/range/offset not page aligned: {:#x} {:#x}\n",
-                data.addr,
-                data.range
-            );
-            return Err(EINVAL); // Must be page aligned
-        }
-
-        let start = data.addr;
-        let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
-        let range = start..end;
-
-        let vms_xa = file.inner().vms();
-        let guard = vms_xa.lock();
-        let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
-
-        // Clone it immediately so we aren't holding the XArray lock
-        let vm = guarded_vm.vm.clone();
-        let kernel_range = guarded_vm.kernel_range.clone();
-        let user_range = guarded_vm.user_range.clone();
-        let _ = guarded_vm;
-        core::mem::drop(guard);
-
-        if !user_range.is_superset(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid unmap range {:#x}..{:#x} (not contained in user range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL); // Invalid map range
-        }
-
-        if kernel_range.overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid unmap range {:#x}..{:#x} (intrudes in kernel range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
-        }
-        if vm.driver_range_overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_unbind: range {:#x}..{:#x} overlaps a device-owned VA\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
-        }
-
-        vm.unmap_range(range.start, range.range())?;
-
-        vm.bo_deferred_cleanup();
-
         Ok(0)
     }
 

@@ -472,3 +472,5 @@
 		apple,always-on; /* used by the SMC firmware */
 	};
 };
+
+#include "t8140-hybrid-pmgr-additions.dtsi"

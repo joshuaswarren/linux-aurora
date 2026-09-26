@@ -4,12 +4,10 @@
 #ifndef __APPLE_DCP_LIFECYCLE_H__
 #define __APPLE_DCP_LIFECYCLE_H__
 
-#include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/types.h>
 
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN	BIT(4)
-#define APPLE_DCP_COPROC_CPU_CONTROL_STOP_SECOND_CLEAR	BIT(5)
 #define APPLE_DCP_COPROC_CPU_STATUS_RUNNING	BIT(0)
 #define APPLE_DCP_COPROC_CPU_STATUS_STOPPED	BIT(1)
 
@@ -29,14 +27,6 @@ static inline bool apple_dcp_coprocessor_is_active(u32 cpu_control, u32 cpu_stat
 	return !(cpu_status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED);
 }
 
-static inline bool
-apple_dcp_preserve_adopted_mappings(bool adopted, u32 cpu_control,
-				    u32 cpu_status)
-{
-	return adopted &&
-	       apple_dcp_coprocessor_is_active(cpu_control, cpu_status);
-}
-
 static inline enum apple_dcp_coprocessor_start
 apple_dcp_coprocessor_start_mode(bool loader_quiesced, bool can_adopt,
 				 u32 cpu_control, u32 cpu_status)
@@ -49,28 +39,6 @@ apple_dcp_coprocessor_start_mode(bool loader_quiesced, bool can_adopt,
 		return APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART;
 
 	return APPLE_DCP_COPROCESSOR_COLD_START;
-}
-
-static inline bool
-apple_dcp_needs_adoption(enum apple_dcp_coprocessor_start start_mode)
-{
-	return start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART;
-}
-
-static inline bool
-apple_dcp_needs_fresh_boot(enum apple_dcp_coprocessor_start start_mode)
-{
-	return start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART;
-}
-
-static inline u32 apple_dcp_coprocessor_stop_first(u32 control)
-{
-	return control & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN;
-}
-
-static inline u32 apple_dcp_coprocessor_stop_second(u32 control)
-{
-	return control & ~APPLE_DCP_COPROC_CPU_CONTROL_STOP_SECOND_CLEAR;
 }
 
 #endif /* __APPLE_DCP_LIFECYCLE_H__ */

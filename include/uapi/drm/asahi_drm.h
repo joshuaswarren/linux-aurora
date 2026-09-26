@@ -1288,6 +1288,17 @@ enum drm_asahi_compute_flags {
 };
 
 /**
+ * enum drm_asahi_compute_flags - Compute command flags
+ */
+enum drm_asahi_compute_flags {
+	/**
+	 * @DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF: Populate the retained G17P
+	 * three-buffer table from this command's three compute attachments.
+	 */
+	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
+};
+
+/**
  * struct drm_asahi_get_time - Arguments passed to DRM_IOCTL_ASAHI_GET_TIME
  */
 struct drm_asahi_get_time {

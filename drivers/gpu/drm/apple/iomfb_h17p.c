@@ -20,13 +20,6 @@ struct dcp_h17p_swap_info_request {
 	u8 padding[3];
 } __packed;
 
-struct dcp_h17p_read_edt_string_reply {
-	u8 value[0x40];
-	__le32 count;
-	u8 ret;
-	u8 padding[3];
-} __packed;
-
 static_assert(sizeof(struct dcp_h17p_hotplug_request) == 0x58);
 static_assert(sizeof(struct dcp_h17p_swap_info_request) == 0xe4);
 /* D590 swap_complete_ap_gated: 0x730 on the wire in 1919/1919 traced swaps. */
@@ -150,30 +143,6 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 	*(__le64 *)out = cpu_to_le64(rate);
 	return true;
 }
-
-static struct dcp_get_uint_prop_resp
-dcpep_cb_get_uint_prop_h17p(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *request)
-{
-	struct dcp_get_uint_prop_resp reply;
-
-	if (memcmp(request->obj, "SUMP", sizeof(request->obj)) ||
-	    strncmp(request->key, "Temperature", sizeof(request->key)))
-		return dcpep_cb_get_uint_prop(dcp, request);
-
-	reply = (struct dcp_get_uint_prop_resp) {
-		.value = 3029,
-		.ret = true,
-	};
-	dev_info(dcp->dev,
-		 "DCP25G83_SUMP_TEMPERATURE_REPLY value %llu ret %u\n",
-		 reply.value, reply.ret);
-
-	return reply;
-}
-
-TRAMPOLINE_INOUT(trampoline_get_uint_prop_h17p,
-		 dcpep_cb_get_uint_prop_h17p,
-		 struct dcp_get_uint_prop_req, struct dcp_get_uint_prop_resp);
 
 static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 				    void *out, void *in)
@@ -433,14 +402,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 
 void iomfb_start_h17p(struct apple_dcp *dcp)
 {
-	if (dcp->link_abi != APPLE_DCP_LINK_ABI_C3) {
-		dev_err(dcp->dev, "refusing unknown H17P DCPLink ABI %#x\n",
-			dcp->link_abi);
-		return;
-	}
-
-	dcp->cb_handlers = cb_handlers_c3;
-	dev_info(dcp->dev, "DCP25G83_SUMP_TEMPERATURE_3029 armed\n");
+	dcp->cb_handlers = cb_handlers;
 	dcp_start_signal(dcp, false, dcp_started, NULL);
 }
 

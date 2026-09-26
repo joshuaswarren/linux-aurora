@@ -41,17 +41,6 @@ static void apple_dcp_zero_status_is_active_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_dcp_coprocessor_is_active(0, 0));
 }
 
-static void apple_dcp_adopted_mapping_lifetime_test(struct kunit *test)
-{
-	KUNIT_EXPECT_TRUE(test,
-		apple_dcp_preserve_adopted_mappings(true, 0x10, 0x68));
-	KUNIT_EXPECT_FALSE(test,
-		apple_dcp_preserve_adopted_mappings(false, 0x10, 0x68));
-	KUNIT_EXPECT_FALSE(test,
-		apple_dcp_preserve_adopted_mappings(
-			true, 0, APPLE_DCP_COPROC_CPU_STATUS_STOPPED));
-}
-
 static void apple_dcp_j700_adoption_test(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test,
@@ -87,7 +76,6 @@ static struct kunit_case apple_dcp_lifecycle_test_cases[] = {
 	KUNIT_CASE(apple_dcp_status_running_test),
 	KUNIT_CASE(apple_dcp_j700_live_state_test),
 	KUNIT_CASE(apple_dcp_zero_status_is_active_test),
-	KUNIT_CASE(apple_dcp_adopted_mapping_lifetime_test),
 	KUNIT_CASE(apple_dcp_j700_adoption_test),
 	KUNIT_CASE(apple_dcp_j700_quiesced_handoff_test),
 	KUNIT_CASE(apple_dcp_cold_start_selection_test),

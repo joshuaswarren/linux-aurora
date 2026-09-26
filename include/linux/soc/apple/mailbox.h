@@ -38,11 +38,11 @@ enum apple_mbox_ascwrap_v6_role {
  * @wrapper_size: size of the provider's ASCWrap window
  * @iop_vbar_start: CPU physical base of the provider's IOP VBAR window
  * @iop_vbar_size: size of the provider's IOP VBAR window
- * @missing: remaining provider lifecycle work; zero for T8140 and T8142
+ * @missing: remaining provider lifecycle work; zero for T8140
  *
  * The apple-mailbox provider owns both mappings.  Consumers request CPU
  * transitions through the provider and never map either resource themselves.
- * T8140 and T8142 have a matching start and stop transform. AppleA7IOP's
+ * T8140 has a complete matching start and stop transform.  AppleA7IOP's
  * resetState() only updates software state and performs no reset MMIO.
  */
 struct apple_mbox_ascwrap_v6_lifecycle {
@@ -79,7 +79,11 @@ struct apple_mbox {
 	void (*rx)(struct apple_mbox *mbox, struct apple_mbox_msg msg, void *cookie);
 	void *cookie;
 
-	/* Protected by tx_lock; send-error and IRQ paths mask this only once. */
+	/*
+	 * Protected by tx_lock. IRQ, send-error and provider-removal paths
+	 * mask an outstanding unmask only once; rebuild every consumer when
+	 * changing this internal structure's layout.
+	 */
 	bool tx_irq_unmasked;
 };
 
@@ -98,7 +102,5 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox);
-int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
-				     u32 *control, u32 *status);
 
 #endif

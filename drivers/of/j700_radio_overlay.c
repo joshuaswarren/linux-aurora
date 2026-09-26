@@ -7,7 +7,6 @@
 #include <linux/types.h>
 
 #define J700_PCIE_PATH	"/soc/pcie@1cb0000000"
-#define J700_DART_PATH	"/soc/iommu@390000000"
 #define J700_WIFI_PATH	J700_PCIE_PATH "/pci@0,0/wifi@0,0"
 
 extern u8 __dtbo_j700_radio_begin[];
@@ -21,78 +20,6 @@ MODULE_PARM_DESC(mac_address,
 		 "Wi-Fi MAC as xx:xx:xx:xx:xx:xx. Overrides /chosen/asahi,wifi-mac-address. "
 		 "With neither present no local-mac-address is published and mt76 falls "
 		 "back to the MT7932's own EEPROM address, which is normally what you want.");
-
-/*
- * of_overlay will not add a `phandle` property to a node that is already part
- * of the live tree: add_changeset_property() in drivers/of/overlay.c skips
- * anything is_pseudo_property() matches (drivers/of/of_private.h), which
- * covers "name", "phandle" and "linux,phandle". This DTB already declares the
- * APCIe DART, so the iommu-map the overlay just installed on the host bridge
- * refers to a phandle that no node owns, of_find_node_by_phandle() returns
- * NULL, and of_iommu_configure() would decide the radio has no IOMMU -- which
- * is the exact failure this overlay exists to fix.
- *
- * Take the phandle the resolver assigned to the overlay's own copy of the node
- * and hand it to the live one. of_find_node_by_phandle() walks the tree on a
- * cache miss and compares np->phandle, so the assignment is enough to make it
- * resolvable; no cache surgery is required.
- */
-static int j700_radio_adopt_dart_phandle(void)
-{
-	struct device_node *pcie, *dart, *owner;
-	u32 handle;
-	int ret;
-
-	pcie = of_find_node_by_path(J700_PCIE_PATH);
-	if (!pcie)
-		return -ENODEV;
-
-	dart = of_find_node_by_path(J700_DART_PATH);
-	if (!dart) {
-		of_node_put(pcie);
-		return -ENODEV;
-	}
-
-	/* iommu-map = <rid-base &dart sid-base count>; cell 1 is the phandle. */
-	ret = of_property_read_u32_index(pcie, "iommu-map", 1, &handle);
-	if (ret)
-		goto out;
-	if (!handle) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	if (dart->phandle == handle) {
-		ret = 0;
-		goto out;
-	}
-
-	owner = of_find_node_by_phandle(handle);
-	if (owner) {
-		/* Somebody already owns it; adopting would corrupt the tree. */
-		pr_err("J700_RADIO_OVERLAY: phandle 0x%x already held by %pOF\n",
-		       handle, owner);
-		of_node_put(owner);
-		ret = -EEXIST;
-		goto out;
-	}
-
-	if (dart->phandle) {
-		pr_err("J700_RADIO_OVERLAY: %pOF already has phandle 0x%x, overlay wants 0x%x\n",
-		       dart, dart->phandle, handle);
-		ret = -EEXIST;
-		goto out;
-	}
-
-	dart->phandle = handle;
-	pr_info("J700_RADIO_OVERLAY_DART_PHANDLE: adopted 0x%x for %pOF\n",
-		handle, dart);
-	ret = 0;
-out:
-	of_node_put(dart);
-	of_node_put(pcie);
-	return ret;
-}
 
 /*
  * Resolve the MAC to publish, if any. The loader hands one over on J700 as
@@ -110,8 +37,7 @@ static bool j700_radio_resolve_mac(u8 *out)
 	if (mac_address) {
 		if (mac_pton(mac_address, out) && is_valid_ether_addr(out))
 			return true;
-		pr_warn("J700_RADIO_OVERLAY: ignoring unusable mac_address=\"%s\"\n",
-			mac_address);
+		pr_warn("J700_RADIO_OVERLAY: invalid mac_address parameter ignored\n");
 	}
 
 	chosen = of_find_node_by_path("/chosen");
@@ -180,37 +106,37 @@ static int __init j700_radio_overlay_init(void)
 	size = __dtbo_j700_radio_end - __dtbo_j700_radio_begin;
 	ret = of_overlay_fdt_apply(__dtbo_j700_radio_begin, size,
 				   &j700_radio_overlay_id, NULL);
-	if (ret)
-		return ret;
+	if (ret) {
+		struct device_node *symbols =
+			of_find_node_by_path("/__symbols__");
+		const char *aic_path = NULL;
 
-	ret = j700_radio_adopt_dart_phandle();
-	if (ret)
-		goto out_overlay;
+		if (symbols)
+			of_property_read_string(symbols, "aic", &aic_path);
+		pr_err("J700_RADIO_OVERLAY: apply failed %d (symbols=%u aic=%s)\n",
+		       ret, !!symbols, aic_path ?: "missing");
+		of_node_put(symbols);
+		return ret;
+	}
 
 	if (have_mac) {
 		ret = j700_radio_publish_mac(mac);
-		if (ret)
-			goto out_overlay;
+		if (ret) {
+			pr_warn("J700_RADIO_OVERLAY: MAC publication failed (%d); using chip address\n",
+				ret);
+			have_mac = false;
+		}
 	}
 
 	pr_info("J700_RADIO_OVERLAY_PASS: bytes=%zu id=%d order=post-nvme-root mac=%s\n",
 		size, j700_radio_overlay_id,
-		have_mac ? (mac_address ? "module-param" : "loader-handoff")
+			have_mac ? (mac_address ? "module-param" : "loader-handoff")
 			 : "chip-eeprom");
 	return 0;
-
-out_overlay:
-	of_overlay_remove(&j700_radio_overlay_id);
-	return ret;
 }
+/* The overlay modifies live nodes used by bound PCI/IOMMU clients. Leave it
+ * for the lifetime of this boot; ordinary module removal must be refused. */
 module_init(j700_radio_overlay_init);
-
-static void __exit j700_radio_overlay_exit(void)
-{
-	if (j700_radio_overlay_id >= 0)
-		of_overlay_remove(&j700_radio_overlay_id);
-}
-module_exit(j700_radio_overlay_exit);
 
 MODULE_DESCRIPTION("Post-root J700 wireless PCIe device-tree overlay");
 MODULE_LICENSE("GPL");

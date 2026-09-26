@@ -107,6 +107,187 @@ const T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH: u8 = 1;
 const T8140_CONTEXT_USER_OWNED: u8 = 2;
 const T8140_CONTEXT_OPENING_RENDER_SHARED: u8 = 3;
 
+/// Hardware contexts the G17P compute path declares.
+///
+/// `G17PComputeSubmissionContext { context_id: 2, .. }` (`g17_live_boot.rs`)
+/// is encoded into compute registers `0x10201`/`0x10428` as
+/// `(context_id << 8) | work_ordinal` and into descriptor `+0x0c`
+/// (`g17_compute.rs`).  These are the contexts m1n1's hardware-proven
+/// `agx_g17p_native_add3.py` uses:
+///
+/// ```text
+/// CONTEXT = 2                                                     # :24
+/// context_id = CONTEXT if ordinal == 0 else CONTEXT + 1           # :364
+/// ```
+///
+/// i.e. workload 0 runs in context 2 and every later workload runs in
+/// context 3, the "retained context-3 pair" its own comment names (`:375`).
+/// m1n1 installs both halves of both contexts' roots before it kicks
+/// (`:1072-1073` and `:1087-1089`).
+const T8140_COMPUTE_CTXS: [usize; 2] = [2, 3];
+/// First context handed out by native's application-GART context manager on
+/// the captured G17P system. Contexts 0/1 are the opening pair, 2/3 are the
+/// fixed compute aliases and context 4 is accelerator-reserved. Native render
+/// command GARTs consequently appear at 5, 6, ... depending on live allocator
+/// state; those values are allocator results, not descriptor constants.
+const T8140_APP_CONTEXT_START: usize = 5;
+const T8140_APP_CONTEXT_RESERVED_MASK: u64 = (1u64 << T8140_APP_CONTEXT_START) - 1;
+const T8140_APP_CONTEXT_AVAILABLE_MASK: u64 = !T8140_APP_CONTEXT_RESERVED_MASK;
+
+/// Bootstrap-only T8140 UAT binding count. Ordinary jobs retain context 1 as
+/// the global FList root and use independently allocated app-GART contexts.
+const T8140_BIND_SLOTS: usize =
+    1 + crate::g17_queue_limits::BIND_CONTEXT_COUNT as usize;
+
+/// Hardware context for one T8140 UAT bind slot, or `None` above the pool.
+///
+/// Slot 0 maps to context 1 for the measured driver-owned opening. No ordinary
+/// render or independent compute queue reaches this allocator.
+const fn t8140_bind_context(slot: u32) -> Option<usize> {
+    if slot == 0 {
+        Some(1)
+    } else if (slot as usize) < T8140_BIND_SLOTS {
+        Some(crate::g17_queue_limits::BIND_CONTEXT_FIRST as usize + slot as usize - 1)
+    } else {
+        None
+    }
+}
+
+const _: () = {
+    // The bind band must not overlap anything else that owns a TTBAT entry.
+    assert!(
+        crate::g17_queue_limits::BIND_CONTEXT_MASK
+            & crate::g17_queue_limits::COMPUTE_CONTEXT_MASK
+            == 0
+    );
+    assert!(crate::g17_queue_limits::BIND_CONTEXT_MASK & T8140_APP_CONTEXT_RESERVED_MASK == 0);
+    assert!(
+        crate::g17_queue_limits::BIND_CONTEXT_MASK
+            & (1u64 << crate::g17_queue_limits::RENDER_APP_CONTEXT)
+            == 0
+    );
+    assert!(crate::g17_queue_limits::BIND_CONTEXT_FIRST as usize + 1 > T8140_APP_CONTEXT_START);
+};
+pub(crate) const T8140_PARAMETER_METRICS_LOW_VA: u64 = 0x0000_0010_0008_0000;
+pub(crate) const T8140_PARAMETER_METRICS_SIZE: usize = 0x8000;
+
+/// One native G17P process resource and its secure-GART context-0 view.
+///
+/// `source_address` names the canonical process-GART mapping userspace owns;
+/// `context_address` is the low-32-bit address returned for the same native
+/// `AGXSecureMemoryMap`. Permissions describe the restricted view, not the
+/// (potentially more permissive) ordinary mapping.
+#[derive(Clone, Copy)]
+struct T8140NativeContextView {
+    source_address: u64,
+    context_address: u64,
+    size: usize,
+    requires_source_write: bool,
+    context_prot: Prot,
+}
+
+/// Initial render-context restricted-view fanout observed through native
+/// `AGXSecureGart`.
+///
+/// The first object is a four-page resource whose ordinary GART address is
+/// `0x1000_0000_00`; `getGPUVirtualAddressForUserProcess` returns zero for the
+/// same `AGXSecureMemoryMap`. Native maps the canonical high address with raw
+/// leaf attributes `...0xc8b`; SecureGart supplies the low user presentation
+/// without a second leaf in the captured native root. The following six views
+/// are the same high-to-low transformation for the fixed resources occupying
+/// the rest of Mesa's current 0x80000 context BO. Linux hardware reports dIPP
+/// misses for those low presentations in context 0, so the driver emulates
+/// SecureGart by materializing them in the retained lower root only while the
+/// submitting VM owns the render graph.
+const T8140_NATIVE_CONTEXT_VIEWS: [T8140NativeContextView; 7] = [
+    T8140NativeContextView {
+        source_address: 0x0010_0000_0000,
+        context_address: 0,
+        size: 0x1_0000,
+        requires_source_write: false,
+        context_prot: PROT_GPU_SHARED_RO,
+    },
+    T8140NativeContextView {
+        source_address: 0x0010_0001_8000,
+        context_address: 0x0001_8000,
+        size: 0x8000,
+        requires_source_write: false,
+        context_prot: PROT_GPU_SHARED_RO,
+    },
+    T8140NativeContextView {
+        source_address: 0x0010_0002_8000,
+        context_address: 0x0002_8000,
+        size: 0x8000,
+        requires_source_write: false,
+        context_prot: PROT_GPU_SHARED_RO,
+    },
+    T8140NativeContextView {
+        source_address: 0x0010_0003_8000,
+        context_address: 0x0003_8000,
+        size: 0x8000,
+        requires_source_write: false,
+        context_prot: PROT_GPU_SHARED_RO,
+    },
+    T8140NativeContextView {
+        source_address: 0x0010_0004_8000,
+        context_address: 0x0004_8000,
+        size: 0x8000,
+        requires_source_write: false,
+        context_prot: PROT_GPU_SHARED_RO,
+    },
+    T8140NativeContextView {
+        source_address: 0x0010_0005_8000,
+        context_address: 0x0005_8000,
+        size: 0x8000,
+        requires_source_write: true,
+        context_prot: PROT_GPU_SHARED_RW,
+    },
+    T8140NativeContextView {
+        source_address: 0x0010_0006_8000,
+        context_address: 0x0006_8000,
+        size: 0xc000,
+        requires_source_write: true,
+        context_prot: PROT_GPU_SHARED_RW,
+    },
+];
+const T8140_NATIVE_CONTEXT_VIEW_COUNT: usize = T8140_NATIVE_CONTEXT_VIEWS.len();
+
+/// Native's SecureGart low presentation of view 0, materialized in the
+/// submitting process's *own* low root rather than in the retained context-0
+/// root.
+///
+/// `AGXSecureGart` gives a process resource two presentations: the canonical
+/// GART address (0x10_0000_0000 here) and a low "user process" address, which
+/// `getGPUVirtualAddressForUserProcess` reports as zero for this resource.
+/// Linux materializes the low presentation itself, and hardware proved the
+/// client regime needs it too: with only the context-0 aliases installed, the
+/// first fragment publication latched four gUPM (unit 0xd9) faults at
+/// `0x1e00`/`0x1e80`/`0x1f00`/`0x1f80` with `reason=Unmapped` and `vm-slot=1`,
+/// i.e. inside the render VM's own root, which had no leaf below
+/// `IOVA_USER_BASE` at all.
+///
+/// The faulting transactions report `read=0`, so this view is mapped
+/// GPU-writable: an unmapped *write* cannot be satisfied by a read-only leaf.
+/// Contrast the context-0 copy above, which keeps the restricted class-1
+/// attributes captured from native for the canonical mapping.
+const T8140_CLIENT_NULL_VIEW: T8140NativeContextView = T8140NativeContextView {
+    source_address: 0x0010_0000_0000,
+    context_address: 0,
+    size: 0x1_0000,
+    requires_source_write: true,
+    context_prot: PROT_GPU_SHARED_RW,
+};
+
+/// VA window a T8140 client root keeps for [`T8140_CLIENT_NULL_VIEW`].
+///
+/// Reserved for the VM's whole lifetime even though the leaf itself only
+/// exists while that VM owns the render graph, so a user bind can never take
+/// the window between graphs. Mesa's own heap starts orders of magnitude
+/// above this, and Mesa binds the remaining low views (0x18000 upwards)
+/// itself.
+pub(crate) const T8140_CLIENT_NULL_VIEW_START: u64 = T8140_CLIENT_NULL_VIEW.context_address;
+pub(crate) const T8140_CLIENT_NULL_VIEW_SIZE: usize = T8140_CLIENT_NULL_VIEW.size;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct T8140RootLayout {
     low: [u64; 2],
@@ -115,6 +296,16 @@ struct T8140RootLayout {
 
 fn t8140_tagged_root(root: u64, slot: usize) -> u64 {
     root | TTBR_VALID | ((slot as u64) << TTBR_ASID_SHIFT)
+}
+
+fn context_mask_for_root(root: u64, ttbs: &[SlotTTBS; UAT_NUM_CTX]) -> u64 {
+    let mut contexts = 0u64;
+    for (context_id, ttb) in ttbs.iter().enumerate() {
+        if ttb.ttb0.load(Ordering::Acquire) == t8140_tagged_root(root, context_id) {
+            contexts |= 1u64 << context_id;
+        }
+    }
+    contexts
 }
 
 fn t8140_opening_render_layout(render_low: u64, source_high: u64) -> T8140RootLayout {
@@ -149,11 +340,18 @@ fn t8140_split_render_layout(
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
-/// Lower/user top VA. The exposed user ABI remains at 39 bits until the
-/// generation-specific 42-bit PTE/update policies are implemented.
+/// Lower/user top VA for the 39-bit (AGX2) roots. Geometry-aware paths must
+/// use [`iova_user_range`]/[`iova_user_usable_range`] instead; this const
+/// remains for the AGX2 initdata builder, which is 39-bit-only.
 pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
-/// Lower/user VA range
-pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
+
+fn lower_vm_start(cfg: UatConfig, t8140_internal: bool) -> u64 {
+    if cfg == UatConfig::T8140 && t8140_internal {
+        0
+    } else {
+        IOVA_USER_BASE
+    }
+}
 
 /// Whether the firmware-shared MMU state (Handoff/FlushInfo layout, TTBAT
 /// publication, kernel-half window placement) has been validated against an
@@ -169,12 +367,20 @@ pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 /// the RTKit MMU/PPL runtime, not by the AGX message handlers. The on-disk M5
 /// `GFX.a010.macho` confirms the region exists on G17 (`"MMU uat_handoff !map"`
 /// / `"PPL handoff !vm export"` @ 0x2b570 / 0x2b518) but does not expose its
-/// exact field offsets, and -- critically -- [`Handoff::init`] blocks until the
+/// exact field offsets, and — critically — [`Handoff::init`] blocks until the
 /// firmware writes `magic_fw == PPL_MAGIC`, so a correct layout can only ever
 /// be *confirmed* by a live boot ACK. This is therefore the one gate that
 /// stays fail-closed by design: it is exactly the "needs a live firmware ACK"
-/// boundary. [`Uat::new`] fails closed on it for 42-bit parts. Flip it only
-/// once a live G15+/G17 boot completes the PPL handshake.
+/// boundary. [`Uat::new`] fails closed on it for 42-bit parts *in Dekker
+/// mode*. Flip it only once a live G15+/G17 boot completes the PPL handshake.
+///
+/// T8140 (A18 Pro / G17P) is different and is handled by
+/// [`HandoffMode::AbsentStandinT8140`], not by this flag: live J700 runs that
+/// booted both firmware instances confirmed the firmware **never publishes
+/// its half of the PPL magic on this part** — a `magic_fw` waiter hangs
+/// forever. The correct behavior there is an absent-handoff stand-in (no
+/// magic wait, no Dekker peer, no flush handshake ACK expectation), which is
+/// what that mode implements.
 const AGX3_FIRMWARE_HANDOFF_VALIDATED: bool = false;
 
 /// How the firmware-shared UAT handoff region behaves for the target SoC.
@@ -192,16 +398,6 @@ pub(crate) enum HandoffMode {
     /// Constructed by the T8140 resource owner before either role receives an
     /// init-data root.
     AbsentStandinT8140,
-    /// M5 25G76 bring-up mode. Native snapshots before/after exact GPU work
-    /// leave the entire handoff page zero. The explicit M5 startup path
-    /// tests this no-peer policy; it does not enable userspace or flushing.
-    NoPeerT8142,
-    /// T8152/G18G (J873, 26A428) bring-up mode: the same no-peer policy as
-    /// [`HandoffMode::NoPeerT8142`], kept separate because the G18G handoff
-    /// page has not been observed. [`Handoff::init`] refuses it when the
-    /// firmware half (magic or lock) is already non-zero, so a live peer is
-    /// detected rather than overwritten.
-    NoPeerT8152,
 }
 
 const T8140_SECONDARY_SHARED_ROOT_DELTA: u64 = 0x40000;
@@ -317,15 +513,6 @@ impl FirmwareContextTableReader {
         self.context_root(0)
     }
 
-    /// Diagnostic read-only view of context 0's upper root. Addresses passed
-    /// to the walker are offsets within that root, not canonical high VAs.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn context0_upper_root(&self) -> Option<FirmwarePageTableRoot> {
-        let shared = self.inner.lock();
-        decode_firmware_ttb_root(shared.ttbs()[0].ttb1.load(Ordering::Acquire), self.cfg)
-            .map(|ttb| FirmwarePageTableRoot { ttb, cfg: self.cfg })
-    }
-
     /// Copy one T8140 crash buffer through the retained WC CPU alias. This is
     /// distinct from the raw physical walker used to diagnose the live UAT:
     /// the latter maps pages WB and can hide device writes behind a conflicting
@@ -411,53 +598,30 @@ impl UatConfig {
         ias: 42,
         oas: 42,
     };
-
-    const T8142: Self = Self { chip_id: 0x8142, ias: 42, oas: 42 };
-
-    /// T8152 (J873, G18G). The ADT uat-vaddr-size is 43, as on T8142: 42
-    /// bits per root plus the TTBR-select bit. The ADT
-    /// agx-address-space-mgmt-mode is 1 on both. J873 DRAM ends at
-    /// 0x106_0000_0000, inside the 42-bit output space.
-    const T8152: Self = Self { chip_id: 0x8152, ias: 42, oas: 42 };
-
-    fn has_g17_private_roots(self) -> bool {
-        self == Self::T8140 || self == Self::T8142 || self == Self::T8152
-    }
-
-    /// Dual-role firmware whose native topology gives each role a private
-    /// upper root that shares one L2 page (M5 25G76 and J873 26A428).
-    fn has_m5_native_topology(self) -> bool {
-        self == Self::T8142 || self == Self::T8152
-    }
 }
-
-/// J873 (T8152) boot-local firmware reservations from the ADT /arm-io/sgx
-/// node, as a loader copies them into /reserved-memory.
-#[allow(dead_code)]
-const T8152_DRAM_BASE: u64 = 0x100_0000_0000;
-/// J873 DRAM end: /chosen dram-base 0x100_0000_0000 + dram-size 24 GiB.
-#[allow(dead_code)]
-const T8152_DRAM_END: u64 = 0x106_0000_0000;
-/// (memory-region name, exact size): 26A428 GFX/GFX1 __DATA, then the
-/// __DATA_SHARED_RO segments (firmware VA +0x10c000 / +0x108000).
-#[allow(dead_code)]
-const T8152_FIRMWARE_DATA: [(&CStr, u64); 2] = [
-    (c_str!("gfx-data"), 0xbc000),
-    (c_str!("gfx1-data"), 0xb4000),
-];
-#[allow(dead_code)]
-const T8152_FIRMWARE_SHARED_RO: [(&CStr, u64); 2] = [
-    (c_str!("gfx-data-shared-ro"), 0x8000),
-    (c_str!("gfx1-data-shared-ro"), 0x8000),
-];
-/// Size of one RTKit crash view (ADT iop-gfx(1)-nub coredump-copy-buffer).
-#[allow(dead_code)]
-const T8152_CRASH_VIEW_SIZE: u64 = 0x8000;
 
 fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
     // 39-bit (G13/G14) and 42-bit (G15+) roots are the two recovered
     // geometries; anything else is undefined.
-    UatGeometry::new(cfg.uat_ias).ok_or(ENODEV)
+    UatGeometry::new(cfg.ias).ok_or(ENODEV)
+}
+
+/// Lower/user VA range for this SoC's root geometry (one page up to the
+/// per-root translation top: `1 << 39` on AGX2, `1 << 42` on AGX3).
+#[allow(dead_code)]
+pub(crate) fn iova_user_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+    Ok(IOVA_USER_BASE..uat_geometry(UatConfig::from_hw(cfg))?.user_va_top())
+}
+
+/// The unknown-page VA for this SoC's root geometry (two pages below the
+/// user top, reproducing the AGX2-proven placement under either root width).
+pub(crate) fn iova_unk_page(cfg: &hw::HwConfig) -> Result<u64> {
+    Ok(uat_geometry(UatConfig::from_hw(cfg))?.user_va_top() - 2 * UAT_PGSZ as u64)
+}
+
+/// Usable lower/user VA range for this SoC (excludes the unknown page).
+pub(crate) fn iova_user_usable_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+    Ok(IOVA_USER_BASE..iova_unk_page(cfg)?)
 }
 
 /// Driver-managed kernel VA range within the upper root for this SoC.
@@ -465,7 +629,7 @@ fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
 /// `0xffffffa000000000..0xffffffb000000000` for 39-bit roots (the
 /// AGX2-proven placement) and the same window offset under the bit-42
 /// selector (`0xfffffc2000000000..0xfffffc3000000000`) for 42-bit roots.
-fn iova_kern_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+fn iova_kern_range(cfg: UatConfig) -> Result<Range<u64>> {
     let geometry = uat_geometry(cfg)?;
     Ok(geometry.kernel_va_base()..geometry.kernel_va_top())
 }
@@ -701,7 +865,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         // GPUVM cannot see driver-owned KernelMappings.  Preflight the full
         // object range in the authoritative page table and allocate every
         // intermediate table before the first scatterlist leaf is written.
-        self.note_mapping_validation_change(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?);
         self.page_table
             .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
 
@@ -944,11 +1107,7 @@ impl VmInner {
         fence(Ordering::SeqCst);
         for context_id in 0..UAT_NUM_CTX {
             if contexts & (1u64 << context_id) != 0 {
-                if self.uat_inner.t8140 {
-                    mem::tlbi_range_t8140(context_id as u8, addr as usize, size as usize);
-                } else {
-                    mem::tlbi_range(context_id as u8, addr as usize, size as usize);
-                }
+                mem::tlbi_range(context_id as u8, addr as usize, size as usize);
             }
         }
         mem::sync();
@@ -962,7 +1121,6 @@ impl VmInner {
             .ok_or(EOVERFLOW)?;
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
-        self.note_mapping_validation_change(iova..mapping_end);
         self.page_table.prepare_map(iova..mapping_end)?;
         let guard = node.bo.as_ref().ok_or(EINVAL)?.get()?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
@@ -1042,6 +1200,13 @@ pub(crate) struct Vm {
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
     driver_mappings: Arc<Mutex<Option<VmDriverMappings>>>,
+    job_lifetime: Arc<Mutex<T8140VmJobLifetime>>,
+    mapping_gate: Arc<T8140VmMappingGate>,
+    status: Arc<crate::g17_status::VmStatus>,
+    /// User bindings which are eligible for native's restricted context-0
+    /// view. This records backing identity only; it never changes context 0
+    /// until the VM owns a render submission.
+    t8140_native_context_bindings: Option<Arc<Mutex<T8140NativeContextBindings>>>,
 }
 no_debug!(Vm);
 
@@ -1227,12 +1392,12 @@ impl Drop for T8140NativeContextAliases {
         self.mappings.clear();
         fence(Ordering::SeqCst);
         for view in T8140_NATIVE_CONTEXT_VIEWS {
-            mem::tlbi_range_t8140(0, view.context_address as usize, view.size);
-            mem::tlbi_range_t8140(1, view.context_address as usize, view.size);
+            mem::tlbi_range(0, view.context_address as usize, view.size);
+            mem::tlbi_range(1, view.context_address as usize, view.size);
         }
         for context_id in 0..UAT_NUM_CTX {
             if client_contexts & (1u64 << context_id) != 0 {
-                mem::tlbi_range_t8140(
+                mem::tlbi_range(
                     context_id as u8,
                     T8140_CLIENT_NULL_VIEW_START as usize,
                     T8140_CLIENT_NULL_VIEW_SIZE,
@@ -1247,10 +1412,34 @@ struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
     simplefb: Option<KernelMapping>,
-    render_pools: [Option<VmRenderPoolMappings>; 64],
+    render_pools: [Option<VmRenderPoolMappings>; 2],
     compute_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
+
+/// Cached aliases of one retained render pool in this VM. KernelMapping owns
+/// GpuVm<VmInner>, which has no back-reference to Vm::driver_mappings. Do not
+/// retain a Vm, VmBind or application-context lease here: those own the outer
+/// Vm and would make this cache keep itself alive.
+struct VmRenderPoolMappings {
+    pool_id: u64,
+    /// Number of this pool's TVB blocks mapped in this VM (zero for compute).
+    tvb_blocks: usize,
+    mappings: KVec<KernelMapping>,
+}
+no_debug!(VmRenderPoolMappings);
+
+impl VmDriverMappings {
+    fn iter_mappings(&self) -> impl Iterator<Item = &KernelMapping> {
+        Iterator::chain(
+            Iterator::chain(
+                Iterator::chain(self.mappings.iter(), self.simplefb.iter()),
+                self.compute_pool.iter().flat_map(|pool| pool.mappings.iter()),
+            ),
+            self.render_pools.iter().flatten().flat_map(|pool| pool.mappings.iter()),
+        )
+    }
+}
 
 fn any_range_overlaps<I>(target: Range<u64>, mut ranges: I) -> bool
 where
@@ -1314,9 +1503,24 @@ impl VmBind {
         self.1
     }
 
+    /// The bound `Vm` itself, for diagnostics that need to walk its tables.
+    pub(crate) fn vm(&self) -> &Vm {
+        &self.0
+    }
+
     /// Whether this retained binding belongs to the supplied DRM VM.
     pub(crate) fn matches(&self, vm: &Vm) -> bool {
         core::ptr::eq(&*self.0.inner, &*vm.inner)
+    }
+
+    /// Physical base of the bound VM's page-table root.
+    pub(crate) fn root(&self) -> u64 {
+        self.0.ttb()
+    }
+
+    /// The bound VM's driver-assigned id.
+    pub(crate) fn vm_id(&self) -> u64 {
+        self.0.id
     }
 }
 
@@ -1598,73 +1802,6 @@ impl KernelMapping {
             prot,
             false,
         )
-    }
-
-    /// Map this shared GEM subrange into the end of another mapping's guards.
-    /// The caller must keep GPU work quiescent until the complete resource
-    /// update is published. Existing mappings are never removed or relocated.
-    pub(crate) fn map_alias_into_guard(
-        &self, anchor: &mut KernelMapping, prot: Prot,
-    ) -> Result<KernelMapping> {
-        let size = self.size();
-        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
-        if size == 0 || size & UAT_PGMSK != 0 || prot.is_cached_noncoherent()
-            || !gem.is_kernel_object()
-            || self.0.offset.checked_add(size).ok_or(EOVERFLOW)? > gem.size()
-        {
-            return Err(EINVAL);
-        }
-        let available = anchor.0.size().checked_sub(anchor.size() as u64).ok_or(EINVAL)?;
-        if size as u64 > available { return Err(ENOSPC); }
-        let sgt = gem.owned_sg_table()?;
-        let owner_ref = anchor.0.owner.clone();
-        let mut owner = owner_ref.exec_lock(Some(gem), false)?;
-        let vm_bo = owner_ref.obtain_bo(gem)?;
-        {
-            let mut guard = vm_bo.inner().inner.lock();
-            if guard.sgt.is_none() { guard.sgt.replace(sgt); }
-        }
-        let mut vm_bo = Some(ImmediateGpuVmBoRef::new(vm_bo, owner_ref.clone()));
-        // As in map_at_with_guards, the fallible allocator operation must not
-        // own DMA-reservation references whose Drop would reacquire this lock.
-        let node = anchor.0.as_mut().split_tail(size as u64, KernelMappingInner {
-            owner: owner_ref.clone(), uat_inner: owner.uat_inner.clone(), prot,
-            bo: None, _gem: None, offset: self.0.offset, mapped_size: size,
-        });
-        let mut node = match node {
-            Ok(node) => node,
-            Err(error) => { drop(owner); return Err(error); }
-        };
-        {
-            let inner = node.as_mut().inner_mut();
-            inner.bo = vm_bo.take();
-            inner._gem = Some(gem.clone());
-        }
-        let mapped = owner.map_node(&node, prot);
-        if let Err(error) = mapped {
-            // Restore reservation coverage before the temporary mapping is
-            // dropped. Its normal Drop unmaps partial PTEs and invalidates
-            // every live context; the detached node cannot free the guard.
-            let rollback = anchor.0.as_mut().rejoin_tail(node.as_mut());
-            drop(owner);
-            drop(KernelMapping(node));
-            rollback?;
-            return Err(error);
-        }
-        drop(owner);
-        Ok(KernelMapping(node))
-    }
-
-    /// Undo a staged guard-tail alias before publication. Consume tails in
-    /// reverse growth order so each remains adjacent to its original anchor.
-    /// The caller owns the tail and must ensure no GPU work can reference it.
-    pub(crate) fn rollback_guard_tail(&mut self, mut tail: KernelMapping) -> Result {
-        if tail.0.prot.is_cached_noncoherent() { return Err(EINVAL); }
-        self.0.as_mut().rejoin_tail(tail.0.as_mut())?;
-        // KernelMapping::drop removes the PTEs and flushes live contexts. Its
-        // now-invalid MM node leaves the restored guard reservation intact.
-        drop(tail);
-        Ok(())
     }
 
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
@@ -1979,8 +2116,14 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    /// Dedicated native context-1 root for the device-global FList/operand
+    /// closure. Context 0 has overlapping fixed KSM mappings, so sharing its
+    /// lower root cannot represent the render-only final operand block.
+    t8140_render_global_vm: Option<Vm>,
     _t8140_firmware_crash_buffers: Option<[KernelMapping; 2]>,
     t8140_firmware_crash_gems: Option<[ARef<gem::Object>; 2]>,
+    _t8140_parameter_metrics_low: Option<KernelMapping>,
+    t8140_parameter_metrics_gem: Option<ARef<gem::Object>>,
     t8140_secondary_ttb1: Option<u64>,
     t8140_empty_high_roots: Option<[Vm; 2]>,
     t8140_context_phase: AtomicU8,
@@ -2058,20 +2201,6 @@ impl Handoff {
     /// firmware never writes its half (hardware-verified), so the AP
     /// publishes its own state and proceeds without a peer.
     fn init(&self, mode: HandoffMode) -> Result {
-        if mode == HandoffMode::NoPeerT8142
-            && (self.magic_fw.load(Ordering::Acquire) != 0
-                || self.lock_fw.load(Ordering::Acquire) != 0)
-        {
-            pr_err!("M5 handoff: unexpected firmware peer; refusing no-peer mode\n");
-            return Err(ENODEV);
-        }
-        if mode == HandoffMode::NoPeerT8152
-            && (self.magic_fw.load(Ordering::Acquire) != 0
-                || self.lock_fw.load(Ordering::Acquire) != 0)
-        {
-            pr_err!("T8152 handoff: unexpected firmware peer; refusing no-peer mode\n");
-            return Err(ENODEV);
-        }
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(0, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
@@ -2145,9 +2274,7 @@ impl HandoffFlush {
         // it, so the state legitimately remains where begin_flush left it.
         let expected = match self.1 {
             HandoffMode::FirmwareDekker => 2,
-            HandoffMode::AbsentStandinT8140
-            | HandoffMode::NoPeerT8142
-            | HandoffMode::NoPeerT8152 => 1,
+            HandoffMode::AbsentStandinT8140 => 1,
         };
         if state != expected {
             pr_err!(
@@ -2172,9 +2299,6 @@ impl Vm {
     /// the same identity, which is this id.
     pub(crate) fn id(&self) -> u64 { self.id }
 
-    /// Application VA interval reserved by VM_CREATE for driver allocations.
-    pub(crate) fn kernel_range(&self) -> Range<u64> { self.kernel_range.clone() }
-
     /// Create a new virtual memory address space
     fn new(
         dev: &driver::AsahiDevice,
@@ -2190,9 +2314,9 @@ impl Vm {
         let iova_kern_range = iova_kern_range(cfg)?;
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.uat_ias, cfg.uat_oas)?
+            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.ias, cfg.oas)?
         } else {
-            UatPageTable::new(cfg.uat_ias, cfg.uat_oas)?
+            UatPageTable::new(cfg.ias, cfg.oas)?
         };
 
         let lower_start = lower_vm_start(cfg, t8140_internal);
@@ -2202,11 +2326,7 @@ impl Vm {
         // driver's internal allocator is widened: the GPUVM range userspace
         // binds through, and the `vm_start` the driver publishes, both still
         // begin at `IOVA_USER_BASE`.
-        // The saved T8152 compute submission also has a user allocation at VA
-        // zero. Admit it only to explicitly internal VMs; the GPUVM userspace
-        // range and ordinary T8152 client allocators still start at USER_BASE.
-        let driver_start = if cfg == UatConfig::T8140
-            || (cfg == UatConfig::T8152 && t8140_internal) { 0 } else { lower_start };
+        let driver_start = if cfg == UatConfig::T8140 { 0 } else { lower_start };
         let (va_range, gpuvm_range) = if is_kernel {
             (iova_kern_range, kernel_range.clone())
         } else {
@@ -2214,7 +2334,7 @@ impl Vm {
             // user/usable ranges byte-for-byte; 42-bit parts extend the
             // user half to the full per-root width.
             (
-                lower_start..uat_geometry(cfg)?.user_va_top(),
+                driver_start..uat_geometry(cfg)?.user_va_top(),
                 lower_start..(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64),
             )
         };
@@ -2268,12 +2388,173 @@ impl Vm {
             )?,
             binding,
             driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
+            status: Arc::new(crate::g17_status::VmStatus::new(), GFP_KERNEL)?,
+            job_lifetime: Arc::pin_init(new_mutex!(T8140VmJobLifetime {
+                active: 0, quarantined: false, draining: false, closed: false,
+                close_ranges: None, deferred_unmaps: KVec::new(),
+                closed_objects: KVec::new(),
+            }, "T8140VmJobLifetime"), GFP_KERNEL)?,
+            mapping_gate: Arc::pin_init(
+                pin_init!(T8140VmMappingGate {
+                    state <- new_mutex!(T8140VmMappingGateState {
+                        blocked: false,
+                        commits: 0,
+                    }, "T8140VmMappingGate"),
+                    idle <- new_condvar!("T8140VmMappingGate::idle"),
+                }),
+                GFP_KERNEL,
+            )?,
+            t8140_native_context_bindings: if cfg == UatConfig::T8140 {
+                Some(Arc::pin_init(
+                    new_mutex!(
+                        T8140NativeContextBindings {
+                            slots: [None, None, None, None, None, None, None],
+                            generation: 0,
+                        },
+                        "T8140NativeContextBindings",
+                    ),
+                    GFP_KERNEL,
+                )?)
+            } else {
+                None
+            },
         })
     }
 
     /// Get the translation table base for this Vm
     fn ttb(&self) -> u64 {
         self.binding.lock().ttb
+    }
+
+    /// Track backing for every native restricted view covered by a user bind,
+    /// without publishing it into context 0.
+    ///
+    /// A native resource can be a subrange of a larger userspace bind (Mesa's
+    /// current context BO is one example), so record the derived object offset
+    /// of the exact source interval rather than requiring equal bind bounds.
+    /// Publication is delayed until this VM owns the retained render graph;
+    /// Vulkan creates a probe VM and a logical-device VM with identical fixed
+    /// resources, so doing it here would let the probe steal the global root
+    /// from the queue that actually submits.
+    pub(crate) fn track_t8140_native_context_binding(
+        &self,
+        gem: ARef<gem::Object>,
+        address: u64,
+        size: u64,
+        object_offset: u64,
+    ) -> Result {
+        let Some(native_bindings) = self.t8140_native_context_bindings.as_ref() else {
+            return Ok(());
+        };
+        let end = address.checked_add(size).ok_or(EOVERFLOW)?;
+        let range = address..end;
+        // Preflight every arithmetic/conversion before mutating the registry.
+        // A failed oversized bind must not silently invalidate an otherwise
+        // complete retained-view candidate without advancing its generation.
+        let mut offsets = [None; T8140_NATIVE_CONTEXT_VIEW_COUNT];
+        for (index, view) in T8140_NATIVE_CONTEXT_VIEWS.iter().copied().enumerate() {
+            let source_end = view
+                .source_address
+                .checked_add(view.size as u64)
+                .ok_or(EOVERFLOW)?;
+            let source_range = view.source_address..source_end;
+            if range.is_superset(source_range) {
+                let delta = view.source_address.checked_sub(address).ok_or(EOVERFLOW)?;
+                offsets[index] = Some(
+                    object_offset
+                        .checked_add(delta)
+                        .ok_or(EOVERFLOW)?
+                        .try_into()?,
+                );
+            }
+        }
+        let mut bindings = native_bindings.lock();
+        let mut touched = false;
+        for (index, view) in T8140_NATIVE_CONTEXT_VIEWS.iter().copied().enumerate() {
+            let source_range =
+                view.source_address..view.source_address + view.size as u64;
+            if source_range.overlaps(range.clone()) {
+                bindings.slots[index] = None;
+                touched = true;
+            }
+            if let Some(object_offset) = offsets[index] {
+                bindings.slots[index] = Some(T8140NativeContextBinding {
+                    gem: gem.clone(),
+                    object_offset,
+                });
+                touched = true;
+            }
+        }
+        if touched {
+            bindings.generation = bindings.generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Invalidate every tracked restricted slot touched by a user unmap.
+    pub(crate) fn untrack_t8140_native_context_range(&self, range: Range<u64>) {
+        let Some(native_bindings) = self.t8140_native_context_bindings.as_ref() else {
+            return;
+        };
+        let mut bindings = native_bindings.lock();
+        let mut touched = false;
+        for (index, view) in T8140_NATIVE_CONTEXT_VIEWS.iter().copied().enumerate() {
+            let source_range =
+                view.source_address..view.source_address + view.size as u64;
+            if source_range.overlaps(range.clone()) {
+                bindings.slots[index] = None;
+                touched = true;
+            }
+        }
+        if touched {
+            bindings.generation = bindings.generation.wrapping_add(1);
+        }
+    }
+
+    /// GEM close can remove all GPUVA mappings without issuing range unbinds.
+    pub(crate) fn untrack_t8140_native_context_object(&self, gem: &gem::Object) {
+        let Some(native_bindings) = self.t8140_native_context_bindings.as_ref() else {
+            return;
+        };
+        let mut bindings = native_bindings.lock();
+        let mut touched = false;
+        for slot in bindings.slots.iter_mut() {
+            if slot
+                .as_ref()
+                .is_some_and(|binding| core::ptr::eq(&*binding.gem, gem))
+            {
+                *slot = None;
+                touched = true;
+            }
+        }
+        if touched {
+            bindings.generation = bindings.generation.wrapping_add(1);
+        }
+    }
+
+    /// A repeated single-page GPUVA is not the same physical layout as any
+    /// native restricted resource. Reject any overlap before GPUVM commits it;
+    /// otherwise alias installation could derive contiguous object pages from
+    /// a source interval whose GPU mapping repeatedly names only one page.
+    pub(crate) fn validate_t8140_native_context_binding(
+        &self,
+        address: u64,
+        size: u64,
+        single_page: bool,
+    ) -> Result {
+        if self.t8140_native_context_bindings.is_none() || !single_page {
+            return Ok(());
+        }
+        let end = address.checked_add(size).ok_or(EOVERFLOW)?;
+        let range = address..end;
+        if T8140_NATIVE_CONTEXT_VIEWS.iter().any(|view| {
+            let source_range =
+                view.source_address..view.source_address + view.size as u64;
+            source_range.overlaps(range.clone())
+        }) {
+            return Err(EINVAL);
+        }
+        Ok(())
     }
 
     /// Retain hardware-required fixed aliases for this VM's complete
@@ -2292,7 +2573,7 @@ impl Vm {
             mappings,
             reserved_ranges,
             simplefb: None,
-            render_pools: [const { None }; 64],
+            render_pools: [None, None],
             compute_pool: None,
         });
         Ok(())
@@ -2344,7 +2625,7 @@ impl Vm {
         tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || render_slot as usize >= 64 {
+        if pool_id == 0 || render_slot as usize >= 2 {
             return Err(EINVAL);
         }
         let mut retained = self.driver_mappings.lock();
@@ -2370,7 +2651,7 @@ impl Vm {
         &self, render_slot: u8, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || render_slot as usize >= 64 || tvb_blocks <= previous_blocks
+        if pool_id == 0 || render_slot as usize >= 2 || tvb_blocks <= previous_blocks
             || mappings.len() != tvb_blocks - previous_blocks { return Err(EINVAL); }
         let mut retained = self.driver_mappings.lock();
         let pool = Option::as_mut(&mut *retained)
@@ -2447,13 +2728,53 @@ impl Vm {
         self.driver_mappings.lock().as_ref().is_some_and(|driver| {
             any_range_overlaps(
                 range.clone(),
-                driver.mappings.iter().map(KernelMapping::iova_range),
+                driver.iter_mappings().map(KernelMapping::iova_range),
             ) || any_range_overlaps(range, driver.reserved_ranges.iter().cloned())
         })
     }
 
+    pub(crate) fn retain_t8140_job(&self) -> Result<T8140VmJobGuard> {
+        let mut gate = self.mapping_gate.state.lock();
+        loop {
+            let mut state = self.job_lifetime.lock();
+            if state.closed { return Err(ENOENT); }
+            if gate.blocked { return Err(EIO); }
+            if state.draining {
+                core::mem::drop(state);
+                self.mapping_gate.idle.wait(&mut gate);
+                continue;
+            }
+            state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
+            return Ok(T8140VmJobGuard { vm: self.clone() });
+        }
+    }
+
     /// Remove userspace mappings while preserving VM-lifetime driver aliases.
     pub(crate) fn unmap_user_ranges(
+        &self,
+        user_range: Range<u64>,
+        kernel_range: Range<u64>,
+    ) -> Result {
+        // VM destruction permanently closes this gate. Wait for an already
+        // prepared leaf transaction before deciding whether the final unmap is
+        // immediate or belongs to the last job guard.
+        let mut gate = self.mapping_gate.state.lock();
+        gate.blocked = true;
+        while gate.commits != 0 {
+            self.mapping_gate.idle.wait(&mut gate);
+        }
+        let mut state = self.job_lifetime.lock();
+        state.closed = true;
+        if state.active != 0 {
+            state.close_ranges = Some((user_range, kernel_range));
+            return Ok(());
+        }
+        core::mem::drop(state);
+        core::mem::drop(gate);
+        self.unmap_user_ranges_now(user_range, kernel_range)
+    }
+
+    fn unmap_user_ranges_now(
         &self,
         user_range: Range<u64>,
         kernel_range: Range<u64>,
@@ -2471,7 +2792,7 @@ impl Vm {
             let mut next = user_range.end;
             let mut covering_end = cursor;
             if let Some(driver) = driver {
-                for mapping in driver.mappings.iter() {
+                for mapping in driver.iter_mappings() {
                     let range = mapping.iova_range();
                     if range.contains(&cursor) {
                         covering_end = covering_end.max(range.end);
@@ -2503,9 +2824,41 @@ impl Vm {
         Ok(())
     }
 
+    /// Install one VM-lifetime alias of the boot framebuffer aperture.
+    ///
+    /// The caller has already validated that the physical interval is the
+    /// exact DT-owned simplefb allocation and that the IOVA is inside the
+    /// usable user range. Keeping this separate from GEM prevents the no-map
+    /// carveout from ever being treated as ordinary `struct page` memory.
+    pub(crate) fn install_simplefb_mapping(
+        &self,
+        iova: u64,
+        phys: usize,
+        size: usize,
+    ) -> Result {
+        {
+            let retained = self.driver_mappings.lock();
+            let driver = retained.as_ref().ok_or(EINVAL)?;
+            if driver.simplefb.is_some() {
+                return Err(EBUSY);
+            }
+        }
+
+        let mapping = self.map_io(iova, phys, size, PROT_GPU_SHARED_RW)?;
+        let mut retained = self.driver_mappings.lock();
+        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
+        if driver.simplefb.is_some() {
+            core::mem::drop(retained);
+            core::mem::drop(mapping);
+            return Err(EBUSY);
+        }
+        driver.simplefb = Some(mapping);
+        Ok(())
+    }
+
     /// Check that a byte range is fully mapped with the requested GPU access.
-    fn covers_range_locked(
-        inner: &mut VmInner,
+    pub(crate) fn covers_range(
+        &self,
         address: u64,
         size: u64,
         need_read: bool,
@@ -2527,6 +2880,10 @@ impl Vm {
                 None => return false,
             }
         };
+        let mut inner = match self.inner.exec_lock(None, false) {
+            Ok(inner) => inner,
+            Err(_) => return false,
+        };
         if start < inner.va_range.start || aligned_end > inner.va_range.end {
             return false;
         }
@@ -2534,81 +2891,6 @@ impl Vm {
             .page_table
             .covers_range(start..aligned_end, need_read, need_write)
             .unwrap_or(false)
-    }
-
-    pub(crate) fn covers_range(
-        &self,
-        address: u64,
-        size: u64,
-        need_read: bool,
-        need_write: bool,
-    ) -> bool {
-        let mut inner = match self.inner.exec_lock(None, false) {
-            Ok(inner) => inner,
-            Err(_) => return false,
-        };
-        Self::covers_range_locked(&mut inner, address, size, need_read, need_write)
-    }
-
-    /// Evaluate a sparse block/guard set against one consistent page-table
-    /// snapshot. The old loop acquired the GPUVM exec lock twice per block.
-    pub(crate) fn covers_sparse_blocks_with_guards(
-        &self,
-        addresses: &[u64],
-        block_size: u64,
-        stride: u64,
-    ) -> bool {
-        if stride <= block_size {
-            return false;
-        }
-        let mut inner = match self.inner.exec_lock(None, false) {
-            Ok(inner) => inner,
-            Err(_) => return false,
-        };
-        addresses.iter().all(|&address| {
-            let Some(guard) = address.checked_add(block_size) else {
-                return false;
-            };
-            Self::covers_range_locked(&mut inner, address, block_size, true, true)
-                && !Self::covers_range_locked(
-                    &mut inner, guard, stride - block_size, false, false)
-        })
-    }
-
-    /// A conservative stamp for cached reachability checks. Taking the exec
-    /// lock makes a lookup wait for any in-progress leaf transaction, including
-    /// one that partially failed. `None` means the caller must validate fully.
-    pub(crate) fn mapping_validation_epoch(&self) -> Option<u64> {
-        self.inner.exec_lock(None, false).ok()?.mapping_validation_epoch
-    }
-
-    /// Report whether mutations since `previous` touched a dependency.
-    /// History loss or an unavailable lock refuses the proof.
-    pub(crate) fn mapping_changes_since(
-        &self,
-        previous: u64,
-        mut intersects: impl FnMut(Range<u64>) -> bool,
-    ) -> Option<(u64, bool)> {
-        let inner = self.inner.exec_lock(None, false).ok()?;
-        let changes = inner.mapping_validation_changes.as_ref()?;
-        let current = inner.mapping_validation_epoch?;
-        let count = current.checked_sub(previous)?;
-        if count > MAPPING_VALIDATION_HISTORY as u64 {
-            return None;
-        }
-        if count == 0 {
-            return Some((current, false));
-        }
-        for epoch in previous + 1..=current {
-            let change = changes[epoch as usize % MAPPING_VALIDATION_HISTORY]?;
-            if change.epoch != epoch {
-                return None;
-            }
-            if intersects(change.start..change.end) {
-                return Some((current, true));
-            }
-        }
-        Some((current, false))
     }
 
     /// Resolve an IOVA through this VM's current page table. Callers use this
@@ -2629,15 +2911,13 @@ impl Vm {
         if offset >= T8140_CLIENT_NULL_VIEW_SIZE as u64 {
             return Err(EINVAL);
         }
-        let canonical_address = T8140_CLIENT_NULL_VIEW
-            .source_address
-            .checked_add(offset)
-            .ok_or(EOVERFLOW)?;
-        // Compare both aliases from one page-table snapshot, without taking
-        // the GPUVM execution lock once per translation.
-        let mut inner = self.inner.exec_lock(None, false)?;
-        let canonical = inner.page_table.translate_iova(canonical_address)?;
-        let client = inner.page_table.translate_iova(
+        let canonical = self.translate_iova(
+            T8140_CLIENT_NULL_VIEW
+                .source_address
+                .checked_add(offset)
+                .ok_or(EOVERFLOW)?,
+        )?;
+        let client = self.translate_iova(
             T8140_CLIENT_NULL_VIEW_START
                 .checked_add(offset)
                 .ok_or(EOVERFLOW)?,
@@ -2658,23 +2938,6 @@ impl Vm {
     ) -> Result<(usize, bool)> {
         let mut inner = self.inner.exec_lock(None, false)?;
         inner.page_table.collect_mapped_ranges(range, out)
-    }
-
-    /// Test a fixed-address kernel alias against both translated pages and
-    /// GPUVA reservations. A mapped-range census alone misses the unmapped
-    /// guard at the end of a `map_in_range(..., guard=true)` allocation, while
-    /// `map_at` still rejects that guard through drm_mm with ENOSPC.
-    pub(crate) fn first_occupied_alias_range(
-        &self,
-        range: Range<u64>,
-    ) -> Result<Option<Range<u64>>> {
-        let mut inner = self.inner.exec_lock(None, false)?;
-        let mut mapped = [pgtable::MappedRange::default(); 1];
-        let (count, _) = inner.page_table.collect_mapped_ranges(range.clone(), &mut mapped)?;
-        if count != 0 {
-            return Ok(Some(mapped[0].start..mapped[0].end));
-        }
-        inner.mm.first_overlap(range)
     }
 
     /// Read GPU-visible bytes out of this VM.
@@ -2724,48 +2987,6 @@ impl Vm {
             done += chunk;
         }
         Ok(())
-    }
-
-    /// Resolve and read one audit region under a single GPUVM execution lock.
-    /// Preserve the checks and error order of `translate_iova` followed by
-    /// `read_bytes`, including the explicit readable-range proof. The guard
-    /// ends here: callers may then compare against a GEM VMap without nesting
-    /// a GEM reservation lock inside this execution-lock transaction.
-    pub(crate) fn read_bytes_with_physical(
-        &self,
-        iova: u64,
-        out: &mut [u8],
-    ) -> Result<PhysicalAddr> {
-        let mut inner = self.inner.exec_lock(None, false)?;
-        let first_physical = inner.page_table.translate_iova(iova)?;
-        if out.is_empty() {
-            return Err(EINVAL);
-        }
-        if !Self::covers_range_locked(&mut inner, iova, out.len() as u64, true, false) {
-            return Err(EFAULT);
-        }
-        let total = out.len();
-        let mut done = 0usize;
-        while done < total {
-            let addr = iova.checked_add(done as u64).ok_or(EOVERFLOW)?;
-            let phys = inner.page_table.translate_iova(addr)?;
-            let page_mask = (kernel::page::PAGE_SIZE as PhysicalAddr) - 1;
-            let page_phys = phys & !page_mask;
-            let offset = (phys - page_phys) as usize;
-            let chunk = cmp::min(kernel::page::PAGE_SIZE - offset, total - done);
-            // SAFETY: The execution guard keeps the resolved GEM mapping
-            // stable through this read. borrow_phys also requires struct page.
-            let page = unsafe { Page::borrow_phys(&page_phys) }.ok_or(EFAULT)?;
-            let dst = &mut out[done..done + chunk];
-            page.with_pointer_into_page(offset, chunk, |ptr| {
-                // SAFETY: with_pointer_into_page bounds-checks this page span.
-                let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, chunk) };
-                dst.copy_from_slice(src);
-                Ok(())
-            })?;
-            done += chunk;
-        }
-        Ok(first_physical)
     }
 
     /// Physical base of this VM's page-table root.
@@ -2875,7 +3096,7 @@ impl Vm {
         };
         {
             let node_inner = node.as_mut().inner_mut();
-            node_inner.bo = Some(vm_bo);
+            node_inner.bo = vm_bo.take();
             node_inner._gem = Some(gem.into());
         }
 
@@ -2952,7 +3173,7 @@ impl Vm {
         };
         {
             let node_inner = node.as_mut().inner_mut();
-            node_inner.bo = Some(vm_bo);
+            node_inner.bo = vm_bo.take();
             node_inner._gem = Some(gem.clone());
         }
 
@@ -3281,7 +3502,6 @@ impl Vm {
             0,
         )?;
 
-        inner.note_mapping_validation_change(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
         let prepared = inner
             .page_table
             .prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
@@ -3582,20 +3802,6 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
-    /// A memory-layout consumer must not confuse identical root geometry
-    /// with target admission. This checks identity only; it does not create
-    /// an M5 UAT or authorize an absent firmware handoff protocol.
-    pub(crate) fn is_t8142_geometry(&self) -> bool {
-        self.cfg.chip_id == 0x8142 && self.cfg.ias == 42 && self.cfg.oas == 42
-    }
-
-    /// The T8152 counterpart of [`Uat::is_t8142_geometry`]; identity only.
-    /// Consumed by the G18 live-boot module.
-    #[allow(dead_code)]
-    pub(crate) fn is_t8152_geometry(&self) -> bool {
-        self.cfg == UatConfig::T8152
-    }
-
     pub(crate) fn t8140_render_global_vm(&self) -> Result<&Vm> {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
@@ -3881,24 +4087,17 @@ impl Uat {
         // presentation page-for-page before adding the sole missing view 0.
         for (index, (gem, object_offset)) in snapshot.iter().enumerate().skip(1) {
             let view = T8140_NATIVE_CONTEXT_VIEWS[index];
-            let source_covered = source.covers_range(
+            if !source.covers_range(
                 view.source_address,
                 view.size as u64,
                 true,
                 view.requires_source_write,
-            );
-            let context_covered = source.covers_range(
+            ) || !source.covers_range(
                 view.context_address,
                 view.size as u64,
                 true,
                 view.requires_source_write,
-            );
-            if !source_covered || !context_covered {
-                dev_err!(self.dev.as_ref(),
-                    "MMU: T8140 job context VM {} view {} incomplete: source={:#x} covered={} low={:#x} covered={} size={:#x} write={}\n",
-                    source.id, index, view.source_address, source_covered,
-                    view.context_address, context_covered, view.size,
-                    view.requires_source_write);
+            ) {
                 return Err(EFAULT);
             }
             let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
@@ -3931,9 +4130,6 @@ impl Uat {
             true,
             view.requires_source_write,
         ) {
-            dev_err!(self.dev.as_ref(),
-                "MMU: T8140 job context VM {} null source={:#x}+{:#x} lacks required permissions (write={})\n",
-                source.id, view.source_address, view.size, view.requires_source_write);
             return Err(EFAULT);
         }
         let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
@@ -3994,15 +4190,13 @@ impl Uat {
             {
                 return Err(EAGAIN);
             }
-            if crate::util::g17p_verbose() {
-                dev_info!(
-                    self.dev.as_ref(),
-                    "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
-                    T8140_NATIVE_CONTEXT_VIEW_COUNT,
-                    source.id,
-                    source_generation,
-                );
-            }
+            dev_info!(
+                self.dev.as_ref(),
+                "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
+                T8140_NATIVE_CONTEXT_VIEW_COUNT,
+                source.id,
+                source_generation,
+            );
             return Ok(mappings);
         }
         let mapping = source.map_in_range(
@@ -4034,15 +4228,13 @@ impl Uat {
         {
             return Err(EAGAIN);
         }
-        if crate::util::g17p_verbose() {
-            dev_info!(
-                self.dev.as_ref(),
-                "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
-                T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
-                source.id,
-                source_generation,
-            );
-        }
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
+            T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
+            source.id,
+            source_generation,
+        );
         Ok(mappings)
     }
 
@@ -4230,30 +4422,6 @@ impl Uat {
             secondary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
             Ok(())
         })?;
-        if self.cfg.has_m5_native_topology() {
-            let node = self.dev.as_ref().of_node().ok_or(EINVAL)?;
-            let shared_l2 = node.reserved_mem_region_to_resource_byname(c_str!("shared-l2"))?;
-            let mask = ((1u64 << self.cfg.oas) - 1) & !(UAT_PGMSK as u64);
-            if shared_l2.size() != UAT_PGSZ as u64
-                || Iterator::chain(primary_entries.iter(), secondary_entries.iter()).any(|pte| pte & 3 != 3)
-                || primary_entries[2] & mask != shared_l2.start()
-                || secondary_entries[2] & mask != shared_l2.start()
-                || primary_entries[0] & mask == secondary_entries[0] & mask
-            {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "{} firmware-private roots/shared L2 do not match the native topology\n",
-                    (if self.cfg == UatConfig::T8142 { "M5" } else { "T8152" })
-                );
-                return Err(EIO);
-            }
-        }
-        primary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
-            let entries = unsafe { core::slice::from_raw_parts_mut(
-                pointer as *mut u64, UAT_PGSZ / core::mem::size_of::<u64>()) };
-            clear_stale_host_root_entries(entries);
-            Ok(())
-        })?;
         fence(Ordering::SeqCst);
         mem::tlbi_all();
         mem::sync();
@@ -4408,6 +4576,57 @@ impl Uat {
                 == (high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
     }
 
+    /// Activate the device-global render FList root before the first user
+    /// submission. The boot path has no driver-owned bootstrap render, so the
+    /// later bootstrap-retirement restore hook is not reached in the normal
+    /// UAPI stage; leaving context 1 on `kernel_lower_vm` makes gUPM's first
+    /// operand-table read fault at 0x7000208000.
+    pub(crate) fn activate_t8140_render_global_context(&self) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let kernel_low = self.kernel_lower_vm.ttb();
+        let global_low = self.t8140_render_global_vm()?.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let phase = self.t8140_context_phase.load(Ordering::Acquire);
+        let expected_high = match phase {
+            T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH => source_high,
+            T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH => empty[1].ttb(),
+            _ => return Err(EBUSY),
+        };
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let ready = ttbs[0].ttb0.load(Ordering::Acquire) == (kernel_low | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (kernel_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+            && ttbs[1].ttb1.load(Ordering::Acquire)
+                == (expected_high | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+        if !ready {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[1].ttb0.store(
+            global_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        fence(Ordering::SeqCst);
+        mem::tlbi_asid(1);
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: context 1 activated with global render FList root {:#x}\n",
+            global_low,
+        );
+        Ok(())
+    }
+
     /// Confirm the post-opening first-work split. Unlike a steady-state user
     /// bind, the driver-owned bootstrap graph still names firmware-high
     /// objects, so both active slots retain the populated source high root.
@@ -4504,6 +4723,7 @@ impl Uat {
         inner.handoff().unlock();
         core::mem::drop(inner);
 
+        fence(Ordering::SeqCst);
         mem::tlbi_asid(0);
         mem::tlbi_asid(1);
         mem::sync();
@@ -4556,6 +4776,7 @@ impl Uat {
         inner.handoff().unlock();
         core::mem::drop(inner);
 
+        fence(Ordering::SeqCst);
         mem::tlbi_asid(0);
         mem::tlbi_asid(1);
         mem::sync();
@@ -4621,6 +4842,7 @@ impl Uat {
         core::mem::drop(inner);
 
         if changed? {
+            fence(Ordering::SeqCst);
             mem::tlbi_asid(0);
             mem::tlbi_asid(1);
             mem::sync();
@@ -4628,26 +4850,28 @@ impl Uat {
         Ok(())
     }
 
-    /// Restore the retained context-1 low root after a completed driver-owned
-    /// bootstrap render VM drops. Firmware has retired both queues before this
-    /// transition, and subsequent user binds may replace slot 1 normally.
+    /// Install the retained device-global context-1 low root after a completed
+    /// driver-owned bootstrap render VM drops. Firmware has retired both
+    /// queues before this transition. Ordinary jobs keep context 1 stable and
+    /// execute their command data through separately allocated app-GART roots.
     pub(crate) fn restore_t8140_kernel_context_after_bootstrap_render(&self) -> Result {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
         let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
-        let low = self.kernel_lower_vm.ttb();
+        let context0_low = self.kernel_lower_vm.ttb();
+        let context1_low = self.t8140_render_global_vm()?.ttb();
         let inner = self.inner.lock();
         inner.handoff().lock();
         let ttbs = inner.ttbs();
         if self.t8140_context_phase.load(Ordering::Acquire) != T8140_CONTEXT_USER_OWNED
-            || ttbs[0].ttb0.load(Ordering::Acquire) != (low | TTBR_VALID)
+            || ttbs[0].ttb0.load(Ordering::Acquire) != (context0_low | TTBR_VALID)
         {
             inner.handoff().unlock();
             return Err(EIO);
         }
         ttbs[1].ttb0.store(
-            low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            context1_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
             Ordering::Release,
         );
         ttbs[0]
@@ -4662,6 +4886,7 @@ impl Uat {
         inner.handoff().unlock();
         core::mem::drop(inner);
 
+        fence(Ordering::SeqCst);
         mem::tlbi_asid(0);
         mem::tlbi_asid(1);
         mem::sync();
@@ -4699,6 +4924,7 @@ impl Uat {
         inner.handoff().unlock();
         core::mem::drop(inner);
 
+        fence(Ordering::SeqCst);
         mem::tlbi_asid(0);
         mem::tlbi_asid(1);
         mem::sync();
@@ -4760,7 +4986,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
-        let mask = crate::g17_config::CTX2_ROOT;
+        let mask = *module_parameters::g17p_ctx2_root.value();
         if mask == 0 {
             dev_info!(
                 self.dev.as_ref(),
@@ -4856,7 +5082,7 @@ impl Uat {
         }
 
         let low_root = bind.0.ttb();
-        let high_root = if crate::g17_config::RENDER_POPULATED_HIGH_ROOT != 0 {
+        let high_root = if *module_parameters::g17p_render_populated_high_root.value() != 0 {
             self.kernel_vm.ttb()
         } else {
             self.t8140_empty_high_roots.as_ref().ok_or(EIO)?[1].ttb()
@@ -5035,7 +5261,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 {
             return Ok(());
         }
-        if crate::g17_config::CTX2_ROOT == 0 {
+        if *module_parameters::g17p_ctx2_root.value() == 0 {
             return Ok(());
         }
         if self.t8140_compute_context_alias_ready(bind) {
@@ -5126,7 +5352,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
             return false;
         }
-        let mask = crate::g17_config::CTX2_ROOT;
+        let mask = *module_parameters::g17p_ctx2_root.value();
         if mask == 0 {
             return false;
         }
@@ -5221,7 +5447,7 @@ impl Uat {
                 let uat_inner = self.inner.lock();
 
                 let ttb1 = if self.cfg == UatConfig::T8140 {
-                    let high_root = if crate::g17_config::RENDER_POPULATED_HIGH_ROOT
+                    let high_root = if *module_parameters::g17p_render_populated_high_root.value()
                         != 0
                     {
                         // Diagnostic only: native gives each app GART a distinct,
@@ -5249,10 +5475,14 @@ impl Uat {
                         idx
                     );
                 }
-                if self.cfg == UatConfig::T8140
+                // At the first-work boundary the populated firmware high root
+                // leaves contexts 0 and 1. Compute contexts 2/3 retain that
+                // root explicitly, while the opening pair becomes the two
+                // measured empty-high roots.
+                let changed_ctx0 = self.cfg == UatConfig::T8140
                     && idx == 1
-                    && t8140_phase == T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH
-                {
+                    && t8140_phase == T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH;
+                if changed_ctx0 {
                     let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
                     ttbs[0]
                         .ttb1
@@ -5263,7 +5493,7 @@ impl Uat {
                 if self.cfg == UatConfig::T8140 && idx == 1 {
                     self.t8140_context_phase
                         .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
-                    if crate::g17_config::RENDER_POPULATED_HIGH_ROOT != 0 {
+                    if *module_parameters::g17p_render_populated_high_root.value() != 0 {
                         dev_warn!(
                             self.dev.as_ref(),
                             "MMU: DIAGNOSTIC render context 1 exposes populated high root {:#x}\n",
@@ -5436,101 +5666,7 @@ impl Uat {
             HandoffMode::AbsentStandinT8140,
         )?;
         uat.install_t8140_firmware_crash_buffers(dev)?;
-        Ok(uat)
-    }
-
-    /// J873/T8152 (G18G, 26A428) UAT owner for the staged live-boot module.
-    ///
-    /// This validates the loader-filled boot-local reservations before any
-    /// page-table state is touched:
-    /// - `gfx-data` is exactly 0xbc000 and `gfx1-data` exactly 0xb4000,
-    ///   i.e. the 26A428 __DATA segments;
-    /// - `gfx-data-shared-ro` and `gfx1-data-shared-ro` are 0x8000 each.
-    ///   They are validated so that Linux never reuses that memory, but they
-    ///   are never mapped: the firmware sees them at VA +0x10c000/+0x108000
-    ///   through its own roots;
-    /// - all four regions are 16 KiB aligned, lie inside J873 DRAM
-    ///   (0x100_0000_0000..0x106_0000_0000) and do not overlap.
-    ///
-    /// Firmware contexts 0..2 stay reserved (the shared UatInner lease mask
-    /// starts at 0b111) and application binding is refused, as on M5. The
-    /// handoff page runs in [`HandoffMode::NoPeerT8152`].
-    ///
-    /// `crash_views` gives the DATA-relative offsets of the GFX and GFX1
-    /// RTKit crash views. M5 uses +0xa0000; the G18G offset is not yet known,
-    /// so pass `None` until the EP1 crashlog request reports it. Each view is
-    /// 0x8000 bytes (ADT coredump-copy-buffer) and is mapped read-write into
-    /// context 0 at the M5 DVA rule (physical address truncated to 40 bits).
-    #[allow(dead_code)] // Called by the G18 live-boot module.
-    pub(crate) fn new_t8152(
-        dev: &driver::AsahiDevice,
-        crash_views: Option<[u64; 2]>,
-    ) -> Result<Self> {
-        let node = dev.as_ref().of_node().ok_or(EINVAL)?;
-        let mut data = [0u64; 2];
-        let mut regions = [(0u64, 0u64); 4];
-        for (index, (name, size)) in Iterator::chain(
-            T8152_FIRMWARE_DATA.into_iter(),
-            T8152_FIRMWARE_SHARED_RO,
-        )
-        .enumerate()
-        {
-            let region = node.reserved_mem_region_to_resource_byname(name)?;
-            let start = region.start();
-            let end = start.checked_add(region.size()).ok_or(EOVERFLOW)?;
-            if start < T8152_DRAM_BASE
-                || region.size() != size
-                || start & UAT_PGMSK as u64 != 0
-                || end > T8152_DRAM_END
-            {
-                dev_err!(
-                    dev.as_ref(),
-                    "MMU: T8152 {} reservation {:#x}+{:#x} does not match the 26A428 layout ({:#x} bytes in J873 DRAM)\n",
-                    name,
-                    start,
-                    region.size(),
-                    size
-                );
-                return Err(EINVAL);
-            }
-            if regions[..index].iter().any(|&(s, e)| start < e && s < end) {
-                dev_err!(dev.as_ref(), "MMU: T8152 {} overlaps another firmware reservation\n", name);
-                return Err(EINVAL);
-            }
-            regions[index] = (start, end);
-            if index < data.len() {
-                data[index] = start;
-            }
-        }
-
-        let mut uat = Self::new_with_config(dev, UatConfig::T8152, false, HandoffMode::NoPeerT8152)?;
-        if let Some(offsets) = crash_views {
-            let mut physical = [0u64; 2];
-            for (index, offset) in offsets.into_iter().enumerate() {
-                let (_, data_size) = T8152_FIRMWARE_DATA[index];
-                if offset & UAT_PGMSK as u64 != 0
-                    || offset.checked_add(T8152_CRASH_VIEW_SIZE).ok_or(EOVERFLOW)? > data_size
-                {
-                    dev_err!(
-                        dev.as_ref(),
-                        "MMU: T8152 crash view offset {:#x} is outside role {} __DATA\n",
-                        offset,
-                        index
-                    );
-                    return Err(EINVAL);
-                }
-                physical[index] = data[index] + offset;
-            }
-            let map = |pa: u64| {
-                uat.kernel_lower_vm.map_io(
-                    pa & ((1u64 << 40) - 1),
-                    pa.try_into()?,
-                    T8152_CRASH_VIEW_SIZE as usize,
-                    PROT_FW_SHARED_RW,
-                )
-            };
-            uat._t8142_firmware_crash_views = Some([map(physical[0])?, map(physical[1])?]);
-        }
+        uat.install_t8140_parameter_metrics(dev)?;
         Ok(uat)
     }
 
@@ -5652,6 +5788,48 @@ impl Uat {
         Ok(())
     }
 
+    /// Install the global PM page-metrics primary alias before either ASC
+    /// starts. Firmware B1 later dereferences the primary VA directly at
+    /// `0xbba0`; adding a TTBR0 top-level entry after launch leaves the
+    /// firmware CPU on its boot snapshot and produces FSC level 0.
+    fn install_t8140_parameter_metrics(&mut self, dev: &driver::AsahiDevice) -> Result {
+        if self.cfg != UatConfig::T8140
+            || self._t8140_parameter_metrics_low.is_some()
+            || self.t8140_parameter_metrics_gem.is_some()
+        {
+            return Err(EINVAL);
+        }
+        let mut object = gem::new_kernel_object_wc(dev, T8140_PARAMETER_METRICS_SIZE)?;
+        object.vmap()?.memset(0);
+        let retained_gem = object.gem.clone();
+        let low = object.map_at(
+            &self.kernel_lower_vm,
+            T8140_PARAMETER_METRICS_LOW_VA,
+            PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        if low.iova() != T8140_PARAMETER_METRICS_LOW_VA
+            || low.size() != T8140_PARAMETER_METRICS_SIZE
+            || !self.kernel_lower_vm.covers_range(
+                low.iova(),
+                low.size() as u64,
+                true,
+                true,
+            )
+        {
+            return Err(EFAULT);
+        }
+        dev_info!(
+            dev.as_ref(),
+            "MMU: preinstalled T8140 PM page metrics low={:#x} size={:#x}\n",
+            low.iova(),
+            T8140_PARAMETER_METRICS_SIZE
+        );
+        self._t8140_parameter_metrics_low = Some(low);
+        self.t8140_parameter_metrics_gem = Some(retained_gem);
+        Ok(())
+    }
+
     /// Creates a new `Uat` instance with an explicit handoff mode.
     ///
     /// The mode is evidence-gated: `FirmwareDekker` on a 42-bit part remains
@@ -5686,11 +5864,11 @@ impl Uat {
         // Validate the geometry first: 39- and 42-bit roots are the two
         // recovered layouts, and the page-table walk, kernel-half VA window,
         // and leaf PTE policy are implemented for both (the AGX3 leaf PTE
-        // encoder is byte-identical to AGX2). What is *not* validated for
-        // AGX3 is the firmware-shared state this constructor touches next:
-        // the Handoff/FlushInfo struct layout and the firmware's view of the
-        // kernel-half window are per-firmware-build ABI observed only on
-        // AGX2. Fail closed on exactly that boundary.
+        // encoder is byte-identical to AGX2). What must remain fail-closed
+        // per mode is the firmware-shared state this constructor touches
+        // next: the Handoff/FlushInfo protocol is per-firmware-build ABI
+        // observed on AGX2 (Dekker) and, separately, observed *absent* on
+        // T8140.
         let kernel_range = iova_kern_range(cfg)?;
         match handoff_mode {
             HandoffMode::FirmwareDekker => {
@@ -5716,16 +5894,6 @@ impl Uat {
                     return Err(ENODEV);
                 }
             }
-            HandoffMode::NoPeerT8142 => {
-                if cfg != UatConfig::T8142 {
-                    return Err(ENODEV);
-                }
-            }
-            HandoffMode::NoPeerT8152 => {
-                if cfg != UatConfig::T8152 {
-                    return Err(ENODEV);
-                }
-            }
         }
 
         let inner = Self::make_inner(dev, cfg, handoff_mode)?;
@@ -5746,8 +5914,16 @@ impl Uat {
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
-        let kernel_lower_vm = Vm::new(dev, inner.clone(), IOVA_USER_RANGE, cfg, None, 1)?;
-        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
+        let kernel_lower_vm = Vm::new(
+            dev,
+            inner.clone(),
+            lower_vm_start(cfg, true)..uat_geometry(cfg)?.user_va_top(),
+            cfg,
+            None,
+            1,
+            true,
+        )?;
+        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0, false)?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
 
@@ -5776,14 +5952,30 @@ impl Uat {
         } else {
             None
         };
+        let t8140_render_global_vm = if cfg == UatConfig::T8140 {
+            Some(Vm::new(
+                dev,
+                inner.clone(),
+                IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                cfg,
+                None,
+                0x8140_1002,
+                false,
+            )?)
+        } else {
+            None
+        };
 
         let uat = Self {
             dev: dev.into(),
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            t8140_render_global_vm,
             _t8140_firmware_crash_buffers: None,
             t8140_firmware_crash_gems: None,
+            _t8140_parameter_metrics_low: None,
+            t8140_parameter_metrics_gem: None,
             t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
                 Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
             } else {
@@ -5857,6 +6049,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_mask_follows_every_published_copy_of_one_vm_root() {
+        let root = 0x101_abc0_0000;
+        let other = 0x101_def0_0000;
+        let ttbs = core::array::from_fn(|_| SlotTTBS {
+            ttb0: AtomicU64::new(0),
+            ttb1: AtomicU64::new(0),
+        });
+
+        for context in [1usize, 5, 17, 62] {
+            ttbs[context]
+                .ttb0
+                .store(t8140_tagged_root(root, context), Ordering::Relaxed);
+        }
+        ttbs[9]
+            .ttb0
+            .store(t8140_tagged_root(other, 9), Ordering::Relaxed);
+        /* A root tagged for the wrong ASID is not owned by this context. */
+        ttbs[23]
+            .ttb0
+            .store(t8140_tagged_root(root, 22), Ordering::Relaxed);
+
+        assert_eq!(
+            context_mask_for_root(root, &ttbs),
+            (1u64 << 1) | (1u64 << 5) | (1u64 << 17) | (1u64 << 62)
+        );
+        assert_eq!(context_mask_for_root(other, &ttbs), 1u64 << 9);
+    }
+
+    #[test]
     fn g17p_fixed_pages_and_cl_arena_overlap_the_driver_ledger() {
         let protected = [
             0x10_0019_0000..0x10_0019_4000,
@@ -5924,6 +6145,52 @@ mod tests {
     }
 
     #[test]
+    fn t8140_client_null_view_covers_the_faulting_gupm_writes() {
+        let canonical = T8140_NATIVE_CONTEXT_VIEWS[0];
+        let client = T8140_CLIENT_NULL_VIEW;
+
+        // Same resource, same offset, same span as native's canonical view 0:
+        // only the regime it is presented in differs.
+        assert_eq!(client.source_address, canonical.source_address);
+        assert_eq!(client.context_address, canonical.context_address);
+        assert_eq!(client.size, canonical.size);
+        assert_eq!(T8140_CLIENT_NULL_VIEW_START, client.context_address);
+        assert_eq!(T8140_CLIENT_NULL_VIEW_SIZE, client.size);
+
+        // Hardware reported these four as unmapped *writes* (read=0) in the
+        // client's own vm-slot, so the leaf has to be GPU-writable and the
+        // window has to contain all four.
+        assert!(client.requires_source_write);
+        assert!(client.context_prot.allows_gpu(true, true));
+        let window = T8140_CLIENT_NULL_VIEW_START
+            ..T8140_CLIENT_NULL_VIEW_START + T8140_CLIENT_NULL_VIEW_SIZE as u64;
+        for address in [0x1e00u64, 0x1e80, 0x1f00, 0x1f80] {
+            assert!(window.contains(&address));
+        }
+
+        // It begins below the published user base, so no user bind could ever
+        // reach the first view; the reservation only protects the tail that
+        // does overlap the user window.
+        assert_eq!(window.start, 0);
+        assert!(window.start < IOVA_USER_BASE);
+        assert!(window.end > IOVA_USER_BASE);
+    }
+
+    #[test]
+    fn t8140_job_root_has_exactly_one_driver_owned_secure_gart_view() {
+        let null_end = T8140_CLIENT_NULL_VIEW.context_address
+            + T8140_CLIENT_NULL_VIEW.size as u64;
+        assert_eq!(T8140_NATIVE_CONTEXT_VIEWS[0].context_address, 0);
+        assert_eq!(T8140_NATIVE_CONTEXT_VIEWS[0].size, T8140_CLIENT_NULL_VIEW.size);
+        for view in T8140_NATIVE_CONTEXT_VIEWS.iter().skip(1) {
+            // These ranges are explicitly supplied by Mesa's GPUVM binds and
+            // must only be validated, never acquired by a KernelMapping.
+            assert!(null_end <= view.context_address);
+            assert!(view.context_address >= IOVA_USER_BASE);
+        }
+    }
+
+    #[test]
     fn only_t8140_internal_lower_vm_contains_the_null_leaf() {
         assert_eq!(lower_vm_start(UatConfig::T8140, true), 0);
         assert_eq!(lower_vm_start(UatConfig::T8140, false), IOVA_USER_BASE);
@@ -5933,6 +6200,29 @@ mod tests {
             oas: 42,
         };
         assert_eq!(lower_vm_start(legacy, true), IOVA_USER_BASE);
+    }
+
+    #[test]
+    fn t8140_native_context_views_match_secure_gart_low32_fanout() {
+        let canonical_bo = 0x0010_0000_0000..0x0010_0008_0000;
+        let mut previous_context_end = 0;
+
+        for view in T8140_NATIVE_CONTEXT_VIEWS {
+            assert_eq!(view.source_address & 0xffff_ffff, view.context_address);
+            assert_eq!(view.source_address & UAT_PGMSK as u64, 0);
+            assert_eq!(view.context_address & UAT_PGMSK as u64, 0);
+            assert_eq!(view.size & UAT_PGMSK, 0);
+            assert!(canonical_bo.is_superset(
+                view.source_address..view.source_address + view.size as u64
+            ));
+            assert!(previous_context_end <= view.context_address);
+            previous_context_end = view.context_address + view.size as u64;
+        }
+
+        assert_eq!(T8140_NATIVE_CONTEXT_VIEWS[0].context_address, 0);
+        assert!(!T8140_NATIVE_CONTEXT_VIEWS[4].requires_source_write);
+        assert!(T8140_NATIVE_CONTEXT_VIEWS[5].requires_source_write);
+        assert!(T8140_NATIVE_CONTEXT_VIEWS[6].requires_source_write);
     }
 
     #[test]

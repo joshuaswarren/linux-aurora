@@ -15,7 +15,9 @@ const IOMMUS_PROP: &CStr = c"iommus";
 const STATUS_PROP: &CStr = c"status";
 const STATUS_OKAY: &CStr = c"okay";
 
-// SEP DMA is offset BIT(40) above the DART input; one 64-bit value = two cells.
+// Fallback for boards that describe a low 0..4 GiB DMA window. J700's base
+// DT already names the high DART-visible window and supplies a zero offset.
+// One 64-bit value occupies two cells.
 const DMA_OFFSET_PROP: &CStr = c"apple,dma-offset";
 // [0x100, 0] = BIT(40); [0x1, 0] would be BIT(32) and miss the page tables.
 const DMA_OFFSET_CELLS: [u32; 2] = [0x100, 0x0];
@@ -241,9 +243,15 @@ pub(crate) fn enable_sep_and_dart() -> Result<()> {
             }
             Ok(queued)
         })?;
-        pr_info!(
-            "apple_sep: SEP DART changeset applied (offset BIT(40), range 0..4GiB, status okay)\n"
-        );
+        if need_offset || need_range {
+            pr_info!(
+                "apple_sep: SEP DART changeset applied (offset BIT(40), range 0..4GiB, status okay)\n"
+            );
+        } else {
+            pr_info!(
+                "apple_sep: SEP DART enabled with its preconfigured DMA window\n"
+            );
+        }
     } else {
         pr_info!("apple_sep: SEP DART already enabled and configured\n");
     }

@@ -21,6 +21,7 @@
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -37,6 +38,22 @@
 #include "iomfb_internal.h"
 #include "parser.h"
 #include "trace.h"
+
+
+/*
+ * A476 payload.  macOS sends 1 (dcp-calls.log line 1648); we sent 0 on the
+ * theory that A476 is set_dcp_clamshellstate and 1 meant "lid shut".  That
+ * attribution is unverified -- A476's shape (in 4, out 0) equally fits
+ * set_has_frame_swap_function(bool) -- and the black panel it appeared to fix
+ * was really the surf_iova misalignment, so the evidence for 0 was
+ * coincidental.  Follow the capture.
+ */
+u32 dcp_clamshell_state = 1;
+module_param_named(clamshell_state, dcp_clamshell_state, uint, 0644);
+
+bool dcp_send_modeset;   /* macOS never issues A413 */
+module_param_named(send_modeset, dcp_send_modeset, bool, 0644);
+
 
 
 /*
@@ -86,6 +103,10 @@ static void dcp_start_extra_eps(struct apple_dcp *dcp)
 	}
 }
 
+
+bool dcp_park_display = true;
+module_param_named(park_display, dcp_park_display, bool, 0644);
+MODULE_PARM_DESC(park_display, "H17P: power the display down after boot until a modeset");
 
 bool dcp_defer_client_open;
 module_param_named(defer_client_open, dcp_defer_client_open, bool, 0644);
@@ -613,6 +634,29 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		return;
 	}
 
+	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
+	    !dcp->cb_handlers[tag]) {
+		dev_warn(dev, "received unknown callback %c%c%c%c\n",
+			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+		/*
+		 * Leaving a callback unanswered wedges the coprocessor: it
+		 * waits for the ack forever and the outer call never returns.
+		 * On H17P answer it with a zeroed output instead, so the
+		 * warning above names the tag we still have to implement
+		 * rather than costing a reboot to discover one tag at a time.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			if (hdr->out_len)
+				memset(out, 0, hdr->out_len);
+			depth = dcp_push_depth(&ch->depth);
+			ch->output[depth] = out;
+			ch->end[depth] = offset +
+					 ALIGN(length, DCP_PACKET_ALIGNMENT);
+			dcp_ack(dcp, context);
+		}
+		return;
+	}
+
 	// TODO: verify that in_len and out_len match our prototypes
 	// for now just clear the out data to have at least consistent results
 	if (hdr->out_len)
@@ -940,6 +984,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	dcp_retain_unbound_fbs(dcp, crtc, state);
 
 	if (dcp_channel_busy(&dcp->ch_cmd))
 	{

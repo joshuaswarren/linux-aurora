@@ -19,14 +19,14 @@
 //! native G17 channel-command dispatcher is also modeled for the exact A18
 //! Pro/G17P identity: it reads a little-endian u32 tag at command offset zero,
 //! keeps unresolved and nested SKU meanings out of the top-level enum, and
-//! separates the host's `Nop=17` name from the firmware's fatal rejection of
+//! separates the host's `Nop=17` name from the firmware's fatal handling of
 //! that value.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
 //! (`g17s a0, SKSM Enabled`), all three pinned A18 Pro `g17p` firmware variants
 //! (`a000`, `b000`, and `b100`), and the pinned G17P/G17G/G17X host kexts. The
 //! native G17P channel-state ABI is admitted only for the A18 Pro identity;
-//! the M5-family identities stay fail-closed.
+//! the M5-family identities remain unsupported.
 //! Firmware addresses are VAs (0xfffffc0000000000 + fileoff - 0x4000). See
 //! `research/gpu/GPU_AGX3_G17_SUBMISSION_2026-08-25.md`.
 //!
@@ -35,18 +35,29 @@
 //! and cited; [`EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE`] states whether a
 //! submission can be driven to completion offline. It is `false`: the SKSM
 //! completion path is a hardware kick FIFO the firmware reads through indexed
-//! MMIO scratch registers. The host publication form is grounded, but its live
-//! aperture values, silicon bridge to the firmware scratch consumer, round
-//! trip, and completion IRQ can only be confirmed on-device. See
-//! [`SUBMISSION_LIVE_GAPS`].
+//! MMIO scratch registers. The host publication form, runtime scratch geometry,
+//! and resource-0 ordered writer are implemented. J700 has completed the
+//! channel-doorbell round trip with exact compute output across a retained CL2
+//! queue, and the measured first-partial path has executed graphics through
+//! the classic channel transport. Linux still needs that contract wired into
+//! its runtime and completion IRQ ingress. The native kext `addKicks` path is
+//! tracked independently. See [`SUBMISSION_LIVE_GAPS`].
+
+#[cfg(not(test))]
+use crate::g17_manager::G17SksmScratchGeometry;
+#[cfg(test)]
+#[path = "g17_manager.rs"]
+mod g17_manager;
+#[cfg(test)]
+use g17_manager::G17SksmScratchGeometry;
 
 /// The submission producer subset is byte-grounded against the M5 firmware.
 /// See [`SUBMISSION_ABI_LEDGER`] for the inherited, still-unconfirmed pieces.
 pub(crate) const GROUNDED_SUBMISSION_PRODUCER_AVAILABLE: bool = true;
 
 /// Whether a submission can be driven to completion. `false`: see
-/// [`SUBMISSION_LIVE_GAPS`]. This is what keeps `SUBMISSION_TRANSPORT`
-/// fail-closed in `g17_boot::pre_handoff_gate`.
+/// [`SUBMISSION_LIVE_GAPS`]. This keeps `SUBMISSION_TRANSPORT` out of
+/// `g17_boot::pre_handoff_gate` admission until completion is implemented.
 pub(crate) const EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE: bool =
     SUBMISSION_LIVE_GAPS.all_proven();
 
@@ -87,7 +98,7 @@ const DOORBELL_INDEX_MASK: u64 = 0x7;
 pub(crate) const DOORBELL_KICKFW: u8 = 0x10;
 pub(crate) const DOORBELL_DEVCTRL: u8 = 0x11;
 
-/// The three GPU submission pipes. The firmware rejects `pipe_type == 3`
+/// The three GPU submission pipes. The firmware treats `pipe_type == 3` as invalid
 /// (`cmp w8, #0x3 ; b.eq 0x252f4` — no such pipe).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
@@ -97,13 +108,9 @@ pub(crate) enum PipeType {
     Compute = 2,
 }
 
-/// Fail-closed refusals from the submission codec.
+/// Errors from the submission codec.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionError {
-    RenderBarrierFuture,
-    RenderBarrierSequenceOverflow,
-    RenderBarrierMissingToken,
-    RenderBarrierPredecessorFailed,
     /// A doorbell index outside the 3-bit [4:2] field.
     DoorbellIndexOutOfRange,
     /// A doorbell whose type field is not the TX (channel-kick) type.
@@ -118,12 +125,50 @@ pub(crate) enum SubmissionError {
     KickTimestampOutOfRange,
     /// The runtime queue geometry must contain between 1 and 256 stamps.
     KickStampCountOutOfRange,
+    /// No SKSM queue geometry is proven for this target/backend pair.
+    KickQueueGeometryUnconfirmed,
+    /// The queue stride/count/alignment/extent/seed tuple is inconsistent.
+    KickQueueGeometryInvalid,
     /// The timestamp's low-byte slot does not exist in this queue geometry.
     KickStampIndexOutOfRange,
     /// A zero-byte entry stride would alias every queue entry.
     KickEntryStrideZero,
     /// Multiplying the slot by the runtime entry stride overflowed u32.
     KickEntryOffsetOverflow,
+    /// The queue already has `num_stamps` entries awaiting completion.
+    KickQueueSubmittedFull,
+    /// A completion observed no submitted entries or exceeded their count.
+    KickCompletionUnderflow,
+    /// A provider-owned pre-B2 state object is smaller than one 16 KiB page.
+    KickB2PrimaryStateBufferTooSmall,
+    /// The retained queue already published its one-time pre-B2 state.
+    KickB2PrimaryStateAlreadyPublished,
+    /// A retained queue static object is smaller than its native extent.
+    KickRetainedStorageBufferTooSmall,
+    /// A CL entry has one implicit dependency and at most 31 explicit ones.
+    KickDependencyCountOutOfRange,
+    /// A CL dependency names a queue outside the seven-bit entry field.
+    KickDependencyQueueIdOutOfRange,
+    /// The MCache aperture index or count cannot be represented in its field.
+    KickMcacheFieldOutOfRange,
+    /// The MCache aperture address is unaligned or exceeds its 38-bit field.
+    KickMcacheAddressUnencodable,
+    /// The RCE kind is outside the two-bit entry field.
+    KickRceKindOutOfRange,
+    /// An RCE tag is outside its seven-bit entry field.
+    KickRceTagOutOfRange,
+    /// An RCE address is unaligned or exceeds its 38-bit entry field.
+    KickRceAddressUnencodable,
+    /// A compute descriptor-relative RCE address overflowed u64.
+    ComputeRceAddressOverflow,
+    /// A compute event counter overflowed its 64-bit entry field.
+    ComputeEventCounterOverflow,
+    /// Required first-bind command publication facts are still unresolved.
+    FirstBindCommandPublicationIncomplete,
+    /// G17P target-1 requires both retained CPU and booted RTKit owners.
+    RunningClientPowerTransitionUnavailable,
+    /// The middle QoS field is wider than the five bits copied by the host.
+    KickQosClassOutOfRange,
     /// The runtime MMIO aperture selector or base offset overflowed u32.
     KickMmioOffsetOverflow,
     /// The A18 Pro SKSM queue data-master field is limited to TA/3D/CL.
@@ -142,8 +187,6 @@ pub(crate) enum SubmissionError {
     RingIndexOutOfRange,
     /// Advancing the producer would make it collide with the consumer.
     RingFull,
-    /// Registered G17P channel state is firmware-owned until explicit recovery.
-    ChannelStateFirmwareOwned,
     /// G17 exposes four priority groups in its runtime channel table.
     ChannelPriorityOutOfRange,
     /// This native channel layout is not grounded for the selected identity.
@@ -152,12 +195,28 @@ pub(crate) enum SubmissionError {
     CommandAbiUnconfirmed,
     /// A top-level channel command must expose its complete four-byte tag.
     CommandHeaderTooShort,
+    /// A first-render status pointer overflowed while deriving the FWCtl VAs.
+    PartialOpeningAddressOverflow,
+    /// A first-render scheduler or index mapping is not exactly one 16 KiB page.
+    PartialOpeningPageSize,
+    /// A first-render outer-channel counter has bits outside the 8-bit ring index.
+    PartialOpeningChannelCounterOutOfRange,
+    /// A first-render queue head does not fit the outer slot's 16-bit field.
+    PartialOpeningQueueHeadOutOfRange,
+    /// A cold-opening support object does not match its exact encoded extent.
+    PartialOpeningGraphObjectSize,
+    /// A first-partial descriptor cannot be represented by its context locators.
+    PartialOpeningDescriptorLocatorUnencodable,
     /// The host/firmware meaning of this in-range top-level tag is unresolved.
     CommandTagUnresolved,
     /// This value is not a grounded G17P top-level command tag.
     CommandTagInvalid,
-    /// The host names this tag, but the matched firmware rejects it fatally.
-    CommandTagRejectedByFirmware,
+    /// The host names this tag, but the matched firmware handles it fatally.
+    CommandTagInvalidForFirmware,
+    /// A tag-14 AddKicks command must publish at least one new kick entry.
+    KsmAddKicksCountZero,
+    /// The tag-14 AddKicks count does not fit the record's 16-bit field.
+    KsmAddKicksCountOutOfRange,
 }
 
 /// Encode a work-submission doorbell exactly as `gpu.rs::run_job` does:
@@ -171,13 +230,342 @@ pub(crate) const fn encode_tx_doorbell(pipe: PipeType, index: u8) -> Result<u64,
     Ok(MSG_TX_DOORBELL | (pipe as u64) | ((index as u64) << DOORBELL_INDEX_SHIFT))
 }
 
+/// Host state which decides the two distinct EP 0x21 notifications around a
+/// direct G17P CL submit. Activation is first-or-changed-channel state; the
+/// direct kick has its own feature, suppression, and command-enable gates.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PDirectClNotificationState {
+    pub(crate) cached_channel_identity: u64,
+    pub(crate) submitted_channel_identity: u64,
+    pub(crate) firmware_ready: bool,
+    pub(crate) direct_feature: bool,
+    pub(crate) submission_suppressed: bool,
+    pub(crate) command_submission_enabled: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PDirectClNotifications {
+    pub(crate) activation: Option<u64>,
+    pub(crate) direct_kick: Option<u64>,
+}
+
+/// Submission backend identity. This keeps the T8140 G17P HAL200 hybrid
+/// distinct from both classic channels and the unimplemented HAL300 family
+/// without changing mature generic paths.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17ClSubmissionBackend {
+    Classic,
+    G17PHal200Hybrid,
+    Hal300,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PClBackendConfig {
+    pub(crate) backend: G17ClSubmissionBackend,
+    pub(crate) direct_feature: bool,
+    pub(crate) submission_suppressed: bool,
+    pub(crate) command_submission_enabled: bool,
+}
+
+pub(crate) const T8140_G17P_CL_BACKEND: G17PClBackendConfig = G17PClBackendConfig {
+    backend: G17ClSubmissionBackend::G17PHal200Hybrid,
+    direct_feature: true,
+    submission_suppressed: false,
+    command_submission_enabled: true,
+};
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PContractPredicateState {
+    Pending,
+    ProvenPresent,
+}
+
+/// Dedicated FlushID classification is not sufficient for release: an absent
+/// feature needs a proven represented fallback, while a present feature needs
+/// its numeric allocator, lifetime, and command operands implemented.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PFlushIdImplementationState {
+    Pending,
+    ProvenAbsentFallbackUnverified,
+    ProvenAbsentFallbackRepresented,
+    ProvenPresentUnimplemented,
+    ProvenPresentImplemented,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PCorrelationRingImplementationState {
+    Pending,
+    ProvenInactive,
+    ProvenRequiredImplemented,
+}
+
+/// Required first-bind commands and publication facts. FlushID uses represented
+/// fallback zero, the command-pointer ring is implemented, and the taken
+/// correlation branch is represented by a host-only nonzero job token.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirstBindCommandPlan {
+    pub(crate) config_update_required: bool,
+    pub(crate) entry_signal_required: bool,
+    pub(crate) logical_flush_id_required: bool,
+    pub(crate) fallback_logical_flush_id: u32,
+    pub(crate) flush_id_serialized_in_tag15: bool,
+    pub(crate) flush_id_completion_release_required: bool,
+    pub(crate) dedicated_flush_id: G17PFlushIdImplementationState,
+    pub(crate) native_command_pointer_ring: G17PContractPredicateState,
+    pub(crate) optional_correlation_ring: G17PCorrelationRingImplementationState,
+}
+
+impl G17PFirstBindCommandPlan {
+    pub(crate) const fn hardware_release_ready(self) -> bool {
+        self.config_update_required
+            && self.entry_signal_required
+            && self.logical_flush_id_required
+            && self.fallback_logical_flush_id == 0
+            && !self.flush_id_serialized_in_tag15
+            && !self.flush_id_completion_release_required
+            && matches!(
+                self.dedicated_flush_id,
+                G17PFlushIdImplementationState::ProvenAbsentFallbackRepresented
+                    | G17PFlushIdImplementationState::ProvenPresentImplemented
+            )
+            && matches!(
+                self.native_command_pointer_ring,
+                G17PContractPredicateState::ProvenPresent
+            )
+            && matches!(
+                self.optional_correlation_ring,
+                G17PCorrelationRingImplementationState::ProvenInactive
+                    | G17PCorrelationRingImplementationState::ProvenRequiredImplemented
+            )
+    }
+}
+
+pub(crate) const G17P_FIRST_BIND_COMMAND_PLAN: G17PFirstBindCommandPlan =
+    G17PFirstBindCommandPlan {
+        config_update_required: true,
+        entry_signal_required: true,
+        logical_flush_id_required: true,
+        fallback_logical_flush_id: 0,
+        flush_id_serialized_in_tag15: false,
+        flush_id_completion_release_required: false,
+        dedicated_flush_id:
+            G17PFlushIdImplementationState::ProvenAbsentFallbackRepresented,
+        native_command_pointer_ring: G17PContractPredicateState::ProvenPresent,
+        optional_correlation_ring:
+            G17PCorrelationRingImplementationState::ProvenRequiredImplemented,
+    };
+
+/// Compile-time release gate consumed by the live first-add3 boundary. Keep
+/// true only because the host-only correlation token, tag-15/tag-16 pointer
+/// publisher, and FlushID fallback are all represented for this profile.
+pub(crate) const G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY: bool =
+    G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready();
+
+pub(crate) const fn require_g17p_first_bind_direct_hardware_release(
+    plan: G17PFirstBindCommandPlan,
+) -> Result<(), SubmissionError> {
+    if plan.hardware_release_ready() {
+        Ok(())
+    } else {
+        Err(SubmissionError::FirstBindCommandPublicationIncomplete)
+    }
+}
+
+/// Native target-bound active state required before TA/3D/CL submission.
+///
+/// D93 role 1 is managed and non-standalone. Linux retains its started CPU,
+/// mailbox, and booted RTKit owners for the complete session, which is the
+/// native target-1 state. Submit performs no management power request.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PRunningClientPowerContract {
+    pub(crate) role_index: u8,
+    pub(crate) service_id: u8,
+    pub(crate) target: u8,
+    pub(crate) management_request_used: bool,
+    pub(crate) managed: bool,
+    pub(crate) standalone: bool,
+}
+
+pub(crate) const G17P_RUNNING_CLIENT_POWER_CONTRACT: G17PRunningClientPowerContract =
+    G17PRunningClientPowerContract {
+        role_index: 1,
+        service_id: 0x20,
+        target: 1,
+        management_request_used: false,
+        managed: true,
+        standalone: false,
+    };
+
+pub(crate) const fn require_g17p_running_client_power_transition(
+    contract: G17PRunningClientPowerContract,
+    retained_cpu_owner: bool,
+    retained_rtkit_owner: bool,
+) -> Result<(), SubmissionError> {
+    if contract.role_index == 1
+        && contract.service_id == 0x20
+        && contract.target == 1
+        && !contract.management_request_used
+        && contract.managed
+        && !contract.standalone
+        && retained_cpu_owner
+        && retained_rtkit_owner
+    {
+        Ok(())
+    } else {
+        Err(SubmissionError::RunningClientPowerTransitionUnavailable)
+    }
+}
+
+/// Required lifetime of the eventual target-1 active lease.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PComputePowerLeaseStep {
+    AcquireBeforeReadiness,
+    HoldThroughClaim,
+    HoldThroughCompletion,
+    ReleaseAfterCompletion,
+}
+
+pub(crate) const G17P_COMPUTE_POWER_LEASE_ORDER: [G17PComputePowerLeaseStep; 4] = [
+    G17PComputePowerLeaseStep::AcquireBeforeReadiness,
+    G17PComputePowerLeaseStep::HoldThroughClaim,
+    G17PComputePowerLeaseStep::HoldThroughCompletion,
+    G17PComputePowerLeaseStep::ReleaseAfterCompletion,
+];
+
+pub(crate) const fn g17p_first_bind_tag15_required(queue_config_dirty: bool) -> bool {
+    queue_config_dirty
+}
+
+pub(crate) const fn g17p_first_bind_tag16_required(
+    backend: G17PClBackendConfig,
+    queue_config_dirty: bool,
+) -> bool {
+    matches!(backend.backend, G17ClSubmissionBackend::G17PHal200Hybrid)
+        && backend.direct_feature
+        && queue_config_dirty
+}
+
+/// Host-only first/repeat state for the direct CL submission contract.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PDirectClLifecycleState {
+    pub(crate) queue_config_dirty: bool,
+    pub(crate) cached_channel_identity: u64,
+    /// Nonzero host-only descriptor sequence used for job ownership/fencing.
+    pub(crate) next_correlation_token: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PDirectClLifecycle {
+    pub(crate) publish_config_update: bool,
+    pub(crate) publish_entry_signal: bool,
+    pub(crate) correlation_token: u64,
+    pub(crate) notifications: PreparedG17PDirectClNotifications,
+    pub(crate) next: G17PDirectClLifecycleState,
+}
+
+/// Derive first-bind and repeat transitions without selecting publication
+/// storage. First bind publishes tags 15/16; a clean repeat omits both and the
+/// unchanged channel identity omits activation, while direct kick remains.
+pub(crate) const fn prepare_g17p_direct_cl_lifecycle(
+    current: G17PDirectClLifecycleState,
+    submitted_channel_identity: u64,
+    firmware_ready: bool,
+    backend: G17PClBackendConfig,
+) -> Result<PreparedG17PDirectClLifecycle, SubmissionError> {
+    if current.next_correlation_token == 0 {
+        return Err(SubmissionError::ComputeEventCounterOverflow);
+    }
+    let next_correlation_token = match current.next_correlation_token.checked_add(1) {
+        Some(token) => token,
+        None => return Err(SubmissionError::ComputeEventCounterOverflow),
+    };
+    let publish_config_update = g17p_first_bind_tag15_required(current.queue_config_dirty);
+    let publish_entry_signal =
+        g17p_first_bind_tag16_required(backend, current.queue_config_dirty);
+    let notifications = match prepare_g17p_direct_cl_notifications(
+        G17PDirectClNotificationState {
+            cached_channel_identity: current.cached_channel_identity,
+            submitted_channel_identity,
+            firmware_ready,
+            direct_feature: backend.direct_feature,
+            submission_suppressed: backend.submission_suppressed,
+            command_submission_enabled: backend.command_submission_enabled,
+        },
+    ) {
+        Ok(notifications) => notifications,
+        Err(error) => return Err(error),
+    };
+    Ok(PreparedG17PDirectClLifecycle {
+        publish_config_update,
+        publish_entry_signal,
+        correlation_token: current.next_correlation_token,
+        notifications,
+        next: G17PDirectClLifecycleState {
+            queue_config_dirty: false,
+            cached_channel_identity: submitted_channel_identity,
+            next_correlation_token,
+        },
+    })
+}
+
+/// First/new compute-channel activation. Priority 2 encodes as `0x...0a`;
+/// this is independent of SKSM QID 4 and outer work-channel index 10.
+pub(crate) const fn encode_g17p_cl_activation(priority: u8) -> Result<u64, SubmissionError> {
+    encode_tx_doorbell(PipeType::Compute, priority)
+}
+
+/// Direct CL `kickFirmware(4, 3, false)`, byte-proven as EP 0x21 `0x...10`.
+pub(crate) const fn encode_g17p_direct_cl_kick() -> u64 {
+    MSG_TX_DOORBELL | DOORBELL_KICKFW as u64
+}
+
+/// Exact J700 native EP21 lifecycle around firmware startup and the first real
+/// userspace CL. Startup publishes no work or record-less device-control
+/// announcement; the first changed priority-2 CL emits activation then the
+/// direct kick.
+pub(crate) const G17P_NATIVE_PRE_USER_EP21_MESSAGES: [u64; 0] = [];
+pub(crate) const G17P_NATIVE_FIRST_USER_EP21_MESSAGES: [u64; 2] = [
+    0x0083_0000_0000_000a,
+    0x0083_0000_0000_0010,
+];
+
+/// Pure predicate/encoding boundary. A repeat submit omits activation when the
+/// cached identity already matches, but an enabled, direct, unsuppressed submit
+/// still emits the separate direct kick.
+pub(crate) const fn prepare_g17p_direct_cl_notifications(
+    state: G17PDirectClNotificationState,
+) -> Result<PreparedG17PDirectClNotifications, SubmissionError> {
+    let activation = if state.cached_channel_identity != state.submitted_channel_identity
+        && state.firmware_ready
+    {
+        match encode_g17p_cl_activation(2) {
+            Ok(message) => Some(message),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let direct_kick = if state.direct_feature
+        && !state.submission_suppressed
+        && state.command_submission_enabled
+    {
+        Some(encode_g17p_direct_cl_kick())
+    } else {
+        None
+    };
+    Ok(PreparedG17PDirectClNotifications {
+        activation,
+        direct_kick,
+    })
+}
+
 /// Extract the firmware's 6-bit doorbell type from bits [53:48].
 pub(crate) const fn doorbell_type(message: u64) -> u8 {
     ((message >> DOORBELL_TYPE_SHIFT) & DOORBELL_TYPE_MASK) as u8
 }
 
 /// Decode a TX doorbell to `(pipe_type, index)`, applying the firmware's exact
-/// masks and its `pipe == 3` rejection.
+/// masks and its invalid `pipe == 3` outcome.
 pub(crate) const fn decode_tx_doorbell(message: u64) -> Result<(PipeType, u8), SubmissionError> {
     if doorbell_type(message) != DOORBELL_TYPE_TX {
         return Err(SubmissionError::NotATxDoorbell);
@@ -193,8 +581,9 @@ pub(crate) const fn decode_tx_doorbell(message: u64) -> Result<(PipeType, u8), S
 }
 
 /// The firmware's pending-pipe bit for a submitted pipe: `1 << pipe_type`
-/// (`mov w9,#1 ; lsl w8,w9,w8` @ 0x2529c; atomic-OR'd into the global at
-/// 0xfffffc00001049e8).
+/// (`mov w9,#1 ; lsl w8,w9,w8` in the pinned J700 A000 type-3 handler). This
+/// path is distinct from the type-4 device-control bit 17 at scheduler root
+/// `0xfffffc0000177190`.
 pub(crate) const fn pending_pipe_bit(pipe: PipeType) -> u32 {
     1u32 << (pipe as u32)
 }
@@ -285,14 +674,9 @@ pub(crate) const fn g17_channel_descriptor_offset(
 //     separate `AGXUncachedFWChannelMem` reset touches only seven u32 fields
 //     through +0x63; bytes between them are deliberately preserved here.
 //
-//     Reset is a channel-lifecycle operation, not a submission operation. The
-//     G17P host allocates and registers this state once; normal command
-//     submission reuses it. Once registered, mutable channel words are
-//     firmware-owned until the explicit recovery path regains ownership.
-//
 //     These are independent host-reset records. They do not prove that the
 //     inherited AGX2 ChannelState/RingState names in sections 2/3 describe the
-//     G17 firmware consumer, so those ledger entries remain fail-closed.
+//     G17 firmware consumer, so those ledger entries remain unsupported.
 // ---------------------------------------------------------------------------
 
 /// Full byte extent cleared by the G17 host for `_AGFIChannelState`.
@@ -348,27 +732,6 @@ pub(crate) struct G17HostChannelStateResetValues {
     pub(crate) gpu_va_70: u64,
 }
 
-/// Host authority over a G17 channel-state record.
-///
-/// The distinction is explicit so a future native G17 submission path cannot
-/// rebuild channel state for every command. `Recovery` means firmware has been
-/// stopped and the host has deliberately regained reset authority.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum G17ChannelStatePhase {
-    BeforeRegistration,
-    Registered,
-    Recovery,
-}
-
-const fn authorize_g17_channel_state_reset(
-    phase: G17ChannelStatePhase,
-) -> Result<(), SubmissionError> {
-    match phase {
-        G17ChannelStatePhase::BeforeRegistration | G17ChannelStatePhase::Recovery => Ok(()),
-        G17ChannelStatePhase::Registered => Err(SubmissionError::ChannelStateFirmwareOwned),
-    }
-}
-
 /// Fields touched in `AGXUncachedFWChannelMem` during a G17 channel reset.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17UncachedChannelResetLayout {
@@ -396,17 +759,18 @@ fn put_u32_le(raw: &mut [u8], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn put_u16_le(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
 fn put_u64_le(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 /// Build the exact 0x80-byte `_AGFIChannelState` reset image.
 pub(crate) fn encode_g17_host_channel_state_reset(
-    phase: G17ChannelStatePhase,
     values: G17HostChannelStateResetValues,
-) -> Result<[u8; G17_HOST_CHANNEL_STATE_RESET_SIZE], SubmissionError> {
-    authorize_g17_channel_state_reset(phase)?;
-
+) -> [u8; G17_HOST_CHANNEL_STATE_RESET_SIZE] {
     let mut raw = [0u8; G17_HOST_CHANNEL_STATE_RESET_SIZE];
     let layout = G17_HOST_CHANNEL_STATE_RESET_LAYOUT;
 
@@ -422,7 +786,7 @@ pub(crate) fn encode_g17_host_channel_state_reset(
     put_u32_le(&mut raw, layout.word_44, values.word_44);
     put_u32_le(&mut raw, layout.zero_58, 0);
     put_u64_le(&mut raw, layout.gpu_va_70, values.gpu_va_70);
-    Ok(raw)
+    raw
 }
 
 /// Apply only the seven uncached reset stores made by the G17 host.
@@ -430,14 +794,9 @@ pub(crate) fn encode_g17_host_channel_state_reset(
 /// The host does not clear the intervening bytes in `resetChannelState`; a
 /// caller-provided image therefore stays intact outside the proven stores.
 pub(crate) fn apply_g17_uncached_channel_reset(
-    phase: G17ChannelStatePhase,
     raw: &mut [u8; G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT],
     ring_entry_count: u32,
-) -> Result<(), SubmissionError> {
-    // Refuse before the first store so failure leaves firmware-owned state
-    // byte-identical.
-    authorize_g17_channel_state_reset(phase)?;
-
+) {
     let layout = G17_UNCACHED_CHANNEL_RESET_LAYOUT;
 
     put_u32_le(raw, layout.zero_00, 0);
@@ -447,7 +806,6 @@ pub(crate) fn apply_g17_uncached_channel_reset(
     put_u32_le(raw, layout.zero_40, 0);
     put_u32_le(raw, layout.sentinel_50, u32::MAX);
     put_u32_le(raw, layout.ring_entry_count_60, ring_entry_count);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +898,7 @@ pub(crate) const G17P_CHANNEL_ABI: G17PChannelAbiLayout = G17PChannelAbiLayout {
 pub(crate) const G17P_CHANNEL_PRODUCER_REQUIRES_DMB_ISH: bool = true;
 
 /// Return the native channel ABI only for the exact identity whose producer
-/// and consumer were both inspected. M5-family targets remain fail-closed.
+/// and consumer were both inspected. M5-family targets remain unsupported.
 pub(crate) const fn g17_channel_abi(
     target: G17ChannelAbiTarget,
 ) -> Result<G17PChannelAbiLayout, SubmissionError> {
@@ -1277,8 +1635,8 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     // running, with an identically shaped descriptor, a satisfied barrier and
     // geometry already tiled. Overriding this isolates the data master itself.
     let override_dm = match stage {
-        G17PColdOpeningStage::Fragment => crate::g17_config::RENDER_3D_DM,
-        G17PColdOpeningStage::Tiling => crate::g17_config::RENDER_TA_DM,
+        G17PColdOpeningStage::Fragment => *crate::module_parameters::g17p_render_3d_dm.value(),
+        G17PColdOpeningStage::Tiling => *crate::module_parameters::g17p_render_ta_dm.value(),
     };
     if override_dm != 0xff {
         put_u16_le(out, 0x22, override_dm as u16);
@@ -2017,9 +2375,9 @@ pub(crate) const HOST_MAX_OUTSTANDING_JOB_SLOTS: u32 = 127;
 
 /// Advance a producer/consumer index within a ring of `size` entries.
 ///
-/// Fail closed instead of panicking on a zero-sized ring or accepting a stale
-/// producer index. A valid `index` is always below `u32::MAX`, so `index + 1`
-/// cannot overflow after these checks.
+/// Return an error for a zero-sized ring or a producer outside the ring. A
+/// valid `index` is always below `u32::MAX`, so `index + 1` cannot overflow
+/// after these checks.
 pub(crate) const fn ring_next(index: u32, size: u32) -> Result<u32, SubmissionError> {
     if size == 0 {
         return Err(SubmissionError::RingSizeZero);
@@ -2136,7 +2494,7 @@ pub(crate) const fn decode_kick_word(word: u64) -> Result<SksmKickWord, Submissi
 //    advanced modulo runtime `num_stamps`. Wrapping the slot to zero increments
 //    the 32-bit stamp in bits [39:8]. This coupling is load-bearing: choosing a
 //    different entry slot from the one encoded in the doorbell desynchronizes
-//    the queue and can reach the firmware's out-of-order rejection path.
+//    the queue and can reach the firmware's out-of-order fatal path.
 // ---------------------------------------------------------------------------
 
 /// Stamp sequence in bits [39:8] of a host SKSM timestamp.
@@ -2228,7 +2586,7 @@ pub(crate) const fn encode_g17p_3d_completion_scratch(
 ///
 /// `num_stamps` and `entry_stride` are intentionally runtime inputs: Apple's
 /// host loads both from the per-queue geometry rather than hard-coding them.
-/// Invalid geometry is rejected before an entry address or doorbell is
+/// Invalid geometry returns an error before an entry address or doorbell is
 /// produced. No shared memory, counter, barrier, MMIO, or endpoint state is
 /// mutated here.
 pub(crate) const fn prepare_kick_submission(
@@ -2472,9 +2830,6 @@ pub(crate) const G17P_CL_KICK_ENTRY_LAYOUT: G17PClKickEntryLayout = G17PClKickEn
 /// selects the shared-stamp source and has no independent wire field.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PClBarrierDependency {
-    /// Already converted native predecessor stamp. Never reinterpret it using
-    /// the consumer queue's base timestamp or ring geometry.
-    pub(crate) native_timestamp: Option<u64>,
     pub(crate) event_word: u32,
     pub(crate) shared_stamp: u64,
     pub(crate) queue_id: u8,
@@ -2495,69 +2850,10 @@ pub(crate) fn g17p_render_barrier_from_timestamp(
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
     }
     Ok(G17PClBarrierDependency {
-        native_timestamp: None,
         event_word: (timestamp as u32).wrapping_shl(8),
         shared_stamp: timestamp >> 24,
         queue_id,
     })
-}
-
-/// Logical render prefix, resolved at ioctl admission before asynchronous work.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
-pub(crate) struct G17PRenderOrder {
-    pub(crate) sequence: u64,
-    pub(crate) wait_through: Option<u64>,
-}
-
-/// Zero snapshots all preceding ioctls; N adds the first N renders of this
-/// ioctl. NONE remains independent. Sequence zero is reserved for internal work.
-pub(crate) fn g17p_render_order(
-    ioctl_base: u64, preceding: u64, barrier: u16,
-) -> Result<G17PRenderOrder, SubmissionError> {
-    let sequence = ioctl_base.checked_add(preceding)
-        .and_then(|n| n.checked_add(1))
-        .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?;
-    let wait_through = if barrier == u16::MAX {
-        None
-    } else {
-        if u64::from(barrier) > preceding {
-            return Err(SubmissionError::RenderBarrierFuture);
-        }
-        Some(ioctl_base.checked_add(u64::from(barrier))
-            .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?)
-    };
-    Ok(G17PRenderOrder { sequence, wait_through })
-}
-
-/// Resolve a still-owned predecessor. A successful retirement needs no GPU
-/// dependency; errors and an unassigned token must never satisfy the prefix.
-/// The caller filters owner identity and supplies every live predecessor in
-/// the prefix under the same runtime lock as publication and retirement.
-pub(crate) fn g17p_live_render_dependency(
-    order: G17PRenderOrder, predecessor_sequence: u64,
-    predecessor_status: i32, native_word: u64,
-) -> Result<Option<G17PClBarrierDependency>, SubmissionError> {
-    if !g17p_render_prefix_contains(order.wait_through, predecessor_sequence) {
-        return Ok(None);
-    }
-    if predecessor_status < 0 {
-        return Err(SubmissionError::RenderBarrierPredecessorFailed);
-    }
-    if predecessor_status > 0 { return Ok(None); }
-    if native_word == u64::MAX {
-        return Err(SubmissionError::RenderBarrierMissingToken);
-    }
-    let token = decode_kick_word(native_word)?;
-    if token.mask_selector != 0 {
-        return Err(SubmissionError::KickWordUnmodeledBits);
-    }
-    let mut dependency = g17p_render_barrier_from_timestamp(token.timestamp, token.queue_id)?;
-    dependency.native_timestamp = Some(token.timestamp);
-    Ok(Some(dependency))
-}
-
-pub(crate) fn g17p_render_prefix_contains(prefix: Option<u64>, sequence: u64) -> bool {
-    sequence != 0 && prefix.is_some_and(|limit| sequence <= limit)
 }
 
 /// Optional MCache aperture descriptor copied into entry +0x08.
@@ -2773,7 +3069,6 @@ pub(crate) fn encode_g17p_compute_optional_event(
 pub(crate) fn prepare_g17p_compute_cl_command_state(
     descriptor_low: u64,
     submission_ordinal: u64,
-    primary_checkpoint: u8,
 ) -> Result<G17PComputeClCommandState, SubmissionError> {
     let next = submission_ordinal
         .checked_add(1)
@@ -2796,7 +3091,7 @@ pub(crate) fn prepare_g17p_compute_cl_command_state(
         rce_bindings: [
             G17PClRceBinding {
                 address: rce_a,
-                tag: primary_checkpoint,
+                tag: 0x22,
             },
             G17PClRceBinding {
                 address: rce_b,
@@ -2843,7 +3138,7 @@ pub(crate) fn prepare_g17p_render_cl_command_state(
             external_binding(2, 0x17)?,
             external_binding(3, 0x0a)?,
         ];
-        match crate::g17_config::RENDER_3D_RCE {
+        match *crate::module_parameters::g17p_render_3d_rce.value() {
             0 => [empty, empty, empty, empty],
             1 => [full[0], empty, empty, empty],
             2 => [full[0], full[1], empty, empty],
@@ -3039,10 +3334,6 @@ fn encode_g17p_cl_barrier_dependency(
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
     }
 
-    if let Some(timestamp) = barrier.native_timestamp {
-        return encode_g17p_cl_dependency(timestamp, barrier.queue_id);
-    }
-
     let stamp_count = queue.geometry.stamp_count() as u64;
     let event_timestamp = (((barrier.event_word as u64) >> 8)
         | barrier.shared_stamp.wrapping_shl(24))
@@ -3170,7 +3461,7 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     // unsatisfiable from cold. Omitting it isolates whether the SKSM front-end
     // is waiting on it.
     let omit_implicit = !queue.previous_valid
-        && crate::g17_config::NO_IMPLICIT_DEP != 0;
+        && *crate::module_parameters::g17p_no_implicit_dep.value() != 0;
     if !omit_implicit {
         put_u64_le(
             &mut entry,
@@ -3319,57 +3610,21 @@ pub(crate) const fn g17p_cl_full_support_initialization_allowed(registered: bool
     !registered
 }
 
-/// The one compute private-memory pool, distinct from render's pool ID zero.
-/// B1 indexes the same registration table with tag15 +0x46 and FList +0x08.
-pub(crate) const G17P_COMPUTE_FLIST_ID: u16 = crate::g17_config::COMPUTE_FLIST_ID;
-
-/// Initialize pool-owned state before its first firmware registration.
-pub(crate) fn apply_g17p_cl_flist_static_state(
-    shared_support: &mut [u8],
-    support_state: &mut [u8],
-    page_list_gpu_va: u64,
-    run_table_gpu_va: u64,
-    support_state_gpu_va: u64,
-    pool_id: u16,
-) -> Result<(), SubmissionError> {
-    if shared_support.len() < 0x4000 || support_state.len() < 0x4000 {
-        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
-    }
-    shared_support.fill(0);
-    support_state.fill(0);
-    put_u64_le(shared_support, 0x00, 2);
-    put_u64_le(shared_support, 0x08, u64::from(pool_id));
-    put_u64_le(shared_support, 0x10, 2);
-    put_u64_le(shared_support, 0x14, page_list_gpu_va);
-    put_u32_le(shared_support, 0x1c, 0x4_0000);
-    put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
-    put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
-    put_u64_le(shared_support, 0x30, run_table_gpu_va);
-    put_u64_le(shared_support, 0x40, 4);
-    put_u32_le(shared_support, 0x48, 0xa8);
-    put_u64_le(shared_support, 0x4c, support_state_gpu_va);
-    // B1 compares *FList[+0x4c] (submitted) with FList[+0x54]
-    // (completed). Both are pool-wide u64 counters, initially zero.
-    put_u64_le(shared_support, 0x54, 0);
-    put_u32_le(shared_support, 0x5c, 1);
-    put_u32_le(shared_support, 0x60, 2);
-    Ok(())
-}
-
-/// Historical captured per-queue fixture initializer. Production pool creation
-/// uses `apply_g17p_cl_flist_static_state`; never call this on its shared pages.
-pub(crate) fn apply_g17p_cl_queue_static_state(
+/// Initialize the queue-owned pages exactly once, before SKSM registration.
+pub(crate) fn apply_g17p_cl_retained_static_state(
     shared_support: &mut [u8],
     support_state: &mut [u8],
     scheduler_state: &mut [u8],
+    channel_control: &mut [u8],
     page_list_gpu_va: u64,
-    run_table_gpu_va: u64,
+    operand_table_gpu_va: u64,
     support_state_gpu_va: u64,
     scheduler_state_gpu_va: u64,
 ) -> Result<(), SubmissionError> {
     if shared_support.len() < 0x4000
         || support_state.len() < 0x4000
         || scheduler_state.len() < 0x4000
+        || channel_control.len() < 0x40
     {
         return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
     }
@@ -3377,12 +3632,9 @@ pub(crate) fn apply_g17p_cl_queue_static_state(
     shared_support.fill(0);
     support_state.fill(0);
     scheduler_state.fill(0);
+    channel_control.fill(0);
 
     put_u64_le(shared_support, 0x00, 2);
-    // AGXUSCPrivMemFList+0x08 is the pool ID copied into the firmware's
-    // internal allocator entry and ultimately written to gUPM's pool-select
-    // operation. All compute queues share this pool and UMA slot; QoS
-    // HardwareBufferIDs remain per queue.
     put_u64_le(shared_support, 0x08, 1);
     put_u64_le(shared_support, 0x10, 2);
     // _AGFIUMAPagePoolState stores the full VA at unaligned +0x14.
@@ -3391,10 +3643,7 @@ pub(crate) fn apply_g17p_cl_queue_static_state(
     put_u32_le(shared_support, 0x1c, 0x4_0000);
     put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
     put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
-    // Every queue names the run table that describes the shared backing.
-    // A private empty table here is incoherent with the shared pool and leaves
-    // overlapping spill allocation without the pool's initialized run map.
-    put_u64_le(shared_support, 0x30, run_table_gpu_va);
+    put_u64_le(shared_support, 0x30, operand_table_gpu_va);
     put_u64_le(shared_support, 0x40, 4);
     put_u32_le(shared_support, 0x48, 0xa8);
     put_u64_le(shared_support, 0x4c, support_state_gpu_va);
@@ -3410,46 +3659,10 @@ pub(crate) fn apply_g17p_cl_queue_static_state(
     put_u32_le(support_state, 0, 1);
     put_u32_le(scheduler_state, 8, 1);
 
-    Ok(())
-}
-
-/// Initialize the one channel-control page retained by physical CL_2.
-pub(crate) fn apply_g17p_cl_channel_control_static_state(
-    channel_control: &mut [u8],
-) -> Result<(), SubmissionError> {
-    if channel_control.len() < 0x40 {
-        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
-    }
-    channel_control.fill(0);
-
     put_u64_le(channel_control, 0x00, 0x0000_0100_0000_ffff);
     put_u64_le(channel_control, 0x20, 0x0002_0000_0000_0000);
     put_u64_le(channel_control, 0x30, 0x0000_0000_ff00_0000);
     Ok(())
-}
-
-/// Compatibility helper for byte-layout tests covering both ownership
-/// domains. Production initializes the queue pages and CL_2 page separately.
-pub(crate) fn apply_g17p_cl_retained_static_state(
-    shared_support: &mut [u8],
-    support_state: &mut [u8],
-    scheduler_state: &mut [u8],
-    channel_control: &mut [u8],
-    page_list_gpu_va: u64,
-    run_table_gpu_va: u64,
-    support_state_gpu_va: u64,
-    scheduler_state_gpu_va: u64,
-) -> Result<(), SubmissionError> {
-    apply_g17p_cl_queue_static_state(
-        shared_support,
-        support_state,
-        scheduler_state,
-        page_list_gpu_va,
-        run_table_gpu_va,
-        support_state_gpu_va,
-        scheduler_state_gpu_va,
-    )?;
-    apply_g17p_cl_channel_control_static_state(channel_control)
 }
 
 /// Apply the exact host-owned pre-B2 values to three provider-owned pages.
@@ -3488,10 +3701,8 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     Ok(activation)
 }
 
-/// Apply the session-wide CL_2 half of B2 activation. The pointer is pinned to
-/// a dedicated bootstrap owner; logical queues have separate scheduler pages.
-/// The exact consumer of this firmware-private slot remains unresolved. Never
-/// retarget it during ordinary queue switching. PBDesc/UMA are separate state.
+/// Apply the queue-local half of B2 activation. The channel-control pointer
+/// changes with the compute work queue; the PBDesc and UMA tables do not.
 pub(crate) fn apply_g17p_cl_b2_computed_state(
     activation: G17PClB2ActivationState,
     computed: &mut [u8],
@@ -3607,11 +3818,44 @@ pub(crate) const fn g17p_cl_retained_submission_order(
 //
 //    The host does not write the firmware-side `timestamp | (qid << 40)` word
 //    directly.  The pinned G17P/G17G/G17X implementations publish a
-//    target-specific 64-bit queue tag followed by the 32-bit add count to two
-//    runtime-selected aperture offsets.  The runtime bank selector is
-//    multiplied by nine for every target.  This is a pure description of the
-//    two ordered stores; it performs no MMIO.
+//    target-specific 64-bit queue tag followed by the zero-extended add count
+//    as a second 64-bit store to two
+//    runtime-selected scratch offsets. The host adds nine times the runtime
+//    stride to both bases for every target. Publication never reads either
+//    location and preserves the exact word-0 then word-1 order. The separate
+//    host diagnostic path may read word 1; word 0 must never be read.
+//    G17P `addKicks` performs `str x20` then `str x19` at
+//    0xfffffe0008a57b5c/0xfffffe0008a57b60; the earlier `mov w19,w1`
+//    zero-extends the add count.
 // ---------------------------------------------------------------------------
+
+/// One ordered transaction for the two SKSM scratch FIFO ports.
+///
+/// `word0` must be stored first and `word1` second. There is deliberately no
+/// read operation in this publication interface.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17SksmOrderedWritePair {
+    pub(crate) word0_offset: u32,
+    pub(crate) word0: u64,
+    pub(crate) word1_offset: u32,
+    pub(crate) word1: u64,
+}
+
+/// Minimal backend for an ordered pair of 64-bit FIFO stores.
+pub(crate) trait G17SksmPairWriter {
+    type Error;
+
+    fn write64(&self, offset: u32, value: u64) -> core::result::Result<(), Self::Error>;
+}
+
+/// Publish one pair in the only order accepted by the pinned host sequence.
+pub(crate) fn publish_g17p_sksm_write_pair<P: G17SksmPairWriter>(
+    port: &P,
+    pair: G17SksmOrderedWritePair,
+) -> core::result::Result<(), P::Error> {
+    port.write64(pair.word0_offset, pair.word0)?;
+    port.write64(pair.word1_offset, pair.word1)
+}
 
 /// Host producer family with an independently recovered `addKicks` tag.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -3624,24 +3868,27 @@ pub(crate) enum SksmAddKicksTarget {
     G17X,
 }
 
-/// Runtime aperture geometry loaded by Apple's host immediately before the
-/// two publication stores.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct SksmAddKicksMmioGeometry {
-    pub(crate) tag_offset_base: u32,
-    pub(crate) count_offset_base: u32,
-    pub(crate) aperture_index: u32,
-}
-
 /// Exact ordered values and offsets for one host `addKicks` publication.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedSksmAddKicksMmio {
     /// First store: 64-bit target tag to `tag_offset`.
     pub(crate) tag_offset: u32,
     pub(crate) tag: u64,
-    /// Second store: 32-bit number of newly published kicks.
+    /// Second store: zero-extended number of newly published kicks.
     pub(crate) count_offset: u32,
     pub(crate) add_count: u32,
+}
+
+impl PreparedSksmAddKicksMmio {
+    /// Convert the decoded host values to the exact two 64-bit FIFO stores.
+    pub(crate) const fn write_pair(self) -> G17SksmOrderedWritePair {
+        G17SksmOrderedWritePair {
+            word0_offset: self.tag_offset,
+            word0: self.tag,
+            word1_offset: self.count_offset,
+            word1: self.add_count as u64,
+        }
+    }
 }
 
 const fn sksm_add_kicks_tag(target: SksmAddKicksTarget, queue_id: u8) -> u64 {
@@ -3658,39 +3905,26 @@ const fn sksm_add_kicks_tag(target: SksmAddKicksTarget, queue_id: u8) -> u64 {
 const G17P_ADD_KICKS_TAG: u64 = 0x0000_0400_0002_1018;
 const G17G_ADD_KICKS_TAG: u64 = 0x0000_0800_0002_1018;
 const G17X_ADD_KICKS_TAG: u64 = 0x0020_0800_0002_1018;
-const SKSM_ADD_KICKS_APERTURE_SCALE: u32 = 9;
-
 /// Prepare the host's two ordered MMIO stores without touching the aperture.
 pub(crate) const fn prepare_sksm_add_kicks_mmio(
     target: SksmAddKicksTarget,
     queue_id: u8,
     add_count: u32,
-    geometry: SksmAddKicksMmioGeometry,
+    geometry: G17SksmScratchGeometry,
 ) -> Result<PreparedSksmAddKicksMmio, SubmissionError> {
     if queue_id > KICK_QID_MASK as u8 {
         return Err(SubmissionError::QueueIdOutOfRange);
     }
 
-    let bank_offset = match geometry
-        .aperture_index
-        .checked_mul(SKSM_ADD_KICKS_APERTURE_SCALE)
-    {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let tag_offset = match geometry.tag_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let count_offset = match geometry.count_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    let offsets = match geometry.fifo_offsets() {
+        Ok(offsets) => offsets,
+        Err(_) => return Err(SubmissionError::KickMmioOffsetOverflow),
     };
 
     Ok(PreparedSksmAddKicksMmio {
-        tag_offset,
+        tag_offset: offsets.write0,
         tag: sksm_add_kicks_tag(target, queue_id),
-        count_offset,
+        count_offset: offsets.write1,
         add_count,
     })
 }
@@ -3700,48 +3934,72 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 //
 //    Grounded from the pinned G17P host. `AGXKSMKickQueueG16::configureHardware`
 //    at 0xfffffe0008a56580-0xfffffe0008a5682c reads the runtime MMIO geometry
-//    at accelerator +0x10730/+0x10734/+0x10738, writes a 64-bit queue tag and
-//    64-bit queue payload, then publishes the QID bit at MMIO +0x21068. The
-//    same geometry is used by `addKicks` (§6). This closes the host-side
-//    programming equation, but not the silicon aperture mapping or live store
-//    ordering, so this module still performs no MMIO and the executable gate
-//    remains closed.
+//    from accelerator-object fields +0x10730/+0x10734/+0x10738, writes a
+//    64-bit queue tag and 64-bit queue payload, then publishes the QID bit at
+//    MMIO +0x21068. The object fields contain base0=0x4000, base1=0x4008 and
+//    stride=0x10; they are not MMIO locations. The same geometry is used by
+//    `addKicks` (§6). Linux resource 0 (`sgx`) owns this window. Its two
+//    scratch locations receive ordered stores; queue enable is a separate
+//    read/modify/write register after the pair. The production publication
+//    surface intentionally exposes no scratch read operation.
 //
 //    `AGXAcceleratorG16::populateKSMCompletionQueue` at
 //    0xfffffe0008a53034-0xfffffe0008a532b8 emits four 0x20-byte descriptors.
 //    Each present queue has 0x40-byte entries and a fixed ordinal 0..3. The
 //    matched firmware consumes those queues. D93AP IRQ 1001 and RTBuddy AKF
 //    message type 2 converge on source 4 and drain the event rings that carry
-//    completion stamps. The completion gap remains live-gated until an actual
+//    completion stamps. The completion path remains pending until an actual
 //    SKSM kick proves that complete round trip on D93AP hardware.
 // ---------------------------------------------------------------------------
 
-/// Offsets of the three runtime words loaded by the G17P host before every
-/// SKSM configuration or `addKicks` publication.
+/// Accelerator-object fields holding the three runtime geometry values.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PSksmRuntimeMmioGeometryLayout {
-    pub(crate) tag_offset_base: u32,
-    pub(crate) payload_offset_base: u32,
-    pub(crate) aperture_index: u32,
+pub(crate) struct G17PSksmRuntimeGeometryObjectLayout {
+    pub(crate) write0_base_field: u32,
+    pub(crate) write1_base_field: u32,
+    pub(crate) stride_field: u32,
 }
 
-pub(crate) const G17P_SKSM_RUNTIME_MMIO_GEOMETRY_LAYOUT: G17PSksmRuntimeMmioGeometryLayout =
-    G17PSksmRuntimeMmioGeometryLayout {
-        tag_offset_base: 0x10730,
-        payload_offset_base: 0x10734,
-        aperture_index: 0x10738,
+pub(crate) const G17P_SKSM_RUNTIME_GEOMETRY_OBJECT_LAYOUT: G17PSksmRuntimeGeometryObjectLayout =
+    G17PSksmRuntimeGeometryObjectLayout {
+        write0_base_field: 0x10730,
+        write1_base_field: 0x10734,
+        stride_field: 0x10738,
     };
 
 /// QID-valid mask base written after the two queue-configuration stores.
 pub(crate) const G17P_SKSM_QUEUE_ENABLE_MASK_BASE: u32 = 0x21068;
+/// QID-disable mask base written before changing a registered queue's routing.
+pub(crate) const G17P_SKSM_QUEUE_DISABLE_MASK_BASE: u32 = 0x21078;
 /// Queue-entry address bits preserved by the host payload encoder.
 pub(crate) const G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0;
 /// Fixed portion of the first G17P queue-configuration store.
 const G17P_SKSM_QUEUE_CONFIG_TAG: u64 = 0x0000_0400_0002_1008;
 const G17P_SKSM_QUEUE_COMPLETION_SELECTOR_MAX: u32 = 4;
+/// `_AGFIDataMasterType` selected by the G17P TA channel.
+pub(crate) const G17P_TA_DATA_MASTER: u32 = 0;
+/// `_AGFIDataMasterType` selected by the G17P 3D channel.
+pub(crate) const G17P_3D_DATA_MASTER: u32 = 1;
+/// `_AGFIDataMasterType` selected by `AGXCommandQueue::processComputeSetup`.
+pub(crate) const G17P_COMPUTE_DATA_MASTER: u32 = 2;
 
-/// Pure description of the three ordered host-side publications that make one
-/// A18 Pro SKSM queue visible to the hardware bridge.
+/// Runtime routing state that the compute-channel setup owns for one queue.
+///
+/// The pinned host selects the queue by the CL channel QID, prepares the
+/// queue's mapping resource, obtains a completion selector from the channel,
+/// and stores `selector | (2 << 32)` at queue `+0x1c`. Keeping the selector
+/// and queue address together prevents a caller from supplying a non-compute
+/// data-master value to the production compute path.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PComputeQueueRouting {
+    pub(crate) queue_id: u8,
+    pub(crate) completion_selector: u32,
+    pub(crate) entry_gpu_va: u64,
+    pub(crate) geometry: G17SksmQueueGeometry,
+}
+
+/// Pure description of the ordered host-side publications that make one A18
+/// Pro SKSM queue visible to the hardware bridge.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedG17PSksmQueueConfig {
     /// First store: 64-bit QID tag.
@@ -3750,9 +4008,22 @@ pub(crate) struct PreparedG17PSksmQueueConfig {
     /// Second store: 64-bit queue address/data-master/completion selector.
     pub(crate) payload_offset: u32,
     pub(crate) payload: u64,
-    /// Final read/modify/write: enable this QID in one of two mask words.
-    pub(crate) enable_mask_offset: u32,
-    pub(crate) enable_mask: u64,
+    /// Final stores: high 64 QIDs first, then low 64 QIDs.
+    pub(crate) enable_pair: G17SksmOrderedWritePair,
+    /// Stores used before changing an already-enabled queue's routing.
+    pub(crate) disable_pair: G17SksmOrderedWritePair,
+}
+
+impl PreparedG17PSksmQueueConfig {
+    /// Convert the queue configuration to its two ordered write-only stores.
+    pub(crate) const fn write_pair(self) -> G17SksmOrderedWritePair {
+        G17SksmOrderedWritePair {
+            word0_offset: self.tag_offset,
+            word0: self.tag,
+            word1_offset: self.payload_offset,
+            word1: self.payload,
+        }
+    }
 }
 
 /// Prepare the exact G17P host queue-configuration stores without touching
@@ -3763,7 +4034,7 @@ pub(crate) const fn prepare_g17p_sksm_queue_config(
     data_master: u32,
     completion_selector: u32,
     entry_gpu_va: u64,
-    geometry: SksmAddKicksMmioGeometry,
+    geometry: G17SksmScratchGeometry,
 ) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
     match target {
         G17ChannelAbiTarget::A18ProG17P => {}
@@ -3784,41 +4055,115 @@ pub(crate) const fn prepare_g17p_sksm_queue_config(
         return Err(SubmissionError::KickQueueEntryAddressUnencodable);
     }
 
-    let bank_offset = match geometry
-        .aperture_index
-        .checked_mul(SKSM_ADD_KICKS_APERTURE_SCALE)
-    {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let tag_offset = match geometry.tag_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let payload_offset = match geometry.count_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    let offsets = match geometry.fifo_offsets() {
+        Ok(offsets) => offsets,
+        Err(_) => return Err(SubmissionError::KickMmioOffsetOverflow),
     };
 
     // Host sequence: 3 * (4 - selector) + 0x3fe, shifted into bit 54.
     let completion_field = (3 * (4 - completion_selector) + 0x3fe) as u64;
     let payload =
         (((data_master as u64) + 1) << 60) | entry_gpu_va | completion_field.wrapping_shl(54);
-    let mask_word = (queue_id as u32 >> 6) * 8;
+    let low_mask = if queue_id < 64 { 1u64 << queue_id } else { 0 };
+    let high_mask = if queue_id >= 64 {
+        1u64 << (queue_id - 64)
+    } else {
+        0
+    };
+    let enable_pair = G17SksmOrderedWritePair {
+        word0_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE + 8,
+        word0: high_mask,
+        word1_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE,
+        word1: low_mask,
+    };
+    let disable_pair = G17SksmOrderedWritePair {
+        word0_offset: G17P_SKSM_QUEUE_DISABLE_MASK_BASE + 8,
+        word0: high_mask,
+        word1_offset: G17P_SKSM_QUEUE_DISABLE_MASK_BASE,
+        word1: low_mask,
+    };
 
     Ok(PreparedG17PSksmQueueConfig {
-        tag_offset,
+        tag_offset: offsets.write0,
         tag: G17P_SKSM_QUEUE_CONFIG_TAG | ((queue_id as u64) << 43),
-        payload_offset,
+        payload_offset: offsets.write1,
         payload,
-        enable_mask_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE + mask_word,
-        enable_mask: 1u64 << (queue_id & 63),
+        enable_pair,
+        disable_pair,
     })
+}
+
+/// Prepare the queue-configuration transaction produced by the G17P compute
+/// setup path.
+///
+/// `AGXCommandQueue::processComputeSetup` at
+/// `0xfffffe0008a077a4..0xfffffe0008a078d4` selects the queue from the CL
+/// channel QID, prepares its mapping resource, obtains the channel completion
+/// selector, and writes the packed selector/data-master pair. The captured
+/// native CL2 queue uses QID 4, selector 2, and entry VA `0x70004d8000`.
+pub(crate) const fn prepare_g17p_compute_sksm_queue_config(
+    routing: G17PComputeQueueRouting,
+    geometry: G17SksmScratchGeometry,
+) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
+    match routing.geometry.validate() {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+    if routing.entry_gpu_va & (routing.geometry.allocation_alignment() - 1) != 0 {
+        return Err(SubmissionError::KickQueueEntryAddressUnencodable);
+    }
+    prepare_g17p_sksm_queue_config(
+        G17ChannelAbiTarget::A18ProG17P,
+        routing.queue_id,
+        G17P_COMPUTE_DATA_MASTER,
+        routing.completion_selector,
+        routing.entry_gpu_va,
+        geometry,
+    )
+}
+
+/// Prepare the queue-configuration transaction for one G17P *render* queue.
+///
+/// Identical to the compute helper except for the data master, which the
+/// twelve captured macOS render passes pin to TA = 0 and 3D = 1 in three
+/// independent places (outer ring slot `+0x10`, tag-14 `+0x11`, tag-15
+/// `+0x22`). The compute data master is rejected here so a render caller
+/// cannot silently configure a CL queue.
+pub(crate) const fn prepare_g17p_render_sksm_queue_config(
+    routing: G17PComputeQueueRouting,
+    data_master: u32,
+    geometry: G17SksmScratchGeometry,
+) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
+    match routing.geometry.validate() {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+    if data_master != G17P_TA_DATA_MASTER && data_master != G17P_3D_DATA_MASTER {
+        return Err(SubmissionError::KickQueueDataMasterOutOfRange);
+    }
+    if routing.entry_gpu_va & (routing.geometry.allocation_alignment() - 1) != 0 {
+        return Err(SubmissionError::KickQueueEntryAddressUnencodable);
+    }
+    prepare_g17p_sksm_queue_config(
+        G17ChannelAbiTarget::A18ProG17P,
+        routing.queue_id,
+        data_master,
+        routing.completion_selector,
+        routing.entry_gpu_va,
+        geometry,
+    )
 }
 
 pub(crate) const G17P_KSM_COMPLETION_QUEUE_COUNT: u8 = 4;
 pub(crate) const G17P_KSM_COMPLETION_DESCRIPTOR_SIZE: usize = 0x20;
 pub(crate) const G17P_KSM_COMPLETION_ENTRY_SIZE: u32 = 0x40;
+pub(crate) const G17P_KSM_COMPLETION_CAPACITY: u32 = 0x800;
+pub(crate) const G17P_KSM_COMPLETION_BACKING_SIZE: usize =
+    G17P_KSM_COMPLETION_CAPACITY as usize * G17P_KSM_COMPLETION_ENTRY_SIZE as usize;
+pub(crate) const G17P_KSM_COMPLETION_PRESENT_ORDINALS: [u8; 2] = [0, 2];
+/// Normal direct CL completion uses ordinal 0, independently of the compute
+/// SKSM queue's numeric completion selector 2.
+pub(crate) const G17P_NORMAL_CL_COMPLETION_ORDINAL: u8 = 0;
 
 /// Exact field offsets in one host-produced G17P completion descriptor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -3887,17 +4232,17 @@ pub(crate) const G17P_COMPLETION_HOST_ABI_GROUNDED: bool = true;
 //    0xfffffc00000122a8.
 //
 //    All three firmware variants validate at least four bytes, load a u32 tag
-//    from command offset zero, and reject tags above 18. Their jump tables
+//    from command offset zero, and treat tags above 18 as invalid. Their jump tables
 //    process 0/1/2/3/4/5/7/9/12/14/15/16/18. Tag 6 reaches the dedicated
 //    `PMRebuild must not be received in SKSM` fatal, while 8/10/11/13/17
 //    reach the invalid-command fatal. The host nevertheless names 17 `Nop`;
-//    that producer identity is preserved, but the admission helper rejects it
+//    that producer identity is preserved, but the admission helper marks it invalid
 //    because the matched consumer cannot process it.
 //
 //    Tags 6/8/10/11 remain semantically unresolved instead of inheriting an
 //    AGX2 or nested SKU-stream meaning. SKU-stream opcodes are a distinct
 //    nested domain and intentionally have no representation in the top-level
-//    enum. M5-family identities remain fail-closed pending their own paired
+//    enum. M5-family identities remain unsupported pending their own paired
 //    producer/consumer pass.
 //
 //    The optional pre-dispatch filter uses literal mask 0x1d03f for tags <=
@@ -3912,7 +4257,7 @@ pub(crate) const G17P_TOP_LEVEL_COMMAND_TAG_WIDTH: u32 = 4;
 /// Host-grounded G17P top-level command types.
 ///
 /// This type intentionally excludes unresolved tags and every nested
-/// SKU-stream opcode. `Nop` records the host ABI but is rejected by
+/// SKU-stream opcode. `Nop` records the host ABI but is invalid for
 /// [`admit_g17p_top_level_command`] because all matched firmware variants send
 /// tag 17 to the invalid-command fatal path.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -3937,7 +4282,7 @@ pub(crate) enum G17PTopLevelCommandType {
 /// Highest tag admitted by the G17P jump-table bounds check.
 pub(crate) const G17P_CHANNEL_COMMAND_TYPE_MAX: u32 = 18;
 
-/// Tags named by the pinned host's top-level ABI, including rejected `Nop`.
+/// Tags named by the pinned host's top-level ABI, including invalid `Nop`.
 pub(crate) const G17P_TOP_LEVEL_COMMAND_KNOWN_MASK: u32 = 0x0007_d2bf;
 /// In-range top-level tags whose host/firmware semantics remain unresolved.
 pub(crate) const G17P_TOP_LEVEL_COMMAND_UNRESOLVED_MASK: u32 = 0x0000_0d40;
@@ -4050,7 +4395,7 @@ pub(crate) const fn classify_g17p_channel_command(
 
 /// Decode a top-level tag and require a normal matched-firmware dispatch case.
 ///
-/// In particular, host-grounded `Nop = 17` is rejected here because the
+/// In particular, host-grounded `Nop = 17` is invalid here because the
 /// firmware sends it to the invalid-command fatal path.
 pub(crate) const fn admit_g17p_top_level_command(
     target: G17ChannelAbiTarget,
@@ -4065,7 +4410,7 @@ pub(crate) const fn admit_g17p_top_level_command(
         Ok(
             G17PChannelCommandDisposition::PmRebuildForbiddenFatal
             | G17PChannelCommandDisposition::InvalidCommandFatal,
-        ) => Err(SubmissionError::CommandTagRejectedByFirmware),
+        ) => Err(SubmissionError::CommandTagInvalidForFirmware),
         Err(error) => Err(error),
     }
 }
@@ -4094,7 +4439,7 @@ pub(crate) enum AbiProvenance {
     /// AGX3-specific, grounded first-hand from matched host/firmware artifacts.
     ForkedAgx3Grounded,
     /// AGX2 layout the driver produces; the G17 firmware's *own* consumer
-    /// offsets were not read first-hand this pass. Kept fail-closed.
+    /// offsets were not read first-hand this pass. Kept unsupported.
     Agx2InheritedUnconfirmed,
 }
 
@@ -4119,12 +4464,12 @@ pub(crate) struct SubmissionAbiLedger {
 
 /// The doorbell is byte-grounded (§1); the SKSM kick word/record and host
 /// queue-timestamp producer are AGX3 forks grounded first-hand (§2-§5). The
-/// generic channel/ring producer records remain inherited and fail-closed.
+/// generic channel/ring producer records remain inherited and unsupported.
 /// A separate G17P-only channel-state entry records the matched A18 Pro host
 /// producer and firmware consumer (§2c); it does not admit either M5 family.
 /// The queue bridge/completion descriptors and command dispatch are grounded,
 /// G17P-only AGX3 forks (§7-§8): the M5
-/// identities remain fail-closed, unresolved values do not inherit AGX2 or
+/// identities remain unsupported; unresolved values do not inherit AGX2 or
 /// nested SKU meanings, and the host's `Nop = 17` is not firmware-admitted.
 pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedger {
     tx_doorbell: AbiProvenance::IdenticalToAgx2,
@@ -4158,115 +4503,67 @@ pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = true;
 /// needs a live target device.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionLiveGaps {
-    /// Host `addKicks` publication and firmware scratch consumption are both
-    /// grounded. D93AP exposes only the two SGX ranges; the pinned host loads
-    /// runtime geometry words at +0x10730/+0x10734/+0x10738 without exposing
-    /// their values. The silicon bridge and ordering still need a live witness.
-    pub(crate) sksm_hardware_kick_fifo_mmio_scratch_proven: bool,
-    /// The kick -> execute -> completion IRQ handshake is a live event.
-    pub(crate) doorbell_round_trip_proven: bool,
+    /// Linux has an ordered pair writer on resource 0, including fixed-slot
+    /// geometry and serialization across queue owners.
+    pub(crate) sksm_resource0_ordered_write_implemented: bool,
+    /// EP 0x21 plus the retained CL2 channel queue has executed real work.
+    pub(crate) channel_doorbell_round_trip_proven: bool,
+    /// Linux allocates and publishes every object in the measured first-partial
+    /// graphics contract through its runtime path.
+    pub(crate) partial_graphics_runtime_implemented: bool,
+    /// The measured first-partial channel path executed paired graphics work.
+    pub(crate) partial_graphics_round_trip_proven: bool,
+    /// A native SKSM queue entry followed by the host `addKicks` MMIO pair has
+    /// executed real work. The shipping kext uses this path, but the classic
+    /// first-partial graphics path is independently executable.
+    pub(crate) sksm_add_kicks_round_trip_proven: bool,
     /// Apple's host builds platform interrupt event sources from runtime
     /// `interrupts`/`interrupts-valid` properties. D93AP physical IRQ 1001 and
     /// RTBuddy AKF type 2 both converge exactly on source 4 and drain the main
     /// firmware event rings, but an on-device SKSM completion round trip has
     /// not proven that this ingress is sufficient for Linux completion.
     pub(crate) completion_irq_route_proven: bool,
+    /// Ordinal-0 notification, entry, QID/timestamp, and EP0x20 stamp
+    /// correlation is implemented as a pure transaction before outstanding
+    /// subtraction. Physical IRQ/event-ring/ACK ownership remains separate.
+    pub(crate) normal_cl_completion_consumer_implemented: bool,
 }
 
 impl SubmissionLiveGaps {
-    /// True only if every live gap is closed.
-    pub(crate) const fn all_proven(&self) -> bool {
-        self.sksm_hardware_kick_fifo_mmio_scratch_proven
-            && self.doorbell_round_trip_proven
+    pub(crate) const fn classic_graphics_proven(&self) -> bool {
+        self.channel_doorbell_round_trip_proven
+            && self.partial_graphics_runtime_implemented
+            && self.partial_graphics_round_trip_proven
             && self.completion_irq_route_proven
     }
-}
 
-/// All live gaps are open (fail-closed).
-pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
-    sksm_hardware_kick_fifo_mmio_scratch_proven: false,
-    doorbell_round_trip_proven: false,
-    completion_irq_route_proven: false,
-};
+    pub(crate) const fn native_sksm_proven(&self) -> bool {
+        self.sksm_resource0_ordered_write_implemented
+            && self.sksm_add_kicks_round_trip_proven
+            && self.normal_cl_completion_consumer_implemented
+            && self.completion_irq_route_proven
+    }
 
-/// Exact proxy observables needed to close each live gap without borrowing
-/// evidence from the direct channel/work-queue path.
-///
-/// The first four fields describe one same-QID SKSM bridge transaction. The
-/// next three extend that transaction through execution/fence completion and
-/// the platform interrupt route. `direct_cl2_only` is an explicit poison bit:
-/// repeated direct CL2 execution proves the queue-prefix lifecycle, but never
-/// witnesses queue configuration, `addKicks`, or SKSM scratch consumption.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PSubmissionProxyEvidence {
-    pub(crate) same_qid_configured: bool,
-    pub(crate) same_qid_enabled: bool,
-    pub(crate) same_qid_add_kicks_one: bool,
-    pub(crate) same_qid_scratch_transition: bool,
-    pub(crate) compute_doorbell_after_add_kicks: bool,
-    pub(crate) matching_completion_fence: bool,
-    pub(crate) native_workload_completed: bool,
-    pub(crate) irq_1001_after_matching_completion: bool,
-    pub(crate) direct_cl2_only: bool,
-}
-
-impl G17PSubmissionProxyEvidence {
-    /// Map live observations one-to-one to the executable transport gates.
-    ///
-    /// This does not mutate [`SUBMISSION_LIVE_GAPS`]; a reviewed hardware
-    /// artifact must still be promoted deliberately. In particular, observing
-    /// the byte-exact compute doorbell or IRQ without matching fence ownership
-    /// cannot close either downstream gap.
-    pub(crate) const fn live_gaps(&self) -> SubmissionLiveGaps {
-        if self.direct_cl2_only {
-            return SubmissionLiveGaps {
-                sksm_hardware_kick_fifo_mmio_scratch_proven: false,
-                doorbell_round_trip_proven: false,
-                completion_irq_route_proven: false,
-            };
-        }
-
-        let sksm_bridge = self.same_qid_configured
-            && self.same_qid_enabled
-            && self.same_qid_add_kicks_one
-            && self.same_qid_scratch_transition;
-        let round_trip = sksm_bridge
-            && self.compute_doorbell_after_add_kicks
-            && self.matching_completion_fence
-            && self.native_workload_completed;
-        let completion_irq = round_trip && self.irq_1001_after_matching_completion;
-
-        SubmissionLiveGaps {
-            sksm_hardware_kick_fifo_mmio_scratch_proven: sksm_bridge,
-            doorbell_round_trip_proven: round_trip,
-            completion_irq_route_proven: completion_irq,
-        }
+    /// True when either independently modeled transport can complete work.
+    pub(crate) const fn all_proven(&self) -> bool {
+        self.classic_graphics_proven() || self.native_sksm_proven()
     }
 }
 
-/// Hardware facts proven by the retained-state direct CL2 experiment.
-///
-/// Two cold boots each completed four exact workloads while the direct inner
-/// queue and outer channel consumers advanced. That is strong evidence for the
-/// direct queue-prefix ownership model, but none of those publications passed
-/// through the host SKSM `addKicks` MMIO producer.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PDirectCl2ProxyEvidence {
-    pub(crate) cold_boots: u8,
-    pub(crate) exact_workloads_per_boot: u8,
-    pub(crate) inner_queue_completion_observed: bool,
-    pub(crate) outer_channel_completion_observed: bool,
-    pub(crate) sksm_add_kicks_observed: bool,
-}
-
-pub(crate) const G17P_REPEATED_DIRECT_CL2_PROXY_EVIDENCE: G17PDirectCl2ProxyEvidence =
-    G17PDirectCl2ProxyEvidence {
-        cold_boots: 2,
-        exact_workloads_per_boot: 4,
-        inner_queue_completion_observed: true,
-        outer_channel_completion_observed: true,
-        sksm_add_kicks_observed: false,
-    };
+/// The host-side writer is implemented. The channel-doorbell execution result
+/// comes from `20260827-g17p-compact-contract-queue-live12`: exact 64-float
+/// add3 output, then two more submissions on the same CL2 queue at queue and
+/// channel counters 6/6/6 and 9/9/9. That does not prove the separate native
+/// SKSM `addKicks` FIFO used by the shipping graphics channels.
+pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
+    sksm_resource0_ordered_write_implemented: true,
+    channel_doorbell_round_trip_proven: true,
+    partial_graphics_runtime_implemented: false,
+    partial_graphics_round_trip_proven: true,
+    sksm_add_kicks_round_trip_proven: false,
+    completion_irq_route_proven: false,
+    normal_cl_completion_consumer_implemented: true,
+};
 
 #[cfg(test)]
 mod tests {
@@ -4369,14 +4666,14 @@ mod tests {
 
     #[test]
     fn compute_command_state_tracks_each_descriptor_slot() {
-        let first = prepare_g17p_compute_cl_command_state(0x70_0034_0000, 0, 0x26).unwrap();
+        let first = prepare_g17p_compute_cl_command_state(0x70_0034_0000, 0).unwrap();
         assert_eq!(first.event_mask, [0, 0, 4, 0]);
         assert_eq!(
             first.rce_bindings,
             [
                 G17PClRceBinding {
                     address: 0x70_0034_0040,
-                    tag: 0x26,
+                    tag: 0x22,
                 },
                 G17PClRceBinding {
                     address: 0x70_0034_0760,
@@ -4387,7 +4684,7 @@ mod tests {
             ]
         );
 
-        let second = prepare_g17p_compute_cl_command_state(0x70_0034_4000, 1, 0x26).unwrap();
+        let second = prepare_g17p_compute_cl_command_state(0x70_0034_4000, 1).unwrap();
         assert_eq!(second.event_mask, [0, 2, 8, 0]);
         assert_eq!(second.rce_bindings[0].address, 0x70_0034_4040);
         assert_eq!(second.rce_bindings[1].address, 0x70_0034_4760);
@@ -4461,6 +4758,36 @@ mod tests {
     }
 
     #[test]
+    fn native_initial_render_uses_the_paired_priority_zero_doorbell() {
+        // Pipe identity at priority zero: 3D is the low Fragment pipe 1 and
+        // TA is the low Vertex pipe 0. Compute is the remaining pipe 2.
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Fragment, 0),
+            Ok(0x0083_0000_0000_0001)
+        );
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Vertex, 0),
+            Ok(0x0083_0000_0000_0000)
+        );
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Compute, 0),
+            Ok(0x0083_0000_0000_0002)
+        );
+
+        assert_eq!(G17P_NATIVE_RENDER_DOORBELL_PRIORITY, 0);
+        assert_eq!(G17P_NATIVE_3D_DOORBELL, 0x0083_0000_0000_0001);
+        assert_eq!(G17P_NATIVE_TA_DOORBELL, 0x0083_0000_0000_0000);
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Fragment, 0),
+            Ok(G17P_NATIVE_3D_DOORBELL)
+        );
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Vertex, 0),
+            Ok(G17P_NATIVE_TA_DOORBELL)
+        );
+    }
+
+    #[test]
     fn doorbell_types_come_from_the_firmware_dispatch() {
         // 0x83/0x84/0x85 & 0x3f -> 3/4/5, the firmware's cmp targets.
         assert_eq!(DOORBELL_TYPE_TX, (0x83u8 & 0x3f));
@@ -4474,7 +4801,7 @@ mod tests {
     }
 
     #[test]
-    fn firmware_rejects_pipe_three() {
+    fn firmware_marks_pipe_three_invalid() {
         // The firmware `cmp w8,#0x3 ; b.eq done` path: pipe 3 is not a pipe.
         let msg = (0x83u64 << 48) | 0x3;
         assert_eq!(doorbell_type(msg), DOORBELL_TYPE_TX);
@@ -4489,6 +4816,294 @@ mod tests {
         assert_eq!(decode_tx_doorbell(kickfw), Ok((PipeType::Vertex, 4)));
         let devctrl = (0x83u64 << 48) | DOORBELL_DEVCTRL as u64;
         assert_eq!(decode_tx_doorbell(devctrl), Ok((PipeType::Fragment, 4)));
+    }
+
+    #[test]
+    fn g17p_running_client_power_gate_precedes_every_submit_mutation() {
+        let contract = G17P_RUNNING_CLIENT_POWER_CONTRACT;
+        assert_eq!(contract.role_index, 1);
+        assert_eq!(contract.service_id, 0x20);
+        assert_eq!(contract.target, 1);
+        assert!(!contract.management_request_used);
+        assert!(contract.managed);
+        assert!(!contract.standalone);
+        assert_eq!(
+            G17P_COMPUTE_POWER_LEASE_ORDER,
+            [
+                G17PComputePowerLeaseStep::AcquireBeforeReadiness,
+                G17PComputePowerLeaseStep::HoldThroughClaim,
+                G17PComputePowerLeaseStep::HoldThroughCompletion,
+                G17PComputePowerLeaseStep::ReleaseAfterCompletion,
+            ]
+        );
+
+        let mut vm_bind_mutations = 0;
+        let mut readiness_mutations = 0;
+        let mut sksm_mutations = 0;
+        let mut mailbox_mutations = 0;
+        let gated: Result<(), SubmissionError> = (|| {
+            require_g17p_running_client_power_transition(contract, true, false)?;
+            vm_bind_mutations += 1;
+            readiness_mutations += 1;
+            sksm_mutations += 1;
+            mailbox_mutations += 1;
+            Ok(())
+        })();
+        assert_eq!(
+            gated,
+            Err(SubmissionError::RunningClientPowerTransitionUnavailable)
+        );
+        assert_eq!(vm_bind_mutations, 0);
+        assert_eq!(readiness_mutations, 0);
+        assert_eq!(sksm_mutations, 0);
+        assert_eq!(mailbox_mutations, 0);
+        assert_eq!(
+            require_g17p_running_client_power_transition(contract, true, true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn g17p_native_boot_is_ep21_quiet_until_first_real_user_cl() {
+        assert!(G17P_NATIVE_PRE_USER_EP21_MESSAGES.is_empty());
+        assert_eq!(
+            G17P_NATIVE_FIRST_USER_EP21_MESSAGES,
+            [
+                encode_g17p_cl_activation(2).unwrap(),
+                encode_g17p_direct_cl_kick(),
+            ]
+        );
+        assert_eq!(
+            G17P_NATIVE_FIRST_USER_EP21_MESSAGES.map(doorbell_type),
+            [3, 3]
+        );
+        assert!(!G17P_NATIVE_FIRST_USER_EP21_MESSAGES
+            .iter()
+            .any(|message| doorbell_type(*message) == 4));
+    }
+
+    #[test]
+    fn g17p_direct_cl_notifications_match_first_and_repeat_fixtures() {
+        const ACTIVATION: &[u8; 8] =
+            include_bytes!("fixtures/g17p_first_submit/ep21-first-activation.bin");
+        const DIRECT_KICK: &[u8; 8] =
+            include_bytes!("fixtures/g17p_first_submit/ep21-direct-kick.bin");
+        const FIRST_SEQUENCE: &[u8; 16] =
+            include_bytes!("fixtures/g17p_first_submit/ep21-first-direct-sequence.bin");
+
+        let first_state = G17PDirectClNotificationState {
+            cached_channel_identity: 0,
+            submitted_channel_identity: 0xffff_fc20_c07a_1dc0,
+            firmware_ready: true,
+            direct_feature: true,
+            submission_suppressed: false,
+            command_submission_enabled: true,
+        };
+        let first = prepare_g17p_direct_cl_notifications(first_state).unwrap();
+        assert_eq!(first.activation.unwrap().to_le_bytes(), *ACTIVATION);
+        assert_eq!(first.direct_kick.unwrap().to_le_bytes(), *DIRECT_KICK);
+        let mut sequence = [0u8; 16];
+        sequence[..8].copy_from_slice(&first.activation.unwrap().to_le_bytes());
+        sequence[8..].copy_from_slice(&first.direct_kick.unwrap().to_le_bytes());
+        assert_eq!(sequence, *FIRST_SEQUENCE);
+
+        let repeat = prepare_g17p_direct_cl_notifications(G17PDirectClNotificationState {
+            cached_channel_identity: first_state.submitted_channel_identity,
+            ..first_state
+        })
+        .unwrap();
+        assert_eq!(repeat.activation, None);
+        assert_eq!(repeat.direct_kick.unwrap().to_le_bytes(), *DIRECT_KICK);
+
+        let not_ready = prepare_g17p_direct_cl_notifications(G17PDirectClNotificationState {
+            firmware_ready: false,
+            ..first_state
+        })
+        .unwrap();
+        assert_eq!(not_ready.activation, None);
+        assert_eq!(not_ready.direct_kick.unwrap().to_le_bytes(), *DIRECT_KICK);
+
+        for disabled in [
+            G17PDirectClNotificationState {
+                direct_feature: false,
+                ..first_state
+            },
+            G17PDirectClNotificationState {
+                submission_suppressed: true,
+                ..first_state
+            },
+            G17PDirectClNotificationState {
+                command_submission_enabled: false,
+                ..first_state
+            },
+        ] {
+            let prepared = prepare_g17p_direct_cl_notifications(disabled).unwrap();
+            assert_eq!(prepared.activation.unwrap().to_le_bytes(), *ACTIVATION);
+            assert_eq!(prepared.direct_kick, None);
+        }
+
+        assert_eq!(
+            T8140_G17P_CL_BACKEND,
+            G17PClBackendConfig {
+                backend: G17ClSubmissionBackend::G17PHal200Hybrid,
+                direct_feature: true,
+                submission_suppressed: false,
+                command_submission_enabled: true,
+            }
+        );
+        assert!(g17p_first_bind_tag15_required(true));
+        assert!(g17p_first_bind_tag16_required(
+            T8140_G17P_CL_BACKEND,
+            true
+        ));
+        assert!(!g17p_first_bind_tag16_required(
+            G17PClBackendConfig {
+                backend: G17ClSubmissionBackend::Classic,
+                ..T8140_G17P_CL_BACKEND
+            },
+            true
+        ));
+        assert!(!g17p_first_bind_tag16_required(
+            G17PClBackendConfig {
+                direct_feature: false,
+                ..T8140_G17P_CL_BACKEND
+            },
+            true
+        ));
+        assert!(G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready());
+        assert!(G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY);
+
+        let first_lifecycle = prepare_g17p_direct_cl_lifecycle(
+            G17PDirectClLifecycleState {
+                queue_config_dirty: true,
+                cached_channel_identity: 0,
+                next_correlation_token: 1,
+            },
+            first_state.submitted_channel_identity,
+            true,
+            T8140_G17P_CL_BACKEND,
+        )
+        .unwrap();
+        assert!(first_lifecycle.publish_config_update);
+        assert!(first_lifecycle.publish_entry_signal);
+        assert_eq!(first_lifecycle.correlation_token, 1);
+        assert_eq!(first_lifecycle.notifications, first);
+        assert_eq!(
+            first_lifecycle.next,
+            G17PDirectClLifecycleState {
+                queue_config_dirty: false,
+                cached_channel_identity: first_state.submitted_channel_identity,
+                next_correlation_token: 2,
+            }
+        );
+
+        let repeat_lifecycle = prepare_g17p_direct_cl_lifecycle(
+            first_lifecycle.next,
+            first_state.submitted_channel_identity,
+            true,
+            T8140_G17P_CL_BACKEND,
+        )
+        .unwrap();
+        assert!(!repeat_lifecycle.publish_config_update);
+        assert!(!repeat_lifecycle.publish_entry_signal);
+        assert_eq!(repeat_lifecycle.correlation_token, 2);
+        assert_eq!(repeat_lifecycle.notifications.activation, None);
+        assert_eq!(repeat_lifecycle.notifications.direct_kick, first.direct_kick);
+        assert_eq!(repeat_lifecycle.next.next_correlation_token, 3);
+        assert_eq!(
+            prepare_g17p_direct_cl_lifecycle(
+                G17PDirectClLifecycleState {
+                    next_correlation_token: 0,
+                    ..first_lifecycle.next
+                },
+                first_state.submitted_channel_identity,
+                true,
+                T8140_G17P_CL_BACKEND,
+            ),
+            Err(SubmissionError::ComputeEventCounterOverflow)
+        );
+
+        let mut command_ring_mutations = 0;
+        let mut sksm_storage_mutations = 0;
+        let mut sksm_mmio_mutations = 0;
+        let mut outer_ring_mutations = 0;
+        let mut mailbox_mutations = 0;
+        let blocked_plan = G17PFirstBindCommandPlan {
+            optional_correlation_ring: G17PCorrelationRingImplementationState::Pending,
+            ..G17P_FIRST_BIND_COMMAND_PLAN
+        };
+        let gated: Result<(), SubmissionError> = (|| {
+            require_g17p_first_bind_direct_hardware_release(blocked_plan)?;
+            command_ring_mutations += 2;
+            sksm_storage_mutations += 1;
+            sksm_mmio_mutations += 1;
+            outer_ring_mutations += 1;
+            mailbox_mutations += 2;
+            Ok(())
+        })();
+        assert_eq!(
+            gated,
+            Err(SubmissionError::FirstBindCommandPublicationIncomplete)
+        );
+        assert_eq!(command_ring_mutations, 0);
+        assert_eq!(sksm_storage_mutations, 0);
+        assert_eq!(sksm_mmio_mutations, 0);
+        assert_eq!(outer_ring_mutations, 0);
+        assert_eq!(mailbox_mutations, 0);
+
+        let resolved = G17P_FIRST_BIND_COMMAND_PLAN;
+        assert_eq!(resolved.fallback_logical_flush_id, 0);
+        assert!(!resolved.flush_id_serialized_in_tag15);
+        assert!(!resolved.flush_id_completion_release_required);
+        assert!(resolved.hardware_release_ready());
+        assert_eq!(
+            require_g17p_first_bind_direct_hardware_release(resolved),
+            Ok(())
+        );
+        for unresolved_implementation in [
+            G17PFlushIdImplementationState::Pending,
+            G17PFlushIdImplementationState::ProvenAbsentFallbackUnverified,
+            G17PFlushIdImplementationState::ProvenPresentUnimplemented,
+        ] {
+            assert!(!G17PFirstBindCommandPlan {
+                dedicated_flush_id: unresolved_implementation,
+                ..resolved
+            }
+            .hardware_release_ready());
+        }
+        assert!(G17PFirstBindCommandPlan {
+            dedicated_flush_id: G17PFlushIdImplementationState::ProvenPresentImplemented,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(!G17PFirstBindCommandPlan {
+            optional_correlation_ring: G17PCorrelationRingImplementationState::Pending,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(!G17PFirstBindCommandPlan {
+            native_command_pointer_ring: G17PContractPredicateState::Pending,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(G17PFirstBindCommandPlan {
+            optional_correlation_ring: G17PCorrelationRingImplementationState::ProvenInactive,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(G17PFirstBindCommandPlan {
+            optional_correlation_ring:
+                G17PCorrelationRingImplementationState::ProvenRequiredImplemented,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(!g17p_first_bind_tag16_required(
+            G17PClBackendConfig {
+                backend: G17ClSubmissionBackend::Hal300,
+                ..T8140_G17P_CL_BACKEND
+            },
+            true
+        ));
     }
 
     #[test]
@@ -4553,6 +5168,36 @@ mod tests {
         assert_eq!(G17P_CHANNEL_ABI.command_pointer_entry_bytes, 8);
         assert_eq!(G17P_CHANNEL_ABI.accelerator_target_width, 2);
         assert!(G17P_CHANNEL_PRODUCER_REQUIRES_DMB_ISH);
+    }
+
+    #[test]
+    fn g17p_classic_work_slots_and_sksm_pointer_entries_are_distinct() {
+        assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE, 0x18);
+        assert_eq!(G17P_CHANNEL_ABI.command_pointer_entry_bytes, 0x08);
+
+        let sksm = prepare_g17p_channel_write(
+            G17ChannelAbiTarget::A18ProG17P,
+            1,
+            3,
+            4,
+        )
+        .unwrap();
+        assert_eq!(sksm.entry_byte_offset, 0x08);
+
+        let classic = prepare_g17p_partial_opening_outer_slot(
+            G17PPartialOpeningOuterChannelState {
+                consumers: [0, 0],
+                producer: 1,
+                queue_gpu_va: 0xffff_fc20_c000_00c0,
+                queue_write_index: 3,
+            },
+            G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(classic.slot_byte_offset, 0x18);
+        assert_eq!(get_u64_le(&classic.slot, 0x08), 0xffff_fc20_c000_00c0);
     }
 
     #[test]
@@ -5313,9 +5958,7 @@ mod tests {
             word_44: 0x7654_3210,
             gpu_va_70: 0xfedc_ba98_7654_3210,
         };
-        let raw =
-            encode_g17_host_channel_state_reset(G17ChannelStatePhase::BeforeRegistration, values)
-                .expect("pre-registration reset must be authorized");
+        let raw = encode_g17_host_channel_state_reset(values);
         let layout = G17_HOST_CHANNEL_STATE_RESET_LAYOUT;
 
         assert_eq!(raw.len(), 0x80);
@@ -5374,12 +6017,7 @@ mod tests {
     fn g17_uncached_channel_reset_preserves_unwritten_bytes() {
         let mut raw = [0xa5; G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT];
         let ring_entry_count = 0x800;
-        apply_g17_uncached_channel_reset(
-            G17ChannelStatePhase::Recovery,
-            &mut raw,
-            ring_entry_count,
-        )
-        .expect("explicit recovery reset must be authorized");
+        apply_g17_uncached_channel_reset(&mut raw, ring_entry_count);
         let layout = G17_UNCACHED_CHANNEL_RESET_LAYOUT;
 
         for offset in [
@@ -5444,14 +6082,236 @@ mod tests {
             apply_g17p_retained_event_with_stamp(G17PColdOpeningStage::Tiling, 1u64 << 40, 0, &mut event)
                 .is_err()
         );
+    }
 
-        let before = [0xa5; G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT];
-        let mut raw = before;
-        assert_eq!(
-            apply_g17_uncached_channel_reset(G17ChannelStatePhase::Registered, &mut raw, 0x800,),
-            Err(SubmissionError::ChannelStateFirmwareOwned)
-        );
-        assert_eq!(raw, before, "rejected reset must not mutate channel state");
+    /// The render pair configures TA on data master 0 and 3D on data master 1;
+    /// the compute data master must be refused on this path.
+    #[test]
+    fn g17p_render_queue_config_admits_only_render_data_masters() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        let scratch = g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch;
+        for (queue_id, data_master, entry) in [
+            (
+                G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX,
+                G17P_TA_DATA_MASTER,
+                0x70_0043_8000u64,
+            ),
+            (
+                G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
+                G17P_3D_DATA_MASTER,
+                0x70_0046_0000u64,
+            ),
+        ] {
+            let routing = G17PComputeQueueRouting {
+                queue_id,
+                completion_selector: 2,
+                entry_gpu_va: entry,
+                geometry,
+            };
+            let config =
+                prepare_g17p_render_sksm_queue_config(routing, data_master, scratch).unwrap();
+            assert_eq!(config.payload & G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK, entry);
+            assert_eq!(config.payload >> 60, data_master as u64 + 1);
+            assert_eq!(config.enable_pair.word1, 1u64 << queue_id);
+            assert_eq!(config.enable_pair.word0, 0);
+            assert!(prepare_g17p_render_sksm_queue_config(
+                routing,
+                G17P_COMPUTE_DATA_MASTER,
+                scratch
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn g17p_secondary_render_pair_matches_native_configure_words() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        let scratch = g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch;
+        for (queue_id, data_master, entry, tag, payload, mask) in [
+            (
+                2,
+                G17P_TA_DATA_MASTER,
+                0x70_01f4_8000,
+                0x0000_1400_0002_1008,
+                0x1280_0070_01f4_8000,
+                0x4,
+            ),
+            (
+                3,
+                G17P_3D_DATA_MASTER,
+                0x70_01f7_0000,
+                0x0000_1c00_0002_1008,
+                0x2280_0070_01f7_0000,
+                0x8,
+            ),
+        ] {
+            let config = prepare_g17p_render_sksm_queue_config(
+                G17PComputeQueueRouting {
+                    queue_id,
+                    completion_selector: 0,
+                    entry_gpu_va: entry,
+                    geometry,
+                },
+                data_master,
+                scratch,
+            )
+            .unwrap();
+            assert_eq!(config.tag, tag);
+            assert_eq!(config.payload, payload);
+            assert_eq!(config.enable_pair.word0, 0);
+            assert_eq!(config.enable_pair.word1, mask);
+        }
+    }
+
+    #[test]
+    fn g17p_render_config_update_carries_context_hardware_buffer_id_and_pid() {
+        let addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 5,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
+            owner_pid: 0x625,
+            ta_hardware_buffer_id: 7,
+        };
+        for context_id in [5, 62] {
+            for stage in [
+                G17PColdOpeningStage::Tiling,
+                G17PColdOpeningStage::Fragment,
+            ] {
+                let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+                apply_g17p_retained_optional(
+                    stage,
+                    addresses,
+                    0,
+                    false,
+                    0,
+                    1,
+                    5,
+                    1,
+                    context_id,
+                    &mut optional,
+                )
+                .unwrap();
+                assert_eq!(get_u16_le(&optional, 0x32), context_id);
+                assert_eq!(get_u32_le(&optional, 0x46), 5);
+                assert_eq!(get_u16_le(&optional, 0x56), 5);
+                assert_eq!(get_u32_le(&optional, 0x5a), 0x625);
+                assert_eq!(
+                    get_u32_le(&optional, 0x7e),
+                    if stage == G17PColdOpeningStage::Tiling {
+                        7
+                    } else {
+                        u32::MAX
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn g17p_retained_canonical_records_advance_logically_without_moving() {
+        let addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 0,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
+            owner_pid: 0x15,
+            ta_hardware_buffer_id: 0,
+        };
+        for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
+            let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+            apply_g17p_retained_optional(
+                stage,
+                addresses,
+                1,
+                false,
+                0,
+                0,
+                0,
+                1,
+                1,
+                &mut optional,
+            )
+                .unwrap();
+            assert_eq!(get_u16_le(&optional, 0x1a), 0);
+            assert_eq!(get_u16_le(&optional, 0x2a), 1);
+            assert_eq!(get_u16_le(&optional, 0x2e), 0x100);
+            assert_eq!(get_u16_le(&optional, 0x3e), 1);
+            assert_eq!(get_u16_le(&optional, 0x52), 0);
+            assert_eq!(get_u16_le(&optional, 0x62), 0);
+            assert_eq!(
+                get_u16_le(&optional, 0x76),
+                if stage == G17PColdOpeningStage::Tiling {
+                    0
+                } else {
+                    u16::MAX
+                }
+            );
+
+            let mut event = [0u8; G17P_COLD_OPENING_EVENT_SIZE];
+            apply_g17p_retained_event(stage, 1, 0, &mut event).unwrap();
+            assert_eq!(get_u32_le(&event, 0x08), 0x202);
+        }
+
+        let pair = prepare_g17p_partial_opening_work_pair(
+            G17PPartialOpeningOuterChannelState {
+                consumers: [1, 1],
+                producer: 1,
+                queue_gpu_va: 0x70_0300_00c0,
+                queue_write_index: 3,
+            },
+            G17PPartialOpeningOuterChannelState {
+                consumers: [1, 1],
+                producer: 1,
+                queue_gpu_va: 0x70_0300_0000,
+                queue_write_index: 3,
+            },
+            1,
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pair.fragment.slot_index, 1);
+        assert_eq!(pair.tiling.slot_index, 1);
+        assert_eq!(pair.fragment.next_producer, 2);
+        assert_eq!(pair.tiling.next_producer, 2);
+        assert_eq!(get_u32_le(&pair.fragment.slot, 0x14), 0x0001_0003);
+        assert_eq!(get_u32_le(&pair.tiling.slot, 0x14), 0x0000_0003);
+    }
+
+    #[test]
+    fn g17p_context_update_is_fresh_graph_state_not_global_ordinal_state() {
+        let addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 0,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
+            owner_pid: 0x15,
+            ta_hardware_buffer_id: 0,
+        };
+        for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
+            for (ordinal, context_update) in [(0, true), (195, true), (196, false)] {
+                let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+                apply_g17p_retained_optional_with_flist_generation_and_context_update(
+                    stage, addresses, ordinal, 2022, false, 2, 3, 2, 0, 6,
+                    context_update, &mut optional,
+                )
+                .unwrap();
+                assert_eq!(get_u16_le(&optional, 0x1a), 0);
+                assert_eq!(get_u16_le(&optional, 0x52), if ordinal == 0 { 1 } else { 0 });
+                assert_eq!(get_u16_le(&optional, 0x62), u16::from(context_update));
+                assert_eq!(get_u16_le(&optional, 0x32), 6);
+            }
+        }
     }
 
     #[test]
@@ -5482,7 +6342,9 @@ mod tests {
                 timestamp: ts,
                 queue_id: 0x7f,
                 mask_selector: 1,
-            })
+            }),
+            1,
+            0
         );
         // A word with bit 47 set is outside the modeled form.
         assert_eq!(
@@ -5537,7 +6399,7 @@ mod tests {
                 Ok(expected),
             );
         }
-        assert_eq!(g17p_serialized_render_scratch_payload(u64::from(u32::MAX)), 0);
+        assert_eq!(g17p_serialized_render_scratch_payload(u32::MAX), 0);
     }
 
     #[test]
@@ -5599,6 +6461,93 @@ mod tests {
     }
 
     #[test]
+    fn g17p_hal200_queue_geometry_is_exact_and_other_backends_stay_unconfirmed() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        assert_eq!(geometry.validate(), Ok(()));
+        assert_eq!(geometry.allocation_alignment(), 0x100);
+        assert_eq!(geometry.entry_stride(), 0x200);
+        assert_eq!(geometry.stamp_count(), 0x100);
+        assert_eq!(geometry.timestamp_seed(), 1);
+        assert_eq!(geometry.backing_size(), 0x20000);
+        assert_eq!(
+            geometry.entry_stride() as usize * geometry.stamp_count() as usize,
+            geometry.backing_size()
+        );
+        assert_eq!(
+            g17_sksm_queue_geometry(
+                G17ChannelAbiTarget::A18ProG17P,
+                G17ClSubmissionBackend::G17PHal200Hybrid,
+            ),
+            Some(geometry)
+        );
+        for backend in [
+            G17ClSubmissionBackend::Classic,
+            G17ClSubmissionBackend::Hal300,
+        ] {
+            assert_eq!(
+                g17_sksm_queue_geometry(G17ChannelAbiTarget::A18ProG17P, backend),
+                None
+            );
+        }
+        for target in [
+            G17ChannelAbiTarget::M5G17G,
+            G17ChannelAbiTarget::M5ProMaxG17X,
+        ] {
+            assert_eq!(
+                g17_sksm_queue_geometry(target, G17ClSubmissionBackend::G17PHal200Hybrid),
+                None
+            );
+        }
+
+        let producer = geometry
+            .initial_producer_state(
+                4,
+                2,
+                G17PClQosConfig {
+                    queue_byte_32: 1,
+                    class_40: 8,
+                    word_48: 0xffff,
+                },
+            )
+            .unwrap();
+        assert_eq!(producer.geometry, geometry);
+        assert_eq!(producer.submitted, 0);
+        assert_eq!(producer.current_timestamp, geometry.timestamp_seed());
+        assert_eq!(producer.last_add_kicks_timestamp, geometry.timestamp_seed());
+        assert_eq!(producer.base_timestamp, geometry.timestamp_seed());
+        assert!(!producer.previous_valid);
+    }
+
+    #[test]
+    fn g17p_hal200_queue_geometry_drives_last_slot_and_wrap() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        let timestamp = encode_kick_timestamp(KickTimestamp {
+            stamp: 0x1234_5678,
+            stamp_index: (geometry.stamp_count() - 1) as u8,
+        });
+        let prepared = prepare_kick_submission(
+            timestamp,
+            4,
+            geometry.stamp_count(),
+            geometry.entry_stride(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.entry_index, 0xff);
+        assert_eq!(
+            prepared.entry_offset as usize + geometry.entry_stride() as usize,
+            geometry.backing_size()
+        );
+        assert_eq!(
+            decode_kick_timestamp(prepared.next_timestamp),
+            Ok(KickTimestamp {
+                stamp: 0x1234_5679,
+                stamp_index: 0,
+            })
+        );
+    }
+
+    #[test]
     fn kick_queue_preparation_matches_all_runtime_stamp_geometries() {
         for num_stamps in 1u16..=KICK_NUM_STAMPS_MAX {
             for index in 0u16..num_stamps {
@@ -5630,7 +6579,7 @@ mod tests {
     }
 
     #[test]
-    fn kick_queue_preparation_rejects_unrepresentable_state_before_publication() {
+    fn kick_queue_preparation_reports_unrepresentable_state_before_publication() {
         assert_eq!(
             prepare_kick_submission(1 << 40, 0, 1, 0x180),
             Err(SubmissionError::KickTimestampOutOfRange)
@@ -5973,14 +6922,14 @@ mod tests {
             204
         );
 
-        let command = prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW, 0, 0x26).unwrap();
+        let command = prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW, 0).unwrap();
         let empty = G17PClRceBinding { address: 0, tag: 0 };
         assert_eq!(
             command.rce_bindings,
             [
                 G17PClRceBinding {
                     address: DESCRIPTOR_LOW + 0x40,
-                    tag: 0x26,
+                    tag: 0x22,
                 },
                 G17PClRceBinding {
                     address: DESCRIPTOR_LOW + 0x760,
@@ -6057,7 +7006,7 @@ mod tests {
         const SECOND_AFTER: &[u8; 0x200] =
             include_bytes!("fixtures/g17p_first_submit/sksm-entry-second-after.bin");
         let second_command =
-            prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW + 0x1040, 1, 0x26).unwrap();
+            prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW + 0x1040, 1).unwrap();
         let second = prepare_g17p_cl_kick_entry(
             prepared.producer_after,
             G17PClKickEntryOperands {
@@ -6340,7 +7289,6 @@ mod tests {
     #[test]
     fn g17p_cl_entry_encodes_every_optional_section() {
         let barriers = [G17PClBarrierDependency {
-            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 3,
@@ -6470,7 +7418,6 @@ mod tests {
         assert_eq!(get_u64_le(&ta.entry, 0x20), 0xffff_0c02_0000_0001);
 
         let fragment_barrier = [G17PClBarrierDependency {
-            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 0,
@@ -6614,7 +7561,6 @@ mod tests {
         );
 
         let too_many = [G17PClBarrierDependency {
-            native_timestamp: None,
             event_word: 0,
             shared_stamp: 0,
             queue_id: 0,
@@ -6633,10 +7579,10 @@ mod tests {
 
     #[test]
     fn host_add_kicks_tags_match_all_three_pinned_producers() {
-        let geometry = SksmAddKicksMmioGeometry {
-            tag_offset_base: 0x100,
-            count_offset_base: 0x104,
-            aperture_index: 3,
+        let geometry = G17SksmScratchGeometry {
+            write0_base: 0x100,
+            write1_base: 0x104,
+            stride: 3,
         };
 
         for queue_id in 0u8..=0x7f {
@@ -6646,6 +7592,15 @@ mod tests {
             assert_eq!(p.tag_offset, 0x11b);
             assert_eq!(p.count_offset, 0x11f);
             assert_eq!(p.add_count, 5);
+            assert_eq!(
+                p.write_pair(),
+                G17SksmOrderedWritePair {
+                    word0_offset: 0x11b,
+                    word0: 0x0000_0400_0002_1018 | ((queue_id as u64) << 43),
+                    word1_offset: 0x11f,
+                    word1: 5,
+                }
+            );
 
             let g = prepare_sksm_add_kicks_mmio(
                 SksmAddKicksTarget::G17G,
@@ -6665,47 +7620,106 @@ mod tests {
     }
 
     #[test]
-    fn host_add_kicks_mmio_offsets_fail_closed_on_overflow() {
-        let valid = SksmAddKicksMmioGeometry {
-            tag_offset_base: 0,
-            count_offset_base: 0,
-            aperture_index: u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE,
+    fn pair_writer_publishes_two_64_bit_words_in_order() {
+        use std::cell::RefCell;
+
+        struct Recorder(RefCell<Vec<(u32, u64)>>);
+
+        impl G17SksmPairWriter for Recorder {
+            type Error = ();
+
+            fn write64(&self, offset: u32, value: u64) -> core::result::Result<(), Self::Error> {
+                self.0.borrow_mut().push((offset, value));
+                Ok(())
+            }
+        }
+
+        let pair = prepare_sksm_add_kicks_mmio(
+            SksmAddKicksTarget::G17P,
+            0x2a,
+            0x89ab_cdef,
+            g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch,
+        )
+        .unwrap()
+        .write_pair();
+        let recorder = Recorder(RefCell::new(Vec::new()));
+
+        assert_eq!(publish_g17p_sksm_write_pair(&recorder, pair), Ok(()));
+        assert_eq!(
+            recorder.0.into_inner(),
+            vec![
+                (0x4090, 0x0001_5400_0002_1018),
+                (0x4098, 0x0000_0000_89ab_cdef),
+            ]
+        );
+    }
+
+    #[test]
+    fn pair_writer_does_not_publish_word1_after_word0_error() {
+        use std::cell::Cell;
+
+        struct FirstWriteError(Cell<u32>);
+
+        impl G17SksmPairWriter for FirstWriteError {
+            type Error = u32;
+
+            fn write64(&self, _offset: u32, _value: u64) -> core::result::Result<(), Self::Error> {
+                let calls = self.0.get() + 1;
+                self.0.set(calls);
+                Err(calls)
+            }
+        }
+
+        let writer = FirstWriteError(Cell::new(0));
+        let pair = G17SksmOrderedWritePair {
+            word0_offset: 0x4090,
+            word0: 1,
+            word1_offset: 0x4098,
+            word1: 2,
+        };
+        assert_eq!(publish_g17p_sksm_write_pair(&writer, pair), Err(1));
+        assert_eq!(writer.0.get(), 1);
+    }
+
+    #[test]
+    fn host_add_kicks_mmio_offsets_report_overflow() {
+        let valid = G17SksmScratchGeometry {
+            write0_base: 0,
+            write1_base: 0,
+            stride: u32::MAX / 9,
         };
         let publication =
             prepare_sksm_add_kicks_mmio(SksmAddKicksTarget::G17G, 0, 1, valid).unwrap();
-        assert_eq!(
-            publication.tag_offset,
-            (u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE) * SKSM_ADD_KICKS_APERTURE_SCALE
-        );
+        assert_eq!(publication.tag_offset, (u32::MAX / 9) * 9);
 
         assert_eq!(
             prepare_sksm_add_kicks_mmio(
                 SksmAddKicksTarget::G17P,
                 0x80,
                 1,
-                SksmAddKicksMmioGeometry {
-                    tag_offset_base: 0,
-                    count_offset_base: 4,
-                    aperture_index: 0,
+                G17SksmScratchGeometry {
+                    write0_base: 0,
+                    write1_base: 4,
+                    stride: 0,
                 },
             ),
             Err(SubmissionError::QueueIdOutOfRange)
         );
         for geometry in [
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: 0,
-                count_offset_base: 0,
-                aperture_index: u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE + 1,
+            G17SksmScratchGeometry {
+                write0_base: 0,
+                write1_base: 0,
+                stride: u32::MAX / 9 + 1,
             },
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: u32::MAX,
-                count_offset_base: 0,
-                aperture_index: 1,
+            G17SksmScratchGeometry {
+                write0_base: u32::MAX,
+                write1_base: 0,
+                stride: 1,
             },
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: 0,
-                count_offset_base: u32::MAX,
-                aperture_index: 1,
+            G17SksmScratchGeometry {
+                write0_base: 0,
+                write1_base: u32::MAX,
+                stride: 1,
             },
         ] {
             assert_eq!(
@@ -6718,11 +7732,11 @@ mod tests {
     #[test]
     fn g17p_sksm_queue_configuration_matches_the_host_store_sequence() {
         assert_eq!(
-            G17P_SKSM_RUNTIME_MMIO_GEOMETRY_LAYOUT,
-            G17PSksmRuntimeMmioGeometryLayout {
-                tag_offset_base: 0x10730,
-                payload_offset_base: 0x10734,
-                aperture_index: 0x10738,
+            G17P_SKSM_RUNTIME_GEOMETRY_OBJECT_LAYOUT,
+            G17PSksmRuntimeGeometryObjectLayout {
+                write0_base_field: 0x10730,
+                write1_base_field: 0x10734,
+                stride_field: 0x10738,
             }
         );
         assert_eq!(G17P_SKSM_QUEUE_ENABLE_MASK_BASE, 0x21068);
@@ -6734,32 +7748,90 @@ mod tests {
             1,
             0,
             0x12340,
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: 0x100,
-                count_offset_base: 0x104,
-                aperture_index: 2,
-            },
+            g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch,
         )
         .unwrap();
 
-        // configureHardware: base + aperture*9, tag, payload, then QID mask.
-        assert_eq!(config.tag_offset, 0x112);
+        // configureHardware: base + 9*stride, tag, payload, then QID mask.
+        assert_eq!(config.tag_offset, 0x4090);
         assert_eq!(config.tag, 0x0002_0400_0002_1008);
-        assert_eq!(config.payload_offset, 0x116);
+        assert_eq!(config.payload_offset, 0x4098);
         // This hard-coded value catches both the 32-bit selector arithmetic
         // and the host's ADD of `(data_master + 1) << 60` before the OR.
         assert_eq!(config.payload, 0x2280_0000_0001_2340);
-        assert_eq!(config.enable_mask_offset, 0x21070);
-        assert_eq!(config.enable_mask, 1);
+        assert_eq!(
+            config.write_pair(),
+            G17SksmOrderedWritePair {
+                word0_offset: 0x4090,
+                word0: 0x0002_0400_0002_1008,
+                word1_offset: 0x4098,
+                word1: 0x2280_0000_0001_2340,
+            }
+        );
+        assert_eq!(
+            config.enable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21070,
+                word0: 1,
+                word1_offset: 0x21068,
+                word1: 0,
+            }
+        );
+        assert_eq!(
+            config.disable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21080,
+                word0: 1,
+                word1_offset: 0x21078,
+                word1: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn g17p_compute_queue_matches_the_captured_native_cl2_tuple() {
+        assert_eq!(G17P_TA_DATA_MASTER, 0);
+        assert_eq!(G17P_3D_DATA_MASTER, 1);
+        assert_eq!(G17P_COMPUTE_DATA_MASTER, 2);
+
+        let config = prepare_g17p_compute_sksm_queue_config(
+            G17PComputeQueueRouting {
+                queue_id: 4,
+                completion_selector: 2,
+                entry_gpu_va: 0x0000_0070_004d_8000,
+                geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
+            },
+            g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch,
+        )
+        .unwrap();
+
+        assert_eq!(config.tag_offset, 0x4090);
+        assert_eq!(config.tag, 0x0000_2400_0002_1008);
+        assert_eq!(config.payload_offset, 0x4098);
+        assert_eq!(config.payload, 0x3100_0070_004d_8000);
+        assert_eq!(
+            config.enable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21070,
+                word0: 0,
+                word1_offset: 0x21068,
+                word1: 1 << 4,
+            }
+        );
+        assert_eq!(
+            config.disable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21080,
+                word0: 0,
+                word1_offset: 0x21078,
+                word1: 1 << 4,
+            }
+        );
     }
 
     #[test]
     fn g17p_sksm_queue_configuration_is_identity_and_range_scoped() {
-        let geometry = SksmAddKicksMmioGeometry {
-            tag_offset_base: 0,
-            count_offset_base: 4,
-            aperture_index: 0,
-        };
+        let geometry = g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch;
 
         for target in [
             G17ChannelAbiTarget::M5G17G,
@@ -6823,10 +7895,10 @@ mod tests {
                 0,
                 0,
                 0x20,
-                SksmAddKicksMmioGeometry {
-                    tag_offset_base: u32::MAX,
-                    count_offset_base: 0,
-                    aperture_index: 1,
+                G17SksmScratchGeometry {
+                    write0_base: u32::MAX,
+                    write1_base: 0,
+                    stride: 1,
                 },
             ),
             Err(SubmissionError::KickMmioOffsetOverflow)
@@ -6838,6 +7910,10 @@ mod tests {
         assert_eq!(G17P_KSM_COMPLETION_QUEUE_COUNT, 4);
         assert_eq!(G17P_KSM_COMPLETION_DESCRIPTOR_SIZE, 0x20);
         assert_eq!(G17P_KSM_COMPLETION_ENTRY_SIZE, 0x40);
+        assert_eq!(G17P_KSM_COMPLETION_CAPACITY, 0x800);
+        assert_eq!(G17P_KSM_COMPLETION_BACKING_SIZE, 0x20000);
+        assert_eq!(G17P_KSM_COMPLETION_PRESENT_ORDINALS, [0, 2]);
+        assert_eq!(G17P_NORMAL_CL_COMPLETION_ORDINAL, 0);
         assert_eq!(
             G17P_KSM_COMPLETION_DESCRIPTOR_LAYOUT,
             G17PKsmCompletionDescriptorLayout {
@@ -6874,7 +7950,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_completion_descriptors_fail_closed() {
+    fn g17p_completion_descriptors_report_invalid_inputs() {
         assert_eq!(
             encode_g17p_ksm_completion_descriptor(
                 G17ChannelAbiTarget::M5G17G,
@@ -7037,7 +8113,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_top_level_command_decode_fails_closed_by_tag_and_identity() {
+    fn g17p_top_level_command_decode_reports_bad_tag_and_identity() {
         for raw in [6u32, 8, 10, 11] {
             assert_eq!(
                 decode_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &raw.to_le_bytes()),
@@ -7106,7 +8182,7 @@ mod tests {
         );
         assert_eq!(
             admit_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &nop),
-            Err(SubmissionError::CommandTagRejectedByFirmware)
+            Err(SubmissionError::CommandTagInvalidForFirmware)
         );
 
         for command_type in [
@@ -7181,7 +8257,7 @@ mod tests {
             SUBMISSION_ABI_LEDGER.kick_record,
             AbiProvenance::ForkedAgx3Grounded
         );
-        // The channel/ring state records stay inherited and fail-closed. The
+        // The channel/ring state records stay inherited and unsupported. The
         // widened native descriptor geometry is grounded first-hand.
         assert_eq!(
             SUBMISSION_ABI_LEDGER.channel_state,
@@ -7215,86 +8291,49 @@ mod tests {
     }
 
     #[test]
-    fn transport_stays_fail_closed_with_named_live_gaps() {
+    fn transport_tracks_classic_graphics_and_native_sksm_independently() {
         assert!(GROUNDED_SUBMISSION_PRODUCER_AVAILABLE);
         assert!(!EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE);
         assert!(!SUBMISSION_LIVE_GAPS.all_proven());
-        assert!(!SUBMISSION_LIVE_GAPS.sksm_hardware_kick_fifo_mmio_scratch_proven);
-        assert!(!SUBMISSION_LIVE_GAPS.doorbell_round_trip_proven);
+        assert!(!SUBMISSION_LIVE_GAPS.classic_graphics_proven());
+        assert!(!SUBMISSION_LIVE_GAPS.native_sksm_proven());
+        assert!(SUBMISSION_LIVE_GAPS.sksm_resource0_ordered_write_implemented);
+        assert!(SUBMISSION_LIVE_GAPS.channel_doorbell_round_trip_proven);
+        assert!(!SUBMISSION_LIVE_GAPS.partial_graphics_runtime_implemented);
+        assert!(SUBMISSION_LIVE_GAPS.partial_graphics_round_trip_proven);
+        assert!(!SUBMISSION_LIVE_GAPS.sksm_add_kicks_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.completion_irq_route_proven);
+        assert!(SUBMISSION_LIVE_GAPS.normal_cl_completion_consumer_implemented);
 
-        // A hypothetical all-proven set would flip the executable signal — the
-        // gate is wired to the evidence, not hard-coded.
-        let proven = SubmissionLiveGaps {
-            sksm_hardware_kick_fifo_mmio_scratch_proven: true,
-            doorbell_round_trip_proven: true,
+        let classic = SubmissionLiveGaps {
+            sksm_resource0_ordered_write_implemented: true,
+            channel_doorbell_round_trip_proven: true,
+            partial_graphics_runtime_implemented: true,
+            partial_graphics_round_trip_proven: true,
+            sksm_add_kicks_round_trip_proven: false,
             completion_irq_route_proven: true,
+            normal_cl_completion_consumer_implemented: true,
         };
-        assert!(proven.all_proven());
-    }
+        assert!(classic.classic_graphics_proven());
+        assert!(!classic.native_sksm_proven());
+        assert!(classic.all_proven());
+        assert!(!classic.sksm_add_kicks_round_trip_proven);
 
-    #[test]
-    fn proxy_evidence_closes_live_gaps_only_at_their_exact_boundaries() {
-        let mut evidence = G17PSubmissionProxyEvidence {
-            same_qid_configured: true,
-            same_qid_enabled: true,
-            same_qid_add_kicks_one: true,
-            same_qid_scratch_transition: true,
-            compute_doorbell_after_add_kicks: false,
-            matching_completion_fence: false,
-            native_workload_completed: false,
-            irq_1001_after_matching_completion: false,
-            direct_cl2_only: false,
+        let native = SubmissionLiveGaps {
+            sksm_resource0_ordered_write_implemented: true,
+            channel_doorbell_round_trip_proven: false,
+            partial_graphics_runtime_implemented: false,
+            partial_graphics_round_trip_proven: false,
+            sksm_add_kicks_round_trip_proven: true,
+            completion_irq_route_proven: true,
+            normal_cl_completion_consumer_implemented: true,
         };
-
-        let bridge_only = evidence.live_gaps();
-        assert!(bridge_only.sksm_hardware_kick_fifo_mmio_scratch_proven);
-        assert!(!bridge_only.doorbell_round_trip_proven);
-        assert!(!bridge_only.completion_irq_route_proven);
-
-        evidence.compute_doorbell_after_add_kicks = true;
-        evidence.native_workload_completed = true;
-        // Execution without a QID/timestamp completion owner is not a fence.
-        assert!(!evidence.live_gaps().doorbell_round_trip_proven);
-
-        evidence.matching_completion_fence = true;
-        let round_trip = evidence.live_gaps();
-        assert!(round_trip.sksm_hardware_kick_fifo_mmio_scratch_proven);
-        assert!(round_trip.doorbell_round_trip_proven);
-        assert!(!round_trip.completion_irq_route_proven);
-
-        evidence.irq_1001_after_matching_completion = true;
-        assert!(evidence.live_gaps().all_proven());
-    }
-
-    #[test]
-    fn each_sksm_bridge_observable_is_individually_load_bearing() {
-        let complete = G17PSubmissionProxyEvidence {
-            same_qid_configured: true,
-            same_qid_enabled: true,
-            same_qid_add_kicks_one: true,
-            same_qid_scratch_transition: true,
-            compute_doorbell_after_add_kicks: false,
-            matching_completion_fence: false,
-            native_workload_completed: false,
-            irq_1001_after_matching_completion: false,
-            direct_cl2_only: false,
-        };
-
-        for missing in 0..4 {
-            let mut evidence = complete;
-            match missing {
-                0 => evidence.same_qid_configured = false,
-                1 => evidence.same_qid_enabled = false,
-                2 => evidence.same_qid_add_kicks_one = false,
-                3 => evidence.same_qid_scratch_transition = false,
-                _ => unreachable!(),
-            }
-            assert!(
-                !evidence
-                    .live_gaps()
-                    .sksm_hardware_kick_fifo_mmio_scratch_proven
-            );
+        assert!(!native.classic_graphics_proven());
+        assert!(native.native_sksm_proven());
+        assert!(native.all_proven());
+        assert!(!SubmissionLiveGaps {
+            normal_cl_completion_consumer_implemented: false,
+            ..native
         }
         .native_sksm_proven());
     }
@@ -7450,20 +8489,6 @@ pub(crate) const fn g17p_umadesc_offset(hardware_buffer_id: u32) -> Option<usize
     Some(hardware_buffer_id as usize * G17P_UMA_DESC_ENTRY_SIZE)
 }
 
-/// Recover the mutable pool state before its hardware slot changes owners.
-/// The address and allocation unit belong to the retained pool; word three
-/// is firmware-owned and is not part of the load/store handshake.
-pub(crate) const fn decode_g17p_umadesc(
-    descriptor: [u64; 4],
-    mut state: G17PUmaPagePoolState,
-) -> G17PUmaPagePoolState {
-    state.counter_a = ((descriptor[1] >> 5) & 0x0fff_ffff) as u32;
-    state.counter_b = ((descriptor[1] >> 33) & 0x0fff_ffff) as u32;
-    state.empty = (descriptor[1] >> 61) as u32;
-    state.total_pages = descriptor[2] as u32;
-    state
-}
-
 #[cfg(test)]
 mod uma_descriptor_tests {
     use super::*;
@@ -7587,34 +8612,33 @@ mod usc_freelist_tests {
     }
 
     #[test]
-    fn repeated_direct_cl2_evidence_cannot_promote_an_sksm_gap() {
+    fn linux_owned_first_render_usc_freelist_record_is_exact() {
+        let mut record = [0xa5; 0x40];
+        encode_g17p_usc_freelist_control(
+            0xffff_fc20_c082_8000,
+            G17P_USC_FREELIST_LOW_VA,
+            G17P_USC_FREELIST_LOW_END,
+            G17PUscFreelistSequence {
+                word_04: 1,
+                word_0c: 0,
+                word_30: 0,
+            },
+            &mut record,
+        )
+        .unwrap();
+        assert_eq!(u32_at(&record, 0x00), G17P_DEVCTL_USC_FREELIST);
+        assert_eq!(u32_at(&record, 0x04), 1);
+        assert_eq!(u32_at(&record, 0x08), 0x3f);
+        assert_eq!(u32_at(&record, 0x0c), 0);
+        assert_eq!(u64_at(&record, 0x14), 0xffff_fc20_c082_8000);
+        assert_eq!(u64_at(&record, 0x1c), G17P_USC_FREELIST_LOW_VA);
+        assert_eq!(u64_at(&record, 0x24), G17P_USC_FREELIST_LOW_END);
         assert_eq!(
-            G17P_REPEATED_DIRECT_CL2_PROXY_EVIDENCE,
-            G17PDirectCl2ProxyEvidence {
-                cold_boots: 2,
-                exact_workloads_per_boot: 4,
-                inner_queue_completion_observed: true,
-                outer_channel_completion_observed: true,
-                sksm_add_kicks_observed: false,
-            }
+            u32_at(&record, 0x2c),
+            G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES
         );
-
-        let mislabeled = G17PSubmissionProxyEvidence {
-            same_qid_configured: true,
-            same_qid_enabled: true,
-            same_qid_add_kicks_one: true,
-            same_qid_scratch_transition: true,
-            compute_doorbell_after_add_kicks: true,
-            matching_completion_fence: true,
-            native_workload_completed: true,
-            irq_1001_after_matching_completion: true,
-            direct_cl2_only: true,
-        };
-        assert!(!mislabeled.live_gaps().all_proven());
-        assert!(
-            !mislabeled
-                .live_gaps()
-                .sksm_hardware_kick_fifo_mmio_scratch_proven
-        );
+        assert_eq!(u32_at(&record, 0x30), 0);
+        assert_eq!(u32_at(&record, 0x34), 1);
+        assert!(record[0x38..].iter().all(|byte| *byte == 0));
     }
 }

@@ -48,7 +48,33 @@
 #define APPLE_ASC_MBOX_I2A_RECV0 0x830
 #define APPLE_ASC_MBOX_I2A_RECV1 0x838
 
-/* T8140 AOP setup-port FIFO/control offsets. */
+/* ASCWrap v6 embeds the unchanged ASC mailbox block at this offset. */
+#define APPLE_ASCWRAP_V6_MBOX_OFFSET 0x8000
+#define APPLE_ASCWRAP_V6_WRAPPER_SIZE 0x88000
+#define APPLE_ASCWRAP_V6_IOP_VBAR_SIZE 0x8
+#define APPLE_ASCWRAP_V6_CPU_CONTROL 0x44
+#define APPLE_ASCWRAP_V6_CPU_RUN BIT(4)
+#define APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR BIT(5)
+
+#define APPLE_T8140_GFX_WRAPPER_BASE 0x482600000ULL
+#define APPLE_T8140_GFX_IOP_VBAR_BASE 0x482050000ULL
+#define APPLE_T8140_GFX1_WRAPPER_BASE 0x482e00000ULL
+#define APPLE_T8140_GFX1_IOP_VBAR_BASE 0x482850000ULL
+
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_CONTROL ==
+	      0x8110);
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_CONTROL ==
+	      0x8114);
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_SEND0 ==
+	      0x8800);
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
+	      0x8830);
+
+/*
+ * The T8140 AOP "setup port" (ADT aop-exclave-mailbox): the second mailbox
+ * the J700 AOP firmware boots through.  Layout measured on hardware by the
+ * native m1n1 microphone host (artifacts/j700-native-lpmic-20260906).
+ */
 #define APPLE_T8140_AOP_SETUP_A2I_CONTROL 0x000
 #define APPLE_T8140_AOP_SETUP_I2A_CONTROL 0x004
 #define APPLE_T8140_AOP_SETUP_A2I_SEND0   0x180
@@ -90,6 +116,8 @@
 #define APPLE_MBOX_TX_TIMEOUT 500
 
 struct apple_mbox_hw {
+	unsigned int reg_offset;
+	bool is_ascwrap_v6;
 	bool ap_initializes_mailboxes;
 
 	unsigned int control_full;
@@ -110,67 +138,6 @@ struct apple_mbox_hw {
 	unsigned int irq_bit_send_empty;
 };
 
-/*
- * Provider-private state kept outside the consumer-visible struct apple_mbox.
- * Every provider is allocated as one of these; apple_mbox_get() hands out a
- * pointer to the embedded mailbox.
- */
-struct apple_mbox_priv {
-	struct apple_mbox mbox;
-	/* ASCWrap v8 only: the provider's PMGR2 PSD service block (read-only). */
-	void __iomem *psd_regs;
-	/* ASCWrap v8 only: receive by polling; fixed at probe. */
-	bool rx_poll_only;
-	/* rx_lock: recv interrupt enabled and not yet disabled again. */
-	bool rx_irq_live;
-	/* rx_lock: consecutive recv interrupts that drained nothing. */
-	unsigned int rx_irq_empty_run;
-	/* rx_lock: an unpowered-PSD receive skip was logged this activation. */
-	bool rx_psd_skip_logged;
-	struct delayed_work rx_poll_work;
-};
-
-static struct apple_mbox_priv *apple_mbox_to_priv(struct apple_mbox *mbox)
-{
-	return container_of(mbox, struct apple_mbox_priv, mbox);
-}
-
-static bool apple_mbox_has_rx_poller(const struct apple_mbox *mbox)
-{
-	return mbox->hw->is_ascwrap_v8 || mbox->hw->rx_poll_required;
-}
-
-/* Both ASCWrap generations share the consumer lifecycle API below. */
-static bool apple_mbox_has_cpu_lifecycle(const struct apple_mbox *mbox)
-{
-	return mbox->hw->is_ascwrap_v6 || mbox->hw->is_ascwrap_v8;
-}
-
-/*
- * Read-only proof that a v8 ASC block is powered before any wrapper MMIO.
- * The exact T8152 GFX/GFX1 providers use state 2, matching native 26A428.
- * J873 hardware confirms reading STATE clears the transition ACK: snapshot
- * ACK first, but do not require it to remain set for steady-state access.
- * Cold state 6 is rejected. Never writes the PSD request register.
- */
-static int apple_mbox_ascwrap_v8_psd_powered(struct apple_mbox *mbox,
-					     u32 *state, u32 *ack)
-{
-	void __iomem *psd = apple_mbox_to_priv(mbox)->psd_regs;
-
-	*state = 0;
-	*ack = 0;
-	if (!mbox->hw->is_ascwrap_v8 || !psd)
-		return -ENODEV;
-
-	*ack = readl(psd + APPLE_PSD_ACK);
-	*state = readl(psd + APPLE_PSD_STATE);
-	if (FIELD_GET(APPLE_PSD_STATE_MASK, *state) != APPLE_T8152_GPU_ASC_PSD_ACTIVE)
-		return -EHOSTDOWN;
-
-	return 0;
-}
-
 int apple_mbox_ascwrap_v6_get_lifecycle(
 	struct apple_mbox *mbox,
 	struct apple_mbox_ascwrap_v6_lifecycle *lifecycle)
@@ -179,7 +146,7 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 		return -EINVAL;
 	if (READ_ONCE(mbox->removing))
 		return -ENODEV;
-	if (!apple_mbox_has_cpu_lifecycle(mbox))
+	if (!mbox->hw->is_ascwrap_v6)
 		return -EOPNOTSUPP;
 
 	*lifecycle = mbox->ascwrap_v6;
@@ -189,7 +156,7 @@ EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_get_lifecycle);
 
 int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox)
 {
-	if (!mbox || !apple_mbox_has_cpu_lifecycle(mbox))
+	if (!mbox || !mbox->hw->is_ascwrap_v6)
 		return -EOPNOTSUPP;
 	if (READ_ONCE(mbox->removing))
 		return -ENODEV;
@@ -210,34 +177,14 @@ static void apple_mbox_ascwrap_v6_stop_cpu_locked(struct apple_mbox *mbox)
 	if (!mbox->ascwrap_v6_cpu_running)
 		return;
 
-	if (mbox->hw->is_ascwrap_v8) {
-		u32 state, ack;
+	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
+		      APPLE_ASCWRAP_V6_CPU_CONTROL;
 
-		/*
-		 * Reached only after an approved v8 start. m1n1 asc_cpu_stop():
-		 * clear RUN at +0x44. An unpowered block cannot be running, and
-		 * touching its wrapper would fault, so skip the write then.
-		 */
-		cpu_control = (u8 __iomem *)mbox->wrapper_regs +
-			      APPLE_ASCWRAP_V8_CPU_CONTROL;
-		if (apple_mbox_ascwrap_v8_psd_powered(mbox, &state, &ack)) {
-			dev_warn(mbox->dev,
-				 "ASCWrap v8 PSD state=%#x ack=%#x is not powered; CPU stop write skipped\n",
-				 state, ack);
-		} else {
-			val = readl(cpu_control);
-			writel(val & ~APPLE_ASCWRAP_V8_CPU_RUN, cpu_control);
-		}
-	} else {
-		cpu_control = (u8 __iomem *)mbox->wrapper_regs +
-			      APPLE_ASCWRAP_V6_CPU_CONTROL;
-
-		/* AppleASCWrapV6::_runCPU(false): clear RUN, reread, clear bit 5. */
-		val = readl(cpu_control);
-		writel(val & ~APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
-		val = readl(cpu_control);
-		writel(val & ~APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR, cpu_control);
-	}
+	/* AppleASCWrapV6::_runCPU(false): clear RUN, reread, clear bit 5. */
+	val = readl(cpu_control);
+	writel(val & ~APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
+	val = readl(cpu_control);
+	writel(val & ~APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR, cpu_control);
 
 	mbox->ascwrap_v6_cpu_running = false;
 	pm_runtime_mark_last_busy(mbox->dev);
@@ -250,11 +197,8 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 	u32 val;
 	int ret = 0;
 
-	if (!mbox || !apple_mbox_has_cpu_lifecycle(mbox) || !mbox->wrapper_regs)
+	if (!mbox || !mbox->hw->is_ascwrap_v6 || !mbox->wrapper_regs)
 		return -EOPNOTSUPP;
-	/* REQUIRES USER APPROVAL: see the ascwrap_v8_cpu_control parameter. */
-	if (mbox->hw->is_ascwrap_v8 && !ascwrap_v8_cpu_control)
-		return -EPERM;
 
 	mutex_lock(&mbox->lifecycle_lock);
 	if (mbox->removing) {
@@ -269,36 +213,17 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 		ret = -EBUSY;
 		goto out_unlock;
 	}
-	if (mbox->hw->is_ascwrap_v8) {
-		u32 state, ack;
-
-		ret = apple_mbox_ascwrap_v8_psd_powered(mbox, &state, &ack);
-		if (ret) {
-			dev_err(mbox->dev,
-				"ASCWrap v8 PSD state=%#x ack=%#x is not powered; CPU start refused\n",
-				state, ack);
-			goto out_unlock;
-		}
-	}
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret)
 		goto out_unlock;
 
-	if (mbox->hw->is_ascwrap_v8) {
-		/* m1n1 asc_cpu_start(): set RUN at reg[0] + 0x44. */
-		cpu_control = (u8 __iomem *)mbox->wrapper_regs +
-			      APPLE_ASCWRAP_V8_CPU_CONTROL;
-		val = readl(cpu_control);
-		writel(val | APPLE_ASCWRAP_V8_CPU_RUN, cpu_control);
-	} else {
-		cpu_control = (u8 __iomem *)mbox->wrapper_regs +
-			      APPLE_ASCWRAP_V6_CPU_CONTROL;
+	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
+		      APPLE_ASCWRAP_V6_CPU_CONTROL;
 
-		/* AppleASCWrapV6::_runCPU(true): read, set RUN, write. */
-		val = readl(cpu_control);
-		writel(val | APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
-	}
+	/* AppleASCWrapV6::_runCPU(true): read, set RUN, write. */
+	val = readl(cpu_control);
+	writel(val | APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
 	mbox->ascwrap_v6_cpu_running = true;
 
 out_unlock:
@@ -311,11 +236,8 @@ int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox)
 {
 	int ret = 0;
 
-	if (!mbox || !apple_mbox_has_cpu_lifecycle(mbox) || !mbox->wrapper_regs)
+	if (!mbox || !mbox->hw->is_ascwrap_v6 || !mbox->wrapper_regs)
 		return -EOPNOTSUPP;
-	/* REQUIRES USER APPROVAL: see the ascwrap_v8_cpu_control parameter. */
-	if (mbox->hw->is_ascwrap_v8 && !ascwrap_v8_cpu_control)
-		return -EPERM;
 
 	mutex_lock(&mbox->lifecycle_lock);
 	if (mbox->removing) {
@@ -323,7 +245,6 @@ int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox)
 		goto out_unlock;
 	}
 
-	/* A no-op unless this provider started the CPU itself. */
 	apple_mbox_ascwrap_v6_stop_cpu_locked(mbox);
 
 out_unlock:
@@ -331,115 +252,6 @@ out_unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_stop_cpu);
-
-int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
-				     u32 *control, u32 *status)
-{
-	int ret = 0;
-
-	if (!mbox || !control || !status || !apple_mbox_has_cpu_lifecycle(mbox) ||
-	    !mbox->wrapper_regs)
-		return -EOPNOTSUPP;
-
-	mutex_lock(&mbox->lifecycle_lock);
-	if (mbox->removing) {
-		ret = -ENODEV;
-	} else if (mbox->hw->is_ascwrap_v8) {
-		u32 state, ack;
-
-		/* PSD proof first; an unpowered wrapper read would SError. */
-		*control = 0;
-		*status = 0;
-		ret = apple_mbox_ascwrap_v8_psd_powered(mbox, &state, &ack);
-		if (ret) {
-			dev_info_ratelimited(mbox->dev,
-					     "ASCWrap v8 PSD state=%#x ack=%#x is not powered; CPU_CONTROL/STATUS reads skipped\n",
-					     state, ack);
-		} else {
-			*control = readl((u8 __iomem *)mbox->wrapper_regs +
-					 APPLE_ASCWRAP_V8_CPU_CONTROL);
-			*status = readl((u8 __iomem *)mbox->wrapper_regs +
-					APPLE_ASCWRAP_V8_CPU_STATUS);
-			dev_dbg(mbox->dev,
-				 "ASCWrap v8 PSD state=%#x ack=%#x CPU_CONTROL=%#x CPU_STATUS=%#x\n",
-				 state, ack, *control, *status);
-		}
-	} else {
-		*control = readl((u8 __iomem *)mbox->wrapper_regs +
-				APPLE_ASCWRAP_V6_CPU_CONTROL);
-		*status = readl((u8 __iomem *)mbox->wrapper_regs +
-			       APPLE_ASCWRAP_V6_CPU_STATUS);
-	}
-	mutex_unlock(&mbox->lifecycle_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_get_cpu_state);
-
-static bool apple_mbox_tx_full(struct apple_mbox *mbox, u32 status)
-{
-	if (mbox->hw->counted_fifo)
-		return !(status & mbox->hw->control_full);
-	return status & mbox->hw->control_full;
-}
-
-static bool apple_mbox_rx_empty(struct apple_mbox *mbox, u32 status)
-{
-	if (mbox->hw->counted_fifo)
-		return !(status & mbox->hw->control_empty);
-	return status & mbox->hw->control_empty;
-}
-
-/* ASCWrap v8 transfers each message with one paired access. Its status word
- * contains RX occupancy and free TX slots, rather than full/empty flags.
- * Keep the two words together, as on the qualified native T8152 path.
- */
-static void apple_mbox_write_msg(struct apple_mbox *mbox,
-			       struct apple_mbox_msg msg)
-{
-	u64 high = FIELD_PREP(APPLE_MBOX_MSG1_MSG, msg.msg1);
-
-#ifdef CONFIG_ARM64
-	if (mbox->hw->counted_fifo) {
-		u64 low = (__force u64)cpu_to_le64(msg.msg0);
-
-		high = (__force u64)cpu_to_le64(high);
-		wmb();
-		asm volatile("stp %0, %1, [%2]"
-			     : : "r" (low), "r" (high),
-				 "r" (mbox->regs + mbox->hw->a2i_send0)
-			     : "memory");
-	} else
-#endif
-	{
-		writeq_relaxed(msg.msg0, mbox->regs + mbox->hw->a2i_send0);
-		writeq_relaxed(high, mbox->regs + mbox->hw->a2i_send1);
-	}
-}
-
-static struct apple_mbox_msg apple_mbox_read_msg(struct apple_mbox *mbox)
-{
-	struct apple_mbox_msg msg;
-	u64 low, high;
-
-#ifdef CONFIG_ARM64
-	if (mbox->hw->counted_fifo) {
-		asm volatile("ldp %0, %1, [%2]"
-			     : "=&r" (low), "=&r" (high)
-			     : "r" (mbox->regs + mbox->hw->i2a_recv0)
-			     : "memory");
-		rmb();
-		low = le64_to_cpu((__force __le64)low);
-		high = le64_to_cpu((__force __le64)high);
-	} else
-#endif
-	{
-		low = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
-		high = readq_relaxed(mbox->regs + mbox->hw->i2a_recv1);
-	}
-	msg.msg0 = low;
-	msg.msg1 = FIELD_GET(APPLE_MBOX_MSG1_MSG, high);
-	return msg;
-}
 
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)
@@ -572,10 +384,7 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 	int ret = 0;
 	u32 mbox_ctrl;
 
-	/*
-	 * A detached receiver (RTKit teardown in progress) leaves firmware
-	 * traffic in the FIFO; it is drained again once a receiver is attached.
-	 */
+	/* A stopped receiver may still have firmware traffic in its FIFO. */
 	if (!mbox->rx)
 		return 0;
 	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
@@ -651,9 +460,7 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 
 	spin_lock(&mbox->rx_lock);
 	if (likely(!READ_ONCE(mbox->removing)))
-		drained = apple_mbox_poll_locked(mbox);
-	if (mbox->hw->is_ascwrap_v8)
-		apple_mbox_v8_rx_irq_guard(mbox, drained);
+		apple_mbox_poll_locked(mbox);
 	spin_unlock(&mbox->rx_lock);
 
 	return IRQ_HANDLED;
@@ -733,7 +540,7 @@ static void apple_mbox_v8_rx_stop(struct apple_mbox *mbox)
 int apple_mbox_start(struct apple_mbox *mbox)
 {
 	u32 control;
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&mbox->lifecycle_lock);
 	if (mbox->removing) {
@@ -746,16 +553,6 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret)
 		goto out_unlock;
-
-	if (mbox->hw->ap_initializes_mailboxes) {
-		/* AppleA7IOP::startCPUWithOptions() enables the IOP outbox. */
-		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
-		writel_relaxed(control | BIT(0),
-			       mbox->regs + mbox->hw->i2a_control);
-		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
-		dev_info(mbox->dev,
-			 "T8140 IOP outbox enabled control=%#x\n", control);
-	}
 
 	if (mbox->hw->ap_initializes_mailboxes) {
 		/* The primary T8140 outbox requires its enable bit before use. */
@@ -848,26 +645,25 @@ static void apple_mbox_quiesce(void *data)
 	 * inversion. The removal fence prevents any matching restart.
 	 */
 	was_active = mbox->active;
-	WRITE_ONCE(mbox->active, false);
+	mbox->active = false;
 	mutex_unlock(&mbox->lifecycle_lock);
 	if (was_active) {
-		if (apple_mbox_has_rx_poller(mbox))
-			apple_mbox_v8_rx_stop(mbox);
-		else
-			disable_irq(mbox->irq_recv_not_empty);
+		disable_irq(mbox->irq_recv_not_empty);
 		pm_runtime_mark_last_busy(mbox->dev);
 		pm_runtime_put_autosuspend(mbox->dev);
 	}
-	/* The v8 poller also stops on the removal fence; make sure it is gone. */
-	if (apple_mbox_has_rx_poller(mbox))
-		cancel_delayed_work_sync(&apple_mbox_to_priv(mbox)->rx_poll_work);
 
-	/* The TX IRQ is normally disabled; force and synchronize that state. */
-	disable_irq(mbox->irq_send_empty);
-	mbox->tx_irq_unmasked = false;
+	/* Serialize once-only masking with the IRQ and send-error paths. */
+	spin_lock_irqsave(&mbox->tx_lock, flags);
+	if (mbox->tx_irq_unmasked) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = false;
+	}
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	/* The handler takes tx_lock, so drain it after releasing the lock. */
+	synchronize_irq(mbox->irq_send_empty);
 	complete_all(&mbox->tx_empty);
-	if (!mbox->hw->rx_poll_required)
-		synchronize_irq(mbox->irq_recv_not_empty);
+	synchronize_irq(mbox->irq_recv_not_empty);
 
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	had_rx = mbox->rx;
@@ -1050,10 +846,9 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	int ret;
 	char *irqname;
 	const char *firmware_role;
-	struct apple_mbox_priv *priv;
 	struct apple_mbox *mbox;
 	struct device *dev = &pdev->dev;
-	struct resource *res;
+	struct resource *res, *iop_vbar_res;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -1067,13 +862,75 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	if (mbox->hw->counted_fifo && !IS_ENABLED(CONFIG_ARM64))
 		return -EOPNOTSUPP;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res || resource_size(res) < mbox->hw->i2a_recv1 + sizeof(u64))
-		return dev_err_probe(dev, -EINVAL, "mailbox register window is too small\n");
+	if (mbox->hw->is_ascwrap_v6) {
+		/*
+		 * Validate the entire provider identity before mapping either
+		 * resource.  These are fixed T8140 CPU-physical windows and role
+		 * assignments, not generic consumer-provided aliases.
+		 */
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wrapper");
+		iop_vbar_res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							    "iop-vbar");
+		if (!res || !iop_vbar_res ||
+		    resource_size(res) != APPLE_ASCWRAP_V6_WRAPPER_SIZE ||
+		    resource_size(iop_vbar_res) != APPLE_ASCWRAP_V6_IOP_VBAR_SIZE)
+			return dev_err_probe(dev, -EINVAL,
+					     "invalid ASCWrap v6 provider resources\n");
 
-	mbox->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(mbox->regs))
-		return PTR_ERR(mbox->regs);
+		ret = of_property_read_string(dev->of_node, "apple,firmware-role",
+					      &firmware_role);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "missing ASCWrap v6 firmware role\n");
+
+		if (!strcmp(firmware_role, "GFX")) {
+			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
+			if (res->start != APPLE_T8140_GFX_WRAPPER_BASE ||
+			    iop_vbar_res->start != APPLE_T8140_GFX_IOP_VBAR_BASE)
+				return dev_err_probe(dev, -EINVAL,
+						     "GFX ASCWrap v6 resources do not match T8140\n");
+		} else if (!strcmp(firmware_role, "GFX1")) {
+			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1;
+			if (res->start != APPLE_T8140_GFX1_WRAPPER_BASE ||
+			    iop_vbar_res->start != APPLE_T8140_GFX1_IOP_VBAR_BASE)
+				return dev_err_probe(dev, -EINVAL,
+						     "GFX1 ASCWrap v6 resources do not match T8140\n");
+		} else {
+			return dev_err_probe(dev, -EINVAL,
+					     "invalid ASCWrap v6 firmware role\n");
+		}
+
+		mbox->ascwrap_v6.wrapper_start = res->start;
+		mbox->ascwrap_v6.wrapper_size = resource_size(res);
+		mbox->ascwrap_v6.iop_vbar_start = iop_vbar_res->start;
+		mbox->ascwrap_v6.iop_vbar_size = resource_size(iop_vbar_res);
+		/* resetState() is software-only; the matching stop lives above. */
+		mbox->ascwrap_v6.missing = 0;
+
+		mbox->wrapper_regs =
+			devm_platform_ioremap_resource_byname(pdev, "wrapper");
+		if (IS_ERR(mbox->wrapper_regs))
+			return PTR_ERR(mbox->wrapper_regs);
+
+		mbox->iop_vbar_regs =
+			devm_platform_ioremap_resource_byname(pdev, "iop-vbar");
+		if (IS_ERR(mbox->iop_vbar_regs))
+			return PTR_ERR(mbox->iop_vbar_regs);
+
+		mbox->regs = (u8 __iomem *)mbox->wrapper_regs +
+			     mbox->hw->reg_offset;
+	} else {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!res || resource_size(res) < mbox->hw->reg_offset +
+						mbox->hw->i2a_recv1 + sizeof(u64))
+			return dev_err_probe(dev, -EINVAL,
+					     "mailbox register window is too small\n");
+
+		mbox->regs = devm_platform_ioremap_resource(pdev, 0);
+		if (IS_ERR(mbox->regs))
+			return PTR_ERR(mbox->regs);
+		mbox->regs = (u8 __iomem *)mbox->regs + mbox->hw->reg_offset;
+	}
 
 	mbox->irq_recv_not_empty =
 		platform_get_irq_byname(pdev, "recv-not-empty");
@@ -1083,6 +940,11 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	mbox->irq_send_empty = platform_get_irq_byname(pdev, "send-empty");
 	if (mbox->irq_send_empty < 0)
 		return -ENODEV;
+
+	spin_lock_init(&mbox->rx_lock);
+	spin_lock_init(&mbox->tx_lock);
+	mutex_init(&mbox->lifecycle_lock);
+	init_completion(&mbox->tx_empty);
 
 	irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-recv", dev_name(dev));
 	if (!irqname)
@@ -1172,6 +1034,24 @@ static const struct apple_mbox_hw apple_mbox_t8140_asc_hw = {
 	.has_irq_controls = false,
 };
 
+static const struct apple_mbox_hw apple_mbox_ascwrap_v6_hw = {
+	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
+	.is_ascwrap_v6 = true,
+
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
+	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
+
+	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
+	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
 static const struct apple_mbox_hw apple_mbox_t8140_aop_setup_hw = {
 	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
@@ -1207,6 +1087,7 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 };
 
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
 	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },

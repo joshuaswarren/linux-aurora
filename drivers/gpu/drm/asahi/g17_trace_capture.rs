@@ -71,8 +71,6 @@ pub(crate) enum Kind {
     ClSupportState = 51,
     ClSchedulerState = 52,
     ClOperandTable = 53,
-    /// Opt-in boot-time upper-root bytes; identity must be verified offline.
-    FirmwareCodeWindow = 54,
     // Coverage declarations, intentionally omitted in first-stage capture.
     ClientObjects = 0x100,
     TvbPayload = 0x101,

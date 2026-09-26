@@ -1720,11 +1720,12 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_12_3;
 }
 
-unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
+const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->iomfb_surfaces;
+	*count = dcp->iomfb_surfaces.count;
+	return dcp->iomfb_surfaces.id;
 }
 
 int dcp_start(struct platform_device *pdev)
@@ -2421,15 +2422,156 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
+#define APPLE_PMGR_PS_ACTUAL	GENMASK(7, 4)
+#define APPLE_PMGR_PS_TARGET	GENMASK(3, 0)
+#define APPLE_PMGR_PS_ACTIVE	0xf
+
+/*
+ * Power up the "pmc" domain for the DCP.
+ *
+ * As soon as the AP acks the fifth D563 (pmgrConfigDispPerfState), the DCP's
+ * RTKPMGR_pmc_boost_disp_perf_state path reads the PMC idle register at
+ * physical 0x3028aa140.  That aperture belongs to the T8140 "pmc" power
+ * domain, which the ADT marks initially-on but which Linux leaves off because
+ * no device claims it.  The read then takes an L2C access fault and the
+ * coprocessor dies with a data abort -- silently, with no further mailbox
+ * traffic, immediately after the boot property storm, which looks exactly like
+ * a hang.  Turn the domain on before booting the firmware.
+ */
+static void dcp_enable_pmc_domain(struct apple_dcp *dcp)
+{
+	struct device_node *np;
+	const char *label;
+	u32 offset, val = 0;
+	int i;
+
+	for_each_compatible_node(np, NULL, "apple,t8103-pmgr-pwrstate") {
+		struct regmap *regmap;
+
+		if (of_property_read_string(np, "label", &label) ||
+		    strcmp(label, "pmc"))
+			continue;
+
+		if (of_property_read_u32_index(np, "reg", 0, &offset)) {
+			dev_warn(dcp->dev, "pmc: no reg offset\n");
+			break;
+		}
+
+		regmap = syscon_node_to_regmap(np->parent);
+		if (IS_ERR(regmap)) {
+			dev_warn(dcp->dev, "pmc: no parent regmap: %ld\n",
+				 PTR_ERR(regmap));
+			break;
+		}
+
+		if (regmap_update_bits(regmap, offset, APPLE_PMGR_PS_TARGET,
+				       FIELD_PREP(APPLE_PMGR_PS_TARGET,
+						  APPLE_PMGR_PS_ACTIVE))) {
+			dev_warn(dcp->dev, "pmc: failed to request active\n");
+			break;
+		}
+
+		for (i = 0; i < 200; i++) {
+			if (regmap_read(regmap, offset, &val))
+				break;
+			if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) ==
+			    APPLE_PMGR_PS_ACTIVE) {
+				dev_info(dcp->dev, "pmc domain on (%#x)\n", val);
+				of_node_put(np);
+				return;
+			}
+			udelay(10);
+		}
+		dev_warn(dcp->dev, "pmc domain did not activate (%#x)\n", val);
+		of_node_put(np);
+		return;
+	}
+
+	dev_warn(dcp->dev, "pmc power domain not found\n");
+}
+
+/*
+ * Reset the display coprocessor's ASC core.
+ *
+ * Once Linux has driven a DCP session the firmware stops answering the
+ * management endpoint: it will not re-HELLO on INIT (it is already ON) and it
+ * will not acknowledge a power-state change either, so neither apple_rtkit_wake
+ * nor apple_rtkit_quiesce can recover it and the module could previously only
+ * be reloaded by rebooting the machine.
+ *
+ * CPU_CONTROL.RUN is a raw register in the ASC wrapper and needs no cooperation
+ * from the firmware, so clearing it stops the core no matter how wedged it is.
+ * The firmware image itself is left alone -- iBoot mapped it into the DCP's own
+ * DART and nothing here touches those mappings -- so setting RUN again restarts
+ * it from its reset vector and it comes back with a fresh HELLO.
+ */
+static int dcp_asc_restart(struct apple_dcp *dcp)
+{
+	u32 ctrl, status;
+	int i;
+
+	ctrl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	writel_relaxed(ctrl & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+
+	/*
+	 * T8140 clears CPU_STATUS.RUNNING when the core halts but never sets
+	 * the STOPPED bit (status goes 0x6d -> 0x48), so gate on RUNNING going
+	 * away rather than on STOPPED appearing.
+	 */
+	for (i = 0; i < 500; i++) {
+		status = readl_relaxed(dcp->coproc_reg +
+				       APPLE_DCP_COPROC_CPU_STATUS);
+		if (!(status & APPLE_DCP_COPROC_CPU_STATUS_RUNNING) ||
+		    (status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED))
+			break;
+		usleep_range(100, 200);
+	}
+	if (status & APPLE_DCP_COPROC_CPU_STATUS_RUNNING) {
+		dev_err(dcp->dev, "DCP ASC did not stop (status %#x)\n", status);
+		return -ETIMEDOUT;
+	}
+
+	dev_info(dcp->dev, "DCP ASC stopped (status %#x), restarting it\n",
+		 status);
+	usleep_range(1000, 2000);
+	writel_relaxed(ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	return 0;
+}
+
+
+
+
+
+static int dcp_restart_inherited_session(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return apple_rtkit_quiesce(dcp->rtk);
+
+	/*
+	 * J700's inherited DCP rejects AP QUIESCED. The dcp-neo m1n1
+	 * bring-up established IOP OFF and its exact state-zero ACK instead
+	 * (4a927cdcae729f1b12b2173117e7f96b3271dca9). OFF is not a normal
+	 * sleep state: stop and restart the ASC before negotiating a new
+	 * RTKit session. Never reset a session whose OFF request timed out.
+	 */
+	ret = apple_rtkit_poweroff_adopted(dcp->rtk);
+	if (ret)
+		return dev_err_probe(dcp->dev, ret,
+				     "Inherited DCP IOP OFF not acknowledged\n");
+
+	dev_info(dcp->dev, "inherited DCP acknowledged IOP OFF\n");
+	return dcp_asc_restart(dcp);
+}
+
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	enum apple_dcp_coprocessor_start start_mode;
-	enum apple_dcp_loader_handoff loader_handoff;
-	struct iommu_domain *coproc_iommu_dom;
-	phys_addr_t iop_vbar_phys;
-	u64 iop_vbar;
 	u32 cpu_ctrl, cpu_status;
 	u32 handoff_state;
 	bool loader_quiesced;
@@ -2496,6 +2638,25 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		loader_quiesced, dcp->hw.adopt_running_coprocessor,
 		cpu_ctrl, cpu_status);
 
+	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+				 APPLE_DCP_COPROC_CPU_CONTROL);
+	cpu_status = readl_relaxed(dcp->coproc_reg +
+				   APPLE_DCP_COPROC_CPU_STATUS);
+	loader_quiesced = of_chosen &&
+		!of_property_read_u32(of_chosen,
+				      APPLE_DCP_RTKIT_HANDOFF_PROPERTY,
+				      &handoff_state) &&
+		handoff_state == 1;
+	start_mode = apple_dcp_coprocessor_start_mode(
+		loader_quiesced, dcp->hw.adopt_running_coprocessor,
+		cpu_ctrl, cpu_status);
+
+	of_property_read_u32(dev->of_node, "apple,dcp-index",
+					   &dcp->index);
+	of_property_read_u32(dev->of_node, "apple,dptx-phy",
+					   &dcp->dptx_phy);
+	of_property_read_u32(dev->of_node, "apple,dptx-die",
+					   &dcp->dptx_die);
 	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
@@ -2567,26 +2728,20 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	}
 
 	dcp->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(dcp->clk)) {
-		ret = dev_err_probe(dev, PTR_ERR(dcp->clk),
-				    "Unable to find clock\n");
-		goto err_destroy_piodma;
-	}
+	if (IS_ERR(dcp->clk))
+		return dev_err_probe(dev, PTR_ERR(dcp->clk),
+				     "Unable to find clock\n");
 	dcp->clk_194 = devm_clk_get_optional(dev, "clock-194");
-	if (IS_ERR(dcp->clk_194)) {
-		ret = dev_err_probe(dev, PTR_ERR(dcp->clk_194),
-				    "Unable to find clock 0x194\n");
-		goto err_destroy_piodma;
-	}
+	if (IS_ERR(dcp->clk_194))
+		return dev_err_probe(dev, PTR_ERR(dcp->clk_194),
+				     "Unable to find clock 0x194\n");
 
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
 	set_bit(0, dcp->memdesc_map);
 
-	INIT_DELAYED_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->stall_wq, dcp_stall_check);
-	INIT_LIST_HEAD(&dcp->pending_flushes);
-	mutex_init(&dcp->pending_flush_lock);
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
@@ -2597,31 +2752,23 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	if (start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART) {
 		dev_info(dev,
-			 "adopting live inherited DCP session (control=%#x status=%#x)\n",
+			 "quiescing inherited DCP session (control=%#x status=%#x)\n",
 			 cpu_ctrl, cpu_status);
 		dcp->adopting_session = true;
 		dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp, "mbox", 0,
 							  &rtkit_ops);
 		if (IS_ERR(dcp->rtk)) {
 			dcp->adopting_session = false;
-			ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
-					    "Failed to adopt RTKit\n");
-			dcp->rtk = NULL;
-			goto err_destroy_piodma;
+			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
+					     "Failed to adopt RTKit\n");
 		}
 
 		ret = dcp_restart_inherited_session(dcp);
 		dcp->adopting_session = false;
-		dcp->adopted_session = true;
-		ret = dcp_rtk_import_adopted_crashlog(dcp);
-		if (ret) {
-			dev_err(dev,
-				"failed to import inherited DCP crashlog state: %d\n",
-				ret);
-			devm_apple_rtkit_free(dev, dcp->rtk);
-			dcp->rtk = NULL;
-			goto err_destroy_piodma;
-		}
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "Failed to quiesce inherited RTKit: %d\n",
+					     ret);
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
@@ -2805,8 +2952,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
-	int ret, surf, num_surfs;
-	u32 surf_en;
+	int num_surfaces;
+	u32 surface_ids[DCP_MAX_PLANES];
 	u32 mux_index;
 	int ret;
 
@@ -2840,6 +2987,28 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->typec_fabric_retrain_wq,
 			  dcp_typec_retrain_work);
 
+	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces")) {
+		ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces, NULL, 0);
+	} else {
+		num_surfaces = of_property_count_u32_elems(dev->of_node,
+							  "apple,iomfb-surfaces");
+		if (num_surfaces <= 0 || num_surfaces > DCP_MAX_PLANES)
+			return dev_err_probe(dev,
+				num_surfaces < 0 ? num_surfaces : -EINVAL,
+				"invalid apple,iomfb-surfaces length %d\n",
+				num_surfaces);
+		ret = of_property_read_u32_array(dev->of_node,
+						 "apple,iomfb-surfaces",
+						 surface_ids, num_surfaces);
+		if (!ret)
+			ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces,
+							   surface_ids,
+							   num_surfaces);
+	}
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "invalid apple,iomfb-surfaces order\n");
+
 	platform_set_drvdata(pdev, dcp);
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
@@ -2849,31 +3018,6 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	}
 	dcp->fixed_phy = dcp->phy;
 
-	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
-	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
-		num_surfs = 0;
-	else
-		num_surfs = of_property_count_elems_of_size(dev->of_node,
-						    "apple,iomfb-surfaces",
-						    sizeof(u32));
-
-	if (num_surfs == 0 || num_surfs == -ENODATA) {
-		set_bit(0, dcp->iomfb_surfaces);
-		set_bit(1, dcp->iomfb_surfaces);
-	} else if (num_surfs < 0) {
-		return num_surfs;
-	} else if (num_surfs > DCP_MAX_PLANES) {
-		dev_err(dev, "Number of iomfb-surfaces (%d) exceeds DCP_MAX_PLANES\n",
-			num_surfs);
-		return -EINVAL;
-	}
-
-	surf = 0;
-	of_property_for_each_u32(dev->of_node, "apple,iomfb-surfaces", surf_en) {
-		if (surf_en)
-			set_bit(surf, dcp->iomfb_surfaces);
-		surf++;
-	}
 
 	if (dcp->phy) {
 		int ret;
@@ -2919,7 +3063,41 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 
 		/*
-		 * A DCP may have both a fixed HDMI/DP route and allocatable Type-C
+		 * Acquire the display crossbar even when there is no
+		 * "mux-index".  On J700 the crossbar that routes dispext0 to
+		 * the ATC0 DP lanes must be selected when a DP-Alt sink
+		 * arrives, not at probe: selecting it here would force the ATC
+		 * PHY to DP-only while the rear connector still carries the
+		 * debug cable.  dcp_typec_mux_set() does the select instead.
+		 */
+		if (of_property_present(dev->of_node, "mux-controls") &&
+		    !of_property_present(dev->of_node, "mux-index")) {
+			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
+			if (IS_ERR(dcp->xbar)) {
+				dev_err(dev, "Failed to get dp-xbar: %ld\n",
+					PTR_ERR(dcp->xbar));
+				return PTR_ERR(dcp->xbar);
+			}
+			/*
+			 * Also route it now, before the DCP runs its own
+			 * external-core detection.  With the crossbar left
+			 * "disconnected" at init the firmware latches that core
+			 * as noconnect and never looks again: routing it later,
+			 * on the DP-Alt event, produced no firmware reaction at
+			 * all.  This is a display-side mux, so selecting it does
+			 * not disturb USB or the debug cable on the connector.
+			 */
+			ret = mux_control_select(dcp->xbar, DCP_DPXBAR_SELECTOR);
+			if (ret) {
+				dev_warn(dev, "J700_DPXBAR: probe select failed: %d\n",
+					 ret);
+			} else {
+				dcp->xbar_selected = true;
+				dev_info(dev, "J700_DPXBAR: selected at probe\n");
+			}
+		}
+
+		/* A DCP may have both a fixed HDMI/DP route and allocatable Type-C
 		 * routes. Keep the fixed route selected until the allocator borrows
 		 * this otherwise-idle pipeline for a Type-C display.
 		 */
@@ -2965,6 +3143,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	}
 
 	ret = dcp_register_typec_routes(dcp);
+	if (ret)
+		return ret;
+	ret = dcp_register_typec_mux(dcp);
 	if (ret)
 		return ret;
 

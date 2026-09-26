@@ -47,6 +47,8 @@ struct apple_rtkit {
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;
 	bool crashed;
+	bool adopted;
+	bool awaiting_iop_idle;
 	bool shutting_down;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
@@ -75,6 +77,8 @@ struct apple_rtkit {
 	/* Session inherited from the bootloader: INIT geometry never observed. */
 	bool syslog_inherited;
 	bool crashlog_inherited;
+	bool firmware_owned_crashlog;
+	bool crashlog_endpoint_started;
 
 	struct workqueue_struct *wq;
 };

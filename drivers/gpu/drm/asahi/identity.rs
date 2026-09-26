@@ -15,8 +15,6 @@ pub(crate) enum GpuGen {
     G15 = 15,
     G16 = 16,
     G17 = 17,
-    /// M6 family (T8152 G18G). AGX·PI_400 host HAL.
-    G18 = 18,
 }
 
 /// GPU variant enumeration. Note: Part of the UABI.
@@ -42,8 +40,6 @@ pub(crate) enum GpuHalGeneration {
     Legacy = 0,
     Hal200 = 200,
     Hal300 = 300,
-    /// `AGX·PI_400` (26A428 AGXG18G, `__ZTV31AGX·PI_400·G·A0·Accelerator`).
-    Hal400 = 400,
 }
 
 /// Firmware-role topology presented by Apple's RTBuddy driver.
@@ -81,8 +77,6 @@ pub(crate) enum SubmissionBackendFamily {
     G17Hal200Hybrid,
     /// PI_300 target SKSM channels used by G17G and G17X.
     G17Hal300Sksm,
-    /// PI_400 target SKSM channels used by G18G.
-    G18Hal400Sksm,
 }
 
 /// Strength of the target-specific evidence behind one family selection.
@@ -1359,19 +1353,10 @@ pub(crate) fn decode_gpu_identity(family: u8, variant: u8, num_dies: u8) -> Opti
         (0xb, 2) => (G17, G, 3, Hal300),
         (0xb, 3) => (G17, S, 3, Hal300),
         (0xb, 4) => (G17, C, 3, Hal300),
-
-        // G18 (M6). 26A428 `AGX·PI_400·G·A0·Accelerator::readChipInfo`
-        // @ 0xfffffe0008c3d3a0 accepts only family 0xc (`lsr w8,w23,#24;
-        // cmp w8,#0xc` @ 0xfffffe0008c3d498) and decodes variants 0, 2 and 5
-        // (@ 0xfffffe0008c3d4a4..0x4b8). Variant 2 stores 12 at +0x78, which
-        // matches the J873 AGXAcceleratorG18G registry (num_cores=12,
-        // gpu_var=G, usc_gen=3). Variants 0 and 5 have no named target here
-        // and stay undecoded.
-        (0xc, 2) => (G18, G, 3, Hal400),
         _ => return None,
     };
 
-    let firmware_roles = if matches!(gpu_gen, G17 | G18) {
+    let firmware_roles = if gpu_gen == G17 {
         FirmwareRoleTopology::Dual
     } else {
         FirmwareRoleTopology::Single
@@ -1383,9 +1368,6 @@ pub(crate) fn decode_gpu_identity(family: u8, variant: u8, num_dies: u8) -> Opti
         (0xa, 0 | 3 | 4 | 5) => SubmissionTransport::ClassicAndSksm,
         // HAL300 removes the classic SKU channel stack.
         (0xb, 2 | 3 | 4) => SubmissionTransport::Sksm,
-        // PI_400 links only `AGX·PI_400·G·A0·{3D,CL,TA}ChannelSKSM`; the
-        // 26A428 AGXG18G symbol table has no SKU channel class.
-        (0xc, 2) => SubmissionTransport::Sksm,
         _ => SubmissionTransport::Classic,
     };
 
@@ -1516,19 +1498,6 @@ pub(crate) const fn submission_backend_selection(
             provenance: KextProven,
             implementation: NotImplemented,
         }),
-        GpuIdentity {
-            gpu_gen: G18,
-            gpu_variant: G,
-            usc_generation: 3,
-            gpu_hal_generation: Hal400,
-            firmware_roles: Dual,
-            submission_transport: Sksm,
-            uat_input_address_bits: 42,
-        } => Ok(SubmissionBackendSelection {
-            family: SubmissionBackendFamily::G18Hal400Sksm,
-            provenance: KextProven,
-            implementation: NotImplemented,
-        }),
         // G16P is represented by the identity decoder, but the recovered
         // factory-family contract does not independently admit it here.
         GpuIdentity {
@@ -1645,9 +1614,6 @@ pub(crate) const fn sksm_kick_queue_id_config(
 
     match (gpu_gen, gpu_variant) {
         (G16, S | C) | (G17, P | G | S | C) => Some(SKSM_KICK_QUEUE_ID_CONFIG),
-        // J873 native ioreg AGXAcceleratorG18G: kickid_qid_shift=40,
-        // kickid_qid_mask=127 (the same layout).
-        (G18, G) => Some(SKSM_KICK_QUEUE_ID_CONFIG),
         _ => None,
     }
 }
@@ -2900,6 +2866,96 @@ mod tests {
             assert_eq!(g17_hal300.submission_transport, SubmissionTransport::Sksm);
             assert_eq!(g17_hal300.uat_input_address_bits, 42);
         }
+    }
+
+    #[test]
+    fn submission_backend_family_is_selected_from_the_complete_identity() {
+        let classic = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::ClassicSku,
+            provenance: SubmissionBackendProvenance::KextProven,
+            implementation: SubmissionBackendImplementation::ExistingClassic,
+        };
+        for identity in [
+            id(0x4, 0, 1),
+            id(0x4, 4, 1),
+            id(0x5, 2, 1),
+            id(0x6, 4, 2),
+            id(0x7, 0, 1),
+            id(0x7, 2, 1),
+            id(0x7, 4, 2),
+            id(0xa, 2, 1),
+        ] {
+            assert_eq!(submission_backend_selection(identity), Ok(classic));
+            assert_eq!(require_executable_submission_backend(identity), Ok(classic));
+        }
+
+        let g16_sksm = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G16Hal200Sksm,
+            provenance: SubmissionBackendProvenance::KextProven,
+            implementation: SubmissionBackendImplementation::NotImplemented,
+        };
+        for identity in [id(0xa, 3, 1), id(0xa, 4, 1)] {
+            assert_eq!(submission_backend_selection(identity), Ok(g16_sksm));
+            assert_eq!(
+                require_executable_submission_backend(identity),
+                Err(SubmissionBackendSelectionError::BackendNotImplemented)
+            );
+        }
+
+        let g17p = id(0xa, 0, 1);
+        assert_eq!(
+            submission_backend_selection(g17p),
+            Ok(T8140_G17P_SUBMISSION_BACKEND)
+        );
+        assert_eq!(
+            require_executable_submission_backend(g17p),
+            Ok(T8140_G17P_SUBMISSION_BACKEND)
+        );
+
+        let g17a = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G17Hal200Hybrid,
+            provenance: SubmissionBackendProvenance::CrossGenerationDerived,
+            implementation: SubmissionBackendImplementation::Unconfirmed,
+        };
+        assert_eq!(submission_backend_selection(id(0xa, 5, 1)), Ok(g17a));
+        assert_eq!(
+            require_executable_submission_backend(id(0xa, 5, 1)),
+            Err(SubmissionBackendSelectionError::UnconfirmedTarget)
+        );
+
+        let hal300 = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G17Hal300Sksm,
+            provenance: SubmissionBackendProvenance::KextProven,
+            implementation: SubmissionBackendImplementation::NotImplemented,
+        };
+        for identity in [id(0xb, 2, 1), id(0xb, 3, 1), id(0xb, 4, 1)] {
+            assert_eq!(submission_backend_selection(identity), Ok(hal300));
+            assert_eq!(
+                require_executable_submission_backend(identity),
+                Err(SubmissionBackendSelectionError::BackendNotImplemented)
+            );
+        }
+    }
+
+    #[test]
+    fn submission_backend_selection_does_not_enable_unproven_or_forged_targets() {
+        assert_eq!(
+            submission_backend_selection(id(0x8, 0, 1)),
+            Err(SubmissionBackendSelectionError::UnconfirmedTarget)
+        );
+
+        let mut forged = id(0xa, 0, 1);
+        forged.gpu_hal_generation = GpuHalGeneration::Hal300;
+        assert_eq!(
+            submission_backend_selection(forged),
+            Err(SubmissionBackendSelectionError::InconsistentIdentity)
+        );
+        forged = id(0xb, 2, 1);
+        forged.submission_transport = SubmissionTransport::ClassicAndSksm;
+        assert_eq!(
+            submission_backend_selection(forged),
+            Err(SubmissionBackendSelectionError::InconsistentIdentity)
+        );
     }
 
     #[test]
@@ -4857,47 +4913,6 @@ mod tests {
         assert_eq!(g17s.firmware_roles, FirmwareRoleTopology::Dual);
         assert_eq!(g17s.submission_transport, SubmissionTransport::Sksm);
         assert_eq!(g17s.uat_input_address_bits, 42);
-    }
-
-    #[test]
-    fn m6_g18g_acceptance_matrix() {
-        let g18g = id(0xc, 2, 1);
-        assert_eq!(
-            (g18g.gpu_gen, g18g.gpu_variant),
-            (GpuGen::G18, GpuVariant::G)
-        );
-        assert_eq!(g18g.gpu_gen as u32, 18);
-        assert_eq!(g18g.usc_generation, 3);
-        assert_eq!(g18g.gpu_hal_generation, GpuHalGeneration::Hal400);
-        assert_eq!(g18g.gpu_hal_generation as u32, 400);
-        assert_eq!(g18g.firmware_roles, FirmwareRoleTopology::Dual);
-        assert_eq!(g18g.submission_transport, SubmissionTransport::Sksm);
-        assert_eq!(g18g.uat_input_address_bits, 42);
-        assert_eq!(
-            submission_backend_selection(g18g),
-            Ok(SubmissionBackendSelection {
-                family: SubmissionBackendFamily::G18Hal400Sksm,
-                provenance: SubmissionBackendProvenance::KextProven,
-                implementation: SubmissionBackendImplementation::NotImplemented,
-            })
-        );
-        assert_eq!(
-            require_executable_submission_backend(g18g),
-            Err(SubmissionBackendSelectionError::BackendNotImplemented)
-        );
-        assert_eq!(
-            sksm_kick_queue_id_config(GpuGen::G18, GpuVariant::G),
-            Some(SKSM_KICK_QUEUE_ID_CONFIG)
-        );
-        // Only the named M6 target decodes; the other PI_400 variants and
-        // every other variant byte stay unknown.
-        for variant in [0, 1, 3, 4, 5] {
-            assert!(decode_gpu_identity(0xc, variant, 1).is_none());
-        }
-        // No G18 target is admitted by any G17-only contract table.
-        assert!(submission_channel_selection_config(GpuGen::G18, GpuVariant::G).is_none());
-        assert!(firmware_kick_endpoint_config(GpuGen::G18, GpuVariant::G).is_none());
-        assert!(data_master_ring_config(GpuGen::G18, GpuVariant::G).is_none());
     }
 
     #[test]

@@ -32,7 +32,7 @@ use g17_submission::{
 
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
 pub(crate) const UAPI_RENDER_SIZE: usize = 256;
-pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;
+pub(crate) const UAPI_COMPUTE_SIZE: usize = 64;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
@@ -65,7 +65,6 @@ const RENDER_FLAGS: u32 = RENDER_VERTEX_SCRATCH
 const SAMPLER_SIZE: u64 = 8;
 const MAX_SAMPLERS: u32 = 1024;
 const PAGE_SIZE: u64 = 0x4000;
-const BG_RESOURCE_PREFIX: u64 = 0x0007_8000_0000_0000;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum UapiTranslateError {
@@ -83,7 +82,8 @@ pub(crate) enum UapiTranslateError {
     QueueUscRange,
     AddressRange,
     AddressAlignment,
-    Flags,
+    FlagsUnknownBits,
+    FlagsUnsupported,
     Dimensions,
     Layers,
     UtileDimensions,
@@ -109,6 +109,46 @@ impl From<RenderBuildError> for UapiTranslateError {
 impl From<g17_compute::ComputeBuildError> for UapiTranslateError {
     fn from(value: g17_compute::ComputeBuildError) -> Self {
         Self::ComputeBuild(value)
+    }
+}
+
+impl UapiTranslateError {
+    /// Stable short name for one rejection, so a failing submit reports which
+    /// check refused it instead of a bare EINVAL. Kept as `&'static str` (no
+    /// `Debug` formatting) to stay cheap on the ioctl path.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::HeaderTruncated => "header-truncated",
+            Self::PayloadTruncated => "payload-truncated",
+            Self::PayloadTail => "payload-tail",
+            Self::CommandType => "command-type",
+            Self::AttachmentPayloadSize => "attachment-payload-size",
+            Self::AttachmentCount => "attachment-count",
+            Self::AttachmentFields => "attachment-fields",
+            Self::AttachmentBarrier => "attachment-barrier",
+            Self::HardwareCommandCount => "hardware-command-count",
+            Self::BarrierFuture => "barrier-future",
+            Self::QueueUscAlignment => "queue-usc-alignment",
+            Self::QueueUscRange => "queue-usc-range",
+            Self::AddressRange => "address-range",
+            Self::AddressAlignment => "address-alignment",
+            Self::FlagsUnknownBits => "flags-unknown-bits",
+            Self::FlagsUnsupported => "flags-unsupported",
+            Self::Dimensions => "dimensions",
+            Self::Layers => "layers",
+            Self::UtileDimensions => "utile-dimensions",
+            Self::Samples => "samples",
+            Self::TilebufferSize => "tilebuffer-size",
+            Self::SamplerCount => "sampler-count",
+            Self::SamplerPair => "sampler-pair",
+            Self::HelperProgram => "helper-program",
+            Self::Add3ProofAttachments => "add3-proof-attachments",
+            Self::ProgramOffset => "program-offset",
+            Self::ZlsFields => "zls-fields",
+            Self::StencilClearBits => "stencil-clear-bits",
+            Self::RenderBuild(_) => "render-build",
+            Self::ComputeBuild(_) => "compute-build",
+        }
     }
 }
 
@@ -361,28 +401,11 @@ pub(crate) struct UapiComputeCommand {
     pub(crate) sampler_heap: u64,
     pub(crate) helper: UapiHelperProgram,
     pub(crate) timestamps: UapiTimestamps,
-    pub(crate) scs_layout: u64,
 }
 
 impl UapiComputeCommand {
     fn parse(raw: &[u8]) -> Result<Self, UapiTranslateError> {
-        // Legacy compute payloads are zero-extended as before. A flagged
-        // metadata payload must be complete; padding it could hide truncation
-        // of a valid zero-valued field or reserved word.
-        let has_resources = raw.len() >= 4 && get_u32(raw, 0) & COMPUTE_G18_RESOURCES != 0;
-        if has_resources && raw.len() < UAPI_G18_COMPUTE_SIZE {
-            return Err(UapiTranslateError::PayloadTruncated);
-        }
-        if !has_resources && raw.len() > UAPI_COMPUTE_SIZE
-            && raw[UAPI_COMPUTE_SIZE..].iter().any(|byte| *byte != 0)
-        {
-            return Err(UapiTranslateError::PayloadTail);
-        }
-        let raw = padded_payload::<UAPI_G18_COMPUTE_SIZE>(raw)?;
-        let mut g18_resources = [0; 16];
-        for (i, word) in g18_resources.iter_mut().enumerate() {
-            *word = get_u32(&raw, UAPI_COMPUTE_SIZE + i * 4);
-        }
+        let raw = padded_payload::<UAPI_COMPUTE_SIZE>(raw)?;
         Ok(Self {
             flags: get_u32(&raw, 0),
             sampler_count: get_u32(&raw, 4),
@@ -391,7 +414,6 @@ impl UapiComputeCommand {
             sampler_heap: get_u64(&raw, 0x18),
             helper: helper(&raw, 0x20),
             timestamps: timestamps(&raw, 0x30),
-            scs_layout: get_u64(&raw, 0x40),
         })
     }
 }
@@ -589,9 +611,12 @@ impl QueueUscWindow {
             .checked_add((tagged_offset & !7) as u64)
             .ok_or(UapiTranslateError::ProgramOffset)?;
         require_range(address_space, allocation, 4, GpuAccess::Read)?;
-        self.base
-            .checked_add(tagged_offset as u64)
-            .ok_or(UapiTranslateError::ProgramOffset)
+        // Honeykrisp carries resource metadata in the low three UAPI bits,
+        // but G17P's native 3D command strips those bits before programming
+        // every BG/EOT/partial USC address. Preserving bit 2 launched four
+        // bytes into the instruction stream and contradicted all complete
+        // Metal register-list captures.
+        Ok(allocation)
     }
 }
 
@@ -642,13 +667,6 @@ pub(crate) struct RenderInternalState {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedRenderCommand {
-    /// Exact logical render prefix assigned by the DRM ioctl dispatcher.
-    pub(crate) render_order: g17_submission::G17PRenderOrder,
-    /// Original UAPI render index, retained through admission.
-    pub(crate) render_barrier: u16,
-    /// UAPI CDM barrier. Cross-engine ordering is currently enforced by the
-    /// scheduler dependency, but retain the exact request with the packet.
-    pub(crate) compute_barrier: u16,
     pub(crate) flags: u32,
     pub(crate) vdm_base: u64,
     pub(crate) parameters: G17pRenderParameters,
@@ -716,22 +734,39 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     address_space: &A,
     internal: RenderInternalState,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
-    if command.flags & !RENDER_FLAGS != 0
-        || command.flags & (RENDER_VERTEX_SCRATCH | RENDER_NO_VERTEX_CLUSTERING) != 0
-    {
-        return Err(UapiTranslateError::Flags);
+    if command.flags & !RENDER_FLAGS != 0 {
+        return Err(UapiTranslateError::FlagsUnknownBits);
     }
-    let has_resource_spec_high = [
-        command.background.resource_spec,
-        command.end_of_tile.resource_spec,
-        command.partial_background.resource_spec,
-        command.partial_end_of_tile.resource_spec,
-    ]
-    .iter()
-    .any(|value| value >> 32 != 0);
-    if has_resource_spec_high && command.flags & RENDER_RSRC_SPEC_HI == 0 {
-        return Err(UapiTranslateError::Flags);
+    // Genuinely unimplemented on G17P rather than merely unvalidated:
+    // `G17pRenderParameters` carries no helper-program fields at all, so
+    // VERTEX_SCRATCH has nowhere to put the scratch binding, and there is no
+    // cluster-count control for NO_VERTEX_CLUSTERING. A clean EINVAL beats
+    // rendering with the request silently dropped.
+    if command.flags & (RENDER_VERTEX_SCRATCH | RENDER_NO_VERTEX_CLUSTERING) != 0 {
+        return Err(UapiTranslateError::FlagsUnsupported);
     }
+    // RSRC_SPEC_HI is *declarative*, and honouring it must not mean rejecting.
+    // The UAPI defines it as "the appended resource-specifier high dwords are
+    // present", and states its purpose: "This flag lets old kernels report an
+    // unsupported render payload instead of silently truncating 64-bit G17
+    // values." It exists for kernels that do NOT understand the dwords.
+    //
+    // This kernel does understand them -- `program()` ORs the high dword in
+    // unconditionally, with no reference to the flag -- so the flag cannot
+    // change what we do with a payload that sets it. The old check therefore
+    // refused payloads it would otherwise have handled identically, protecting
+    // nothing; it is the same bring-up leftover as the stencil-clear mask.
+    //
+    // Honour the documented meaning instead: when the flag is clear the high
+    // dwords are "not present", so mask them off rather than refuse the
+    // submission. A userspace built against the 240-byte upstream struct (whose
+    // payload `padded_payload` zero-fills) and one that clears the flag now
+    // behave identically, which is what "not present" has to mean.
+    let resource_spec_mask = if command.flags & RENDER_RSRC_SPEC_HI != 0 {
+        u64::MAX
+    } else {
+        u32::MAX as u64
+    };
     if !(1..=16_384).contains(&command.width) || !(1..=16_384).contains(&command.height) {
         return Err(UapiTranslateError::Dimensions);
     }
@@ -807,9 +842,19 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     {
         return Err(UapiTranslateError::HelperProgram);
     }
-    if command.stencil_clear & !0xff != 0 {
-        return Err(UapiTranslateError::StencilClearBits);
-    }
+    // `isp_bgobjvals` is the *whole* ISP_BGOBJVALS register value, not just
+    // the stencil clear: the UAPI documents "the bottom 8-bits contain the
+    // stencil buffer clear value", and every Mesa backend unconditionally
+    // seeds the upper bits with 0x300 before OR-ing the clear in
+    // (hk_cmd_draw.c `render->cr.isp_bgobjvals = 0x300;`,
+    // agx_pipe.c `c->isp_bgobjvals = 0x300;`, d12_queue.c `0x300 | stencil`).
+    // The legacy queue path passes the field straight through to the firmware
+    // (queue/render.rs `let load_bgobjvals = cmdbuf.isp_bgobjvals as u64`), so
+    // rejecting anything above 0xff refused every real render pass while the
+    // in-tree render selftest -- which leaves the field zero -- was accepted.
+    // Accept the register value; `build_*_descriptor` re-asserts the 0x300
+    // bits with `stencil_clear_value | 0x300`, which is idempotent for the
+    // value userspace sends and still supplies 0x300 when it sends zero.
 
     let background = queue.full_program(address_space, command.background.usc)?;
     let end_of_tile = queue.full_program(address_space, command.end_of_tile.usc)?;
@@ -851,16 +896,6 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.stencil_stride = command.stencil.stride as u64;
     parameters.stencil_aux_stride = command.stencil.compression_stride as u64;
     parameters.depth_flags = command.zls_control;
-    // The firmware's internal partial-render phases preserve attached Z/S
-    // surfaces even when the render-pass boundary is store-only. Mesa already
-    // computes this distinction for its partial BG/EOT programs, but the
-    // current 256-byte render UAPI carries only the boundary ZLS word. Derive
-    // the exact uncompressed enable bits here until the append-only partial
-    // ZLS UAPI field is plumbed; tiling/compression/format bits remain those
-    // packed into the original word.
-    parameters.partial_depth_flags = command.zls_control
-        | if command.depth.base != 0 { (1 << 15) | (1 << 19) } else { 0 }
-        | if command.stencil.base != 0 { (1 << 14) | (1 << 18) } else { 0 };
     parameters.occlusion_query_base = command.occlusion_query_base;
     parameters.scissor_array = command.scissor_base;
     parameters.depth_bias_array = command.depth_bias_base;
@@ -871,19 +906,29 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.merge_upper_y_bits = command.merge_upper_y;
     parameters.depth_clear_value_bits = command.depth_clear;
     parameters.stencil_clear_value = command.stencil_clear;
-    parameters.load_pipeline_bind = BG_RESOURCE_PREFIX | command.background.resource_spec;
+    parameters.load_pipeline_bind = g17p_bg_resource_spec(
+        command.background.resource_spec,
+        resource_spec_mask,
+        internal.parameters.bg_resource_prefix,
+    );
     parameters.load_pipeline = background;
-    parameters.store_pipeline_bind = command.end_of_tile.resource_spec;
+    parameters.store_pipeline_bind = command.end_of_tile.resource_spec & resource_spec_mask;
     parameters.store_pipeline = end_of_tile;
-    parameters.partial_load_pipeline_bind = command.partial_background.resource_spec;
+    // These high 17 bits are BG shader pass control, not an address class.
+    // Native derives main and partial masks from their respective shader
+    // outputs; they need not match. The default diagnostic prefix is zero,
+    // preserving both full RT0 output masks and no-output masks from userspace.
+    parameters.partial_load_pipeline_bind = g17p_bg_resource_spec(
+        command.partial_background.resource_spec,
+        resource_spec_mask,
+        internal.parameters.bg_resource_prefix,
+    );
     parameters.partial_load_pipeline = partial_background;
-    parameters.partial_store_pipeline_bind = command.partial_end_of_tile.resource_spec;
+    parameters.partial_store_pipeline_bind =
+        command.partial_end_of_tile.resource_spec & resource_spec_mask;
     parameters.partial_store_pipeline = partial_end_of_tile;
 
     Ok(TranslatedRenderCommand {
-        render_order: g17_submission::G17PRenderOrder::default(),
-        render_barrier: UAPI_BARRIER_NONE,
-        compute_barrier: UAPI_BARRIER_NONE,
         flags: command.flags,
         vdm_base: command.vdm_base,
         parameters,
@@ -892,6 +937,10 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
         vertex_timestamps: command.vertex_timestamps,
         fragment_timestamps: command.fragment_timestamps,
     })
+}
+
+fn g17p_bg_resource_spec(resource_spec: u64, present_mask: u64, diagnostic_prefix: u64) -> u64 {
+    diagnostic_prefix | (resource_spec & present_mask)
 }
 
 pub(crate) fn build_render_descriptors(
@@ -914,8 +963,6 @@ pub(crate) fn build_render_descriptors(
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedComputeCommand {
-    pub(crate) render_wait_through: Option<u64>,
-    pub(crate) render_wait_last: Option<u64>,
     pub(crate) usc_exec_base: u64,
     pub(crate) control_stream_base: u64,
     pub(crate) control_stream_end: u64,
@@ -925,7 +972,6 @@ pub(crate) struct TranslatedComputeCommand {
     pub(crate) attachments: UapiAttachmentList,
     pub(crate) g17p_add3_buffers: Option<[u64; 3]>,
     pub(crate) timestamps: UapiTimestamps,
-    pub(crate) scs_layout: u64,
 }
 
 pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
@@ -936,10 +982,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
 ) -> Result<TranslatedComputeCommand, UapiTranslateError> {
     queue.validate()?;
     if command.flags & !COMPUTE_G17P_ADD3_PROOF != 0 {
-        return Err(UapiTranslateError::Flags);
-    }
-    if command.g18_resources != [0; 16] {
-        return Err(UapiTranslateError::FlagsUnsupported);
+        return Err(UapiTranslateError::FlagsUnknownBits);
     }
     if command.control_stream_base & 3 != 0
         || command.control_stream_end & 3 != 0
@@ -996,8 +1039,6 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         None
     };
     Ok(TranslatedComputeCommand {
-        render_wait_through: None,
-        render_wait_last: None,
         usc_exec_base: queue.base,
         control_stream_base: command.control_stream_base,
         control_stream_end: command.control_stream_end,
@@ -1007,7 +1048,6 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         attachments,
         g17p_add3_buffers,
         timestamps: command.timestamps,
-        scs_layout: command.scs_layout,
     })
 }
 
@@ -1020,7 +1060,7 @@ pub(crate) struct ComputeInternalState {
     pub(crate) work_ordinal: u32,
     pub(crate) robustness: u64,
     pub(crate) operand_state_base: u64,
-    pub(crate) usc_flist_id: u32,
+    pub(crate) execution_gate: u64,
 }
 
 /// GPU addresses resolved from the UAPI timestamp handles while the object
@@ -1041,32 +1081,6 @@ pub(crate) const fn completed_compute_timestamps(start: u64, end: u64) -> Option
     }
 }
 
-/// Derive the descriptor/RCE checkpoint quartet from the exact command's
-/// register program without publishing either object.
-pub(crate) fn compute_resume_checkpoints(
-    command: &TranslatedComputeCommand,
-    internal: ComputeInternalState,
-) -> Result<[u16; 4], UapiTranslateError> {
-    let registers = g17_compute::build_compute_registers_for_layout(
-        g17_compute::ComputeRegisterParameters {
-            preempt_base: internal.preempt_base,
-            cdm_base: command.control_stream_base,
-            usc_exec_base: command.usc_exec_base,
-            helper_binary: 0,
-            helper_data: 0,
-            helper_config: 0,
-            dispatch_identity: internal.dispatch_identity,
-            context_id: internal.context_id,
-            work_ordinal: internal.work_ordinal,
-            robustness: internal.robustness,
-            operand_state_base: internal.operand_state_base,
-            usc_flist_id: internal.usc_flist_id,
-        },
-        command.scs_layout,
-    )?;
-    Ok(g17_compute::compute_resume_checkpoints(registers.as_slice())?)
-}
-
 /// Build the complete selector-3 descriptor for a translated command.
 ///
 /// This is the boundary that consumes the command's CDM range, sampler state,
@@ -1079,8 +1093,8 @@ pub(crate) fn build_compute_descriptor(
     metadata: g17_compute::ComputeDescriptorMetadata,
     timestamps: ComputeTimestampAddresses,
     raw: &mut [u8],
-) -> Result<[u16; 4], UapiTranslateError> {
-    let registers = g17_compute::build_compute_registers_for_layout(
+) -> Result<(), UapiTranslateError> {
+    let registers = g17_compute::build_compute_registers(
         g17_compute::ComputeRegisterParameters {
             preempt_base: internal.preempt_base,
             cdm_base: command.control_stream_base,
@@ -1093,11 +1107,10 @@ pub(crate) fn build_compute_descriptor(
             work_ordinal: internal.work_ordinal,
             robustness: internal.robustness,
             operand_state_base: internal.operand_state_base,
-            usc_flist_id: internal.usc_flist_id,
+            execution_gate: internal.execution_gate,
         },
-        command.scs_layout,
     )?;
-    let resume_checkpoints = g17_compute::build_compute_descriptor(
+    g17_compute::build_compute_descriptor(
         &registers,
         objects,
         metadata,
@@ -1110,12 +1123,13 @@ pub(crate) fn build_compute_descriptor(
         },
         raw,
     )?;
-    Ok(resume_checkpoints)
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct ComputeEntryContext<'a> {
     pub(crate) descriptor_flag_4c: bool,
+    pub(crate) descriptor_flag_5c8: bool,
     pub(crate) converted_command_timestamp: u64,
     pub(crate) barriers: &'a [G17PClBarrierDependency],
     pub(crate) mcache: Option<G17PClMcacheAperture>,
@@ -1127,24 +1141,13 @@ pub(crate) struct ComputeEntryContext<'a> {
 }
 
 impl TranslatedComputeCommand {
-    /// Native `processComputeSetup` writes descriptor +0x5c8 from whether the
-    /// derived SCS page count is nonzero. `scs_pages_for_layout` has already
-    /// validated the same layout before an entry can be published; its native
-    /// zero-page gate is exactly both payload fields being zero.
-    pub(crate) const fn scs_enabled(&self) -> bool {
-        self.scs_layout >> 32 != 0
-    }
-
     pub(crate) const fn entry_operands<'a>(
         &self,
         context: ComputeEntryContext<'a>,
     ) -> G17PClKickEntryOperands<'a> {
         G17PClKickEntryOperands {
             descriptor_flag_4c: context.descriptor_flag_4c,
-            // `generateCLRegisterListG16Common` uses the same +0x5c8 bit to
-            // prepend 0x17d9, and encodeCLKickEntry copies it to header bit61.
-            // Derive both from the command so they cannot diverge.
-            descriptor_flag_5c8: self.scs_enabled(),
+            descriptor_flag_5c8: context.descriptor_flag_5c8,
             converted_command_timestamp: context.converted_command_timestamp,
             barriers: context.barriers,
             mcache: context.mcache,
@@ -1244,6 +1247,9 @@ mod tests {
 
         let mut internal = G17pRenderParameters::source_rsrc8();
         internal.context_base = 0;
+        // This frozen descriptor fixture predates userspace high-dword masks;
+        // retain its explicit legacy diagnostic mask, not a default injection.
+        internal.bg_resource_prefix = 0x0007_8000_0000_0000;
         let translated = translate_render_command(
             payload,
             vertex,
@@ -1255,15 +1261,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(translated.parameters.load_pipeline, 0x11_0001_0004);
-        assert_eq!(translated.parameters.store_pipeline, 0x11_0002_0004);
+        assert_eq!(translated.parameters.load_pipeline, 0x11_0001_0000);
+        assert_eq!(translated.parameters.store_pipeline, 0x11_0002_0000);
         assert_eq!(
             translated.parameters.load_pipeline_bind,
             0x0007_8000_0000_0040
         );
         assert_eq!(translated.parameters.store_pipeline_bind, 0x8);
-        assert_eq!(translated.parameters.partial_load_pipeline, 0x11_0001_0004);
-        assert_eq!(translated.parameters.partial_store_pipeline, 0x11_0002_0004);
+        assert_eq!(translated.parameters.partial_load_pipeline, 0x11_0001_0000);
+        assert_eq!(translated.parameters.partial_store_pipeline, 0x11_0002_0000);
         assert_eq!(translated.parameters.utile_config, 0xa000);
         assert_eq!(translated.parameters.tib_blocks, 2);
         assert_eq!(translated.parameters.tile_config, 0x1_0280);
@@ -1312,37 +1318,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_zls_preserves_depth_and_stencil_across_internal_splits() {
-        let mut parser = UapiCommandParser::new(&RENDER_FIXTURE);
-        let (mut payload, vertex, fragment) = match parser.next_hardware().unwrap().unwrap() {
-            ParsedHardwareCommand::Render {
-                payload,
-                vertex_attachments,
-                fragment_attachments,
-                ..
-            } => (payload, vertex_attachments, fragment_attachments),
-            _ => panic!("wrong command kind"),
-        };
-        payload.depth.base = 0x1_8000;
-        payload.stencil.base = 0x1_c000;
-        payload.zls_control = 0x000c_0000;
-
-        let translated = translate_render_command(
-            payload,
-            vertex,
-            fragment,
-            window(),
-            &TestAddressSpace,
-            RenderInternalState {
-                parameters: G17pRenderParameters::source_rsrc8(),
-            },
-        )
-        .unwrap();
-        assert_eq!(translated.parameters.depth_flags, 0x000c_0000);
-        assert_eq!(translated.parameters.partial_depth_flags, 0x000c_c000);
-    }
-
-    #[test]
     fn render_resource_spec_high_dwords_reach_g17_register_programs() {
         const RENDER_HEADER: usize = 64;
         const PAYLOAD: usize = RENDER_HEADER + UAPI_COMMAND_HEADER_SIZE;
@@ -1360,8 +1335,8 @@ mod tests {
         for (offset, value) in [
             (0xf0, 0x0007_8000),
             (0xf4, 0x0007_8001),
-            (0xf8, 0x0007_8002),
-            (0xfc, 0x0007_8003),
+            (0xf8, 0xffff_8002),
+            (0xfc, 0),
         ] {
             extended[PAYLOAD + offset..PAYLOAD + offset + 4]
                 .copy_from_slice(&(value as u32).to_le_bytes());
@@ -1399,11 +1374,11 @@ mod tests {
         );
         assert_eq!(
             translated.parameters.load_pipeline_bind,
-            0x0007_8002_0000_0042
+            0xffff_8002_0000_0042
         );
         assert_eq!(
             translated.parameters.partial_load_pipeline_bind,
-            0x0007_8003_0000_0043
+            0x43
         );
         let registers = g17_render::build_fragment_registers(&translated.parameters).unwrap();
         assert_eq!(
@@ -1412,23 +1387,43 @@ mod tests {
                 .find(|register| register.number == 0x15369)
                 .unwrap()
                 .value,
-            0x0007_8002_0000_0042
+            0xffff_8002_0000_0042
         );
 
+        // Clearing RSRC_SPEC_HI means "the high dwords are not present", so
+        // they are masked off -- not grounds to refuse the submission.
         let mut no_flag = payload;
         no_flag.flags &= !RENDER_RSRC_SPEC_HI;
+        let masked = translate_render_command(
+            no_flag,
+            vertex,
+            fragment,
+            window(),
+            &TestAddressSpace,
+            RenderInternalState {
+                parameters: G17pRenderParameters::source_rsrc8(),
+            },
+        )
+        .unwrap();
+        assert_eq!(masked.parameters.load_pipeline_bind, 0x42);
         assert_eq!(
-            translate_render_command(
-                no_flag,
-                vertex,
-                fragment,
-                window(),
-                &TestAddressSpace,
-                RenderInternalState {
-                    parameters: G17pRenderParameters::source_rsrc8(),
-                },
-            ),
-            Err(UapiTranslateError::Flags)
+            masked.parameters.partial_load_pipeline_bind,
+            0x43
+        );
+
+        // An explicitly selected diagnostic OR-mask still applies; it is no
+        // longer silently imposed on ordinary no-output background programs.
+        let mut diagnostic = G17pRenderParameters::source_rsrc8();
+        diagnostic.bg_resource_prefix = 0xffff_8000_0000_0000;
+        let overridden = translate_render_command(
+            no_flag, vertex, fragment, window(), &TestAddressSpace,
+            RenderInternalState { parameters: diagnostic },
+        )
+        .unwrap();
+        assert_eq!(overridden.parameters.load_pipeline_bind, 0xffff_8000_0000_0042);
+        assert_eq!(
+            overridden.parameters.partial_load_pipeline_bind,
+            0xffff_8000_0000_0043
         );
     }
 
@@ -1468,6 +1463,7 @@ mod tests {
         let empty = G17PClRceBinding { address: 0, tag: 0 };
         let operands = translated.entry_operands(ComputeEntryContext {
             descriptor_flag_4c: false,
+            descriptor_flag_5c8: false,
             converted_command_timestamp: 1,
             barriers: &[],
             mcache: None,
@@ -1483,22 +1479,6 @@ mod tests {
         );
         assert_eq!(operands.event_mask, [1, 2, 3, 4]);
         assert_eq!(operands.auxiliary, 0x003f_ffff_ffff_ffff);
-        assert!(!operands.descriptor_flag_5c8);
-
-        let mut scs_translated = translated;
-        scs_translated.scs_layout = 0x48u64 << 48;
-        let scs_operands = scs_translated.entry_operands(ComputeEntryContext {
-            descriptor_flag_4c: false,
-            converted_command_timestamp: 1,
-            barriers: &[],
-            mcache: None,
-            payload: [0xffff_fc20_c001_a000, 0xffff_fc20_c000_0480],
-            event_mask: [1, 2, 3, 4],
-            rce_kind: 0,
-            rce_bindings: [empty; 4],
-            auxiliary: 0x003f_ffff_ffff_ffff,
-        });
-        assert!(scs_operands.descriptor_flag_5c8);
         let entry = g17_submission::prepare_g17p_cl_kick_entry(
             g17_submission::G17PClKickProducerState {
                 queue_id: 4,
@@ -1512,6 +1492,7 @@ mod tests {
                 },
                 submitted: 0,
                 current_timestamp: 0,
+                last_add_kicks_timestamp: 0,
                 base_timestamp: 0,
                 previous_valid: false,
                 previous_timestamp: 0,
@@ -1531,7 +1512,7 @@ mod tests {
                 work_ordinal: 7,
                 robustness: 0x100_0430_0000,
                 operand_state_base: 0x70_0022_8000,
-                usc_flist_id: 2,
+                execution_gate: 2,
             },
             g17_compute::ComputeDescriptorObjects {
                 scheduler_record: 0xffff_fc20_c099_8100,
@@ -1541,7 +1522,7 @@ mod tests {
                 status_a: 0xffff_fc20_0002_4c68,
                 status_b: 0xffff_fc20_0002_4c70,
                 shared_control: 0xffff_fc20_c095_0000,
-                usage_record: 0xffff_fc20_0171_0000,
+                zero_page: 0xffff_fc20_0171_0000,
             },
             g17_compute::ComputeDescriptorMetadata {
                 submit_sequence: 5,
@@ -1655,7 +1636,6 @@ mod tests {
                                 offset: 0,
                             },
                         },
-                        scs_layout: 0,
                     }
                 );
             }
