@@ -1087,11 +1087,15 @@ pub(crate) fn observe_paired_render_window_depth(
 ) -> Result<PairedRenderCompletion, CompletionDecodeError> {
     let limit = window.count.checked_mul(max_groups)
         .ok_or(CompletionDecodeError::RenderWindow)?;
+    // Both snapshots may already include successors queued on the same
+    // pair: the previous observation can carry a later group's write
+    // pointer, and the current one its done/read cursors. Bound both by the
+    // same host publication depth; completion is still done >= this target.
     let mut result = observe_paired_render_completion(
-        window.normalize(tiling_previous)?,
+        window.normalize_with_limit(tiling_previous, limit)?,
         window.normalize_with_limit(tiling_current, limit)?,
         window.count,
-        window.normalize(fragment_previous)?,
+        window.normalize_with_limit(fragment_previous, limit)?,
         window.normalize_with_limit(fragment_current, limit)?,
         window.count,
         execution,
