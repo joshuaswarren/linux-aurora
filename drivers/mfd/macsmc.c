@@ -51,21 +51,14 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
 	MFD_CELL_NAME("macsmc-power"),
 	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
-	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio"),
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
-/* J700 diagnostic gate: expose only the established gPxx GPIO bank. */
-static const struct mfd_cell apple_smc_gpio_devs[] = {
-	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
-};
-
-/* Initial T8152 support is read-only telemetry. Firmware retains fan control. */
-static const struct mfd_cell apple_smc_telemetry_devs[] = {
-	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
-};
+/* The second GPIO bank ('gp' keys) only exists on some SMCs. */
+static const struct mfd_cell apple_smc_low_gpio_dev =
+	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
 
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 				  u64 size, u64 wsize, u32 *ret_data)
@@ -623,6 +616,7 @@ static void apple_smc_debugfs_init(struct apple_smc *smc) { }
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct device_node *np;
 	struct apple_smc *smc;
 	bool j700_gpio_only;
 	bool j700_read_only;
@@ -759,6 +753,20 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(smc->dev, ret, "Failed to register sub-devices");
 
+	/*
+	 * Register the second GPIO bank only where the device tree describes
+	 * it: the MFD core would otherwise create an unbound device and warn
+	 * that it found no node on every SMC without one.
+	 */
+	np = of_get_compatible_child(dev->of_node, "apple,smc-low-gpio");
+	if (np) {
+		of_node_put(np);
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					   &apple_smc_low_gpio_dev, 1, NULL, 0, NULL);
+		if (ret)
+			return dev_err_probe(smc->dev, ret,
+					     "Failed to register the second GPIO bank");
+	}
 
 	return 0;
 }
