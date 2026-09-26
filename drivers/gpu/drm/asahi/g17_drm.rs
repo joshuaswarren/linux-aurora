@@ -36,6 +36,12 @@ const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> =
 /// `g17p_trace_depth` caps the number of records for the whole module lifetime.
 static G17P_RENDER_TIMING_RECORDS: AtomicU32 = AtomicU32::new(0);
 static G17P_RENDER_POLL_RECORDS: AtomicU32 = AtomicU32::new(0);
+/// Publish-path wait accounting: renders published, and how many of them slept
+/// on a pending FList release or device-control backpressure first.
+static G17P_PUBLISH_COUNT: AtomicU64 = AtomicU64::new(0);
+static G17P_PUBLISH_FLIST_WAITS: AtomicU64 = AtomicU64::new(0);
+static G17P_PUBLISH_FLIST_POLLS: AtomicU64 = AtomicU64::new(0);
+static G17P_PUBLISH_CONTROL_WAITS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type SharedG17PRuntime = Arc<Mutex<g17_live_boot::G17PLiveRuntime>>;
 
@@ -1638,6 +1644,22 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
                     }
                 }
                 failure_stage = "render-submit-translated";
+                {
+                    let n = G17P_PUBLISH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if flist_release_polls != 0 {
+                        G17P_PUBLISH_FLIST_WAITS.fetch_add(1, Ordering::Relaxed);
+                        G17P_PUBLISH_FLIST_POLLS.fetch_add(flist_release_polls as u64, Ordering::Relaxed);
+                    }
+                    if device_control_polls != 0 {
+                        G17P_PUBLISH_CONTROL_WAITS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if n % 4096 == 0 {
+                        pr_info!("G17P publish waits: renders={} flist-waits={} flist-polls={} control-waits={}\n",
+                            n, G17P_PUBLISH_FLIST_WAITS.load(Ordering::Relaxed),
+                            G17P_PUBLISH_FLIST_POLLS.load(Ordering::Relaxed),
+                            G17P_PUBLISH_CONTROL_WAITS.load(Ordering::Relaxed));
+                    }
+                }
                 break runtime.submit_translated_render(
                     &self.vm,
                     render_slot,

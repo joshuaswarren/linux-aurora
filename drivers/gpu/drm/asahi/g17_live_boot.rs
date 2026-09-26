@@ -5184,11 +5184,8 @@ impl G17PLiveRuntime {
                 let observed = &mut self.render_event_masks[slot as usize];
                 observed[0] |= new_masks[0];
                 observed[1] |= new_masks[1];
-                let expected = {
-                    let manager = self.manager.as_mut().ok_or(ENODEV)?;
-                    manager.select_render_slot(slot)?;
-                    manager.render_completion_masks()?
-                };
+                let expected = self.manager.as_ref().ok_or(ENODEV)?
+                    .render_completion_masks_for_slot(slot)?;
                 if !g17_completion::g17p_render_type1_complete(*observed, expected) {
                     continue;
                 }
