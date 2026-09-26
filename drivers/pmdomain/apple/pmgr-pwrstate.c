@@ -8,6 +8,8 @@
 #include <linux/bitops.h>
 #include <linux/bitfield.h>
 #include <linux/err.h>
+#include <linux/init.h>
+#include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -43,6 +45,7 @@ struct apple_pmgr_ps {
 	struct generic_pm_domain genpd;
 	struct reset_controller_dev rcdev;
 	struct regmap *regmap;
+	void __iomem *gfx_axi2af;
 	u32 offset;
 	u32 min_state;
 	bool force_disable;
@@ -52,6 +55,174 @@ struct apple_pmgr_ps {
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
+
+/* Only T8140's GFX domain owns the two AXI2AF words in the SGX aperture. */
+#define APPLE_T8140_SGX_BASE 0x480000000ULL
+#define APPLE_T8140_AXI2AF_OFFSET 0x1000104
+#define APPLE_T8140_AXI2AF_SIZE 8
+
+static bool apple_pmgr_is_t8140_gfx(struct apple_pmgr_ps *ps)
+{
+	struct resource parent;
+
+	return ps->offset == 0x1f0 &&
+	       of_device_is_compatible(ps->dev->of_node,
+				       "apple,t8140-pmgr-pwrstate") &&
+	       !of_address_to_resource(ps->dev->of_node->parent, 0, &parent) &&
+	       parent.start == 0x300700000ULL;
+}
+
+static int apple_pmgr_map_gfx_axi2af(struct apple_pmgr_ps *ps)
+{
+	struct device_node *gpu, *domain;
+	struct resource sgx;
+	int index, ret;
+
+	if (!apple_pmgr_is_t8140_gfx(ps))
+		return 0;
+
+	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8140");
+	if (!gpu)
+		return dev_err_probe(ps->dev, -ENODEV,
+				     "missing T8140 GPU AXI2AF resource\n");
+
+	domain = of_parse_phandle(gpu, "power-domains", 0);
+	ret = domain == ps->dev->of_node ? 0 : -EINVAL;
+	of_node_put(domain);
+	if (ret)
+		goto out;
+
+	index = of_property_match_string(gpu, "reg-names", "sgx");
+	if (index < 0) {
+		ret = index;
+		goto out;
+	}
+	ret = of_address_to_resource(gpu, index, &sgx);
+	if (ret)
+		goto out;
+	if (sgx.start != APPLE_T8140_SGX_BASE ||
+	    resource_size(&sgx) < APPLE_T8140_AXI2AF_OFFSET + APPLE_T8140_AXI2AF_SIZE) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* The GPU driver reserves SGX; the provider maps only its two words. */
+	ps->gfx_axi2af = devm_ioremap(ps->dev,
+			sgx.start + APPLE_T8140_AXI2AF_OFFSET,
+			APPLE_T8140_AXI2AF_SIZE);
+	ret = ps->gfx_axi2af ? 0 : -ENOMEM;
+out:
+	of_node_put(gpu);
+	if (ret)
+		return dev_err_probe(ps->dev, ret,
+				     "invalid T8140 GPU AXI2AF resource\n");
+	return 0;
+}
+
+enum apple_pmgr_gfx_axi_action {
+	APPLE_PMGR_GFX_AXI_NONE,
+	APPLE_PMGR_GFX_AXI_CLEAR_BEFORE,
+	APPLE_PMGR_GFX_AXI_SET_AFTER,
+};
+
+static enum apple_pmgr_gfx_axi_action apple_pmgr_gfx_axi_action(u32 before,
+							 u32 requested)
+{
+	u32 old_target = FIELD_GET(APPLE_PMGR_PS_TARGET, before);
+	u32 new_target = FIELD_GET(APPLE_PMGR_PS_TARGET, requested);
+	bool old_disable = before & APPLE_PMGR_DEV_DISABLE;
+	bool new_disable = requested & APPLE_PMGR_DEV_DISABLE;
+
+	if ((new_target == APPLE_PMGR_PS_ACTIVE && old_target != new_target) ||
+	    (old_disable && !new_disable))
+		return APPLE_PMGR_GFX_AXI_SET_AFTER;
+	if ((new_target == APPLE_PMGR_PS_PWRGATE && old_target != new_target) ||
+	    (!old_disable && new_disable))
+		return APPLE_PMGR_GFX_AXI_CLEAR_BEFORE;
+	return APPLE_PMGR_GFX_AXI_NONE;
+}
+
+static int apple_pmgr_apply_gfx_axi2af(struct apple_pmgr_ps *ps, bool enable)
+{
+	unsigned int offset;
+
+	if (!ps->gfx_axi2af)
+		return -ENODEV;
+
+	for (offset = 0; offset < APPLE_T8140_AXI2AF_SIZE; offset += sizeof(u32)) {
+		u32 before = readl(ps->gfx_axi2af + offset);
+		u32 requested = enable ? before | BIT(0) : before & ~BIT(0);
+		u32 after;
+
+		writel(requested, ps->gfx_axi2af + offset);
+		after = readl(ps->gfx_axi2af + offset);
+		dev_info(ps->dev,
+			 "GFX AXI transition: offset=0x%x before=0x%08x requested=0x%08x after=0x%08x\n",
+			 APPLE_T8140_AXI2AF_OFFSET + offset, before, requested, after);
+		if (!!(after & BIT(0)) != enable)
+			return -EIO;
+	}
+	return 0;
+}
+
+static int apple_pmgr_finish_gfx_on(struct apple_pmgr_ps *ps)
+{
+	u32 cur;
+	int ret;
+
+	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
+		FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == APPLE_PMGR_PS_ACTIVE,
+		1, APPLE_PMGR_PS_SET_TIMEOUT);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
+		!(cur & APPLE_PMGR_BUSY), 1, APPLE_PMGR_PS_SET_TIMEOUT);
+	if (ret)
+		return ret;
+	return apple_pmgr_apply_gfx_axi2af(ps, true);
+}
+
+static int apple_pmgr_gfx_write(struct apple_pmgr_ps *ps, u32 mask, u32 value)
+{
+	enum apple_pmgr_gfx_axi_action action;
+	u32 before, requested;
+	int ret;
+
+	ret = regmap_read(ps->regmap, ps->offset, &before);
+	if (ret)
+		return ret;
+	requested = (before & ~mask) | (value & mask);
+	action = apple_pmgr_gfx_axi_action(before, requested);
+	if (action == APPLE_PMGR_GFX_AXI_CLEAR_BEFORE) {
+		ret = apple_pmgr_apply_gfx_axi2af(ps, false);
+		if (ret)
+			return ret;
+	}
+
+	if (mask == ~0U)
+		ret = regmap_write(ps->regmap, ps->offset, value);
+	else
+		ret = regmap_update_bits(ps->regmap, ps->offset, mask, value);
+	if (ret)
+		return ret;
+	if (action == APPLE_PMGR_GFX_AXI_SET_AFTER)
+		return apple_pmgr_finish_gfx_on(ps);
+	return 0;
+}
+
+static int apple_pmgr_write(struct apple_pmgr_ps *ps, u32 value)
+{
+	if (ps->gfx_axi2af)
+		return apple_pmgr_gfx_write(ps, ~0U, value);
+	return regmap_write(ps->regmap, ps->offset, value);
+}
+
+static int apple_pmgr_update_bits(struct apple_pmgr_ps *ps, u32 mask, u32 value)
+{
+	if (ps->gfx_axi2af)
+		return apple_pmgr_gfx_write(ps, mask, value);
+	return regmap_update_bits(ps->regmap, ps->offset, mask, value);
+}
 
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
 {
@@ -77,7 +248,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		if (ps->force_reset)
 			reg_pre |= APPLE_PMGR_PS_RESET;
 
-		regmap_write(ps->regmap, ps->offset, reg_pre);
+		ret = apple_pmgr_write(ps, reg_pre);
+		if (ret && ps->gfx_axi2af)
+			return ret;
 
 		ret = regmap_read_poll_timeout_atomic(
 			ps->regmap, ps->offset, cur,
@@ -98,7 +271,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
 
-	regmap_write(ps->regmap, ps->offset, reg);
+	ret = apple_pmgr_write(ps, reg);
+	if (ret && ps->gfx_axi2af)
+		return ret;
 
 	if (ps->externally_clocked && pstate == APPLE_PMGR_PS_ACTIVE) {
 		/*
@@ -123,7 +298,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	if (auto_enable) {
 		/* Not all devices implement this; this is a no-op where not implemented. */
 		reg |= APPLE_PMGR_AUTO_ENABLE;
-		regmap_write(ps->regmap, ps->offset, reg);
+		ret = apple_pmgr_write(ps, reg);
+		if (ret && ps->gfx_axi2af)
+			return ret;
 	}
 
 	return ret;
@@ -157,6 +334,7 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
@@ -166,34 +344,41 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 
 	dev_dbg(ps->dev, "PS 0x%x: assert reset\n", ps->offset);
 	/* Quiesce device before asserting reset */
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE,
-			   APPLE_PMGR_DEV_DISABLE);
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET,
-			   APPLE_PMGR_RESET);
+	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE,
+				     APPLE_PMGR_DEV_DISABLE);
+	if (ret && ps->gfx_axi2af)
+		goto out;
+	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET,
+				     APPLE_PMGR_RESET);
 
+out:
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
 
-	return 0;
+	return ps->gfx_axi2af ? ret : 0;
 }
 
 static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	dev_dbg(ps->dev, "PS 0x%x: deassert reset\n", ps->offset);
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET, 0);
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0);
+	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET, 0);
+	if (ret && ps->gfx_axi2af)
+		goto out;
+	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
 		dev_err_ratelimited(ps->dev,
 			"PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
 
+out:
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
 
-	return 0;
+	return ps->gfx_axi2af ? ret : 0;
 }
 
 static int apple_pmgr_reset_reset(struct reset_controller_dev *rcdev, unsigned long id)
@@ -270,6 +455,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->genpd.name = name;
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
 	ps->genpd.power_off = apple_pmgr_ps_power_off;
+	ret = apple_pmgr_map_gfx_axi2af(ps);
+	if (ret)
+		return ret;
 
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
 	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
@@ -298,9 +486,30 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on */
-	if (active)
-		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
-				   APPLE_PMGR_AUTO_ENABLE);
+	if (active) {
+		if (ps->gfx_axi2af) {
+			u32 inherited;
+
+			ret = regmap_read(ps->regmap, ps->offset, &inherited);
+			if (ret)
+				return ret;
+			ret = apple_pmgr_ps_set(&ps->genpd,
+						 APPLE_PMGR_PS_ACTIVE, false);
+			if (ret)
+				return ret;
+			if (FIELD_GET(APPLE_PMGR_PS_TARGET, inherited) == APPLE_PMGR_PS_ACTIVE &&
+			    !(inherited & APPLE_PMGR_DEV_DISABLE)) {
+				ret = apple_pmgr_finish_gfx_on(ps);
+				if (ret)
+					return ret;
+			}
+		}
+		ret = apple_pmgr_update_bits(ps,
+					     APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
+					     APPLE_PMGR_AUTO_ENABLE);
+		if (ret && ps->gfx_axi2af)
+			return ret;
+	}
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {
