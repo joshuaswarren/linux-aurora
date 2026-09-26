@@ -3867,6 +3867,13 @@ impl G17PLiveRuntime {
         if let Some(stamp) = blamed_stamp {
             self.settle_render_blamed_by_recovery(stamp, EIO);
         }
+        // Compute completions observed while the recovery was open were left
+        // armed. Their completion edges may already have been consumed, so
+        // re-scan every active queue now rather than waiting for the watchdog.
+        if let Err(error) = self.service_async_compute_completions() {
+            dev_warn!(pdev.as_ref(),
+                "G17P recovery: post-recovery compute scan failed ({:?})\n", error);
+        }
         self.log_recovery_alignment("post-recovery");
         // Realign before the next kick. Continuity across a recovery is exactly
         // the assumption the evidence contradicts.

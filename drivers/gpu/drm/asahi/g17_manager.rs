@@ -8926,6 +8926,10 @@ impl G17PManagerConstruction {
             || ticket.descriptor != queue.completion_descriptor
             || ticket.item_count == 0
         {
+            dev_err!(self.resources.dev().as_ref(),
+                "G17P async compute: retirement-invariant qid={} cause=poll-ticket qid={}/{} descriptor={:#x}/{:#x} item-count={}\n",
+                queue.queue_id, ticket.queue_id, queue.queue_id,
+                ticket.descriptor, queue.completion_descriptor, ticket.item_count);
             return Err(EIO);
         }
         // Two different failures leave this function as a bare EIO, and the
@@ -8985,6 +8989,9 @@ impl G17PManagerConstruction {
         let [target, completed] = queue.compute.read_compute_submitted_counters()?;
         let ring = queue.compute.read_compute_ring_state()?;
         if ring.count != ticket.item_count {
+            dev_err!(self.resources.dev().as_ref(),
+                "G17P async compute: retirement-invariant qid={} cause=ring-count actual={} expected={}\n",
+                queue.queue_id, ring.count, ticket.item_count);
             return Err(EIO);
         }
         let consumer = ring.consumer % ring.count;
