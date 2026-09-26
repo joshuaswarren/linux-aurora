@@ -4059,6 +4059,25 @@ impl G17PRenderFlist {
             total_pages: read_u32(0x2c)?,
         })
     }
+
+    fn store_uma_state(&self, state: g17_submission::G17PUmaPagePoolState) -> Result {
+        let vmap = self.control_shared.object.gem.vmap::<u8>()?;
+        for (offset, value) in [
+            (0x20, state.counter_a),
+            (0x24, state.counter_b),
+            (0x28, state.empty),
+            (0x2c, state.total_pages),
+        ] {
+            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                // SAFETY: these fields are within the retained control
+                // object. The caller has retired TA, 3D and FList references
+                // before transferring the physical pool slot to another owner.
+                unsafe { core::ptr::write_volatile(vmap.as_mut_ptr().add(offset + index), byte) };
+            }
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// Queue-owned mappings retained from SKSM registration through completion.
@@ -17802,6 +17821,19 @@ impl G17ResourceOwner {
         storage: &G17PUserRenderStorage,
     ) -> Result {
         self.stage_render_uma_owner(&storage.render_flist)
+    }
+
+    /// Pair the UMA load with a store at the retired graph boundary. The
+    /// shared FList object is not updated by GPU allocation or async growth;
+    /// reloading it unchanged would reset cursors and forget grown pages.
+    pub(crate) fn save_user_render_uma(&mut self, storage: &G17PUserRenderStorage) -> Result {
+        let owner = &storage.render_flist;
+        let state = owner.uma_state()?;
+        let descriptor = self.snapshot_compute_uma(owner.id() as u8)?;
+        if descriptor[0] != g17_submission::encode_g17p_umadesc([0; 4], state)[0] {
+            return Err(EIO);
+        }
+        owner.store_uma_state(g17_submission::decode_g17p_umadesc(descriptor, state))
     }
 
     pub(crate) fn stage_render_uma_page_pool_descriptor(&mut self) -> Result {

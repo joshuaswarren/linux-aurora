@@ -8643,6 +8643,20 @@ pub(crate) const fn g17p_umadesc_offset(hardware_buffer_id: u32) -> Option<usize
     Some(hardware_buffer_id as usize * G17P_UMA_DESC_ENTRY_SIZE)
 }
 
+/// Recover the mutable pool state before its hardware slot changes owners.
+/// The address and allocation unit belong to the retained pool; word three
+/// is firmware-owned and is not part of the load/store handshake.
+pub(crate) const fn decode_g17p_umadesc(
+    descriptor: [u64; 4],
+    mut state: G17PUmaPagePoolState,
+) -> G17PUmaPagePoolState {
+    state.counter_a = ((descriptor[1] >> 5) & 0x0fff_ffff) as u32;
+    state.counter_b = ((descriptor[1] >> 33) & 0x0fff_ffff) as u32;
+    state.empty = (descriptor[1] >> 61) as u32;
+    state.total_pages = descriptor[2] as u32;
+    state
+}
+
 #[cfg(test)]
 mod uma_descriptor_tests {
     use super::*;
