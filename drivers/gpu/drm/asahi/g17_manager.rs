@@ -6347,6 +6347,7 @@ impl G17PManagerConstruction {
                 .map_err(|_| EBUSY)?,
             );
         }
+        let mut mapping_proof_reused = false;
         {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
             storage
@@ -6365,6 +6366,7 @@ impl G17PManagerConstruction {
             let reachability_started = stages.enabled.then(
                 kernel::time::Instant::<kernel::time::Monotonic>::now);
             let unreachable = storage.first_unreachable_cached(self.resources.uat(), vm);
+            mapping_proof_reused = storage.last_reachability_cache_hit();
             if let Some(started) = reachability_started {
                 stages.reachability_ns = started.elapsed().as_nanos().max(0) as u64;
                 stages.reachability_cache_hit = storage.last_reachability_cache_hit();
@@ -6703,7 +6705,12 @@ impl G17PManagerConstruction {
         // through this VM's own slot, and an unmapped write there is exactly
         // the fault this view exists to remove; a wrong or missing leaf must
         // fail here, on the host, rather than as another opaque dIPP miss.
-        for offset in [0x1e00u64, 0x1f80u64] {
+        // The null-view probe and the RCE readback below are mapping
+        // validations. When the retained graph's reachability proof was reused
+        // for this generation (same VM and kernel mapping epochs), neither can
+        // observe anything new, and each costs page-table walks under VM exec
+        // locks on every render.
+        for offset in [0x1e00u64, 0x1f80u64].into_iter().filter(|_| !mapping_proof_reused) {
             let (canonical, client) = vm
                 .t8140_client_null_view_probe(offset)
                 .map_err(|error| {
@@ -6736,11 +6743,13 @@ impl G17PManagerConstruction {
                 );
             }
         }
-        self.render_storage
-            .as_mut()
-            .ok_or(ENODEV)?
-            .audit_fragment_rce_mapping(dev, vm)
-            .map_err(|error| Self::render_stage_fail("fragment-rce-vm-audit", error))?;
+        if !mapping_proof_reused {
+            self.render_storage
+                .as_mut()
+                .ok_or(ENODEV)?
+                .audit_fragment_rce_mapping(dev, vm)
+                .map_err(|error| Self::render_stage_fail("fragment-rce-vm-audit", error))?;
+        }
         if g17p_native_fragment_first_mode(native_doorbell_mode) {
             fence(Ordering::Acquire);
             let current = self.render_storage.as_mut().ok_or(ENODEV)?
@@ -8298,13 +8307,74 @@ impl G17PManagerConstruction {
             }
             tracker.tiling_previous = state.tiling;
             tracker.fragment_previous = state.fragment;
-            if completion.complete {
-                self.render_tracker = None;
-                self.render_submission_ordinal = self
-                    .render_submission_ordinal
-                    .checked_add(1)
-                    .ok_or(EOVERFLOW)?;
-                return Ok(completion);
+        }
+        Ok(G17PRenderPollOutcome::Pending)
+    }
+
+    /// Completion masks of any retained render slot, without selecting it.
+    /// Selecting swaps the whole slot state in and out, which event service
+    /// used to do for every pending slot on every firmware event.
+    pub(crate) fn render_completion_masks_for_slot(&self, slot: u8) -> Result<[u64; 2]> {
+        if slot == self.active_render_slot {
+            return self.render_completion_masks();
+        }
+        self.parked_render_slots
+            .get(usize::from(slot))
+            .ok_or(EINVAL)?
+            .as_ref()
+            .ok_or(ENODEV)?
+            .storage
+            .as_ref()
+            .ok_or(ENODEV)?
+            .queue_pair()
+            .completion_masks()
+            .ok_or(EINVAL)
+    }
+
+    pub(crate) fn render_completion_masks(&self) -> Result<[u64; 2]> {
+        self.render_storage
+            .as_ref()
+            .ok_or(ENODEV)?
+            .queue_pair()
+            .completion_masks()
+            .ok_or(EINVAL)
+    }
+
+    /// Nominal render wait bound, expressed the way it was originally written:
+    /// 2000 polls of one millisecond each.
+    ///
+    /// The waits are now deadline-driven (`g17p_render_wait_ms`, which
+    /// defaults to exactly this many milliseconds) because the poll interval
+    /// varies. The constant stays so the two cannot drift apart and so the
+    /// timeout report still names a poll budget.
+    pub(crate) const RENDER_COMPLETION_POLLS: usize = 2000;
+
+    pub(crate) fn wait_translated_render_completion(
+        &mut self,
+    ) -> Result<g17_completion::PairedRenderCompletion> {
+        let mut schedule = crate::g17_perf::PollSchedule::new(
+            *module_parameters::g17p_render_poll_us.value(),
+        );
+        let deadline_ns =
+            i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
+        let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
+        loop {
+            match self.poll_translated_render_completion()? {
+                G17PRenderPollOutcome::Complete(completion) => return Ok(completion),
+                // Re-poll immediately, do not sleep -- but still inside the
+                // deadline. Without the old fixed poll count, an outcome that
+                // never advances would spin this loop forever.
+                G17PRenderPollOutcome::Retry => {
+                    if started.elapsed().as_nanos() >= deadline_ns {
+                        break;
+                    }
+                }
+                G17PRenderPollOutcome::Pending => {
+                    if started.elapsed().as_nanos() >= deadline_ns {
+                        break;
+                    }
+                    fsleep(Delta::from_micros(i64::from(schedule.next_delay_us())));
+                }
             }
             fsleep(Delta::from_millis(1));
         }
