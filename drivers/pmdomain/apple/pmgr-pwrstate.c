@@ -157,54 +157,10 @@ early_param("apple_pmgr.suppress_write_mask",
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
 
-static unsigned int apple_pmgr_t8140_diagnostic_bit(struct apple_pmgr_ps *ps)
-{
-	struct resource parent;
-
-	if (!of_device_is_compatible(ps->dev->of_node,
-				     "apple,t8140-pmgr-pwrstate"))
-		return 0;
-
-	switch (ps->offset) {
-	case 0x280:
-		return APPLE_PMGR_T8140_DISP_SYS;
-	case 0x288:
-		return APPLE_PMGR_T8140_DISPEXT0_SYS;
-	case 0x318:
-		return APPLE_PMGR_T8140_DISP_FE;
-	case 0x320:
-		return APPLE_PMGR_T8140_DISPEXT0_FE;
-	case 0x258:
-		return APPLE_PMGR_T8140_APCIE_GP;
-	case 0x278:
-		return APPLE_PMGR_T8140_ANS;
-	case 0x2a0:
-		return APPLE_PMGR_T8140_APCIE_SYS_GP;
-	case 0x310:
-		return APPLE_PMGR_T8140_APCIE_ST;
-	case 0x3a0:
-		return APPLE_PMGR_T8140_APCIE_SYS_ST;
-	case 0x3c0:
-		return APPLE_PMGR_T8140_APCIE_PHY_SW;
-	default:
-		break;
-	}
-
-	if (of_address_to_resource(ps->dev->of_node->parent, 0, &parent))
-		return 0;
-	if (parent.start == 0x308280000ULL && ps->offset == 0x8030)
-		return APPLE_PMGR_T8140_NUB_ALL |
-		       APPLE_PMGR_T8140_NUB_SMC_I2CM1;
-	if (parent.start == 0x308280000ULL && ps->offset == 0x8038)
-		return APPLE_PMGR_T8140_NUB_ALL |
-		       APPLE_PMGR_T8140_NUB_SMC_I2CM2;
-	if (parent.start == 0x308280000ULL)
-		return APPLE_PMGR_T8140_NUB_ALL;
-	if (parent.start == 0x300700000ULL)
-		return APPLE_PMGR_T8140_MAIN_NON_NVME;
-
-	return 0;
-}
+/* Only T8140's GFX domain owns the two AXI2AF words in the SGX aperture. */
+#define APPLE_T8140_SGX_BASE 0x480000000ULL
+#define APPLE_T8140_AXI2AF_OFFSET 0x1000104
+#define APPLE_T8140_AXI2AF_SIZE 8
 
 static bool apple_pmgr_is_t8140_gfx(struct apple_pmgr_ps *ps)
 {
@@ -217,11 +173,6 @@ static bool apple_pmgr_is_t8140_gfx(struct apple_pmgr_ps *ps)
 	       parent.start == 0x300700000ULL;
 }
 
-/* The AXI2AF words are in the GPU's named SGX resource, not in PMGR. */
-#define APPLE_T8140_SGX_BASE 0x480000000ULL
-#define APPLE_T8140_AXI2AF_OFFSET 0x1000104
-#define APPLE_T8140_AXI2AF_SIZE 8
-
 static int apple_pmgr_map_gfx_axi2af(struct apple_pmgr_ps *ps)
 {
 	struct device_node *gpu, *domain;
@@ -233,7 +184,8 @@ static int apple_pmgr_map_gfx_axi2af(struct apple_pmgr_ps *ps)
 
 	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8140");
 	if (!gpu)
-		return dev_err_probe(ps->dev, -ENODEV, "missing T8140 GPU AXI2AF resource\n");
+		return dev_err_probe(ps->dev, -ENODEV,
+				     "missing T8140 GPU AXI2AF resource\n");
 
 	domain = of_parse_phandle(gpu, "power-domains", 0);
 	ret = domain == ps->dev->of_node ? 0 : -EINVAL;
@@ -255,19 +207,16 @@ static int apple_pmgr_map_gfx_axi2af(struct apple_pmgr_ps *ps)
 		goto out;
 	}
 
-	/*
-	 * The GPU driver reserves the enclosing SGX resource. Map only these
-	 * two words without a conflicting exclusive reservation: the GFX power
-	 * provider owns their writes, and DRM only validates them after power-on.
-	 * No register is accessed here while the domain may still be off.
-	 */
-	ps->gfx_axi2af = devm_ioremap(ps->dev, sgx.start + APPLE_T8140_AXI2AF_OFFSET,
-				    APPLE_T8140_AXI2AF_SIZE);
+	/* The GPU driver reserves SGX; the provider maps only its two words. */
+	ps->gfx_axi2af = devm_ioremap(ps->dev,
+			sgx.start + APPLE_T8140_AXI2AF_OFFSET,
+			APPLE_T8140_AXI2AF_SIZE);
 	ret = ps->gfx_axi2af ? 0 : -ENOMEM;
 out:
 	of_node_put(gpu);
 	if (ret)
-		return dev_err_probe(ps->dev, ret, "invalid T8140 GPU AXI2AF resource\n");
+		return dev_err_probe(ps->dev, ret,
+				     "invalid T8140 GPU AXI2AF resource\n");
 	return 0;
 }
 
@@ -277,14 +226,14 @@ enum apple_pmgr_gfx_axi_action {
 	APPLE_PMGR_GFX_AXI_SET_AFTER,
 };
 
-static enum apple_pmgr_gfx_axi_action apple_pmgr_gfx_axi_action(u32 before, u32 requested)
+static enum apple_pmgr_gfx_axi_action apple_pmgr_gfx_axi_action(u32 before,
+							 u32 requested)
 {
 	u32 old_target = FIELD_GET(APPLE_PMGR_PS_TARGET, before);
 	u32 new_target = FIELD_GET(APPLE_PMGR_PS_TARGET, requested);
 	bool old_disable = before & APPLE_PMGR_DEV_DISABLE;
 	bool new_disable = requested & APPLE_PMGR_DEV_DISABLE;
 
-	/* AppleT8140PMGR::_applyAxi2afWorkaround(index, requested, false, false). */
 	if ((new_target == APPLE_PMGR_PS_ACTIVE && old_target != new_target) ||
 	    (old_disable && !new_disable))
 		return APPLE_PMGR_GFX_AXI_SET_AFTER;
@@ -301,12 +250,6 @@ static int apple_pmgr_apply_gfx_axi2af(struct apple_pmgr_ps *ps, bool enable)
 	if (!ps->gfx_axi2af)
 		return -ENODEV;
 
-	/*
-	 * Native clears bit 0 before OFF/DEV_DISABLE and sets it after ON has
-	 * reached ACTIVE with BUSY clear. Both halves use this word order.
-	 * Complete the accesses before subsequent PMGR writes and preserve
-	 * every unrelated AXI bit. The caller owns the power-state preconditions.
-	 */
 	for (offset = 0; offset < APPLE_T8140_AXI2AF_SIZE; offset += sizeof(u32)) {
 		u32 before = readl(ps->gfx_axi2af + offset);
 		u32 requested = enable ? before | BIT(0) : before & ~BIT(0);
@@ -323,26 +266,11 @@ static int apple_pmgr_apply_gfx_axi2af(struct apple_pmgr_ps *ps, bool enable)
 	return 0;
 }
 
-static void apple_pmgr_log_gfx_write(struct apple_pmgr_ps *ps,
-				     const char *reason, u32 mask, u32 requested,
-				     u32 before, int before_ret, int write_ret)
-{
-	u32 after = 0;
-	int after_ret = regmap_read(ps->regmap, ps->offset, &after);
-
-	/* Observation only: do not change requested values or operation results. */
-	dev_info(ps->dev,
-		 "GFX PMGR observe reason=%s offset=0x%x mask=0x%08x before=0x%08x requested=0x%08x after=0x%08x before_rc=%d write_rc=%d after_rc=%d\n",
-		 reason, ps->offset, mask, before, requested, after,
-		 before_ret, write_ret, after_ret);
-}
-
 static int apple_pmgr_finish_gfx_on(struct apple_pmgr_ps *ps)
 {
 	u32 cur;
 	int ret;
 
-	/* Native writeReg32 waits for both ACTUAL=ACTIVE and BUSY=0, in order. */
 	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
 		FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == APPLE_PMGR_PS_ACTIVE,
 		1, APPLE_PMGR_PS_SET_TIMEOUT);
@@ -355,15 +283,12 @@ static int apple_pmgr_finish_gfx_on(struct apple_pmgr_ps *ps)
 	return apple_pmgr_apply_gfx_axi2af(ps, true);
 }
 
-static int apple_pmgr_gfx_write(struct apple_pmgr_ps *ps, u32 mask, u32 value,
-				const char *reason)
+static int apple_pmgr_gfx_write(struct apple_pmgr_ps *ps, u32 mask, u32 value)
 {
 	enum apple_pmgr_gfx_axi_action action;
 	u32 before, requested;
 	int ret;
 
-	if (!ps->gfx_axi2af)
-		return -ENODEV;
 	ret = regmap_read(ps->regmap, ps->offset, &before);
 	if (ret)
 		return ret;
@@ -379,60 +304,24 @@ static int apple_pmgr_gfx_write(struct apple_pmgr_ps *ps, u32 mask, u32 value,
 		ret = regmap_write(ps->regmap, ps->offset, value);
 	else
 		ret = regmap_update_bits(ps->regmap, ps->offset, mask, value);
-	apple_pmgr_log_gfx_write(ps, reason, mask, value, before, 0, ret);
 	if (ret)
 		return ret;
-	if (action == APPLE_PMGR_GFX_AXI_SET_AFTER) {
-		ret = apple_pmgr_finish_gfx_on(ps);
-		if (ret)
-			dev_err(ps->dev, "GFX AXI post-ON handshake failed: %d\n", ret);
-	}
-	return ret;
+	if (action == APPLE_PMGR_GFX_AXI_SET_AFTER)
+		return apple_pmgr_finish_gfx_on(ps);
+	return 0;
 }
 
-static int apple_pmgr_write(struct apple_pmgr_ps *ps, u32 value,
-			    const char *reason)
+static int apple_pmgr_write(struct apple_pmgr_ps *ps, u32 value)
 {
-	unsigned int bit = apple_pmgr_t8140_diagnostic_bit(ps);
-
-	if (apple_pmgr_suppress_write_mask & bit) {
-		dev_info(ps->dev,
-			 "diagnostic: PMGR write suppressed reason=%s offset=0x%x value=0x%08x mask=0x%x\n",
-			 reason, ps->offset, value,
-			 apple_pmgr_suppress_write_mask);
-		return 0;
-	}
-
-	if (apple_pmgr_trace_writes)
-		dev_info(ps->dev,
-			 "diagnostic: PMGR write reason=%s offset=0x%x value=0x%08x\n",
-			 reason, ps->offset, value);
-
-	if (apple_pmgr_is_t8140_gfx(ps))
-		return apple_pmgr_gfx_write(ps, ~0U, value, reason);
+	if (ps->gfx_axi2af)
+		return apple_pmgr_gfx_write(ps, ~0U, value);
 	return regmap_write(ps->regmap, ps->offset, value);
 }
 
-static int apple_pmgr_update_bits(struct apple_pmgr_ps *ps, u32 mask,
-				  u32 value, const char *reason)
+static int apple_pmgr_update_bits(struct apple_pmgr_ps *ps, u32 mask, u32 value)
 {
-	unsigned int bit = apple_pmgr_t8140_diagnostic_bit(ps);
-
-	if (apple_pmgr_suppress_write_mask & bit) {
-		dev_info(ps->dev,
-			 "diagnostic: PMGR update suppressed reason=%s offset=0x%x mask=0x%08x value=0x%08x suppress_mask=0x%x\n",
-			 reason, ps->offset, mask, value,
-			 apple_pmgr_suppress_write_mask);
-		return 0;
-	}
-
-	if (apple_pmgr_trace_writes)
-		dev_info(ps->dev,
-			 "diagnostic: PMGR update reason=%s offset=0x%x mask=0x%08x value=0x%08x\n",
-			 reason, ps->offset, mask, value);
-
-	if (apple_pmgr_is_t8140_gfx(ps))
-		return apple_pmgr_gfx_write(ps, mask, value, reason);
+	if (ps->gfx_axi2af)
+		return apple_pmgr_gfx_write(ps, mask, value);
 	return regmap_update_bits(ps->regmap, ps->offset, mask, value);
 }
 
@@ -460,7 +349,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		if (ps->force_reset)
 			reg_pre |= APPLE_PMGR_PS_RESET;
 
-		ret = apple_pmgr_write(ps, reg_pre, "set-pre-disable-reset");
+		ret = apple_pmgr_write(ps, reg_pre);
 		if (ret && ps->gfx_axi2af)
 			return ret;
 
@@ -483,8 +372,8 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
 
-	ret = apple_pmgr_write(ps, reg, "set-target");
-	if (ret < 0 && ps->gfx_axi2af)
+	ret = apple_pmgr_write(ps, reg);
+	if (ret && ps->gfx_axi2af)
 		return ret;
 
 	if (ps->externally_clocked && pstate == APPLE_PMGR_PS_ACTIVE) {
@@ -512,10 +401,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 		/* Not all devices implement this; this is a no-op where not implemented. */
 		reg |= APPLE_PMGR_AUTO_ENABLE;
-		write_ret = apple_pmgr_write(ps, reg, "set-auto-enable");
-
-		if (write_ret && ps->gfx_axi2af)
-			return write_ret;
+		ret = apple_pmgr_write(ps, reg);
+		if (ret && ps->gfx_axi2af)
+			return ret;
 	}
 
 	return ret;
@@ -715,11 +603,11 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	dev_dbg(ps->dev, "PS 0x%x: assert reset\n", ps->offset);
 	/* Quiesce device before asserting reset */
 	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE,
-				   APPLE_PMGR_DEV_DISABLE, "reset-assert-disable");
+				     APPLE_PMGR_DEV_DISABLE);
 	if (ret && ps->gfx_axi2af)
 		goto out;
 	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET,
-				   APPLE_PMGR_RESET, "reset-assert");
+				     APPLE_PMGR_RESET);
 
 out:
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
@@ -736,12 +624,10 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	dev_dbg(ps->dev, "PS 0x%x: deassert reset\n", ps->offset);
-	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET, 0,
-				   "reset-deassert");
+	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET, 0);
 	if (ret && ps->gfx_axi2af)
 		goto out;
-	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0,
-				   "reset-deassert-enable");
+	ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
 		dev_err_ratelimited(ps->dev,
@@ -839,6 +725,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->genpd.name = name;
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
 	ps->genpd.power_off = apple_pmgr_ps_power_off;
+	ret = apple_pmgr_map_gfx_axi2af(ps);
+	if (ret)
+		return ret;
 
 	ret = apple_pmgr_map_gfx_axi2af(ps);
 	if (ret)
@@ -872,24 +761,18 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
 	}
 
-	/* Turn on auto-PM if the domain is already on. */
-	if (active && !apple_pmgr_preserve_auto_on_probe(ps)) {
+	/* Turn on auto-PM if the domain is already on */
+	if (active) {
 		if (ps->gfx_axi2af) {
 			u32 inherited;
 
-			/*
-			 * An inherited target=ACTIVE has no target transition for
-			 * writeReg32 to detect. Native's explicit restore path also
-			 * sets AXI2AF for these domains. Hold auto-PM disabled until
-			 * that restore is complete, then publish this provider.
-			 */
 			ret = regmap_read(ps->regmap, ps->offset, &inherited);
 			if (ret)
 				return ret;
-			ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE, false);
+			ret = apple_pmgr_ps_set(&ps->genpd,
+						 APPLE_PMGR_PS_ACTIVE, false);
 			if (ret)
 				return ret;
-			/* A target/enable transition already ran the post-write half. */
 			if (FIELD_GET(APPLE_PMGR_PS_TARGET, inherited) == APPLE_PMGR_PS_ACTIVE &&
 			    !(inherited & APPLE_PMGR_DEV_DISABLE)) {
 				ret = apple_pmgr_finish_gfx_on(ps);
@@ -897,14 +780,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 					return ret;
 			}
 		}
-		ret = apple_pmgr_update_bits(ps, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
-					     APPLE_PMGR_AUTO_ENABLE, "probe-auto-enable");
+		ret = apple_pmgr_update_bits(ps,
+					     APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
+					     APPLE_PMGR_AUTO_ENABLE);
 		if (ret && ps->gfx_axi2af)
 			return ret;
-	} else if (active)
-		dev_info(dev,
-			 "diagnostic: preserving firmware AUTO_ENABLE state for %s (mask=0x%x)\n",
-			 name, apple_pmgr_preserve_auto_probe_mask);
+	}
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {
