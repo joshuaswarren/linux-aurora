@@ -1059,6 +1059,25 @@ pub(crate) fn encode_render_control_shared(out: &mut [u8]) -> Result<(), Initdat
     Ok(())
 }
 
+/// Encode a per-pair render FList whose whole pool is populated up front.
+///
+/// Same object as `encode_render_control_shared`, but the page counts at
+/// +0x24/+0x2c and the run cursor at +0x48 cover every block, as
+/// AGXUSCPrivMemFList::populateInitialFirmwareState writes them for Apple's
+/// 3D pool (0x1600 pages, cursor 0xb0 for 22 blocks). Nothing is left for a
+/// first opcode-0x20 grow to append.
+pub(crate) fn encode_presized_render_control_shared(
+    out: &mut [u8],
+    blocks: u32,
+) -> Result<(), InitdataError> {
+    let pages = blocks.checked_mul(0x100).ok_or(InitdataError::BufferSize)?;
+    encode_render_control_shared(out)?;
+    put_u64(out, 0x20, u64::from(pages) << 32);
+    put_u64(out, 0x28, u64::from(pages) << 32);
+    put_u32(out, CONTROL_SHARED_CURSOR_OFFSET, blocks * 8);
+    Ok(())
+}
+
 /// Encode the hardware-proven compute form of the compact class-2 object.
 ///
 /// This is deliberately separate from the render UMA form above. Compute's
@@ -3637,6 +3656,20 @@ mod tests {
         assert_eq!(get_u64(&shared, 0x10), 2);
         assert_eq!(get_u64(&shared, 0x14), 0x70_0000_0000);
         assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x60), 3);
+    }
+
+    #[test]
+    fn presized_render_control_shared_matches_apple_initial_3d_pool() {
+        let mut shared = [0u8; CONTROL_SHARED_OBJECT_SIZE];
+        encode_presized_render_control_shared(&mut shared, 22).unwrap();
+        // 25G83 populateInitialFirmwareState for the 3D pool: 0x1600 pages
+        // at +0x24 and +0x2c, run cursor 0xb0.
+        assert_eq!(get_u64(&shared, 0x20), 0x0000_1600_0000_0000);
+        assert_eq!(get_u64(&shared, 0x28), 0x0000_1600_0000_0000);
+        assert_eq!(get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET), 0xb0);
+        assert_eq!(get_u64(&shared, 0x00), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u64(&shared, 0x60), 3);
     }
