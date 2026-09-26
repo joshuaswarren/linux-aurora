@@ -832,11 +832,12 @@ fn append_render_prefix_dependencies(
 ) -> Result {
     for (sequence, fence) in frontier {
         if crate::g17_submission::g17p_render_prefix_contains(prefix, *sequence) {
-            // Queue publication is ordered by scheduled fences. Keep every
-            // hardware status separately: a scheduled fence does not propagate
-            // a failed run_job, and native tokens carry the actual GPU waits.
+            // Native tokens order GPU execution, but user timestamps are
+            // copied by the host after retirement. Such producers must finish
+            // that copy before a consumer can publish. Keep hardware status
+            // separately so publication cannot hide a failed run_job.
             checked_dependencies.push(fence.completed.clone(), GFP_KERNEL)?;
-            dependencies.push(fence.published.clone(), GFP_KERNEL)?;
+            dependencies.push(fence.ready.clone(), GFP_KERNEL)?;
         }
     }
     Ok(())
@@ -1454,7 +1455,7 @@ struct G17PQueue {
     /// just as a render following compute must not overtake it. Independent
     /// logical queues retain their own timelines and can still overlap.
     last_submission: Option<Fence>,
-    last_publication: Option<Fence>,
+    last_ready: Option<Fence>,
     /// Preserve the existing cross-engine fence in addition to exact indexed
     /// render-prefix coverage; same-engine FIFO alone orders publication, not
     /// completion across two physical render pairs.
@@ -1909,7 +1910,7 @@ impl G17PQueue {
             async_scheduler: None,
             render_scheduler: Some(render_scheduler),
             last_submission: None,
-            last_publication: None,
+            last_ready: None,
             render_sequence: 0,
             render_frontier: KVec::new(),
             last_submission_engine: None,
@@ -2178,9 +2179,10 @@ impl G17PQueue {
             translated.render_wait_last = Some(self.render_sequence);
             if let Some(prior) = self.last_submission.as_ref() {
                 firmware_fences.push(prior.clone(), GFP_KERNEL)?;
-                dependencies.push(self.last_publication.as_ref().ok_or(EIO)?.clone(), GFP_KERNEL)?;
+                dependencies.push(self.last_ready.as_ref().ok_or(EIO)?.clone(), GFP_KERNEL)?;
             }
         }
+        let host_timestamps = destinations.iter().any(Option::is_some);
         let completion = g17_job::G17PJobCompletion::new(
             output,
             timestamps,
@@ -2194,11 +2196,16 @@ impl G17PQueue {
             KVec::new(), KVec::new(), checked_dependencies, firmware_fences,
             Some(completion),
         )?;
-        let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
+        let mut finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
+        // Firmware dependency tokens precede the CPU timestamp copy. A
+        // consumer must not copy the query sentinel before that write lands.
+        if host_timestamps {
+            finished.ready = finished.completed.clone();
+        }
         // The job is queued and owns its completion from here: give userspace
         // the fence that signals when the GPU has actually run it.
         self.last_submission = Some(finished.completed.clone());
-        self.last_publication = Some(finished.published.clone());
+        self.last_ready = Some(finished.ready.clone());
         self.last_submission_engine = Some(G17PSubmissionEngine::Compute);
         if crate::util::g17p_verbose() {
             pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
@@ -2243,6 +2250,7 @@ impl G17PQueue {
             .new_fence(0, G17PSubmissionFence)
             .map_err(|error| Self::stage_fail(submission_id, "new-render-fence", error))?
             .into();
+        let host_timestamps = timestamps.iter().any(Option::is_some);
         let completion = G17PRenderCompletion::new(
             hardware_fence,
             timestamps,
@@ -2266,16 +2274,21 @@ impl G17PQueue {
         if self.last_submission_engine != Some(G17PSubmissionEngine::Render) {
             if let Some(prior) = self.last_submission.as_ref() {
                 firmware_fences.push(prior.clone(), GFP_KERNEL)?;
-                dependencies.push(self.last_publication.as_ref().ok_or(EIO)?.clone(), GFP_KERNEL)?;
+                dependencies.push(self.last_ready.as_ref().ok_or(EIO)?.clone(), GFP_KERNEL)?;
             }
         }
         let packet = g17_job::G17PRenderJobPacket::new(
             submission_id, translated, checked_dependencies, firmware_fences, completion,
         )?;
-        let finished = self.render_scheduler.as_mut().ok_or(ENODEV)?
+        let mut finished = self.render_scheduler.as_mut().ok_or(ENODEV)?
             .enqueue(packet, dependencies)?;
+        // Firmware dependency tokens precede the CPU timestamp copy. A
+        // consumer must not copy the query sentinel before that write lands.
+        if host_timestamps {
+            finished.ready = finished.completed.clone();
+        }
         self.last_submission = Some(finished.completed.clone());
-        self.last_publication = Some(finished.published.clone());
+        self.last_ready = Some(finished.ready.clone());
         self.last_submission_engine = Some(G17PSubmissionEngine::Render);
         self.render_sequence = translated.render_order.sequence;
         self.render_frontier.push_within_capacity((self.render_sequence, finished))

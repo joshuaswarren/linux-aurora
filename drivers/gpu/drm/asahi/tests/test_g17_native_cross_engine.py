@@ -51,7 +51,7 @@ mod g17_status {pub struct VmStatus;}
 #[derive(Default)]struct KVec<T>(Vec<T>);
 impl<T>KVec<T>{fn push(&mut self,x:T,_f:())->Result{self.0.push(x);Ok(())}}
 impl<T>std::ops::Deref for KVec<T>{type Target=[T];fn deref(&self)->&[T]{&self.0}}
-mod g17_job {#[derive(Clone)]pub struct G17PCommandFences {pub published:crate::Fence,pub completed:crate::Fence}}
+mod g17_job {#[derive(Clone)]pub struct G17PCommandFences {pub ready:crate::Fence,pub completed:crate::Fence}}
 '''
 program += '\nmod g17_submission {\n' + '\n'.join(constants)
 for name in ['SubmissionError', 'KickTimestamp', 'SksmKickWord', 'G17PClBarrierDependency', 'G17PRenderOrder']:
@@ -97,7 +97,7 @@ impl Runtime {
 '''+block(comp, '    pub(crate) fn async_compute_native_dependency(')+'}\n'
 program += r'''
 fn fence(id:u64,status:i32)->Fence{Fence{id,status:Arc::new(AtomicI32::new(status))}}
-fn pair(id:u64)->g17_job::G17PCommandFences{g17_job::G17PCommandFences{published:fence(id+100,1),completed:fence(id,0)}}
+fn pair(id:u64)->g17_job::G17PCommandFences{g17_job::G17PCommandFences{ready:fence(id+100,1),completed:fence(id,0)}}
 fn render(vm:&Arc<g17_status::VmStatus>,seq:u64,qid:u8,stamp:u64)->Render{
  Render{owner:7,status:vm.clone(),render_order:g17_submission::G17PRenderOrder{sequence:seq,wait_through:None},
  fragment_dependency:AtomicU64::new(g17_submission::encode_kick_word(stamp,qid).unwrap()),fence:fence(seq,0)}
@@ -163,14 +163,14 @@ fn runtime(vm:&Arc<g17_status::VmStatus>)->Runtime{
 sched = (root.parent / 'scheduler/sched_main.c').read_text()
 assert sched.index('fence = sched->ops->run_job(sched_job);') < sched.index('drm_sched_fence_scheduled(s_fence, fence);')
 assert job.count('let published = job.fences().scheduled();') == 2
-assert job.count('Ok(G17PCommandFences { published, completed: hardware })') == 2
+assert job.count('Ok(G17PCommandFences { ready: published, completed: hardware })') == 2
 assert 'barriers: &dependencies[..dependency_count]' in comp
 assert 'packet.command().render_wait_through, packet.command().render_wait_last' in comp
 assert 'completion.owner(), &completion.vm_status(),' in live
 assert 'get_mut(dependency_count).ok_or(EOVERFLOW)?' in live
 for name in ['submit_compute_async', 'submit_render_async']:
     body = block(drm, '    fn '+name+'(')
-    assert 'dependencies.push(self.last_publication.as_ref().ok_or(EIO)?.clone()' in body
+    assert 'dependencies.push(self.last_ready.as_ref().ok_or(EIO)?.clone()' in body
     assert 'checked_dependencies.push(prior.clone()' not in body
 assert 'dma_fence_wait_timeout' not in block(drm, '    fn check_firmware_fence(')
 assert 'MAX_IN_FLIGHT_PER_QUEUE: u32 = 2' in (root / 'g17_queue_limits.rs').read_text()
