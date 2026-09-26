@@ -16,6 +16,7 @@ use kernel::{
         DriverObject, //
     },
     error::Result,
+    iosys_map::IoSysMapRef,
     prelude::*,
     sync::aref::ARef,
     uapi, //
@@ -81,11 +82,16 @@ impl ObjectRef {
     }
 
     /// Return the `VMap` for this object, creating it if necessary.
-    pub(crate) fn vmap(&mut self) -> Result<shmem::VMapRef<'_, AsahiObject, u8>> {
+    ///
+    /// The owned mapping lives as long as this reference, so hand out a view
+    /// of it directly. Going back through `gem.vmap()` took and dropped the
+    /// object's reservation lock and vmap refcount on every access, which the
+    /// G17P firmware-memory accessors do hundreds of times per submission.
+    pub(crate) fn vmap(&mut self) -> Result<IoSysMapRef<'_, u8>> {
         if self.vmap.is_none() {
             self.vmap = Some(self.gem.owned_vmap()?);
         }
-        self.gem.vmap()
+        Ok(self.vmap.as_ref().ok_or(EINVAL)?.get())
     }
 
     /// Returns the size of an object in bytes

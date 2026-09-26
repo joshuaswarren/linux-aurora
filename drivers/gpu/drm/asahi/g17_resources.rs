@@ -6916,7 +6916,7 @@ fn prepare_g17p_pm_submitted_operation(
 /// and excludes host restaging between its read and the infallible commit.
 #[cfg(not(test))]
 pub(crate) struct G17PPmSubmittedOperation<'a> {
-    vmap: kernel::drm::gem::shmem::VMapRef<'a, gem::AsahiObject, u8>,
+    vmap: kernel::iosys_map::IoSysMapRef<'a, u8>,
     size: usize,
     plan: G17PPmSubmittedOperationPlan,
 }
