@@ -20,13 +20,14 @@ pub(crate) const BIND_CONTEXT_MASK: u64 =
 pub(crate) const COMPUTE_CONTEXT_MASK: u64 =
     ((1u64 << BIND_CONTEXT_FIRST) - 1) & !((1u64 << COMPUTE_CONTEXT_FIRST) - 1);
 pub(crate) const MAX_QUEUES: u32 = COMPUTE_CONTEXT_MASK.count_ones();
-/// Physical TA/3D pairs a logical queue may keep in flight. This driver still
-/// publishes one render per pair, so this is the queue depth. Native G17P
-/// (AGXG17P 353.14) uses two work queues per command queue but pipelines up
-/// to 80 commands on each, ordered by firmware kick parents; with two pairs
-/// here every pass waited for a host round trip, ~0.25 ms per render on Neo.
-/// Cross-pair ordering uses the same explicit firmware parents.
-pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 8;
+/// Physical TA/3D pairs per logical queue. Native G17P (AGXG17P 353.14) uses
+/// two work queues per command queue and pipelines further commands on each,
+/// ordered by firmware kick parents, instead of waiting for a retirement.
+pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 2;
+/// Renders a physical pair may hold at once: one per retained command
+/// generation of its render storage.
+pub(crate) const RENDER_KICKS_PER_PAIR: u32 =
+    crate::g17_resources::G17P_RENDER_MAX_IN_FLIGHT as u32;
 pub(crate) const MAX_COMPUTE_IN_FLIGHT_PER_QUEUE: u32 = 1;
 /// Two GiB boundary inside the existing four GiB runtime reservation. In
 /// addition to descriptor arrays, each independently executing CL graph owns

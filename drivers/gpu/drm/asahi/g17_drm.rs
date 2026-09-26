@@ -270,12 +270,27 @@ impl G17PQueueLeaseState {
             }
         }
 
-        // Bound each logical queue to the native configured array of two
-        // independent physical pairs. Per-pair command-generation depth is a
-        // separate retirement property and must not cap the live-pair count.
+        // Bound each logical queue to the native two physical pairs. Once
+        // both are busy, queue the next kick on the owner's least-loaded pair
+        // up to the per-pair command depth, as AGXG17P does on its work
+        // queues: firmware orders consecutive kicks on one queue through the
+        // implicit previous-kick parent and cross-pair work through explicit
+        // parents, so the host does not wait for a retirement first.
         let owned = self.render_owner.iter().filter(|id| **id == owner).count();
         if owned >= crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE as usize {
-            return None;
+            let depth = crate::g17_queue_limits::RENDER_KICKS_PER_PAIR as u8;
+            let slot = (0..G17P_RENDER_SLOTS)
+                .filter(|slot| {
+                    self.render_owner[*slot] == owner
+                        && self.render_quarantined & (1u64 << *slot) == 0
+                        && self.render_slots & (1u64 << *slot) != 0
+                        && self.render_refs[*slot] < depth
+                })
+                .min_by_key(|slot| (self.render_refs[*slot], u64::MAX - self.render_epoch[*slot]))?;
+            self.render_refs[slot] += 1;
+            self.epoch = self.epoch.wrapping_add(1);
+            self.render_epoch[slot] = self.epoch;
+            return Some(slot as u8);
         }
 
         let free = (!self.render_slots) & Self::render_mask() & !self.render_quarantined;
@@ -1901,7 +1916,8 @@ impl G17PQueue {
             context: context.clone(),
         }, GFP_KERNEL)?;
         let render_scheduler = g17_job::G17PRenderScheduler::new(
-            dev, render_backend.clone(), crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE,
+            dev, render_backend.clone(),
+            crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE * crate::g17_queue_limits::RENDER_KICKS_PER_PAIR,
         )?;
         Ok(Self {
             dev: dev.into(),
