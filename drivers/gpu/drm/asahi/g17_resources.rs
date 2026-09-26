@@ -4074,6 +4074,8 @@ pub(crate) struct G17PComputeRingState {
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct G17PComputeSubmissionSnapshot {
     pub(crate) descriptor: u64,
+    pub(crate) cdm_base: Option<u64>,
+    pub(crate) cdm_terminator: u64,
     pub(crate) selector: u32,
     pub(crate) context: u32,
     /// B1 selector-3 resource-reclaim inputs. These are retained DRAM bytes,
@@ -5625,6 +5627,7 @@ impl G17PComputeDescriptorStorage {
         let mut snapshot = self.descriptors.with_bytes_mut(|bytes| {
             let raw = bytes.get(offset..end).ok_or(ERANGE)?;
             let mut work_key = None;
+            let mut cdm_base = None;
             // The Linux builder emits forty 12-byte primary RCE entries at
             // +0x40, or forty-one when the kick carries an SCS scratch
             // request. Report the encoded 0x10201 value, not a reconstructed
@@ -5635,6 +5638,9 @@ impl G17PComputeDescriptorStorage {
                 let at = 0x40 + index * 12;
                 if read_u32(raw, at)? == 0x10201 {
                     work_key = Some(read_u64(raw, at + 4)?);
+                }
+                if read_u32(raw, at)? == 0x1a420 {
+                    cdm_base = Some(read_u64(raw, at + 4)?);
                 }
             }
             let resource_index = read_u16(raw, 0xfb0)?;
@@ -5647,6 +5653,7 @@ impl G17PComputeDescriptorStorage {
                 None
             };
             Ok(G17PComputeSubmissionSnapshot {
+                cdm_base, cdm_terminator: read_u64(raw, 0xee0)?,
                 descriptor, selector: read_u32(raw, 0)?, context: read_u32(raw, 0x0c)?,
                 resource_state: read_u16(raw, 0x22)?,
                 primary_register_count: read_u16(raw, 0x748)?,
