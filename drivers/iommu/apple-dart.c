@@ -371,6 +371,8 @@ struct apple_dart_domain {
 	dma_addr_t dma_max;
 	u64 mask;
 	dma_addr_t dma_offset;
+	/* Snapshot of firmware-owned root slots in each imported locked TTBR. */
+	u64 *inherited_roots[DART_MAX_TTBR];
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 
@@ -492,7 +494,7 @@ apple_dart_hw_clear_all_ttbrs(struct apple_dart_stream_map *stream_map)
  * mappings added after Linux attached.
  */
 static int apple_dart_publish_root(u64 *live, u64 *owned, const u64 *ours,
-				   size_t entries)
+				   const u64 *inherited, size_t entries)
 {
 	size_t i;
 
@@ -500,6 +502,11 @@ static int apple_dart_publish_root(u64 *live, u64 *owned, const u64 *ours,
 		u64 next = READ_ONCE(ours[i]);
 		u64 previous = READ_ONCE(owned[i]);
 
+		if (inherited && inherited[i]) {
+			if (next != inherited[i] || previous)
+				return -EBUSY;
+			continue;
+		}
 		if (!next && !previous)
 			continue;
 		if (READ_ONCE(live[i]) != previous)
@@ -511,6 +518,8 @@ static int apple_dart_publish_root(u64 *live, u64 *owned, const u64 *ours,
 		u64 next = READ_ONCE(ours[i]);
 		u64 previous = READ_ONCE(owned[i]);
 
+		if (inherited && inherited[i])
+			continue;
 		if (next == previous)
 			continue;
 		if (cmpxchg(&live[i], previous, next) != previous)
@@ -520,20 +529,47 @@ static int apple_dart_publish_root(u64 *live, u64 *owned, const u64 *ours,
 	return 0;
 }
 
-static void apple_dart_retire_root(u64 *live, u64 *owned, size_t entries)
+/* Host allocations may use only root windows untouched by firmware. */
+static int apple_dart_root_window_vacant(const u64 *inherited, size_t entries,
+				       unsigned int root_shift, unsigned int ttbr,
+				       u64 first, u64 last)
+{
+	u64 first_slot, last_slot, root_base;
+	size_t i;
+
+	if (!inherited || !entries || root_shift >= 64 || first > last)
+		return -EINVAL;
+	first_slot = first >> root_shift;
+	last_slot = last >> root_shift;
+	root_base = (u64)ttbr * entries;
+	for (i = 0; i < entries; i++)
+		if (root_base + i >= first_slot && root_base + i <= last_slot &&
+		    inherited[i])
+			return -EBUSY;
+	return 0;
+}
+
+static int apple_dart_retire_root(u64 *live, u64 *owned, size_t entries)
 {
 	size_t i;
+	int ret = 0;
 
 	for (i = 0; i < entries; i++) {
 		u64 previous = READ_ONCE(owned[i]);
 
 		if (!previous)
 			continue;
-		/* Preserve a slot if its owner changed after we published it. */
-		cmpxchg(&live[i], previous, 0);
+		/* Preserve both the slot and our table if ownership changed. */
+		u64 observed = cmpxchg(&live[i], previous, 0);
+
+		if (observed && observed != previous) {
+			ret = -EBUSY;
+			continue;
+		}
 		WRITE_ONCE(owned[i], 0);
 	}
 	dma_wmb();
+	return ret;
 }
 
 static int
@@ -585,7 +621,7 @@ static int
 apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 {
 	struct apple_dart *dart = stream_map->dart;
-	int sid;
+	int sid, ret = 0;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u64 *live = dart->locked_ttbr[sid][idx];
@@ -593,17 +629,22 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 
 		if (!live)
 			continue;
-		apple_dart_retire_root(live, owned, dart->pgsize / sizeof(*live));
+		if (apple_dart_retire_root(live, owned,
+					   dart->pgsize / sizeof(*live))) {
+			ret = -EBUSY;
+			continue;
+		}
 		devm_memunmap(dart->dev, live);
 		devm_kfree(dart->dev, owned);
 		dart->locked_ttbr[sid][idx] = NULL;
 		dart->locked_owned[sid][idx] = NULL;
 	}
-	return 0;
+	return ret;
 }
 
 static int
-apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
+apple_dart_hw_sync_locked(struct apple_dart_domain *domain,
+			 struct io_pgtable_cfg *cfg,
 			 struct apple_dart_stream_map *stream_map)
 {
 	struct apple_dart *dart = stream_map->dart;
@@ -617,18 +658,12 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			u64 *owned = dart->locked_owned[sid][idx];
 			u64 *ours = cfg->apple_dart_cfg.ttbr[idx];
 
-			/*
-			 * A stream whose firmware-owned root has not been mapped
-			 * yet is not translating through this domain; its attach
-			 * maps the root and publishes everything then.
-			 */
-			if (!live || !owned)
-				continue;
-			if (!ours) {
+			if (!live || !owned || !ours) {
 				ret = -EIO;
 				goto out;
 			}
 			ret = apple_dart_publish_root(live, owned, ours,
+						      domain->inherited_roots[idx],
 						      dart->pgsize / sizeof(*live));
 			if (ret)
 				goto out;
@@ -698,10 +733,8 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 			val |= DART_T8110_TLB_CMD_V2;
 		if (range) {
 			val |= DART_T8110_TLB_CMD_RANGE | DART_T8110_TLB_CMD_STT;
-			apple_dart_writel(dart, (first >> ilog2(dart->pgsize)) << 2,
-					  DART_T8110_TLB_START);
-			apple_dart_writel(dart, (last >> ilog2(dart->pgsize)) << 2,
-					  DART_T8110_TLB_END);
+			apple_dart_writel(dart, (first >> 14) << 2, DART_T8110_TLB_START);
+			apple_dart_writel(dart, (last >> 14) << 2, DART_T8110_TLB_END);
 		}
 		dma_wmb();
 		apple_dart_writel(dart, val, DART_T8110_TLB_CMD);
@@ -904,7 +937,7 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 				"failed to power DART for TLB synchronization: %d\n", ret);
 			return ret;
 		}
-		ret = stream.dart->locked ? apple_dart_hw_sync_locked(cfg, &stream) : 0;
+		ret = stream.dart->locked ? apple_dart_hw_sync_locked(domain, cfg, &stream) : 0;
 		if (ret)
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to publish host page-table entries: %d\n", ret);
@@ -971,9 +1004,37 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 {
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
+	struct apple_dart *dart = dart_domain->stream_maps[0].dart;
 
 	if (!ops)
 		return -ENODEV;
+	if (dart && dart->locked) {
+		struct io_pgtable_cfg *cfg = &io_pgtable_ops_to_pgtable(ops)->cfg;
+		unsigned int root_shift = __ffs(dart->pgsize) +
+			(__ffs(dart->pgsize) - 3) *
+			(cfg->apple_dart_cfg.n_levels - 2);
+		size_t bytes;
+		u64 first, last;
+		int i, ret;
+
+		if (!pgsize || !pgcount ||
+		    check_mul_overflow(pgsize, pgcount, &bytes) ||
+		    check_add_overflow((u64)iova, (u64)dart_domain->dma_offset,
+				       &first) ||
+		    check_add_overflow(first, bytes - 1, &last))
+			return -EINVAL;
+		if ((first ^ last) & ~dart_domain->mask)
+			return -ERANGE;
+		for (i = 0; i < cfg->apple_dart_cfg.n_ttbrs; i++) {
+			ret = apple_dart_root_window_vacant(
+				dart_domain->inherited_roots[i],
+				dart->pgsize / sizeof(u64), root_shift, i,
+				first & dart_domain->mask,
+				last & dart_domain->mask);
+			if (ret)
+				return ret;
+		}
+	}
 
 	return ops->map_pages(ops,
 			      (iova + dart_domain->dma_offset) &
@@ -1033,7 +1094,7 @@ apple_dart_setup_translation_locked(struct apple_dart_domain *domain,
 		if (ret)
 			goto unmap;
 	}
-	ret = apple_dart_hw_sync_locked(cfg, stream_map);
+	ret = apple_dart_hw_sync_locked(domain, cfg, stream_map);
 	if (!ret)
 		ret = stream_map->dart->hw->invalidate_tlb(stream_map);
 	if (!ret)
@@ -1067,7 +1128,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	u64 translated_max;
 	u32 ias;
 	int ret = 0;
-	int i, j;
+	int i, j, locked_sid = -1;
 
 	if (dart->pgsize > PAGE_SIZE)
 		return -EINVAL;
@@ -1102,24 +1163,27 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 
 	if (dart->locked) {
 		unsigned long *sidmap;
-		int sid;
 		u32 ttbr;
 
 		/* Locked DARTs can only have a single stream bound */
 		sidmap = cfg->stream_maps[0].sidmap;
-		sid = find_first_bit(sidmap, dart->num_streams);
+		locked_sid = find_first_bit(sidmap, dart->num_streams);
 
-		if (sid >= dart->num_streams || bitmap_weight(sidmap, dart->num_streams) != 1) {
+		if (locked_sid >= dart->num_streams ||
+		    bitmap_weight(sidmap, dart->num_streams) != 1) {
 			ret = -EINVAL;
 			goto done;
 		}
-		ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
+		ttbr = apple_dart_readl(dart, DART_TTBR(dart, locked_sid, 0));
 
-		WARN_ON(!(ttbr & dart->hw->ttbr_valid));
+		if (!(ttbr & dart->hw->ttbr_valid)) {
+			ret = -EIO;
+			goto done;
+		}
 
 		/* If the DART is locked, we need to keep the translation level count. */
 		if (dart->hw->tcr_4level && dart->ias > 36) {
-			if (apple_dart_readl(dart, DART_TCR(dart, sid)) &
+			if (apple_dart_readl(dart, DART_TCR(dart, locked_sid)) &
 			    dart->hw->tcr_4level) {
 				if (ias < 37) {
 					dev_dbg(dart->dev, "Expanded to ias=37 due to lock\n");
@@ -1146,6 +1210,30 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		ret = -ENOMEM;
 		goto done;
 	}
+	if (dart->locked) {
+		for (i = 0; i < pgtbl_cfg.apple_dart_cfg.n_ttbrs; i++) {
+			phys_addr_t phys;
+			u32 ttbr = apple_dart_readl(dart,
+						 DART_TTBR(dart, locked_sid, i));
+
+			if (!(ttbr & dart->hw->ttbr_valid)) {
+				ret = -EIO;
+				goto err_free_pgtable;
+			}
+			ttbr &= ~dart->hw->ttbr_valid;
+			if (dart->hw->ttbr_addr_field_shift)
+				ttbr >>= dart->hw->ttbr_addr_field_shift;
+			phys = (phys_addr_t)ttbr << dart->hw->ttbr_shift;
+			ret = io_pgtable_apple_dart_import(dart_domain->pgtbl_ops,
+							 i, phys);
+			if (ret) {
+				dev_err(dart->dev,
+					"failed to import locked TTBR[%d] for SID %d: %d\n",
+					i, locked_sid, ret);
+				goto err_free_pgtable;
+			}
+		}
+	}
 
 	if (pgtbl_cfg.pgsize_bitmap == SZ_4K)
 		dart_domain->mask = DMA_BIT_MASK(min_t(u32, dart->ias, 32));
@@ -1153,6 +1241,17 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		dart_domain->mask = DMA_BIT_MASK(min_t(u32, dart->ias, 36));
 	else if (pgtbl_cfg.apple_dart_cfg.n_levels == 4)
 		dart_domain->mask = DMA_BIT_MASK(min_t(u32, dart->ias, 47));
+	if (dart->locked) {
+		for (i = 0; i < pgtbl_cfg.apple_dart_cfg.n_ttbrs; i++) {
+			dart_domain->inherited_roots[i] = kmemdup(
+				pgtbl_cfg.apple_dart_cfg.ttbr[i], dart->pgsize,
+				GFP_KERNEL);
+			if (!dart_domain->inherited_roots[i]) {
+				ret = -ENOMEM;
+				goto err_free_pgtable;
+			}
+		}
+	}
 
 	dart_domain->domain.pgsize_bitmap = pgtbl_cfg.pgsize_bitmap;
 	dart_domain->domain.geometry.aperture_start = dma_min;
@@ -1161,9 +1260,74 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	dart_domain->dma_offset = dart->dma_offset;
 
 	dart_domain->finalized = true;
+	goto done;
 
+err_free_pgtable:
+	for (i = 0; i < DART_MAX_TTBR; i++) {
+		kfree(dart_domain->inherited_roots[i]);
+		dart_domain->inherited_roots[i] = NULL;
+	}
+	free_io_pgtable_ops(dart_domain->pgtbl_ops);
+	dart_domain->pgtbl_ops = NULL;
 done:
 	mutex_unlock(&dart_domain->init_lock);
+	return ret;
+}
+
+static int
+apple_dart_reconcile_locked_translated(struct apple_dart_domain *dart_domain,
+				       struct device *dev)
+{
+	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+	struct apple_dart *dart = cfg->stream_maps[0].dart;
+	struct iommu_resv_region *entry;
+	unsigned long pgsize = dart_domain->domain.pgsize_bitmap;
+	LIST_HEAD(regions);
+	int ret = 0;
+
+	if (!cfg->locked)
+		return 0;
+
+	iommu_get_resv_regions(dev, &regions);
+	list_for_each_entry(entry, &regions, list) {
+		struct io_pgtable_apple_dart_reconcile result;
+		phys_addr_t phys_start, phys_end;
+		dma_addr_t dva;
+		size_t size;
+
+		if (entry->type != IOMMU_RESV_TRANSLATED)
+			continue;
+		if (check_add_overflow(entry->start, entry->length, &phys_end)) {
+			ret = -EOVERFLOW;
+			break;
+		}
+
+		phys_start = ALIGN(entry->start, pgsize);
+		phys_end = ALIGN(phys_end, pgsize);
+		dva = ALIGN(entry->dva, pgsize);
+		if (phys_end <= phys_start)
+			continue;
+		size = phys_end - phys_start;
+
+		ret = io_pgtable_apple_dart_reconcile(
+			dart_domain->pgtbl_ops, dva & dart_domain->mask,
+			phys_start, size, entry->prot, &result);
+		if (ret) {
+			dev_err(dart->dev,
+				"locked translated mapping DVA %pad PA %pa size %#zx failed permission reconciliation: %d\n",
+				&dva, &phys_start, size, ret);
+			break;
+		}
+
+		dev_info(dart->dev,
+			 "locked translated mapping DVA %pad PA %pa size %#zx inherited first PTE %#018llx (no-read=%u no-write=%u), reconciled %#018llx, changed %u pages\n",
+			 &dva, &phys_start, size, result.first_pte_before,
+			 !!(result.first_pte_before & BIT_ULL(3)),
+			 !!(result.first_pte_before & BIT_ULL(2)),
+			 result.first_pte_after, result.changed);
+	}
+	iommu_put_resv_regions(dev, &regions);
+
 	return ret;
 }
 
@@ -1215,6 +1379,9 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
+	if (ret)
+		goto err;
+	ret = apple_dart_reconcile_locked_translated(dart_domain, dev);
 	if (ret)
 		goto err;
 
@@ -1386,7 +1553,7 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct apple_dart_atomic_stream_map *map;
 	struct apple_dart_stream_map stream;
-	int i, j, idx;
+	int i, j, idx, ret;
 
 	for_each_stream_map(i, dart_domain, map) {
 		if (!map->dart->locked)
@@ -1400,8 +1567,16 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 				"retaining page tables after power failure: %d\n", j);
 			return;
 		}
-		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++)
-			apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++) {
+			ret = apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+			if (ret) {
+				pm_runtime_put(stream.dart->dev);
+				dev_err_ratelimited(stream.dart->dev,
+					"retaining page tables after owner change: %d\n",
+					ret);
+				return;
+			}
+		}
 		j = stream.dart->hw->invalidate_tlb(&stream);
 		pm_runtime_put(stream.dart->dev);
 		/* Do not free page tables that hardware may still cache. */
@@ -1412,6 +1587,8 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 		}
 	}
 	free_io_pgtable_ops(dart_domain->pgtbl_ops);
+	for (i = 0; i < DART_MAX_TTBR; i++)
+		kfree(dart_domain->inherited_roots[i]);
 	kfree(dart_domain);
 }
 
