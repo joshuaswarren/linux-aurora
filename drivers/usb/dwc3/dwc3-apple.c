@@ -121,6 +121,8 @@ struct dwc3_apple {
 	struct reset_control *reset;
 	struct usb_role_switch *role_sw;
 	struct gpio_desc *hub_reset_gpio;
+	bool legacy_fixed_usb2;
+	struct phy *usb2_phy;
 	bool force_usb2_host;
 	bool usb2_hub_always_on;
 	bool usb2_retry_reset;
@@ -353,7 +355,10 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 */
 	switch (state) {
 	case DWC3_APPLE_HOST:
-		phy_set_mode(appledwc->dwc.usb2_generic_phy[0], PHY_MODE_USB_HOST);
+		ret = phy_set_mode(appledwc->legacy_fixed_usb2 ? appledwc->usb2_phy :
+				   appledwc->dwc.usb2_generic_phy[0], PHY_MODE_USB_HOST);
+		if (ret)
+			return ret;
 		break;
 	case DWC3_APPLE_DEVICE:
 		phy_set_mode(appledwc->dwc.usb2_generic_phy[0], PHY_MODE_USB_DEVICE);
@@ -377,7 +382,8 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 * Now that the core is initialized and already went through dwc3_core_soft_reset we can
 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
 	 */
-	dwc3_apple_setup_cio(appledwc);
+	if (!appledwc->legacy_fixed_usb2)
+		dwc3_apple_setup_cio(appledwc);
 
 	switch (state) {
 	case DWC3_APPLE_HOST:
@@ -818,12 +824,24 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
+	appledwc->legacy_fixed_usb2 = of_machine_is_compatible("apple,j700") &&
+		device_property_read_bool(dev, "apple,usb2-fixed-host");
+	if (appledwc->legacy_fixed_usb2) {
+		appledwc->usb2_phy = devm_phy_get(dev, "usb2-phy");
+		if (IS_ERR(appledwc->usb2_phy))
+			return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
+					     "USB2 PHY unavailable\n");
+	}
 	mutex_init(&appledwc->lock);
 	INIT_DELAYED_WORK(&appledwc->usb2_retry_work,
 			  dwc3_apple_usb2_retry_work);
 	appledwc->force_usb2_host = device_property_read_bool(dev, "apple,force-usb2-host");
 	appledwc->usb2_hub_always_on = device_property_read_bool(
 		dev, "apple,usb2-hub-always-on");
+	if (appledwc->legacy_fixed_usb2) {
+		appledwc->force_usb2_host = true;
+		appledwc->usb2_hub_always_on = true;
+	}
 	appledwc->usb2_retry_reset =
 		device_property_read_bool(dev, "apple,j700-usb2-retry-reset");
 
@@ -1103,7 +1121,8 @@ static int dwc3_apple_resume(struct device *dev)
 	if (ret)
 		goto reset_assert;
 
-	dwc3_apple_setup_cio(appledwc);
+	if (!appledwc->legacy_fixed_usb2)
+		dwc3_apple_setup_cio(appledwc);
 
 	if (appledwc->pm_state == DWC3_APPLE_HOST) {
 		appledwc->dwc.dr_mode = USB_DR_MODE_HOST;

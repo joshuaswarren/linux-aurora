@@ -236,6 +236,7 @@ static const struct hw_info t8140_hw = {
 };
 
 struct apple_pcie {
+	bool legacy_handoff;
 	struct mutex		lock;
 	struct device		*dev;
 	void __iomem            *base;
@@ -850,6 +851,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	/* Use the first reg entry to work out the port index */
 	port->idx = idx >> 11;
+	if (pcie->legacy_handoff && port->idx != 0)
+		return -EOPNOTSUPP;
 	port->pcie = pcie;
 	port->np = np;
 
@@ -888,6 +891,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	/* link might be already brought up by u-boot, skip setup then */
 	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
+		if (pcie->legacy_handoff)
+			return dev_err_probe(pcie->dev, -ENOLINK, "Missing retained radio link\n");
 		ret = apple_pcie_setup_link(pcie, port, np);
 		if (ret)
 			return ret;
@@ -906,11 +911,18 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (ret)
 		return ret;
 
-	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
-	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
-		if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
-			break;
-		apple_pcie_rid2sid_write(port, i, 0);
+	if (pcie->legacy_handoff) {
+		/* Retain mappings for firmware-owned functions. */
+		for (i = 0; i < pcie->hw->max_rid2sid; i++)
+			if (readl_relaxed(port_rid2sid_addr(port, i)) & PORT_RID2SID_VALID)
+				__set_bit(i, port->sid_map);
+	} else {
+		/* Reset all RID/SID mappings, and check for RAZ/WI registers */
+		for (i = 0; i < pcie->hw->max_rid2sid; i++) {
+			if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
+				break;
+			apple_pcie_rid2sid_write(port, i, 0);
+		}
 	}
 
 	dev_dbg(pcie->dev, "%pOF: %d RID/SID mapping entries\n", np, i);
@@ -1024,6 +1036,8 @@ static bool apple_pcie_config_hidden(struct apple_pcie *pcie,
 	struct pci_config_window *cfg = bus->sysdata;
 	u16 bdf = (bus->number << 8) | devfn;
 
+	if (pcie && pcie->legacy_handoff && (bus->number > 1 || devfn != 0))
+		return true;
 	if (pcie && pcie->hide_bdf && bdf == pcie->hidden_bdf)
 		return true;
 	if (pcie && pcie->valid_functions &&
@@ -1228,7 +1242,11 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	mutex_lock(&port->pcie->lock);
 
 	if (port->pcie->hw->rid2sid_index_is_sid) {
-		if (sid >= port->sid_map_sz || test_bit(sid, port->sid_map)) {
+		if (port->pcie->legacy_handoff && sid < port->sid_map_sz &&
+		    readl_relaxed(port_rid2sid_addr(port, sid)) ==
+		    (PORT_RID2SID_VALID | FIELD_PREP(PORT_RID2SID_SID, sid) | rid)) {
+			idx = sid;
+		} else if (sid >= port->sid_map_sz || test_bit(sid, port->sid_map)) {
 			idx = -ENOSPC;
 		} else {
 			__set_bit(sid, port->sid_map);
@@ -1289,7 +1307,7 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 	if (WARN_ON(!pcie))
 		return -ENOENT;
 
-	if (pcie->hw->requires_piodma && piodma_config) {
+	if (pcie->hw->requires_piodma && piodma_config && !pcie->legacy_handoff) {
 		struct device_node *node;
 
 		node = of_parse_phandle(dev->of_node, "apple,piodma", 0);
@@ -1307,6 +1325,8 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 		dev_info(dev,
 			 "J700_PCIE_PIODMA_CONFIG: enabled=1 read_limit=%d writes=%u\n",
 			 piodma_config_read_limit, piodma_config_writes);
+	} else if (pcie->legacy_handoff) {
+		dev_info(dev, "Using retained J700 Wi-Fi ECAM handoff\n");
 	} else if (pcie->hw->requires_piodma) {
 		dev_info(dev,
 			 "J700_PCIE_PIODMA_CONFIG: enabled=0 provider=skipped diagnostic=1\n");
@@ -1384,6 +1404,10 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie->hw = of_device_get_match_data(dev);
 	if (!pcie->hw)
 		return -ENODEV;
+	pcie->legacy_handoff = pcie->hw->requires_piodma &&
+		of_machine_is_compatible("apple,j700") &&
+		of_property_read_bool(dev->of_node, "apple,firmware-initialized") &&
+		!of_property_present(dev->of_node, "apple,piodma");
 	{
 		u32 hidden_bdf;
 		u32 valid_functions;

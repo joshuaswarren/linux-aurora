@@ -198,6 +198,7 @@ struct apple_nvme_hw {
 	bool has_queue_count;
 	bool has_separate_nvmmu;
 	bool needs_ioq_registers;
+	bool requires_cold_start;
 	u32 max_queue_depth;
 };
 
@@ -277,7 +278,8 @@ static inline struct apple_nvme *ctrl_to_apple_nvme(struct nvme_ctrl *ctrl)
 static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 {
 	/* CPU_RUN and BOOT_STATUS survive an inactive firmware session. */
-	return anv->hw->needs_ioq_registers &&
+	return !anv->hw->requires_cold_start &&
+		anv->hw->needs_ioq_registers &&
 		(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		 APPLE_ANS_COPROC_CPU_CONTROL_RUN) &&
 		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
@@ -1350,7 +1352,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
 
-		if (anv->hw->needs_ioq_registers) {
+		if (anv->hw->needs_ioq_registers &&
+		    !anv->hw->requires_cold_start) {
 			/*
 			 * Post-M4 ANS cannot be reset through PMGR: the reset
 			 * assert raises an SError. A previous boot stage that
@@ -1382,6 +1385,9 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
 		ret = apple_rtkit_boot(anv->rtk);
+	} else if (anv->hw->requires_cold_start) {
+		dev_err(anv->dev, "bootloader left ANS running without a Linux RTKit session\n");
+		ret = -EBUSY;
 	} else {
 		ret = apple_rtkit_wake(anv->rtk);
 	}
@@ -2192,7 +2198,22 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.max_queue_depth = 64,
 };
 
+/*
+ * J700's qualified boot chain shuts ANS down before entering Linux. Reset
+ * that stopped controller and establish a fresh RTKit session, as required
+ * by the working J700 driver, rather than only setting the CPU RUN bit.
+ */
+static const struct apple_nvme_hw apple_nvme_t8140_hw = {
+	.has_lsq_nvmmu = true,
+	.has_linear_sq_ctrl = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.requires_cold_start = true,
+	.max_queue_depth = 64,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
+	{ .compatible = "apple,t8140-nvme-ans3", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },

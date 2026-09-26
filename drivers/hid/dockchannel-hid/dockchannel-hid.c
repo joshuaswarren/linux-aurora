@@ -442,6 +442,7 @@ static int dchid_inherited_pm2_transition(struct dchid_iface *iface, u8 state)
 static bool dchid_j700_power_v2(struct dchid_iface *iface)
 {
 	return of_machine_is_compatible("apple,j700") &&
+	       !of_property_present(iface->of_node, "apple,power-method") &&
 	       iface->index == 1 && !strcmp(iface->name, "multi-touch");
 }
 

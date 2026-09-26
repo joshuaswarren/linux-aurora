@@ -285,6 +285,25 @@ struct macsmc_gpio_of_match_data {
 	smc_key base_key;
 };
 
+/* The inherited MTP profile uses the original gP13 AFE-reset command. */
+static bool macsmc_gpio_legacy_mtp(void)
+{
+	struct device_node *hid, *helper;
+	u32 inherited = 0;
+
+	hid = of_find_compatible_node(NULL, NULL, "apple,t8140-dockchannel-hid");
+	if (!hid)
+		return false;
+	helper = of_parse_phandle(hid, "apple,helper-cpu", 0);
+	of_node_put(hid);
+	if (helper) {
+		of_property_read_u32(helper, "linux-enablement-mac,rtkit-inherited",
+				     &inherited);
+		of_node_put(helper);
+	}
+	return inherited == 1;
+}
+
 static int macsmc_gpio_probe(struct platform_device *pdev)
 {
 	struct macsmc_gpio *smcgp;
@@ -303,6 +322,7 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->j700_pcio_pin8 = of_property_read_bool(
 		pdev->dev.of_node, "apple,j700-pcio-pin8");
 	smcgp->j700_pcio_pin19 = of_machine_is_compatible("apple,j700") &&
+		!macsmc_gpio_legacy_mtp() &&
 		device_is_compatible(&pdev->dev, "apple,smc-gpio");
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
