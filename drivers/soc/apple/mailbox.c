@@ -215,8 +215,14 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 	}
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
-	if (ret)
+	if (ret) {
+		dev_err(mbox->dev,
+			"ASC CPU start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
+			ret, mbox->active, mbox->dev->power.runtime_status,
+			mbox->dev->power.disable_depth,
+			mbox->dev->power.runtime_error);
 		goto out_unlock;
+	}
 
 	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
 		      APPLE_ASCWRAP_V6_CPU_CONTROL;
@@ -551,8 +557,14 @@ int apple_mbox_start(struct apple_mbox *mbox)
 		goto out_unlock;
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
-	if (ret)
+	if (ret) {
+		dev_err(mbox->dev,
+			"mailbox start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
+			ret, mbox->active, mbox->dev->power.runtime_status,
+			mbox->dev->power.disable_depth,
+			mbox->dev->power.runtime_error);
 		goto out_unlock;
+	}
 
 	if (mbox->hw->ap_initializes_mailboxes) {
 		/* The primary T8140 outbox requires its enable bit before use. */

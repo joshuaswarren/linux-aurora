@@ -303,19 +303,27 @@ impl G17PMailboxProvider {
         Ok(Self { mbox })
     }
 
-    fn lifecycle(&self) -> Result<G17PAscwrapV6Lifecycle> {
+    fn lifecycle(&self, pdev: &platform::Device) -> Result<G17PAscwrapV6Lifecycle> {
         let mut raw = MaybeUninit::<bindings::apple_mbox_ascwrap_v6_lifecycle>::uninit();
         // SAFETY: `self.mbox` is the live provider returned by
         // apple_mbox_get() and `raw` points to writable storage.
         to_result(unsafe {
             bindings::apple_mbox_ascwrap_v6_get_lifecycle(self.mbox, raw.as_mut_ptr())
+        }).map_err(|error| {
+            dev_err!(pdev.as_ref(), "G17P provider lifecycle read failed ({:?})\n", error);
+            error
         })?;
         // SAFETY: the successful C call initialized every field.
         let raw = unsafe { raw.assume_init() };
         let role = match raw.role as u32 {
             1 => G17PAscwrapV6Role::Gfx,
             2 => G17PAscwrapV6Role::Gfx1,
-            _ => return Err(EINVAL),
+            _ => {
+                dev_err!(pdev.as_ref(), "G17P provider: unknown ASCWrap v6 role {} wrapper={:#x}+{:#x} iop-vbar={:#x}+{:#x}\n",
+                    raw.role, raw.wrapper_start, raw.wrapper_size,
+                    raw.iop_vbar_start, raw.iop_vbar_size);
+                return Err(EINVAL);
+            }
         };
         Ok(G17PAscwrapV6Lifecycle {
             role,
@@ -2430,14 +2438,21 @@ const GFX1_PROVIDER: ExpectedProvider = ExpectedProvider {
 };
 
 fn validate_provider(
+    pdev: &platform::Device,
     provider: &G17PMailboxProvider,
     expected: ExpectedProvider,
 ) -> Result<G17PAscwrapV6Lifecycle> {
-    let lifecycle = provider.lifecycle()?;
+    let lifecycle = provider.lifecycle(pdev)?;
     if lifecycle.role != expected.role
         || lifecycle.wrapper != expected.wrapper
         || lifecycle.iop_vbar != expected.iop_vbar
     {
+        dev_err!(pdev.as_ref(),
+            "G17P provider mismatch: got {:?} wrapper={:#x}+{:#x} iop-vbar={:#x}+{:#x} missing={:#x}; expected {:?} wrapper={:#x}+{:#x} iop-vbar={:#x}+{:#x}\n",
+            lifecycle.role, lifecycle.wrapper.0, lifecycle.wrapper.1,
+            lifecycle.iop_vbar.0, lifecycle.iop_vbar.1, lifecycle.missing,
+            expected.role, expected.wrapper.0, expected.wrapper.1,
+            expected.iop_vbar.0, expected.iop_vbar.1);
         return Err(EINVAL);
     }
 
@@ -2648,9 +2663,9 @@ fn boot_session(
     stop_unproven: &mut bool,
 ) -> Result<G17PBootedSession> {
     let gfx = G17PMailboxProvider::get(pdev.as_ref(), 0)?;
-    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
+    let gfx_lifecycle = validate_provider(pdev, &gfx, GFX_PROVIDER)?;
     let gfx1 = G17PMailboxProvider::get(pdev.as_ref(), 1)?;
-    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
+    let gfx1_lifecycle = validate_provider(pdev, &gfx1, GFX1_PROVIDER)?;
     let gfx_gate = gfx.require_safe_cpu_lifecycle();
     let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
     let transaction_gate =
@@ -2865,9 +2880,9 @@ fn boot_initial_session(
     test_stage: G17PTestStage,
 ) -> Result<(KBox<g17_manager::G17PManagerConstruction>, G17PBootedSession)> {
     let gfx = G17PMailboxProvider::get(pdev.as_ref(), 0)?;
-    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
+    let gfx_lifecycle = validate_provider(pdev, &gfx, GFX_PROVIDER)?;
     let gfx1 = G17PMailboxProvider::get(pdev.as_ref(), 1)?;
-    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
+    let gfx1_lifecycle = validate_provider(pdev, &gfx1, GFX1_PROVIDER)?;
     let gfx_gate = gfx.require_safe_cpu_lifecycle();
     let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
     let transaction_gate =
@@ -2877,7 +2892,10 @@ fn boot_initial_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
-    let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true)?, GFP_KERNEL)?);
+    let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true).map_err(|error| {
+        dev_err!(pdev.as_ref(), "G17P initial session: UAT setup failed ({:?})\n", error);
+        error
+    })?, GFP_KERNEL)?);
     let firmware_contexts = uat
         .as_ref()
         .ok_or(EIO)?
@@ -2904,10 +2922,37 @@ fn boot_initial_session(
         ),
         GFP_KERNEL,
     )?;
-    let mut gfx_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
-    let gfx1_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
+    // The mailbox provider resumes its genpd in apple_mbox_start().  The
+    // observed failure lies in this constructor window, but its exact errno
+    // source is not yet proven. A failed constructor releases its RX claim,
+    // and neither ASC has started, so a bounded EINVAL retry is safe here.
+    let new_rtkit = |index, state: Arc<G17PRoleRtkitState>| {
+        for attempt in 1..=3 {
+            match rtkit::RtKit::<G17PRtkitOps>::new_g17p(
+                drm.as_ref(), None, index, state.clone(),
+            ) {
+                Ok(rtkit) => return Ok(rtkit),
+                Err(error) => {
+                    dev_err!(pdev.as_ref(),
+                        "G17P initial session: RTKit receiver {} constructor attempt {} failed ({:?})\n",
+                        index, attempt, error);
+                    if error != EINVAL {
+                        return Err(error);
+                    }
+                    if attempt == 3 {
+                        dev_err!(pdev.as_ref(),
+                            "G17P initial session: RTKit receiver {} still EINVAL; deferring probe until providers settle\n",
+                            index);
+                        return Err(EPROBE_DEFER);
+                    }
+                    fsleep(Delta::from_millis(20));
+                }
+            }
+        }
+        Err(EPROBE_DEFER)
+    };
+    let mut gfx_rtkit = new_rtkit(0, gfx_state.clone())?;
+    let gfx1_rtkit = new_rtkit(1, gfx1_state.clone())?;
     dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
     registers.validate_t8140_axi_transition()?;
@@ -3015,9 +3060,17 @@ fn boot_initial_session(
         }
         let handoff = manager.handoff();
         let gfx_init = g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root)
-            .map_err(|_| EINVAL)?;
+            .map_err(|error| {
+                dev_err!(pdev.as_ref(), "G17P initial session: invalid gfx initdata root {:#x} ({:?})\n",
+                    handoff.primary.instance.root, error);
+                EINVAL
+            })?;
         let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
-            .map_err(|_| EINVAL)?;
+            .map_err(|error| {
+                dev_err!(pdev.as_ref(), "G17P initial session: invalid gfx1 initdata root {:#x} ({:?})\n",
+                    handoff.secondary.instance.root, error);
+                EINVAL
+            })?;
         // Serialise the two roles' initdata handshakes, as native does. MEASURED
         // on the m1n1 hv capture 20260904-001852Z: macOS completes role 0 entirely
         // before it touches role 1's endpoints.
