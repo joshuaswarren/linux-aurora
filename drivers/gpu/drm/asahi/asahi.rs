@@ -89,7 +89,7 @@ kernel::module_platform_driver! {
         },
         g18_initdata_test: u32 {
             default: 0,
-            description: "T8152/J873 G18G bring-up stage. 0 (default) refuses with ENODEV before any MMIO, DMA or processor access. 1 = read-only probe (PSD state, then only if powered: SGX ID, ASC CPU control/status, GFX/GFX1 post-office status), ENODEV. 2 = REQUIRES USER APPROVAL: GPU must already be powered; start GFX1+GFX ASC CPUs, RTKit HELLO/EPMAP with syslog+crashlog, stop, ENODEV. 3 = REQUIRES USER APPROVAL: 2 + init-data roots on EP 0x20 and both 0x0009 ACKs, stop, ENODEV. 4 = REQUIRES USER APPROVAL: 3 + 0x89 + idle-policy wake + passive 60 s event/trace drain, stop, owner retained. Stages 2-4 need the loader's G18G firmware receipt and apple_mailbox.ascwrap_v8_cpu_control=1. 90 = REQUIRES USER APPROVAL: PMGR2 PSD power-on of services 3/81/82 only (never implied by another stage), ENODEV. Other values are refused",
+            description: "T8152/J873 G18G bring-up stage. 0 refuses before MMIO/DMA. 1=read-only powered-resource probe. 2=RTKit. 3=initdata ACKs. 4=openings, idle policy, 60 s observation. 5=empty queue registration then observation, no GPU jobs. Firmware stages require prior power, loader receipt and apple_mailbox.ascwrap_v8_cpu_control=1; all owners remain retained until reboot. 90=SGX power-on; 92=GFX1 power-on; 91=GFX power-on; 93=idle requests. Power stages are never implied. Mutating stages require user-authorized bring-up. Other values refused",
         },
         m5_graphics_frames: u32 {
             default: 1,
