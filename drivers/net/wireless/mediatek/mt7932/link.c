@@ -287,6 +287,7 @@ static int mt_retire_connection(struct mt7932 *m)
 	netif_tx_disable(m->netdev);
 	/* ndo_start_xmit rechecks the closed admission gate under data_lock. */
 	spin_lock_irqsave(&m->data_lock, flags);
+	mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);
