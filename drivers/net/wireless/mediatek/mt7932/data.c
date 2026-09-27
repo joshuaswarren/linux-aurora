@@ -1,6 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "mt7932.h"
 
+static bool batch_tx = true;
+module_param(batch_tx, bool, 0644);
+MODULE_PARM_DESC(batch_tx, "Batch TX doorbells with xmit_more (disable for comparison)");
+
+void mt_data_kick_locked(struct mt7932 *m)
+{
+	if (!m->tx_pending)
+		return;
+	dma_wmb();
+	mt_write(m, m->tx[0].reg + 8, m->tx[0].head);
+	m->tx_pending = false;
+}
+
 static bool mt_bss_tx_allowed(struct mt7932 *m);
 static void mt_bss_tx_account(struct mt7932 *m);
 
@@ -59,9 +72,10 @@ void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event)
 	spin_lock_irqsave(&m->data_lock, flags);
 	m->bss_absent = !!body[1];
 	m->bss_quota = body[2];
-	if (!mt_bss_tx_allowed(m))
+	if (!mt_bss_tx_allowed(m)) {
+		mt_data_kick_locked(m);
 		netif_stop_queue(m->netdev);
-	else if (READ_ONCE(m->data_ready))
+	} else if (READ_ONCE(m->data_ready))
 		mt_data_clean_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	dev_dbg_ratelimited(&m->pdev->dev, "BSS_PRESENCE: absent=%u quota=%u\n",
@@ -122,6 +136,7 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	slot = q->head;
 	if (!mt_bss_tx_allowed(m) || m->data_live[slot] || q->queued >= q->count - 1) {
 		netif_stop_queue(netdev);
+		mt_data_kick_locked(m);
 		spin_unlock_irqrestore(&m->data_lock, flags);
 		return NETDEV_TX_BUSY;
 	}
@@ -146,17 +161,28 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	desc->control = cpu_to_le32((64 << 16) | BIT(30));
 	q->head = (slot + 1) % q->count;
 	q->queued++;
-	dma_wmb();
-	mt_write(m, q->reg + 8, q->head);
+	m->tx_pending = true;
 	mt_bss_tx_account(m);
 	if (!mt_bss_tx_allowed(m) || m->data_live[q->head] || q->queued >= q->count - 1)
 		netif_stop_queue(netdev);
+	/* Flush before returning a stopped queue: there may be no next skb.
+	 * Bound a long qdisc burst to sixteen descriptors per doorbell.
+	 */
+	if (!READ_ONCE(batch_tx) || !netdev_xmit_more() ||
+	    netif_queue_stopped(netdev) || !(q->head % 16))
+		mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	netdev->stats.tx_packets++;
 	netdev->stats.tx_bytes += skb->len;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 drop:
+	/* A rejected last skb must also publish earlier xmit_more packets. */
+	if (READ_ONCE(m->data_ready)) {
+		spin_lock_irqsave(&m->data_lock, flags);
+		mt_data_kick_locked(m);
+		spin_unlock_irqrestore(&m->data_lock, flags);
+	}
 	netdev->stats.tx_dropped++;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;

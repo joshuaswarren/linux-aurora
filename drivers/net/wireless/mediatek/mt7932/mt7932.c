@@ -35,6 +35,10 @@ static int mt_initialize(struct mt7932 *m);
 static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 static void mt_shutdown(struct pci_dev *pdev);
 
+static bool batch_rx = true;
+module_param(batch_rx, bool, 0644);
+MODULE_PARM_DESC(batch_rx, "Batch runtime RX refill doorbells (disable for comparison)");
+
 static bool legacy_irq_test;
 module_param(legacy_irq_test, bool, 0444);
 MODULE_PARM_DESC(legacy_irq_test, "Explicit diagnostic use of standard PCI INTx instead of MSI");
@@ -205,7 +209,7 @@ unlock:
 
 static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 {
-	unsigned int budget = q->count;
+	unsigned int budget = q->count, pending = 0;
 
 	while (budget--) {
 		u32 ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].control));
@@ -235,9 +239,20 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		mt_rx_post(q, m->runtime_epoch ? q->tail : q->head);
 		q->head = (q->head + 1) % q->count;
 		q->tail = (q->tail + 1) % q->count;
+		pending++;
+		/* Keep the download protocol unchanged. Runtime batches are smaller
+		 * than the smallest ring, so a full wrap never hides returned slots.
+		 */
+		if (!m->runtime_epoch || !READ_ONCE(batch_rx) || pending == 16) {
+			dma_wmb();
+			mt_write(m, q->reg + 8, m->runtime_epoch ?
+				 (q->head + q->count - 1) % q->count : q->head);
+			pending = 0;
+		}
+	}
+	if (pending) {
 		dma_wmb();
-		mt_write(m, q->reg + 8,
-			 m->runtime_epoch ? (q->head + q->count - 1) % q->count : q->head);
+		mt_write(m, q->reg + 8, (q->head + q->count - 1) % q->count);
 	}
 }
 

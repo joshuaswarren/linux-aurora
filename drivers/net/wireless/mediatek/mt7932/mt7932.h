@@ -136,6 +136,7 @@ struct mt7932 {
 	struct mt7932_duplicate duplicates[17];
 	u64 tx_released, rx_ethernet;
 	bool data_ready;
+	bool tx_pending; /* data_lock: descriptors awaiting a doorbell */
 	bool bss_absent;
 	u8 bss_quota;
 	u32 irq_mask;
@@ -159,6 +160,7 @@ int mt_recovery_gate(struct mt7932 *m);
 int mt_cal_procedure(struct mt7932 *m, struct mt7932_cal_piece *pieces,
 				    unsigned int count, unsigned int logical, u8 context_version);
 int mt_calibration_gate(struct mt7932 *m);
+void mt_data_kick_locked(struct mt7932 *m);
 void mt_data_clean_locked(struct mt7932 *m);
 void mt_data_clean(struct mt7932 *m);
 void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event);
