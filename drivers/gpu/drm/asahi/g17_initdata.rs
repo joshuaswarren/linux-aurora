@@ -3371,6 +3371,55 @@ pub(crate) const G18G_26A428_REGION_C_ADT_WORDS: [(usize, u32); 3] = [
     (0x09c, J873_GPU_NUM_PERF_STATES * 100),
 ];
 
+/// J873/26A428 pre-handoff policy corrections relative to the relocated
+/// J813 baseline. Both roles in four cold captures (051/053/073/075) agree
+/// byte-for-byte except the separately encoded boot timestamp. Values are
+/// captured calibration/configuration, not inferred field types or MHz.
+/// No owned address or timestamp is part of this table. The complete
+/// production encoder is compared by experiments/j873/hv/tools/
+/// compare-g18-startup.py; allocation and execution require live proof.
+pub(crate) const G18G_26A428_POLICY_CAPTURED_WORDS: [(usize, u32); 65] = [
+    (0x0048, 0x00000514), (0x0088, 0x00000514),
+    (0x009c, 1), (0x00a0, 1), (0x00a4, 1), (0x00a8, 1),
+    (0x0104, 0x3f828f5c), (0x09f0, 0x470f1600),
+    (0x09fc, 0xbd115e00), (0x0a04, 0x00000514),
+    (0x0a08, 0x00000514), (0x0a14, 0x00008f16),
+    (0x0a48, 0x00000514), (0x0abc, 0x00000514),
+    (0x0acc, 0x00008f16), (0x0b4c, 1),
+    (0x0b84, 0x414a1af3), (0x0b8c, 0x00000514), (0x0ca0, 0),
+    (0x22ac, 0x42c80000), (0x22b0, 0x44a28000),
+    (0x22b4, 0x000006c7), (0x22c8, 0x00000064),
+    (0x2320, 0xff003f80), (0x234c, 0x3d20045e),
+    (0x235c, 0x41a770a4), (0x236c, 0x00000514),
+    (0x2370, 0x00000514), (0x23b0, 0x00000514),
+    (0x25c8, 0x00000020), (0x2810, 0x05140000),
+    (0x2854, 0x05140000), (0x298c, 0x00040000),
+    (0x2a88, 0x71480000), (0x2a90, 0x00640000),
+    (0x2aa0, 0x00008f16), (0x2aa4, 0x00008f16),
+    (0x2aa8, 0x00008f16), (0x2bd0, 0x00000514),
+    (0x2bd4, 0x00000514), (0x2bdc, 0x470f1600),
+    (0x2be0, 0x00008f16), (0x2c14, 0x00000514),
+    (0x2d60, 0x00000514), (0x2f08, 0x0000000c),
+    (0x2f0c, 0x00001388), (0x2f10, 0x000007d0),
+    (0x2f14, 0x00001388), (0x2fb4, 0x00000514),
+    (0x2fb8, 0x00000514), (0x2fc8, 0),
+    (0x301c, 0x000004b0), (0x3020, 0x00000514),
+    (0x3024, 0x00000514), (0x3030, 0x00000514),
+    (0x3064, 0x00000514), (0x30ac, 0),
+    (0x30b0, 0x42c80000), (0x30c0, 0xff003f80),
+    (0x3d38, 0xff003f80), (0x64e0, 0x67305452),
+    (0x6520, 1), (0x6c6c, 0x43366667),
+    (0x6cac, 0x44e5c000), (0x6cec, 0x42f00000),
+];
+
+/// Stable region-C inputs from the same eight initialization snapshots.
+/// +0x38 is the new 26A428 feature bit, no longer a guessed zero.
+pub(crate) const G18G_26A428_REGION_C_CAPTURED_WORDS: [(usize, u32); 7] = [
+    (0x0038, 1), (0x0088, 0x00008f16), (0x008c, 0x00000514),
+    (0x0090, 0x00000514), (0x09b0, 0x00000200),
+    (0x09dc, 0x00000032), (0x0e0c, 0x000000fa),
+];
+
 /// Initialize the six allocations following G18G hw_data (0x2880..0xd400)
 /// from the J813 policy words relocated by [`G18G_26A428_POLICY_BANDS`], plus
 /// the owned pointers, the boot timestamp and the J873 ADT tunables. Preserves
@@ -3429,14 +3478,17 @@ pub(crate) fn encode_g18g_26a428_bundle_policy(
     for (offset, value) in G18G_26A428_POLICY_ADT_WORDS {
         put_u32(policy, offset, value);
     }
+    for (offset, value) in G18G_26A428_POLICY_CAPTURED_WORDS {
+        put_u32(policy, offset, value);
+    }
     Ok(())
 }
 
 // --- Region C (plan step 1.5) -------------------------------------------------------
 
 /// Encode the G18G region C: the J813 bytes, the 25G76 fields from +0x38 on
-/// moved up by 4 (FW_PROVEN), the new +0x38 left zero (GUESSED; 26A428 stores
-/// a feature bit, accel+0x6b9 bit 2) and the J873 ADT tunables.
+/// moved up by 4 (FW_PROVEN), the J873 ADT tunables and stable native J873
+/// inputs. The new +0x38 feature bit (accel+0x6b9 bit 2) is captured as one.
 pub(crate) fn encode_g18g_26a428_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() != REGION_C_SIZE {
         return Err(InitdataError::BufferSize);
@@ -3451,6 +3503,9 @@ pub(crate) fn encode_g18g_26a428_region_c(out: &mut [u8]) -> Result<(), Initdata
     out.copy_within(0x38..shifted, 0x3c);
     out[0x38..0x3c].fill(0);
     for (offset, value) in G18G_26A428_REGION_C_ADT_WORDS {
+        put_u32(out, offset, value);
+    }
+    for (offset, value) in G18G_26A428_REGION_C_CAPTURED_WORDS {
         put_u32(out, offset, value);
     }
     Ok(())
@@ -3631,19 +3686,19 @@ pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
     unproven("register_map", 49, 1, Evidence::Inferred, "FenderRegsHWL flags 0 (base sets none) mapped read-only"),
     unproven("register_map", 0, 60, Evidence::Inferred, "device VAs assigned by the J813 allocation rule"),
     unproven("policy", 0x0000, 0x7800, Evidence::Inferred,
-             "J813 policy words relocated by G18G_26A428_POLICY_BANDS; values not proven"),
-    unproven("policy", 0x00b0, 0x160, Evidence::Inferred, "0x160-byte host config copy carried from J813"),
+             "matches eight native J873 snapshots with owned pointers/timestamp normalized; calibration semantics unqualified"),
+    unproven("policy", 0x00b0, 0x160, Evidence::Inferred, "captured host config matches; individual field semantics unqualified"),
     unproven("policy", 0x1ca7, 0x400, Evidence::Inferred, "512 x 0x7fff u16 table moved with its +0x10 band"),
     unproven("policy", 0x0b5c, 0x10, Evidence::Inferred,
              "filter-time-constant terms: J813 defaults (J873 ADT has none)"),
     unproven("policy", 0x0b9c, 0xc, Evidence::Inferred,
              "tgt - dz and dz with dz = 1 carried from J813 (J873 ADT has no gpu-perf-dz)"),
-    unproven("policy", 0x64e0, 0x9c, Evidence::Guessed,
-             "J813 RT0g/LFCR/LFXG/LPXG words (+0x6468..+0x650b) dropped: insertion point unknown"),
+    unproven("policy", 0x64e0, 0x9c, Evidence::Inferred,
+             "native RT0g at +0x64e0 and one at +0x6520; other words zero, complete semantics unqualified"),
     unproven("region_c", 0x0000, 0xe80, Evidence::Inferred,
-             "J813 region C (T8140 runs + J813 scalars) with the proven +4 shift"),
-    unproven("region_c", 0x0038, 4, Evidence::Guessed, "new u32 (accel+0x6b9 bit 2); left 0"),
-    unproven("region_c", 0x008c, 8, Evidence::Inferred, "1200 carried; probably num-perf-states x 100 (1300)"),
+             "matches eight native J873 snapshots; individual field semantics unqualified"),
+    unproven("region_c", 0x0038, 4, Evidence::Inferred, "new feature bit captured as one; runtime effect unqualified"),
+    unproven("region_c", 0x008c, 8, Evidence::Inferred, "native 1300/1300; field units unqualified"),
     unproven("region_c", 0x009c, 4, Evidence::Inferred, "1300 = this+0xf14 x 100 assumed equal to the state count"),
     unproven("status_b", 0x0004, 4, Evidence::Inferred, "1 carried (26A428 stores accel+0x6b0 bit 2)"),
     unproven("status_config", 0x0000, 0x640, Evidence::Inferred, "J813 status/config words relocated"),
