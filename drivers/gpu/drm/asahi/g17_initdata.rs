@@ -4191,22 +4191,28 @@ pub(crate) const G18G_26A428_QOS_POINTER_OFFSET: usize = 0x27cc;
 pub(crate) const G18G_26A428_HW_2714_OFFSET: usize = 0x2714;
 pub(crate) const G18G_26A428_HW_2714_VALUE: u32 = 0x96;
 /// Fields that exist only in 26A428 (KEXT_PROVEN stores), with their size.
-/// +0x2714 is KEXT_PROVEN. The enables +0x283a/+0x283e are captured as 1;
-/// the remaining new fields are left zero (GUESSED).
+/// +0x2714 is KEXT_PROVEN. Captured scalars below override the zero defaults;
+/// the native-owned pointer +0x27d4 remains unresolved and is not copied.
 pub(crate) const G18G_26A428_HW_NEW_FIELDS: [(usize, usize); 11] = [
     (0x0fa8, 8), (0x1078, 8), (0x10b4, 4), (0x2714, 4), (0x27d4, 8), (0x2818, 4),
     (0x281e, 4), (0x2822, 8), (0x2832, 4), (0x283a, 4), (0x283e, 4),
 ];
 
-/// Stable scalar values from both roles in macOS 26A428 captures 051/053/073.
+/// Stable scalar values from both roles in macOS 26A428 captures 051/053/073/075.
 /// Replace the J813 defaults and unknown zero enables only at these offsets.
 /// Their values are observed; their complete semantics remain unqualified.
 /// Failure boundaries: no pointers, timing values, voltage tables or register
-/// writes are copied from a capture, and all six receipts must agree.
-pub(crate) const G18G_26A428_HW_CAPTURED_WORDS: [(usize, u32); 6] = [
+/// writes are copied. audit-g18-hwdata-scalars.py checks all eight snapshots,
+/// the float32 ladders, and the full opening records before a hardware trial.
+pub(crate) const G18G_26A428_HW_CAPTURED_WORDS: [(usize, u32); 17] = [
     (0x0fb4, 1), (0x10d4, 0x1b), (0x10d8, 4), (0x10dc, 12),
     (0x283a, 1), (0x283e, 1),
+    (0x0fa8, 0x8000), (0x0fac, 0), (0x0fb8, 1),
+    (0x1044, 12), (0x10a4, 12), (0x2660, 0), (0x2684, 12),
+    (0x2710, 0), (0x2720, 0), (0x2724, 1), (0x281e, 1),
 ];
+/// The adjacent +0x281e word is unaligned; +0x281c is only a halfword.
+pub(crate) const G18G_26A428_HW_CAPTURED_HALFWORDS: [(usize, u16); 1] = [(0x281c, 1)];
 
 /// J873 ADT /arm-io/sgx perf-states: (MHz, core mV), 14 entries including
 /// state 0. ADT_PROVEN.
@@ -4221,12 +4227,18 @@ pub(crate) const J873_GPU_PERF_STATES_SRAM_MV: [u32; 14] =
 pub(crate) const J873_GPU_NUM_PERF_STATES: u32 = 13;
 /// INFERRED: the J813 per-state scale word (1.02f), one per state.
 const G18G_26A428_PERF_SCALE_VALUE: u32 = 0x3f82_8f5c;
-/// GUESSED: the J813 relative-performance ladders re-sampled at the J873
-/// frequencies (linear in f / f_max). Their derivation is unknown on J813 too.
+/// Native 26A428 relative-performance ladders, identical in both roles of
+/// captures 051/053/073/075. These are IEEE754 float32 bit patterns, not u32
+/// percentages. Store the bits without floating-point operations in kernel
+/// context. All values are finite, monotonic, and bounded by 0..100; the
+/// physical calibration formula is not yet derived. Voltage/frequency tables
+/// above remain the independently verified J873 ADT values.
 const G18G_26A428_PERF_RELATIVE_A: [u32; 14] =
-    [0, 22, 29, 39, 52, 58, 69, 79, 84, 86, 90, 93, 97, 100];
+    [0, 1100735714, 1103989076, 1107351648, 1109719030, 1110992894, 1112721914,
+     1114199739, 1116076971, 1117492892, 1119211535, 1120006268, 1120204862, 1120403456];
 const G18G_26A428_PERF_RELATIVE_B: [u32; 14] =
-    [0, 9, 22, 33, 46, 52, 59, 66, 72, 78, 84, 91, 96, 100];
+    [0, 0, 1096332557, 1104636123, 1109537981, 1111408920, 1113279858,
+     1115150797, 1116353300, 1117288769, 1118224238, 1119180968, 1119818789, 1120403456];
 
 /// The 26A428 slot of each 25G76 register slot (FW_PROVEN name tables: G17
 /// DATA 0xfffffc0000073488, 47 rows; b000 DATA 0xfffffc0000078bb8, 53 rows).
@@ -4421,6 +4433,9 @@ pub(crate) fn encode_g18g_26a428_hw_data(
     put_u32(out, G18G_26A428_HW_2714_OFFSET, G18G_26A428_HW_2714_VALUE);
     for (offset, value) in G18G_26A428_HW_CAPTURED_WORDS {
         put_u32(out, offset, value);
+    }
+    for (offset, value) in G18G_26A428_HW_CAPTURED_HALFWORDS {
+        put_u16(out, offset, value);
     }
 
     // Performance ladder from the J873 ADT (values ADT_PROVEN, locations
@@ -4719,10 +4734,10 @@ pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
     unproven("hw_data", 0x0000, 0x640, Evidence::Inferred,
              "host prefix (+0x28 FW VA, two 32x0x18 accelerator tables) carried from J813"),
     unproven("hw_data", 0x0fa0, 8, Evidence::Inferred, "u64 FW VA of accel+0x1d40; J813 0"),
-    unproven("hw_data", 0x0fa8, 8, Evidence::Guessed, "new u64 (vfn 0x1f8 & 0xffffffff); left 0"),
+    unproven("hw_data", 0x0fa8, 8, Evidence::Inferred, "captured 0x8000; complete semantics unqualified"),
     unproven("hw_data", 0x0fb4, 4, Evidence::Inferred, "captured J873 value 1; meaning unknown"),
     unproven("hw_data", 0x0fc0, 0x110, Evidence::Inferred,
-             "platform words relocated from J813 +0xea0..+0xfa8 (+0xfac dropped)"),
+             "J813 relocated words with captured J873 scalar corrections; complete semantics unqualified"),
     unproven("hw_data", 0x10b4, 4, Evidence::Guessed, "new u32 (accel byte & 1); left 0"),
     unproven("hw_data", 0x10d4, 0xc, Evidence::Inferred,
              "captured J873 0x1b/4/12; complete field semantics unqualified"),
@@ -4730,17 +4745,17 @@ pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
     unproven("hw_data", 0x1124, 0x800, Evidence::Inferred,
              "ADT voltages filled into all 16 lanes of each row; b000 reads lanes 0 and 1"),
     unproven("hw_data", 0x1964, 0x38, Evidence::Inferred, "1.02f scale word per state (J813 value)"),
-    unproven("hw_data", 0x19e4, 0x38, Evidence::Guessed, "relative ladder A re-sampled from J813"),
-    unproven("hw_data", 0x1a24, 0x38, Evidence::Guessed, "relative ladder B re-sampled from J813"),
+    unproven("hw_data", 0x19e4, 0x38, Evidence::Inferred, "native float32 ladder A; calibration formula unqualified"),
+    unproven("hw_data", 0x1a24, 0x38, Evidence::Inferred, "native float32 ladder B; calibration formula unqualified"),
     unproven("hw_data", 0x1ae4, 0x40, Evidence::Inferred, "identity index map 0..15 (J813)"),
     unproven("hw_data", 0x2660, 0xd4, Evidence::Inferred,
-             "J813 +0x2544..+0x2614 words relocated (+0x2710 = the J813 +0x25f4 flag)"),
+             "J813 relocated words with captured J873 scalar corrections; complete semantics unqualified"),
     unproven("hw_data", 0x2734, 0x80, Evidence::Inferred,
              "KSM completion descriptor format (capacity 0x800, entry 0x40) carried from J813"),
     unproven("hw_data", 0x27d4, 8, Evidence::Guessed, "new u64 (accel+0x12338); left 0"),
     unproven("hw_data", 0x27dc, 0x3c, Evidence::Inferred, "J813 +0x26b4..+0x26ec words relocated"),
     unproven("hw_data", 0x2818, 4, Evidence::Guessed, "new u32 (accel+0x6c8); read as part of a u64 by b000"),
-    unproven("hw_data", 0x281e, 0xc, Evidence::Guessed, "new u32/u64 (accel+0x111b8/+0x111bc); left 0"),
+    unproven("hw_data", 0x281e, 0xc, Evidence::Inferred, "captured u32=1/u64=0; complete semantics unqualified"),
     unproven("hw_data", 0x2832, 4, Evidence::Guessed, "new mode word, compared with 3 at ~10 b000 sites; left 0"),
     unproven("hw_data", 0x283a, 8, Evidence::Inferred, "new enables (accel+0x1165c/+0x1166c bit 0); captured as 1/1"),
     unproven("register_map", 0, 1, Evidence::Inferred, "AIC SW-int page from ADT meta-sw-interrupt"),
