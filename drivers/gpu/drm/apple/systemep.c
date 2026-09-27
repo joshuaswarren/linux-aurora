@@ -97,6 +97,21 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	dev_dbg(dcp->dev, "systemep: mNits event: Nits: %u.%03u, iDAC: %u\n",
 		mnits.millinits / 1000, mnits.millinits % 1000, mnits.idac);
 
+	/*
+	 * On H17P brightness.nits is not a readback: it is the level the
+	 * driver asks for, the step of the backlight fade in flight that the
+	 * next swap carries (dcp_backlight.c).  These reports only reach us
+	 * since the system endpoint decodes the compact H17P receive header,
+	 * and letting them overwrite the request sent the firmware's own
+	 * reading straight back with the next swap that had an update
+	 * pending: the "DCP reports brightness 0.000 / 466 / 509 nits" bursts
+	 * of the 2026-09-28 daily, the fade restarting from whatever the
+	 * report said.  The level the firmware drives is already logged from
+	 * set_frame_sync_props.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return 0;
+
 	dcp->brightness.nits = mnits.millinits / 1000;
 
 	return 0;
