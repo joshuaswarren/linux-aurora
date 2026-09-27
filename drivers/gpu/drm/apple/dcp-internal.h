@@ -167,8 +167,14 @@ struct dcp_brightness {
 	bool update;
 	/* H17P: the level the firmware last reported in D006, in millinits */
 	u32 h17p_reported_millinits;
-	/* H17P: DPMS off leaves the pipe (and the level) alone */
+	/*
+	 * H17P: DPMS off leaves the pipe up (soft_off); the backlight stands
+	 * in for the power-off by fading to blank_nits (blanked) and brings
+	 * soft_off_nits -- the level asked for last -- back at DPMS on.
+	 */
 	bool soft_off;
+	bool blanked;
+	int soft_off_nits;
 	/*
 	 * H17P: the level is ramped toward the requested one over ramp_ms
 	 * (dcp_backlight.c) instead of jumping there in one swap.  nits is
@@ -458,6 +464,8 @@ void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+void dcp_backlight_soft_off(struct apple_dcp *dcp);
+void dcp_backlight_soft_on(struct apple_dcp *dcp);
 u64 dcp_nits_to_double_bits(u32 nits);
 extern bool dcp_swap_trace;
 extern unsigned int dcp_h17p_surf_flags;

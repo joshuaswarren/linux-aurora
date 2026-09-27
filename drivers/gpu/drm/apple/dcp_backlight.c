@@ -52,6 +52,18 @@ module_param(ramp_max_ms, uint, 0644);
 MODULE_PARM_DESC(ramp_max_ms,
 		 "Longest fade used when brightness requests arrive as a stream (H17P)");
 
+/*
+ * H17P cannot power the pipe down (every off path panics the firmware, see
+ * iomfb_poweroff), so a DPMS off drops the backlight to this level instead
+ * and DPMS on restores the level asked for last.  0 turns the backlight off
+ * (hb94: clean on a live pipe); a negative value keeps the panel lit at its
+ * current level through DPMS off, as before.
+ */
+static int blank_nits;
+module_param(blank_nits, int, 0644);
+MODULE_PARM_DESC(blank_nits,
+		 "Backlight level in nits while the H17P panel is DPMS-off (<0 = keep the current level)");
+
 #define RAMP_STEP_MS	16
 #define RAMP_STREAM_GAP_MS	3000
 /*
@@ -134,6 +146,14 @@ static u32 brightness_part2[] = {
 static int dcp_get_brightness(struct backlight_device *bd)
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
+
+	/*
+	 * While DPMS-off, report the level DPMS on will restore: a session
+	 * that reads the level back while blanked must not save the blank
+	 * level as the user's.
+	 */
+	if (dcp->brightness.blanked)
+		return dcp->brightness.soft_off_nits;
 
 	return dcp->brightness.nits;
 }
@@ -300,6 +320,65 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	if (!dcp->valid_mode)
 		return 0;
 
+	/* H17P with the CRTC off: the ramp worker re-presents the surface */
+	if (dcp->brightness.soft_off) {
+		if (dcp->brightness.bl_dev)
+			mod_delayed_work(system_wq, &dcp->brightness.ramp_work, 0);
+		return 0;
+	}
+
+	/* Wait 1 vblank cycle in the hope an atomic swap has already updated
+	 * the brightness */
+	msleep((1001 + 23) / 24); // 42ms for 23.976 fps
+
+	return drm_crtc_set_brightness(dcp);
+}
+
+/*
+ * H17P with the CRTC off: no commit reaches the firmware (the ACTIVE_ONLY
+ * plane pass skips the flush), so re-present the surface on the panel with
+ * the new level (iomfb_present_brightness).  Waiting for the CRTC's last
+ * commit under its lock orders this after the disable commit that turned
+ * it off, and before any enable commit that turns it back on.
+ */
+static int dcp_backlight_present_off(struct apple_dcp *dcp)
+{
+	struct drm_crtc *crtc = &dcp->crtc->base;
+	struct drm_modeset_acquire_ctx ctx;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	ret = drm_modeset_lock(&crtc->mutex, &ctx);
+	if (ret)
+		goto out;
+
+	if (crtc->state->commit) {
+		ret = drm_crtc_commit_wait(crtc->state->commit);
+		if (ret)
+			goto out;
+	}
+
+	/* back on: the ramp's next step goes out with a commit again */
+	if (crtc->state->active || !dcp->brightness.soft_off) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	if (dcp->brightness.update)
+		ret = dcp_h17p_present_brightness(dcp);
+out:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	return ret;
+}
+
+/* Send the pending level to the firmware without waiting for a frame. */
+static int dcp_backlight_push(struct apple_dcp *dcp)
+{
+	if (dcp->brightness.soft_off)
+		return dcp_backlight_present_off(dcp);
+
 	return drm_crtc_set_brightness(dcp);
 }
 
@@ -348,7 +427,9 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 		dcp->brightness.idle_frames++;
 	else
 		dcp->brightness.idle_frames = 0;
-	unconsumed = dcp->brightness.idle_frames >= RAMP_IDLE_FRAMES;
+	/* with the CRTC off nobody draws: push every step */
+	unconsumed = dcp->brightness.soft_off ||
+		     dcp->brightness.idle_frames >= RAMP_IDLE_FRAMES;
 	if (unconsumed)
 		dcp->brightness.idle_frames = 0;
 
@@ -363,11 +444,12 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 		drm_modeset_acquire_fini(&ctx);
 		if (!pending)
 			return;
-		if (unconsumed && dcp->valid_mode)
-			drm_crtc_set_brightness(dcp);
-		else
-			schedule_delayed_work(&dcp->brightness.ramp_work,
-					      msecs_to_jiffies(RAMP_STEP_MS));
+		/* a busy command channel (or a CRTC coming back) retries */
+		if (unconsumed && dcp->valid_mode &&
+		    dcp_backlight_push(dcp) != -EBUSY)
+			return;
+		schedule_delayed_work(&dcp->brightness.ramp_work,
+				      msecs_to_jiffies(RAMP_STEP_MS));
 		return;
 	}
 
@@ -391,7 +473,7 @@ static void dcp_backlight_ramp_work(struct work_struct *work)
 	drm_modeset_acquire_fini(&ctx);
 
 	if (unconsumed && dcp->valid_mode)
-		drm_crtc_set_brightness(dcp);
+		dcp_backlight_push(dcp);
 
 	schedule_delayed_work(&dcp->brightness.ramp_work,
 			      msecs_to_jiffies(RAMP_STEP_MS));
@@ -418,6 +500,21 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		return -EDEADLK;
 	} else if (ret == -ERESTARTSYS) {
 		return -ERESTARTSYS;
+	}
+
+	/*
+	 * H17P, DPMS-off: the panel stays at blank_nits and this becomes the
+	 * level DPMS on restores.  gnome-shell undims to the saved level when
+	 * it blanks, which used to light the panel back up to full while the
+	 * session was "off".  Take the requested level itself, not the
+	 * effective one: the backlight core's own suspend request (0) is not
+	 * the user's level.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->brightness.blanked) {
+		dcp->brightness.soft_off_nits = bd->props.brightness;
+		drm_modeset_drop_locks(&ctx);
+		drm_modeset_acquire_fini(&ctx);
+		return 0;
 	}
 
 	/*
@@ -465,6 +562,51 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	drm_modeset_drop_locks(&ctx);
 
 	return dcp_backlight_update(dcp);
+}
+
+/*
+ * H17P DPMS off (iomfb_poweroff): the pipe keeps scanning the last frame, so
+ * stand in for the power-off with the backlight.  Remember the level asked
+ * for last and step to blank_nits; the ramp worker re-presents the surface
+ * with it, since no commit reaches the firmware while the CRTC is off.
+ *
+ * Called from the commit tail, which may hold the CRTC lock: only queue
+ * the worker here, never wait for it.
+ */
+void dcp_backlight_soft_off(struct apple_dcp *dcp)
+{
+	struct dcp_brightness *b = &dcp->brightness;
+
+	b->soft_off = true;
+	if (!b->bl_dev || blank_nits < 0 || b->blanked)
+		return;
+
+	b->soft_off_nits = b->target_nits;
+	b->blanked = true;
+	b->target_nits = min(blank_nits, b->soft_off_nits);
+	b->ramp_from = b->nits;
+	b->ramp_start = ktime_get();
+	b->ramp_duration_ms = 0;
+	mod_delayed_work(system_wq, &b->ramp_work, 0);
+}
+
+/*
+ * H17P DPMS on (iomfb_poweron): restore the level; the enable commit's
+ * first swap carries it.
+ */
+void dcp_backlight_soft_on(struct apple_dcp *dcp)
+{
+	struct dcp_brightness *b = &dcp->brightness;
+
+	b->soft_off = false;
+	if (b->blanked) {
+		b->blanked = false;
+		b->target_nits = b->soft_off_nits;
+		b->ramp_from = b->soft_off_nits;
+		b->nits = b->soft_off_nits;
+		b->dac = calculate_dac(dcp, b->nits);
+	}
+	b->update = true;
 }
 
 static const struct backlight_ops dcp_backlight_ops = {

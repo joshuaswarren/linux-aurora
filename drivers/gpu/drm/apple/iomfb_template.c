@@ -1621,11 +1621,13 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	/*
 	 * Resuming from the H17P soft power-off (see iomfb_poweroff): the
 	 * pipe never went down, so there is no power state to restore; the
-	 * next swap re-applies the backlight level.
+	 * backlight gets the level from before the power-off back, and the
+	 * next swap applies it.
 	 */
 	if (dcp->brightness.soft_off) {
-		dcp->brightness.soft_off = false;
-		dev_info(dcp->dev, "dcp_poweron() from soft power-off: pipe was never down\n");
+		dcp_backlight_soft_on(dcp);
+		dev_info(dcp->dev, "dcp_poweron() from soft power-off: pipe was never down, backlight back to %d nits\n",
+			 dcp->brightness.nits);
 		return;
 	}
 #endif
@@ -1757,16 +1759,26 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * (hb94: 2.27 W gone at 210 nits, no send_brightness, no crash).
 	 * Only a reboot brings the panel back from any of the three.
 	 *
-	 * So a DPMS-off does nothing to the coprocessor at all: the pipe
-	 * keeps scanning out the last frame at the current level, and the
-	 * power saving belongs to the backlight device (a session idle hook
-	 * setting brightness 0 and restoring it), which is the path the
-	 * firmware handles.
+	 * So a DPMS-off does nothing to the coprocessor's power state: the
+	 * pipe keeps scanning out the last frame, and the backlight stands in
+	 * for the power-off (dcp_backlight_soft_off): it drops to blank_nits
+	 * (0 by default) and DPMS on restores the level asked for last.  The
+	 * level goes out the way the backlight device sends every level, in
+	 * a swap on the live pipe -- a re-present of the surface already on
+	 * the panel (iomfb_present_brightness), issued from the backlight
+	 * worker once this disable commit has completed.  Unlike the hb99
+	 * swap, which ran from here while the disable commit was releasing
+	 * the scanned-out buffer (hb100's "read PTE invalid" across the old
+	 * surface), that buffer is now retained until a real swap replaces
+	 * it, and the re-present does not arm its release.
+	 * appledrm.blank_nits=-1 keeps the panel lit through DPMS off, as
+	 * before.
 	 */
 	if (dcp_has_panel(dcp)) {
-		dcp->brightness.soft_off = true;
+		dcp_backlight_soft_off(dcp);
 		dev_info(dcp->dev,
-			 "DPMS off: keeping the H17P pipe up at the current level (the firmware panics on every off path; dim through the backlight device instead)\n");
+			 "DPMS off: keeping the H17P pipe up (the firmware panics on every off path), backlight %s\n",
+			 dcp->brightness.blanked ? "to blank_nits" : "left at the current level");
 		return;
 	}
 #endif
