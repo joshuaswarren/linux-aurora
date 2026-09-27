@@ -1024,62 +1024,22 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	}
 }
 
-static void dcp_dispatch_pending_flushes(struct apple_dcp *dcp)
+/*
+ * Apply the backlight level to an H17P panel whose CRTC is off by
+ * re-presenting the surface already on it (iomfb_present_brightness()).
+ * The caller holds the CRTC lock and has waited for the last commit.
+ */
+int dcp_h17p_present_brightness(struct apple_dcp *dcp)
 {
-	struct apple_crtc_state *apple_state;
-	struct drm_atomic_state *state;
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return -ENODEV;
+	if (dcp->crashed || !dcp->active || !dcp->valid_mode ||
+	    !dcp->connector || !dcp->connector->connected)
+		return -ENODEV;
+	if (dcp_channel_busy(&dcp->ch_cmd))
+		return -EBUSY;
 
-again:
-	lockdep_assert_held(&dcp->pending_flush_lock);
-	if (dcp_channel_busy(&dcp->ch_cmd) ||
-	    list_empty(&dcp->pending_flushes))
-		return;
-
-	apple_state = list_first_entry(&dcp->pending_flushes,
-				       struct apple_crtc_state, pending_flush);
-	list_del_init(&apple_state->pending_flush);
-	state = apple_state->base.state;
-
-	dcp_dispatch_flush(dcp, apple_state->base.crtc, state);
-	drm_atomic_state_put(state);
-
-	if (!dcp_channel_busy(&dcp->ch_cmd))
-		goto again;
-}
-
-void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
-{
-	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-	struct drm_crtc_state *base;
-	struct apple_crtc_state *apple_state;
-
-	base = drm_atomic_get_new_crtc_state(state, crtc);
-	apple_state = to_apple_crtc_state(base);
-	drm_atomic_state_get(state);
-
-	mutex_lock(&dcp->pending_flush_lock);
-	WARN_ON(!list_empty(&apple_state->pending_flush));
-	list_add_tail(&apple_state->pending_flush, &dcp->pending_flushes);
-	dcp_dispatch_pending_flushes(dcp);
-	mutex_unlock(&dcp->pending_flush_lock);
-}
-
-void dcp_flush_shutdown(struct apple_dcp *dcp)
-{
-	struct apple_crtc_state *apple_state, *tmp;
-	LIST_HEAD(pending);
-
-	mutex_lock(&dcp->pending_flush_lock);
-	list_splice_init(&dcp->pending_flushes, &pending);
-	mutex_unlock(&dcp->pending_flush_lock);
-
-	list_for_each_entry_safe(apple_state, tmp, &pending, pending_flush) {
-		struct drm_atomic_state *state = apple_state->base.state;
-
-		list_del_init(&apple_state->pending_flush);
-		drm_atomic_state_put(state);
-	}
+	return iomfb_present_brightness_h17p(dcp);
 }
 
 static void iomfb_start(struct apple_dcp *dcp)

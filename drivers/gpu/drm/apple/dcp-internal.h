@@ -304,10 +304,14 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
-	/* Atomic flushes waiting for the single-flight command channel. */
-	struct list_head pending_flushes;
-	/* Serializes the queue with command-channel dispatch. */
-	struct mutex pending_flush_lock;
+	/*
+	 * H17P: the last swap that put a surface on the panel, as built by
+	 * iomfb_flush() before the wire fix-up.  Re-presenting it is how a
+	 * brightness change reaches the firmware while the CRTC is off (see
+	 * iomfb_present_brightness()).
+	 */
+	struct dcp_swap_submit_req_h17p h17p_last_swap;
+	bool h17p_have_last_swap;
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
@@ -464,6 +468,7 @@ extern int dcp_dither_request;
 extern int dcp_pipe_crc_reads;
 extern unsigned int dcp_pipe_crc_idx;
 u32 dcp_h17p_initial_nits(struct apple_dcp *dcp);
+int dcp_h17p_present_brightness(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
