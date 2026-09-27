@@ -39,6 +39,8 @@
 			#power-domain-cells = <0>;
 			#reset-cells = <0>;
 			label = "pmc";
+			/* Preserve iBoot's PMC state while the PMP firmware boots. */
+			status = "disabled";
 		};
 };
 
