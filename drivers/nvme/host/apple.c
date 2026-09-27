@@ -83,12 +83,10 @@
 
 #define APPLE_NVME_IOSQES	7
 
-/*
- * These can be higher, but we need to ensure that any command doesn't
- * require an sg allocation that needs more than a page of data.
- */
+/* Keep the scatterlist allocation within one page. */
 #define NVME_MAX_KB_SZ 4096
 #define NVME_MAX_SEGS  127
+#define NVME_MAX_PRP_LISTS 3
 
 #define APPLE_NVME_INHERITED_RTKIT_RANGES_PROP \
 	"apple,inherited-rtkit-buffer-ranges"
@@ -182,8 +180,8 @@ static inline void apple_nvme_disable_queue(struct apple_nvme_queue *q)
 /*
  * The apple_nvme_iod describes the data in an I/O.
  *
- * The sg pointer contains the list of PRP chunk allocations in addition
- * to the actual struct scatterlist.
+ * The scatterlist is allocated separately from the PRP list pointers so
+ * their capacity does not depend on the number of mapped segments.
  */
 struct apple_nvme_iod {
 	struct nvme_request req;
@@ -194,6 +192,7 @@ struct apple_nvme_iod {
 	dma_addr_t first_dma;
 	unsigned int dma_len; /* length of single DMA segment mapping */
 	struct scatterlist *sg;
+	void *prp_list[NVME_MAX_PRP_LISTS];
 };
 
 struct apple_nvme_hw {
@@ -299,6 +298,11 @@ MODULE_PARM_DESC(flush_interval,
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
+/* Account for a partial first PRP and one link entry per PRP list page. */
+static_assert(DIV_ROUND_UP(8 * DIV_ROUND_UP(NVME_MAX_KB_SZ * 1024 +
+					   NVME_CTRL_PAGE_SIZE,
+					   NVME_CTRL_PAGE_SIZE),
+			   NVME_CTRL_PAGE_SIZE - 8) <= NVME_MAX_PRP_LISTS);
 
 #define APPLE_NVME_CRYPTO_KEY_SIZE 64
 #define APPLE_NVME_CRYPTO_DATA_UNIT_SIZE 4096
@@ -657,30 +661,6 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 	spin_unlock_irq(&anv->lock);
 }
 
-/*
- * From pci.c:
- * Will slightly overestimate the number of pages needed.  This is OK
- * as it only leads to a small amount of wasted memory for the lifetime of
- * the I/O.
- */
-static inline size_t apple_nvme_iod_alloc_size(void)
-{
-	const unsigned int nprps = DIV_ROUND_UP(
-		NVME_MAX_KB_SZ + NVME_CTRL_PAGE_SIZE, NVME_CTRL_PAGE_SIZE);
-	const int npages = DIV_ROUND_UP(8 * nprps, PAGE_SIZE - 8);
-	const size_t alloc_size = sizeof(__le64 *) * npages +
-				  sizeof(struct scatterlist) * NVME_MAX_SEGS;
-
-	return alloc_size;
-}
-
-static void **apple_nvme_iod_list(struct request *req)
-{
-	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
-
-	return (void **)(iod->sg + blk_rq_nr_phys_segments(req));
-}
-
 static void apple_nvme_free_prps(struct apple_nvme *anv, struct request *req)
 {
 	const int last_prp = NVME_CTRL_PAGE_SIZE / sizeof(__le64) - 1;
@@ -689,7 +669,7 @@ static void apple_nvme_free_prps(struct apple_nvme *anv, struct request *req)
 	int i;
 
 	for (i = 0; i < iod->npages; i++) {
-		__le64 *prp_list = apple_nvme_iod_list(req)[i];
+		__le64 *prp_list = iod->prp_list[i];
 		dma_addr_t next_dma_addr = le64_to_cpu(prp_list[last_prp]);
 
 		dma_pool_free(anv->prp_page_pool, prp_list, dma_addr);
@@ -711,7 +691,7 @@ static void apple_nvme_unmap_data(struct apple_nvme *anv, struct request *req)
 
 	dma_unmap_sg(anv->dev, iod->sg, iod->nents, rq_dma_dir(req));
 	if (iod->npages == 0)
-		dma_pool_free(anv->prp_small_pool, apple_nvme_iod_list(req)[0],
+		dma_pool_free(anv->prp_small_pool, iod->prp_list[0],
 			      iod->first_dma);
 	else
 		apple_nvme_free_prps(anv, req);
@@ -744,7 +724,7 @@ static blk_status_t apple_nvme_setup_prps(struct apple_nvme *anv,
 	u64 dma_addr = sg_dma_address(sg);
 	int offset = dma_addr & (NVME_CTRL_PAGE_SIZE - 1);
 	__le64 *prp_list;
-	void **list = apple_nvme_iod_list(req);
+	void **list = iod->prp_list;
 	dma_addr_t prp_dma;
 	int nprps, i;
 
@@ -2416,9 +2396,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
-	WARN_ON_ONCE(apple_nvme_iod_alloc_size() > PAGE_SIZE);
 	anv->iod_mempool =
-		mempool_create_kmalloc_pool(1, apple_nvme_iod_alloc_size());
+		mempool_create_kmalloc_pool(1, sizeof(struct scatterlist) * NVME_MAX_SEGS);
 	if (!anv->iod_mempool) {
 		ret = -ENOMEM;
 		goto out_detach_genpd;
