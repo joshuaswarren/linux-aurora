@@ -258,6 +258,11 @@ static void mt_service(struct mt7932 *m)
 	u32 causes = mt_read(m, W + 0x200) & m->irq_mask;
 	unsigned int i;
 
+	/* Acknowledge the snapshot before draining. A completion arriving after
+	 * its ring was visited must leave a new cause pending for the next IRQ.
+	 * Clearing the old snapshot after draining can erase that notification.
+	 */
+	mt_write(m, W + 0x200, causes);
 	mt_data_clean(m);
 	for (i = 0; i < ARRAY_SIZE(m->rx); i++)
 		if (m->rx[i].count)
@@ -267,7 +272,6 @@ static void mt_service(struct mt7932 *m)
 
 		mt_write(m, W + 0x1f0, sw);
 	}
-	mt_write(m, W + 0x200, causes);
 	if (READ_ONCE(m->running) && !poll_test)
 		mt_write(m, W + 0x204, m->irq_mask);
 }

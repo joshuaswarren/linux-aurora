@@ -386,6 +386,8 @@ void mt_connect_work(struct work_struct *work)
 	u8 *body, mac[8] = {}, queue[32];
 	unsigned long flags;
 	bool submitted = false, peer_owned = false;
+	const char *phase = "prepare";
+	unsigned long started = jiffies;
 	int ret;
 
 	mutex_lock(&m->command_mutex);
@@ -399,6 +401,7 @@ void mt_connect_work(struct work_struct *work)
 	}
 	if (!m->connect_bss) {
 		dev_info(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
+		phase = "discovery";
 		ret = mt_connect_discover(m);
 		if (ret)
 			goto free;
@@ -423,6 +426,7 @@ void mt_connect_work(struct work_struct *work)
 	 * belongs in this field. The recovered framework uses listen interval20.
 	 * Other platform flag policies remain unsupported, not guessed mappings.
 	 */
+	phase = "connect-submit";
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
 		m->connect_open ? NULL : m->connect_pmk, m->connect_bssid,
 		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open);
@@ -443,6 +447,7 @@ free:
 	if (ret)
 		goto report;
 	dev_info(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n", m->connect_bssid, m->connect_channel);
+	phase = "assoc-start";
 	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
 	mutex_unlock(&m->command_mutex);
 	ret = wait_for_completion_timeout(&m->assoc_start, msecs_to_jiffies(5000)) ? 0 : -ETIMEDOUT;
@@ -454,16 +459,19 @@ free:
 	ret = READ_ONCE(m->connect_error);
 	if (ret)
 		goto report;
+	phase = "association-calibration";
 	ret = mt_association_calibration(m);
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (ret)
 		goto report;
 	dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: channel=%u\n", m->connect_channel);
+	phase = "peer-queue";
 	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
 	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
 	if (ret)
 		goto report;
 	mutex_unlock(&m->command_mutex);
+	phase = "connect-complete";
 	if (!wait_for_completion_timeout(&m->assoc_done, msecs_to_jiffies(10000)))
 		ret = -ETIMEDOUT;
 	else
@@ -471,10 +479,18 @@ free:
 	mutex_lock(&m->command_mutex);
 report:
 	ret = ret ?: READ_ONCE(m->connect_error);
-	if (!ret)
+	if (!ret) {
+		phase = "power-save-policy";
 		ret = mt_station_ps_restore(m);
-	if (ret)
+	}
+	if (ret) {
+		dev_err(&m->pdev->dev,
+			"CONNECT_PHASE_FAILED: phase=%s status=%d elapsed-ms=%u start=%u done=%u peer=%u\n",
+			phase, ret, jiffies_to_msecs(jiffies - started),
+			completion_done(&m->assoc_start), completion_done(&m->assoc_done),
+			READ_ONCE(m->peer_valid));
 		mt_transport_snapshot(m);
+	}
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
 	if (ret) {
 		spin_lock_irqsave(&m->response_lock, flags);
