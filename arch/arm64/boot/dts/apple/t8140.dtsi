@@ -309,12 +309,16 @@
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x10e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			/* From the ADT's lane order; not yet seen to change. */
+			apple,fast-die-effort = <&pmp_report 0>;
 		};
 
 		cpufreq_p: cpufreq@211e20000 {
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x11e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			/* Seen to follow P-cluster load. */
+			apple,fast-die-effort = <&pmp_report 1>;
 		};
 
 		pmp_dart: iommu@300300000 {
