@@ -299,6 +299,42 @@ impl G18FirmwareMemory {
         if secondary { self.secondary_root.iova() } else { self.primary_root.iova() }
     }
 
+    pub(crate) fn compute_outer_counters(&mut self) -> Result<[u32; 3]> {
+        let base = PRIVATE_BASE + (init::G18G_26A428_PRIVATE_STATE_GRIDS[0]
+            + init::WORK_STATE_GRID_OFFSETS[8]) as u64;
+        Ok([self.private.read_u32(base)?, self.private.read_u32(base + 0x10)?,
+            self.private.read_u32(base + 0x20)?])
+    }
+
+    /// G18 native 24-byte CL_2 record. Publish exactly once, after all
+    /// aliases/configuration are owned and both firmware openings retired.
+    pub(crate) fn publish_queue_probe(&mut self, address: u64, queue_id: u8) -> Result {
+        if address < KERNEL_BASE || address & 0x3f != 0 || queue_id > 127 {
+            return Err(EINVAL);
+        }
+        if self.compute_outer_counters()? != [0; 3]
+            || self.control_counters()? != [[2; 3], [1; 3]] {
+            return Err(EBUSY);
+        }
+        self.shared.with_bytes_mut(|out| {
+            let start = init::G18G_26A428_WORK_RING_BUNDLE_OFFSETS[8];
+            let record = out.get_mut(start..start + 24).ok_or(EINVAL)?;
+            if record.iter().any(|byte| *byte != 0) { return Err(EBUSY); }
+            record[8..16].copy_from_slice(&address.to_le_bytes());
+            record[16..20].copy_from_slice(&2u32.to_le_bytes());
+            record[20..22].copy_from_slice(&1u16.to_le_bytes());
+            record[22] = queue_id;
+            record[23] = 1;
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        let producer = PRIVATE_BASE + (init::G18G_26A428_PRIVATE_STATE_GRIDS[0]
+            + init::WORK_STATE_GRID_OFFSETS[8] + 0x20) as u64;
+        self.private.write_u32(producer, 1)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     /// The live device-control counters (consumer, CFI, producer) of both
     /// roles, read from the shared state the firmware consumes.
     pub(crate) fn control_counters(&mut self) -> Result<[[u32; 3]; 2]> {
