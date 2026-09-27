@@ -580,7 +580,7 @@ impl Resources {
     /// Read and decode the T8152 (G18G) GPU identity.
     ///
     /// Requires the [`T8152SgxPowered`] proof: the SGX PMGR2 PSD service was
-    /// read and reported active and acknowledged immediately before, so these
+    /// read and reported active immediately before, so these
     /// reads cannot hit a gated block. Only the registers 26A428
     /// `AGX·PI_400·G·A0·Accelerator::readChipInfo` reads are touched: the ID
     /// block at 0xd04000..0xd0401c and the single core-enable word at
@@ -950,23 +950,6 @@ impl Resources {
 const T8152_PSD_STATE: usize = 0x80;
 const T8152_PSD_ACK: usize = 0xbc;
 const T8152_PSD_STATE_MASK: u32 = 0x7;
-/// Active power state. m1n1's qualified ATC3 PSD path requests 0 to enable a
-/// service and 6 to return it to idle, and waits for this state together
-/// with ack bit 0. At J873 cold boot all three GPU services read state 6 and
-/// ack 0.
-///
-/// The ack half of [`T8152PsdSample::powered`] is macOS's own success
-/// predicate, not an assumption: 26A428 `PSD::getPsdAck` (kernelcache
-/// 0xfffffe000a04d2ec / 0xfffffe000a04d304) requires ack bit 0 before it
-/// even reads the state, then requires `(state & 7) == requested`
-/// (hv/evidence/native-psd-ack-and-sk-return-201.json, "gate_correct").
-/// What is NOT qualified is why a raw request never raised the ack: attempt
-/// 201 moved service 3 through state 6 -> 0 -> 6 with ack 0 throughout
-/// (hv/evidence/gpu-power-cycle-after201.log). So a block reading state 0
-/// with ack 0 is deliberately treated as not powered (fail closed, no MMIO)
-/// and reported separately by [`T8152PsdSample::state_active_unacked`].
-const T8152_PSD_STATE_ACTIVE: u32 = 0;
-const T8152_PSD_ACK_DONE: u32 = 1 << 0;
 
 /// One of the three PSD services that power the T8152 GPU.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -982,6 +965,14 @@ pub(crate) enum T8152PsdService {
 impl T8152PsdService {
     /// Every GPU PSD service, in ADT order.
     pub(crate) const ALL: [Self; 3] = [Self::Sgx, Self::GfxAsc, Self::Gfx1Asc];
+
+    /// Native 26A428 request/state, reproduced on J873 with PMP running.
+    pub(crate) const fn active_state(self) -> u32 {
+        match self {
+            Self::Sgx => 0,
+            Self::GfxAsc | Self::Gfx1Asc => 2,
+        }
+    }
 
     const fn resource_name(self) -> &'static CStr {
         match self {
@@ -1020,32 +1011,17 @@ impl T8152PsdSample {
         self.state & T8152_PSD_STATE_MASK
     }
 
-    /// True only for the active state with the transition acknowledged
-    /// (macOS `PSD::getPsdAck`'s success condition). A matching state alone
-    /// is not enough: attempt 201 saw service 3 reach state 0 while its ack
-    /// stayed 0, and the cause is unresolved.
-    ///
-    /// J873 hardware, 2026-09-25: services 3/81/82 requested from Linux reach
-    /// state 0 in ~5 ms and the ack never sets. The ack is taken to be PMP
-    /// bookkeeping (PMP is not running under Linux), so the active state
-    /// alone counts; `state_active_unacked` stays as telemetry.
+    /// Point-in-time active-state proof, not a transition-completion test.
+    /// J873 hardware confirms STATE reads clear ACK. A request must poll
+    /// ACK first and verify STATE once; later access gates use STATE alone.
     pub(crate) const fn powered(&self) -> bool {
-        self.power_state() == T8152_PSD_STATE_ACTIVE
+        self.power_state() == self.service.active_state()
     }
 
-    /// Telemetry only: the state field reads active but the ack bit is
-    /// clear, the unqualified attempt-201 pattern. Never a power proof.
-    pub(crate) const fn state_active_unacked(&self) -> bool {
-        self.power_state() == T8152_PSD_STATE_ACTIVE && self.ack & T8152_PSD_ACK_DONE == 0
-    }
-
-    /// Short verdict for logs: "powered", "state active, ack clear (not
-    /// treated as powered)" or "not powered".
+    /// Short steady-state verdict for logs.
     pub(crate) const fn verdict(&self) -> &'static str {
         if self.powered() {
             "powered"
-        } else if self.state_active_unacked() {
-            "state active, ack clear (not treated as powered)"
         } else {
             "not powered"
         }
@@ -1101,8 +1077,9 @@ pub(crate) fn t8152_read_psd(
         .ok_or(ENODEV)?;
     let iomem = KBox::pin_init(request.iomap(), GFP_KERNEL)?;
     let io = iomem.try_access().ok_or(ENODEV)?;
-    let state = io.try_read32(T8152_PSD_STATE)?;
+    // STATE consumes the transition ACK; preserve it in the snapshot first.
     let ack = io.try_read32(T8152_PSD_ACK)?;
+    let state = io.try_read32(T8152_PSD_STATE)?;
     Ok(T8152PsdSample {
         service,
         state,
@@ -1111,7 +1088,7 @@ pub(crate) fn t8152_read_psd(
 }
 
 /// Read the SGX PSD service and return a power proof only if it is active
-/// and acknowledged. Otherwise log the sample and return [`t8152_not_powered`], so
+/// (state 0). Otherwise log the sample and return [`t8152_not_powered`], so
 /// the caller skips every SGX read.
 pub(crate) fn t8152_prove_sgx_powered(
     pdev: &platform::Device<Core>,
@@ -1120,7 +1097,7 @@ pub(crate) fn t8152_prove_sgx_powered(
     if !sample.powered() {
         dev_info!(
             pdev.as_ref(),
-            "T8152: sgx PSD service 3 state={:#x} (power state {}) ack={:#x} is not active+acked ({}); SGX reads skipped\n",
+            "T8152: sgx PSD service 3 state={:#x} (power state {}) ack={:#x} is not active ({}); SGX reads skipped\n",
             sample.state,
             sample.power_state(),
             sample.ack,

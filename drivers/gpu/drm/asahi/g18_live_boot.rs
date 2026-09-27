@@ -17,21 +17,19 @@
 //! | 2     | GPU must ALREADY be powered (iBoot or stage 90). Start GFX1 then GFX ASC CPU, RTKit HELLO/EPMAP with syslog and crashlog attached, 2 s syslog window, stop. ENODEV | REQUIRES USER APPROVAL |
 //! | 3     | stage 2 + init-data graph, publish GFX then GFX1 root on EP 0x20 (0x81 doorbell), wait for each 0x0009 ACK, stop. ENODEV | REQUIRES USER APPROVAL |
 //! | 4     | stage 3 + 0x89 power-transition-end to both roles, EP 0x21 idle-policy wake, passive 60 s event/trace drain, stop. Returns the retained owner | REQUIRES USER APPROVAL |
-//! | 90    | PMGR2 PSD power-on request (0) for sgx, service 3, ONLY. Waits on the state field; ack is telemetry. No automatic restore. ENODEV | REQUIRES USER APPROVAL |
-//! | 91    | as 90 for gfx-asc, service 81 (sgx must already read state 0) | REQUIRES USER APPROVAL |
-//! | 92    | as 90 for gfx1-asc, service 82 (sgx must already read state 0) | REQUIRES USER APPROVAL |
-//! | 93    | restore: idle request (6) on every GPU service not already idle, in reverse order 82, 81, 3. ENODEV | REQUIRES USER APPROVAL |
+//! | 90    | PMGR2 PSD request 0 for sgx, service 3, ONLY. Poll ACK before reading STATE. No automatic restore. ENODEV | REQUIRES USER APPROVAL |
+//! | 91    | request 2 for gfx-asc, service 81 (sgx must already read state 0) | REQUIRES USER APPROVAL |
+//! | 92    | request 2 for gfx1-asc, service 82 (sgx must already read state 0) | REQUIRES USER APPROVAL |
+//! | 93    | restore: idle request (6) on every GPU service not already idle, in reverse native order 81, 82, 3. ENODEV | REQUIRES USER APPROVAL |
 //!
 //! Stages 2..4 start the ASC CPUs, which the mailbox provider additionally
 //! refuses unless `apple_mailbox.ascwrap_v8_cpu_control=1` (also REQUIRES
 //! USER APPROVAL). Stages 90..93 are the only code in the driver that writes
 //! a PSD request register; each writes one service (93: only the services
-//! it restores), and none is ever implied by another stage. Their
-//! request/ack semantics are not qualified (attempt 201, see
-//! [`regs::T8152PsdSample::powered`]): a transition is judged by the state
-//! field alone and the ack bit is only logged. A block that reaches state 0
-//! with ack 0 is still NOT powered for every read gate, so stages 1..4 keep
-//! failing closed on it.
+//! it restores), and none is ever implied by another stage. Native order is
+//! 90, 92, 91. J873 hardware confirms STATE reads consume ACK: transition
+//! waits poll ACK before reading STATE once. Later access gates require
+//! each service's active state without requiring an already-consumed ACK.
 //!
 //! The GFX/GFX1 mailbox providers exist only when the loader enabled their
 //! nodes, which it does together with the firmware receipt. A missing
@@ -186,7 +184,6 @@ const PSD_ACK: usize = 0xbc;
 const PSD_BLOCK_SIZE: u64 = 0x100;
 /// Cold-boot idle state of all three GPU services on J873.
 const PSD_STATE_IDLE: u32 = 6;
-const PSD_STATE_ACTIVE: u32 = 0;
 const PSD_POLLS: u32 = 1000; // x 1 ms, as gpu_power.py (1 s)
 
 /// ASCWrap v8 CPU control RUN bit (m1n1 asc.c; INFERRED for the GFX
@@ -389,18 +386,31 @@ impl PsdBlock {
 
     fn sample(&self) -> Result<regs::T8152PsdSample> {
         let io = self.io.try_access().ok_or(ENODEV)?;
+        // Reading STATE consumes ACK; capture ACK first for telemetry.
+        let ack = io.try_read32(PSD_ACK)?;
+        let state = io.try_read32(PSD_STATE)?;
         Ok(regs::T8152PsdSample {
             service: self.service,
-            state: io.try_read32(PSD_STATE)?,
-            ack: io.try_read32(PSD_ACK)?,
+            state,
+            ack,
         })
     }
 
-    /// REQUIRES USER APPROVAL. Write the PSD request register. Only the two
-    /// values hv/tools/gpu_power.py uses are accepted: 0 (active) and 6
-    /// (idle). Called by stages 90..93 only.
+    /// Poll ACK without touching STATE until the transition completes.
+    fn acknowledged_sample(&self) -> Result<Option<regs::T8152PsdSample>> {
+        let io = self.io.try_access().ok_or(ENODEV)?;
+        let ack = io.try_read32(PSD_ACK)?;
+        if ack & 1 == 0 {
+            return Ok(None);
+        }
+        let state = io.try_read32(PSD_STATE)?;
+        Ok(Some(regs::T8152PsdSample { service: self.service, state, ack }))
+    }
+
+    /// REQUIRES USER APPROVAL. Accept only this service's native active
+    /// state (SGX 0, ASCs 2) or idle (6). Called by stages 90..93 only.
     fn request(&self, value: u32) -> Result {
-        if value != PSD_STATE_ACTIVE && value != PSD_STATE_IDLE {
+        if value != self.service.active_state() && value != PSD_STATE_IDLE {
             return Err(EINVAL);
         }
         let io = self.io.try_access().ok_or(ENODEV)?;
@@ -1403,36 +1413,27 @@ fn stage_read_only(pdev: &platform::Device<Core>, probe: &T8152Probe) {
 // Stages 90..93: PSD requests (each REQUIRES USER APPROVAL)
 // ---------------------------------------------------------------------------
 
-/// Poll one service until `state[2:0] == target`, logging the first sample
-/// and every change. The ack bit is telemetry only: the raw request/ack
-/// contract is not qualified (attempt 201: the state moved 6 -> 0 -> 6 while
-/// ack stayed 0, and waiting on the ack is what timed out). Reaching the
-/// state therefore does NOT make a block "powered" for any read gate.
+/// Native PSD::getPsdAck order: poll ACK, then read STATE once. STATE
+/// clears ACK on J873; reading it while waiting loses the acknowledgement.
 fn wait_psd_state(pdev: &platform::Device<Core>, block: &PsdBlock, target: u32) -> Result<regs::T8152PsdSample> {
-    let mut last = None;
     let started = Instant::<Monotonic>::now();
     for poll in 0..PSD_POLLS {
-        let sample = block.sample()?;
-        if last != Some((sample.state, sample.ack)) {
-            dev_info!(pdev.as_ref(), "G18_PSD service={} poll={} t={} us state={:#x} ack={:#x} (ack is telemetry)\n",
+        if let Some(sample) = block.acknowledged_sample()? {
+            dev_info!(pdev.as_ref(), "G18_PSD service={} poll={} t={} us state={:#x} ack={:#x} (ACK read before STATE)\n",
                 sample.service.service_id(), poll, started.elapsed().as_micros_ceil(),
                 sample.state, sample.ack);
-            last = Some((sample.state, sample.ack));
-        }
-        if sample.power_state() == target {
-            let ack_note = if sample.ack & 1 != 0 {
-                "ack bit0 set, as macOS PSD::getPsdAck requires"
-            } else {
-                "ack bit0 CLEAR: the macOS success predicate is not met"
-            };
-            dev_info!(pdev.as_ref(), "G18_PSD service={} reached state {} after {} us; ack={:#x} ({})\n",
-                sample.service.service_id(), target, started.elapsed().as_micros_ceil(), sample.ack,
-                ack_note);
+            if sample.power_state() != target {
+                dev_err!(pdev.as_ref(), "G18_PSD service={} acknowledged unexpected state {}, wanted {}\n",
+                    sample.service.service_id(), sample.power_state(), target);
+                return Err(EIO);
+            }
+            dev_info!(pdev.as_ref(), "G18_PSD service={} reached state {} after {} us; ack={:#x}\n",
+                sample.service.service_id(), target, started.elapsed().as_micros_ceil(), sample.ack);
             return Ok(sample);
         }
         fsleep(Delta::from_millis(1));
     }
-    dev_err!(pdev.as_ref(), "G18_PSD service={} did not reach state {} within {} ms\n",
+    dev_err!(pdev.as_ref(), "G18_PSD service={} did not acknowledge state {} within {} ms\n",
         block.service.service_id(), target, PSD_POLLS);
     Err(ETIMEDOUT)
 }
@@ -1459,15 +1460,14 @@ fn map_psd_blocks(pdev: &platform::Device<Core>) -> Result<KVec<PsdBlock>> {
 }
 
 /// REQUIRES USER APPROVAL. Stages 90 (sgx), 91 (gfx-asc), 92 (gfx1-asc):
-/// request the active state (0) on exactly one service.
+/// request the native active state (SGX 0, ASCs 2) on exactly one service.
 ///
 /// Refuses unless that service reads cold idle (state 6); gfx-asc and
-/// gfx1-asc additionally need sgx to read state 0 first (the
-/// gpu_power.py order 3, 81, 82). Waits on the state field only and logs
-/// the ack. On a timeout nothing is restored automatically: the service is
+/// gfx1-asc additionally need sgx to read state 0 first. Native order is
+/// 3, 82, 81. Polls ACK before STATE. On a timeout nothing is restored: the service is
 /// left as requested and the power state is reported UNKNOWN, to be
 /// restored by stage 93 under its own approval. The SGX ID is read only if
-/// sgx then proves powered, ack included.
+/// sgx then proves powered.
 fn stage_psd_power_on(pdev: &platform::Device<Core>, probe: &T8152Probe, service: regs::T8152PsdService) -> Result {
     let dev: &kernel::device::Device<Core> = pdev.as_ref();
     dev_warn!(dev, "G18_PSD stage {}: PMGR2 PSD power-on of service {} only (REQUIRES USER APPROVAL)\n",
@@ -1480,9 +1480,10 @@ fn stage_psd_power_on(pdev: &platform::Device<Core>, probe: &T8152Probe, service
     }
     let index = regs::T8152PsdService::ALL.iter().position(|s| *s == service).ok_or(EINVAL)?;
     let target = &before[index];
-    if target.power_state() == PSD_STATE_ACTIVE {
-        dev_info!(dev, "G18_PSD service {} already reads state 0 ({}); no request written\n",
-            service.service_id(), target.verdict());
+    let active_state = service.active_state();
+    if target.powered() {
+        dev_info!(dev, "G18_PSD service {} already reads state {} ({}); no request written\n",
+            service.service_id(), active_state, target.verdict());
         return Ok(());
     }
     if target.power_state() != PSD_STATE_IDLE {
@@ -1490,7 +1491,7 @@ fn stage_psd_power_on(pdev: &platform::Device<Core>, probe: &T8152Probe, service
             service.service_id(), PSD_STATE_IDLE);
         return Err(EBUSY);
     }
-    if service != regs::T8152PsdService::Sgx && before[0].power_state() != PSD_STATE_ACTIVE {
+    if service != regs::T8152PsdService::Sgx && !before[0].powered() {
         dev_err!(dev, "G18_PSD refused: sgx (service 3) must read state 0 before service {} (run stage 90 first)\n",
             service.service_id());
         return Err(EBUSY);
@@ -1498,8 +1499,8 @@ fn stage_psd_power_on(pdev: &platform::Device<Core>, probe: &T8152Probe, service
     claim_psd_request(dev, psd_request_bit(service))?;
     let block = &blocks[index];
     dev_warn!(dev, "G18_PSD write service={} request={} (REQUIRES USER APPROVAL)\n",
-        service.service_id(), PSD_STATE_ACTIVE);
-    let result = block.request(PSD_STATE_ACTIVE).and_then(|()| wait_psd_state(pdev, block, PSD_STATE_ACTIVE));
+        service.service_id(), active_state);
+    let result = block.request(active_state).and_then(|()| wait_psd_state(pdev, block, active_state));
     for block in blocks.iter() {
         if let Ok(sample) = block.sample() {
             log_psd(pdev, "power-on after", &sample);
@@ -1514,20 +1515,20 @@ fn stage_psd_power_on(pdev: &platform::Device<Core>, probe: &T8152Probe, service
         match regs::t8152_prove_sgx_powered(pdev) {
             Ok(powered) => {
                 let id = probe.registers.get_gpu_id_t8152(&powered, probe.soc)?;
-                dev_info!(dev, "G18_PSD sgx powered (ack included); SGX identity {:?}\n", id);
+                dev_info!(dev, "G18_PSD sgx powered after acknowledged transition; SGX identity {:?}\n", id);
             }
             Err(error) => dev_err!(dev, "G18_PSD sgx reached state 0 but is not provably powered ({:?}); SGX not read\n", error),
         }
     }
-    dev_info!(dev, "G18_PSD stage {} done; service {} left in state 0, no firmware touched; ENODEV\n",
-        probe.stage, service.service_id());
+    dev_info!(dev, "G18_PSD stage {} done; service {} left in state {}, no firmware touched; ENODEV\n",
+        probe.stage, service.service_id(), active_state);
     Ok(())
 }
 
 /// REQUIRES USER APPROVAL. Stage 93: request idle (6) on every GPU service
-/// that reads state 0, in reverse order (82, 81, 3), waiting on the state
-/// field and logging the ack. Refuses if any service reads a state other
-/// than 0 or 6, or if a firmware stage ran this boot. Stops at the first
+/// that reads its active state, in reverse native order (81, 82, 3),
+/// polling ACK before STATE. Refuses if a service is neither active nor
+/// idle, or if a firmware stage ran this boot. Stops at the first
 /// failure and reports the power state UNKNOWN.
 fn stage_psd_restore_idle(pdev: &platform::Device<Core>) -> Result {
     let dev: &kernel::device::Device<Core> = pdev.as_ref();
@@ -1538,8 +1539,8 @@ fn stage_psd_restore_idle(pdev: &platform::Device<Core>) -> Result {
         *slot = block.sample()?;
         log_psd(pdev, "restore before", slot);
     }
-    if samples.iter().any(|sample| sample.power_state() != PSD_STATE_ACTIVE && sample.power_state() != PSD_STATE_IDLE) {
-        dev_err!(dev, "G18_PSD restore refused: a service reads neither state 0 nor state 6\n");
+    if samples.iter().any(|sample| !sample.powered() && sample.power_state() != PSD_STATE_IDLE) {
+        dev_err!(dev, "G18_PSD restore refused: a service is neither active nor idle\n");
         return Err(EBUSY);
     }
     if samples.iter().all(|sample| sample.power_state() == PSD_STATE_IDLE) {
@@ -1548,7 +1549,9 @@ fn stage_psd_restore_idle(pdev: &platform::Device<Core>) -> Result {
     }
     claim_psd_request(dev, PSD_REQUEST_RESTORE_BIT)?;
     let mut result = Ok(());
-    for (block, sample) in blocks.iter().zip(samples.iter()).rev() {
+    for index in [1, 2, 0] {
+        let block = &blocks[index];
+        let sample = &samples[index];
         if sample.power_state() == PSD_STATE_IDLE {
             continue;
         }
@@ -1586,17 +1589,14 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
     }
 
     // The GPU must already be powered (by iBoot, or by approved stages
-    // 90..92 on this boot). This path never requests PSD power. "Powered"
-    // includes the ack bit (macOS PSD::getPsdAck's success condition), so a
-    // service that reached state 0 without an ack still refuses here.
+    // 90..92 on this boot). This path never requests PSD power. STATE reads
+    // consume transition ACK, so this steady-state gate checks the native
+    // active states (SGX 0, ASCs 2), not an already-consumed acknowledgement.
     let psd = read_all_psd(pdev)?;
     for sample in psd.iter() {
         log_psd(pdev, "firmware-stage gate", sample);
     }
     if !psd.iter().all(|sample| sample.powered()) {
-        if psd.iter().any(|sample| sample.state_active_unacked()) {
-            dev_err!(dev, "G18 stage {}: a GPU PSD service reads state 0 with ack 0 (the unqualified attempt-201 pattern); not treated as powered\n", stage);
-        }
         dev_err!(dev, "G18 stage {} refused: the GPU PSD services are not all powered; nothing started\n", stage);
         return Err(ENODEV);
     }
