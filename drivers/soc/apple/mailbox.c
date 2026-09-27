@@ -102,8 +102,7 @@
 #define APPLE_PSD_STATE 0x80
 #define APPLE_PSD_ACK 0xbc
 #define APPLE_PSD_STATE_MASK GENMASK(2, 0)
-#define APPLE_PSD_STATE_ACTIVE 0
-#define APPLE_PSD_ACK_DONE BIT(0)
+#define APPLE_T8152_GPU_ASC_PSD_ACTIVE 2
 /* apple_mbox_ascwrap_v6_lifecycle.missing bit: CPU control not approved. */
 #define APPLE_ASCWRAP_V8_MISSING_CPU_CONTROL_APPROVAL BIT(0)
 /* Receive poll period (poll-only mode, or after the storm guard tripped). */
@@ -250,10 +249,10 @@ static bool apple_mbox_has_cpu_lifecycle(const struct apple_mbox *mbox)
 
 /*
  * Read-only proof that a v8 ASC block is powered before any wrapper MMIO.
- * "Powered" is the PMGR2 PSD active state (state[2:0] == 0) with the
- * transition acknowledged (ack bit 0), the predicate m1n1's qualified ATC3
- * PSD path waits for. J873 cold boot reads GPU services at state 6 / ack 0,
- * which this rejects. Never writes the PSD request register.
+ * The exact T8152 GFX/GFX1 providers use state 2, matching native 26A428.
+ * J873 hardware confirms reading STATE clears the transition ACK: snapshot
+ * ACK first, but do not require it to remain set for steady-state access.
+ * Cold state 6 is rejected. Never writes the PSD request register.
  */
 static int apple_mbox_ascwrap_v8_psd_powered(struct apple_mbox *mbox,
 					     u32 *state, u32 *ack)
@@ -265,15 +264,9 @@ static int apple_mbox_ascwrap_v8_psd_powered(struct apple_mbox *mbox,
 	if (!mbox->hw->is_ascwrap_v8 || !psd)
 		return -ENODEV;
 
-	*state = readl(psd + APPLE_PSD_STATE);
 	*ack = readl(psd + APPLE_PSD_ACK);
-	/*
-	 * J873 hardware, 2026-09-25: requesting power on GPU services 3/81/82
-	 * from Linux reaches state 0 in ~5 ms but the ack never sets. The ack
-	 * is taken to be PMP bookkeeping (nothing runs PMP under Linux), so the
-	 * active state alone admits wrapper reads; the ack stays telemetry.
-	 */
-	if (FIELD_GET(APPLE_PSD_STATE_MASK, *state) != APPLE_PSD_STATE_ACTIVE)
+	*state = readl(psd + APPLE_PSD_STATE);
+	if (FIELD_GET(APPLE_PSD_STATE_MASK, *state) != APPLE_T8152_GPU_ASC_PSD_ACTIVE)
 		return -EHOSTDOWN;
 
 	return 0;
