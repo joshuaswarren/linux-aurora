@@ -11,6 +11,7 @@
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/io.h>
@@ -390,8 +391,13 @@ static bool apple_qspi_wait_complete(struct apple_qspi *qspi)
 		if (time_after_eq(jiffies, deadline))
 			break;
 
-		if (wait_for_completion_timeout(&qspi->done, 1))
-			return true;
+		/*
+		 * The RX threshold interrupt does not fire either, so waiting a
+		 * jiffy here drains one FIFO (256 bytes) per tick: 34 kB/s at
+		 * HZ=250. A 4 KiB read at 40 MHz takes under a millisecond, so
+		 * poll at FIFO-fill granularity instead.
+		 */
+		usleep_range(10, 30);
 	} while (time_before(jiffies, deadline));
 
 	return false;
