@@ -81,9 +81,9 @@
 
 #define APPLE_NVME_IOSQES	7
 
-/* Keep the scatterlist allocation within one page. */
+/* A 1 MiB I/O can span 256 noncontiguous 4 KiB pages. */
 #define NVME_MAX_KB_SZ 4096
-#define NVME_MAX_SEGS  127
+#define NVME_MAX_SEGS  256
 #define NVME_MAX_PRP_LISTS 3
 
 /*
@@ -288,6 +288,10 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
+
+static unsigned int max_segments = NVME_MAX_SEGS;
+module_param(max_segments, uint, 0444);
+MODULE_PARM_DESC(max_segments, "Maximum segments per command (1-256; default 256)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -1657,7 +1661,7 @@ rtkit_ready:
 	 */
 	anv->ctrl.max_hw_sectors = min_t(u32, NVME_MAX_KB_SZ << 1,
 					 dma_max_mapping_size(anv->dev) >> 9);
-	anv->ctrl.max_segments = NVME_MAX_SEGS;
+	anv->ctrl.max_segments = clamp_val(max_segments, 1, NVME_MAX_SEGS);
 
 	dma_set_max_seg_size(anv->dev, 0xffffffff);
 
@@ -2309,7 +2313,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	}
 
 	anv->iod_mempool =
-		mempool_create_kmalloc_pool(1, sizeof(struct scatterlist) * NVME_MAX_SEGS);
+		mempool_create_kmalloc_pool(8, sizeof(struct scatterlist) * NVME_MAX_SEGS);
 	if (!anv->iod_mempool) {
 		ret = -ENOMEM;
 		goto out_detach_genpd;
