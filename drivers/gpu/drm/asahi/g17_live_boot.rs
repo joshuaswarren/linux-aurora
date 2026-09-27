@@ -2611,6 +2611,11 @@ fn finish_boot_session(
     );
 
     if !g17_submission::G17P_NATIVE_PRE_USER_EP21_MESSAGES.is_empty() {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P session: {} unexpected native pre-user EP21 messages\n",
+            g17_submission::G17P_NATIVE_PRE_USER_EP21_MESSAGES.len(),
+        );
         return Err(EINVAL);
     }
     manager.validate_native_pre_user_roots()?;
