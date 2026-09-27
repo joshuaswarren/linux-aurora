@@ -48,6 +48,7 @@ struct apple_rtkit {
 	bool awaiting_iop_idle;
 	bool epmap_only;
 	bool firmware_owned_crashlog;
+	bool t8152_pmp;
 	bool crashlog_endpoint_started;
 	bool hello_seen;
 	bool epmap_finished;
@@ -59,6 +60,7 @@ struct apple_rtkit {
 	struct apple_rtkit_shmem ioreport_buffer;
 	struct apple_rtkit_shmem crashlog_buffer;
 	struct apple_rtkit_shmem oslog_buffer;
+	struct apple_rtkit_shmem pmp_aux_buffer;
 
 	struct apple_rtkit_shmem syslog_buffer;
 	char *syslog_msg_buffer;

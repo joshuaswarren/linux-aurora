@@ -5,6 +5,7 @@
  */
 
 #include "rtkit-internal.h"
+#include <linux/of.h>
 
 static_assert(APPLE_RTKIT_EPMAP_SNAPSHOT_WORDS * 64 ==
 	      APPLE_RTKIT_MAX_ENDPOINTS);
@@ -24,6 +25,7 @@ enum {
 	APPLE_RTKIT_EP_SYSLOG = 2,
 	APPLE_RTKIT_EP_DEBUG = 3,
 	APPLE_RTKIT_EP_IOREPORT = 4,
+	APPLE_RTKIT_EP_PMP_AUX = 7,
 	APPLE_RTKIT_EP_OSLOG = 8,
 	APPLE_RTKIT_EP_TRACEKIT = 0xa,
 };
@@ -259,6 +261,13 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		/* the management endpoint is started by default */
 		case APPLE_RTKIT_EP_MGMT:
 			break;
+		case APPLE_RTKIT_EP_PMP_AUX:
+			if (rtk->t8152_pmp) {
+				apple_rtkit_start_ep(rtk, ep);
+				break;
+			}
+			dev_warn(rtk->dev, "RTKit: unqualified endpoint 7\n");
+			break;
 
 		/* without starting these RTKit refuses to boot */
 		case APPLE_RTKIT_EP_SYSLOG:
@@ -416,6 +425,7 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 					    buffer->iova >> 12);
 		} else {
 			reply = FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
+					   ep == APPLE_RTKIT_EP_PMP_AUX ? 5 :
 					   APPLE_RTKIT_BUFFER_REQUEST);
 			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE,
 					    buffer->size >> 12);
@@ -642,6 +652,24 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
+/* Native J873 26A428 capture074: EP7 requests 8KiB with type1 and
+ * receives type5, the same size and an unshifted 44-bit DVA. Keep the
+ * buffer alive for the RTKit session; never replace a live allocation.
+ */
+static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
+{
+	int ret;
+
+	if (!rtk->t8152_pmp || msg != 0x10200000000000ULL ||
+	    rtk->pmp_aux_buffer.size) {
+		dev_err(rtk->dev, "RTKit: refused PMP EP7 request %#llx\n", msg);
+		return;
+	}
+	ret = apple_rtkit_common_rx_get_buffer(rtk, &rtk->pmp_aux_buffer,
+					     APPLE_RTKIT_EP_PMP_AUX, msg);
+	dev_info(rtk->dev, "RTKit: PMP EP7 8KiB buffer handshake result=%d\n", ret);
+}
+
 static void apple_rtkit_rx_work(struct work_struct *work)
 {
 	struct apple_rtkit_rx_work *rtk_work =
@@ -666,6 +694,9 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 		break;
 	case APPLE_RTKIT_EP_OSLOG:
 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
+		break;
+	case APPLE_RTKIT_EP_PMP_AUX:
+		apple_rtkit_pmp_aux_rx(rtk, rtk_work->msg);
 		break;
 	case APPLE_RTKIT_APP_ENDPOINT_START ... 0xff:
 		if (rtk->ops->recv_message)
@@ -855,6 +886,7 @@ static struct apple_rtkit *__apple_rtkit_init(
 	rtk->ops = ops;
 	rtk->epmap_only = epmap_only;
 	rtk->firmware_owned_crashlog = firmware_owned_crashlog;
+	rtk->t8152_pmp = of_device_is_compatible(dev->of_node, "apple,t8152-pmp-v2");
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
@@ -966,6 +998,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
 
 	kfree(rtk->syslog_msg_buffer);
 
@@ -1304,6 +1337,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
 
 	kfree(rtk->syslog_msg_buffer);
 	kfree(rtk);

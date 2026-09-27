@@ -287,6 +287,8 @@ struct apple_dart {
 	u32 locked : 1;
 	u32 tlb_cmd_v2 : 1;
 	u32 force_available : 1;
+	/* J873 SBR is shared with firmware: Linux owns PMP SID6 only. */
+	u32 pmp_sid6_only : 1;
 	u16 version;
 
 	dma_addr_t dma_min;
@@ -852,6 +854,9 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 
 static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
 {
+	if (dart->pmp_sid6_only)
+		return;
+
 	for (int word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
 		u32 mask = U32_MAX;
 
@@ -889,6 +894,10 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
 	int ret;
+
+	/* Other SBR streams remain owned by iBoot and live coprocessors. */
+	if (dart->pmp_sid6_only)
+		return 0;
 
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
@@ -1550,6 +1559,12 @@ static int apple_dart_of_xlate(struct device *dev,
 	if (args->args_count != 1)
 		return -EINVAL;
 	sid = args->args[0];
+	if (sid >= dart->num_streams)
+		return -EINVAL;
+	if (dart->pmp_sid6_only &&
+	    (sid != 6 || !of_device_is_compatible(dev->of_node,
+						 "apple,t8152-pmp-v2")))
+		return -EINVAL;
 
 	if (!cfg) {
 		cfg = kzalloc_obj(*cfg);
@@ -2014,6 +2029,52 @@ static bool apple_dart_is_locked(struct apple_dart *dart)
 	return !!(readl(dart->regs + dart->hw->lock) & dart->hw->lock_bit);
 }
 
+/* Read-only admission before claiming the stopped PMP's empty boot stream.
+ * Reference: J873 macOS26A428 capture074. The regular reset path cannot be
+ * used here: SBR also translates for devices that Linux does not own.
+ */
+static int apple_dart_pmp_admit(struct apple_dart *dart)
+{
+	void __iomem *wrapper;
+	u64 *root;
+	phys_addr_t pa;
+	u32 control, tcr, ttbr;
+	bool empty;
+
+	if (!of_machine_is_compatible("apple,j873") || dart->locked ||
+	    dart->version != 0x0300 || dart->num_streams != 57 ||
+	    dart->pgsize != SZ_16K || dart->ias != 42 || dart->oas != 42 ||
+	    dart->dma_min < 0x10040000000ULL || dart->dma_max >= BIT_ULL(42))
+		return -EINVAL;
+	if (!(readl(dart->regs + DART_T8110_ENABLE_STREAMS) & BIT(6)))
+		return -EIO;
+	wrapper = ioremap(0x300e00000ULL, SZ_4K);
+	if (!wrapper)
+		return -ENOMEM;
+	control = readl(wrapper + 0x44);
+	iounmap(wrapper);
+	if (control & BIT(4))
+		return -EBUSY;
+	tcr = readl(dart->regs + DART_TCR(dart, 6));
+	ttbr = readl(dart->regs + DART_TTBR(dart, 6, 0));
+	if (tcr != 1 || !(ttbr & 1) || (ttbr & 0xc0000002U))
+		return -EINVAL;
+	pa = ((phys_addr_t)(ttbr >> 2)) << 14;
+	/* Frozen J873 carveout geometry; refuse a changed firmware layout. */
+	if (pa != 0x105ffdf4000ULL)
+		return -EINVAL;
+	root = memremap(pa, SZ_16K, MEMREMAP_WB);
+	if (!root)
+		return -ENOMEM;
+	empty = !memchr_inv(root, 0, SZ_16K);
+	memunmap(root);
+	if (!empty)
+		return -EBUSY;
+	dev_info(dart->dev,
+		 "J873 PMP SID6 admitted: stopped CPU, empty inherited root; shared SBR state preserved\n");
+	return 0;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int bypass_count, enabled_count, ret;
@@ -2038,7 +2099,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
+	dart->pmp_sid6_only = of_device_is_compatible(dev->of_node,
+						     "apple,t8152-pmp-dart");
 	dart->force_available =
+		dart->pmp_sid6_only ||
 		of_property_read_bool(dev->of_node, "apple,force-available");
 	spin_lock_init(&dart->lock);
 
@@ -2051,9 +2115,16 @@ static int apple_dart_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	dart->irq = platform_get_irq(pdev, 0);
-	if (dart->irq < 0)
-		return -ENODEV;
+	if (dart->pmp_sid6_only) {
+		if (res->start != 0x318100000ULL || resource_size(res) != 0xc000)
+			return -EINVAL;
+		/* Do not claim or acknowledge the shared controller's fault IRQ. */
+		dart->irq = -1;
+	} else {
+		dart->irq = platform_get_irq(pdev, 0);
+		if (dart->irq < 0)
+			return -ENODEV;
+	}
 
 	ret = devm_clk_bulk_get_all(dev, &dart->clks);
 	if (ret < 0)
@@ -2169,6 +2240,13 @@ static int apple_dart_probe(struct platform_device *pdev)
 	}
 
 	dart->locked = apple_dart_is_locked(dart);
+	if (dart->pmp_sid6_only) {
+		ret = apple_dart_pmp_admit(dart);
+		if (ret)
+			goto err_clk_disable;
+		/* No identity domain may bypass the PMP's qualified DMA window. */
+		dart->supports_bypass = false;
+	}
 
 	/*
 	 * A locked DART is one the bootloader handed over still translating for
@@ -2191,10 +2269,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 		apple_dart_drain_stale_exceptions(dart);
 	}
 
-	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
-			  "apple-dart fault handler", dart);
-	if (ret)
-		goto err_clk_disable;
+	if (!dart->pmp_sid6_only) {
+		ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
+				  "apple-dart fault handler", dart);
+		if (ret)
+			goto err_clk_disable;
+	}
 
 	platform_set_drvdata(pdev, dart);
 
@@ -2222,7 +2302,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
-	free_irq(dart->irq, dart);
+	if (!dart->pmp_sid6_only)
+		free_irq(dart->irq, dart);
 err_clk_disable:
 	pm_runtime_put(dev);
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
@@ -2237,7 +2318,8 @@ static void apple_dart_remove(struct platform_device *pdev)
 	if (!dart->locked)
 		apple_dart_hw_reset(dart);
 
-	free_irq(dart->irq, dart);
+	if (!dart->pmp_sid6_only)
+		free_irq(dart->irq, dart);
 
 	iommu_device_unregister(&dart->iommu);
 	iommu_device_sysfs_remove(&dart->iommu);
@@ -2357,7 +2439,7 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	unsigned int sid, idx;
 
 	/* Locked DARTs can't be restored so skip saving their registers. */
-	if (dart->locked)
+	if (dart->locked || dart->pmp_sid6_only)
 		return 0;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
@@ -2377,7 +2459,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	int ret;
 
 	/* Locked DARTs can't be restored, and they should not need it */
-	if (dart->locked)
+	if (dart->locked || dart->pmp_sid6_only)
 		return 0;
 
 	ret = apple_dart_hw_reset(dart);
@@ -2399,6 +2481,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 static DEFINE_RUNTIME_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dart_resume, NULL);
 
 static const struct of_device_id apple_dart_of_match[] = {
+	{ .compatible = "apple,t8152-pmp-dart", .data = &apple_dart_hw_t8110 },
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
