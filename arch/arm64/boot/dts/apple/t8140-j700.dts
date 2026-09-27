@@ -19,6 +19,7 @@
 	aliases {
 		atcphy0 = &atcphy0;
 		keyboard = &keyboard;
+		pmp = &pmp;
 		serial0 = &serial0;
 	};
 
@@ -1451,6 +1452,15 @@
 };
 
 &smc_mbox {
+	status = "okay";
+};
+
+/* The bootloader enables the PMP itself once it has added its configuration. */
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_mbox {
 	status = "okay";
 };
 
