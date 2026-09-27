@@ -866,8 +866,11 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	struct apple_rtkit *rtk;
 	int ret;
 
-	if (!ops)
+	if (!ops) {
+		dev_err(dev, "RTKit init: missing callbacks for mailbox index %d\n",
+			mbox_idx);
 		return ERR_PTR(-EINVAL);
+	}
 
 	rtk = kzalloc_obj(*rtk);
 	if (!rtk)
@@ -894,6 +897,9 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 
 	if (IS_ERR(rtk->mbox)) {
 		ret = PTR_ERR(rtk->mbox);
+		if (ret != -EPROBE_DEFER)
+			dev_err(dev, "RTKit init: mailbox index %d lookup failed: %d\n",
+				mbox_idx, ret);
 		goto free_rtk;
 	}
 
@@ -911,8 +917,11 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	apple_rtkit_claim_rx(rtk);
 
 	ret = apple_mbox_start(rtk->mbox);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "RTKit init: mailbox index %d start failed: %d\n",
+			mbox_idx, ret);
 		goto stop_rx;
+	}
 
 	return rtk;
 
