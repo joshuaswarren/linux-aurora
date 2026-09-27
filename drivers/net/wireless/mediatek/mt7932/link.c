@@ -96,16 +96,26 @@ int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 		   const u8 *mac, struct station_info *sinfo)
 {
 	struct mt7932 *m = mt_from_wiphy(wiphy);
+	unsigned long flags;
+	int ret = 0;
 
-	if (wdev != &m->wdev || !READ_ONCE(m->connected))
-		return -ENOENT;
-	if (mac && !ether_addr_equal(mac, m->connect_bssid))
-		return -ENOENT;
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (wdev != &m->wdev || !m->connected ||
+	    (mac && !ether_addr_equal(mac, m->connect_bssid))) {
+		ret = -ENOENT;
+		goto out;
+	}
 	if (READ_ONCE(m->assoc_signal_valid)) {
 		sinfo->signal = READ_ONCE(m->assoc_signal_dbm);
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
 	}
-	return 0;
+	if (m->rx_rate_valid && time_before(jiffies, m->rx_rate_updated + 10 * HZ)) {
+		sinfo->rxrate = m->rx_rate;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+	}
+out:
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	return ret;
 }
 
 int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
@@ -646,6 +656,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_error = 0;
 	m->connect_cancelled = false;
 	m->peer_valid = false;
+	m->rx_rate_valid = false;
+	m->last_rxv = 0;
+	m->rx_rate_updated = 0;
+	WRITE_ONCE(m->assoc_signal_valid, false);
+	WRITE_ONCE(m->cqm_rssi_state, 0);
 	m->connecting = true;
 unlock:
 	spin_unlock_irqrestore(&m->response_lock, flags);

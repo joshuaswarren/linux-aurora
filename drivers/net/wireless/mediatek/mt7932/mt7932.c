@@ -217,6 +217,7 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 
 		if (!(ctrl & DONE))
 			break;
+		m->rx_descriptors++;
 		dma_rmb();
 		length = (ctrl >> 16) & 0x3fff;
 		if (length <= MT7932_RX_CAPACITY && (ctrl & BIT(30)))
@@ -247,12 +248,14 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 			dma_wmb();
 			mt_write(m, q->reg + 8, m->runtime_epoch ?
 				 (q->head + q->count - 1) % q->count : q->head);
+			m->rx_doorbells++;
 			pending = 0;
 		}
 	}
 	if (pending) {
 		dma_wmb();
 		mt_write(m, q->reg + 8, (q->head + q->count - 1) % q->count);
+		m->rx_doorbells++;
 	}
 }
 

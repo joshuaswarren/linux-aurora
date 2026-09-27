@@ -15,3 +15,13 @@ config MT7932_FULLMAC
 	  parameters are required for ordinary station operation.
 	  No automatic recovery or unbind is provided while DMA teardown is
 	  unqualified. Other MediaTek devices and other machines are not matched.
+
+config MT7932_RATE_KUNIT_TEST
+	tristate "MT7932 RX rate decoder tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Test rate decoding and RX descriptor bounds without radio hardware.
+	  Covers legacy, HT, VHT and HE SU rates, invalid vectors and missing
+	  or truncated descriptor groups. This does not validate the firmware's
+	  live RX vector layout or replace an AP-side rate comparison.

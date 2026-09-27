@@ -72,6 +72,9 @@ static int mt_stock_config(struct mt7932 *m)
 			records[j].key_len = strscpy(records[j].key, updates[i].key, 32);
 		}
 		value = updates[i].at == 4 ? min(requested, m->phy_cap[4]) : requested & m->phy_cap[updates[i].at];
+		if (!strcmp(updates[i].key, "StaVHT") || !strcmp(updates[i].key, "Nss"))
+			dev_info(&m->pdev->dev, "PHY_CONFIG: %s=%u requested=%u capability=%u\n",
+				 updates[i].key, value, requested, m->phy_cap[updates[i].at]);
 		memset(records[j].value, 0, 32);
 		records[j].value_len = scnprintf(records[j].value, 32, "0x%x", value);
 	}
@@ -112,6 +115,8 @@ static int mt_stock_config(struct mt7932 *m)
 		if (ret)
 			goto free;
 	}
+	dev_info(&m->pdev->dev,
+		 "PHY_POLICY: 5GHz capped at 20 MHz (Sta5gBw=0, CID0f=1); wide association/calibration unsupported\n");
 	dev_info(&m->pdev->dev, "STOCK_CONFIG_SUBMITTED: %u original/PHY-derived entries\n", count);
 free:
 	kfree(records);

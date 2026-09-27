@@ -15,6 +15,7 @@
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <linux/if_vlan.h>
 #include <linux/pci.h>
 #include <linux/random.h>
@@ -135,6 +136,13 @@ struct mt7932 {
 	bool data_live[512], data_token[512], data_retired[512];
 	struct mt7932_duplicate duplicates[17];
 	u64 tx_released, rx_ethernet;
+	u64 tx_doorbells, tx_busy, rx_descriptors, rx_doorbells;
+	u64 rx_parse_errors, rx_amsdu, rx_filtered, rx_rate_missing;
+	/* response_lock protects the associated unicast RX rate snapshot. */
+	struct rate_info rx_rate;
+	unsigned long rx_rate_updated;
+	u32 last_rxv;
+	bool rx_rate_valid;
 	bool data_ready;
 	bool tx_pending; /* data_lock: descriptors awaiting a doorbell */
 	bool bss_absent;
@@ -198,6 +206,8 @@ int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 int mt_set_cqm_rssi_config(struct wiphy *wiphy, struct net_device *netdev,
 			   s32 rssi_thold, u32 rssi_hyst);
 void mt_signal_update(struct mt7932 *m, const struct mt7932_rx_frame *frame, int signal);
+
+extern const struct ethtool_ops mt_ethtool_ops;
 
 bool mt_transport_polled(void);
 
