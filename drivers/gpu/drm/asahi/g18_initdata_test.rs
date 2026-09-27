@@ -782,6 +782,11 @@ fn g18g_hw_data_moves_every_j813_value_and_leaves_none_behind() {
     set(G18G_26A428_HW_CHIP_ID_OFFSET, &0x8152u32.to_le_bytes());
     set(G18G_26A428_HW_PERF_STATE_COUNT, &13u32.to_le_bytes());
     set(G18G_26A428_HW_2714_OFFSET, &0x96u32.to_le_bytes());
+    // Independent values from both roles in captures 051/053/073.
+    for (offset, value) in [(0xfb4, 1u32), (0x10d4, 0x1b), (0x10d8, 4),
+                            (0x10dc, 12), (0x283a, 1), (0x283e, 1)] {
+        set(offset, &value.to_le_bytes());
+    }
     for (state, &(frequency, core)) in J873_GPU_PERF_STATES.iter().enumerate() {
         set(G18G_26A428_HW_PERF_FREQUENCY + state * 4, &frequency.to_le_bytes());
         for lane in 0..16 {
@@ -818,7 +823,7 @@ fn g18g_hw_data_moves_every_j813_value_and_leaves_none_behind() {
     // Spot checks of the plan's named moves, and of what now occupies the
     // old 25G76 places.
     assert_eq!(get_u32(&hw, 0xfb0), 0x8152);
-    assert_eq!(get_u32(&hw, 0xfb4), 2);
+    assert_eq!(get_u32(&hw, 0xfb4), 1);
     assert_ne!(get_u32(&hw, 0xe90), 0x8142);
     assert_eq!(get_u32(&hw, 0x2714), 0x96);
     assert_eq!(get_u32(&hw, 0x2710), 1, "25G76 +0x25f4 flag");
@@ -840,7 +845,7 @@ fn g18g_hw_data_moves_every_j813_value_and_leaves_none_behind() {
     assert_eq!(get_u32(&hw, 0x1528 + 6 * 0x40), 795);
     assert_eq!(get_u32(&hw, 0x1124 + 14 * 0x40), 0, "rows 14 and 15 stay empty");
     for (field, size) in G18G_26A428_HW_NEW_FIELDS {
-        if field != G18G_26A428_HW_2714_OFFSET {
+        if field != G18G_26A428_HW_2714_OFFSET && field != 0x283a && field != 0x283e {
             assert!(hw[field..field + size].iter().all(|byte| *byte == 0));
         }
     }
@@ -858,7 +863,7 @@ fn g18g_hw_data_moves_every_j813_value_and_leaves_none_behind() {
 }
 
 #[test]
-fn g18g_register_map_renumbers_rebases_and_zeroes_slot_41() {
+fn g18g_register_map_renumbers_rebases_and_zeroes_slots_24_and_41() {
     let hw = g18_hw_data();
     let slot = |index: usize| {
         let base = HW_REGISTER_MAP_OFFSET + index * HW_REGISTER_MAP_ENTRY_SIZE;
@@ -866,6 +871,8 @@ fn g18g_register_map_renumbers_rebases_and_zeroes_slot_41() {
     };
     assert_eq!(G18G_26A428_HW_REGISTER_MAP_END, 0xfa0);
     assert!(slot(G18G_26A428_ZEROED_REGISTER_SLOT).iter().all(|byte| *byte == 0));
+    // Both roles in native 26A428 captures 051/053/073 leave DVFMMgpu absent.
+    assert!(slot(24).iter().all(|byte| *byte == 0));
     for index in G18G_26A428_REGISTER_FLAG_ONLY_SLOTS {
         let entry = slot(index);
         assert_eq!(get_u32(entry, 0x20), 2);
@@ -906,7 +913,7 @@ fn g18g_register_map_renumbers_rebases_and_zeroes_slot_41() {
             continue;
         };
         let Some(g18) = G18G_26A428_REGISTER_WINDOWS.iter().find(|w| w.slot == new_slot as usize) else {
-            assert!(matches!(m5.slot, 12 | 42 | 50), "J813 slot {} lost its window", m5.slot);
+            assert!(matches!(m5.slot, 12 | 24 | 42 | 50), "J813 slot {} lost its window", m5.slot);
             continue;
         };
         if m5.phys >= 0x3_8000_0000 && m5.phys < 0x3_9000_0000 {

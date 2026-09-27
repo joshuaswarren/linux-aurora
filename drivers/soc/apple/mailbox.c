@@ -188,6 +188,8 @@ struct apple_mbox_hw {
 	bool is_ascwrap_v6;
 	/* T8152 GPU ASCWrap v8: wrapper + iop-vbar + post-office window + PSD. */
 	bool is_ascwrap_v8;
+	/* PMP's postoffice is qualified; its IRQ ordering is not yet known. */
+	bool rx_poll_required;
 	bool counted_fifo;
 	u64 ascwrap_v6_base_delta;
 	bool ap_initializes_mailboxes;
@@ -233,6 +235,11 @@ struct apple_mbox_priv {
 static struct apple_mbox_priv *apple_mbox_to_priv(struct apple_mbox *mbox)
 {
 	return container_of(mbox, struct apple_mbox_priv, mbox);
+}
+
+static bool apple_mbox_has_rx_poller(const struct apple_mbox *mbox)
+{
+	return mbox->hw->is_ascwrap_v8 || mbox->hw->rx_poll_required;
 }
 
 /* Both ASCWrap generations share the consumer lifecycle API below. */
@@ -572,7 +579,7 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 
 			break;
 		}
-		if (mbox->hw->is_ascwrap_v8 &&
+		if (apple_mbox_has_rx_poller(mbox) &&
 		    apple_mbox_to_priv(mbox)->rx_poll_only) {
 			/*
 			 * Poll-only v8: never enable the send-empty line.
@@ -856,7 +863,7 @@ int apple_mbox_start(struct apple_mbox *mbox)
 			       mbox->regs + mbox->hw->irq_enable);
 	}
 
-	if (mbox->hw->is_ascwrap_v8) {
+	if (apple_mbox_has_rx_poller(mbox)) {
 		WRITE_ONCE(mbox->active, true);
 		apple_mbox_v8_rx_start(mbox);
 		goto out_unlock;
@@ -876,7 +883,7 @@ static void apple_mbox_stop_locked(struct apple_mbox *mbox)
 	if (!mbox->active)
 		return;
 
-	if (mbox->hw->is_ascwrap_v8) {
+	if (apple_mbox_has_rx_poller(mbox)) {
 		WRITE_ONCE(mbox->active, false);
 		apple_mbox_v8_rx_stop(mbox);
 	} else {
@@ -930,7 +937,7 @@ static void apple_mbox_quiesce(void *data)
 	WRITE_ONCE(mbox->active, false);
 	mutex_unlock(&mbox->lifecycle_lock);
 	if (was_active) {
-		if (mbox->hw->is_ascwrap_v8)
+		if (apple_mbox_has_rx_poller(mbox))
 			apple_mbox_v8_rx_stop(mbox);
 		else
 			disable_irq(mbox->irq_recv_not_empty);
@@ -938,13 +945,15 @@ static void apple_mbox_quiesce(void *data)
 		pm_runtime_put_autosuspend(mbox->dev);
 	}
 	/* The v8 poller also stops on the removal fence; make sure it is gone. */
-	if (mbox->hw->is_ascwrap_v8)
+	if (apple_mbox_has_rx_poller(mbox))
 		cancel_delayed_work_sync(&apple_mbox_to_priv(mbox)->rx_poll_work);
 
 	/* The TX IRQ is normally disabled; force and synchronize that state. */
-	disable_irq(mbox->irq_send_empty);
+	if (!mbox->hw->rx_poll_required)
+		disable_irq(mbox->irq_send_empty);
 	complete_all(&mbox->tx_empty);
-	synchronize_irq(mbox->irq_recv_not_empty);
+	if (!mbox->hw->rx_poll_required)
+		synchronize_irq(mbox->irq_recv_not_empty);
 
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	had_rx = mbox->rx;
@@ -1211,6 +1220,10 @@ static int apple_mbox_probe(struct platform_device *pdev)
 			return ret;
 	} else {
 		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (mbox->hw->rx_poll_required &&
+		    (!of_machine_is_compatible("apple,j873") || !res ||
+		     res->start != 0x316020000ULL || resource_size(res) != 0x80))
+			return -EINVAL;
 		if (!res || resource_size(res) < mbox->hw->reg_offset +
 			    max(mbox->hw->i2a_recv1 + sizeof(u64),
 				mbox->hw->i2a_control + sizeof(u32)))
@@ -1223,6 +1236,18 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		mbox->regs = (u8 __iomem *)mbox->regs + mbox->hw->reg_offset;
 	}
 
+	spin_lock_init(&mbox->rx_lock);
+	spin_lock_init(&mbox->tx_lock);
+	mutex_init(&mbox->lifecycle_lock);
+	init_completion(&mbox->tx_empty);
+	if (mbox->hw->rx_poll_required) {
+		priv->rx_poll_only = true;
+		INIT_DELAYED_WORK(&priv->rx_poll_work, apple_mbox_v8_rx_poll_work);
+		mbox->irq_recv_not_empty = mbox->irq_send_empty = -1;
+		dev_info(dev, "J873 PMP postoffice: paired transfers, bounded polling, no IRQ claim\n");
+		goto setup_pm;
+	}
+
 	mbox->irq_recv_not_empty =
 		platform_get_irq_byname(pdev, "recv-not-empty");
 	if (mbox->irq_recv_not_empty < 0)
@@ -1231,11 +1256,6 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	mbox->irq_send_empty = platform_get_irq_byname(pdev, "send-empty");
 	if (mbox->irq_send_empty < 0)
 		return -ENODEV;
-
-	spin_lock_init(&mbox->rx_lock);
-	spin_lock_init(&mbox->tx_lock);
-	mutex_init(&mbox->lifecycle_lock);
-	init_completion(&mbox->tx_empty);
 
 	irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-recv", dev_name(dev));
 	if (!irqname)
@@ -1257,6 +1277,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+setup_pm:
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return ret;
@@ -1376,6 +1397,20 @@ static const struct apple_mbox_hw apple_mbox_t8152_v8_hw = {
 	.has_irq_controls = false,
 };
 
+static const struct apple_mbox_hw apple_mbox_t8152_pmp_hw = {
+	.rx_poll_required = true,
+	.counted_fifo = true,
+	.control_full = GENMASK(11, 8),
+	.control_empty = GENMASK(3, 0),
+	.a2i_control = 0x20,
+	.a2i_send0 = 0x10,
+	.a2i_send1 = 0x18,
+	.i2a_control = 0x20,
+	.i2a_recv0 = 0x00,
+	.i2a_recv1 = 0x08,
+	.has_irq_controls = false,
+};
+
 /* T8152/J873 GPU GFX/GFX1 ASCWrap v8: the counted-FIFO layout of
  * apple_mbox_t8152_v8_hw at the role's post-office window (reg "mailbox"),
  * plus wrapper lifecycle reads gated on the role's PSD service. The SMC's
@@ -1417,6 +1452,7 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 };
 
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t8152-pmp-mailbox", .data = &apple_mbox_t8152_pmp_hw },
 	{ .compatible = "apple,t8152-ascwrap-v8-mailbox", .data = &apple_mbox_t8152_v8_hw },
 	{ .compatible = "apple,t8152-gfx-ascwrap-v8", .data = &apple_mbox_t8152_gfx_ascwrap_v8_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },

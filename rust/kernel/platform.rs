@@ -79,6 +79,7 @@ unsafe impl<T: Driver + 'static> driver::RegistrationOps for Adapter<T> {
             (*pdrv.get()).remove = Some(Self::remove_callback);
             (*pdrv.get()).driver.of_match_table = of_table;
             (*pdrv.get()).driver.acpi_match_table = acpi_table;
+            (*pdrv.get()).driver.suppress_bind_attrs = T::SUPPRESS_BIND_ATTRS;
         }
 
         // SAFETY: `pdrv` is guaranteed to be a valid `DriverType`.
@@ -217,6 +218,9 @@ pub trait Driver: Send {
 
     /// The table of ACPI device ids supported by the driver.
     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = None;
+
+    /// Hide manual bind/unbind when the device cannot be safely detached.
+    const SUPPRESS_BIND_ATTRS: bool = false;
 
     /// Platform driver probe.
     ///

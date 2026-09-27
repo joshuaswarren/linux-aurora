@@ -15,7 +15,7 @@
 //! | 0     | (driver) refuse with ENODEV before any MMIO | none |
 //! | 1     | read-only: PSD state, SGX ID, both wrappers' CPU control/status, GFX/GFX1 post-office status words. Sends nothing. ENODEV | none |
 //! | 2     | GPU must ALREADY be powered (iBoot or stage 90). Start GFX1 then GFX ASC CPU, RTKit HELLO/EPMAP with syslog and crashlog attached, 2 s syslog window, stop. ENODEV | REQUIRES USER APPROVAL |
-//! | 3     | stage 2 + init-data graph, publish GFX1 then GFX root on EP 0x20 (0x81 doorbell), wait for each 0x0009 ACK, stop. ENODEV | REQUIRES USER APPROVAL |
+//! | 3     | stage 2 + init-data graph, publish GFX then GFX1 root on EP 0x20 (0x81 doorbell), wait for each 0x0009 ACK, stop. ENODEV | REQUIRES USER APPROVAL |
 //! | 4     | stage 3 + 0x89 power-transition-end to both roles, EP 0x21 idle-policy wake, passive 60 s event/trace drain, stop. Returns the retained owner | REQUIRES USER APPROVAL |
 //! | 90    | PMGR2 PSD power-on request (0) for sgx, service 3, ONLY. Waits on the state field; ack is telemetry. No automatic restore. ENODEV | REQUIRES USER APPROVAL |
 //! | 91    | as 90 for gfx-asc, service 81 (sgx must already read state 0) | REQUIRES USER APPROVAL |
@@ -709,7 +709,9 @@ fn dump_crashlog(dev: &kernel::device::Device, role: &str, source: &str, raw: &[
                     Err(_) => dev_err!(dev, "G18_CRASHLOG {} message {}: (not UTF-8)\n", role, id),
                 }
             } else if kind == CRASHLOG_REGISTERS && size >= 16 + 0x350 {
-                let reg = |index: usize| le_u64(raw, body + index * 8).unwrap_or(0);
+                // Crg8 begins with an eight-byte frame descriptor, then X0.
+                // Verified against the 0x401 frame in the stage6 CLHE dump.
+                let reg = |index: usize| le_u64(raw, body + 8 + index * 8).unwrap_or(0);
                 for first in (0..31).step_by(4) {
                     let last = (first + 4).min(31);
                     let mut words = [0u64; 4];
@@ -725,7 +727,7 @@ fn dump_crashlog(dev: &kernel::device::Device, role: &str, source: &str, raw: &[
                     role,
                     le_u64(raw, body + 0x108).unwrap_or(0),
                     le_u64(raw, body + 0x330).unwrap_or(0),
-                    le_u64(raw, body + 0x340).unwrap_or(0),
+                    le_u32(raw, body + 0x340).unwrap_or(0),
                     le_u64(raw, body + 0x100).unwrap_or(0),
                     le_u64(raw, body + 0x110).unwrap_or(0)
                 );
@@ -1191,10 +1193,12 @@ impl G18Session {
         Ok(())
     }
 
-    /// Stage 3: publish GFX1's root, then GFX's, each on EP 0x20 with the
-    /// 0x81 doorbell, and wait for that role's 0x0009 ACK.
+    /// Stage 3: publish GFX's root, then GFX1's, each on EP 0x20 with the
+    /// 0x81 doorbell, and wait for that role's 0x0009 ACK. Native 26A428
+    /// captures 051/053/073 all publish in this order. The ASC CPU/RTKit
+    /// startup order is separate and remains GFX1 first.
     fn publish_roots(&mut self) -> Result {
-        for role in G18Role::START_ORDER {
+        for role in [G18Role::Gfx, G18Role::Gfx1] {
             let index = role.index();
             let address = self.memory.as_ref().ok_or(EIO)?.root(role == G18Role::Gfx1);
             let message = g17_rtkit::encode_initdata_doorbell(address).map_err(|_| EINVAL)?;

@@ -4191,10 +4191,21 @@ pub(crate) const G18G_26A428_QOS_POINTER_OFFSET: usize = 0x27cc;
 pub(crate) const G18G_26A428_HW_2714_OFFSET: usize = 0x2714;
 pub(crate) const G18G_26A428_HW_2714_VALUE: u32 = 0x96;
 /// Fields that exist only in 26A428 (KEXT_PROVEN stores), with their size.
-/// Only +0x2714 has a proven value; the others are left zero (GUESSED).
+/// +0x2714 is KEXT_PROVEN. The enables +0x283a/+0x283e are captured as 1;
+/// the remaining new fields are left zero (GUESSED).
 pub(crate) const G18G_26A428_HW_NEW_FIELDS: [(usize, usize); 11] = [
     (0x0fa8, 8), (0x1078, 8), (0x10b4, 4), (0x2714, 4), (0x27d4, 8), (0x2818, 4),
     (0x281e, 4), (0x2822, 8), (0x2832, 4), (0x283a, 4), (0x283e, 4),
+];
+
+/// Stable scalar values from both roles in macOS 26A428 captures 051/053/073.
+/// Replace the J813 defaults and unknown zero enables only at these offsets.
+/// Their values are observed; their complete semantics remain unqualified.
+/// Failure boundaries: no pointers, timing values, voltage tables or register
+/// writes are copied from a capture, and all six receipts must agree.
+pub(crate) const G18G_26A428_HW_CAPTURED_WORDS: [(usize, u32); 6] = [
+    (0x0fb4, 1), (0x10d4, 0x1b), (0x10d8, 4), (0x10dc, 12),
+    (0x283a, 1), (0x283e, 1),
 ];
 
 /// J873 ADT /arm-io/sgx perf-states: (MHz, core mV), 14 entries including
@@ -4307,11 +4318,12 @@ pub(crate) const fn allocate_register_window_vas<const N: usize>(
 /// - AGXAccelerator::configureDevice (base): flags 2 for the named slots,
 ///   0 for 49; slot 0 {flags 2, count 1} and the AIC SW-interrupt page (the
 ///   ADT meta-sw-interrupt, 0x301014048 on J873: ADT_PROVEN).
-/// - Slot 24 (DVFMMgpu 0x580ec0000/0x10000): no 26A428 setter was found; the
-///   J813 window is carried (INFERRED). The J873 ADT has pmgr-child regs there.
+/// - Slot 24 (DVFMMgpu) is absent. Both roles in native 26A428 initialization
+///   captures 051/053/073 leave all 0x28 bytes zero. Do not carry the J813
+///   0x580ec0000 window into this profile or allocate firmware VA space for it.
 /// The GPU base is the SGX reg 0x580000000 (unchanged, ADT_PROVEN); the AON
 /// base moved 0x380000000 -> 0x300000000 ([`J873_AON_REBASE`]).
-pub(crate) const G18G_26A428_REGISTER_WINDOW_SPECS: [RegisterWindowSpec; 22] = [
+pub(crate) const G18G_26A428_REGISTER_WINDOW_SPECS: [RegisterWindowSpec; 21] = [
     spec(0, 0x3_0101_4000, 0x4000, 0, 2),
     spec(3, 0x2_2010_4000, 0x18000, 0, 2),
     spec(9, 0x3_003d_0000, 0x4000, 0, 2),
@@ -4320,7 +4332,6 @@ pub(crate) const G18G_26A428_REGISTER_WINDOW_SPECS: [RegisterWindowSpec; 22] = [
     spec(15, 0x3_0c84_0000, 0x24000, 0, 2),
     spec(17, 0x5_8000_0000, 0x36000, 0, 2),
     spec(22, 0x5_8100_0000, 0x8000, 0, 2),
-    spec(24, 0x5_80ec_0000, 0x10000, 0, 2),
     spec(29, 0x5_8000_1800, 0x27f8, 0, 0),
     spec(30, 0x5_80ec_2200, 0xfc, 0, 0),
     spec(31, 0x5_80d0_4000, 0x8000, 0xd0_4000, 2),
@@ -4335,7 +4346,7 @@ pub(crate) const G18G_26A428_REGISTER_WINDOW_SPECS: [RegisterWindowSpec; 22] = [
     spec(46, 0x5_80e3_3800, 0x4000, 0, 2),
     spec(49, 0x5_80e1_8000, 0x4000, 0xe1_8000, 0),
 ];
-pub(crate) const G18G_26A428_REGISTER_WINDOWS: [M5RegisterWindow; 22] =
+pub(crate) const G18G_26A428_REGISTER_WINDOWS: [M5RegisterWindow; 21] =
     allocate_register_window_vas(&G18G_26A428_REGISTER_WINDOW_SPECS);
 /// Slots whose base-configured flags are 2 but which receive no physical
 /// window (KEXT_PROVEN by decoding AGXAccelerator::configureDevice; the same
@@ -4408,6 +4419,9 @@ pub(crate) fn encode_g18g_26a428_hw_data(
     // its gpu-num-perf-states); J873 ADT gpu-num-perf-states is 13.
     put_u32(out, G18G_26A428_HW_PERF_STATE_COUNT, J873_GPU_NUM_PERF_STATES);
     put_u32(out, G18G_26A428_HW_2714_OFFSET, G18G_26A428_HW_2714_VALUE);
+    for (offset, value) in G18G_26A428_HW_CAPTURED_WORDS {
+        put_u32(out, offset, value);
+    }
 
     // Performance ladder from the J873 ADT (values ADT_PROVEN, locations
     // FW_PROVEN/KEXT_PROVEN). Each voltage fills all 16 lanes of its row as on
@@ -4706,12 +4720,12 @@ pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
              "host prefix (+0x28 FW VA, two 32x0x18 accelerator tables) carried from J813"),
     unproven("hw_data", 0x0fa0, 8, Evidence::Inferred, "u64 FW VA of accel+0x1d40; J813 0"),
     unproven("hw_data", 0x0fa8, 8, Evidence::Guessed, "new u64 (vfn 0x1f8 & 0xffffffff); left 0"),
-    unproven("hw_data", 0x0fb4, 4, Evidence::Inferred, "u32 after the chip id; J813 2, meaning unknown"),
+    unproven("hw_data", 0x0fb4, 4, Evidence::Inferred, "captured J873 value 1; meaning unknown"),
     unproven("hw_data", 0x0fc0, 0x110, Evidence::Inferred,
              "platform words relocated from J813 +0xea0..+0xfa8 (+0xfac dropped)"),
     unproven("hw_data", 0x10b4, 4, Evidence::Guessed, "new u32 (accel byte & 1); left 0"),
     unproven("hw_data", 0x10d4, 0xc, Evidence::Inferred,
-             "J813 0x20/5/0xa; 0x10d8/0x10dc may be num GPs/cores (J873 ioreg: 6/12)"),
+             "captured J873 0x1b/4/12; complete field semantics unqualified"),
     unproven("hw_data", 0x10e0, 4, Evidence::Inferred, "13 = gpu-num-perf-states (J813 12 matched by value)"),
     unproven("hw_data", 0x1124, 0x800, Evidence::Inferred,
              "ADT voltages filled into all 16 lanes of each row; b000 reads lanes 0 and 1"),
@@ -4728,10 +4742,9 @@ pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
     unproven("hw_data", 0x2818, 4, Evidence::Guessed, "new u32 (accel+0x6c8); read as part of a u64 by b000"),
     unproven("hw_data", 0x281e, 0xc, Evidence::Guessed, "new u32/u64 (accel+0x111b8/+0x111bc); left 0"),
     unproven("hw_data", 0x2832, 4, Evidence::Guessed, "new mode word, compared with 3 at ~10 b000 sites; left 0"),
-    unproven("hw_data", 0x283a, 8, Evidence::Guessed, "new enables (accel+0x1165c/+0x1166c bit 0); left 0"),
+    unproven("hw_data", 0x283a, 8, Evidence::Inferred, "new enables (accel+0x1165c/+0x1166c bit 0); captured as 1/1"),
     unproven("register_map", 0, 1, Evidence::Inferred, "AIC SW-int page from ADT meta-sw-interrupt"),
     unproven("register_map", 12, 1, Evidence::Inferred, "ANE0 doorbell left unmapped: 26A428 G variant no longer sets it"),
-    unproven("register_map", 24, 1, Evidence::Inferred, "DVFMMgpu window carried from J813 (no 26A428 setter found)"),
     unproven("register_map", 29, 2, Evidence::Inferred, "DPEP/ADCLK +0x18 left 0; flags 0 mapped read-only like J813 slots 10/14"),
     unproven("register_map", 49, 1, Evidence::Inferred, "FenderRegsHWL flags 0 (base sets none) mapped read-only"),
     unproven("register_map", 0, 60, Evidence::Inferred, "device VAs assigned by the J813 allocation rule"),

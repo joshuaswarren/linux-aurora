@@ -17,6 +17,8 @@ use kernel::{
     dma::{
         Coherent,
         CoherentBox, //
+        Device as _,
+        DmaMask,
     },
     io::{
         mem::IoMem,
@@ -41,6 +43,7 @@ use kernel::{
         FromBytes, //
     },
     types::ForeignOwnable, //
+    time::{delay::fsleep, Delta},
 };
 
 const PMP_MMIO_SIZE: usize = 0x80000;
@@ -89,6 +92,9 @@ struct PmpState {
     allocs: KVec<PmpAllocation>,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    registry_requests: u32,
+    set_ioreg_count: u32,
+    failed: bool,
 }
 
 impl PmpState {
@@ -98,6 +104,9 @@ impl PmpState {
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            registry_requests: 0,
+            set_ioreg_count: 0,
+            failed: false,
         })
     }
     fn find_alloc(&self, addr: u64) -> Option<usize> {
@@ -110,15 +119,25 @@ impl PmpState {
         }
         None
     }
-    fn get_buf(&mut self, addr: u64) -> Option<&mut Coherent<[u8]>> {
-        let idx = self.find_alloc(addr)?;
-        Some(&mut self.allocs[idx].alloc)
+    fn get_buf(&mut self, addr: u64) -> Option<&mut [u8]> {
+        for entry in self.allocs.iter_mut().rev() {
+            if let Some(offset) = addr.checked_sub(entry.addr) {
+                if offset < entry.alloc.size() as u64 {
+                    // SAFETY: the allocation is owned under the state mutex;
+                    // an endpoint request hands this buffer to the host until
+                    // its reply. No reference survives that reply.
+                    return Some(&mut unsafe { entry.alloc.as_mut() }[offset as usize..]);
+                }
+            }
+        }
+        None
     }
 }
 
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
+    t8152: bool,
     pmp_mmio: Pin<KBox<Devres<IoMem<PMP_MMIO_SIZE>>>>,
     asc_mmio: Pin<KBox<Devres<IoMem<ASC_MMIO_SIZE>>>>,
     #[pin]
@@ -128,7 +147,16 @@ struct PmpData {
 }
 
 impl PmpData {
-    fn new(dev: &platform::Device<Core>) -> Result<Arc<PmpData>> {
+    fn new(dev: &platform::Device<Core>, t8152: bool) -> Result<Arc<PmpData>> {
+        if t8152 {
+            for (name, base, size) in [(c"pmp", 0x300500000, 0xd0000),
+                                       (c"asc", 0x300e00000, 0x74000)] {
+                let res = dev.resource_by_name(name).ok_or(EINVAL)?;
+                if res.start() != base || res.size() != size {
+                    return Err(EINVAL);
+                }
+            }
+        }
         let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
         let pmp_mmio = KBox::pin_init(pmp_req.iomap_sized::<PMP_MMIO_SIZE>(), GFP_KERNEL)?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
@@ -137,6 +165,7 @@ impl PmpData {
             try_pin_init!(
                 PmpData {
                     dev: dev.as_ref().into(),
+                    t8152,
                     pmp_mmio,
                     asc_mmio,
                     rtkit <- new_mutex!(None),
@@ -162,23 +191,59 @@ impl PmpData {
         let io = self.pmp_mmio.access(dev.as_ref())?.relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
-        let mut arg_bytes = kvec![0u8; size]?;
-        io.try_memcpy_fromio(&mut arg_bytes, offset)?;
+        let transfer_size = (size + 3) & !3;
+        if offset % 4 != 0 || !(8..=0x4000).contains(&size) ||
+            offset.checked_add(transfer_size).ok_or(EINVAL)? > PMP_MMIO_SIZE {
+            return Err(EINVAL);
+        }
+        let mut arg_bytes = kvec![0u8; transfer_size]?;
+        if self.t8152 {
+            for (i, chunk) in arg_bytes.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&io.try_read32(offset + i * 4)?.to_le_bytes());
+            }
+        } else { io.try_memcpy_fromio(&mut arg_bytes, offset)?; }
+        let mut seen = kvec![false; patches.len()]?;
+        let mut keys = KVec::new();
         let mut idx = 0;
         while idx < size {
+            if size - idx < 8 { return Err(EINVAL); }
             let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
-            let size = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+            if keys.contains(&key) { return Err(EINVAL); }
+            keys.push(key, GFP_KERNEL)?;
             idx += 8;
-            for (k, v) in patches.iter() {
+            if len > size - idx { return Err(EINVAL); }
+            for (n, (k, v)) in patches.iter().enumerate() {
                 if *k != key {
                     continue;
                 }
-                arg_bytes[idx..idx + size].copy_from_slice(&(*v as u64).to_le_bytes()[..size]);
+                if ![1, 2, 4, 8].contains(&len) ||
+                    (len < 4 && (*v as u64) >= (1u64 << (len * 8))) {
+                    return Err(EINVAL);
+                }
+                arg_bytes[idx..idx + len].copy_from_slice(&(*v as u64).to_le_bytes()[..len]);
+                seen[n] = true;
                 break;
             }
-            idx += size;
+            idx += len;
         }
-        io.try_memcpy_toio(offset, &arg_bytes)
+        if self.t8152 && seen.iter().any(|v| !v) { return Err(EINVAL); }
+        // Only publish after validating the entire blob; never log key material.
+        let mut verify = kvec![0u8; transfer_size]?;
+        if self.t8152 {
+            for (i, chunk) in arg_bytes.chunks_exact(4).enumerate() {
+                io.try_write32(u32::from_le_bytes(chunk.try_into().unwrap()), offset + i * 4)?;
+            }
+            for (i, chunk) in verify.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&io.try_read32(offset + i * 4)?.to_le_bytes());
+            }
+        } else {
+            io.try_memcpy_toio(offset, &arg_bytes)?;
+            io.try_memcpy_fromio(&mut verify, offset)?;
+        }
+        if verify != arg_bytes { return Err(EIO); }
+        dev_info!(self.dev, "PMP bootargs validated and read back: {} fields\n", patches.len());
+        Ok(())
     }
     fn get_iova_table(&self) -> Result<u64> {
         let mut state = self.state.lock();
@@ -230,6 +295,7 @@ impl PmpData {
         Ok(msg)
     }
     fn malloc(&self, size: u64) -> Result<u64> {
+        if size == 0 || (self.t8152 && size > 0x1000000) { return Err(EINVAL); }
         // SAFETY: TODO: ensure self.dev is bound
         let bound_dev = unsafe { self.dev.as_bound() };
         let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size as usize, GFP_KERNEL)?;
@@ -272,11 +338,12 @@ impl PmpData {
             dev_err!(self.dev, "Unable to find buffer");
             return Err(EIO);
         };
-        if ptr_buf.size() < mem::size_of::<u64>() {
+        if ptr_buf.len() < mem::size_of::<u64>() {
             dev_err!(self.dev, "Buffer too small");
             return Err(EIO);
         }
-        let ptr = unsafe { *(ptr_buf.as_ptr() as *const u64) };
+        let ptr = u64::from_le_bytes(ptr_buf[..8].try_into().unwrap());
+        if state.get_buf(ptr).is_none() { return Err(EINVAL); }
         state.value_buf = Some(ptr);
         let msg = (OPC_SET_BUF | OPC_ACK_MASK) << OPC_SHIFT;
         Ok(msg)
@@ -289,20 +356,15 @@ impl PmpData {
             dev_err!(self.dev, "Unable to find buffer");
             return Err(EIO);
         };
-        if msg_buf.size() < 0x44 {
+        if msg_buf.len() < 0x44 {
             dev_err!(self.dev, "Buffer too small");
             return Err(EIO);
         }
-        // SAFETY: TODO
-        let mut size = u32::from_le_bytes(unsafe {
-            <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x40..0x44]).unwrap()
-        });
+        let mut size = u32::from_le_bytes(msg_buf[0x40..0x44].try_into().unwrap());
         if size == 0 {
             let mut name_vec = KVec::with_capacity(0x31, GFP_KERNEL)?;
-            name_vec
-                .extend_from_slice(unsafe { &msg_buf.as_ref()[0..0x30] }, GFP_KERNEL)
-                .unwrap();
-            name_vec.push(0, GFP_KERNEL).unwrap();
+            name_vec.extend_from_slice(&msg_buf[0..0x30], GFP_KERNEL)?;
+            name_vec.push(0, GFP_KERNEL)?;
             let name_str = CStr::from_bytes_until_nul(&name_vec).unwrap();
             let name_str = CString::try_from_fmt(fmt!("apple,tunable-{name_str}"))?;
             let node = self.dev.fwnode().ok_or(EIO)?;
@@ -322,26 +384,42 @@ impl PmpData {
                 let data = node
                     .property_read_array_vec::<u8>(&name_str, len)?
                     .required_by(&self.dev)?;
-                unsafe {
-                    val_buf.as_mut()[0..len].copy_from_slice(&data);
+                if len > val_buf.len() || len > u32::MAX as usize {
+                    return Err(EINVAL);
                 }
+                val_buf[0..len].copy_from_slice(&data);
                 size = len as u32;
             } else {
                 dev_info!(self.dev, "unknown property {:?}", name_str);
             }
         }
-        state.ioreg_entries.push(size, GFP_KERNEL)?;
-        let index = state.ioreg_entries.len() as u64;
+        // Native T8152 only inserts entries backed by data. A missing property
+        // replies with zero and does not consume a registry index.
+        if !self.t8152 || size != 0 {
+            state.ioreg_entries.push(size, GFP_KERNEL)?;
+        }
+        state.registry_requests += 1;
+        let index = if self.t8152 { 0 } else { state.ioreg_entries.len() as u64 };
+        if self.t8152 {
+            dev_info!(self.dev, "PMP property request={} size={:#x}\n", state.registry_requests, size);
+        }
         let msg = (OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT | (index << 32) | size as u64;
         Ok(msg)
     }
     fn set_ioreg(&self, index: u64) -> Result<u64> {
-        let len = *self
-            .state
-            .lock()
+        let mut state = self.state.lock();
+        let len = *state
             .ioreg_entries
             .get(index as usize)
             .ok_or(EIO)? as u64;
+        state.set_ioreg_count += 1;
+        if self.t8152 {
+            // 26A428 ApplePMPv2::handleRegistryRemoveEntryReq handles 0x34.
+            // Removing index3 shifts the later native index26 by one. Keep
+            // this correction scoped to the captured T8152 protocol.
+            let _ = state.ioreg_entries.remove(index as usize);
+            dev_info!(self.dev, "PMP remove property index={} size={:#x}\n", index, len);
+        }
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
@@ -387,11 +465,13 @@ impl rtkit::Operations for PmpData {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _ep: u8, msg: u64) {
         let ret = data.recv_message(msg);
         if let Err(e) = ret {
+            data.state.lock().failed = true;
             dev_err!(data.dev, "Failed to handle rtkit message, error: {:?}", e);
         }
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
+        data.state.lock().failed = true;
         dev_err!(data.dev, "PMP firmware crashed");
     }
 }
@@ -402,24 +482,69 @@ struct PmpDriver(Arc<PmpData>);
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
-    (),
-    [(of::DeviceId::new(c"apple,t6000-pmp-v2"), ())]
+    bool,
+    [(of::DeviceId::new(c"apple,t6000-pmp-v2"), false),
+     (of::DeviceId::new(c"apple,t8152-pmp-v2"), true)]
 );
 
 impl platform::Driver for PmpDriver {
-    type IdInfo = ();
+    type IdInfo = bool;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+    // Firmware retains coherent allocations. Manual detach has no qualified stop
+    // handshake, including on the older profile; preserve ownership until reboot.
+    const SUPPRESS_BIND_ATTRS: bool = true;
 
-    fn probe(pdev: &platform::Device<Core>, _info: Option<&()>) -> impl PinInit<Self, Error> {
+    fn probe(pdev: &platform::Device<Core>, info: Option<&bool>) -> impl PinInit<Self, Error> {
+        // Allocate the platform driver's storage before starting firmware. An
+        // allocation failure after CPU_RUN must not release the device's devres.
+        pin_init::pin_init_scope(move || Ok(Self::probe_inner(pdev, info)))
+    }
+}
+
+impl PmpDriver {
+    fn probe_inner(pdev: &platform::Device<Core>, info: Option<&bool>) -> Result<Self> {
+        let t8152 = *info.ok_or(ENODEV)?;
         let dev: ARef<device::Device> = pdev.as_ref().into();
-        let data = PmpData::new(pdev)?;
+        let data = PmpData::new(pdev, t8152)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")
             .required_by(&dev)?;
         let bdid = node.property_read(c"apple,board-id").required_by(&dev)?;
-        match node.property_read(c"apple,dram-capacity").optional() {
+        if t8152 {
+            if bdid != 0x24 || node.property_present(c"apple,pio-ranges") {
+                return Err(EINVAL);
+            }
+            let profile: CString = node.property_read(c"apple,firmware-profile").required_by(&dev)?;
+            if profile.to_bytes() != b"j873-26A428-pmp-reference074" { return Err(EINVAL); }
+            let pmc: u32 = node.property_read(c"apple,pmc").required_by(&dev)?;
+            let pmgr: u32 = node.property_read(c"apple,pmc-pmgr").required_by(&dev)?;
+            let latency: u32 = node.property_read(c"apple,pmc-max-bwr-latency-us").required_by(&dev)?;
+            if pmc != 1 || pmgr != 31 || latency != 1_000_000 { return Err(EINVAL); }
+            if data.asc_mmio.access(pdev.as_ref())?.read32(CPU_CONTROL) & CPU_RUN != 0 {
+                return Err(EBUSY);
+            }
+            // The exact DART profile has already admitted only SID6 on J873.
+            // SAFETY: no DMA allocations or firmware callbacks exist yet.
+            unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())?; }
+            let domain = unsafe { bindings::iommu_get_domain_for_dev(dev.as_raw()) };
+            if domain.is_null() { return Err(ENODEV); }
+            let probe = Coherent::<u8>::zeroed_slice(pdev.as_ref(), 0x4000, GFP_KERNEL)?;
+            let iova = probe.dma_handle();
+            let translated = unsafe { bindings::iommu_iova_to_phys(domain, iova) };
+            if !(0x10040000000..0x10080000000).contains(&iova) || translated == 0 {
+                return Err(EIO);
+            }
+            drop(probe);
+            if unsafe { bindings::iommu_iova_to_phys(domain, iova) } != 0 { return Err(EIO); }
+            dev_info!(dev, "PMP SID6 DMA map/unmap translation check passed\n");
+            data.patch_bootargs(pdev, &[
+                (from_fourcc(b"BDID"), bdid), (from_fourcc(b"DVID"), dvid),
+                (from_fourcc(b"PMC_"), pmc), (from_fourcc(b"PMCV"), pmgr & 1),
+                (from_fourcc(b"PMCB"), (pmgr >> 3) & 1), (from_fourcc(b"PMCM"), latency),
+            ])?;
+        } else { match node.property_read(c"apple,dram-capacity").optional() {
             Some(dcap) => data.patch_bootargs(
                 pdev,
                 &[
@@ -432,9 +557,33 @@ impl platform::Driver for PmpDriver {
                 pdev,
                 &[(from_fourcc(b"BDID"), bdid), (from_fourcc(b"DVID"), dvid)],
             )?,
-        };
+        }};
         let rtkit = rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?;
         *data.rtkit.lock() = Some(rtkit);
+        if t8152 {
+            // Keep callback code, devres and DMA owners resident even on timeout.
+            // The RtKit context owns a second Arc to data; no detached allocations.
+            unsafe { bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
+            let result = data.start_cpu(pdev).and_then(|_| data.start()).and_then(|_| {
+                for _ in 0..500 {
+                    {
+                        let state = data.state.lock();
+                        if state.failed { return Err(EIO); }
+                        if state.registry_requests == 40 && state.set_ioreg_count >= 2 {
+                            dev_info!(dev, "PMP reference074 property exchange completed; owners retained until reboot\n");
+                            return Ok(());
+                        }
+                    }
+                    fsleep(Delta::from_millis(10));
+                }
+                Err(ETIMEDOUT)
+            });
+            if let Err(e) = result {
+                dev_err!(dev, "PMP startup failed {:?}; retaining bound DMA owners until reboot\n", e);
+                data.state.lock().failed = true;
+            }
+            return Ok(PmpDriver(data));
+        }
         data.start_cpu(pdev)?;
         data.start()?;
         Ok(PmpDriver(data))
