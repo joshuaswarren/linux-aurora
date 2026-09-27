@@ -2136,6 +2136,125 @@ static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 }
 #endif
 
+static void dcp_swap_set_timestamps(struct apple_dcp *dcp,
+				    struct DCP_FW_NAME(dcp_swap_submit_req) *req)
+{
+	u64 submit_timestamp, timestamp;
+
+	if (!dcp->use_timestamps && !dcp->vrr_enabled)
+		return;
+
+	submit_timestamp = dcp->swap_submit_timestamp;
+	timestamp = arch_timer_read_counter();
+
+	/*
+	 * IOMobileFramebuffer uses Mach continuous-time values here. On
+	 * Apple Silicon that is the ARM architectural counter. Empirical
+	 * testing shows that using the current submission time together
+	 * with the previous accepted swap makes DCP follow swap pacing.
+	 */
+	if (!submit_timestamp)
+		submit_timestamp = timestamp;
+
+	/* Firmware 12.x/13.x requires timestamp types 1, 2, and 7. */
+	req->swap.timestamp[0] = timestamp;
+	req->swap.timestamp[1] = submit_timestamp;
+	req->swap.timestamp[6] = timestamp;
+
+	trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, timestamp,
+				   submit_timestamp);
+}
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+/*
+ * A brightness change on H17P travels inside a swap, and while the CRTC is
+ * off nothing flushes one: the ACTIVE_ONLY plane pass of commit_tail_rpm()
+ * skips an inactive CRTC, so the backlight device's own commit
+ * (drm_crtc_set_brightness()) never reaches iomfb_flush() and the level sat
+ * in sysfs while the panel stayed lit at 5 W (2026-09-28 daily, GNOME idle
+ * blank).  Re-present the swap that put the current surface on the panel
+ * instead, with the new level in its backlight block.
+ *
+ * That surface is safe to hand over again: its framebuffer is either still
+ * bound to the plane or held by dcp_retain_unbound_fbs() since the commit
+ * that unbound it, and it stays held because this swap does not arm the
+ * retained entries -- it displaces nothing, and arming them would release
+ * the very buffer it shows once it completed (the hb100 DART fault).  The
+ * next real swap arms them as usual.
+ *
+ * The caller holds the CRTC lock, has waited for the last commit, and has
+ * checked that the command channel is idle.
+ */
+static void dcp_bl_swapped(struct apple_dcp *dcp, void *data, void *cookie)
+{
+	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
+	struct dcp_swap_cookie *info = cookie;
+
+	if (resp->ret)
+		dev_err(dcp->dev, "brightness swap failed! status %u\n",
+			resp->ret);
+
+	complete(&info->done);
+	kref_put(&info->refcount, release_swap_cookie);
+}
+
+static void dcp_bl_swap_started(struct apple_dcp *dcp, void *data,
+				void *cookie)
+{
+	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
+	struct dcp_swap_cookie *info = cookie;
+
+	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	info->swap_id = resp->swap_id;
+	/* deliberately no dcp_arm_swapped_out_fbs(), see above */
+	dcp_h17p_fix_swap_surfaces(dcp);
+	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_bl_swapped,
+			cookie);
+}
+
+int DCP_FW_NAME(iomfb_present_brightness)(struct apple_dcp *dcp)
+{
+	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
+	struct DCP_FW_NAME(dcp_swap_start_req) start_req = { 0 };
+	struct dcp_swap_cookie *cookie;
+	int ret;
+
+	if (!dcp_has_panel(dcp) || !dcp->h17p_have_last_swap)
+		return -ENODEV;
+
+	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	memcpy(req, &dcp->h17p_last_swap, sizeof(*req));
+	/* the surface is already there: no background fill, no clear */
+	req->swap.swap_enabled &= ~IOMFB_SET_BACKGROUND;
+	req->swap.bg_color = 0;
+	req->clear = 0;
+	dcp_swap_set_timestamps(dcp, req);
+	req->swap.swap_completed = req->swap.swap_enabled;
+	dcp_h17p_set_swap_brightness(dcp, &req->swap, dcp->brightness.nits);
+	dcp->brightness.update = false;
+
+	dcp_swap_start(dcp, false, &start_req, dcp_bl_swap_started, cookie);
+
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(100));
+	kref_put(&cookie->refcount, release_swap_cookie);
+	if (ret <= 0) {
+		dev_warn(dcp->dev,
+			 "brightness swap at %d nits not acknowledged\n",
+			 dcp->brightness.nits);
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+#endif
+
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 					  void *cookie)
 {
@@ -2450,27 +2569,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	}
 #endif
 
-	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
-		u64 submit_timestamp = dcp->swap_submit_timestamp;
-		u64 timestamp = arch_timer_read_counter();
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * Keep what this swap puts on the panel, before the timestamps, the
+	 * backlight block and the wire fix-up go in, so the backlight can
+	 * re-present it while the CRTC is off.
+	 */
+	memcpy(&dcp->h17p_last_swap, req, sizeof(*req));
+	dcp->h17p_have_last_swap = true;
+#endif
 
-		/*
-		 * IOMobileFramebuffer uses Mach continuous-time values here. On
-		 * Apple Silicon that is the ARM architectural counter. Empirical
-		 * testing shows that using the current submission time together
-		 * with the previous accepted swap makes DCP follow swap pacing.
-		 */
-		if (!submit_timestamp)
-			submit_timestamp = timestamp;
-
-		/* Firmware 12.x/13.x requires timestamp types 1, 2, and 7. */
-		req->swap.timestamp[0] = timestamp;
-		req->swap.timestamp[1] = submit_timestamp;
-		req->swap.timestamp[6] = timestamp;
-
-		trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, timestamp,
-					   submit_timestamp);
-	}
+	if (has_surface)
+		dcp_swap_set_timestamps(dcp, req);
 
 	/* These fields should be set together */
 	req->swap.swap_completed = req->swap.swap_enabled;

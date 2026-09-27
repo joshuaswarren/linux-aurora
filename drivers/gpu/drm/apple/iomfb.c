@@ -935,6 +935,24 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	}
 }
 
+/*
+ * Apply the backlight level to an H17P panel whose CRTC is off by
+ * re-presenting the surface already on it (iomfb_present_brightness()).
+ * The caller holds the CRTC lock and has waited for the last commit.
+ */
+int dcp_h17p_present_brightness(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return -ENODEV;
+	if (dcp->crashed || !dcp->active || !dcp->valid_mode ||
+	    !dcp->connector || !dcp->connector->connected)
+		return -ENODEV;
+	if (dcp_channel_busy(&dcp->ch_cmd))
+		return -EBUSY;
+
+	return iomfb_present_brightness_h17p(dcp);
+}
+
 static void iomfb_start(struct apple_dcp *dcp)
 {
 	switch (dcp->fw_compat) {

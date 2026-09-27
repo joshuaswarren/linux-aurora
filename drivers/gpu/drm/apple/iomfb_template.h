@@ -315,5 +315,8 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp);
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+int DCP_FW_NAME(iomfb_present_brightness)(struct apple_dcp *dcp);
+#endif
 
 #endif
