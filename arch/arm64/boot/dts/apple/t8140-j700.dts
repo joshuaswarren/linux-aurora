@@ -55,31 +55,45 @@
 	};
 
 	/*
-	 * The J700 is fanless: the CPUs are the only cooling devices.  Every
-	 * die sensor gets a zone that throttles both clusters, since they share
-	 * one die and one heat spreader.  The power allocator splits the budget
-	 * by the energy models, with the E cluster weighted three to one: its
-	 * cores do several times more work per watt, so all-core loads keep
-	 * them at full speed and trim the P cores instead.
+	 * The J700 is fanless: the CPUs are the only cooling devices, and two
+	 * loops keep them within limits.
 	 *
-	 * The SMC refreshes these readings about once a second and the die
-	 * settles within that time, so the loop carries a full sample of delay,
-	 * and the power a core draws per energy-model watt varies about 2.7x
-	 * between integer and floating-point work.  The governor derives its
-	 * gains from sustainable-power and the switch-on to control gap; 1.5 W
-	 * over 37 C gives 40/81/8 mW per C, which held the clock within one
-	 * P-state on both kinds of load (higher gains oscillate on the heavy
-	 * one).  1.5 W lies inside the sustainable range measured at ~93 C:
-	 * 1.1 W for floating-point and 2.5 W for integer loads.  The switch-on
-	 * trip sits above the idle temperature (48-53 C), so the controller,
-	 * and with it any integral wind-up, resets whenever the machine rests.
+	 * The fast loop runs in the PMP on its own die sensors.  cpufreq caps
+	 * each cluster by the PMP's die-temperature effort, which rises within
+	 * milliseconds of the die exceeding the firmware's target
+	 * (apple,fast-die-effort).  While the PMP is not running, cpufreq holds
+	 * each cluster at a third of its peak power instead.
+	 *
+	 * These zones are the slow outer loop.  The SMC refreshes its readings
+	 * about once a second, too slowly to guard the die on its own, but fast
+	 * enough to settle a sustained load.  sustainable-power is about the
+	 * steady CPU rail power of a sustained all-core load at the control
+	 * temperature, 105 C; the critical trip sits between it and the 125 C
+	 * hardware alarm.  With both loops, a 600 s all-core load left the
+	 * fast loop idle after the first minute, and the zones then held the
+	 * CPU rails at 4.1 W and the SMC die sensors at 102.8 C on average
+	 * (98.5-105.9 C), with the P cluster between 2472 and 2916 MHz and
+	 * the E cluster at 2424 MHz.  A floating-point all-core load keeps the
+	 * fast loop busy: over 90 s it swung the P cluster between 744 and
+	 * 2916 MHz, 1776 MHz on average, at 104.1 C.
+	 *
+	 * Every die sensor gets a zone that throttles both clusters, since they
+	 * share one die and one heat spreader.  The power allocator splits the
+	 * budget by the energy models, with the E cluster weighted three to one:
+	 * its cores do several times more work per watt, so all-core loads keep
+	 * them at full speed and trim the P cores instead.  The governor derives
+	 * its gains from sustainable-power and the switch-on to control gap:
+	 * 4.2 W over 47 C gives 89/179/18 mW per C.  Larger gains, from a
+	 * narrower gap, oscillated in testing.  The switch-on trip sits above
+	 * the idle temperature (41-53 C), so the controller, and with it any
+	 * integral wind-up, resets whenever the machine rests.
 	 */
 	thermal-zones {
 		cpu-e0-thermal {
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 0>;	/* Te05 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_e0_alert: trip-alert {
@@ -89,13 +103,13 @@
 				};
 
 				cpu_e0_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				trip-critical {
-					temperature = <110000>;
+					temperature = <115000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -126,7 +140,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 1>;	/* Te0S */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_e1_alert: trip-alert {
@@ -136,13 +150,13 @@
 				};
 
 				cpu_e1_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				trip-critical {
-					temperature = <110000>;
+					temperature = <115000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -173,7 +187,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 2>;	/* Tp01 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p0_alert: trip-alert {
@@ -183,13 +197,13 @@
 				};
 
 				cpu_p0_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				trip-critical {
-					temperature = <110000>;
+					temperature = <115000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -220,7 +234,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 3>;	/* Tp05 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p1_alert: trip-alert {
@@ -230,13 +244,13 @@
 				};
 
 				cpu_p1_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				trip-critical {
-					temperature = <110000>;
+					temperature = <115000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -267,7 +281,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 4>;	/* Tp09 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p2_alert: trip-alert {
@@ -277,13 +291,13 @@
 				};
 
 				cpu_p2_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				trip-critical {
-					temperature = <110000>;
+					temperature = <115000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -314,7 +328,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 5>;	/* Tp0D */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p3_alert: trip-alert {
@@ -324,13 +338,13 @@
 				};
 
 				cpu_p3_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				trip-critical {
-					temperature = <110000>;
+					temperature = <115000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
