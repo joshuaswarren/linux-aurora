@@ -18,12 +18,13 @@
 //! | 3     | stage 2 + init-data graph, publish GFX then GFX1 root on EP 0x20 (0x81 doorbell), wait for each 0x0009 ACK, stop. ENODEV | REQUIRES USER APPROVAL |
 //! | 4     | stage 3 + 0x89 power-transition-end to both roles, EP 0x21 idle-policy wake, passive 60 s event/trace drain, stop. Returns the retained owner | REQUIRES USER APPROVAL |
 //! | 5     | stage 4 plus one owned empty queue registration before the passive observation. No GPU job. Returns the retained owner | REQUIRES USER APPROVAL |
+//! | 6     | stage 5 plus a second tag15 binding the owned scheduler/control object. No GPU job | REQUIRES USER APPROVAL |
 //! | 90    | PMGR2 PSD request 0 for sgx, service 3, ONLY. Poll ACK before reading STATE. No automatic restore. ENODEV | REQUIRES USER APPROVAL |
 //! | 91    | request 2 for gfx-asc, service 81 (sgx must already read state 0) | REQUIRES USER APPROVAL |
 //! | 92    | request 2 for gfx1-asc, service 82 (sgx must already read state 0) | REQUIRES USER APPROVAL |
 //! | 93    | restore: idle request (6) on every GPU service not already idle, in reverse native order 81, 82, 3. ENODEV | REQUIRES USER APPROVAL |
 //!
-//! Stages 2..5 start the ASC CPUs, which the mailbox provider additionally
+//! Stages 2..6 start the ASC CPUs, which the mailbox provider additionally
 //! refuses unless `apple_mailbox.ascwrap_v8_cpu_control=1` (also REQUIRES
 //! USER APPROVAL). Stages 90..93 are the only code in the driver that writes
 //! a PSD request register; each writes one service (93: only the services
@@ -97,6 +98,8 @@ pub(crate) const STAGE_INITDATA: u32 = 3;
 pub(crate) const STAGE_HEARTBEAT: u32 = 4;
 /// Owned empty queue registration, then the same 60 s stability observation.
 pub(crate) const STAGE_QUEUE_REGISTER: u32 = 5;
+/// Register an owned queue and bind its scheduler/control, without a GPU job.
+pub(crate) const STAGE_SCHEDULER_BIND: u32 = 6;
 /// REQUIRES USER APPROVAL: PMGR2 PSD power-on request for sgx (service 3)
 /// only. Standalone; no other stage requests PSD power.
 pub(crate) const STAGE_PSD_POWER_ON: u32 = 90;
@@ -117,6 +120,7 @@ pub(crate) const fn stage_is_known(stage: u32) -> bool {
             | STAGE_INITDATA
             | STAGE_HEARTBEAT
             | STAGE_QUEUE_REGISTER
+            | STAGE_SCHEDULER_BIND
             | STAGE_PSD_POWER_ON
             | STAGE_PSD_POWER_ON_GFX
             | STAGE_PSD_POWER_ON_GFX1
@@ -142,7 +146,8 @@ const fn stage_writes_psd(stage: u32) -> bool {
 /// Stages that run the loaded firmware and therefore need the loader's
 /// G18G firmware receipt and the 42-bit DMA mask.
 pub(crate) const fn stage_runs_firmware(stage: u32) -> bool {
-    matches!(stage, STAGE_RTKIT | STAGE_INITDATA | STAGE_HEARTBEAT | STAGE_QUEUE_REGISTER)
+    matches!(stage, STAGE_RTKIT | STAGE_INITDATA | STAGE_HEARTBEAT
+        | STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND)
 }
 
 /// Set once any firmware stage reached its first ASC CPU start request.
@@ -312,7 +317,7 @@ impl G18Role {
 
 // Compile-time guards on the stage gates and the fixed J873 facts.
 const _: () = {
-    assert!(!stage_is_known(0) && !stage_is_known(6) && !stage_is_known(89) && !stage_is_known(94));
+    assert!(!stage_is_known(0) && !stage_is_known(7) && !stage_is_known(89) && !stage_is_known(94));
     assert!(stage_is_known(STAGE_READ_ONLY) && stage_is_known(STAGE_PSD_POWER_ON));
     assert!(stage_is_known(STAGE_PSD_POWER_ON_GFX) && stage_is_known(STAGE_PSD_POWER_ON_GFX1));
     assert!(stage_is_known(STAGE_PSD_RESTORE_IDLE));
@@ -1117,8 +1122,11 @@ impl G18Session {
         }
         self.retire_openings()?;
         self.wake_idle_policy()?;
-        if self.stage == STAGE_QUEUE_REGISTER {
+        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND) {
             self.register_queue()?;
+        }
+        if self.stage == STAGE_SCHEDULER_BIND {
+            self.bind_scheduler()?;
         }
         self.heartbeat()
     }
@@ -1203,8 +1211,9 @@ impl G18Session {
         let roots = self.uat.prepare_t8140_firmware_high_roots()?;
         let memory = G18FirmwareMemory::new_with_uat(&self.dev, self.uat.clone(), cntvct())?;
         self.memory = Some(memory);
-        if self.stage == STAGE_QUEUE_REGISTER {
-            self.queue_probe = Some(G18QueueProbe::new(&self.dev, &self.uat)?);
+        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND) {
+            self.queue_probe = Some(G18QueueProbe::new(&self.dev, &self.uat,
+                self.stage == STAGE_SCHEDULER_BIND)?);
         }
         self.uat.confirm_t8140_primary_high_root(roots)?;
         self.uat.mirror_t8140_secondary_high_root()?;
@@ -1318,7 +1327,7 @@ impl G18Session {
         dev_info!(self.device(), "G18_QUEUE before tag15-only {:?}\n", before);
         if before != ([0; 3], [0, 0, 1], [0; 5]) { return Err(EBUSY); }
         let address = self.queue_probe.as_ref().ok_or(EIO)?.queue_address();
-        self.memory.as_mut().ok_or(EIO)?.publish_queue_probe(address, QUEUE_ID)?;
+        self.memory.as_mut().ok_or(EIO)?.publish_queue_probe(address, QUEUE_ID, 1)?;
         Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
             .send_message(EP_GFX_INTERRUPTS, 0x0083_0000_0000_000a)?;
         for _ in 0..CONTROL_POLLS {
@@ -1337,7 +1346,35 @@ impl G18Session {
         Err(ETIMEDOUT)
     }
 
-    /// Stage 4/5: passive drain of both roles' event and trace rings. Sends
+    fn bind_scheduler(&mut self) -> Result {
+        let probe = self.queue_probe.as_mut().ok_or(EIO)?;
+        let before = probe.scheduler_status()?;
+        dev_info!(self.dev.as_ref(), "G18_SCHED before bind {:x?}\n", before);
+        probe.prepare_scheduler_bind()?;
+        let address = probe.queue_address();
+        self.memory.as_mut().ok_or(EIO)?.publish_queue_probe(address, QUEUE_ID, 2)?;
+        Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
+            .send_message(EP_GFX_INTERRUPTS, 0x0083_0000_0000_000a)?;
+        for _ in 0..CONTROL_POLLS {
+            self.check_faults("scheduler bind")?;
+            let (outer, inner, slot) = self.queue_probe_status()?;
+            let status = self.queue_probe.as_mut().ok_or(EIO)?.scheduler_status()?;
+            if outer == [2; 3] && inner == [2; 3] && G18QueueProbe::installed(slot)
+                && G18QueueProbe::scheduler_bound(status) {
+                dev_info!(self.device(),
+                    "G18_SCHED bound qid11 outer={:?} inner={:?} status={:x?}; no kicks\n",
+                    outer, inner, status);
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        let queues = self.queue_probe_status()?;
+        let status = self.queue_probe.as_mut().ok_or(EIO)?.scheduler_status()?;
+        dev_err!(self.device(), "G18_SCHED bind timeout queues={:?} status={:x?}\n", queues, status);
+        Err(ETIMEDOUT)
+    }
+
+    /// Stage 4/5/6: passive drain of both roles' event and trace rings. Sends
     /// nothing. This is the milestone-1 heartbeat.
     fn heartbeat(&mut self) -> Result {
         dev_info!(self.device(), "G18_HEARTBEAT passive drain for {} ms, no host messages\n", HEARTBEAT_MS);
@@ -1616,7 +1653,7 @@ fn stage_psd_restore_idle(pdev: &platform::Device<Core>) -> Result {
 }
 
 // ---------------------------------------------------------------------------
-// Stages 2..5
+// Stages 2..6
 // ---------------------------------------------------------------------------
 
 fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Arc<dyn G18Runtime>> {
@@ -1754,7 +1791,7 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
     let _ = retained.stop("stage end");
 
     match result {
-        Ok(()) if matches!(stage, STAGE_HEARTBEAT | STAGE_QUEUE_REGISTER) => {
+        Ok(()) if matches!(stage, STAGE_HEARTBEAT | STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND) => {
             let owner: Arc<G18Owner> = Arc::pin_init(
                 try_pin_init!(G18Owner { session <- new_mutex!(retained, "G18Owner::session") }),
                 GFP_KERNEL,
