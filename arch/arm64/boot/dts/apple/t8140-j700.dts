@@ -12,6 +12,10 @@
 #include "t8140.dtsi"
 #include <dt-bindings/thermal/thermal.h>
 
+&cpuidle {
+	status = "okay";
+};
+
 / {
 	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
 	model = "Apple MacBook Neo";
