@@ -339,6 +339,13 @@ impl G18FirmwareMemory {
         Ok(self.compute_payload.as_mut().unwrap())
     }
 
+    /// Connect the retained payload VM to the command/channel owner. Context
+    /// roots remain unpublished until the complete command has been prepared.
+    pub(crate) fn bind_compute_process(&mut self, dev: &AsahiDevice) -> Result<u32> {
+        let payload = self.compute_payload.as_ref().ok_or(EINVAL)?;
+        self.compute.bind_process(dev, &self.uat, payload.vm())
+    }
+
     pub(crate) fn prepare_uma_pool_binding(&mut self) -> Result<G18UmaPoolBinding> {
         self.uma_pool.prepare_binding()
     }
