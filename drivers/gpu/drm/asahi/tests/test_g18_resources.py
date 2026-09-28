@@ -49,6 +49,8 @@ pub mod prelude {
     pub const EBUSY: Error = Error(16);
     pub const ENODEV: Error = Error(19);
     pub const EINVAL: Error = Error(22);
+    pub const ENOSPC: Error = Error(28);
+    pub const EOVERFLOW: Error = Error(75);
     impl From<core::num::TryFromIntError> for Error {
         fn from(_: core::num::TryFromIntError) -> Self { EINVAL }
     }
@@ -66,6 +68,13 @@ pub mod prelude {
             Ok(())
         }
         pub fn len(&self) -> usize { self.0.len() }
+    }
+    impl<T> core::ops::Deref for KVec<T> {
+        type Target = [T];
+        fn deref(&self) -> &[T] { &self.0 }
+    }
+    impl<T> core::ops::DerefMut for KVec<T> {
+        fn deref_mut(&mut self) -> &mut [T] { &mut self.0 }
     }
     pub struct KBox<T>(Box<T>);
     impl<T> KBox<T> {
@@ -94,6 +103,12 @@ mod module_parameters {
 }
 #[path = @@G17_CONFIG@@] mod g17_config;
 #[path = @@G17_INITDATA@@] mod g17_initdata;
+#[path = @@G18_UMA@@] mod g18_uma;
+
+mod hw { pub mod agx3 {
+    pub struct Registry { pub num_cores: u32 }
+    pub const T8152_REGISTRY: Registry = Registry { num_cores: 12 };
+} }
 
 mod driver {
     pub struct Device;
@@ -127,7 +142,7 @@ mod physmem {
 mod mmu {
     use kernel::prelude::*;
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     pub const UAT_PGSZ: usize = 0x4000;
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Prot(pub &'static str);
@@ -137,12 +152,40 @@ mod mmu {
     pub const PROT_FW_SHARED_RO: Prot = Prot("shared-ro");
     pub const PROT_FW_PRIV_RW: Prot = Prot("priv-rw");
     pub const PROT_GPU_SHARED_RW: Prot = Prot("gpu-shared-rw");
-    pub struct KernelMapping { pub iova: u64, pub size: usize, pub prot: Prot }
-    pub struct Vm { pub pages: Mutex<BTreeMap<u64, (u64, Prot)>> }
+    pub struct KernelMapping {
+        pub iova: u64, pub size: usize, pub prot: Prot,
+        pages: Arc<Mutex<BTreeMap<u64, (u64, Prot)>>>,
+        reservations: Arc<Mutex<BTreeMap<u64, u64>>>,
+    }
+    impl Drop for KernelMapping {
+        fn drop(&mut self) {
+            let mut pages = self.pages.lock().unwrap();
+            for page in (0..self.size as u64).step_by(UAT_PGSZ) {
+                pages.remove(&(self.iova + page));
+            }
+            self.reservations.lock().unwrap().remove(&self.iova);
+        }
+    }
+    pub struct Vm {
+        pub pages: Arc<Mutex<BTreeMap<u64, (u64, Prot)>>>,
+        pub reservations: Arc<Mutex<BTreeMap<u64, u64>>>,
+    }
     impl Vm {
-        pub fn new() -> Self { Self { pages: Mutex::new(BTreeMap::new()) } }
+        pub fn new() -> Self { Self {
+            pages: Arc::new(Mutex::new(BTreeMap::new())),
+            reservations: Arc::new(Mutex::new(BTreeMap::new())),
+        } }
         pub(crate) fn map_pages(&self, iova: u64, phys: u64, size: usize, prot: Prot) -> Result<KernelMapping> {
+            self.map_pages_with_guards(iova, phys, size, prot, 0)
+        }
+        pub(crate) fn map_pages_with_guards(&self, iova: u64, phys: u64, size: usize,
+                                            prot: Prot, guards: usize) -> Result<KernelMapping> {
             if (iova | phys | size as u64) & 0x3fff != 0 || size == 0 { return Err(EINVAL); }
+            let end = iova + size as u64 + guards as u64 * UAT_PGSZ as u64;
+            let mut reservations = self.reservations.lock().unwrap();
+            if reservations.iter().any(|(&start, &limit)| start < end && iova < limit) {
+                return Err(EBUSY);
+            }
             let mut pages = self.pages.lock().unwrap();
             for page in (0..size as u64).step_by(UAT_PGSZ) {
                 if pages.contains_key(&(iova + page)) { return Err(EBUSY); }
@@ -150,7 +193,9 @@ mod mmu {
             for page in (0..size as u64).step_by(UAT_PGSZ) {
                 pages.insert(iova + page, (phys + page, prot));
             }
-            Ok(KernelMapping { iova, size, prot })
+            reservations.insert(iova, end);
+            Ok(KernelMapping { iova, size, prot,
+                pages: self.pages.clone(), reservations: self.reservations.clone() })
         }
         pub(crate) fn map_io(&self, iova: u64, phys: usize, size: usize, prot: Prot) -> Result<KernelMapping> {
             self.map_pages(iova, phys as u64, size, prot)
@@ -229,10 +274,17 @@ mod g17_resources {
         fn map_alias_at(&mut self, vm: &mmu::Vm, address: u64, prot: mmu::Prot) -> Result<mmu::KernelMapping> {
             vm.map_pages(address, self.phys, (self.logical_size + 0x3fff) & !0x3fff, prot)
         }
+        fn map_alias_at_with_guards(&mut self, vm: &mmu::Vm, address: u64, prot: mmu::Prot,
+                                   guards: usize) -> Result<mmu::KernelMapping> {
+            vm.map_pages_with_guards(address, self.phys, (self.logical_size + 0x3fff) & !0x3fff,
+                                    prot, guards)
+        }
     }
 
     #[path = @@G18_RESOURCES@@]
     pub(crate) mod g18;
+    #[path = @@G18_POOL@@]
+    pub(crate) mod g18_pool;
 }
 
 use g17_initdata as init;
@@ -269,10 +321,51 @@ fn main() {
     let dev = driver::AsahiDevice(driver::Device);
     assert_eq!(G18FirmwareMemory::new_with_uat(&dev, uat(false), 1).err(), Some(kernel::prelude::ENODEV));
 
+    // Fail halfway through the sparse alias graph. All earlier reservations
+    // and high mappings must unwind; the unrelated conflicting owner stays.
+    let failure_uat = uat(true);
+    let conflict = failure_uat.lower.map_io(0x70_0200_0000 + 5 * 0x158000,
+        0x100_0040_0000, 0x4000, mmu::PROT_GPU_SHARED_RW).unwrap();
+    assert_eq!(G18FirmwareMemory::new_with_uat(&dev, failure_uat.clone(), 1).err(),
+               Some(kernel::prelude::EBUSY));
+    assert!(failure_uat.kernel.pages.lock().unwrap().is_empty());
+    assert!(failure_uat.kernel.reservations.lock().unwrap().is_empty());
+    assert_eq!(failure_uat.lower.pages.lock().unwrap().len(), 1);
+    assert_eq!(failure_uat.lower.reservations.lock().unwrap().len(), 1);
+    drop(conflict);
+    assert!(failure_uat.lower.reservations.lock().unwrap().is_empty());
+
     let uat = uat(true);
     let timestamp = 0x0123_4567_89ab_cdef;
     let mut memory = G18FirmwareMemory::new_with_uat(&dev, uat.clone(), timestamp).unwrap();
     memory.log_summary(&dev);
+
+    let pool = memory.uma_pool();
+    let view = pool.view();
+    assert_eq!((view.directory_base, view.reservation_bytes, view.stride, view.page_count,
+                view.gpu_base_offset), (0x70_0200_0000, 0x1024000, 0x158000, 13, 0x3c00));
+    let mut mapped = 0;
+    for offset in (0..view.reservation_bytes).step_by(0x4000) {
+        if offset % view.stride == 0 {
+            let index = (offset / view.stride) as usize;
+            let high = pool.directory_page_high(index).unwrap();
+            assert_eq!(uat.kernel_vm().translate_iova(high),
+                       uat.kernel_lower_vm().translate_iova(view.directory_base + offset));
+            assert!(fw_read(&uat, high, 0x4000).iter().all(|&v| v == 0));
+            mapped += 1;
+        } else {
+            assert_eq!(uat.kernel_lower_vm().translate_iova(view.directory_base + offset),
+                       Err(kernel::prelude::EFAULT));
+        }
+    }
+    assert_eq!(mapped, 13);
+    assert_eq!(uat.lower.map_io(view.directory_base + view.reservation_bytes - 0x8000,
+        0x100_0040_0000, 0x4000, mmu::PROT_GPU_SHARED_RW).err(), Some(kernel::prelude::EBUSY));
+    assert_eq!(uat.kernel_vm().translate_iova(view.block_list_high),
+               uat.kernel_lower_vm().translate_iova(view.block_list_low));
+    assert_eq!(u32_at(&uat, view.state_high + 8), u32::MAX);
+    assert!(fw_read(&uat, view.block_list_high, 0x4000).iter().all(|&v| v == 0));
+    assert!(pool.directory_page_high(13).is_none());
 
     // Walk the graph from the two roots, as each firmware image would.
     let private = 0xffff_fc20_0002_0000u64;
@@ -427,11 +520,19 @@ fn main() {
     assert_eq!(memory.drain_reports(&dev).err(), Some(kernel::prelude::EIO));
     println!("G18_RESOURCES_OK windows={} log_lines={}", init::G18G_26A428_REGISTER_WINDOWS.len(),
              kernel::LOG.lock().unwrap().len());
+    drop(memory);
+    assert!(uat.kernel.pages.lock().unwrap().is_empty());
+    assert!(uat.kernel.reservations.lock().unwrap().is_empty());
+    assert!(uat.lower.pages.lock().unwrap().is_empty());
+    assert!(uat.lower.reservations.lock().unwrap().is_empty());
+    println!("G18_SPARSE_OWNER_OK mapped_pages=13 holes=1020 rollback=verified teardown=verified");
 }
 '''
 
 source = (source.replace('@@G17_CONFIG@@', path('g17_config.rs'))
           .replace('@@G17_INITDATA@@', path('g17_initdata.rs'))
+          .replace('@@G18_UMA@@', path('g18_uma.rs'))
+          .replace('@@G18_POOL@@', path('g18_pool_resources.rs'))
           .replace('@@G18_RESOURCES@@', path('g18_resources.rs')))
 
 with tempfile.TemporaryDirectory(prefix='g18-resources-') as tmp:

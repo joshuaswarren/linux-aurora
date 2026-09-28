@@ -50,6 +50,10 @@ pub(crate) mod m5;
 pub(crate) mod g18;
 
 #[cfg(not(test))]
+#[path = "g18_pool_resources.rs"]
+pub(crate) mod g18_pool;
+
+#[cfg(not(test))]
 #[path = "g18_queue_probe.rs"]
 pub(crate) mod g18_queue;
 
