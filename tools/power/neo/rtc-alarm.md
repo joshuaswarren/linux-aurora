@@ -1,3 +1,17 @@
+# Daily-full integration (2026-09-28)
+
+The driver is now a platform child of the existing Baku PMIC NVMEM provider.
+It shares that provider's regmap and keeps the reboot/RTC offset cells available.
+The normal DT contains the child. Build CONFIG_RTC_DRV_APPLE_PMU=m and load
+`modprobe rtc-apple-pmu experimental=1` only for retained-s2idle qualification.
+Without experimental=1 probe returns ENODEV before touching hardware.
+Do not load the historical neo-rtc-overlay: it creates a second device on
+SPMI slave 14, already owned by apple-spmi-nvmem in the daily tree.
+The port has only host object checks; repeat the awake alarm, cancellation,
+rearm, and timed-s2idle tests below on the new kernel.
+
+---
+
 # J700 PMU alarm qualification
 
 The SMC RTC implementation has no alarm operations. J700 instead describes a

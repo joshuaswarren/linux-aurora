@@ -433,6 +433,15 @@
 				compatible = "apple,baku-pmic", "apple,spmi-nvmem";
 				reg = <0xe SPMI_USID>;
 
+				pmu_rtc: rtc {
+					compatible = "apple,j700-pmu-rtc";
+					interrupt-parent = <&nub_spmi0>;
+					interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+					wakeup-source;
+					/* Driver additionally requires experimental=1. */
+					status = "okay";
+				};
+
 				nvmem-layout {
 					compatible = "fixed-layout";
 					#address-cells = <1>;

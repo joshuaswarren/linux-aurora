@@ -12,10 +12,17 @@ static int overlay_id;
 static int __init neo_rtc_overlay_init(void)
 {
 	const struct firmware *fw;
+	struct device_node *node;
 	int ret;
 
 	if (!firmware || !of_machine_is_compatible("apple,j700"))
 		return -ENODEV;
+	/* The daily DT already owns this slave through its NVMEM provider. */
+	node = of_find_node_by_path("/soc/spmi@308714000/pmic@e");
+	if (node) {
+		of_node_put(node);
+		return -EEXIST;
+	}
 	ret = request_firmware(&fw, firmware, NULL);
 	if (ret)
 		return ret;
