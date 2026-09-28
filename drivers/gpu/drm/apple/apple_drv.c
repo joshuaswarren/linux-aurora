@@ -1030,3 +1030,5 @@ module_exit(appledrm_unregister);
 MODULE_AUTHOR("Asahi Linux contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("Dual MIT/GPL");
+
+MODULE_VERSION("20260928-dp6");

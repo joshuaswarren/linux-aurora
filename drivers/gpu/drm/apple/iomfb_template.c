@@ -902,7 +902,8 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	 * hardware.  Answer it the way macOS does; these apertures are reached
 	 * physically, so dva == addr.
 	 */
-	if (req->index == DCP_H17P_DISP0_REG_INDEX) {
+	if (req->index == DCP_H17P_DISP0_REG_INDEX &&
+	    !of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext")) {
 		dev_info(dcp->dev, "map_reg[5]: disp0 window %#llx len %#llx\n",
 			 (u64)DCP_H17P_DISP0_REG_BASE,
 			 (u64)DCP_H17P_DISP0_REG_SIZE);
@@ -930,6 +931,9 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 * DMA_MAPPING_ERROR as a device address.
 		 */
 		dma_addr_t dva = rsrc->start;
+		dev_info(dcp->dev, "map_reg[%u]: addr %pa len %#llx dva %#llx\n",
+			 req->index, &rsrc->start,
+			 (u64)resource_size(rsrc), (u64)dva);
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
 						  DMA_BIDIRECTIONAL, 0);
@@ -1801,6 +1805,13 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 			 dcp->brightness.blanked ? "to blank_nits" : "left at the current level");
 		return;
 	}
+	/*
+	 * Physical Type-C unplug is quiesced before deasserting HPD. Keep the
+	 * last scanout surface pinned and send only the native OOB power call;
+	 * a clear-surface swap is neither needed nor safe during this teardown.
+	 */
+	if (READ_ONCE(dcp->typec_unplugged))
+		goto set_power_state;
 #endif
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
@@ -1876,6 +1887,9 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	dev_dbg(dcp->dev, "%s: clear swap submitted: %u\n", __func__, swap_id);
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+set_power_state:
+#endif
 	poff_cookie = kzalloc(sizeof(*poff_cookie), GFP_KERNEL);
 	if (!poff_cookie)
 		return;
@@ -2398,7 +2412,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
-	 * Inherit the mode iBoot already programmed instead of asking for one.
+	 * For the built-in panel, inherit the mode iBoot already programmed.
+	 * A hotplugged external display has no inherited timings: it needs
+	 * the real modeset below before firmware will submit a frame.
 	 *
 	 * macOS never issues A413 in a full capture -- it attaches to a display
 	 * iBoot has already configured.  Ours asks for colorID 1 / timingID 2
@@ -2407,7 +2423,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * already running at its native 2408x1506, so skip the modeset and let
 	 * that timing stand.
 	 */
-	if (!dcp_send_modeset) {
+	if (!dcp_send_modeset &&
+	    dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		dev_info(dcp->dev, "inheriting the bootloader's display mode\n");
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else

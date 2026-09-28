@@ -231,6 +231,7 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route);
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
+static void _dcp_poweroff(struct apple_dcp *dcp);
 
 /*
  * Pipelines are ranked by CRTC index so the fabric's choice is a pure function
@@ -1644,9 +1645,24 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp_is_typec_output(dcp)) {
+		WRITE_ONCE(dcp->typec_unplugged, true);
 		WRITE_ONCE(dcp->typec_cable_connected, false);
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
+	}
+
+	/*
+	 * H17P's HPD teardown powers down a live scanout pipe and can stop the
+	 * coprocessor before displayRelease replies. Quiesce the external pipe
+	 * while the DPTX session is still valid, retaining the last surface.
+	 * Publishing the DRM disconnect comes afterward so its CRTC disable
+	 * cannot race this power transition.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    READ_ONCE(dcp->typec_unplugged) &&
+	    dcp->dptxport[port].enabled && dcp->dptxport[port].connected) {
+		dev_info(dcp->dev, "Type-C unplug: quiescing external pipe before HPD removal\n");
+		_dcp_poweroff(dcp);
 	}
 
 	disconnected_hpd_event(dcp->connector);
@@ -1953,6 +1969,9 @@ void dcp_poweron(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	/* CRTC commits serialize the old disable before this new enable. */
+	WRITE_ONCE(dcp->typec_unplugged, false);
+
 	if (dcp_is_typec_output(dcp)) {
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 
@@ -2000,6 +2019,25 @@ void dcp_poweroff(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
+
+	/*
+	 * Cable removal already deasserts HPD and releases the DPTX display in
+	 * dcp_dptx_disconnect_oob(). H17P powers the pipe down as part of that
+	 * operation. Starting a surface-clear swap in parallel wedges A406
+	 * during the shutdown and prevents every later reconnect.
+	 *
+	 * Remember the unplug until the next CRTC enable, not merely until the
+	 * next cable event: userspace may disable the old CRTC after the route
+	 * has been released, or after a quick replug has marked the cable live.
+	 * The atomic-disable path retains the old framebuffers until a later
+	 * completed swap, so bypassing the clear does not free a live surface.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    READ_ONCE(dcp->typec_unplugged)) {
+		dev_info(dcp->dev,
+			 "Type-C unplug: DPTX owns shutdown; skipping CRTC clear swap\n");
+		return;
+	}
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);
