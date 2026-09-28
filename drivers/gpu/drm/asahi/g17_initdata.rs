@@ -4124,6 +4124,17 @@ pub(crate) const G18G_26A428_STATUS_CONFIG_BANDS: &[LayoutBand] = &[
     band(0x5cc, 0x628, 0x18, Evidence::KextProven),
 ];
 
+/// J873 secondary power-control inputs from eight native 26A428 capture views.
+/// The original initPowerAndPerformanceData stores at 8c30740..8c30760
+/// copy these u32 fields from accelerator+10c10+92c..948/950. GFX1 then
+/// consumes them at b010 1071c onward. Do not inherit the J813 controller
+/// settings here. Values and store geometry are qualified; semantic names
+/// and any relationship to the outstanding compute stall remain unqualified.
+const G18G_26A428_STATUS_CONFIG_POWER_WORDS: &[(usize, u32)] = &[
+    (0x1c0, 0), (0x1c4, 1), (0x1c8, 1), (0x1cc, 4), (0x1d0, 1),
+    (0x1d4, 1), (0x1d8, 1), (0x1dc, 1), (0x1e0, 29000),
+];
+
 /// Copy every non-zero byte of `words` (u32 at `offset - source_base`) to its
 /// relocated place in `out`. Bytes without a band are dropped.
 fn write_relocated_words(
@@ -4677,6 +4688,9 @@ pub(crate) fn encode_g18g_26a428_primary_status_b(
             status_b + (config + G18G_26A428_STATUS_CONFIG_LINK_WORD) as u64);
     write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, G18G_26A428_STATUS_CONFIG_BANDS,
                           &mut out[config..config + G18G_26A428_STATUS_CONFIG_SIZE])?;
+    for &(offset, value) in G18G_26A428_STATUS_CONFIG_POWER_WORDS {
+        put_u32(out, config + offset, value);
+    }
     put_u32(out, config + G18G_26A428_STATUS_CONFIG_LINK_WORD, 1);
     put_u64(out, config + G18G_26A428_STATUS_CONFIG_LINK_PTR,
             status_b + G18G_26A428_STATUS_B_LINK_WORD as u64);
@@ -4834,8 +4848,10 @@ pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
     unproven("region_c", 0x008c, 8, Evidence::Inferred, "native 1300/1300; field units unqualified"),
     unproven("region_c", 0x009c, 4, Evidence::Inferred, "1300 = this+0xf14 x 100 assumed equal to the state count"),
     unproven("status_b", 0x0004, 4, Evidence::Inferred, "1 carried (26A428 stores accel+0x6b0 bit 2)"),
-    unproven("status_config", 0x0000, 0x640, Evidence::Inferred, "J813 status/config words relocated"),
-    unproven("status_config", 0x01dc, 8, Evidence::Guessed, "new words; left 0"),
+    unproven("status_config", 0x0000, 0x640, Evidence::Inferred,
+             "J813 words relocated with native J873 +1c0..1e0 controller inputs; remaining semantics unqualified"),
+    unproven("status_config", 0x01dc, 8, Evidence::Inferred,
+             "native J873 1/29000 and original host stores verified; semantic names unqualified"),
     unproven("status_config", 0x03e8, 0x104, Evidence::Guessed, "new 0x104-byte block; left 0"),
     unproven("main_config", 0x0300, 4, Evidence::Inferred, "secondary kind 0xc carried (accel+0x10a74)"),
     unproven("main_config", 0x02f8, 8, Evidence::Guessed, "third descriptor table (accel[0x235e]) absent: 0"),
