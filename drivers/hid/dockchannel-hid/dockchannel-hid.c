@@ -1257,6 +1257,10 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return ret;
+
 	dchid->dev = dev;
 
 	/*
