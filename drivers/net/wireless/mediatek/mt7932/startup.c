@@ -441,7 +441,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		}
 		if (m->connecting) {
 			m->connect_error = -ECANCELED;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 			complete(&m->discovery_done);
 		}

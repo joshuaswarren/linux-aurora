@@ -475,7 +475,7 @@ int mt_register_interface(struct mt7932 *m)
 	INIT_WORK(&m->cal_work, mt_cal_work);
 	INIT_WORK(&m->connect_work, mt_connect_work);
 	INIT_WORK(&m->disconnect_work, mt_disconnect_work);
-	init_completion(&m->assoc_start);
+	init_completion(&m->assoc_update);
 	init_completion(&m->assoc_done);
 	init_completion(&m->disconnect_done);
 	init_completion(&m->discovery_done);

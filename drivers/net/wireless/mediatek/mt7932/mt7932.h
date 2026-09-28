@@ -122,7 +122,8 @@ struct mt7932 {
 	u32 cqm_rssi_hyst;
 	int cqm_rssi_state;
 	struct work_struct connect_work, disconnect_work;
-	struct completion assoc_start, assoc_done, disconnect_done;
+	struct completion assoc_update, assoc_done, disconnect_done;
+	bool assoc_pending; /* response_lock; freezes the calibration parameters */
 	struct completion discovery_done;
 	struct completion scan_done;
 	struct ieee80211_channel *connect_channel_req, *connect_channel_hint;

@@ -173,7 +173,7 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 			}
 			complete(&m->response);
 			complete(&m->cal_response);
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 			complete(&m->discovery_done);
 			dev_err(&m->pdev->dev,
