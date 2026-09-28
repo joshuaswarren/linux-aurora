@@ -16,6 +16,18 @@ config APPLE_ANE_BRINGUP
 	  unimplemented. No accelerator device or command submission is exposed.
 	  Leave disabled unless testing ANE bring-up on a MacBook Neo.
 
+config APPLE_ANE_FW_TEST
+	tristate "Apple T8140 ANE pinned firmware transport"
+	depends on APPLE_ANE_BRINGUP && IOMMU_API && ARM64_16K_PAGES
+	depends on OF_OVERLAY
+	select FW_LOADER
+	select CRYPTO_LIB_SHA256
+	help
+	  Experimental J700/25G83 firmware transport. Firmware startup requires
+	  an explicit sysfs action and ordered power/DART overlays. After start,
+	  DMA and power remain held until reboot and system sleep is vetoed.
+	  A separately prepared, SHA-pinned model is needed for inference.
+
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST
