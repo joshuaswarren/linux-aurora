@@ -8,6 +8,8 @@ static const char mt_stat_names[][ETH_GSTRING_LEN] = {
 	"tx_doorbells", "tx_busy", "tx_tokens_released",
 	"tx_ring_queued", "tx_live_slots", "bss_absent", "bss_quota",
 	"last_rxv", "rx_rate_valid", "rx_rate_age_ms",
+	"bw_requested_mhz", "bw_effective_limit_mhz", "bw_fallback_latched",
+	"bw_policy_pending", "bw_assoc_mhz", "bw_assoc_center", "fw_asserted",
 };
 
 static int mt_get_sset_count(struct net_device *netdev, int set)
@@ -59,6 +61,13 @@ static void mt_get_stats(struct net_device *netdev, struct ethtool_stats *stats,
 		time_before(jiffies, m->rx_rate_updated + 10 * HZ);
 	data[17] = m->rx_rate_updated ?
 		jiffies_to_msecs(jiffies - m->rx_rate_updated) : U32_MAX;
+	data[18] = mt_bw_requested();
+	data[19] = m->bw_fallback ? 20 : m->bw_limit;
+	data[20] = m->bw_fallback;
+	data[21] = m->bw_policy_pending;
+	data[22] = m->connected ? (m->assoc_width ? 80 : m->assoc_sco ? 40 : 20) : 0;
+	data[23] = m->connected ? m->assoc_center : 0;
+	data[24] = m->fw_asserted;
 	spin_unlock_irqrestore(&m->response_lock, flags);
 }
 

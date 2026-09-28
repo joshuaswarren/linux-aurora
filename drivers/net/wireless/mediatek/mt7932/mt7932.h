@@ -28,6 +28,7 @@
 #include "packet.h"
 #include "scan.h"
 #include "association.h"
+#include "bandwidth.h"
 #include "regulatory.h"
 
 
@@ -84,6 +85,11 @@ struct mt7932 {
 	struct ieee80211_channel channels[MT7932_CHANNELS_2G];
 	struct ieee80211_channel channels5[MT7932_CHANNELS_5G];
 	struct ieee80211_supported_band band5;
+	struct ieee80211_sband_iftype_data band5_iftype;
+	unsigned int bw_limit;
+	bool bw_fallback, bw_policy_pending, fw_asserted;
+	bool bw_cal_active, bw_cal_rejected;
+	u8 assoc_width, assoc_sco, assoc_center;
 	u8 scan_band, scan_batch;
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
@@ -152,6 +158,13 @@ struct mt7932 {
 	dma_addr_t ipc_dma, aux_dma;
 };
 
+unsigned int mt_bw_requested(void);
+void mt_bw_caps(struct mt7932 *m);
+u32 mt_bw_channel_flags(struct mt7932 *m, struct ieee80211_channel *channel);
+int mt_bw_assoc_start(struct mt7932 *m, const u8 *body, size_t length);
+void mt_bw_latch(struct mt7932 *m, const char *reason);
+void mt_bw_narrow_host(struct mt7932 *m);
+int mt_bw_apply_fallback(struct mt7932 *m);
 bool mt_rf_allowed(struct mt7932 *m);
 u32 mt_read(struct mt7932 *m, u32 reg);
 void mt_write(struct mt7932 *m, u32 reg, u32 value);

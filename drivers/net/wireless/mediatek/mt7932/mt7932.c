@@ -155,6 +155,32 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		return;
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
+	/* Private 25G83 arEventTable entry 31: EIDf0 -> nicEventAssertDump.
+	 * Keep the default path unchanged. Never print opaque dump contents.
+	 * An assert is not a DMA fence or a successful command completion.
+	 */
+	if (event.eid == 0xf0 && m->bw_limit > 20) {
+		if (!m->fw_asserted) {
+			mt_bw_latch(m, "firmware-assert-EIDf0");
+			m->fw_asserted = true;
+			m->link_failed = true;
+			m->cal_state.error = -EIO;
+			m->connect_error = -EIO;
+			WRITE_ONCE(m->rf_ready, false);
+			if (m->netdev) {
+				netif_stop_queue(m->netdev);
+				netif_carrier_off(m->netdev);
+			}
+			complete(&m->response);
+			complete(&m->cal_response);
+			complete(&m->assoc_start);
+			complete(&m->assoc_done);
+			complete(&m->discovery_done);
+			dev_err(&m->pdev->dev,
+				"BW_FIRMWARE_ASSERT: EIDf0; 20 MHz latched, DMA retained; crash reset unavailable, reboot with mt7932_fullmac.max_bw_mhz=20\n");
+		}
+		goto unlock;
+	}
 	if (event.eid == 0xee) {
 		mt_link_event(m, &event);
 		goto unlock;
@@ -168,9 +194,14 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		goto unlock;
 	}
 	if (event.eid == 0xd6) {
+		bool terminal = m->bw_cal_active && m->cal_state.active &&
+			m->cal_state.expected == 1 && !m->cal_state.received;
+
 		ret = mt7932_cal_null(&m->cal_state, packet + 36,
 				     event.length >= 36 ? event.length - 36 : 0,
 				     m->smart_version);
+		if (terminal && ret == -EREMOTEIO)
+			m->bw_cal_rejected = true;
 		dev_info(&m->pdev->dev, "CAL_EVENT: seq=%u length=%zu result=%d credits=%u/%u\n",
 			 event.seq, event.length, ret, m->cal_state.received, m->cal_state.expected);
 		if (ret)
@@ -349,6 +380,8 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 	unsigned long flags;
 	int ret;
 
+	if (READ_ONCE(m->fw_asserted))
+		return -EIO;
 	if (q->used >= q->slots) {
 		/* Command buffers can wrap only after every published descriptor has
 		 * retired. Never reclaim by elapsed time or by a reply alone.
@@ -386,6 +419,8 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 			ret = -ETIMEDOUT;
 		}
 	}
+	if (READ_ONCE(m->fw_asserted))
+		ret = -EIO;
 	if (ret == -ETIMEDOUT) {
 		/* Diagnostic only: never turn a polled late reply into IRQ success. */
 		unsigned int i;
