@@ -65,6 +65,7 @@ static int isp_gpio_wait(struct apple_isp *isp, u32 reg, u32 expected)
 /* Power up the local domains that are not on yet, in order. */
 static int apple_isp_power_up_domains(struct apple_isp *isp)
 {
+	int was_on = isp->pds_on;
 	int ret;
 
 	for (int i = isp->pds_on + 1; i < isp->pd_count; i++) {
@@ -74,10 +75,12 @@ static int apple_isp_power_up_domains(struct apple_isp *isp)
 			dev_err(isp->dev,
 				"Failed to power up power domain %d: %d\n", i, ret);
 			apple_isp_pm_trace(isp, "domain %d did not come up", i);
-			while (--i > isp->pds_on)
-				pm_runtime_put_sync(isp->pd_dev[i]);
+			if (!isp->hw->resident_fw)
+				while (isp->pds_on > was_on)
+					pm_runtime_put_sync(isp->pd_dev[isp->pds_on--]);
 			return ret;
 		}
+		isp->pds_on = i;
 	}
 
 	isp->pds_on = max(isp->pd_count - 1, 0);
@@ -367,7 +370,9 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 	apple_isp_pm_step(isp, "stop coprocessor");
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
-	apple_isp_power_down_domains(isp);
+	/* A failed resident boot may leave the ISP CPU in an unknown state. */
+	if (isp->fw_state != ISP_FW_DEAD)
+		apple_isp_power_down_domains(isp);
 }
 
 static int isp_firmware_boot_stage1(struct apple_isp *isp)
@@ -428,6 +433,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	return 0;
 
 shutdown:
+	if (isp->hw->resident_fw)
+		isp->fw_state = ISP_FW_DEAD;
 	isp_firmware_shutdown_stage1(isp);
 	return err;
 }
@@ -922,6 +929,8 @@ shutdown_stage3:
 shutdown_stage2:
 	isp_firmware_shutdown_stage2(isp);
 shutdown_stage1:
+	if (isp->hw->resident_fw)
+		isp->fw_state = ISP_FW_DEAD;
 	isp_firmware_shutdown_stage1(isp);
 garbage_collect:
 	isp_collect_gc_surface(isp);
@@ -937,8 +946,11 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	 * uses, also when it did not acknowledge the suspend request.
 	 */
 	apple_isp_pm_step(isp, "suspend firmware");
-	if (isp_stop_command_processor(isp))
-		dev_warn(isp->dev, "firmware did not suspend, stopping it\n");
+	if (isp_stop_command_processor(isp)) {
+		dev_warn(isp->dev, "firmware did not suspend, retaining its power domains\n");
+		if (isp->hw->resident_fw)
+			isp->fw_state = ISP_FW_DEAD;
+	}
 	apple_isp_pm_trace(isp, "firmware suspended");
 	isp_disable_irq(isp);
 	isp_firmware_shutdown_stage1(isp);
@@ -970,7 +982,7 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 		return 0;
 	case ISP_FW_DEAD:
 		dev_err_ratelimited(isp->dev,
-				    "firmware was stopped and cannot be restarted before the next boot\n");
+				    "firmware is unavailable until the next system boot\n");
 		return -EIO;
 	}
 
@@ -979,15 +991,22 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	err = pm_runtime_resume_and_get(isp->dev);
 	if (err < 0) {
 		dev_err(isp->dev, "failed to enable power: %d\n", err);
+		if (isp->hw->resident_fw) {
+			isp->fw_state = ISP_FW_DEAD;
+			return -EIO;
+		}
 		return err;
 	}
 
 	err = isp_firmware_boot(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
-		pm_runtime_put_sync(isp->dev);
-		if (isp->hw->resident_fw)
+		if (isp->hw->resident_fw) {
+			/* Never gate ISP CPU domains after an unsuccessful start. */
 			isp->fw_state = ISP_FW_DEAD;
+			return -EIO;
+		}
+		pm_runtime_put_sync(isp->dev);
 		return err;
 	}
 
@@ -1017,6 +1036,8 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 
 	apple_isp_pm_trace(isp, "halt");
 	isp_firmware_shutdown(isp);
+	if (isp->fw_state == ISP_FW_DEAD)
+		return;
 	apple_isp_pm_step(isp, "halt: power down");
 	pm_runtime_put_sync(isp->dev);
 	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;

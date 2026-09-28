@@ -25,6 +25,12 @@ static void apple_isp_detach_genpd(struct apple_isp *isp)
 {
 	if (isp->pd_count <= 1)
 		return;
+	/* genpd detach queues power-off even with power_off=false. Keep the
+	 * virtual devices attached after a failed resident boot so ISP CPU
+	 * domains cannot be gated before the next system boot.
+	 */
+	if (isp->hw->resident_fw && isp->pds_on)
+		return;
 
 	for (int i = isp->pd_count - 1; i >= 0; i--) {
 		if (isp->pd_link[i])
@@ -360,6 +366,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct apple_isp *isp;
 	struct resource *res;
+	int hold;
 	int err;
 
 	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
@@ -510,11 +517,12 @@ static int apple_isp_probe(struct platform_device *pdev)
 	return 0;
 
 halt_firmware:
-	pm_runtime_get_sync(dev);
+	hold = pm_runtime_resume_and_get(dev);
 	apple_isp_firmware_halt(isp);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
-	pm_runtime_put_sync(dev);
+	if (hold >= 0)
+		pm_runtime_put_sync(dev);
 	pm_runtime_disable(dev);
 	goto destroy_wq;
 free_surface:
@@ -533,6 +541,7 @@ detach_genpd:
 static void apple_isp_remove(struct platform_device *pdev)
 {
 	struct apple_isp *isp = platform_get_drvdata(pdev);
+	bool hold;
 
 	/*
 	 * Keep the ISP, and with it its DARTs and ISP_SYS, powered until the
@@ -542,7 +551,10 @@ static void apple_isp_remove(struct platform_device *pdev)
 	 * just been stopped.
 	 */
 	apple_isp_pm_step(isp, "remove: hold power");
-	pm_runtime_get_sync(isp->dev);
+	hold = !isp->hw->resident_fw || isp->fw_state != ISP_FW_DEAD ||
+	       !isp->pds_on;
+	if (hold && pm_runtime_resume_and_get(isp->dev) < 0)
+		hold = false;
 	apple_isp_debug_unregister(isp);
 
 	apple_isp_pm_step(isp, "remove: unregister video");
@@ -555,7 +567,11 @@ static void apple_isp_remove(struct platform_device *pdev)
 	apple_isp_free_iommu(isp);
 
 	apple_isp_pm_step(isp, "remove: release power");
-	pm_runtime_put_sync(isp->dev);
+	/* A dead resident boot retains the ISP and local-domain PM references.
+	 * Dropping either here can hang the SoC at an ISP CPU domain.
+	 */
+	if (hold)
+		pm_runtime_put_sync(isp->dev);
 	pm_runtime_disable(isp->dev);
 	destroy_workqueue(isp->wq);
 	apple_isp_pm_step(isp, "remove: detach power domains");
