@@ -504,7 +504,13 @@ static int apple_isp_probe(struct platform_device *pdev)
 	return 0;
 
 halt_firmware:
+	pm_runtime_get_sync(dev);
 	apple_isp_firmware_halt(isp);
+	apple_isp_free_firmware_surface(isp);
+	apple_isp_free_iommu(isp);
+	pm_runtime_put_sync(dev);
+	pm_runtime_disable(dev);
+	goto destroy_wq;
 free_surface:
 	pm_runtime_disable(dev);
 	apple_isp_free_firmware_surface(isp);
@@ -521,13 +527,24 @@ static void apple_isp_remove(struct platform_device *pdev)
 {
 	struct apple_isp *isp = platform_get_drvdata(pdev);
 
+	/*
+	 * Keep the ISP, and with it its DARTs and ISP_SYS, powered until the
+	 * last mapping is gone. Otherwise stopping the firmware lets the
+	 * domain go off, and every unmap after that powers the DARTs up and
+	 * down again, resetting them each time, around a firmware that has
+	 * just been stopped.
+	 */
+	pm_runtime_get_sync(isp->dev);
+
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
 	apple_isp_firmware_halt(isp);
 	apple_isp_free_video(isp);
-	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
+
+	pm_runtime_put_sync(isp->dev);
+	pm_runtime_disable(isp->dev);
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
 }
