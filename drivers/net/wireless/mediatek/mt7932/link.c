@@ -214,9 +214,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		if (length >= 20)
 			dev_info(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
 				 get_unaligned_le32(body + 12), body[16], body[17], body[19]);
-		if (length < 20 || get_unaligned_le32(body + 12) != mt7932_channel_band(m->connect_channel) ||
-		    body[16] || body[17] != m->connect_channel || body[19])
-			m->connect_error = -EPROTO;
+		m->connect_error = m->connect_error ?: mt_bw_assoc_start(m, body, length);
 		complete(&m->assoc_start);
 		break;
 	case 0x40:
@@ -254,14 +252,28 @@ static int mt_association_calibration(struct mt7932 *m)
 {
 	const struct firmware *oca;
 	struct mt7932_cal_piece pieces[2];
+	unsigned long flags;
 	int ret;
 
 	ret = request_firmware_direct(&oca, "mediatek/mt7932/oca2.bin", &m->pdev->dev);
 	if (ret)
 		return ret;
-	ret = mt7932_cal_association(oca->data, oca->size, m->connect_channel, pieces);
-	if (ret == 2)
+	if (m->assoc_width || m->assoc_sco)
+		ret = mt7932_cal_association_wide(oca->data, oca->size, m->assoc_center, pieces);
+	else
+		ret = mt7932_cal_association(oca->data, oca->size, m->connect_channel, pieces);
+	if (ret == 2 && (m->assoc_width || m->assoc_sco))
+		dev_info(&m->pdev->dev, "BW_CAL: center=%u parameter=%08x group=%u fragments=2\n",
+			 m->assoc_center, pieces[0].parameter, pieces[0].parameter & 0xff);
+	if (ret == 2) {
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->bw_cal_active = m->assoc_width || m->assoc_sco;
+		spin_unlock_irqrestore(&m->response_lock, flags);
 		ret = mt_cal_procedure(m, pieces, 2, 1, 0);
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->bw_cal_active = false;
+		spin_unlock_irqrestore(&m->response_lock, flags);
+	}
 	release_firmware(oca);
 	return ret;
 }
@@ -355,6 +367,18 @@ static int mt_retire_connection(struct mt7932 *m)
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
+	/* A well-formed negative D6 is terminal for the single logical wide
+	 * association calibration. Only after EE44, TX/token drain and joining
+	 * RX/D7 may that explicit rejection be retired. Timeouts, malformed
+	 * events, D7 errors and asserts retain their original sticky epoch.
+	 */
+	if (!ret && m->bw_cal_rejected && !m->fw_asserted &&
+	    !m->cal_state.active && m->cal_state.error == -EREMOTEIO &&
+	    !m->cal_request_count && !m->waiting) {
+		memset(&m->cal_state, 0, sizeof(m->cal_state));
+		m->bw_cal_rejected = false;
+		dev_info(&m->pdev->dev, "BW_CAL_REJECTION_RETIRED: next attempt may use 20 MHz\n");
+	}
 	if (!ret && (m->cal_state.active || m->cal_state.error || m->cal_request_count || m->waiting))
 		ret = -EPROTO;
 	if (!ret)
@@ -410,6 +434,10 @@ void mt_connect_work(struct work_struct *work)
 		ret = -ECANCELED;
 		goto free;
 	}
+	phase = "bandwidth-policy";
+	ret = mt_bw_apply_fallback(m);
+	if (ret)
+		goto free;
 	if (!m->connect_bss) {
 		dev_info(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
 		phase = "discovery";
@@ -436,6 +464,10 @@ void mt_connect_work(struct work_struct *work)
 	 * This yields flag2 independently of credentials; no scan-result count
 	 * belongs in this field. The recovered framework uses listen interval20.
 	 * Other platform flag policies remain unsupported, not guessed mappings.
+	 */
+	/* Native assocSendConnectCmd supplies band/primary only at 0x338/9.
+	 * 0x33a/b are reserved, not width/center slots. Firmware selects the
+	 * negotiated CW/SCO and returns them in EE4d before calibration.
 	 */
 	phase = "connect-submit";
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
@@ -500,6 +532,8 @@ report:
 			phase, ret, jiffies_to_msecs(jiffies - started),
 			completion_done(&m->assoc_start), completion_done(&m->assoc_done),
 			READ_ONCE(m->peer_valid));
+		if (submitted && m->connect_channel > 14 && ret != -ECANCELED)
+			mt_bw_latch(m, phase);
 		mt_transport_snapshot(m);
 	}
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
@@ -509,7 +543,11 @@ report:
 		spin_unlock_irqrestore(&m->response_lock, flags);
 		mutex_unlock(&m->command_mutex);
 		if (submitted) {
-			mt_retire_connection(m);
+			int retired = mt_retire_connection(m);
+
+			if (retired && READ_ONCE(m->bw_fallback))
+				dev_err(&m->pdev->dev,
+					"BW_FALLBACK_BLOCKED: firmware/DMA epoch not retired; reboot with mt7932_fullmac.max_bw_mhz=20 required\n");
 		} else if (peer_owned) {
 			mutex_lock(&m->command_mutex);
 			spin_lock_irqsave(&m->response_lock, flags);
@@ -633,6 +671,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		ret = m->link_failed ? -EIO : -EBUSY;
 		goto unlock;
 	}
+	if (READ_ONCE(m->bw_fallback))
+		mt_bw_narrow_host(m);
+	m->assoc_width = 0;
+	m->assoc_sco = 0;
+	m->assoc_center = 0;
 	reinit_completion(&m->assoc_start);
 	m->disconnect_seen = false;
 	m->disconnect_event_received = false;
