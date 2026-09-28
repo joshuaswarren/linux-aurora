@@ -202,7 +202,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		}
 		if (m->connecting) {
 			m->connect_error = -ECONNRESET;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 		}
 		return;
@@ -214,8 +214,16 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		if (length >= 20)
 			dev_info(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
 				 get_unaligned_le32(body + 12), body[16], body[17], body[19]);
-		m->connect_error = m->connect_error ?: mt_bw_assoc_start(m, body, length);
-		complete(&m->assoc_start);
+		/* Do not overwrite parameters while calibration is pending/in flight. */
+		if (!m->connect_error) {
+			if (m->assoc_pending || completion_done(&m->assoc_done))
+				m->connect_error = -EPROTO;
+			else
+				m->connect_error = mt_bw_assoc_start(m, body, length);
+		}
+		if (!m->connect_error)
+			m->assoc_pending = true;
+		complete(&m->assoc_update);
 		break;
 	case 0x40:
 		if (length >= 52)
@@ -227,7 +235,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		 */
 		if (!mt7932_assoc_resources(body, length, &m->peer_ids, m->connect_channel, m->connect_open)) {
 			m->connect_error = -EPROTO;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 			break;
 		}
@@ -244,6 +252,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		if (length < 2 || get_unaligned_le16(body) || !m->peer_valid)
 			m->connect_error = -ECONNREFUSED;
 		complete(&m->assoc_done);
+		complete(&m->assoc_update);
 		break;
 	}
 }
@@ -419,8 +428,9 @@ void mt_connect_work(struct work_struct *work)
 	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
 	struct cfg80211_connect_resp_params response = {};
 	u8 *body, mac[8] = {}, queue[32];
-	unsigned long flags;
-	bool submitted = false, peer_owned = false;
+	unsigned long flags, deadline, remaining;
+	bool submitted = false, peer_owned = false, queue_enabled = false;
+	bool pending, done;
 	const char *phase = "prepare";
 	unsigned long started = jiffies;
 	int ret;
@@ -491,35 +501,57 @@ free:
 		goto report;
 	dev_info(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n", m->connect_bssid, m->connect_channel);
 	phase = "assoc-start";
-	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
-	mutex_unlock(&m->command_mutex);
-	ret = wait_for_completion_timeout(&m->assoc_start, msecs_to_jiffies(5000)) ? 0 : -ETIMEDOUT;
-	mutex_lock(&m->command_mutex);
-	if (ret) {
-		ret = -ETIMEDOUT;
-		goto report;
+	deadline = jiffies + msecs_to_jiffies(5000);
+	for (;;) {
+		remaining = jiffies;
+		if (time_after_eq(remaining, deadline)) {
+			ret = -ETIMEDOUT;
+			goto report;
+		}
+		remaining = deadline - remaining;
+		/* Service genuine D7 work while waiting for either link event. */
+		mutex_unlock(&m->command_mutex);
+		ret = wait_for_completion_timeout(&m->assoc_update, remaining) ?
+			0 : -ETIMEDOUT;
+		mutex_lock(&m->command_mutex);
+		spin_lock_irqsave(&m->response_lock, flags);
+		ret = m->connect_error ?: ret;
+		pending = m->assoc_pending;
+		done = completion_done(&m->assoc_done);
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		if (ret)
+			goto report;
+		if (!pending) {
+			if (!done || !queue_enabled)
+				ret = -EPROTO;
+			break;
+		}
+		/* Firmware may restart association within one submitted join. Each
+		 * new start needs calibration; waiting only for CONNECT_REPORT after
+		 * the first start leaves that restart stalled until our timeout.
+		 */
+		phase = "association-calibration";
+		ret = mt_association_calibration(m);
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->assoc_pending = false;
+		ret = ret ?: m->connect_error;
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		if (ret)
+			goto report;
+		dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: channel=%u\n",
+			 m->connect_channel);
+		if (!queue_enabled) {
+			phase = "peer-queue";
+			mt7932_peer_queue(queue, m->peer_ids.station[0], true);
+			ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
+			if (ret)
+				goto report;
+			queue_enabled = true;
+			deadline = jiffies + msecs_to_jiffies(10000);
+		}
+		/* Repeated starts never renew the connection-complete deadline. */
+		phase = "connect-complete";
 	}
-	ret = READ_ONCE(m->connect_error);
-	if (ret)
-		goto report;
-	phase = "association-calibration";
-	ret = mt_association_calibration(m);
-	ret = ret ?: READ_ONCE(m->connect_error);
-	if (ret)
-		goto report;
-	dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: channel=%u\n", m->connect_channel);
-	phase = "peer-queue";
-	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
-	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
-	if (ret)
-		goto report;
-	mutex_unlock(&m->command_mutex);
-	phase = "connect-complete";
-	if (!wait_for_completion_timeout(&m->assoc_done, msecs_to_jiffies(10000)))
-		ret = -ETIMEDOUT;
-	else
-		ret = READ_ONCE(m->connect_error);
-	mutex_lock(&m->command_mutex);
 report:
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (!ret) {
@@ -530,7 +562,7 @@ report:
 		dev_err(&m->pdev->dev,
 			"CONNECT_PHASE_FAILED: phase=%s status=%d elapsed-ms=%u start=%u done=%u peer=%u\n",
 			phase, ret, jiffies_to_msecs(jiffies - started),
-			completion_done(&m->assoc_start), completion_done(&m->assoc_done),
+			READ_ONCE(m->assoc_pending), completion_done(&m->assoc_done),
 			READ_ONCE(m->peer_valid));
 		if (submitted && m->connect_channel > 14 && ret != -ECANCELED)
 			mt_bw_latch(m, phase);
@@ -676,7 +708,8 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->assoc_width = 0;
 	m->assoc_sco = 0;
 	m->assoc_center = 0;
-	reinit_completion(&m->assoc_start);
+	reinit_completion(&m->assoc_update);
+	m->assoc_pending = false;
 	m->disconnect_seen = false;
 	m->disconnect_event_received = false;
 	reinit_completion(&m->assoc_done);
@@ -750,7 +783,7 @@ int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 		m->connect_error = -ECANCELED;
 		m->connect_cancelled = true;
 		m->disconnect_reason = reason;
-		complete(&m->assoc_start);
+		complete(&m->assoc_update);
 		complete(&m->assoc_done);
 		complete(&m->discovery_done);
 	} else if (m->connected) {

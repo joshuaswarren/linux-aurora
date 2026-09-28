@@ -35,3 +35,13 @@ config MT7932_BW_KUNIT_TEST
 	help
 	  Test native width encodings, regulatory constituent-channel gating,
 	  fallback capabilities and synthetic calibration plans without hardware.
+
+config MT7932_LINK_KUNIT_TEST
+	bool "MT7932 association event tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Test repeated association starts, calibration ownership and completion
+	  wakeups using synthetic firmware events, without radio hardware.
+	  Covers terminal failures and rejects overlapping calibration requests.
+	  These tests do not replace cold-boot association qualification.
