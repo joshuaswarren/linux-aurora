@@ -2587,6 +2587,28 @@ static int apple_nvme_resume(struct device *dev)
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
+/*
+ * A post-M4 ANS keeps running across system sleep, and its PCIe link has to
+ * stay up with it: with apcie_phy off the firmware reports a link timeout,
+ * and a post-M4 ANS cannot be restarted. genpd powers a domain off in the
+ * noirq phase once all of its devices are suspended, runtime PM references
+ * or not, so mark the domain devices as being on the awake path, as the DCP
+ * driver does for its firmware. genpd then leaves them powered.
+ */
+static void apple_nvme_keep_domains_awake(struct apple_nvme *anv)
+{
+	int i;
+
+	if (anv->pd_count <= 1) {
+		device_set_awake_path(anv->dev);
+		return;
+	}
+
+	for (i = 0; i < anv->pd_count; i++)
+		if (!IS_ERR_OR_NULL(anv->pd_dev[i]))
+			device_set_awake_path(anv->pd_dev[i]);
+}
+
 static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
@@ -2606,6 +2628,7 @@ static int apple_nvme_suspend(struct device *dev)
 	 */
 	if (anv->hw->needs_ioq_registers) {
 		cancel_work_sync(&anv->recovery_work);
+		apple_nvme_keep_domains_awake(anv);
 		return 0;
 	}
 
