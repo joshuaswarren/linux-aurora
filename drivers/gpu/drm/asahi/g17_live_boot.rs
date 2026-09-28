@@ -2994,10 +2994,11 @@ fn boot_initial_session(
         ),
         GFP_KERNEL,
     )?;
-    // The mailbox provider resumes its genpd in apple_mbox_start().  The
-    // observed failure lies in this constructor window, but its exact errno
-    // source is not yet proven. A failed constructor releases its RX claim,
-    // and neither ASC has started, so a bounded EINVAL retry is safe here.
+    // The mailbox provider resumes its genpd in apple_mbox_start().  A GFX
+    // power-on that does not settle fails that resume with ETIMEDOUT; the
+    // provider then clears the runtime PM error, which used to turn every
+    // later attempt into EINVAL. A failed constructor releases its RX claim,
+    // and neither ASC has started, so a bounded retry is safe here.
     let new_rtkit = |index, state: Arc<G17PRoleRtkitState>| {
         for attempt in 1..=3 {
             match rtkit::RtKit::<G17PRtkitOps>::new_g17p(
@@ -3008,13 +3009,13 @@ fn boot_initial_session(
                     dev_err!(pdev.as_ref(),
                         "G17P initial session: RTKit receiver {} constructor attempt {} failed ({:?})\n",
                         index, attempt, error);
-                    if error != EINVAL {
+                    if error != EINVAL && error != ETIMEDOUT {
                         return Err(error);
                     }
                     if attempt == 3 {
                         dev_err!(pdev.as_ref(),
-                            "G17P initial session: RTKit receiver {} still EINVAL; deferring probe until providers settle\n",
-                            index);
+                            "G17P initial session: RTKit receiver {} still failing ({:?}); deferring probe until providers settle\n",
+                            index, error);
                         return Err(EPROBE_DEFER);
                     }
                     fsleep(Delta::from_millis(20));
