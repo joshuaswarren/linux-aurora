@@ -66,6 +66,61 @@ pub(crate) fn g18_uma_geometry(
     })
 }
 
+/// Initial sparse directory layout for the native G18 pool flags value 3.
+///
+/// The virtual extent is NOT a request for that much physical backing. Only
+/// `initial_page_count` pages are committed initially, at `page_offset(i)`;
+/// the owner must reserve the intervening unmapped addresses for later growth.
+pub(crate) struct G18UmaSparseDirectory {
+    pub(crate) reservation_bytes: u64,
+    pub(crate) page_bytes: u64,
+    pub(crate) initial_page_count: u32,
+    pub(crate) gpu_base_offset: u64,
+    directory_bytes_per_usc: u64,
+}
+
+impl G18UmaSparseDirectory {
+    pub(crate) fn page_offset(&self, index: u32) -> Option<u64> {
+        if index >= self.initial_page_count {
+            return None;
+        }
+        let offset = self.directory_bytes_per_usc.checked_mul(u64::from(index))?;
+        if offset.checked_add(self.page_bytes)? > self.reservation_bytes {
+            return None;
+        }
+        Some(offset)
+    }
+}
+
+/// Native FList init reserves one extra page and backs one page per USC plus
+/// the final page. `prepareBufferResources` exposes the directory beginning
+/// one KiB before the end of the first page. Other pool flag modes are outside
+/// this contract; the caller must first resolve the device's actual flags.
+pub(crate) fn g18_uma_sparse_directory(
+    geometry: &G18UmaGeometry,
+    uscs: u32,
+    page_shift: u32,
+) -> Option<G18UmaSparseDirectory> {
+    if uscs == 0 || uscs > 128 || !(12..=16).contains(&page_shift) {
+        return None;
+    }
+    let page_bytes = 1u64 << page_shift;
+    let stride = geometry.directory_bytes_per_usc;
+    if stride < page_bytes
+        || stride & (page_bytes - 1) != 0
+        || stride.checked_mul(u64::from(uscs))? != geometry.directory_bytes
+    {
+        return None;
+    }
+    Some(G18UmaSparseDirectory {
+        reservation_bytes: geometry.directory_bytes.checked_add(page_bytes)?,
+        page_bytes,
+        initial_page_count: uscs + 1,
+        gpu_base_offset: page_bytes - 0x400,
+        directory_bytes_per_usc: stride,
+    })
+}
+
 /// Native `halInitSMAEnableMask` at 0xfffffe0008c41bdc splits the active
 /// 128-bit mask into sixteen groups, each stored in a 16-bit output lane.
 /// The primary mask is accelerator+0x470; +0x480 is used only when it is zero.
