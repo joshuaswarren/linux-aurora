@@ -38,6 +38,7 @@ use super::MappedObject;
 use super::g18_pool::{G18UmaPoolBinding, G18UmaPoolMemory};
 use super::g18_scheduler::G18SchedulerMemory;
 use super::g18_compute::G18ComputeMemory;
+use super::g18_compute_payload::G18ComputePayloadMemory;
 use crate::{driver::AsahiDevice, g17_initdata as init, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
@@ -111,6 +112,7 @@ pub(crate) struct G18FirmwareMemory {
     uma_pool: G18UmaPoolMemory,
     scheduler: G18SchedulerMemory,
     compute: G18ComputeMemory,
+    compute_payload: Option<G18ComputePayloadMemory>,
     completions: KVec<MappedObject>,
     aliases: KVec<mmu::KernelMapping>,
     registers: KVec<mmu::KernelMapping>,
@@ -316,7 +318,8 @@ impl G18FirmwareMemory {
         // Keep the retained graph off the kernel stack.
         KBox::init(try_init!(Self {
             primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
-            pbdesc, uma, uma_pool, scheduler, compute, completions, aliases, registers,
+            pbdesc, uma, uma_pool, scheduler, compute, compute_payload: None,
+            completions, aliases, registers,
             report_counts: [[0; 2]; 2], trace_printed: [0; 2], uat,
         }), GFP_KERNEL)
     }
@@ -326,6 +329,15 @@ impl G18FirmwareMemory {
     pub(crate) fn scheduler(&mut self) -> &mut G18SchedulerMemory { &mut self.scheduler }
 
     pub(crate) fn compute(&mut self) -> &mut G18ComputeMemory { &mut self.compute }
+
+    /// Retain a private shader/input/output VM. This does not select a process
+    /// context or make its roots visible to firmware, and never queues work.
+    pub(crate) fn prepare_compute_payload(&mut self, dev: &AsahiDevice)
+        -> Result<&mut G18ComputePayloadMemory> {
+        if self.compute_payload.is_some() { return Err(EBUSY); }
+        self.compute_payload = Some(G18ComputePayloadMemory::load(dev, &self.uat)?);
+        Ok(self.compute_payload.as_mut().unwrap())
+    }
 
     pub(crate) fn prepare_uma_pool_binding(&mut self) -> Result<G18UmaPoolBinding> {
         self.uma_pool.prepare_binding()

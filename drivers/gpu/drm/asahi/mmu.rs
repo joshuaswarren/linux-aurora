@@ -2081,6 +2081,17 @@ impl Vm {
         };
 
         let lower_start = lower_vm_start(cfg, t8140_internal);
+        // Native's SecureGart presents a process's first fixed resource at low
+        // VA 0 inside that process's own translation regime, so a T8140 client
+        // root has to be able to hold a leaf below `IOVA_USER_BASE`. Only the
+        // driver's internal allocator is widened: the GPUVM range userspace
+        // binds through, and the `vm_start` the driver publishes, both still
+        // begin at `IOVA_USER_BASE`.
+        // The saved T8152 compute submission also has a user allocation at VA
+        // zero. Admit it only to explicitly internal VMs; the GPUVM userspace
+        // range and ordinary T8152 client allocators still start at USER_BASE.
+        let driver_start = if cfg == UatConfig::T8140
+            || (cfg == UatConfig::T8152 && t8140_internal) { 0 } else { lower_start };
         let (va_range, gpuvm_range) = if is_kernel {
             (iova_kern_range, kernel_range.clone())
         } else {
@@ -4957,6 +4968,16 @@ impl Uat {
             id,
             false,
         )
+    }
+
+    /// Unpublished, driver-private VM for the qualified G18 compute fixture.
+    /// Its VA-zero allocation is required by the saved native user payload.
+    /// This allocates page tables only; no context slot or TTB root is written.
+    pub(crate) fn new_t8152_compute_fixture_vm(&self) -> Result<Vm> {
+        if !self.is_t8152_geometry() { return Err(ENODEV); }
+        Vm::new(&self.dev, self.inner.clone(),
+            IOVA_USER_BASE..uat_geometry(self.cfg)?.user_va_top(),
+            self.cfg, None, 0x8152_0001, true)
     }
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
