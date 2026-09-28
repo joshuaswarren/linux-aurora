@@ -1437,7 +1437,8 @@ impl G18Session {
         let completion = memory.compute().completion_snapshot()?;
         let scheduler = memory.scheduler().snapshot(0)?;
         if output.checked != 4096 || output.untouched != 4096 || output.correct != 0
-            || completion.stamps != [0; 2] || scheduler.submitted != 0
+            || completion.stamps != [0; 2] || memory.completion_masks() != [0; 2]
+            || completion.timestamps != [0; 2] || scheduler.submitted != 0
             || scheduler.completed != 0 || scheduler.linked != 0 {
             return Err(EBUSY);
         }
@@ -1463,18 +1464,35 @@ impl G18Session {
             let memory = self.memory.as_mut().ok_or(EIO)?;
             let completion = memory.compute().completion_snapshot()?;
             let scheduler = memory.scheduler().snapshot(0)?;
+            let masks = memory.completion_masks();
             if outer == [4; 3] && inner == [6; 3]
-                && completion.stamps == [command.expected_stamp; 2]
+                // Original b000 19234/19268 writes through the first qword.
+                // The second qword is carried into trace 0xe as an identity,
+                // not written by this completion path (stage29 hardware).
+                && completion.stamps[0] == command.expected_stamp
+                && masks[0] & (1u64 << QUEUE_ID) != 0
+                && completion.timestamps[0] != 0
+                && completion.timestamps[1] >= completion.timestamps[0]
                 && scheduler.submitted == 1 && scheduler.completed == 1 && scheduler.linked == 0 {
                 let output = memory.addition_output()?;
                 dev_info!(self.dev.as_ref(),
-                    "G18_COMPUTE completion outer={:?} inner={:?} stamps={:x?} times={:x?} scheduler={:?} output={:?}\n",
-                    outer, inner, completion.stamps, completion.timestamps, scheduler, output);
-                if output.checked != 4096 || output.correct != 4096 || output.untouched != 0 {
+                    "G18_COMPUTE completion outer={:?} inner={:?} stamps={:x?} times={:x?} event_masks={:x?} scheduler={:?} output={:?}\n",
+                    outer, inner, completion.stamps, completion.timestamps, masks, scheduler, output);
+                // g18_compute_variant=1 dispatches nothing: every output must stay poisoned.
+                let empty = *crate::module_parameters::g18_compute_variant.value() == 1;
+                let expected = if empty { (0, 4096) } else { (4096, 0) };
+                if output.checked != 4096 || (output.correct, output.untouched) != expected {
+                    if empty {
+                        dev_err!(self.device(), "G18_COMPUTE_EMPTY_STREAM_FAIL: completed without a dispatch, but output changed {:?}\n", output);
+                    }
                     return Err(EIO);
                 }
                 self.check_faults("compute output")?;
-                dev_info!(self.device(), "G18_COMPUTE_ADD_PASS: all 4096 outputs match after independent completion\n");
+                if empty {
+                    dev_info!(self.device(), "G18_COMPUTE_EMPTY_STREAM_PASS: completion observed with no dispatch; all 4096 outputs still poisoned\n");
+                } else {
+                    dev_info!(self.device(), "G18_COMPUTE_ADD_PASS: all 4096 outputs match after independent completion\n");
+                }
                 return Ok(());
             }
             if step % 1000 == 999 {

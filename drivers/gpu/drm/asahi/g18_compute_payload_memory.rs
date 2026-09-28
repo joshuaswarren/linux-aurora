@@ -11,12 +11,26 @@ use crate::{driver::AsahiDevice, g18_compute::*, g18_compute_payload as payload,
 use core::sync::atomic::{fence, Ordering};
 use kernel::{firmware::Firmware, prelude::*};
 
+/// The verified CDM control stream (register 0x1a420) is a 40-byte direct
+/// launch, this barrier and this terminate. Command +0xee0 (`d4e0`, the
+/// G17/M5 `cdm_terminator`) is the terminate word's address. Block type is
+/// bits 31:29, as Mesa agx3_cmdstream.h decodes this capture.
+const CDM_LAUNCH_BYTES: usize = 40;
+const CDM_BARRIER: u32 = 0x6000_0160;
+const CDM_TERMINATE: u32 = 0x4000_0000;
+
+fn stream_words(bytes: &[u8]) -> [u32; 12] {
+    core::array::from_fn(|i| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()))
+}
+
 pub(crate) struct G18ComputePayloadMemory {
     // Mappings and their GEM storage are released before the VM root owner.
     pages: KVec<MappedObject>,
     vm: mmu::Vm,
     state: [u8; G18_COMPUTE_STATE_BYTES],
     output: usize,
+    /// `g18_compute_variant=1` replacement for command +0xee0.
+    cdm_terminator: Option<u64>,
 }
 
 impl G18ComputePayloadMemory {
@@ -49,10 +63,15 @@ impl G18ComputePayloadMemory {
             pages.push(page, GFP_KERNEL)?;
         }
         let state = reference.state_bytes().try_into().map_err(|_| EINVAL)?;
-        let mut owner = Self { pages, vm, state, output: output.ok_or(EINVAL)? };
+        let mut owner = Self { pages, vm, state, output: output.ok_or(EINVAL)?, cdm_terminator: None };
         let initial = owner.output_snapshot()?;
         if initial.checked != 4096 || initial.untouched != 4096 || initial.correct != 0 {
             return Err(EIO);
+        }
+        match *crate::module_parameters::g18_compute_variant.value() {
+            0 => {}
+            1 => owner.empty_cdm_stream(dev)?,
+            _ => return Err(EINVAL),
         }
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(),
@@ -73,7 +92,50 @@ impl G18ComputePayloadMemory {
 
     pub(crate) fn addition_inputs(&self)
         -> Result<(G18ComputeCommandInputs, G18ComputeRegisterInputs)> {
-        payload::addition_inputs(&self.state).map_err(|_| EINVAL)
+        let (mut command, registers) = payload::addition_inputs(&self.state).map_err(|_| EINVAL)?;
+        if let Some(terminator) = self.cdm_terminator { command.d4e0 = terminator; }
+        Ok((command, registers))
+    }
+
+    /// Stage8 bisection, `g18_compute_variant=1`: dispatch nothing. Only after
+    /// the unchanged verified load, rewrite the stream as the capture's own
+    /// barrier and terminate at +0/+4, zero +8..+0x2f (the old launch,
+    /// barrier and terminate) and point command +0xee0 at the new terminate.
+    /// Every other byte, page and register is unchanged; nothing is published.
+    fn empty_cdm_stream(&mut self, dev: &AsahiDevice) -> Result {
+        let mut command = G18ComputeCommandInputs::default();
+        let mut registers = G18ComputeRegisterInputs::default();
+        self.apply_state(&mut command, &mut registers);
+        // g18_compute.rs emits program[1] as register 0x1a420.
+        let (stream, terminator) = (registers.program[1], command.d4e0);
+        let end = CDM_LAUNCH_BYTES + 8;
+        let page = self.pages.iter().position(|page| page.iova() == stream);
+        let patched = match page {
+            Some(index) if terminator == stream + end as u64 - 4 =>
+                self.pages[index].with_bytes_mut(|bytes| {
+                    let before = stream_words(bytes);
+                    if before[0] >> 29 != 0 || before[10] != CDM_BARRIER
+                        || before[11] != CDM_TERMINATE || bytes[end..].iter().any(|b| *b != 0) {
+                        return Ok(None);
+                    }
+                    bytes[..end].fill(0);
+                    bytes[..4].copy_from_slice(&CDM_BARRIER.to_le_bytes());
+                    bytes[4..8].copy_from_slice(&CDM_TERMINATE.to_le_bytes());
+                    Ok(Some((before, stream_words(bytes))))
+                })?,
+            _ => None,
+        };
+        let Some((before, after)) = patched else {
+            dev_err!(dev.as_ref(),
+                "G18_COMPUTE_VARIANT=1 refused: stream {:#x} terminator {:#x} is not the captured launch, barrier and terminate; nothing changed\n",
+                stream, terminator);
+            return Err(EINVAL);
+        };
+        self.cdm_terminator = Some(stream + 4);
+        dev_info!(dev.as_ref(),
+            "G18_COMPUTE_VARIANT=1 empty stream {:#x}: words {:08x?} (were {:08x?}); command +0xee0 d4e0 {:#x} -> {:#x}; registers and all other bytes unchanged\n",
+            stream, after, before, terminator, stream + 4);
+        Ok(())
     }
 
     /// Call only while the GPU is quiescent or after an independently verified

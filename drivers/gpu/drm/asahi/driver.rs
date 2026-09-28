@@ -552,6 +552,15 @@ fn probe_t8152(
         );
         return Err(EINVAL);
     }
+    let variant = *crate::module_parameters::g18_compute_variant.value();
+    if variant > 1 || (variant != 0 && stage != g18_live_boot::STAGE_COMPUTE_ADD) {
+        dev_err!(
+            pdev.as_ref(),
+            "G18G: g18_compute_variant={} needs 0, or 1 with g18_initdata_test=8; refused before any MMIO\n",
+            variant
+        );
+        return Err(EINVAL);
+    }
     let probe = prepare_t8152_device(pdev, soc, stage)?;
     g18_live_boot_start(pdev, probe)
 }

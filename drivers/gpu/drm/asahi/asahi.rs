@@ -93,6 +93,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "T8152/J873 G18G bring-up stage. 0 refuses before MMIO/DMA. 1=read-only powered-resource probe. 2=RTKit. 3=initdata ACKs. 4=openings, idle policy, 60 s observation. 5=empty queue. 6=queue plus scheduler binding. 7=owned empty UMA pool binding. Stages 5/6/7 then observe without GPU jobs. Firmware stages require prior power, loader receipt and apple_mailbox.ascwrap_v8_cpu_control=1; all owners remain retained until reboot. 90=SGX power-on; 92=GFX1 power-on; 91=GFX power-on; 93=idle requests. Power stages are never implied. Mutating stages require user-authorized bring-up. Other values refused",
         },
+        g18_compute_variant: u32 {
+            default: 0,
+            description: "Stage 8 bisection. 0=the captured compute-add (default, unchanged). 1=empty stream: after the verified payload load, the CDM control stream becomes the capture's barrier 0x60000160 and terminate 0x40000000 at +0/+4, the old launch, barrier and terminate (+8..+0x2f) are zeroed, and command +0xee0 names the new terminate; nothing is dispatched, so a completion must leave all 4096 outputs poisoned. Other values, or 1 without g18_initdata_test=8, are refused",
+        },
         m5_graphics_frames: u32 {
             default: 1,
             description: "Number of sequential mode12 renders on a fresh RAM boot (1..64); reset pixels between completed frames",
