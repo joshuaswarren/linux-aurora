@@ -339,7 +339,9 @@ impl G18FirmwareMemory {
     pub(crate) fn use_firmware_queue_programming(&mut self, dev: &AsahiDevice) -> Result {
         let policy = SHARED_BASE + 0x2724;
         let trace = PRIVATE_BASE + init::G18G_26A428_PRIVATE_STATUS_A[0] as u64;
-        if self.shared.read_u32(policy)? != 1 || self.private.read_u32(trace)? != 0 {
+        let progress = REGION_C_BASE + 0x9ac;
+        if self.shared.read_u32(policy)? != 1 || self.private.read_u32(trace)? != 0
+            || self.region_c.read_u32(progress)? != 0x333 {
             return Err(EINVAL);
         }
         self.shared.write_u32(policy, 0)?;
@@ -348,10 +350,17 @@ impl G18FirmwareMemory {
         // scheduling/recovery. audit-g18-trace-mask-native.py executes these
         // exact branches. GFX1 and other trace classes remain unchanged.
         self.private.write_u32(trace, 3)?;
+        // b000 refresh 0x352c/0x3688 copies region-C+0x9ac into
+        // global 0x109488. Its compute nibble (bits8..11) selects native
+        // progress sampling: mode3 only checks busy; mode2 takes the
+        // detailed sampler. Keep TA/3D nibbles and all timeout bounds.
+        // This is a diagnostic selection for the single stage8 job.
+        self.region_c.write_u32(progress, 0x233)?;
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(),
             "G18_QUEUE_OWNER firmware: hwdata+0x2724=0 before root publication; no host KSMFE writes\n");
         dev_info!(dev.as_ref(), "G18_TRACE_MASK GFX status-A=3 before root publication\n");
+        dev_info!(dev.as_ref(), "G18_PROGRESS_POLICY region-C+0x9ac=0x233 before publication; timeout bounds unchanged\n");
         Ok(())
     }
 
