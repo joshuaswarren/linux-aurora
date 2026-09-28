@@ -1358,17 +1358,25 @@ dcpep_cb_set_frame_sync_props_h17p(struct apple_dcp *dcp,
 	u32 millinits;
 
 	/*
-	 * +0x04 is the brightness the firmware is driving, in 16.16 nits
-	 * (5957818 = 90.909 nits in the capture, +0x08 = 500.0 alongside it).
-	 * It reads 0 until the AP has set one.  Keep it as evidence of what
-	 * the firmware accepted; the backlight device reports the requested
-	 * level, as on every other firmware.
+	 * +0x04 is the brightness level applied by the frame this D006
+	 * belongs to, in 16.16 nits (5957818 = 90.909 nits in the capture,
+	 * +0x08 = 500.0 alongside it).  It is not a level readback: it is
+	 * non-zero only on the frame whose swap carried a new level and reads
+	 * 0 on every other frame, while the panel stays lit.  hb94 shows it
+	 * plainly: "reports 60.000", then 4 ms later the firmware logs
+	 * "send_brightness: dbv: 1259" (60 nits) again and D006 says 0.000,
+	 * with PSTR at the 60-nit figure throughout.  Logging every change
+	 * therefore printed "0 / 166 / 0 / 156" for each step of a fade.
+	 * A real 0 on the panel is only ever one we asked for, and
+	 * dcp_h17p_set_swap_brightness() logs that; keep this at debug and
+	 * never let a 0 through as a level.
 	 */
 	millinits = (u32)(((u64)get_unaligned_le32(&req->unk[4]) * 1000) >> 16);
-	if (millinits != dcp->brightness.h17p_reported_millinits) {
+	if (millinits &&
+	    millinits != dcp->brightness.h17p_reported_millinits) {
 		dcp->brightness.h17p_reported_millinits = millinits;
-		dev_info(dcp->dev, "DCP reports brightness %u.%03u nits\n",
-			 millinits / 1000, millinits % 1000);
+		dev_dbg(dcp->dev, "DCP applied brightness %u.%03u nits\n",
+			millinits / 1000, millinits % 1000);
 	}
 
 	for (i = 0; i < ARRAY_SIZE(identity_at); i++) {
@@ -1395,6 +1403,18 @@ static void dcp_h17p_set_swap_brightness(struct apple_dcp *dcp,
 	static const u8 flags[6] = { 1, 1, 1, 0, 1, 0 };
 	const u64 one = 0x3ff0000000000000ULL;	/* 1.0 */
 	u64 max = dcp_nits_to_double_bits(dcp->brightness.maximum);
+	int prev = dcp->brightness.h17p_sent_nits;
+
+	/*
+	 * A fade sends a level every frame; only the backlight going off,
+	 * coming back, or the first level after power-on is worth a line.
+	 */
+	if (prev < 0 || !prev != !nits)
+		dev_info(dcp->dev, "panel backlight %s (%u nits)\n",
+			 nits ? "on" : "off", nits);
+	else
+		dev_dbg(dcp->dev, "panel backlight %u nits\n", nits);
+	dcp->brightness.h17p_sent_nits = nits;
 
 	swap->bl_h17p_update = 1;
 	memcpy(swap->bl_h17p_flags, flags, sizeof(flags));
