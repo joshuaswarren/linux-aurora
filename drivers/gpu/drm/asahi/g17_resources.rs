@@ -54,6 +54,10 @@ pub(crate) mod g18;
 pub(crate) mod g18_pool;
 
 #[cfg(not(test))]
+#[path = "g18_scheduler_resources.rs"]
+pub(crate) mod g18_scheduler;
+
+#[cfg(not(test))]
 #[path = "g18_queue_probe.rs"]
 pub(crate) mod g18_queue;
 
