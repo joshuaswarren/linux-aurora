@@ -106,11 +106,27 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	 * reading straight back with the next swap that had an update
 	 * pending: the "DCP reports brightness 0.000 / 466 / 509 nits" bursts
 	 * of the 2026-09-28 daily, the fade restarting from whatever the
-	 * report said.  The level the firmware drives is already logged from
-	 * set_frame_sync_props.
+	 * report said.
+	 *
+	 * The one report that is useful is one that arrives before the
+	 * backlight device exists and before power-on has seeded a level:
+	 * that is the level the bootloader left the panel at, which every
+	 * other firmware publishes as IOMFB_PROPERTY_NITS and Asahi keeps.
+	 * Take it as the initial level, so the panel does not jump to
+	 * initial_brightness when the driver takes over.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		u32 nits = mnits.millinits / 1000;
+
+		if (!dcp->brightness.bl_dev && !dcp->brightness.nits && nits &&
+		    dcp->brightness.maximum > 0) {
+			nits = min(nits, dcp_h17p_max_nits(dcp));
+			dcp->brightness.nits = nits;
+			dev_info(dcp->dev, "inheriting the bootloader's backlight level: %u nits\n",
+				 nits);
+		}
 		return 0;
+	}
 
 	dcp->brightness.nits = mnits.millinits / 1000;
 
