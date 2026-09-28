@@ -98,6 +98,37 @@ const TRACE_JOURNAL_CAPACITY: usize = 32768;
 /// b000 0x7de8 constructs type4 with counter at +4 and stamp index at +12.
 const EVENT_TYPE_RECOVERY: u32 = 4;
 
+/// `halLoadUMADesc` device words (accelerator+0x11af8..0x11b10) as native
+/// `halInitSMAEnableMask` 0xfffffe0008c41bdc derives them on J873.
+/// getProbeScore stores readChipInfo's 0xe01500 core-enable word as the
+/// accelerator+0x480 fallback (0xfffffe0008c3d6c4, 0xfffffe0008c002d8); the
+/// +0x470 override stays zero without gpu-fstp-downgrade properties, which the
+/// J873 ADT lacks. Width +0x4ec is ID_COUNTS_1[7:0] (0xfffffe0008c3d554) and
+/// +0x4d4 the cluster count; generateRegisterList reads the same two fields,
+/// so they must equal the command topology. getPropertyCoreConfigImpl splits
+/// the same selected mask into the native registry core_mask_list, so every
+/// 16-bit lane must equal that list (zero beyond it).
+fn j873_sma_device_words(clusters: u32, width: u32) -> Result<[u64; 4]> {
+    let facts = crate::hw::agx3::T8152_REGISTRY;
+    if clusters != facts.num_mgpus || facts.core_mask_list.len() != clusters as usize
+        || !(1..=16).contains(&width) || width.checked_mul(clusters) != Some(facts.num_cores) {
+        return Err(EINVAL);
+    }
+    let mut mask = 0u64;
+    for (index, &cores) in facts.core_mask_list.iter().enumerate() {
+        if u64::from(cores) >> width != 0 { return Err(EINVAL); }
+        mask |= u64::from(cores) << (index as u32 * width);
+    }
+    let words = crate::g18_uma::pack_g18_sma_masks([0; 2], [mask, 0], width).ok_or(EINVAL)?;
+    for group in 0..16 {
+        let lane = (words[group / 4] >> ((group % 4) * 16)) & 0xffff;
+        if lane != facts.core_mask_list.get(group).map_or(0, |&cores| u64::from(cores)) {
+            return Err(EINVAL);
+        }
+    }
+    Ok(words)
+}
+
 struct G18TraceRecord {
     ordinal: u32,
     raw: [u8; REPORT_RECORD_SIZE],
@@ -125,6 +156,7 @@ pub(crate) struct G18FirmwareMemory {
     aliases: KVec<mmu::KernelMapping>,
     registers: KVec<mmu::KernelMapping>,
     report_counts: [[u32; 2]; 2],
+    completion_masks: [u64; 2],
     trace_printed: [u32; 2],
     trace_journal: [KVVec<G18TraceRecord>; 2],
     trace_dropped: [u32; 2],
@@ -334,7 +366,7 @@ impl G18FirmwareMemory {
             primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
             pbdesc, uma, uma_pool, scheduler, compute, compute_payload: None,
             completions, aliases, registers,
-            report_counts: [[0; 2]; 2], trace_printed: [0; 2], uat,
+            report_counts: [[0; 2]; 2], completion_masks: [0; 2], trace_printed: [0; 2], uat,
             trace_journal, trace_dropped: [0; 2],
         }), GFP_KERNEL)
     }
@@ -416,7 +448,15 @@ impl G18FirmwareMemory {
         let (mut command, mut registers) = self.prepare_compute_payload(dev)?.addition_inputs()?;
         let context_id = self.bind_compute_process(dev)?;
         let scratch = self.prepare_compute_scratch(dev)?;
+        // The hardware reads the pool through the job's context (stage27
+        // GMMU fault in vm_slot 3), so the pool must be mapped in that VM.
+        let payload_vm = self.compute_payload.as_ref().ok_or(EINVAL)?.vm();
+        self.uma_pool.alias_into_process(dev, &self.uat, payload_vm)?;
         let pool = self.prepare_uma_pool_binding()?;
+        // Native prepareLocked loads the hardware descriptor for the same slot
+        // before the submit's tag15 names the pool; bind_pool publishes later.
+        let sma = j873_sma_device_words(registers.clusters, registers.cluster_width)?;
+        self.uma_pool.load_hardware_descriptor(dev, &mut self.uma, pool, sma)?;
         let scheduler = self.scheduler.prepare(0, 1)?;
 
         // One fresh CL queue, first work ordinal 0, hardware stamp 1. Native
@@ -630,6 +670,15 @@ impl G18FirmwareMemory {
                         dev_info!(dev.as_ref(), "G18_EVENT role={} ordinal={} type={} payload={:x?}\n",
                             role, count, word(0), [qword(4), qword(12), qword(20), qword(28), qword(36)]);
                         recovery |= word(0) == EVENT_TYPE_RECOVERY;
+                        if role == 0 && word(0) == 1 {
+                            // Original G18 b000 233a8..233d4 uses this exact
+                            // type-1 prefix. Copy/validate before releasing the
+                            // slot; the remaining bytes are not completion proof.
+                            let event = crate::g17_completion::decode_g17p_firmware_stamp_event(&raw)
+                                .map_err(|_| EIO)?;
+                            self.completion_masks[0] |= event.masks[0];
+                            self.completion_masks[1] |= event.masks[1];
+                        }
                     } else if self.trace_printed[role] < TRACE_PRINT_BUDGET[role] {
                         dev_info!(dev.as_ref(),
                             "G18_TRACE role={} ordinal={} timestamp={} type={} id={:#x} args={:x?}\n",
@@ -649,6 +698,11 @@ impl G18FirmwareMemory {
     /// Report-record totals per role and channel since construction.
     pub(crate) fn report_counts(&self) -> [[u32; 2]; 2] {
         self.report_counts
+    }
+
+    /// Only primary firmware type-1 records contribute to these fresh-boot bits.
+    pub(crate) fn completion_masks(&self) -> [u64; 2] {
+        self.completion_masks
     }
 
     /// Export after the transaction and stop requests, never while polling a

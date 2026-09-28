@@ -7,7 +7,7 @@
 //! M6 adds 12 bytes at config +0x6e; never use M5's 0x86-byte packet here.
 
 use super::MappedObject;
-use super::g18_pool::G18UmaPoolBinding;
+use super::g18_pool::{G18UmaPoolBinding, G18_UMA_HARDWARE_SLOT};
 use super::g18_compute::G18PreparedComputeCommand;
 use crate::{driver::AsahiDevice, mmu};
 use core::sync::atomic::{fence, Ordering};
@@ -30,6 +30,9 @@ const SLOT: usize = 0xb90b8 - 0x50000 + QUEUE_ID as usize * 0x28;
 const SCHEDULER: usize = 0xb7468 - 0x50000 + QUEUE_ID as usize * 8;
 const POOL_SLOT: usize = 0x5f660 - 0x50000; // owned slot 0, native stride 0x100
 const QUEUE_POOLS: usize = 0x6f660 - 0x50000 + QUEUE_ID as usize * 0x38;
+// POOL_SLOT, the first membership word and pool_bound's bit assume the
+// firmware pool slot equals the hardware UMA slot that the host loaded.
+const _: () = assert!(G18_UMA_HARDWARE_SLOT == 0);
 
 /// Reserved GFX DATA, never written by the host. No native snapshot pointers
 /// are used: the current DT reservation is the only physical address source.
@@ -233,7 +236,7 @@ impl G18QueueProbe {
         let before = self.pool_status();
         if self.counters()? != [2; 3] || !Self::installed(self.slot())
             || !Self::scheduler_bound(self.scheduler_status()?)
-            || binding.slot != 0 || binding.generation != 0
+            || binding.slot != G18_UMA_HARDWARE_SLOT || binding.generation != 0
             || binding.state < KERNEL_BASE || binding.state & 0x3fff != 0
             || before[0] != 0 || before[3..5] != [0; 2]
             || before[6..9] != [0; 3] {
