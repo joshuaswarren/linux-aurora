@@ -36,6 +36,7 @@
 
 use super::MappedObject;
 use super::g18_pool::{G18UmaPoolBinding, G18UmaPoolMemory};
+use super::g18_scheduler::G18SchedulerMemory;
 use crate::{driver::AsahiDevice, g17_initdata as init, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
@@ -107,6 +108,7 @@ pub(crate) struct G18FirmwareMemory {
     pbdesc: MappedObject,
     uma: MappedObject,
     uma_pool: G18UmaPoolMemory,
+    scheduler: G18SchedulerMemory,
     completions: KVec<MappedObject>,
     aliases: KVec<mmu::KernelMapping>,
     registers: KVec<mmu::KernelMapping>,
@@ -223,6 +225,7 @@ impl G18FirmwareMemory {
             init::G18G_26A428_AON_PTD_SIZE, mmu::UAT_PGSZ as u64, mmu::PROT_FW_PRIV_RW)?;
         let uma_pool = G18UmaPoolMemory::new(dev, &uat, DYNAMIC_START..DYNAMIC_END,
             crate::hw::agx3::T8152_REGISTRY.num_cores)?;
+        let scheduler = G18SchedulerMemory::new(dev, &uat, DYNAMIC_START..DYNAMIC_END)?;
 
         aon.with_bytes_mut(|out| init::encode_g18g_26a428_aon_ptd(out).map_err(|_| EINVAL))?;
         region_c.with_bytes_mut(|out| {
@@ -308,12 +311,14 @@ impl G18FirmwareMemory {
         // Keep the retained graph off the kernel stack.
         KBox::init(try_init!(Self {
             primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
-            pbdesc, uma, uma_pool, completions, aliases, registers,
+            pbdesc, uma, uma_pool, scheduler, completions, aliases, registers,
             report_counts: [[0; 2]; 2], trace_printed: [0; 2], uat,
         }), GFP_KERNEL)
     }
 
     pub(crate) fn uma_pool(&self) -> &G18UmaPoolMemory { &self.uma_pool }
+
+    pub(crate) fn scheduler(&mut self) -> &mut G18SchedulerMemory { &mut self.scheduler }
 
     pub(crate) fn prepare_uma_pool_binding(&mut self) -> Result<G18UmaPoolBinding> {
         self.uma_pool.prepare_binding()
