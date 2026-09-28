@@ -92,7 +92,7 @@ const REPORT_PRODUCER_OFFSET: u64 = 0x20;
 const REPORT_CAPACITY: [u32; 2] = [256, 512];
 const REPORT_DRAIN_BUDGET: usize = 128;
 const TRACE_PRINT_BUDGET: [u32; 2] = [512, 16];
-/// Event type the J813 firmware used for recovery records (INFERRED unchanged).
+/// b000 0x7de8 constructs type4 with counter at +4 and stamp index at +12.
 const EVENT_TYPE_RECOVERY: u32 = 4;
 
 /// Owning mappings are declared before the UAT so they drop first. Aliases
@@ -273,8 +273,8 @@ impl G18FirmwareMemory {
             sentinel_high: SENTINEL_BASE,
             alias_high: [PBDESC_BASE, UMA_BASE],
         };
-        // The J813 status-A trace mask (m5_fw_trace) is deliberately not
-        // applied: the 26A428 trace-class bits have not been re-derived.
+        // GFX traces remain disabled here. Stage8 explicitly enables only
+        // re-derived b000 command/scheduler classes before root publication.
         shared.with_bytes_mut(|out| {
             init::encode_g18g_26a428_hw_data(completion_bindings, qos.iova(),
                 &mut out[..init::G18G_26A428_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
@@ -338,11 +338,20 @@ impl G18FirmwareMemory {
     /// sends tag15/tag14 and performs no host KSMFE MMIO, so choose one owner.
     pub(crate) fn use_firmware_queue_programming(&mut self, dev: &AsahiDevice) -> Result {
         let policy = SHARED_BASE + 0x2724;
-        if self.shared.read_u32(policy)? != 1 { return Err(EINVAL); }
+        let trace = PRIVATE_BASE + init::G18G_26A428_PRIVATE_STATUS_A[0] as u64;
+        if self.shared.read_u32(policy)? != 1 || self.private.read_u32(trace)? != 0 {
+            return Err(EINVAL);
+        }
         self.shared.write_u32(policy, 0)?;
+        // b000 0x216b8 obtains GFX status-A; 0x3508 loads its first word
+        // into global 0x1093e4. Bit0 gates commands/completion; bit1 gates
+        // scheduling/recovery. audit-g18-trace-mask-native.py executes these
+        // exact branches. GFX1 and other trace classes remain unchanged.
+        self.private.write_u32(trace, 3)?;
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(),
             "G18_QUEUE_OWNER firmware: hwdata+0x2724=0 before root publication; no host KSMFE writes\n");
+        dev_info!(dev.as_ref(), "G18_TRACE_MASK GFX status-A=3 before root publication\n");
         Ok(())
     }
 
