@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
+#include <linux/math64.h>
 #include <linux/module.h>
 
 #include <media/media-device.h>
@@ -647,9 +648,13 @@ static int isp_vidioc_enum_frameintervals(struct file *filp, void *priv,
 	if (interval->index != 0)
 		return -EINVAL;
 
-	interval->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	interval->discrete.numerator = 1;
-	interval->discrete.denominator = 30;
+	interval->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
+	interval->stepwise.min.numerator = ISP_FRAME_RATE_SCALE;
+	interval->stepwise.min.denominator = ISP_FRAME_RATE_MAX;
+	interval->stepwise.max.numerator = ISP_FRAME_RATE_SCALE;
+	interval->stepwise.max.denominator = ISP_FRAME_RATE_MIN;
+	interval->stepwise.step.numerator = 1;
+	interval->stepwise.step.denominator = 1;
 	return 0;
 }
 
@@ -836,8 +841,8 @@ static int isp_vidioc_get_param(struct file *file, void *fh,
 
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
-	a->parm.capture.timeperframe.numerator = ISP_FRAME_RATE_NUM;
-	a->parm.capture.timeperframe.denominator = ISP_FRAME_RATE_DEN;
+	a->parm.capture.timeperframe.numerator = ISP_FRAME_RATE_SCALE;
+	a->parm.capture.timeperframe.denominator = isp->frame_rate;
 
 	return 0;
 }
@@ -846,17 +851,34 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
 				struct v4l2_streamparm *a)
 {
 	struct apple_isp *isp = video_drvdata(file);
+	struct v4l2_fract *tpf = &a->parm.capture.timeperframe;
+	u64 frame_rate;
 
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
 	    (!isp->multiplanar ||
 	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
 		return -EINVAL;
 
-	/* Not supporting frame rate sets. No use. Plus floats. */
+	if (vb2_is_streaming(&isp->vbq))
+		return -EBUSY;
+
+	/* A zero interval resets the nominal rate, as required by V4L2. */
+	if (!tpf->numerator || !tpf->denominator) {
+		frame_rate = ISP_FRAME_RATE_MAX;
+	} else {
+		frame_rate = div64_u64((u64)tpf->denominator *
+					     ISP_FRAME_RATE_SCALE +
+					     tpf->numerator / 2,
+				     tpf->numerator);
+		frame_rate = clamp_val(frame_rate, ISP_FRAME_RATE_MIN,
+				       ISP_FRAME_RATE_MAX);
+	}
+
+	isp->frame_rate = frame_rate;
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
-	a->parm.capture.timeperframe.numerator = ISP_FRAME_RATE_NUM;
-	a->parm.capture.timeperframe.denominator = ISP_FRAME_RATE_DEN;
+	tpf->numerator = ISP_FRAME_RATE_SCALE;
+	tpf->denominator = isp->frame_rate;
 
 	return 0;
 }
@@ -926,6 +948,8 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	struct vb2_queue *vbq = &isp->vbq;
 	struct isp_format *fmt = isp_get_current_format(isp);
 	int err;
+
+	isp->frame_rate = ISP_FRAME_RATE_MAX;
 
 	err = isp_set_preset(isp, fmt, &isp->presets[0]);
 	if (err) {

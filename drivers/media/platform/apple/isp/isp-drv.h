@@ -266,6 +266,8 @@ struct apple_isp {
 	enum isp_firmware_version fw_compat;
 	u32 platform_id;
 	u32 temporal_filter;
+	/* Requested capture rate in frames per second, scaled by 256. */
+	u32 frame_rate;
 	struct isp_preset *presets;
 	int num_presets;
 

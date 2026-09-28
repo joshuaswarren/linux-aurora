@@ -381,11 +381,12 @@ static int isp_ch_configure_frame_rate(struct apple_isp *isp, u32 ch)
 {
 	int err;
 
-	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, ISP_FRAME_RATE_DEN);
+	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, isp->frame_rate);
 	if (err)
 		return err;
 
-	return isp_cmd_ch_ae_frame_rate_min_set(isp, ch, ISP_FRAME_RATE_DEN2);
+	/* Keep AE from extending the frame time; it must raise gain instead. */
+	return isp_cmd_ch_ae_frame_rate_min_set(isp, ch, isp->frame_rate);
 }
 
 static int isp_ch_configure_pools(struct apple_isp *isp, u32 ch)
