@@ -25,6 +25,8 @@
 
 		keyboard = &keyboard;
 
+		wifi0 = &wifi0;
+
 	};
 
 
@@ -115,6 +117,31 @@
 		power-domains = <&ps_apcie_sys_gp>;
 	};
 
+	/*
+	 * The radio's DMA path.  This machine has no RAM below 4 GiB, so
+	 * the MT7932 needs the translated aperture of the APCIe DART and
+	 * PIODMA before its driver can claim the functions.  These used to
+	 * be applied after boot by an overlay (drivers/of/j700_radio.dtso);
+	 * the overlay module now only adds a MAC address override.
+	 */
+	piodma_radio: piodma@390030000 {
+		compatible = "apple,t8140-pcie-piodma";
+		reg = <0x3 0x90030000 0x0 0x4000>,
+		      <0x3 0x90034000 0x0 0x4000>,
+		      <0x3 0x90038000 0x0 0x4000>;
+		reg-names = "engine", "irq-aggregator", "fabric";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1207 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart 17>;
+		apple,iova-address-bits = <36>;
+		apple,piodma-base-addresses = <0x1c 0xb0000000>,
+					      <0xb 0xc0000000>,
+					      <0xb 0x80000000>;
+		apple,piodma-aperture-sizes = <0x0 0x10000000>,
+					      <0x0 0x20000000>,
+					      <0x0 0x40000000>;
+	};
+
 	pcie0: pcie@1cb0000000 {
 		compatible = "apple,t8140-pcie", "apple,t6020-pcie";
 		device_type = "pci";
@@ -132,6 +159,14 @@
 		msi-parent = <&pcie0>;
 		msi-ranges = <&aic AIC_IRQ 1331 IRQ_TYPE_EDGE_RISING 32>;
 		power-domains = <&ps_apcie_sys_gp>;
+
+		iommu-map = <0x100 &pcie0_dart 1 1>,
+			    <0x101 &pcie0_dart 2 1>;
+		iommu-map-mask = <0xffff>;
+		dma-coherent;
+		apple,valid-functions = <0x3>;
+		apple,endpoint-iova-address-bits = <32>;
+		apple,piodma = <&piodma_radio>;
 
 		bus-range = <0 8>;
 		#address-cells = <3>;
@@ -163,6 +198,13 @@
 					<0 0 0 2 &port00 0 0 0 1>,
 					<0 0 0 3 &port00 0 0 0 2>,
 					<0 0 0 4 &port00 0 0 0 3>;
+
+			wifi0: wifi@0,0 {
+				compatible = "pci14c3,7932";
+				reg = <0x10000 0x0 0x0 0x0 0x0>;
+				/* To be filled by the loader */
+				local-mac-address = [00 00 00 00 00 00];
+			};
 		};
 	};
 };
