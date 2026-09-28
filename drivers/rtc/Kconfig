@@ -2095,7 +2095,7 @@ config RTC_DRV_WILCO_EC
 
 config RTC_DRV_APPLE_PMU
 	tristate "Experimental Apple J700 PMU RTC"
-	depends on ARCH_APPLE && SPMI && PM_SLEEP
+	depends on ARCH_APPLE && NVMEM_APPLE_SPMI && PM_SLEEP
 	help
 	  Qualification driver for the Baku PMU RTC alarm on J700. Requires
 	  experimental=1 and a manually installed device-tree description.

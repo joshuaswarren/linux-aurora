@@ -7,7 +7,8 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/rtc.h>
-#include <linux/spmi.h>
+#include <linux/platform_device.h>
+#include <linux/regmap.h>
 #include <linux/suspend.h>
 #include <linux/unaligned.h>
 
@@ -28,8 +29,10 @@ module_param(experimental, bool, 0444);
 MODULE_PARM_DESC(experimental, "Allow retained-power J700 RTC qualification");
 
 struct apple_pmu_rtc {
-	struct spmi_device *sdev;
+	struct device *dev;
+	struct regmap *regmap;
 	struct rtc_device *rtc;
+	/* Serialize alarm transactions and the threaded interrupt handler. */
 	struct mutex lock;
 	s64 offset;
 	int irq;
@@ -39,12 +42,12 @@ struct apple_pmu_rtc {
 
 static int pmu_read(struct apple_pmu_rtc *p, u16 addr, void *buf, size_t len)
 {
-	return spmi_ext_register_readl(p->sdev, addr, buf, len);
+	return regmap_bulk_read(p->regmap, addr, buf, len);
 }
 
 static int pmu_write(struct apple_pmu_rtc *p, u16 addr, const void *buf, size_t len)
 {
-	return spmi_ext_register_writel(p->sdev, addr, buf, len);
+	return regmap_bulk_write(p->regmap, addr, buf, len);
 }
 
 static int pmu_update(struct apple_pmu_rtc *p, u16 addr, u8 mask, u8 val)
@@ -219,15 +222,15 @@ static irqreturn_t pmu_irq(int irq, void *data)
 	}
 	mutex_unlock(&p->lock);
 	if (ret) {
-		dev_err(&p->sdev->dev, "alarm IRQ I/O failed: %d; IRQ disabled\n", ret);
-		pm_wakeup_dev_event(&p->sdev->dev, 0, true);
+		dev_err(p->dev, "alarm IRQ I/O failed: %d; IRQ disabled\n", ret);
+		pm_wakeup_dev_event(p->dev, 0, true);
 		return IRQ_HANDLED;
 	}
 	if (!(event & PMU_ALARM_BIT))
 		return IRQ_NONE;
-	dev_info(&p->sdev->dev, "PMU RTC alarm fired\n");
-	if (device_may_wakeup(&p->sdev->dev))
-		pm_wakeup_dev_event(&p->sdev->dev, 0, true);
+	dev_info(p->dev, "PMU RTC alarm fired\n");
+	if (device_may_wakeup(p->dev))
+		pm_wakeup_dev_event(p->dev, 0, true);
 	rtc_update_irq(p->rtc, 1, RTC_AF | RTC_IRQF);
 	return IRQ_HANDLED;
 }
@@ -260,14 +263,14 @@ static void pmu_cleanup(void *data)
 		disable_irq(p->irq);
 	mutex_lock(&p->lock);
 	if (pmu_disarm(p))
-		dev_err(&p->sdev->dev, "failed to disarm alarm during cleanup\n");
+		dev_err(p->dev, "failed to disarm alarm during cleanup\n");
 	mutex_unlock(&p->lock);
-	device_init_wakeup(&p->sdev->dev, false);
+	device_init_wakeup(p->dev, false);
 }
 
-static int pmu_probe(struct spmi_device *sdev)
+static int pmu_probe(struct platform_device *pdev)
 {
-	struct device *dev = &sdev->dev;
+	struct device *dev = &pdev->dev;
 	struct apple_pmu_rtc *p;
 	__le32 sec;
 	__le16 frac;
@@ -279,7 +282,10 @@ static int pmu_probe(struct spmi_device *sdev)
 	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
-	p->sdev = sdev;
+	p->dev = dev;
+	p->regmap = dev_get_regmap(dev->parent, NULL);
+	if (!p->regmap)
+		return -EPROBE_DEFER;
 	mutex_init(&p->lock);
 	dev_set_drvdata(dev, p);
 	p->irq = of_irq_get(dev->of_node, 0);
@@ -347,7 +353,7 @@ static const struct of_device_id pmu_match[] = {
 };
 MODULE_DEVICE_TABLE(of, pmu_match);
 
-static struct spmi_driver pmu_driver = {
+static struct platform_driver pmu_driver = {
 	.probe = pmu_probe,
 	.driver = {
 		.name = "apple-pmu-rtc",
@@ -355,7 +361,7 @@ static struct spmi_driver pmu_driver = {
 		.pm = &pmu_pm_ops,
 	},
 };
-module_spmi_driver(pmu_driver);
+module_platform_driver(pmu_driver);
 
 MODULE_DESCRIPTION("Experimental Apple J700 retained-power PMU RTC");
 MODULE_LICENSE("GPL");
