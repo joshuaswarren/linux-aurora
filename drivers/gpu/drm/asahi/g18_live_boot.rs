@@ -1478,6 +1478,14 @@ impl G18Session {
                 dev_info!(self.dev.as_ref(),
                     "G18_COMPUTE completion outer={:?} inner={:?} stamps={:x?} times={:x?} event_masks={:x?} scheduler={:?} output={:?}\n",
                     outer, inner, completion.stamps, completion.timestamps, masks, scheduler, output);
+                if *crate::module_parameters::g18_compute_variant.value() == 2 {
+                    let pixels = memory.triangle_output()?;
+                    dev_info!(self.dev.as_ref(), "G18_COMPUTE_TRIANGLE output={:?}\n", pixels);
+                    if !pixels.passed() { return Err(EIO); }
+                    self.check_faults("compute triangle output")?;
+                    dev_info!(self.device(), "G18_COMPUTE_TRIANGLE_PASS: 4096 GPU pixels match after independent completion; compute rasterization, no TA/3D or Mesa\n");
+                    return Ok(());
+                }
                 // g18_compute_variant=1 dispatches nothing: every output must stay poisoned.
                 let empty = *crate::module_parameters::g18_compute_variant.value() == 1;
                 let expected = if empty { (0, 4096) } else { (4096, 0) };
