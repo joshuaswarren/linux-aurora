@@ -20,9 +20,11 @@
 #include "dcp-internal.h"
 
 /*
- * H17P (J700) does not tell us the level iBoot left the panel at (D006
- * reports 0 nits until the AP sets one), so the first swap after power-on
- * applies this.  40 % of the panel's 525 nits.
+ * H17P (J700) does not publish the level iBoot left the panel at (D006
+ * reports 0 nits until the AP sets one).  When the powerlog service
+ * reports it before power-on, that level is kept (systemep.c); otherwise
+ * the first swap after power-on applies this.  40 % of the panel's 525
+ * nits.
  */
 static unsigned int initial_brightness = 210;
 module_param(initial_brightness, uint, 0644);
@@ -177,11 +179,15 @@ u64 dcp_nits_to_double_bits(u32 nits)
 	return ((u64)(1023 + msb) << 52) | mant;
 }
 
+/* The highest level the H17P backlight device offers. */
+u32 dcp_h17p_max_nits(struct apple_dcp *dcp)
+{
+	return min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+}
+
 u32 dcp_h17p_initial_nits(struct apple_dcp *dcp)
 {
-	u32 max = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
-
-	return clamp_t(u32, initial_brightness, 1, max);
+	return clamp_t(u32, initial_brightness, 1, dcp_h17p_max_nits(dcp));
 }
 
 #define SCALE_FACTOR (1 << 10)

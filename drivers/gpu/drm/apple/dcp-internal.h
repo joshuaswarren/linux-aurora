@@ -480,6 +480,7 @@ extern char dcp_rtp_request[32];
 extern int dcp_dither_request;
 extern int dcp_pipe_crc_reads;
 extern unsigned int dcp_pipe_crc_idx;
+u32 dcp_h17p_max_nits(struct apple_dcp *dcp);
 u32 dcp_h17p_initial_nits(struct apple_dcp *dcp);
 int dcp_h17p_present_brightness(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
