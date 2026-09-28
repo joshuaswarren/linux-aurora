@@ -331,17 +331,18 @@ impl G18FirmwareMemory {
     pub(crate) fn compute(&mut self) -> &mut G18ComputeMemory { &mut self.compute }
 
     /// Select the firmware-owned KSMFE queue path before root publication.
-    /// b000 0x2183c..0x21844 copies hwdata+0x101c to global+0x109f5c;
+    /// b000 0x216f8..0x21700 forms x10=global+0x1093e0, then 0x21884
+    /// copies hwdata+0x2724 to [x10+0xb7c] (global+0x109f5c);
     /// 0x12cdc..0x12de8 skips tag15 hardware queue setup when it is nonzero.
     /// Native macOS uses host queue programming. This first Linux submission
     /// sends tag15/tag14 and performs no host KSMFE MMIO, so choose one owner.
     pub(crate) fn use_firmware_queue_programming(&mut self, dev: &AsahiDevice) -> Result {
-        let policy = SHARED_BASE + 0x101c;
+        let policy = SHARED_BASE + 0x2724;
         if self.shared.read_u32(policy)? != 1 { return Err(EINVAL); }
         self.shared.write_u32(policy, 0)?;
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(),
-            "G18_QUEUE_OWNER firmware: hwdata+0x101c=0 before root publication; no host KSMFE writes\n");
+            "G18_QUEUE_OWNER firmware: hwdata+0x2724=0 before root publication; no host KSMFE writes\n");
         Ok(())
     }
 
