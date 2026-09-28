@@ -7,6 +7,7 @@
 //! M6 adds 12 bytes at config +0x6e; never use M5's 0x86-byte packet here.
 
 use super::MappedObject;
+use super::g18_pool::G18UmaPoolBinding;
 use crate::{driver::AsahiDevice, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::{c_str, io, prelude::*};
@@ -26,6 +27,8 @@ const CONFIG: usize = 0x1800;
 const DATA_SIZE: usize = 0xbc000;
 const SLOT: usize = 0xb90b8 - 0x50000 + QUEUE_ID as usize * 0x28;
 const SCHEDULER: usize = 0xb7468 - 0x50000 + QUEUE_ID as usize * 8;
+const POOL_SLOT: usize = 0x5f660 - 0x50000; // owned slot 0, native stride 0x100
+const QUEUE_POOLS: usize = 0x6f660 - 0x50000 + QUEUE_ID as usize * 0x38;
 
 /// Reserved GFX DATA, never written by the host. No native snapshot pointers
 /// are used: the current DT reservation is the only physical address source.
@@ -210,6 +213,54 @@ impl G18QueueProbe {
             && (header >> 8) & 0xff != 0xff
             && (header >> 16) & 0xffff_ffff == 0x0104_0204
             && low == 1u64 << QUEUE_ID && high == 0
+    }
+
+    /// Observe both directions of firmware-owned pool membership, in addition
+    /// to the state/generation tuple. Retirement alone is not a binding proof.
+    pub(crate) fn pool_status(&self) -> [u64; 9] {
+        let header = self.firmware.words::<3>(POOL_SLOT);
+        let members = self.firmware.words::<2>(POOL_SLOT + 0x78);
+        let flags = self.firmware.words::<1>(POOL_SLOT + 0xe0);
+        let growth = self.firmware.words::<2>(POOL_SLOT + 0xf0);
+        let queues = self.firmware.words::<1>(QUEUE_POOLS);
+        [header[0], header[1], header[2], members[0], members[1], flags[0],
+         growth[0], growth[1], queues[0]]
+    }
+
+    pub(crate) fn prepare_pool_bind(&mut self, binding: G18UmaPoolBinding) -> Result {
+        let before = self.pool_status();
+        if self.counters()? != [2; 3] || !Self::installed(self.slot())
+            || !Self::scheduler_bound(self.scheduler_status()?)
+            || binding.slot != 0 || binding.generation != 0
+            || binding.state < KERNEL_BASE || binding.state & 0x3fff != 0
+            || before[0] != 0 || before[3..5] != [0; 2]
+            || before[6..9] != [0; 3] {
+            return Err(EBUSY);
+        }
+        self.graph.with_bytes_mut(|out| {
+            if out[CONFIG + 0x200..CONFIG + 0x298].iter().any(|x| *x != 0)
+                || out[CONFIG + 0x136..CONFIG + 0x13e].iter().any(|x| *x != 0)
+                || out[CONFIG + 0x13e..CONFIG + 0x14a].iter().any(|x| *x != 0xff) {
+                return Err(EBUSY);
+            }
+            out.copy_within(CONFIG + 0x100..CONFIG + 0x198, CONFIG + 0x200);
+            let config = &mut out[CONFIG + 0x200..CONFIG + 0x298];
+            put32(config, 0x52, 0); // scheduler is already bound
+            put64(config, 0x36, binding.state);
+            put64(config, 0x3e, binding.generation);
+            put32(config, 0x46, binding.slot);
+            put64(out, ITEMS + 16, GRAPH_BASE + CONFIG as u64 + 0x200);
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40, 3)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn pool_bound(status: [u64; 9], binding: G18UmaPoolBinding) -> bool {
+        status == [binding.state, binding.generation, (2u64 << 32) | 3,
+                   1u64 << QUEUE_ID, 0, 1, 0, 0, 1]
     }
 
     pub(crate) fn installed(slot: [u64; 5]) -> bool {

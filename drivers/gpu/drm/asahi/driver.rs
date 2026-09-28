@@ -546,7 +546,7 @@ fn probe_t8152(
     if !g18_live_boot::stage_is_known(stage) {
         dev_err!(
             pdev.as_ref(),
-            "G18G: g18_initdata_test={} is not a known stage (1-6, 90-93); refused before any MMIO\n",
+            "G18G: g18_initdata_test={} is not a known stage (1-7, 90-93); refused before any MMIO\n",
             stage
         );
         return Err(EINVAL);

@@ -12,13 +12,21 @@
 use super::MappedObject;
 use crate::{driver::AsahiDevice, g18_uma, mmu};
 use core::ops::Range;
+use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 
 // Host-selected addresses in the shared GPU view, disjoint from the descriptor
 // and completion aliases. Actual extents are checked before allocation.
 const DIRECTORY_BASE: u64 = 0x70_0200_0000;
 const BLOCK_LIST_BASE: u64 = 0x70_0400_0000;
-const STATE_BYTES: usize = 0xa0;
+const STATE_BYTES: usize = g18_uma::G18_POOL_STATE_BYTES;
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G18UmaPoolBinding {
+    pub(crate) state: u64,
+    pub(crate) generation: u64,
+    pub(crate) slot: u32,
+}
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct G18UmaPoolView {
@@ -41,6 +49,7 @@ pub(crate) struct G18UmaPoolMemory {
     state: MappedObject,
     geometry: g18_uma::G18UmaGeometry,
     layout: g18_uma::G18UmaSparseDirectory,
+    encoded: bool,
 }
 
 impl G18UmaPoolMemory {
@@ -126,7 +135,46 @@ impl G18UmaPoolMemory {
         dev_info!(dev.as_ref(),
             "G18 UMA sparse owner: reserved={:#x} backing_pages={} holes={} bias={:#x} aliases=verified guards=verified unpublished\n",
             layout.reservation_bytes, layout.initial_page_count, holes, layout.gpu_base_offset);
-        Ok(Self { aliases, directory, block_list, state, geometry, layout })
+        Ok(Self { aliases, directory, block_list, state, geometry, layout, encoded: false })
+    }
+
+    /// Prepare this boot's single empty compute pool. The caller may publish
+    /// the returned identity once; ownership must survive firmware access.
+    /// No committed private blocks or runtime growth are provided yet.
+    pub(crate) fn prepare_binding(&mut self) -> Result<G18UmaPoolBinding> {
+        if self.encoded { return Err(EBUSY); }
+        let encoded = g18_uma::encode_g18_pool_state(&g18_uma::G18UmaPoolState {
+            // Host identities are local to this one fixed-VA pool and boot.
+            // The statistics ID and FList generation have different meanings.
+            statistics_id: 1,
+            // Native halUMAGetGrowType returns 2; implicit engine init also
+            // stores 2. This records the protocol, not an implemented grow path.
+            grow_engine: 2,
+            priority: 2,
+            directory_gpu: DIRECTORY_BASE + self.layout.gpu_base_offset,
+            directory_stride: self.geometry.directory_bytes_per_usc,
+            chunk_counters: [0, 0],
+            block_list_gpu: BLOCK_LIST_BASE,
+            populated_blocks: 0,
+            block_units_64k: (self.geometry.block_bytes >> 16).try_into()?,
+            // Native base configureDevice initializes this mode to zero.
+            sma_mode: 0,
+            preempt_counter_gpu: 0,
+            preempt_counter: 0,
+            compute: true,
+            // Fresh Pool::init clears +0x1f0; prepareBufferResources writes 1.
+            policy_value: 1,
+        });
+        self.state.with_bytes_mut(|bytes| {
+            if bytes.iter().enumerate().any(|(i, &v)| v != if (8..12).contains(&i) { 0xff } else { 0 }) {
+                return Err(EBUSY);
+            }
+            bytes.copy_from_slice(&encoded);
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        self.encoded = true;
+        Ok(G18UmaPoolBinding { state: self.state.iova(), generation: 0, slot: 0 })
     }
 
     pub(crate) fn directory_page_high(&self, index: usize) -> Option<u64> {
