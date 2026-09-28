@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! Retained M5 application root leases, shared by render and compute queues.
+//! Retained M5 application root leases, shared by render and compute queues,
+//! with an explicitly admitted T8152 diagnostic compute lease.
 //!
 //! Native M5 compute has a private lower root and a distinct empty upper
 //! root. Its firmware-global root is not copied into the application slot.
@@ -58,7 +59,18 @@ impl Uat {
     pub(crate) fn prepare_t8142_execution_context(
         &self, vm: &Vm,
     ) -> Result<M5ExecutionContext> {
-        self.prepare_t8142_execution_context_mask(vm, !0b111)
+        self.prepare_native_execution_context_mask(vm, !0b111, UatConfig::T8142)
+    }
+
+    /// G18's 26A428 HAL400 exposes 64 context IDs (8c44c50..8c44c58).
+    /// The T8152 UAT already reserves the native firmware roots in 0..2;
+    /// use a separate, retained lower/empty-upper pair for compute. This
+    /// claims a slot only. Root publication remains explicit and bounded by
+    /// the owning G18 firmware session's lifetime.
+    pub(crate) fn prepare_t8152_execution_context(
+        &self, vm: &Vm,
+    ) -> Result<M5ExecutionContext> {
+        self.prepare_native_execution_context_mask(vm, !0b111, UatConfig::T8152)
     }
 
     /// Select a slot for the native-program regression test. Ordinary DRM
@@ -74,13 +86,13 @@ impl Uat {
         // allocating private resources; they are not user VM_BIND mappings.
         let range = crate::m5_vm::DRIVER_BASE..crate::m5_vm::DRIVER_END;
         let vm = self.new_vm(0x8142_0000 + context as u64, range)?;
-        self.prepare_t8142_execution_context_mask(&vm, 1u64 << context)
+        self.prepare_native_execution_context_mask(&vm, 1u64 << context, UatConfig::T8142)
     }
 
-    fn prepare_t8142_execution_context_mask(
-        &self, vm: &Vm, allowed: u64,
+    fn prepare_native_execution_context_mask(
+        &self, vm: &Vm, allowed: u64, expected: UatConfig,
     ) -> Result<M5ExecutionContext> {
-        if self.cfg != UatConfig::T8142 {
+        if self.cfg != expected || !self.cfg.has_m5_native_topology() {
             return Err(ENODEV);
         }
         {
@@ -108,7 +120,7 @@ impl Uat {
         // returns its claim. This high VM is never exposed for mappings.
         let slot = M5ContextSlot { inner: self.inner.clone(), context };
         let range = IOVA_USER_BASE..uat_geometry(self.cfg)?.user_va_top();
-        let high = self.new_vm(0x8142_1000 + context as u64, range)?;
+        let high = self.new_vm((u64::from(self.cfg.chip_id) << 16) + 0x1000 + context as u64, range)?;
         Ok(M5ExecutionContext { slot, low: vm.clone(), high, published: false })
     }
 }

@@ -37,6 +37,8 @@ pub(crate) struct G18ComputeCompletionSnapshot {
 }
 
 pub(crate) struct G18ComputeMemory {
+    // Retract the process roots before dropping their aliases and backing.
+    process: Option<G18ComputeProcess>,
     // Alias owns the same GEM object and is released before the lower mapping.
     command_high: mmu::KernelMapping,
     command: MappedObject,
@@ -45,6 +47,12 @@ pub(crate) struct G18ComputeMemory {
     layout: G18ComputeChannelLayout,
     pointers: G18ComputeChannelPointers,
     prepared: bool,
+}
+
+struct G18ComputeProcess {
+    context: mmu::M5ExecutionContext,
+    // Same GEM pages and GPU VAs as the firmware-owned command/channel.
+    aliases: [mmu::KernelMapping; 2],
 }
 
 impl G18ComputeMemory {
@@ -113,6 +121,7 @@ impl G18ComputeMemory {
             channel.iova(), layout.allocation_bytes, pointers.operands[0], pointers.operands[1],
             pointers.control, pointers.tail, command.iova(), command_high.iova(), support.iova());
         Ok(Self {
+            process: None,
             command_high,
             command,
             channel,
@@ -123,10 +132,34 @@ impl G18ComputeMemory {
         })
     }
 
-    /// Encode one unpublished command using this owner's addresses. The lower
-    /// mappings currently belong to context 0, so a process context cannot be
-    /// selected until its mappings have an explicit retained owner as well.
-    /// Caller must supply owned shader/argument bindings and native policy.
+    /// Bind the payload VM while retaining both aliases and the context lease.
+    /// A failure leaves the original command/channel and firmware roots intact.
+    pub(crate) fn bind_process(
+        &mut self, dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
+    ) -> Result<u32> {
+        if self.prepared || self.process.is_some() { return Err(EBUSY); }
+        let context = uat.prepare_t8152_execution_context(vm)?;
+        let command = self.command.map_alias_at(vm, self.command.iova(), mmu::PROT_GPU_SHARED_RW)?;
+        let channel = self.channel.map_alias_at(vm, self.channel.iova(), mmu::PROT_GPU_SHARED_RW)?;
+        for (address, length) in [(self.command.iova(), G18_COMPUTE_COMMAND_BYTES),
+                                 (self.channel.iova(), self.layout.allocation_bytes as usize)] {
+            for offset in (0..length).step_by(mmu::UAT_PGSZ) {
+                let address = address + offset as u64;
+                if vm.translate_iova(address)? != uat.kernel_lower_vm().translate_iova(address)? {
+                    return Err(EFAULT);
+                }
+            }
+        }
+        let id = u32::from(context.context_id());
+        dev_info!(dev.as_ref(),
+            "G18 compute context: id={} roots={:x?}; command/channel aliases retained, unpublished\n",
+            id, context.roots());
+        self.process = Some(G18ComputeProcess { context, aliases: [command, channel] });
+        Ok(id)
+    }
+
+    /// Encode one unpublished command. Caller must retain shader/argument
+    /// bindings in the selected process VM and supply native device policy.
     pub(crate) fn prepare(
         &mut self,
         scheduler: G18SchedulerBinding,
@@ -136,9 +169,10 @@ impl G18ComputeMemory {
         if self.prepared {
             return Err(EBUSY);
         }
+        let process = self.process.as_ref().ok_or(EINVAL)?;
         if registers.clusters != self.layout.clusters
             || registers.cluster_width != self.layout.width
-            || registers.context_id != 0
+            || registers.context_id != u32::from(process.context.context_id())
             || inputs.channel_ordinal >= 4
             || inputs.completion.stamp == 0
             || scheduler.record == 0
@@ -171,6 +205,16 @@ impl G18ComputeMemory {
             scheduler_record: scheduler.record,
             registers: summary,
         })
+    }
+
+    /// Root publication is delayed until every command field is prepared.
+    /// It does not publish a queue entry or advance a scheduler counter.
+    pub(crate) fn publish_context(&mut self) -> Result<[u64; 2]> {
+        if !self.prepared { return Err(EINVAL); }
+        let process = self.process.as_mut().ok_or(EINVAL)?;
+        process.context.publish()?;
+        if !process.context.is_current() { return Err(EIO); }
+        Ok(process.context.roots())
     }
 
     /// These independent WC reads are diagnostic, not an atomic completion
