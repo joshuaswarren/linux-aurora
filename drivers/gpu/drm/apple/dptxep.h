@@ -70,6 +70,7 @@ struct dptx_port {
 	u32 lane_count;
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
+	u32 training_settings[4][3];
 	/*
 	 * Bitmask of AP-call indices already reported as unhandled, so each one
 	 * is named once per port instead of on every repetition. The firmware

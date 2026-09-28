@@ -53,8 +53,8 @@ struct dptxport_apcall_get_support {
 struct dptxport_apcall_max_drive_settings {
 	__le32 retcode;
 	u8 _unk0[12];
-	__le32 max_drive_settings[2];
-	u8 _unk1[8];
+	__le32 max_drive_settings[3];
+	u8 _unk1[4];
 };
 
 struct dptxport_apcall_drive_settings {
@@ -165,6 +165,122 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 	return 0;
 }
 
+struct dptxport_training_entry {
+	__le32 unknown;
+	__le32 voltage;
+	__le32 preemphasis;
+} __packed;
+
+struct dptxport_apcall_training {
+	__le32 retcode;
+	u8 pad0[12];
+	__le32 count;
+	u8 pad1[12];
+	struct dptxport_training_entry entries[];
+} __packed;
+
+static bool dptxport_has_native_training(struct apple_epic_service *service)
+{
+	return of_device_is_compatible(service->ep->dcp->dev->of_node,
+				       "apple,t8140-dcpext");
+}
+
+static int dptxport_set_native_training(struct dptx_port *dptx,
+				       const void *data, size_t size,
+				       void *reply_data, size_t reply_size)
+{
+	const struct dptxport_apcall_training *request = data;
+	struct dptxport_apcall_training *reply = reply_data;
+	union phy_configure_opts opts = {};
+	u32 count;
+	size_t bytes;
+	int ret;
+
+	if (size < sizeof(*request) || reply_size < sizeof(*reply))
+		return -EINVAL;
+	count = le32_to_cpu(request->count);
+	if (count > ARRAY_SIZE(dptx->training_settings) || count > dptx->lane_count ||
+	    count == 3)
+		return -EINVAL;
+	bytes = sizeof(*request) + count * sizeof(request->entries[0]);
+	if (size < bytes || reply_size < bytes)
+		return -EINVAL;
+	for (u32 i = 0; i < count; i++) {
+		opts.dp.voltage[i] = le32_to_cpu(request->entries[i].voltage);
+		opts.dp.pre[i] = le32_to_cpu(request->entries[i].preemphasis);
+		if (opts.dp.voltage[i] > 3 || opts.dp.pre[i] > 3)
+			return -EINVAL;
+	}
+	if (count) {
+		if (!dptx->atcphy)
+			return -ENODEV;
+		opts.dp.link_rate = dptx->phy_ops.dp.link_rate;
+		opts.dp.lanes = count;
+		opts.dp.set_voltages = 1;
+		ret = phy_configure(dptx->atcphy, &opts);
+		if (ret)
+			return ret;
+	}
+	for (u32 i = 0; i < count; i++) {
+		dptx->training_settings[i][0] = le32_to_cpu(request->entries[i].unknown);
+		dptx->training_settings[i][1] = opts.dp.voltage[i];
+		dptx->training_settings[i][2] = opts.dp.pre[i];
+		dptx->phy_ops.dp.voltage[i] = opts.dp.voltage[i];
+		dptx->phy_ops.dp.pre[i] = opts.dp.pre[i];
+	}
+	memmove(reply, request, bytes);
+	reply->retcode = cpu_to_le32(0);
+	return 0;
+}
+
+static int dptxport_get_native_training(struct dptx_port *dptx,
+				       const void *data, size_t size,
+				       void *reply_data, size_t reply_size)
+{
+	const struct dptxport_apcall_training *request = data;
+	struct dptxport_apcall_training *reply = reply_data;
+	u32 count;
+	size_t bytes;
+
+	if (size < sizeof(*request) || reply_size < sizeof(*reply))
+		return -EINVAL;
+	/* Get takes the requested count at body+0 and returns status at body+0x10. */
+	count = le32_to_cpu(request->retcode);
+	if (count > ARRAY_SIZE(dptx->training_settings))
+		return -EINVAL;
+	bytes = sizeof(*reply) + count * sizeof(reply->entries[0]);
+	if (reply_size < bytes)
+		return -EINVAL;
+	memmove(reply, request, sizeof(*reply));
+	for (u32 i = 0; i < count; i++) {
+		reply->entries[i].unknown = cpu_to_le32(dptx->training_settings[i][0]);
+		reply->entries[i].voltage = cpu_to_le32(dptx->training_settings[i][1]);
+		reply->entries[i].preemphasis = cpu_to_le32(dptx->training_settings[i][2]);
+	}
+	reply->count = cpu_to_le32(0);
+	return 0;
+}
+
+static int dptxport_set_native_lanes(struct dptx_port *dptx, u32 lanes)
+{
+	union phy_configure_opts opts = {};
+	int ret;
+
+	if (lanes > 4 || lanes == 3)
+		return -EINVAL;
+	if (!dptx->atcphy)
+		return -ENODEV;
+	opts.dp.lanes = lanes;
+	opts.dp.set_lanes = 1;
+	ret = phy_configure(dptx->atcphy, &opts);
+	if (ret)
+		return ret;
+	dptx->lane_count = lanes;
+	dptx->phy_ops.dp.lanes = lanes;
+	dptx->phy_ops.dp.set_lanes = 0;
+	return 0;
+}
+
 static int
 dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 				     void *reply_, size_t reply_size)
@@ -173,6 +289,13 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
+
+	if (dptxport_has_native_training(service)) {
+		memset(reply, 0, sizeof(*reply));
+		reply->max_drive_settings[1] = cpu_to_le32(3);
+		reply->max_drive_settings[2] = cpu_to_le32(3);
+		return 0;
+	}
 
 	reply->retcode = cpu_to_le32(0);
 	reply->max_drive_settings[0] = cpu_to_le32(0x3);
@@ -189,6 +312,10 @@ dptxport_call_get_drive_settings(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 	const struct dptxport_apcall_drive_settings *request = request_;
 	struct dptxport_apcall_drive_settings *reply = reply_;
+
+	if (dptxport_has_native_training(service))
+		return dptxport_get_native_training(dptx, request_, request_size,
+						   reply_, reply_size);
 
 	if (reply_size < sizeof(*reply) || request_size < sizeof(*request))
 		return -EINVAL;
@@ -223,6 +350,10 @@ dptxport_call_set_drive_settings(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 	const struct dptxport_apcall_drive_settings *request = request_;
 	struct dptxport_apcall_drive_settings *reply = reply_;
+
+	if (dptxport_has_native_training(service))
+		return dptxport_set_native_training(dptx, request_, request_size,
+						   reply_, reply_size);
 
 	if (reply_size < sizeof(*reply) || request_size < sizeof(*request))
 		return -EINVAL;
@@ -306,6 +437,19 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		return -1;
 
 	u64 lane_count = le64_to_cpu(request->lane_count);
+
+	if (dptxport_has_native_training(service)) {
+		if (lane_count > 4)
+			return -EINVAL;
+		ret = dptxport_set_native_lanes(dptx, lane_count);
+		if (ret)
+			return ret;
+		reply->retcode = cpu_to_le32(0);
+		reply->lane_count = cpu_to_le64(lane_count);
+		if (lane_count)
+			complete(&dptx->linkcfg_completion);
+		return 0;
+	}
 
 	if (dptx->lane_count < lane_count)
 		dev_err(dcp->dev, "set_active_lane_count: unexpected lane "
