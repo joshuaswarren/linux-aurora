@@ -14,7 +14,7 @@ The three bandwidth enums must not be interchanged:
 
 | Field | 20 MHz | 40 MHz | 80 MHz |
 | --- | --- | --- | --- |
-| Config `Sta5gBw` (MAX_BW) | 0 | 1 | 2 |
+| Config `StaBw` and `Sta5gBw` (MAX_BW) | 0 | 1 | 2 |
 | CID0f 5 GHz selector (CONFIG_BW) | 1 | 0 | 0 |
 | EE4d association-start CW | 0 | 0 | 1 |
 | EE4d secondary channel / SCO | 0 | 1 above / 3 below | 0 or consistent HT secondary |
@@ -23,6 +23,14 @@ The three bandwidth enums must not be interchanged:
 Public definitions: MediaTek gen4 `include/wlan_lib.h` (MAX_BW),
 `include/mgmt/rlm.h` (CONFIG_BW), `include/nic/wlan_def.h` (CW/SCO);
 in-tree `mt76_connac.h` (CMD_CBW), `mt7921/mcu.c` (center-channel/SCO).
+Public MediaTek `wlan_lib.c` also reads the separate station-wide `StaBw`
+and 5 GHz `Sta5gBw` maxima. The first 80 MHz candidate only raised
+`Sta5gBw`; this revision raises both under the same boot opt-in and lowers
+both in the safe fallback. `BW_CONFIG` reports the original and selected
+values. `BW_BSS` reports the AP VHT operation width and segments from the
+Linux scan entry before submitting a wide join. An 80 MHz AP on primary 149
+should advertise VHT width 1 and segment 0 channel 155. Neither log is a
+firmware policy readback or proof that the firmware selected 80 MHz.
 
 Native `AppleSunriseWLAN` SHA-256:
 `ff462b980c4073b462a77f9e817c95ad52aeebfa0655ab00d639ca224cb5ed0c`.
@@ -45,7 +53,7 @@ advertisement alone does not prove HE negotiation.
 
 After a submitted 5 GHz join fails, the width latch stays at 20 until reboot.
 Following clean firmware disconnect and DMA/token retirement, the next
-userspace connect narrows host capabilities and submits Sta5gBw=0 plus the
+userspace connect narrows host capabilities and submits StaBw=0, Sta5gBw=0 plus the
 20-only CID0f policy before joining. A terminal negative response to the
 single wide association calibration can be retired only at that same fence.
 Firmware SET submissions are not acknowledged policy readbacks.

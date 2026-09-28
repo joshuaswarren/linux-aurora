@@ -7,6 +7,32 @@ static void mt_peer_release(struct mt7932 *m);
 static int mt_retire_connection(struct mt7932 *m);
 static bool mt_open_request(const struct cfg80211_connect_params *p);
 
+/* The firmware owns BSS parsing for its join. Record the Linux scan copy so
+ * a wide-policy attempt can be compared with the AP's advertised operation.
+ */
+static void mt_bw_log_bss(struct mt7932 *m)
+{
+	const struct cfg80211_bss_ies *ies;
+	const u8 *vht;
+	int width = -1, seg0 = -1, seg1 = -1;
+
+	if (m->bw_limit < 80 || !m->connect_bss)
+		return;
+	rcu_read_lock();
+	ies = rcu_dereference(m->connect_bss->ies);
+	vht = ies ? cfg80211_find_ie(WLAN_EID_VHT_OPERATION,
+					 ies->data, ies->len) : NULL;
+	if (vht && vht[1] >= 5) {
+		width = vht[2];
+		seg0 = vht[3];
+		seg1 = vht[4];
+	}
+	rcu_read_unlock();
+	dev_info(&m->pdev->dev,
+		 "BW_BSS: primary=%u VHT-operation-width=%d seg0=%d seg1=%d\n",
+		 m->connect_bss->channel->hw_value, width, seg0, seg1);
+}
+
 /* command_mutex held.  The native J700 nicConfigPowerSaveProfile sends legacy
  * CID05, set=1, no response, four bytes: BSS index, profile, two reserved
  * bytes; CAM=0, MAX PS=1, FAST PS=2 (AppleSunriseWLAN
@@ -460,6 +486,7 @@ void mt_connect_work(struct work_struct *work)
 		ret = -EINVAL;
 		goto free;
 	}
+	mt_bw_log_bss(m);
 	spin_lock_irqsave(&m->response_lock, flags);
 	ret = m->connect_error ?: mt_peer_reserve(m);
 	if (!ret) {

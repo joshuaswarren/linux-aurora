@@ -33,7 +33,7 @@ static int mt_stock_config(struct mt7932 *m)
 	if (file->size != 8 + 65 * 68 || memcmp(file->data, "J7CF", 4) ||
 	    get_unaligned_le32(file->data + 4) != 65)
 		goto out;
-	records = kcalloc(72, sizeof(*records), GFP_KERNEL);
+	records = kcalloc(80, sizeof(*records), GFP_KERNEL);
 	if (!records) {
 		ret = -ENOMEM;
 		goto out;
@@ -79,21 +79,31 @@ static int mt_stock_config(struct mt7932 *m)
 		records[j].value_len = scnprintf(records[j].value, 32, "0x%x", value);
 	}
 	{
-		/* MAX_BW enum: 20=0, 40=1, 80=2, stock 3 permits 160.
-		 * CID0f instead uses 1=20-only, 0=20/40 (also permits VHT).
-		 * Private experiment; original firmware artifact stays untouched.
+		static const char * const keys[] = { "StaBw", "Sta5gBw" };
+		u8 value = m->bw_limit == 80 ? '2' :
+			   m->bw_limit == 40 ? '1' : '0';
+
+		/* MAX_BW enum: 20=0, 40=1, 80=2. The station-wide cap
+		 * and the 5 GHz cap both constrain a join. CID0f's 0 is its
+		 * separate 20/40 selector; VHT operation selects 80 MHz.
+		 * Preserve the original package and the legacy 20 MHz policy.
 		 */
-		for (j = 0; j < count; j++)
-			if (!strcmp(records[j].key, "Sta5gBw"))
-				break;
-		if (j == count) {
-			ret = -EINVAL;
-			goto free;
+		for (i = m->bw_limit > 20 ? 0 : 1; i < ARRAY_SIZE(keys); i++) {
+			for (j = 0; j < count; j++)
+				if (!strcmp(records[j].key, keys[i]))
+					break;
+			if (j == count) {
+				count++;
+				records[j].type = 3;
+				strscpy(records[j].key, keys[i], sizeof(records[j].key));
+				records[j].key_len = strlen(keys[i]);
+			}
+			dev_info(&m->pdev->dev, "BW_CONFIG: %s original=%s selected=%c\n",
+				 keys[i], j < 65 ? records[j].value : "(absent)", value);
+			memset(records[j].value, 0, sizeof(records[j].value));
+			records[j].value[0] = value;
+			records[j].value_len = 1;
 		}
-		memset(records[j].value, 0, sizeof(records[j].value));
-		records[j].value[0] = m->bw_limit == 80 ? '2' :
-				      m->bw_limit == 40 ? '1' : '0';
-		records[j].value_len = 1;
 		for (j = 0; j < count; j++)
 			if (!strcmp(records[j].key, "DisRoaming"))
 				break;
@@ -147,9 +157,11 @@ out:
  */
 int mt_bw_apply_fallback(struct mt7932 *m)
 {
-	struct mt_config_record record = {
-		.type = 3, .key_len = 7, .value_len = 1,
-		.key = "Sta5gBw", .value = "0",
+	struct mt_config_record records[] = {
+		{ .type = 3, .key_len = 5, .value_len = 1,
+		  .key = "StaBw", .value = "0" },
+		{ .type = 3, .key_len = 7, .value_len = 1,
+		  .key = "Sta5gBw", .value = "0" },
 	};
 	struct mt7932_reg_snapshot reg;
 	unsigned long flags;
@@ -171,9 +183,9 @@ int mt_bw_apply_fallback(struct mt7932 *m)
 	m->reg_desired = reg;
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	put_unaligned_le32(1, body + 4);
-	body[8] = 1;
-	put_unaligned_le16(sizeof(record), body + 10);
-	memcpy(body + 12, &record, sizeof(record));
+	body[8] = ARRAY_SIZE(records);
+	put_unaligned_le16(sizeof(records), body + 10);
+	memcpy(body + 12, records, sizeof(records));
 	ret = mt_request(m, 0x70, true, true, false, body, sizeof(body));
 	if (!ret)
 		ret = mt_request(m, 0x0f, true, true, false, reg.domain, reg.length);
