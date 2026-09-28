@@ -142,8 +142,9 @@ impl G18QueueProbe {
             }
 
             // b000 0x12824 requests 0x98 bytes. Unwritten trailing padding
-            // is zero. Both event tuples and the new +0x6e/+0x72 pair are
-            // disabled; no scheduler/context update is requested.
+            // is zero. UMA/PB pool bindings and the new +0x6e/+0x72 grow
+            // pair are disabled. UMA +0x3e is a FList generation identity,
+            // not an event pointer; +0x46 selects its firmware pool slot.
             let config = &mut out[CONFIG..CONFIG + 0x98];
             put32(config, 0, 15);
             put64(config, 8, ENTRY_LOW);
