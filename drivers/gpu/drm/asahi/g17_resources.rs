@@ -67,6 +67,10 @@ pub(crate) mod g18_scheduler;
 pub(crate) mod g18_compute;
 
 #[cfg(not(test))]
+#[path = "g18_compute_payload_memory.rs"]
+pub(crate) mod g18_compute_payload;
+
+#[cfg(not(test))]
 #[path = "g18_queue_probe.rs"]
 pub(crate) mod g18_queue;
 
