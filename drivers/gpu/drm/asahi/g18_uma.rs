@@ -11,6 +11,60 @@
 
 pub(crate) const G18_UMA_STATE_BYTES: usize = 0x7c;
 pub(crate) const G18_UMA_DESCRIPTOR_BYTES: usize = 0x80;
+pub(crate) const G18_POOL_STATE_BYTES: usize = 0xa0;
+
+/// Resolved inputs to the full native FList firmware state. The directory
+/// address includes its sparse page-end adjustment. Accessor/policy values
+/// and resource ownership are the caller's responsibility.
+pub(crate) struct G18UmaPoolState {
+    pub(crate) statistics_id: u64,
+    pub(crate) grow_engine: u32,
+    pub(crate) priority: u32,
+    pub(crate) directory_gpu: u64,
+    pub(crate) directory_stride: u64,
+    /// Original FList +0xac/+0xb0 order; native rev64 swaps the output lanes.
+    pub(crate) chunk_counters: [u32; 2],
+    pub(crate) block_list_gpu: u64,
+    pub(crate) populated_blocks: u32,
+    pub(crate) block_units_64k: u32,
+    pub(crate) sma_mode: u32,
+    pub(crate) preempt_counter_gpu: u64,
+    pub(crate) preempt_counter: u64,
+    pub(crate) compute: bool,
+    pub(crate) policy_value: u32,
+}
+
+/// Native state initialization at 0xfffffe0008c8d404 and serialization at
+/// 0xfffffe0008c8c004. This is the 0xa0-byte firmware state, not the 0x80-byte
+/// hardware UMA descriptor. Zero padding matches a fresh native allocation.
+pub(crate) fn encode_g18_pool_state(state: &G18UmaPoolState) -> [u8; G18_POOL_STATE_BYTES] {
+    let mut out = [0; G18_POOL_STATE_BYTES];
+    for (offset, value) in [
+        (0x00, state.statistics_id),
+        (0x14, state.directory_gpu),
+        (0x1c, state.directory_stride),
+        (0x4c, state.block_list_gpu),
+        (0x88, state.preempt_counter_gpu),
+        (0x90, state.preempt_counter),
+    ] {
+        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    for (offset, value) in [
+        (0x08, u32::MAX),
+        (0x0c, state.grow_engine),
+        (0x10, state.priority),
+        (0x44, state.chunk_counters[1]),
+        (0x48, state.chunk_counters[0]),
+        (0x54, state.populated_blocks),
+        (0x58, state.block_units_64k),
+        (0x7c, state.sma_mode),
+        (0x98, u32::from(state.compute)),
+        (0x9c, state.policy_value),
+    ] {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    out
+}
 
 /// Dimensions written by the M6 pool's `computeAndSetUMAPoolVariables`.
 pub(crate) struct G18UmaGeometry {

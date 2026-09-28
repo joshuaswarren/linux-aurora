@@ -35,7 +35,7 @@
 //! ```
 
 use super::MappedObject;
-use super::g18_pool::G18UmaPoolMemory;
+use super::g18_pool::{G18UmaPoolBinding, G18UmaPoolMemory};
 use crate::{driver::AsahiDevice, g17_initdata as init, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
@@ -315,6 +315,10 @@ impl G18FirmwareMemory {
 
     pub(crate) fn uma_pool(&self) -> &G18UmaPoolMemory { &self.uma_pool }
 
+    pub(crate) fn prepare_uma_pool_binding(&mut self) -> Result<G18UmaPoolBinding> {
+        self.uma_pool.prepare_binding()
+    }
+
     /// FW VA of one role's root, for the EP 0x20 0x81 doorbell.
     pub(crate) fn root(&self, secondary: bool) -> u64 {
         if secondary { self.secondary_root.iova() } else { self.primary_root.iova() }
@@ -331,7 +335,7 @@ impl G18FirmwareMemory {
     /// scheduler-bind records. Each new producer is published exactly once.
     pub(crate) fn publish_queue_probe(&mut self, address: u64, queue_id: u8, producer: u32) -> Result {
         if address < KERNEL_BASE || address & 0x3f != 0 || queue_id > 127
-            || !(1..=2).contains(&producer) {
+            || !(1..=3).contains(&producer) {
             return Err(EINVAL);
         }
         if self.compute_outer_counters()? != [producer - 1; 3]
