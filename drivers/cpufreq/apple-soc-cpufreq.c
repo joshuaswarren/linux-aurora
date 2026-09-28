@@ -164,9 +164,58 @@ struct apple_fast_die {
 	struct work_struct work;
 	struct freq_qos_request req;
 	cpumask_var_t cpus;
+	u64 budget;		/* LAB: smoothed power budget */
+	unsigned long control_last; /* LAB: last budget update */
+	unsigned long control_change; /* LAB: last OPP change */
+	unsigned long control_high; /* LAB: last substantial effort */
+	unsigned long control_start; /* LAB: direct-map capture start */
+	unsigned long emergency_start; /* LAB: continuous maximum effort */
+	u64 control_sum; /* LAB: sum of captured OPP powers */
+	unsigned int control_count;
+	bool control_active;
+	bool control_capturing;
+	bool control_enabled;
 	unsigned int nr_states;
 	unsigned long power[] __counted_by(nr_states);
 };
+
+/*
+ * LAB (research, not for submission): smooth the power budget derived from
+ * the effort.  fd_smooth=0 keeps the direct map.  With fd_smooth=1 the budget
+ * follows the direct-map target through a first-order filter per sample,
+ * 1/2^fd_down_shift of the gap when falling and 1/2^fd_up_shift when rising,
+ * and snaps to the target once the effort reaches fd_emergency.
+ */
+static unsigned int fd_smooth;
+module_param(fd_smooth, uint, 0644);
+static unsigned int fd_down_shift = 3;
+module_param(fd_down_shift, uint, 0644);
+static unsigned int fd_up_shift = 5;
+module_param(fd_up_shift, uint, 0644);
+static unsigned int fd_emergency = 224;
+module_param(fd_emergency, uint, 0644);
+
+/* LAB only.  Mode 0 retains the existing direct mapping (or fd_smooth). */
+static unsigned int fd_control;
+module_param(fd_control, uint, 0644);
+static unsigned int fd_tau_ms = 4000;
+module_param(fd_tau_ms, uint, 0644);
+static unsigned int fd_capture_ms = 1000;
+module_param(fd_capture_ms, uint, 0644);
+static unsigned int fd_activation = 64;
+module_param(fd_activation, uint, 0644);
+static unsigned int fd_hyst_uw = 20000;
+module_param(fd_hyst_uw, uint, 0644);
+static unsigned int fd_dwell_ms = 100;
+module_param(fd_dwell_ms, uint, 0644);
+static unsigned int fd_release_ms = 2000;
+module_param(fd_release_ms, uint, 0644);
+static unsigned int fd_control_emergency = 250;
+module_param(fd_control_emergency, uint, 0644);
+static unsigned int fd_emergency_hold_ms = 2000;
+module_param(fd_emergency_hold_ms, uint, 0644);
+static unsigned int fd_hot_cap_khz = 3144000;
+module_param(fd_hot_cap_khz, uint, 0644);
 
 /**
  * struct apple_fast_die_timer - per-CPU sampling timer
@@ -512,6 +561,133 @@ static unsigned int apple_fast_die_limit(const struct apple_fast_die *fd,
 					  APPLE_FAST_DIE_EFFORT_MAX));
 }
 
+/* LAB: see fd_smooth.  Call with @lock held. */
+static unsigned int apple_fast_die_smooth(struct apple_fast_die *fd,
+					  unsigned int effort)
+{
+	u64 pmax = fd->power[fd->nr_states - 1];
+	u64 target = div_u64(pmax * (APPLE_FAST_DIE_EFFORT_MAX - effort),
+			     APPLE_FAST_DIE_EFFORT_MAX);
+	s64 gap = (s64)target - (s64)fd->budget;
+	s64 step;
+
+	if (effort >= READ_ONCE(fd_emergency) || !fd->budget) {
+		fd->budget = target;
+	} else if (gap) {
+		unsigned int shift = gap < 0 ? READ_ONCE(fd_down_shift) :
+					       READ_ONCE(fd_up_shift);
+
+		step = gap < 0 ? -((-gap) >> min(shift, 30U)) : gap >> min(shift, 30U);
+		fd->budget += step ? step : gap;
+	}
+
+	return apple_fast_die_fit(fd, fd->budget);
+}
+
+/*
+ * LAB: the PMP closes the die-temperature loop.  A second, slower loop
+ * follows its effort-derived power request on the OPP/EM power axis.  First
+ * capture one second of direct-map OPP powers so the follower starts at the
+ * average delivered power rather than at an arbitrary effort.  A symmetric
+ * four-second filter then removes the large FP oscillation; OPP hysteresis
+ * and upward dwell keep quantization from feeding back into the PMP loop.
+ *
+ * A high ceiling plus near-maximum effort immediately uses the direct map.
+ * At a lower ceiling, near-maximum effort must persist before the same snap;
+ * this avoids treating brief control-loop spikes as runaway heat.  The
+ * filtered budget tracks the snap (anti-windup).  A quiet lane returns to the
+ * direct map, preserving integer and single-core performance.
+ */
+static unsigned int apple_fast_die_control(struct apple_fast_die *fd,
+					   unsigned int effort)
+{
+	u64 pmax = fd->power[fd->nr_states - 1];
+	u64 direct = div_u64(pmax * (APPLE_FAST_DIE_EFFORT_MAX - effort),
+			     APPLE_FAST_DIE_EFFORT_MAX);
+	unsigned long now = jiffies;
+	unsigned int activation = min(READ_ONCE(fd_activation), 255U);
+	unsigned int emergency = min(READ_ONCE(fd_control_emergency), 255U);
+	unsigned int limit, idx, elapsed;
+	s64 delta;
+
+	if (effort >= activation)
+		fd->control_high = now;
+	if (time_after(now, fd->control_high +
+		       msecs_to_jiffies(READ_ONCE(fd_release_ms)))) {
+		fd->control_active = false;
+		fd->control_capturing = false;
+		fd->emergency_start = 0;
+		fd->budget = direct;
+		fd->control_last = now;
+		return apple_fast_die_fit(fd, direct);
+	}
+
+	if (effort >= emergency) {
+		if (!fd->emergency_start)
+			fd->emergency_start = now;
+		if (fd->limit >= READ_ONCE(fd_hot_cap_khz) ||
+		    time_after_eq(now, fd->emergency_start +
+				  msecs_to_jiffies(READ_ONCE(fd_emergency_hold_ms)))) {
+			fd->budget = min(fd->budget, direct);
+			fd->control_last = now;
+			return apple_fast_die_fit(fd, fd->budget);
+		}
+	} else {
+		fd->emergency_start = 0;
+	}
+
+	if (!fd->control_active) {
+		if (!fd->control_capturing) {
+			if (effort < activation)
+				return apple_fast_die_fit(fd, direct);
+			fd->control_start = now;
+			fd->control_sum = 0;
+			fd->control_count = 0;
+			fd->control_capturing = true;
+		}
+		idx = 0;
+		limit = apple_fast_die_fit(fd, direct);
+		while (idx + 1 < fd->nr_states &&
+		       fd->policy->freq_table[idx + 1].frequency <= limit)
+			idx++;
+		fd->control_sum += fd->power[idx];
+		fd->control_count++;
+		if (time_after_eq(now, fd->control_start +
+				  msecs_to_jiffies(READ_ONCE(fd_capture_ms)))) {
+			fd->budget = div_u64(fd->control_sum,
+						 fd->control_count);
+			fd->control_active = true;
+			fd->control_last = now;
+			fd->control_change = now;
+		}
+		return limit;
+	}
+
+	elapsed = min(jiffies_to_msecs(now - fd->control_last), 100U);
+	fd->control_last = now;
+	delta = div_s64(((s64)direct - (s64)fd->budget) * elapsed,
+			 max(READ_ONCE(fd_tau_ms), 1U));
+	fd->budget = clamp_t(s64, (s64)fd->budget + delta, 0, pmax);
+	limit = fd->limit;
+	idx = 0;
+	while (idx + 1 < fd->nr_states &&
+	       fd->policy->freq_table[idx + 1].frequency <= limit)
+		idx++;
+	if (fd->budget + READ_ONCE(fd_hyst_uw) < fd->power[idx]) {
+		limit = apple_fast_die_fit(fd, fd->budget);
+	} else if (idx + 1 < fd->nr_states &&
+		   fd->budget >= fd->power[idx + 1] +
+				 READ_ONCE(fd_hyst_uw) &&
+		   time_after_eq(now, fd->control_change +
+			     msecs_to_jiffies(READ_ONCE(fd_dwell_ms)))) {
+		limit = apple_fast_die_fit(fd,
+					  fd->budget - READ_ONCE(fd_hyst_uw));
+	}
+	if (limit != fd->limit)
+		fd->control_change = now;
+	return limit;
+}
+
 static ktime_t apple_fast_die_interval(const struct apple_fast_die *fd)
 {
 	if (!fd->waiting)
@@ -543,10 +719,36 @@ static void apple_fast_die_sample(struct apple_fast_die *fd)
 
 	ret = apple_pmp_report_fast_die_effort(fd->report, fd->lane, &effort);
 	if (!ret) {
-		limit = apple_fast_die_limit(fd, effort);
+		if (READ_ONCE(fd_control) == 1) {
+			if (!fd->control_enabled) {
+				fd->control_active = false;
+				fd->control_capturing = false;
+				fd->emergency_start = 0;
+				fd->control_high = jiffies;
+				fd->budget = fd->power[fd->nr_states - 1];
+				fd->control_enabled = true;
+			}
+			limit = apple_fast_die_control(fd, effort);
+		} else if (READ_ONCE(fd_smooth)) {
+			if (fd->control_enabled) {
+				fd->budget = fd->power[fd->nr_states - 1];
+				fd->control_enabled = false;
+			}
+			limit = apple_fast_die_smooth(fd, effort);
+		} else {
+			if (fd->control_enabled)
+				fd->budget = fd->power[fd->nr_states - 1];
+			fd->control_enabled = false;
+			limit = apple_fast_die_limit(fd, effort);
+		}
 		fd->waiting = false;
 	} else {
 		limit = fd->fallback;
+		fd->control_active = false;
+		fd->control_capturing = false;
+		fd->control_enabled = false;
+		fd->emergency_start = 0;
+		fd->budget = fd->power[0];
 		fd->waiting = true;
 		if (!fd->warned &&
 		    time_after(jiffies, fd->start + APPLE_FAST_DIE_WARN_S * HZ)) {
@@ -713,6 +915,10 @@ static int apple_fast_die_init(struct cpufreq_policy *policy,
 			fd->per_cpu = false;
 	fd->max = policy->freq_table[n - 1].frequency;
 	fd->fallback = apple_fast_die_fit(fd, div_u64(fd->power[n - 1], 3));
+	fd->budget = fd->power[n - 1];
+	fd->control_last = jiffies;
+	fd->control_change = jiffies;
+	fd->control_high = jiffies;
 	fd->start = jiffies;
 
 	if (parsed) {
