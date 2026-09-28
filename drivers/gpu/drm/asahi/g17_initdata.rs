@@ -4135,6 +4135,39 @@ const G18G_26A428_STATUS_CONFIG_POWER_WORDS: &[(usize, u32)] = &[
     (0x1d4, 1), (0x1d8, 1), (0x1dc, 1), (0x1e0, 29000),
 ];
 
+/// Remaining fixed J873/26A428 status/config defaults. These typed scalar
+/// corrections and the generated tables below make the complete 0x6d0-byte
+/// allocation match all eight pre-publication native capture views. Preserve
+/// the exact float bit patterns; individual calibration meanings are not
+/// qualified. Never use post-run firmware counters as encoder defaults.
+const G18G_26A428_STATUS_CONFIG_NATIVE_WORDS: &[(usize, u32)] = &[
+    (0x0d8, 0x41a770a4), (0x0dc, 0x3d20045e), (0x12c, 0x8f16),
+    (0x4e8, 0x00010001), (0x59c, 1), (0x5a0, 700), (0x5a4, 12),
+    (0x5a8, 5000), (0x5ac, 2000), (0x5b0, 5000), (0x5b4, 0),
+    (0x5b8, 0), (0x618, 0), (0x628, 1300), (0x638, 1200),
+];
+
+fn encode_g18g_26a428_status_config_defaults(out: &mut [u8]) {
+    for words in [G18G_26A428_STATUS_CONFIG_POWER_WORDS, G18G_26A428_STATUS_CONFIG_NATIVE_WORDS] {
+        for &(offset, value) in words {
+            put_u32(out, offset, value);
+        }
+    }
+    // Original host stores at 8c30790..8c30804 copy two 16x16 tables
+    // from accelerator+111c4/+113c4, then two u16 enables at +4e8/+4ea.
+    // Native J873 tables have zero first rows/columns and linear remaining
+    // entries. Generate the values; do not carry the different J813 table.
+    for row in 0..16 {
+        for col in 0..16 {
+            let active = row != 0 && col != 0;
+            let wide = if active { (col * 0x1000 - 1) as u16 } else { 0 };
+            let narrow = if active { (col * 0x10 - 1) as u8 } else { 0 };
+            put_u16(out, 0x1e8 + 2 * (row * 16 + col), wide);
+            out[0x3e8 + row * 16 + col] = narrow;
+        }
+    }
+}
+
 /// Copy every non-zero byte of `words` (u32 at `offset - source_base`) to its
 /// relocated place in `out`. Bytes without a band are dropped.
 fn write_relocated_words(
@@ -4688,9 +4721,8 @@ pub(crate) fn encode_g18g_26a428_primary_status_b(
             status_b + (config + G18G_26A428_STATUS_CONFIG_LINK_WORD) as u64);
     write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, G18G_26A428_STATUS_CONFIG_BANDS,
                           &mut out[config..config + G18G_26A428_STATUS_CONFIG_SIZE])?;
-    for &(offset, value) in G18G_26A428_STATUS_CONFIG_POWER_WORDS {
-        put_u32(out, config + offset, value);
-    }
+    encode_g18g_26a428_status_config_defaults(
+        &mut out[config..config + G18G_26A428_STATUS_CONFIG_SIZE]);
     put_u32(out, config + G18G_26A428_STATUS_CONFIG_LINK_WORD, 1);
     put_u64(out, config + G18G_26A428_STATUS_CONFIG_LINK_PTR,
             status_b + G18G_26A428_STATUS_B_LINK_WORD as u64);
@@ -4849,10 +4881,11 @@ pub(crate) const G18G_26A428_UNPROVEN: &[UnprovenField] = &[
     unproven("region_c", 0x009c, 4, Evidence::Inferred, "1300 = this+0xf14 x 100 assumed equal to the state count"),
     unproven("status_b", 0x0004, 4, Evidence::Inferred, "1 carried (26A428 stores accel+0x6b0 bit 2)"),
     unproven("status_config", 0x0000, 0x640, Evidence::Inferred,
-             "J813 words relocated with native J873 +1c0..1e0 controller inputs; remaining semantics unqualified"),
+             "complete 0x6d0 allocation matches eight native J873 pre-boot views; individual calibration semantics unqualified"),
     unproven("status_config", 0x01dc, 8, Evidence::Inferred,
              "native J873 1/29000 and original host stores verified; semantic names unqualified"),
-    unproven("status_config", 0x03e8, 0x104, Evidence::Guessed, "new 0x104-byte block; left 0"),
+    unproven("status_config", 0x03e8, 0x104, Evidence::Inferred,
+             "native generated 16x16 u8 table and two u16 enables; original host copy geometry verified"),
     unproven("main_config", 0x0300, 4, Evidence::Inferred, "secondary kind 0xc carried (accel+0x10a74)"),
     unproven("main_config", 0x02f8, 8, Evidence::Guessed, "third descriptor table (accel[0x235e]) absent: 0"),
     unproven("aon_ptd", 0x0000, 0xc, Evidence::Inferred, "J813 PTD header words"),
