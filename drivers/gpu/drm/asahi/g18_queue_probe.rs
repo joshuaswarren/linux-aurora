@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! J873/26A428 tag15-only queue registration. No SKSM kicks or GPU jobs.
+//! J873/26A428 queue registration and one bounded compute submission.
 //!
 //! Native kernelcache: AGXChannel::resetChannelState 0xfffffe0008bdd178;
 //! AGXCLChannelSKSM::submitBuffer 0xfffffe0008be3ddc..0x8be3fcc.
@@ -8,6 +8,7 @@
 
 use super::MappedObject;
 use super::g18_pool::G18UmaPoolBinding;
+use super::g18_compute::G18PreparedComputeCommand;
 use crate::{driver::AsahiDevice, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::{c_str, io, prelude::*};
@@ -94,6 +95,7 @@ pub(crate) struct G18QueueProbe {
     _entry: MappedObject,
     graph: MappedObject,
     firmware: FirmwareDataView,
+    compute_prepared: bool,
 }
 
 fn put32(out: &mut [u8], offset: usize, value: u32) {
@@ -166,7 +168,7 @@ impl G18QueueProbe {
         })?;
         fence(Ordering::SeqCst);
         Ok(Self { _entry_alias: entry_alias, _entry: entry, graph,
-            firmware: FirmwareDataView::new(dev)? })
+            firmware: FirmwareDataView::new(dev)?, compute_prepared: false })
     }
 
     pub(crate) fn queue_address(&self) -> u64 { GRAPH_BASE }
@@ -261,6 +263,81 @@ impl G18QueueProbe {
     pub(crate) fn pool_bound(status: [u64; 9], binding: G18UmaPoolBinding) -> bool {
         status == [binding.state, binding.generation, (2u64 << 32) | 3,
                    1u64 << QUEUE_ID, 0, 1, 0, 0, 1]
+    }
+
+    /// Store an unpublished SKSM entry and its three inner commands. The
+    /// original HAL400 encoder 8c4a290, dependency writer 8c4a5a4 and timestamp
+    /// converter 8c5620c agree byte-for-byte with the shared M5 serializer in
+    /// this bounded domain (audit-g18-sksm-native.py). The tag15 remains the
+    /// M6 0x98-byte form; never substitute the shorter M5 configuration.
+    pub(crate) fn prepare_compute_job(&mut self, command: G18PreparedComputeCommand,
+                                     pool: G18UmaPoolBinding) -> Result {
+        use crate::m5_sksm as sksm;
+        if self.compute_prepared || self.counters()? != [3; 3]
+            || !Self::installed(self.slot())
+            || !Self::scheduler_bound(self.scheduler_status()?)
+            || !Self::pool_bound(self.pool_status(), pool)
+            || !(3..64).contains(&command.context_id) || command.expected_stamp != 0x100
+            || command.firmware_address < KERNEL_BASE
+            || command.registers.main_count > 127 || command.registers.secondary_count != 4 {
+            return Err(EINVAL);
+        }
+        let entry = sksm::prepare_m5_sksm_entry(sksm::M5SksmQueue {
+            id: QUEUE_ID, priority: 2, current_stamp: 1, submitted: 0, previous_stamp: None,
+        }, sksm::M5SksmOperands {
+            barriers: &[], first_predecessor: 0, implicit_dependency_type: 1,
+            mcache: None, flag_bit1: false, flag_bit61: false, flag_bit63: false,
+            payload: [command.firmware_address, GRAPH_BASE],
+            qos_byte_32: 3, qos_class_40: 8, qos_word_48: 0xffff,
+            // Native CL event mask uses type 2 * 64 contexts + context ID.
+            event_mask: [0, 0, 1u64 << command.context_id, 0], rce_kind: 0,
+            rce: [sksm::M5SksmRce { address: command.registers.main_gpu,
+                                   tag: command.registers.main_count as u8 },
+                  sksm::M5SksmRce { address: command.registers.secondary_gpu, tag: 4 },
+                  sksm::M5SksmRce { address: 0, tag: 0 },
+                  sksm::M5SksmRce { address: 0, tag: 0 }],
+            auxiliary: 0x3f_ffff_ffff_ffff,
+        }).map_err(|_| EINVAL)?;
+        // Original 26A428 submitBuffer 8be481c..8be4848 writes this same
+        // packed 21-byte form: type14, qid, count, priority, stamp, DM2.
+        let kick = sksm::encode_m5_sksm_add_kicks(QUEUE_ID, 2, 1, 1).map_err(|_| EINVAL)?;
+        self._entry.with_bytes_mut(|out| {
+            let bytes = &mut out[entry.offset as usize..entry.offset as usize + entry.bytes.len()];
+            if bytes.iter().any(|v| *v != 0) { return Err(EBUSY); }
+            bytes.copy_from_slice(&entry.bytes);
+            Ok(())
+        })?;
+        self.graph.with_bytes_mut(|out| {
+            if out[CONFIG + 0x300..CONFIG + 0x500].iter().any(|v| *v != 0)
+                || out[ITEMS + 24..ITEMS + 48].iter().any(|v| *v != 0) {
+                return Err(EBUSY);
+            }
+            out.copy_within(CONFIG + 0x200..CONFIG + 0x298, CONFIG + 0x300);
+            let config = &mut out[CONFIG + 0x300..CONFIG + 0x398];
+            put32(config, 0x32, command.context_id);
+            put32(config, 0x62, 1); // native descriptor+0x190: update context
+            put32(config, 0x66, 1); // retained process owner identity
+            out[CONFIG + 0x400..CONFIG + 0x400 + kick.len()].copy_from_slice(&kick);
+            for (index, address) in [command.firmware_address,
+                GRAPH_BASE + CONFIG as u64 + 0x300,
+                GRAPH_BASE + CONFIG as u64 + 0x400].into_iter().enumerate() {
+                put64(out, ITEMS + (index + 3) * 8, address);
+            }
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        self.compute_prepared = true;
+        Ok(())
+    }
+
+    /// Publish only after process roots and submitted-counter are ready.
+    /// A later failure cannot authorize resetting the shared ring or entry.
+    pub(crate) fn publish_compute_job(&mut self) -> Result {
+        if !self.compute_prepared || self.counters()? != [3; 3] { return Err(EBUSY); }
+        fence(Ordering::SeqCst);
+        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40, 6)?;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn installed(slot: [u64; 5]) -> bool {

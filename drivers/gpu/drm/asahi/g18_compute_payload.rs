@@ -48,6 +48,30 @@ pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
         (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3))
 }
 
+/// Build the captured addition's state and default device control fields.
+/// Original 26A428 setup 8bf1280/8bf1414 supplies the spill inputs to 8bf16cc:
+/// d518/d520/d524 and d5a8/d5b0/d5d8 are all zero for submission 1. Native
+/// configureDevice stores at 8bc73fc, 8c492a0, 8bc93bc and 8bc7774 establish
+/// the register defaults below. Optional tuning and debug policies stay off.
+/// Context, pool, scratch, scheduler, completion and addresses belong to the
+/// retained owners; this function never publishes or submits a command.
+pub(crate) fn addition_inputs(state: &[u8])
+    -> Result<(G18ComputeCommandInputs, G18ComputeRegisterInputs), PayloadError> {
+    if state.len() != G18_COMPUTE_STATE_BYTES || fnv64(state) != 0x956a_f8e1_8848_5ce8 {
+        return Err(PayloadError::State);
+    }
+    let mut command = G18ComputeCommandInputs::default();
+    let mut registers = G18ComputeRegisterInputs {
+        a10aac: 1,
+        a6d0: 1,
+        clusters: 2,
+        cluster_width: 6,
+        ..G18ComputeRegisterInputs::default()
+    };
+    G18ComputeState::parse(state).ok_or(PayloadError::State)?.apply(&mut command, &mut registers);
+    Ok((command, registers))
+}
+
 /// Exact IEEE754 encoding of a small signed integer divided by four. Keeps
 /// float operations out of kernel code; the qualified values fit in 13 bits.
 fn quarter_bits(value: i32) -> u32 {

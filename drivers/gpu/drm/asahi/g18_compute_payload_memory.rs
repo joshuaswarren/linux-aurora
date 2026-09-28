@@ -63,8 +63,17 @@ impl G18ComputePayloadMemory {
 
     pub(crate) fn vm(&self) -> &mmu::Vm { &self.vm }
 
+    pub(crate) fn scratch_plan(&self) -> Result<crate::g18_uma::G18ComputeScratchPlan> {
+        crate::g18_uma::g18_addition_scratch(&self.state).ok_or(EINVAL)
+    }
+
     pub(crate) fn apply_state(&self, c: &mut G18ComputeCommandInputs, r: &mut G18ComputeRegisterInputs) {
         G18ComputeState::parse(&self.state).unwrap().apply(c, r);
+    }
+
+    pub(crate) fn addition_inputs(&self)
+        -> Result<(G18ComputeCommandInputs, G18ComputeRegisterInputs)> {
+        payload::addition_inputs(&self.state).map_err(|_| EINVAL)
     }
 
     /// Call only while the GPU is quiescent or after an independently verified

@@ -26,6 +26,7 @@ pub(crate) struct G18PreparedComputeCommand {
     pub(crate) firmware_address: u64,
     pub(crate) gpu_address: u64,
     pub(crate) expected_stamp: u32,
+    pub(crate) context_id: u32,
     pub(crate) scheduler_record: u64,
     pub(crate) registers: G18ComputeRegisterSummary,
 }
@@ -190,6 +191,10 @@ impl G18ComputeMemory {
             command_gpu: self.command.iova(),
             operands: self.pointers.operands,
             support_control: self.pointers.control,
+            // 26A428 loadCommandBufferData 8be5eac selects this record;
+            // prepare 8be58b0 then takes its +8 word, independently of the
+            // UAT context ID. Optional SMAPP resource objects are disabled.
+            d630: scheduler.sequence,
             ..*registers
         };
         let summary = self.command.with_bytes_mut(|out| {
@@ -202,6 +207,7 @@ impl G18ComputeMemory {
             firmware_address: self.command_high.iova(),
             gpu_address: self.command.iova(),
             expected_stamp: inputs.completion.stamp,
+            context_id: registers.context_id,
             scheduler_record: scheduler.record,
             registers: summary,
         })
