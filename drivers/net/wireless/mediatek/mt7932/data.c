@@ -5,6 +5,9 @@
 static bool batch_tx = true;
 module_param(batch_tx, bool, 0644);
 MODULE_PARM_DESC(batch_tx, "Batch TX doorbells with xmit_more (disable for comparison)");
+static unsigned int tx_batch_limit = 16;
+module_param(tx_batch_limit, uint, 0644);
+MODULE_PARM_DESC(tx_batch_limit, "TX doorbell batch size (1..64, default 16)");
 
 void mt_data_kick_locked(struct mt7932 *m)
 {
@@ -124,6 +127,7 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	dma_addr_t dma;
 	unsigned long flags;
 	unsigned int slot;
+	u64 copy_start = 0;
 	int ret;
 
 	if (!READ_ONCE(m->connected) || !mt_rf_allowed(m) || !READ_ONCE(m->data_ready) ||
@@ -139,6 +143,8 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	slot = q->head;
 	if (!mt_bss_tx_allowed(m) || m->data_live[slot] || q->queued >= q->count - 1) {
 		netif_stop_queue(netdev);
+		if (mt_perf_enabled())
+			m->perf_tx_queue_stops++;
 		mt_data_kick_locked(m);
 		m->tx_busy++;
 		spin_unlock_irqrestore(&m->data_lock, flags);
@@ -146,7 +152,14 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	}
 	payload = m->data_payloads + 4096 * slot;
 	header = m->data_headers + 64 * slot;
+	if (mt_perf_enabled())
+		copy_start = ktime_get_ns();
 	ret = skb_copy_bits(skb, 0, payload, skb->len);
+	if (mt_perf_enabled()) {
+		m->perf_tx_copy_ns += ktime_get_ns() - copy_start;
+		m->perf_tx_frames++;
+		m->perf_tx_bytes += skb->len;
+	}
 	if (!ret)
 		ret = mt7932_data_header(header, payload, skb->len, m->data_payloads_dma + 4096 * slot,
 					 slot, m->peer_wtbl, 0, 0, !m->connect_open);
@@ -165,15 +178,20 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	desc->control = cpu_to_le32((64 << 16) | BIT(30));
 	q->head = (slot + 1) % q->count;
 	q->queued++;
+	if (mt_perf_enabled())
+		m->perf_tx_queued_max = max(m->perf_tx_queued_max, (u64)q->queued);
 	m->tx_pending = true;
 	mt_bss_tx_account(m);
 	if (!mt_bss_tx_allowed(m) || m->data_live[q->head] || q->queued >= q->count - 1)
 		netif_stop_queue(netdev);
+	if (mt_perf_enabled() && netif_queue_stopped(netdev))
+		m->perf_tx_queue_stops++;
 	/* Flush before returning a stopped queue: there may be no next skb.
 	 * Bound a long qdisc burst to sixteen descriptors per doorbell.
 	 */
 	if (!READ_ONCE(batch_tx) || !netdev_xmit_more() ||
-	    netif_queue_stopped(netdev) || !(q->head % 16))
+	    netif_queue_stopped(netdev) ||
+	    !(q->head % clamp_val(READ_ONCE(tx_batch_limit), 1, 64)))
 		mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	netdev->stats.tx_packets++;
@@ -196,6 +214,7 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 {
 	struct sk_buff *skb;
 	unsigned long flags;
+	u64 copy_start = 0;
 
 	if (!READ_ONCE(m->connected) || !READ_ONCE(m->peer_valid) || !READ_ONCE(m->data_ready))
 		return;
@@ -227,13 +246,26 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 		m->netdev->stats.rx_dropped++;
 		return;
 	}
+	if (mt_perf_enabled())
+		copy_start = ktime_get_ns();
 	skb_put_data(skb, frame->data, frame->length);
+	if (mt_perf_enabled()) {
+		m->perf_rx_copy_ns += ktime_get_ns() - copy_start;
+		m->perf_rx_frames++;
+		m->perf_rx_bytes += frame->length;
+	}
 	skb->protocol = eth_type_trans(skb, m->netdev);
 	skb->ip_summed = CHECKSUM_NONE;
 	m->netdev->stats.rx_packets++;
 	m->netdev->stats.rx_bytes += frame->length;
 	m->rx_ethernet++;
-	netif_rx(skb);
+	if (m->gro_cells_ready) {
+		if (mt_perf_enabled())
+			m->perf_rx_gro_frames++;
+		gro_cells_receive(&m->gro_cells, skb);
+	} else {
+		netif_rx(skb);
+	}
 	dev_dbg_ratelimited(&m->pdev->dev, "ETHERNET_RX: bytes=%zu peer=%u total=%llu\n",
 		frame->length, frame->wtbl, m->rx_ethernet);
 }
@@ -244,7 +276,7 @@ int mt_data_prepare(struct mt7932 *m)
 	u8 protection[12];
 	int ret;
 
-	if (m->tx[0].count != ARRAY_SIZE(m->data_live))
+	if (!m->tx[0].count || m->tx[0].count > ARRAY_SIZE(m->data_live))
 		return -EINVAL;
 	spin_lock_init(&m->data_lock);
 	m->data_headers = mt_alloc(m, 512 * 64, &m->data_headers_dma);

@@ -1,5 +1,64 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "mt7932.h"
+#include <linux/seq_file.h>
+
+static bool perf_stats;
+module_param(perf_stats, bool, 0444);
+MODULE_PARM_DESC(perf_stats, "Expose optional host datapath profiling in debugfs");
+
+static bool gro_rx;
+module_param(gro_rx, bool, 0444);
+MODULE_PARM_DESC(gro_rx, "Use GRO cells for received Ethernet frames");
+
+bool mt_perf_enabled(void)
+{
+	return perf_stats;
+}
+
+bool mt_gro_enabled(void)
+{
+	return gro_rx;
+}
+
+static int mt_perf_show(struct seq_file *s, void *unused)
+{
+	struct mt7932 *m = s->private;
+	unsigned int i;
+
+	seq_printf(s, "irq_services %llu\nirq_total_ns %llu\nirq_max_ns %llu\n",
+		   READ_ONCE(m->interrupts), READ_ONCE(m->perf_irq_ns),
+		   READ_ONCE(m->perf_irq_max_ns));
+	seq_printf(s, "rx_frames %llu\nrx_bytes %llu\nrx_copy_ns %llu\n",
+		   READ_ONCE(m->perf_rx_frames), READ_ONCE(m->perf_rx_bytes),
+		   READ_ONCE(m->perf_rx_copy_ns));
+	seq_printf(s, "rx_drain_full %llu\nrx_drain_max %llu\nrx_gro_frames %llu\n",
+		   READ_ONCE(m->perf_rx_drain_full), READ_ONCE(m->perf_rx_drain_max),
+		   READ_ONCE(m->perf_rx_gro_frames));
+	seq_printf(s, "tx_frames %llu\ntx_bytes %llu\ntx_copy_ns %llu\n",
+		   READ_ONCE(m->perf_tx_frames), READ_ONCE(m->perf_tx_bytes),
+		   READ_ONCE(m->perf_tx_copy_ns));
+	seq_printf(s, "tx_queue_stops %llu\ntx_queued_max %llu\n",
+		   READ_ONCE(m->perf_tx_queue_stops), READ_ONCE(m->perf_tx_queued_max));
+	seq_printf(s, "rx_doorbells %llu\ntx_doorbells %llu\ntx_busy %llu\n",
+		   READ_ONCE(m->rx_doorbells), READ_ONCE(m->tx_doorbells),
+		   READ_ONCE(m->tx_busy));
+	for (i = 0; i < ARRAY_SIZE(m->rx); i++)
+		if (m->rx[i].count)
+			seq_printf(s, "rx%u_size %u\n", i, m->rx[i].count);
+	seq_printf(s, "tx0_size %u\n", m->tx[0].count);
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(mt_perf);
+
+void mt_perf_init(struct mt7932 *m)
+{
+	if (!perf_stats)
+		return;
+	m->perf_dir = debugfs_create_dir(dev_name(&m->pdev->dev), NULL);
+	debugfs_create_file("mt7932_datapath", 0400, m->perf_dir, m,
+			    &mt_perf_fops);
+}
 
 static const char mt_stat_names[][ETH_GSTRING_LEN] = {
 	"irq_services", "rx_descriptors", "rx_refill_doorbells",

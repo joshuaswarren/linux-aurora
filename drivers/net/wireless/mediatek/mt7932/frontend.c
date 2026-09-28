@@ -483,8 +483,21 @@ int mt_register_interface(struct mt7932 *m)
 	m->peer_alloc = BIT(0) | BIT(19);
 	INIT_DELAYED_WORK(&m->scan_timeout_work, mt_scan_timeout_work);
 	m->netdev = netdev;
+	if (mt_gro_enabled()) {
+		ret = gro_cells_init(&m->gro_cells, netdev);
+		if (ret) {
+			m->netdev = NULL;
+			free_netdev(netdev);
+			return ret;
+		}
+		m->gro_cells_ready = true;
+	}
 	ret = register_netdev(netdev);
 	if (ret) {
+		if (m->gro_cells_ready) {
+			gro_cells_destroy(&m->gro_cells);
+			m->gro_cells_ready = false;
+		}
 		m->netdev = NULL;
 		free_netdev(netdev);
 		return ret;

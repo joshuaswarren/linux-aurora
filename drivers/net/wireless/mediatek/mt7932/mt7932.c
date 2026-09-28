@@ -38,6 +38,15 @@ static void mt_shutdown(struct pci_dev *pdev);
 static bool batch_rx = true;
 module_param(batch_rx, bool, 0644);
 MODULE_PARM_DESC(batch_rx, "Batch runtime RX refill doorbells (disable for comparison)");
+static unsigned int rx_batch_limit = 16;
+module_param(rx_batch_limit, uint, 0644);
+MODULE_PARM_DESC(rx_batch_limit, "Runtime RX refill batch size (1..32, default 16)");
+static unsigned int rx_data_ring_entries = 512;
+module_param(rx_data_ring_entries, uint, 0444);
+MODULE_PARM_DESC(rx_data_ring_entries, "RX2/RX7 entries: 256, 512 (default), or 1024");
+static unsigned int tx_data_ring_entries = 512;
+module_param(tx_data_ring_entries, uint, 0444);
+MODULE_PARM_DESC(tx_data_ring_entries, "TX0 entries: 256 or 512 (default)");
 
 static bool legacy_irq_test;
 module_param(legacy_irq_test, bool, 0444);
@@ -240,7 +249,8 @@ unlock:
 
 static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 {
-	unsigned int budget = q->count, pending = 0;
+	unsigned int budget = q->count, pending = 0, drained = 0;
+	unsigned int limit = clamp_val(READ_ONCE(rx_batch_limit), 1, 32);
 
 	while (budget--) {
 		u32 ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].control));
@@ -249,6 +259,7 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		if (!(ctrl & DONE))
 			break;
 		m->rx_descriptors++;
+		drained++;
 		dma_rmb();
 		length = (ctrl >> 16) & 0x3fff;
 		if (length <= MT7932_RX_CAPACITY && (ctrl & BIT(30)))
@@ -275,7 +286,7 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		/* Keep the download protocol unchanged. Runtime batches are smaller
 		 * than the smallest ring, so a full wrap never hides returned slots.
 		 */
-		if (!m->runtime_epoch || !READ_ONCE(batch_rx) || pending == 16) {
+		if (!m->runtime_epoch || !READ_ONCE(batch_rx) || pending == limit) {
 			dma_wmb();
 			mt_write(m, q->reg + 8, m->runtime_epoch ?
 				 (q->head + q->count - 1) % q->count : q->head);
@@ -287,6 +298,11 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		dma_wmb();
 		mt_write(m, q->reg + 8, (q->head + q->count - 1) % q->count);
 		m->rx_doorbells++;
+	}
+	if (mt_perf_enabled()) {
+		m->perf_rx_drain_max = max(m->perf_rx_drain_max, (u64)drained);
+		if (drained == q->count)
+			m->perf_rx_drain_full++;
 	}
 }
 
@@ -328,9 +344,17 @@ static void mt_service(struct mt7932 *m)
 static irqreturn_t mt_irq_thread(int irq, void *data)
 {
 	struct mt7932 *m = data;
+	u64 start = 0, elapsed;
 
+	if (mt_perf_enabled())
+		start = ktime_get_ns();
 	m->interrupts++;
 	mt_service(m);
+	if (mt_perf_enabled()) {
+		elapsed = ktime_get_ns() - start;
+		m->perf_irq_ns += elapsed;
+		m->perf_irq_max_ns = max(m->perf_irq_max_ns, elapsed);
+	}
 	return IRQ_HANDLED;
 }
 
@@ -510,6 +534,19 @@ static int mt_dma_setup(struct mt7932 *m)
 	unsigned int i, j;
 	int ret;
 	u32 glo;
+	unsigned int rx_data_entries = READ_ONCE(rx_data_ring_entries);
+	unsigned int tx_data_entries = READ_ONCE(tx_data_ring_entries);
+
+	if (rx_data_entries != 256 && rx_data_entries != 512 && rx_data_entries != 1024) {
+		dev_warn(&m->pdev->dev, "invalid RX data ring size %u, using 512\n",
+			 rx_data_entries);
+		rx_data_entries = 512;
+	}
+	if (tx_data_entries != 256 && tx_data_entries != 512) {
+		dev_warn(&m->pdev->dev, "invalid TX data ring size %u, using 512\n",
+			 tx_data_entries);
+		tx_data_entries = 512;
+	}
 
 	mt_write(m, W + 0x204, 0);
 	mt_write(m, 0x10188, poll_test ? 0 : 0xff);
@@ -543,14 +580,17 @@ static int mt_dma_setup(struct mt7932 *m)
 	for (i = 0; i < ARRAY_SIZE(m->tx); i++) {
 		if (i == 15)
 			continue;
-		ret = mt_ring_alloc(m, &m->tx[i], i, false, i < 15 ? 512 : i == 16 ? 256 : i == 17 ? 24 : 16);
+		ret = mt_ring_alloc(m, &m->tx[i], i, false,
+				    i == 0 ? tx_data_entries :
+				    i < 15 ? 512 : i == 16 ? 256 : i == 17 ? 24 : 16);
 		if (ret)
 			return ret;
 	}
 	for (i = 0; i < ARRAY_SIZE(m->rx); i++) {
 		if (!rx_counts[i])
 			continue;
-		ret = mt_ring_alloc(m, &m->rx[i], i, true, rx_counts[i]);
+		ret = mt_ring_alloc(m, &m->rx[i], i, true,
+				    (i == 2 || i == 7) ? rx_data_entries : rx_counts[i]);
 		if (ret)
 			return ret;
 	}
@@ -1122,6 +1162,7 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	init_completion(&m->cal_response);
 	mutex_init(&m->command_mutex);
 	spin_lock_init(&m->response_lock);
+	mt_perf_init(m);
 	ret = mt_ownership(m);
 	if (ret)
 		goto retain;

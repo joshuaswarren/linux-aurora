@@ -5,6 +5,7 @@
 
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
@@ -23,6 +24,7 @@
 #include <linux/workqueue.h>
 #include <linux/mutex.h>
 #include <net/cfg80211.h>
+#include <net/gro_cells.h>
 #include "firmware.h"
 #include "calibration.h"
 #include "packet.h"
@@ -145,6 +147,14 @@ struct mt7932 {
 	u64 tx_released, rx_ethernet;
 	u64 tx_doorbells, tx_busy, rx_descriptors, rx_doorbells;
 	u64 rx_parse_errors, rx_amsdu, rx_filtered, rx_rate_missing;
+	/* Optional host-side profiling; the IRQ thread owns RX samples. */
+	struct dentry *perf_dir;
+	u64 perf_irq_ns, perf_irq_max_ns, perf_rx_copy_ns, perf_tx_copy_ns;
+	u64 perf_rx_frames, perf_rx_bytes, perf_tx_frames, perf_tx_bytes;
+	u64 perf_rx_drain_full, perf_rx_drain_max, perf_tx_queue_stops;
+	u64 perf_tx_queued_max, perf_rx_gro_frames;
+	struct gro_cells gro_cells;
+	bool gro_cells_ready;
 	/* response_lock protects the associated unicast RX rate snapshot. */
 	struct rate_info rx_rate;
 	unsigned long rx_rate_updated;
@@ -222,6 +232,9 @@ int mt_set_cqm_rssi_config(struct wiphy *wiphy, struct net_device *netdev,
 void mt_signal_update(struct mt7932 *m, const struct mt7932_rx_frame *frame, int signal);
 
 extern const struct ethtool_ops mt_ethtool_ops;
+bool mt_perf_enabled(void);
+bool mt_gro_enabled(void);
+void mt_perf_init(struct mt7932 *m);
 
 bool mt_transport_polled(void);
 
