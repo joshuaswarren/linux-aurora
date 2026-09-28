@@ -504,6 +504,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto halt_firmware;
 	}
 
+	apple_isp_debug_register(isp);
+
 	return 0;
 
 halt_firmware:
@@ -540,6 +542,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 	 */
 	apple_isp_pm_step(isp, "remove: hold power");
 	pm_runtime_get_sync(isp->dev);
+	apple_isp_debug_unregister(isp);
 
 	apple_isp_pm_step(isp, "remove: unregister video");
 	apple_isp_remove_video(isp);

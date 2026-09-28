@@ -9,6 +9,8 @@
 extern unsigned int apple_isp_pm_debug;
 
 void apple_isp_debug_init(struct apple_isp *isp);
+void apple_isp_debug_register(struct apple_isp *isp);
+void apple_isp_debug_unregister(struct apple_isp *isp);
 void apple_isp_debug_exit(struct apple_isp *isp);
 __printf(3, 4)
 void __apple_isp_pm_trace(struct apple_isp *isp, bool step, const char *fmt,
