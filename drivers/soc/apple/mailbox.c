@@ -190,6 +190,18 @@ static void apple_mbox_ascwrap_v6_stop_cpu_locked(struct apple_mbox *mbox)
 	pm_runtime_put_autosuspend(mbox->dev);
 }
 
+/*
+ * A failed resume leaves the runtime PM error set, and runtime PM then fails
+ * every later resume with -EINVAL without retrying the power domain.  The
+ * provider keeps no state across a failed resume, so mark it suspended again
+ * and let the next start retry the domain.
+ */
+static void apple_mbox_clear_resume_error(struct apple_mbox *mbox)
+{
+	if (mbox->dev->power.runtime_error)
+		pm_runtime_set_suspended(mbox->dev);
+}
+
 int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 {
 	void __iomem *cpu_control;
@@ -220,6 +232,7 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 			ret, mbox->active, mbox->dev->power.runtime_status,
 			mbox->dev->power.disable_depth,
 			mbox->dev->power.runtime_error);
+		apple_mbox_clear_resume_error(mbox);
 		goto out_unlock;
 	}
 
@@ -447,6 +460,7 @@ int apple_mbox_start(struct apple_mbox *mbox)
 			ret, mbox->active, mbox->dev->power.runtime_status,
 			mbox->dev->power.disable_depth,
 			mbox->dev->power.runtime_error);
+		apple_mbox_clear_resume_error(mbox);
 		goto out_unlock;
 	}
 
