@@ -56,7 +56,7 @@ static bool j700_radio_resolve_mac(u8 *out)
 
 static int j700_radio_publish_mac(const u8 *mac)
 {
-	struct property *property;
+	struct property *property, *old;
 	struct device_node *wifi;
 	int ret;
 
@@ -77,6 +77,18 @@ static int j700_radio_publish_mac(const u8 *mac)
 		goto err;
 	}
 
+	/*
+	 * The base DT carries a loader-filled local-mac-address; replace it.
+	 * of_update_property() is not exported, so remove and add; mt7932
+	 * reads the address once, at probe.
+	 */
+	old = of_find_property(wifi, "local-mac-address", NULL);
+	if (old) {
+		ret = of_remove_property(wifi, old);
+		if (ret)
+			goto err;
+	}
+
 	ret = of_add_property(wifi, property);
 	if (ret)
 		goto err;
@@ -91,17 +103,37 @@ err:
 	return ret;
 }
 
+/*
+ * Current device trees describe the radio's DMA path themselves, which is
+ * what the overlay used to add; applying it on top of them only rewrites
+ * the same properties and logs an OF_OVERLAY leak warning for each.
+ */
+static bool j700_radio_in_base_dt(void)
+{
+	struct device_node *pcie;
+	bool present;
+
+	pcie = of_find_node_by_path(J700_PCIE_PATH);
+	present = pcie && of_property_present(pcie, "apple,piodma");
+	of_node_put(pcie);
+
+	return present;
+}
+
 static int __init j700_radio_overlay_init(void)
 {
 	u8 mac[ETH_ALEN];
 	bool have_mac;
-	size_t size;
+	size_t size = 0;
 	int ret;
 
 	if (!of_machine_is_compatible("apple,j700"))
 		return -ENODEV;
 
 	have_mac = j700_radio_resolve_mac(mac);
+
+	if (j700_radio_in_base_dt())
+		goto publish_mac;
 
 	size = __dtbo_j700_radio_end - __dtbo_j700_radio_begin;
 	ret = of_overlay_fdt_apply(__dtbo_j700_radio_begin, size,
@@ -119,6 +151,7 @@ static int __init j700_radio_overlay_init(void)
 		return ret;
 	}
 
+publish_mac:
 	if (have_mac) {
 		ret = j700_radio_publish_mac(mac);
 		if (ret) {
@@ -128,8 +161,9 @@ static int __init j700_radio_overlay_init(void)
 		}
 	}
 
-	pr_info("J700_RADIO_OVERLAY_PASS: bytes=%zu id=%d order=post-nvme-root mac=%s\n",
+	pr_info("J700_RADIO_OVERLAY_PASS: bytes=%zu id=%d order=%s mac=%s\n",
 		size, j700_radio_overlay_id,
+		size ? "post-nvme-root" : "base-dt",
 			have_mac ? (mac_address ? "module-param" : "loader-handoff")
 			 : "chip-eeprom");
 	return 0;
