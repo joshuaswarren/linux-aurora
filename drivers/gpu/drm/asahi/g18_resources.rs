@@ -92,8 +92,16 @@ const REPORT_PRODUCER_OFFSET: u64 = 0x20;
 const REPORT_CAPACITY: [u32; 2] = [256, 512];
 const REPORT_DRAIN_BUDGET: usize = 128;
 const TRACE_PRINT_BUDGET: [u32; 2] = [512, 16];
+/// Host-only storage; do not change the native firmware ring geometry.
+/// Roughly 5 MiB for both roles, allocated before publication.
+const TRACE_JOURNAL_CAPACITY: usize = 32768;
 /// b000 0x7de8 constructs type4 with counter at +4 and stamp index at +12.
 const EVENT_TYPE_RECOVERY: u32 = 4;
+
+struct G18TraceRecord {
+    ordinal: u32,
+    raw: [u8; REPORT_RECORD_SIZE],
+}
 
 /// Owning mappings are declared before the UAT so they drop first. Aliases
 /// retain the SAME GEM backing; no firmware pointer names a copied snapshot.
@@ -118,6 +126,8 @@ pub(crate) struct G18FirmwareMemory {
     registers: KVec<mmu::KernelMapping>,
     report_counts: [[u32; 2]; 2],
     trace_printed: [u32; 2],
+    trace_journal: [KVVec<G18TraceRecord>; 2],
+    trace_dropped: [u32; 2],
     uat: Arc<mmu::Uat>,
 }
 
@@ -147,6 +157,10 @@ impl G18FirmwareMemory {
         if !uat.is_t8152_geometry() {
             return Err(ENODEV);
         }
+        let trace_journal = [
+            KVVec::with_capacity(TRACE_JOURNAL_CAPACITY, GFP_KERNEL)?,
+            KVVec::with_capacity(TRACE_JOURNAL_CAPACITY, GFP_KERNEL)?,
+        ];
         let mut registers = KVec::new();
         for window in init::G18G_26A428_REGISTER_WINDOWS {
             let (physical, virtual_address, span) = window.mapped_pages().map_err(|_| EINVAL)?;
@@ -321,6 +335,7 @@ impl G18FirmwareMemory {
             pbdesc, uma, uma_pool, scheduler, compute, compute_payload: None,
             completions, aliases, registers,
             report_counts: [[0; 2]; 2], trace_printed: [0; 2], uat,
+            trace_journal, trace_dropped: [0; 2],
         }), GFP_KERNEL)
     }
 
@@ -600,6 +615,17 @@ impl G18FirmwareMemory {
                     let word = |off: usize| u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
                     let qword = |off: usize| u64::from(word(off)) | (u64::from(word(off + 4)) << 32);
                     let count = self.report_counts[role][channel];
+                    if channel == 1 {
+                        // Preserve all bytes before firmware may reuse this slot.
+                        // No allocation, MMIO, or extra logging in the hot path.
+                        if self.trace_journal[role].len() >= TRACE_JOURNAL_CAPACITY
+                            || self.trace_journal[role]
+                                .push_within_capacity(G18TraceRecord { ordinal: count, raw })
+                                .is_err()
+                        {
+                            self.trace_dropped[role] = self.trace_dropped[role].saturating_add(1);
+                        }
+                    }
                     if channel == 0 {
                         dev_info!(dev.as_ref(), "G18_EVENT role={} ordinal={} type={} payload={:x?}\n",
                             role, count, word(0), [qword(4), qword(12), qword(20), qword(28), qword(36)]);
@@ -623,6 +649,30 @@ impl G18FirmwareMemory {
     /// Report-record totals per role and channel since construction.
     pub(crate) fn report_counts(&self) -> [[u32; 2]; 2] {
         self.report_counts
+    }
+
+    /// Export after the transaction and stop requests, never while polling a
+    /// GPU job. Completeness covers consumed records, not a possibly live producer.
+    pub(crate) fn log_trace_journal(&self, dev: &AsahiDevice) {
+        for role in 0..2 {
+            let journal = &self.trace_journal[role];
+            let consumed = self.report_counts[role][1];
+            dev_info!(dev.as_ref(),
+                "G18_TRACE_JOURNAL_BEGIN role={} consumed={} stored={} dropped={} capacity={}\n",
+                role, consumed, journal.len(), self.trace_dropped[role], TRACE_JOURNAL_CAPACITY);
+            for record in journal.iter() {
+                let words: [u64; 9] = core::array::from_fn(|index| {
+                    let mut bytes = [0; 8];
+                    bytes.copy_from_slice(&record.raw[index * 8..index * 8 + 8]);
+                    u64::from_le_bytes(bytes)
+                });
+                dev_info!(dev.as_ref(), "G18_TRACE_JOURNAL role={} ordinal={} words={:016x?}\n",
+                    role, record.ordinal, words);
+            }
+            dev_info!(dev.as_ref(),
+                "G18_TRACE_JOURNAL_END role={} consumed={} stored={} dropped={}\n",
+                role, consumed, journal.len(), self.trace_dropped[role]);
+        }
     }
 
     /// One-line construction summary for the bring-up log.

@@ -1904,6 +1904,20 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
     }
     let _ = retained.stop("stage end");
 
+    // Bulk logging must not delay active job polling. Stop is not qualified,
+    // so drain only a bounded tail and retain all owners as before. The export
+    // accounts for consumed records; it does not assert the producer is halted.
+    if let Some(session) = retained.0.as_mut() {
+        for _ in 0..4 {
+            if session.drain().is_err() {
+                break;
+            }
+        }
+        if let Some(memory) = session.memory.as_ref() {
+            memory.log_trace_journal(&session.dev);
+        }
+    }
+
     match result {
         Ok(()) if matches!(stage, STAGE_HEARTBEAT | STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND) => {
             let owner: Arc<G18Owner> = Arc::pin_init(
