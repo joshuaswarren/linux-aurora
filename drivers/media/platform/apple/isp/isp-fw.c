@@ -12,6 +12,7 @@
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
+#include "isp-debug.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
 #include "isp-ipc.h"
@@ -69,6 +70,7 @@ static int apple_isp_power_up_domains(struct apple_isp *isp)
 		return 0;
 
 	for (int i = 1; i < isp->pd_count; i++) {
+		apple_isp_pm_step(isp, "power up domain %d", i);
 		ret = pm_runtime_resume_and_get(isp->pd_dev[i]);
 		if (ret < 0) {
 			dev_err(isp->dev,
@@ -80,6 +82,7 @@ static int apple_isp_power_up_domains(struct apple_isp *isp)
 	}
 
 	isp->pds_active = true;
+	apple_isp_pm_trace(isp, "local domains up");
 
 	return 0;
 }
@@ -92,6 +95,7 @@ static void apple_isp_power_down_domains(struct apple_isp *isp)
 		return;
 
 	for (int i = isp->pd_count - 1; i >= 1; i--) {
+		apple_isp_pm_step(isp, "power down domain %d", i);
 		ret = pm_runtime_put_sync(isp->pd_dev[i]);
 		if (ret < 0)
 			dev_err(isp->dev,
@@ -99,6 +103,7 @@ static void apple_isp_power_down_domains(struct apple_isp *isp)
 	}
 
 	isp->pds_active = false;
+	apple_isp_pm_trace(isp, "local domains down");
 }
 
 void *apple_isp_translate(struct apple_isp *isp, struct isp_surf *surf,
@@ -361,6 +366,7 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 {
+	apple_isp_pm_step(isp, "stop coprocessor");
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
 	apple_isp_power_down_domains(isp);
@@ -389,9 +395,11 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	}
 #endif
 
+	apple_isp_pm_step(isp, "reset coprocessor");
 	err = isp_reset_coproc(isp);
 	if (err < 0)
 		goto shutdown;
+	apple_isp_pm_trace(isp, "coprocessor reset");
 
 	isp_gpio_write32(isp, ISP_GPIO_0, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0x0);
@@ -404,6 +412,7 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
+	apple_isp_pm_step(isp, "start coprocessor");
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x10);
 
@@ -411,10 +420,12 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
 		isp_err(isp,
 			"never received first magic number from firmware\n");
+		apple_isp_pm_trace(isp, "no first magic");
 		err = -ENODEV;
 		goto shutdown;
 	}
 	isp_dbg(isp, "got first magic number from firmware\n");
+	apple_isp_pm_trace(isp, "first magic");
 
 	return 0;
 
@@ -577,6 +588,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
 		isp_err(isp,
 			"never received second magic number from firmware\n");
+		apple_isp_pm_trace(isp, "no second magic");
 		err = -ENODEV;
 		goto free_extra;
 	}
@@ -748,11 +760,13 @@ static int isp_firmware_boot_stage3(struct apple_isp *isp)
 	if (isp_gpio_wait(isp, ISP_GPIO_3, 0x0)) {
 		isp_err(isp,
 			"never received third magic number from firmware\n");
+		apple_isp_pm_trace(isp, "no third magic");
 		isp_free_channel_info(isp);
 		return -ENODEV;
 	}
 
 	isp_dbg(isp, "firmware booted!\n");
+	apple_isp_pm_trace(isp, "firmware booted");
 
 	return 0;
 }
@@ -924,14 +938,18 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	 * Stop the coprocessor before releasing any memory the firmware
 	 * uses, also when it did not acknowledge the suspend request.
 	 */
+	apple_isp_pm_step(isp, "suspend firmware");
 	if (isp_stop_command_processor(isp))
 		dev_warn(isp->dev, "firmware did not suspend, stopping it\n");
+	apple_isp_pm_trace(isp, "firmware suspended");
 	isp_disable_irq(isp);
 	isp_firmware_shutdown_stage1(isp);
 
+	apple_isp_pm_step(isp, "free firmware memory");
 	isp_firmware_shutdown_stage3(isp);
 	isp_firmware_shutdown_stage2(isp);
 	isp_collect_gc_surface(isp);
+	apple_isp_pm_trace(isp, "firmware memory freed");
 }
 
 /*
@@ -959,6 +977,7 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	}
 
 	/* Needs to be power cycled for IOMMU to behave correctly */
+	apple_isp_pm_step(isp, "boot: power up");
 	err = pm_runtime_resume_and_get(isp->dev);
 	if (err < 0) {
 		dev_err(isp->dev, "failed to enable power: %d\n", err);
@@ -975,6 +994,7 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	}
 
 	isp->fw_state = ISP_FW_RUNNING;
+	apple_isp_pm_trace(isp, "boot: running");
 
 	return 0;
 }
@@ -997,8 +1017,10 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 	if (isp->fw_state != ISP_FW_RUNNING)
 		return;
 
+	apple_isp_pm_trace(isp, "halt");
 	isp_firmware_shutdown(isp);
-	isp->fw_booted = false;
+	apple_isp_pm_step(isp, "halt: power down");
 	pm_runtime_put_sync(isp->dev);
 	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
+	apple_isp_pm_trace(isp, "halted");
 }

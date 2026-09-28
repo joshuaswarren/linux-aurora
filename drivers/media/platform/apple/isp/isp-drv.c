@@ -15,6 +15,7 @@
 #include <linux/workqueue.h>
 
 #include "isp-cam.h"
+#include "isp-debug.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
 #include "isp-regs.h"
@@ -404,6 +405,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to attatch power domains\n");
 		return err;
 	}
+	apple_isp_debug_init(isp);
+	apple_isp_pm_trace(isp, "probe");
 
 	isp->coproc = devm_platform_ioremap_resource_byname(pdev, "coproc");
 	if (IS_ERR(isp->coproc)) {
@@ -520,6 +523,7 @@ free_iommu:
 destroy_wq:
 	destroy_workqueue(isp->wq);
 detach_genpd:
+	apple_isp_debug_exit(isp);
 	apple_isp_detach_genpd(isp);
 	return err;
 }
@@ -535,19 +539,27 @@ static void apple_isp_remove(struct platform_device *pdev)
 	 * down again, resetting them each time, around a firmware that has
 	 * just been stopped.
 	 */
+	apple_isp_pm_step(isp, "remove: hold power");
 	pm_runtime_get_sync(isp->dev);
 
+	apple_isp_pm_step(isp, "remove: unregister video");
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
 	apple_isp_firmware_halt(isp);
+	apple_isp_pm_step(isp, "remove: unmap");
 	apple_isp_free_video(isp);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
 
+	apple_isp_pm_step(isp, "remove: release power");
 	pm_runtime_put_sync(isp->dev);
 	pm_runtime_disable(isp->dev);
 	destroy_workqueue(isp->wq);
+	apple_isp_pm_step(isp, "remove: detach power domains");
+	apple_isp_debug_exit(isp);
 	apple_isp_detach_genpd(isp);
+	if (READ_ONCE(apple_isp_pm_debug))
+		dev_info(isp->dev, "pm: removed\n");
 }
 
 static const struct apple_isp_hw apple_isp_hw_t8103 = {
