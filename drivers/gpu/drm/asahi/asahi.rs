@@ -49,6 +49,7 @@ mod g18_compute_memory;
 mod g18_compute_state;
 mod g18_compute_payload;
 mod g18_compute_triangle;
+mod g18_graphics_payload;
 mod g18_scheduler;
 mod g18_live_boot;
 mod g18_uma;
