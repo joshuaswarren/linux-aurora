@@ -326,13 +326,16 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			genpd->name, pstate, reg, cur);
 
 	if (auto_enable) {
+		int err;
+
 		/* Not all devices implement this; this is a no-op where not implemented. */
 		reg |= APPLE_PMGR_AUTO_ENABLE;
-		ret = apple_pmgr_write(ps, reg);
-		if (ret && ps->gfx_axi2af)
-			return ret;
+		err = apple_pmgr_write(ps, reg);
+		if (err && ps->gfx_axi2af)
+			return err;
 	}
 
+	/* A power state that was not reached fails the transition. */
 	return ret;
 }
 
