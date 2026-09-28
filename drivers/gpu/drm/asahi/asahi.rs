@@ -41,6 +41,7 @@ mod g17_submission;
 mod g17_trace_capture;
 mod g17_uapi;
 mod g18_live_boot;
+mod g18_uma;
 mod gem;
 mod gpu;
 mod hw;
