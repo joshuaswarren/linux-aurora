@@ -62,47 +62,45 @@ static int isp_gpio_wait(struct apple_isp *isp, u32 reg, u32 expected)
 				  ISP_FIRMWARE_TIMEOUT_US);
 }
 
+/* Power up the local domains that are not on yet, in order. */
 static int apple_isp_power_up_domains(struct apple_isp *isp)
 {
 	int ret;
 
-	if (isp->pds_active)
-		return 0;
-
-	for (int i = 1; i < isp->pd_count; i++) {
+	for (int i = isp->pds_on + 1; i < isp->pd_count; i++) {
 		apple_isp_pm_step(isp, "power up domain %d", i);
 		ret = pm_runtime_resume_and_get(isp->pd_dev[i]);
 		if (ret < 0) {
 			dev_err(isp->dev,
 				"Failed to power up power domain %d: %d\n", i, ret);
-			while (--i >= 1)
+			apple_isp_pm_trace(isp, "domain %d did not come up", i);
+			while (--i > isp->pds_on)
 				pm_runtime_put_sync(isp->pd_dev[i]);
 			return ret;
 		}
 	}
 
-	isp->pds_active = true;
+	isp->pds_on = max(isp->pd_count - 1, 0);
 	apple_isp_pm_trace(isp, "local domains up");
 
 	return 0;
 }
 
+/* Power the local domains down in reverse order, except pds_keep of them. */
 static void apple_isp_power_down_domains(struct apple_isp *isp)
 {
+	int keep = clamp(isp->pds_keep, 0, isp->pds_on);
 	int ret;
 
-	if (!isp->pds_active)
-		return;
-
-	for (int i = isp->pd_count - 1; i >= 1; i--) {
+	for (int i = isp->pds_on; i > keep; i--) {
 		apple_isp_pm_step(isp, "power down domain %d", i);
 		ret = pm_runtime_put_sync(isp->pd_dev[i]);
 		if (ret < 0)
 			dev_err(isp->dev,
-				"Failed to power up power domain %d: %d\n", i, ret);
+				"Failed to power down power domain %d: %d\n", i, ret);
 	}
 
-	isp->pds_active = false;
+	isp->pds_on = keep;
 	apple_isp_pm_trace(isp, "local domains down");
 }
 

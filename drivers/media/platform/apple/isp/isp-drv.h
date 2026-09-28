@@ -284,7 +284,10 @@ struct apple_isp {
 	int pd_count;
 	struct device **pd_dev;
 	struct device_link **pd_link;
-	bool pds_active;
+	/* local domains held on, always pd_dev[1..pds_on] */
+	int pds_on;
+	/* local domains the next power-down leaves on, for debugging */
+	int pds_keep;
 
 	int irq;
 
@@ -352,6 +355,7 @@ struct apple_isp {
 		struct device *darts[ISP_MAX_DARTS];
 		int num_darts;
 		struct dentry *dir;
+		bool rpm_held;
 	} dbg;
 };
 

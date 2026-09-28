@@ -25,8 +25,12 @@
 #include <linux/seq_buf.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
 
+#include "isp-cam.h"
 #include "isp-debug.h"
+#include "isp-fw.h"
 #include "isp-regs.h"
 
 unsigned int apple_isp_pm_debug;
@@ -69,8 +73,9 @@ static void isp_debug_state(struct apple_isp *isp, struct seq_buf *s,
 
 	seq_buf_printf(s, "fw %s rpm %s/%d local-on %d", fw_states[isp->fw_state],
 		       isp_rpm_status(isp->dev),
-		       atomic_read(&isp->dev->power.usage_count),
-		       isp->pds_active ? isp->pd_count - 1 : 0);
+		       atomic_read(&isp->dev->power.usage_count), isp->pds_on);
+	if (isp->dbg.rpm_held)
+		seq_buf_puts(s, " held");
 
 	/* The PMGR is always on; this reads what the hardware reports. */
 	seq_buf_printf(s, "%sps", sep);
@@ -97,7 +102,7 @@ static void isp_debug_state(struct apple_isp *isp, struct seq_buf *s,
 	 * The coprocessor and the handshake words are only read while the
 	 * ISP and its CPU domain are held on.
 	 */
-	if (isp->pds_active && isp->dev->power.runtime_status == RPM_ACTIVE) {
+	if (isp->pds_on > 0 && isp->dev->power.runtime_status == RPM_ACTIVE) {
 		u32 ctl = isp->hw->coproc_control ?: ISP_COPROC_CONTROL;
 
 		seq_buf_printf(s, "%sctl %08x gpio0 %08x gpio3 %08x gpio7 %08x",
@@ -152,6 +157,161 @@ static int isp_debug_power_show(struct seq_file *m, void *data)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(isp_debug_power);
+
+/*
+ * Stopping and starting the firmware by hand, to find what it takes to
+ * boot the resident T8140 firmware again. A mode says how much power the
+ * stop keeps:
+ *
+ *   warm   every domain stays on: only the firmware stops
+ *   pipe   the ISP CPU and its two cores stay on, the pipeline goes off
+ *   local  all local domains go off; ISP_SYS and the DARTs stay on
+ *   sys    the ISP's runtime PM reference goes too, so ISP_SYS and the
+ *          DARTs go down as far as nothing else holds them
+ *
+ * Commands, written to <debugfs>/320000000.isp/firmware, with pm_debug set
+ * and no stream open:
+ *
+ *   halt <mode>      stop the firmware
+ *   boot             boot it again and query the camera, as at probe
+ *   restart <mode>   both
+ *
+ * A boot here is tried even after one failed. If it fails, the firmware
+ * is left stopped, with all local domains off.
+ */
+struct isp_debug_mode {
+	const char *name;
+	int keep;	/* local domains left on, as pd_dev[1..keep] */
+	bool hold;	/* keep the runtime PM reference */
+};
+
+static const struct isp_debug_mode isp_debug_modes[] = {
+	{ "warm", INT_MAX, true },
+	{ "pipe", 3, true },	/* isp_cpu, isp_cpu_core0, isp_cpu_core1 */
+	{ "local", 0, true },
+	{ "sys", 0, false },
+};
+
+static int isp_debug_halt(struct apple_isp *isp,
+			  const struct isp_debug_mode *mode)
+{
+	int err;
+
+	if (mode->hold && !isp->dbg.rpm_held) {
+		err = pm_runtime_resume_and_get(isp->dev);
+		if (err < 0)
+			return err;
+		isp->dbg.rpm_held = true;
+	}
+
+	apple_isp_pm_trace(isp, "debug: halt %s", mode->name);
+	isp->pds_keep = mode->keep;
+	apple_isp_firmware_halt(isp);
+	isp->pds_keep = 0;
+
+	if (!mode->hold && isp->dbg.rpm_held) {
+		pm_runtime_put_sync(isp->dev);
+		isp->dbg.rpm_held = false;
+	}
+
+	/* Let a DART that its consumer released suspend first. */
+	msleep(200);
+	apple_isp_pm_trace(isp, "debug: halted %s", mode->name);
+
+	return 0;
+}
+
+static int isp_debug_boot(struct apple_isp *isp)
+{
+	int err;
+
+	apple_isp_pm_trace(isp, "debug: boot");
+	if (isp->fw_state == ISP_FW_DEAD)
+		isp->fw_state = ISP_FW_OFF;
+
+	err = apple_isp_detect_camera(isp);
+
+	if (isp->dbg.rpm_held) {
+		pm_runtime_put_sync(isp->dev);
+		isp->dbg.rpm_held = false;
+	}
+
+	/* A failed boot is not retried outside this file. */
+	if (err && isp->fw_state == ISP_FW_OFF)
+		isp->fw_state = ISP_FW_DEAD;
+
+	apple_isp_pm_trace(isp, "debug: boot %s (%d)", err ? "failed" : "done",
+			   err);
+
+	return err;
+}
+
+static int isp_debug_firmware_cmd(struct apple_isp *isp, char *cmd)
+{
+	const struct isp_debug_mode *mode = NULL;
+	char *op = strsep(&cmd, " ");
+	int err;
+
+	if (cmd) {
+		cmd = strim(cmd);
+		for (int i = 0; i < ARRAY_SIZE(isp_debug_modes); i++)
+			if (!strcmp(cmd, isp_debug_modes[i].name))
+				mode = &isp_debug_modes[i];
+		if (!mode)
+			return -EINVAL;
+	}
+
+	if (!strcmp(op, "boot") && !mode)
+		return isp_debug_boot(isp);
+
+	if (!mode)
+		return -EINVAL;
+
+	if (!strcmp(op, "halt"))
+		return isp_debug_halt(isp, mode);
+
+	if (!strcmp(op, "restart")) {
+		err = isp_debug_halt(isp, mode);
+		return err ?: isp_debug_boot(isp);
+	}
+
+	return -EINVAL;
+}
+
+static ssize_t isp_debug_firmware_write(struct file *file,
+					const char __user *ubuf, size_t len,
+					loff_t *off)
+{
+	struct apple_isp *isp = file->private_data;
+	char buf[32];
+	int err;
+
+	if (!READ_ONCE(apple_isp_pm_debug))
+		return -EPERM;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	mutex_lock(&isp->video_lock);
+	if (test_bit(ISP_STATE_STREAMING, &isp->state) ||
+	    vb2_is_busy(&isp->vbq))
+		err = -EBUSY;
+	else
+		err = isp_debug_firmware_cmd(isp, strim(buf));
+	mutex_unlock(&isp->video_lock);
+
+	return err ?: len;
+}
+
+static const struct file_operations isp_debug_firmware_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = isp_debug_firmware_write,
+	.llseek = noop_llseek,
+};
 
 /* Find the PMGR word of each power domain, to read it directly. */
 static void isp_debug_init_domains(struct apple_isp *isp)
@@ -216,21 +376,37 @@ static void isp_debug_init_darts(struct apple_isp *isp)
 	}
 }
 
+/* Find what the traces report; before anything is traced */
 void apple_isp_debug_init(struct apple_isp *isp)
 {
 	isp_debug_init_domains(isp);
 	isp_debug_init_darts(isp);
+}
 
+/* Once the driver is set up */
+void apple_isp_debug_register(struct apple_isp *isp)
+{
 	isp->dbg.dir = debugfs_create_dir(dev_name(isp->dev), NULL);
 	debugfs_create_file("power", 0400, isp->dbg.dir, isp,
 			    &isp_debug_power_fops);
+	debugfs_create_file("firmware", 0200, isp->dbg.dir, isp,
+			    &isp_debug_firmware_fops);
 }
 
-void apple_isp_debug_exit(struct apple_isp *isp)
+/* With the ISP held on by the caller */
+void apple_isp_debug_unregister(struct apple_isp *isp)
 {
 	debugfs_remove_recursive(isp->dbg.dir);
 	isp->dbg.dir = NULL;
 
+	if (isp->dbg.rpm_held) {
+		pm_runtime_put_noidle(isp->dev);
+		isp->dbg.rpm_held = false;
+	}
+}
+
+void apple_isp_debug_exit(struct apple_isp *isp)
+{
 	for (int i = 0; i < isp->dbg.num_darts; i++)
 		put_device(isp->dbg.darts[i]);
 	isp->dbg.num_darts = 0;
