@@ -19,6 +19,7 @@ TEST_PROGS += hid-wacom.sh
 
 TEST_FILES := run-hid-tools-tests.sh
 TEST_FILES += tests
+TEST_FILES += j700-fnrow.py
 
 CXX ?= $(CROSS_COMPILE)g++
 
