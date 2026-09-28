@@ -69,12 +69,23 @@ static bool afk_endpoint_is_v2(struct apple_dcp_afkep *ep)
  * commands still use the established system endpoint path; only the DP
  * endpoints have a validated V2 command/reply exchange.  Decode 0x20's RX
  * header and reports without changing its INIT or transmit sequence.
+ *
+ * The disp endpoint (0x23) appears to use the same compact header: read
+ * with the wide one, the external DCP's first message after the ring
+ * set-up (its dispext-service announce on older firmware) comes out as
+ * "expected announce but got 0x0 on channel 0" on every boot.  Its
+ * service is a do-nothing handshake (ibootep.c), so decoding its RX
+ * header cannot change what the driver sends.
  */
 static bool afk_endpoint_has_v2_rx(struct apple_dcp_afkep *ep)
 {
-	return afk_endpoint_is_v2(ep) ||
-	       (ep && ep->dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		ep->endpoint == SYSTEM_ENDPOINT);
+	if (afk_endpoint_is_v2(ep))
+		return true;
+	if (!ep || ep->dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return false;
+
+	return ep->endpoint == SYSTEM_ENDPOINT ||
+	       ep->endpoint == DISP0_ENDPOINT;
 }
 
 
