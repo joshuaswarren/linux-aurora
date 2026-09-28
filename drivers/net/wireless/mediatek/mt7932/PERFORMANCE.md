@@ -13,8 +13,8 @@ NAPI poller or programmable device interrupt coalescing. A budgeted NAPI
 conversion requires separate interrupt and firmware-event validation.
 
 Boot-only parameters use the `mt7932_fullmac.` prefix. With no parameters,
-the data path retains the previous 512-entry TX0/RX2/RX7 rings, 16-entry
-RX refill and TX doorbell boundaries, and `netif_rx()` delivery:
+the data path retains the previous 512-entry TX0/RX2/RX7 rings, a 16-entry
+RX refill boundary, a 64-entry TX doorbell boundary, and `netif_rx()` delivery:
 
 | Parameter | Default | Experiment |
 | --- | ---: | --- |
@@ -22,13 +22,19 @@ RX refill and TX doorbell boundaries, and `netif_rx()` delivery:
 | `gro_rx` | 0 | Route translated Ethernet through kernel GRO cells. |
 | `tx_data_ring_entries` | 512 | 256 or 512 TX0 descriptors. |
 | `rx_data_ring_entries` | 512 | 256, 512, or 1024 RX2/RX7 descriptors. |
-| `tx_batch_limit` | 16 | 1..64 TX doorbell boundary; requires `batch_tx=1`. |
+| `tx_batch_limit` | 64 | 1..64 TX doorbell boundary; requires `batch_tx=1`. |
 | `rx_batch_limit` | 16 | 1..32 RX refill boundary; requires `batch_rx=1`. |
 
 The two batch-limit parameters are writable through sysfs, but change them
 only between traffic runs. The ring sizes and GRO setting require a reboot.
-Invalid ring sizes fall back to 512; out-of-range batch limits are clamped.
+Invalid ring sizes fall back to 512. Out-of-range TX batch limits are
+rejected; RX batch limits are clamped.
 Keep the 20 MHz boot entry available when exercising `max_bw_mhz=80`.
+
+On the j700i 40 MHz association, raising `tx_batch_limit` from 16 to 64
+increased measured uplink from 114 to 141 Mbit/s (+24%) without a measured
+downlink change. The 16-entry setting remains available as a runtime
+comparison through `/sys/module/mt7932_fullmac/parameters/tx_batch_limit`.
 
 When `perf_stats=1`, read
 `/sys/kernel/debug/<PCI device name>/mt7932_datapath` as root. Values are

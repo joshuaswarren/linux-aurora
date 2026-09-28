@@ -6,7 +6,7 @@ static bool batch_tx = true;
 module_param(batch_tx, bool, 0644);
 MODULE_PARM_DESC(batch_tx, "Batch TX doorbells with xmit_more (disable for comparison)");
 
-static unsigned int tx_batch_limit = 16;
+static unsigned int tx_batch_limit = 64;
 
 static int mt_set_tx_batch_limit(const char *val, const struct kernel_param *kp)
 {
@@ -28,7 +28,7 @@ static const struct kernel_param_ops tx_batch_limit_ops = {
 };
 
 module_param_cb(tx_batch_limit, &tx_batch_limit_ops, &tx_batch_limit, 0644);
-MODULE_PARM_DESC(tx_batch_limit, "Maximum data TX descriptors per doorbell (1-64)");
+MODULE_PARM_DESC(tx_batch_limit, "Maximum data TX descriptors per doorbell (1-64, default 64)");
 
 void mt_data_kick_locked(struct mt7932 *m)
 {
