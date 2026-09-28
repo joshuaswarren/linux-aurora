@@ -1028,6 +1028,47 @@ static int mt_initialize(struct mt7932 *m)
 	return ret;
 }
 
+static void mt_release_startup_firmware(void *data)
+{
+	release_firmware(data);
+}
+
+static int mt_prepare_startup_firmware(struct device *dev)
+{
+	static const char * const names[] = {
+		"mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin",
+		"mediatek/mt7932/IZUBA_W7932_2.bin",
+		"mediatek/mt7932/ppr.bin",
+		"mediatek/mt7932/config-original.bin",
+		"mediatek/mt7932/wcal.bin",
+		"mediatek/mt7932/oca2.bin",
+		"mediatek/mt7932/policy/world-XZ.bin",
+	};
+	const struct firmware *fw;
+	unsigned int i;
+	int ret;
+
+	/* Firmware lives outside the initramfs. Defer before touching hardware;
+	 * userspace retries drivers_probe once the external files are staged.
+	 * Hold references for asynchronous calibration/configuration requests.
+	 */
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		ret = request_firmware_direct(&fw, names[i], dev);
+		if (ret == -ENOENT) {
+			dev_info_once(dev, "waiting for external Wi-Fi firmware\n");
+			return dev_err_probe(dev, -EPROBE_DEFER,
+					     "external firmware not available: %s\n", names[i]);
+		}
+		if (ret)
+			return dev_err_probe(dev, ret, "cannot load %s\n", names[i]);
+		ret = devm_add_action_or_reset(dev, mt_release_startup_firmware,
+					      (void *)fw);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct mt7932 *m;
@@ -1039,6 +1080,9 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	domain = iommu_get_domain_for_dev(&pdev->dev);
 	if (!domain || (domain->type != IOMMU_DOMAIN_DMA && domain->type != IOMMU_DOMAIN_DMA_FQ))
 		return dev_err_probe(&pdev->dev, -EINVAL, "translated DMA domain required\n");
+	ret = mt_prepare_startup_firmware(&pdev->dev);
+	if (ret)
+		return ret;
 	ret = pcim_enable_device(pdev);
 	if (ret)
 		return ret;

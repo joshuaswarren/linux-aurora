@@ -22,7 +22,7 @@ def function(text, marker):
 
 assert "last_submission: Option<Fence>" in source
 assert "last_submission_engine: Option<G17PSubmissionEngine>" in source
-assert "last_publication: Option<Fence>" in source
+assert "last_ready: Option<Fence>" in source
 assert "last_async_compute" not in source
 
 compute = function(source, "    fn submit_compute_async(")

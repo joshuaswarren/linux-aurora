@@ -287,6 +287,9 @@ struct apple_dart {
 	u32 locked : 1;
 	u32 tlb_cmd_v2 : 1;
 	u32 force_available : 1;
+	u32 retained_bypass;
+	u32 owned_streams;
+	u32 static_dart_bypass;
 	u16 version;
 
 	dma_addr_t dma_min;
@@ -856,6 +859,11 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 
 static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
 {
+	if (dart->owned_streams) {
+		writel(dart->owned_streams | dart->static_dart_bypass,
+		       dart->regs + dart->hw->enable_streams);
+		return;
+	}
 	for (int word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
 		u32 mask = U32_MAX;
 
@@ -916,9 +924,20 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	struct apple_dart_stream_map stream_map;
 	int ret;
 
+	/* The MTP firmware is still using this inherited identity mapping. */
+	if (dart->retained_bypass)
+		return 0;
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
+	if (dart->owned_streams) {
+		bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
+		stream_map.sidmap[0] = dart->owned_streams;
+		apple_dart_hw_disable_dma(&stream_map);
+		apple_dart_hw_clear_all_ttbrs(&stream_map);
+		apple_dart_hw_enable_global_streams(dart);
+		return dart->hw->invalidate_tlb(&stream_map);
+	}
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 	apple_dart_hw_apply_remaps(dart);
@@ -1375,6 +1394,10 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 
 	for_each_stream_map(i, cfg, stream_map)
+		if (stream_map->dart->retained_bypass)
+			return -EBUSY;
+
+	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
@@ -1411,6 +1434,10 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 	struct apple_dart_stream_map *stream_map;
 	int i;
 
+	for_each_stream_map(i, cfg, stream_map)
+		if (stream_map->dart->owned_streams)
+			return -EINVAL;
+
 	if (!cfg->supports_bypass)
 		return -EINVAL;
 
@@ -1421,7 +1448,8 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	for_each_stream_map(i, cfg, stream_map)
-		apple_dart_hw_enable_bypass(stream_map);
+		if (!stream_map->dart->retained_bypass)
+			apple_dart_hw_enable_bypass(stream_map);
 
 	for_each_stream_map(i, cfg, stream_map)
 		pm_runtime_put(stream_map->dart->dev);
@@ -1447,6 +1475,10 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 
 	if (cfg->locked)
 		return -EINVAL;
+
+	for_each_stream_map(i, cfg, stream_map)
+		if (stream_map->dart->retained_bypass)
+			return -EBUSY;
 
 	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
@@ -1597,6 +1629,12 @@ static int apple_dart_of_xlate(struct device *dev,
 	if (args->args_count != 1)
 		return -EINVAL;
 	sid = args->args[0];
+	if (sid < 0 || sid >= dart->num_streams)
+		return -EINVAL;
+	if (dart->retained_bypass && sid != 0)
+		return -EINVAL;
+	if (dart->owned_streams && (sid >= 32 || !(dart->owned_streams & BIT(sid))))
+		return -EINVAL;
 
 	if (!cfg) {
 		cfg = kzalloc_obj(*cfg);
@@ -1757,6 +1795,10 @@ static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
+	if (cfg->stream_maps[0].dart->retained_bypass)
+		return IOMMU_DOMAIN_IDENTITY;
+	if (cfg->stream_maps[0].dart->owned_streams)
+		return IOMMU_DOMAIN_DMA;
 	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
@@ -2061,13 +2103,47 @@ static bool apple_dart_is_locked(struct apple_dart *dart)
 	return !!(readl(dart->regs + dart->hw->lock) & dart->hw->lock_bit);
 }
 
+/* Legacy J700 handoff: preserve APF while enabling the declared radio streams. */
+static int apple_dart_static_bypass_test(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map map = { .dart = dart };
+	unsigned int sid;
+	int ret;
+
+	if (!dart->static_dart_bypass)
+		return 0;
+	if (dart->owned_streams != BIT(1) || dart->num_streams != 19 ||
+	    !dart->supports_bypass || dart->locked ||
+	    dart->static_dart_bypass != (BIT(16) | BIT(18)))
+		return -EINVAL;
+	map.sidmap[0] = dart->static_dart_bypass;
+	/* Validate every target before changing any; preserve TTBR contents. */
+	for_each_set_bit(sid, map.sidmap, dart->num_streams) {
+		u32 tcr = readl(dart->regs + DART_TCR(dart, sid));
+		u32 ttbr = readl(dart->regs + DART_TTBR(dart, sid, 0));
+
+		if ((ttbr & dart->hw->ttbr_valid) || (tcr != 0 && tcr != 1 && tcr != 2))
+			return -EBUSY;
+	}
+	for_each_set_bit(sid, map.sidmap, dart->num_streams)
+		writel(DART_T8110_TCR_BYPASS_DART, dart->regs + DART_TCR(dart, sid));
+	writel(dart->static_dart_bypass, dart->regs + dart->hw->enable_streams);
+	ret = dart->hw->invalidate_tlb(&map);
+	if (ret)
+		return ret;
+	for_each_set_bit(sid, map.sidmap, dart->num_streams)
+		if (readl(dart->regs + DART_TCR(dart, sid)) != DART_T8110_TCR_BYPASS_DART)
+			return -EIO;
+	dev_info(dart->dev, "SID16/18 ADT DART-only bypass test active; APF retained, SID17 untouched\n");
+	return 0;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int bypass_count, enabled_count, remap_count, ret;
 	u32 dart_params[4], sid;
 	struct resource *res;
 	struct apple_dart *dart;
-	struct apple_dart_stream_map bypass_map = {};
 	struct device *dev = &pdev->dev;
 	u64 dma_range[2];
 
@@ -2244,6 +2320,47 @@ static int apple_dart_probe(struct platform_device *pdev)
 	}
 
 	dart->locked = apple_dart_is_locked(dart);
+	of_property_read_u32(dev->of_node, "linux-enablement-mac,owned-streams",
+			     &dart->owned_streams);
+	of_property_read_u32(dev->of_node, "linux-enablement-mac,static-dart-bypass-test",
+			     &dart->static_dart_bypass);
+	of_property_read_u32(dev->of_node, "linux-enablement-mac,retained-bypass",
+			     &dart->retained_bypass);
+	if (dart->owned_streams || dart->retained_bypass || dart->static_dart_bypass) {
+		if (!of_machine_is_compatible("apple,j700") ||
+		    !of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
+		    dart->locked || (dart->owned_streams && dart->retained_bypass)) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dart->force_available = 1;
+	}
+	if (dart->owned_streams) {
+		if (res->start != 0x390000000ULL || dart->owned_streams != BIT(1) ||
+		    dart->num_streams != 19 || dart->pgsize > PAGE_SIZE) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dev_info(dev, "Legacy radio handoff: owning SID1 only\n");
+	} else if (dart->static_dart_bypass) {
+		ret = -EINVAL;
+		goto err_clk_disable;
+	}
+	if (dart->retained_bypass) {
+		if (res->start != 0x314800000ULL || dart->retained_bypass != 1 ||
+		    !dart->supports_bypass ||
+		    (readl(dart->regs + DART_TCR(dart, 0)) &
+		     (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_TRANSLATE_ENABLE)) !=
+		    DART_T8110_TCR_BYPASS_DART ||
+		    (readl(dart->regs + DART_TTBR(dart, 0, 0)) & dart->hw->ttbr_valid)) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dev_info(dev, "Preserving inherited SID0 bypass for live MTP\n");
+	}
+	ret = apple_dart_static_bypass_test(dart);
+	if (ret)
+		goto err_clk_disable;
 
 	/*
 	 * A locked DART is one the bootloader handed over still translating for
@@ -2431,6 +2548,9 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 
+	if (dart->retained_bypass || dart->owned_streams)
+		return -EBUSY;
+
 	/* Locked DARTs can't be restored so skip saving their registers. */
 	if (dart->locked)
 		return 0;
@@ -2450,6 +2570,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 	int ret;
+
+	if (dart->retained_bypass || dart->owned_streams)
+		return -EBUSY;
 
 	/* Locked DARTs can't be restored, and they should not need it */
 	if (dart->locked)

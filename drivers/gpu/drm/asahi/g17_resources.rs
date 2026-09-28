@@ -4059,6 +4059,25 @@ impl G17PRenderFlist {
             total_pages: read_u32(0x2c)?,
         })
     }
+
+    fn store_uma_state(&self, state: g17_submission::G17PUmaPagePoolState) -> Result {
+        let vmap = self.control_shared.object.gem.vmap::<u8>()?;
+        for (offset, value) in [
+            (0x20, state.counter_a),
+            (0x24, state.counter_b),
+            (0x28, state.empty),
+            (0x2c, state.total_pages),
+        ] {
+            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                // SAFETY: these fields are within the retained control
+                // object. The caller has retired TA, 3D and FList references
+                // before transferring the physical pool slot to another owner.
+                unsafe { core::ptr::write_volatile(vmap.as_mut_ptr().add(offset + index), byte) };
+            }
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// Queue-owned mappings retained from SKSM registration through completion.
@@ -4155,6 +4174,8 @@ pub(crate) struct G17PComputeRingState {
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct G17PComputeSubmissionSnapshot {
     pub(crate) descriptor: u64,
+    pub(crate) cdm_base: Option<u64>,
+    pub(crate) cdm_terminator: u64,
     pub(crate) selector: u32,
     pub(crate) context: u32,
     /// B1 selector-3 resource-reclaim inputs. These are retained DRAM bytes,
@@ -5710,6 +5731,7 @@ impl G17PComputeDescriptorStorage {
         let mut snapshot = self.descriptors.with_bytes_mut(|bytes| {
             let raw = bytes.get(offset..end).ok_or(ERANGE)?;
             let mut work_key = None;
+            let mut cdm_base = None;
             // The Linux builder emits forty 12-byte primary RCE entries at
             // +0x40, or forty-one when the kick carries an SCS scratch
             // request. Report the encoded 0x10201 value, not a reconstructed
@@ -5720,6 +5742,9 @@ impl G17PComputeDescriptorStorage {
                 let at = 0x40 + index * 12;
                 if read_u32(raw, at)? == 0x10201 {
                     work_key = Some(read_u64(raw, at + 4)?);
+                }
+                if read_u32(raw, at)? == 0x1a420 {
+                    cdm_base = Some(read_u64(raw, at + 4)?);
                 }
             }
             let resource_index = read_u16(raw, 0xfb0)?;
@@ -5732,6 +5757,7 @@ impl G17PComputeDescriptorStorage {
                 None
             };
             Ok(G17PComputeSubmissionSnapshot {
+                cdm_base, cdm_terminator: read_u64(raw, 0xee0)?,
                 descriptor, selector: read_u32(raw, 0)?, context: read_u32(raw, 0x0c)?,
                 resource_state: read_u16(raw, 0x22)?,
                 primary_register_count: read_u16(raw, 0x748)?,
@@ -17802,6 +17828,19 @@ impl G17ResourceOwner {
         storage: &G17PUserRenderStorage,
     ) -> Result {
         self.stage_render_uma_owner(&storage.render_flist)
+    }
+
+    /// Pair the UMA load with a store at the retired graph boundary. The
+    /// shared FList object is not updated by GPU allocation or async growth;
+    /// reloading it unchanged would reset cursors and forget grown pages.
+    pub(crate) fn save_user_render_uma(&mut self, storage: &G17PUserRenderStorage) -> Result {
+        let owner = &storage.render_flist;
+        let state = owner.uma_state()?;
+        let descriptor = self.snapshot_compute_uma(owner.id() as u8)?;
+        if descriptor[0] != g17_submission::encode_g17p_umadesc([0; 4], state)[0] {
+            return Err(EIO);
+        }
+        owner.store_uma_state(g17_submission::decode_g17p_umadesc(descriptor, state))
     }
 
     pub(crate) fn stage_render_uma_page_pool_descriptor(&mut self) -> Result {

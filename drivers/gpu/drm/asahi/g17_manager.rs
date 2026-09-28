@@ -4358,6 +4358,12 @@ impl G17PManagerConstruction {
             );
             return Err(EFAULT);
         }
+        // The slot is idle, but its UMA descriptor contains firmware-updated
+        // cursors and growth. Save them with this graph before another pool
+        // overwrites the slot; reloading the constructor values loses pages.
+        if crate::g17_config::RENDER_USC_FREELIST != 0 {
+            self.resources.save_user_render_uma(self.render_storage.as_ref().ok_or(EIO)?)?;
+        }
         let backing = self.render_storage.as_mut().ok_or(EIO)?.take_sksm_backing()?;
         self.render_sksm.as_mut().ok_or(EIO)?.backing = Some(backing);
         Ok(())
