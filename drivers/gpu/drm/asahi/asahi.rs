@@ -41,6 +41,7 @@ mod g17_submission;
 mod g17_trace_capture;
 mod g17_uapi;
 mod g18_compute;
+mod g18_compute_memory;
 mod g18_scheduler;
 mod g18_live_boot;
 mod g18_uma;
