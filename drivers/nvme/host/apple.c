@@ -149,6 +149,8 @@ struct apple_nvme_queue {
 	u16 sq_tail;
 	u16 cq_head;
 	u8 cq_phase;
+	u8 pending_tags[64];
+	u8 pending_count;
 
 	bool is_adminq;
 	bool enabled;
@@ -292,6 +294,31 @@ MODULE_PARM_DESC(flush_interval,
 static unsigned int max_segments = NVME_MAX_SEGS;
 module_param(max_segments, uint, 0444);
 MODULE_PARM_DESC(max_segments, "Maximum segments per command (1-256; default 256)");
+
+static bool batch_doorbells;
+module_param(batch_doorbells, bool, 0444);
+MODULE_PARM_DESC(batch_doorbells,
+		 "Defer post-M4 I/O tag doorbells to the blk-mq dispatch boundary");
+
+static bool skip_inval_readback;
+module_param(skip_inval_readback, bool, 0444);
+MODULE_PARM_DESC(skip_inval_readback,
+		 "Skip post-M4 NVMMU invalidation status read (experimental)");
+
+static unsigned int irq_coalesce_time;
+module_param(irq_coalesce_time, uint, 0444);
+MODULE_PARM_DESC(irq_coalesce_time,
+		 "Post-M4 I/O interrupt aggregation time in 100us units (0-255)");
+
+static unsigned int irq_coalesce_threshold;
+module_param(irq_coalesce_threshold, uint, 0444);
+MODULE_PARM_DESC(irq_coalesce_threshold,
+		 "Post-M4 I/O interrupt aggregation threshold, zero-based (0-255)");
+
+static unsigned int max_hw_kb = NVME_MAX_KB_SZ;
+module_param(max_hw_kb, uint, 0444);
+MODULE_PARM_DESC(max_hw_kb,
+		 "Driver transfer cap in KiB (4-4096; Identify MDTS still applies)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -556,9 +583,20 @@ static void apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
 	writel(tag, anv->mmio_nvmmu + APPLE_NVMMU_TCB_INVAL);
-	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
+	if ((!anv->hw->needs_ioq_registers || !skip_inval_readback) &&
+	    readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
 		dev_warn_ratelimited(anv->dev,
 				     "NVMMU TCB invalidation failed\n");
+}
+
+/* Called with anv->lock held; the linear SQ doorbell accepts one tag/write. */
+static void apple_nvme_ring_pending(struct apple_nvme_queue *q)
+{
+	u8 i;
+
+	for (i = 0; i < q->pending_count; i++)
+		writel(q->pending_tags[i], q->sq_db);
+	q->pending_count = 0;
 }
 
 static void apple_nvme_submit_cmd_t8015(struct apple_nvme_queue *q,
@@ -583,7 +621,7 @@ static void apple_nvme_submit_cmd_t8015(struct apple_nvme_queue *q,
 
 
 static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
-				  struct nvme_command *cmd)
+				  struct nvme_command *cmd, bool last)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 	u32 tag = nvme_tag_from_cid(cmd->common.command_id);
@@ -615,8 +653,34 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 	 * and the final CQ update.
 	 */
 	spin_lock_irq(&anv->lock);
-	writel(tag, q->sq_db);
+	if (q->is_adminq || !anv->hw->needs_ioq_registers ||
+	    !batch_doorbells) {
+		writel(tag, q->sq_db);
+	} else {
+		if (WARN_ON_ONCE(q->pending_count == ARRAY_SIZE(q->pending_tags)))
+			apple_nvme_ring_pending(q);
+		q->pending_tags[q->pending_count++] = tag;
+		if (last)
+			apple_nvme_ring_pending(q);
+	}
 	spin_unlock_irq(&anv->lock);
+}
+
+static void apple_nvme_commit_rqs(struct blk_mq_hw_ctx *hctx)
+{
+	struct apple_nvme_queue *q = hctx->driver_data;
+	struct apple_nvme *anv = queue_to_apple_nvme(q);
+	unsigned long flags;
+
+	if (!anv->hw->needs_ioq_registers || !batch_doorbells)
+		return;
+
+	spin_lock_irqsave(&anv->lock, flags);
+	if (apple_nvme_queue_enabled(q))
+		apple_nvme_ring_pending(q);
+	else
+		q->pending_count = 0;
+	spin_unlock_irqrestore(&anv->lock, flags);
 }
 
 static void apple_nvme_free_prps(struct apple_nvme *anv, struct request *req)
@@ -1011,6 +1075,32 @@ static int apple_nvme_remove_sq(struct apple_nvme *anv)
 	return nvme_submit_sync_cmd(anv->ctrl.admin_q, &c, NULL, 0);
 }
 
+static int apple_nvme_set_irq_coalescing(struct apple_nvme *anv)
+{
+	u32 cdw11;
+	int ret;
+
+	if (!anv->hw->needs_ioq_registers ||
+	    (!irq_coalesce_time && !irq_coalesce_threshold))
+		return 0;
+	if (!irq_coalesce_time || !irq_coalesce_threshold ||
+	    irq_coalesce_time > U8_MAX || irq_coalesce_threshold > U8_MAX) {
+		dev_warn(anv->dev, "invalid I/O interrupt coalescing settings\n");
+		return 0;
+	}
+
+	/* TIME occupies bits 15:8; THR is zero-based in bits 7:0. */
+	cdw11 = (irq_coalesce_time << 8) | irq_coalesce_threshold;
+	ret = nvme_set_features(&anv->ctrl, NVME_FEAT_IRQ_COALESCE,
+				cdw11, NULL, 0, NULL);
+	if (ret > 0) {
+		dev_warn(anv->dev,
+			 "I/O interrupt coalescing rejected (status %#x)\n", ret);
+		return 0;
+	}
+	return ret;
+}
+
 static bool apple_nvme_delayed_flush(struct apple_nvme *anv, struct nvme_ns *ns,
 				     struct request *req)
 {
@@ -1079,7 +1169,7 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
         }
 
 	if (anv->hw->has_lsq_nvmmu)
-		apple_nvme_submit_cmd_t8103(q, cmnd);
+		apple_nvme_submit_cmd_t8103(q, cmnd, bd->last);
 	else
 		apple_nvme_submit_cmd_t8015(q, cmnd);
 
@@ -1460,6 +1550,7 @@ static const struct blk_mq_ops apple_nvme_mq_admin_ops = {
 
 static const struct blk_mq_ops apple_nvme_mq_ops = {
 	.queue_rq = apple_nvme_queue_rq,
+	.commit_rqs = apple_nvme_commit_rqs,
 	.complete = apple_nvme_complete_rq,
 	.init_hctx = apple_nvme_init_hctx,
 	.init_request = apple_nvme_init_request,
@@ -1473,6 +1564,7 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
 	q->sq_tail = 0;
+	q->pending_count = 0;
 	q->cq_head = 0;
 	q->cq_phase = 1;
 	if (anv->hw->has_lsq_nvmmu)
@@ -1659,7 +1751,8 @@ rtkit_ready:
 	 * Limit the max command size to prevent iod->sg allocations going
 	 * over a single page.
 	 */
-	anv->ctrl.max_hw_sectors = min_t(u32, NVME_MAX_KB_SZ << 1,
+	anv->ctrl.max_hw_sectors = min_t(u32,
+					 clamp_val(max_hw_kb, 4, NVME_MAX_KB_SZ) << 1,
 					 dma_max_mapping_size(anv->dev) >> 9);
 	anv->ctrl.max_segments = clamp_val(max_segments, 1, NVME_MAX_SEGS);
 
@@ -1766,6 +1859,9 @@ rtkit_ready:
 	ret = apple_nvme_create_sq(anv);
 	if (ret)
 		goto out_remove_cq;
+	ret = apple_nvme_set_irq_coalescing(anv);
+	if (ret)
+		goto out_remove_sq;
 
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
