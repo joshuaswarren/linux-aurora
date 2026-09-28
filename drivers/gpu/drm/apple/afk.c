@@ -1203,8 +1203,8 @@ int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 	work->ep = ep;
 	work->message = message;
 
-	dev_info(ep->dcp->dev, "J700_AFK_RX: ep:%02x message=%#llx type=%#llx\n",
-		 ep->endpoint, message, (u64)FIELD_GET(RBEP_TYPE, message));
+	dev_dbg(ep->dcp->dev, "J700_AFK_RX: ep:%02x message=%#llx type=%#llx\n",
+		ep->endpoint, message, (u64)FIELD_GET(RBEP_TYPE, message));
 
 	INIT_WORK(&work->work, afk_receive_message_worker);
 	queue_work(ep->wq, &work->work);
