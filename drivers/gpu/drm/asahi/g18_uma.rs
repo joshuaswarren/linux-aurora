@@ -12,6 +12,60 @@
 pub(crate) const G18_UMA_STATE_BYTES: usize = 0x7c;
 pub(crate) const G18_UMA_DESCRIPTOR_BYTES: usize = 0x80;
 
+/// Dimensions written by the M6 pool's `computeAndSetUMAPoolVariables`.
+pub(crate) struct G18UmaGeometry {
+    pub(crate) pool_bytes: u64,
+    pub(crate) block_bytes: u64,
+    pub(crate) block_count: u32,
+    pub(crate) directory_bytes: u64,
+    pub(crate) initial_committed_bytes: u64,
+    pub(crate) total_1k_chunks: u64,
+    pub(crate) directory_bytes_per_usc: u64,
+    pub(crate) chunks_per_usc: u32,
+}
+
+/// Derive allocation geometry after resolving the device's native accessors.
+///
+/// Native arithmetic uses 32-bit intermediates for chunk counts and directory
+/// sizes. Reject overflow instead of wrapping an allocation. The caller must
+/// supply the actual mode and topology; this helper does not select defaults.
+pub(crate) fn g18_uma_geometry(
+    max_bytes: u64,
+    block_bytes: u64,
+    uscs: u32,
+    chunks64k: bool,
+    page_aligned: bool,
+    page_shift: u32,
+) -> Option<G18UmaGeometry> {
+    if uscs == 0
+        || uscs > 128
+        || !block_bytes.is_power_of_two()
+        || block_bytes < 0x10000
+        || !(12..=16).contains(&page_shift)
+    {
+        return None;
+    }
+    let pool_bytes = max_bytes & !(block_bytes - 1);
+    if pool_bytes == 0 {
+        return None;
+    }
+    let units = u32::try_from(pool_bytes >> 16).ok()?;
+    let per_usc = units.checked_add(uscs - 1)? / uscs;
+    let raw_directory = per_usc.checked_mul(if chunks64k { 4 } else { 512 })?;
+    let align = if page_aligned { 1u64 << page_shift } else { 1024 };
+    let directory_bytes_per_usc = (u64::from(raw_directory) + align - 1) & !(align - 1);
+    Some(G18UmaGeometry {
+        pool_bytes,
+        block_bytes,
+        block_count: u32::try_from(pool_bytes / block_bytes).ok()?,
+        directory_bytes: directory_bytes_per_usc.checked_mul(u64::from(uscs))?,
+        initial_committed_bytes: 0,
+        total_1k_chunks: u64::from(units.checked_mul(64)?),
+        directory_bytes_per_usc,
+        chunks_per_usc: (units / uscs).checked_mul(64)?,
+    })
+}
+
 /// Native `halInitSMAEnableMask` at 0xfffffe0008c41bdc splits the active
 /// 128-bit mask into sixteen groups, each stored in a 16-bit output lane.
 /// The primary mask is accelerator+0x470; +0x480 is used only when it is zero.

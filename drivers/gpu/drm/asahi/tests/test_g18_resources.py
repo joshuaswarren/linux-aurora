@@ -326,12 +326,19 @@ fn main() {
             fw_read(&uat, u64_at(&uat, status_b + 0x4ac0), 0x20);
             fw_read(&uat, u64_at(&uat, status_b + 0x4ac8), 0x1800);
             assert_eq!(u64_at(&uat, root + 0xb8), 0);
-            // PB/UMA views: high and low aliases name the same page.
-            for (high, low) in [(0x2e0u64, 0x2d8u64), (0x2f0, 0x2e8)] {
+            // Native M6 allocation: PB 16 KiB, UMA 32 KiB (256 x 128-byte
+            // descriptors). Walk both complete aliases, including slot 255.
+            for (high, low, size) in [(0x2e0u64, 0x2d8u64, 0x4000usize),
+                                      (0x2f0, 0x2e8, 0x8000)] {
                 let high = u64_at(&uat, main + high);
                 let low = u64_at(&uat, main + low);
-                assert_eq!(uat.kernel_vm().translate_iova(high).unwrap(),
-                           uat.kernel_lower_vm().translate_iova(low).unwrap());
+                for page in (0..size).step_by(0x4000) {
+                    assert_eq!(uat.kernel_vm().translate_iova(high + page as u64).unwrap(),
+                               uat.kernel_lower_vm().translate_iova(low + page as u64).unwrap());
+                    assert!(fw_read(&uat, high + page as u64, 0x4000).iter().all(|b| *b == 0),
+                            "descriptor tables must start empty");
+                }
+                assert_eq!(u64_at(&uat, high + size as u64 - 8), 0);
             }
             assert!(uat.kernel_vm().translate_iova(u64_at(&uat, main + 0x2d0)).is_err(), "sentinel stays unmapped");
             // QoS block and the four completion queues.
