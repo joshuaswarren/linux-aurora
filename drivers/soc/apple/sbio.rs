@@ -1979,7 +1979,7 @@ impl SepData {
                     self.templates_restored.store(false, Relaxed);
                 }
                 Some(n) if self.templates_restored.load(Relaxed) && self.prove_restore() => {
-                    dev_warn!(
+                    dev_info!(
                         self.dev,
                         "Touch ID: restored {} enrolled identity/identities; enrolment survived reboot\n",
                         n
