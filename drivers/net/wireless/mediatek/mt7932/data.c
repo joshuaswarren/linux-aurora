@@ -5,9 +5,30 @@
 static bool batch_tx = true;
 module_param(batch_tx, bool, 0644);
 MODULE_PARM_DESC(batch_tx, "Batch TX doorbells with xmit_more (disable for comparison)");
+
 static unsigned int tx_batch_limit = 16;
-module_param(tx_batch_limit, uint, 0644);
-MODULE_PARM_DESC(tx_batch_limit, "TX doorbell batch size (1..64, default 16)");
+
+static int mt_set_tx_batch_limit(const char *val, const struct kernel_param *kp)
+{
+	unsigned int limit;
+	int ret;
+
+	ret = kstrtouint(val, 0, &limit);
+	if (ret)
+		return ret;
+	if (limit < 1 || limit > 64)
+		return -EINVAL;
+	WRITE_ONCE(*(unsigned int *)kp->arg, limit);
+	return 0;
+}
+
+static const struct kernel_param_ops tx_batch_limit_ops = {
+	.set = mt_set_tx_batch_limit,
+	.get = param_get_uint,
+};
+
+module_param_cb(tx_batch_limit, &tx_batch_limit_ops, &tx_batch_limit, 0644);
+MODULE_PARM_DESC(tx_batch_limit, "Maximum data TX descriptors per doorbell (1-64)");
 
 void mt_data_kick_locked(struct mt7932 *m)
 {
@@ -17,6 +38,8 @@ void mt_data_kick_locked(struct mt7932 *m)
 	mt_write(m, m->tx[0].reg + 8, m->tx[0].head);
 	m->tx_pending = false;
 	m->tx_doorbells++;
+	m->tx_kick_max = max(m->tx_kick_max, m->tx_pending_count);
+	m->tx_pending_count = 0;
 }
 
 static bool mt_bss_tx_allowed(struct mt7932 *m);
@@ -102,6 +125,7 @@ void mt_data_complete(struct mt7932 *m, const u8 *packet, size_t length)
 		return;
 	}
 	spin_lock_irqsave(&m->data_lock, flags);
+	m->tx_free_events++;
 	mt_data_clean_locked(m);
 	for (i = 0; i < count; i++) {
 		unsigned int token = tokens[i];
@@ -181,13 +205,14 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	if (mt_perf_enabled())
 		m->perf_tx_queued_max = max(m->perf_tx_queued_max, (u64)q->queued);
 	m->tx_pending = true;
+	m->tx_pending_count++;
 	mt_bss_tx_account(m);
 	if (!mt_bss_tx_allowed(m) || m->data_live[q->head] || q->queued >= q->count - 1)
 		netif_stop_queue(netdev);
 	if (mt_perf_enabled() && netif_queue_stopped(netdev))
 		m->perf_tx_queue_stops++;
 	/* Flush before returning a stopped queue: there may be no next skb.
-	 * Bound a long qdisc burst to sixteen descriptors per doorbell.
+	 * Bound each qdisc burst to the runtime doorbell limit.
 	 */
 	if (!READ_ONCE(batch_tx) || !netdev_xmit_more() ||
 	    netif_queue_stopped(netdev) ||

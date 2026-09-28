@@ -145,7 +145,8 @@ struct mt7932 {
 	bool data_live[512], data_token[512], data_retired[512];
 	struct mt7932_duplicate duplicates[17];
 	u64 tx_released, rx_ethernet;
-	u64 tx_doorbells, tx_busy, rx_descriptors, rx_doorbells;
+	u64 tx_doorbells, tx_busy, tx_free_events, rx_descriptors, rx_doorbells;
+	u32 tx_kick_max, tx_pending_count;
 	u64 rx_parse_errors, rx_amsdu, rx_filtered, rx_rate_missing;
 	/* Optional host-side profiling; the IRQ thread owns RX samples. */
 	struct dentry *perf_dir;

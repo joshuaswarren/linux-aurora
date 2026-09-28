@@ -69,6 +69,7 @@ static const char mt_stat_names[][ETH_GSTRING_LEN] = {
 	"last_rxv", "rx_rate_valid", "rx_rate_age_ms",
 	"bw_requested_mhz", "bw_effective_limit_mhz", "bw_fallback_latched",
 	"bw_policy_pending", "bw_assoc_mhz", "bw_assoc_center", "fw_asserted",
+	"tx_free_events", "tx_kick_max",
 };
 
 static int mt_get_sset_count(struct net_device *netdev, int set)
@@ -101,6 +102,8 @@ static void mt_get_stats(struct net_device *netdev, struct ethtool_stats *stats,
 	data[6] = READ_ONCE(m->rx_amsdu);
 	data[7] = READ_ONCE(m->rx_rate_missing);
 	memset(data + 8, 0, 7 * sizeof(*data));
+	data[25] = 0;
+	data[26] = 0;
 	if (READ_ONCE(m->data_ready)) {
 		spin_lock_irqsave(&m->data_lock, flags);
 		data[8] = m->tx_doorbells;
@@ -112,6 +115,8 @@ static void mt_get_stats(struct net_device *netdev, struct ethtool_stats *stats,
 		data[12] = live;
 		data[13] = m->bss_absent;
 		data[14] = m->bss_quota;
+		data[25] = m->tx_free_events;
+		data[26] = m->tx_kick_max;
 		spin_unlock_irqrestore(&m->data_lock, flags);
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
