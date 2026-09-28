@@ -5,5 +5,3 @@
  */
 #include "t8140-j700.dts"
 #include "t8140-ave.dtsi"
-#include "t8140-prores.dtsi"
-#include "t8140-jpeg.dtsi"
