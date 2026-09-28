@@ -29,6 +29,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_gp";
+		apple,always-on; /* Parent of apcie_sys_gp, see there */
 	};
 
 	ps_isp_sys: power-controller@268 {
@@ -55,6 +56,13 @@
 		#reset-cells = <0>;
 		label = "apcie_sys_gp";
 		power-domains = <&ps_apcie_gp>;
+		/*
+		 * The internal PCIe root complex (Wi-Fi/Bluetooth) sits here
+		 * rather than in apcie_gp as on t8103/t8112, where apcie_gp is
+		 * always-on for the same reason: the controller has no system
+		 * sleep support and loses its ports if powered down.
+		 */
+		apple,always-on;
 	};
 
 	ps_i2c0: power-controller@2c8 {
