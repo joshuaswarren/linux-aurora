@@ -165,8 +165,13 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
-	/* H17P: the level the firmware last reported in D006, in millinits */
+	/*
+	 * H17P: the last non-zero level D006 reported, in millinits (D006
+	 * reads 0 on every frame that does not change the level), and the
+	 * level the last brightness-carrying swap sent (-1: none yet).
+	 */
 	u32 h17p_reported_millinits;
+	int h17p_sent_nits;
 	/*
 	 * H17P: DPMS off leaves the pipe up (soft_off); the backlight stands
 	 * in for the power-off by fading to blank_nits (blanked) and brings

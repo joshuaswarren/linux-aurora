@@ -2680,6 +2680,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	/* initialize brightness scale to a sensible default to avoid divide by 0*/
 	dcp->brightness.scale = 65536;
+	dcp->brightness.h17p_sent_nits = -1;
 	panel_np = of_get_compatible_child(dev->of_node, "apple,panel-mini-led");
 	if (panel_np)
 		dcp->panel.has_mini_led = true;
