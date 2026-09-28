@@ -1699,3 +1699,7 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
 #include "t8140-j700-hybrid-additions.dtsi"
+
+/* Firmware-free diagnostic encoders; work starts only on explicit submission. */
+#include "t8140-prores.dtsi"
+#include "t8140-jpeg.dtsi"
