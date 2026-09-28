@@ -30,6 +30,9 @@
 /* used to limit the user space buffers to the buffer_pool_config */
 #define ISP_MAX_BUFFERS 16
 
+/* DARTs whose power state the power-path debugging reports */
+#define ISP_MAX_DARTS 3
+
 /* capture metadata buffers, for firmware that has that pool */
 #define ISP_CAPMETA_BUFFERS 8
 
@@ -334,6 +337,16 @@ struct apple_isp {
 	spinlock_t buf_lock;
 	struct list_head bufs_pending;
 	struct list_head bufs_submitted;
+
+	/* power-path debugging, see isp-debug.c */
+	struct {
+		struct regmap **pd_regmap;
+		u32 *pd_offset;
+		const char **pd_name;
+		struct device *darts[ISP_MAX_DARTS];
+		int num_darts;
+		struct dentry *dir;
+	} dbg;
 };
 
 struct isp_chan_ops {
