@@ -1553,6 +1553,9 @@ static G17P_PARAMETER_BUFFER_RETARGETS: AtomicU32 = AtomicU32::new(0);
 /// One `context/qos` control sample per boot, taken from a render that
 /// completed, so the wedge sample has something to be compared against.
 static RENDER_CONTEXT_WITNESS_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Reason label of the one healthy control sample per boot; that sample is
+/// logged at info level, a wedge sample at error level.
+const HEALTHY_RENDER_WITNESS: &str = "healthy-paired-completion";
 pub(crate) static G17P_MARK_TAG15_INSTALLS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static G17P_MARK_ZERO_DURATION: AtomicU32 = AtomicU32::new(0);
 pub(crate) static G17P_MARK_GATE_REBUILDS: AtomicU32 = AtomicU32::new(0);
@@ -7167,7 +7170,7 @@ impl G17PManagerConstruction {
                 // this record and the diagnostic -- and the comment above it
                 // claiming it is "the exact host-safe witness" -- is wrong.
                 if !RENDER_CONTEXT_WITNESS_LOGGED.swap(true, Ordering::Relaxed) {
-                    self.log_render_context_witness("healthy-paired-completion");
+                    self.log_render_context_witness(HEALTHY_RENDER_WITNESS);
                 }
                 return Ok(G17PRenderPollOutcome::Complete(completion));
             }
@@ -7389,6 +7392,18 @@ impl G17PManagerConstruction {
     /// cannot distinguish "the firmware cleared this" from "the firmware never
     /// wrote it" -- only a healthy sample can.
     pub(crate) fn log_render_context_witness(&mut self, reason: &'static str) {
+        // The healthy control is evidence, not an error: keep it out of
+        // `dmesg --level=err` so a clean boot has no GPU error lines.
+        let healthy = reason == HEALTHY_RENDER_WITNESS;
+        macro_rules! witness {
+            ($($arg:tt)*) => {
+                if healthy {
+                    dev_info!($($arg)*)
+                } else {
+                    dev_err!($($arg)*)
+                }
+            };
+        }
         // The counter pair that decides whether the job gets unlinked at all.
         //
         // `poll_translated_render_completion` states the rule: "B1 unlinks
@@ -7414,7 +7429,7 @@ impl G17PManagerConstruction {
             .ok_or(ENODEV)
             .and_then(|storage| storage.render_event_control_state())
         {
-            Ok(event_control) => dev_err!(
+            Ok(event_control) => witness!(
                 self.resources.dev().as_ref(),
                 "G17P render event-control [{}]: record={} submitted={} slot-word={} completed={} lag={} membership={:#x} unlinked={} pool-a-reusable={:?}/35\n",
                 reason,
@@ -7438,9 +7453,9 @@ impl G17PManagerConstruction {
         // records point at. A second pair whose lanes still read as the first
         // pair's is the measured retire-without-executing shape.
         if let Ok(lanes) = self.resources.render_stamp_lanes() {
-            dev_err!(
+            witness!(
                 self.resources.dev().as_ref(),
-                "G17P render: stamp lanes [{}] A(qid0..3)={:#x?} B(qid0..3)={:#x?}\n",
+                "G17P render: stamp lanes [{}] A(qid0..3)={:x?} B(qid0..3)={:x?}\n",
                 reason,
                 lanes[0],
                 lanes[1],
@@ -7498,7 +7513,7 @@ impl G17PManagerConstruction {
                 prefix[0x1a], prefix[0x1b], prefix[0x1c], prefix[0x1d],
                 prefix[0x1e], prefix[0x1f], prefix[0x20], prefix[0x21],
             ]);
-            dev_err!(
+            witness!(
                 self.resources.dev().as_ref(),
                 "G17P render context/qos [{}]: requested-slot={} ctxdesc(slot={},ctx={},prio={},class={},state={},bound-slot={}) qid-bitmap={:#018x}/{:#018x} qos-records TA(qid {})={:?} 3D(qid {})={:?}\n",
                 reason,
@@ -9132,7 +9147,7 @@ impl G17PManagerConstruction {
         };
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P ring[{}]: queue {:#x} consumer {} producer {} mirror {:#x} count {:#x} submitted {} ordinal {} reclaim-cursor {} reclaimed-total {} items {:#x?}\n",
+            "G17P ring[{}]: queue {:#x} consumer {} producer {} mirror {:#x} count {:#x} submitted {} ordinal {} reclaim-cursor {} reclaimed-total {} items {:x?}\n",
             label,
             state.queue,
             state.consumer,
