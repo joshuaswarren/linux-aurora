@@ -239,3 +239,58 @@ pub(crate) fn pack_g18_uma_descriptor(
         read64(state, 0x74),
     ]
 }
+
+/// Fixed first-dispatch policy, recovered with the original SMAV1 sizing code.
+/// This is deliberately limited to the saved addition workload, not a general
+/// replacement for native SMA sizing. Hardware execution remains to be tested.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G18ComputeScratchPlan {
+    pub(crate) block_bytes: u64,
+    pub(crate) block_count: u32,
+    pub(crate) register_pair: [u64; 2],
+    pub(crate) chunk_counters: [u32; 2],
+}
+
+pub(crate) fn g18_addition_scratch(state: &[u8]) -> Option<G18ComputeScratchPlan> {
+    const WORDS: [u32; 23] = [
+        32, 10, 0, 0, 192, 16, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 128, 4, 0, 0,
+    ];
+    if state.len() != 0x268 { return None; }
+    for (index, expected) in WORDS.iter().enumerate() {
+        let offset = 0x198 + index * 4;
+        let value = u32::from_le_bytes(state[offset..offset + 4].try_into().ok()?);
+        if value != *expected { return None; }
+    }
+    // Twelve USCs, one compute job, engine/priority 2, flags 3, no preemption,
+    // 2 GiB maximum and 1 MiB blocks: ideal 5 MiB, minimum 3 MiB.
+    // Native allocatePagesEnd supplies d550/d558 and FList+0xac/+0xb0 below.
+    Some(G18ComputeScratchPlan {
+        block_bytes: 0x10_0000, block_count: 5,
+        register_pair: [16, 6], chunk_counters: [0, 350],
+    })
+}
+
+/// Native 8c8bfc8..8c8bfe0: preserve metadata while encoding a GPU address.
+/// Reject truncation; current backing uses one entry per 1 MiB allocation.
+pub(crate) fn g18_uma_block_entry(gpu_address: u64, previous: u32) -> Option<u32> {
+    if gpu_address == 0 || gpu_address >= (1u64 << 48)
+        || gpu_address & 0x0f_ffff != 0 {
+        return None;
+    }
+    Some((previous & 0xf000_0000) | ((gpu_address >> 20) as u32))
+}
+
+/// Whether the current fixed first-dispatch policy avoids sparse-directory
+/// growth. Native 8c8b8f8..8c8b9ac admits 28 one-MiB blocks on twelve USCs;
+/// 29 requires new backing and is intentionally refused by this owner.
+pub(crate) fn g18_initial_directory_fits(
+    blocks: u32, block_bytes: u64, uscs: u32, flags: u32, page_shift: u32,
+) -> Option<bool> {
+    if blocks == 0 || block_bytes != 0x10_0000 || uscs != 12 || flags != 3 || page_shift != 14 {
+        return None;
+    }
+    let units = (block_bytes >> 16).checked_mul(u64::from(blocks))?;
+    let per_usc = units.checked_add(u64::from(uscs) - 1)? / u64::from(uscs);
+    let initial_units = (((1u64 << page_shift) - 0x400) >> 9) + 8;
+    Some(per_usc <= initial_units)
+}

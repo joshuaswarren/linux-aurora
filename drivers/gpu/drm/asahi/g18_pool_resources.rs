@@ -19,6 +19,8 @@ use kernel::prelude::*;
 // and completion aliases. Actual extents are checked before allocation.
 const DIRECTORY_BASE: u64 = 0x70_0200_0000;
 const BLOCK_LIST_BASE: u64 = 0x70_0400_0000;
+const BLOCK_DATA_BASE: u64 = 0x70_0500_0000;
+const BLOCK_DATA_STRIDE: u64 = 0x20_0000;
 const STATE_BYTES: usize = g18_uma::G18_POOL_STATE_BYTES;
 
 #[derive(Debug, Copy, Clone)]
@@ -44,6 +46,9 @@ pub(crate) struct G18UmaPoolMemory {
     // Drop the GPU aliases and their reservations before the CPU/FW mappings.
     // Every mapping independently retains its GEM backing and owning VM.
     aliases: KVec<mmu::KernelMapping>,
+    scratch_aliases: KVec<mmu::KernelMapping>,
+    scratch: KVec<MappedObject>,
+    scratch_plan: Option<g18_uma::G18ComputeScratchPlan>,
     directory: KVec<MappedObject>,
     block_list: MappedObject,
     state: MappedObject,
@@ -135,12 +140,80 @@ impl G18UmaPoolMemory {
         dev_info!(dev.as_ref(),
             "G18 UMA sparse owner: reserved={:#x} backing_pages={} holes={} bias={:#x} aliases=verified guards=verified unpublished\n",
             layout.reservation_bytes, layout.initial_page_count, holes, layout.gpu_base_offset);
-        Ok(Self { aliases, directory, block_list, state, geometry, layout, encoded: false })
+        Ok(Self {
+            aliases, scratch_aliases: KVec::new(), scratch: KVec::new(), scratch_plan: None,
+            directory, block_list, state, geometry, layout, encoded: false,
+        })
     }
 
-    /// Prepare this boot's single empty compute pool. The caller may publish
-    /// the returned identity once; ownership must survive firmware access.
-    /// No committed private blocks or runtime growth are provided yet.
+    /// Retain the exact addition fixture's initial backing before publication.
+    /// A failed allocation/alias check leaves the prior empty pool untouched.
+    /// No firmware command, process root or hardware pool binding is published.
+    pub(crate) fn prepare_compute_backing(
+        &mut self, dev: &AsahiDevice, uat: &mmu::Uat, high_range: Range<u64>,
+        plan: g18_uma::G18ComputeScratchPlan,
+    ) -> Result<()> {
+        if self.encoded || self.scratch_plan.is_some() { return Err(EBUSY); }
+        if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != 0x4000
+            || plan.block_bytes != self.geometry.block_bytes
+            || plan.block_bytes != 0x10_0000 || plan.block_count != 5
+            || plan.register_pair != [16, 6] || plan.chunk_counters != [0, 350]
+            || self.geometry.pool_bytes != 0x8000_0000
+            || self.geometry.directory_bytes != self.geometry.directory_bytes_per_usc * 12
+            || g18_uma::g18_initial_directory_fits(plan.block_count, plan.block_bytes, 12, 3, 14)
+                != Some(true) {
+            return Err(EINVAL);
+        }
+        let mut backing = KVec::new();
+        let mut aliases = KVec::new();
+        let mut entries = [0u32; 5];
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let gpu = BLOCK_DATA_BASE + index as u64 * BLOCK_DATA_STRIDE;
+            *entry = g18_uma::g18_uma_block_entry(gpu, 0).ok_or(EINVAL)?;
+            let mut block = MappedObject::new_wc_in_range(
+                dev, uat.kernel_vm(), high_range.clone(), plan.block_bytes as usize,
+                mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW,
+            )?;
+            // GPU-address alignment, not physical contiguity: the native list
+            // stores GPU virtual addresses and the UAT retains each GEM page.
+            let alias = block.map_alias_at_with_guards(
+                uat.kernel_lower_vm(), gpu, mmu::PROT_GPU_SHARED_RW, 1,
+            )?;
+            for offset in (0..plan.block_bytes).step_by(mmu::UAT_PGSZ) {
+                if uat.kernel_vm().translate_iova(block.iova() + offset)?
+                    != uat.kernel_lower_vm().translate_iova(gpu + offset)? {
+                    return Err(EFAULT);
+                }
+            }
+            if uat.kernel_lower_vm().translate_iova(gpu + plan.block_bytes).is_ok() {
+                return Err(EFAULT);
+            }
+            aliases.push(alias, GFP_KERNEL)?;
+            backing.push(block, GFP_KERNEL)?;
+        }
+        // All allocations and translations are validated before the first
+        // publication data changes. Nothing fallible follows this write.
+        self.block_list.with_bytes_mut(|bytes| {
+            if bytes.len() < entries.len() * 4 || bytes.iter().any(|&v| v != 0) {
+                return Err(EBUSY);
+            }
+            for (index, entry) in entries.iter().enumerate() {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&entry.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        self.scratch_aliases = aliases;
+        self.scratch = backing;
+        self.scratch_plan = Some(plan);
+        fence(Ordering::SeqCst);
+        dev_info!(dev.as_ref(),
+            "G18 compute scratch: 5 MiB retained, 5 GPU block entries, 320 translations verified; pool unpublished\n");
+        Ok(())
+    }
+
+    /// Prepare this boot's single compute pool, empty unless backing was
+    /// explicitly prepared first. Ownership must survive firmware access.
+    /// Runtime pool growth is not implemented.
     pub(crate) fn prepare_binding(&mut self) -> Result<G18UmaPoolBinding> {
         if self.encoded { return Err(EBUSY); }
         let encoded = g18_uma::encode_g18_pool_state(&g18_uma::G18UmaPoolState {
@@ -153,9 +226,9 @@ impl G18UmaPoolMemory {
             priority: 2,
             directory_gpu: DIRECTORY_BASE + self.layout.gpu_base_offset,
             directory_stride: self.geometry.directory_bytes_per_usc,
-            chunk_counters: [0, 0],
+            chunk_counters: self.scratch_plan.map_or([0, 0], |plan| plan.chunk_counters),
             block_list_gpu: BLOCK_LIST_BASE,
-            populated_blocks: 0,
+            populated_blocks: self.scratch_plan.map_or(0, |plan| plan.block_count),
             block_units_64k: (self.geometry.block_bytes >> 16).try_into()?,
             // Native base configureDevice initializes this mode to zero.
             sma_mode: 0,

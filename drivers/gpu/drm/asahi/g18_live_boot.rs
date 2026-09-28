@@ -61,6 +61,8 @@
 use crate::{
     driver::{AsahiDevice, G18Runtime, T8152Probe},
     g17_resources::g18::G18FirmwareMemory,
+    g17_resources::g18_compute::G18PreparedComputeCommand,
+    g17_resources::g18_pool::G18UmaPoolBinding,
     g17_resources::g18_queue::{G18QueueProbe, QUEUE_ID},
     g17_rtkit, mmu, regs,
 };
@@ -103,6 +105,8 @@ pub(crate) const STAGE_QUEUE_REGISTER: u32 = 5;
 pub(crate) const STAGE_SCHEDULER_BIND: u32 = 6;
 /// Bind the owned empty compute UMA pool, without submitting a GPU job.
 pub(crate) const STAGE_POOL_BIND: u32 = 7;
+/// One captured addition with retained resources and independent completion/output gates.
+pub(crate) const STAGE_COMPUTE_ADD: u32 = 8;
 /// REQUIRES USER APPROVAL: PMGR2 PSD power-on request for sgx (service 3)
 /// only. Standalone; no other stage requests PSD power.
 pub(crate) const STAGE_PSD_POWER_ON: u32 = 90;
@@ -125,6 +129,7 @@ pub(crate) const fn stage_is_known(stage: u32) -> bool {
             | STAGE_QUEUE_REGISTER
             | STAGE_SCHEDULER_BIND
             | STAGE_POOL_BIND
+            | STAGE_COMPUTE_ADD
             | STAGE_PSD_POWER_ON
             | STAGE_PSD_POWER_ON_GFX
             | STAGE_PSD_POWER_ON_GFX1
@@ -151,7 +156,7 @@ const fn stage_writes_psd(stage: u32) -> bool {
 /// G18G firmware receipt and the 42-bit DMA mask.
 pub(crate) const fn stage_runs_firmware(stage: u32) -> bool {
     matches!(stage, STAGE_RTKIT | STAGE_INITDATA | STAGE_HEARTBEAT
-        | STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND)
+        | STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD)
 }
 
 /// Set once any firmware stage reached its first ASC CPU start request.
@@ -321,7 +326,7 @@ impl G18Role {
 
 // Compile-time guards on the stage gates and the fixed J873 facts.
 const _: () = {
-    assert!(!stage_is_known(0) && !stage_is_known(8) && !stage_is_known(89) && !stage_is_known(94));
+    assert!(!stage_is_known(0) && !stage_is_known(9) && !stage_is_known(89) && !stage_is_known(94));
     assert!(stage_is_known(STAGE_READ_ONLY) && stage_is_known(STAGE_PSD_POWER_ON));
     assert!(stage_is_known(STAGE_PSD_POWER_ON_GFX) && stage_is_known(STAGE_PSD_POWER_ON_GFX1));
     assert!(stage_is_known(STAGE_PSD_RESTORE_IDLE));
@@ -333,9 +338,11 @@ const _: () = {
     assert!(stage_runs_firmware(STAGE_RTKIT) && stage_runs_firmware(STAGE_INITDATA));
     assert!(stage_runs_firmware(STAGE_HEARTBEAT));
     assert!(stage_is_known(STAGE_POOL_BIND) && stage_runs_firmware(STAGE_POOL_BIND));
+    assert!(stage_is_known(STAGE_COMPUTE_ADD) && stage_runs_firmware(STAGE_COMPUTE_ADD));
     assert!(!stage_writes_psd(STAGE_RTKIT) && !stage_writes_psd(STAGE_INITDATA));
     assert!(!stage_writes_psd(STAGE_HEARTBEAT));
     assert!(!stage_writes_psd(STAGE_POOL_BIND));
+    assert!(!stage_writes_psd(STAGE_COMPUTE_ADD));
     // Exactly one service per power-on stage, sgx first.
     assert!(matches!(psd_power_on_service(STAGE_PSD_POWER_ON), Some(regs::T8152PsdService::Sgx)));
     assert!(matches!(psd_power_on_service(STAGE_PSD_POWER_ON_GFX), Some(regs::T8152PsdService::GfxAsc)));
@@ -1128,14 +1135,20 @@ impl G18Session {
         }
         self.retire_openings()?;
         self.wake_idle_policy()?;
-        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND) {
+        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD) {
             self.register_queue()?;
         }
-        if matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND) {
+        if matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD) {
             self.bind_scheduler()?;
         }
         if self.stage == STAGE_POOL_BIND {
-            self.bind_pool()?;
+            let binding = self.memory.as_mut().ok_or(EIO)?.prepare_uma_pool_binding()?;
+            self.bind_pool(binding)?;
+        }
+        if self.stage == STAGE_COMPUTE_ADD {
+            let (command, pool) = self.memory.as_mut().ok_or(EIO)?.prepare_addition(&self.dev)?;
+            self.bind_pool(pool)?;
+            self.submit_addition(command, pool)?;
         }
         self.heartbeat()
     }
@@ -1220,13 +1233,16 @@ impl G18Session {
         let roots = self.uat.prepare_t8140_firmware_high_roots()?;
         let memory = G18FirmwareMemory::new_with_uat(&self.dev, self.uat.clone(), cntvct())?;
         self.memory = Some(memory);
-        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND) {
+        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD) {
             self.queue_probe = Some(G18QueueProbe::new(&self.dev, &self.uat,
-                matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND))?);
+                matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD))?);
         }
         self.uat.confirm_t8140_primary_high_root(roots)?;
         self.uat.mirror_t8140_secondary_high_root()?;
         let memory = self.memory.as_mut().ok_or(EIO)?;
+        if self.stage == STAGE_COMPUTE_ADD {
+            memory.use_firmware_queue_programming(&self.dev)?;
+        }
         memory.log_summary(&self.dev);
         dev_info!(self.dev.as_ref(), "G18_INIT status links before publish {:x?}; counters {:?}\n",
             memory.status_links()?, memory.control_counters()?);
@@ -1383,8 +1399,7 @@ impl G18Session {
         Err(ETIMEDOUT)
     }
 
-    fn bind_pool(&mut self) -> Result {
-        let binding = self.memory.as_mut().ok_or(EIO)?.prepare_uma_pool_binding()?;
+    fn bind_pool(&mut self, binding: G18UmaPoolBinding) -> Result {
         let probe = self.queue_probe.as_mut().ok_or(EIO)?;
         let before = probe.pool_status();
         dev_info!(self.dev.as_ref(), "G18_POOL before bind {:x?}; state={:#x} generation={} slot={}\n",
@@ -1413,7 +1428,67 @@ impl G18Session {
         Err(ETIMEDOUT)
     }
 
-    /// Stage 4/5/6/7: passive drain of both roles' event and trace rings. Sends
+    /// Submit exactly one addition; a retired setup or changed stamp alone is
+    /// insufficient. Preserve the whole firmware owner after every outcome.
+    fn submit_addition(&mut self, command: G18PreparedComputeCommand,
+                       pool: G18UmaPoolBinding) -> Result {
+        let memory = self.memory.as_mut().ok_or(EIO)?;
+        let output = memory.addition_output()?;
+        let completion = memory.compute().completion_snapshot()?;
+        let scheduler = memory.scheduler().snapshot(0)?;
+        if output.checked != 4096 || output.untouched != 4096 || output.correct != 0
+            || completion.stamps != [0; 2] || scheduler.submitted != 0
+            || scheduler.completed != 0 || scheduler.linked != 0 {
+            return Err(EBUSY);
+        }
+        let roots = memory.compute().publish_context()?;
+        let probe = self.queue_probe.as_mut().ok_or(EIO)?;
+        probe.prepare_compute_job(command, pool)?;
+        let address = probe.queue_address();
+        // From this counter onward, even a failed publication retains all
+        // memory. Firmware may already observe the host-owned counter.
+        let submitted = self.memory.as_mut().ok_or(EIO)?.scheduler().publish_kick(0)?;
+        self.queue_probe.as_mut().ok_or(EIO)?.publish_compute_job()?;
+        self.memory.as_mut().ok_or(EIO)?.publish_compute_queue(address, QUEUE_ID)?;
+        Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
+            .send_message(EP_GFX_INTERRUPTS, 0x0083_0000_0000_000a)?;
+        dev_info!(self.device(),
+            "G18_COMPUTE submitted qid11 context={} roots={:x?} count={} expected_stamp={:#x}\n",
+            command.context_id, roots, submitted, command.expected_stamp);
+        // Bounded first-use run. Polling observes completion; it sends no
+        // additional commands and never retries a GPU job in this boot.
+        for step in 0..10_000 {
+            self.check_faults("compute addition")?;
+            let (outer, inner, _) = self.queue_probe_status()?;
+            let memory = self.memory.as_mut().ok_or(EIO)?;
+            let completion = memory.compute().completion_snapshot()?;
+            let scheduler = memory.scheduler().snapshot(0)?;
+            if outer == [4; 3] && inner == [6; 3]
+                && completion.stamps == [command.expected_stamp; 2]
+                && scheduler.submitted == 1 && scheduler.completed == 1 && scheduler.linked == 0 {
+                let output = memory.addition_output()?;
+                dev_info!(self.dev.as_ref(),
+                    "G18_COMPUTE completion outer={:?} inner={:?} stamps={:x?} times={:x?} scheduler={:?} output={:?}\n",
+                    outer, inner, completion.stamps, completion.timestamps, scheduler, output);
+                if output.checked != 4096 || output.correct != 4096 || output.untouched != 0 {
+                    return Err(EIO);
+                }
+                self.check_faults("compute output")?;
+                dev_info!(self.device(), "G18_COMPUTE_ADD_PASS: all 4096 outputs match after independent completion\n");
+                return Ok(());
+            }
+            if step % 1000 == 999 {
+                dev_info!(self.dev.as_ref(),
+                    "G18_COMPUTE wait={}ms outer={:?} inner={:?} stamps={:x?} scheduler={:?}\n",
+                    step + 1, outer, inner, completion.stamps, scheduler);
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        dev_err!(self.device(), "G18_COMPUTE timeout; owners retained, no resubmission\n");
+        Err(ETIMEDOUT)
+    }
+
+    /// Stage 4..8: passive drain of both roles' event and trace rings. Sends
     /// nothing. This is the milestone-1 heartbeat.
     fn heartbeat(&mut self) -> Result {
         dev_info!(self.device(), "G18_HEARTBEAT passive drain for {} ms, no host messages\n", HEARTBEAT_MS);

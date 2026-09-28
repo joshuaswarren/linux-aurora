@@ -37,7 +37,7 @@
 use super::MappedObject;
 use super::g18_pool::{G18UmaPoolBinding, G18UmaPoolMemory};
 use super::g18_scheduler::G18SchedulerMemory;
-use super::g18_compute::G18ComputeMemory;
+use super::g18_compute::{G18ComputeMemory, G18PreparedComputeCommand};
 use super::g18_compute_payload::G18ComputePayloadMemory;
 use crate::{driver::AsahiDevice, g17_initdata as init, mmu};
 use core::sync::atomic::{fence, Ordering};
@@ -330,6 +330,21 @@ impl G18FirmwareMemory {
 
     pub(crate) fn compute(&mut self) -> &mut G18ComputeMemory { &mut self.compute }
 
+    /// Select the firmware-owned KSMFE queue path before root publication.
+    /// b000 0x2183c..0x21844 copies hwdata+0x101c to global+0x109f5c;
+    /// 0x12cdc..0x12de8 skips tag15 hardware queue setup when it is nonzero.
+    /// Native macOS uses host queue programming. This first Linux submission
+    /// sends tag15/tag14 and performs no host KSMFE MMIO, so choose one owner.
+    pub(crate) fn use_firmware_queue_programming(&mut self, dev: &AsahiDevice) -> Result {
+        let policy = SHARED_BASE + 0x101c;
+        if self.shared.read_u32(policy)? != 1 { return Err(EINVAL); }
+        self.shared.write_u32(policy, 0)?;
+        fence(Ordering::SeqCst);
+        dev_info!(dev.as_ref(),
+            "G18_QUEUE_OWNER firmware: hwdata+0x101c=0 before root publication; no host KSMFE writes\n");
+        Ok(())
+    }
+
     /// Retain a private shader/input/output VM. This does not select a process
     /// context or make its roots visible to firmware, and never queues work.
     pub(crate) fn prepare_compute_payload(&mut self, dev: &AsahiDevice)
@@ -344,6 +359,58 @@ impl G18FirmwareMemory {
     pub(crate) fn bind_compute_process(&mut self, dev: &AsahiDevice) -> Result<u32> {
         let payload = self.compute_payload.as_ref().ok_or(EINVAL)?;
         self.compute.bind_process(dev, &self.uat, payload.vm())
+    }
+
+    /// Allocate the captured job's scratch pool while its state is unpublished.
+    /// The returned register inputs are valid only with this retained owner.
+    pub(crate) fn prepare_compute_scratch(&mut self, dev: &AsahiDevice)
+        -> Result<crate::g18_uma::G18ComputeScratchPlan> {
+        let plan = self.compute_payload.as_ref().ok_or(EINVAL)?.scratch_plan()?;
+        self.uma_pool.prepare_compute_backing(dev, &self.uat, DYNAMIC_START..DYNAMIC_END, plan)?;
+        Ok(plan)
+    }
+
+    /// Assemble the single captured addition with retained Linux resources.
+    /// Every step is still unpublished: the caller must subsequently bind the
+    /// pool, publish the process roots, encode the owned SKSM entry and only
+    /// then publish a kick. Errors leave any partial owners retained here.
+    pub(crate) fn prepare_addition(&mut self, dev: &AsahiDevice)
+        -> Result<(G18PreparedComputeCommand, G18UmaPoolBinding)> {
+        use crate::g18_compute::G18ComputeCompletionState;
+        use super::g18_queue::QUEUE_ID;
+
+        let (mut command, mut registers) = self.prepare_compute_payload(dev)?.addition_inputs()?;
+        let context_id = self.bind_compute_process(dev)?;
+        let scratch = self.prepare_compute_scratch(dev)?;
+        let pool = self.prepare_uma_pool_binding()?;
+        let scheduler = self.scheduler.prepare(0, 1)?;
+
+        // One fresh CL queue, first work ordinal 0, hardware stamp 1. Native
+        // event-machine conversion with 256 entries and base 1 yields 1 for
+        // event stamp 0x100; no previous completion is imported from macOS.
+        command.sequence = 1;
+        command.d100 = 1;
+        command.d7b8 = pool.state;
+        command.completion = G18ComputeCompletionState {
+            stamp: 0x100, index: u32::from(QUEUE_ID), entries: 256,
+            generation: 0, base: 1,
+        };
+        registers.context_id = context_id;
+        registers.pool_slot = pool.slot;
+        registers.pool_generation = pool.generation;
+        registers.d550 = scratch.register_pair[0];
+        registers.d558 = scratch.register_pair[1];
+        let prepared = self.compute.prepare(scheduler, &command, &registers)?;
+        dev_info!(dev.as_ref(),
+            "G18 addition prepared: command={:#x}/{:#x} context={} scheduler={:#x} stamp={:#x} pool={}/{} registers={:?}; unpublished\n",
+            prepared.gpu_address, prepared.firmware_address, context_id,
+            scheduler.record, prepared.expected_stamp, pool.slot, pool.generation,
+            prepared.registers);
+        Ok((prepared, pool))
+    }
+
+    pub(crate) fn addition_output(&mut self) -> Result<crate::g18_compute_payload::ComputeResult> {
+        self.compute_payload.as_mut().ok_or(EINVAL)?.output_snapshot()
     }
 
     pub(crate) fn prepare_uma_pool_binding(&mut self) -> Result<G18UmaPoolBinding> {
@@ -365,8 +432,20 @@ impl G18FirmwareMemory {
     /// G18 native 24-byte CL_2 record, limited to the registration and
     /// scheduler-bind records. Each new producer is published exactly once.
     pub(crate) fn publish_queue_probe(&mut self, address: u64, queue_id: u8, producer: u32) -> Result {
+        if !(1..=3).contains(&producer) { return Err(EINVAL); }
+        self.publish_compute_outer(address, queue_id, producer, producer)
+    }
+
+    /// After the three setup records, publish one outer item covering the
+    /// command, context configuration and kick (inner producer 6).
+    pub(crate) fn publish_compute_queue(&mut self, address: u64, queue_id: u8) -> Result {
+        self.publish_compute_outer(address, queue_id, 4, 6)
+    }
+
+    fn publish_compute_outer(&mut self, address: u64, queue_id: u8,
+                             producer: u32, inner_producer: u32) -> Result {
         if address < KERNEL_BASE || address & 0x3f != 0 || queue_id > 127
-            || !(1..=3).contains(&producer) {
+            || !(1..=4).contains(&producer) {
             return Err(EINVAL);
         }
         if self.compute_outer_counters()? != [producer - 1; 3]
@@ -379,7 +458,7 @@ impl G18FirmwareMemory {
             if record.iter().any(|byte| *byte != 0) { return Err(EBUSY); }
             record[8..16].copy_from_slice(&address.to_le_bytes());
             record[16..20].copy_from_slice(&2u32.to_le_bytes());
-            record[20..22].copy_from_slice(&(producer as u16).to_le_bytes());
+            record[20..22].copy_from_slice(&(inner_producer as u16).to_le_bytes());
             record[22] = queue_id;
             record[23] = 1;
             Ok(())
