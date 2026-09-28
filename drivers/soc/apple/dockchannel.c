@@ -11,6 +11,7 @@
 #include <linux/irq.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqdomain.h>
+#include <linux/pm_wakeup.h>
 #include <linux/platform_device.h>
 #include <linux/soc/apple/dockchannel.h>
 #include <linux/unaligned.h>
@@ -63,6 +64,7 @@ struct dockchannel_common {
 	struct device *dev;
 	struct irq_domain *domain;
 	int irq;
+	bool wake_irq_armed;
 
 	void __iomem *irq_base;
 };
@@ -365,6 +367,35 @@ static int dockchannel_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static int dockchannel_suspend(struct device *dev)
+{
+	struct dockchannel_common *dcc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!device_wakeup_path(dev))
+		return 0;
+
+	ret = enable_irq_wake(dcc->irq);
+	if (!ret)
+		dcc->wake_irq_armed = true;
+
+	return ret;
+}
+
+static int dockchannel_resume(struct device *dev)
+{
+	struct dockchannel_common *dcc = dev_get_drvdata(dev);
+
+	if (!dcc->wake_irq_armed)
+		return 0;
+
+	dcc->wake_irq_armed = false;
+	return disable_irq_wake(dcc->irq);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_pm_ops,
+				dockchannel_suspend, dockchannel_resume);
+
 static void dockchannel_remove(struct platform_device *pdev)
 {
 	struct dockchannel_common *dcc = platform_get_drvdata(pdev);
@@ -393,6 +424,7 @@ static struct platform_driver dockchannel_driver = {
 	.driver = {
 		.name = "dockchannel",
 		.of_match_table = dockchannel_of_match,
+		.pm = pm_sleep_ptr(&dockchannel_pm_ops),
 	},
 	.probe = dockchannel_probe,
 	.remove = dockchannel_remove,
