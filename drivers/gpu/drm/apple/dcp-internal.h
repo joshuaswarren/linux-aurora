@@ -426,6 +426,8 @@ struct apple_dcp {
 	bool typec_cable_connected;
 	/* CRTC powered off while the Type-C cable stays attached */
 	bool typec_crtc_off;
+	/* Keep the unplug shutdown owner until the next CRTC enable. */
+	bool typec_unplugged;
 	struct delayed_work typec_reconnect_wq;
 	struct delayed_work typec_fabric_retrain_wq;
 	u32 typec_reconnect_tries;

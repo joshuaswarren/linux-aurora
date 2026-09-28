@@ -117,6 +117,21 @@ static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 	u64 clock_request = DCP_H17P_DISP0_REG_BASE + 0x68000;
 	u64 scratch = DCP_H17P_DISP0_REG_BASE + 0x20000;
 
+	/*
+	 * DCPEXT has four display apertures, so its BWR/boost descriptors
+	 * are indices 4/5. Use those same resources for D003: firmware forms
+	 * a CPU pointer by adding (scratch - descriptor physical base) to
+	 * the mapped descriptor. Returning DISP0's address here made that
+	 * subtraction wrap and crashed firmware when power-off cleared BWR.
+	 */
+	if (of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext")) {
+		scratch = dcp->disp_bw_scratch_res.start +
+			  dcp->disp_bw_scratch_offset;
+		clock_request = dcp->disp_bw_doorbell_res.start;
+		dev_info(dcp->dev, "D003 external BWR %#llx boost %#llx\n",
+			 scratch, clock_request);
+	}
+
 	trace_iomfb_callback(dcp, tag, __func__);
 	if (apple_dcp_h17p_rt_bw_encode_reply(&view, scratch,
 						     clock_request))

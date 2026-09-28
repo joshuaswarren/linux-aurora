@@ -99,6 +99,8 @@
 };
 
 &display {
+	/* Both pipes scan out buffers from the DRM device's DMA domain. */
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
 	status = "okay";
 };
 
@@ -252,39 +254,30 @@
 	status = "okay";
 };
 
+&soc {
+	dcpext_bw: display-bandwidth@302828000 {
+		/* Native 25G83: BWR agent 2 and boost agent 3. */
+		reg = <0x3 0x02828000 0x0 0x8>,
+		      <0x3 0x02870000 0x0 0x4>;
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+};
+
 &dcpext {
 	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
 	clock-names = "clock-154", "clock-194";
 	apple,iomfb-surfaces = <0>;
 
-	/*
-	 * Without a "dp-phy" the entire DisplayPort path is absent, and
-	 * silently: dcp_start_rtkit() gates ibootep_init() and dptxep_init()
-	 * on dcp->phy, and the NULL arm of that test prints nothing at all.
-	 * With no dptxep the 0x2a AFK endpoint never starts, no
-	 * "dcpdptx-port-epic" service appears, dptxport[0].enabled stays
-	 * false, and dcp_dptx_connect() would bail at "missing phy" even if a
-	 * hotplug reached it.  One missing property, three blockers.
-	 *
-	 * Deliberately no "mux-index": that property is what makes dcp_probe()
-	 * claim the DP xbar and force the ATC PHY to DP-only at probe, which
-	 * is right for the MacBook Pro DP-to-HDMI socket and wrong for a real
-	 * Type-C port, where typec_displayport must own the mux.  apple,dptx-phy
-	 * and apple,dptx-die are likewise left out: both default to 0, which is
-	 * correct for a single-PHY, single-die part.
-	 */
+	/* The Type-C route owns PHY and crossbar selection on DP Alt Mode. */
 	phys = <&atcphy0 PHY_TYPE_DP>;
-	phy-names = "dp-phy";
-
-	/*
-	 * No "mux-index" on purpose: that property makes dcp_probe()
-	 * select the crossbar and force the ATC PHY to DP-only at probe,
-	 * which is wrong for a real Type-C port.  The select happens on the
-	 * DP-Alt event instead, in dcp_typec_mux_set().
-	 */
+	phy-names = "typec0";
 	mux-controls = <&dpxbar0 0>;
-	mux-control-names = "dp-xbar";
-
+	mux-control-names = "typec0";
+	apple,typec-mux-indices = <2>;
+	apple,typec-dptx-phys = <0>;
+	apple,bw-scratch = <&dcpext_bw 0 4 0>;
+	apple,bw-doorbell = <&dcpext_bw 1 5>;
 
 	/*
 	 * The J700 has no HDMI socket: this DCP's only output is the DP-Alt
@@ -299,19 +292,18 @@
 	apple,connector-type = "USB-C";
 	status = "okay";
 
-	/*
-	 * mode-switch makes the Type-C class treat this node as a mux for the
-	 * connector it is linked to, so dcp_register_typec_mux() can hang a
-	 * typec_mux off it and be called from the same typec_mux_set() that
-	 * drives the ATC PHY.  Properties must precede subnodes, so this sits
-	 * at the end of the block.
-	 */
-	typec-route {
-		mode-switch;
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
 
-		port {
-			dcpext_typec0: endpoint {
-				remote-endpoint = <&typec0_connector_dcp>;
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext_typec0: endpoint {
+					remote-endpoint = <&typec0_connector_dcp>;
+				};
 			};
 		};
 	};
