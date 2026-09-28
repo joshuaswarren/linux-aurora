@@ -72,6 +72,9 @@ struct mt7932 {
 	size_t reply_length;
 	u64 interrupts, packets;
 	bool running;
+	bool irq_vectors_allocated, irq_requested;
+	bool initialized, suspend_running;
+	bool removing;
 	bool ram_config;
 	bool runtime_epoch;
 	bool runtime_cal_valid;

@@ -1170,10 +1170,12 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = pci_alloc_irq_vectors(pdev, 1, 1, legacy_irq_test ? PCI_IRQ_INTX : PCI_IRQ_ALL_TYPES);
 	if (ret < 0)
 		goto retain;
+	m->irq_vectors_allocated = true;
 	ret = devm_request_threaded_irq(&pdev->dev, pci_irq_vector(pdev, 0),
 					mt_irq, mt_irq_thread, IRQF_ONESHOT | IRQF_SHARED, "mt7932", m);
 	if (ret)
 		goto retain;
+	m->irq_requested = true;
 	{
 		struct irq_data *irq = irq_get_irq_data(pci_irq_vector(pdev, 0));
 		unsigned int cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
@@ -1196,10 +1198,12 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				 irq->chip->name, irq->hwirq);
 	}
 	ret = mt_initialize(m);
+	if (!ret)
+		m->initialized = true;
 retain:
 	if (ret)
-		dev_err(&pdev->dev, "initialization failed: %d; retaining DMA storage until reboot\n", ret);
-	/* Built-in only and no unbind: an uncertain device must not DMA into freed RAM. */
+		dev_err(&pdev->dev, "initialization failed: %d; DMA storage retained while bound\n", ret);
+	/* A failed epoch retains its DMA storage until the device is removed. */
 	return 0;
 }
 
@@ -1213,10 +1217,80 @@ static void mt_shutdown(struct pci_dev *pdev)
 	/* Storage remains allocated through reset, even if the engine is stuck. */
 }
 
+static void mt_remove(struct pci_dev *pdev)
+{
+	struct mt7932 *m = pci_get_drvdata(pdev);
+	bool dma_active;
+	int ret = 0;
+
+	/* Close cfg80211 admission first, while responses and DMA are available
+	 * to retire the connection.  No work may use the netdev or wiphy after
+	 * their storage is released.
+	 */
+	WRITE_ONCE(m->removing, true);
+	WRITE_ONCE(m->interface_registered, false);
+	if (m->wiphy)
+		cancel_work_sync(&m->startup_work);
+	if (m->netdev)
+		unregister_netdev(m->netdev);
+	dma_active = READ_ONCE(m->running);
+	if (m->irq_requested) {
+		WRITE_ONCE(m->running, false);
+		mt_write(m, W + 0x204, 0);
+		synchronize_irq(pci_irq_vector(pdev, 0));
+	}
+	if (m->wiphy)
+		cancel_work_sync(&m->startup_work);
+	if (m->netdev) {
+		cancel_delayed_work_sync(&m->scan_timeout_work);
+		cancel_work_sync(&m->scan_finish_work);
+		cancel_work_sync(&m->cal_work);
+		cancel_work_sync(&m->connect_work);
+		cancel_work_sync(&m->disconnect_work);
+		free_netdev(m->netdev);
+		m->netdev = NULL;
+	}
+	if (m->wiphy) {
+		wiphy_unregister(m->wiphy);
+		wiphy_free(m->wiphy);
+		m->wiphy = NULL;
+	}
+	/* Stop new DMA at the engine, then revoke bus mastering before the
+	 * device-managed ring allocations are released.  Even a failed idle
+	 * poll must never leave the old descriptors PCI-accessible.
+	 */
+	if (dma_active) {
+		mt_rmw(m, W + 0x208, BIT(0) | BIT(2), 0);
+		ret = mt_poll(m, W + 0x208, BIT(1) | BIT(3), 0, 100000);
+		if (!pci_wait_for_pending_transaction(pdev))
+			dev_warn(&pdev->dev, "pending PCI transaction during remove\n");
+	}
+	pci_clear_master(pdev);
+	if (ret)
+		dev_warn(&pdev->dev, "DMA idle timeout during remove: %d; bus mastering disabled\n", ret);
+	if (m->irq_requested)
+		devm_free_irq(&pdev->dev, pci_irq_vector(pdev, 0), m);
+	if (m->irq_vectors_allocated)
+		pci_free_irq_vectors(pdev);
+}
+
 static int __maybe_unused mt_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct mt7932 *m = pci_get_drvdata(pdev);
+	int ret;
+
+	/* The firmware and its DMA rings have no restartable epoch.  Save the
+	 * configuration here so pci_pm_suspend_noirq() leaves this function and
+	 * its upstream bridge in D0 during s2idle.  wiphy_suspend() has already
+	 * retired the association; retain the firmware and ring storage.
+	 */
+	ret = pci_save_state(pdev);
+	if (ret)
+		return ret;
+	if (!m->irq_requested)
+		return 0;
+	m->suspend_running = READ_ONCE(m->running);
 
 	/*
 	 * mt_irq() reads W + 0x200 to decide whether the interrupt is ours.
@@ -1234,6 +1308,7 @@ static int __maybe_unused mt_suspend(struct device *dev)
 	WRITE_ONCE(m->running, false);
 	mt_write(m, W + 0x204, 0);
 	disable_irq(pci_irq_vector(pdev, 0));
+	dev_info(dev, "SUSPEND_D0: firmware and DMA retained\n");
 	return 0;
 }
 
@@ -1242,13 +1317,16 @@ static int __maybe_unused mt_resume(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct mt7932 *m = pci_get_drvdata(pdev);
 
-	/* The PCI core has put the device back in D0 before this runs, so the
-	 * register write below is safe again.
+	if (!m->irq_requested)
+		return 0;
+	/* Drain completions accumulated while masked before IRQ delivery resumes.
+	 * The PCI core restores the saved configuration on the rollback path too.
 	 */
+	WRITE_ONCE(m->running, m->suspend_running);
+	if (m->initialized && m->suspend_running)
+		mt_service(m);
 	enable_irq(pci_irq_vector(pdev, 0));
-	WRITE_ONCE(m->running, true);
-	if (!poll_test)
-		mt_write(m, W + 0x204, m->irq_mask);
+	dev_info(dev, "RESUME_D0: firmware and DMA retained\n");
 	return 0;
 }
 
@@ -1263,6 +1341,7 @@ static struct pci_driver mt_driver = {
 	.name = "mt7932-fullmac",
 	.id_table = mt_ids,
 	.probe = mt_probe,
+	.remove = mt_remove,
 	.shutdown = mt_shutdown,
 	.driver.suppress_bind_attrs = true,
 	.driver.pm = &mt_pm_ops,

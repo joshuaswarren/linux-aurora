@@ -393,7 +393,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	/* cfg80211 calls after updating channels under RTNL in this kernel.
 	 * Copy, never retain the transient request or take command_mutex here.
 	 */
-	if (!request)
+	if (!request || READ_ONCE(m->removing))
 		return;
 	memcpy(reg.alpha2, request->alpha2, 2);
 	if (!((reg.alpha2[0] >= 'A' && reg.alpha2[0] <= 'Z' &&
