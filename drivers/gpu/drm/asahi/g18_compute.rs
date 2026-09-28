@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G18 compute register serialization, derived from the original 26A428 HAL400.
+//! G18 compute command serialization, derived from the original 26A428 HAL400.
 //!
-//! This is the register portion of the 0x1020-byte command, not a complete kick.
+//! This encodes the submission fields and registers of the 0x1020-byte command.
+//! It does not create resource owners, publish a queue entry or execute a kick.
 //! The caller must own and validate all GPU addresses before publication. Native
 //! offsets retained in field names are deliberately not assigned guessed meanings.
 //! Register overrides, optional SMAPP preemption objects and random/alternating
@@ -66,6 +67,7 @@ pub(crate) struct G18ComputeRegisterInputs {
 pub(crate) enum G18ComputeRegisterError {
     InvalidTopology,
     AddressOverflow,
+    InvalidCompletionState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +77,160 @@ pub(crate) struct G18ComputeRegisterSummary {
     pub total_main_count: u16,
     pub secondary_gpu: u64,
     pub secondary_count: u16,
+}
+
+/// Inputs to the native per-queue completion calculation. `generation` is the
+/// selected stamp half's u64 generation; selection happens in the owner layer.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct G18ComputeCompletionState {
+    pub stamp: u32,
+    pub index: u32,
+    pub entries: u32,
+    pub generation: u64,
+    pub base: u64,
+}
+
+/// The remaining native submission inputs. Offset names refer to the native
+/// host descriptor, not firmware command offsets. Ownership is a caller duty.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct G18ComputeCommandInputs {
+    pub sequence: u64,
+    pub completion: G18ComputeCompletionState,
+    pub stamp_addresses: [u64; 2],
+    pub channel_ordinal: u32,
+    pub has_wait: bool,
+    pub d100: u64,
+    pub d150: u32,
+    pub d158: u64,
+    pub d198: u64,
+    pub d1b0: u64,
+    pub d1b8: u64,
+    pub d488: u64,
+    pub d490: u64,
+    pub d498: u64,
+    pub d4a0: u64,
+    pub d4a8: u64,
+    pub d4b0: u32,
+    pub d4b8: u64,
+    pub d4c0: u32,
+    pub d4d0: u32,
+    pub d4e0: u64,
+    pub d508: u8,
+    pub d518: u64,
+    pub d520: u32,
+    pub d524: u32,
+    pub d628: u8,
+    pub d629: u8,
+    pub d770: u8,
+    pub d778: u64,
+    pub d780: u64,
+    pub d788: u64,
+    pub d790: u64,
+    pub d7b8: u64,
+    pub d7d4: u8,
+    pub d8b0: u8,
+    pub extra_addresses: [u64; 4],
+    pub extra_policy: u8,
+}
+
+/// Original HAL400 completion expression. Preserve the native u64 division,
+/// u32 arithmetic and final 8-bit index independently; a wide modulo gives
+/// different bytes around counter wrap. G18's native scratch payload is zero.
+pub(crate) fn g18_compute_completion(
+    p: &G18ComputeCompletionState,
+) -> Result<u64, G18ComputeRegisterError> {
+    if p.entries == 0 || p.index >= 128 {
+        return Err(G18ComputeRegisterError::InvalidCompletionState);
+    }
+    let value = (u64::from(p.stamp >> 8) | p.generation << 24).wrapping_sub(1);
+    let quotient = (value / u64::from(p.entries)) as u32;
+    let remainder = (value as u32).wrapping_sub(quotient.wrapping_mul(p.entries));
+    let slot = (p.base as u32 & 0xff) + (remainder & 0xff);
+    let carry = slot / p.entries;
+    let index = (slot - carry * p.entries) & 0xff;
+    let phase = ((p.base >> 8) as u32)
+        .wrapping_add(quotient)
+        .wrapping_add(carry);
+    Ok(u64::from(index) | u64::from(phase) << 8)
+}
+
+/// Encode the native submission field writer and register program. This does
+/// not publish a ring entry or imply that any pointer is backed. The caller
+/// initializes the command allocation, rejects errors and retains all owners.
+/// Aperture entries and optional SMAPP preemption resources are not supported.
+pub(crate) fn encode_g18_compute_command(
+    out: &mut [u8; G18_COMPUTE_COMMAND_BYTES],
+    p: &G18ComputeCommandInputs,
+    registers: &G18ComputeRegisterInputs,
+) -> Result<G18ComputeRegisterSummary, G18ComputeRegisterError> {
+    let completion = g18_compute_completion(&p.completion)?;
+    put32(out, 0, 3);
+    put64(out, 4, p.sequence);
+    put32(out, 0xc, registers.context_id);
+    for (offset, value) in [
+        (0x10, p.d198),
+        (0xfb5, p.d158),
+        (0xe80, p.d518),
+        (0xeb8, p.d488),
+        (0xec0, p.d490),
+        (0xec8, p.d498),
+        (0xed0, p.d4a0),
+        (0xed8, registers.program[0]),
+        (0xee0, p.d4e0),
+        (0xee8, p.d4a8),
+        (0xef8, p.d4b8),
+        (0xf2c, 0),
+        (0xf34, 0),
+        (0xf40, p.stamp_addresses[0]),
+        (0xf48, p.stamp_addresses[1]),
+        (0xf60, completion),
+        (0xf68, p.d100),
+        (0xf74, 0),
+        (0xf7c, p.d1b0),
+        (0xf84, p.d1b8),
+        (0xf8c, p.d778),
+        (0xf94, p.d780),
+        (0xf9c, p.d788),
+        (0xfa4, p.d790),
+        (0xfac, p.d7b8),
+    ] {
+        put64(out, offset, value);
+    }
+    for (offset, value) in [
+        (0xf70, p.d150),
+        (0xe88, p.d520),
+        (0xe90, p.d524),
+        (0xeac, 0),
+        (0xef0, p.d4b0),
+        (0xf00, p.d4c0),
+        (0xf10, p.d4d0),
+        (0xf1c, u32::from(p.d508 & 1)),
+        (0xf20, registers.d50c),
+        (0xf24, registers.d510),
+        (0xf28, registers.d514),
+        (0xf50, p.completion.stamp),
+        (0xf54, p.completion.index),
+        (0xf58, p.channel_ordinal),
+        (0xf5c, u32::from(p.has_wait)),
+        (0xfdd, 0),
+        (0xfe1, 0),
+    ] {
+        put32(out, offset, value);
+    }
+    out[0xfb4] = p.d7d4 & 1;
+    out[0xf3c] = p.d628;
+    out[0xf3d] = p.d629 & 1;
+    out[0xf3e] = p.d770 & 1;
+    out[0xf3f] = p.d8b0 & 1;
+    let summary = encode_g18_compute_registers(out, registers)?;
+    out[0x1005] &= 0xf2;
+    if p.extra_addresses.iter().any(|&value| value != 0) {
+        out[0x1005] |= 1 | ((p.extra_policy & 3) << 2);
+        for (index, value) in p.extra_addresses.iter().enumerate() {
+            put64(out, 0xfe5 + index * 8, *value);
+        }
+    }
+    Ok(summary)
 }
 
 fn put16(out: &mut [u8], offset: usize, value: u16) {
