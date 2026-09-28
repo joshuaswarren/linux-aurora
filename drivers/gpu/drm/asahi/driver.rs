@@ -546,7 +546,7 @@ fn probe_t8152(
     if !g18_live_boot::stage_is_known(stage) {
         dev_err!(
             pdev.as_ref(),
-            "G18G: g18_initdata_test={} is not a known stage (1-5, 90-93); refused before any MMIO\n",
+            "G18G: g18_initdata_test={} is not a known stage (1-6, 90-93); refused before any MMIO\n",
             stage
         );
         return Err(EINVAL);
@@ -669,11 +669,11 @@ fn prepare_t8152_device(
 /// [`g18_live_boot::stage_is_known`]:
 /// - 1: read-only probe (PSD, SGX ID, wrapper CPU state, post-office
 ///   status), then ENODEV;
-/// - 2, 3, 4, 5 (REQUIRE USER APPROVAL, plus the mailbox provider's own
+/// - 2, 3, 4, 5, 6 (REQUIRE USER APPROVAL, plus the mailbox provider's own
 ///   `apple_mailbox.ascwrap_v8_cpu_control=1`): ASC CPU start and RTKit,
 ///   init-data ACKs, openings + idle wake + heartbeat. Stages 2 and 3 end in
-///   ENODEV with every firmware owner retained; stages 4/5 return the owner.
-///   Stage 5 additionally registers one empty owned queue, without GPU jobs;
+///   ENODEV with every firmware owner retained; stages 4/5/6 return the owner.
+///   Stage 5 registers one empty queue; stage 6 binds its scheduler. No GPU jobs;
 /// - 90 (REQUIRES USER APPROVAL): PMGR2 PSD power-on only, then ENODEV.
 ///
 /// On success the driver keeps the owner and calls

@@ -25,6 +25,7 @@ const CAPACITY: u32 = 0x100;
 const CONFIG: usize = 0x1800;
 const DATA_SIZE: usize = 0xbc000;
 const SLOT: usize = 0xb90b8 - 0x50000 + QUEUE_ID as usize * 0x28;
+const SCHEDULER: usize = 0xb7468 - 0x50000 + QUEUE_ID as usize * 8;
 
 /// Reserved GFX DATA, never written by the host. No native snapshot pointers
 /// are used: the current DT reservation is the only physical address source.
@@ -61,9 +62,11 @@ impl FirmwareDataView {
         Ok(Self { map, cache_line })
     }
 
-    fn slot(&self) -> [u64; 5] {
-        let start = SLOT & !(self.cache_line - 1);
-        let end = (SLOT + 40 + self.cache_line - 1) & !(self.cache_line - 1);
+    fn words<const N: usize>(&self, offset: usize) -> [u64; N] {
+        // The only callers are the fixed slot and scheduler extents. Both
+        // are below the constructor-checked slot end inside reserved DATA.
+        let start = offset & !(self.cache_line - 1);
+        let end = (offset + N * 8 + self.cache_line - 1) & !(self.cache_line - 1);
         for offset in (start..end).step_by(self.cache_line) {
             // SAFETY: Constructor bounds the whole covering cache lines.
             // Invalidate only: cleaning stale data would corrupt firmware.
@@ -72,11 +75,11 @@ impl FirmwareDataView {
         }
         // SAFETY: Complete cache invalidation before observing firmware stores.
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        let mut out = [0; 5];
+        let mut out = [0; N];
         for (index, word) in out.iter_mut().enumerate() {
             // SAFETY: Aligned reads wholly inside the constructor-checked slot.
             *word = unsafe { core::ptr::read_volatile(
-                self.map.ptr().add(SLOT + index * 8).cast::<u64>()) };
+                self.map.ptr().add(offset + index * 8).cast::<u64>()) };
         }
         fence(Ordering::Acquire);
         out
@@ -99,7 +102,7 @@ fn put64(out: &mut [u8], offset: usize, value: u64) {
 }
 
 impl G18QueueProbe {
-    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, bind_scheduler: bool) -> Result<Self> {
         if !uat.is_t8152_geometry() { return Err(ENODEV); }
         let mut entry = MappedObject::new_wc_at(dev, uat.kernel_vm(), ENTRY_HIGH,
             ENTRY_SIZE, mmu::PROT_FW_PRIV_RW)?;
@@ -128,6 +131,15 @@ impl G18QueueProbe {
             put32(out, POINTERS + 0x50, u32::MAX);
             put32(out, POINTERS + 0x60, CAPACITY);
             put64(out, JOB_LIST + 8, GRAPH_BASE + JOB_LIST as u64);
+            if bind_scheduler {
+                // 26A428 AGXCommandQueueReclaimableState::init at
+                // 0xfffffe0008bf9014. Both indices start unallocated.
+                out[CONTROL..CONTROL + 2].fill(0xff);
+                out[CONTROL + 5] = 1;
+                out[CONTROL + 0x33] = 0xff;
+                // b000 0xb234 sets2 on this fresh process-slot path.
+                out[CONTROL + 0x26] = 2;
+            }
 
             // b000 0x12824 requests 0x98 bytes. Unwritten trailing padding
             // is zero. Both event tuples and the new +0x6e/+0x72 pair are
@@ -161,7 +173,43 @@ impl G18QueueProbe {
             self.graph.read_u32(GRAPH_BASE + POINTERS as u64 + 0x40)?])
     }
 
-    pub(crate) fn slot(&self) -> [u64; 5] { self.firmware.slot() }
+    pub(crate) fn slot(&self) -> [u64; 5] { self.firmware.words(SLOT) }
+
+    pub(crate) fn scheduler_status(&mut self) -> Result<[u64; 4]> {
+        Ok([self.firmware.words::<1>(SCHEDULER)[0],
+            self.graph.read_u64(GRAPH_BASE + CONTROL as u64)?,
+            self.graph.read_u64(GRAPH_BASE + CONTROL as u64 + 0x12)?,
+            self.graph.read_u64(GRAPH_BASE + CONTROL as u64 + 0x1a)?])
+    }
+
+    pub(crate) fn prepare_scheduler_bind(&mut self) -> Result {
+        if self.counters()? != [1; 3] || !Self::installed(self.slot())
+            || self.scheduler_status()? != [0, 0x1000000ffff, 0, 0] {
+            return Err(EBUSY);
+        }
+        self.graph.with_bytes_mut(|out| {
+            if out[CONFIG + 0x100..CONFIG + 0x198].iter().any(|x| *x != 0) {
+                return Err(EBUSY);
+            }
+            out.copy_within(CONFIG..CONFIG + 0x98, CONFIG + 0x100);
+            let config = &mut out[CONFIG + 0x100..CONFIG + 0x198];
+            put32(config, 0x1a, 0); // already installed
+            put32(config, 0x52, 1); // bind scheduler
+            put64(out, ITEMS + 8, GRAPH_BASE + CONFIG as u64 + 0x100);
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40, 2)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn scheduler_bound([pointer, header, low, high]: [u64; 4]) -> bool {
+        pointer == GRAPH_BASE + CONTROL as u64 && header & 0xff != 0xff
+            && (header >> 8) & 0xff != 0xff
+            && (header >> 16) & 0xffff_ffff == 0x0104_0204
+            && low == 1u64 << QUEUE_ID && high == 0
+    }
 
     pub(crate) fn installed(slot: [u64; 5]) -> bool {
         slot[0] & 1 != 0 && slot[1] == ENTRY_HIGH && slot[2] == ENTRY_LOW
