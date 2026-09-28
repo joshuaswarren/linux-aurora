@@ -59,7 +59,10 @@ const SENTINEL_BASE: u64 = KERNEL_BASE + 0xc07e_0000;
 /// PB descriptor and UMA pool tables, aliased at [`init::REGION_VIEW_LOW_ADDRS`].
 const PBDESC_BASE: u64 = KERNEL_BASE + 0x15e_0000;
 const UMA_BASE: u64 = KERNEL_BASE + 0x15e_8000;
-const TABLE_SIZE: usize = 0x4000;
+const PBDESC_TABLE_SIZE: usize = 0x4000;
+/// 26A428 createHardwareMappings at 0xfffffe0008c41978 requests 0x8000
+/// bytes: 256 native 0x80-byte UMA descriptors, rather than the M5 page.
+const UMA_TABLE_SIZE: usize = 0x8000;
 /// The four KSM completion queues (low context-0 alias / firmware-high).
 const COMPLETION_LOW_BASE: u64 = 0x70_0184_8000;
 const COMPLETION_HIGH_BASE: u64 = KERNEL_BASE + 0xc07e_8000;
@@ -68,6 +71,14 @@ const COMPLETION_STRIDE: u64 = 0x2_8000;
 /// tables and the fixed high graph.
 const DYNAMIC_START: u64 = KERNEL_BASE + 0x168_0000;
 const DYNAMIC_END: u64 = KERNEL_BASE + 0x1000_0000;
+
+const _: () = {
+    assert!(PBDESC_BASE + PBDESC_TABLE_SIZE as u64 <= UMA_BASE);
+    assert!(UMA_BASE + UMA_TABLE_SIZE as u64 <= DYNAMIC_START);
+    assert!(init::REGION_VIEW_LOW_ADDRS[0] + PBDESC_TABLE_SIZE as u64
+        <= init::REGION_VIEW_LOW_ADDRS[1]);
+    assert!(init::REGION_VIEW_LOW_ADDRS[1] + UMA_TABLE_SIZE as u64 <= COMPLETION_LOW_BASE);
+};
 
 /// Report rings keep their 25G76 shape (FW_PROVEN: event producer b000
 /// 0x7f14, 256 x 0x48; trace producer b000 0x19984, 512 x 0x48; host owns the
@@ -162,21 +173,25 @@ impl G18FirmwareMemory {
         let mut region_c = fixed(REGION_C_BASE, init::REGION_C_SIZE, mmu::PROT_FW_SHARED_RO)?;
         let fwctl = fixed(FWCTL_BASE, FWCTL_SIZE, mmu::PROT_FW_SHARED_RW)?;
         // Zero-backed at handoff; owned by later (M2/M3) publication.
-        let mut pbdesc = fixed(PBDESC_BASE, TABLE_SIZE, mmu::PROT_FW_SHARED_RW)?;
-        let mut uma = fixed(UMA_BASE, TABLE_SIZE, mmu::PROT_FW_SHARED_RW)?;
+        let mut pbdesc = fixed(PBDESC_BASE, PBDESC_TABLE_SIZE, mmu::PROT_FW_SHARED_RW)?;
+        let mut uma = fixed(UMA_BASE, UMA_TABLE_SIZE, mmu::PROT_FW_SHARED_RW)?;
         let mut aliases = KVec::new();
-        for (object, address) in [
-            (&mut pbdesc, init::REGION_VIEW_LOW_ADDRS[0]),
-            (&mut uma, init::REGION_VIEW_LOW_ADDRS[1]),
+        for (object, address, size) in [
+            (&mut pbdesc, init::REGION_VIEW_LOW_ADDRS[0], PBDESC_TABLE_SIZE),
+            (&mut uma, init::REGION_VIEW_LOW_ADDRS[1], UMA_TABLE_SIZE),
         ] {
             aliases.push(object.map_alias_at(uat.kernel_lower_vm(), address, mmu::PROT_GPU_SHARED_RW)?,
                          GFP_KERNEL)?;
-            if uat.kernel_vm().translate_iova(object.iova())?
-                != uat.kernel_lower_vm().translate_iova(address)?
-            {
-                return Err(EFAULT);
+            for offset in (0..size).step_by(mmu::UAT_PGSZ) {
+                if uat.kernel_vm().translate_iova(object.iova() + offset as u64)?
+                    != uat.kernel_lower_vm().translate_iova(address + offset as u64)?
+                {
+                    return Err(EFAULT);
+                }
             }
         }
+        dev_info!(dev.as_ref(), "G18 UMA descriptor table: bytes={:#x} slots=256 stride=0x80 alias_pages={} verified\n",
+            UMA_TABLE_SIZE, UMA_TABLE_SIZE / mmu::UAT_PGSZ);
 
         let mut completions = KVec::new();
         let mut completion_bindings =
