@@ -204,16 +204,17 @@
 /* modified TPS_REG_DATA_STATUS bits for CD321x (and likely also TPS65987DDK) */
 #define CD321X_DATA_STATUS_HPD_IRQ	     BIT(14)
 #define CD321X_DATA_STATUS_HPD_LEVEL	     BIT(15)
+#define CD321X_DATA_STATUS_ACTIVE_CABLE	     BIT(22)
 #define CD321X_DATA_STATUS_USB4_CONNECTION   BIT(23)
 
 #define TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK GENMASK(11, 10)
 #define TPS_DATA_STATUS_DP_PIN_ASSIGNMENT(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK, (x))
 #define TPS_DATA_STATUS_TBT_CABLE_SPEED_MASK   GENMASK(27, 25)
-#define TPS_DATA_STATUS_TBT_CABLE_SPEED \
+#define TPS_DATA_STATUS_TBT_CABLE_SPEED(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_TBT_CABLE_SPEED_MASK, (x))
 #define TPS_DATA_STATUS_TBT_CABLE_GEN_MASK     GENMASK(29, 28)
-#define TPS_DATA_STATUS_TBT_CABLE_GEN \
+#define TPS_DATA_STATUS_TBT_CABLE_GEN(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_TBT_CABLE_GEN_MASK, (x))
 
 /* Map data status to DP spec assignments */
@@ -342,7 +343,6 @@ struct tps6598x_intel_vid_status_reg {
 	__le32 attention_vdo;
 	__le16 enter_vdo;
 	__le16 device_mode;
-	__le16 cable_mode;
 } __packed;
 
 struct cd321x_status {
@@ -350,6 +350,7 @@ struct cd321x_status {
 	u32 pwr_status;
 	u32 data_status;
 	u32 status_changed;
+	u32 data_status_changed;
 	struct usb_pd_identity partner_identity;
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
 	struct tps6598x_intel_vid_status_reg intel_vid_status;
@@ -368,10 +369,16 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	u32 dp_status;
+	u32 dp_conf;
+	struct typec_thunderbolt_switch *tbt_switch;
+	bool display_route_active;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
 	struct usb_pd_identity cur_partner_identity;
+
+	struct fwnode_handle *connector_fwnode;
 };
 
 struct sn201202x {

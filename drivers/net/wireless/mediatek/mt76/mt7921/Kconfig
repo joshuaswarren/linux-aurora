@@ -3,7 +3,6 @@ config MT7921_COMMON
 	tristate
 	select MT792x_LIB
 	select WANT_DEV_COREDUMP
-	select CRYPTO_LIB_SHA256
 
 config MT7921E
 	tristate "MediaTek MT7921E (PCIe) support"
@@ -14,17 +13,6 @@ config MT7921E
 	  This adds support for MT7921E 802.11ax 2x2:2SS wireless devices.
 
 	  To compile this driver as a module, choose M here.
-
-config MT7921_J700_MCU_LAB
-	bool "J700 MT7932 MCU conformance checkpoint"
-	depends on MT7921E = y || MT7921E = MT7921_COMMON
-	default n
-	help
-	  Development-only misc-device bridge for measured J700 firmware command
-	  conformance. The kernel retains PCIe, WFDMA, TXD, sequence, IRQ, RX and
-	  reset ownership. It can stop early probe while an external conformance
-	  executor supplies measured firmware commands. Production kernels should
-	  leave this disabled.
 
 config MT7921S
 	tristate "MediaTek MT7921S (SDIO) support"

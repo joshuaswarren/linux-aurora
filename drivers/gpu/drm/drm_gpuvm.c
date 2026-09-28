@@ -1396,23 +1396,9 @@ fn_lock_array(struct drm_gpuvm_exec *vm_exec)
 		struct drm_gem_object **objs;
 		unsigned int num_objs;
 	} *args = vm_exec->extra.priv;
-	unsigned int i;
-	int ret;
 
-	/*
-	 * Keep the zero-fence contract of every other drm_gpuvm_exec helper.
-	 * drm_exec_prepare_array() unconditionally calls
-	 * dma_resv_reserve_fences(), where zero is invalid; exec_prepare_obj()
-	 * deliberately selects drm_exec_lock_obj() for that case instead.
-	 */
-	for (i = 0; i < args->num_objs; i++) {
-		ret = exec_prepare_obj(&vm_exec->exec, args->objs[i],
-				       vm_exec->num_fences);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	return drm_exec_prepare_array(&vm_exec->exec, args->objs,
+				      args->num_objs, vm_exec->num_fences);
 }
 
 /**
@@ -1571,9 +1557,8 @@ drm_gpuvm_resv_add_fence(struct drm_gpuvm *gpuvm,
 			 enum dma_resv_usage extobj_usage)
 {
 	struct drm_gem_object *obj;
-	unsigned long index;
 
-	drm_exec_for_each_locked_object(exec, index, obj) {
+	drm_exec_for_each_locked_object(exec, obj) {
 		dma_resv_assert_held(obj->resv);
 		dma_resv_add_fence(obj->resv, fence,
 				   drm_gpuvm_is_extobj(gpuvm, obj) ?

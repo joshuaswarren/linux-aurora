@@ -2,8 +2,6 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/iommu.h>
-#include <linux/limits.h>
-#include <linux/overflow.h>
 #include <linux/vmalloc.h>
 
 #include "isp-iommu.h"
@@ -106,9 +104,6 @@ static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 	ssize_t mapped;
 	int err;
 
-	if (surf->size > SSIZE_MAX)
-		return -EOVERFLOW;
-
 	err = sg_alloc_table_from_pages(&surf->sgt, surf->pages,
 					surf->num_pages, 0, surf->size,
 					GFP_KERNEL);
@@ -119,14 +114,13 @@ static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 
 	mapped = iommu_map_sgtable(isp->domain, surf->iova, &surf->sgt,
 				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (mapped < 0 || mapped != surf->size) {
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
-		/* Negative errors already unwind their mappings in iommu_map_sg(). */
 		if (mapped > 0)
 			iommu_unmap(isp->domain, surf->iova, mapped);
 		sg_free_table(&surf->sgt);
-		return mapped < 0 ? (int)mapped : -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
 
 	return 0;
@@ -144,9 +138,21 @@ static void __isp_surf_init(struct apple_isp *isp, struct isp_surf *surf,
 
 struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc)
 {
+	struct isp_surf *surf;
 	int err;
 
-	struct isp_surf *surf = kzalloc(sizeof(struct isp_surf), GFP_KERNEL);
+	/*
+	 * The firmware chooses the size of the extra heap and of SHAREDMALLOC
+	 * surfaces. Nothing larger than the IOVA range can be mapped, and the
+	 * bound also keeps the page count within 32 bits.
+	 */
+	if (!size || size > isp->iova_size) {
+		dev_err_ratelimited(isp->dev, "invalid surface size 0x%llx\n",
+				    size);
+		return NULL;
+	}
+
+	surf = kzalloc(sizeof(*surf), GFP_KERNEL);
 	if (!surf)
 		return NULL;
 
@@ -225,28 +231,13 @@ void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
 int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
 			    struct sg_table *sgt, u64 size)
 {
-	struct scatterlist *sg;
-	u64 sgt_size = 0;
-	unsigned int i;
-	ssize_t mapped;
 	int err;
+	ssize_t mapped;
 
+	// TODO userptr sends unaligned sizes
 	surf->mm = NULL;
-	if (!size || !sgt->sgl || !sgt->orig_nents)
-		return -EINVAL;
+	surf->size = size;
 
-	/* iommu_map_sgtable() maps all original entries, not just the payload. */
-	for_each_sgtable_sg(sgt, sg, i) {
-		if (sg_dma_is_bus_address(sg))
-			return -EINVAL;
-		if (check_add_overflow(sgt_size, (u64)sg->length, &sgt_size) ||
-		    sgt_size > SSIZE_MAX)
-			return -EOVERFLOW;
-	}
-	if (sgt_size < size)
-		return -EINVAL;
-
-	surf->size = sgt_size;
 	err = isp_surf_reserve_iova(isp, surf);
 	if (err < 0) {
 		dev_err(isp->dev, "failed to reserve 0x%llx of iova space\n",
@@ -256,14 +247,15 @@ int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
 
 	mapped = iommu_map_sgtable(isp->domain, surf->iova, sgt,
 				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
-	if (mapped < 0 || mapped != surf->size) {
+	if (mapped < 0 || (u64)mapped < surf->size) {
 		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
 			&surf->iova);
 		if (mapped > 0)
 			iommu_unmap(isp->domain, surf->iova, mapped);
 		isp_surf_unreserve_iova(isp, surf);
-		return mapped < 0 ? (int)mapped : -ENXIO;
+		return mapped < 0 ? mapped : -ENXIO;
 	}
+	surf->size = mapped;
 
 	return 0;
 }

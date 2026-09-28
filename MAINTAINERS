@@ -1965,6 +1965,32 @@ L:	linux-hwmon@vger.kernel.org
 S:	Odd fixes
 F:	drivers/hwmon/applesmc.c
 
+APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
+M:	Ryan Murray <ryan@aurorasilicon.org>
+W:	https://aurora-silicon.github.io
+S:	Maintained
+F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
+F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
+F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
+F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
+F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,dockchannel.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-aop.yaml
+F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
+F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
+F:	Documentation/hid/apple-j700-multitouch.rst
+F:	arch/arm64/boot/dts/apple/t8140*
+F:	arch/arm64/include/asm/apple-idle.h
+F:	arch/arm64/kernel/idle-apple.S
+F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
+F:	drivers/iio/common/aop_sensors/
+F:	drivers/soc/apple/aop.rs
+F:	drivers/tty/serial/apple_dockchannel*
+F:	rust/kernel/iio/common/aop_sensors.rs
+F:	rust/kernel/soc/apple/aop.rs
+F:	sound/soc/apple/t8140_aop_audio.rs
+
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
 S:	Odd fixes
@@ -2534,7 +2560,6 @@ F:	Documentation/devicetree/bindings/gpio/apple,smc-gpio.yaml
 F:	Documentation/devicetree/bindings/gpu/apple,agx.yaml
 F:	Documentation/devicetree/bindings/hwmon/apple,smc-hwmon.yaml
 F:	Documentation/devicetree/bindings/i2c/apple,i2c.yaml
-F:	Documentation/devicetree/bindings/input/apple,mesa-fingerprint.yaml
 F:	Documentation/devicetree/bindings/input/touchscreen/apple,z2-multitouch.yaml
 F:	Documentation/devicetree/bindings/interrupt-controller/apple,*
 F:	Documentation/devicetree/bindings/iommu/apple,dart.yaml
@@ -2552,9 +2577,13 @@ F:	Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml
 F:	Documentation/devicetree/bindings/power/apple*
 F:	Documentation/devicetree/bindings/power/reset/apple,smc-reboot.yaml
 F:	Documentation/devicetree/bindings/pwm/apple,s5l-fpwm.yaml
+F:	Documentation/devicetree/bindings/reset/apple,t8103-cio-reset.yaml
 F:	Documentation/devicetree/bindings/rtc/apple,smc-rtc.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
 F:	Documentation/devicetree/bindings/spi/apple,spi.yaml
 F:	Documentation/devicetree/bindings/spmi/apple,spmi.yaml
+F:	Documentation/devicetree/bindings/thunderbolt/apple,t8103-usb4-acio.yaml
+F:	Documentation/devicetree/bindings/thunderbolt/apple,t8103-usb4-nhi.yaml
 F:	Documentation/devicetree/bindings/usb/apple,dwc3.yaml
 F:	Documentation/devicetree/bindings/usb/apple,sn201202x.yaml
 F:	Documentation/devicetree/bindings/watchdog/apple,wdt.yaml
@@ -2583,12 +2612,12 @@ F:	drivers/pinctrl/pinctrl-apple-gpio.c
 F:	drivers/power/reset/macsmc-reboot.c
 F:	drivers/power/supply/macsmc-power.c
 F:	drivers/pwm/pwm-apple.c
+F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
-F:	drivers/thermal/apple-pmp-thermal.c
-F:	drivers/thermal/apple-smc-cpu-thermal.c
+F:	drivers/thunderbolt/apple.c
 F:	drivers/usb/dwc3/dwc3-apple.c
 F:	drivers/usb/typec/tipd/spmi.c
 F:	drivers/video/backlight/apple_dwi_bl.c
@@ -2600,7 +2629,6 @@ F:	include/linux/soc/apple/*
 F:	include/uapi/drm/asahi_drm.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
-F:	tools/testing/selftests/hwmon/macsmc-float-test.py
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
@@ -10049,6 +10077,11 @@ F:	Documentation/firmware_class/
 F:	drivers/base/firmware_loader/
 F:	rust/kernel/firmware.rs
 F:	include/linux/firmware.h
+
+FIXED-LAYOUT NVMEM LAYOUT DRIVER
+M:	Mathieu Dubois-Briand <mathieu.dubois-briand@bootlin.com>
+S:	Maintained
+F:	drivers/nvmem/layouts/fixed-layout.c
 
 FLEXTIMER FTM-QUADDEC DRIVER
 M:	Patrick Havelange <patrick.havelange@essensium.com>

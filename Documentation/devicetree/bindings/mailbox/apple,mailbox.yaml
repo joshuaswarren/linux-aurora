@@ -31,11 +31,14 @@ properties:
               - apple,t8103-asc-mailbox
               - apple,t8112-asc-mailbox
               - apple,t8122-asc-mailbox
-              - apple,t8132-asc-mailbox
               - apple,t8140-asc-mailbox
               - apple,t6000-asc-mailbox
               - apple,t6020-asc-mailbox
           - const: apple,asc-mailbox-v4
+
+      - description:
+          AOP setup-port mailbox with a separate register layout.
+        const: apple,t8140-aop-setup-mailbox
 
       - description:
           An older ASC mailbox interface found on T2 and A11 that is also
@@ -43,21 +46,6 @@ properties:
           controller.
         items:
           - const: apple,t8015-asc-mailbox
-
-      - description:
-          The second ("setup port") mailbox of the T8140 AOP, through which
-          its firmware exchanges the endpoint buffer setup and source-buffer
-          binding messages.  Two control words at 0x0/0x4, send registers at
-          0x180/0x188 and receive registers at 0x1b0/0x1b8.
-        items:
-          - const: apple,t8140-aop-setup-mailbox
-
-      - description:
-          ASCWrap v6 mailbox transport for the two independent T8140 GPU
-          firmware roles. The mailbox-v4 register ABI is embedded at offset
-          0x8000 in the first register window. The second register window is
-          lifecycle-owned IORVBAR state and is not mailbox MMIO.
-        const: apple,t8140-ascwrap-v6
 
       - description:
           M3 mailboxes are an older variant with a slightly different MMIO
@@ -71,12 +59,7 @@ properties:
           - const: apple,m3-mailbox-v2
 
   reg:
-    minItems: 1
-    maxItems: 2
-
-  reg-names:
-    minItems: 2
-    maxItems: 2
+    maxItems: 1
 
   interrupts:
     minItems: 2
@@ -86,15 +69,16 @@ properties:
     minItems: 2
     maxItems: 4
 
-  apple,firmware-role:
+  iommus:
+    maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
     description:
-      Firmware role owned by this independent ASC provider. This is the
-      Linux binding for the role value on the corresponding Apple DeviceTree
-      sibling, not a shared or aggregate GPU mailbox.
-    $ref: /schemas/types.yaml#/definitions/string
-    enum:
-      - GFX
-      - GFX1
+      Setup-port DMA allocation window, expressed as a base and nonzero size.
+      This identifies host-available slots in the inherited AOP stream root.
 
   "#mbox-cells":
     const: 0
@@ -102,58 +86,42 @@ properties:
   power-domains:
     maxItems: 1
 
-required:
-  - compatible
-  - reg
-  - interrupts
-  - interrupt-names
-  - "#mbox-cells"
-
 allOf:
   - if:
       properties:
         compatible:
           contains:
-            const: apple,t8140-ascwrap-v6
+            const: apple,t8140-aop-setup-mailbox
     then:
       properties:
-        reg:
-          items:
-            - description: ASCWrap v6 register window containing the mailbox
-            - description: Eight-byte IOP reset-vector-base-address register
-        reg-names:
-          items:
-            - const: wrapper
-            - const: iop-vbar
         interrupts:
-          items:
-            - description: send FIFO is empty interrupt
-            - description: receive FIFO is not empty interrupt
+          maxItems: 2
         interrupt-names:
           items:
             - const: send-empty
             - const: recv-not-empty
       required:
-        - reg-names
-        - apple,firmware-role
+        - iommus
+        - apple,dma-range
     else:
       properties:
-        reg:
-          maxItems: 1
-        reg-names: false
         interrupts:
-          items:
-            - description: send FIFO is empty interrupt
-            - description: send FIFO is not empty interrupt
-            - description: receive FIFO is empty interrupt
-            - description: receive FIFO is not empty interrupt
+          minItems: 4
         interrupt-names:
           items:
             - const: send-empty
             - const: send-not-empty
             - const: recv-empty
             - const: recv-not-empty
-        apple,firmware-role: false
+        iommus: false
+        apple,dma-range: false
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-names
+  - "#mbox-cells"
 
 additionalProperties: false
 
@@ -166,37 +134,4 @@ examples:
         interrupt-names = "send-empty", "send-not-empty",
                           "recv-empty", "recv-not-empty";
         #mbox-cells = <0>;
-    };
-
-  - |
-    #include <dt-bindings/interrupt-controller/apple-aic.h>
-    #include <dt-bindings/interrupt-controller/irq.h>
-
-    soc {
-        #address-cells = <2>;
-        #size-cells = <2>;
-
-        gfx_asc: mailbox@482600000 {
-            compatible = "apple,t8140-ascwrap-v6";
-            reg = <0x4 0x82600000 0x0 0x88000>,
-                  <0x4 0x82050000 0x0 0x8>;
-            reg-names = "wrapper", "iop-vbar";
-            interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
-                         <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
-            interrupt-names = "send-empty", "recv-not-empty";
-            apple,firmware-role = "GFX";
-            #mbox-cells = <0>;
-        };
-
-        gfx1_asc: mailbox@482e00000 {
-            compatible = "apple,t8140-ascwrap-v6";
-            reg = <0x4 0x82e00000 0x0 0x88000>,
-                  <0x4 0x82850000 0x0 0x8>;
-            reg-names = "wrapper", "iop-vbar";
-            interrupts = <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
-                         <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>;
-            interrupt-names = "send-empty", "recv-not-empty";
-            apple,firmware-role = "GFX1";
-            #mbox-cells = <0>;
-        };
     };

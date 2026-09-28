@@ -4,6 +4,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <clocksource/arm_arch_timer.h>
 #include <linux/align.h>
 #include <linux/bitmap.h>
 #include <linux/clk.h>
@@ -40,6 +41,9 @@
 
 /* Register defines used in bandwidth setup structure */
 #define REG_DOORBELL_BIT(idx) (2 + (idx))
+
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), timestamp[6]) == 0x30);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), flags1) == 0x40);
 
 struct dcp_wait_cookie {
 	struct kref refcount;
@@ -990,9 +994,8 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 	}
 
 	dcp->chunks.length = *length;
-	dcp->chunks.data = devm_kzalloc(dcp->dev, *length,
-					GFP_KERNEL | __GFP_NORETRY |
-					__GFP_NOWARN);
+	dcp->chunks.data = kzalloc(*length, GFP_KERNEL | __GFP_NORETRY |
+				      __GFP_NOWARN);
 
 	if (!dcp->chunks.data) {
 		dev_warn(dcp->dev, "failed to allocate %u chunk bytes\n",
@@ -1045,7 +1048,9 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	if (!strcmp(req->key, "TimingElements")) {
 		dcp->modes = enumerate_modes(&ctx, &dcp->nr_modes,
 					     dcp->width_mm, dcp->height_mm,
-					     dcp->notch_height);
+					     dcp->notch_height,
+					     dcp->fixed_connector_type ==
+						     DRM_MODE_CONNECTOR_eDP);
 
 		if (IS_ERR(dcp->modes)) {
 			dev_warn(dcp->dev, "failed to parse modes\n");
@@ -1353,17 +1358,25 @@ dcpep_cb_set_frame_sync_props_h17p(struct apple_dcp *dcp,
 	u32 millinits;
 
 	/*
-	 * +0x04 is the brightness the firmware is driving, in 16.16 nits
-	 * (5957818 = 90.909 nits in the capture, +0x08 = 500.0 alongside it).
-	 * It reads 0 until the AP has set one.  Keep it as evidence of what
-	 * the firmware accepted; the backlight device reports the requested
-	 * level, as on every other firmware.
+	 * +0x04 is the brightness level applied by the frame this D006
+	 * belongs to, in 16.16 nits (5957818 = 90.909 nits in the capture,
+	 * +0x08 = 500.0 alongside it).  It is not a level readback: it is
+	 * non-zero only on the frame whose swap carried a new level and reads
+	 * 0 on every other frame, while the panel stays lit.  hb94 shows it
+	 * plainly: "reports 60.000", then 4 ms later the firmware logs
+	 * "send_brightness: dbv: 1259" (60 nits) again and D006 says 0.000,
+	 * with PSTR at the 60-nit figure throughout.  Logging every change
+	 * therefore printed "0 / 166 / 0 / 156" for each step of a fade.
+	 * A real 0 on the panel is only ever one we asked for, and
+	 * dcp_h17p_set_swap_brightness() logs that; keep this at debug and
+	 * never let a 0 through as a level.
 	 */
 	millinits = (u32)(((u64)get_unaligned_le32(&req->unk[4]) * 1000) >> 16);
-	if (millinits != dcp->brightness.h17p_reported_millinits) {
+	if (millinits &&
+	    millinits != dcp->brightness.h17p_reported_millinits) {
 		dcp->brightness.h17p_reported_millinits = millinits;
-		dev_info(dcp->dev, "DCP reports brightness %u.%03u nits\n",
-			 millinits / 1000, millinits % 1000);
+		dev_dbg(dcp->dev, "DCP applied brightness %u.%03u nits\n",
+			millinits / 1000, millinits % 1000);
 	}
 
 	for (i = 0; i < ARRAY_SIZE(identity_at); i++) {
@@ -1390,6 +1403,18 @@ static void dcp_h17p_set_swap_brightness(struct apple_dcp *dcp,
 	static const u8 flags[6] = { 1, 1, 1, 0, 1, 0 };
 	const u64 one = 0x3ff0000000000000ULL;	/* 1.0 */
 	u64 max = dcp_nits_to_double_bits(dcp->brightness.maximum);
+	int prev = dcp->brightness.h17p_sent_nits;
+
+	/*
+	 * A fade sends a level every frame; only the backlight going off,
+	 * coming back, or the first level after power-on is worth a line.
+	 */
+	if (prev < 0 || !prev != !nits)
+		dev_info(dcp->dev, "panel backlight %s (%u nits)\n",
+			 nits ? "on" : "off", nits);
+	else
+		dev_dbg(dcp->dev, "panel backlight %u nits\n", nits);
+	dcp->brightness.h17p_sent_nits = nits;
 
 	swap->bl_h17p_update = 1;
 	memcpy(swap->bl_h17p_flags, flags, sizeof(flags));
@@ -1614,11 +1639,13 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	/*
 	 * Resuming from the H17P soft power-off (see iomfb_poweroff): the
 	 * pipe never went down, so there is no power state to restore; the
-	 * next swap re-applies the backlight level.
+	 * backlight gets the level from before the power-off back, and the
+	 * next swap applies it.
 	 */
 	if (dcp->brightness.soft_off) {
-		dcp->brightness.soft_off = false;
-		dev_info(dcp->dev, "dcp_poweron() from soft power-off: pipe was never down\n");
+		dcp_backlight_soft_on(dcp);
+		dev_info(dcp->dev, "dcp_poweron() from soft power-off: pipe was never down, backlight back to %d nits\n",
+			 dcp->brightness.nits);
 		return;
 	}
 #endif
@@ -1750,16 +1777,26 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * (hb94: 2.27 W gone at 210 nits, no send_brightness, no crash).
 	 * Only a reboot brings the panel back from any of the three.
 	 *
-	 * So a DPMS-off does nothing to the coprocessor at all: the pipe
-	 * keeps scanning out the last frame at the current level, and the
-	 * power saving belongs to the backlight device (a session idle hook
-	 * setting brightness 0 and restoring it), which is the path the
-	 * firmware handles.
+	 * So a DPMS-off does nothing to the coprocessor's power state: the
+	 * pipe keeps scanning out the last frame, and the backlight stands in
+	 * for the power-off (dcp_backlight_soft_off): it drops to blank_nits
+	 * (0 by default) and DPMS on restores the level asked for last.  The
+	 * level goes out the way the backlight device sends every level, in
+	 * a swap on the live pipe -- a re-present of the surface already on
+	 * the panel (iomfb_present_brightness), issued from the backlight
+	 * worker once this disable commit has completed.  Unlike the hb99
+	 * swap, which ran from here while the disable commit was releasing
+	 * the scanned-out buffer (hb100's "read PTE invalid" across the old
+	 * surface), that buffer is now retained until a real swap replaces
+	 * it, and the re-present does not arm its release.
+	 * appledrm.blank_nits=-1 keeps the panel lit through DPMS off, as
+	 * before.
 	 */
 	if (dcp_has_panel(dcp)) {
-		dcp->brightness.soft_off = true;
+		dcp_backlight_soft_off(dcp);
 		dev_info(dcp->dev,
-			 "DPMS off: keeping the H17P pipe up at the current level (the firmware panics on every off path; dim through the backlight device instead)\n");
+			 "DPMS off: keeping the H17P pipe up (the firmware panics on every off path), backlight %s\n",
+			 dcp->brightness.blanked ? "to blank_nits" : "left at the current level");
 		return;
 	}
 #endif
@@ -1935,9 +1972,17 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		return;
 
 	if (dcp->during_modeset) {
+		/*
+		 * Remember it rather than dropping it.  Resume re-runs the
+		 * modeset and the firmware reports the display back while that
+		 * is still in flight; discarding it leaves the connector marked
+		 * disconnected forever, with no further event to correct it.
+		 */
 		dev_info(dcp->dev,
-			 "cb_hotplug() ignored during modeset connected:%llu\n",
+			 "cb_hotplug() deferred during modeset connected:%llu\n",
 			 *connected);
+		dcp->pending_hotplug = true;
+		dcp->pending_hotplug_connected = !!(*connected);
 		return;
 	}
 
@@ -2073,6 +2118,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	dcp->swap_start = ktime_get();
+	dcp->swap_submit_timestamp = arch_timer_read_counter();
 	if (dcp_swap_trace)
 		dev_info(dcp->dev, "swap-trace: submitted id=%u t=%lld us\n",
 			 DCP_FW_UNION(dcp->swap).swap.swap_id,
@@ -2122,6 +2168,125 @@ static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 }
 #endif
 
+static void dcp_swap_set_timestamps(struct apple_dcp *dcp,
+				    struct DCP_FW_NAME(dcp_swap_submit_req) *req)
+{
+	u64 submit_timestamp, timestamp;
+
+	if (!dcp->use_timestamps && !dcp->vrr_enabled)
+		return;
+
+	submit_timestamp = dcp->swap_submit_timestamp;
+	timestamp = arch_timer_read_counter();
+
+	/*
+	 * IOMobileFramebuffer uses Mach continuous-time values here. On
+	 * Apple Silicon that is the ARM architectural counter. Empirical
+	 * testing shows that using the current submission time together
+	 * with the previous accepted swap makes DCP follow swap pacing.
+	 */
+	if (!submit_timestamp)
+		submit_timestamp = timestamp;
+
+	/* Firmware 12.x/13.x requires timestamp types 1, 2, and 7. */
+	req->swap.timestamp[0] = timestamp;
+	req->swap.timestamp[1] = submit_timestamp;
+	req->swap.timestamp[6] = timestamp;
+
+	trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, timestamp,
+				   submit_timestamp);
+}
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+/*
+ * A brightness change on H17P travels inside a swap, and while the CRTC is
+ * off nothing flushes one: the ACTIVE_ONLY plane pass of commit_tail_rpm()
+ * skips an inactive CRTC, so the backlight device's own commit
+ * (drm_crtc_set_brightness()) never reaches iomfb_flush() and the level sat
+ * in sysfs while the panel stayed lit at 5 W (2026-09-28 daily, GNOME idle
+ * blank).  Re-present the swap that put the current surface on the panel
+ * instead, with the new level in its backlight block.
+ *
+ * That surface is safe to hand over again: its framebuffer is either still
+ * bound to the plane or held by dcp_retain_unbound_fbs() since the commit
+ * that unbound it, and it stays held because this swap does not arm the
+ * retained entries -- it displaces nothing, and arming them would release
+ * the very buffer it shows once it completed (the hb100 DART fault).  The
+ * next real swap arms them as usual.
+ *
+ * The caller holds the CRTC lock, has waited for the last commit, and has
+ * checked that the command channel is idle.
+ */
+static void dcp_bl_swapped(struct apple_dcp *dcp, void *data, void *cookie)
+{
+	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
+	struct dcp_swap_cookie *info = cookie;
+
+	if (resp->ret)
+		dev_err(dcp->dev, "brightness swap failed! status %u\n",
+			resp->ret);
+
+	complete(&info->done);
+	kref_put(&info->refcount, release_swap_cookie);
+}
+
+static void dcp_bl_swap_started(struct apple_dcp *dcp, void *data,
+				void *cookie)
+{
+	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
+	struct dcp_swap_cookie *info = cookie;
+
+	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	info->swap_id = resp->swap_id;
+	/* deliberately no dcp_arm_swapped_out_fbs(), see above */
+	dcp_h17p_fix_swap_surfaces(dcp);
+	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_bl_swapped,
+			cookie);
+}
+
+int DCP_FW_NAME(iomfb_present_brightness)(struct apple_dcp *dcp)
+{
+	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
+	struct DCP_FW_NAME(dcp_swap_start_req) start_req = { 0 };
+	struct dcp_swap_cookie *cookie;
+	int ret;
+
+	if (!dcp_has_panel(dcp) || !dcp->h17p_have_last_swap)
+		return -ENODEV;
+
+	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	memcpy(req, &dcp->h17p_last_swap, sizeof(*req));
+	/* the surface is already there: no background fill, no clear */
+	req->swap.swap_enabled &= ~IOMFB_SET_BACKGROUND;
+	req->swap.bg_color = 0;
+	req->clear = 0;
+	dcp_swap_set_timestamps(dcp, req);
+	req->swap.swap_completed = req->swap.swap_enabled;
+	dcp_h17p_set_swap_brightness(dcp, &req->swap, dcp->brightness.nits);
+	dcp->brightness.update = false;
+
+	dcp_swap_start(dcp, false, &start_req, dcp_bl_swap_started, cookie);
+
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(100));
+	kref_put(&cookie->refcount, release_swap_cookie);
+	if (ret <= 0) {
+		dev_warn(dcp->dev,
+			 "brightness swap at %d nits not acknowledged\n",
+			 dcp->brightness.nits);
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+#endif
+
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 					  void *cookie)
 {
@@ -2131,6 +2296,35 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
+}
+
+/* DCP applies Adaptive Sync changes when the display mode is reselected. */
+static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
+				     void *cookie)
+{
+	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
+				 complete_set_digital_out_mode, cookie);
+}
+
+static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
+				  void *cookie)
+{
+	struct dcp_set_parameter_dcp param = {
+		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.value = {
+			min_vrr, /* minRR, 16.16 fixed-point Hz */
+			0,       /* mediaTargetRate */
+			0,       /* fractional rate */
+		},
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+		.count = 3,
+#else
+		.count = 1,
+#endif
+	};
+
+	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_adaptive_sync,
+			      cookie);
 }
 
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
@@ -2172,8 +2366,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.timing_mode_id = mode->timing_mode_id
 	};
 
-	/* Keep track of suspected vrr modes */
-	dcp->use_timestamps = mode->vrr;
+	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
+	dcp->use_timestamps = mode->vrr && dcp->main_display;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
@@ -2186,6 +2380,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	kref_get(&cookie->refcount);
 
 	dcp->during_modeset = true;
+	dcp->swap_submit_timestamp = 0;
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
@@ -2203,8 +2398,14 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #endif
-	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
-				 complete_set_digital_out_mode, cookie);
+	if (mode->vrr)
+		dcp_set_adaptive_sync(dcp,
+				      crtc_state->vrr_enabled ? mode->min_vrr : 0,
+				      cookie);
+	else
+		dcp_set_digital_out_mode(dcp, false, &dcp->mode,
+					 complete_set_digital_out_mode, cookie);
+
 
 	/*
 	 * The DCP firmware has an internal timeout of ~8 seconds for
@@ -2214,24 +2415,44 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(8500));
 
-	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->during_modeset = false;
+
+	if (dcp->pending_hotplug) {
+		bool connected = dcp->pending_hotplug_connected;
+		struct apple_connector *connector = dcp->connector;
+
+		dcp->pending_hotplug = false;
+		dev_info(dcp->dev, "replaying deferred hotplug connected:%d\n",
+			 connected);
+
+		if (!connected)
+			dcp->valid_mode = false;
+
+		if (connector && connector->connected != connected) {
+			connector->connected = connected;
+			dcp->valid_mode = false;
+			schedule_work(&connector->hotplug_wq);
+		}
+	}
 	dev_info(dcp->dev, "set_digital_out_mode finished:%d\n", ret);
 
 	if (ret == 0) {
 		dev_info(dcp->dev, "set_digital_out_mode timed out\n");
+		kref_put(&cookie->refcount, release_wait_cookie);
 		return -EIO;
 	} else if (ret < 0) {
 		dev_info(dcp->dev,
 			 "waiting on set_digital_out_mode failed:%d\n", ret);
+		kref_put(&cookie->refcount, release_wait_cookie);
 		return -EIO;
-
-	} else if (ret > 0) {
+	} else {
 		dev_dbg(dcp->dev,
 			"set_digital_out_mode finished with %d to spare\n",
 			jiffies_to_msecs(ret));
 	}
+	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->valid_mode = true;
+	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 
 	return 0;
 }
@@ -2380,15 +2601,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	}
 #endif
 
-	if (has_surface && dcp->use_timestamps) {
-		/*
-		 * Fake timstamps to get 120hz refresh rate. It looks
-		 * like the actual value does not matter, as long  as it is non zero.
-		 */
-		req->swap.ts1 = 120;
-		req->swap.ts2 = 120;
-		req->swap.ts3 = 120;
-	}
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * Keep what this swap puts on the panel, before the timestamps, the
+	 * backlight block and the wire fix-up go in, so the backlight can
+	 * re-present it while the CRTC is off.
+	 */
+	memcpy(&dcp->h17p_last_swap, req, sizeof(*req));
+	dcp->h17p_have_last_swap = true;
+#endif
+
+	if (has_surface)
+		dcp_swap_set_timestamps(dcp, req);
 
 	/* These fields should be set together */
 	req->swap.swap_completed = req->swap.swap_enabled;

@@ -120,18 +120,6 @@ int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base)
 	return CISP_SEND_IN(isp, args);
 }
 
-int isp_cmd_set_dsid_clr_multi_bc_reg_base(struct apple_isp *isp,
-					   u64 dsid_clr_base, u32 dsid_clr_range)
-{
-	struct cmd_set_dsid_clr_multi_bc_reg_base args = {
-		.opcode = CISP_OPCODE(CISP_CMD_SET_DSID_CLR_MULTI_BC_REG_BASE),
-		.count = 1,
-		.dsid_clr_range = dsid_clr_range,
-		.dsid_clr_base = dsid_clr_base,
-	};
-	return CISP_SEND_IN(isp, args);
-}
-
 int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
 				   u64 dsid_clr_base3, u32 dsid_clr_range0,
@@ -159,6 +147,18 @@ int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
 		.opcode = CISP_OPCODE(CISP_CMD_SET_DSID_CLR_REG_BASE),
 		.dsid_clr_base = dsid_clr_base,
 		.dsid_clr_range = dsid_clr_range,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
+				  u32 dsid_clr_range)
+{
+	struct cmd_set_dsid_clr_multi_bc_reg_base args = {
+		.opcode = CISP_OPCODE(CISP_CMD_SET_DSID_CLR_MULTI_BC_REG_BASE),
+		.count = 1,
+		.dsid_clr_range = dsid_clr_range,
+		.dsid_clr_base = dsid_clr_base,
 	};
 	return CISP_SEND_IN(isp, args);
 }
@@ -230,32 +230,26 @@ int isp_cmd_flicker_sensor_set(struct apple_isp *isp, u32 mode)
 int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 			struct cmd_ch_info *args)
 {
+	struct cmd_ch_info_h17 *h17;
+	int err;
+
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET);
 	args->chan = chan;
-	if (isp->hw->gen == ISP_GEN_T8140) {
-		struct cmd_ch_info_t8140 *big;
-		int err;
+	if (isp->hw->fw_abi != ISP_FW_ABI_H17)
+		return CISP_SEND_OUT(isp, args);
 
-		big = kzalloc(sizeof(*big), GFP_KERNEL);
-		if (!big)
-			return -ENOMEM;
-		big->info = *args;
-		err = CISP_SEND_OUT(isp, big);
-		if (!err)
-			*args = big->info;
-		kfree(big);
-		return err;
-	}
-	return CISP_SEND_OUT(isp, args);
-}
+	/* Exchange the longer H17 record and keep the common part. */
+	h17 = kzalloc_obj(*h17);
+	if (!h17)
+		return -ENOMEM;
 
-int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
-				 struct cmd_ch_camera_config *args)
-{
-	args->opcode = CISP_OPCODE(CISP_CMD_CH_CAMERA_CONFIG_GET);
-	args->preset = preset;
-	args->chan = chan;
-	return CISP_SEND_OUT(isp, args);
+	h17->info = *args;
+	err = CISP_SEND_OUT(isp, h17);
+	if (!err)
+		*args = h17->info;
+	kfree(h17);
+
+	return err;
 }
 
 int isp_cmd_ch_camera_config_current_get(struct apple_isp *isp, u32 chan,
@@ -288,18 +282,20 @@ int isp_cmd_ch_buffer_return(struct apple_isp *isp, u32 chan)
 int isp_cmd_ch_set_file_load(struct apple_isp *isp, u32 chan, u64 addr,
 			     u32 size)
 {
-	/*
-	 * The H17 kext (H16CamInChannel::SendSetfileToFirmware) uses the
-	 * 64-bit form with an 0x18-byte reply (in 0x18 / out 0x18).
-	 */
-	if (isp->fw_compat >= ISP_FIRMWARE_V_13_5 || isp->hw->gen == ISP_GEN_T8140) {
+	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
+
+	if (h17 || isp->fw_compat >= ISP_FIRMWARE_V_13_5) {
 		struct cmd_ch_set_file_load64 args = {
 			.opcode = CISP_OPCODE(CISP_CMD_CH_SET_FILE_LOAD),
 			.chan = chan,
 			.addr = addr,
 			.size = size,
 		};
-		if (isp->hw->gen == ISP_GEN_T8140)
+		/*
+		 * The H17 firmware returns the record; what its reply
+		 * contains is not known, so it is not checked.
+		 */
+		if (h17)
 			return CISP_SEND_INOUT(isp, args);
 		return CISP_SEND_IN(isp, args);
 	} else {
@@ -456,12 +452,10 @@ int isp_cmd_ch_buffer_recycle_start(struct apple_isp *isp, u32 chan)
 
 int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan, u16 type)
 {
-	u32 size = isp->hw->meta_size;
-
-	/* H17 keeps a distinct capture-metadata record size (CH_INFO_GET +0x78) */
-	if (type == CISP_POOL_TYPE_META_CAPTURE && isp->hw->capture_meta_size)
-		size = isp->hw->capture_meta_size;
-
+	u32 size = type == CISP_POOL_TYPE_META_CAPTURE &&
+		   isp->hw->capture_meta_size ?
+			   isp->hw->capture_meta_size :
+			   isp->hw->meta_size;
 	struct cmd_ch_buffer_pool_config_set args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
 		.chan = chan,
@@ -478,29 +472,22 @@ int isp_cmd_ch_buffer_pool_config_set(struct apple_isp *isp, u32 chan, u16 type)
 	return CISP_SEND_INOUT(isp, args);
 }
 
-/*
- * The macOS H17 receiver publishes the rendered (output) pool geometry too:
- * plane sizes/strides in the meta-size slots and the first two "zero" words,
- * two data blocks.  Not sent by the t8103..t8122 path.
- */
 int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
 					       u16 count, u32 plane0_size,
-					       u32 stride0, u32 plane1_size,
-					       u32 stride1)
+					       u32 plane0_stride,
+					       u32 plane1_size,
+					       u32 plane1_stride)
 {
-	struct cmd_ch_buffer_pool_config_set args = {
+	struct cmd_ch_buffer_pool_config_set_rendered args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
 		.chan = chan,
 		.type = CISP_POOL_TYPE_RENDERED,
 		.count = count,
-		.meta_size0 = plane0_size,
-		.meta_size1 = stride0,
-		.unk0 = 0,
-		.unk1 = 0,
-		.unk2 = 0,
-		.zero = { plane1_size, stride1 },
+		.plane0_size = plane0_size,
+		.plane0_stride = plane0_stride,
+		.plane1_size = plane1_size,
+		.plane1_stride = plane1_stride,
 		.data_blocks = 2,
-		.compress = 0,
 	};
 	return CISP_SEND_INOUT(isp, args);
 }

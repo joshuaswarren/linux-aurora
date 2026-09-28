@@ -6,9 +6,6 @@
  */
 
 #include <linux/bitfield.h>
-#include <linux/ctype.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
@@ -51,16 +48,14 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
 	MFD_CELL_NAME("macsmc-power"),
 	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
-	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio"),
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
-/* J700 diagnostic gate: expose only the established gPxx GPIO bank. */
-static const struct mfd_cell apple_smc_gpio_devs[] = {
-	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
-};
+/* The second GPIO bank ('gp' keys) only exists on some SMCs. */
+static const struct mfd_cell apple_smc_low_gpio_dev =
+	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
 
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 				  u64 size, u64 wsize, u32 *ret_data)
@@ -415,222 +410,13 @@ static void apple_smc_disable_notifications(void *data)
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
 }
 
-static int apple_smc_j700_log_function_key(struct apple_smc *smc,
-					    smc_key key, const char *name)
-{
-	struct apple_smc_key_info info;
-	int ret;
-
-	ret = apple_smc_get_key_info(smc, key, &info);
-	if (ret < 0)
-		return dev_err_probe(smc->dev, ret,
-				     "Failed to read J700 %s key metadata\n", name);
-
-	dev_info(smc->dev,
-		 "J700_SMC_FUNCTION_KEY: name=%s key=%08x size=%u type=%08x flags=%02x readable=%u writable=%u function=%u\n",
-		 name, key, info.size, info.type_code, info.flags,
-		 !!(info.flags & APPLE_SMC_READABLE),
-		 !!(info.flags & APPLE_SMC_WRITABLE),
-		 !!(info.flags & APPLE_SMC_FUNCTION));
-
-	return 0;
-}
-
-#ifdef CONFIG_DEBUG_FS
-/*
- * Read-only view of the firmware's own key table.  The hwmon child only
- * instantiates the sensors named in the DT, so walking the table is the only
- * way to see which keys a given machine actually implements.  Metadata is
- * always safe to enumerate; values are read only for keys the firmware marks
- * readable and not as functions, so that listing never executes anything.
- */
-#define SMC_DBG_MAX_VALUE 32
-
-static void apple_smc_key_str(smc_key key, char out[5])
-{
-	out[0] = (key >> 24) & 0xff;
-	out[1] = (key >> 16) & 0xff;
-	out[2] = (key >> 8) & 0xff;
-	out[3] = key & 0xff;
-	out[4] = '\0';
-}
-
-/* Same decode as the hwmon child, kept local so this stays debug-only. */
-static int apple_smc_dbg_f32(u32 fval, long *p)
-{
-	int exp = (fval >> 23) & 0xff;
-	u64 val;
-
-	if (exp == 0xff)
-		return -ENODATA;
-
-	val = fval & GENMASK(22, 0);
-	if (exp)
-		val |= BIT(23);
-	else
-		exp = 1;
-	exp -= 127 + 23;
-
-	val *= 1000;
-	if (exp > 40)
-		return -ERANGE;
-	else if (exp < -63)
-		val = 0;
-	else if (exp < 0)
-		val >>= -exp;
-	else
-		val <<= exp;
-
-	*p = (fval & BIT(31)) ? -(long)val : (long)val;
-	return 0;
-}
-
-static void apple_smc_dbg_value(struct seq_file *s, struct apple_smc *smc,
-				smc_key key, const struct apple_smc_key_info *info)
-{
-	u8 buf[SMC_DBG_MAX_VALUE];
-	char type[5];
-	int ret, i;
-
-	if (!(info->flags & APPLE_SMC_READABLE) || (info->flags & APPLE_SMC_FUNCTION))
-		return;
-	if (!info->size || info->size > SMC_DBG_MAX_VALUE)
-		return;
-
-	ret = apple_smc_read(smc, key, buf, info->size);
-	if (ret < 0) {
-		seq_printf(s, " err=%d", ret);
-		return;
-	}
-
-	seq_puts(s, " ");
-	for (i = 0; i < info->size; i++)
-		seq_printf(s, "%02x", buf[i]);
-
-	apple_smc_key_str(info->type_code, type);
-	if (!strcmp(type, "flt ") && info->size == 4) {
-		long v;
-
-		if (!apple_smc_dbg_f32(get_unaligned_le32(buf), &v))
-			seq_printf(s, " = %ld.%03ld", v / 1000, abs(v % 1000));
-	} else if (!strcmp(type, "flag") && info->size == 1) {
-		seq_printf(s, " = %s", buf[0] ? "true" : "false");
-	} else if (!strncmp(type, "ui", 2) || !strncmp(type, "si", 2)) {
-		u64 v = 0;
-
-		/* Integers are big endian on the wire. */
-		for (i = 0; i < info->size && i < 8; i++)
-			v = (v << 8) | buf[i];
-		seq_printf(s, " = %llu", v);
-	} else if (!strcmp(type, "ioft") && info->size == 8) {
-		u64 v = get_unaligned_be64(buf);
-
-		seq_printf(s, " = %llu.%03llu", v >> 16, ((v & 0xffff) * 1000) >> 16);
-	} else if (!strncmp(type, "ch8", 3)) {
-		seq_puts(s, " = \"");
-		for (i = 0; i < info->size; i++)
-			seq_putc(s, isprint(buf[i]) ? buf[i] : '.');
-		seq_puts(s, "\"");
-	}
-}
-
-static int apple_smc_dbg_walk(struct seq_file *s, bool values)
-{
-	struct apple_smc *smc = s->private;
-	char key_str[5], type_str[5];
-	unsigned int i;
-
-	seq_printf(s, "# %u keys, first %c%c%c%c\n", smc->key_count,
-		   (smc->first_key >> 24) & 0xff, (smc->first_key >> 16) & 0xff,
-		   (smc->first_key >> 8) & 0xff, smc->first_key & 0xff);
-	seq_puts(s, "# index key  type size flags\n");
-
-	for (i = 0; i < smc->key_count; i++) {
-		struct apple_smc_key_info info;
-		smc_key key;
-		int ret;
-
-		if (signal_pending(current))
-			return -EINTR;
-
-		ret = apple_smc_get_key_by_index(smc, i, &key);
-		if (ret < 0) {
-			seq_printf(s, "%5u <index error %d>\n", i, ret);
-			continue;
-		}
-
-		apple_smc_key_str(key, key_str);
-		ret = apple_smc_get_key_info(smc, key, &info);
-		if (ret < 0) {
-			seq_printf(s, "%5u %-4s <info error %d>\n", i, key_str, ret);
-			continue;
-		}
-
-		apple_smc_key_str(info.type_code, type_str);
-		seq_printf(s, "%5u %-4s %-4s %4u %c%c%c", i, key_str, type_str,
-			   info.size,
-			   (info.flags & APPLE_SMC_READABLE) ? 'r' : '-',
-			   (info.flags & APPLE_SMC_WRITABLE) ? 'w' : '-',
-			   (info.flags & APPLE_SMC_FUNCTION) ? 'f' : '-');
-
-		if (values)
-			apple_smc_dbg_value(s, smc, key, &info);
-
-		seq_putc(s, '\n');
-	}
-
-	return 0;
-}
-
-static int apple_smc_keys_show(struct seq_file *s, void *unused)
-{
-	return apple_smc_dbg_walk(s, false);
-}
-DEFINE_SHOW_ATTRIBUTE(apple_smc_keys);
-
-static int apple_smc_values_show(struct seq_file *s, void *unused)
-{
-	return apple_smc_dbg_walk(s, true);
-}
-DEFINE_SHOW_ATTRIBUTE(apple_smc_values);
-
-static void apple_smc_debugfs_remove(void *data)
-{
-	debugfs_remove_recursive(data);
-}
-
-static void apple_smc_debugfs_init(struct apple_smc *smc)
-{
-	struct dentry *dir;
-
-	dir = debugfs_create_dir("macsmc", NULL);
-	if (IS_ERR(dir))
-		return;
-
-	debugfs_create_file("keys", 0400, dir, smc, &apple_smc_keys_fops);
-	debugfs_create_file("values", 0400, dir, smc, &apple_smc_values_fops);
-	devm_add_action_or_reset(smc->dev, apple_smc_debugfs_remove, dir);
-}
-#else
-static void apple_smc_debugfs_init(struct apple_smc *smc) { }
-#endif
-
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct device_node *np;
 	struct apple_smc *smc;
-	bool j700_gpio_only;
-	bool j700_read_only;
 	__be32 count;
 	int ret;
-
-	j700_read_only = of_property_read_bool(dev->of_node,
-					       "apple,j700-read-only-diagnostics");
-	j700_gpio_only = of_property_read_bool(dev->of_node,
-					      "apple,j700-gpio-only");
-	if (j700_read_only && j700_gpio_only)
-		return dev_err_probe(dev, -EINVAL,
-				     "J700 SMC diagnostic modes are mutually exclusive\n");
 
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
 	if (!smc)
@@ -687,52 +473,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
-	apple_smc_debugfs_init(smc);
-
-	/*
-	 * J700's shipping multi-touch contract names two SMC functions, but the
-	 * first hardware gate must not execute them.  Probe only their key
-	 * metadata and deliberately skip NTAP plus every MFD child, since both
-	 * paths can issue unrelated writes.  This remains opt-in and has no effect
-	 * on the normal macsmc path or any existing platform DT.
-	 */
-	if (j700_read_only || j700_gpio_only) {
-		ret = apple_smc_j700_log_function_key(smc, SMC_KEY(pcIO),
-						      "pcIO");
-		if (ret)
-			return ret;
-		ret = apple_smc_j700_log_function_key(smc, SMC_KEY(pmIP),
-						      "pmIP");
-		if (ret)
-			return ret;
-
-		if (j700_read_only) {
-			dev_info(smc->dev,
-				 "J700_SMC_READ_ONLY_READY: keys=%u key_writes=0 notifications=0 children=0\n",
-				 smc->key_count);
-			return 0;
-		}
-
-		/*
-		 * A J700 pKW8 function with a 0x80000 mask was proven on the
-		 * machine through existing gP08.  The AFE function's 0x10000 mask
-		 * therefore maps to gP01.  Register only that established GPIO
-		 * provider and leave notifications plus unrelated children off.
-		 */
-		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
-					   apple_smc_gpio_devs,
-					   ARRAY_SIZE(apple_smc_gpio_devs),
-					   NULL, 0, NULL);
-		if (ret)
-			return dev_err_probe(smc->dev, ret,
-					     "Failed to register J700 SMC GPIO provider");
-
-		dev_info(smc->dev,
-			 "J700_SMC_GPIO_ONLY_READY: keys=%u notifications=0 children=macsmc-gpio\n",
-			 smc->key_count);
-		return 0;
-	}
-
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
@@ -745,6 +485,20 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(smc->dev, ret, "Failed to register sub-devices");
 
+	/*
+	 * Register the second GPIO bank only where the device tree describes
+	 * it: the MFD core would otherwise create an unbound device and warn
+	 * that it found no node on every SMC without one.
+	 */
+	np = of_get_compatible_child(dev->of_node, "apple,smc-low-gpio");
+	if (np) {
+		of_node_put(np);
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					   &apple_smc_low_gpio_dev, 1, NULL, 0, NULL);
+		if (ret)
+			return dev_err_probe(smc->dev, ret,
+					     "Failed to register the second GPIO bank");
+	}
 
 	return 0;
 }

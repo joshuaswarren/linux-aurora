@@ -659,6 +659,7 @@
 				<0x2 0x3b3d0000 0x0 0x4000>;
 			apple,bw-scratch = <&pmgr_dcp 0 5 0x14>;
 			apple,bw-doorbell = <&pmgr_dcp 1 6>;
+			apple,iomfb-surfaces = <1 1 0 0>;
 			power-domains = <&ps_disp0_cpu0>;
 			resets = <&ps_disp0_cpu0>;
 			clocks = <&clk_disp0>;
@@ -858,51 +859,6 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
-		};
-
-		/*
-		 * The J313 platform device tree puts the Mesa fingerprint sensor
-		 * on SPI2.  The 120 MHz parent was confirmed by timing transfers:
-		 * a 22158-byte transfer requested at 8 MHz, divider 15, ran at
-		 * 7.45 Mbit/s.  A 200 MHz parent would make that divider
-		 * 13.3 MHz, and the measurement could not then have come out
-		 * below 8 MHz.
-		 *
-		 * The pin group was read out of the hardware rather than taken
-		 * from a schematic.  iBoot leaves every SPI pad it uses at
-		 * peripheral function 1, and the three buses whose groups are
-		 * already described here have the same register signature: two
-		 * pads with no pull for CLK and MOSI, one with a pull-down for
-		 * MISO.  Pins 128, 129 and 130 are the only remaining pads with
-		 * that signature, and they are contiguous, so they are SPI2.
-		 * Pin 131 is a different pad type and is not part of the group.
-		 *
-		 * There is no chip-select pin.  The platform device tree gives
-		 * SPI1, SPI3 and SPI4 a GPIO chip select (pins 45, 49 and 24, each the
-		 * last pad of its group) and gives SPI2 the string "null", so
-		 * SPI2 uses the controller's own chip select.  That is also why
-		 * SPI0, which has no GPIO chip select either, lists three pins.
-		 */
-		spi2: spi@235108000 {
-			compatible = "apple,t8103-spi", "apple,spi";
-			reg = <0x2 0x35108000 0x0 0x4000>;
-			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 616 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&clk_120m>;
-			pinctrl-0 = <&spi2_pins>;
-			pinctrl-names = "default";
-			power-domains = <&ps_spi2>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-			status = "disabled";
-
-			mesa: fingerprint@0 {
-				compatible = "apple,mesa-fingerprint";
-				reg = <0>;
-				spi-max-frequency = <8000000>;
-				spi-cpha;
-				status = "disabled";
-			};
 		};
 
 		spi3: spi@23510c000 {
@@ -1105,6 +1061,12 @@
 			#apple,bw-doorbell-cells = <2>;
 		};
 
+		cio_reset: reset-controller@23b784000 {
+			compatible = "apple,t8103-cio-reset";
+			reg = <0x2 0x3b784000 0x0 0x8000>;
+			#reset-cells = <1>;
+		};
+
 		pinctrl_ap: pinctrl@23c100000 {
 			compatible = "apple,t8103-pinctrl", "apple,pinctrl";
 			reg = <0x2 0x3c100000 0x0 0x100000>;
@@ -1162,12 +1124,6 @@
 					<APPLE_PINMUX(43, 1)>,
 					<APPLE_PINMUX(44, 1)>,
 					<APPLE_PINMUX(45, 1)>;
-			};
-
-			spi2_pins: spi2-pins {
-				pinmux = <APPLE_PINMUX(128, 1)>, /* CLK */
-					<APPLE_PINMUX(129, 1)>, /* MOSI */
-					<APPLE_PINMUX(130, 1)>; /* MISO */
 			};
 
 			spi3_pins: spi3-pins {
@@ -1393,6 +1349,14 @@
 				     <AIC_IRQ 272 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 273 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 274 IRQ_TYPE_LEVEL_HIGH>;
+
+			acio0_pins: acio0-pins {
+				pinmux = <APPLE_PINMUX(39, 1)>;
+			};
+
+			acio1_pins: acio1-pins {
+				pinmux = <APPLE_PINMUX(41, 1)>;
+			};
 		};
 
 		aop_mbox: mbox@24a408000 {
@@ -1536,6 +1500,7 @@
 			      <0x2 0x3b3d0000 0x0 0x4000>;
 			apple,bw-scratch = <&pmgr_dcp 0 5 0x18>;
 			apple,bw-doorbell = <&pmgr_dcp 1 6>;
+			apple,iomfb-surfaces = <1 1 0 0>;
 			power-domains = <&ps_dispext_cpu0>;
 			resets = <&ps_dispext_cpu0>;
 			clocks = <&clk_dispext0>;
@@ -1592,6 +1557,166 @@
 			power-domains = <&ps_ans2>, <&ps_apcie_st>;
 			power-domain-names = "ans", "apcie0";
 			resets = <&ps_ans2>;
+		};
+
+		usb4_0_mbox: mailbox@381100000 {
+			compatible = "apple,t8103-m3-mailbox",
+				"apple,m3-mailbox-v2";
+			reg = <0x3 0x81100000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 812 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 813 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 814 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 815 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		usb4_0_acio: cio@381ac0000 {
+			compatible = "apple,t8103-usb4-acio";
+			reg = <0x3 0x81ac0000 0x0 0xc000>,
+				<0x3 0x81080000 0x0 0x20000>;
+			reg-names = "rc", "sram";
+
+			mboxes = <&usb4_0_mbox>;
+			resets = <&cio_reset 0>;
+
+			power-domains = <&ps_atc0_cio>,
+					<&ps_atc0_cio_pcie>,
+					<&ps_atc0_cio_usb>,
+					<&ps_atc0_pcie>;
+
+			thunderbolt-switch;
+			apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+
+			pinctrl-0 = <&acio0_pins>;
+			pinctrl-names = "default";
+
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0x0 0x3 0x81000000 0x1000000>;
+			nonposted-mmio;
+
+			usb4_0_dart: iommu@a80000 {
+				compatible = "apple,t8103-dart";
+				reg = <0xa80000 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 810 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			usb4_0_nhi: nhi@f00000 {
+				reg = <0xf00000 0x100000>,
+					<0xdb0000 0x30004>;
+				reg-names = "nhi", "pdf";
+				compatible = "apple,t8103-usb4-nhi";
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 783 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 784 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 785 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 786 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 787 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 788 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 789 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 790 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 791 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 792 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 793 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 794 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 795 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 796 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 797 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 798 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 799 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 800 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 801 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 802 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 803 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 804 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 805 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 806 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names =
+					"txring0", "txring1", "txring2",
+					"txring3", "txring4", "txring5",
+					"txring6", "txring7", "txring8",
+					"txring9", "txring10", "txring11",
+					"rxring0", "rxring1", "rxring2",
+					"rxring3", "rxring4", "rxring5",
+					"rxring6", "rxring7", "rxring8",
+					"rxring9", "rxring10", "rxring11";
+				iommus = <&usb4_0_dart 1>;
+				/* To be filled by the loader */
+				apple,thunderbolt-drom = [00];
+			};
+		};
+
+		usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+
+			apciec0_dart: iommu@3a1008000 {
+				compatible = "apple,t8103-dart";
+				reg = <0x3 0xa1008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 771 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			apciec0: pcie@3b0000000 {
+				compatible = "apple,t8103-pciec";
+				device_type = "pci";
+
+				reg = <0x3 0xb0000000 0x0 0x10000000>,
+					<0x3 0xa0000000 0x0 0x4000>,
+					<0x3 0xa1000000 0x0 0x8000>,
+					<0x3 0xa0004000 0x0 0x4000>,
+					<0x3 0xa0200000 0x0 0x4000>,
+					<0x3 0xa1010000 0x0 0x4000>,
+					<0x3 0xa100c000 0x0 0x4000>;
+				reg-names = "config", "rc", "port0", "fabric",
+					    "debug", "ltssm", "intr2axi";
+
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&ps_atc0_pcie>;
+
+				msi-controller;
+				msi-parent = <&apciec0>;
+				msi-ranges = <&aic AIC_IRQ 738 IRQ_TYPE_EDGE_RISING 32>;
+
+				iommu-map = <0x0 &apciec0_dart 0x0 0x40>;
+				iommu-map-mask = <0x3f>;
+
+				bus-range = <0x0 0x7f>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges = <0x43000000 0x4 0x0
+					  0x4 0x0 0x0 0x80000000>,
+					 <0x02000000 0x0 0x80000000
+					  0x4 0x80000000 0x0 0x40000000>,
+					 <0x42000000 0x0 0xc0000000
+					  0x4 0xc0000000 0x0 0x40000000>;
+
+				apciec0_port: pci@0,0 {
+					device_type = "pci";
+					reg = <0x0 0x0 0x0 0x0 0x0>;
+					external-facing;
+
+					#address-cells = <3>;
+					#size-cells = <2>;
+					ranges;
+
+					interrupt-controller;
+					#interrupt-cells = <1>;
+					interrupt-map-mask = <0 0 0 7>;
+					interrupt-map = <0 0 0 1 &apciec0_port 0 0 0 0>,
+							<0 0 0 2 &apciec0_port 0 0 0 1>,
+							<0 0 0 3 &apciec0_port 0 0 0 2>,
+							<0 0 0 4 &apciec0_port 0 0 0 3>;
+				};
+			};
 		};
 
 		dwc3_0: usb@382280000 {
@@ -1651,6 +1776,166 @@
 			reg = <0x3 0x8304c000 0x0 0x4000>;
 			#mux-control-cells = <1>;
 			power-domains = <&ps_atc0_usb>;
+		};
+
+		usb4_1_mbox: mailbox@501100000 {
+			compatible = "apple,t8103-m3-mailbox",
+				"apple,m3-mailbox-v2";
+			reg = <0x5 0x01100000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 892 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 893 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 894 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 895 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		usb4_1_acio: cio@501ac0000 {
+			compatible = "apple,t8103-usb4-acio";
+			reg = <0x5 0x01ac0000 0x0 0xc000>,
+				<0x5 0x01080000 0x0 0x20000>;
+			reg-names = "rc", "sram";
+
+			mboxes = <&usb4_1_mbox>;
+			resets = <&cio_reset 1>;
+
+			power-domains = <&ps_atc1_cio>,
+					<&ps_atc1_cio_pcie>,
+					<&ps_atc1_cio_usb>,
+					<&ps_atc1_pcie>;
+
+			thunderbolt-switch;
+			apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+
+			pinctrl-0 = <&acio1_pins>;
+			pinctrl-names = "default";
+
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0x0 0x5 0x01000000 0x1000000>;
+			nonposted-mmio;
+
+			usb4_1_dart: iommu@a80000 {
+				compatible = "apple,t8103-dart";
+				reg = <0xa80000 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 890 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			usb4_1_nhi: nhi@f00000 {
+				reg = <0xf00000 0x100000>,
+					<0xdb0000 0x30004>;
+				reg-names = "nhi", "pdf";
+				compatible = "apple,t8103-usb4-nhi";
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 863 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 864 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 865 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 866 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 867 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 868 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 869 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 870 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 871 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 872 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 873 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 874 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 875 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 876 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 877 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 878 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 880 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 881 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 882 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 883 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 884 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 885 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 886 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names =
+					"txring0", "txring1", "txring2",
+					"txring3", "txring4", "txring5",
+					"txring6", "txring7", "txring8",
+					"txring9", "txring10", "txring11",
+					"rxring0", "rxring1", "rxring2",
+					"rxring3", "rxring4", "rxring5",
+					"rxring6", "rxring7", "rxring8",
+					"rxring9", "rxring10", "rxring11";
+				iommus = <&usb4_1_dart 1>;
+				/* To be filled by the loader */
+				apple,thunderbolt-drom = [00];
+			};
+		};
+
+		usb4_1_pcie_tunnel: usb4-pcie-tunnel-1 {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+
+			apciec1_dart: iommu@521008000 {
+				compatible = "apple,t8103-dart";
+				reg = <0x5 0x21008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 851 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			apciec1: pcie@530000000 {
+				compatible = "apple,t8103-pciec";
+				device_type = "pci";
+
+				reg = <0x5 0x30000000 0x0 0x10000000>,
+					<0x5 0x20000000 0x0 0x4000>,
+					<0x5 0x21000000 0x0 0x8000>,
+					<0x5 0x20004000 0x0 0x4000>,
+					<0x5 0x20200000 0x0 0x4000>,
+					<0x5 0x21010000 0x0 0x4000>,
+					<0x5 0x2100c000 0x0 0x4000>;
+				reg-names = "config", "rc", "port0", "fabric",
+					    "debug", "ltssm", "intr2axi";
+
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 850 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&ps_atc1_pcie>;
+
+				msi-controller;
+				msi-parent = <&apciec1>;
+				msi-ranges = <&aic AIC_IRQ 818 IRQ_TYPE_EDGE_RISING 32>;
+
+				iommu-map = <0x0 &apciec1_dart 0x0 0x40>;
+				iommu-map-mask = <0x3f>;
+
+				bus-range = <0x0 0x7f>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges = <0x43000000 0x5 0x80000000
+					  0x5 0x80000000 0x0 0x80000000>,
+					 <0x02000000 0x0 0x00100000
+					  0x6 0x00100000 0x0 0x3ff00000>,
+					 <0x42000000 0x0 0x40000000
+					  0x6 0x40000000 0x0 0x40000000>;
+
+				apciec1_port: pci@0,0 {
+					device_type = "pci";
+					reg = <0x0 0x0 0x0 0x0 0x0>;
+					external-facing;
+
+					#address-cells = <3>;
+					#size-cells = <2>;
+					ranges;
+
+					interrupt-controller;
+					#interrupt-cells = <1>;
+					interrupt-map-mask = <0 0 0 7>;
+					interrupt-map = <0 0 0 1 &apciec1_port 0 0 0 0>,
+							<0 0 0 2 &apciec1_port 0 0 0 1>,
+							<0 0 0 3 &apciec1_port 0 0 0 2>,
+							<0 0 0 4 &apciec1_port 0 0 0 3>;
+				};
+			};
 		};
 
 		dwc3_1: usb@502280000 {

@@ -80,21 +80,9 @@ struct apple_mbox {
 	void *cookie;
 
 	/*
-	 * Whether irq_send_empty is currently unmasked, guarded by tx_lock.
-	 *
-	 * apple_mbox_send() unmasks it before waiting and the send-empty
-	 * handler masks it again, but the handler only runs if the FIFO
-	 * actually drains.  On a timeout it never runs, so the sender has to
-	 * mask the interrupt itself -- and it cannot simply call
-	 * disable_irq_nosync(), because the handler may already be spinning on
-	 * tx_lock and would then mask it a second time.  Both sides test and
-	 * clear this flag instead, so the masking stays balanced either way.
-	 *
-	 * Deliberately appended rather than placed next to tx_empty: consumers
-	 * dereference rx and cookie, and inserting a field above them shifts
-	 * their offsets.  A consumer object that has not been rebuilt then
-	 * reads rx at the wrong offset and jumps to garbage from the receive
-	 * interrupt -- an Oops in apple_mbox_recv_irq, seen on J700.
+	 * Protected by tx_lock. IRQ, send-error and provider-removal paths
+	 * mask an outstanding unmask only once; rebuild every consumer when
+	 * changing this internal structure's layout.
 	 */
 	bool tx_irq_unmasked;
 };

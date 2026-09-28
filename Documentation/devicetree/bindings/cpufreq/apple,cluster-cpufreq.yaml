@@ -46,6 +46,22 @@ properties:
   '#performance-domain-cells':
     const: 0
 
+  apple,fast-die-effort:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle to the PMP report region
+          - description:
+              Lane of the cluster in the PMP's fast die-temperature report.
+              Where that report lies in the region is fixed for each SoC and
+              implied by the report region's compatible.
+    description:
+      The power management processor (PMP) runs a fast control loop on the
+      die temperature and reports, for each cluster, an 8-bit effort in its
+      report region. 0 requests no limit, and the effort rises towards 255 as
+      the die exceeds the firmware's target. The effort is only valid while
+      the PMP reports that it is running; a stopped PMP reports 0.
+
 required:
   - compatible
   - reg

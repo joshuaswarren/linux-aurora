@@ -183,18 +183,6 @@ static void apple_rtkit_crashlog_dump_regs(struct apple_rtkit *rtk, u8 *bfr,
 	dev_warn(rtk->dev, "\n");
 }
 
-bool apple_rtkit_crashlog_present(const u8 *bfr, size_t size)
-{
-	struct apple_rtkit_crashlog_header header;
-
-	if (size < sizeof(header))
-		return false;
-	memcpy(&header, bfr, sizeof(header));
-	/* The dump itself bounds header.size against the whole buffer. */
-	return header.fourcc == APPLE_RTKIT_CRASHLOG_HEADER &&
-	       header.size >= sizeof(header);
-}
-
 void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 {
 	size_t offset;

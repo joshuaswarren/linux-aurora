@@ -347,8 +347,6 @@ mt76_tx(struct mt76_phy *phy, struct ieee80211_sta *sta,
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	struct ieee80211_hdr *hdr = (void *)skb->data;
 	struct sk_buff_head *head;
-	unsigned long worker_state_before = 0;
-	unsigned int fullmac_qid = 0;
 
 	if (mt76_testmode_enabled(phy)) {
 		ieee80211_free_txskb(phy->hw, skb);
@@ -380,20 +378,7 @@ mt76_tx(struct mt76_phy *phy, struct ieee80211_sta *sta,
 		list_add_tail(&wcid->tx_list, &phy->tx_list);
 	spin_unlock_bh(&phy->tx_lock);
 
-	if (wcid && (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC)) {
-		worker_state_before = READ_ONCE(phy->dev->tx_worker.state);
-		fullmac_qid = skb_get_queue_mapping(skb);
-	}
 	mt76_worker_schedule(&phy->dev->tx_worker);
-	if (wcid && (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC))
-		dev_info_ratelimited(phy->dev->dev,
-			 "J700_MT7932_FULLMAC_TX_ENQUEUE: wcid=%u qid=%u pending=%u offchannel=%u worker_before=0x%lx worker_after=0x%lx reset=%u phy_offchannel=%u\n",
-			 wcid->idx, fullmac_qid,
-			 skb_queue_len(&wcid->tx_pending),
-			 skb_queue_len(&wcid->tx_offchannel),
-			 worker_state_before,
-			 READ_ONCE(phy->dev->tx_worker.state),
-			 test_bit(MT76_RESET, &phy->state), phy->offchannel);
 }
 EXPORT_SYMBOL_GPL(mt76_tx);
 
@@ -644,7 +629,6 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
 		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
 		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 		int qid = skb_get_queue_mapping(skb);
-		int idx;
 
 		if ((dev->drv->drv_flags & MT_DRV_HW_MGMT_TXQ) &&
 		    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
@@ -655,13 +639,6 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
 			qid = MT_TXQ_PSD;
 
 		q = phy->q_tx[qid];
-		if (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC)
-			dev_info_ratelimited(dev->dev,
-				 "J700_MT7932_FULLMAC_TX_SCHEDULE: wcid=%u qid=%u pending=%u stopped=%u blocked=%u queued=%u ndesc=%u reset=%u phy_offchannel=%u\n",
-				 wcid->idx, qid, skb_queue_len(head),
-				 q->stopped, q->blocked, q->queued, q->ndesc,
-				 test_bit(MT76_RESET, &phy->state),
-				 phy->offchannel);
 		if (mt76_txq_stopped(q) || test_bit(MT76_RESET, &phy->state)) {
 			ret = -1;
 			break;
@@ -672,14 +649,9 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
 
 		sta = wcid_to_sta(wcid);
 		spin_lock(&q->lock);
-		idx = __mt76_tx_queue_skb(phy, qid, skb, wcid, sta, NULL);
+		__mt76_tx_queue_skb(phy, qid, skb, wcid, sta, NULL);
 		dev->queue_ops->kick(dev, q);
 		spin_unlock(&q->lock);
-		if (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC)
-			dev_info_ratelimited(dev->dev,
-				 "J700_MT7932_FULLMAC_TX_SUBMIT: wcid=%u qid=%u sta=%u ret=%d queued=%u head=%u tail=%u\n",
-				 wcid->idx, qid, !!sta, idx, q->queued,
-				 q->head, q->tail);
 
 		spin_lock(&head->lock);
 	}

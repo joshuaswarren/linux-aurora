@@ -18,14 +18,8 @@
 #include "version_utils.h"
 
 struct DCP_FW_NAME(dcp_swap) {
-	u64 ts1;
-	u64 ts2;
-
-	u64 unk_10;
-	u64 unk_18;
-	u64 ts64_unk;
-	u64 unk_28;
-	u64 ts3;
+	/* IOMobileFramebuffer timestamp types 1 through 7, in wire order. */
+	u64 timestamp[7];
 	u64 unk_38;
 
 	u64 flags1;
@@ -321,5 +315,8 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp);
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+int DCP_FW_NAME(iomfb_present_brightness)(struct apple_dcp *dcp);
+#endif
 
 #endif

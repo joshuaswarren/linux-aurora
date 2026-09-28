@@ -17,22 +17,12 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 	struct mt76_txwi_cache *t;
 	int id, pid;
 	u8 *txwi = (u8 *)txwi_ptr;
-	int i;
 
 	if (unlikely(tx_info->skb->len <= ETH_HLEN))
 		return -EINVAL;
 
 	if (!wcid)
 		wcid = &dev->mt76.global_wcid;
-	if (is_mt7932(mdev)) {
-		for (i = 1; i < tx_info->nbuf; i++)
-			if (tx_info->buf[i].addr >> 35) {
-				dev_err_ratelimited(mdev->dev,
-					"J700_MT7932_TXP_ADDRESS_REJECT: buffer=%d dma=%pad limit=35-bit\n",
-					i, &tx_info->buf[i].addr);
-				return -ERANGE;
-			}
-	}
 
 	t = (struct mt76_txwi_cache *)(txwi + mdev->drv->txwi_size);
 	t->skb = tx_info->skb;
@@ -53,40 +43,6 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
 	mt76_connac2_mac_write_txwi(mdev, txwi_ptr, tx_info->skb, wcid, key,
 				    pid, qid, 0);
-	if (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC) {
-		__le32 *txd = txwi_ptr;
-
-		dev_info_ratelimited(mdev->dev,
-			 "J700_MT7932_FULLMAC_TX_PREPARE: qid=%u wcid=%u token=%d pid=%u bytes=%u txd=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x payload=redacted\n",
-			 qid, wcid->idx, id, pid, tx_info->skb->len,
-			 le32_to_cpu(txd[0]), le32_to_cpu(txd[1]),
-			 le32_to_cpu(txd[2]), le32_to_cpu(txd[3]),
-			 le32_to_cpu(txd[4]), le32_to_cpu(txd[5]),
-			 le32_to_cpu(txd[6]), le32_to_cpu(txd[7]));
-	}
-	if (is_mt7932(mdev) &&
-	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
-	    ieee80211_is_auth(((struct ieee80211_hdr *)
-			      tx_info->skb->data)->frame_control)) {
-		__le32 *txd = txwi_ptr;
-		struct ieee80211_mgmt *mgmt =
-			(struct ieee80211_mgmt *)tx_info->skb->data;
-		bool da_is_bssid = ether_addr_equal(mgmt->da, mgmt->bssid);
-		bool sa_is_vif = info->control.vif &&
-			ether_addr_equal(mgmt->sa, info->control.vif->addr);
-
-		dev_info(mdev->dev,
-			 "J700_MT7932_AUTH_TX_PREPARE: qid=%u wcid=%u pid=%u bytes=%u nbuf=%u alg=%u transaction=%u status=%u da_is_bssid=%u sa_is_vif=%u txd=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
-			 qid, wcid->idx, pid, tx_info->skb->len, tx_info->nbuf,
-			 le16_to_cpu(mgmt->u.auth.auth_alg),
-			 le16_to_cpu(mgmt->u.auth.auth_transaction),
-			 le16_to_cpu(mgmt->u.auth.status_code),
-			 da_is_bssid, sa_is_vif,
-			 le32_to_cpu(txd[0]), le32_to_cpu(txd[1]),
-			 le32_to_cpu(txd[2]), le32_to_cpu(txd[3]),
-			 le32_to_cpu(txd[4]), le32_to_cpu(txd[5]),
-			 le32_to_cpu(txd[6]), le32_to_cpu(txd[7]));
-	}
 
 	txp = (struct mt76_connac_hw_txp *)(txwi + MT_TXD_SIZE);
 	memset(txp, 0, sizeof(struct mt76_connac_hw_txp));
@@ -151,22 +107,13 @@ int mt7921e_mac_reset(struct mt792x_dev *dev)
 	if (err)
 		goto out;
 
-	if (is_mt7932(&dev->mt76)) {
-		err = mt7921_reset_hardware(dev);
-		if (err)
-			goto out;
-		err = mt7932_apply_manufacture_policy(dev);
-		if (err)
-			goto out;
-	} else {
-		err = mt7921_mcu_set_eeprom(dev);
-		if (err)
-			goto out;
+	err = mt7921_mcu_set_eeprom(dev);
+	if (err)
+		goto out;
 
-		err = mt7921_mac_init(dev);
-		if (err)
-			goto out;
-	}
+	err = mt7921_mac_init(dev);
+	if (err)
+		goto out;
 
 	err = __mt7921_start(&dev->phy);
 out:

@@ -33,9 +33,10 @@ properties:
   reg:
     minItems: 2
     items:
-      - description: NVMe registers, including NVMMU on older SoCs
+      - description: NVMe controller registers, including the NVMMU
+          registers on SoCs without a separate NVMMU region
       - description: ANS2 co-processor control registers
-      - description: NVMMU registers on M4 and later SoCs
+      - description: NVMMU registers, a separate region since T8132
 
   reg-names:
     minItems: 2
@@ -46,17 +47,20 @@ properties:
 
   resets:
     maxItems: 1
+    description:
+      Reset of the ANS2 co-processor. On T8140 asserting it raises an
+      SError, so it cannot be used to restart the co-processor there.
 
   power-domains:
-    # two domains for t8103, three for t6000 and t8140
+    # two domains for t8103, three for t6000, t6020 and t8140
     minItems: 2
     items:
       - description: power domain for the NVMe controller.
       - description: power domain for the first PCIe bus connecting the NVMe
           controller to the storage modules.
-      - description: optional power domain for either the second PCIe bus
-          connecting the NVMe controller to the storage modules or the ANS
-          PCIe PHY.
+      - description: optional power domain for the second PCIe bus
+          connecting the NVMe controller to the storage modules (T6000,
+          T6020), or for the PCIe PHY of the link to the storage (T8140).
 
   power-domain-names:
     minItems: 2
@@ -81,7 +85,30 @@ properties:
 
       The SART address filter is documented in iommu/apple,sart.yaml.
 
+  apple,rtkit-handoff:
+    $ref: /schemas/types.yaml#/definitions/string
+    const: nvme-disabled-v1
+    description: |
+      Added at boot by a bootloader that ran the ANS2 firmware and hands it
+      over still running instead of shutting it down. It describes the
+      state that bootloader left behind, not the hardware, and must not be
+      written into a board device tree source. Its presence states that the
+      firmware keeps a negotiated RTKit session, that all NVMe controller
+      DMA has stopped (CC.EN and CSTS.RDY clear), that the SART entries the
+      bootloader programmed are kept, and that every buffer shared with the
+      firmware is reserved in the memory map without no-map.
+
 allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8140-nvme-ans2
+    then:
+      properties:
+        apple,rtkit-handoff: false
+
   - if:
       properties:
         compatible:

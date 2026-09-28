@@ -2432,6 +2432,8 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 		lim.features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA;
 	else
 		lim.features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA);
+	if (ns->ctrl->quirks & NVME_QUIRK_BROKEN_FUA)
+		lim.features &= ~BLK_FEAT_FUA;
 
 	if (info->is_rotational)
 		lim.features |= BLK_FEAT_ROTATIONAL;
@@ -4173,11 +4175,6 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
 	ns->queue = disk->queue;
 	ns->ctrl = ctrl;
 	kref_init(&ns->kref);
-
-#ifdef CONFIG_BLK_INLINE_ENCRYPTION
-	if (ctrl->crypto_profile)
-		blk_crypto_register(ctrl->crypto_profile, ns->queue);
-#endif
 
 	if (nvme_init_ns_head(ns, info))
 		goto out_cleanup_disk;

@@ -21,6 +21,7 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 
 #include <linux/pinctrl/pinctrl.h>
@@ -373,6 +374,19 @@ static const struct irq_chip apple_gpio_irqchip = {
 
 /* Probe & register */
 
+struct apple_gpio_hw {
+	/*
+	 * The register block contains slots that fault when read, so the regmap
+	 * cannot be cache-initialised by reading it back; access it uncached and
+	 * only within the valid GPIO registers minus gpio-reserved-ranges.
+	 */
+	bool no_regcache;
+};
+
+static const struct apple_gpio_hw apple_gpio_t8140_hw = {
+	.no_regcache = true,
+};
+
 static int apple_gpio_regmap_access(struct device *dev, unsigned int npins,
 				    struct regmap_config *config)
 {
@@ -484,6 +498,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 {
 	struct apple_gpio_pinctrl *pctl;
 	struct regmap_config pctl_regmap_config = regmap_config;
+	const struct apple_gpio_hw *hw = device_get_match_data(&pdev->dev);
 	struct pinctrl_pin_desc *pins;
 	unsigned int npins;
 	const char **pin_names;
@@ -525,20 +540,12 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(pctl->base))
 		return PTR_ERR(pctl->base);
 
-	/*
-	 * Some newer platforms have GPIO register slots which synchronously
-	 * abort when read.  The flat regcache populates itself by reading every
-	 * slot during probe, including pins Linux never requested.  Let affected
-	 * boards opt out while retaining normal read/modify/write GPIO access.
-	 */
-	if (of_property_read_bool(pdev->dev.of_node, "apple,no-regcache")) {
+	if (hw && hw->no_regcache) {
 		pctl_regmap_config.cache_type = REGCACHE_NONE;
 		pctl_regmap_config.num_reg_defaults_raw = 0;
-		/* GPIO ownership checks do not protect regmap debugfs reads. */
 		res = apple_gpio_regmap_access(&pdev->dev, npins, &pctl_regmap_config);
 		if (res)
 			return dev_err_probe(&pdev->dev, res, "invalid GPIO register ranges\n");
-		dev_info(&pdev->dev, "register cache disabled\n");
 	}
 
 	pctl->map = devm_regmap_init_mmio(&pdev->dev, pctl->base,
@@ -589,6 +596,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
+	{ .compatible = "apple,t8140-pinctrl", .data = &apple_gpio_t8140_hw },
 	{ .compatible = "apple,t8103-pinctrl", },
 	{ .compatible = "apple,pinctrl", },
 	{ }
@@ -603,18 +611,7 @@ static struct platform_driver apple_gpio_pinctrl_driver = {
 	},
 	.probe = apple_gpio_pinctrl_probe,
 };
-
-static int __init apple_gpio_pinctrl_init(void)
-{
-	return platform_driver_register(&apple_gpio_pinctrl_driver);
-}
-subsys_initcall(apple_gpio_pinctrl_init);
-
-static void __exit apple_gpio_pinctrl_exit(void)
-{
-	platform_driver_unregister(&apple_gpio_pinctrl_driver);
-}
-module_exit(apple_gpio_pinctrl_exit);
+module_platform_driver(apple_gpio_pinctrl_driver);
 
 MODULE_DESCRIPTION("Apple pinctrl/GPIO driver");
 MODULE_AUTHOR("Stan Skowronek <stan@corellium.com>");

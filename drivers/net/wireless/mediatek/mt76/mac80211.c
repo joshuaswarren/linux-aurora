@@ -432,7 +432,6 @@ mt76_phy_init(struct mt76_phy *phy, struct ieee80211_hw *hw)
 	INIT_LIST_HEAD(&phy->tx_list);
 	spin_lock_init(&phy->tx_lock);
 	INIT_DELAYED_WORK(&phy->roc_work, mt76_roc_complete_work);
-	skb_queue_head_init(&phy->scan_pending);
 
 	if ((void *)phy != hw->priv)
 		return 0;
@@ -610,40 +609,9 @@ void mt76_unregister_phy(struct mt76_phy *phy)
 		mt76_led_cleanup(phy);
 	mt76_tx_status_check(dev, true);
 	ieee80211_unregister_hw(phy->hw);
-	skb_queue_purge(&phy->scan_pending);
 	dev->phys[phy->band_idx] = NULL;
 }
 EXPORT_SYMBOL_GPL(mt76_unregister_phy);
-
-static int __maybe_unused mt76_page_pool_prewarm(struct mt76_queue *q, int count)
-{
-	struct page **page;
-	int i, ret = 0;
-
-	page = kcalloc(count, sizeof(*page), GFP_KERNEL);
-	if (!page)
-		return -ENOMEM;
-
-	for (i = 0; i < count; i++) {
-		page[i] = page_pool_alloc_pages(q->page_pool,
-						GFP_KERNEL | __GFP_NOWARN |
-						GFP_DMA32);
-		if (!page[i]) {
-			ret = -ENOMEM;
-			break;
-		}
-	}
-	while (i--)
-		page_pool_recycle_direct(q->page_pool, page[i]);
-	kfree(page);
-
-	if (!ret)
-		dev_info(q->dev->dev,
-			 "J700_MT7932_RX_POOL_PREWARM_PASS: hw=%u ring=%d pages=%d reserve=%d\n",
-			 q->hw_idx, q->ndesc, count, count - q->ndesc);
-
-	return ret;
-}
 
 int mt76_create_page_pool(struct mt76_dev *dev, struct mt76_queue *q)
 {
@@ -672,13 +640,6 @@ int mt76_create_page_pool(struct mt76_dev *dev, struct mt76_queue *q)
 		pp_params.pool_size = 16;
 		break;
 	}
-	if (mt76_chip(dev) == 0x7932 && mt76_is_mmio(dev)) {
-		/* Initial queue fill consumes q->ndesc mapped pages.  Keep the
-		 * normal page-pool allowance as an already-mapped replacement
-		 * reserve so the first post-firmware skb cannot grow the DART map.
-		 */
-		pp_params.pool_size += q->ndesc;
-	}
 
 	if (mt76_is_mmio(dev)) {
 		/* rely on page_pool for DMA mapping */
@@ -698,6 +659,7 @@ int mt76_create_page_pool(struct mt76_dev *dev, struct mt76_queue *q)
 		q->page_pool = NULL;
 		return err;
 	}
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mt76_create_page_pool);
@@ -816,8 +778,6 @@ int mt76_register_device(struct mt76_dev *dev, bool vht,
 	mt76_check_sband(&dev->phy, &phy->sband_2g, NL80211_BAND_2GHZ);
 	mt76_check_sband(&dev->phy, &phy->sband_5g, NL80211_BAND_5GHZ);
 	mt76_check_sband(&dev->phy, &phy->sband_6g, NL80211_BAND_6GHZ);
-	if (dev->custom_regd)
-		wiphy_apply_custom_regulatory(hw->wiphy, dev->custom_regd);
 
 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {
 		ret = mt76_led_init(phy);
@@ -849,7 +809,6 @@ void mt76_unregister_device(struct mt76_dev *dev)
 	mt76_tx_status_check(dev, true);
 	mt76_wcid_cleanup(dev, &dev->global_wcid);
 	ieee80211_unregister_hw(hw);
-	skb_queue_purge(&dev->phy.scan_pending);
 }
 EXPORT_SYMBOL_GPL(mt76_unregister_device);
 

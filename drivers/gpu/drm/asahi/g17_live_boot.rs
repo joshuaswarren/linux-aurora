@@ -247,8 +247,13 @@ fn wait_for_g17p_asc_idle(pdev: &platform::Device, checkpoint: &'static str) {
     }
 }
 
-// Runtime-PM entry points the Rust `kernel` crate does not wrap. These are
-// `EXPORT_SYMBOL_GPL` in drivers/base/power/runtime.c.
+/// Runtime-PM entry points the Rust `kernel` crate does not wrap.
+///
+/// All of these are `EXPORT_SYMBOL_GPL` in `drivers/base/power/runtime.c`.
+/// The inline helpers drivers normally call -- `pm_runtime_set_active`,
+/// `pm_runtime_get_sync`, `pm_runtime_put_sync_suspend`,
+/// `pm_runtime_resume_and_get` -- are exactly the compositions spelled out at
+/// each call site below, so nothing is invented here.
 extern "C" {
     fn devm_pm_runtime_enable(dev: *mut bindings::device) -> c_int;
     fn __pm_runtime_set_status(dev: *mut bindings::device, status: c_uint) -> c_int;
@@ -298,19 +303,27 @@ impl G17PMailboxProvider {
         Ok(Self { mbox })
     }
 
-    fn lifecycle(&self) -> Result<G17PAscwrapV6Lifecycle> {
+    fn lifecycle(&self, pdev: &platform::Device) -> Result<G17PAscwrapV6Lifecycle> {
         let mut raw = MaybeUninit::<bindings::apple_mbox_ascwrap_v6_lifecycle>::uninit();
         // SAFETY: `self.mbox` is the live provider returned by
         // apple_mbox_get() and `raw` points to writable storage.
         to_result(unsafe {
             bindings::apple_mbox_ascwrap_v6_get_lifecycle(self.mbox, raw.as_mut_ptr())
+        }).map_err(|error| {
+            dev_err!(pdev.as_ref(), "G17P provider lifecycle read failed ({:?})\n", error);
+            error
         })?;
         // SAFETY: the successful C call initialized every field.
         let raw = unsafe { raw.assume_init() };
         let role = match raw.role as u32 {
             1 => G17PAscwrapV6Role::Gfx,
             2 => G17PAscwrapV6Role::Gfx1,
-            _ => return Err(EINVAL),
+            _ => {
+                dev_err!(pdev.as_ref(), "G17P provider: unknown ASCWrap v6 role {} wrapper={:#x}+{:#x} iop-vbar={:#x}+{:#x}\n",
+                    raw.role, raw.wrapper_start, raw.wrapper_size,
+                    raw.iop_vbar_start, raw.iop_vbar_size);
+                return Err(EINVAL);
+            }
         };
         Ok(G17PAscwrapV6Lifecycle {
             role,
@@ -751,7 +764,7 @@ fn probe_g17p_reports(
     manager: &mut g17_manager::G17PManagerConstruction,
     checkpoint: &'static str,
 ) {
-    let mode = crate::g17_config::REPORT_DRAIN;
+    let mode = *module_parameters::g17p_report_drain.value();
     if mode == 0 {
         return;
     }
@@ -760,7 +773,7 @@ fn probe_g17p_reports(
         manager,
         checkpoint,
         mode >= 2,
-        crate::g17_config::REPORT_DRAIN_BUDGET,
+        *module_parameters::g17p_report_drain_budget.value(),
     );
 }
 
@@ -1141,11 +1154,13 @@ fn validate_primary_bootstrap_uma_completion(
 ) -> Result<g17_manager::G17PBootstrapUmaCompletion> {
     let uma = g17_completion::decode_g17p_firmware_uma_grow_event(&record.raw)
         .map_err(|_| EIO)?;
+    let expected_operand_table = g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS;
+    let expected_cookie = g17_submission::G17P_USC_FREELIST_LOW_END;
     if uma.stamp_index != 1
-        || g17_submission::g17p_umadesc_offset(uma.pool_index).is_none()
-        || uma.shared_control == 0
-        || uma.operand_table == 0
-        || uma.cookie <= uma.operand_table
+        || uma.pool_index != 0
+        || uma.shared_control != g17_initdata::CONTROL_SHARED_ADDRESS
+        || uma.operand_table != expected_operand_table
+        || uma.cookie != expected_cookie
         || uma.result != g17_submission::G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES
     {
         dev_err!(
@@ -1184,7 +1199,6 @@ struct G17PPrimaryFirmwareEventBatch {
     /// Counted and skipped, never a drain failure -- see the type-4 arm.
     stale_recovery_records: u32,
     notification_count: u32,
-    control_backpressured: bool,
 }
 
 /// Drain the complete primary event-ring batch in native cursor order. Multiple
@@ -1195,6 +1209,7 @@ fn drain_primary_firmware_event_batch(
     pdev: &platform::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
     state: &G17PRoleRtkitState,
+    signal: &G17PCompletionSignal,
     announce_device_control: &mut impl FnMut() -> Result,
 ) -> Result<G17PPrimaryFirmwareEventBatch> {
     let notification_count = state
@@ -1211,7 +1226,6 @@ fn drain_primary_firmware_event_batch(
         blamed_recovery_records: 0,
         stale_recovery_records: 0,
         notification_count,
-        control_backpressured: false,
     };
     let role = match state.processor {
         G17PProcessor::Gfx => g17_initdata::InstanceRole::Primary,
@@ -1225,6 +1239,37 @@ fn drain_primary_firmware_event_batch(
                 let recovery =
                     g17_completion::decode_g17p_firmware_recovery_event(&record.raw)
                         .map_err(|_| EIO)?;
+                if recovery.stamp_index != -1 {
+                    // A stamp-blamed recovery is a real firmware request, not a
+                    // malformed record. Returning EIO here aborted the whole
+                    // batch drain and, because the caller treats that as a hard
+                    // failure, left every later record in the ring unreachable --
+                    // the same stall that unmodelled record types used to cause.
+                    // Report it and keep draining; the recovery bookkeeping below
+                    // is only valid for the empty (stamp -1) form, so skip it.
+                    // Do NOT skip this. Draining past a stamp-blamed recovery
+                    // fixed the ring stall but broke the handshake: skipping left
+                    // `recovery_generation == None`, and every caller keys off
+                    // that field, so nothing ever scheduled the recovery. The
+                    // firmware raises halt unconditionally and then spins until
+                    // the host writes 2 into status_b[0x4900]; never answering
+                    // leaves KSM halted forever, which is the ETIMEDOUT we saw.
+                    // Fall through to the same generation bookkeeping the empty
+                    // form gets -- those checks are stamp-independent.
+                    dev_err!(
+                        pdev.as_ref(),
+                        "G17P recovery: firmware requests stamp-blamed recovery generation={} stamp={}; servicing\n",
+                        recovery.generation,
+                        recovery.stamp_index
+                    );
+                    batch.blamed_recovery_records =
+                        batch.blamed_recovery_records.saturating_add(1);
+                    let stamp = u8::try_from(recovery.stamp_index).map_err(|_| EIO)?;
+                    if stamp >= 128 {
+                        return Err(EIO);
+                    }
+                    batch.blamed_stamp = Some(stamp);
+                }
                 dev_info!(
                     pdev.as_ref(),
                     "G17P event worker: type4 generation={} cursor={}->{} producer={}\n",
@@ -1258,26 +1303,6 @@ fn drain_primary_firmware_event_batch(
                         );
                     }
                     continue;
-                }
-                if recovery.stamp_index != -1 {
-                    // Attribute a stamp only after accepting this recovery
-                    // generation. A delayed copy from the other RTKit role may
-                    // carry a numeric QID that has since changed logical owners;
-                    // treating that stale record as current blame poisons the
-                    // replacement queue's lifetime decision.
-                    let stamp = u8::try_from(recovery.stamp_index).map_err(|_| EIO)?;
-                    if stamp >= 128 {
-                        return Err(EIO);
-                    }
-                    dev_err!(
-                        pdev.as_ref(),
-                        "G17P recovery: firmware requests stamp-blamed recovery generation={} stamp={}; servicing\n",
-                        recovery.generation,
-                        recovery.stamp_index
-                    );
-                    batch.blamed_recovery_records =
-                        batch.blamed_recovery_records.saturating_add(1);
-                    batch.blamed_stamp = Some(stamp);
                 }
                 if let Err(error) =
                     manager.validate_empty_primary_firmware_recovery(recovery.generation)
@@ -1324,15 +1349,8 @@ fn drain_primary_firmware_event_batch(
                         return Err(EIO);
                     }
                 };
-                match manager.service_render_tvb_grow(request)? {
-                    g17_manager::G17PTvbGrowDisposition::IgnoredStale => {}
-                    g17_manager::G17PTvbGrowDisposition::Published => {
-                        announce_device_control()?;
-                    }
-                    g17_manager::G17PTvbGrowDisposition::Deferred => {
-                        batch.control_backpressured = true;
-                        break;
-                    }
+                if manager.service_render_tvb_grow(request)? {
+                    announce_device_control()?;
                 }
             }
             g17_completion::G17P_FIRMWARE_EVENT_UMA_GROW_TYPE => {
@@ -1435,7 +1453,7 @@ fn drain_primary_firmware_event_batch(
 fn complete_primary_real_recovery(
     pdev: &platform::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
-    async_compute_queues: &mut KVec<G17PAsyncComputeQueue>,
+    async_compute_queues: &KVec<G17PAsyncComputeQueue>,
     registers: Option<&regs::Resources>,
     state: &G17PRoleRtkitState,
     generation: u64,
@@ -1473,7 +1491,7 @@ fn complete_primary_real_recovery(
     // clear regardless, skip the wipe while render state is live.
     let scheduler_active = manager.render_scheduler_active();
     if scheduler_active {
-        if crate::g17_config::RECOVERY_ALLOW_ACTIVE_SCHEDULER == 0 {
+        if *module_parameters::g17p_recovery_allow_active_scheduler.value() == 0 {
             manager.validate_empty_primary_firmware_recovery_scheduler()?;
         }
         dev_warn!(
@@ -1503,11 +1521,6 @@ fn complete_primary_real_recovery(
     // firmware is halted at state 1, before the host's 1 -> 2 acknowledge.
     // Match that exact window below, guarded by the always-on GPC state.
     log_g17p_fault_report(pdev.as_ref(), manager, "recovery-blamed-cause");
-    // Compute-only tails need a drain here too: the last render checkpoint
-    // may precede the very kicks that faulted. Capture before acknowledgement
-    // lets firmware mutate the halted state. This is a no-op unless tracing
-    // was explicitly enabled before boot; it changes no scheduling policy.
-    probe_g17p_ktrace(pdev.as_ref(), manager, "fault-before-ack");
     probe_g17p_recovery_report_history(pdev.as_ref(), manager);
     log_g17p_halted_slot0(pdev.as_ref(), manager, registers, handshake.epoch);
     log_g17p_halted_gmmu(
@@ -1537,62 +1550,6 @@ fn complete_primary_real_recovery(
         lowest_blamed_slot,
         cause.host_recovery
     );
-    // Firmware is halted at recovery state 1, so this is the last point at
-    // which the queue state that caused the watchdog can be sampled without
-    // racing firmware or losing it to the acknowledgement below. Keep this on
-    // the recovery path: none of these reads belong in normal submission.
-    for queue in async_compute_queues.iter_mut().filter(|queue| queue.active.is_some()) {
-        if let Some(active) = &queue.active {
-            let packet = &active.packet;
-            let command = packet.command();
-            let timestamps = packet.completion()
-                .and_then(|completion| completion.halted_timestamp_snapshot());
-            dev_err!(
-                pdev.as_ref(),
-                "G17P recovery active-compute: owner={:?} qid={} submission={} context={} vm={} root={:#x} command-images={} input-fences={} usc={:#x} stream=[{:#x},{:#x}) terminator={:#x} samplers={} attachments={} add3={} scs={:#x} timestamps={:x?}\n",
-                queue.owner,
-                queue.queue.queue_id(),
-                packet.submission_id(),
-                packet.context().context_id(),
-                packet.context().vm_id(),
-                packet.context().root(),
-                packet.command_images().len(),
-                packet.input_fences().len(),
-                command.usc_exec_base,
-                command.control_stream_base,
-                command.control_stream_end,
-                command.control_stream_terminator,
-                command.sampler_count,
-                command.attachments.as_slice().len(),
-                command.g17p_add3_buffers.is_some(),
-                command.scs_layout,
-                timestamps,
-            );
-            let mut stream = [0u8; 512];
-            let length = command.control_stream_end
-                .saturating_sub(command.control_stream_base)
-                .min(stream.len() as u64) as usize;
-            match packet.context().vm().read_bytes(
-                command.control_stream_base, &mut stream[..length],
-            ) {
-                Ok(()) => {
-                    for (index, bytes) in stream[..length].chunks(16).enumerate() {
-                        dev_err!(
-                            pdev.as_ref(),
-                            "G17P recovery CDM: qid={} offset={:#x} bytes={:02x?}\n",
-                            queue.queue.queue_id(), index * 16, bytes,
-                        );
-                    }
-                }
-                Err(error) => dev_err!(
-                    pdev.as_ref(),
-                    "G17P recovery CDM: qid={} read failed {:?}\n",
-                    queue.queue.queue_id(), error,
-                ),
-            }
-        }
-        manager.log_async_compute_timeout(&mut queue.queue);
-    }
     // `detected-source-count` must equal the mask population and the blamed
     // slot must be its lowest set bit. When they disagree the mask is not the
     // whole story for this fault, which is worth one line to know.
@@ -1795,12 +1752,13 @@ fn settle_primary_empty_recovery(
     pdev: &platform::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
     state: &G17PRoleRtkitState,
+    signal: &G17PCompletionSignal,
     announce_device_control: &mut impl FnMut() -> Result,
 ) -> Result<(Option<g17_manager::G17PBootstrapUmaRelease>, [u64; 2])> {
     let mut uma_release = None;
     let mut completion_masks = [0u64; 2];
     for _ in 0..g17_completion::G17P_FIRMWARE_EVENT_CAPACITY {
-        let batch = drain_primary_firmware_event_batch(pdev, manager, state, announce_device_control)?;
+        let batch = drain_primary_firmware_event_batch(pdev, manager, state, &signal, announce_device_control)?;
         completion_masks[0] |= batch.completion_masks[0];
         completion_masks[1] |= batch.completion_masks[1];
         if let Some(release) = batch.uma_release {
@@ -1818,9 +1776,6 @@ fn settle_primary_empty_recovery(
                 batch.recovery_records,
                 batch.blamed_stamp,
             )?;
-            return Ok((uma_release, completion_masks));
-        }
-        if batch.control_backpressured {
             return Ok((uma_release, completion_masks));
         }
         let handshake = manager.firmware_recovery_handshake_snapshot()?;
@@ -2483,14 +2438,21 @@ const GFX1_PROVIDER: ExpectedProvider = ExpectedProvider {
 };
 
 fn validate_provider(
+    pdev: &platform::Device,
     provider: &G17PMailboxProvider,
     expected: ExpectedProvider,
 ) -> Result<G17PAscwrapV6Lifecycle> {
-    let lifecycle = provider.lifecycle()?;
+    let lifecycle = provider.lifecycle(pdev)?;
     if lifecycle.role != expected.role
         || lifecycle.wrapper != expected.wrapper
         || lifecycle.iop_vbar != expected.iop_vbar
     {
+        dev_err!(pdev.as_ref(),
+            "G17P provider mismatch: got {:?} wrapper={:#x}+{:#x} iop-vbar={:#x}+{:#x} missing={:#x}; expected {:?} wrapper={:#x}+{:#x} iop-vbar={:#x}+{:#x}\n",
+            lifecycle.role, lifecycle.wrapper.0, lifecycle.wrapper.1,
+            lifecycle.iop_vbar.0, lifecycle.iop_vbar.1, lifecycle.missing,
+            expected.role, expected.wrapper.0, expected.wrapper.1,
+            expected.iop_vbar.0, expected.iop_vbar.1);
         return Err(EINVAL);
     }
 
@@ -2578,13 +2540,6 @@ fn rollback_starting_session(
     stopped
 }
 
-fn rollback_boxed_starting_session(
-    pdev: &platform::Device,
-    session: KBox<G17PStartingSession>,
-) -> bool {
-    rollback_starting_session(pdev, KBox::into_inner(session))
-}
-
 fn wait_initdata_ack(state: &G17PRoleRtkitState) -> Result {
     for _ in 0..INITDATA_ACK_POLLS {
         if state.acked.load(Ordering::Acquire) {
@@ -2656,6 +2611,11 @@ fn finish_boot_session(
     );
 
     if !g17_submission::G17P_NATIVE_PRE_USER_EP21_MESSAGES.is_empty() {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P session: {} unexpected native pre-user EP21 messages\n",
+            g17_submission::G17P_NATIVE_PRE_USER_EP21_MESSAGES.len(),
+        );
         return Err(EINVAL);
     }
     manager.validate_native_pre_user_roots()?;
@@ -2708,9 +2668,9 @@ fn boot_session(
     stop_unproven: &mut bool,
 ) -> Result<G17PBootedSession> {
     let gfx = G17PMailboxProvider::get(pdev.as_ref(), 0)?;
-    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
+    let gfx_lifecycle = validate_provider(pdev, &gfx, GFX_PROVIDER)?;
     let gfx1 = G17PMailboxProvider::get(pdev.as_ref(), 1)?;
-    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
+    let gfx1_lifecycle = validate_provider(pdev, &gfx1, GFX1_PROVIDER)?;
     let gfx_gate = gfx.require_safe_cpu_lifecycle();
     let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
     let transaction_gate =
@@ -2791,7 +2751,7 @@ fn boot_session(
     // to wake up a possibly sleeping IOP". A cold ASC coming out of reset
     // volunteers HELLO, which is why the probe path works; nothing establishes
     // that an ASC whose RUN bit was merely toggled does the same.
-    let restart_mode = crate::g17_config::ASC_RESTART;
+    let restart_mode = *module_parameters::g17p_asc_restart.value();
     let start_result = cpus.start_staged_in_place(|| {
         dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
         log_g17p_asc_state(pdev.as_ref(), &gfx_diag, "gfx", "post-cpu-run");
@@ -2924,17 +2884,10 @@ fn boot_initial_session(
     gpc_perf_state_control: u32,
     test_stage: G17PTestStage,
 ) -> Result<(KBox<g17_manager::G17PManagerConstruction>, G17PBootedSession)> {
-    // Allocate the transaction owner before either ASC can become live.  The
-    // RTKit transports are large enough that retaining their aggregate by
-    // value across resource construction exhausts the module-probe task's
-    // stack.  In-place initialization below transfers them directly into
-    // this preallocated owner without introducing an allocation failure after
-    // CPU start.
-    let session_slot = KBox::<G17PStartingSession>::new_uninit(GFP_KERNEL)?;
     let gfx = G17PMailboxProvider::get(pdev.as_ref(), 0)?;
-    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
+    let gfx_lifecycle = validate_provider(pdev, &gfx, GFX_PROVIDER)?;
     let gfx1 = G17PMailboxProvider::get(pdev.as_ref(), 1)?;
-    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
+    let gfx1_lifecycle = validate_provider(pdev, &gfx1, GFX1_PROVIDER)?;
     let gfx_gate = gfx.require_safe_cpu_lifecycle();
     let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
     let transaction_gate =
@@ -2944,7 +2897,10 @@ fn boot_initial_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
-    let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true)?, GFP_KERNEL)?);
+    let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true).map_err(|error| {
+        dev_err!(pdev.as_ref(), "G17P initial session: UAT setup failed ({:?})\n", error);
+        error
+    })?, GFP_KERNEL)?);
     let firmware_contexts = uat
         .as_ref()
         .ok_or(EIO)?
@@ -2971,10 +2927,37 @@ fn boot_initial_session(
         ),
         GFP_KERNEL,
     )?;
-    let mut gfx_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
-    let gfx1_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
+    // The mailbox provider resumes its genpd in apple_mbox_start().  The
+    // observed failure lies in this constructor window, but its exact errno
+    // source is not yet proven. A failed constructor releases its RX claim,
+    // and neither ASC has started, so a bounded EINVAL retry is safe here.
+    let new_rtkit = |index, state: Arc<G17PRoleRtkitState>| {
+        for attempt in 1..=3 {
+            match rtkit::RtKit::<G17PRtkitOps>::new_g17p(
+                drm.as_ref(), None, index, state.clone(),
+            ) {
+                Ok(rtkit) => return Ok(rtkit),
+                Err(error) => {
+                    dev_err!(pdev.as_ref(),
+                        "G17P initial session: RTKit receiver {} constructor attempt {} failed ({:?})\n",
+                        index, attempt, error);
+                    if error != EINVAL {
+                        return Err(error);
+                    }
+                    if attempt == 3 {
+                        dev_err!(pdev.as_ref(),
+                            "G17P initial session: RTKit receiver {} still EINVAL; deferring probe until providers settle\n",
+                            index);
+                        return Err(EPROBE_DEFER);
+                    }
+                    fsleep(Delta::from_millis(20));
+                }
+            }
+        }
+        Err(EPROBE_DEFER)
+    };
+    let mut gfx_rtkit = new_rtkit(0, gfx_state.clone())?;
+    let gfx1_rtkit = new_rtkit(1, gfx1_state.clone())?;
     dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
     registers.validate_t8140_axi_transition()?;
@@ -3003,15 +2986,15 @@ fn boot_initial_session(
         dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
         Ok(())
     });
-    let mut session = session_slot.write_init(try_init!(G17PStartingSession {
+    let mut session = G17PStartingSession {
         cpus,
         gfx_state,
         gfx_rtkit,
         gfx1_state,
         gfx1_rtkit,
-    }))?;
+    };
     if let Err(error) = start_result {
-        rollback_boxed_starting_session(pdev, session);
+        rollback_starting_session(pdev, session);
         return Err(error);
     }
 
@@ -3028,7 +3011,7 @@ fn boot_initial_session(
         result
     };
     if let Err(error) = gfx1_boot_result {
-        rollback_boxed_starting_session(pdev, session);
+        rollback_starting_session(pdev, session);
         return Err(error);
     }
     dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
@@ -3040,7 +3023,7 @@ fn boot_initial_session(
     {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            rollback_boxed_starting_session(pdev, session);
+            rollback_starting_session(pdev, session);
             return Err(error);
         }
     };
@@ -3059,7 +3042,7 @@ fn boot_initial_session(
     let mut manager = match manager_result {
         Ok(manager) => manager,
         Err(error) => {
-            rollback_boxed_starting_session(pdev, session);
+            rollback_starting_session(pdev, session);
             return Err(error);
         }
     };
@@ -3082,9 +3065,17 @@ fn boot_initial_session(
         }
         let handoff = manager.handoff();
         let gfx_init = g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root)
-            .map_err(|_| EINVAL)?;
+            .map_err(|error| {
+                dev_err!(pdev.as_ref(), "G17P initial session: invalid gfx initdata root {:#x} ({:?})\n",
+                    handoff.primary.instance.root, error);
+                EINVAL
+            })?;
         let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
-            .map_err(|_| EINVAL)?;
+            .map_err(|error| {
+                dev_err!(pdev.as_ref(), "G17P initial session: invalid gfx1 initdata root {:#x} ({:?})\n",
+                    handoff.secondary.instance.root, error);
+                EINVAL
+            })?;
         // Serialise the two roles' initdata handshakes, as native does. MEASURED
         // on the m1n1 hv capture 20260904-001852Z: macOS completes role 0 entirely
         // before it touches role 1's endpoints.
@@ -3175,9 +3166,9 @@ fn boot_initial_session(
     })();
 
     match boot_result {
-        Ok(config) => Ok((manager, KBox::into_inner(session).into_booted(config))),
+        Ok(config) => Ok((manager, session.into_booted(config))),
         Err(error) => {
-            if !rollback_boxed_starting_session(pdev, session) {
+            if !rollback_starting_session(pdev, session) {
                 // The initdata roots are live and a stop failed. The manager
                 // owns every DMA object behind those roots, so it must outlive
                 // the unproven processors along with the starting session.
@@ -3351,10 +3342,8 @@ pub(crate) struct G17PLiveRuntime {
     /// Event-driven hardware fences for the two independently owned render
     /// slots. Installed before the work doorbell and removed only by exact
     /// retirement or the DRM scheduler's bounded timeout recovery.
-    pending_render: KVec<Option<Arc<crate::g17_drm::G17PRenderCompletion>>>,
-    pending_render_queued: KVec<g17_completion::PairFifo<
-        Arc<crate::g17_drm::G17PRenderCompletion>, { g17_resources::G17P_RENDER_QUEUED_PER_PAIR }>>,
-    queue_registry: Option<Arc<crate::g17_drm::G17PQueueRegistry>>,
+    pending_render: [Option<Arc<crate::g17_drm::G17PRenderCompletion>>;
+        g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
     /// Lost render packets whose firmware retirement was not proven. Their
     /// VM job guards keep userspace mappings alive until both processors stop.
     quarantined_render_completions:
@@ -3362,19 +3351,12 @@ pub(crate) struct G17PLiveRuntime {
     /// Type-1 EventMachine QID bits observed since each slot was armed.
     /// Cleared at arm/settlement so a compute-only or prior render event can
     /// never retire the current fence.
-    render_event_masks: KVec<[u64; 2]>,
+    render_event_masks: [[u64; 2];
+        g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
     render_fence_state: g17_completion::RenderFenceState,
 }
 
 impl G17PLiveRuntime {
-    pub(crate) fn attach_queue_registry(
-        &mut self, registry: Arc<crate::g17_drm::G17PQueueRegistry>,
-    ) -> Result {
-        if self.queue_registry.is_some() { return Err(EBUSY); }
-        self.queue_registry = Some(registry);
-        Ok(())
-    }
-
     /// Close every path which can enqueue device-owning firmware work.
     /// Platform unbind calls this before synchronously cancelling the work
     /// items; runtime Drop then performs the firmware-visible teardown.
@@ -3407,96 +3389,12 @@ impl G17PLiveRuntime {
         Ok(())
     }
 
-    /// Queue a control-backpressure continuation while the caller owns the
-    /// runtime mutex. Unbind takes the same mutex before disarming, so it
-    /// either cancels this work or makes the enqueue impossible.
-    fn queue_primary_control_continuation(&self) {
-        if let Some(state) = self.gfx_state.as_ref() {
-            if state.event_worker_armed.load(Ordering::Acquire) {
-                crate::driver::queue_g17p_firmware_event_worker(state.dev.clone());
-            }
-        }
-    }
-
     /// The interrupt-driven completion handoff for this runtime.
     ///
     /// Cloned out before the caller drops the runtime mutex, so the wait can
     /// happen with that mutex released.
     pub(crate) fn completion_signal(&self) -> Arc<G17PCompletionSignal> {
         self.completion_signal.clone()
-    }
-
-    pub(crate) fn firmware_event_worker_armed(&self) -> bool {
-        self.gfx_state.as_ref().is_some_and(|state| {
-            state.event_worker_armed.load(Ordering::Acquire)
-        })
-    }
-
-    pub(crate) fn primary_device_control_backpressured(&self) -> bool {
-        !self.is_crashed() && self.manager.as_ref().is_some_and(|manager| {
-            manager.primary_device_control_backpressured()
-        })
-    }
-
-    fn primary_tvb_reply_pending(&self) -> bool {
-        !self.is_crashed() && self.manager.as_ref().is_some_and(|manager| {
-            manager.primary_tvb_reply_pending()
-        })
-    }
-
-    /// Publish an already encoded mandatory reply before consuming another
-    /// firmware event from either role. The manager clears the pending slot
-    /// after producer publication and before this doorbell, so an RTKit send
-    /// failure is fail-closed and can never replay the record or its TVB grow.
-    fn flush_pending_primary_device_control(&mut self) -> Result<bool> {
-        let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
-        let state = self.gfx_state.as_ref().cloned().ok_or(ENODEV)?;
-        let result = (|| -> Result<bool> {
-            let flush = self
-                .manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .flush_pending_primary_device_control()?;
-            match flush {
-                g17_manager::G17PPendingPrimaryControlFlush::Empty => Ok(true),
-                g17_manager::G17PPendingPrimaryControlFlush::Blocked => Ok(false),
-                g17_manager::G17PPendingPrimaryControlFlush::Published(_) => {
-                    fence(Ordering::SeqCst);
-                    Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?).send_message(
-                        g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-                        g17_rtkit::encode_primary_device_control(),
-                    )?;
-                    Ok(true)
-                }
-            }
-        })();
-        if let Err(error) = result {
-            note_state_crashed(&pdev, &state, "primary-control-retry", error, None);
-        }
-        result
-    }
-
-    /// Publish a render completion's retained FList release after any
-    /// mandatory TVB reply. EAGAIN means the encoded lifecycle remains Ready
-    /// and can be retried; every post-publication failure ends the session.
-    fn flush_pending_render_usc_freelist_release(&mut self) -> Result<bool> {
-        let Some(release) = self
-            .manager
-            .as_ref()
-            .and_then(|manager| manager.pending_render_usc_freelist_release())
-        else {
-            return Ok(true);
-        };
-        match self.service_render_usc_freelist_release(release) {
-            Ok(()) => Ok(true),
-            Err(error) if error == EAGAIN => Ok(false),
-            Err(error) => {
-                let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
-                let state = self.gfx_state.as_ref().cloned().ok_or(ENODEV)?;
-                note_state_crashed(&pdev, &state, "render-usc-freelist-release", error, None);
-                Err(error)
-            }
-        }
     }
 
     pub(crate) fn primary_firmware_event_pending(&self) -> bool {
@@ -3507,7 +3405,7 @@ impl G17PLiveRuntime {
             state.firmware_event_notifications.load(Ordering::Acquire) != 0
         }) || self.gfx1_state.as_ref().is_some_and(|state| {
             state.firmware_event_notifications.load(Ordering::Acquire) != 0
-        }) || self.queue_setup_pending || self.primary_device_control_backpressured()
+        }) || self.queue_setup_pending
     }
 
     pub(crate) fn primary_recovery_pending(&self) -> bool {
@@ -3520,7 +3418,7 @@ impl G17PLiveRuntime {
     /// pending cold grow publishes 0x20 and waits for type 13; retained pairs
     /// still acquire command references but return ready without a grow.
     fn publish_render_usc_freelist_request(&mut self) -> Result {
-        if crate::g17_config::RENDER_USC_FREELIST == 0 {
+        if *module_parameters::g17p_render_usc_freelist.value() == 0 {
             return Ok(());
         }
         let Some(publication) = self
@@ -3629,19 +3527,11 @@ impl G17PLiveRuntime {
         &mut self,
         release: g17_manager::G17PBootstrapUmaRelease,
     ) -> Result {
-        let publication = match self
+        let publication = self
             .manager
             .as_mut()
             .ok_or(ENODEV)?
-            .publish_render_usc_freelist_release(release)
-        {
-            Ok(publication) => publication,
-            Err(error) if error == EAGAIN => {
-                self.queue_primary_control_continuation();
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+            .publish_render_usc_freelist_release(release)?;
         fence(Ordering::SeqCst);
         let announcement = g17_rtkit::encode_primary_device_control();
         if crate::util::g17p_verbose() {
@@ -3664,48 +3554,83 @@ impl G17PLiveRuntime {
             .ok_or(ENODEV)?
             .mark_render_usc_freelist_release_sent(publication.producer_after)?;
 
-        // Native release is asynchronous. Take one nonblocking snapshot; any
-        // sent owner not yet consumed remains retained and is settled by later
-        // event/publication boundaries. Never sleep under the runtime mutex.
-        fence(Ordering::SeqCst);
-        let settled = self
-            .manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .settle_consumed_render_usc_freelist_releases()?;
-        if settled != 0 && crate::util::g17p_verbose() {
-            dev_info!(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                "G17P render USC FList: settled {} asynchronous release(s) after producer {}\n",
-                settled,
-                publication.producer_after,
-            );
+        // Observation is bounded and non-gating, matching native's async
+        // release. If firmware has not consumed it yet the lifecycle remains
+        // retained in Sent state for exact settlement at the next admission
+        // (or the stopped-processor teardown boundary).
+        for _ in 0..20 {
+            fence(Ordering::SeqCst);
+            if self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .complete_render_usc_freelist_release_if_consumed(
+                    publication.producer_after,
+                )?
+            {
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render USC FList: release consumed at producer {}\n",
+                        publication.producer_after,
+                    );
+                }
+                return Ok(());
+            }
+            fsleep(Delta::from_micros(50));
         }
+        dev_warn!(
+            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P render USC FList: release remains asynchronous at producer {}; retaining owner for later settlement\n",
+            publication.producer_after,
+        );
         Ok(())
     }
 
-    /// Refresh all sent owners without waiting. The caller separately retries
-    /// only if the requested render slot still owns an unconsumed release.
+    /// A release that missed the short completion-path observation window is
+    /// ordinary control-ring backpressure, not a corrupt retained owner. Wait
+    /// for the exact published producer before acquiring the next command's
+    /// FList references. The same bounded 100ms retirement contract is used by
+    /// the synchronous opcode-0x20 path above.
     fn settle_render_usc_freelist_release_before_submission(&mut self) -> Result {
-        fence(Ordering::SeqCst);
-        self.manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .settle_consumed_render_usc_freelist_releases()?;
-        Ok(())
-    }
-
-    /// Check one physical pair after refreshing the shared control cursor.
-    /// An unrelated slot's delayed release never enters this retry condition.
-    pub(crate) fn render_usc_freelist_release_pending_for_slot(
-        &mut self,
-        slot: u8,
-    ) -> Result<bool> {
-        self.settle_render_usc_freelist_release_before_submission()?;
-        self.manager
+        let Some(target) = self
+            .manager
             .as_ref()
-            .ok_or(ENODEV)?
-            .render_slot_flist_release_sent(slot)
+            .and_then(|manager| manager.pending_render_usc_freelist_release_producer())
+        else {
+            return Ok(());
+        };
+
+        for poll in 0..CONTROL_COUNTER_POLLS {
+            fence(Ordering::SeqCst);
+            if self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .complete_render_usc_freelist_release_if_consumed(target)?
+            {
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render USC FList: settled pending release producer {} before next submission after {}ms\n",
+                        target,
+                        poll,
+                    );
+                }
+                return Ok(());
+            }
+            if self.is_crashed() {
+                return Err(EIO);
+            }
+            fsleep(Delta::from_millis(1));
+        }
+
+        dev_err!(
+            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P render USC FList: pending release producer {} did not retire before next submission\n",
+            target,
+        );
+        Err(ETIMEDOUT)
     }
 
     pub(crate) fn service_primary_firmware_events(&mut self) -> Result {
@@ -3715,93 +3640,11 @@ impl G17PLiveRuntime {
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
         let state = self.gfx_state.as_ref().cloned().ok_or(ENODEV)?;
         let signal = self.completion_signal.clone();
-        let flushed_pending_control = if self.primary_tvb_reply_pending() {
-            let flushed = self.flush_pending_primary_device_control()?;
-            if !flushed {
-                if let Err(error) = self.manager
-                    .as_mut()
-                    .ok_or(ENODEV)?
-                    .note_primary_device_control_backpressure()
-                {
-                    note_state_crashed(
-                        &pdev,
-                        &state,
-                        "primary-control-backpressure-timeout",
-                        error,
-                        None,
-                    );
-                    return Err(error);
-                }
-                return Ok(());
-            }
-            true
-        } else {
-            false
-        };
-        let flushed_pending_release = if self
-            .manager
-            .as_ref()
-            .is_some_and(|manager| manager.pending_render_usc_freelist_release().is_some())
-        {
-            if !self.flush_pending_render_usc_freelist_release()? {
-                if let Err(error) = self
-                    .manager
-                    .as_mut()
-                    .ok_or(ENODEV)?
-                    .note_flist_release_backpressure()
-                {
-                    note_state_crashed(
-                        &pdev,
-                        &state,
-                        "render-usc-freelist-release-timeout",
-                        error,
-                        None,
-                    );
-                    return Err(error);
-                }
-                return Ok(());
-            }
-            true
-        } else {
-            false
-        };
         if let Some(manager) = self.manager.as_mut() {
-            // IRQ-completion mode returns from the submit path before its
-            // polling loop, so that loop cannot keep the firmware KTrace
-            // consumer moving.  A trace-enabled overlap run can therefore
-            // fill the 0x200-entry ring before the fault we are trying to
-            // observe; the recovery-time drain then preserves only the
-            // prefix.  Consume it on the same event-worker turns that retire
-            // submissions.  This is diagnostic-only (the class mask defaults
-            // to zero) and remains under the runtime mutex, like every other
-            // firmware-ring consumer here.
-            if g17p_ktrace_enabled() {
-                let verbose = *module_parameters::g17p_fw_ktrace_verbose.value() != 0;
-                let budget = *module_parameters::g17p_fw_ktrace_budget.value();
-                for role in [
-                    g17_initdata::InstanceRole::Primary,
-                    g17_initdata::InstanceRole::Secondary,
-                ] {
-                    if let Err(error) = manager.drain_ktrace_ring(role, verbose, budget) {
-                        dev_warn!(
-                            pdev.as_ref(),
-                            "G17P event worker: KTrace drain failed for {:?} ({:?})\n",
-                            role,
-                            error,
-                        );
-                    }
-                }
-            }
-            // The shared legacy completion waiter is armed only by the
-            // synchronous/bootstrap compute path.  Render doorbells and the
-            // independently tracked async-compute queues retire below from
-            // their exact event identities; scanning the entire shared KSM
-            // completion ring for every one of those events only holds the
-            // runtime mutex and delays render publication/completion.
-            if self.pending_compute.is_some() {
-                if let Ok(Some(timestamps)) = manager.read_compute_completion() {
-                    signal.record(G17PComputeCompletion { timestamps });
-                }
+            // The doorbell that woke this worker is also the signal that a
+            // submission may have retired; publish it to any waiter.
+            if let Ok(Some(timestamps)) = manager.read_compute_completion() {
+                signal.record(G17PComputeCompletion { timestamps });
             }
         }
         // Both RTKit roles notify the shared completion/event resources.
@@ -3811,10 +3654,8 @@ impl G17PLiveRuntime {
         let secondary_notifications = self.gfx1_state.as_ref().map_or(0, |secondary| {
             secondary.firmware_event_notifications.load(Ordering::Acquire)
         });
-        let notifications_pending = flushed_pending_control
-            || flushed_pending_release
-            || secondary_notifications != 0
-            || state.firmware_event_notifications.load(Ordering::Acquire) != 0;
+        let notifications_pending = secondary_notifications != 0 ||
+            state.firmware_event_notifications.load(Ordering::Acquire) != 0;
         let recovery_pending = self
             .manager
             .as_ref()
@@ -3844,7 +3685,7 @@ impl G17PLiveRuntime {
             let rtkit = self.gfx_rtkit.as_mut().ok_or(ENODEV)?;
             let mut announce = || Pin::new(&mut *rtkit).send_message(
                 g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
-            match settle_primary_empty_recovery(&pdev, manager, &state, &mut announce) {
+            match settle_primary_empty_recovery(&pdev, manager, &state, &signal, &mut announce) {
                 Ok((release, masks)) => {
                     uma_release = release;
                     completion_masks = masks;
@@ -3854,9 +3695,7 @@ impl G17PLiveRuntime {
             }
         };
         let result = result.and_then(|()| {
-            if self.primary_device_control_backpressured() {
-                Ok(())
-            } else if let Some(release) = uma_release {
+            if let Some(release) = uma_release {
                 self.service_render_usc_freelist_release(release)
                     .map_err(step("render-usc-freelist-release"))
             } else {
@@ -3864,46 +3703,39 @@ impl G17PLiveRuntime {
             }
         });
         let result = result.and_then(|()| {
-            if !self.primary_device_control_backpressured() {
-                if let Some(secondary) = self.gfx1_state.as_ref().cloned() {
-                    let rtkit = self.gfx_rtkit.as_mut().ok_or(("no-gfx-rtkit", ENODEV))?;
-                    let mut announce = || Pin::new(&mut *rtkit).send_message(
-                        g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-                        g17_rtkit::encode_primary_device_control(),
-                    );
-                    let batch = drain_primary_firmware_event_batch(
-                        &pdev,
-                        self.manager.as_mut().ok_or(("no-manager", ENODEV))?,
-                        &secondary,
-                        &mut announce,
-                    )
+            if let Some(secondary) = self.gfx1_state.as_ref().cloned() {
+                let rtkit = self.gfx_rtkit.as_mut().ok_or(("no-gfx-rtkit", ENODEV))?;
+                let mut announce = || Pin::new(&mut *rtkit).send_message(
+                    g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
+                let batch = drain_primary_firmware_event_batch(&pdev,
+                    self.manager.as_mut().ok_or(("no-manager", ENODEV))?, &secondary, &signal,
+                    &mut announce)
                     .map_err(step("drain-gfx1-event-ring"))?;
-                    completion_masks[0] |= batch.completion_masks[0];
-                    completion_masks[1] |= batch.completion_masks[1];
-                    if let Some(release) = batch.uma_release {
-                        self.service_render_usc_freelist_release(release)
-                            .map_err(step("gfx1-render-usc-freelist-release"))?;
-                    }
-                    if let Some(generation) = batch.recovery_generation {
-                        // The firmware raises ONE restart request and both roles can
-                        // see it, so this is routinely the same request the gfx ring
-                        // queued a few lines ago. `queue_primary_recovery` answers
-                        // that with EBUSY, and EBUSY here killed the session.
-                        let queued = self.manager.as_mut().ok_or(("no-manager", ENODEV))?
-                            .queue_or_coalesce_primary_recovery(
-                                generation,
-                                batch.recovery_records,
-                                batch.blamed_stamp,
-                            )
-                            .map_err(step("queue-gfx1-recovery"))?;
-                        if !queued {
-                            dev_info!(
-                                pdev.as_ref(),
-                                "G17P recovery: gfx1 type4 generation={} records={} folded into the request the gfx ring already queued\n",
-                                generation,
-                                batch.recovery_records,
-                            );
-                        }
+                completion_masks[0] |= batch.completion_masks[0];
+                completion_masks[1] |= batch.completion_masks[1];
+                if let Some(release) = batch.uma_release {
+                    self.service_render_usc_freelist_release(release)
+                        .map_err(step("gfx1-render-usc-freelist-release"))?;
+                }
+                if let Some(generation) = batch.recovery_generation {
+                    // The firmware raises ONE restart request and both roles can
+                    // see it, so this is routinely the same request the gfx ring
+                    // queued a few lines ago. `queue_primary_recovery` answers
+                    // that with EBUSY, and EBUSY here killed the session.
+                    let queued = self.manager.as_mut().ok_or(("no-manager", ENODEV))?
+                        .queue_or_coalesce_primary_recovery(
+                            generation,
+                            batch.recovery_records,
+                            batch.blamed_stamp,
+                        )
+                        .map_err(step("queue-gfx1-recovery"))?;
+                    if !queued {
+                        dev_info!(
+                            pdev.as_ref(),
+                            "G17P recovery: gfx1 type4 generation={} records={} folded into the request the gfx ring already queued\n",
+                            generation,
+                            batch.recovery_records,
+                        );
                     }
                 }
             }
@@ -3933,29 +3765,16 @@ impl G17PLiveRuntime {
     fn service_firmware_events_inline(&mut self) -> Result<u32> {
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
         let state = self.gfx_state.as_ref().cloned().ok_or(ENODEV)?;
-        let pending_control = self.primary_tvb_reply_pending();
-        let pending_release = self
-            .manager
-            .as_ref()
-            .is_some_and(|manager| manager.pending_render_usc_freelist_release().is_some());
-        if state.firmware_event_notifications.load(Ordering::Acquire) == 0
-            && !pending_control
-            && !pending_release
-        {
+        if state.firmware_event_notifications.load(Ordering::Acquire) == 0 {
             return Ok(0);
         }
-        if pending_control && !self.flush_pending_primary_device_control()? {
-            return Ok(0);
-        }
-        if pending_release && !self.flush_pending_render_usc_freelist_release()? {
-            return Ok(0);
-        }
+        let signal = self.completion_signal.clone();
         let batch = {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             let rtkit = self.gfx_rtkit.as_mut().ok_or(ENODEV)?;
             let mut announce = || Pin::new(&mut *rtkit).send_message(
                 g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
-            drain_primary_firmware_event_batch(&pdev, manager, &state, &mut announce)?
+            drain_primary_firmware_event_batch(&pdev, manager, &state, &signal, &mut announce)?
         };
         let completion_masks = batch.completion_masks;
         for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize {
@@ -4015,31 +3834,6 @@ impl G17PLiveRuntime {
     pub(crate) fn service_primary_recovery(&mut self) -> Result {
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
         let state = self.gfx_state.as_ref().cloned().ok_or(ENODEV)?;
-        for (pending_slot, completion) in self.pending_render.iter().enumerate() {
-            let Some(completion) = completion.as_ref() else { continue };
-            let (submission_id, vdm_base, lease_slot, signalled) =
-                completion.diagnostic_identity();
-            dev_err!(
-                pdev.as_ref(),
-                "G17P fault correlation: pending-slot={} lease-slot={} submission={} vdm={:#x} signalled={}\n",
-                pending_slot,
-                lease_slot,
-                submission_id,
-                vdm_base,
-                signalled,
-            );
-        }
-        for (pending_slot, completion) in self.pending_render_queued.iter().enumerate()
-            .flat_map(|(slot, queued)| queued.iter().map(move |completion| (slot, completion)))
-        {
-            let (submission_id, vdm_base, lease_slot, signalled) =
-                completion.diagnostic_identity();
-            dev_err!(
-                pdev.as_ref(),
-                "G17P fault correlation: queued-slot={} lease-slot={} submission={} vdm={:#x} signalled={}\n",
-                pending_slot, lease_slot, submission_id, vdm_base, signalled,
-            );
-        }
         // Sample the queue/firmware agreement either side of the recovery.
         // A boot with no fault hands the retained graph to any number of
         // sequential clients; one GMMU fault in between and every later kick is
@@ -4048,7 +3842,7 @@ impl G17PLiveRuntime {
         // DRAM only -- see `log_compute_recovery_alignment`.
         self.log_recovery_alignment("pre-recovery");
         let registers = self.registers.as_ref();
-        let async_compute_queues = &mut self.async_compute_queues;
+        let async_compute_queues = &self.async_compute_queues;
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         let Some((generation, records, blamed_stamp)) = manager.pending_primary_recovery() else {
             return Ok(());
@@ -4078,25 +3872,32 @@ impl G17PLiveRuntime {
                 return Err(error);
             }
         };
-        if let Some(stamp) = blamed_stamp {
-            self.settle_render_blamed_by_recovery(stamp, EIO);
-        }
-        // The recovery acknowledged its final clear at state 0: the firmware
-        // is alive and reset. Release the compute admission poison here;
-        // otherwise only a session rebuild (which ends in rtkit-boot ETIME)
-        // could clear it and one fault locked every later client out.
-        if let Some(registry) = self.queue_registry.as_ref() {
-            if registry.clear_compute_poison() {
-                dev_info!(pdev.as_ref(),
-                    "G17PMARK recovery cleared the device-wide compute admission poison\n");
+        // The recovery above acknowledged its final clear at state=0, so the
+        // firmware is alive and reset. That is a rehabilitation boundary, and
+        // until now nothing treated it as one: `compute_faulted` was cleared
+        // only by `rehabilitate_after_processor_stop`, i.e. by a session
+        // rebuild that is known to end in rtkit-boot ETIME. So one quarantined
+        // compute queue poisoned the device for the rest of the boot. Every
+        // lease guard shares one registry, so clearing through any live guard
+        // clears it for everyone.
+        if *module_parameters::g17p_clear_poison_on_recovery.value() != 0 {
+            let mut cleared = false;
+            for q in &self.async_compute_queues {
+                if let Some(active) = q.active.as_ref() {
+                    active._lease.rehabilitate_after_processor_stop();
+                    cleared = true;
+                    break;
+                }
+            }
+            if cleared {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17PMARK recovery cleared the device-wide compute admission poison\n",
+                );
             }
         }
-        // Compute completions observed while the recovery was open were left
-        // armed. Their completion edges may already have been consumed, so
-        // re-scan every active queue now rather than waiting for the watchdog.
-        if let Err(error) = self.service_async_compute_completions() {
-            dev_warn!(pdev.as_ref(),
-                "G17P recovery: post-recovery compute scan failed ({:?})\n", error);
+        if let Some(stamp) = blamed_stamp {
+            self.settle_render_blamed_by_recovery(stamp, EIO);
         }
         self.log_recovery_alignment("post-recovery");
         // Realign before the next kick. Continuity across a recovery is exactly
@@ -4194,7 +3995,7 @@ impl G17PLiveRuntime {
             self.runtime_pm_armed = true;
         }
 
-        if crate::g17_config::ASC_TEARDOWN & 1 != 0 {
+        if *module_parameters::g17p_asc_teardown.value() & 1 != 0 {
             wait_for_g17p_asc_idle(pdev, "pre-gate");
         }
 
@@ -4235,7 +4036,7 @@ impl G17PLiveRuntime {
         // pmgr-pwrstate.c, which should mask BUSY out of the written value and
         // poll it clear before the ON the way it already polls it after.
         fsleep(Delta::from_millis(
-            (crate::g17_config::ASC_GATE_SETTLE_MS).clamp(1, 2000) as i64,
+            (*module_parameters::g17p_asc_gate_settle_ms.value()).clamp(1, 2000) as i64,
         ));
         // `pm_runtime_resume_and_get()`.
         // SAFETY: as above.
@@ -4326,7 +4127,7 @@ impl G17PLiveRuntime {
         if !self.is_crashed() {
             return false;
         }
-        if crate::g17_config::ABANDON_RECOVERY == 0
+        if *module_parameters::g17p_abandon_recovery.value() == 0
             || self.crash_recoveries >= CRASH_RECOVERY_ATTEMPTS
         {
             return true;
@@ -4513,7 +4314,7 @@ impl G17PLiveRuntime {
         // the rebuilt session's first bind re-asserts the tag-15 install flag
         // on a QID the firmware still has installed and fails for the
         // completely different reason this work started from.
-        if self.compute_gate_suspect && crate::g17_config::ZERO_DURATION >= 2 {
+        if self.compute_gate_suspect && *module_parameters::g17p_zero_duration.value() >= 2 {
             // Time the rebuild. Whether thousands of these become a bottleneck
             // across a conformance run is a question about milliseconds, and
             // nobody has measured one; guessing at a cheaper recovery before
@@ -4540,7 +4341,7 @@ impl G17PLiveRuntime {
             }
             return result;
         }
-        if crate::g17_config::QUEUE_RECYCLE >= 2
+        if *module_parameters::g17p_queue_recycle.value() >= 2
             && self.compute_queue_can_rebind()
         {
             return self.rebind_compute_queue();
@@ -4578,7 +4379,7 @@ impl G17PLiveRuntime {
             return false;
         }
         if self.compute_abandoned
-            && (crate::g17_config::ABANDON_RECOVERY == 0
+            && (*module_parameters::g17p_abandon_recovery.value() == 0
                 || self.quarantined_bindings.len() >= Self::QUARANTINED_BINDING_LIMIT)
         {
             return false;
@@ -4687,7 +4488,7 @@ impl G17PLiveRuntime {
     pub(crate) fn release_render_owner(&mut self, owner: u64, context: u16) {
         let Some(manager) = self.manager.as_mut() else { return };
         manager.release_render_context_owner(context);
-        if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
+        if let Some(pdev) = self.pdev.as_ref() {
             dev_info!(
                 pdev.as_ref(),
                 "G17P render: client queue {} released descriptor context {} after scheduler drain\n",
@@ -4725,7 +4526,7 @@ impl G17PLiveRuntime {
         // running session cannot be talked out of.
         let outstanding =
             self.compute_abandoned || self.pending_compute.is_some() || self.compute_gate_suspect;
-        let queue_only = crate::g17_config::QUEUE_RECYCLE != 0
+        let queue_only = *module_parameters::g17p_queue_recycle.value() != 0
             && !outstanding
             && !self.is_crashed()
             && self.retired_queues.len() < Self::RETIRED_QUEUE_LIMIT;
@@ -4898,13 +4699,8 @@ impl G17PLiveRuntime {
     /// and were genuinely empty, so nothing about this makes the work run.
     fn wait_render_completion_servicing_events(
         &mut self,
-        render_slot: u8,
     ) -> Result<g17_completion::PairedRenderCompletion> {
-        self.manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .select_render_slot(render_slot)?;
-        if crate::g17_config::RENDER_SERVICE_EVENTS == 0 {
+        if *module_parameters::g17p_render_service_events.value() == 0 {
             let completion = self
                 .manager
                 .as_mut()
@@ -4920,15 +4716,7 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .retire_render_usc_freelist_at_completion()?;
             if let Some(release) = release {
-                match self.service_render_usc_freelist_release(release) {
-                    Ok(()) => {}
-                    Err(error) if error == EAGAIN => {
-                        // The lifecycle remains Ready with zero references.
-                        // Event service gives the mandatory TVB reply the next
-                        // credit, then publishes this release exactly once.
-                    }
-                    Err(error) => return Err(error),
-                }
+                self.service_render_usc_freelist_release(release)?;
             }
             return Ok(completion);
         }
@@ -4944,13 +4732,6 @@ impl G17PLiveRuntime {
             i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
         let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
         loop {
-            // Event service visits every pending render slot. Assert the exact
-            // submission identity at each poll boundary instead of depending
-            // on ambient manager selection.
-            self.manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .select_render_slot(render_slot)?;
             match self
                 .manager
                 .as_mut()
@@ -4980,10 +4761,6 @@ impl G17PLiveRuntime {
                             }
                         }
                     }
-                    self.manager
-                        .as_mut()
-                        .ok_or(ENODEV)?
-                        .select_render_slot(render_slot)?;
                     if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
                         finish_g17p_render_trace(pdev.as_ref(), manager,
                             crate::g17_trace_capture::Phase::AfterPairRetirement);
@@ -4994,11 +4771,7 @@ impl G17PLiveRuntime {
                         .ok_or(ENODEV)?
                         .retire_render_usc_freelist_at_completion()?;
                     if let Some(release) = release {
-                        match self.service_render_usc_freelist_release(release) {
-                            Ok(()) => {}
-                            Err(error) if error == EAGAIN => {}
-                            Err(error) => return Err(error),
-                        }
+                        self.service_render_usc_freelist_release(release)?;
                     }
                     if serviced != 0 {
                         if let Some(pdev) = self.pdev.as_ref() {
@@ -5038,10 +4811,6 @@ impl G17PLiveRuntime {
                     service_failures += 1;
                 }
             }
-            self.manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .select_render_slot(render_slot)?;
             if started.elapsed().as_nanos() >= deadline_ns {
                 break;
             }
@@ -5055,10 +4824,6 @@ impl G17PLiveRuntime {
                 service_failures
             );
         }
-        self.manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .select_render_slot(render_slot)?;
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
@@ -5125,16 +4890,12 @@ impl G17PLiveRuntime {
         if self.pending_render.get(index).and_then(Option::as_ref).is_none() {
             return Err(EIO);
         }
+        if !self.render_fence_state.settle(render_slot) {
+            return Ok(false);
+        }
+        self.render_event_masks[index] = [0; 2];
         let signal = self.pending_render[index].take().ok_or(EIO)?;
         signal.complete(Ok(observed));
-        if let Some(next) = self.pending_render_queued[index].take() {
-            self.pending_render[index] = Some(next);
-        } else {
-            if !self.render_fence_state.settle(render_slot) {
-                return Ok(false);
-            }
-            self.render_event_masks[index] = [0; 2];
-        }
 
         let cleanup = (|| -> Result {
             let release = self
@@ -5143,15 +4904,7 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .retire_render_usc_freelist_at_completion()?;
             if let Some(release) = release {
-                match self.service_render_usc_freelist_release(release) {
-                    Ok(()) => {}
-                    Err(error) if error == EAGAIN => {
-                        // The lifecycle remains Ready with zero references.
-                        // Event service publishes it after the pending TVB
-                        // reply without re-signalling this render fence.
-                    }
-                    Err(error) => return Err(error),
-                }
+                self.service_render_usc_freelist_release(release)?;
             }
             Ok(())
         })();
@@ -5173,63 +4926,38 @@ impl G17PLiveRuntime {
     /// first cannot strand the earlier slot, and taking the pending Arc makes
     /// duplicate notifications idempotent.
     fn service_async_render_completions(&mut self, new_masks: [u64; 2]) -> Result {
-        let caller_slot = self
-            .manager
-            .as_ref()
-            .ok_or(ENODEV)?
-            .active_render_slot();
-        let serviced = (|| -> Result {
-            for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
-                if !self.render_fence_state.pending(slot) {
-                    continue;
-                }
-                let observed = &mut self.render_event_masks[slot as usize];
-                observed[0] |= new_masks[0];
-                observed[1] |= new_masks[1];
-                let expected = self.manager.as_ref().ok_or(ENODEV)?
-                    .render_completion_masks_for_slot(slot)?;
-                if !g17_completion::g17p_render_type1_complete(*observed, expected) {
-                    continue;
-                }
-                // One event edge may cover both ordered groups. Settle the front,
-                // promote its queued successor, and immediately inspect that
-                // successor before discarding the already-observed QID mask.
-                for _ in 0..g17_resources::G17P_RENDER_MAX_IN_FLIGHT {
-                    let mut completion = None;
-                    for _ in 0..2 {
-                        match self.poll_deferred_render_completion(slot)? {
-                            Some(observed) => {
-                                completion = Some(observed);
-                                break;
-                            }
-                            None => {}
-                        }
-                    }
-                    let Some(observed) = completion else { break };
-                    if !self.settle_deferred_render_completion(slot, observed)? {
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            if !self.render_fence_state.pending(slot) {
+                continue;
+            }
+            let observed = &mut self.render_event_masks[slot as usize];
+            observed[0] |= new_masks[0];
+            observed[1] |= new_masks[1];
+            let expected = {
+                let manager = self.manager.as_mut().ok_or(ENODEV)?;
+                manager.select_render_slot(slot)?;
+                manager.render_completion_masks()?
+            };
+            if !g17_completion::g17p_render_type1_complete(*observed, expected) {
+                continue;
+            }
+            let mut completion = None;
+            // A completed firmware list can require one immediate quiesce
+            // pass before the paired retirement becomes observable.
+            for _ in 0..2 {
+                match self.poll_deferred_render_completion(slot)? {
+                    Some(observed) => {
+                        completion = Some(observed);
                         break;
                     }
-                    // Final settlement disarms the physical slot. Only a promoted
-                    // successor leaves it armed; polling again without one asks
-                    // the manager for a tracker that no longer exists and turns a
-                    // successful one-deep render into a spurious ENODEV crash.
-                    if !self.render_fence_state.pending(slot) {
-                        break;
-                    }
+                    None => {}
                 }
             }
-            Ok(())
-        })();
-        // Event service is a visitor over every pending slot, not an ownership
-        // transfer. Keep the caller's active graph selected even when one of
-        // those visits fails, otherwise the submit that owns the runtime mutex
-        // can poll, time out, or retire a different physical pair.
-        let restored = self
-            .manager
-            .as_mut()
-            .ok_or(ENODEV)
-            .and_then(|manager| manager.select_render_slot(caller_slot));
-        serviced.and(restored)
+            if let Some(observed) = completion {
+                self.settle_deferred_render_completion(slot, observed)?;
+            }
+        }
+        Ok(())
     }
 
     fn install_render_completion(
@@ -5240,18 +4968,12 @@ impl G17PLiveRuntime {
         let pending = self.pending_render
             .get_mut(render_slot as usize)
             .ok_or(EINVAL)?;
-        if pending.is_none() {
-            if !self.render_fence_state.arm(render_slot) {
-                return Err(EBUSY);
-            }
-            self.render_event_masks[render_slot as usize] = [0; 2];
-            *pending = Some(completion);
-            return Ok(());
+        if pending.is_some() || !self.render_fence_state.arm(render_slot) {
+            return Err(EBUSY);
         }
-        let queued = self.pending_render_queued
-            .get_mut(render_slot as usize)
-            .ok_or(EINVAL)?;
-        queued.push(completion).map_err(|_| EBUSY)
+        self.render_event_masks[render_slot as usize] = [0; 2];
+        *pending = Some(completion);
+        Ok(())
     }
 
     /// Release error-fence owners only after both processors are stopped.
@@ -5284,10 +5006,7 @@ impl G17PLiveRuntime {
             .get(usize::from(render_slot)).and_then(Option::as_ref) else {
                 return;
             };
-        let queued_matches = self.pending_render_queued
-            .get(usize::from(render_slot))
-            .is_some_and(|queued| queued.iter().any(|queued| Arc::ptr_eq(queued, completion)));
-        if !Arc::ptr_eq(current, completion) && !queued_matches {
+        if !Arc::ptr_eq(current, completion) {
             return;
         }
         self.settle_failed_deferred_render(
@@ -5301,18 +5020,26 @@ impl G17PLiveRuntime {
     /// Settle the render named by a firmware type-4 recovery record.
     ///
     /// Type-1 event masks and type-4 `stamp_index` use the same 128-bit
-    /// EventMachine QID namespace. Resolve the current lease owner rather than
-    /// inferring a render slot from the numeric QID. Do this after the firmware
-    /// reaches state 0: at that point a
+    /// EventMachine QID namespace. A recovery naming TA/3D QID 0/1 therefore
+    /// belongs only to physical render slot 0, while QID 2/3 belongs only to
+    /// slot 1. Do this after the firmware reaches state 0: at that point a
     /// final DRAM observation can either salvage an actual completion or
     /// classify the rejected group without waiting for the scheduler's
     /// unrelated two-second watchdog.
     fn settle_render_blamed_by_recovery(&mut self, stamp: u8, error: Error) {
-        let Some(slot) = self.manager.as_ref().and_then(|manager|
-            manager.render_slot_for_qid(stamp)
-        ) else { return; };
-        if !self.render_fence_state.pending(slot) { return; }
-        self.settle_failed_deferred_render(slot, None, Some(stamp), error);
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            let Some(pair) = g17_resources::G17PRenderQueuePair::for_slot(slot) else {
+                continue;
+            };
+            if stamp != pair.tiling as u8 && stamp != pair.fragment as u8 {
+                continue;
+            }
+            if !self.render_fence_state.pending(slot) {
+                return;
+            }
+            self.settle_failed_deferred_render(slot, None, Some(stamp), error);
+            return;
+        }
     }
 
     /// Exact-once settlement shared by the watchdog and a firmware-blamed
@@ -5409,14 +5136,7 @@ impl G17PLiveRuntime {
             let Some(signal) = self.pending_render
                 .get_mut(render_slot as usize)
                 .and_then(Option::take) else { return; };
-            let mut queued_signals = g17_completion::PairFifo::<
-                Arc<crate::g17_drm::G17PRenderCompletion>,
-                { g17_resources::G17P_RENDER_QUEUED_PER_PAIR },
-            >::new();
-            while let Some(queued) = self.pending_render_queued[render_slot as usize].take() {
-                let _ = queued_signals.push(queued);
-            }
-            let retired = queued_signals.is_none() && self
+            let retired = self
                 .retire_failed_deferred_render(render_slot, submission_id.is_some())
                 .unwrap_or(false);
             if let Some(pdev) = self.pdev.as_ref() {
@@ -5439,7 +5159,7 @@ impl G17PLiveRuntime {
                 // graph; this flag makes the required processor-stop boundary
                 // reachable from the next device query/submission instead of
                 // leaving the remaining clients permanently capacity-poisoned.
-                if crate::g17_config::QUARANTINE_SCOPE & 2 == 0 {
+                if *module_parameters::g17p_quarantine_scope.value() & 2 == 0 {
                     note_session_recovery_pending(
                         &mut self.session_recovery_pending,
                         self.pdev.as_ref(),
@@ -5465,18 +5185,6 @@ impl G17PLiveRuntime {
                     pr_err!(
                         "G17P render: completion quarantine exhausted; retaining VM mappings permanently\n"
                     );
-                }
-                while let Some(queued) = queued_signals.take() {
-                    queued.fail_while_owned(error);
-                    if let Err(error) = self
-                        .quarantined_render_completions
-                        .push_within_capacity(queued)
-                    {
-                        core::mem::forget(error.0);
-                        pr_err!(
-                            "G17P render: queued completion quarantine exhausted; retaining VM mappings permanently\n"
-                        );
-                    }
                 }
             }
             self.fail_outstanding_jobs_for_vm(&status, error);
@@ -5532,7 +5240,7 @@ impl G17PLiveRuntime {
             // nothing about firmware ownership, so it keeps the strict rule.
             .retire_abandoned_render_if_firmware_retired(
                 !timed_out
-                    && crate::g17_config::RENDER_RECOVERY_RETIRE != 0,
+                    && *module_parameters::g17p_render_recovery_retire.value() != 0,
             )
         {
             Ok(retired) => retired,
@@ -5553,10 +5261,6 @@ impl G17PLiveRuntime {
             // device-global FList refcount does not leak two references per
             // abandoned render. Neither failure changes the slot's state.
             let _ = self.service_firmware_events_inline();
-            self.manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .select_render_slot(render_slot)?;
             match self
                 .manager
                 .as_mut()
@@ -5565,14 +5269,12 @@ impl G17PLiveRuntime {
             {
                 Ok(Some(release)) => {
                     if let Err(error) = self.service_render_usc_freelist_release(release) {
-                        if error != EAGAIN {
-                            if let Some(pdev) = self.pdev.as_ref() {
-                                dev_warn!(
-                                    pdev.as_ref(),
-                                    "G17P render: FList release after a firmware-retired group failed ({:?})\n",
-                                    error
-                                );
-                            }
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_warn!(
+                                pdev.as_ref(),
+                                "G17P render: FList release after a firmware-retired group failed ({:?})\n",
+                                error
+                            );
                         }
                     }
                 }
@@ -5643,44 +5345,28 @@ impl G17PLiveRuntime {
         Err(ETIMEDOUT)
     }
 
-    /// Called only by the opt-in render transition qualification control.
-    /// Recovery is compound and must not activate a single-class guard.
-    pub(crate) fn render_transition_reasons(
-        &mut self,
-        vm: &mmu::Vm,
-        render_slot: u8,
-        context: &crate::g17_resources::G17PLogicalQueueContext,
-        command: &g17_uapi::TranslatedRenderCommand,
-    ) -> Result<u32> {
-        if self.is_crashed() {
-            return Ok(g17_manager::render_transition::SESSION_RECYCLE);
-        }
-        self.manager.as_mut().ok_or(ENODEV)?
-            .render_transition_reasons(vm, render_slot, context, command)
-    }
-
     pub(crate) fn submit_translated_render(
         &mut self,
         vm: &mmu::Vm,
         render_slot: u8,
         defer_completion: bool,
-        execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
         command: &g17_uapi::TranslatedRenderCommand,
         completion: Arc<crate::g17_drm::G17PRenderCompletion>,
-        stages: &mut crate::g17_perf::RenderStageTimes,
     ) -> Result {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
-        let queue_pair = self.manager.as_mut().ok_or(ENODEV)?.render_queue_pair(render_slot)?;
+        let queue_pair = g17_resources::G17PRenderQueuePair::for_slot(render_slot)
+            .ok_or(EINVAL)?;
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
             .select_render_slot(render_slot)?;
         let native_doorbell_mode =
-            crate::g17_config::RENDER_NATIVE_DOORBELLS;
+            *module_parameters::g17p_render_native_doorbells.value();
         let native_doorbells = native_doorbell_mode != 0;
-        let split_launch = crate::g17_config::RENDER_SPLIT_LAUNCH != 0;
+        let split_launch = *module_parameters::g17p_render_split_launch.value() != 0;
         if native_doorbell_mode > 3 || (native_doorbells && split_launch) {
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_err!(
@@ -5693,6 +5379,9 @@ impl G17PLiveRuntime {
         if self.is_crashed() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        // Settle an older asynchronous release before any recovery/control
+        // publication can advance the same ring past its exact target.
+        self.settle_render_usc_freelist_release_before_submission()?;
         // Never publish while a firmware recovery is open. The compute path
         // has done this since the recovery work; render never did, and the
         // firmware behaviour it guards against is exactly render's symptom:
@@ -5704,29 +5393,16 @@ impl G17PLiveRuntime {
         // A render that is admitted, armed on its pipe and never launched is
         // what that produces.
         self.settle_open_recovery_before_publication()?;
-        // Inline event servicing scans every pending render slot and leaves
-        // the final scanned slot selected. Restore this submission's slot
-        // before handoff reads or replaces the active graph, bind, tracker,
-        // hardware-buffer owner, retirement state, and SKSM backing.
-        self.manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .select_render_slot(render_slot)?;
         // The legacy synchronous compute path keeps its client resources in
         // fixed contexts 2/3; this render owns a distinct application-GART
         // context and embeds its complete low-view closure there.  They no
         // longer alias, so neither an idle nor an in-flight QID4 binding is a
         // reason to hand the compute graph back before render publication.
         let descriptor_context_id = execution_context.context_id() as u16;
-        let handoff_started = stages.enabled.then(
-            kernel::time::Instant::<kernel::time::Monotonic>::now);
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
             .handoff_retained_render_vm(vm, execution_context.clone())?;
-        if let Some(started) = handoff_started {
-            stages.handoff_ns = started.elapsed().as_nanos().max(0) as u64;
-        }
         let recycle = self
             .manager
             .as_ref()
@@ -5747,53 +5423,15 @@ impl G17PLiveRuntime {
         // the exact configureHardware boundary.  The previous preamble did the
         // power transaction before graph construction; verbose construction
         // alone was long enough for firmware to close the aperture again.
-        // Render entity FIFO has published every earlier logical render by
-        // now. The runtime mutex excludes retirement while we snapshot the
-        // live prefix; successfully retired pairs need no dependency. Keep
-        // each remaining pair's exact native token, including independent
-        // earlier renders which the last render alone does not cover.
-        if completion.vm_status().get() != 0 { return Err(EIO); }
-        let mut render_dependencies = [g17_submission::G17PClBarrierDependency {
-            native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
-        }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
-        let mut dependency_count = 0;
-        for predecessor in Iterator::chain(
-            self.pending_render.iter().flatten(),
-            self.pending_render_queued.iter().flatten(),
-        )
-        {
-            if let Some(dependency) = completion.predecessor_dependency(predecessor)? {
-                let target = render_dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)?;
-                *target = dependency;
-                dependency_count += 1;
-            }
-        }
-        // Every render published while an earlier compute remains live must
-        // carry its token. With publication-only host edges, the second render
-        // can run on another physical pair before the first render retires.
-        if let Some(dependency) = self.async_compute_native_dependency(
-            completion.owner(), &completion.vm_status(),
-        )? {
-            *render_dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)? = dependency;
-            dependency_count += 1;
-        }
-        // Diagnostic modes 2/3 construct TA later and do not accept this
-        // dependency slice. Refuse an unresolved prefix instead of losing it.
-        if dependency_count != 0 && (native_doorbell_mode == 2 || native_doorbell_mode == 3) {
-            return Err(ENOTSUPP);
-        }
         let mut manager = self.manager.take().ok_or(ENODEV)?;
         let registers = self.registers.take().ok_or(ENODEV)?;
         let mut registration_powered = false;
-        let prepare_started = stages.enabled.then(
-            kernel::time::Instant::<kernel::time::Monotonic>::now);
         let prepared = manager.begin_translated_render(
             &drm,
             vm,
             queue_pair,
             execution_context,
             command,
-            &render_dependencies[..dependency_count],
             &registers,
             &mut |manager| {
                 registration_powered = false;
@@ -5801,11 +5439,7 @@ impl G17PLiveRuntime {
                 registration_powered = true;
                 Ok(())
             },
-            stages,
         );
-        if let Some(started) = prepare_started {
-            stages.prepare_ns = started.elapsed().as_nanos().max(0) as u64;
-        }
         // `ensurePoweredHardware(true)` is a scoped native prerequisite. The
         // IdlePowerOff(0) disables firmware idle descent around the direct
         // KSMFE registration. Restore ordinary idle policy before any work
@@ -5827,9 +5461,6 @@ impl G17PLiveRuntime {
         self.manager = Some(manager);
         self.registers = Some(registers);
         let prepared = prepared?;
-        completion.set_fragment_dependency(
-            self.manager.as_ref().ok_or(ENODEV)?.staged_render_fragment_dependency()?,
-        );
         // Arm the exact fence after the tracker has been reset for this group,
         // but before any control or work doorbell can report its retirement.
         self.install_render_completion(render_slot, completion)?;
@@ -5849,16 +5480,11 @@ impl G17PLiveRuntime {
         // notification itself wakes the scheduler, so a merely staged final
         // work doorbell is not a visibility barrier: the old ordering let TA
         // run here against a half-grown FList and emit only an empty header.
-        let flist_started = stages.enabled.then(
-            kernel::time::Instant::<kernel::time::Monotonic>::now);
         if let Err(error) = self.publish_render_usc_freelist_request() {
             return match g17_lifecycle::recover_persistent_runtime(self) {
                 Ok(()) => Err(error),
                 Err(recovery_error) => Err(recovery_error),
             };
-        }
-        if let Some(started) = flist_started {
-            stages.flist_request_ns = started.elapsed().as_nanos().max(0) as u64;
         }
         // Working Metal traces publish no device-control record before their
         // render kicks.  Keep the RE-derived IdlePowerOff transaction strictly
@@ -5866,7 +5492,7 @@ impl G17PLiveRuntime {
         // the kick, mode 2 after it, and the native/default mode 0 publishes
         // nothing.  This used to call the helper unconditionally, which made a
         // supposedly clean mode-0 render materially different from Metal.
-        if crate::g17_config::POWER_WIRE == 1 {
+        if *module_parameters::g17p_power_wire.value() == 1 {
             if let Err(error) = self.wire_g17p_submit_gpu_power() {
                 return match g17_lifecycle::recover_persistent_runtime(self) {
                     Ok(()) => Err(error),
@@ -5897,7 +5523,7 @@ impl G17PLiveRuntime {
                 manager.log_render_outer_channels("pre-fragment-doorbell");
             }
         }
-        if crate::g17_config::RENDER_KSM_PROBE != 0 {
+        if *module_parameters::g17p_render_ksm_probe.value() != 0 {
             // Reacquire after the mutable power/control calls above so this
             // diagnostic borrow does not artificially span them.
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
@@ -5961,9 +5587,9 @@ impl G17PLiveRuntime {
         // this driver rang between the two groups has no counterpart in the
         // oracle. Publish the tiling group first, then ring the single
         // doorbell below.
-        if crate::g17_config::SEED_WORK_CHANNEL != 0 {
+        if *module_parameters::g17p_seed_work_channel.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
-                let value = u64::from(crate::g17_config::SEED_WORK_CHANNEL);
+                let value = u64::from(*module_parameters::g17p_seed_work_channel.value());
                 match registers.g17p_seed_work_channel(value) {
                     Ok(()) => dev_info!(
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
@@ -5978,7 +5604,7 @@ impl G17PLiveRuntime {
                 }
             }
         }
-        if crate::g17_config::FW_TRACE_CLASSES != 0 {
+        if *module_parameters::g17p_fw_trace_classes.value() != 0 {
             // 0x17780c bits 1,2 and 0x17780d bit 1, inside the qword at
             // 0x177808: byte 4 bits 1,2 -> qword bits 33,34; byte 5 bit 1 ->
             // qword bit 41.
@@ -5988,7 +5614,7 @@ impl G17PLiveRuntime {
             // mode 1 produced ch=1 but no ch=9, so the one-bit-per-class
             // reading is unconfirmed and the cheapest way to find 0x909 is to
             // stop guessing the mapping.
-            let class_bits: u64 = if crate::g17_config::FW_TRACE_CLASSES >= 2 {
+            let class_bits: u64 = if *module_parameters::g17p_fw_trace_classes.value() >= 2 {
                 0x0000_ffff_0000_0000
             } else {
                 (1u64 << 33) | (1u64 << 34) | (1u64 << 41)
@@ -6011,7 +5637,7 @@ impl G17PLiveRuntime {
                 ),
             }
         }
-        if crate::g17_config::KSM_COLD_ARM != 0 {
+        if *module_parameters::g17p_ksm_cold_arm.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
                 match registers.g17p_ksm_cold_arm() {
                     Ok(()) => dev_info!(
@@ -6026,9 +5652,9 @@ impl G17PLiveRuntime {
                 }
             }
         }
-        if crate::g17_config::ADMIT_ARM != 0 {
+        if *module_parameters::g17p_admit_arm.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
-                let both = crate::g17_config::ADMIT_ARM >= 2;
+                let both = *module_parameters::g17p_admit_arm.value() >= 2;
                 let mut queues = KVec::new();
                 queues.push(queue_pair.tiling as u8, GFP_KERNEL)?;
                 if both {
@@ -6053,14 +5679,14 @@ impl G17PLiveRuntime {
                 }
             }
         }
-        if crate::g17_config::RENDER_SEED_TS != 0 {
+        if *module_parameters::g17p_render_seed_ts.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
                 for qid in [
                     queue_pair.tiling as u8,
                     queue_pair.fragment as u8,
                 ] {
                     let seed =
-                        u64::from(crate::g17_config::RENDER_SEED_TS) - 1;
+                        u64::from(*module_parameters::g17p_render_seed_ts.value()) - 1;
                     match registers.g17p_seed_queue_completed_timestamp(qid, seed) {
                         Ok(()) => dev_info!(
                             self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
@@ -6079,7 +5705,7 @@ impl G17PLiveRuntime {
             }
         }
         if (native_doorbell_mode == 2 || native_doorbell_mode == 3)
-            && crate::g17_config::RENDER_SLOT_TEMPLATE != 0
+            && *module_parameters::g17p_render_slot_template.value() != 0
         {
             if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
                 .send_message(
@@ -6114,7 +5740,7 @@ impl G17PLiveRuntime {
                 // Sample every read-only fault bank here so a single run can
                 // distinguish a fragment-created dIPP condition from one
                 // introduced by the later TA ConfigUpdate/AddKicks group.
-                if crate::g17_config::RENDER_KSM_PROBE != 0 {
+                if *module_parameters::g17p_render_ksm_probe.value() != 0 {
                     let registers = self.registers.as_ref().ok_or(ENODEV)?;
                     match registers.g17p_render_fault_irq_snapshot() {
                         Ok(Some(snapshot)) => dev_info!(
@@ -6173,7 +5799,7 @@ impl G17PLiveRuntime {
                     Err(recovery_error) => Err(recovery_error),
                 };
             }
-            if crate::g17_config::IRQ_BURST != 0 {
+            if *module_parameters::g17p_irq_burst.value() != 0 {
                 if let Some(registers) = self.registers.as_ref() {
                     let mut seen = [(0u64, 0u64, 0u64); 12];
                     match registers.g17p_burst_sample_irq(&mut seen) {
@@ -6194,7 +5820,7 @@ impl G17PLiveRuntime {
                     }
                 }
             }
-            if crate::g17_config::SLOT_BURST != 0 {
+            if *module_parameters::g17p_slot_burst.value() != 0 {
                 if let Some(registers) = self.registers.as_ref() {
                     let mut seen = [0u64; 16];
                     match registers.g17p_burst_sample_slot0(&mut seen) {
@@ -6219,7 +5845,7 @@ impl G17PLiveRuntime {
             // then advances read+consumed on both. The pre-fragment-doorbell
             // snapshot is taken before the late tiling publication, so it cannot
             // say whether the TA producer is ever bumped at all -- this one can.
-            if crate::g17_config::DEP_RECORDS != 0 {
+            if *module_parameters::g17p_dep_records.value() != 0 {
                 if let Some(manager) = self.manager.as_mut() {
                     manager.log_render_outer_channels("post-doorbells");
                 }
@@ -6238,7 +5864,7 @@ impl G17PLiveRuntime {
             //  && ((DAT_1771f8 & 0x60) == 0 || DAT_124ba4 == 1)
             // so read both. If 0x18 or 0x60 is set here, the firmware is
             // skipping the work scan and that is the whole bug.
-            if crate::g17_config::SCAN_GATE != 0 {
+            if *module_parameters::g17p_scan_gate.value() != 0 {
                 let polls = 64usize;
                 for (label, link, mask) in [
                     ("run-state 0x1771f8", 0xffff_fc00_0017_71f8u64, 0x78u64),
@@ -6289,7 +5915,7 @@ impl G17PLiveRuntime {
             // after the doorbell. An sgx read with the cores gated raises an
             // asynchronous SError and panics the machine, which is why this is
             // opt-in and 0x100-granular rather than an arbitrary address.
-            let dump = crate::g17_config::REG_DUMP;
+            let dump = *module_parameters::g17p_reg_dump.value();
             if dump != 0 {
                 if let Some(registers) = self.registers.as_ref() {
                     let base = (dump as usize) << 8;
@@ -6330,7 +5956,7 @@ impl G17PLiveRuntime {
             // work scan (FUN_261a4) and the recovery replay (FUN_eb7c) advance
             // read and coherency, so the cursors alone cannot say WHICH path
             // consumed our rings -- these two words can.
-            if crate::g17_config::SCAN_GATE != 0 {
+            if *module_parameters::g17p_scan_gate.value() != 0 {
                 if let Some(manager) = self.manager.as_mut() {
                     manager.log_render_outer_channels("post-wait");
                 }
@@ -6419,10 +6045,7 @@ impl G17PLiveRuntime {
             // predicate during otherwise native-shaped submissions.
             self.probe_render_ksm_admission_after_render_doorbells();
         }
-        if !split_launch {
-            self.manager.as_mut().ok_or(ENODEV)?.commit_render_publication()?;
-        }
-        if crate::g17_config::POWER_WIRE >= 2 {
+        if *module_parameters::g17p_power_wire.value() >= 2 {
             if let Err(error) = self.wire_g17p_submit_gpu_power() {
                 return match g17_lifecycle::recover_persistent_runtime(self) {
                     Ok(()) => Err(error),
@@ -6451,7 +6074,7 @@ impl G17PLiveRuntime {
         // burst right after the kick, while the firmware is still handling it.
         // Compute's signature is a transient 0x0 -> 0x1 -> 0x0, which a single
         // read would very likely miss -- hence a burst rather than one sample.
-        let gate_probe = crate::g17_config::RENDER_GATE_PROBE;
+        let gate_probe = *module_parameters::g17p_render_gate_probe.value();
         if gate_probe != 0 && split_launch {
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_warn!(
@@ -6513,14 +6136,13 @@ impl G17PLiveRuntime {
                 self.abandon_render_submission_after_timeout();
                 return Err(error);
             }
-            self.manager.as_mut().ok_or(ENODEV)?.commit_render_publication()?;
             // As for paired publication, enter the servicing wait before any
             // expensive host-memory dump of the now-live fragment resources.
         }
         if defer_completion {
             return Ok(());
         }
-        let completion = match self.wait_render_completion_servicing_events(render_slot) {
+        let completion = match self.wait_render_completion_servicing_events() {
             Ok(completion) => completion,
             Err(error) => {
                 if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
@@ -6979,7 +6601,7 @@ impl G17PLiveRuntime {
         // A zero policy already disables idle descent. If this diagnostic asks
         // for an explicit hold, publish another zero after wake retirement so
         // a cold configuration refresh cannot restore Region-C's default one.
-        if crate::g17_config::POWER_HOLD != 0 {
+        if *module_parameters::g17p_power_hold.value() != 0 {
             match self
                 .manager
                 .as_mut()
@@ -7143,7 +6765,7 @@ impl G17PLiveRuntime {
         // the mask to zero and therefore actually invokes `0x20a70`.
         // Pair this with `g17p_power_wire=2`.
         if self.compute_gate_suspect {
-            let quiesce = crate::g17_config::GATE_QUIESCE_MS;
+            let quiesce = *module_parameters::g17p_gate_quiesce_ms.value();
             self.compute_gate_suspect = false;
             if quiesce != 0 {
                 if let Some(pdev) = self.pdev.as_ref() {
@@ -7163,7 +6785,7 @@ impl G17PLiveRuntime {
         // would otherwise wedge its own queue. Its binding is still live and
         // still owned by this client, so nothing needs quarantining here.
         if self.compute_abandoned
-            && crate::g17_config::ABANDON_RECOVERY != 0
+            && *module_parameters::g17p_abandon_recovery.value() != 0
             && !self.is_crashed()
         {
             if let (Some(manager), Some(queue)) = (self.manager.as_mut(), self.queue.as_mut()) {
@@ -7264,7 +6886,7 @@ impl G17PLiveRuntime {
         // has a chance to clear bit 3 first (0xdeb8 reports outstanding work ->
         // 0x25c00 -> 0x25dc0) and this record's bit-1 clear becomes the
         // transition to zero.
-        if crate::g17_config::POWER_WIRE == 1 {
+        if *module_parameters::g17p_power_wire.value() == 1 {
             self.wire_g17p_submit_gpu_power()?;
         }
         {
@@ -7306,11 +6928,13 @@ impl G17PLiveRuntime {
                 g17_manager::G17PComputeSubmissionContext {
                     context_id: 2,
                     dispatch_identity: 0x0100_01d7_0200_01dc,
+                    execution_gate: 1,
                     timestamps: g17_uapi::ComputeTimestampAddresses {
                         start: timestamp_start,
                         end: timestamp_end,
                     },
                     descriptor_flag_4c: false,
+                    descriptor_flag_5c8: false,
                     converted_command_timestamp: 1,
                     barriers: &[],
                     mcache: None,
@@ -7441,7 +7065,7 @@ impl G17PLiveRuntime {
         // scheduler's idle loop clear pause bit 3. Clearing bit 1 here is then
         // the clear that takes the mask to zero and calls the core power
         // sequencer.
-        if crate::g17_config::POWER_WIRE >= 2 {
+        if *module_parameters::g17p_power_wire.value() >= 2 {
             if let Err(error) = self.wire_g17p_submit_gpu_power() {
                 dev_warn!(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
@@ -7473,7 +7097,7 @@ impl G17PLiveRuntime {
         let mut ktrace_primary = G17PKtraceTotals::default();
         let mut ktrace_secondary = G17PKtraceTotals::default();
         let mut ktrace_failures: u32 = 0;
-        if crate::g17_config::IRQ_COMPLETION != 0 {
+        if *module_parameters::g17p_irq_completion.value() != 0 {
             // Publish and return. The wait happens in the caller with the
             // runtime mutex released, so the RTKit doorbell's event worker can
             // actually run and signal us -- holding the mutex across a wait is
@@ -7484,8 +7108,8 @@ impl G17PLiveRuntime {
             return Ok(G17PSubmitOutcome::Pending(self.completion_signal()));
         }
         let completion = owned_timestamps.with_cpu_bytes(|raw| {
-            let polls = crate::g17_config::SUBMIT_POLLS as usize;
-            let mut low_probe_done = crate::g17_config::PROBE_LOW_RANGE == 0;
+            let polls = *module_parameters::g17p_submit_polls.value() as usize;
+            let mut low_probe_done = *module_parameters::g17p_probe_low_range.value() == 0;
             for poll in 0..polls {
                 // Every previous probe of the sgx GPU-core register file ran
                 // with the cores unpowered, where it takes an asynchronous
@@ -7499,7 +7123,7 @@ impl G17PLiveRuntime {
                 // that flag starts *true* when the probe is disabled, which
                 // made this sampler issue SKSM port MMIO before the GPU cores
                 // are powered and take an asynchronous SError.
-                if crate::g17_config::PROBE_LOW_RANGE != 0
+                if *module_parameters::g17p_probe_low_range.value() != 0
                     && low_probe_done
                     && poll >= 50
                     && poll % 50 == 0
@@ -7546,7 +7170,7 @@ impl G17PLiveRuntime {
                                         error
                                     );
                                 }
-                                if crate::g17_config::LATE_SKSM != 0 {
+                                if *module_parameters::g17p_late_sksm.value() != 0 {
                                     dev_warn!(
                                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                                         "G17P SKSM replay suppressed: queue registration must be firmware-mediated\n"
@@ -7981,7 +7605,7 @@ impl G17PLiveRuntime {
             // device is strictly worse than an immediate honest error, so
             // rebuilding is opt-in (mode 2) until a rebuild is known to work
             // from this state.
-            if crate::g17_config::ZERO_DURATION != 0 {
+            if *module_parameters::g17p_zero_duration.value() != 0 {
                 return Err(ETIMEDOUT);
             }
         }
@@ -7992,7 +7616,7 @@ impl G17PLiveRuntime {
             manager.log_compute_ring_state(queue, "post-completion");
             let ordinal = manager.compute_queue_submission_ordinal(queue);
             let depth = *module_parameters::g17p_trace_depth.value();
-            let trace = depth != 0 && ordinal <= depth;
+            let trace = depth == 0 || ordinal <= depth;
             if *module_parameters::g17p_completion_trace.value() != 0 && trace {
                 manager.log_compute_retire(queue, completion, ordinal);
             }
@@ -8092,7 +7716,7 @@ impl G17PLiveRuntime {
         // covers both. The open question is whether the new-work interrupt
         // ever fires at all: the render window measures bit 4 clear and
         // 0x10a60 = 0, and compute is the workload that actually completes.
-        if crate::g17_config::IRQ_BURST >= 2 {
+        if *module_parameters::g17p_irq_burst.value() >= 2 {
             if let (Some(registers), Some(bpdev)) =
                 (self.registers.as_ref(), self.pdev.as_ref())
             {
@@ -8115,7 +7739,7 @@ impl G17PLiveRuntime {
                 }
             }
         }
-        if crate::g17_config::RENDER_KSM_PROBE == 0 {
+        if *module_parameters::g17p_render_ksm_probe.value() == 0 {
             return;
         }
         // B1's new-work path is a two-stage latch. FUN_216f0 first masks the
@@ -8153,7 +7777,7 @@ impl G17PLiveRuntime {
         let mut last = None;
         let mut last_fault_irq = None;
         for poll in 0..POLLS {
-            if poll == 2 && crate::g17_config::RENDER_3D_STROBE != 0 {
+            if poll == 2 && *module_parameters::g17p_render_3d_strobe.value() != 0 {
                 // b1's state 7 releases the fragment's entry and activates its
                 // descriptor BEFORE state 4 strobes; a still-parented entry
                 // cannot start, which is why a bare strobe did nothing.
@@ -8196,7 +7820,7 @@ impl G17PLiveRuntime {
                 if let (Some(registers), Some(pdev)) =
                     (self.registers.as_ref(), self.pdev.as_ref())
                 {
-                    let selector = crate::g17_config::RENDER_3D_STROBE - 1;
+                    let selector = *module_parameters::g17p_render_3d_strobe.value() - 1;
                     match registers.g17p_strobe_3d_launch(selector) {
                         Ok((slot, mode, strobe)) => dev_info!(
                             pdev.as_ref(),
@@ -8308,7 +7932,7 @@ impl G17PLiveRuntime {
                         // Sweep the pipe window while the cores are still up:
                         // by the wait-failed checkpoint the port is no longer
                         // drivable and the read returns EAGAIN.
-                        if poll == 1 && crate::g17_config::PIPE_SWEEP != 0 {
+                        if poll == 1 && *module_parameters::g17p_pipe_sweep.value() != 0 {
                             if let Err(error) = registers.g17p_sweep_pipe_registers("poll1") {
                                 dev_warn!(
                                     pdev.as_ref(),
@@ -8565,20 +8189,8 @@ impl G17PLiveRuntime {
         // partially drop `manager` before `cpus`, violating the same stop-first
         // rule enforced by normal runtime teardown.
         let completion_signal = G17PCompletionSignal::new()?;
-        // Keep owner-capacity arrays out of the by-value runtime construction
-        // and the probe caller's frame. Allocate before either ASC starts.
-        let owner_count = g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize;
-        let mut pending_render = KVec::with_capacity(owner_count, GFP_KERNEL)?;
-        let mut pending_render_queued = KVec::with_capacity(owner_count, GFP_KERNEL)?;
-        let mut render_event_masks = KVec::with_capacity(owner_count, GFP_KERNEL)?;
-        for _ in 0..owner_count {
-            pending_render.push(None, GFP_KERNEL)?;
-            pending_render_queued.push(g17_completion::PairFifo::new(), GFP_KERNEL)?;
-            render_event_masks.push([0; 2], GFP_KERNEL)?;
-        }
         let quarantined_render_completions = KVec::with_capacity(
-            g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize
-                * g17_resources::G17P_RENDER_MAX_IN_FLIGHT,
+            g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize,
             GFP_KERNEL,
         )?;
         let pdev_ref: ARef<platform::Device> = pdev.into();
@@ -8650,11 +8262,10 @@ impl G17PLiveRuntime {
             compute_gate_suspect: false,
             completion_signal,
             pending_compute: None,
-            pending_render,
-            pending_render_queued,
-            queue_registry: None,
+            pending_render: [None, None],
             quarantined_render_completions,
-            render_event_masks,
+            render_event_masks: [[0; 2];
+                g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
             render_fence_state: g17_completion::RenderFenceState::default(),
         })
     }
@@ -8863,9 +8474,6 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         for completion in self.pending_render.iter().flatten() {
             completion.fail_while_owned(EIO);
         }
-        for completion in self.pending_render_queued.iter().flatten() {
-            completion.fail_while_owned(EIO);
-        }
         for queue in &mut self.async_compute_queues {
             let Some(active) = queue.active.as_ref() else {
                 continue;
@@ -8907,14 +8515,9 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
             // successful stop is the independent release witness.
             completion.release_after_processor_stop();
         }
-        for queued in self.pending_render_queued.iter_mut() {
-            while let Some(completion) = queued.take() {
-                completion.complete(Err(EIO));
-                completion.release_after_processor_stop();
-            }
-        }
         self.release_quarantined_render_after_processor_stop();
-        self.render_event_masks.fill([0; 2]);
+        self.render_event_masks = [[0; 2];
+            g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
         drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());
@@ -8949,7 +8552,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         drop(self.cpus.take());
         let pdev = self.pdev.as_ref().ok_or(ENODEV)?.clone();
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
-        if crate::g17_config::ASC_RESTART >= 2 {
+        if *module_parameters::g17p_asc_restart.value() >= 2 {
             let cycled = match self.cycle_gfx_power_domain(&pdev) {
                 Ok(()) => true,
                 Err(error) => {
@@ -8969,7 +8572,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
             #[cfg(CONFIG_DEV_COREDUMP)]
             self.report_and_restore_firmware_data(
                 &pdev,
-                cycled && crate::g17_config::ASC_RESTART >= 3,
+                cycled && *module_parameters::g17p_asc_restart.value() >= 3,
             );
         }
         let (boot_result, stop_unproven) = {
@@ -9031,7 +8634,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
                 // Everything below runs with both CPUs stopped and before any
                 // owner is dropped, which is the only window where the ASC
                 // cannot write and the domain is still up to be read.
-                let flags = crate::g17_config::ASC_TEARDOWN;
+                let flags = *module_parameters::g17p_asc_teardown.value();
                 if let Some(pdev) = self.pdev.as_ref().map(|pdev| pdev.clone()) {
                     if flags & 1 != 0 {
                         wait_for_g17p_asc_idle(&pdev, "teardown");
@@ -9071,7 +8674,6 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         core::mem::forget(core::mem::take(&mut self.async_compute_queues));
         core::mem::forget(core::mem::take(&mut self.quarantined_bindings));
         core::mem::forget(core::mem::take(&mut self.pending_render));
-        core::mem::forget(core::mem::take(&mut self.pending_render_queued));
         core::mem::forget(core::mem::take(
             &mut self.quarantined_render_completions,
         ));
@@ -9101,14 +8703,9 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
             completion.complete(Err(EIO));
             completion.release_after_processor_stop();
         }
-        for queued in self.pending_render_queued.iter_mut() {
-            while let Some(completion) = queued.take() {
-                completion.complete(Err(EIO));
-                completion.release_after_processor_stop();
-            }
-        }
         self.release_quarantined_render_after_processor_stop();
-        self.render_event_masks.fill([0; 2]);
+        self.render_event_masks = [[0; 2];
+            g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
         drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());

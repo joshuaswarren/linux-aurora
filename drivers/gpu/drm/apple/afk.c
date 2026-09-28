@@ -38,11 +38,11 @@ enum rbep_msg_type {
 };
 
 /*
- * Which endpoints speak the AFKEP V2 command/response envelope.
+ * Which endpoints use the AFKEP V2 command/response transmit path.
  *
  * Only the DisplayPort endpoints do.  The first attempt gated this on the
  * firmware alone, which also rerouted 0x20 (system) and 0x23 (disp/dispext) --
- * endpoints that work perfectly under the classic path on both DCPs -- and
+ * endpoints whose INIT and transmit paths work under the classic path -- and
  * broke the internal panel: "DCP did not answer INIT" followed by
  * "Inherited DCP IOP OFF not acknowledged" and a failed component bind.
  * Keep the blast radius to the endpoints that actually need it.
@@ -61,6 +61,31 @@ static bool afk_endpoint_is_v2(struct apple_dcp_afkep *ep)
 	default:
 		return false;
 	}
+}
+
+/*
+ * The H17P system endpoint (0x20) also receives the compact V2 EPIC header,
+ * with its service channel at +2 and type/category at +16/+17.  Its outgoing
+ * commands still use the established system endpoint path; only the DP
+ * endpoints have a validated V2 command/reply exchange.  Decode 0x20's RX
+ * header and reports without changing its INIT or transmit sequence.
+ *
+ * The disp endpoint (0x23) appears to use the same compact header: read
+ * with the wide one, the external DCP's first message after the ring
+ * set-up (its dispext-service announce on older firmware) comes out as
+ * "expected announce but got 0x0 on channel 0" on every boot.  Its
+ * service is a do-nothing handshake (ibootep.c), so decoding its RX
+ * header cannot change what the driver sends.
+ */
+static bool afk_endpoint_has_v2_rx(struct apple_dcp_afkep *ep)
+{
+	if (afk_endpoint_is_v2(ep))
+		return true;
+	if (!ep || ep->dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return false;
+
+	return ep->endpoint == SYSTEM_ENDPOINT ||
+	       ep->endpoint == DISP0_ENDPOINT;
 }
 
 
@@ -415,8 +440,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	const char *epic_name = NULL, *epic_class = NULL;
 	const struct apple_epic_service_ops *ops;
 	struct dcp_parse_ctx ctx;
-	u8 *props = payload + sizeof(name);
-	size_t props_size = payload_size - sizeof(name);
+	u8 *props;
+	size_t props_size;
 
 	WARN_ON(afk_epic_find_service(ep, channel));
 
@@ -425,6 +450,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			ep->endpoint, payload_size);
 		return;
 	}
+	props = payload + sizeof(name);
+	props_size = payload_size - sizeof(name);
 
 	if (ep->num_channels >= AFK_MAX_CHANNEL) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: too many enabled services!\n",
@@ -898,7 +925,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	u8 *payload;
 	size_t payload_size;
 
-	if (afk_endpoint_is_v2(ep)) {
+	if (afk_endpoint_has_v2_rx(ep)) {
 		const struct epic_sub_hdr_h17p *c =
 			(const struct epic_sub_hdr_h17p *)(data + sizeof(*ehdr));
 
@@ -950,9 +977,15 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			return;
 		}
 		if (eshdr->category != EPIC_CAT_REPORT) {
-			dev_err(ep->dcp->dev,
-				"AFK[ep:%02x]: expected report but got 0x%x on channel %d\n",
-				ep->endpoint, eshdr->category, channel);
+			if (ep->endpoint == SYSTEM_ENDPOINT &&
+			    afk_endpoint_has_v2_rx(ep))
+				dev_dbg(ep->dcp->dev,
+					"AFK[ep:20]: unmatched H17P service category %#x type %#x on channel %u\n",
+					eshdr->category, subtype, channel);
+			else
+				dev_err(ep->dcp->dev,
+					"AFK[ep:%02x]: expected report but got 0x%x on channel %d\n",
+					ep->endpoint, eshdr->category, channel);
 			return;
 		}
 		if (subtype == EPIC_SUBTYPE_TEARDOWN) {
@@ -962,9 +995,16 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			return;
 		}
 		if (subtype != EPIC_SUBTYPE_ANNOUNCE) {
-			dev_err(ep->dcp->dev,
-				"AFK[ep:%02x]: expected announce but got 0x%x on channel %d\n",
-				ep->endpoint, subtype, channel);
+			/* Unsolicited V2 reports can precede their service publish. */
+			if (ep->endpoint == SYSTEM_ENDPOINT &&
+			    afk_endpoint_has_v2_rx(ep))
+				dev_dbg(ep->dcp->dev,
+					"AFK[ep:20]: unmatched H17P report type %#x on channel %u\n",
+					subtype, channel);
+			else
+				dev_err(ep->dcp->dev,
+					"AFK[ep:%02x]: expected announce but got 0x%x on channel %d\n",
+					ep->endpoint, subtype, channel);
 			return;
 		}
 
@@ -983,7 +1023,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	 * envelope (inline payload, category byte, tag at +25).  Handle it
 	 * here; the classic checks below never match a V2 message.
 	 */
-	if (afk_endpoint_is_v2(ep)) {
+	if (afk_endpoint_has_v2_rx(ep)) {
 		afk_recv_handle_v2(ep, service, data, data_size);
 		return;
 	}
@@ -1174,8 +1214,8 @@ int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 	work->ep = ep;
 	work->message = message;
 
-	dev_info(ep->dcp->dev, "J700_AFK_RX: ep:%02x message=%#llx type=%#llx\n",
-		 ep->endpoint, message, (u64)FIELD_GET(RBEP_TYPE, message));
+	dev_dbg(ep->dcp->dev, "J700_AFK_RX: ep:%02x message=%#llx type=%#llx\n",
+		ep->endpoint, message, (u64)FIELD_GET(RBEP_TYPE, message));
 
 	INIT_WORK(&work->work, afk_receive_message_worker);
 	queue_work(ep->wq, &work->work);

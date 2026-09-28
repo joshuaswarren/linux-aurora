@@ -16,12 +16,15 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -442,10 +445,48 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
  * waits for vblank (a DCP callback). That means we deadlock if we call from
  * the RTKit thread! Instead, move the call to another thread via a workqueue.
  */
+static int dcp_retrain_active_crtc(struct apple_connector *connector)
+{
+	struct drm_device *dev = connector->base.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc;
+	int ret;
+
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+
+	crtc = connector->base.state ? connector->base.state->crtc : NULL;
+	if (crtc && crtc->state && crtc->state->active)
+		ret = drm_atomic_helper_reset_crtc(crtc, &ctx);
+	else
+		ret = 0;
+
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
+
+	return ret;
+}
+
+void dcp_retrain_oob(struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(connector->dcp);
+
+	if (!READ_ONCE(connector->connected) || !READ_ONCE(dcp->valid_mode))
+		return;
+
+	/*
+	 * Bringing up another high-speed Type-C route can disturb an active DPTX
+	 * stream without changing its HPD state.  Invalidate the IOMFB mode and
+	 * use the normal hotplug worker to replay the active CRTC from process
+	 * context; sending a synthetic disconnect would tear down the connector.
+	 */
+	WRITE_ONCE(dcp->valid_mode, false);
+	schedule_work(&connector->hotplug_wq);
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
 	struct apple_dcp *dcp;
+	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
 
@@ -468,9 +509,23 @@ void dcp_hotplug(struct work_struct *work)
 	 * display modes from atomic_flush, so userspace needs to trigger a
 	 * flush, or the CRTC gets no signal.
 	 */
-	if (connector->base.state && !dcp->valid_mode && connector->connected)
+	if (connector->base.state && !dcp->valid_mode && connector->connected) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
+
+		/*
+		 * A short Type-C route interruption can leave the DRM CRTC active
+		 * while DCP has discarded its display mode.  Userspace is then free
+		 * to keep submitting plane-only commits, none of which retrains the
+		 * link.  Re-apply the active CRTC state once the DPTX link-config
+		 * callback has completed.
+		 */
+		ret = dcp_retrain_active_crtc(connector);
+		if (ret)
+			dev_warn(dcp->dev,
+				 "failed to retrain active CRTC after hotplug: %d\n",
+				 ret);
+	}
 
 	drm_kms_helper_connector_hotplug_event(&connector->base);
 }
@@ -616,13 +671,30 @@ int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 	struct platform_device *pdev = apple_connector->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_dcp *dcp;
 
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
+	u16 min_vfreq = 0, max_vfreq = 0;
+	bool vrr_capable = false;
 	int i;
 
+	/* A Type-C port has no pipeline while the fabric is moving it. */
+	if (!pdev)
+		return 0;
+	dcp = platform_get_drvdata(pdev);
+
 	for (i = 0; i < dcp->nr_modes; ++i) {
+		if (dcp->modes[i].vrr) {
+			u16 lo = dcp->modes[i].min_vrr >> 16;
+			u16 hi = dcp->modes[i].max_vrr >> 16;
+
+			if (!min_vfreq || lo < min_vfreq)
+				min_vfreq = lo;
+			if (hi > max_vfreq)
+				max_vfreq = hi;
+		}
+		vrr_capable |= dcp->modes[i].vrr;
 		mode = drm_mode_duplicate(dev, &dcp->modes[i].mode);
 
 		if (!mode) {
@@ -632,6 +704,7 @@ int dcp_get_modes(struct drm_connector *connector)
 
 		drm_mode_probed_add(connector, mode);
 	}
+	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
 	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
 	    !apple_connector->drm_edid) {
@@ -646,6 +719,18 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	if (dcp->nr_modes && apple_connector->drm_edid)
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
+
+	/*
+	 * An internal panel has no EDID, so nothing fills in the refresh range
+	 * that userspace needs before it will drive VRR. Supply the range DCP
+	 * reported for the mode. This has to follow the EDID update, which
+	 * resets display_info.
+	 */
+	if (vrr_capable && max_vfreq &&
+	    !connector->display_info.monitor_range.max_vfreq) {
+		connector->display_info.monitor_range.min_vfreq = min_vfreq;
+		connector->display_info.monitor_range.max_vfreq = max_vfreq;
+	}
 
 	return dcp->nr_modes;
 }
@@ -671,7 +756,11 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 	struct platform_device *pdev = apple_connector->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_dcp *dcp;
+
+	if (!pdev)
+		return MODE_ERROR;
+	dcp = platform_get_drvdata(pdev);
 
 	return lookup_mode(dcp, mode) ? MODE_OK : MODE_BAD;
 }
@@ -792,6 +881,20 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	/*
+	 * DCP does not complete swaps after a link loss.  A plane-only commit
+	 * arriving between the reconnect callback and the required modeset
+	 * would otherwise leave an unsignalled flip event in front of the
+	 * recovery commit.  Modesets set valid_mode before reaching flush.
+	 *
+	 * The same applies while a connector is still disconnected: resume
+	 * re-runs the modeset, which marks the mode valid again, before the
+	 * firmware has reported the display back.
+	 */
+	if (!dcp->valid_mode || !dcp->connector || !dcp->connector->connected) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 	dcp_retain_unbound_fbs(dcp, crtc, state);
 
 	if (dcp_channel_busy(&dcp->ch_cmd))
@@ -830,6 +933,24 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+}
+
+/*
+ * Apply the backlight level to an H17P panel whose CRTC is off by
+ * re-presenting the surface already on it (iomfb_present_brightness()).
+ * The caller holds the CRTC lock and has waited for the last commit.
+ */
+int dcp_h17p_present_brightness(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return -ENODEV;
+	if (dcp->crashed || !dcp->active || !dcp->valid_mode ||
+	    !dcp->connector || !dcp->connector->connected)
+		return -ENODEV;
+	if (dcp_channel_busy(&dcp->ch_cmd))
+		return -EBUSY;
+
+	return iomfb_present_brightness_h17p(dcp);
 }
 
 static void iomfb_start(struct apple_dcp *dcp)

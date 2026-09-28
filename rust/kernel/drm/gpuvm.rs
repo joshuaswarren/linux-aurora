@@ -36,7 +36,7 @@ use crate::{
 
 use core::cell::UnsafeCell;
 use core::marker::{PhantomData, PhantomPinned};
-use core::mem::{ManuallyDrop, MaybeUninit};
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut, Range};
 use core::ptr::NonNull;
 use pin_init;
@@ -384,10 +384,7 @@ pub(super) unsafe extern "C" fn vm_bo_alloc_callback<T: DriverGpuVm>() -> *mut b
 {
     let obj: Result<Pin<KBox<GpuVmBo<T>>>> = KBox::try_pin_init(
         try_pin_init!(GpuVmBo::<T> {
-            // The bindgen `Default` implementation is exactly a zero fill, but its
-            // out-of-line symbol is not exported to loadable modules. `drm_gpuvm_bo`
-            // is `Zeroable`, so initialize it directly without a cross-crate call.
-            bo <- pin_init::zeroed::<bindings::drm_gpuvm_bo>(),
+            bo <- pin_init::default(),
             inner <- T::GpuVmBo::new(),
             _p: PhantomPinned
         }),
@@ -579,20 +576,13 @@ impl<T: DriverGpuVm> GpuVm<T> {
                     } else {
                         0
                     },
-                    // SAFETY: bindgen's `Default` for this C structure is exactly
-                    // `MaybeUninit::zeroed().assume_init()`. Spell that out here so
-                    // external modules do not import its unexported trait method.
-                    exec: unsafe { MaybeUninit::<bindings::drm_exec>::zeroed().assume_init() },
+                    exec: Default::default(),
                     extra: match (is_ext, obj) {
                         (true, Some(obj)) => bindings::drm_gpuvm_exec__bindgen_ty_1 {
                             fn_: Some(exec_lock_gem_object),
                             priv_: obj.as_raw() as *const _ as *mut _,
                         },
-                        // SAFETY: as above, this bindgen C structure is zero-valid.
-                        _ => unsafe {
-                            MaybeUninit::<bindings::drm_gpuvm_exec__bindgen_ty_1>::zeroed()
-                                .assume_init()
-                        },
+                        _ => Default::default(),
                     },
                     num_fences: 0,
                 }),
@@ -631,14 +621,8 @@ impl<T: DriverGpuVm> GpuVm<T> {
                     } else {
                         0
                     }) | bindings::DRM_EXEC_IGNORE_DUPLICATES,
-                    // SAFETY: both bindgen C structures are zero-valid; their generated
-                    // `Default` methods perform the same zero initialization but are not
-                    // exported from the kernel crate to loadable modules.
-                    exec: unsafe { MaybeUninit::<bindings::drm_exec>::zeroed().assume_init() },
-                    extra: unsafe {
-                        MaybeUninit::<bindings::drm_gpuvm_exec__bindgen_ty_1>::zeroed()
-                            .assume_init()
-                    },
+                    exec: Default::default(),
+                    extra: Default::default(),
                     num_fences: 0,
                 }),
                 GFP_KERNEL,

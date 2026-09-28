@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
-obj-$(CONFIG_APPLE_ANE_BRINGUP) += apple-ane-bringup.o
-
 obj-$(CONFIG_APPLE_DOCKCHANNEL) += apple-dockchannel.o
 apple-dockchannel-y = dockchannel.o
 
@@ -31,7 +29,3 @@ apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 		crypto_shim.o sensor_shim.o p256_shim.o trusted_shim.o work_shim.o
 
 obj-$(CONFIG_APPLE_PMP) += pmp.o
-
-obj-$(CONFIG_APPLE_PMP_V2_KUNIT_TEST) += pmp-v2-test.o
-
-obj-$(CONFIG_APPLE_PMP_V2) += pmp-v2.o

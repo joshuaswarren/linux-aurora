@@ -305,6 +305,7 @@ config APPLE_DART
 	tristate "Apple DART IOMMU Support"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on !GENERIC_ATOMIC64	# for IOMMU_IO_PGTABLE_DART
+	select APPLE_TUNABLE
 	select IOMMU_API
 	select IOMMU_IO_PGTABLE_DART
 	help
@@ -314,17 +315,6 @@ config APPLE_DART
 	  the main memory.
 
 	  Say Y here if you are using an Apple SoC.
-
-config APPLE_DART_KUNIT_TEST
-	bool "KUnit tests for Apple DART" if !KUNIT_ALL_TESTS
-	depends on KUNIT
-	depends on APPLE_DART=y
-	default KUNIT_ALL_TESTS
-	help
-	  Tests the T8110 DART v2 exception contract and locked page-table
-	  handoff. The suite covers pending-bit decoding, exception records,
-	  acknowledgements, and inherited table publication. These tests do
-	  not access DART hardware.
 
 config S390_IOMMU
 	def_bool y if S390 && PCI

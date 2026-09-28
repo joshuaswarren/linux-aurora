@@ -540,15 +540,6 @@ impl File {
         let gpu = &device.gpu;
         let file_id = file.inner().id;
         let vm = gpu.new_vm(kernel_range.clone())?;
-        if *module_parameters::g17p_fault_report.value() & 2 != 0 {
-            dev_info!(
-                device.as_ref(),
-                "G17P diagnostic VM owner: vm={} pid={} file={}\n",
-                vm.id(),
-                kernel::current!().group_leader().pid(),
-                file_id,
-            );
-        }
 
         let simplefb_iova = *module_parameters::g17p_simplefb_iova.value();
         if simplefb_iova != 0 {

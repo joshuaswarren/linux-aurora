@@ -7,6 +7,7 @@
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
@@ -25,10 +26,26 @@
 #include "epic/dpavservep.h"
 
 #define DCP_MAX_PLANES APPLE_DCP_MAX_SURFACES
+#define DCP_MAX_TYPEC_ROUTES 4
 
 struct apple_dcp;
 
 struct apple_dcp_afkep;
+struct apple_dcp_typec_port;
+
+struct apple_dcp_typec_route {
+	struct apple_dcp *dcp;
+	struct apple_dcp_typec_port *port;
+	struct list_head port_link;
+	struct phy *phy;
+	struct mux_control *xbar;
+	struct typec_mux_dev *typec_mux;
+	u32 dptx_phy;
+	u32 mux_index;
+	bool selected;
+};
+
+bool dcp_is_typec_output(struct apple_dcp *dcp);
 
 struct dcpav_service_epic;
 
@@ -150,10 +167,21 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
-	/* H17P: the level the firmware last reported in D006, in millinits */
+	/*
+	 * H17P: the last non-zero level D006 reported, in millinits (D006
+	 * reads 0 on every frame that does not change the level), and the
+	 * level the last brightness-carrying swap sent (-1: none yet).
+	 */
 	u32 h17p_reported_millinits;
-	/* H17P: DPMS off leaves the pipe (and the level) alone */
+	int h17p_sent_nits;
+	/*
+	 * H17P: DPMS off leaves the pipe up (soft_off); the backlight stands
+	 * in for the power-off by fading to blank_nits (blanked) and brings
+	 * soft_off_nits -- the level asked for last -- back at DPMS on.
+	 */
 	bool soft_off;
+	bool blanked;
+	int soft_off_nits;
 	/*
 	 * H17P: the level is ramped toward the requested one over ramp_ms
 	 * (dcp_backlight.c) instead of jumping there in one swap.  nits is
@@ -223,6 +251,7 @@ struct apple_dcp {
 	bool adopting_session;
 	struct apple_dcp_surface_order iomfb_surfaces;
 
+
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *
 	 * sense to keep some of the members in apple_dcp.                    *
@@ -275,16 +304,30 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
+	/*
+	 * H17P: the last swap that put a surface on the panel, as built by
+	 * iomfb_flush() before the wire fix-up.  Re-presenting it is how a
+	 * brightness change reaches the firmware while the CRTC is off (see
+	 * iomfb_present_brightness()).
+	 */
+	struct dcp_swap_submit_req_h17p h17p_last_swap;
+	bool h17p_have_last_swap;
+
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
 	ktime_t swap_start;
+	u64 swap_submit_timestamp;
 
 	/* Current display mode */
 	bool during_modeset;
+	/* hotplug reported while a modeset was in flight, applied afterwards */
+	bool pending_hotplug;
+	bool pending_hotplug_connected;
 	bool valid_mode;
 	bool use_timestamps;
+	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -308,6 +351,7 @@ struct apple_dcp {
 
 	/* Attributes of the connector */
 	int connector_type;
+	int fixed_connector_type;
 
 	/* Attributes of the connected display */
 	int width_mm, height_mm;
@@ -371,9 +415,18 @@ struct apple_dcp {
 
 	/* these fields are output port specific */
 	struct phy *phy;
+	struct phy *fixed_phy;
 	struct mux_control *xbar;
 	bool xbar_selected;
 	struct typec_mux *typec_mux;
+	struct apple_dcp_typec_route typec_routes[DCP_MAX_TYPEC_ROUTES];
+	struct apple_dcp_typec_route *active_typec_route;
+	u32 nr_typec_routes;
+	bool phy_managed_by_typec;
+	bool typec_cable_connected;
+	struct delayed_work typec_reconnect_wq;
+	struct delayed_work typec_fabric_retrain_wq;
+	u32 typec_reconnect_tries;
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
@@ -383,6 +436,11 @@ struct apple_dcp {
 
 	u32 dptx_phy;
 	u32 dptx_die;
+	u32 fixed_dptx_phy;
+	u32 fixed_mux_index;
+	bool fixed_route_selected;
+	struct apple_connector *fixed_connector;
+	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
 };
 
@@ -390,6 +448,8 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+void dcp_backlight_soft_off(struct apple_dcp *dcp);
+void dcp_backlight_soft_on(struct apple_dcp *dcp);
 u64 dcp_nits_to_double_bits(u32 nits);
 extern bool dcp_swap_trace;
 extern unsigned int dcp_h17p_surf_flags;
@@ -399,7 +459,9 @@ extern char dcp_rtp_request[32];
 extern int dcp_dither_request;
 extern int dcp_pipe_crc_reads;
 extern unsigned int dcp_pipe_crc_idx;
+u32 dcp_h17p_max_nits(struct apple_dcp *dcp);
 u32 dcp_h17p_initial_nits(struct apple_dcp *dcp);
+int dcp_h17p_present_brightness(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15

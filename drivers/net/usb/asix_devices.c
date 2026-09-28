@@ -597,70 +597,17 @@ static void ax88772_suspend(struct usbnet *dev)
 {
 	struct asix_common_private *priv = dev->driver_priv;
 	u16 medium;
-	u8 opt = 0;
-	bool wol;
-
-	/*
-	 * Ask the chip what it is armed to wake on rather than assuming it is
-	 * nothing.  asix_set_wol() writes the monitor-mode register directly,
-	 * so this is the authoritative state, and asix_read_cmd()'s in_pm form
-	 * is safe here for the same reason asix_read_medium_status(dev, 1) is.
-	 *
-	 * Clearing AX_MEDIUM_RE stops the MAC receiving, so a magic packet
-	 * could never reach the part however the monitor-mode register was
-	 * set.  That is what the !wol guard further down exists to avoid, and
-	 * it is the part of this worth keeping.
-	 *
-	 * The armed state is deliberately NOT handed to phylink_suspend() --
-	 * see the comment at that call for why doing so killed the interface
-	 * across every suspend.
-	 */
-	if (asix_read_cmd(dev, AX_CMD_READ_MONITOR_MODE, 0, 0, 1, &opt, 1) < 0)
-		opt = 0;
-	wol = opt & (AX_MONITOR_LINK | AX_MONITOR_MAGIC);
 
 	if (netif_running(dev->net)) {
 		rtnl_lock();
-		/*
-		 * Pass false, not `wol`, even when the chip is armed.
-		 *
-		 * phylink_suspend(pl, true) deliberately does not stop the
-		 * state machine -- it keeps the link up so WoL frames keep
-		 * arriving, which is right for a PHY on a bus that stays
-		 * alive.  This PHY is behind USB.  usbcore suspends the device
-		 * first, so every subsequent MDIO access fails, and the
-		 * resulting half-configured PHY does not come back:
-		 *
-		 *   PM: suspend debug: Waiting for 5 second(s).
-		 *   asix ...: Failed to write reg index 0x0000: -108
-		 *   asix ...: Failed to enable software MII access
-		 *   asix ...: Link is Down
-		 *
-		 * after which the interface is dead until the driver is
-		 * unbound and rebound.  Isolated with a control on a J700:
-		 * armed -> those errors and a dead link, disarmed -> no asix
-		 * messages at all and the link intact.  Because the part
-		 * powers up reporting "Wake-on: pg", that broke *every*
-		 * suspend, not just a deliberate WoL test.
-		 *
-		 * The chip's own WoL does not depend on this: the monitor-mode
-		 * register is already written by asix_set_wol(), and the
-		 * AX_MEDIUM_RE handling below keeps the receiver enabled.
-		 * What is lost is only phylink's keep-the-link-up behaviour,
-		 * and Wake-on-LAN does not resume this machine anyway -- the
-		 * wake does not propagate through xhci/dwc3 during s2idle.
-		 * Revisit together with that, not before.
-		 */
 		phylink_suspend(priv->phylink, false);
 		rtnl_unlock();
 	}
 
-	/* Stop MAC operation -- but not when it has to keep listening. */
-	if (!wol) {
-		medium = asix_read_medium_status(dev, 1);
-		medium &= ~AX_MEDIUM_RE;
-		asix_write_medium_mode(dev, medium, 1);
-	}
+	/* Stop MAC operation */
+	medium = asix_read_medium_status(dev, 1);
+	medium &= ~AX_MEDIUM_RE;
+	asix_write_medium_mode(dev, medium, 1);
 
 	netdev_dbg(dev->net, "ax88772_suspend: medium=0x%04x\n",
 		   asix_read_medium_status(dev, 1));

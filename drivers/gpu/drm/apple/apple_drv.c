@@ -30,6 +30,7 @@
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_print.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_modeset_helper.h>
@@ -45,7 +46,7 @@
 #define DRIVER_NAME     "apple"
 #define DRIVER_DESC     "Apple display controller DRM driver"
 
-#define MAX_COPROCESSORS 3
+#define MAX_COPROCESSORS 8
 
 struct apple_drm_private {
 	struct drm_device drm;
@@ -65,9 +66,37 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+static bool apple_drm_fbdev_needs_alpha(struct device *dev);
+
+/*
+ * The H17P pipe (T8140) blends the fourth byte of every 32-bit surface as
+ * straight alpha whatever the DRM format says, and its firmware offers no
+ * alpha-less 32-bit format (blend-CRC oracle, 2026-09-19).  An XRGB8888
+ * console therefore scans out fully transparent: fbcon builds its
+ * pseudo-palette from the fbdev var, which has no transp bits for XRGB,
+ * so text and background both carry 0x00 there and the panel stays black.
+ *
+ * The fb helper reduces any preferred format to a colour depth, and depth
+ * 24 at 32 bpp always resolves to XRGB8888, so the format has to be fixed
+ * here: ask the DMA fbdev helper for depth 32, which the legacy mapping
+ * defines as ARGB8888.  fbcon then gets transp bits in the var, and
+ * drm_fb_helper_setcolreg() sets them in every palette entry, so whatever
+ * the console draws is opaque.  Other firmware generations keep XRGB8888,
+ * which they display as opaque.
+ */
+static int apple_drm_fbdev_probe(struct drm_fb_helper *fb_helper,
+				 struct drm_fb_helper_surface_size *sizes)
+{
+	if (sizes->surface_bpp == 32 && sizes->surface_depth == 24 &&
+	    apple_drm_fbdev_needs_alpha(fb_helper->dev->dev))
+		sizes->surface_depth = 32;
+
+	return drm_fbdev_dma_driver_fbdev_probe(fb_helper, sizes);
+}
+
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
-	DRM_FBDEV_DMA_DRIVER_OPS,
+	.fbdev_probe = apple_drm_fbdev_probe,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -90,12 +119,12 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
-	printk("#### oob_hotplug status:0x%x ####\n", (u32)status);
-
 	if (status == connector_status_connected)
 		dcp_dptx_connect_oob(apple_connector->dcp, 0);
 	else if (status == connector_status_disconnected)
 		dcp_dptx_disconnect_oob(apple_connector->dcp, 0);
+	else if (status == connector_status_unknown)
+		dcp_retrain_oob(apple_connector);
 	else
 		dev_err(&apple_connector->dcp->dev, "unexpected connector status"
 			":0x%x in oob_hotplug event\n", (u32)status);
@@ -243,8 +272,14 @@ static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
 
 static void appledrm_connector_cleanup(struct drm_connector *connector)
 {
+	struct apple_connector *apple_connector = to_apple_connector(connector);
+
 	drm_connector_cleanup(connector);
-	kfree(to_apple_connector(connector));
+	kfree(apple_connector->color_elements.data);
+	kfree(apple_connector->timing_elements.data);
+	kfree(apple_connector->display_attributes.data);
+	kfree(apple_connector->transport.data);
+	kfree(apple_connector);
 }
 
 static const struct drm_connector_funcs apple_connector_funcs = {
@@ -258,9 +293,35 @@ static const struct drm_connector_funcs apple_connector_funcs = {
 	.oob_hotplug_event	= apple_connector_oob_hotplug,
 };
 
+/*
+ * A Type-C connector is attached to every pipeline that can drive its port, so
+ * the atomic helper cannot pick one on its own.  Follow the fabric's choice.
+ */
+static struct drm_encoder *
+apple_connector_atomic_best_encoder(struct drm_connector *conn,
+				    struct drm_atomic_state *state)
+{
+	struct apple_connector *apple_connector = to_apple_connector(conn);
+	struct drm_encoder *encoder;
+
+	/*
+	 * A Type-C port has one encoder, and its possible_crtcs already names
+	 * the pipeline the fabric routed the port to, so it is the only answer
+	 * there is.
+	 */
+	if (apple_connector->port_encoder)
+		return apple_connector->port_encoder;
+
+	drm_connector_for_each_possible_encoder(conn, encoder)
+		return encoder;
+
+	return NULL;
+}
+
 static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 	.get_modes		= dcp_get_modes,
 	.mode_valid		= dcp_mode_valid,
+	.atomic_best_encoder	= apple_connector_atomic_best_encoder,
 };
 
 static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
@@ -272,19 +333,69 @@ static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
 	.mode_fixup		= dcp_crtc_mode_fixup,
 };
 
+static int apple_connector_create(struct drm_device *drm,
+				  struct platform_device *dcp,
+				  struct apple_crtc *crtc,
+				  struct apple_encoder *encoder,
+				  int connector_type, bool attach_fwnode)
+{
+	struct apple_connector *connector;
+	int ret;
+
+	connector = kzalloc_obj(*connector);
+	if (!connector)
+		return -ENOMEM;
+
+	mutex_init(&connector->chunk_lock);
+	drm_connector_helper_add(&connector->base,
+				 &apple_connector_helper_funcs);
+	if (attach_fwnode)
+		connector->base.fwnode = fwnode_handle_get(dcp->dev.fwnode);
+
+	ret = drm_connector_init(drm, &connector->base, &apple_connector_funcs,
+				 connector_type);
+	if (ret)
+		goto err_free;
+	ret = drm_connector_attach_vrr_capable_property(&connector->base);
+	if (ret)
+		goto err_cleanup;
+
+	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
+	connector->connected = false;
+	connector->dcp = dcp;
+	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+
+	ret = drm_connector_attach_encoder(&connector->base, &encoder->base);
+	if (ret)
+		goto err_cleanup;
+	dcp_link(dcp, crtc, connector);
+
+	return 0;
+
+err_cleanup:
+	drm_connector_cleanup(&connector->base);
+	kfree(connector);
+	return ret;
+err_free:
+	fwnode_handle_put(connector->base.fwnode);
+	kfree(connector);
+	return ret;
+}
+
 static int apple_probe_per_dcp(struct device *dev,
 			       struct drm_device *drm,
 			       struct platform_device *dcp,
-			       int num, bool dcp_ext)
+			       int num, bool dcp_ext,
+			       struct drm_encoder **encoder,
+			       u32 *crtc_mask)
 {
 	struct apple_crtc *crtc;
-	struct apple_connector *connector;
 	struct apple_encoder *enc;
 	struct drm_plane *planes[DCP_MAX_PLANES];
 	const u32 *iomfb_surfaces;
 	enum drm_plane_type type;
 	u32 num_surfaces;
-	int ret, zpos;
+	int ret, zpos, connector_type;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
 
 	iomfb_surfaces = dcp_get_iomfb_surfaces(dcp, &num_surfaces);
@@ -315,36 +426,113 @@ static int apple_probe_per_dcp(struct device *dev,
 	drm_crtc_helper_add(&crtc->base, &apple_crtc_helper_funcs);
 	drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
 
+	crtc->dcp = dcp;
+	*crtc_mask = drm_crtc_mask(&crtc->base);
+	connector_type = dcp_get_connector_type(dcp);
+
+	/*
+	 * Type-C outputs are physical ports, not pipelines: several DCPs may be
+	 * able to drive one port, and which one does can change at runtime.
+	 * Those connectors are created per port once every pipeline is known,
+	 * so a pipeline whose only output is Type-C gets no connector here --
+	 * and no encoder either, because the port's encoder spans every
+	 * pipeline that can drive it.
+	 */
+	if (connector_type == DRM_MODE_CONNECTOR_USB) {
+		dcp_link(dcp, crtc, NULL);
+		*encoder = NULL;
+		return 0;
+	}
+
 	enc = drmm_simple_encoder_alloc(drm, struct apple_encoder, base,
 					DRM_MODE_ENCODER_TMDS);
 	if (IS_ERR(enc))
-                return PTR_ERR(enc);
-	enc->base.possible_crtcs = drm_crtc_mask(&crtc->base);
+		return PTR_ERR(enc);
+	enc->base.possible_crtcs = *crtc_mask;
+	*encoder = &enc->base;
 
-	connector = kzalloc(sizeof(*connector), GFP_KERNEL);
-	mutex_init(&connector->chunk_lock);
-	drm_connector_helper_add(&connector->base,
-				 &apple_connector_helper_funcs);
+	return apple_connector_create(drm, dcp, crtc, enc, connector_type,
+				      dcp_ext);
+}
 
-	// HACK:
-	if (dcp_ext)
-		connector->base.fwnode = fwnode_handle_get(dcp->dev.fwnode);
+/*
+ * Create one connector per physical Type-C port and attach it to every
+ * pipeline that can drive it.  Keeping the connector tied to the port rather
+ * than to a pipeline is what gives userspace a stable name to hang its
+ * per-monitor configuration on.
+ */
+static int apple_probe_typec_ports(struct drm_device *drm,
+				   struct platform_device **dcp,
+				   u32 *crtc_mask, int num_dcp)
+{
+	unsigned int idx, nr_ports = dcp_typec_nr_ports();
+	int i, ret;
 
-	ret = drm_connector_init(drm, &connector->base, &apple_connector_funcs,
-				 dcp_get_connector_type(dcp));
-	if (ret)
-		return ret;
+	for (idx = 0; idx < nr_ports; idx++) {
+		struct apple_connector *connector;
+		struct apple_encoder *enc;
+		u32 mask = 0;
 
-	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
-	connector->connected = false;
-	connector->dcp = dcp;
+		connector = kzalloc_obj(*connector);
+		if (!connector)
+			return -ENOMEM;
 
-	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+		mutex_init(&connector->chunk_lock);
+		drm_connector_helper_add(&connector->base,
+					 &apple_connector_helper_funcs);
 
-	crtc->dcp = dcp;
-	dcp_link(dcp, crtc, connector);
+		ret = drm_connector_init(drm, &connector->base,
+					 &apple_connector_funcs,
+					 DRM_MODE_CONNECTOR_USB);
+		if (ret) {
+			kfree(connector);
+			return ret;
+		}
 
-	return drm_connector_attach_encoder(&connector->base, &enc->base);
+		ret = drm_connector_attach_vrr_capable_property(&connector->base);
+		if (ret)
+			return ret;
+
+		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
+		connector->connected = false;
+		connector->dcp = NULL;
+		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+
+		for (i = 0; i < num_dcp; i++) {
+			if (dcp_typec_port_has_candidate(idx, dcp[i]))
+				mask |= crtc_mask[i];
+		}
+
+		if (!mask) {
+			drm_warn(drm, "Type-C port %u has no display pipeline\n",
+				 idx);
+			return -ENODEV;
+		}
+
+		/*
+		 * One encoder for the port, spanning every pipeline that can
+		 * drive it.  Attaching one encoder per pipeline would describe
+		 * the same hardware, but userspace takes the CRTCs a connector
+		 * can use to be what all of its encoders have in common, and
+		 * single-pipeline encoders have nothing in common -- the port
+		 * ends up with no usable CRTC and the monitor is left dark.
+		 */
+		enc = drmm_simple_encoder_alloc(drm, struct apple_encoder, base,
+						DRM_MODE_ENCODER_TMDS);
+		if (IS_ERR(enc))
+			return PTR_ERR(enc);
+		enc->base.possible_crtcs = mask;
+
+		ret = drm_connector_attach_encoder(&connector->base, &enc->base);
+		if (ret)
+			return ret;
+		connector->port_encoder = &enc->base;
+		connector->candidate_crtcs = mask;
+
+		dcp_typec_port_set_connector(idx, connector);
+	}
+
+	return 0;
 }
 
 static int apple_get_fb_resource(struct device *dev, const char *name,
@@ -389,6 +577,8 @@ static int apple_drm_init_dcp(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 	struct platform_device *dcp[MAX_COPROCESSORS];
+	struct drm_encoder *encoder[MAX_COPROCESSORS];
+	u32 crtc_mask[MAX_COPROCESSORS] = {};
 	struct device_node *np;
 	u64 timeout;
 	int i, ret, num_dcp = 0;
@@ -410,11 +600,8 @@ static int apple_drm_init_dcp(struct device *dev)
 		device_link_add(dev, &dcp[num_dcp]->dev, DL_FLAG_AUTOREMOVE_SUPPLIER);
 
 		ret = apple_probe_per_dcp(dev, &apple->drm, dcp[num_dcp],
-					  num_dcp, dcp_ext);
-		if (ret)
-			continue;
-
-		ret = dcp_start(dcp[num_dcp]);
+					  num_dcp, dcp_ext, &encoder[num_dcp],
+					  &crtc_mask[num_dcp]);
 		if (ret)
 			continue;
 
@@ -423,6 +610,21 @@ static int apple_drm_init_dcp(struct device *dev)
 
 	if (num_dcp < 1)
 		return -ENODEV;
+
+	/*
+	 * Build the Type-C port connectors before starting any pipeline: a
+	 * pipeline can be handed a route as soon as the Type-C mux notifies,
+	 * and it needs somewhere to report the display.
+	 */
+	ret = apple_probe_typec_ports(&apple->drm, dcp, crtc_mask, num_dcp);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < num_dcp; i++) {
+		ret = dcp_start(dcp[i]);
+		if (ret)
+			dev_warn(dev, "DCP[%d] failed to start: %d\n", i, ret);
+	}
 
 	/*
 	 * Starting DPTX might take some time.
@@ -446,6 +648,35 @@ static int apple_drm_init_dcp(struct device *dev)
 	msleep(100);
 
 	return 0;
+}
+
+/*
+ * True when any display coprocessor bound to this device runs the H17P
+ * firmware, whose compositor treats the X byte of XRGB surfaces as alpha.
+ */
+static bool apple_drm_fbdev_needs_alpha(struct device *dev)
+{
+	struct device_node *np;
+	bool needs_alpha = false;
+
+	for_each_matching_node(np, apple_dcp_id_tbl) {
+		struct platform_device *pdev;
+
+		if (!of_device_is_available(np))
+			continue;
+		pdev = of_find_device_by_node(np);
+		if (!pdev)
+			continue;
+		if (platform_get_drvdata(pdev) && dcp_fw_compat_is_h17p(pdev))
+			needs_alpha = true;
+		put_device(&pdev->dev);
+		if (needs_alpha) {
+			of_node_put(np);
+			break;
+		}
+	}
+
+	return needs_alpha;
 }
 
 static int apple_drm_init(struct device *dev)
@@ -569,6 +800,7 @@ static int apple_drm_init(struct device *dev)
 	if (ret)
 		goto err_unbind;
 
+	/* The console buffer format is chosen in apple_drm_fbdev_probe(). */
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
 	return 0;

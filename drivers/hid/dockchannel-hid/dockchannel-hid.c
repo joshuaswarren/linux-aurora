@@ -151,12 +151,11 @@ struct dchid_iface {
 
 	int index;
 	const char *name;
-	const struct device_node *of_node;
+	struct device_node *of_node;
 
 	uint8_t tx_seq;
 	bool deferred;
 	bool starting;
-	bool startup_failed;
 	bool open;
 	struct completion ready;
 
@@ -166,7 +165,7 @@ struct dchid_iface {
 	struct gpio_desc *gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
-	bool gpio_request_seen;
+	bool gpio_announced;
 
 	struct mutex out_mutex;
 	u32 out_flags;
@@ -178,13 +177,16 @@ struct dchid_iface {
 
 	u32 keyboard_layout_id;
 	u32 power_method;
-	bool inherited_power_method_2;
 };
 
 struct dockchannel_hid {
 	struct device *dev;
 	struct dockchannel *dc;
 	struct device_link *helper_link;
+	bool stopping;
+
+	/* Held from probe on when the multi-touch interface uses power method 2 */
+	struct gpio_desc *afe_reset;
 
 	bool id_ready;
 	struct dchid_stm_id device_id;
@@ -214,12 +216,12 @@ static DEVICE_ATTR_RO(apple_layout_id);
 static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
+	u32 power_method = DCHID_POWER_METHOD_1;
+	struct device_node *of_node = NULL;
 	struct dchid_iface *iface;
-	const char *firmware_name;
-	bool explicit_power_method;
-	bool j700_firmware;
-	bool multi_touch;
-	bool no_stm;
+
+	if (READ_ONCE(dchid->stopping))
+		return NULL;
 
 	if (index >= MAX_INTERFACES) {
 		dev_err(dchid->dev, "Interface index %d out of range\n", index);
@@ -229,54 +231,53 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	if (dchid->ifaces[index])
 		return dchid->ifaces[index];
 
+	/* Comm is not a HID subdevice */
+	if (strcmp(name, "comm")) {
+		of_node = of_get_child_by_name(dchid->dev->of_node, name);
+		if (!of_node) {
+			dev_dbg(dchid->dev, "No OF node for subdevice %s, ignoring\n", name);
+			return NULL;
+		}
+
+		of_property_read_u32(of_node, "apple,power-method", &power_method);
+		if (power_method != DCHID_POWER_METHOD_1 &&
+		    power_method != DCHID_POWER_METHOD_2) {
+			dev_err(dchid->dev, "Unsupported power method %u for %s\n",
+				power_method, name);
+			goto err_put_node;
+		}
+		if (power_method == DCHID_POWER_METHOD_2 && !dchid->afe_reset) {
+			dev_err(dchid->dev, "Power method 2 for %s needs the AFE reset line\n",
+				name);
+			goto err_put_node;
+		}
+	}
+
 	iface = devm_kzalloc(dchid->dev, sizeof(struct dchid_iface), GFP_KERNEL);
 	if (!iface)
-		return NULL;
+		goto err_put_node;
 
 	iface->index = index;
 	iface->name = devm_kstrdup(dchid->dev, name, GFP_KERNEL);
+	if (!iface->name)
+		goto err_put_node;
 	iface->dchid = dchid;
-	iface->out_report= -1;
+	iface->of_node = of_node;
+	iface->power_method = power_method;
+	iface->out_report = -1;
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
 	mutex_init(&iface->out_mutex);
 	iface->wq = alloc_ordered_workqueue("dchid-%s", WQ_MEM_RECLAIM, iface->name);
 	if (!iface->wq)
-		return NULL;
-
-	/* Comm is not a HID subdevice */
-	if (!strcmp(name, "comm")) {
-		dchid->ifaces[index] = iface;
-		return iface;
-	}
-
-	iface->of_node = of_get_child_by_name(dchid->dev->of_node, name);
-	if (!iface->of_node) {
-		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
-		return NULL;
-	}
-
-	explicit_power_method = !of_property_read_u32(iface->of_node,
-						      "apple,power-method",
-						      &iface->power_method);
-	if (!explicit_power_method) {
-		no_stm = of_property_read_bool(dchid->dev->of_node, "apple,no-stm");
-		j700_firmware =
-			!of_property_read_string(iface->of_node, "firmware-name",
-						 &firmware_name) &&
-			!strcmp(firmware_name, "apple/tpmtfw-j700.bin");
-		multi_touch = !strcmp(name, "multi-touch");
-		iface->power_method = dchid_default_pm(no_stm, multi_touch, j700_firmware);
-		iface->inherited_power_method_2 =
-			iface->power_method == DCHID_POWER_METHOD_2;
-	}
-
-	if (iface->power_method == DCHID_POWER_METHOD_2 &&
-	    !iface->inherited_power_method_2)
-		strscpy(iface->gpio_name, "afe-reset", MAX_GPIO_NAME);
+		goto err_put_node;
 
 	dchid->ifaces[index] = iface;
 	return iface;
+
+err_put_node:
+	of_node_put(of_node);
+	return NULL;
 }
 
 static u32 dchid_checksum(void *p, size_t length)
@@ -303,6 +304,10 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 		struct dchid_hdr hdr;
 		struct dchid_subhdr sub;
 	} __packed h;
+
+	/* Both length fields are 16 bits wide. */
+	if (size > U16_MAX - sizeof(h.sub) - 3)
+		return -EMSGSIZE;
 
 	memset(&h, 0, sizeof(h));
 	h.hdr.hdr_len = sizeof(h.hdr);
@@ -398,89 +403,37 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
-	u8 msg[DCHID_POWER_METHOD_1_CMD_SIZE];
+	u8 msg[DCHID_PM1_CMD_SIZE];
 
 	dchid_pm1_command(iface->index, state, msg);
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
-static int dchid_power_method_2_transition(struct dchid_iface *iface,
-					   bool has_changed)
+/*
+ * Power method 2: announce the transition, drive the AFE reset line to the
+ * new state and confirm the transition. The reset is asserted for a power-off
+ * and held for 50 ms, and released for a power-on.
+ */
+static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 {
-	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
-
-	dchid_pm2_command(iface->index, has_changed, msg);
-	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-}
-
-static int dchid_inherited_pm2_transition(struct dchid_iface *iface, u8 state)
-{
-	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
+	struct dockchannel_hid *dchid = iface->dchid;
+	u8 msg[DCHID_PM2_CMD_SIZE];
 	int ret;
 
-	dchid_pm2_state_command(iface->index, state, false, msg);
-	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	dchid_pm2_command(iface->index, state, false, msg);
+	ret = dchid_comm_cmd(dchid, msg, sizeof(msg));
 	if (ret < 0)
 		return ret;
 
-	/* Match the J700 transaction that reached the Touch-ready event. */
-	if (state == DCHID_POWER_STATE_ON)
-		msleep(50);
-
-	dchid_pm2_state_command(iface->index, state, true, msg);
-	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-}
-
-static bool dchid_j700_power_v2(struct dchid_iface *iface)
-{
-	return of_machine_is_compatible("apple,j700") &&
-	       !of_property_present(iface->of_node, "apple,power-method") &&
-	       iface->index == 1 && !strcmp(iface->name, "multi-touch");
-}
-
-static int dchid_j700_set_power(struct dchid_iface *iface, u8 state)
-{
-	struct {
-		u8 command;
-		u8 version;
-		u8 iface;
-		u8 state;
-		u8 did_change;
-		__le32 status;
-	} __packed msg = {
-		.command = DCHID_CMD_RESET_INTERFACE,
-		.version = 2,
-		.iface = iface->index,
-		.state = state,
-	};
-	int ret;
-
-	/*
-	 * J700 MTP_SYS selects PowerMethod=2. Its comm firmware accepts only
-	 * nine-byte v2 reports: will-change, platform function, has-changed.
-	 * The pinned power-sequence uses physical High for 50 ms on power-off
-	 * and Low with no delay on power-on. Use raw levels for this platform
-	 * function, independent of the legacy DT's active-low GPIO flag.
-	 * macsmc-gpio maps it to pKW8(pcIO, 0x10000, 0x130000).
-	 */
-	if (state != 0 && state != 2)
-		return -EINVAL;
-
-	ret = dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
+	ret = gpiod_set_value_cansleep(dchid->afe_reset,
+				       state == DCHID_POWER_STATE_OFF);
 	if (ret < 0)
 		return ret;
+	if (state == DCHID_POWER_STATE_OFF)
+		fsleep(50 * USEC_PER_MSEC);
 
-	ret = gpiod_set_raw_value_cansleep(iface->gpio, state == 0);
-	if (ret < 0)
-		return ret;
-	if (state == 0)
-		fsleep(50000);
-
-	msg.did_change = 1;
-	ret = dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
-	dev_info(iface->dchid->dev, "J700 MTP power-v2 state=%u result=%d\n",
-		 state, ret);
-	return ret;
+	dchid_pm2_command(iface->index, state, true, msg);
+	return dchid_comm_cmd(dchid, msg, sizeof(msg));
 }
 
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
@@ -532,6 +485,13 @@ static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t
 	if (ret)
 		return ret;
 
+	if (fw->size < sizeof(*hdr)) {
+		dev_warn(iface->dchid->dev, "%s: firmware too short for its header\n",
+			 fw_name);
+		ret = -EINVAL;
+		goto done;
+	}
+
 	hdr = (struct fw_header *)fw->data;
 
 	if (hdr->magic != FW_MAGIC || hdr->version != FW_VER ||
@@ -562,8 +522,7 @@ done:
 	return ret;
 }
 
-static int dchid_request_gpio(struct dchid_iface *iface,
-			      enum gpiod_flags flags)
+static int dchid_request_gpio(struct dchid_iface *iface)
 {
 	char prop_name[MAX_GPIO_NAME + 16];
 	int ret;
@@ -574,17 +533,22 @@ static int dchid_request_gpio(struct dchid_iface *iface,
 	dev_info(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
 		 iface->name, iface->gpio_id, iface->gpio_name);
 
+	/* A power method 2 interface holds its reset line from probe on. */
+	if (iface->power_method == DCHID_POWER_METHOD_2 &&
+	    !strcmp(iface->gpio_name, "afe-reset")) {
+		iface->gpio = iface->dchid->afe_reset;
+		return 0;
+	}
+
 	snprintf(prop_name, sizeof(prop_name), "apple,%s", iface->gpio_name);
 
-	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0,
-					   flags);
+	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0, GPIOD_OUT_LOW);
 
-	if (IS_ERR_OR_NULL(iface->gpio)) {
-		ret = iface->gpio ? PTR_ERR(iface->gpio) : -ENODEV;
-		dev_err(iface->dchid->dev,
-			"Failed to request GPIO %s-gpios: %d\n",
-			prop_name, ret);
+	if (IS_ERR(iface->gpio)) {
+		ret = PTR_ERR(iface->gpio);
 		iface->gpio = NULL;
+		dev_err(iface->dchid->dev, "Failed to request GPIO %s-gpios: %d\n",
+			prop_name, ret);
 		return ret;
 	}
 
@@ -593,14 +557,9 @@ static int dchid_request_gpio(struct dchid_iface *iface,
 
 static int dchid_start_interface(struct dchid_iface *iface)
 {
-	bool power_method_2;
-	bool inherited_power_method_2;
 	void *fw;
 	size_t size;
 	int ret;
-
-	if (iface->startup_failed)
-		return -EIO;
 
 	if (iface->starting) {
 		dev_warn(iface->dchid->dev, "Interface %s is already starting", iface->name);
@@ -611,72 +570,20 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 	iface->starting = true;
 
-	power_method_2 = iface->power_method == DCHID_POWER_METHOD_2;
-	inherited_power_method_2 = iface->inherited_power_method_2;
-	if (iface->power_method != DCHID_POWER_METHOD_1 && !power_method_2) {
-		dev_err(iface->dchid->dev,
-			"Unsupported power method %u for %s\n",
-			iface->power_method, iface->name);
-		ret = -EINVAL;
-		goto err;
-	}
-
 	/* Look to see if we need firmware */
 	ret = dchid_get_firmware(iface, &fw, &size);
-	if (ret < 0) {
-		dev_err(iface->dchid->dev,
-			"Failed to load firmware for %s: %d\n",
-			iface->name, ret);
+	if (ret < 0)
 		goto err;
-	}
 
-	if (power_method_2 && (!fw || !size)) {
-		dev_err(iface->dchid->dev,
-			"Power method 2 for %s requires firmware\n",
-			iface->name);
-		ret = -EINVAL;
-		goto err;
-	}
-	if (power_method_2 && !inherited_power_method_2 &&
-	    !iface->gpio_name[0]) {
-		dev_err(iface->dchid->dev,
-			"Explicit power method 2 for %s requires afe-reset\n",
-			iface->name);
-		ret = -EINVAL;
-		goto err;
-	}
-
-	if (dchid_j700_power_v2(iface) && !iface->gpio) {
-		/* Do not toggle the line before the will-change notification. */
-		iface->gpio = devm_gpiod_get_index(iface->dchid->dev,
-						 "apple,afe-reset", 0, GPIOD_ASIS);
-		if (IS_ERR(iface->gpio)) {
-			ret = PTR_ERR(iface->gpio);
-			iface->gpio = NULL;
-			goto err;
-		}
-	}
-
-	/* Dynamic requests include ID zero; Power Method 2 uses afe-reset. */
-	if (!dchid_j700_power_v2(iface) && !inherited_power_method_2 &&
-	    (iface->gpio_request_seen || power_method_2)) {
-		ret = dchid_request_gpio(iface, power_method_2 ?
-					 GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+	/* If we need a GPIO, make sure we have it. */
+	if (iface->gpio_announced) {
+		ret = dchid_request_gpio(iface);
 		if (ret < 0)
 			goto err;
-
-		if (power_method_2) {
-			/* GPIO descriptors use logical values for active-low lines. */
-			gpiod_set_value_cansleep(iface->gpio, 1);
-			msleep(50);
-		}
 	}
 
 	/* Only multi-touch has firmware */
 	if (fw && size) {
-
-		if (dchid_j700_power_v2(iface))
-			iface->startup_failed = true;
 
 		/* Send firmware to the device */
 		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
@@ -686,43 +593,18 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			goto err;
 		}
 
-		dev_info(iface->dchid->dev,
-			 "Powering on %s with power method %u\n",
-			 iface->name, iface->power_method);
-		if (dchid_j700_power_v2(iface)) {
-			ret = dchid_j700_set_power(iface, DCHID_POWER_STATE_OFF);
+		/* After loading firmware, multi-touch needs a reset */
+		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
+		if (iface->power_method == DCHID_POWER_METHOD_2) {
+			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
 			if (ret < 0)
 				goto err;
-			ret = dchid_j700_set_power(iface, DCHID_POWER_STATE_ON);
+			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
 			if (ret < 0)
 				goto err;
-		} else if (power_method_2) {
-			if (inherited_power_method_2) {
-				ret = dchid_inherited_pm2_transition(iface, DCHID_POWER_STATE_OFF);
-				if (ret < 0)
-					goto err;
-
-				ret = dchid_inherited_pm2_transition(iface, DCHID_POWER_STATE_ON);
-				if (ret < 0)
-					goto err;
-			} else {
-				ret = dchid_power_method_2_transition(iface, false);
-				if (ret < 0)
-					goto err;
-
-				gpiod_set_value_cansleep(iface->gpio, 0);
-
-				ret = dchid_power_method_2_transition(iface, true);
-				if (ret < 0) {
-					gpiod_set_value_cansleep(iface->gpio, 1);
-					goto err;
-				}
-			}
 		} else {
-			ret = dchid_reset_interface(iface,
-						    DCHID_POWER_STATE_ON);
-			if (ret < 0)
-				goto err;
+			dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
+			dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
 		}
 	}
 
@@ -761,6 +643,9 @@ static int dchid_open(struct hid_device *hdev)
 	struct dchid_iface *iface = hdev->driver_data;
 	int ret;
 
+	if (READ_ONCE(iface->dchid->stopping))
+		return -ESHUTDOWN;
+
 	if (!completion_done(&iface->ready)) {
 		ret = dchid_start_interface(iface);
 		if (ret < 0)
@@ -773,7 +658,6 @@ static int dchid_open(struct hid_device *hdev)
 	}
 
 	iface->open = true;
-	iface->startup_failed = false;
 	return 0;
 }
 
@@ -799,18 +683,27 @@ static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum, void *b
 	return ret <= 0 ? ret : ret - 1;
 }
 
+/* Note: buf includes report number! */
+static int dchid_set_report(struct dchid_iface *iface, void *buf, size_t len)
+{
+	return dchid_cmd(iface, HID_OUTPUT_REPORT, REQ_SET_REPORT, buf, len, NULL, 0);
+}
+
 static int dchid_raw_request(struct hid_device *hdev,
 				unsigned char reportnum, __u8 *buf, size_t len,
 				unsigned char rtype, int reqtype)
 {
 	struct dchid_iface *iface = hdev->driver_data;
 
+	if (READ_ONCE(iface->dchid->stopping))
+		return -ESHUTDOWN;
+
 	switch (reqtype) {
 	case HID_REQ_GET_REPORT:
 		buf[0] = reportnum;
 		return dchid_cmd(iface, rtype, REQ_GET_REPORT, &reportnum, 1, buf + 1, len - 1);
 	case HID_REQ_SET_REPORT:
-		return dchid_cmd(iface, rtype, REQ_SET_REPORT, buf, len, NULL, 0);
+		return dchid_set_report(iface, buf, len);
 	default:
 		return -EIO;
 	}
@@ -833,6 +726,9 @@ static void dchid_create_interface_work(struct work_struct *ws)
 	struct dockchannel_hid *dchid = iface->dchid;
 	struct hid_device *hid;
 	int ret;
+
+	if (READ_ONCE(dchid->stopping))
+		return;
 
 	if (iface->hid) {
 		dev_warn(dchid->dev, "Interface %s already created!\n",
@@ -899,6 +795,8 @@ static void dchid_create_interface_work(struct work_struct *ws)
 
 static int dchid_create_interface(struct dchid_iface *iface)
 {
+	if (READ_ONCE(iface->dchid->stopping))
+		return -ESHUTDOWN;
 	if (iface->creating)
 		return -EBUSY;
 
@@ -981,11 +879,15 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 	struct dchid_init_hdr *hdr = data;
 	struct dchid_iface *iface;
 	struct dchid_init_block_hdr *blk;
+	char name[sizeof(hdr->name) + 1];
 
 	if (length < sizeof(*hdr))
 		return;
 
-	iface = dchid_get_interface(dchid, hdr->iface, hdr->name);
+	/* The name field is not necessarily NUL-terminated. */
+	memcpy(name, hdr->name, sizeof(hdr->name));
+	name[sizeof(hdr->name)] = '\0';
+	iface = dchid_get_interface(dchid, hdr->iface, name);
 	if (!iface)
 		return;
 
@@ -1008,10 +910,13 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 		case INIT_GPIO_REQUEST: {
 			struct dchid_gpio_request *req = data;
 
-			if (sizeof(*req) > length)
+			if (blk->length < sizeof(*req)) {
+				dev_warn(dchid->dev, "Short GPIO request for %s\n",
+					 iface->name);
 				break;
+			}
 
-			if (iface->gpio_request_seen) {
+			if (iface->gpio_announced) {
 				dev_err(dchid->dev,
 					"Cannot request more than one GPIO per interface!\n");
 				break;
@@ -1019,7 +924,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 
 			strscpy(iface->gpio_name, req->name, MAX_GPIO_NAME);
 			iface->gpio_id = req->id;
-			iface->gpio_request_seen = true;
+			iface->gpio_announced = true;
 			break;
 		}
 
@@ -1029,7 +934,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 		case INIT_PRODUCT_NAME: {
 			char *product = data;
 
-			if (product[blk->length - 1] != 0) {
+			if (!blk->length || product[blk->length - 1] != 0) {
 				dev_warn(dchid->dev, "Unterminated product name for %s\n",
 					 iface->name);
 			} else {
@@ -1078,14 +983,13 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 		goto err;
 	}
 
-	if (!iface->gpio_request_seen) {
-		dev_err(dchid->dev,
-			"Got GPIO command without a request for %s\n",
+	if (!iface->gpio_announced) {
+		dev_err(dchid->dev, "Got GPIO command for %s, which announced no GPIO\n",
 			iface->name);
 		goto err;
 	}
 
-	if (dchid_request_gpio(iface, GPIOD_OUT_LOW) < 0)
+	if (dchid_request_gpio(iface) < 0)
 		goto err;
 
 	if (!iface->gpio || cmd->gpio != iface->gpio_id) {
@@ -1128,6 +1032,10 @@ err:
 static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t length)
 {
 	u8 *p = data;
+
+	if (!length)
+		return;
+
 	switch (*p) {
 	case EVENT_INIT:
 		dchid_handle_init(dchid, data, length);
@@ -1161,14 +1069,25 @@ static void dchid_packet_work(struct work_struct *ws)
 	struct dchid_work *work = container_of(ws, struct dchid_work, work);
 	struct dchid_subhdr *shdr = (void *)work->data;
 	struct dockchannel_hid *dchid = work->iface->dchid;
-	int type = FIELD_GET(FLAGS_GROUP, shdr->flags);
 	u8 *payload = work->data + sizeof(*shdr);
+	int type;
+
+	if (READ_ONCE(dchid->stopping))
+		goto out;
+
+	if (work->hdr.length < sizeof(*shdr)) {
+		dev_err(dchid->dev, "Short packet (%u bytes) for iface %d\n",
+			work->hdr.length, work->hdr.iface);
+		goto out;
+	}
 
 	if (shdr->length + sizeof(*shdr) > work->hdr.length) {
 		dev_err(dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, work->hdr.length - sizeof(*shdr));
-		return;
+		goto out;
 	}
+
+	type = FIELD_GET(FLAGS_GROUP, shdr->flags);
 
 	switch (type) {
 	case HID_INPUT_REPORT:
@@ -1182,6 +1101,7 @@ static void dchid_packet_work(struct work_struct *ws)
 		break;
 	}
 
+out:
 	kfree(work);
 }
 
@@ -1190,6 +1110,11 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	struct dchid_subhdr *shdr = (void *)data;
 	u8 *payload = data + sizeof(*shdr);
 
+	if (hdr->length < sizeof(*shdr)) {
+		dev_err(iface->dchid->dev, "Short ACK packet (%u bytes)\n",
+			hdr->length);
+		return;
+	}
 	if (shdr->length + sizeof(*shdr) > hdr->length) {
 		dev_err(iface->dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, hdr->length - sizeof(*shdr));
@@ -1217,10 +1142,21 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 		return;
 	}
 
-	if (iface->resp_buf && iface->resp_size)
-		memcpy(iface->resp_buf, payload + 1, min((size_t)shdr->length - 1, iface->resp_size));
+	/*
+	 * Report the response length as the bytes actually delivered, so that
+	 * a caller with a small buffer is not told about bytes that were never
+	 * copied. The report ID byte counts as delivered.
+	 */
+	if (iface->resp_buf) {
+		size_t copied = min((size_t)shdr->length - 1, iface->resp_size);
 
-	iface->resp_size = shdr->length;
+		if (copied)
+			memcpy(iface->resp_buf, payload + 1, copied);
+		iface->resp_size = copied + 1;
+	} else {
+		iface->resp_size = shdr->length;
+	}
+
 	iface->out_report = -1;
 	iface->retcode = shdr->retcode;
 	complete(&iface->out_complete);
@@ -1233,6 +1169,9 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 	struct dchid_work *work;
 	struct dchid_iface *iface;
 	u32 checksum;
+
+	if (READ_ONCE(dchid->stopping))
+		return;
 
 	if (dockchannel_recv(dchid->dc, &hdr, sizeof(hdr)) != sizeof(hdr)) {
 		dev_err(dchid->dev, "Read failed (header)\n");
@@ -1261,6 +1200,7 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 
 	if (hdr.iface >= MAX_INTERFACES) {
 		dev_err(dchid->dev, "Bad iface %d\n", hdr.iface);
+		goto done;
 	}
 
 	iface = dchid->ifaces[hdr.iface];
@@ -1284,7 +1224,7 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 
 	work = kzalloc(sizeof(*work) + hdr.length, GFP_KERNEL);
 	if (!work)
-		return;
+		goto done;
 
 	work->hdr = hdr;
 	work->iface = iface;
@@ -1294,7 +1234,9 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 	queue_work(iface->wq, &work->work);
 
 done:
-	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
+	if (!READ_ONCE(dchid->stopping))
+		dockchannel_await(dchid->dc, dchid_handle_packet, dchid,
+				  sizeof(struct dchid_hdr));
 }
 
 static int dockchannel_hid_probe(struct platform_device *pdev)
@@ -1316,7 +1258,13 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
-	/* Neo firmware has no STM interface from which to obtain identity. */
+
+	/*
+	 * The STM interface reports the machine's vendor and product IDs,
+	 * keyboard type and serial number, and the other interfaces wait for
+	 * it. Firmware without an STM interface gets Apple's vendor ID and
+	 * nothing else.
+	 */
 	if (of_property_read_bool(dev->of_node, "apple,no-stm")) {
 		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
 		dchid->id_ready = true;
@@ -1347,6 +1295,28 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 			} else {
 				gpiod_put(gpio);
 			}
+		}
+	}
+
+	/*
+	 * With power method 2 the host drives the multi-touch AFE reset line
+	 * during every power transition, so the line must be there before the
+	 * coprocessor announces the interface. Request it now, while a
+	 * -EPROBE_DEFER can still be honoured, and leave its level alone until
+	 * the first transition has been announced.
+	 */
+	child = of_get_child_by_name(dev->of_node, "multi-touch");
+	if (child) {
+		u32 power_method = DCHID_POWER_METHOD_1;
+
+		of_property_read_u32(child, "apple,power-method", &power_method);
+		of_node_put(child);
+		if (power_method == DCHID_POWER_METHOD_2) {
+			dchid->afe_reset = devm_gpiod_get(dev, "apple,afe-reset",
+							  GPIOD_ASIS);
+			if (IS_ERR(dchid->afe_reset))
+				return dev_err_probe(dev, PTR_ERR(dchid->afe_reset),
+						     "Failed to request the AFE reset line\n");
 		}
 	}
 
@@ -1390,10 +1360,12 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	dchid->comm = dchid_get_interface(dchid, IFACE_COMM, "comm");
 	if (!dchid->comm) {
 		dev_err(dchid->dev, "Failed to initialize comm interface");
+		destroy_workqueue(dchid->new_iface_wq);
 		return -EIO;
 	}
 
 	dev_info(dchid->dev, "Initialized, awaiting packets\n");
+	platform_set_drvdata(pdev, dchid);
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 
 	return 0;
@@ -1401,7 +1373,32 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 
 static void dockchannel_hid_remove(struct platform_device *pdev)
 {
-	BUG_ON(1);
+	struct dockchannel_hid *dchid = platform_get_drvdata(pdev);
+	int i;
+
+	/*
+	 * Stop the receive path first: no new packets, no new work, and a
+	 * receive callback that is still running does not re-arm itself.
+	 */
+	WRITE_ONCE(dchid->stopping, true);
+	dockchannel_await(dchid->dc, NULL, NULL, 0);
+
+	/* Packet work can still queue interface creation; drain it first. */
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		if (dchid->ifaces[i])
+			destroy_workqueue(dchid->ifaces[i]->wq);
+	}
+	destroy_workqueue(dchid->new_iface_wq);
+
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (!iface)
+			continue;
+		if (iface->hid)
+			hid_destroy_device(iface->hid);
+		of_node_put(iface->of_node);
+	}
 }
 
 static const struct of_device_id dockchannel_hid_of_match[] = {
@@ -1415,6 +1412,8 @@ static struct platform_driver dockchannel_hid_driver = {
 	.driver = {
 		.name = "dockchannel-hid",
 		.of_match_table = dockchannel_hid_of_match,
+		/* The coprocessor announces its interfaces only once per boot. */
+		.suppress_bind_attrs = true,
 	},
 	.probe = dockchannel_hid_probe,
 	.remove = dockchannel_hid_remove,

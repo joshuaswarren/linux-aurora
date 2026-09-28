@@ -11,11 +11,16 @@
 //!   dart-aop stream 9, with a cursor report every 3,200 frames.  There is
 //!   no DMA engine on the host side: the ring is bound to the firmware over
 //!   the AOP setup port (the AOP driver owns it, the firmware binds it once
-//!   per boot) and the driver copies each reported span into the ALSA
-//!   buffer of its own card, the Low-Power Audio Interface.
+//!   per boot, and hands out reads of it) and the driver copies each
+//!   reported span into the ALSA buffer of the first PCM of its own card.
+//! * `hpai`, the high-quality microphone array: a PDM part behind the AOP,
+//!   read back as float32 over leap-s ADMAC RX0.  It has no codec and no
+//!   serializer of ours, so it is the second PCM of the driver's own card,
+//!   as the other AOP microphones are on the machines with an `aop_audio`
+//!   node.
 //! * `cout`/`cin` (the CS42L83 jack on MCA1, base-ns ADMAC TX2/RX2), `spkr`
 //!   (the MAX98360A speakers on LEAP TX0, leap-ns ADMAC TX0) and `tap `
-//!   (the speaker sense, base-ns RX1): ASoC back-end DAIs that attach the
+//!   (the speaker tap, base-ns RX1): ASoC back-end DAIs that attach the
 //!   service, request its power states (`pw0 ` idle, `pwrd` running, the
 //!   firmware then runs the serializer clocks) and runtime-power the
 //!   AP-side PMGR leaves, with DPCM front-end PCMs on the ADMAC channels.
@@ -27,9 +32,9 @@
 //! 20 dB down whenever no speaker-protection daemon owns it.
 //!
 //! Copyright (C) The Asahi Linux Contributors
+//! Copyright (C) 2026 The Aurora Silicon Contributors
 
 use core::{
-    arch::asm,
     mem,
     ptr,
     slice, //
@@ -45,6 +50,7 @@ use kernel::{
         Device as DmaDevice,
         DmaMask, //
     },
+    error::from_err_ptr,
     module_platform_driver,
     new_spinlock,
     of,
@@ -62,12 +68,14 @@ use kernel::{
         aref::ARef,
         atomic::{
             Atomic,
+            AtomicFlag,
             Relaxed, //
         },
         Arc,
+        ArcBorrow,
         SpinLock, //
     },
-    types::ForeignOwnable,
+    types::{ForeignOwnable, Opaque},
     workqueue::{
         self,
         impl_has_work,
@@ -100,28 +108,49 @@ const AUDIO_DEV_CIN: u32 = from_fourcc(b"cin ");
 /// The high-quality microphone array (ADT /arm-io/iop-audio-controller/
 /// audio-hp-mic, identifier 'iaph' -- ADT FourCCs are byte-reversed).  Unlike
 /// `lpai` it is the machine's only `iop-audio-s` stream: its data comes back
-/// over leap-s ADMAC RX0, not the AOP source ring, and macOS reaches it
-/// through the HPMicAudioDriver exclave rather than this EPIC service.
+/// over leap-s ADMAC RX0, not the AOP source ring.
 const AUDIO_DEV_HPAI: u32 = from_fourcc(b"hpai");
 /// kIOReturnBusy from the firmware: the device is already attached.
 const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
 const SPKR_POWER_STATE_PWRD: u32 = from_fourcc(b"pwrd");
-const RATE: u32 = 16000;
-const CHANNELS: u32 = 2;
-const FRAME_BYTES: usize = 8;
+
+/// Leaf power-up retries while the firmware raises the fabric (see `PowerDomain::get`).
+/// Blind attempts before the fabric is raised, and attempts while it rises.
+const PD_GET_ATTEMPTS: u32 = 3;
+const PD_GET_RAISED_ATTEMPTS: u32 = 60;
+const PD_GET_RETRY_MS: i64 = 10;
+/// The fabric comes up some tens to hundreds of milliseconds after the
+/// low-power microphone is asked to run (45–200 ms measured at boot); its
+/// first report proves the stream, and so the fabric, is up. Poll for it
+/// before the first leaf request so that request does not time out, and
+/// log, in the PMGR driver.
+const FABRIC_RAISE_POLL_MS: i64 = 5;
+const FABRIC_RAISE_POLLS: u32 = 100;
+
+/// The low-power microphone stream: 16 kHz stereo S32 in a 512 KiB ring
+/// reported every 3,200 frames.
+const LPAI_RATE: u32 = 16000;
+const LPAI_CHANNELS: u32 = 2;
+const LPAI_FRAME_BYTES: usize = 8;
 const RING_BYTES: usize = 0x80000;
-const PERIOD_FRAMES: usize = 3200;
-const PERIOD_BYTES: usize = PERIOD_FRAMES * FRAME_BYTES;
-const PERIODS_MAX: u32 = 16;
+const LPAI_PERIOD_FRAMES: usize = 3200;
+const LPAI_PERIOD_BYTES: usize = LPAI_PERIOD_FRAMES * LPAI_FRAME_BYTES;
+const LPAI_PERIODS_MAX: u32 = 16;
 const REPORT_MIN_LEN: usize = 0x68;
 
-// Firmware power timestamps use the 24 MHz always-on timebase. The
-// architectural counter can run at a different rate (1 GHz on T8140).
+/// The high-quality microphone array: 48 kHz stereo float32 over the LEAP
+/// ADMAC.
+const HPAI_RATE: u32 = 48000;
+const HPAI_CHANNELS: u32 = 2;
+
+/// Firmware power requests carry a timestamp in the 24 MHz always-on
+/// timebase; the architected counter runs at a different rate (1 GHz on
+/// T8140), so its reading is converted.
 const AOP_TIMEBASE_HZ: u64 = 24_000_000;
 
 fn aop_counter_ticks(counter: u64, frequency: u64) -> Result<u64> {
-    if frequency == 0 || frequency > u32::MAX as u64 {
+    if frequency == 0 || frequency > u64::from(u32::MAX) {
         return Err(EINVAL);
     }
     // Split whole seconds from the remainder to avoid overflowing a u64
@@ -135,16 +164,23 @@ fn aop_counter_ticks(counter: u64, frequency: u64) -> Result<u64> {
 }
 
 fn aop_timestamp() -> Result<u64> {
-    let counter: u64;
-    let frequency: u64;
-    // SAFETY: architectural read-only timer registers; no private EL2
-    // register access is needed for the firmware's timestamp domain.
-    unsafe {
-        asm!("isb", "mrs {counter}, cntvct_el0", "mrs {frequency}, cntfrq_el0",
-             counter = out(reg) counter, frequency = out(reg) frequency,
-             options(nostack, preserves_flags));
-    }
-    aop_counter_ticks(counter, frequency)
+    // SAFETY: both helpers read the architected timer through the arch timer
+    // layer and take no arguments.
+    let (counter, rate) = unsafe { (bindings::arch_timer_counter(), bindings::arch_timer_rate()) };
+    aop_counter_ticks(counter, u64::from(rate))
+}
+
+/// Little-endian field readers for firmware replies and reports.
+fn le_u32(buf: &[u8], off: usize) -> Result<u32> {
+    let b = buf.get(off..off + 4).ok_or(EINVAL)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn le_u64(buf: &[u8], off: usize) -> Result<u64> {
+    let b = buf.get(off..off + 8).ok_or(EINVAL)?;
+    Ok(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 #[repr(C, packed(4))]
@@ -268,17 +304,103 @@ impl PowerRequest {
     }
 }
 
-/// One firmware audio service driven as an ASoC back-end: attached once,
-/// requested into `pw0 ` (idle) at startup and `pwrd` (running) when the
-/// stream starts, back to `pw0 ` at shutdown, with its serializer's PMGR
-/// leaves runtime-powered for the stream's lifetime.
+/// A named power domain of this device (`dev_pm_domain_attach_by_name()`):
+/// the virtual device the PM core hands out for one of several domains,
+/// runtime-powered around the streams that need it and detached when the
+/// driver data goes away.
+struct PowerDomain {
+    dev: ptr::NonNull<bindings::device>,
+    name: &'static str,
+}
+
+// SAFETY: the virtual domain device belongs to the PM core, which serializes
+// its runtime-PM state itself; this handle only passes the pointer to the
+// runtime-PM calls, which may be made from any thread, until `Drop` detaches
+// it after the last user is gone.
+unsafe impl Send for PowerDomain {}
+// SAFETY: as for `Send`; a shared `PowerDomain` exposes nothing but those
+// calls.
+unsafe impl Sync for PowerDomain {}
+
+impl PowerDomain {
+    /// Attaches the domain named `name`; `Ok(None)` when the device has no
+    /// domain of that name.
+    fn attach(
+        dev: &device::Device,
+        name: &'static str,
+        dt_name: &'static CStr,
+    ) -> Result<Option<Self>> {
+        // SAFETY: `dev` is live for the call and `dt_name` is NUL-terminated.
+        let pd = from_err_ptr(unsafe {
+            bindings::dev_pm_domain_attach_by_name(dev.as_raw(), dt_name.as_char_ptr())
+        })?;
+        Ok(ptr::NonNull::new(pd).map(|dev| PowerDomain { dev, name }))
+    }
+
+    /// Takes a runtime-PM reference and waits for the domain to be on.
+    ///
+    /// The firmware brings the audio fabric back asynchronously after the
+    /// service's `pw0 ` request, so the first leaf request under it can miss
+    /// the PMGR driver's poll window with the parent still coming up. A
+    /// failed resume leaves the virtual domain device in the runtime-PM error
+    /// state, where every later request fails with EINVAL; clear that state
+    /// and retry a bounded number of times before giving up.
+    fn get(&self, attempts: u32) -> Result<()> {
+        let mut rc = 0;
+        for attempt in 0..attempts {
+            // SAFETY: the domain device stays attached for the lifetime of `self`.
+            rc = unsafe { bindings::pm_runtime_get_sync(self.dev.as_ptr()) };
+            if rc >= 0 {
+                return Ok(());
+            }
+            // SAFETY: as above; a failed resume still took the usage count.
+            unsafe { bindings::pm_runtime_put_noidle(self.dev.as_ptr()) };
+            // SAFETY: as above; the device is suspended from runtime PM's point
+            // of view once the failed resume has been undone. Clearing the
+            // error state also lets a later open try again after a final
+            // failure here.
+            unsafe {
+                bindings::__pm_runtime_set_status(
+                    self.dev.as_ptr(),
+                    bindings::rpm_status_RPM_SUSPENDED as u32,
+                )
+            };
+            if Error::from_errno(rc) != ETIMEDOUT || attempt + 1 == attempts {
+                break;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(PD_GET_RETRY_MS));
+        }
+        Err(Error::from_errno(rc))
+    }
+
+    /// Drops a reference taken by [`Self::get`].
+    fn put(&self) {
+        // SAFETY: the domain device stays attached for the lifetime of `self`.
+        unsafe { bindings::pm_runtime_put_sync(self.dev.as_ptr()) };
+    }
+}
+
+impl Drop for PowerDomain {
+    fn drop(&mut self) {
+        // SAFETY: attached in `attach`; the driver data that owns this handle
+        // is dropped only after every stream, and with it every `get`, has
+        // been balanced by a `put`.
+        unsafe { bindings::dev_pm_domain_detach(self.dev.as_ptr(), true) };
+    }
+}
+
+/// One firmware audio service driven as an ASoC back-end (or, for the
+/// microphone array, by its own PCM): attached once, requested into `pw0 `
+/// (idle) at startup and `pwrd` (running) when the stream starts, back to
+/// `pw0 ` at shutdown, with its serializer's PMGR leaves runtime-powered for
+/// the stream's lifetime.
 struct Service {
     dev_id: u32,
     name: &'static str,
     /// Request sequence of the property 202 messages.
     sequence: Atomic<u32>,
     /// In `pwrd`.
-    running: Atomic<u32>,
+    running: AtomicFlag,
 }
 
 impl Service {
@@ -287,7 +409,7 @@ impl Service {
             dev_id,
             name,
             sequence: Atomic::new(0),
-            running: Atomic::new(0),
+            running: AtomicFlag::new(false),
         }
     }
 }
@@ -298,95 +420,120 @@ impl Service {
 /// it and close cannot free the substream under a report.
 struct StreamState {
     substream: *mut bindings::snd_pcm_substream,
-    /// absolute producer byte count at the last report
-    last_absolute: Option<u64>,
     /// absolute producer byte count already copied into the ALSA buffer
     copied: Option<u64>,
     hw_ptr_bytes: usize,
     period_acc: usize,
     buffer_bytes: usize,
-    overruns: u32,
 }
 
+// SAFETY: the raw substream pointer is only dereferenced under the spinlock
+// that holds this state, and only while ALSA keeps the substream alive: open
+// sets it and close clears it under the same lock.
 unsafe impl Send for StreamState {}
 
 #[pin_data]
 struct SndSocT8140AopData {
     dev: ARef<device::Device>,
-    fwnode: ARef<FwNode>,
     adata: Arc<dyn AOP>,
     service: EPICService,
     ring: Arc<SourceRing>,
     ring_bytes: Atomic<u32>,
     sequence: Atomic<u32>,
-    powered: Atomic<u32>,
-    /// The microphone stream is triggered (set and cleared under the ALSA
-    /// stream lock, read by the report path).
-    running: Atomic<u32>,
+    /// lpai is in `runn`.
+    powered: AtomicFlag,
+    /// A low-power microphone report arrived since the last run request.
+    reported: AtomicFlag,
+    /// The low-power microphone stream is triggered (set and cleared under
+    /// the ALSA stream lock, read by the report path).
+    running: AtomicFlag,
     hw_ptr_frames: Atomic<u32>,
+    /// One warning per producer-report fault class and driver instance.
+    report_warnings: [AtomicFlag; 5],
     /// The back-end services: the jack's output and headset microphone,
-    /// the speakers and their sense.
+    /// the speakers and their tap, and the microphone array.
     cout: Service,
     cin: Service,
     spkr: Service,
     tap: Service,
-    /// The high-quality microphone array (leap-s ADMAC RX0).
     hpai: Service,
-    /// Virtual power-domain devices (dev_pm_domain_attach_by_name) of the
-    /// serializer leaves, held for the driver's lifetime and runtime-powered
-    /// around streams; 0 if absent: audio_mca1_m (jack), audio_mca0_m
-    /// (sense), audio_leap_tx0 and audio_leap_mca (speakers).
-    pd_mca1: Atomic<usize>,
-    pd_mca0: Atomic<usize>,
-    pd_tx0: Atomic<usize>,
-    pd_leap_mca: Atomic<usize>,
-    /// audio_leap_rx0: the microphone array's leap-s RX0 leaf, the exact
-    /// sibling of `pd_tx0`.  A LEAP ADMAC only answers on a channel whose own
-    /// leaf is powered.
-    pd_rx0: Atomic<usize>,
+    /// The serializer leaves, runtime-powered around streams: audio_mca1_m
+    /// (jack), audio_mca0_m (tap and the LEAP's serializer), audio_leap_tx0
+    /// and audio_leap_mca (speakers), audio_leap_rx0 (microphone array).
+    pd_mca1: Option<PowerDomain>,
+    pd_mca0: Option<PowerDomain>,
+    pd_tx0: Option<PowerDomain>,
+    pd_leap_mca: Option<PowerDomain>,
+    pd_rx0: Option<PowerDomain>,
     /// A speaker stream has been triggered and not yet stopped.
-    spkr_want_run: Atomic<u32>,
-    /// A HQ-mic stream has been triggered and not yet stopped.
-    hpai_want_run: Atomic<u32>,
+    spkr_want_run: AtomicFlag,
+    /// A microphone-array stream has been triggered and not yet stopped.
+    hpai_want_run: AtomicFlag,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
     spkr_volume: Atomic<u32>,
-    /// User-facing linear gain within the speaker-protection volume ceiling.
-    spkr_user_volume: Atomic<u32>,
-    /// DMA channels of the front-end PCMs, [FE DAI id][stream] (raw dma_chan pointers).
+    /// The sleeping firmware starts queued from the atomic triggers.
     #[pin]
-    fe_chans: SpinLock<[[usize; 2]; FE_COUNT]>,
+    spkr_start_work: Work<Self, SPKR_START_WORK>,
+    #[pin]
+    hpai_start_work: Work<Self, HPAI_START_WORK>,
     #[pin]
     stream: SpinLock<StreamState>,
 }
 
-unsafe impl Send for SndSocT8140AopData {}
-unsafe impl Sync for SndSocT8140AopData {}
+const SPKR_START_WORK: u64 = 0;
+const HPAI_START_WORK: u64 = 1;
+
+impl_has_work! {
+    impl HasWork<Self, SPKR_START_WORK> for SndSocT8140AopData { self.spkr_start_work }
+    impl HasWork<Self, HPAI_START_WORK> for SndSocT8140AopData { self.hpai_start_work }
+}
+
+/// The speaker stream start (pwrd + unmute), queued by the back-end DAI's
+/// trigger START: those are sleeping firmware calls, and the DMA must already
+/// be running when the LEAP starts consuming.
+impl WorkItem<SPKR_START_WORK> for SndSocT8140AopData {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        if let Err(e) = this.spkr_go() {
+            dev_err!(this.dev, "spkr: start failed: {:?}\n", e);
+        }
+    }
+}
+
+/// The microphone-array stream start (`pwrd`), queued by its PCM trigger
+/// START for the same reason as the speaker's: the ADMAC must already be
+/// running before the LEAP starts producing.
+impl WorkItem<HPAI_START_WORK> for SndSocT8140AopData {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        if let Err(e) = this.hpai_go() {
+            dev_err!(this.dev, "hpai: start failed: {:?}\n", e);
+        }
+    }
+}
 
 impl SndSocT8140AopData {
     fn epic_wrapped_call<T>(&self, data: &T) -> Result<u32> {
         // SAFETY: T is a plain packed firmware record.
         let msg_bytes =
-            unsafe { slice::from_raw_parts(data as *const T as *const u8, mem::size_of::<T>()) };
+            unsafe { slice::from_raw_parts(ptr::from_ref(data).cast::<u8>(), mem::size_of::<T>()) };
         self.adata
             .epic_call(&self.service, EPIC_SUBTYPE_WRAPPED_CALL, msg_bytes)
     }
 
-    /// The raw form: hands back the firmware's return code with the reply and
-    /// logs nothing, so a caller that expects some calls to be refused (a
-    /// property sweep) does not fill the log with errors.
-    fn epic_wrapped_call_ret_code<T>(&self, data: &T, ret_len: usize) -> Result<(u32, KVec<u8>)> {
+    fn epic_wrapped_call_ret<T>(&self, data: &T, ret_len: usize) -> Result<KVec<u8>> {
         // SAFETY: T is a plain packed firmware record.
         let msg_bytes =
-            unsafe { slice::from_raw_parts(data as *const T as *const u8, mem::size_of::<T>()) };
-        self.adata
-            .epic_call_ret(&self.service, EPIC_SUBTYPE_WRAPPED_CALL, msg_bytes, ret_len)
-    }
-
-    fn epic_wrapped_call_ret<T>(&self, data: &T, ret_len: usize) -> Result<KVec<u8>> {
-        let (retcode, ret) = self.epic_wrapped_call_ret_code(data, ret_len)?;
+            unsafe { slice::from_raw_parts(ptr::from_ref(data).cast::<u8>(), mem::size_of::<T>()) };
+        let (retcode, ret) = self.adata.epic_call_ret(
+            &self.service,
+            EPIC_SUBTYPE_WRAPPED_CALL,
+            msg_bytes,
+            ret_len,
+        )?;
         if retcode != 0 {
-            // Not "lpai": this helper serves every device on the service, and
-            // naming one of them made an hpai failure read as an lpai failure.
             dev_err!(
                 self.dev,
                 "audio wrapped call failed, return code {:#x}\n",
@@ -403,15 +550,7 @@ impl SndSocT8140AopData {
     fn attach_device(&self, dev_id: u32, name: &str) -> Result<()> {
         let ret = self.epic_wrapped_call(&AudioAttachDevice::new(dev_id))?;
         match ret {
-            0 => Ok(()),
-            AUDIO_RET_BUSY => {
-                dev_dbg!(
-                    self.dev,
-                    "{} already attached by an earlier instance\n",
-                    name
-                );
-                Ok(())
-            }
+            0 | AUDIO_RET_BUSY => Ok(()),
             _ => {
                 dev_err!(
                     self.dev,
@@ -422,10 +561,6 @@ impl SndSocT8140AopData {
                 Err(EIO)
             }
         }
-    }
-
-    fn attach_lpai(&self) -> Result<()> {
-        self.attach_device(AUDIO_DEV_LPAI, "lpai")
     }
 
     fn set_channel_control(&self) -> Result<()> {
@@ -463,7 +598,7 @@ impl SndSocT8140AopData {
             );
             return Err(EIO);
         }
-        let reported = u32::from_le_bytes(ret[..4].try_into().unwrap()) as usize;
+        let reported = le_u32(&ret, 0)? as usize;
         if reported != len {
             dev_err!(
                 self.dev,
@@ -480,9 +615,13 @@ impl SndSocT8140AopData {
     fn read_geometry(&self) -> Result<()> {
         // 302: FourCC/pad, ring frames u64, report frames u64
         let geo = self.get_prop(PROP_RING_GEOMETRY, 24)?;
-        let frames = u64::from_le_bytes(geo[12..20].try_into().unwrap());
-        let quantum = u64::from_le_bytes(geo[20..28].try_into().unwrap());
-        if frames == 0 || frames as usize * FRAME_BYTES > RING_BYTES || quantum == 0 {
+        let frames = le_u64(&geo, 12)?;
+        let quantum = le_u64(&geo, 20)?;
+        if frames == 0
+            || frames > (RING_BYTES / LPAI_FRAME_BYTES) as u64
+            || quantum == 0
+            || quantum > frames
+        {
             dev_err!(
                 self.dev,
                 "invalid lpai ring geometry: {} frames, {} per report\n",
@@ -492,20 +631,19 @@ impl SndSocT8140AopData {
             return Err(EIO);
         }
         self.ring_bytes
-            .store((frames as usize * FRAME_BYTES) as u32, Relaxed);
+            .store((frames as usize * LPAI_FRAME_BYTES) as u32, Relaxed);
         // 301: stream format, sample rate at +4
         let fmt = self.get_prop(PROP_STREAM_FORMAT, 16)?;
-        let rate = u32::from_le_bytes(fmt[8..12].try_into().unwrap());
-        if rate != RATE {
+        let rate = le_u32(&fmt, 8)?;
+        if rate != LPAI_RATE {
             dev_err!(self.dev, "unexpected lpai sample rate {}\n", rate);
             return Err(EIO);
         }
-        dev_info!(
+        dev_dbg!(
             self.dev,
-            "lpai: {} Hz, ring {} frames ({} bytes), {} frames per report\n",
+            "lpai: {} Hz, ring {} frames, {} frames per report\n",
             rate,
             frames,
-            frames * FRAME_BYTES as u64,
             quantum
         );
         Ok(())
@@ -529,7 +667,7 @@ impl SndSocT8140AopData {
             return Err(EIO);
         }
         let st = self.get_prop(PROP_POWER_STATE, 4)?;
-        let now = u32::from_le_bytes(st[4..8].try_into().unwrap());
+        let now = le_u32(&st, 4)?;
         if now != state {
             dev_err!(
                 self.dev,
@@ -567,10 +705,7 @@ impl SndSocT8140AopData {
         if state == SPKR_POWER_STATE_PW0 {
             let ret = self
                 .epic_wrapped_call_ret(&AudioGetDeviceProp::new(svc.dev_id, PROP_POWER_STATE), 8)?;
-            if ret.len() < 8 {
-                return Err(EIO);
-            }
-            let now = u32::from_le_bytes(ret[4..8].try_into().unwrap());
+            let now = le_u32(&ret, 4)?;
             if now != state {
                 dev_err!(
                     self.dev,
@@ -585,115 +720,113 @@ impl SndSocT8140AopData {
         Ok(())
     }
 
-    /// Runtime-power (or release) serializer leaves, parents first on the
-    /// way up.
-    fn domains(&self, svc: &Service, pds: &[&Atomic<usize>], on: bool) -> Result<()> {
-        if pds.iter().any(|pd| pd.load(Relaxed) == 0) {
-            dev_err!(
-                self.dev,
-                "{}: its power domains are not attached\n",
-                svc.name
-            );
-            return Err(ENODEV);
-        }
-        if on {
-            for (i, pd) in pds.iter().enumerate() {
-                let dev = pd.load(Relaxed) as *mut bindings::device;
-                // SAFETY: the virtual domain devices live until Drop detaches them.
-                let mut rc = unsafe { bindings::pm_runtime_get_sync(dev) };
-                if rc < 0 {
-                    // A leaf the firmware also manages was once seen missing
-                    // the PMGR driver's poll window on its first power-up
-                    // after boot; a failed resume leaves the virtual device
-                    // in the runtime-PM error state, so clear that and try
-                    // once more before giving up.
-                    dev_warn!(
-                        self.dev,
-                        "{}: power domain {} did not power up: {}, retrying\n",
-                        svc.name,
-                        i,
-                        rc
-                    );
-                    // SAFETY: `dev` is a power-domain device attached at probe and detached only in
-                    // `Drop`.
-                    unsafe {
-                        bindings::pm_runtime_put_noidle(dev);
-                        bindings::__pm_runtime_set_status(
-                            dev,
-                            bindings::rpm_status_RPM_SUSPENDED as u32,
-                        );
-                    }
-                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
-                    // SAFETY: `dev` is a power-domain device attached at probe and detached only in
-                    // `Drop`.
-                    rc = unsafe { bindings::pm_runtime_get_sync(dev) };
-                }
-                if rc < 0 {
+    /// Runtime-power serializer leaves, parents first.  A leaf that fails to
+    /// power up fails the stream; recovering a domain from that state is the
+    /// power-domain driver's business, not a consumer's.
+    fn power_up(&self, name: &str, pds: &[&Option<PowerDomain>], attempts: u32) -> Result<()> {
+        for (i, slot) in pds.iter().enumerate() {
+            let Some(pd) = slot else {
+                dev_err!(self.dev, "{}: power domain not attached\n", name);
+                self.power_down(&pds[..i]);
+                return Err(ENODEV);
+            };
+            if let Err(e) = pd.get(attempts) {
+                if e != ETIMEDOUT || attempts > PD_GET_ATTEMPTS {
                     dev_err!(
                         self.dev,
-                        "{}: power domain {} did not power up: {}\n",
-                        svc.name,
-                        i,
-                        rc
+                        "{}: power domain {} did not power up: {:?}\n",
+                        name,
+                        pd.name,
+                        e
                     );
-                    // SAFETY: `dev` is a power-domain device attached at probe and detached only in
-                    // `Drop`.
-                    unsafe { bindings::pm_runtime_put_noidle(dev) };
-                    for done in pds[..i].iter() {
-                        // SAFETY: `done` holds a power-domain device attached at probe; the get
-                        // above succeeded for it.
-                        unsafe {
-                            bindings::pm_runtime_put_sync(
-                                done.load(Relaxed) as *mut bindings::device
-                            )
-                        };
-                    }
-                    return Err(EIO);
                 }
-            }
-        } else {
-            for pd in pds.iter().rev() {
-                // SAFETY: as above.
-                unsafe { bindings::pm_runtime_put_sync(pd.load(Relaxed) as *mut bindings::device) };
+                self.power_down(&pds[..i]);
+                return Err(e);
             }
         }
         Ok(())
     }
 
-    /// Back-end startup: attach the service, power its leaves, `pw0 `.
-    fn service_startup(&self, svc: &Service, pds: &[&Atomic<usize>]) -> Result<()> {
-        self.attach_device(svc.dev_id, svc.name)?;
-        self.domains(svc, pds, true)?;
-        if let Err(e) = self.service_set_power(svc, SPKR_POWER_STATE_PW0) {
-            let _ = self.domains(svc, pds, false);
-            return Err(e);
+    /// Release leaves powered by [`Self::power_up`], children first.
+    fn power_down(&self, pds: &[&Option<PowerDomain>]) {
+        for pd in pds.iter().rev().filter_map(|pd| pd.as_ref()) {
+            pd.put();
         }
-        svc.running.store(0, Relaxed);
-        dev_dbg!(self.dev, "{}: attached, powered, pw0\n", svc.name);
+    }
+
+    /// Back-end startup: attach the service, `pw0 `, then power its leaves.
+    ///
+    /// The firmware owns the audio fabric and power-gates it (`audio_p` and
+    /// the LEAP domains under it) whenever none of its services is held in
+    /// `pw0 ` or `pwrd`, for instance after a low-power microphone capture.
+    /// Requesting `pw0 ` first brings the fabric back; only then can the
+    /// serializer leaves under it be powered from the AP side, otherwise the
+    /// PMGR reports the parent off and the leaf request never completes.
+    fn service_startup(&self, svc: &Service, pds: &[&Option<PowerDomain>]) -> Result<()> {
+        self.attach_device(svc.dev_id, svc.name)?;
+        self.service_set_power(svc, SPKR_POWER_STATE_PW0)?;
+        self.power_up_raising(svc.name, pds)?;
+        svc.running.store(false, Relaxed);
         Ok(())
+    }
+
+    /// [`Self::power_up`] with the fabric raised first.
+    ///
+    /// The fabric may be gated at any open (a low-power capture is enough,
+    /// and a service left in `pw0 ` after its stream does not keep it up),
+    /// and a blind leaf request against it fails noisily in the PMGR
+    /// driver, so always go through the raised path; with the fabric up it
+    /// costs one brief low-power microphone run.
+    fn power_up_raising(&self, name: &str, pds: &[&Option<PowerDomain>]) -> Result<()> {
+        self.with_fabric_raised(|| self.power_up(name, pds, PD_GET_RAISED_ATTEMPTS))
+    }
+
+    /// Raise the audio fabric the firmware gated. A service's `pw0 ` request
+    /// does not do that (measured: `audio_p` stays gated for the whole leaf
+    /// retry window), only a running stream does, after which a service in
+    /// `pw0 ` keeps it up only while its stream runs. The low-power
+    /// microphone is attached for the firmware's lifetime, so run it briefly
+    /// around `f` when it is idle, once its first report has arrived.
+    fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        if self.powered.load(Relaxed) {
+            return f();
+        }
+        self.reported.store(false, Relaxed);
+        self.set_power(POWER_STATE_RUN)?;
+        let mut polls = 0;
+        while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(FABRIC_RAISE_POLL_MS));
+            polls += 1;
+        }
+        if polls == FABRIC_RAISE_POLLS {
+            dev_warn!(self.dev, "lpai: no report while raising the fabric\n");
+        }
+        let ret = f();
+        if let Err(e) = self.set_power(POWER_STATE_IDLE) {
+            dev_warn!(self.dev, "lpai: unable to idle after raising the fabric: {:?}\n", e);
+        }
+        ret
     }
 
     /// `pwrd`: the firmware starts the serializer clocks and the stream.
     fn service_run(&self, svc: &Service) -> Result<()> {
-        if svc.running.load(Relaxed) != 0 {
+        if svc.running.load(Relaxed) {
             return Ok(());
         }
         self.service_set_power(svc, SPKR_POWER_STATE_PWRD)?;
-        svc.running.store(1, Relaxed);
-        dev_dbg!(self.dev, "{}: pwrd\n", svc.name);
+        svc.running.store(true, Relaxed);
         Ok(())
     }
 
     /// Back-end shutdown: `pw0 ` if running, then the leaves.
-    fn service_shutdown(&self, svc: &Service, pds: &[&Atomic<usize>]) {
-        if svc.running.load(Relaxed) != 0 {
+    fn service_shutdown(&self, svc: &Service, pds: &[&Option<PowerDomain>]) {
+        if svc.running.load(Relaxed) {
             if let Err(e) = self.service_set_power(svc, SPKR_POWER_STATE_PW0) {
                 dev_err!(self.dev, "{}: pw0 failed: {:?}\n", svc.name, e);
             }
-            svc.running.store(0, Relaxed);
+            svc.running.store(false, Relaxed);
         }
-        let _ = self.domains(svc, pds, false);
-        dev_dbg!(self.dev, "{}: pw0, released\n", svc.name);
+        self.power_down(pds);
     }
 
     // ---- 3.5 mm jack: cout (MCA1, base-ns TX2) and cin (the headset
@@ -721,10 +854,10 @@ impl SndSocT8140AopData {
         self.service_shutdown(self.jack_service(playback), &[&self.pd_mca1])
     }
 
-    // ---- speaker sense: the native SpeakerTap, base-ns RX1 under the tap
+    // ---- speaker tap: the native SpeakerTap, base-ns RX1 under the tap
     // service on MCA0.  The words the amplifier receives come back on this
-    // stream (the card's "Speaker Sense" capture, device 2): it observes the
-    // serial data, it senses no current or voltage. ----
+    // stream (the card's "Speaker Sense" capture): it observes the serial
+    // data after the copy-time gain, it senses no current or voltage. ----
 
     fn sense_startup(&self) -> Result<()> {
         self.service_startup(&self.tap, &[&self.pd_mca0])
@@ -739,52 +872,48 @@ impl SndSocT8140AopData {
     }
 
     // ---- the high-quality microphone array: the hpai service feeding
-    // leap-s ADMAC RX0.  The firmware owns this array's fabric entirely -- a
-    // bare PowerRequest took it idle -> pwrd -> pw0 with no host-side
-    // power-domain work at all -- so unlike the jack and speaker paths this
-    // back-end holds no serializer leaves of its own. ----
+    // leap-s ADMAC RX0.  The host holds its RX0 leaf and the shared LEAP MCA
+    // domain while the firmware service owns the microphone fabric. ----
 
     /// The array's LEAP leaves: its own RX0 channel leaf, plus the LEAP MCA
     /// the speaker path also holds.
-    fn hpai_domain_refs(&self) -> [&Atomic<usize>; 2] {
+    fn hpai_domains(&self) -> [&Option<PowerDomain>; 2] {
         [&self.pd_rx0, &self.pd_leap_mca]
     }
 
     fn hpai_startup(&self) -> Result<()> {
-        self.service_startup(&self.hpai, &self.hpai_domain_refs())
+        self.service_startup(&self.hpai, &self.hpai_domains())
     }
 
-    /// Deliberately does NOT start the array.  `prepare` runs before the ALSA
-    /// trigger, i.e. before `snd_dmaengine_pcm_trigger` has started the ADMAC,
-    /// and `pwrd` makes the LEAP start *producing* immediately.  Samples the
-    /// array emits into a ring the DMA is not yet servicing are lost, and the
-    /// capture returns whatever was in the buffer for its whole duration --
-    /// measured at about one capture in three being pure noise, all-or-nothing.
-    /// The start moves to `hpai_go`, queued from trigger START.  This is the
-    /// capture mirror of the speaker rule: the DMA must be running before the
-    /// LEAP starts moving samples.
-    fn hpai_prepare(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// HQ-mic start (`pwrd`), from the system workqueue right after trigger
-    /// START: a sleeping firmware call, so it cannot run in the atomic trigger.
+    /// The array's start (`pwrd`), from the system workqueue right after
+    /// trigger START.  Started earlier, from prepare, the LEAP produces into
+    /// a ring the ADMAC is not servicing yet and the capture is noise from
+    /// then on; started here, the DMA is already running.
     fn hpai_go(&self) -> Result<()> {
-        if self.hpai_want_run.load(Relaxed) == 0 || self.hpai.running.load(Relaxed) != 0 {
+        if !self.hpai_want_run.load(Relaxed) || self.hpai.running.load(Relaxed) {
             return Ok(());
         }
         self.service_run(&self.hpai)
     }
 
+    /// Called from sleeping close paths: a queued start must finish before
+    /// the service is retired.
+    fn flush_hpai_start(&self) {
+        self.hpai_want_run.store(false, Relaxed);
+        // SAFETY: the work item lives in `self` for the driver's lifetime;
+        // flushing waits for a queued `hpai_go` to finish.
+        unsafe { bindings::flush_work(Work::raw_get(&self.hpai_start_work)) };
+    }
+
     fn hpai_shutdown(&self) {
-        self.hpai_want_run.store(0, Relaxed);
-        self.service_shutdown(&self.hpai, &self.hpai_domain_refs())
+        self.flush_hpai_start();
+        self.service_shutdown(&self.hpai, &self.hpai_domains())
     }
 
     // ---- internal speakers: the spkr service on LEAP TX0 (leap-ns ADMAC
     // channel 0); the leaves are tx0 (-> leap_c -> leap_a -> audio_fr ->
     // audio_a), leap_mca (-> audio_p) and the MCA0 serializer the LEAP
-    // drives the amplifiers through -- shared with the sense capture, so
+    // drives the amplifiers through -- shared with the tap capture, so
     // both hold it and neither can power it off under the other ----
 
     /// Output mute (property 700) is independent of the amplifier's SD_MODE;
@@ -793,7 +922,7 @@ impl SndSocT8140AopData {
         let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(
             AUDIO_DEV_SPKR,
             PROP_OUTPUT_MUTE,
-            muted as u32,
+            u32::from(muted),
         ))?;
         if ret != 0 {
             dev_err!(self.dev, "speaker mute request rejected: {:#x}\n", ret);
@@ -802,12 +931,27 @@ impl SndSocT8140AopData {
         Ok(())
     }
 
-    fn spkr_domain_refs(&self) -> [&Atomic<usize>; 3] {
+    fn spkr_domains(&self) -> [&Option<PowerDomain>; 3] {
         [&self.pd_tx0, &self.pd_leap_mca, &self.pd_mca0]
     }
 
     fn spkr_startup(&self) -> Result<()> {
-        self.service_startup(&self.spkr, &self.spkr_domain_refs())
+        self.service_startup(&self.spkr, &self.spkr_domains())
+    }
+
+    /// A PCM underrun stops the DMA without closing the back-end, so the
+    /// service may still be in `pwrd` when the stream is prepared again.
+    /// Retire that run here so the next trigger queues a fresh `pwrd` and
+    /// unmute once the DMA has restarted.
+    fn spkr_prepare(&self) -> Result<()> {
+        self.flush_spkr_start();
+        if !self.spkr.running.load(Relaxed) {
+            return Ok(());
+        }
+        self.spkr_set_mute(true)?;
+        self.service_set_power(&self.spkr, SPKR_POWER_STATE_PW0)?;
+        self.spkr.running.store(false, Relaxed);
+        Ok(())
     }
 
     /// Speaker stream start, from the system workqueue right after trigger
@@ -816,91 +960,111 @@ impl SndSocT8140AopData {
     /// firmware unmute, the value the native amplifier driver writes after
     /// enabling its output.
     fn spkr_go(&self) -> Result<()> {
-        if self.spkr_want_run.load(Relaxed) == 0 || self.spkr.running.load(Relaxed) != 0 {
+        if !self.spkr_want_run.load(Relaxed) || self.spkr.running.load(Relaxed) {
             return Ok(());
         }
         self.service_run(&self.spkr)?;
         if let Err(e) = self.spkr_set_mute(false) {
             let _ = self.service_set_power(&self.spkr, SPKR_POWER_STATE_PW0);
-            self.spkr.running.store(0, Relaxed);
+            self.spkr.running.store(false, Relaxed);
             return Err(e);
         }
         Ok(())
     }
 
+    /// Called from sleeping prepare/shutdown paths while ALSA serializes
+    /// this stream: a queued start must finish before the mute and pw0.
+    fn flush_spkr_start(&self) {
+        self.spkr_want_run.store(false, Relaxed);
+        // SAFETY: the work item lives in `self` for the driver's lifetime;
+        // flushing waits for a queued `spkr_go` to finish.
+        unsafe { bindings::flush_work(Work::raw_get(&self.spkr_start_work)) };
+    }
+
     /// Speaker back-end shutdown: mute, then the service; the amplifier is
     /// already off (codec trigger STOP) and a queued start was flushed.
     fn spkr_shutdown(&self) {
-        self.spkr_want_run.store(0, Relaxed);
-        if self.spkr.running.load(Relaxed) != 0 {
+        self.flush_spkr_start();
+        if self.spkr.running.load(Relaxed) {
             if let Err(e) = self.spkr_set_mute(true) {
                 dev_err!(self.dev, "spkr: mute failed: {:?}\n", e);
             }
         }
-        self.service_shutdown(&self.spkr, &self.spkr_domain_refs());
-    }
-
-    fn ring_slice(&self, off: usize, len: usize) -> &[u8] {
-        // SAFETY: the ring is a coherent allocation of RING_BYTES; callers
-        // keep off + len within the active ring.
-        unsafe { &self.ring.buf.as_ref()[off..off + len] }
+        self.service_shutdown(&self.spkr, &self.spkr_domains());
     }
 }
 
 /// Copy `len` bytes from the source ring (absolute producer offset `from`)
-/// into the ALSA buffer at `hw_ptr`, both wrapping.
+/// into the ALSA buffer at `hw_ptr`, both wrapping.  Only spans the firmware
+/// has announced through a producer report are copied, so the producer is
+/// past them; `ring_bytes` is the geometry the firmware reported and never
+/// exceeds the ring, so `read()` cannot fail on range.
 fn copy_span(
-    data: &SndSocT8140AopData,
+    ring: &SourceRing,
     dma_area: *mut u8,
     buffer_bytes: usize,
     ring_bytes: usize,
     from: u64,
     len: usize,
     hw_ptr: usize,
-) -> usize {
+) -> Result<usize> {
     let mut src = (from % ring_bytes as u64) as usize;
     let mut dst = hw_ptr;
     let mut left = len;
     while left > 0 {
         let n = left.min(ring_bytes - src).min(buffer_bytes - dst);
-        let s = data.ring_slice(src, n);
-        // SAFETY: dst + n <= buffer_bytes, the ALSA buffer stays mapped while
-        // the substream is set in the stream state.
-        unsafe { ptr::copy_nonoverlapping(s.as_ptr(), dma_area.add(dst), n) };
+        // SAFETY: dst + n <= buffer_bytes, and the ALSA buffer stays mapped
+        // while the substream is set in the stream state, whose lock the
+        // caller holds.
+        let span = unsafe { slice::from_raw_parts_mut(dma_area.add(dst), n) };
+        ring.read(src, span)?;
         src = (src + n) % ring_bytes;
         dst = (dst + n) % buffer_bytes;
         left -= n;
     }
-    dst
+    Ok(dst)
 }
 
 impl ReportListener for SndSocT8140AopData {
     fn process_report(&self, _subtype: u16, report: &[u8]) -> Result<()> {
         if report.len() < REPORT_MIN_LEN {
-            dev_err!(
-                self.dev,
-                "short lpai producer report ({} bytes)\n",
-                report.len()
-            );
+            if !self.report_warnings[0].xchg(true, Relaxed) {
+                dev_warn!(
+                    self.dev,
+                    "short lpai producer report ({} bytes)\n",
+                    report.len()
+                );
+            }
             return Ok(());
         }
-        let frames = u64::from_le_bytes(report[0x40..0x48].try_into().unwrap()) + 1;
-        let cursor = u64::from_le_bytes(report[0x60..0x68].try_into().unwrap());
+        let count = le_u64(report, 0x40)?;
+        let Some(absolute) = count
+            .checked_add(1)
+            .and_then(|frames| frames.checked_mul(LPAI_FRAME_BYTES as u64))
+        else {
+            if !self.report_warnings[1].xchg(true, Relaxed) {
+                dev_warn!(self.dev, "overflowing lpai producer counter\n");
+            }
+            return Ok(());
+        };
+        let frames = absolute / LPAI_FRAME_BYTES as u64;
+        self.reported.store(true, Relaxed);
+        let cursor = le_u64(report, 0x60)?;
         let ring_bytes = self.ring_bytes.load(Relaxed) as usize;
-        let absolute = frames * FRAME_BYTES as u64;
         if ring_bytes == 0 || cursor != absolute % ring_bytes as u64 {
-            dev_warn!(
-                self.dev,
-                "inconsistent lpai report: frames {} cursor {:#x}\n",
-                frames,
-                cursor
-            );
+            if !self.report_warnings[2].xchg(true, Relaxed) {
+                dev_warn!(
+                    self.dev,
+                    "inconsistent lpai report: frames {} cursor {:#x}\n",
+                    frames,
+                    cursor
+                );
+            }
             return Ok(());
         }
 
         let mut st = self.stream.lock();
-        st.last_absolute = Some(absolute);
-        if self.running.load(Relaxed) == 0 || st.substream.is_null() {
+        if !self.running.load(Relaxed) || st.substream.is_null() {
             return Ok(());
         }
         let copied = match st.copied {
@@ -912,43 +1076,45 @@ impl ReportListener for SndSocT8140AopData {
             }
         };
         if absolute < copied {
-            dev_warn!(self.dev, "lpai producer moved backwards\n");
+            if !self.report_warnings[3].xchg(true, Relaxed) {
+                dev_warn!(self.dev, "lpai producer moved backwards\n");
+            }
             st.copied = Some(absolute);
             return Ok(());
         }
         let delta = (absolute - copied) as usize;
         if delta >= ring_bytes {
-            st.overruns += 1;
             st.copied = Some(absolute);
-            dev_warn!(self.dev, "lpai source overrun ({} bytes)\n", delta);
+            if !self.report_warnings[4].xchg(true, Relaxed) {
+                dev_warn!(self.dev, "lpai source overrun ({} bytes)\n", delta);
+            }
             return Ok(());
         }
         if delta == 0 {
             return Ok(());
         }
-        // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for
-        // the op's duration (between hw_params and hw_free for the buffer).
-        let runtime = unsafe { (*st.substream).runtime };
-        // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for
-        // the op's duration (between hw_params and hw_free for the buffer).
-        let dma_area = unsafe { (*runtime).dma_area };
+        // SAFETY: the substream is registered in the stream state, which
+        // close clears under this lock, so it is live; its runtime and DMA
+        // buffer exist between hw_params and hw_free, which bracket prepare
+        // (where `buffer_bytes` was taken) and every triggered state.
+        let dma_area = unsafe { (*(*st.substream).runtime).dma_area };
         let buffer_bytes = st.buffer_bytes;
         let new_ptr = copy_span(
-            self,
+            &self.ring,
             dma_area,
             buffer_bytes,
             ring_bytes,
             copied,
             delta,
             st.hw_ptr_bytes,
-        );
+        )?;
         st.hw_ptr_bytes = new_ptr;
         st.copied = Some(absolute);
         st.period_acc += delta;
         self.hw_ptr_frames
-            .store((new_ptr / FRAME_BYTES) as u32, Relaxed);
-        if st.period_acc >= PERIOD_BYTES {
-            st.period_acc %= PERIOD_BYTES;
+            .store((new_ptr / LPAI_FRAME_BYTES) as u32, Relaxed);
+        if st.period_acc >= LPAI_PERIOD_BYTES {
+            st.period_acc %= LPAI_PERIOD_BYTES;
             // SAFETY: the substream is valid while it is registered in
             // the stream state, which close clears under this lock.
             unsafe { bindings::snd_pcm_period_elapsed(st.substream) };
@@ -957,58 +1123,30 @@ impl ReportListener for SndSocT8140AopData {
     }
 }
 
-/// The speaker stream start (pwrd + unmute), queued by the back-end DAI's
-/// trigger START: those are sleeping firmware calls, and the DMA must already
-/// be running when the LEAP starts consuming.
-#[pin_data]
-struct SpkrStartWork {
-    data: Arc<SndSocT8140AopData>,
-    #[pin]
-    work: Work<SpkrStartWork>,
+// ---- the driver's own card: the low-power microphone (PCM 0) and the
+// microphone array (PCM 1) ----
+
+/// The driver data behind one of this card's PCMs.
+///
+/// # Safety
+///
+/// `substream` must be a live substream of a PCM whose private data is the
+/// `Arc` handed to ALSA at probe (released in `pcm_free_private` after the
+/// last op).
+unsafe fn pcm_data<'a>(
+    substream: *mut bindings::snd_pcm_substream,
+) -> ArcBorrow<'a, SndSocT8140AopData> {
+    // SAFETY: by the caller's contract.
+    unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) }
 }
 
-impl_has_work! {
-    impl HasWork<Self> for SpkrStartWork { self.work }
-}
-
-impl WorkItem for SpkrStartWork {
-    type Pointer = Arc<SpkrStartWork>;
-
-    fn run(this: Arc<SpkrStartWork>) {
-        if let Err(e) = this.data.spkr_go() {
-            dev_err!(this.data.dev, "spkr: start failed: {:?}\n", e);
-        }
-    }
-}
-
-/// The HQ-mic stream start (`pwrd`), queued by the back-end DAI's trigger
-/// START for the same reason as the speaker's: the ADMAC must already be
-/// running before the LEAP starts producing.
-#[pin_data]
-struct HpaiStartWork {
-    data: Arc<SndSocT8140AopData>,
-    #[pin]
-    work: Work<HpaiStartWork>,
-}
-
-impl_has_work! {
-    impl HasWork<Self> for HpaiStartWork { self.work }
-}
-
-impl WorkItem for HpaiStartWork {
-    type Pointer = Arc<HpaiStartWork>;
-
-    fn run(this: Arc<HpaiStartWork>) {
-        if let Err(e) = this.data.hpai_go() {
-            dev_err!(this.data.dev, "hpai: start failed: {:?}\n", e);
-        }
-    }
-}
-
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
 unsafe extern "C" fn lpai_pcm_open(substream: *mut bindings::snd_pcm_substream) -> i32 {
-    // SAFETY: the PCM's private data is the `Arc` handed to ALSA at probe, released in
-    // `lpai_pcm_free_private` after the last op.
-    let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
+    // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
+    let data = unsafe { pcm_data(substream) };
     let hw = bindings::snd_pcm_hardware {
         info: bindings::SNDRV_PCM_INFO_MMAP
             | bindings::SNDRV_PCM_INFO_MMAP_VALID
@@ -1016,23 +1154,23 @@ unsafe extern "C" fn lpai_pcm_open(substream: *mut bindings::snd_pcm_substream) 
         formats: bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE,
         subformats: 0,
         rates: bindings::SNDRV_PCM_RATE_16000,
-        rate_min: RATE,
-        rate_max: RATE,
-        channels_min: CHANNELS,
-        channels_max: CHANNELS,
-        buffer_bytes_max: PERIOD_BYTES * PERIODS_MAX as usize,
-        period_bytes_min: PERIOD_BYTES,
-        period_bytes_max: PERIOD_BYTES,
+        rate_min: LPAI_RATE,
+        rate_max: LPAI_RATE,
+        channels_min: LPAI_CHANNELS,
+        channels_max: LPAI_CHANNELS,
+        buffer_bytes_max: LPAI_PERIOD_BYTES * LPAI_PERIODS_MAX as usize,
+        period_bytes_min: LPAI_PERIOD_BYTES,
+        period_bytes_max: LPAI_PERIOD_BYTES,
         periods_min: 2,
-        periods_max: PERIODS_MAX,
+        periods_max: LPAI_PERIODS_MAX,
         fifo_size: 0,
     };
-    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for the
-    // op's duration (between hw_params and hw_free for the buffer).
+    // SAFETY: ALSA calls this op with a live substream whose runtime exists
+    // for the op's duration.
     unsafe {
         (*(*substream).runtime).hw = hw;
     }
-    data.running.store(0, Relaxed);
+    data.running.store(false, Relaxed);
     let mut st = data.stream.lock();
     st.substream = substream;
     st.copied = None;
@@ -1042,140 +1180,340 @@ unsafe extern "C" fn lpai_pcm_open(substream: *mut bindings::snd_pcm_substream) 
     0
 }
 
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
 unsafe extern "C" fn lpai_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
-    // SAFETY: the PCM's private data is the `Arc` handed to ALSA at probe, released in
-    // `lpai_pcm_free_private` after the last op.
-    let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
-    data.running.store(0, Relaxed);
+    // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
+    let data = unsafe { pcm_data(substream) };
+    data.running.store(false, Relaxed);
     {
         let mut st = data.stream.lock();
         st.substream = ptr::null_mut();
     }
-    if data.powered.load(Relaxed) != 0 {
+    if data.powered.load(Relaxed) {
         if let Err(e) = data.set_power(POWER_STATE_IDLE) {
             dev_err!(data.dev, "unable to return lpai to idle\n");
             return e.to_errno();
         }
-        data.powered.store(0, Relaxed);
+        data.powered.store(false, Relaxed);
     }
     0
 }
 
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
 unsafe extern "C" fn lpai_pcm_prepare(substream: *mut bindings::snd_pcm_substream) -> i32 {
-    // SAFETY: the PCM's private data is the `Arc` handed to ALSA at probe, released in
-    // `lpai_pcm_free_private` after the last op.
-    let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
-    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for the
-    // op's duration (between hw_params and hw_free for the buffer).
-    let runtime = unsafe { (*substream).runtime };
+    // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
+    let data = unsafe { pcm_data(substream) };
     {
         let mut st = data.stream.lock();
-        // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for
-        // the op's duration (between hw_params and hw_free for the buffer).
-        st.buffer_bytes = unsafe { (*runtime).dma_bytes };
+        // SAFETY: ALSA calls this op with a live substream; its runtime and
+        // DMA buffer exist between hw_params and hw_free, which bracket
+        // prepare.
+        st.buffer_bytes = unsafe { (*(*substream).runtime).dma_bytes };
         st.hw_ptr_bytes = 0;
         st.period_acc = 0;
         st.copied = None;
         data.hw_ptr_frames.store(0, Relaxed);
     }
-    if data.powered.load(Relaxed) == 0 {
+    if !data.powered.load(Relaxed) {
         if let Err(e) = data.set_power(POWER_STATE_RUN) {
             dev_err!(data.dev, "unable to run lpai\n");
             return e.to_errno();
         }
-        data.powered.store(1, Relaxed);
+        data.powered.store(true, Relaxed);
     }
     0
 }
 
 /// Called with the ALSA stream lock held: only the run flag changes here,
 /// the counters were reset by prepare.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
 unsafe extern "C" fn lpai_pcm_trigger(
     substream: *mut bindings::snd_pcm_substream,
     cmd: i32,
 ) -> i32 {
-    // SAFETY: the PCM's private data is the `Arc` handed to ALSA at probe, released in
-    // `lpai_pcm_free_private` after the last op.
-    let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
+    // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
+    let data = unsafe { pcm_data(substream) };
     match cmd as u32 {
         bindings::SNDRV_PCM_TRIGGER_START | bindings::SNDRV_PCM_TRIGGER_RESUME => {
-            data.running.store(1, Relaxed);
+            data.running.store(true, Relaxed);
             0
         }
         bindings::SNDRV_PCM_TRIGGER_STOP | bindings::SNDRV_PCM_TRIGGER_SUSPEND => {
-            data.running.store(0, Relaxed);
+            data.running.store(false, Relaxed);
             0
         }
         _ => EINVAL.to_errno(),
     }
 }
 
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
 unsafe extern "C" fn lpai_pcm_pointer(
     substream: *mut bindings::snd_pcm_substream,
 ) -> bindings::snd_pcm_uframes_t {
-    // SAFETY: the PCM's private data is the `Arc` handed to ALSA at probe, released in
-    // `lpai_pcm_free_private` after the last op.
-    let data = unsafe { Arc::<SndSocT8140AopData>::borrow((*substream).private_data.cast()) };
+    // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
+    let data = unsafe { pcm_data(substream) };
     data.hw_ptr_frames.load(Relaxed) as bindings::snd_pcm_uframes_t
 }
 
-unsafe extern "C" fn lpai_pcm_free_private(pcm: *mut bindings::snd_pcm) {
-    // SAFETY: this is the `Arc` leaked into the PCM's private data at probe; ALSA calls this once,
-    // when the PCM goes away.
+/// The microphone array's capture: the LEAP produces float32 into the ADMAC
+/// channel requested here; the channel's SRAM registers only answer while
+/// its own LEAP leaf is powered, so the service (and with it the leaves)
+/// comes up before the request and goes down after the release.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
+unsafe extern "C" fn hpai_pcm_open(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: ALSA calls this op with a live substream of the HPAI PCM.
+    let data = unsafe { pcm_data(substream) };
+    if let Err(e) = data.hpai_startup() {
+        return e.to_errno();
+    }
+    // SAFETY: the platform device is live and the channel name is
+    // NUL-terminated.
+    let chan = match from_err_ptr(unsafe {
+        bindings::dma_request_chan(data.dev.as_raw(), c"hpai".as_char_ptr())
+    }) {
+        Ok(chan) => chan,
+        Err(e) => {
+            dev_err!(data.dev, "hpai: DMA channel unavailable: {:?}\n", e);
+            data.hpai_shutdown();
+            return e.to_errno();
+        }
+    };
+    let mut hw = dmaengine_hw();
+    hw.rates = bindings::SNDRV_PCM_RATE_48000;
+    hw.rate_min = HPAI_RATE;
+    hw.rate_max = HPAI_RATE;
+    hw.channels_min = HPAI_CHANNELS;
+    hw.channels_max = HPAI_CHANNELS;
+    let ret = pcm_open_dmaengine(
+        substream,
+        chan,
+        hw,
+        bindings::BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE,
+    );
+    if ret < 0 {
+        // SAFETY: `chan` was requested above and is not attached to the
+        // substream when the open failed.
+        unsafe { bindings::dma_release_channel(chan) };
+        data.hpai_shutdown();
+    }
+    ret
+}
+
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
+unsafe extern "C" fn hpai_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: ALSA calls this op with a live substream of the HPAI PCM.
+    let data = unsafe { pcm_data(substream) };
+    // SAFETY: the substream is live and its dmaengine runtime was set up by
+    // `snd_dmaengine_pcm_open` in `hpai_pcm_open`.
+    let ret = unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
+    data.hpai_shutdown();
+    ret
+}
+
+/// Nothing to arm before the trigger: the dmaengine runtime was set up at
+/// open, and the DMA start followed by the queued firmware run belong to
+/// trigger.  ALSA calls the prepare op unconditionally, so it must exist:
+/// without it the first hpai prepare jumped to address 0.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM.
+unsafe extern "C" fn hpai_pcm_prepare(_substream: *mut bindings::snd_pcm_substream) -> i32 {
+    0
+}
+
+/// Trigger, with the ALSA stream lock held: the DMA first, then the
+/// sleeping firmware start queued behind it.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
+unsafe extern "C" fn hpai_pcm_trigger(
+    substream: *mut bindings::snd_pcm_substream,
+    cmd: i32,
+) -> i32 {
+    // SAFETY: ALSA calls this op with a live substream of the HPAI PCM.
+    let data = unsafe { pcm_data(substream) };
+    // SAFETY: the substream is live and its dmaengine runtime was set up by
+    // `snd_dmaengine_pcm_open` in `hpai_pcm_open`.
+    let ret = unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) };
+    if ret < 0 {
+        return ret;
+    }
+    match cmd as u32 {
+        bindings::SNDRV_PCM_TRIGGER_START
+        | bindings::SNDRV_PCM_TRIGGER_RESUME
+        | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
+            data.hpai_want_run.store(true, Relaxed);
+            // Err = already queued: the pending run will see want_run.
+            let _ = workqueue::system().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
+        }
+        _ => data.hpai_want_run.store(false, Relaxed),
+    }
+    0
+}
+
+/// # Safety
+///
+/// Called once by ALSA when the PCM goes away, with the `Arc` leaked into
+/// its private data at probe.
+unsafe extern "C" fn pcm_free_private(pcm: *mut bindings::snd_pcm) {
+    // SAFETY: this is the `Arc` leaked into the PCM's private data at probe;
+    // ALSA calls this once, when the PCM goes away.
     unsafe {
         Arc::<SndSocT8140AopData>::from_foreign((*pcm).private_data.cast());
     }
 }
+
+/// The dmaengine PCMs' common description: mmap-able, interleaved, a 1 MiB
+/// buffer in periods from 256 bytes to the ADMAC's segment size.  Rates,
+/// channels and formats are left to the caller (or, for a DPCM front-end,
+/// to the DAI streams: ASoC fills in what is still zero here).
+fn dmaengine_hw() -> bindings::snd_pcm_hardware {
+    bindings::snd_pcm_hardware {
+        info: bindings::SNDRV_PCM_INFO_MMAP
+            | bindings::SNDRV_PCM_INFO_MMAP_VALID
+            | bindings::SNDRV_PCM_INFO_INTERLEAVED,
+        formats: 0,
+        subformats: 0,
+        rates: 0,
+        rate_min: 0,
+        rate_max: 0,
+        channels_min: 0,
+        channels_max: 0,
+        buffer_bytes_max: PCM_BUFFER_MAX,
+        period_bytes_min: PCM_PERIOD_BYTES_MIN,
+        period_bytes_max: PCM_PERIOD_BYTES_MAX,
+        periods_min: 2,
+        periods_max: (PCM_BUFFER_MAX / PCM_PERIOD_BYTES_MIN) as u32,
+        fifo_size: 16,
+    }
+}
+
+/// Set up a dmaengine-backed substream on `chan`: a managed buffer on the
+/// DMA device (once per substream), `hw` refined by the channel's
+/// capabilities and its formats narrowed to `formats`, then the dmaengine
+/// runtime.  On failure the channel is left with the caller.
+fn pcm_open_dmaengine(
+    substream: *mut bindings::snd_pcm_substream,
+    chan: *mut bindings::dma_chan,
+    mut hw: bindings::snd_pcm_hardware,
+    formats: u64,
+) -> i32 {
+    // SAFETY: the callers hand over a live substream and a channel they
+    // requested.
+    let unallocated =
+        unsafe { (*substream).dma_buffer.dev.type_ == bindings::SNDRV_DMA_TYPE_UNKNOWN as i32 };
+    if unallocated {
+        // SAFETY: as above; the channel's device is the DMA controller and
+        // outlives the buffer, which ALSA frees with the PCM.
+        let ret = unsafe {
+            bindings::snd_pcm_set_managed_buffer(
+                substream,
+                bindings::SNDRV_DMA_TYPE_DEV as i32,
+                (*(*chan).device).dev,
+                0,
+                0,
+            )
+        };
+        if ret < 0 {
+            return ret;
+        }
+    }
+    let mut dma_data = bindings::snd_dmaengine_dai_dma_data::default();
+    // SAFETY: the substream and the channel are live for the call.
+    let ret = unsafe {
+        bindings::snd_dmaengine_pcm_refine_runtime_hwparams(substream, &mut dma_data, &mut hw, chan)
+    };
+    if ret < 0 {
+        return ret;
+    }
+    // The refinement describes the bus widths the channel can move, not the
+    // sample representation; the LEAP produces and consumes one encoding.
+    hw.formats &= formats;
+    if hw.formats == 0 {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: the substream's runtime exists for the op's duration; the
+    // dmaengine open attaches `chan` to it on success.
+    unsafe {
+        (*(*substream).runtime).hw = hw;
+        bindings::snd_dmaengine_pcm_open(substream, chan)
+    }
+}
+
+/// Buffer limits of the dmaengine PCMs.  A period is bounded by the ADMAC's
+/// segment size (the channel's capabilities refine it further).
+const PCM_BUFFER_MAX: usize = 1024 * 1024;
+const PCM_PERIOD_BYTES_MIN: usize = 256;
+const PCM_PERIOD_BYTES_MAX: usize = 0x10000;
+/// A copy-time gain change must not sit behind a long queue of converted
+/// speaker samples: at 48 kHz stereo S32 this bounds the queued audio to
+/// 16384 frames (341 ms), while still allowing the largest PipeWire quantum.
+const SPKR_BUFFER_MAX: usize = 128 * 1024;
 
 fn copy_str(target: &mut [u8], source: &[u8]) {
     target[..source.len()].copy_from_slice(source)
 }
 
 // ---- ASoC component: DPCM front-end PCMs on the ADMAC channels, back-end
-// DAIs on the AOP output services (macaudio's t8140 variant links them) ----
+// DAIs on the AOP output services (macaudio's J700 variant links them) ----
 
-/// Front-end PCM DAIs ("j700-pcm-N"): 0 primary playback (the jack),
-/// 1 secondary playback (the speaker, later), 2 capture (unused).
-const FE_COUNT: usize = 4;
+/// Front-end PCM DAIs ("j700-pcm-N"): 0 the jack (playback and the headset
+/// microphone), 1 the speaker (playback only), 2 the speaker tap (capture).
+const FE_COUNT: usize = 3;
 /// DMA channel names per front-end and stream (dma-names on the audio
 /// child): [playback, capture].  The primary front-end is the jack: cout on
 /// base-ns TX2, cin (the headset microphone) on base-ns RX2.  The speaker
-/// front-end's "spkr" channel is requested once the speaker link exists:
-/// requesting it touches the LEAP ADMAC.
+/// front-end's "spkr" channel is on the LEAP ADMAC: requesting it touches
+/// the channel's SRAM registers, which only answer with its leaf powered.
 const FE_DMA_NAMES: [[Option<&core::ffi::CStr>; 2]; FE_COUNT] = [
     [Some(c"cout"), Some(c"cin")],
     [Some(c"spkr"), None],
     [None, Some(c"spkr-tap")],
-    // the HQ microphone array, leap-s ADMAC RX0
-    [None, Some(c"hpai")],
 ];
 /// The front-end that plays the internal speaker (j700-pcm-1, the card's
 /// "Secondary" PCM): its data goes through `spkr_copy` below.
 const FE_SPKR: usize = 1;
-/// The microphone-array front-end (j700-pcm-3).  Unlike the other three it is
-/// not a DPCM front end, so nothing overwrites its runtime hw afterwards.
-const FE_HPAI: usize = 3;
-/// SNDRV_PCM_FMTBIT_S32_LE (format index 10).
-const FMTBIT_S32_LE: u64 = 1 << 10;
 
 /// Digital ceiling of the speaker path, as a Q31 gain applied to every
 /// sample userspace writes: 0.5, the amplifier's full scale.
 ///
-/// Measured at the SpeakerTap on 2026-09-17 (hb51, amp off), the words on the
-/// speaker wire are exactly `2 × float × 2^31` -- a float of 6 791 000/2^31
-/// came back as a clean 1 kHz sine with peak 13 582 000 and nothing else in
-/// the path.  A float of 0.5 is therefore the I2S full scale (0 dBFS on the
-/// wire, 7.3 V peak at the MAX98360A's output on the J700) and anything
-/// above it would wrap.  Protection is the userspace daemon's job, exactly
-/// as on the other Apple laptops: it owns "Speaker Playback Volume" and
-/// governs it from the sense stream with the speaker's thermal model; when
-/// no daemon holds the lock, macaudio keeps the control 20 dB down (the
-/// level Apple's own bring-up profile of this speaker uses).
+/// The words on the speaker wire are `2 × float × 2^31`, as read back on
+/// the SpeakerTap: a float of 6 791 000/2^31 came back as a clean 1 kHz
+/// sine with peak 13 582 000 and nothing else in the path.  A float of 0.5
+/// is therefore the I2S full scale (0 dBFS on the wire, 7.3 V peak at the
+/// MAX98360A's output on the J700) and anything above it would wrap.
+/// Protection is the userspace daemon's job, exactly as on the other Apple
+/// laptops: it owns "Speaker Playback Volume" and governs it with the
+/// speaker's thermal model, fed by the tap; when no daemon holds the lock,
+/// macaudio keeps the control 20 dB down.
 const SPKR_CEILING_Q31: i64 = 1 << 30;
 
 /// "Speaker Playback Volume": the software gain below the ceiling that the
 /// speaker-protection daemon and the card's volume lock drive, 0.5 dB per
-/// step from -63.5 dB (1) to 0 dB (127) relative to SPKR_CEILING_Q31, 0 =
+/// step from -63.0 dB (1) to 0 dB (127) relative to SPKR_CEILING_Q31, 0 =
 /// mute; entry i = round(SPKR_CEILING_Q31 * 10^(-(127 - i) / 40)).
 const SPKR_VOLUME_MAX: u32 = 127;
 const _: () = assert!(SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64 == SPKR_CEILING_Q31);
@@ -1196,48 +1534,41 @@ const SPKR_VOLUME_Q31: [u32; 128] = [
     677485290, 717628817, 760150998, 805192776, 852903448, 903441154, 956973408, 1013677647,
     1073741824,
 ];
-/// The component's software registers for protected and user speaker gain.
+/// The component's only "register": the speaker volume.
 const REG_SPKR_VOLUME: u32 = 0;
-const REG_SPKR_USER_VOLUME: u32 = 1;
-/// SNDRV_CTL_ELEM_IFACE_MIXER (a __force-cast macro bindgen cannot import).
-const SNDRV_CTL_ELEM_IFACE_MIXER: bindings::snd_ctl_elem_iface_t = 2;
-/// DECLARE_TLV_DB_SCALE(-6350, 50, 1): SNDRV_CTL_TLVT_DB_SCALE, 8 bytes,
-/// min -63.50 dB, 0.50 dB steps, the lowest value mutes.
-static SPKR_VOLUME_TLV: [u32; 4] = [1, 8, (-6350i32) as u32, 50 | 0x10000];
-/// Managed buffer sizes for the PCMs.
-const PCM_BUFFER_PREALLOC: usize = 256 * 1024;
-const PCM_BUFFER_MAX: usize = 1024 * 1024;
-const RATE_48000_BIT: u32 = 1 << 7; // SNDRV_PCM_RATE_48000
+/// DECLARE_TLV_DB_SCALE(-6350, 50, 1): a dB scale from -63.50 dB in 0.50 dB
+/// steps whose lowest value mutes.
+static SPKR_VOLUME_TLV: [u32; 4] = [
+    bindings::SNDRV_CTL_TLVT_DB_SCALE,
+    2 * mem::size_of::<u32>() as u32,
+    (-6350i32) as u32,
+    50 | bindings::TLV_DB_SCALE_MUTE,
+];
 
-/// Sync wrapper for the static ASoC descriptor tables (raw pointers inside).
-struct SyncCell<T>(T);
-unsafe impl<T> Sync for SyncCell<T> {}
-
-/// Driver data from an ASoC component.
+/// Audio data from a live ASoC component's separately owned context.
 ///
 /// # Safety
 ///
-/// `component` must be this driver's registered component: its device's
-/// drvdata is the pinned `SndSocT8140AopDriver`, which outlives every op.
+/// `component` must belong to this driver's live per-instance descriptor.
+/// The descriptor/context outlives synchronous registration and unregister.
 unsafe fn component_data<'a>(
     component: *mut bindings::snd_soc_component,
 ) -> &'a SndSocT8140AopData {
     // SAFETY: by the caller's contract.
-    unsafe { &component_driver(component).data }
+    unsafe { &component_context(component).data }
 }
 
-/// The pinned driver behind an ASoC component.
+/// The stable context behind this component's descriptor.
 ///
 /// # Safety
 ///
 /// As for [`component_data`].
-unsafe fn component_driver<'a>(
-    component: *mut bindings::snd_soc_component,
-) -> &'a SndSocT8140AopDriver {
+unsafe fn component_context<'a>(component: *mut bindings::snd_soc_component) -> &'a AsocContext {
     // SAFETY: by the caller's contract.
-    let drv = unsafe { (*(*component).dev).driver_data } as *const SndSocT8140AopDriver;
-    // SAFETY: by the caller's contract.
-    unsafe { &*drv }
+    let descriptor = unsafe { (*component).driver };
+    // SAFETY: AsocContext is repr(C), with the descriptor as its first field.
+    // C keeps the exact descriptor pointer passed to registration.
+    unsafe { &*descriptor.cast::<AsocContext>() }
 }
 
 /// The ASoC runtime of a substream.
@@ -1249,7 +1580,11 @@ unsafe fn substream_rtd(
     substream: *mut bindings::snd_pcm_substream,
 ) -> *mut bindings::snd_soc_pcm_runtime {
     // SAFETY: by the caller's contract.
-    unsafe { (*substream).private_data as *mut bindings::snd_soc_pcm_runtime }
+    unsafe {
+        (*substream)
+            .private_data
+            .cast::<bindings::snd_soc_pcm_runtime>()
+    }
 }
 
 /// Whether a runtime is a DPCM back-end (no PCM of its own).
@@ -1293,214 +1628,134 @@ unsafe fn fe_index(rtd: *mut bindings::snd_soc_pcm_runtime) -> Option<usize> {
     }
 }
 
-unsafe extern "C" fn asoc_pcm_new(
-    component: *mut bindings::snd_soc_component,
-    rtd: *mut bindings::snd_soc_pcm_runtime,
-) -> i32 {
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
-    let data = unsafe { component_data(component) };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
-    if unsafe { rtd_is_be(rtd) } {
-        return 0;
-    }
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
-    let Some(fe) = (unsafe { fe_index(rtd) }) else {
-        return EINVAL.to_errno();
-    };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
-    let pcm = unsafe { (*rtd).pcm };
-    for stream in 0..2usize {
-        let Some(name) = FE_DMA_NAMES[fe][stream] else {
-            continue;
-        };
-        // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-        // `snd_soc_pcm_runtime` of one of this component's links.
-        let substream = unsafe { (*pcm).streams[stream].substream };
-        if substream.is_null() {
-            continue;
-        }
-        // A LEAP ADMAC's per-channel SRAM registers only answer with that
-        // channel's own leaf powered, so a LEAP channel is requested with it
-        // on: tx0 for the speaker's leap-ns TX0, rx0 for the array's leap-s
-        // RX0.  Requesting either with its leaf down writes
-        // REG_CHAN_SRAM_CARVEOUT into a dead aperture, which takes an
-        // asynchronous SError and panics the machine inside
-        // dma_request_chan().
-        let spkr_leap = data.spkr_domain_refs();
-        let hpai_leap = data.hpai_domain_refs();
-        let (leap_svc, leap): (&Service, &[&Atomic<usize>]) = if fe == FE_HPAI {
-            (&data.hpai, &hpai_leap[..])
-        } else {
-            (&data.spkr, &spkr_leap[..])
-        };
-        let powered =
-            (fe == FE_SPKR || fe == FE_HPAI) && data.domains(leap_svc, leap, true).is_ok();
-        // SAFETY: FFI call with the live platform device and a NUL-terminated channel name.
-        let requested = kernel::error::from_err_ptr(unsafe {
-            bindings::dma_request_chan(data.dev.as_raw(), name.as_ptr())
-        });
-        if powered {
-            let _ = data.domains(leap_svc, leap, false);
-        }
-        let chan = match requested {
-            Ok(c) => c,
-            Err(e) => {
-                // A front-end can be left without a channel: its PCM exists
-                // but opens with ENODEV.
-                dev_info!(
-                    data.dev,
-                    "front-end {}: DMA channel {:?} unavailable: {:?}\n",
-                    fe,
-                    name,
-                    e
-                );
-                continue;
-            }
-        };
-        data.fe_chans.lock()[fe][stream] = chan as usize;
-        // SAFETY: the substream and the DMA channel's device are live; ALSA frees the managed
-        // buffer with the PCM.
-        unsafe {
-            bindings::snd_pcm_set_managed_buffer(
-                substream,
-                bindings::SNDRV_DMA_TYPE_DEV as i32,
-                (*(*chan).device).dev,
-                PCM_BUFFER_PREALLOC,
-                PCM_BUFFER_MAX,
-            );
-        }
-    }
-    0
+/// # Safety
+///
+/// `substream` must be live.
+unsafe fn substream_is_playback(substream: *mut bindings::snd_pcm_substream) -> bool {
+    // SAFETY: by the caller's contract.
+    let stream = unsafe { (*substream).stream };
+    stream == bindings::SNDRV_PCM_STREAM_PLAYBACK as i32
 }
 
-unsafe extern "C" fn asoc_pcm_free(
-    component: *mut bindings::snd_soc_component,
-    pcm: *mut bindings::snd_pcm,
-) {
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
-    let data = unsafe { component_data(component) };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
-    let rtd = unsafe { (*pcm).private_data as *mut bindings::snd_soc_pcm_runtime };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
-    if unsafe { rtd_is_be(rtd) } {
-        return;
-    }
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
-    let Some(fe) = (unsafe { fe_index(rtd) }) else {
-        return;
-    };
-    for stream in 0..2 {
-        let chan = core::mem::replace(&mut data.fe_chans.lock()[fe][stream], 0);
-        if chan != 0 {
-            // SAFETY: `chan` was returned by `dma_request_chan` in `asoc_pcm_new` and is released
-            // once.
-            unsafe { bindings::dma_release_channel(chan as *mut bindings::dma_chan) };
-        }
-    }
-}
-
+/// Front-end open: request the stream's ADMAC channel and set the substream
+/// up on it.  The speaker channel is on the LEAP ADMAC, whose channel
+/// registers only answer with the LEAP leaves powered, so those are held
+/// from here to close (the back-end holds its own references while the
+/// service runs).
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_open(
     component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> i32 {
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
+    // SAFETY: ASoC calls this op on a component whose descriptor/context stays live
+    // throughout registration, use and unregister.
     let data = unsafe { component_data(component) };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
     let rtd = unsafe { substream_rtd(substream) };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
+    // SAFETY: as above.
     if unsafe { rtd_is_be(rtd) } {
         return 0;
     }
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
+    // SAFETY: as above.
     let Some(fe) = (unsafe { fe_index(rtd) }) else {
         return EINVAL.to_errno();
     };
     // SAFETY: the substream is live for the duration of the op.
-    let stream = unsafe { (*substream).stream } as usize;
-    let chan = data.fe_chans.lock()[fe][stream & 1] as *mut bindings::dma_chan;
-    if chan.is_null() {
+    let playback = unsafe { substream_is_playback(substream) };
+    let Some(name) = FE_DMA_NAMES[fe][usize::from(!playback)] else {
         return ENODEV.to_errno();
-    }
-    let mut hw = bindings::snd_pcm_hardware::default();
-    if fe == FE_SPKR {
-        // No mmap: every sample goes through spkr_copy's fixed ceiling and
-        // the S32 -> float32 conversion the LEAP consumes.
-        hw.info = bindings::SNDRV_PCM_INFO_INTERLEAVED;
-        hw.formats = FMTBIT_S32_LE;
-    } else {
-        hw.info = bindings::SNDRV_PCM_INFO_MMAP
-            | bindings::SNDRV_PCM_INFO_MMAP_VALID
-            | bindings::SNDRV_PCM_INFO_INTERLEAVED;
-    }
-    hw.periods_min = 2;
-    hw.periods_max = u32::MAX;
-    hw.period_bytes_min = 256;
-    // dma_get_max_seg_size() is inline: the ADMAC sets no dma_parms, SZ_64K.
-    hw.period_bytes_max = 0x10000;
-    hw.buffer_bytes_max = usize::MAX;
-    hw.fifo_size = 16;
-    if fe == FE_HPAI {
-        // The other three front ends are DPCM, and dpcm_set_fe_runtime()
-        // replaces runtime->hw with the merged back-end hardware before ALSA
-        // ever sees the open bounds above.  This one is a plain link -- the
-        // array has no back end to merge with -- so the unbounded values
-        // survive into snd_pcm_hw_constraints_complete(), where a periods and
-        // buffer-bytes maximum of "as large as the type allows" refines to an
-        // empty interval and the open fails with EINVAL.  Give ALSA the real
-        // bounds of the managed buffer instead.
-        hw.buffer_bytes_max = PCM_BUFFER_MAX;
-        hw.periods_max = (PCM_BUFFER_MAX / hw.period_bytes_min as usize) as u32;
-    }
-    let mut dma_data = bindings::snd_dmaengine_dai_dma_data::default();
-    // SAFETY: the substream is live and `chan` is the channel requested for this front-end in
-    // `asoc_pcm_new`.
-    let rc = unsafe {
-        bindings::snd_dmaengine_pcm_refine_runtime_hwparams(substream, &mut dma_data, &mut hw, chan)
     };
-    if rc < 0 {
-        return rc;
+    let leap = fe == FE_SPKR;
+    if leap {
+        if let Err(e) = data.power_up_raising(data.spkr.name, &data.spkr_domains()) {
+            return e.to_errno();
+        }
     }
-    // snd_soc_set_runtime_hwparams() is inline: copy into the runtime.
-    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for the
-    // op's duration (between hw_params and hw_free for the buffer).
-    unsafe { (*(*substream).runtime).hw = hw };
-    // SAFETY: the substream is live and its dmaengine runtime was set up by
-    // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
-    unsafe { bindings::snd_dmaengine_pcm_open(substream, chan) }
+    // SAFETY: the platform device is live and the channel name is
+    // NUL-terminated.
+    let chan = match from_err_ptr(unsafe {
+        bindings::dma_request_chan(data.dev.as_raw(), name.as_char_ptr())
+    }) {
+        Ok(chan) => chan,
+        Err(e) => {
+            dev_err!(
+                data.dev,
+                "front-end {}: DMA channel {:?} unavailable: {:?}\n",
+                fe,
+                name,
+                e
+            );
+            if leap {
+                data.power_down(&data.spkr_domains());
+            }
+            return e.to_errno();
+        }
+    };
+    let mut hw = dmaengine_hw();
+    let mut formats = u64::MAX;
+    if fe == FE_SPKR {
+        // S32 in, converted by `asoc_pcm_copy` through the ceiling into the
+        // float32 the LEAP consumes: no mmap, and a bounded queue.
+        hw.info = bindings::SNDRV_PCM_INFO_INTERLEAVED;
+        hw.buffer_bytes_max = SPKR_BUFFER_MAX;
+        hw.periods_max = (SPKR_BUFFER_MAX / PCM_PERIOD_BYTES_MIN) as u32;
+        formats = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE;
+    }
+    let ret = pcm_open_dmaengine(substream, chan, hw, formats);
+    if ret < 0 {
+        // SAFETY: `chan` was requested above and is not attached to the
+        // substream when the open failed.
+        unsafe { bindings::dma_release_channel(chan) };
+        if leap {
+            data.power_down(&data.spkr_domains());
+        }
+    }
+    ret
 }
 
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_close(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> i32 {
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
+    // SAFETY: ASoC calls this op on a component whose descriptor/context stays live
+    // throughout registration, use and unregister.
+    let data = unsafe { component_data(component) };
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
-    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+    let rtd = unsafe { substream_rtd(substream) };
+    // SAFETY: as above.
+    if unsafe { rtd_is_be(rtd) } {
         return 0;
     }
     // SAFETY: the substream is live and its dmaengine runtime was set up by
     // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
-    unsafe { bindings::snd_dmaengine_pcm_close(substream) }
+    let ret = unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
+    // SAFETY: as for `rtd_is_be`.
+    if unsafe { fe_index(rtd) } == Some(FE_SPKR) {
+        data.power_down(&data.spkr_domains());
+    }
+    ret
 }
 
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_hw_params(
     _component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
     params: *mut bindings::snd_pcm_hw_params,
 ) -> i32 {
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
     if unsafe { rtd_is_be(substream_rtd(substream)) } {
         return 0;
@@ -1509,8 +1764,7 @@ unsafe extern "C" fn asoc_pcm_hw_params(
     // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
     let chan = unsafe { bindings::snd_dmaengine_pcm_get_chan(substream) };
     let mut cfg = bindings::dma_slave_config::default();
-    // SAFETY: the substream is live and its dmaengine runtime was set up by
-    // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
+    // SAFETY: the substream and the hardware parameters are live for the op.
     let rc = unsafe { bindings::snd_hwparams_to_dma_slave_config(substream, params, &mut cfg) };
     if rc < 0 {
         return rc;
@@ -1523,9 +1777,10 @@ unsafe extern "C" fn asoc_pcm_hw_params(
             as usize];
         iv.min
     };
+    // The ADMAC moves one frame per burst, up to four words wide.
     let window = core::cmp::min(channels, 4);
     // SAFETY: the substream is live for the duration of the op.
-    if unsafe { (*substream).stream } == bindings::SNDRV_PCM_STREAM_PLAYBACK as i32 {
+    if unsafe { substream_is_playback(substream) } {
         cfg.dst_port_window_size = window;
     } else {
         cfg.src_port_window_size = window;
@@ -1539,30 +1794,34 @@ unsafe extern "C" fn asoc_pcm_hw_params(
     }
 }
 
-/// The speaker front-end's DMA buffer must never carry stale words: the LEAP
-/// starts consuming at pwrd (back-end prepare), before the DMA is started.
+/// Clear old words before a new speaker stream or recovery from a revoked
+/// protection lease; the queued firmware start follows the DMA trigger.
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_prepare(
     _component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> i32 {
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
     let rtd = unsafe { substream_rtd(substream) };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
+    // SAFETY: as above.
     if unsafe { rtd_is_be(rtd) } || unsafe { fe_index(rtd) } != Some(FE_SPKR) {
         return 0;
     }
-    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for the
-    // op's duration (between hw_params and hw_free for the buffer).
-    let runtime = unsafe { (*substream).runtime };
-    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for the
-    // op's duration (between hw_params and hw_free for the buffer).
-    let (area, bytes) = unsafe { ((*runtime).dma_area, (*runtime).dma_bytes) };
+    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA
+    // buffer exist between hw_params and hw_free, which bracket prepare.
+    let (area, bytes) = unsafe {
+        let runtime = (*substream).runtime;
+        ((*runtime).dma_area, (*runtime).dma_bytes)
+    };
     if !area.is_null() && bytes != 0 {
         // SAFETY: the managed buffer is dma_bytes long and no DMA runs before
         // trigger START.
-        unsafe { core::ptr::write_bytes(area, 0, bytes) };
+        unsafe { ptr::write_bytes(area, 0, bytes) };
     }
     0
 }
@@ -1589,40 +1848,46 @@ fn f32_bits_of_q31(v: i32) -> u32 {
 /// One S32 sample -> the float32 word the LEAP consumes, through the volume
 /// table (whose top entry is the ceiling).
 fn spkr_f32_bits(sample: i32, gain_q31: u32) -> u32 {
-    let scaled = ((sample as i64) * gain_q31 as i64) >> 31; // |scaled| < SPKR_CEILING_Q31
+    let scaled = (i64::from(sample) * i64::from(gain_q31)) >> 31; // |scaled| < SPKR_CEILING_Q31
     f32_bits_of_q31(scaled as i32)
 }
 
 /// Copy between userspace and the front-end buffers.  The speaker front-end
 /// converts and limits; the jack front-ends copy verbatim (their buffers are
 /// also mmap-able, this path serves read()/write()).
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_copy(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
     _channel: i32,
     pos: usize,
     iter: *mut bindings::iov_iter,
     bytes: usize,
 ) -> i32 {
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
     let rtd = unsafe { substream_rtd(substream) };
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
-    // `snd_soc_pcm_runtime` of one of this component's links.
+    // SAFETY: as above.
     if unsafe { rtd_is_be(rtd) } {
         return EINVAL.to_errno();
     }
-    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for the
-    // op's duration (between hw_params and hw_free for the buffer).
-    let runtime = unsafe { (*substream).runtime };
-    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA buffer exist for the
-    // op's duration (between hw_params and hw_free for the buffer).
-    let (area, dma_bytes) = unsafe { ((*runtime).dma_area, (*runtime).dma_bytes) };
-    if area.is_null() || pos.checked_add(bytes).map_or(true, |end| end > dma_bytes) {
+    // SAFETY: ALSA calls this op with a live substream; its runtime and DMA
+    // buffer exist between hw_params and hw_free, which bracket every copy.
+    let (area, dma_bytes) = unsafe {
+        let runtime = (*substream).runtime;
+        ((*runtime).dma_area, (*runtime).dma_bytes)
+    };
+    if area.is_null() || pos.checked_add(bytes).is_none_or(|end| end > dma_bytes) {
         return EINVAL.to_errno();
     }
-    // SAFETY: bounds checked against the managed buffer above.
-    let dst = unsafe { core::slice::from_raw_parts_mut(area.add(pos), bytes) };
+    // SAFETY: bounds checked against the managed buffer above; ALSA
+    // serializes the copies of a substream.
+    let dst = unsafe { slice::from_raw_parts_mut(area.add(pos), bytes) };
+    // SAFETY: the substream is live for the duration of the op.
     let playback = unsafe { substream_is_playback(substream) };
     if !playback {
         // SAFETY: ALSA hands us a live iov_iter for the whole call.
@@ -1635,6 +1900,7 @@ unsafe extern "C" fn asoc_pcm_copy(
     }
     // SAFETY: as above.
     let iov = unsafe { kernel::iov::IovIterSource::from_raw(iter) };
+    // SAFETY: as for `rtd_is_be`.
     if unsafe { fe_index(rtd) } != Some(FE_SPKR) {
         return if iov.copy_from_iter(dst) == bytes {
             0
@@ -1643,12 +1909,11 @@ unsafe extern "C" fn asoc_pcm_copy(
         };
     }
     // S32_LE interleaved stereo in, float32 LE out, same byte count.
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
-    let data = unsafe { component_data(_component) };
+    // SAFETY: ASoC calls this op on a component whose descriptor/context stays live
+    // throughout registration, use and unregister.
+    let data = unsafe { component_data(component) };
     let volume = core::cmp::min(data.spkr_volume.load(Relaxed), SPKR_VOLUME_MAX) as usize;
-    let user_volume = core::cmp::min(data.spkr_user_volume.load(Relaxed), 100);
-    let gain = ((SPKR_VOLUME_Q31[volume] as u64 * user_volume as u64) / 100) as u32;
+    let gain = SPKR_VOLUME_Q31[volume];
     let mut chunk = [0u8; 512];
     let mut off = 0;
     while off < bytes {
@@ -1669,12 +1934,16 @@ unsafe extern "C" fn asoc_pcm_copy(
     0
 }
 
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_trigger(
     _component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
     cmd: i32,
 ) -> i32 {
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
     if unsafe { rtd_is_be(substream_rtd(substream)) } {
         return 0;
@@ -1684,46 +1953,56 @@ unsafe extern "C" fn asoc_pcm_trigger(
     unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) }
 }
 
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_pointer(
     _component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> bindings::snd_pcm_uframes_t {
-    // SAFETY: ASoC hands its ops a live substream/PCM whose private data is the
+    // SAFETY: ASoC hands its ops a live substream whose private data is the
     // `snd_soc_pcm_runtime` of one of this component's links.
     if unsafe { rtd_is_be(substream_rtd(substream)) } {
-        return ENOTSUPP_POINTER;
+        // -ENOTSUPP as the pointer callback returns it (mca does the same).
+        return (-i64::from(bindings::ENOTSUPP)) as bindings::snd_pcm_uframes_t;
     }
     // SAFETY: the substream is live and its dmaengine runtime was set up by
     // `snd_dmaengine_pcm_open` in `asoc_pcm_open`.
     unsafe { bindings::snd_dmaengine_pcm_pointer(substream) }
 }
 
-/// -ENOTSUPP as the pointer callback returns it (mca does the same).
-const ENOTSUPP_POINTER: bindings::snd_pcm_uframes_t = (-524i64) as bindings::snd_pcm_uframes_t;
-
 /// The component's register file: the speaker volume, read and written by
 /// the standard volsw control helpers.
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_component_read(
     component: *mut bindings::snd_soc_component,
     reg: u32,
 ) -> u32 {
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
+    // SAFETY: ASoC calls this op on a component whose descriptor/context stays live
+    // throughout registration, use and unregister.
     let data = unsafe { component_data(component) };
     match reg {
         REG_SPKR_VOLUME => data.spkr_volume.load(Relaxed),
-        REG_SPKR_USER_VOLUME => data.spkr_user_volume.load(Relaxed),
         _ => 0,
     }
 }
 
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component, with live
+/// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_component_write(
     component: *mut bindings::snd_soc_component,
     reg: u32,
     val: u32,
 ) -> i32 {
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
+    // SAFETY: ASoC calls this op on a component whose descriptor/context stays live
+    // throughout registration, use and unregister.
     let data = unsafe { component_data(component) };
     match reg {
         REG_SPKR_VOLUME => {
@@ -1731,89 +2010,9 @@ unsafe extern "C" fn asoc_component_write(
                 .store(core::cmp::min(val, SPKR_VOLUME_MAX), Relaxed);
             0
         }
-        REG_SPKR_USER_VOLUME => {
-            data.spkr_user_volume.store(core::cmp::min(val, 100), Relaxed);
-            0
-        }
         _ => EINVAL.to_errno(),
     }
 }
-
-/// Writable, like the C compound literal: the card's volume lock updates
-/// `platform_max` in place.
-static mut SPKR_VOLUME_MC: bindings::soc_mixer_control = bindings::soc_mixer_control {
-    min: 0,
-    max: SPKR_VOLUME_MAX as i32,
-    platform_max: SPKR_VOLUME_MAX as i32,
-    reg: REG_SPKR_VOLUME as i32,
-    rreg: REG_SPKR_VOLUME as i32,
-    shift: 0,
-    rshift: 0,
-    // SAFETY: zero is the C initializer's value for the remaining fields
-    // (sign_bit, invert, autodisable, topology object).
-    ..unsafe { core::mem::zeroed() }
-};
-
-/// A linear 0..100 gain within the raw speaker volume's safe ceiling.
-static mut SPKR_USER_VOLUME_MC: bindings::soc_mixer_control = bindings::soc_mixer_control {
-    min: 0,
-    max: 100,
-    platform_max: 100,
-    reg: REG_SPKR_USER_VOLUME as i32,
-    rreg: REG_SPKR_USER_VOLUME as i32,
-    shift: 0,
-    rshift: 0,
-    ..unsafe { core::mem::zeroed() }
-};
-
-/// SOC_SINGLE_TLV("Speaker Playback Volume", REG_SPKR_VOLUME, 0, 127, 0, tlv);
-/// `private_value` (the mixer control's address) is filled in at probe, as
-/// const evaluation cannot cast a pointer.
-static mut ASOC_CONTROLS: [bindings::snd_kcontrol_new; 2] = [bindings::snd_kcontrol_new {
-    iface: SNDRV_CTL_ELEM_IFACE_MIXER,
-    name: c"Speaker Playback Volume".as_ptr(),
-    access: bindings::SNDRV_CTL_ELEM_ACCESS_TLV_READ | bindings::SNDRV_CTL_ELEM_ACCESS_READWRITE,
-    info: Some(bindings::snd_soc_info_volsw),
-    get: Some(bindings::snd_soc_get_volsw),
-    put: Some(bindings::snd_soc_put_volsw),
-    tlv: bindings::snd_kcontrol_new__bindgen_ty_1 {
-        p: SPKR_VOLUME_TLV.as_ptr(),
-    },
-    private_value: 0,
-    // SAFETY: zero is a valid value for the remaining fields (device, subdevice,
-    // index, count, lock, unlock).
-    ..unsafe { core::mem::zeroed() }
-}, bindings::snd_kcontrol_new {
-    iface: SNDRV_CTL_ELEM_IFACE_MIXER,
-    name: c"Speaker User Playback Volume".as_ptr(),
-    access: bindings::SNDRV_CTL_ELEM_ACCESS_READWRITE,
-    info: Some(bindings::snd_soc_info_volsw),
-    get: Some(bindings::snd_soc_get_volsw),
-    put: Some(bindings::snd_soc_put_volsw),
-    private_value: 0,
-    ..unsafe { core::mem::zeroed() }
-}];
-
-static mut ASOC_COMPONENT: bindings::snd_soc_component_driver =
-    bindings::snd_soc_component_driver {
-        name: c"j700-aop-audio".as_ptr(),
-        read: Some(asoc_component_read),
-        write: Some(asoc_component_write),
-        controls: ptr::null(),
-        num_controls: 2,
-        open: Some(asoc_pcm_open),
-        close: Some(asoc_pcm_close),
-        hw_params: Some(asoc_pcm_hw_params),
-        prepare: Some(asoc_pcm_prepare),
-        trigger: Some(asoc_pcm_trigger),
-        pointer: Some(asoc_pcm_pointer),
-        copy: Some(asoc_pcm_copy),
-        pcm_new: Some(asoc_pcm_new),
-        pcm_free: Some(asoc_pcm_free),
-        // SAFETY: all-zero is a valid (empty) component driver; the fields
-        // above are the ones this component implements.
-        ..unsafe { core::mem::zeroed() }
-    };
 
 /// Driver data from one of this component's DAIs.
 ///
@@ -1825,11 +2024,30 @@ unsafe fn dai_data<'a>(dai: *mut bindings::snd_soc_dai) -> &'a SndSocT8140AopDat
     unsafe { component_data((*dai).component) }
 }
 
+/// The ASoC context of one of this component's DAIs.
+///
+/// # Safety
+///
+/// As for [`dai_data`].
+unsafe fn dai_context<'a>(dai: *mut bindings::snd_soc_dai) -> &'a AsocContext {
+    // SAFETY: by the caller's contract.
+    unsafe { component_context((*dai).component) }
+}
+
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn dai_accept_fmt(_dai: *mut bindings::snd_soc_dai, _fmt: u32) -> i32 {
-    // The AOP runs the serializers: I2S, 32-bit slots, clocks from the firmware.
+    // The AOP runs the serializers: the format, slots and clocks are the
+    // firmware's, whatever the machine driver asks for.
     0
 }
 
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn dai_accept_sysclk(
     _dai: *mut bindings::snd_soc_dai,
     _id: i32,
@@ -1839,19 +2057,18 @@ unsafe extern "C" fn dai_accept_sysclk(
     0
 }
 
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn dai_accept_bclk_ratio(_dai: *mut bindings::snd_soc_dai, _ratio: u32) -> i32 {
     0
 }
 
 /// # Safety
 ///
-/// `substream` must be live.
-unsafe fn substream_is_playback(substream: *mut bindings::snd_pcm_substream) -> bool {
-    // SAFETY: by the caller's contract.
-    let stream = unsafe { (*substream).stream };
-    stream == bindings::SNDRV_PCM_STREAM_PLAYBACK as i32
-}
-
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn cout_dai_startup(
     substream: *mut bindings::snd_pcm_substream,
     dai: *mut bindings::snd_soc_dai,
@@ -1865,6 +2082,10 @@ unsafe extern "C" fn cout_dai_startup(
     }
 }
 
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn cout_dai_prepare(
     substream: *mut bindings::snd_pcm_substream,
     dai: *mut bindings::snd_soc_dai,
@@ -1878,6 +2099,10 @@ unsafe extern "C" fn cout_dai_prepare(
     }
 }
 
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn cout_dai_shutdown(
     substream: *mut bindings::snd_pcm_substream,
     dai: *mut bindings::snd_soc_dai,
@@ -1888,6 +2113,10 @@ unsafe extern "C" fn cout_dai_shutdown(
     data.jack_shutdown(unsafe { substream_is_playback(substream) });
 }
 
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn spkr_dai_startup(
     substream: *mut bindings::snd_pcm_substream,
     dai: *mut bindings::snd_soc_dai,
@@ -1906,26 +2135,38 @@ unsafe extern "C" fn spkr_dai_startup(
     }
 }
 
-/// The sense (capture) side runs from prepare: the RX DMA is armed by then
+/// The tap (capture) side runs from prepare: the RX DMA is armed by then
 /// and a capture may start before or after the speaker plays.
+///
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn spkr_dai_prepare(
     substream: *mut bindings::snd_pcm_substream,
     dai: *mut bindings::snd_soc_dai,
 ) -> i32 {
-    // SAFETY: the substream is live for the duration of the op.
-    if unsafe { substream_is_playback(substream) } {
-        return 0;
-    }
     // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
     let data = unsafe { dai_data(dai) };
-    match data.sense_prepare() {
+    // SAFETY: the substream is live for the duration of the op.
+    let ret = if unsafe { substream_is_playback(substream) } {
+        data.spkr_prepare()
+    } else {
+        data.sense_prepare()
+    };
+    match ret {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }
 }
 
 /// Atomic context: queue the sleeping start, or note the stop (playback
-/// only; the sense side needs nothing here).
+/// only; the tap side needs nothing here).
+///
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn spkr_dai_trigger(
     substream: *mut bindings::snd_pcm_substream,
     cmd: i32,
@@ -1935,297 +2176,254 @@ unsafe extern "C" fn spkr_dai_trigger(
     if !unsafe { substream_is_playback(substream) } {
         return 0;
     }
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
-    let drv = unsafe { component_driver((*dai).component) };
+    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
+    let context = unsafe { dai_context(dai) };
     match cmd as u32 {
         bindings::SNDRV_PCM_TRIGGER_START
         | bindings::SNDRV_PCM_TRIGGER_RESUME
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
-            drv.data.spkr_want_run.store(1, Relaxed);
-            if let Some(work) = drv.spkr_start.as_ref() {
-                // Err = already queued: the pending run will see want_run.
-                let _ = workqueue::system().enqueue(work.clone());
-            }
+            context.data.spkr_want_run.store(true, Relaxed);
+            // Err = already queued: the pending run will see want_run.
+            let _ = workqueue::system().enqueue::<_, SPKR_START_WORK>(context.data.clone());
             0
         }
         bindings::SNDRV_PCM_TRIGGER_STOP
         | bindings::SNDRV_PCM_TRIGGER_SUSPEND
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_PUSH => {
-            drv.data.spkr_want_run.store(0, Relaxed);
+            context.data.spkr_want_run.store(false, Relaxed);
             0
         }
         _ => EINVAL.to_errno(),
     }
 }
 
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this driver's registered component
+/// (and a live substream where one is passed).
 unsafe extern "C" fn spkr_dai_shutdown(
     substream: *mut bindings::snd_pcm_substream,
     dai: *mut bindings::snd_soc_dai,
 ) {
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
-    let drv = unsafe { component_driver((*dai).component) };
+    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
+    let data = unsafe { dai_data(dai) };
     // SAFETY: the substream is live for the duration of the op.
-    if !unsafe { substream_is_playback(substream) } {
-        drv.data.sense_shutdown();
-        return;
+    if unsafe { substream_is_playback(substream) } {
+        data.spkr_shutdown();
+    } else {
+        data.sense_shutdown();
     }
-    drv.data.spkr_want_run.store(0, Relaxed);
-    if let Some(work) = drv.spkr_start.as_ref() {
-        // A start still queued or running must finish before the mute/pw0.
-        // SAFETY: the work item lives in the pinned driver data; flushing waits for a queued
-        // `spkr_go`.
-        unsafe {
-            let raw = workqueue::Work::raw_get(&work.work);
-            bindings::flush_work(raw);
+}
+
+/// The DAI operation tables, built once per instance (the C descriptors
+/// hold function pointers, which have no constant zero form in Rust).
+struct DaiOps {
+    cout: bindings::snd_soc_dai_ops,
+    spkr: bindings::snd_soc_dai_ops,
+    fe: bindings::snd_soc_dai_ops,
+}
+
+impl DaiOps {
+    fn new() -> Self {
+        let fe = bindings::snd_soc_dai_ops {
+            set_fmt: Some(dai_accept_fmt),
+            set_sysclk: Some(dai_accept_sysclk),
+            set_bclk_ratio: Some(dai_accept_bclk_ratio),
+            ..Default::default()
+        };
+        DaiOps {
+            cout: bindings::snd_soc_dai_ops {
+                startup: Some(cout_dai_startup),
+                prepare: Some(cout_dai_prepare),
+                shutdown: Some(cout_dai_shutdown),
+                ..fe
+            },
+            spkr: bindings::snd_soc_dai_ops {
+                startup: Some(spkr_dai_startup),
+                prepare: Some(spkr_dai_prepare),
+                trigger: Some(spkr_dai_trigger),
+                shutdown: Some(spkr_dai_shutdown),
+                ..fe
+            },
+            fe,
         }
     }
-    drv.data.spkr_shutdown();
 }
 
-/// The microphone array's DAI: capture only, and the firmware does the rest.
-/// `pwrd` from prepare, like the speaker sense, so the RX DMA is armed before
-/// the firmware starts filling it.
-unsafe extern "C" fn hpai_dai_startup(
-    _substream: *mut bindings::snd_pcm_substream,
-    dai: *mut bindings::snd_soc_dai,
-) -> i32 {
-    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
-    let data = unsafe { dai_data(dai) };
-    match data.hpai_startup() {
-        Ok(()) => 0,
-        Err(e) => e.to_errno(),
-    }
-}
-
-unsafe extern "C" fn hpai_dai_prepare(
-    _substream: *mut bindings::snd_pcm_substream,
-    dai: *mut bindings::snd_soc_dai,
-) -> i32 {
-    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
-    let data = unsafe { dai_data(dai) };
-    match data.hpai_prepare() {
-        Ok(()) => 0,
-        Err(e) => e.to_errno(),
-    }
-}
-
-unsafe extern "C" fn hpai_dai_trigger(
-    _substream: *mut bindings::snd_pcm_substream,
-    cmd: i32,
-    dai: *mut bindings::snd_soc_dai,
-) -> i32 {
-    // SAFETY: ASoC calls this op on our registered component, whose device drvdata is the pinned
-    // driver.
-    let drv = unsafe { component_driver((*dai).component) };
-    match cmd as u32 {
-        bindings::SNDRV_PCM_TRIGGER_START
-        | bindings::SNDRV_PCM_TRIGGER_RESUME
-        | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
-            drv.data.hpai_want_run.store(1, Relaxed);
-            if let Some(work) = drv.hpai_start.as_ref() {
-                // Err = already queued: the pending run will see want_run.
-                let _ = workqueue::system().enqueue(work.clone());
-            }
-            0
-        }
-        bindings::SNDRV_PCM_TRIGGER_STOP
-        | bindings::SNDRV_PCM_TRIGGER_SUSPEND
-        | bindings::SNDRV_PCM_TRIGGER_PAUSE_PUSH => {
-            drv.data.hpai_want_run.store(0, Relaxed);
-            0
-        }
-        _ => EINVAL.to_errno(),
-    }
-}
-
-unsafe extern "C" fn hpai_dai_shutdown(
-    _substream: *mut bindings::snd_pcm_substream,
-    dai: *mut bindings::snd_soc_dai,
-) {
-    // SAFETY: ASoC calls DAI ops with a DAI of our registered component.
-    unsafe { dai_data(dai) }.hpai_shutdown();
-}
-
-static HPAI_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
-    startup: Some(hpai_dai_startup),
-    prepare: Some(hpai_dai_prepare),
-    trigger: Some(hpai_dai_trigger),
-    shutdown: Some(hpai_dai_shutdown),
-    set_fmt: Some(dai_accept_fmt),
-    set_sysclk: Some(dai_accept_sysclk),
-    set_bclk_ratio: Some(dai_accept_bclk_ratio),
-    // SAFETY: zero is an empty ops table.
-    ..unsafe { core::mem::zeroed() }
-});
-
-static SPKR_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
-    startup: Some(spkr_dai_startup),
-    prepare: Some(spkr_dai_prepare),
-    trigger: Some(spkr_dai_trigger),
-    shutdown: Some(spkr_dai_shutdown),
-    set_fmt: Some(dai_accept_fmt),
-    set_sysclk: Some(dai_accept_sysclk),
-    set_bclk_ratio: Some(dai_accept_bclk_ratio),
-    // SAFETY: zero is an empty ops table.
-    ..unsafe { core::mem::zeroed() }
-});
-
-static COUT_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
-    startup: Some(cout_dai_startup),
-    prepare: Some(cout_dai_prepare),
-    shutdown: Some(cout_dai_shutdown),
-    set_fmt: Some(dai_accept_fmt),
-    set_sysclk: Some(dai_accept_sysclk),
-    set_bclk_ratio: Some(dai_accept_bclk_ratio),
-    // SAFETY: zero is an empty ops table.
-    ..unsafe { core::mem::zeroed() }
-});
-
-static FE_DAI_OPS: SyncCell<bindings::snd_soc_dai_ops> = SyncCell(bindings::snd_soc_dai_ops {
-    set_fmt: Some(dai_accept_fmt),
-    set_sysclk: Some(dai_accept_sysclk),
-    set_bclk_ratio: Some(dai_accept_bclk_ratio),
-    // SAFETY: zero is an empty ops table.
-    ..unsafe { core::mem::zeroed() }
-});
-
-const fn pcm_stream_ch(
+fn pcm_stream(
     name: &'static core::ffi::CStr,
     formats: u64,
     channels: u32,
 ) -> bindings::snd_soc_pcm_stream {
     bindings::snd_soc_pcm_stream {
-        stream_name: name.as_ptr(),
+        stream_name: name.as_char_ptr(),
         formats,
-        // An empty subformat mask fails a non-DPCM open: snd_soc_runtime_calc_hw()
-        // does `hw->subformats &= p->subformats`, and snd_pcm_hw_constraints_complete()
-        // then refines SNDRV_PCM_HW_PARAM_SUBFORMAT against nothing and returns
-        // -EINVAL.  The three DPCM front ends never reached that path, so 0 went
-        // unnoticed until the microphone array's plain link.
-        subformats: bindings::BINDINGS_SNDRV_PCM_SUBFMTBIT_STD,
-        rates: RATE_48000_BIT,
+        rates: bindings::SNDRV_PCM_RATE_48000,
         rate_min: 48000,
         rate_max: 48000,
         channels_min: channels,
         channels_max: channels,
-        sig_bits: 0,
-    }
-}
-
-const fn pcm_stream(name: &'static core::ffi::CStr, formats: u64) -> bindings::snd_soc_pcm_stream {
-    pcm_stream_ch(name, formats, 2)
-}
-
-const fn empty_stream() -> bindings::snd_soc_pcm_stream {
-    bindings::snd_soc_pcm_stream {
-        stream_name: ptr::null(),
-        formats: 0,
-        subformats: 0,
-        rates: 0,
-        rate_min: 0,
-        rate_max: 0,
-        channels_min: 0,
-        channels_max: 0,
-        sig_bits: 0,
+        ..Default::default()
     }
 }
 
 /// The AOP-configured serializers take 24-bit samples from the low bits
-/// of each 32-bit DMA word (macOS "slot: 32bits smpl: 24bits"): S24_LE.
+/// of each 32-bit DMA word: S24_LE.
 const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
+const S32_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE;
 
-/// DAI table: [0] the cout back-end (DT index 0), the front-end PCMs, then
-/// [4] the speaker back-end (DT index 4).
-/// Order is ABI: `sound-dai = <&aop_audio N>` in the machine DTS indexes this
-/// array, so `<&aop_audio 0>` is cout and `<&aop_audio 4>` is spkr. Append new
-/// DAIs at the end; inserting one renumbers every DAI after it and silently
-/// repoints the existing dai-links.
-static ASOC_DAIS: SyncCell<[bindings::snd_soc_dai_driver; 2 + FE_COUNT]> = SyncCell([
-    bindings::snd_soc_dai_driver {
-        name: c"cout".as_ptr(),
-        id: BE_DAI_ID_COUT,
-        ops: &COUT_DAI_OPS.0,
-        playback: pcm_stream(c"COUT TX", OUT_FORMATS),
-        // cin: the headset microphone, one 32-bit slot per frame
-        capture: pcm_stream_ch(c"CIN RX", OUT_FORMATS, 1),
-        // SAFETY: zero is a valid base for the remaining fields.
-        ..unsafe { core::mem::zeroed() }
-    },
-    bindings::snd_soc_dai_driver {
-        name: c"j700-pcm-0".as_ptr(),
-        id: FE_DAI_ID_BASE,
-        ops: &FE_DAI_OPS.0,
-        playback: pcm_stream(c"PCM0 TX", OUT_FORMATS),
-        // macaudio routes "Headset Capture" into PCM0 RX (mono cin)
-        capture: pcm_stream_ch(c"PCM0 RX", OUT_FORMATS, 1),
-        // SAFETY: all-zero is a valid (empty) value of this C descriptor; the fields set above are
-        // the ones used.
-        ..unsafe { core::mem::zeroed() }
-    },
-    bindings::snd_soc_dai_driver {
-        name: c"j700-pcm-1".as_ptr(),
-        id: FE_DAI_ID_BASE + 1,
-        ops: &FE_DAI_OPS.0,
-        // the speaker front-end: S32 in, converted through the ceiling
-        playback: pcm_stream(c"PCM1 TX", FMTBIT_S32_LE),
-        capture: empty_stream(),
-        // SAFETY: all-zero is a valid (empty) value of this C descriptor; the fields set above are
-        // the ones used.
-        ..unsafe { core::mem::zeroed() }
-    },
-    bindings::snd_soc_dai_driver {
-        name: c"j700-pcm-2".as_ptr(),
-        id: FE_DAI_ID_BASE + 2,
-        ops: &FE_DAI_OPS.0,
-        playback: empty_stream(),
-        // the speaker sense front-end: the words on the speaker wire
-        capture: pcm_stream(c"PCM2 RX", FMTBIT_S32_LE),
-        // SAFETY: all-zero is a valid (empty) value of this C descriptor; the fields set above are
-        // the ones used.
-        ..unsafe { core::mem::zeroed() }
-    },
-    // The internal speaker back-end: LEAP TX0 under the AOP spkr service,
-    // the MAX98360A's SD_MODE driven by its own codec driver; its capture
-    // side is the SpeakerTap (base-ns RX1, the tap service).
-    bindings::snd_soc_dai_driver {
-        name: c"spkr".as_ptr(),
-        id: BE_DAI_ID_SPKR,
-        ops: &SPKR_DAI_OPS.0,
-        playback: pcm_stream(c"SPKR TX", FMTBIT_S32_LE),
-        capture: pcm_stream(c"SPKR RX", FMTBIT_S32_LE),
-        // SAFETY: all-zero is a valid (empty) value of this C descriptor; the fields set above are
-        // the ones used.
-        ..unsafe { core::mem::zeroed() }
-    },
-    bindings::snd_soc_dai_driver {
-        name: c"j700-pcm-3".as_ptr(),
-        id: FE_DAI_ID_BASE + 3,
-        // The array has no codec and no serializer of ours -- it is a PDM part
-        // on the AOP's own sense PDM controller -- so there is nothing for a
-        // back-end to represent and this front-end drives the hpai service
-        // itself.  HPAI_DAI_OPS is a superset of FE_DAI_OPS.
-        ops: &HPAI_DAI_OPS.0,
-        playback: empty_stream(),
-        // the HQ microphone array: 48 kHz stereo, 8 bytes per frame
-        capture: pcm_stream(c"PCM3 RX", FMTBIT_S32_LE),
-        // SAFETY: all-zero is a valid (empty) value of this C descriptor; the fields set above are
-        // the ones used.
-        ..unsafe { core::mem::zeroed() }
-    },
-]);
+/// The DAI table: [0] the cout back-end, [1..=3] the front-end PCMs, [4] the
+/// speaker back-end.  The order is ABI: `sound-dai = <&aop_audio N>` in the
+/// machine DTS indexes this array, so `<&aop_audio 0>` is cout and
+/// `<&aop_audio 4>` is spkr.  New DAIs go at the end; inserting one
+/// renumbers every DAI after it and silently repoints the existing links.
+const DAI_COUNT: usize = 2 + FE_COUNT;
+
+fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
+    [
+        bindings::snd_soc_dai_driver {
+            name: c"cout".as_char_ptr(),
+            id: BE_DAI_ID_COUT,
+            ops: &ops.cout,
+            playback: pcm_stream(c"COUT TX", OUT_FORMATS, 2),
+            // cin: the headset microphone, one 32-bit slot per frame
+            capture: pcm_stream(c"CIN RX", OUT_FORMATS, 1),
+            ..Default::default()
+        },
+        bindings::snd_soc_dai_driver {
+            name: c"j700-pcm-0".as_char_ptr(),
+            id: FE_DAI_ID_BASE,
+            ops: &ops.fe,
+            playback: pcm_stream(c"PCM0 TX", OUT_FORMATS, 2),
+            // macaudio routes "Headset Capture" into PCM0 RX (mono cin)
+            capture: pcm_stream(c"PCM0 RX", OUT_FORMATS, 1),
+            ..Default::default()
+        },
+        bindings::snd_soc_dai_driver {
+            name: c"j700-pcm-1".as_char_ptr(),
+            id: FE_DAI_ID_BASE + 1,
+            ops: &ops.fe,
+            // the speaker front-end: S32 in, converted through the ceiling
+            playback: pcm_stream(c"PCM1 TX", S32_FORMATS, 2),
+            ..Default::default()
+        },
+        bindings::snd_soc_dai_driver {
+            name: c"j700-pcm-2".as_char_ptr(),
+            id: FE_DAI_ID_BASE + 2,
+            ops: &ops.fe,
+            // the speaker tap front-end: the words on the speaker wire
+            capture: pcm_stream(c"PCM2 RX", S32_FORMATS, 2),
+            ..Default::default()
+        },
+        // The internal speaker back-end: LEAP TX0 under the AOP spkr service,
+        // the MAX98360A's SD_MODE driven by its own codec driver; its capture
+        // side is the SpeakerTap (base-ns RX1, the tap service).
+        bindings::snd_soc_dai_driver {
+            name: c"spkr".as_char_ptr(),
+            id: BE_DAI_ID_SPKR,
+            ops: &ops.spkr,
+            playback: pcm_stream(c"SPKR TX", S32_FORMATS, 2),
+            capture: pcm_stream(c"SPKR RX", S32_FORMATS, 2),
+            ..Default::default()
+        },
+    ]
+}
+
+/// The ASoC component and everything the core keeps pointers into.  C
+/// retains the address of `component`, so this is allocated before
+/// registration and kept until unregistration has finished all callbacks.
+#[repr(C)]
+struct AsocContext {
+    component: bindings::snd_soc_component_driver,
+    data: Arc<SndSocT8140AopData>,
+    dais: KBox<Opaque<[bindings::snd_soc_dai_driver; DAI_COUNT]>>,
+    _ops: KBox<DaiOps>,
+    _controls: KBox<[bindings::snd_kcontrol_new; 1]>,
+    // The C mixer helpers modify platform_max under their control locks.
+    _volume: KBox<Opaque<bindings::soc_mixer_control>>,
+}
+
+const _: () = assert!(mem::offset_of!(AsocContext, component) == 0);
+
+impl AsocContext {
+    fn new(data: Arc<SndSocT8140AopData>) -> Result<KBox<Self>> {
+        let ops = KBox::new(DaiOps::new(), GFP_KERNEL)?;
+        let dais = KBox::new(Opaque::new(dai_drivers(&ops)), GFP_KERNEL)?;
+        let volume = KBox::new(
+            Opaque::new(bindings::soc_mixer_control {
+                min: 0,
+                max: SPKR_VOLUME_MAX as i32,
+                platform_max: SPKR_VOLUME_MAX as i32,
+                reg: REG_SPKR_VOLUME as i32,
+                rreg: REG_SPKR_VOLUME as i32,
+                ..Default::default()
+            }),
+            GFP_KERNEL,
+        )?;
+        // SOC_SINGLE_TLV("Speaker Playback Volume", REG_SPKR_VOLUME, 0, 127, 0, tlv)
+        let controls = KBox::new(
+            [bindings::snd_kcontrol_new {
+                iface: bindings::BINDINGS_SNDRV_CTL_ELEM_IFACE_MIXER,
+                name: c"Speaker Playback Volume".as_char_ptr(),
+                access: bindings::SNDRV_CTL_ELEM_ACCESS_TLV_READ
+                    | bindings::SNDRV_CTL_ELEM_ACCESS_READWRITE,
+                info: Some(bindings::snd_soc_info_volsw),
+                get: Some(bindings::snd_soc_get_volsw),
+                put: Some(bindings::snd_soc_put_volsw),
+                tlv: bindings::snd_kcontrol_new__bindgen_ty_1 {
+                    p: SPKR_VOLUME_TLV.as_ptr(),
+                },
+                private_value: volume.get() as usize,
+                ..Default::default()
+            }],
+            GFP_KERNEL,
+        )?;
+        let component = bindings::snd_soc_component_driver {
+            name: c"t8140-aop-audio".as_char_ptr(),
+            read: Some(asoc_component_read),
+            write: Some(asoc_component_write),
+            controls: controls.as_ptr(),
+            num_controls: 1,
+            open: Some(asoc_pcm_open),
+            close: Some(asoc_pcm_close),
+            hw_params: Some(asoc_pcm_hw_params),
+            prepare: Some(asoc_pcm_prepare),
+            trigger: Some(asoc_pcm_trigger),
+            pointer: Some(asoc_pcm_pointer),
+            copy: Some(asoc_pcm_copy),
+            ..Default::default()
+        };
+        Ok(KBox::new(
+            Self {
+                component,
+                data,
+                dais,
+                _ops: ops,
+                _controls: controls,
+                _volume: volume,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+}
 
 struct SndSocT8140AopDriver {
     card: *mut bindings::snd_card,
     data: Arc<SndSocT8140AopData>,
+    asoc: KBox<AsocContext>,
     asoc_registered: bool,
-    spkr_start: Option<Arc<SpkrStartWork>>,
-    hpai_start: Option<Arc<HpaiStartWork>>,
+    closed: AtomicFlag,
 }
 
+// SAFETY: the raw card pointer is only used from probe, unbind and drop,
+// which the driver core serializes; the card's own state is guarded by
+// ALSA.  Everything else is `Send + Sync` on its own.
+unsafe impl Send for SndSocT8140AopDriver {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for SndSocT8140AopDriver {}
+
 impl SndSocT8140AopDriver {
-    const VTABLE: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
+    const LPAI_OPS: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
         open: Some(lpai_pcm_open),
         close: Some(lpai_pcm_close),
         prepare: Some(lpai_pcm_prepare),
@@ -2243,30 +2441,44 @@ impl SndSocT8140AopDriver {
         ack: None,
     };
 
-    fn new(data: Arc<SndSocT8140AopData>) -> Result<Self> {
-        let start_data = data.clone();
-        let spkr_start = Arc::pin_init(
-            pin_init!(SpkrStartWork {
-                data: start_data,
-                work <- new_work!("SpkrStartWork::work"),
-            }),
-            GFP_KERNEL,
-        )?;
-        let hpai_data = data.clone();
-        let hpai_start = Arc::pin_init(
-            pin_init!(HpaiStartWork {
-                data: hpai_data,
-                work <- new_work!("HpaiStartWork::work"),
-            }),
-            GFP_KERNEL,
-        )?;
+    const HPAI_OPS: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
+        open: Some(hpai_pcm_open),
+        close: Some(hpai_pcm_close),
+        prepare: Some(hpai_pcm_prepare),
+        trigger: Some(hpai_pcm_trigger),
+        pointer: Some(bindings::snd_dmaengine_pcm_pointer),
+        ioctl: None,
+        hw_params: Some(hpai_pcm_hw_params),
+        hw_free: None,
+        sync_stop: None,
+        get_time_info: None,
+        fill_silence: None,
+        copy: None,
+        page: None,
+        mmap: None,
+        ack: None,
+    };
+
+    fn new(data: Arc<SndSocT8140AopData>, fwnode: &FwNode) -> Result<Self> {
+        // From here on a failure drops `this`, whose teardown undoes
+        // whatever was set up.
         let mut this = SndSocT8140AopDriver {
             card: ptr::null_mut(),
+            asoc: AsocContext::new(data.clone())?,
             data: data.clone(),
             asoc_registered: false,
-            spkr_start: Some(spkr_start),
-            hpai_start: Some(hpai_start),
+            closed: AtomicFlag::new(false),
         };
+
+        // The low-power microphone: its ring is reported to us by the
+        // firmware for the AOP's lifetime.
+        data.attach_device(AUDIO_DEV_LPAI, "lpai")?;
+        data.set_channel_control()?;
+        data.read_geometry()?;
+        let listener: Arc<dyn ReportListener> = data.clone();
+        data.adata
+            .add_report_listener(data.service, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
+
         // SAFETY: FFI call with the live device and the module; `this.card` receives the new card.
         let ret = unsafe {
             bindings::snd_card_new(
@@ -2279,85 +2491,51 @@ impl SndSocT8140AopDriver {
             )
         };
         if ret < 0 {
-            dev_err!(data.dev, "Unable to allocate sound card\n");
+            dev_err!(data.dev, "unable to allocate the sound card\n");
             return Err(Error::from_errno(ret));
         }
-        // Named like the other AOP audio cards: Apple<chassis>LPAI.
-        let chassis = data
-            .fwnode
+        // Named like the other AOP audio cards: Apple<chassis><interface>.
+        let chassis = fwnode
             .property_read::<CString>(c_str!("apple,chassis-name"))
             .required_by(&data.dev)?;
-        let machine_kind = data
-            .fwnode
+        let machine_kind = fwnode
             .property_read::<CString>(c_str!("apple,machine-kind"))
             .required_by(&data.dev)?;
-        let id_str = CString::try_from_fmt(fmt!("Apple{}LPAI", *chassis))?;
-        let shortname = CString::try_from_fmt(fmt!("{} {} LPAI", *machine_kind, *chassis))?;
-        let longname = CString::try_from_fmt(fmt!(
-            "{} {} Low-Power Audio Interface",
-            *machine_kind,
-            *chassis
-        ))?;
+        let id_str = CString::try_from_fmt(fmt!("Apple{}AOP", *chassis))?;
+        let shortname = CString::try_from_fmt(fmt!("{} {} AOP", *machine_kind, *chassis))?;
+        let longname = CString::try_from_fmt(fmt!("{} {} AOP Audio", *machine_kind, *chassis))?;
         // SAFETY: `card` was created by `snd_card_new` above; the fixed-size name fields are filled
         // with NUL-terminated strings that fit.
         unsafe {
-            copy_str(&mut (*this.card).driver, c"aop_audio".to_bytes_with_nul());
+            copy_str(
+                &mut (*this.card).driver,
+                c"t8140-aop-audio".to_bytes_with_nul(),
+            );
             copy_str(&mut (*this.card).id, id_str.to_bytes_with_nul());
             copy_str(&mut (*this.card).shortname, shortname.to_bytes_with_nul());
             copy_str(&mut (*this.card).longname, longname.to_bytes_with_nul());
         }
 
-        let mut pcm = ptr::null_mut();
-        // SAFETY: `card` was created by `snd_card_new` above; `pcm` receives the new PCM.
-        let ret =
-            unsafe { bindings::snd_pcm_new(this.card, longname.as_ptr() as _, 0, 0, 1, &mut pcm) };
-        if ret < 0 {
-            dev_err!(data.dev, "Unable to allocate PCM device\n");
-            return Err(Error::from_errno(ret));
-        }
-        // SAFETY: `pcm` was created by `snd_pcm_new` above; the vtable is static and the private
-        // data is an `Arc` released by `lpai_pcm_free_private`.
-        unsafe {
-            bindings::snd_pcm_set_ops(
-                pcm,
-                bindings::SNDRV_PCM_STREAM_CAPTURE as i32,
-                &Self::VTABLE,
-            );
-            (*pcm).private_data = data.clone().into_foreign() as _;
-            (*pcm).private_free = Some(lpai_pcm_free_private);
-            (*pcm).info_flags = 0;
-            copy_str(&mut (*pcm).name, c"aop_audio".to_bytes_with_nul());
-            bindings::snd_pcm_set_managed_buffer_all(
-                pcm,
-                bindings::SNDRV_DMA_TYPE_VMALLOC as i32,
-                ptr::null_mut(),
-                PERIOD_BYTES * 4,
-                PERIOD_BYTES * PERIODS_MAX as usize,
-            );
-        }
+        this.new_pcm(0, c"lpai", c"Low-Power Microphone", &Self::LPAI_OPS)?;
+        this.new_pcm(1, c"hpai", c"High-Quality Microphone", &Self::HPAI_OPS)?;
 
         // SAFETY: `card` was created by `snd_card_new` above and is not registered yet.
         let ret = unsafe { bindings::snd_card_register(this.card) };
         if ret < 0 {
-            dev_err!(data.dev, "Unable to register sound card\n");
+            dev_err!(data.dev, "unable to register the sound card\n");
             return Err(Error::from_errno(ret));
         }
 
         // The ASoC side: the jack (cout) and speaker back-ends, the
         // front-end PCMs and the speaker volume control.
-        // SAFETY: probe runs once at a time; the statics are only completed
-        // here, before the component is registered, and never changed again.
+        // SAFETY: the descriptor, the DAI table and the controls are heap
+        // allocations owned by `this.asoc`, which outlives the component.
         let ret = unsafe {
-            let controls = &raw mut ASOC_CONTROLS;
-            (*controls)[0].private_value = (&raw mut SPKR_VOLUME_MC) as usize as _;
-            (*controls)[1].private_value = (&raw mut SPKR_USER_VOLUME_MC) as usize as _;
-            let component = &raw mut ASOC_COMPONENT;
-            (*component).controls = (*controls).as_ptr();
             bindings::snd_soc_register_component(
                 data.dev.as_raw(),
-                component,
-                ASOC_DAIS.0.as_ptr() as *mut bindings::snd_soc_dai_driver,
-                ASOC_DAIS.0.len() as i32,
+                &this.asoc.component,
+                this.asoc.dais.get().cast(),
+                DAI_COUNT as i32,
             )
         };
         if ret < 0 {
@@ -2367,71 +2545,120 @@ impl SndSocT8140AopDriver {
         this.asoc_registered = true;
         Ok(this)
     }
-}
 
-impl Drop for SndSocT8140AopDriver {
-    fn drop(&mut self) {
-        if self.asoc_registered {
-            // SAFETY: the component was registered with this driver descriptor in probe.
-            unsafe {
-                bindings::snd_soc_unregister_component_by_driver(
-                    self.data.dev.as_raw(),
-                    ptr::null(),
-                )
-            };
+    /// One capture PCM of the card, with the driver data as its private
+    /// data.
+    fn new_pcm(
+        &mut self,
+        device: i32,
+        id: &'static core::ffi::CStr,
+        name: &'static core::ffi::CStr,
+        ops: &'static bindings::snd_pcm_ops,
+    ) -> Result<()> {
+        let mut pcm = ptr::null_mut();
+        // SAFETY: `card` was created by `snd_card_new`; `pcm` receives the new PCM.
+        let ret =
+            unsafe { bindings::snd_pcm_new(self.card, id.as_char_ptr(), device, 0, 1, &mut pcm) };
+        if ret < 0 {
+            dev_err!(self.data.dev, "unable to allocate PCM {}\n", device);
+            return Err(Error::from_errno(ret));
         }
-        if let Some(work) = self.hpai_start.take() {
-            self.data.hpai_want_run.store(0, Relaxed);
-            // SAFETY: the work item lives in the pinned driver data; flushing waits for a queued
-            // `hpai_go`.
+        // SAFETY: `pcm` was created by `snd_pcm_new` above; the ops are static and the private
+        // data is an `Arc` released by `pcm_free_private`; `name` fits the fixed-size field.
+        unsafe {
+            bindings::snd_pcm_set_ops(pcm, bindings::SNDRV_PCM_STREAM_CAPTURE as i32, ops);
+            (*pcm).private_data = self.data.clone().into_foreign().cast();
+            (*pcm).private_free = Some(pcm_free_private);
+            (*pcm).info_flags = 0;
+            copy_str(&mut (*pcm).name, name.to_bytes_with_nul());
+        }
+        if device == 0 {
+            // The low-power microphone's buffer is filled by the driver from
+            // the source ring; the array's is set up on its DMA device at
+            // open.
+            // SAFETY: `pcm` is live; a vmalloc buffer needs no device.
             unsafe {
-                let raw = workqueue::Work::raw_get(&work.work);
-                bindings::flush_work(raw);
+                bindings::snd_pcm_set_managed_buffer_all(
+                    pcm,
+                    bindings::SNDRV_DMA_TYPE_VMALLOC as i32,
+                    ptr::null_mut(),
+                    LPAI_PERIOD_BYTES * 4,
+                    LPAI_PERIOD_BYTES * LPAI_PERIODS_MAX as usize,
+                );
             }
         }
-        if let Some(work) = self.spkr_start.take() {
-            self.data.spkr_want_run.store(0, Relaxed);
-            // SAFETY: the work item lives in the pinned driver data; flushing waits for a queued
-            // `spkr_go`.
-            unsafe {
-                let raw = workqueue::Work::raw_get(&work.work);
-                bindings::flush_work(raw);
-            }
+        Ok(())
+    }
+
+    /// Undo probe: stop the reports, unregister the ASoC component and free
+    /// the card (which closes every stream, releasing its channel and power
+    /// references), then return lpai to idle.  Runs from unbind, and again
+    /// (as a no-op) from Drop; also on a failed probe, with whatever had
+    /// been set up.
+    fn teardown(&self) {
+        if self.closed.xchg(true, Relaxed) {
+            return;
         }
-        for slot in [
-            &self.data.pd_mca1,
-            &self.data.pd_mca0,
-            &self.data.pd_tx0,
-            &self.data.pd_leap_mca,
-        ] {
-            let pd = slot.xchg(0, Relaxed);
-            if pd != 0 {
-                // SAFETY: `pd` is a device returned by `dev_pm_domain_attach_by_name` in probe.
-                unsafe { bindings::dev_pm_domain_detach(pd as *mut bindings::device, true) };
-            }
-        }
-        if !self.card.is_null() {
-            // SAFETY: `card` was created in probe and is freed once.
-            unsafe {
-                bindings::snd_card_free(self.card);
-            }
-        }
-        // The AOP keeps dispatching producer reports to the first listener
-        // registered for the service: unhook this instance so a reload sees
-        // its own reports.
+        self.data.running.store(false, Relaxed);
+        // Stop reports before ALSA destroys any substream or module callback.
         self.data
             .adata
             .remove_report_listener(&self.data.service, EPIC_SUBTYPE_PRODUCER_REPORT);
-        if self.data.powered.load(Relaxed) != 0 {
-            if self.data.set_power(POWER_STATE_IDLE).is_ok() {
-                self.data.powered.store(0, Relaxed);
-            }
+        if self.asoc_registered {
+            // SAFETY: the context remains owned until after unregister
+            // completes PCM, DAI and control callbacks.
+            unsafe {
+                bindings::snd_soc_unregister_component_by_driver(
+                    self.data.dev.as_raw(),
+                    &self.asoc.component,
+                )
+            };
+        }
+        self.data.flush_spkr_start();
+        self.data.flush_hpai_start();
+        if !self.card.is_null() {
+            // SAFETY: the card is freed once, while the binding remains live.
+            unsafe { bindings::snd_card_free(self.card) };
+        }
+        if self.data.powered.load(Relaxed) && self.data.set_power(POWER_STATE_IDLE).is_ok() {
+            self.data.powered.store(false, Relaxed);
         }
     }
 }
 
-unsafe impl Send for SndSocT8140AopDriver {}
-unsafe impl Sync for SndSocT8140AopDriver {}
+impl Drop for SndSocT8140AopDriver {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+/// # Safety
+///
+/// Called by ALSA with a live substream of this card's PCM, whose private
+/// data is the driver's `Arc`.
+unsafe extern "C" fn hpai_pcm_hw_params(
+    substream: *mut bindings::snd_pcm_substream,
+    params: *mut bindings::snd_pcm_hw_params,
+) -> i32 {
+    // SAFETY: the substream is live and its dmaengine runtime was set up by
+    // `snd_dmaengine_pcm_open` in `hpai_pcm_open`.
+    let chan = unsafe { bindings::snd_dmaengine_pcm_get_chan(substream) };
+    let mut cfg = bindings::dma_slave_config::default();
+    // SAFETY: the substream and the hardware parameters are live for the op.
+    let rc = unsafe { bindings::snd_hwparams_to_dma_slave_config(substream, params, &mut cfg) };
+    if rc < 0 {
+        return rc;
+    }
+    // One stereo frame per burst.
+    cfg.src_port_window_size = HPAI_CHANNELS;
+    // SAFETY: `chan` is the live channel behind this substream's dmaengine runtime.
+    unsafe {
+        match (*(*chan).device).device_config {
+            Some(f) => f(chan, &mut cfg),
+            None => ENOSYS.to_errno(),
+        }
+    }
+}
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -2450,108 +2677,87 @@ impl platform::Driver for SndSocT8140AopDriver {
         _info: Option<&Self::IdInfo>,
     ) -> impl PinInit<Self, Error> {
         let dev = ARef::<device::Device>::from(pdev.as_ref());
-        let parent = pdev.as_ref().parent().ok_or(ENODEV)?;
-        // SAFETY: our parent is the AOP, whose drvdata is a pinned Arc<dyn AOP>.
-        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent.get_drvdata()) };
-        let adata = (&*adata_ptr).clone();
-        // SAFETY: the AOP driver sets the platform data to the EPIC service.
-        let svc = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
+        // SAFETY: this is a service device the AOP core registered, being
+        // probed here; the lookup defers the probe until the core has
+        // published its driver data.
+        let adata = unsafe { <dyn AOP>::from_child(pdev.as_ref()) }?;
+        // SAFETY: the AOP core sets this child's platform data to the EPIC
+        // service it created the child for; it lives as long as the child.
+        let service = unsafe { (*dev.as_raw()).platform_data as *const EPICService };
+        if service.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: the pointer was checked above and stays valid with the child.
+        let svc = unsafe { *service };
 
         // The source ring: 512 KiB through our own IOMMU stream (dart-aop 9),
         // owned by the AOP driver because the firmware binds it once per boot.
         // SAFETY: no DMA is in flight on this device yet.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
-        // SAFETY: the device is bound while probe runs.
-        let bound = unsafe { dev.as_bound() };
-        let ring = adata.source_ring(bound, RING_BYTES)?;
-        let ring_iova = ring.iova;
+        let ring = adata.source_ring(pdev.as_ref(), RING_BYTES)?;
 
-        let data_dev = dev.clone();
-        let fwnode = ARef::from(dev.fwnode().ok_or(ENOENT)?);
+        // The serializer leaves.  A missing one only disables the paths that
+        // need it; those fail to open with ENODEV.
+        let mut pds: [Option<PowerDomain>; 5] = [None, None, None, None, None];
+        for (slot, (name, dt_name)) in pds.iter_mut().zip([
+            ("mca1", c"mca1"),
+            ("mca0", c"mca0"),
+            ("tx0", c"tx0"),
+            ("leap mca", c"mca"),
+            ("rx0", c"rx0"),
+        ]) {
+            match PowerDomain::attach(&dev, name, dt_name) {
+                Ok(Some(pd)) => *slot = Some(pd),
+                Ok(None) => dev_warn!(dev, "no {} power domain\n", name),
+                Err(e) => dev_warn!(dev, "{} power domain attach failed: {:?}\n", name, e),
+            }
+        }
+        let [pd_mca1, pd_mca0, pd_tx0, pd_leap_mca, pd_rx0] = pds;
+
+        let fwnode = pdev.as_ref().fwnode().ok_or(ENOENT)?;
         let data = Arc::pin_init(
             pin_init!(SndSocT8140AopData {
-                dev: data_dev,
-                fwnode,
+                dev,
                 adata,
                 service: svc,
                 ring,
                 ring_bytes: Atomic::new(0),
                 sequence: Atomic::new(0),
-                powered: Atomic::new(0),
-                running: Atomic::new(0),
+                powered: AtomicFlag::new(false),
+                reported: AtomicFlag::new(false),
+                running: AtomicFlag::new(false),
                 hw_ptr_frames: Atomic::new(0),
+                report_warnings: [const { AtomicFlag::new(false) }; 5],
                 cout: Service::new(AUDIO_DEV_COUT, "cout"),
                 cin: Service::new(AUDIO_DEV_CIN, "cin"),
                 spkr: Service::new(AUDIO_DEV_SPKR, "spkr"),
                 tap: Service::new(AUDIO_DEV_TAP, "tap"),
                 hpai: Service::new(AUDIO_DEV_HPAI, "hpai"),
-                pd_mca1: Atomic::new(0),
-                pd_mca0: Atomic::new(0),
-                pd_tx0: Atomic::new(0),
-                pd_leap_mca: Atomic::new(0),
-                pd_rx0: Atomic::new(0),
-                spkr_want_run: Atomic::new(0),
-                hpai_want_run: Atomic::new(0),
+                pd_mca1,
+                pd_mca0,
+                pd_tx0,
+                pd_leap_mca,
+                pd_rx0,
+                spkr_want_run: AtomicFlag::new(false),
+                hpai_want_run: AtomicFlag::new(false),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
-                spkr_user_volume: Atomic::new(100),
-                fe_chans <- new_spinlock!([[0usize; 2]; FE_COUNT]),
+                spkr_start_work <- new_work!("SndSocT8140AopData::spkr_start_work"),
+                hpai_start_work <- new_work!("SndSocT8140AopData::hpai_start_work"),
                 stream <- new_spinlock!(StreamState {
                     substream: ptr::null_mut(),
-                    last_absolute: None,
                     copied: None,
                     hw_ptr_bytes: 0,
                     period_acc: 0,
                     buffer_bytes: 0,
-                    overruns: 0,
                 }),
             }),
             GFP_KERNEL,
         )?;
+        Self::new(data, fwnode)
+    }
 
-        data.attach_lpai()?;
-        data.set_channel_control()?;
-        data.read_geometry()?;
-        let listener: Arc<dyn ReportListener> = data.clone();
-        data.adata
-            .add_report_listener(svc, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
-        dev_dbg!(
-            dev,
-            "low-power microphone ready (source ring at {:#x})\n",
-            ring_iova
-        );
-        // The jack path's serializer domain (audio_mca1_m), held for the
-        // driver's lifetime and runtime-powered around cout streams.
-        // SAFETY: FFI call with the live platform device and a NUL-terminated domain name.
-        let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), c"mca1".as_ptr()) };
-        match kernel::error::from_err_ptr(pd) {
-            Ok(p) if !p.is_null() => data.pd_mca1.store(p as usize, Relaxed),
-            Ok(_) => dev_warn!(
-                dev,
-                "no mca1 power domain: the jack path will not power its serializer\n"
-            ),
-            Err(e) => dev_warn!(dev, "mca1 power domain attach failed: {:?}\n", e),
-        }
-        // The speaker path's LEAP leaves (tx0 -> leap_c -> leap_a -> audio_fr
-        // -> audio_a, leap_mca -> audio_p), runtime-powered around streams.
-        for (name, slot) in [
-            (c"tx0", &data.pd_tx0),
-            (c"mca", &data.pd_leap_mca),
-            (c"mca0", &data.pd_mca0),
-            (c"rx0", &data.pd_rx0),
-        ] {
-            // SAFETY: FFI call with the live platform device and a NUL-terminated domain name.
-            let pd = unsafe { bindings::dev_pm_domain_attach_by_name(dev.as_raw(), name.as_ptr()) };
-            match kernel::error::from_err_ptr(pd) {
-                Ok(p) if !p.is_null() => slot.store(p as usize, Relaxed),
-                Ok(_) => dev_warn!(
-                    dev,
-                    "no {:?} power domain: the speaker or sense path is unavailable\n",
-                    name
-                ),
-                Err(e) => dev_warn!(dev, "{:?} power domain attach failed: {:?}\n", name, e),
-            }
-        }
-        Self::new(data.clone())
+    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+        this.teardown();
     }
 }
 

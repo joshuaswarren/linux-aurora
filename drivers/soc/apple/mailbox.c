@@ -214,8 +214,14 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 	}
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
-	if (ret)
+	if (ret) {
+		dev_err(mbox->dev,
+			"ASC CPU start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
+			ret, mbox->active, mbox->dev->power.runtime_status,
+			mbox->dev->power.disable_depth,
+			mbox->dev->power.runtime_error);
 		goto out_unlock;
+	}
 
 	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
 		      APPLE_ASCWRAP_V6_CPU_CONTROL;
@@ -294,26 +300,18 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
-		mbox->tx_irq_unmasked = true;
 		reinit_completion(&mbox->tx_empty);
+		if (!mbox->tx_irq_unmasked) {
+			mbox->tx_irq_unmasked = true;
+			enable_irq(mbox->irq_send_empty);
+		}
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
 		if (t <= 0) {
-			/*
-			 * Nothing drained the FIFO, so the send-empty handler
-			 * never ran and never masked the interrupt again.
-			 * Leaving it unmasked makes the next enable_irq() here
-			 * unbalanced, which the IRQ core warns about and which
-			 * eventually leaves the line masked for good:
-			 *   Unbalanced enable for IRQ 40
-			 *   WARNING: kernel/irq/manage.c:775 at enable_irq
-			 *   apple_mbox_send / SepData::get_entropy_word
-			 * once every timeout, from the SEP hwrng kthread.
-			 */
+			/* A late IRQ may already have masked this under tx_lock. */
 			spin_lock_irqsave(&mbox->tx_lock, flags);
 			if (mbox->tx_irq_unmasked) {
 				disable_irq_nosync(mbox->irq_send_empty);
@@ -367,8 +365,12 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 {
 	struct apple_mbox_msg msg;
 	int ret = 0;
+	u32 mbox_ctrl;
 
-	u32 mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+	/* A stopped receiver may still have firmware traffic in its FIFO. */
+	if (!mbox->rx)
+		return 0;
+	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
 
 	while (!(mbox_ctrl & mbox->hw->control_empty)) {
 		msg.msg0 = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
@@ -439,17 +441,19 @@ int apple_mbox_start(struct apple_mbox *mbox)
 		goto out_unlock;
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
-	if (ret)
+	if (ret) {
+		dev_err(mbox->dev,
+			"mailbox start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
+			ret, mbox->active, mbox->dev->power.runtime_status,
+			mbox->dev->power.disable_depth,
+			mbox->dev->power.runtime_error);
 		goto out_unlock;
+	}
 
 	if (mbox->hw->ap_initializes_mailboxes) {
-		/* AppleA7IOP::startCPUWithOptions() enables the IOP outbox. */
-		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
-		writel_relaxed(control | BIT(0),
-			       mbox->regs + mbox->hw->i2a_control);
-		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
-		dev_info(mbox->dev,
-			 "T8140 IOP outbox enabled control=%#x\n", control);
+		/* The primary T8140 outbox requires its enable bit before use. */
+		control = readl(mbox->regs + mbox->hw->i2a_control);
+		writel(control | BIT(0), mbox->regs + mbox->hw->i2a_control);
 	}
 
 	/*
@@ -534,9 +538,15 @@ static void apple_mbox_quiesce(void *data)
 		pm_runtime_put_autosuspend(mbox->dev);
 	}
 
-	/* The TX IRQ is normally disabled; force and synchronize that state. */
-	disable_irq(mbox->irq_send_empty);
-	mbox->tx_irq_unmasked = false;
+	/* Serialize once-only masking with the IRQ and send-error paths. */
+	spin_lock_irqsave(&mbox->tx_lock, flags);
+	if (mbox->tx_irq_unmasked) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = false;
+	}
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	/* The handler takes tx_lock, so drain it after releasing the lock. */
+	synchronize_irq(mbox->irq_send_empty);
 	complete_all(&mbox->tx_empty);
 	synchronize_irq(mbox->irq_recv_not_empty);
 

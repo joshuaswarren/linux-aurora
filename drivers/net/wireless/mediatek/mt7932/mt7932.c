@@ -35,6 +35,10 @@ static int mt_initialize(struct mt7932 *m);
 static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 static void mt_shutdown(struct pci_dev *pdev);
 
+static bool batch_rx = true;
+module_param(batch_rx, bool, 0644);
+MODULE_PARM_DESC(batch_rx, "Batch runtime RX refill doorbells (disable for comparison)");
+
 static bool legacy_irq_test;
 module_param(legacy_irq_test, bool, 0444);
 MODULE_PARM_DESC(legacy_irq_test, "Explicit diagnostic use of standard PCI INTx instead of MSI");
@@ -151,6 +155,32 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		return;
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
+	/* Private 25G83 arEventTable entry 31: EIDf0 -> nicEventAssertDump.
+	 * Keep the default path unchanged. Never print opaque dump contents.
+	 * An assert is not a DMA fence or a successful command completion.
+	 */
+	if (event.eid == 0xf0 && m->bw_limit > 20) {
+		if (!m->fw_asserted) {
+			mt_bw_latch(m, "firmware-assert-EIDf0");
+			m->fw_asserted = true;
+			m->link_failed = true;
+			m->cal_state.error = -EIO;
+			m->connect_error = -EIO;
+			WRITE_ONCE(m->rf_ready, false);
+			if (m->netdev) {
+				netif_stop_queue(m->netdev);
+				netif_carrier_off(m->netdev);
+			}
+			complete(&m->response);
+			complete(&m->cal_response);
+			complete(&m->assoc_update);
+			complete(&m->assoc_done);
+			complete(&m->discovery_done);
+			dev_err(&m->pdev->dev,
+				"BW_FIRMWARE_ASSERT: EIDf0; 20 MHz latched, DMA retained; crash reset unavailable, reboot with mt7932_fullmac.max_bw_mhz=20\n");
+		}
+		goto unlock;
+	}
 	if (event.eid == 0xee) {
 		mt_link_event(m, &event);
 		goto unlock;
@@ -164,9 +194,14 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		goto unlock;
 	}
 	if (event.eid == 0xd6) {
+		bool terminal = m->bw_cal_active && m->cal_state.active &&
+			m->cal_state.expected == 1 && !m->cal_state.received;
+
 		ret = mt7932_cal_null(&m->cal_state, packet + 36,
 				     event.length >= 36 ? event.length - 36 : 0,
 				     m->smart_version);
+		if (terminal && ret == -EREMOTEIO)
+			m->bw_cal_rejected = true;
 		dev_info(&m->pdev->dev, "CAL_EVENT: seq=%u length=%zu result=%d credits=%u/%u\n",
 			 event.seq, event.length, ret, m->cal_state.received, m->cal_state.expected);
 		if (ret)
@@ -205,7 +240,7 @@ unlock:
 
 static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 {
-	unsigned int budget = q->count;
+	unsigned int budget = q->count, pending = 0;
 
 	while (budget--) {
 		u32 ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].control));
@@ -213,6 +248,7 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 
 		if (!(ctrl & DONE))
 			break;
+		m->rx_descriptors++;
 		dma_rmb();
 		length = (ctrl >> 16) & 0x3fff;
 		if (length <= MT7932_RX_CAPACITY && (ctrl & BIT(30)))
@@ -235,9 +271,22 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		mt_rx_post(q, m->runtime_epoch ? q->tail : q->head);
 		q->head = (q->head + 1) % q->count;
 		q->tail = (q->tail + 1) % q->count;
+		pending++;
+		/* Keep the download protocol unchanged. Runtime batches are smaller
+		 * than the smallest ring, so a full wrap never hides returned slots.
+		 */
+		if (!m->runtime_epoch || !READ_ONCE(batch_rx) || pending == 16) {
+			dma_wmb();
+			mt_write(m, q->reg + 8, m->runtime_epoch ?
+				 (q->head + q->count - 1) % q->count : q->head);
+			m->rx_doorbells++;
+			pending = 0;
+		}
+	}
+	if (pending) {
 		dma_wmb();
-		mt_write(m, q->reg + 8,
-			 m->runtime_epoch ? (q->head + q->count - 1) % q->count : q->head);
+		mt_write(m, q->reg + 8, (q->head + q->count - 1) % q->count);
+		m->rx_doorbells++;
 	}
 }
 
@@ -258,6 +307,11 @@ static void mt_service(struct mt7932 *m)
 	u32 causes = mt_read(m, W + 0x200) & m->irq_mask;
 	unsigned int i;
 
+	/* Acknowledge the snapshot before draining. A completion arriving after
+	 * its ring was visited must leave a new cause pending for the next IRQ.
+	 * Clearing the old snapshot after draining can erase that notification.
+	 */
+	mt_write(m, W + 0x200, causes);
 	mt_data_clean(m);
 	for (i = 0; i < ARRAY_SIZE(m->rx); i++)
 		if (m->rx[i].count)
@@ -267,7 +321,6 @@ static void mt_service(struct mt7932 *m)
 
 		mt_write(m, W + 0x1f0, sw);
 	}
-	mt_write(m, W + 0x200, causes);
 	if (READ_ONCE(m->running) && !poll_test)
 		mt_write(m, W + 0x204, m->irq_mask);
 }
@@ -327,6 +380,8 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 	unsigned long flags;
 	int ret;
 
+	if (READ_ONCE(m->fw_asserted))
+		return -EIO;
 	if (q->used >= q->slots) {
 		/* Command buffers can wrap only after every published descriptor has
 		 * retired. Never reclaim by elapsed time or by a reply alone.
@@ -364,6 +419,8 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 			ret = -ETIMEDOUT;
 		}
 	}
+	if (READ_ONCE(m->fw_asserted))
+		ret = -EIO;
 	if (ret == -ETIMEDOUT) {
 		/* Diagnostic only: never turn a polled late reply into IRQ success. */
 		unsigned int i;
@@ -1028,47 +1085,6 @@ static int mt_initialize(struct mt7932 *m)
 	return ret;
 }
 
-static void mt_release_startup_firmware(void *data)
-{
-	release_firmware(data);
-}
-
-static int mt_prepare_startup_firmware(struct device *dev)
-{
-	static const char * const names[] = {
-		"mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin",
-		"mediatek/mt7932/IZUBA_W7932_2.bin",
-		"mediatek/mt7932/ppr.bin",
-		"mediatek/mt7932/config-original.bin",
-		"mediatek/mt7932/wcal.bin",
-		"mediatek/mt7932/oca2.bin",
-		"mediatek/mt7932/policy/world-XZ.bin",
-	};
-	const struct firmware *fw;
-	unsigned int i;
-	int ret;
-
-	/* Firmware lives outside the initramfs. Defer before touching hardware;
-	 * userspace retries drivers_probe once the external files are staged.
-	 * Hold references for asynchronous calibration/configuration requests.
-	 */
-	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		ret = request_firmware_direct(&fw, names[i], dev);
-		if (ret == -ENOENT) {
-			dev_info_once(dev, "waiting for external Wi-Fi firmware\n");
-			return dev_err_probe(dev, -EPROBE_DEFER,
-					     "external firmware not available: %s\n", names[i]);
-		}
-		if (ret)
-			return dev_err_probe(dev, ret, "cannot load %s\n", names[i]);
-		ret = devm_add_action_or_reset(dev, mt_release_startup_firmware,
-					      (void *)fw);
-		if (ret)
-			return ret;
-	}
-	return 0;
-}
-
 static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct mt7932 *m;
@@ -1080,9 +1096,6 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	domain = iommu_get_domain_for_dev(&pdev->dev);
 	if (!domain || (domain->type != IOMMU_DOMAIN_DMA && domain->type != IOMMU_DOMAIN_DMA_FQ))
 		return dev_err_probe(&pdev->dev, -EINVAL, "translated DMA domain required\n");
-	ret = mt_prepare_startup_firmware(&pdev->dev);
-	if (ret)
-		return ret;
 	ret = pcim_enable_device(pdev);
 	if (ret)
 		return ret;

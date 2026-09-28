@@ -21,13 +21,3 @@ config PHY_APPLE_DPTX
 	  such as the M2.
 	  This driver provides support for DisplayPort and is used on the
 	  Mac mini (M2 and M2 Pro, 2023).
-
-config PHY_APPLE_J700_REPEATER
-	tristate "Apple J700 USB2 repeater supplier"
-	depends on I2C && GPIOLIB && OF
-	depends on ARCH_APPLE || COMPILE_TEST
-	select GENERIC_PHY
-	help
-	  Configure the J700 USB2 repeater before the SoC PHY starts. This
-	  retained-power first-light path holds the shared hub GPIO without
-	  pulsing reset and does not take over Type-C power policy.

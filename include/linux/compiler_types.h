@@ -372,8 +372,7 @@ struct ftrace_likely_data {
  * __bdos on clang < 19.1.3 can be off by 4:
  * https://github.com/llvm/llvm-project/pull/112636
  */
-#if defined(CONFIG_CC_HAS_COUNTED_BY) && \
-	!(defined(__clang__) && __clang_major__ == 22)
+#ifdef CONFIG_CC_HAS_COUNTED_BY
 # define __counted_by(member)		__attribute__((__counted_by__(member)))
 #else
 # define __counted_by(member)
@@ -389,8 +388,7 @@ struct ftrace_likely_data {
  *   gcc: https://gcc.gnu.org/pipermail/gcc-patches/2025-April/681727.html
  * clang: https://clang.llvm.org/docs/AttributeReference.html#counted-by-counted-by-or-null-sized-by-sized-by-or-null
  */
-#if defined(CONFIG_CC_HAS_COUNTED_BY_PTR) && \
-	!(defined(__clang__) && __clang_major__ == 22)
+#ifdef CONFIG_CC_HAS_COUNTED_BY_PTR
 #define __counted_by_ptr(member)	__attribute__((__counted_by__(member)))
 #else
 #define __counted_by_ptr(member)

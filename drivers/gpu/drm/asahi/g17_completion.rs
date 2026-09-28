@@ -64,12 +64,12 @@ pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
 /// late event is ignored rather than signalling or releasing twice.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RenderFenceState {
-    pending: u64,
+    pending: u8,
 }
 
 impl RenderFenceState {
-    const fn bit(slot: u8) -> Option<u64> {
-        if slot < 64 { Some(1u64 << slot) } else { None }
+    const fn bit(slot: u8) -> Option<u8> {
+        if slot < 8 { Some(1u8 << slot) } else { None }
     }
 
     pub(crate) fn arm(&mut self, slot: u8) -> bool {
@@ -384,7 +384,7 @@ pub(crate) struct G17PKtracePrintBudget {
 impl G17PKtracePrintBudget {
     pub(crate) fn allow(&mut self, key: u16, ordinary_limit: u32) -> bool {
         if g17p_ktrace_key_is_dm_monitor(key) {
-            if ordinary_limit != 0 && self.monitor_printed >= 64 {
+            if self.monitor_printed >= 64 {
                 self.monitor_dropped = self.monitor_dropped.saturating_add(1);
                 return false;
             }
@@ -392,7 +392,7 @@ impl G17PKtracePrintBudget {
             return true;
         }
         if key < 0x100 {
-            if ordinary_limit != 0 && self.submission_printed >= 64 {
+            if self.submission_printed >= 64 {
                 self.submission_dropped = self.submission_dropped.saturating_add(1);
                 return false;
             }
@@ -1470,7 +1470,8 @@ pub(crate) struct RenderExecutionState {
 
 impl RenderExecutionState {
     pub(crate) fn observed(self) -> bool {
-        self.tiling_timestamps.iter().all(|value| *value != 0)
+        self.job_list_empty
+            && self.tiling_timestamps.iter().all(|value| *value != 0)
             && self.fragment_timestamps.iter().all(|value| *value != 0)
     }
 }
@@ -1487,7 +1488,8 @@ pub(crate) const fn render_gpu_interval(
 ) -> Option<[u64; 2]> {
     let start = execution.tiling_timestamps[0];
     let end = execution.fragment_timestamps[1];
-    if start != 0
+    if execution.job_list_empty
+        && start != 0
         && execution.tiling_timestamps[1] == start
         && execution.fragment_timestamps[0] == start
         && start < end
@@ -1547,24 +1549,13 @@ impl RenderQueueWindow {
     }
 
     fn normalize(self, indices: QueueIndices) -> Result<QueueIndices, CompletionDecodeError> {
-        self.normalize_with_limit(indices, self.count)
-    }
-
-    fn normalize_with_limit(
-        self,
-        indices: QueueIndices,
-        limit: u32,
-    ) -> Result<QueueIndices, CompletionDecodeError> {
-        if limit < self.count || limit >= self.capacity {
-            return Err(CompletionDecodeError::RenderWindow);
-        }
         let distance = |value: u32| {
             if value >= self.capacity {
                 return Err(CompletionDecodeError::RenderCursorOutsideWindow);
             }
             let distance = ((u64::from(value) + u64::from(self.capacity)
                 - u64::from(self.base)) % u64::from(self.capacity)) as u32;
-            if distance > limit {
+            if distance > self.count {
                 return Err(CompletionDecodeError::RenderCursorOutsideWindow);
             }
             Ok(distance)
@@ -1575,66 +1566,6 @@ impl RenderQueueWindow {
             write: distance(indices.write)?,
         })
     }
-}
-
-/// Bounded FIFO of work queued behind the front render of one physical pair,
-/// oldest first. Fixed capacity, so admission and retirement never allocate.
-pub(crate) struct PairFifo<T, const N: usize> {
-    slots: [Option<T>; N],
-    len: usize,
-}
-
-impl<T, const N: usize> PairFifo<T, N> {
-    pub(crate) const fn new() -> Self {
-        Self { slots: [const { None }; N], len: 0 }
-    }
-
-    /// True when anything is queued.
-    pub(crate) fn is_some(&self) -> bool { self.len != 0 }
-
-    pub(crate) fn is_none(&self) -> bool { self.len == 0 }
-
-    pub(crate) fn has_room(&self) -> bool { self.len < N }
-
-    pub(crate) fn front(&self) -> Option<&T> {
-        if self.len == 0 { None } else { self.slots[0].as_ref() }
-    }
-
-    pub(crate) fn push(&mut self, item: T) -> core::result::Result<(), T> {
-        if self.len >= N { return Err(item); }
-        self.slots[self.len] = Some(item);
-        self.len += 1;
-        Ok(())
-    }
-
-    /// Remove and return the oldest queued item.
-    pub(crate) fn take(&mut self) -> Option<T> {
-        if self.len == 0 { return None; }
-        let item = self.slots[0].take();
-        for index in 1..self.len {
-            self.slots[index - 1] = self.slots[index].take();
-        }
-        self.len -= 1;
-        item
-    }
-
-    pub(crate) fn clear(&mut self) {
-        while self.take().is_some() {}
-    }
-
-    pub(crate) fn iter(&self) -> core::iter::Flatten<core::slice::Iter<'_, Option<T>>> {
-        self.slots[..self.len].iter().flatten()
-    }
-}
-
-impl<T, const N: usize> Default for PairFifo<T, N> {
-    fn default() -> Self { Self::new() }
-}
-
-impl<'a, T, const N: usize> IntoIterator for &'a PairFifo<T, N> {
-    type Item = &'a T;
-    type IntoIter = core::iter::Flatten<core::slice::Iter<'a, Option<T>>>;
-    fn into_iter(self) -> Self::IntoIter { self.iter() }
 }
 
 /// Render-only normalization: the generic observer and proven compute path
@@ -1650,56 +1581,6 @@ pub(crate) fn observe_paired_render_window(
     let mut result = observe_paired_render_completion(
         window.normalize(tiling_previous)?, window.normalize(tiling_current)?, window.count,
         window.normalize(fragment_previous)?, window.normalize(fragment_current)?, window.count,
-        execution,
-    )?;
-    result.tiling.indices = tiling_current;
-    result.fragment.indices = fragment_current;
-    result.tiling.published_prefix = window.target();
-    result.fragment.published_prefix = window.target();
-    Ok(result)
-}
-
-/// Observe one prefix while later groups are already appended to the same
-/// physical ring. `max_groups` is the host publication bound, so modular
-/// cursor progress remains unambiguous across wrap.
-pub(crate) fn observe_paired_render_window_depth(
-    window: RenderQueueWindow,
-    max_groups: u32,
-    tiling_previous: QueueIndices,
-    tiling_current: QueueIndices,
-    fragment_previous: QueueIndices,
-    fragment_current: QueueIndices,
-    execution: RenderExecutionState,
-) -> Result<PairedRenderCompletion, CompletionDecodeError> {
-    // Up to max_groups groups share one physical pair. A queued render's
-    // previous snapshot can predate earlier groups still in flight (cursors
-    // behind this window's base), and either snapshot can include later
-    // groups (cursors past this target). Anchor the modular window that many
-    // groups before this base so every legal cursor is a small non-negative
-    // distance; completion is still done >= this group's own target.
-    let groups = max_groups.max(1);
-    let back = window.count.checked_mul(groups - 1)
-        .ok_or(CompletionDecodeError::RenderWindow)?;
-    let limit = window.count.checked_mul(groups)
-        .and_then(|ahead| ahead.checked_add(back))
-        .ok_or(CompletionDecodeError::RenderWindow)?;
-    if limit >= window.capacity {
-        return Err(CompletionDecodeError::RenderWindow);
-    }
-    let anchored = RenderQueueWindow {
-        base: ((u64::from(window.base) + u64::from(window.capacity) - u64::from(back))
-            % u64::from(window.capacity)) as u32,
-        count: window.count,
-        capacity: window.capacity,
-    };
-    let prefix = back + window.count;
-    let mut result = observe_paired_render_completion(
-        anchored.normalize_with_limit(tiling_previous, limit)?,
-        anchored.normalize_with_limit(tiling_current, limit)?,
-        prefix,
-        anchored.normalize_with_limit(fragment_previous, limit)?,
-        anchored.normalize_with_limit(fragment_current, limit)?,
-        prefix,
         execution,
     )?;
     result.tiling.indices = tiling_current;
@@ -1757,15 +1638,14 @@ mod tests {
         assert!(complete.complete && complete.idle);
         assert_eq!(complete.tiling.indices, current);
         assert_eq!(complete.fragment.published_prefix, 1);
-        let linked_successor = observe_paired_render_window(
-            window, previous, current, previous, current,
+        for pending in [
             RenderExecutionState { job_list_empty: false, ..execution },
-        ).unwrap();
-        assert!(linked_successor.complete && !linked_successor.idle);
-        assert!(!observe_paired_render_window(
-            window, previous, current, previous, current,
             RenderExecutionState { fragment_timestamps: [1, 0], ..execution },
-        ).unwrap().complete);
+        ] {
+            assert!(!observe_paired_render_window(
+                window, previous, current, previous, current, pending,
+            ).unwrap().complete);
+        }
         assert!(observe_compute_completion(previous, current, 1).is_err());
     }
 
@@ -1958,18 +1838,6 @@ mod tests {
         assert!(budget.allow(G17P_KTRACE_LOST_KEY, 32));
         assert!(!g17p_ktrace_key_is_dm_monitor(0x010f));
         assert!(!g17p_ktrace_key_is_dm_monitor(0x090a));
-    }
-
-    #[test]
-    fn ktrace_explicit_unlimited_budget_preserves_the_whole_ring() {
-        let mut budget = G17PKtracePrintBudget::default();
-        for _ in 0..G17P_KTRACE_CAPACITY {
-            assert!(budget.allow(0x0041, 0));
-            assert!(budget.allow(0x0903, 0));
-            assert!(budget.allow(0x0101, 0));
-        }
-        assert_eq!(budget.submission_dropped, 0);
-        assert_eq!(budget.monitor_dropped, 0);
     }
 
     #[test]

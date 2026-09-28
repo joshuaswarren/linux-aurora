@@ -111,10 +111,6 @@ pub(crate) enum PipeType {
 /// Errors from the submission codec.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionError {
-    RenderBarrierFuture,
-    RenderBarrierSequenceOverflow,
-    RenderBarrierMissingToken,
-    RenderBarrierPredecessorFailed,
     /// A doorbell index outside the 3-bit [4:2] field.
     DoorbellIndexOutOfRange,
     /// A doorbell whose type field is not the TX (channel-kick) type.
@@ -1639,8 +1635,8 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     // running, with an identically shaped descriptor, a satisfied barrier and
     // geometry already tiled. Overriding this isolates the data master itself.
     let override_dm = match stage {
-        G17PColdOpeningStage::Fragment => crate::g17_config::RENDER_3D_DM,
-        G17PColdOpeningStage::Tiling => crate::g17_config::RENDER_TA_DM,
+        G17PColdOpeningStage::Fragment => *crate::module_parameters::g17p_render_3d_dm.value(),
+        G17PColdOpeningStage::Tiling => *crate::module_parameters::g17p_render_ta_dm.value(),
     };
     if override_dm != 0xff {
         put_u16_le(out, 0x22, override_dm as u16);
@@ -2834,9 +2830,6 @@ pub(crate) const G17P_CL_KICK_ENTRY_LAYOUT: G17PClKickEntryLayout = G17PClKickEn
 /// selects the shared-stamp source and has no independent wire field.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PClBarrierDependency {
-    /// Already converted native predecessor stamp. Never reinterpret it using
-    /// the consumer queue's base timestamp or ring geometry.
-    pub(crate) native_timestamp: Option<u64>,
     pub(crate) event_word: u32,
     pub(crate) shared_stamp: u64,
     pub(crate) queue_id: u8,
@@ -2857,69 +2850,10 @@ pub(crate) fn g17p_render_barrier_from_timestamp(
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
     }
     Ok(G17PClBarrierDependency {
-        native_timestamp: None,
         event_word: (timestamp as u32).wrapping_shl(8),
         shared_stamp: timestamp >> 24,
         queue_id,
     })
-}
-
-/// Logical render prefix, resolved at ioctl admission before asynchronous work.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
-pub(crate) struct G17PRenderOrder {
-    pub(crate) sequence: u64,
-    pub(crate) wait_through: Option<u64>,
-}
-
-/// Zero snapshots all preceding ioctls; N adds the first N renders of this
-/// ioctl. NONE remains independent. Sequence zero is reserved for internal work.
-pub(crate) fn g17p_render_order(
-    ioctl_base: u64, preceding: u64, barrier: u16,
-) -> Result<G17PRenderOrder, SubmissionError> {
-    let sequence = ioctl_base.checked_add(preceding)
-        .and_then(|n| n.checked_add(1))
-        .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?;
-    let wait_through = if barrier == u16::MAX {
-        None
-    } else {
-        if u64::from(barrier) > preceding {
-            return Err(SubmissionError::RenderBarrierFuture);
-        }
-        Some(ioctl_base.checked_add(u64::from(barrier))
-            .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?)
-    };
-    Ok(G17PRenderOrder { sequence, wait_through })
-}
-
-/// Resolve a still-owned predecessor. A successful retirement needs no GPU
-/// dependency; errors and an unassigned token must never satisfy the prefix.
-/// The caller filters owner identity and supplies every live predecessor in
-/// the prefix under the same runtime lock as publication and retirement.
-pub(crate) fn g17p_live_render_dependency(
-    order: G17PRenderOrder, predecessor_sequence: u64,
-    predecessor_status: i32, native_word: u64,
-) -> Result<Option<G17PClBarrierDependency>, SubmissionError> {
-    if !g17p_render_prefix_contains(order.wait_through, predecessor_sequence) {
-        return Ok(None);
-    }
-    if predecessor_status < 0 {
-        return Err(SubmissionError::RenderBarrierPredecessorFailed);
-    }
-    if predecessor_status > 0 { return Ok(None); }
-    if native_word == u64::MAX {
-        return Err(SubmissionError::RenderBarrierMissingToken);
-    }
-    let token = decode_kick_word(native_word)?;
-    if token.mask_selector != 0 {
-        return Err(SubmissionError::KickWordUnmodeledBits);
-    }
-    let mut dependency = g17p_render_barrier_from_timestamp(token.timestamp, token.queue_id)?;
-    dependency.native_timestamp = Some(token.timestamp);
-    Ok(Some(dependency))
-}
-
-pub(crate) fn g17p_render_prefix_contains(prefix: Option<u64>, sequence: u64) -> bool {
-    sequence != 0 && prefix.is_some_and(|limit| sequence <= limit)
 }
 
 /// Optional MCache aperture descriptor copied into entry +0x08.
@@ -3135,7 +3069,6 @@ pub(crate) fn encode_g17p_compute_optional_event(
 pub(crate) fn prepare_g17p_compute_cl_command_state(
     descriptor_low: u64,
     submission_ordinal: u64,
-    primary_checkpoint: u8,
 ) -> Result<G17PComputeClCommandState, SubmissionError> {
     let next = submission_ordinal
         .checked_add(1)
@@ -3158,7 +3091,7 @@ pub(crate) fn prepare_g17p_compute_cl_command_state(
         rce_bindings: [
             G17PClRceBinding {
                 address: rce_a,
-                tag: primary_checkpoint,
+                tag: 0x22,
             },
             G17PClRceBinding {
                 address: rce_b,
@@ -3205,7 +3138,7 @@ pub(crate) fn prepare_g17p_render_cl_command_state(
             external_binding(2, 0x17)?,
             external_binding(3, 0x0a)?,
         ];
-        match crate::g17_config::RENDER_3D_RCE {
+        match *crate::module_parameters::g17p_render_3d_rce.value() {
             0 => [empty, empty, empty, empty],
             1 => [full[0], empty, empty, empty],
             2 => [full[0], full[1], empty, empty],
@@ -3401,10 +3334,6 @@ fn encode_g17p_cl_barrier_dependency(
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
     }
 
-    if let Some(timestamp) = barrier.native_timestamp {
-        return encode_g17p_cl_dependency(timestamp, barrier.queue_id);
-    }
-
     let stamp_count = queue.geometry.stamp_count() as u64;
     let event_timestamp = (((barrier.event_word as u64) >> 8)
         | barrier.shared_stamp.wrapping_shl(24))
@@ -3532,7 +3461,7 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     // unsatisfiable from cold. Omitting it isolates whether the SKSM front-end
     // is waiting on it.
     let omit_implicit = !queue.previous_valid
-        && crate::g17_config::NO_IMPLICIT_DEP != 0;
+        && *crate::module_parameters::g17p_no_implicit_dep.value() != 0;
     if !omit_implicit {
         put_u64_le(
             &mut entry,
@@ -3681,57 +3610,21 @@ pub(crate) const fn g17p_cl_full_support_initialization_allowed(registered: bool
     !registered
 }
 
-/// The one compute private-memory pool, distinct from render's pool ID zero.
-/// B1 indexes the same registration table with tag15 +0x46 and FList +0x08.
-pub(crate) const G17P_COMPUTE_FLIST_ID: u16 = crate::g17_config::COMPUTE_FLIST_ID;
-
-/// Initialize pool-owned state before its first firmware registration.
-pub(crate) fn apply_g17p_cl_flist_static_state(
-    shared_support: &mut [u8],
-    support_state: &mut [u8],
-    page_list_gpu_va: u64,
-    run_table_gpu_va: u64,
-    support_state_gpu_va: u64,
-    pool_id: u16,
-) -> Result<(), SubmissionError> {
-    if shared_support.len() < 0x4000 || support_state.len() < 0x4000 {
-        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
-    }
-    shared_support.fill(0);
-    support_state.fill(0);
-    put_u64_le(shared_support, 0x00, 2);
-    put_u64_le(shared_support, 0x08, u64::from(pool_id));
-    put_u64_le(shared_support, 0x10, 2);
-    put_u64_le(shared_support, 0x14, page_list_gpu_va);
-    put_u32_le(shared_support, 0x1c, 0x4_0000);
-    put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
-    put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
-    put_u64_le(shared_support, 0x30, run_table_gpu_va);
-    put_u64_le(shared_support, 0x40, 4);
-    put_u32_le(shared_support, 0x48, 0xa8);
-    put_u64_le(shared_support, 0x4c, support_state_gpu_va);
-    // B1 compares *FList[+0x4c] (submitted) with FList[+0x54]
-    // (completed). Both are pool-wide u64 counters, initially zero.
-    put_u64_le(shared_support, 0x54, 0);
-    put_u32_le(shared_support, 0x5c, 1);
-    put_u32_le(shared_support, 0x60, 2);
-    Ok(())
-}
-
-/// Historical captured per-queue fixture initializer. Production pool creation
-/// uses `apply_g17p_cl_flist_static_state`; never call this on its shared pages.
-pub(crate) fn apply_g17p_cl_queue_static_state(
+/// Initialize the queue-owned pages exactly once, before SKSM registration.
+pub(crate) fn apply_g17p_cl_retained_static_state(
     shared_support: &mut [u8],
     support_state: &mut [u8],
     scheduler_state: &mut [u8],
+    channel_control: &mut [u8],
     page_list_gpu_va: u64,
-    run_table_gpu_va: u64,
+    operand_table_gpu_va: u64,
     support_state_gpu_va: u64,
     scheduler_state_gpu_va: u64,
 ) -> Result<(), SubmissionError> {
     if shared_support.len() < 0x4000
         || support_state.len() < 0x4000
         || scheduler_state.len() < 0x4000
+        || channel_control.len() < 0x40
     {
         return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
     }
@@ -3739,12 +3632,9 @@ pub(crate) fn apply_g17p_cl_queue_static_state(
     shared_support.fill(0);
     support_state.fill(0);
     scheduler_state.fill(0);
+    channel_control.fill(0);
 
     put_u64_le(shared_support, 0x00, 2);
-    // AGXUSCPrivMemFList+0x08 is the pool ID copied into the firmware's
-    // internal allocator entry and ultimately written to gUPM's pool-select
-    // operation. All compute queues share this pool and UMA slot; QoS
-    // HardwareBufferIDs remain per queue.
     put_u64_le(shared_support, 0x08, 1);
     put_u64_le(shared_support, 0x10, 2);
     // _AGFIUMAPagePoolState stores the full VA at unaligned +0x14.
@@ -3753,10 +3643,7 @@ pub(crate) fn apply_g17p_cl_queue_static_state(
     put_u32_le(shared_support, 0x1c, 0x4_0000);
     put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
     put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
-    // Every queue names the run table that describes the shared backing.
-    // A private empty table here is incoherent with the shared pool and leaves
-    // overlapping spill allocation without the pool's initialized run map.
-    put_u64_le(shared_support, 0x30, run_table_gpu_va);
+    put_u64_le(shared_support, 0x30, operand_table_gpu_va);
     put_u64_le(shared_support, 0x40, 4);
     put_u32_le(shared_support, 0x48, 0xa8);
     put_u64_le(shared_support, 0x4c, support_state_gpu_va);
@@ -3772,46 +3659,10 @@ pub(crate) fn apply_g17p_cl_queue_static_state(
     put_u32_le(support_state, 0, 1);
     put_u32_le(scheduler_state, 8, 1);
 
-    Ok(())
-}
-
-/// Initialize the one channel-control page retained by physical CL_2.
-pub(crate) fn apply_g17p_cl_channel_control_static_state(
-    channel_control: &mut [u8],
-) -> Result<(), SubmissionError> {
-    if channel_control.len() < 0x40 {
-        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
-    }
-    channel_control.fill(0);
-
     put_u64_le(channel_control, 0x00, 0x0000_0100_0000_ffff);
     put_u64_le(channel_control, 0x20, 0x0002_0000_0000_0000);
     put_u64_le(channel_control, 0x30, 0x0000_0000_ff00_0000);
     Ok(())
-}
-
-/// Compatibility helper for byte-layout tests covering both ownership
-/// domains. Production initializes the queue pages and CL_2 page separately.
-pub(crate) fn apply_g17p_cl_retained_static_state(
-    shared_support: &mut [u8],
-    support_state: &mut [u8],
-    scheduler_state: &mut [u8],
-    channel_control: &mut [u8],
-    page_list_gpu_va: u64,
-    run_table_gpu_va: u64,
-    support_state_gpu_va: u64,
-    scheduler_state_gpu_va: u64,
-) -> Result<(), SubmissionError> {
-    apply_g17p_cl_queue_static_state(
-        shared_support,
-        support_state,
-        scheduler_state,
-        page_list_gpu_va,
-        run_table_gpu_va,
-        support_state_gpu_va,
-        scheduler_state_gpu_va,
-    )?;
-    apply_g17p_cl_channel_control_static_state(channel_control)
 }
 
 /// Apply the exact host-owned pre-B2 values to three provider-owned pages.
@@ -3850,10 +3701,8 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     Ok(activation)
 }
 
-/// Apply the session-wide CL_2 half of B2 activation. The pointer is pinned to
-/// a dedicated bootstrap owner; logical queues have separate scheduler pages.
-/// The exact consumer of this firmware-private slot remains unresolved. Never
-/// retarget it during ordinary queue switching. PBDesc/UMA are separate state.
+/// Apply the queue-local half of B2 activation. The channel-control pointer
+/// changes with the compute work queue; the PBDesc and UMA tables do not.
 pub(crate) fn apply_g17p_cl_b2_computed_state(
     activation: G17PClB2ActivationState,
     computed: &mut [u8],
@@ -4817,14 +4666,14 @@ mod tests {
 
     #[test]
     fn compute_command_state_tracks_each_descriptor_slot() {
-        let first = prepare_g17p_compute_cl_command_state(0x70_0034_0000, 0, 0x26).unwrap();
+        let first = prepare_g17p_compute_cl_command_state(0x70_0034_0000, 0).unwrap();
         assert_eq!(first.event_mask, [0, 0, 4, 0]);
         assert_eq!(
             first.rce_bindings,
             [
                 G17PClRceBinding {
                     address: 0x70_0034_0040,
-                    tag: 0x26,
+                    tag: 0x22,
                 },
                 G17PClRceBinding {
                     address: 0x70_0034_0760,
@@ -4835,7 +4684,7 @@ mod tests {
             ]
         );
 
-        let second = prepare_g17p_compute_cl_command_state(0x70_0034_4000, 1, 0x26).unwrap();
+        let second = prepare_g17p_compute_cl_command_state(0x70_0034_4000, 1).unwrap();
         assert_eq!(second.event_mask, [0, 2, 8, 0]);
         assert_eq!(second.rce_bindings[0].address, 0x70_0034_4040);
         assert_eq!(second.rce_bindings[1].address, 0x70_0034_4760);
@@ -6550,7 +6399,7 @@ mod tests {
                 Ok(expected),
             );
         }
-        assert_eq!(g17p_serialized_render_scratch_payload(u64::from(u32::MAX)), 0);
+        assert_eq!(g17p_serialized_render_scratch_payload(u32::MAX), 0);
     }
 
     #[test]
@@ -7073,14 +6922,14 @@ mod tests {
             204
         );
 
-        let command = prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW, 0, 0x26).unwrap();
+        let command = prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW, 0).unwrap();
         let empty = G17PClRceBinding { address: 0, tag: 0 };
         assert_eq!(
             command.rce_bindings,
             [
                 G17PClRceBinding {
                     address: DESCRIPTOR_LOW + 0x40,
-                    tag: 0x26,
+                    tag: 0x22,
                 },
                 G17PClRceBinding {
                     address: DESCRIPTOR_LOW + 0x760,
@@ -7157,7 +7006,7 @@ mod tests {
         const SECOND_AFTER: &[u8; 0x200] =
             include_bytes!("fixtures/g17p_first_submit/sksm-entry-second-after.bin");
         let second_command =
-            prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW + 0x1040, 1, 0x26).unwrap();
+            prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW + 0x1040, 1).unwrap();
         let second = prepare_g17p_cl_kick_entry(
             prepared.producer_after,
             G17PClKickEntryOperands {
@@ -7440,7 +7289,6 @@ mod tests {
     #[test]
     fn g17p_cl_entry_encodes_every_optional_section() {
         let barriers = [G17PClBarrierDependency {
-            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 3,
@@ -7570,7 +7418,6 @@ mod tests {
         assert_eq!(get_u64_le(&ta.entry, 0x20), 0xffff_0c02_0000_0001);
 
         let fragment_barrier = [G17PClBarrierDependency {
-            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 0,
@@ -7714,7 +7561,6 @@ mod tests {
         );
 
         let too_many = [G17PClBarrierDependency {
-            native_timestamp: None,
             event_word: 0,
             shared_stamp: 0,
             queue_id: 0,
@@ -8641,20 +8487,6 @@ pub(crate) const fn g17p_umadesc_offset(hardware_buffer_id: u32) -> Option<usize
         return None;
     }
     Some(hardware_buffer_id as usize * G17P_UMA_DESC_ENTRY_SIZE)
-}
-
-/// Recover the mutable pool state before its hardware slot changes owners.
-/// The address and allocation unit belong to the retained pool; word three
-/// is firmware-owned and is not part of the load/store handshake.
-pub(crate) const fn decode_g17p_umadesc(
-    descriptor: [u64; 4],
-    mut state: G17PUmaPagePoolState,
-) -> G17PUmaPagePoolState {
-    state.counter_a = ((descriptor[1] >> 5) & 0x0fff_ffff) as u32;
-    state.counter_b = ((descriptor[1] >> 33) & 0x0fff_ffff) as u32;
-    state.empty = (descriptor[1] >> 61) as u32;
-    state.total_pages = descriptor[2] as u32;
-    state
 }
 
 #[cfg(test)]

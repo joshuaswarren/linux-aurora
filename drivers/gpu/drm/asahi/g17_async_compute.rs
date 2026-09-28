@@ -4,28 +4,20 @@
 struct G17PAsyncComputeActive {
     packet: Arc<crate::g17_job::G17PComputeJobPacket>,
     _lease: crate::g17_drm::G17PComputeLeaseGuard,
-    retirement: Option<G17PAsyncComputeRetirementTicket>,
+    /// `G17P_COMPLETIONS_SEEN` when this submission was published. Comparing it
+    /// against the counter at quarantine time answers the one question the
+    /// QUARANTINE line could not: was the firmware still retiring OTHER work
+    /// when we gave up on this one? A non-zero delta means the 2000ms wall
+    /// clock in `G17P_COMPUTE_COMPLETION_TIMEOUT_MS` expired on a firmware that
+    /// was demonstrably alive and making progress, which is a different defect
+    /// from a firmware that is stuck. Diagnostic only -- nothing branches on it.
+    completions_at_publish: u64,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct G17PAsyncComputeRetirementTicket {
-    owner: u64,
-    submission: u64,
-    context: u32,
-    recovery_epoch: u64,
-    firmware: g17_manager::G17PComputeRetirementTicket,
-}
-
-/// A prepared alias set does not change the context retained by firmware.
-/// Keep the superseded root and aliases until work published under the new
-/// context has actually executed, or both firmware processors have stopped.
-struct G17PAsyncComputePreviousBinding {
-    _binding: Option<g17_manager::G17PComputeUserBinding>,
-    _context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
-    /// Exact first publication using the replacement binding, and its
-    /// firmware recovery epoch. An error/zero-duration fence is not a witness.
-    publication: Option<(u64, u64)>,
-}
+/// Successful async-compute completions this boot. Read by
+/// `g17p_quarantine_selftest` and by the quarantine progress witness.
+static G17P_COMPLETIONS_SEEN: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Installed queue graphs survive logical queue destruction. Firmware retains
 /// their addresses; exact command retirement permits rebinding, not freeing.
@@ -33,17 +25,14 @@ struct G17PAsyncComputeQueue {
     owner: Option<u64>,
     queue: g17_manager::G17PSksmQueue,
     binding: Option<g17_manager::G17PComputeUserBinding>,
-    context: Option<Arc<crate::g17_resources::G17PLogicalQueueContext>>,
-    previous_binding: Option<G17PAsyncComputePreviousBinding>,
+    context: Option<Arc<mmu::T8140ComputeExecutionContext>>,
     active: Option<G17PAsyncComputeActive>,
     released: bool,
-    /// The most recent publication passed every queue-local retirement gate.
-    /// Consumed when ownership changes or another command is published.
-    retirement_ready: bool,
     quarantined: bool,
-    /// The client cancelled its pending waiter. Keep observing exact command
-    /// retirement; installed backing remains retained afterward. Also marks a
-    /// failed unpublished-owner restore, which remains quarantined separately.
+    /// Quarantined because `drm_sched_fini()` cancelled a pending job when the
+    /// client destroyed its queue -- not because anything faulted. The queue is
+    /// still permanently retired, so its memory stays safe, but it must not
+    /// refuse OTHER clients' submissions: the owner that tore it down is gone.
     retired_by_teardown: bool,
     terminal_fanout: Option<(Arc<crate::g17_status::VmStatus>, Error)>,
 }
@@ -74,33 +63,20 @@ impl G17PLiveRuntime {
             }
         }
         self.async_compute_queues.clear();
-        if let Some(registry) = &self.queue_registry {
-            registry.release_retained_owners_after_processor_stop();
-        }
     }
 
     pub(crate) fn prepare_queue_execution_context(
         &mut self, vm: &mmu::Vm,
-    ) -> Result<Arc<crate::g17_resources::G17PLogicalQueueContext>> {
+    ) -> Result<Arc<mmu::T8140ComputeExecutionContext>> {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
-        let manager = self.manager.as_mut().ok_or(ENODEV)?;
-        manager.prepare_logical_queue_context(self.drm.as_ref().ok_or(ENODEV)?, vm)
-    }
-
-    pub(crate) fn prepare_compute_execution_context(
-        &mut self,
-        context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
-    ) -> Result<Arc<crate::g17_resources::G17PLogicalQueueContext>> {
-        if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
-        self.manager.as_mut().ok_or(ENODEV)?.prepare_compute_execution_context(
-            context, *module_parameters::g17p_split_execution_id_probe.value() != 0,
-        )
+        self.manager.as_ref().ok_or(ENODEV)?
+            .uat().allocate_t8140_compute_execution_context(vm)
     }
 
     pub(crate) fn prepare_async_compute_queue(
         &mut self, owner: u64, vm: &mmu::Vm,
-        context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
-    ) -> Result<(u8, Arc<crate::g17_resources::G17PLogicalQueueContext>)> {
+        context: Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result<(u8, Arc<mmu::T8140ComputeExecutionContext>)> {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
         if !context.matches(vm) || !context.is_current() { return Err(EFAULT); }
         if let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) {
@@ -109,31 +85,18 @@ impl G17PLiveRuntime {
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.stage_compute_flist_state()?;
         let free = self.async_compute_queues.iter().position(|q|
-            q.queue.requires_first_install() && q.previous_binding.is_none() &&
             crate::g17_queue_limits::reusable_idle_compute_graph(
                 q.owner.is_none(),
                 q.active.is_none(),
                 q.binding.is_none(),
                 q.context.is_none(),
                 q.quarantined,
-            )).or_else(|| {
-                if crate::g17_config::ASYNC_COMPUTE_REBIND == 0 {
-                    return None;
-                }
-                self.async_compute_queues.iter().position(|q|
-                    !q.queue.requires_first_install()
-                        && q.previous_binding.is_none()
-                        && q.binding.is_some()
-                        && q.context.is_some()
-                        && q.retirement_ready
-                        && crate::g17_queue_limits::rebindable_released_compute_graph(
-                            q.owner.is_none(),
-                            q.active.is_none(),
-                            q.released,
-                            q.quarantined,
-                        )
-                )
-            });
+            ) || crate::g17_queue_limits::rebindable_released_compute_graph(
+                q.owner.is_none(),
+                q.active.is_none(),
+                q.released,
+                q.quarantined,
+            ));
         let index = if let Some(index) = free { index } else {
             self.async_compute_queues.reserve(1, GFP_KERNEL)?;
             // Reuse the unsubmitted boot graph, preserving QID 4 as first queue.
@@ -148,68 +111,31 @@ impl G17PLiveRuntime {
             let index = self.async_compute_queues.len();
             self.async_compute_queues.push(G17PAsyncComputeQueue {
                 owner: None, queue, binding: None, context: None, active: None,
-                previous_binding: None,
-                released: false, retirement_ready: false,
-                quarantined: false, retired_by_teardown: false,
+                released: false, quarantined: false, retired_by_teardown: false,
                 terminal_fanout: None,
             }, GFP_KERNEL)?;
             index
         };
         let q = &mut self.async_compute_queues[index];
-        if q.binding.is_some() != q.context.is_some() {
-            return Err(EIO);
-        }
-        // Finish QID/graph allocation before retaining the incoming page:
-        // ENOSPC must not pin a new unused control on every failed prepare.
-        // This still precedes fresh alias binding and same-VM retargeting;
-        // any failure after pointer exposure keeps the page through stop.
-        manager.retain_logical_channel_control(&context.channel_control)?;
-        // Same-VM reuse keeps the existing aliases, but logical queue identity
-        // is independent of VM identity. Install the incoming root/scheduler
-        // owner and retain the old root until replacement work completes.
-        if let Some(current) = q.context.as_ref().filter(|current|
-            current.matches(vm) && current.is_current()
-        ) {
-            let previous = current.clone();
-            let binding = q.binding.as_mut().ok_or(EIO)?;
-            if !binding.matches(vm) { return Err(EFAULT); }
-            q.queue.bind_logical_channel_control(&context)?;
-            binding.retarget_logical_context(context.clone())?;
-            q.previous_binding = Some(G17PAsyncComputePreviousBinding {
-                _binding: None, _context: previous, publication: None,
-            });
-            q.context = Some(context.clone());
-            q.owner = Some(owner);
-            q.released = false;
-            q.retirement_ready = false;
-            q.retired_by_teardown = false;
-            return Ok((q.queue.queue_id(), context));
-        }
+        // The one lawful boundary for a departed client's binding: the rebind
+        // below reinstalls the QID's roots, so nothing the firmware can name
+        // survives unmapped across this point. Dropping these at queue-destroy
+        // time instead is what left the firmware sweeping a freed record.
+        drop(q.binding.take());
+        drop(q.context.take());
         let reused_installed = !q.queue.requires_first_install();
-        // All fallible mapping work precedes the ownership transition. An
-        // allocation/validation failure leaves the old queue fully bound.
         let binding = manager.bind_independent_compute_user_vm(
             &mut q.queue, vm, context.clone(),
         )?;
-        q.queue.bind_logical_channel_control(&context)?;
-        if let (Some(binding), Some(context)) = (q.binding.take(), q.context.take()) {
-            q.previous_binding = Some(G17PAsyncComputePreviousBinding {
-                _binding: Some(binding),
-                _context: context,
-                publication: None,
-            });
-        }
         q.binding = Some(binding);
         q.context = Some(context.clone());
         q.owner = Some(owner);
         q.released = false;
-        q.retirement_ready = false;
-        q.retired_by_teardown = false;
         if reused_installed {
-            if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
+            if let Some(pdev) = self.pdev.as_ref() {
                 dev_info!(
                     pdev.as_ref(),
-                    "G17P async compute: prepared installed graph rebind qid={} owner={} context={} retaining previous binding until completion\n",
+                    "G17P async compute: rebound retired installed graph qid={} owner={} context={} without reinstall\n",
                     q.queue.queue_id(),
                     owner,
                     context.context_id(),
@@ -230,7 +156,7 @@ impl G17PLiveRuntime {
     /// Treat that as an internal ownership error instead.
     pub(crate) fn async_compute_queue_matches(
         &self, owner: u64, hardware_queue: u8,
-        context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        context: &Arc<mmu::T8140ComputeExecutionContext>,
     ) -> Result<bool> {
         let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) else {
             return Ok(false);
@@ -260,7 +186,7 @@ impl G17PLiveRuntime {
         // quarantine retires the queue permanently -- nothing it owns is freed
         // or reused -- so the device-wide refusal protects nothing that the
         // retirement does not already protect. See `g17p_quarantine_scope`.
-        let scoped = crate::g17_config::QUARANTINE_SCOPE & 1 != 0;
+        let scoped = *crate::module_parameters::g17p_quarantine_scope.value() & 1 != 0;
         let blocked = self.async_compute_queues.iter().any(|q| {
             // A queue retired by client teardown never refuses anyone but its
             // own (already departed) owner. Leaving it in the device-wide test
@@ -288,72 +214,16 @@ impl G17PLiveRuntime {
             .active.as_ref()?.packet.completion().ok().map(|c| c.fence())
     }
 
-    /// The runtime lock serializes this snapshot against publication and
-    /// retirement. Keep the published QID stamp, never predict the next kick.
-    pub(crate) fn async_compute_native_dependency(
-        &mut self, owner: u64, status: &Arc<crate::g17_status::VmStatus>,
-    ) -> Result<Option<g17_submission::G17PClBarrierDependency>> {
-        let handshake = self.manager.as_mut().ok_or(ENODEV)?
-            .firmware_recovery_handshake_snapshot()?;
-        let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) else {
-            return Ok(None);
-        };
-        let Some(active) = q.active.as_ref() else { return Ok(None); };
-        let completion = active.packet.completion()?;
-        if !Arc::ptr_eq(&completion.status, status) { return Err(EIO); }
-        let ticket = active.retirement.as_ref().ok_or(EIO)?;
-        // Publication settles any open recovery first. A closed recovery since
-        // this compute's publication leaves its native stamp meaningful.
-        let _ = ticket;
-        if q.quarantined || handshake.state != 0 {
-            return Err(EIO);
-        }
-        // SAFETY: completion retains this hardware fence throughout the read.
-        let fence = completion.fence();
-        let state = unsafe { kernel::bindings::dma_fence_get_status(
-            kernel::dma_fence::RawDmaFence::raw(&fence),
-        ) };
-        if state < 0 { return Err(Error::from_errno(state)); }
-        if state > 0 { return Ok(None); }
-        Ok(Some(q.queue.published_compute_dependency()?))
-    }
-
-    /// A burst experiment must not include first install or a newly rebound
-    /// graph. These checks are diagnostic eligibility, not execution capacity.
-    pub(crate) fn async_compute_burst_steady(&self, owner: u64) -> bool {
-        self.async_compute_queues.iter().find(|q| q.owner == Some(owner))
-            .is_some_and(|q| !q.queue.requires_first_install()
-                && q.previous_binding.is_none() && q.binding.is_some()
-                && q.context.as_ref().is_some_and(|context| context.is_current())
-                && q.active.is_none() && !q.released && !q.quarantined)
-    }
-
     pub(crate) fn publish_async_compute(
         &mut self, owner: u64, packet: Arc<crate::g17_job::G17PComputeJobPacket>,
         lease: crate::g17_drm::G17PComputeLeaseGuard,
     ) -> Result {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
         self.settle_open_recovery_before_publication()?;
-        let mut dependencies = [g17_submission::G17PClBarrierDependency {
-            native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
-        }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
-        let mut dependency_count = 0;
-        for predecessor in Iterator::chain(
-            self.pending_render.iter().flatten(),
-            self.pending_render_queued.iter().flatten(),
-        ) {
-            if let Some(dependency) = predecessor.compute_predecessor_dependency(
-                owner, &packet.completion()?.status,
-                packet.command().render_wait_through, packet.command().render_wait_last,
-            )? {
-                *dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)? = dependency;
-                dependency_count += 1;
-            }
-        }
         // Render jobs now retain independent application-GART roots and
         // job-private low views.  Compute QID4+ has no render context lease to
         // reclaim, so publication may proceed while either render slot runs.
-        if crate::g17_config::POWER_WIRE == 1 { self.wire_g17p_submit_gpu_power()?; }
+        if *module_parameters::g17p_power_wire.value() == 1 { self.wire_g17p_submit_gpu_power()?; }
         let index = self.async_compute_queues.iter().position(|q| q.owner == Some(owner)).ok_or(EINVAL)?;
         let q = &mut self.async_compute_queues[index];
         if q.active.is_some() || q.quarantined || q.released { return Err(EBUSY); }
@@ -364,48 +234,26 @@ impl G17PLiveRuntime {
         let timestamp_end = timestamp_start.checked_add(8).ok_or(EOVERFLOW)?;
         let state = self.gfx_state.as_ref().cloned().ok_or(ENODEV)?;
         state.submission_phase.store(g17_manager::G17P_SUBMIT_PHASE_IDLE, Ordering::Release);
-        let publication_handshake = self.manager.as_mut().ok_or(ENODEV)?
-            .firmware_recovery_handshake_snapshot()?;
-        if publication_handshake.state != 0 { return Err(EBUSY); }
         // From this point, every error retains the packet, mappings and root.
         // A failed notification does not prove the firmware missed the kick.
-        q.retirement_ready = false;
         q.active = Some(G17PAsyncComputeActive {
-            packet: packet.clone(), _lease: lease, retirement: None,
+            packet: packet.clone(),
+            _lease: lease,
+            completions_at_publish: G17P_COMPLETIONS_SEEN.load(Ordering::Acquire),
         });
         let result = (|| {
-            let manager = self.manager.as_mut().ok_or(ENODEV)?;
-            let notifications = manager.submit_translated_compute(
+            let notifications = self.manager.as_mut().ok_or(ENODEV)?.submit_translated_compute(
                 self.registers.as_ref().ok_or(ENODEV)?, &mut q.queue,
                 &state.submission_phase, q.binding.as_ref().ok_or(ENODEV)?, packet.command(),
                 g17_manager::G17PComputeSubmissionContext {
                     context_id: packet.context().context_id(),
-                    dispatch_identity: 0x0100_01d7_0200_01dc,
+                    dispatch_identity: 0x0100_01d7_0200_01dc, execution_gate: 1,
                     timestamps: g17_uapi::ComputeTimestampAddresses { start: timestamp_start, end: timestamp_end },
-                    descriptor_flag_4c: false,
-                    converted_command_timestamp: 1,
-                    barriers: &dependencies[..dependency_count], mcache: None,
+                    descriptor_flag_4c: false, descriptor_flag_5c8: false,
+                    converted_command_timestamp: 1, barriers: &[], mcache: None,
                     rce_kind: 0, auxiliary: 0x003f_ffff_ffff_ffff,
                 },
             )?;
-            let firmware = manager
-                .capture_independent_compute_retirement_ticket(&mut q.queue)?;
-            let accepted = manager.firmware_recovery_handshake_snapshot()?;
-            if accepted.state != 0 || accepted.epoch != publication_handshake.epoch {
-                return Err(EIO);
-            }
-            let retirement = G17PAsyncComputeRetirementTicket {
-                owner,
-                submission: packet.submission_id(),
-                context: packet.context().context_id(),
-                recovery_epoch: accepted.epoch,
-                firmware,
-            };
-            let publication = (retirement.submission, retirement.recovery_epoch);
-            q.active.as_mut().ok_or(EIO)?.retirement = Some(retirement);
-            if let Some(previous) = q.previous_binding.as_mut() {
-                previous.publication = Some(publication);
-            }
             if let Some(notifications) = notifications {
                 for message in [notifications.activation, notifications.direct_kick].into_iter().flatten() {
                     fence(Ordering::SeqCst);
@@ -420,27 +268,25 @@ impl G17PLiveRuntime {
                 // No firmware-facing publication occurred: release this packet
                 // and permit a later valid job to retry the prepared queue.
                 self.async_compute_queues[index].active = None;
-                if let Some(previous) = self.async_compute_queues[index].previous_binding.as_mut() {
-                    previous.publication = None;
-                }
             } else {
                 self.quarantine_async_compute(owner, packet.submission_id(), error);
             }
             return Err(error);
         }
-        if crate::g17_config::POWER_WIRE >= 2 {
+        if *module_parameters::g17p_power_wire.value() >= 2 {
             if let Err(error) = self.wire_g17p_submit_gpu_power() {
                 self.quarantine_async_compute(owner, packet.submission_id(), error);
                 return Err(error);
             }
         }
-        let pdev = self.pdev.as_ref().ok_or(ENODEV)?;
-        if crate::util::g17p_verbose() {
-            let outstanding = self.async_compute_queues.iter().filter(|q| q.active.is_some()).count();
-            dev_info!(pdev.as_ref(),
-                "G17P async compute: PUBLISHED submission={} owner={} qid={} context={} root={:#x} outstanding={}\n",
-                packet.submission_id(), owner, packet.hardware_queue_id(),
-                packet.context().context_id(), packet.context().root(), outstanding);
+        let outstanding = self.async_compute_queues.iter().filter(|q| q.active.is_some()).count();
+        // Per-submission, and ungated until now while every other trace in this
+        // path already honoured g17p_trace_depth. See that parameter.
+        if crate::g17_manager::g17p_compute_trace_enabled(packet.submission_id() as u32) {
+        dev_info!(self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P async compute: PUBLISHED submission={} owner={} qid={} context={} root={:#x} outstanding={}\n",
+            packet.submission_id(), owner, packet.hardware_queue_id(),
+            packet.context().context_id(), packet.context().root(), outstanding);
         }
         Ok(())
     }
@@ -463,7 +309,7 @@ impl G17PLiveRuntime {
     /// Full-scan fallback for a final watchdog observation or an event batch
     /// whose record did not carry a usable QID mask. These paths deliberately
     /// preserve the old lost/coalesced-edge recovery behaviour.
-    pub(crate) fn service_async_compute_completions(&mut self) -> Result {
+    fn service_async_compute_completions(&mut self) -> Result {
         self.service_async_compute_completions_matching(None)
     }
 
@@ -471,17 +317,12 @@ impl G17PLiveRuntime {
         &mut self,
         masks: Option<[u64; 2]>,
     ) -> Result {
-        let pdev = self.pdev.as_ref();
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.begin_independent_compute_completion_batch();
         let mut requested = false;
         for q in &self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
-            // Its scheduler watchdog is gone after cancellation. Observe a
-            // retained teardown on later event batches even if its own edge
-            // preceded the final stamp's visibility. Healthy queues retain
-            // the normal QID-filtered scan.
-            if !q.retired_by_teardown && masks.is_some_and(|masks| {
+            if masks.is_some_and(|masks| {
                 !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
             }) {
                 continue;
@@ -494,99 +335,40 @@ impl G17PLiveRuntime {
         manager.scan_independent_compute_completion_batch()?;
         for q in &mut self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
-            if !q.retired_by_teardown && masks.is_some_and(|masks| {
+            if masks.is_some_and(|masks| {
                 !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
             }) {
                 continue;
             }
-            let completion = q.active.as_ref().and_then(|active| active.retirement)
-                .ok_or_else(|| {
-                    if let Some(pdev) = pdev {
-                        dev_err!(pdev.as_ref(),
-                            "G17P async compute: retirement-invariant qid={} cause=missing-ticket\n",
-                            q.queue.queue_id());
-                    }
-                    EIO
-                })
-                .and_then(|ticket| {
-                    let active = q.active.as_ref().ok_or(EIO)?;
-                    if q.owner != Some(ticket.owner)
-                        || active.packet.submission_id() != ticket.submission
-                        || active.packet.context().context_id() != ticket.context
-                    {
-                        if let Some(pdev) = pdev {
-                            dev_err!(pdev.as_ref(),
-                                "G17P async compute: retirement-invariant qid={} cause=ticket-identity owner={:?}/{} submission={}/{} context={}/{}\n",
-                                q.queue.queue_id(), q.owner, ticket.owner,
-                                active.packet.submission_id(), ticket.submission,
-                                active.packet.context().context_id(), ticket.context);
-                        }
-                        return Err(EIO);
-                    }
-                    // J700 firmware routinely raises fault-free recoveries. An
-                    // open one says nothing about this job yet: keep it armed
-                    // and let the recovery settle first. Once the handshake is
-                    // closed, a changed epoch only means a recovery happened
-                    // while the job was live; the exact descriptor, stamp and
-                    // ring checks below still decide completed, zero-duration
-                    // or pending. Failing here killed healthy sessions.
-                    let handshake = manager.firmware_recovery_handshake_snapshot()?;
-                    if handshake.state != 0 {
-                        return Err(EAGAIN);
-                    }
-                    if handshake.epoch != ticket.recovery_epoch && crate::util::g17p_verbose() {
-                        if let Some(pdev) = pdev {
-                            dev_info!(pdev.as_ref(),
-                                "G17P async compute: qid={} retiring across recovery epoch {}/{}\n",
-                                q.queue.queue_id(), handshake.epoch, ticket.recovery_epoch);
-                        }
-                    }
-                    let completion = manager.poll_staged_independent_compute_completion(
-                        &mut q.queue, &ticket.firmware,
-                    ).map_err(|error| {
-                        if error != EAGAIN {
-                            if let Some(pdev) = pdev {
-                                dev_err!(pdev.as_ref(),
-                                    "G17P async compute: retirement-invariant qid={} cause=poll errno={}\n",
-                                    q.queue.queue_id(), error.to_errno());
-                            }
-                        }
-                        error
-                    })?;
-                    if completion.is_some()
-                        && q.previous_binding.as_ref().is_some_and(|previous|
-                            previous.publication
-                                != Some((ticket.submission, ticket.recovery_epoch)))
-                    {
-                        if let Some(pdev) = pdev {
-                            dev_err!(pdev.as_ref(),
-                                "G17P async compute: retirement-invariant qid={} cause=previous-binding-publication expected=({},{}) actual={:?}\n",
-                                q.queue.queue_id(), ticket.submission, ticket.recovery_epoch,
-                                q.previous_binding.as_ref().and_then(|previous| previous.publication));
-                        }
-                        return Err(EIO);
-                    }
-                    Ok(completion)
-                });
-            match completion {
+            match manager.poll_staged_independent_compute_completion(&mut q.queue) {
                 Ok(Some(timestamps)) => {
                     let active = q.active.take().ok_or(EIO)?;
-                    q.retirement_ready = true;
-                    // Only the poller's exact descriptor/fresh timestamp/final
-                    // stamp success in the publication epoch can release the
-                    // superseded aliases. Current binding stays queue-owned.
-                    drop(q.previous_binding.take());
-                    if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
+                    if let Some(pdev) = self.pdev.as_ref().filter(|_| {
+                        crate::g17_manager::g17p_compute_trace_enabled(
+                            active.packet.submission_id() as u32)
+                    }) {
                         dev_info!(pdev.as_ref(),
                             "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={}\n",
                             active.packet.submission_id(), q.queue.queue_id(),
                             active.packet.context().context_id(), timestamps[0], timestamps[1]);
                     }
-                    let completion = active.packet.completion()?;
-                    if q.retired_by_teardown {
-                        completion.release_after_retirement();
+                    // Reproduction oracle for the quarantine blast radius; see
+                    // `g17p_quarantine_selftest`. Off unless the parameter is
+                    // set, and it fires at most once per boot.
+                    let selftest = *crate::module_parameters::g17p_quarantine_selftest.value();
+                    if selftest != 0 {
+                        let seen = G17P_COMPLETIONS_SEEN.fetch_add(1, Ordering::AcqRel) + 1;
+                        if seen == selftest as u64 {
+                            active._lease.quarantine();
+                            q.quarantined = true;
+                            if let Some(pdev) = self.pdev.as_ref() {
+                                dev_err!(pdev.as_ref(),
+                                    "G17PMARK quarantine-selftest fired at completion {} qid={} -- the device-wide arm ran; this client still completes\n",
+                                    seen, q.queue.queue_id());
+                            }
+                        }
                     }
-                    completion.complete(Ok(timestamps));
+                    active.packet.completion()?.complete(Ok(timestamps));
                     drop(active);
                     if q.released {
                         // Retain `binding` and `context`. The firmware still has
@@ -602,15 +384,6 @@ impl G17PLiveRuntime {
                 Ok(None) => {}
                 Err(error) if error == EAGAIN => {}
                 Err(error) => {
-                    // Zero-duration recovery may retire this queue without
-                    // entering quarantine_async_compute. Capture admission
-                    // before that path consumes the active packet/lease too.
-                    if let (Some(pdev), Some(active)) = (self.pdev.as_ref(), q.active.as_ref()) {
-                        dev_info!(pdev.as_ref(),
-                            "G17P async compute: admission-at-retirement-error qid={} submission={} errno={} leases(compute,render-mask,install,render-transition,render-quarantine)={:?}\n",
-                            q.queue.queue_id(), active.packet.submission_id(), error.to_errno(),
-                            active._lease.admission_snapshot());
-                    }
                     // This queue is still firmware-owned and cannot be made
                     // reusable from an error fence. Make the proven
                     // processor-stop recovery reachable by the next client.
@@ -641,7 +414,7 @@ impl G17PLiveRuntime {
                                 "G17P async compute: queue retired after a zero-duration retire qid={} -- the client fails, the session stays up\n",
                                 q.queue.queue_id());
                         }
-                    } else if crate::g17_config::QUARANTINE_SCOPE & 1 == 0 {
+                    } else if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
                         crate::g17_live_boot::note_session_recovery_pending(
                             &mut self.session_recovery_pending,
                             self.pdev.as_ref(),
@@ -652,18 +425,8 @@ impl G17PLiveRuntime {
                             "G17PMARK quarantine-scoped unclassifiable-completion qid={} ({:?}) -- queue retired, client fails, session stays up\n",
                             q.queue.queue_id(), error);
                     }
-                    q.retired_by_teardown = false;
                     q.quarantined = true;
-                    // A zero-duration retire is the documented outcome after a
-                    // firmware recovery on a live, reset firmware. Retire this
-                    // queue and fail its client, but do not raise the device
-                    // admission poison: nothing is stuck, and the latch would
-                    // outlive the recovery that already cleared it.
-                    if submission_scoped {
-                        q.active.as_mut().ok_or(EIO)?._lease.release_retired_admission();
-                    } else {
-                        q.active.as_ref().ok_or(EIO)?._lease.quarantine();
-                    }
+                    q.active.as_ref().ok_or(EIO)?._lease.quarantine();
                     let completion = q.active.as_ref().ok_or(EIO)?.packet.completion()?;
                     completion.fail_while_owned(error);
                     q.terminal_fanout = Some((completion.status.clone(), error));
@@ -844,92 +607,18 @@ impl G17PLiveRuntime {
     /// leave the firmware's compute context pointing at memory the allocator
     /// has taken back" -- and releases the binding immediately before the next
     /// bind reinstalls those roots, or after both CPUs have stopped. This path
-    /// gives up the claim but retains everything firmware can still name.
-    /// A prepared replacement is also retained until its exact successful
-    /// publication completes; preparing aliases alone does not switch roots.
+    /// now obeys the same rule: give up the claim, keep everything the firmware
+    /// can still name.
     pub(crate) fn release_async_compute_queue(&mut self, owner: u64) {
-        if let Some(index) = self.async_compute_queues.iter().position(|q| q.owner == Some(owner)) {
-            let q = &self.async_compute_queues[index];
-            if q.active.is_none() && !q.quarantined && q.previous_binding.is_none()
-                && self.manager.as_mut().is_some_and(|manager|
-                    manager.cancel_unpublished_compute_queue(&q.queue))
-            {
-                // No firmware-visible publication used this exact lease. Its
-                // private graph and client aliases can be dropped immediately.
-                // Published or ambiguous owners still follow retention below.
-                drop(self.async_compute_queues.remove(index));
-                return;
-            }
-            let q = &mut self.async_compute_queues[index];
+        if let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) {
             q.released = true;
             if q.active.is_none() && !q.quarantined {
-                // A client may disappear before its first publication (or
-                // after a definitely-unpublished failure). Cancel only that
-                // preparation, restoring the still-installed old binding.
-                if q.previous_binding.as_ref().is_some_and(|previous|
-                    previous.publication.is_none()
-                ) {
-                    let previous = q.previous_binding.as_ref().unwrap();
-                    let restored = q.queue.bind_logical_channel_control(&previous._context)
-                        .and_then(|()| {
-                            if previous._binding.is_none() {
-                                q.binding.as_mut().ok_or(EIO)?
-                                    .retarget_logical_context(previous._context.clone())?;
-                            }
-                            Ok(())
-                        });
-                    if restored.is_err() {
-                        // Keep both owners and their mappings if restoring an
-                        // unpublished handoff cannot be proven. No reuse.
-                        q.quarantined = true;
-                        q.retired_by_teardown = true;
-                        return;
-                    }
-                    if let Some(previous) = q.previous_binding.take() {
-                        if let Some(binding) = previous._binding {
-                            q.binding = Some(binding);
-                        }
-                        q.context = Some(previous._context);
-                    }
-                    q.retirement_ready = true;
-                }
-                if q.retirement_ready {
-                    q.owner = None;
-                }
+                q.owner = None;
             }
         }
-    }
-
-    /// Cancel only the scheduler waiter. A published command must remain in
-    /// the ordinary completion scan until its exact retirement is observed.
-    /// No global lease poison or hardware-failure fanout belongs on this path.
-    pub(crate) fn cancel_async_compute(&mut self, owner: u64, submission: u64) -> bool {
-        let _ = self.service_async_compute_completions();
-        let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) else {
-            return false;
-        };
-        let Some(active) = q.active.as_ref() else { return false; };
-        if active.packet.submission_id() != submission { return false; }
-        // A real hardware fault already owns its quarantine decision. Queue
-        // teardown must neither undo that nor signal the same fence twice.
-        if q.quarantined { return true; }
-        q.released = true;
-        q.retired_by_teardown = true;
-        if let Ok(completion) = active.packet.completion() {
-            completion.cancel_while_owned();
-        }
-        if let Some(pdev) = &self.pdev {
-            dev_info!(pdev.as_ref(),
-                "G17P async compute: client waiter cancelled owner={} qid={} submission={}; retaining resources until exact retirement\n",
-                owner, q.queue.queue_id(), submission);
-        }
-        true
     }
 
     pub(crate) fn quarantine_async_compute(&mut self, owner: u64, submission: u64, error: Error) -> bool {
-        if error == ECANCELED {
-            return self.cancel_async_compute(owner, submission);
-        }
         // One final DRAM-only retirement attempt distinguishes an event-service
         // race from a job whose completion really is absent. Never throw away
         // a proven successful hardware completion merely because a timer ran.
@@ -941,17 +630,54 @@ impl G17PLiveRuntime {
                 if active.packet.submission_id() == submission {
                     matched = true;
                     if !q.quarantined {
-                        if let Some(pdev) = &self.pdev {
-                            dev_info!(pdev.as_ref(),
-                                "G17P async compute: admission-at-quarantine qid={} submission={} leases(compute,render-mask,install,render-transition,render-quarantine)={:?}\n",
-                                q.queue.queue_id(), submission,
-                                active._lease.admission_snapshot());
-                        }
-                        // Client cancellation took the separate retention path
-                        // above. A real failure still poisons hardware admission
-                        // and retains everything firmware may reference.
-                        q.retired_by_teardown = false;
-                        if crate::g17_config::QUARANTINE_SCOPE & 1 == 0 {
+                        // ECANCELED is not a fault. `drm_sched_fini()` is its
+                        // only source: `drm_sched_cancel_remaining_jobs()` walks
+                        // the pending list and calls `cancel_job` on each entry
+                        // purely so their fences are signalled before the
+                        // scheduler is torn down. So this errno means "the
+                        // client destroyed its queue while a submission was
+                        // still pending", which is ordinary lifecycle -- a
+                        // process exiting with work in flight -- and says
+                        // nothing about the firmware or the hardware.
+                        //
+                        // Measured on G17P, two boots, both ECANCELED:
+                        //   qid=7 submission=448    owner=6    PUBLISHED +271us
+                        //   qid=8 submission=297575 owner=1921 PUBLISHED +274us
+                        // Both carried `root-current=true`, so the VM root was
+                        // still live; neither was preceded by a `publishing
+                        // target=` lag line in any boot; and the scheduler's
+                        // timeout is 2000ms, three orders of magnitude away.
+                        // Nothing timed out and the firmware was never behind.
+                        //
+                        // Escalating it killed the device: `note_session_
+                        // recovery_pending` makes `is_crashed()` true, so every
+                        // new client gets ENODEV and every existing one EIO,
+                        // and it arms a firmware rebuild that is known to end in
+                        // `apple_rtkit_boot` ETIME and ENODEV for the rest of
+                        // the boot. A CTS sweep exits a deqp process thousands
+                        // of times, so one of them eventually races an unretired
+                        // submission and takes the whole GPU with it.
+                        //
+                        // The QUEUE still quarantines, which is what keeps
+                        // firmware-referenced memory safe: a quarantined queue
+                        // is permanently retired, `release_async_compute_queue`
+                        // will not strip it, `reusable_idle_compute_graph` and
+                        // `rebindable_released_compute_graph` exclude it, and
+                        // `prepare_async_compute_queue` skips it. The session
+                        // flag never contributed to that safety -- see the
+                        // `g17p_quarantine_scope` description in asahi.rs.
+                        //
+                        // Scope: ECANCELED only. ETIMEDOUT and EIO still
+                        // escalate exactly as before.
+                        let client_teardown = error == ECANCELED;
+                        q.retired_by_teardown = client_teardown;
+                        if client_teardown {
+                            if let Some(pdev) = &self.pdev {
+                                dev_info!(pdev.as_ref(),
+                                    "G17P async compute: queue retired after client teardown owner={} qid={} submission={} -- drm_sched_fini cancelled a pending job; the session stays up\n",
+                                    owner, q.queue.queue_id(), submission);
+                            }
+                        } else if *crate::module_parameters::g17p_quarantine_scope.value() & 1 == 0 {
                             crate::g17_live_boot::note_session_recovery_pending(
                                 &mut self.session_recovery_pending,
                                 self.pdev.as_ref(),
@@ -971,6 +697,12 @@ impl G17PLiveRuntime {
                                 active.packet.context().vm_id(), active.packet.context().root(),
                                 active.packet.context().is_current(),
                                 self.gfx_state.as_ref().map(|s| s.submission_phase.load(Ordering::Acquire)), error);
+                            let now = G17P_COMPLETIONS_SEEN.load(Ordering::Acquire);
+                            let retired_since = now.saturating_sub(active.completions_at_publish);
+                            dev_err!(pdev.as_ref(),
+                                "G17PMARK quarantine-progress submission={} qid={} other-completions-retired-since-publish={} -- non-zero means the firmware was alive and retiring work when the {}ms timer gave up on this submission\n",
+                                submission, q.queue.queue_id(), retired_since,
+                                crate::g17_drm::G17P_COMPUTE_COMPLETION_TIMEOUT_MS);
                         }
                         if let Some(manager) = self.manager.as_mut() {
                             // Sample the actual retained owner, not the legacy

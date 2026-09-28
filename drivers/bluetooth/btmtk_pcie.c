@@ -523,17 +523,24 @@ static int btmtk_pcie_load_firmware_image(struct btmtk_pcie_dev *bdev,
 	int err = -ENOENT;
 
 	for (index = 0; index < candidates->count; index++) {
-		err = request_firmware(&firmware, candidates->names[index],
-				       &bdev->pdev->dev);
+		err = firmware_request_nowarn(&firmware, candidates->names[index],
+					      &bdev->pdev->dev);
 		if (!err) {
 			*loaded_name = candidates->names[index];
 			break;
 		}
-		if (err != -ENOENT)
+		if (err != -ENOENT) {
+			dev_err(&bdev->pdev->dev, "Failed to load firmware %s: %d\n",
+				candidates->names[index], err);
 			return err;
+		}
 	}
-	if (!firmware)
+	if (!firmware) {
+		dev_err(&bdev->pdev->dev,
+			"No Bluetooth firmware found for ROM B%u (%zu candidates)\n",
+			bdev->rom_version, candidates->count);
 		return err;
+	}
 	if (firmware->size <= MTK_PCIE_FW_TRAILER_SIZE) {
 		err = -EINVAL;
 		goto out_release;

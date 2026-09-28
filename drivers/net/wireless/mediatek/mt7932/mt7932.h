@@ -15,6 +15,7 @@
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <linux/if_vlan.h>
 #include <linux/pci.h>
 #include <linux/random.h>
@@ -27,6 +28,7 @@
 #include "packet.h"
 #include "scan.h"
 #include "association.h"
+#include "bandwidth.h"
 #include "regulatory.h"
 
 
@@ -83,6 +85,11 @@ struct mt7932 {
 	struct ieee80211_channel channels[MT7932_CHANNELS_2G];
 	struct ieee80211_channel channels5[MT7932_CHANNELS_5G];
 	struct ieee80211_supported_band band5;
+	struct ieee80211_sband_iftype_data band5_iftype;
+	unsigned int bw_limit;
+	bool bw_fallback, bw_policy_pending, fw_asserted;
+	bool bw_cal_active, bw_cal_rejected;
+	u8 assoc_width, assoc_sco, assoc_center;
 	u8 scan_band, scan_batch;
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
@@ -115,7 +122,8 @@ struct mt7932 {
 	u32 cqm_rssi_hyst;
 	int cqm_rssi_state;
 	struct work_struct connect_work, disconnect_work;
-	struct completion assoc_start, assoc_done, disconnect_done;
+	struct completion assoc_update, assoc_done, disconnect_done;
+	bool assoc_pending; /* response_lock; freezes the calibration parameters */
 	struct completion discovery_done;
 	struct completion scan_done;
 	struct ieee80211_channel *connect_channel_req, *connect_channel_hint;
@@ -135,7 +143,15 @@ struct mt7932 {
 	bool data_live[512], data_token[512], data_retired[512];
 	struct mt7932_duplicate duplicates[17];
 	u64 tx_released, rx_ethernet;
+	u64 tx_doorbells, tx_busy, rx_descriptors, rx_doorbells;
+	u64 rx_parse_errors, rx_amsdu, rx_filtered, rx_rate_missing;
+	/* response_lock protects the associated unicast RX rate snapshot. */
+	struct rate_info rx_rate;
+	unsigned long rx_rate_updated;
+	u32 last_rxv;
+	bool rx_rate_valid;
 	bool data_ready;
+	bool tx_pending; /* data_lock: descriptors awaiting a doorbell */
 	bool bss_absent;
 	u8 bss_quota;
 	u32 irq_mask;
@@ -143,6 +159,13 @@ struct mt7932 {
 	dma_addr_t ipc_dma, aux_dma;
 };
 
+unsigned int mt_bw_requested(void);
+void mt_bw_caps(struct mt7932 *m);
+u32 mt_bw_channel_flags(struct mt7932 *m, struct ieee80211_channel *channel);
+int mt_bw_assoc_start(struct mt7932 *m, const u8 *body, size_t length);
+void mt_bw_latch(struct mt7932 *m, const char *reason);
+void mt_bw_narrow_host(struct mt7932 *m);
+int mt_bw_apply_fallback(struct mt7932 *m);
 bool mt_rf_allowed(struct mt7932 *m);
 u32 mt_read(struct mt7932 *m, u32 reg);
 void mt_write(struct mt7932 *m, u32 reg, u32 value);
@@ -159,6 +182,7 @@ int mt_recovery_gate(struct mt7932 *m);
 int mt_cal_procedure(struct mt7932 *m, struct mt7932_cal_piece *pieces,
 				    unsigned int count, unsigned int logical, u8 context_version);
 int mt_calibration_gate(struct mt7932 *m);
+void mt_data_kick_locked(struct mt7932 *m);
 void mt_data_clean_locked(struct mt7932 *m);
 void mt_data_clean(struct mt7932 *m);
 void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event);
@@ -196,6 +220,8 @@ int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 int mt_set_cqm_rssi_config(struct wiphy *wiphy, struct net_device *netdev,
 			   s32 rssi_thold, u32 rssi_hyst);
 void mt_signal_update(struct mt7932 *m, const struct mt7932_rx_frame *frame, int signal);
+
+extern const struct ethtool_ops mt_ethtool_ops;
 
 bool mt_transport_polled(void);
 

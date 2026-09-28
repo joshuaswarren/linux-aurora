@@ -485,5 +485,6 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 		drm_plane_helper_add(&plane->base, &apple_plane_helper_funcs);
 	plane->iomfb_surface = iomfb_surface;
 
+
 	return &plane->base;
 }

@@ -9,6 +9,8 @@
 
 /dts-v1/;
 
+#define T8112_TYPEC_DCP
+
 #include "t8112.dtsi"
 #include "t8112-jxxx.dtsi"
 
@@ -18,17 +20,9 @@
 	chassis-type = "desktop";
 
 	aliases {
-		bluetooth0 = &bluetooth0;
-		/delete-property/ dcp;
-		dcpext = &dcpext;
 		ethernet0 = &ethernet0;
-		sio = &sio;
 		wifi0 = &wifi0;
 	};
-};
-
-&framebuffer0 {
-	power-domains = <&ps_dispext_cpu0>, <&ps_dptx_ext_phy>;
 };
 
 &dptxphy {
@@ -66,13 +60,83 @@
 	apple,dptx-phy = <5>;
 };
 
-/* remove once m1n1 enables sio nodes after setup */
-&sio {
-        status = "okay";
+&display {
+	/* dispext0_dart needs to be first for m1n1's */
+	iommus = <&dispext0_dart 0>, <&disp0_dart 0>;
 };
 
-&dpaudio1 {
+&disp0_dart {
 	status = "okay";
+};
+
+&dcp {
+	status = "okay";
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>;
+	mux-control-names = "typec0", "typec1";
+	apple,typec-mux-indices = <0 0>;
+	apple,typec-dptx-phys = <0 1>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcp_typec0: endpoint {
+					remote-endpoint = <&typec0_dcp>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcp_typec1: endpoint {
+					remote-endpoint = <&typec1_dcp>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext {
+	/delete-property/ mux-controls;
+	/delete-property/ mux-control-names;
+	/delete-property/ mux-index;
+};
+
+&dpaudio0 {
+	status = "okay";
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dcp: endpoint {
+				remote-endpoint = <&dcp_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_dcp: endpoint {
+				remote-endpoint = <&dcp_typec1>;
+			};
+		};
+	};
 };
 
 /*

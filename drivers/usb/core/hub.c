@@ -33,7 +33,6 @@
 #include <linux/random.h>
 #include <linux/pm_qos.h>
 #include <linux/kobject.h>
-#include <linux/of.h>
 
 #include <linux/bitfield.h>
 #include <linux/uaccess.h>
@@ -1863,25 +1862,6 @@ static bool hub_descriptor_is_sane(struct usb_host_interface *desc)
         return true;
 }
 
-static bool hub_is_j700_onboard(struct usb_device *hdev)
-{
-	struct device *controller;
-
-	/* Not an external VIA hub, nor the same hub on another Apple model. */
-	if (!of_machine_is_compatible("apple,j700") ||
-	    le16_to_cpu(hdev->descriptor.idVendor) != 0x2109 ||
-	    le16_to_cpu(hdev->descriptor.idProduct) != 0x2122 ||
-	    hdev->parent != hdev->bus->root_hub || hdev->portnum != 1)
-		return false;
-
-	for (controller = hdev->bus->controller; controller;
-	     controller = controller->parent)
-		if (of_device_is_compatible(controller->of_node, "apple,t8140-dwc3"))
-			return true;
-
-	return false;
-}
-
 static int hub_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_host_interface *desc;
@@ -2005,15 +1985,7 @@ static int hub_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (id->driver_info & HUB_QUIRK_CHECK_PORT_AUTOSUSPEND)
 		hub->quirk_check_port_auto_suspend = 1;
 
-	/*
-	 * J700's fixed eUSB2/repeater/hub path can miss downstream attachment
-	 * while suspended. Resuming the onboard hub makes normal hub discovery
-	 * find the devices again. Keep just this hub active until remote wake
-	 * through that path is qualified; do not disable PM for all USB devices.
-	 * The existing quirk reference is balanced by hub_disconnect().
-	 */
-	if ((id->driver_info & HUB_QUIRK_DISABLE_AUTOSUSPEND) ||
-	    hub_is_j700_onboard(hdev)) {
+	if (id->driver_info & HUB_QUIRK_DISABLE_AUTOSUSPEND) {
 		hub->quirk_disable_autosuspend = 1;
 		usb_autopm_get_interface_no_resume(intf);
 	}

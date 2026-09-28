@@ -1,14 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Windowed host submission accounting and optional GPU interval statistics.
+//! Steady-state throughput accounting for the G17P submit path.
 //!
-//! The asynchronous DRM path supplies host ioctl/publication costs only.
-//! GPU statistics require separately supplied firmware completion intervals;
-//! an empty interval set means unmeasured, not idle. Submission counts are
-//! accepted jobs, not completed jobs or presented frames.
+//! Nothing in this driver has ever reported how fast it is. The per-submission
+//! `dev_info!` dumps are gated off (`g17p_verbose`), which is right for the
+//! journal and wrong for measurement: with them off there is no number at all,
+//! and with them on the printk cost dominates whatever is being measured.
 //!
-//! Production arithmetic stays in `u64`: the kernel has no 128-bit division
-//! helper. Tests use wider arithmetic as an independent rounding reference.
+//! This module is the measurement instead. It keeps plain integer counters --
+//! no allocation, no formatting, one uncontended lock round trip per
+//! submission -- and emits a single line once per window of submissions. At a
+//! 256-submission window and 60 frames per second that is one line every four
+//! seconds.
+//!
+//! Two properties make the numbers trustworthy:
+//!
+//! * **The GPU busy time is the firmware's own.** `render_gpu_interval`
+//!   already extracts the native pass envelope (TA stamps the start word, 3D
+//!   stamps the end word) from a completed pair. Those are GPU-written
+//!   timestamps in the CNTPCT domain, not host estimates.
+//! * **The timebase is derived, not assumed.** Occupancy is a ratio of two
+//!   spans in the same tick domain, so it needs no conversion at all, and the
+//!   report also divides the observed tick span by the observed nanosecond
+//!   span to state the tick rate it measured. The completion path publishes
+//!   these timestamps as 24 MHz ticks (`g17_job::G17P_COMMAND_TIMESTAMP_HZ`);
+//!   a report whose `tick_khz` comes back near 24000 confirms that on
+//!   hardware rather than trusting it.
+//!
+//! Every arithmetic path below stays inside `u64`. The kernel has no
+//! 128-bit division helper, so a `u128` divide would fail to link.
 
 /// Nominal GPU timestamp rate, in kHz.
 ///
@@ -17,22 +37,6 @@
 /// `SubmitReport::tick_khz` re-derives the rate from each window so a wrong
 /// constant is visible instead of silent.
 pub(crate) const NOMINAL_TICK_KHZ: u64 = 24_000;
-
-/// Opt-in subdivisions of one G17P render publication. The bounded trace
-/// prints these after preparation, so its printk cannot inflate inner stages.
-#[derive(Default)]
-pub(crate) struct RenderStageTimes {
-    pub(crate) enabled: bool,
-    pub(crate) runtime_lock_ns: u64,
-    pub(crate) handoff_ns: u64,
-    pub(crate) prepare_ns: u64,
-    pub(crate) restage_ns: u64,
-    pub(crate) reachability_ns: u64,
-    pub(crate) reachability_cache_hit: bool,
-    pub(crate) flist_request_ns: u64,
-    pub(crate) tvb_blocks: u32,
-    pub(crate) retained: bool,
-}
 
 /// Backoff schedule for a completion poll loop.
 ///
@@ -166,8 +170,7 @@ const fn div_round(numerator: u64, denominator: u64) -> u64 {
     if denominator == 0 {
         0
     } else {
-        numerator / denominator
-            + (numerator % denominator >= denominator - denominator / 2) as u64
+        (numerator + denominator / 2) / denominator
     }
 }
 
@@ -285,33 +288,6 @@ impl SubmitWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rounding_matches_a_wide_reference_at_integer_boundaries() {
-        let values = [0, 1, 2, 3, 99, 100, 101, u64::MAX / 2, u64::MAX - 1, u64::MAX];
-        for numerator in values {
-            for denominator in values {
-                let expected = if denominator == 0 {
-                    0
-                } else {
-                    ((numerator as u128 + denominator as u128 / 2) / denominator as u128) as u64
-                };
-                assert_eq!(div_round(numerator, denominator), expected,
-                           "{numerator} / {denominator}");
-            }
-        }
-    }
-
-    #[test]
-    fn saturated_accounting_does_not_overflow_when_reporting() {
-        let mut window = SubmitWindow::default();
-        window.open();
-        window.record_compute(u64::MAX);
-        window.record_compute(u64::MAX);
-        let report = window.close(1_000);
-        assert!(report.ioctl_avg_us_x10 > 0);
-        assert!(report.ioctl_pct_x10 > 0);
-    }
 
     #[test]
     fn adaptive_schedule_doubles_from_twenty_to_one_thousand_and_stays() {

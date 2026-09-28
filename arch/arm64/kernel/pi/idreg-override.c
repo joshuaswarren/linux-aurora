@@ -244,8 +244,8 @@ static const struct {
 	  "id_aa64isar1.api=0 id_aa64isar1.apa=0 "
 	  "id_aa64isar2.gpa3=0 id_aa64isar2.apa3=0"	   },
 	{ "arm64.nomops",		"id_aa64isar2.mops=0" },
-	{ "arm64.nowfxt",		"id_aa64isar2.wfxt=0" },
 	{ "arm64.nomte",		"id_aa64pfr1.mte=0" },
+	{ "arm64.nowfxt",		"id_aa64isar2.wfxt=0" },
 	{ "nokaslr",			"arm64_sw.nokaslr=1" },
 	{ "rodata=off",			"arm64_sw.rodataoff=1" },
 	{ "arm64.nolva",		"id_aa64mmfr2.varange=0" },

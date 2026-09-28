@@ -96,16 +96,26 @@ int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 		   const u8 *mac, struct station_info *sinfo)
 {
 	struct mt7932 *m = mt_from_wiphy(wiphy);
+	unsigned long flags;
+	int ret = 0;
 
-	if (wdev != &m->wdev || !READ_ONCE(m->connected))
-		return -ENOENT;
-	if (mac && !ether_addr_equal(mac, m->connect_bssid))
-		return -ENOENT;
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (wdev != &m->wdev || !m->connected ||
+	    (mac && !ether_addr_equal(mac, m->connect_bssid))) {
+		ret = -ENOENT;
+		goto out;
+	}
 	if (READ_ONCE(m->assoc_signal_valid)) {
 		sinfo->signal = READ_ONCE(m->assoc_signal_dbm);
 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
 	}
-	return 0;
+	if (m->rx_rate_valid && time_before(jiffies, m->rx_rate_updated + 10 * HZ)) {
+		sinfo->rxrate = m->rx_rate;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+	}
+out:
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	return ret;
 }
 
 int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
@@ -192,7 +202,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		}
 		if (m->connecting) {
 			m->connect_error = -ECONNRESET;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 		}
 		return;
@@ -204,10 +214,16 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		if (length >= 20)
 			dev_info(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
 				 get_unaligned_le32(body + 12), body[16], body[17], body[19]);
-		if (length < 20 || get_unaligned_le32(body + 12) != mt7932_channel_band(m->connect_channel) ||
-		    body[16] || body[17] != m->connect_channel || body[19])
-			m->connect_error = -EPROTO;
-		complete(&m->assoc_start);
+		/* Do not overwrite parameters while calibration is pending/in flight. */
+		if (!m->connect_error) {
+			if (m->assoc_pending || completion_done(&m->assoc_done))
+				m->connect_error = -EPROTO;
+			else
+				m->connect_error = mt_bw_assoc_start(m, body, length);
+		}
+		if (!m->connect_error)
+			m->assoc_pending = true;
+		complete(&m->assoc_update);
 		break;
 	case 0x40:
 		if (length >= 52)
@@ -219,7 +235,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		 */
 		if (!mt7932_assoc_resources(body, length, &m->peer_ids, m->connect_channel, m->connect_open)) {
 			m->connect_error = -EPROTO;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 			break;
 		}
@@ -236,6 +252,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		if (length < 2 || get_unaligned_le16(body) || !m->peer_valid)
 			m->connect_error = -ECONNREFUSED;
 		complete(&m->assoc_done);
+		complete(&m->assoc_update);
 		break;
 	}
 }
@@ -244,14 +261,28 @@ static int mt_association_calibration(struct mt7932 *m)
 {
 	const struct firmware *oca;
 	struct mt7932_cal_piece pieces[2];
+	unsigned long flags;
 	int ret;
 
 	ret = request_firmware_direct(&oca, "mediatek/mt7932/oca2.bin", &m->pdev->dev);
 	if (ret)
 		return ret;
-	ret = mt7932_cal_association(oca->data, oca->size, m->connect_channel, pieces);
-	if (ret == 2)
+	if (m->assoc_width || m->assoc_sco)
+		ret = mt7932_cal_association_wide(oca->data, oca->size, m->assoc_center, pieces);
+	else
+		ret = mt7932_cal_association(oca->data, oca->size, m->connect_channel, pieces);
+	if (ret == 2 && (m->assoc_width || m->assoc_sco))
+		dev_info(&m->pdev->dev, "BW_CAL: center=%u parameter=%08x group=%u fragments=2\n",
+			 m->assoc_center, pieces[0].parameter, pieces[0].parameter & 0xff);
+	if (ret == 2) {
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->bw_cal_active = m->assoc_width || m->assoc_sco;
+		spin_unlock_irqrestore(&m->response_lock, flags);
 		ret = mt_cal_procedure(m, pieces, 2, 1, 0);
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->bw_cal_active = false;
+		spin_unlock_irqrestore(&m->response_lock, flags);
+	}
 	release_firmware(oca);
 	return ret;
 }
@@ -287,6 +318,7 @@ static int mt_retire_connection(struct mt7932 *m)
 	netif_tx_disable(m->netdev);
 	/* ndo_start_xmit rechecks the closed admission gate under data_lock. */
 	spin_lock_irqsave(&m->data_lock, flags);
+	mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);
@@ -344,6 +376,18 @@ static int mt_retire_connection(struct mt7932 *m)
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
+	/* A well-formed negative D6 is terminal for the single logical wide
+	 * association calibration. Only after EE44, TX/token drain and joining
+	 * RX/D7 may that explicit rejection be retired. Timeouts, malformed
+	 * events, D7 errors and asserts retain their original sticky epoch.
+	 */
+	if (!ret && m->bw_cal_rejected && !m->fw_asserted &&
+	    !m->cal_state.active && m->cal_state.error == -EREMOTEIO &&
+	    !m->cal_request_count && !m->waiting) {
+		memset(&m->cal_state, 0, sizeof(m->cal_state));
+		m->bw_cal_rejected = false;
+		dev_info(&m->pdev->dev, "BW_CAL_REJECTION_RETIRED: next attempt may use 20 MHz\n");
+	}
 	if (!ret && (m->cal_state.active || m->cal_state.error || m->cal_request_count || m->waiting))
 		ret = -EPROTO;
 	if (!ret)
@@ -384,8 +428,11 @@ void mt_connect_work(struct work_struct *work)
 	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
 	struct cfg80211_connect_resp_params response = {};
 	u8 *body, mac[8] = {}, queue[32];
-	unsigned long flags;
-	bool submitted = false, peer_owned = false;
+	unsigned long flags, deadline, remaining;
+	bool submitted = false, peer_owned = false, queue_enabled = false;
+	bool pending, done;
+	const char *phase = "prepare";
+	unsigned long started = jiffies;
 	int ret;
 
 	mutex_lock(&m->command_mutex);
@@ -397,8 +444,13 @@ void mt_connect_work(struct work_struct *work)
 		ret = -ECANCELED;
 		goto free;
 	}
+	phase = "bandwidth-policy";
+	ret = mt_bw_apply_fallback(m);
+	if (ret)
+		goto free;
 	if (!m->connect_bss) {
 		dev_info(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
+		phase = "discovery";
 		ret = mt_connect_discover(m);
 		if (ret)
 			goto free;
@@ -423,6 +475,11 @@ void mt_connect_work(struct work_struct *work)
 	 * belongs in this field. The recovered framework uses listen interval20.
 	 * Other platform flag policies remain unsupported, not guessed mappings.
 	 */
+	/* Native assocSendConnectCmd supplies band/primary only at 0x338/9.
+	 * 0x33a/b are reserved, not width/center slots. Firmware selects the
+	 * negotiated CW/SCO and returns them in EE4d before calibration.
+	 */
+	phase = "connect-submit";
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
 		m->connect_open ? NULL : m->connect_pmk, m->connect_bssid,
 		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open);
@@ -443,38 +500,74 @@ free:
 	if (ret)
 		goto report;
 	dev_info(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n", m->connect_bssid, m->connect_channel);
-	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
-	mutex_unlock(&m->command_mutex);
-	ret = wait_for_completion_timeout(&m->assoc_start, msecs_to_jiffies(5000)) ? 0 : -ETIMEDOUT;
-	mutex_lock(&m->command_mutex);
-	if (ret) {
-		ret = -ETIMEDOUT;
-		goto report;
+	phase = "assoc-start";
+	deadline = jiffies + msecs_to_jiffies(5000);
+	for (;;) {
+		remaining = jiffies;
+		if (time_after_eq(remaining, deadline)) {
+			ret = -ETIMEDOUT;
+			goto report;
+		}
+		remaining = deadline - remaining;
+		/* Service genuine D7 work while waiting for either link event. */
+		mutex_unlock(&m->command_mutex);
+		ret = wait_for_completion_timeout(&m->assoc_update, remaining) ?
+			0 : -ETIMEDOUT;
+		mutex_lock(&m->command_mutex);
+		spin_lock_irqsave(&m->response_lock, flags);
+		ret = m->connect_error ?: ret;
+		pending = m->assoc_pending;
+		done = completion_done(&m->assoc_done);
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		if (ret)
+			goto report;
+		if (!pending) {
+			if (!done || !queue_enabled)
+				ret = -EPROTO;
+			break;
+		}
+		/* Firmware may restart association within one submitted join. Each
+		 * new start needs calibration; waiting only for CONNECT_REPORT after
+		 * the first start leaves that restart stalled until our timeout.
+		 */
+		phase = "association-calibration";
+		ret = mt_association_calibration(m);
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->assoc_pending = false;
+		ret = ret ?: m->connect_error;
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		if (ret)
+			goto report;
+		dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: channel=%u\n",
+			 m->connect_channel);
+		if (!queue_enabled) {
+			phase = "peer-queue";
+			mt7932_peer_queue(queue, m->peer_ids.station[0], true);
+			ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
+			if (ret)
+				goto report;
+			queue_enabled = true;
+			deadline = jiffies + msecs_to_jiffies(10000);
+		}
+		/* Repeated starts never renew the connection-complete deadline. */
+		phase = "connect-complete";
 	}
-	ret = READ_ONCE(m->connect_error);
-	if (ret)
-		goto report;
-	ret = mt_association_calibration(m);
-	ret = ret ?: READ_ONCE(m->connect_error);
-	if (ret)
-		goto report;
-	dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: channel=%u\n", m->connect_channel);
-	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
-	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
-	if (ret)
-		goto report;
-	mutex_unlock(&m->command_mutex);
-	if (!wait_for_completion_timeout(&m->assoc_done, msecs_to_jiffies(10000)))
-		ret = -ETIMEDOUT;
-	else
-		ret = READ_ONCE(m->connect_error);
-	mutex_lock(&m->command_mutex);
 report:
 	ret = ret ?: READ_ONCE(m->connect_error);
-	if (!ret)
+	if (!ret) {
+		phase = "power-save-policy";
 		ret = mt_station_ps_restore(m);
-	if (ret)
+	}
+	if (ret) {
+		dev_err(&m->pdev->dev,
+			"CONNECT_PHASE_FAILED: phase=%s status=%d elapsed-ms=%u start=%u done=%u peer=%u\n",
+			phase, ret, jiffies_to_msecs(jiffies - started),
+			READ_ONCE(m->assoc_pending), completion_done(&m->assoc_done),
+			READ_ONCE(m->peer_valid));
+		if (submitted && m->connect_channel > 14 && ret != -ECANCELED)
+			mt_bw_latch(m, phase);
 		mt_transport_snapshot(m);
+	}
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
 	if (ret) {
 		spin_lock_irqsave(&m->response_lock, flags);
@@ -482,7 +575,11 @@ report:
 		spin_unlock_irqrestore(&m->response_lock, flags);
 		mutex_unlock(&m->command_mutex);
 		if (submitted) {
-			mt_retire_connection(m);
+			int retired = mt_retire_connection(m);
+
+			if (retired && READ_ONCE(m->bw_fallback))
+				dev_err(&m->pdev->dev,
+					"BW_FALLBACK_BLOCKED: firmware/DMA epoch not retired; reboot with mt7932_fullmac.max_bw_mhz=20 required\n");
 		} else if (peer_owned) {
 			mutex_lock(&m->command_mutex);
 			spin_lock_irqsave(&m->response_lock, flags);
@@ -606,7 +703,13 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		ret = m->link_failed ? -EIO : -EBUSY;
 		goto unlock;
 	}
-	reinit_completion(&m->assoc_start);
+	if (READ_ONCE(m->bw_fallback))
+		mt_bw_narrow_host(m);
+	m->assoc_width = 0;
+	m->assoc_sco = 0;
+	m->assoc_center = 0;
+	reinit_completion(&m->assoc_update);
+	m->assoc_pending = false;
 	m->disconnect_seen = false;
 	m->disconnect_event_received = false;
 	reinit_completion(&m->assoc_done);
@@ -629,6 +732,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_error = 0;
 	m->connect_cancelled = false;
 	m->peer_valid = false;
+	m->rx_rate_valid = false;
+	m->last_rxv = 0;
+	m->rx_rate_updated = 0;
+	WRITE_ONCE(m->assoc_signal_valid, false);
+	WRITE_ONCE(m->cqm_rssi_state, 0);
 	m->connecting = true;
 unlock:
 	spin_unlock_irqrestore(&m->response_lock, flags);
@@ -675,7 +783,7 @@ int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 		m->connect_error = -ECANCELED;
 		m->connect_cancelled = true;
 		m->disconnect_reason = reason;
-		complete(&m->assoc_start);
+		complete(&m->assoc_update);
 		complete(&m->assoc_done);
 		complete(&m->discovery_done);
 	} else if (m->connected) {

@@ -509,15 +509,6 @@ impl FirmwareContextTableReader {
         self.context_root(0)
     }
 
-    /// Diagnostic read-only view of context 0's upper root. Addresses passed
-    /// to the walker are offsets within that root, not canonical high VAs.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn context0_upper_root(&self) -> Option<FirmwarePageTableRoot> {
-        let shared = self.inner.lock();
-        decode_firmware_ttb_root(shared.ttbs()[0].ttb1.load(Ordering::Acquire), self.cfg)
-            .map(|ttb| FirmwarePageTableRoot { ttb, cfg: self.cfg })
-    }
-
     /// Copy one T8140 crash buffer through the retained WC CPU alias. This is
     /// distinct from the raw physical walker used to diagnose the live UAT:
     /// the latter maps pages WB and can hide device writes behind a conflicting
@@ -698,58 +689,16 @@ const SLOTS_SIZE: usize = UAT_NUM_CTX * size_of::<SlotTTBS>();
 // We need at least page 0 (ttb0)
 const PAGETABLES_SIZE: usize = UAT_PGSZ;
 
-// Retained renders can prove their mappings unchanged across unrelated BO
-// changes without walking every retained PTE on each submission.
-const MAPPING_VALIDATION_HISTORY: usize = 128;
-
-#[derive(Clone, Copy)]
-struct MappingValidationChange {
-    epoch: u64,
-    start: u64,
-    end: u64,
-}
-
 /// Inner data for a Vm instance. This is reference-counted by the outer Vm object.
 struct VmInner {
     dev: driver::AsahiDevRef,
     is_kernel: bool,
     va_range: Range<u64>,
     page_table: UatPageTable,
-    /// Changes before every attempted leaf or permission mutation while the
-    /// GPUVM exec lock is held. A failed attempt may invalidate a cached
-    /// reachability result conservatively. Overflow disables caching.
-    mapping_validation_epoch: Option<u64>,
-    mapping_validation_changes: Option<KBox<[Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY]>>,
     mm: mm::Allocator<(), KernelMappingInner>,
     uat_inner: Arc<UatInner>,
     binding: Arc<Mutex<VmBinding>>,
     id: u64,
-}
-
-impl VmInner {
-    fn note_mapping_validation_change(&mut self, range: Range<u64>) {
-        self.mapping_validation_epoch = self.mapping_validation_epoch
-            .and_then(|epoch| epoch.checked_add(1));
-        // A PTE covers the whole page. Record that leaf even if the caller's
-        // byte range is narrower, so an adjacent graph predicate cannot be
-        // incorrectly treated as untouched.
-        let mask = UAT_PGSZ as u64 - 1;
-        let end = range.end.checked_add(mask).map(|end| end & !mask);
-        if range.start >= range.end || end.is_none() {
-            self.mapping_validation_epoch = None;
-        }
-        if let (Some(epoch), Some(changes)) = (
-            self.mapping_validation_epoch,
-            self.mapping_validation_changes.as_mut(),
-        ) {
-            changes[epoch as usize % MAPPING_VALIDATION_HISTORY] =
-                Some(MappingValidationChange {
-                    epoch,
-                    start: range.start & !mask,
-                    end: end.unwrap(),
-                });
-        }
-    }
 }
 
 /// Slot binding-related inner data for a Vm instance.
@@ -870,7 +819,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         // GPUVM cannot see driver-owned KernelMappings.  Preflight the full
         // object range in the authoritative page table and allocate every
         // intermediate table before the first scatterlist leaf is written.
-        self.note_mapping_validation_change(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?);
         self.page_table
             .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
 
@@ -990,7 +938,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         let va = op.va().expect("step_unmap: missing VA");
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
 
-        self.note_mapping_validation_change(va.addr()..va.addr().checked_add(va.range()).ok_or(EOVERFLOW)?);
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
@@ -1035,7 +982,6 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let unmap_range = unmap_end - unmap_start;
 
-        self.note_mapping_validation_change(unmap_start..unmap_end);
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
         self.tlbi_live_contexts(unmap_start, unmap_range);
@@ -1111,11 +1057,7 @@ impl VmInner {
         fence(Ordering::SeqCst);
         for context_id in 0..UAT_NUM_CTX {
             if contexts & (1u64 << context_id) != 0 {
-                if self.uat_inner.t8140 {
-                    mem::tlbi_range_t8140(context_id as u8, addr as usize, size as usize);
-                } else {
-                    mem::tlbi_range(context_id as u8, addr as usize, size as usize);
-                }
+                mem::tlbi_range(context_id as u8, addr as usize, size as usize);
             }
         }
         mem::sync();
@@ -1129,7 +1071,6 @@ impl VmInner {
             .ok_or(EOVERFLOW)?;
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
-        self.note_mapping_validation_change(iova..mapping_end);
         self.page_table.prepare_map(iova..mapping_end)?;
         let guard = node.bo.as_ref().ok_or(EINVAL)?.get()?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
@@ -1187,15 +1128,6 @@ impl VmInner {
             iova += len as u64;
             left -= len;
         }
-        // Fixed driver mappings can be added after this root is already live.
-        // G17P TVB growth is the important case: firmware requests more blocks
-        // while the render application context remains published, and the GPU
-        // may already have cached a negative translation for those reserved
-        // addresses.  GPUVM's step_map applies the same matching-root range
-        // invalidation after installing user PTEs.  Do it here only after the
-        // complete fixed mapping is visible, before its address is published
-        // through the parameter-buffer inventory.
-        self.tlbi_live_contexts(node.start(), node.mapped_size as u64);
         Ok(())
     }
 }
@@ -1400,12 +1332,12 @@ impl Drop for T8140NativeContextAliases {
         self.mappings.clear();
         fence(Ordering::SeqCst);
         for view in T8140_NATIVE_CONTEXT_VIEWS {
-            mem::tlbi_range_t8140(0, view.context_address as usize, view.size);
-            mem::tlbi_range_t8140(1, view.context_address as usize, view.size);
+            mem::tlbi_range(0, view.context_address as usize, view.size);
+            mem::tlbi_range(1, view.context_address as usize, view.size);
         }
         for context_id in 0..UAT_NUM_CTX {
             if client_contexts & (1u64 << context_id) != 0 {
-                mem::tlbi_range_t8140(
+                mem::tlbi_range(
                     context_id as u8,
                     T8140_CLIENT_NULL_VIEW_START as usize,
                     T8140_CLIENT_NULL_VIEW_SIZE,
@@ -1420,7 +1352,7 @@ struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
     simplefb: Option<KernelMapping>,
-    render_pools: [Option<VmRenderPoolMappings>; 64],
+    render_pools: [Option<VmRenderPoolMappings>; 2],
     compute_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
@@ -1831,7 +1763,6 @@ impl KernelMapping {
         // Remap in-place as uncached.
         // Do not try to unmap the guard page (-1)
         let prot = self.0.prot.as_uncached();
-        owner.note_mapping_validation_change(self.iova_range());
         if owner
             .page_table
             .reprot_pages(self.iova_range(), prot)
@@ -2000,7 +1931,6 @@ impl Drop for KernelMapping {
             self.size()
         );
 
-        owner.note_mapping_validation_change(self.iova_range());
         if owner.page_table.unmap_pages(self.iova_range()).is_err() {
             dev_err!(
                 owner.dev.as_ref(),
@@ -2012,11 +1942,7 @@ impl Drop for KernelMapping {
 
         if let Some(asid) = owner.slot() {
             fence(Ordering::SeqCst);
-            if owner.uat_inner.t8140 {
-                mem::tlbi_range_t8140(asid as u8, self.iova() as usize, self.size());
-            } else {
-                mem::tlbi_range(asid as u8, self.iova() as usize, self.size());
-            }
+            mem::tlbi_range(asid as u8, self.iova() as usize, self.size());
             mod_dev_dbg!(
                 owner.dev,
                 "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
@@ -2361,11 +2287,6 @@ impl Vm {
             GFP_KERNEL,
         )?;
 
-        let mapping_validation_changes = if cfg == UatConfig::T8140 {
-            Some(KBox::new([None; MAPPING_VALIDATION_HISTORY], GFP_KERNEL)?)
-        } else {
-            None
-        };
         let binding_clone = binding.clone();
         Ok(Vm {
             id,
@@ -2383,8 +2304,6 @@ impl Vm {
                     va_range,
                     is_kernel,
                     page_table,
-                    mapping_validation_epoch: Some(0),
-                    mapping_validation_changes,
                     mm,
                     uat_inner,
                     binding: binding_clone,
@@ -2578,7 +2497,7 @@ impl Vm {
             mappings,
             reserved_ranges,
             simplefb: None,
-            render_pools: [const { None }; 64],
+            render_pools: [None, None],
             compute_pool: None,
         });
         Ok(())
@@ -2630,7 +2549,7 @@ impl Vm {
         tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || render_slot as usize >= 64 {
+        if pool_id == 0 || render_slot as usize >= 2 {
             return Err(EINVAL);
         }
         let mut retained = self.driver_mappings.lock();
@@ -2656,7 +2575,7 @@ impl Vm {
         &self, render_slot: u8, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || render_slot as usize >= 64 || tvb_blocks <= previous_blocks
+        if pool_id == 0 || render_slot as usize >= 2 || tvb_blocks <= previous_blocks
             || mappings.len() != tvb_blocks - previous_blocks { return Err(EINVAL); }
         let mut retained = self.driver_mappings.lock();
         let pool = Option::as_mut(&mut *retained)
@@ -2862,8 +2781,8 @@ impl Vm {
     }
 
     /// Check that a byte range is fully mapped with the requested GPU access.
-    fn covers_range_locked(
-        inner: &mut VmInner,
+    pub(crate) fn covers_range(
+        &self,
         address: u64,
         size: u64,
         need_read: bool,
@@ -2885,6 +2804,10 @@ impl Vm {
                 None => return false,
             }
         };
+        let mut inner = match self.inner.exec_lock(None, false) {
+            Ok(inner) => inner,
+            Err(_) => return false,
+        };
         if start < inner.va_range.start || aligned_end > inner.va_range.end {
             return false;
         }
@@ -2892,81 +2815,6 @@ impl Vm {
             .page_table
             .covers_range(start..aligned_end, need_read, need_write)
             .unwrap_or(false)
-    }
-
-    pub(crate) fn covers_range(
-        &self,
-        address: u64,
-        size: u64,
-        need_read: bool,
-        need_write: bool,
-    ) -> bool {
-        let mut inner = match self.inner.exec_lock(None, false) {
-            Ok(inner) => inner,
-            Err(_) => return false,
-        };
-        Self::covers_range_locked(&mut inner, address, size, need_read, need_write)
-    }
-
-    /// Evaluate a sparse block/guard set against one consistent page-table
-    /// snapshot. The old loop acquired the GPUVM exec lock twice per block.
-    pub(crate) fn covers_sparse_blocks_with_guards(
-        &self,
-        addresses: &[u64],
-        block_size: u64,
-        stride: u64,
-    ) -> bool {
-        if stride <= block_size {
-            return false;
-        }
-        let mut inner = match self.inner.exec_lock(None, false) {
-            Ok(inner) => inner,
-            Err(_) => return false,
-        };
-        addresses.iter().all(|&address| {
-            let Some(guard) = address.checked_add(block_size) else {
-                return false;
-            };
-            Self::covers_range_locked(&mut inner, address, block_size, true, true)
-                && !Self::covers_range_locked(
-                    &mut inner, guard, stride - block_size, false, false)
-        })
-    }
-
-    /// A conservative stamp for cached reachability checks. Taking the exec
-    /// lock makes a lookup wait for any in-progress leaf transaction, including
-    /// one that partially failed. `None` means the caller must validate fully.
-    pub(crate) fn mapping_validation_epoch(&self) -> Option<u64> {
-        self.inner.exec_lock(None, false).ok()?.mapping_validation_epoch
-    }
-
-    /// Report whether mutations since `previous` touched a dependency.
-    /// History loss or an unavailable lock refuses the proof.
-    pub(crate) fn mapping_changes_since(
-        &self,
-        previous: u64,
-        mut intersects: impl FnMut(Range<u64>) -> bool,
-    ) -> Option<(u64, bool)> {
-        let inner = self.inner.exec_lock(None, false).ok()?;
-        let changes = inner.mapping_validation_changes.as_ref()?;
-        let current = inner.mapping_validation_epoch?;
-        let count = current.checked_sub(previous)?;
-        if count > MAPPING_VALIDATION_HISTORY as u64 {
-            return None;
-        }
-        if count == 0 {
-            return Some((current, false));
-        }
-        for epoch in previous + 1..=current {
-            let change = changes[epoch as usize % MAPPING_VALIDATION_HISTORY]?;
-            if change.epoch != epoch {
-                return None;
-            }
-            if intersects(change.start..change.end) {
-                return Some((current, true));
-            }
-        }
-        Some((current, false))
     }
 
     /// Resolve an IOVA through this VM's current page table. Callers use this
@@ -2987,15 +2835,13 @@ impl Vm {
         if offset >= T8140_CLIENT_NULL_VIEW_SIZE as u64 {
             return Err(EINVAL);
         }
-        let canonical_address = T8140_CLIENT_NULL_VIEW
-            .source_address
-            .checked_add(offset)
-            .ok_or(EOVERFLOW)?;
-        // Compare both aliases from one page-table snapshot, without taking
-        // the GPUVM execution lock once per translation.
-        let mut inner = self.inner.exec_lock(None, false)?;
-        let canonical = inner.page_table.translate_iova(canonical_address)?;
-        let client = inner.page_table.translate_iova(
+        let canonical = self.translate_iova(
+            T8140_CLIENT_NULL_VIEW
+                .source_address
+                .checked_add(offset)
+                .ok_or(EOVERFLOW)?,
+        )?;
+        let client = self.translate_iova(
             T8140_CLIENT_NULL_VIEW_START
                 .checked_add(offset)
                 .ok_or(EOVERFLOW)?,
@@ -3016,23 +2862,6 @@ impl Vm {
     ) -> Result<(usize, bool)> {
         let mut inner = self.inner.exec_lock(None, false)?;
         inner.page_table.collect_mapped_ranges(range, out)
-    }
-
-    /// Test a fixed-address kernel alias against both translated pages and
-    /// GPUVA reservations. A mapped-range census alone misses the unmapped
-    /// guard at the end of a `map_in_range(..., guard=true)` allocation, while
-    /// `map_at` still rejects that guard through drm_mm with ENOSPC.
-    pub(crate) fn first_occupied_alias_range(
-        &self,
-        range: Range<u64>,
-    ) -> Result<Option<Range<u64>>> {
-        let mut inner = self.inner.exec_lock(None, false)?;
-        let mut mapped = [pgtable::MappedRange::default(); 1];
-        let (count, _) = inner.page_table.collect_mapped_ranges(range.clone(), &mut mapped)?;
-        if count != 0 {
-            return Ok(Some(mapped[0].start..mapped[0].end));
-        }
-        inner.mm.first_overlap(range)
     }
 
     /// Read GPU-visible bytes out of this VM.
@@ -3084,48 +2913,6 @@ impl Vm {
         Ok(())
     }
 
-    /// Resolve and read one audit region under a single GPUVM execution lock.
-    /// Preserve the checks and error order of `translate_iova` followed by
-    /// `read_bytes`, including the explicit readable-range proof. The guard
-    /// ends here: callers may then compare against a GEM VMap without nesting
-    /// a GEM reservation lock inside this execution-lock transaction.
-    pub(crate) fn read_bytes_with_physical(
-        &self,
-        iova: u64,
-        out: &mut [u8],
-    ) -> Result<PhysicalAddr> {
-        let mut inner = self.inner.exec_lock(None, false)?;
-        let first_physical = inner.page_table.translate_iova(iova)?;
-        if out.is_empty() {
-            return Err(EINVAL);
-        }
-        if !Self::covers_range_locked(&mut inner, iova, out.len() as u64, true, false) {
-            return Err(EFAULT);
-        }
-        let total = out.len();
-        let mut done = 0usize;
-        while done < total {
-            let addr = iova.checked_add(done as u64).ok_or(EOVERFLOW)?;
-            let phys = inner.page_table.translate_iova(addr)?;
-            let page_mask = (kernel::page::PAGE_SIZE as PhysicalAddr) - 1;
-            let page_phys = phys & !page_mask;
-            let offset = (phys - page_phys) as usize;
-            let chunk = cmp::min(kernel::page::PAGE_SIZE - offset, total - done);
-            // SAFETY: The execution guard keeps the resolved GEM mapping
-            // stable through this read. borrow_phys also requires struct page.
-            let page = unsafe { Page::borrow_phys(&page_phys) }.ok_or(EFAULT)?;
-            let dst = &mut out[done..done + chunk];
-            page.with_pointer_into_page(offset, chunk, |ptr| {
-                // SAFETY: with_pointer_into_page bounds-checks this page span.
-                let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, chunk) };
-                dst.copy_from_slice(src);
-                Ok(())
-            })?;
-            done += chunk;
-        }
-        Ok(first_physical)
-    }
-
     /// Physical base of this VM's page-table root.
     ///
     /// This is what a hardware context's TTB0 has to name for the GPU to see
@@ -3170,28 +2957,7 @@ impl Vm {
         prot: Prot,
         guard: bool,
     ) -> Result<KernelMapping> {
-        self.map_in_range_with_guard_size(
-            gem, object_range, alignment, range, prot,
-            if guard { UAT_PGSZ } else { 0 },
-        )
-    }
-
-    /// Reserve an explicitly sized unmapped guard with the mapping. G17 PB
-    /// blocks use 32-KiB guards even though the UAT page size is 16 KiB.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn map_in_range_with_guard_size(
-        &self,
-        gem: &gem::Object,
-        object_range: Range<usize>,
-        alignment: u64,
-        range: Range<u64>,
-        prot: Prot,
-        guard_size: usize,
-    ) -> Result<KernelMapping> {
-        if guard_size % UAT_PGSZ != 0 { return Err(EINVAL); }
-        let size = object_range.end.checked_sub(object_range.start).ok_or(EINVAL)?;
-        if size == 0 || object_range.end > gem.size() { return Err(EINVAL); }
-        let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
+        let size = object_range.range();
         let sgt = gem.owned_sg_table()?;
         let mut inner = self.inner.exec_lock(Some(gem), false)?;
         let vm_bo = self.inner.obtain_bo(gem)?;
@@ -3217,7 +2983,7 @@ impl Vm {
                 offset: object_range.start,
                 mapped_size: size,
             },
-            reserved_size as u64,
+            (size + if guard { UAT_PGSZ } else { 0 }) as u64, // Add guard page
             alignment,
             0,
             range.start,
@@ -3622,7 +3388,6 @@ impl Vm {
             0,
         )?;
 
-        inner.note_mapping_validation_change(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
         let prepared = inner
             .page_table
             .prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
@@ -4208,24 +3973,17 @@ impl Uat {
         // presentation page-for-page before adding the sole missing view 0.
         for (index, (gem, object_offset)) in snapshot.iter().enumerate().skip(1) {
             let view = T8140_NATIVE_CONTEXT_VIEWS[index];
-            let source_covered = source.covers_range(
+            if !source.covers_range(
                 view.source_address,
                 view.size as u64,
                 true,
                 view.requires_source_write,
-            );
-            let context_covered = source.covers_range(
+            ) || !source.covers_range(
                 view.context_address,
                 view.size as u64,
                 true,
                 view.requires_source_write,
-            );
-            if !source_covered || !context_covered {
-                dev_err!(self.dev.as_ref(),
-                    "MMU: T8140 job context VM {} view {} incomplete: source={:#x} covered={} low={:#x} covered={} size={:#x} write={}\n",
-                    source.id, index, view.source_address, source_covered,
-                    view.context_address, context_covered, view.size,
-                    view.requires_source_write);
+            ) {
                 return Err(EFAULT);
             }
             let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
@@ -4258,9 +4016,6 @@ impl Uat {
             true,
             view.requires_source_write,
         ) {
-            dev_err!(self.dev.as_ref(),
-                "MMU: T8140 job context VM {} null source={:#x}+{:#x} lacks required permissions (write={})\n",
-                source.id, view.source_address, view.size, view.requires_source_write);
             return Err(EFAULT);
         }
         let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
@@ -4321,15 +4076,13 @@ impl Uat {
             {
                 return Err(EAGAIN);
             }
-            if crate::util::g17p_verbose() {
-                dev_info!(
-                    self.dev.as_ref(),
-                    "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
-                    T8140_NATIVE_CONTEXT_VIEW_COUNT,
-                    source.id,
-                    source_generation,
-                );
-            }
+            dev_info!(
+                self.dev.as_ref(),
+                "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
+                T8140_NATIVE_CONTEXT_VIEW_COUNT,
+                source.id,
+                source_generation,
+            );
             return Ok(mappings);
         }
         let mapping = source.map_in_range(
@@ -4361,15 +4114,13 @@ impl Uat {
         {
             return Err(EAGAIN);
         }
-        if crate::util::g17p_verbose() {
-            dev_info!(
-                self.dev.as_ref(),
-                "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
-                T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
-                source.id,
-                source_generation,
-            );
-        }
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
+            T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
+            source.id,
+            source_generation,
+        );
         Ok(mappings)
     }
 
@@ -5121,7 +4872,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
-        let mask = crate::g17_config::CTX2_ROOT;
+        let mask = *module_parameters::g17p_ctx2_root.value();
         if mask == 0 {
             dev_info!(
                 self.dev.as_ref(),
@@ -5217,7 +4968,7 @@ impl Uat {
         }
 
         let low_root = bind.0.ttb();
-        let high_root = if crate::g17_config::RENDER_POPULATED_HIGH_ROOT != 0 {
+        let high_root = if *module_parameters::g17p_render_populated_high_root.value() != 0 {
             self.kernel_vm.ttb()
         } else {
             self.t8140_empty_high_roots.as_ref().ok_or(EIO)?[1].ttb()
@@ -5396,7 +5147,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 {
             return Ok(());
         }
-        if crate::g17_config::CTX2_ROOT == 0 {
+        if *module_parameters::g17p_ctx2_root.value() == 0 {
             return Ok(());
         }
         if self.t8140_compute_context_alias_ready(bind) {
@@ -5487,7 +5238,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
             return false;
         }
-        let mask = crate::g17_config::CTX2_ROOT;
+        let mask = *module_parameters::g17p_ctx2_root.value();
         if mask == 0 {
             return false;
         }
@@ -5572,7 +5323,7 @@ impl Uat {
                 let uat_inner = self.inner.lock();
 
                 let ttb1 = if self.cfg == UatConfig::T8140 {
-                    let high_root = if crate::g17_config::RENDER_POPULATED_HIGH_ROOT
+                    let high_root = if *module_parameters::g17p_render_populated_high_root.value()
                         != 0
                     {
                         // Diagnostic only: native gives each app GART a distinct,
@@ -5618,7 +5369,7 @@ impl Uat {
                 if self.cfg == UatConfig::T8140 && idx == 1 {
                     self.t8140_context_phase
                         .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
-                    if crate::g17_config::RENDER_POPULATED_HIGH_ROOT != 0 {
+                    if *module_parameters::g17p_render_populated_high_root.value() != 0 {
                         dev_warn!(
                             self.dev.as_ref(),
                             "MMU: DIAGNOSTIC render context 1 exposes populated high root {:#x}\n",

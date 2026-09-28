@@ -5,5 +5,3 @@ phy-apple-atc-y			:= atc.o
 
 obj-$(CONFIG_PHY_APPLE_DPTX)	+= phy-apple-dptx.o
 phy-apple-dptx-y		+= dptx.o
-
-obj-$(CONFIG_PHY_APPLE_J700_REPEATER) += j700-repeater.o

@@ -318,24 +318,8 @@ config BT_HCIMT79XX_PCIE
 	select FW_LOADER
 	help
 	  Experimental PCIe transport for MediaTek MT79xx Bluetooth functions,
-	  including the MT7932 companion function with PCI ID 14c3:793b used by
-	  Apple J700 systems.
-
-	  The default behavior is a fail-closed BAR and chip-identity inventory.
-	  The apple_attach parameter replays Apple's pre-firmware companion attach:
-	  64-bit DMA, PCI bus mastering, one non-shared MSI vector, config 0x48c,
-	  the remapped core-ID read, transport remap, and IPC allocation. Used alone
-	  it stops before firmware or HCI registration. With gate=4..8 it continues
-	  through the recovered image activation, IPC state machine, ring transport,
-	  HCI registration, and Sunrise board-radio setup. The full path also
-	  implements the MT7932 IPC host-sleep handshake and wake-before-TX rule.
-
-	  The radio gate requires the matching Izuba PTX plus separately captured
-	  J700 board-calibration and local-address blobs for the 0xfdd0 SRS and
-	  0xfc1a address commands. All activation gates remain explicit and
-	  hardware-unvalidated.
-
-	  Say Y here only for bounded platform bring-up.
+	  including the MT7932 companion function on Apple J700 systems. It
+	  requires the matching local firmware and board calibration.
 
 config BT_HCIBPA10X
 	tristate "HCI BPA10x USB driver"

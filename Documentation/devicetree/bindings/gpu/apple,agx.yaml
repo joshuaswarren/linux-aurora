@@ -27,41 +27,24 @@ properties:
               - apple,agx-g14c
               - apple,agx-g14d
           - const: apple,agx-g14s
-      - description:
-          T8140 (A18 Pro) G17P GPU. Unlike the single-coprocessor AGX2
-          parts above, it is driven by two independent ASC coprocessors
-          carrying the GFX and GFX1 firmware roles, each with its own
-          ASCWrap v6 mailbox provider. The second compatible entry is the
-          literal Apple Device Tree identifier for this node.
-        items:
-          - const: apple,agx-t8140
-          - const: gpu,t8140
 
   reg:
-    minItems: 2
     items:
       - description: GPU coprocessor control registers
       - description: GPU block MMIO registers
-      - description:
-          Control registers of the secondary GPU coprocessor, on SoCs
-          driven by two independent GPU coprocessors (T8140)
 
   reg-names:
-    minItems: 2
     items:
       - const: asc
       - const: sgx
-      - const: asc1
 
   power-domains:
     maxItems: 1
 
   mboxes:
-    minItems: 1
-    maxItems: 2
+    maxItems: 1
 
   memory-region:
-    minItems: 3
     items:
       - description: Region containing GPU MMU TTBs
       - description: Region containing GPU MMU page tables
@@ -73,7 +56,6 @@ properties:
       - description: Shared global variables with GPU firmware
 
   memory-region-names:
-    minItems: 3
     items:
       - const: ttbs
       - const: pagetables
@@ -81,8 +63,6 @@ properties:
       - const: hw-cal-a
       - const: hw-cal-b
       - const: globals
-
-  operating-points-v2: true
 
   apple,firmware-abi:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -97,58 +77,7 @@ required:
   - reg
   - mboxes
   - memory-region
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,agx-t8140
-    then:
-      properties:
-        reg:
-          minItems: 2
-          maxItems: 2
-          items:
-            - description:
-                Topology alias of the primary ASCWrap v6 window. The
-                apple,t8140-ascwrap-v6 mailbox provider is the sole mapping
-                and CPU-lifecycle owner; the GPU consumer must not map this
-                alias or write CPU control directly.
-            - description: GPU block MMIO registers
-        reg-names:
-          minItems: 2
-          maxItems: 2
-        mboxes:
-          items:
-            - description:
-                Mailbox of the GFX (primary) firmware role, an
-                apple,t8140-ascwrap-v6 provider
-            - description:
-                Mailbox of the GFX1 (scheduler peer) firmware role, an
-                apple,t8140-ascwrap-v6 provider
-        memory-region:
-          maxItems: 3
-        memory-region-names:
-          maxItems: 3
-        apple,firmware-abi: false
-      required:
-        - reg-names
-        - operating-points-v2
-    else:
-      properties:
-        reg:
-          maxItems: 2
-        reg-names:
-          maxItems: 2
-        mboxes:
-          maxItems: 1
-        memory-region:
-          minItems: 6
-        memory-region-names:
-          minItems: 6
-      required:
-        - apple,firmware-abi
+  - apple,firmware-abi
 
 additionalProperties: false
 
@@ -167,23 +96,5 @@ examples:
                               "hw-cal-a", "hw-cal-b", "globals";
 
         apple,firmware-abi = <0 0 0>;
-    };
-
-  - |
-    soc {
-        #address-cells = <2>;
-        #size-cells = <2>;
-
-        gpu@482600000 {
-            compatible = "apple,agx-t8140", "gpu,t8140";
-            reg = <0x4 0x82600000 0x0 0x88000>,
-                  <0x4 0x80000000 0x0 0x4000000>;
-            reg-names = "asc", "sgx";
-            mboxes = <&gfx_asc>, <&gfx1_asc>;
-            power-domains = <&ps_gfx>;
-            memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>;
-            memory-region-names = "ttbs", "pagetables", "handoff";
-            operating-points-v2 = <&gpu_opp>;
-        };
     };
 ...

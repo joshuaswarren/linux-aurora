@@ -91,6 +91,7 @@ enum iomfb_property_id {
 /* Structures used in v12.0 firmware */
 
 #define SWAP_SURFACES 4
+
 struct dcp_iouserclient {
 	/* Handle for the IOUserClient. macOS sets this to a kernel VA. */
 	u64 handle;

@@ -15,7 +15,6 @@
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-v4l2.h>
 
-/* #define APPLE_ISP_DEBUG */
 #define APPLE_ISP_DEVICE_NAME "apple-isp"
 #define APPLE_ISP_CARD_NAME "FaceTime HD Camera"
 
@@ -26,29 +25,48 @@
 #define ISP_META_SIZE_T8112  0x4840
 #define ISP_META_SIZE_T6031  0x4a40
 #define ISP_META_SIZE_T8140  0x4d00
-/* H17 (t8140) capture-metadata pool entry (CH_INFO_GET +0x78) */
 #define ISP_CAPTURE_META_SIZE_T8140 0x29fc0
 
 /* used to limit the user space buffers to the buffer_pool_config */
 #define ISP_MAX_BUFFERS 16
 
-/*
- * MMIO windows the firmware reaches through its DART (the DAPF slices of the
- * ADT dart-isp node), mapped 1:1 in the ISP domain as the native host did.
- */
-struct isp_identity_window {
-	u64 base;
-	u64 size;
-};
-/* t8140: capture-metadata pool entries the H17 receiver keeps queued */
+/* capture metadata buffers, for firmware that has that pool */
 #define ISP_CAPMETA_BUFFERS 8
-#define ISP_POOL_TYPE_CAPMETA_SUBMIT 2
+
+/*
+ * The command area holds one command or one buffer batch at a time. A
+ * batch is a 16-byte header and a 64-byte descriptor per buffer, and
+ * carries at most every metadata buffer, the @capmeta capture metadata
+ * buffers and one full rendered pool.
+ */
+#define ISP_BUFLIST_HDR_SIZE  0x10
+#define ISP_BUFLIST_DESC_SIZE 0x40
+#define ISP_CMD_AREA_SIZE(capmeta) \
+	(ISP_BUFLIST_HDR_SIZE + ISP_BUFLIST_DESC_SIZE * \
+	 (ISP_MAX_BUFFERS + (capmeta) + ISP_MAX_BUFFERS))
 
 enum isp_generation {
 	ISP_GEN_T8103,
 	ISP_GEN_T8112,
 	ISP_GEN_T6031,
 	ISP_GEN_T8140,
+};
+
+/*
+ * Firmware interface generation. The existing SoCs pick their command
+ * layouts by apple,firmware-compat; T8140 only runs the H17 firmware, so
+ * its match data selects that interface.
+ */
+enum isp_fw_abi {
+	ISP_FW_ABI_LEGACY,
+	ISP_FW_ABI_H17,
+};
+
+enum isp_fw_state {
+	ISP_FW_OFF,
+	ISP_FW_RUNNING,
+	/* resident firmware that stopped: it cannot be started again */
+	ISP_FW_DEAD,
 };
 
 enum isp_firmware_version {
@@ -107,6 +125,12 @@ struct coord {
 	u32 y;
 };
 
+/* MMIO window the firmware accesses at its physical address */
+struct isp_mmio_window {
+	u64 base;
+	u64 size;
+};
+
 struct isp_preset {
 	u32 index;
 	struct coord input_dim;
@@ -117,6 +141,7 @@ struct isp_preset {
 
 struct apple_isp_hw {
 	enum isp_generation gen;
+	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
 	int dsid_count;
@@ -143,17 +168,31 @@ struct apple_isp_hw {
 	bool scl1;
 	bool lpdp;
 
-	/*
-	 * t8140 (ISP17a / H17 firmware): the doorbell/ack block is inside the
-	 * "mbox" window (mbox2_offset), the ASC control register moved, the
-	 * firmware takes the 0x290-byte H16 boot descriptor and the EIC's ISP
-	 * watchdog window must be petted by the host while streaming.
-	 */
+	/* address bits the ISP DARTs translate, 0 for all */
+	u64 fw_iova_mask;
+
+	/* doorbell block inside "mbox" instead of an "mbox2" window */
 	u32 mbox2_offset;
-	u32 asc_control;
+	/* further interrupt enable and routing words (ISP17a) */
+	bool mbox_irq_route;
+	/* coprocessor control register, 0 for ISP_COPROC_CONTROL */
+	u32 coproc_control;
+
+	/* windows mapped 1:1 for the firmware */
+	const struct isp_mmio_window *fw_mmio;
+	unsigned int num_fw_mmio;
+
+	/* ISP_GPIO_6 boot mode */
+	u32 boot_mode;
+
+	/* size of a capture metadata buffer, 0 for no such pool */
 	u32 capture_meta_size;
-	const struct isp_identity_window *identity;
-	int num_identity;
+
+	/*
+	 * The firmware can be started only once per system boot, so it is
+	 * started at probe and kept running while the driver is bound.
+	 */
+	bool resident_fw;
 };
 
 enum isp_sensor_id {
@@ -256,26 +295,16 @@ struct apple_isp {
 
 	struct iommu_domain *domain;
 	unsigned long shift;
-	/*
-	 * Firmware-reported IOVAs carry the DART vm-base (bit 40 on t8140)
-	 * while our tables live at the low addresses: mask before comparing
-	 * or translating anything the firmware hands back.
-	 */
-	u64 fw_iova_mask;
 	struct drm_mm iovad; /* TODO iova.c can't allocate bottom-up */
+	u64 iova_size; /* size of the iovad range */
+	u64 fw_iova_mask; /* see isp_fw_iova() */
 	struct mutex iovad_lock;
 
 	struct isp_firmware {
 		u64 heap_top;
 	} fw;
-	/*
-	 * t8140: the H17 firmware does not come back from a warm restart
-	 * (no first handshake after suspend + ASC reset), so it is booted once
-	 * at probe and kept running until the driver goes away; every stream
-	 * re-configures its channel.
-	 */
-	bool fw_persistent;
-	bool fw_booted;
+	/* changes under video_lock once the video device is registered */
+	enum isp_fw_state fw_state;
 
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;
@@ -325,19 +354,21 @@ enum {
 	ISP_STATE_SLEEPING,
 };
 
-#ifdef APPLE_ISP_DEBUG
-#define isp_dbg(isp, fmt, ...) \
-	dev_info((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
-#else
 #define isp_dbg(isp, fmt, ...) \
 	dev_dbg((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
-#endif
 
 #define isp_err(isp, fmt, ...) \
 	dev_err((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
 
+/*
+ * Addresses from the firmware may carry bits above the ones the DART
+ * translates (the vm-base on T8140); strip them before comparing or
+ * translating.
+ */
 #define isp_fw_iova(isp, x)	    ((x) & (isp)->fw_iova_mask)
 #define isp_get_format(isp, ch)	    (&(isp)->fmts[(ch)])
+#define isp_num_capmeta(isp) \
+	((isp)->hw->capture_meta_size ? ISP_CAPMETA_BUFFERS : 0)
 #define isp_get_current_format(isp) (isp_get_format(isp, isp->current_ch))
 
 #endif /* __ISP_DRV_H__ */

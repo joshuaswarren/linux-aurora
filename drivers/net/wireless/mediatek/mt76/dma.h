@@ -62,18 +62,12 @@
 
 #define Q_WRITE(_q, _field, _val)	do {				\
 	u32 _offset = offsetof(struct mt76_queue_regs, _field);		\
-	u32 _write_val = (_val);					\
 	if ((_q)->flags & MT_QFLAG_WED)					\
 		mtk_wed_device_reg_write((_q)->wed,			\
 					 ((_q)->wed_regs + _offset),	\
-					 _write_val);			\
-	else {							\
-		mt76_mmio_j700_reg_write((_q)->dev,			\
-			(u32)((unsigned long)&(_q)->regs->_field -	\
-			      (unsigned long)(_q)->dev->mmio.regs),	\
-			_write_val);					\
-		writel(_write_val, &(_q)->regs->_field);		\
-	}							\
+					 _val);				\
+	else								\
+		writel(_val, &(_q)->regs->_field);			\
 } while (0)
 
 #elif IS_ENABLED(CONFIG_MT76_NPU)
@@ -98,7 +92,6 @@
 
 #define Q_WRITE(_q, _field, _val)	do {				\
 	u32 _offset = offsetof(struct mt76_queue_regs, _field);		\
-	u32 _write_val = (_val);					\
 	if ((_q)->flags & MT_QFLAG_NPU) {				\
 		struct airoha_npu *npu;					\
 									\
@@ -106,28 +99,17 @@
 		npu = rcu_dereference(q->dev->mmio.npu);		\
 		if (npu)						\
 			regmap_write(npu->regmap,			\
-				     ((_q)->wed_regs + _offset),	\
-				     _write_val);			\
+				     ((_q)->wed_regs + _offset), _val);	\
 		rcu_read_unlock();					\
 	} else {							\
-		mt76_mmio_j700_reg_write((_q)->dev,			\
-			(u32)((unsigned long)&(_q)->regs->_field -	\
-			      (unsigned long)(_q)->dev->mmio.regs),	\
-			_write_val);					\
-		writel(_write_val, &(_q)->regs->_field);		\
+		writel(_val, &(_q)->regs->_field);			\
 	}								\
 } while (0)
 
 #else
 
 #define Q_READ(_q, _field)		readl(&(_q)->regs->_field)
-#define Q_WRITE(_q, _field, _val)	do {				\
-	u32 _write_val = (_val);					\
-	mt76_mmio_j700_reg_write((_q)->dev,				\
-		(u32)((unsigned long)&(_q)->regs->_field -		\
-		      (unsigned long)(_q)->dev->mmio.regs), _write_val); \
-	writel(_write_val, &(_q)->regs->_field);			\
-} while (0)
+#define Q_WRITE(_q, _field, _val)	writel(_val, &(_q)->regs->_field)
 
 #endif
 
@@ -182,19 +164,12 @@ enum mt76_dma_wed_ind_reason {
 };
 
 int mt76_dma_rx_poll(struct napi_struct *napi, int budget);
-int mt76_dma_rx_poll_sync(struct mt76_dev *dev, int budget);
 void mt76_dma_attach(struct mt76_dev *dev);
 void mt76_dma_cleanup(struct mt76_dev *dev);
 int mt76_dma_rx_fill(struct mt76_dev *dev, struct mt76_queue *q,
 		     bool allow_direct);
-int mt76_dma_rx_rebuild_existing(struct mt76_dev *dev,
-				 enum mt76_rxq_id qid);
 void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
 			  bool reset_idx);
-int mt76_dma_alloc_tx_bounce(struct mt76_dev *dev, struct mt76_queue *q,
-			     u32 entries, u32 stride);
-void mt76_dma_reset_tx_pools(struct mt76_dev *dev, struct mt76_queue *q);
-int mt76_dma_prealloc_txwi(struct mt76_dev *dev, int count);
 
 static inline void
 mt76_dma_reset_tx_queue(struct mt76_dev *dev, struct mt76_queue *q)

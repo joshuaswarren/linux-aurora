@@ -464,6 +464,7 @@ int mt_register_interface(struct mt7932 *m)
 	m->wdev.netdev = netdev;
 	netdev->ieee80211_ptr = &m->wdev;
 	netdev->netdev_ops = &mt_net_ops;
+	netdev->ethtool_ops = &mt_ethtool_ops;
 	netdev->min_mtu = ETH_MIN_MTU;
 	netdev->max_mtu = ETH_DATA_LEN;
 	SET_NETDEV_DEV(netdev, &m->pdev->dev);
@@ -474,7 +475,7 @@ int mt_register_interface(struct mt7932 *m)
 	INIT_WORK(&m->cal_work, mt_cal_work);
 	INIT_WORK(&m->connect_work, mt_connect_work);
 	INIT_WORK(&m->disconnect_work, mt_disconnect_work);
-	init_completion(&m->assoc_start);
+	init_completion(&m->assoc_update);
 	init_completion(&m->assoc_done);
 	init_completion(&m->disconnect_done);
 	init_completion(&m->discovery_done);
@@ -518,7 +519,11 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 	int signal;
 	int ret = mt7932_rx_frame(packet, length, &frame);
 
-	if (ret || !READ_ONCE(m->rf_ready))
+	if (ret) {
+		m->rx_parse_errors++;
+		return;
+	}
+	if (!READ_ONCE(m->rf_ready))
 		return;
 	band = mt7932_channel_band(frame.channel);
 	channel = ieee80211_get_channel(m->wiphy, band == 1 ? 2407 + 5 * frame.channel : 5000 + 5 * frame.channel);

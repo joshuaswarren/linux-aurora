@@ -2,7 +2,6 @@
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 
-	.text
 /*
  * T8140 secondaries can resume from WFI with cleared general registers.
  * SP and stack memory survive. Preserve the AAPCS64 callee-saved registers
@@ -37,8 +36,10 @@
 	ret
 	.endm
 
+	.pushsection .cpuidle.text, "ax"
 SYM_FUNC_START(apple_cpu_wfi)
 	apple_wait_save
 	wfi
 	apple_wait_restore
 SYM_FUNC_END(apple_cpu_wfi)
+	.popsection
