@@ -10,6 +10,7 @@
 #include <linux/cpu_pm.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/moduleparam.h>
 #include <asm/cpuidle.h>
 
 /* Keep the qualified arch idle fallback until CPU PM is validated on J700. */
@@ -31,6 +32,13 @@ enum idle_state {
 	STATE_PWRDOWN,
 	STATE_COUNT
 };
+
+/* Lab escape hatch for an unverified SoC deep idle path. */
+static bool lab_disable_deep = true;
+static bool t8140_cpuidle;
+module_param_named(lab_disable_deep, lab_disable_deep, bool, 0644);
+MODULE_PARM_DESC(lab_disable_deep,
+	"Disable T8140 CPU power-down (defaults to disabled pending hardware validation)");
 
 asm(
 	".pushsection .cpuidle.text, \"ax\"\n"
@@ -81,6 +89,14 @@ static __cpuidle int apple_enter_wfi(struct cpuidle_device *dev, struct cpuidle_
 
 static __cpuidle int apple_enter_idle(struct cpuidle_device *dev, struct cpuidle_driver *drv, int index)
 {
+	if (t8140_cpuidle && READ_ONCE(lab_disable_deep)) {
+		/* CPU PD has RCU_IDLE set; its WFI fallback must handle RCU. */
+		ct_cpuidle_enter();
+		cpu_do_idle();
+		ct_cpuidle_exit();
+		return STATE_WFI;
+	}
+
 	/*
 	 * Deep WFI will clobber FP state, among other things.
 	 * The CPU PM notifier will take care of saving that and anything else
@@ -193,41 +209,19 @@ static struct cpuidle_driver apple_neo_idle_driver = {
 
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
-	struct cpuidle_driver *drv = &apple_idle_driver;
-	int ret;
-
-	if (of_machine_is_compatible("apple,j700")) {
-		int cpu = READ_ONCE(neo_cpu);
-
-		/* Leave an unbound device for controlled activation after boot. */
-		if (!READ_ONCE(neo_cpuidle))
-			return -ENODEV;
-		if (cpu < -1 || (cpu >= 0 &&
-				(cpu >= nr_cpu_ids || !cpu_online(cpu))))
-			return -EINVAL;
-
-		/* A nonzero state index also permits tick-freezing during s2idle. */
-		drv = &apple_neo_idle_driver;
-		cpumask_copy(&neo_cpumask, cpu < 0 ? cpu_possible_mask : cpumask_of(cpu));
-		drv->cpumask = &neo_cpumask;
-		dev_info(&pdev->dev, "Registering idle CPUs %*pbl, experimental state disabled\n",
-			 cpumask_pr_args(drv->cpumask));
-	}
-
-	ret = cpuidle_register(drv, NULL);
-	if (!ret)
-		platform_set_drvdata(pdev, drv);
-	return ret;
+	t8140_cpuidle = !!pdev->dev.of_node;
+	return cpuidle_register(&apple_idle_driver, NULL);
 }
 
-static void apple_cpuidle_remove(struct platform_device *pdev)
-{
-	cpuidle_unregister(platform_get_drvdata(pdev));
-}
+static const struct of_device_id apple_cpuidle_of_match[] = {
+	{ .compatible = "apple,t8140-cpuidle" },
+	{ }
+};
 
 static struct platform_driver apple_cpuidle_driver = {
 	.driver = {
 		.name = "cpuidle-apple",
+		.of_match_table = apple_cpuidle_of_match,
 	},
 	.probe = apple_cpuidle_probe,
 	.remove = apple_cpuidle_remove,
