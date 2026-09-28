@@ -7,6 +7,7 @@
 
 use super::MappedObject;
 use crate::{driver::AsahiDevice, g18_compute::*, g18_compute_payload as payload,
+    g18_compute_triangle::{TrianglePatch, TriangleResult, PATCH_COUNT},
     g18_compute_state::{G18ComputeState, G18_COMPUTE_STATE_BYTES}, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::{firmware::Firmware, prelude::*};
@@ -71,6 +72,7 @@ impl G18ComputePayloadMemory {
         match *crate::module_parameters::g18_compute_variant.value() {
             0 => {}
             1 => owner.empty_cdm_stream(dev)?,
+            2 => owner.triangle_shader(dev, payload::fnv64(&firmware.data()[payload::HEADER_BYTES..]))?,
             _ => return Err(EINVAL),
         }
         fence(Ordering::SeqCst);
@@ -136,6 +138,49 @@ impl G18ComputePayloadMemory {
             "G18_COMPUTE_VARIANT=1 empty stream {:#x}: words {:08x?} (were {:08x?}); command +0xee0 d4e0 {:#x} -> {:#x}; registers and all other bytes unchanged\n",
             stream, after, before, terminator, stream + 4);
         Ok(())
+    }
+
+    /// Validate every original site before mutating any page. All pages and
+    /// roots are still private; failure cannot publish a partial program.
+    fn triangle_shader(&mut self, dev: &AsahiDevice, base_fnv: u64) -> Result {
+        let firmware = Firmware::request(c"asahi/g18-26a428-compute-triangle.bin", dev.as_ref())?;
+        let patch = TrianglePatch::parse(firmware.data(), base_fnv).ok_or(EINVAL)?;
+        let mut indices = [0usize; PATCH_COUNT];
+        for (i, index) in indices.iter_mut().enumerate() {
+            let site = patch.site(i).ok_or(EINVAL)?;
+            let base = site.address & !(payload::PAGE_BYTES as u64 - 1);
+            let offset = (site.address - base) as usize;
+            *index = self.pages.iter().position(|page| page.iova() == base).ok_or(EINVAL)?;
+            self.pages[*index].with_bytes_mut(|bytes| {
+                let before = bytes.get(offset..offset + site.bytes.len()).ok_or(EINVAL)?;
+                if payload::fnv64(before) != site.before_fnv { return Err(EINVAL); }
+                Ok(())
+            })?;
+        }
+        for (i, index) in indices.into_iter().enumerate() {
+            let site = patch.site(i).ok_or(EINVAL)?;
+            let offset = (site.address & (payload::PAGE_BYTES as u64 - 1)) as usize;
+            self.pages[index].with_bytes_mut(|bytes| {
+                let target = bytes.get_mut(offset..offset + site.bytes.len()).ok_or(EINVAL)?;
+                target.copy_from_slice(site.bytes);
+                fence(Ordering::SeqCst);
+                for (j, expected) in site.bytes.iter().enumerate() {
+                    // SAFETY: j is within this initialized, CPU-mapped slice.
+                    if unsafe { core::ptr::read_volatile(target.as_ptr().add(j)) } != *expected {
+                        return Err(EIO);
+                    }
+                }
+                Ok(())
+            })?;
+            dev_info!(dev.as_ref(), "G18_COMPUTE_VARIANT=2 patch {} address={:#x} bytes={} before_fnv={:#x} after_fnv={:#x}; VM unpublished\n",
+                i, site.address, site.bytes.len(), site.before_fnv, payload::fnv64(site.bytes));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn triangle_output_snapshot(&mut self) -> Result<TriangleResult> {
+        fence(Ordering::SeqCst);
+        self.pages[self.output].with_bytes_mut(|bytes| TriangleResult::inspect(bytes).ok_or(EINVAL))
     }
 
     /// Call only while the GPU is quiescent or after an independently verified

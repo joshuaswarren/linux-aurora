@@ -487,6 +487,10 @@ impl G18FirmwareMemory {
         self.compute_payload.as_mut().ok_or(EINVAL)?.output_snapshot()
     }
 
+    pub(crate) fn triangle_output(&mut self) -> Result<crate::g18_compute_triangle::TriangleResult> {
+        self.compute_payload.as_mut().ok_or(EINVAL)?.triangle_output_snapshot()
+    }
+
     pub(crate) fn prepare_uma_pool_binding(&mut self) -> Result<G18UmaPoolBinding> {
         self.uma_pool.prepare_binding()
     }

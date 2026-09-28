@@ -44,6 +44,7 @@ mod g18_compute;
 mod g18_compute_memory;
 mod g18_compute_state;
 mod g18_compute_payload;
+mod g18_compute_triangle;
 mod g18_scheduler;
 mod g18_live_boot;
 mod g18_uma;
@@ -95,7 +96,7 @@ kernel::module_platform_driver! {
         },
         g18_compute_variant: u32 {
             default: 0,
-            description: "Stage 8 bisection. 0=the captured compute-add (default, unchanged). 1=empty stream: after the verified payload load, the CDM control stream becomes the capture's barrier 0x60000160 and terminate 0x40000000 at +0/+4, the old launch, barrier and terminate (+8..+0x2f) are zeroed, and command +0xee0 names the new terminate; nothing is dispatched, so a completion must leave all 4096 outputs poisoned. Other values, or 1 without g18_initdata_test=8, are refused",
+            description: "Stage 8 compute diagnostic. 0=captured compute-add. 1=empty stream: captured barrier and terminate replace the launch; all output must remain poisoned. 2=64x64 compute triangle using a separately verified private shader patch; no TA/3D or Mesa. Variants 1 and 2 require g18_initdata_test=8. Other values are refused",
         },
         m5_graphics_frames: u32 {
             default: 1,
