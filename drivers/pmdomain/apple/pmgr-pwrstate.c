@@ -39,6 +39,11 @@
 #define APPLE_PMGR_PS_PWRGATE   0x0
 
 #define APPLE_PMGR_PS_SET_TIMEOUT 100
+/*
+ * A failed GFX power-on fails the GPU's mailbox resume, so give the domain
+ * longer to come up than the 100 us the other domains get.
+ */
+#define APPLE_PMGR_GFX_ON_TIMEOUT 1000
 #define APPLE_PMGR_RESET_TIME 1
 
 struct apple_pmgr_ps {
@@ -266,6 +271,16 @@ static int apple_pmgr_apply_gfx_axi2af(struct apple_pmgr_ps *ps, bool enable)
 	return 0;
 }
 
+static bool apple_pmgr_gfx_axi2af_enabled(struct apple_pmgr_ps *ps)
+{
+	unsigned int offset;
+
+	for (offset = 0; offset < APPLE_T8140_AXI2AF_SIZE; offset += sizeof(u32))
+		if (!(readl(ps->gfx_axi2af + offset) & BIT(0)))
+			return false;
+	return true;
+}
+
 static int apple_pmgr_finish_gfx_on(struct apple_pmgr_ps *ps)
 {
 	u32 cur;
@@ -273,13 +288,16 @@ static int apple_pmgr_finish_gfx_on(struct apple_pmgr_ps *ps)
 
 	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
 		FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == APPLE_PMGR_PS_ACTIVE,
-		1, APPLE_PMGR_PS_SET_TIMEOUT);
-	if (ret)
+		1, APPLE_PMGR_GFX_ON_TIMEOUT);
+	if (!ret)
+		ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
+			!(cur & APPLE_PMGR_BUSY), 1, APPLE_PMGR_GFX_ON_TIMEOUT);
+	if (ret) {
+		dev_err_ratelimited(ps->dev,
+			"PS %s: GFX power-on did not settle: %d (now: 0x%x)\n",
+			ps->genpd.name, ret, cur);
 		return ret;
-	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
-		!(cur & APPLE_PMGR_BUSY), 1, APPLE_PMGR_PS_SET_TIMEOUT);
-	if (ret)
-		return ret;
+	}
 	return apple_pmgr_apply_gfx_axi2af(ps, true);
 }
 
@@ -294,6 +312,18 @@ static int apple_pmgr_gfx_write(struct apple_pmgr_ps *ps, u32 mask, u32 value)
 		return ret;
 	requested = (before & ~mask) | (value & mask);
 	action = apple_pmgr_gfx_axi_action(before, requested);
+	/*
+	 * A power-on that failed leaves the target at ACTIVE, but genpd still
+	 * counts the domain as off and its next power-on writes the same
+	 * target.  Finish the handshake then too.  The AXI2AF words are only
+	 * read once the domain is on.
+	 */
+	if (action == APPLE_PMGR_GFX_AXI_NONE &&
+	    FIELD_GET(APPLE_PMGR_PS_TARGET, requested) == APPLE_PMGR_PS_ACTIVE &&
+	    !(requested & APPLE_PMGR_DEV_DISABLE) &&
+	    (FIELD_GET(APPLE_PMGR_PS_ACTUAL, before) != APPLE_PMGR_PS_ACTIVE ||
+	     !apple_pmgr_gfx_axi2af_enabled(ps)))
+		action = APPLE_PMGR_GFX_AXI_SET_AFTER;
 	if (action == APPLE_PMGR_GFX_AXI_CLEAR_BEFORE) {
 		ret = apple_pmgr_apply_gfx_axi2af(ps, false);
 		if (ret)
