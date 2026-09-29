@@ -1664,6 +1664,32 @@ fn apply_g17p_viewport(width: u32, height: u32, page: &mut [u8]) -> Option<()> {
     Some(())
 }
 
+/// Snapshot a firmware-owned ring record after observing its producer cursor.
+/// The caller must retain the consumer slot until this copy is complete; word
+/// loads do not make the complete record atomic. Natural-width volatile loads
+/// keep strict-alignment builds from fusing the byte decoder into a sequence
+/// of uncached byte reads against the firmware mapping.
+#[inline]
+fn g17p_snapshot_fw_record(bytes: &[u8], offset: usize, output: &mut [u8]) -> Result {
+    if output.is_empty() || output.len() & 3 != 0
+        || offset.checked_add(output.len()).is_none_or(|end| end > bytes.len())
+        || (bytes.as_ptr() as usize).checked_add(offset)
+            .is_none_or(|address| address & 3 != 0)
+    {
+        return Err(EINVAL);
+    }
+    for (index, word) in output.chunks_exact_mut(4).enumerate() {
+        // SAFETY: the complete range and its four-byte alignment were checked
+        // before any load. The caller keeps this allocation mapped and the
+        // producer-published slot owned until all words have been copied.
+        let value = unsafe {
+            core::ptr::read_volatile(bytes.as_ptr().add(offset + index * 4).cast::<u32>())
+        };
+        word.copy_from_slice(&value.to_ne_bytes());
+    }
+    Ok(())
+}
+
 fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -15157,13 +15183,9 @@ impl G17ResourceOwner {
         let record_offset = record_address
             .checked_sub(self.ktrace_object(role).iova())
             .ok_or(EINVAL)? as usize;
-        let record_end = record_offset
-            .checked_add(g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE)
-            .ok_or(EINVAL)?;
         let mut raw = [0u8; g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE];
         self.ktrace_object(role).with_bytes_mut(|bytes| {
-            raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
-            Ok(())
+            g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
         })?;
         let event_type = u32::from_le_bytes(raw[0..4].try_into().map_err(|_| EIO)?);
         let validation = match event_type {
@@ -16362,13 +16384,9 @@ impl G17ResourceOwner {
             let record_offset = record_address
                 .checked_sub(self.ktrace_object(role).iova())
                 .ok_or(EINVAL)? as usize;
-            let record_end = record_offset
-                .checked_add(g17_completion::G17P_KTRACE_ENTRY_SIZE)
-                .ok_or(EINVAL)?;
             let mut raw = [0u8; g17_completion::G17P_KTRACE_ENTRY_SIZE];
             self.ktrace_object(role).with_bytes_mut(|bytes| {
-                raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
-                Ok(())
+                g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
             })?;
 
             // Publish before decoding or printing. dev_info! is slow and the
