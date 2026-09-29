@@ -55,6 +55,15 @@ impl SepData {
                 dev_info!(self.dev, "sbio: {} answered status {:#x} (prerequisite missing; establishing it and retrying)\n", op.name(), err);
                 SbioOutcome::PrerequisiteMissing
             }
+            crate::sbio::SBIO_STATUS_ALREADY_ACTIVE => {
+                dev_info!(
+                    self.dev,
+                    "sbio: {} answered status {:#x} (biometric operation already active)\n",
+                    op.name(),
+                    err
+                );
+                SbioOutcome::AlreadyActive
+            }
             crate::sbio::SBIO_STATUS_16 => {
                 dev_warn!(self.dev, "sbio: {} answered status {:#x}\n", op.name(), err);
                 SbioOutcome::Status16
@@ -378,12 +387,47 @@ impl SepData {
         true
     }
 
-    fn begin_enrolment_on_enclave(&self) -> Option<OpenEnrolment<'_>> {
-        if self.enrol_open.load(Relaxed) {
-            self.enrol_open.store(false, Relaxed);
-            let _ = self.sbio_call(&crate::sbio::sbio_cancel_operation());
+    fn cancel_biometric_operation(&self, why: &CStr) -> bool {
+        self.enrol_open.store(false, Relaxed);
+        match self.sbio_call(&crate::sbio::sbio_cancel_operation()) {
+            SbioOutcome::Ok(_) => {
+                dev_info!(self.dev, "bio: cancelled active operation {}\n", why);
+                true
+            }
+            _ => {
+                dev_err!(
+                    self.dev,
+                    "bio: could not cancel active operation {}; refusing to overlap biometric operations\n",
+                    why
+                );
+                false
+            }
+        }
+    }
+
+    fn begin_enrolment_attempt(&self, user: crate::sbio::UserId) -> SbioOutcome {
+        // 0x03 answers 0x1 until an enrolment context exists.
+        if !self.open_enrolment_context(user) {
+            dev_err!(
+                self.dev,
+                "enrol: could not open the enclave enrolment context\n"
+            );
+            return SbioOutcome::Other;
         }
 
+        let Some(acm_handle) = self.establish_passcode_validated_context(user) else {
+            dev_err!(
+                self.dev,
+                "enrol: could not establish the PasscodeValidated SCRD credential; not falling back to a transient SKS token (a catacomb sealed under one does not survive a reboot)\n"
+            );
+            return SbioOutcome::Other;
+        };
+        let op =
+            crate::sbio::sbio_begin_enrol(user, crate::sbio::BE_AUTH_TYPE_ACM_CONTEXT, &acm_handle);
+        self.sbio_call(&op)
+    }
+
+    fn begin_enrolment_on_enclave(&self) -> Option<OpenEnrolment<'_>> {
         let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID)?;
 
         // 0x03 answers -3 until a user key bag is designated
@@ -395,30 +439,55 @@ impl SepData {
             return None;
         }
 
-        // 0x03 answers 0x1 until an enrolment context exists
-        if !self.open_enrolment_context(user) {
+        // A successful identify/verify leaves an SBIO biometric operation
+        // active even though the image context was cleaned up. GNOME performs
+        // just such an identify before EnrollStart. BEGIN_ENROL answers 0x101
+        // (already active) until operation 0x05 tears that state down.
+        if !self.cancel_biometric_operation(c"before BEGIN_ENROL") {
             return None;
         }
 
-        let Some(acm_handle) = self.establish_passcode_validated_context(user) else {
-            dev_err!(
-                self.dev,
-                "enrol: could not establish the PasscodeValidated SCRD credential; not falling back to a transient SKS token (a catacomb sealed under one does not survive a reboot)\n"
-            );
-            return None;
+        let outcome = match self.begin_enrolment_attempt(user) {
+            SbioOutcome::AlreadyActive => {
+                // One bounded recovery covers a stale enrolment operation as
+                // well as a match operation that raced the first teardown.
+                dev_info!(
+                    self.dev,
+                    "enrol: BEGIN_ENROL found an already-active operation; cancelling and retrying once\n"
+                );
+                if !self.cancel_biometric_operation(c"before the bounded BEGIN_ENROL retry") {
+                    let _ = self.establish_scrd_match_context(user);
+                    return None;
+                }
+                self.begin_enrolment_attempt(user)
+            }
+            other => other,
         };
-        let op =
-            crate::sbio::sbio_begin_enrol(user, crate::sbio::BE_AUTH_TYPE_ACM_CONTEXT, &acm_handle);
 
-        match self.sbio_call(&op) {
+        match outcome {
             SbioOutcome::Ok(_payload) => {
                 self.enrol_open.store(true, Relaxed);
+                dev_info!(
+                    self.dev,
+                    "enrol: BEGIN_ENROL accepted after biometric-operation teardown\n"
+                );
                 Some(OpenEnrolment {
                     sep: self,
                     armed: true,
                 })
             }
-            _ => None,
+            SbioOutcome::AlreadyActive => {
+                dev_err!(
+                    self.dev,
+                    "enrol: BEGIN_ENROL still answered already-active after one teardown retry\n"
+                );
+                let _ = self.establish_scrd_match_context(user);
+                None
+            }
+            _ => {
+                let _ = self.establish_scrd_match_context(user);
+                None
+            }
         }
     }
 
@@ -617,7 +686,7 @@ impl SepData {
                     // 0x101 ALREADY_ACTIVE is a success
                     Ok(done)
                         if done.status.answered()
-                            == Some(crate::sbio::SBIO_STATUS_ALREADY_ACTIVE) =>
+                            == Some(u32::from(crate::sbio::SBIO_STATUS_ALREADY_ACTIVE)) =>
                     {
                         self.confirm_active(id, what, LoadAnswer::AlreadyActive)
                     }
@@ -1533,10 +1602,17 @@ impl SepData {
             self.reconcile_identities();
 
             // The enrollment just changed, so the boot-time match context no
-            // longer vouches for it. Refresh it now rather than leaving the
-            // first match to discover it.
+            // longer vouches for it. Close the enrol operation and bind a new
+            // context only after the changed catacomb is durable.
             if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
-                self.establish_scrd_match_context(user);
+                if self.cancel_biometric_operation(c"after completed enrolment")
+                    && !self.establish_scrd_match_context(user)
+                {
+                    dev_warn!(
+                        self.dev,
+                        "enrol: completed and persisted, but verification could not be re-armed\n"
+                    );
+                }
             }
         }
 
@@ -2110,9 +2186,10 @@ impl SepData {
                 // enclave answers 0x16 to one mode word and 0x2d to another, so
                 // walk the whole enumeration and let the summary say what each
                 // value did.
-                SbioOutcome::Status16 | SbioOutcome::PrerequisiteMissing | SbioOutcome::Other => {
-                    continue
-                }
+                SbioOutcome::Status16
+                | SbioOutcome::PrerequisiteMissing
+                | SbioOutcome::AlreadyActive
+                | SbioOutcome::Other => continue,
             }
         }
         let Some(share) = share else {
@@ -2165,7 +2242,7 @@ impl SepData {
                     }
                 }
             }
-            SbioOutcome::Status16 => {
+            SbioOutcome::AlreadyActive | SbioOutcome::Status16 => {
                 return false;
             }
             SbioOutcome::Other => {
@@ -2210,7 +2287,7 @@ impl SepData {
                     }
                 }
             }
-            SbioOutcome::Status16 => {
+            SbioOutcome::AlreadyActive | SbioOutcome::Status16 => {
                 return None;
             }
             SbioOutcome::Other => {
@@ -3238,28 +3315,72 @@ impl SepData {
     }
 
     fn delete_identity(&self, identity: &crate::sbio::IdentityV1) -> Result<()> {
-        if self.enclave_lists(identity.uuid()) == Some(false) {
-            self.forget_identity(identity.uuid(), c"a host entry the enclave never had");
-            return Ok(());
+        let already_absent = self.enclave_lists(identity.uuid()) == Some(false);
+        if !already_absent {
+            let op = crate::sbio::sbio_delete_identity(identity);
+
+            if self.sbio_expect_ok(&op).is_none() {
+                dev_err!(
+                    self.dev,
+                    "bio: 0x57 failed, status above; host index left unchanged (forgetting a template the enclave still holds would report a deletion that did not happen)\n"
+                );
+                return Err(EIO);
+            }
         }
 
-        let op = crate::sbio::sbio_delete_identity(identity);
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return Err(EIO);
+        };
 
-        if self.sbio_expect_ok(&op).is_none() {
+        // DELETE_IDENTITY changes volatile enclave state. Commit the same four
+        // anti-replay artefacts as a completed enrolment, with the master
+        // snapshot last, before claiming success to userspace. This also makes
+        // an idempotent retry repair an earlier delete whose save was cut short.
+        if !self.save_all_components(user) {
             dev_err!(
                 self.dev,
-                "bio: 0x57 failed, status above; host index left unchanged (forgetting a template the enclave still holds would report a deletion that did not happen)\n"
+                "bio: identity deletion reached the enclave but its changed catacomb was not fully persisted; host index left unchanged so the delete can be retried\n"
+            );
+            return Err(EIO);
+        }
+        if !self.resnapshot_identity_keybag() {
+            dev_err!(
+                self.dev,
+                "bio: identity deletion catacombs were saved but the identity-bag snapshot was not; host index left unchanged so the delete can be retried\n"
             );
             return Err(EIO);
         }
 
-        self.forget_identity(identity.uuid(), c"removed from the enclave");
-
-        // Deleting a finger changes the enrollment the match context vouches
-        // for, exactly as enrolling one does.
-        if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
-            self.establish_scrd_match_context(user);
+        // The old match context vouches for the pre-delete set. Tear down the
+        // active biometric operation, then bind and validate a context against
+        // the now-durable set. Do not log success unless SCRD says satisfied.
+        if !self.cancel_biometric_operation(c"after identity deletion")
+            || !self.establish_scrd_match_context(user)
+        {
+            dev_err!(
+                self.dev,
+                "bio: identity deletion is durable, but verification could not be re-armed; host index left unchanged so recovery can be retried\n"
+            );
+            return Err(EIO);
         }
+
+        self.templates_restored.store(
+            self.enclave_identities_for(SBIO_PROBE_USER_ID)
+                .is_some_and(|ids| !ids.is_empty()),
+            Relaxed,
+        );
+        self.forget_identity(
+            identity.uuid(),
+            if already_absent {
+                c"a host entry the enclave no longer had"
+            } else {
+                c"removed from the enclave and persisted"
+            },
+        );
+        dev_info!(
+            self.dev,
+            "bio: identity deletion persisted; verification re-armed with the changed enrollment\n"
+        );
         Ok(())
     }
 
@@ -3759,9 +3880,9 @@ pub(crate) const SBIO_STATUS_COLD_TRANSITION: u32 = 0x8002;
 static_assert!(SBIO_STATUS_COLD_TRANSITION != 0);
 
 // 0x101 from a 0x6d load = already active; a success answer, not an error
-pub(crate) const SBIO_STATUS_ALREADY_ACTIVE: u32 = 0x101;
+pub(crate) const SBIO_STATUS_ALREADY_ACTIVE: u16 = 0x101;
 static_assert!(SBIO_STATUS_ALREADY_ACTIVE != 0);
-static_assert!(SBIO_STATUS_ALREADY_ACTIVE != SBIO_STATUS_COLD_TRANSITION);
+static_assert!(SBIO_STATUS_ALREADY_ACTIVE as u32 != SBIO_STATUS_COLD_TRANSITION);
 
 pub(crate) const COMPONENT_STATE_COLD: u32 = 0x1;
 pub(crate) const COMPONENT_STATE_ACTIVE: u32 = 0x2;
