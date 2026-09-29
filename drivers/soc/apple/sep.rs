@@ -282,40 +282,63 @@ impl Drop for ImageContext<'_> {
 struct OpenEnrolment<'a> {
     sep: &'a SepData,
     armed: bool,
+    acm_handle: Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
 }
 
 impl OpenEnrolment<'_> {
-    fn completed(mut self) {
+    fn completed(mut self) -> bool {
         self.armed = false;
         self.sep.enrol_open.store(false, Relaxed);
+        if let Some(handle) = self.acm_handle.take() {
+            let released = self
+                .sep
+                .delete_scrd_context(&handle, c"after completed enrolment authorization");
+            if !released {
+                self.sep.remember_unreleased_scrd_context(handle);
+            }
+            return released;
+        }
+        true
     }
 }
 
 impl Drop for OpenEnrolment<'_> {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let cancelled = matches!(
-            self.sep.sbio_call(&crate::sbio::sbio_cancel_operation()),
-            SbioOutcome::Ok(_)
-        );
-        self.sep.enrol_open.store(false, Relaxed);
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
-            return;
-        };
-        if !cancelled {
-            dev_warn!(
-                self.sep.dev,
-                "enrol: cancelling the abandoned enclave operation failed; not claiming the match context was restored\n"
+        if self.armed {
+            let cancelled = matches!(
+                self.sep.sbio_call(&crate::sbio::sbio_cancel_operation()),
+                SbioOutcome::Ok(_)
             );
-            return;
-        }
-        if !self.sep.establish_scrd_match_context(user) {
-            dev_warn!(
-                self.sep.dev,
-                "enrol: cancelled, but verification could not be re-armed with a fresh match context\n"
-            );
+            self.sep.enrol_open.store(false, Relaxed);
+            let context_released = self.acm_handle.take().is_none_or(|handle| {
+                let released = self
+                    .sep
+                    .delete_scrd_context(&handle, c"after cancelled enrolment authorization");
+                if !released {
+                    self.sep.remember_unreleased_scrd_context(handle);
+                }
+                released
+            });
+            let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+                return;
+            };
+            if !cancelled || !context_released {
+                dev_warn!(
+                    self.sep.dev,
+                    "enrol: abandoned operation teardown was incomplete; not overlapping it with a new match context\n"
+                );
+                return;
+            }
+            if !self.sep.establish_scrd_match_context(user) {
+                dev_warn!(
+                    self.sep.dev,
+                    "enrol: cancelled, but verification could not be re-armed with a fresh match context\n"
+                );
+            }
+        } else if let Some(handle) = self.acm_handle.take() {
+            let _ = self
+                .sep
+                .delete_scrd_context(&handle, c"while closing enrolment authorization");
         }
     }
 }
@@ -673,6 +696,8 @@ struct SepData {
     scrd_probe: Mutex<ScrdProbe>,
     #[pin]
     scrd_wq: CondVar,
+    #[pin]
+    scrd_active_context: Mutex<Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
 
     sensor_present: Atomic<bool>,
     /// True only when the machine has no fingerprint sensor at all, as opposed
@@ -886,6 +911,7 @@ impl SepData {
                 ool_scrd <- new_mutex!(Some(ool_scrd)),
                 scrd_probe <- new_mutex!(ScrdProbe::new()),
                 scrd_wq <- new_condvar!("SepData::scrd_wq"),
+                scrd_active_context <- new_mutex!(None),
                 dma_ring <- new_mutex!(Some(dma_ring)),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
@@ -1674,6 +1700,59 @@ impl SepData {
         Some((reply.status, out))
     }
 
+    fn delete_scrd_context(
+        &self,
+        handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN],
+        why: &CStr,
+    ) -> bool {
+        let Some((status, _)) = self.scrd_command(&crate::scrd::scrd_context_delete(handle)) else {
+            dev_warn!(
+                self.dev,
+                "scrd: context delete got no reply {}; the context may still be active\n",
+                why
+            );
+            return false;
+        };
+        if status != 0 {
+            dev_warn!(
+                self.dev,
+                "scrd: context delete answered status {} {}; the context may still be active\n",
+                status,
+                why
+            );
+            return false;
+        }
+        dev_info!(self.dev, "scrd: context released {}\n", why);
+        true
+    }
+
+    fn remember_unreleased_scrd_context(&self, handle: [u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let mut slot = self.scrd_active_context.lock();
+        if slot.is_none() {
+            *slot = Some(handle);
+        } else {
+            dev_warn!(
+                self.dev,
+                "scrd: more than one context could not be released; one handle could not be retained\n"
+            );
+        }
+    }
+
+    fn release_scrd_active_context(&self, why: &CStr) -> bool {
+        let Some(handle) = self.scrd_active_context.lock().take() else {
+            return true;
+        };
+        if self.delete_scrd_context(&handle, why) {
+            return true;
+        }
+
+        // Keep ownership on an ambiguous failure. A later retry can attempt
+        // the same idempotent teardown instead of silently leaking the only
+        // handle by which this tracked context can be named.
+        self.remember_unreleased_scrd_context(handle);
+        false
+    }
+
     fn establish_passcode_validated_context(
         &self,
         user: crate::sbio::UserId,
@@ -1690,37 +1769,55 @@ impl SepData {
             (material.special, Secret(copy))
         };
 
-        let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize())?;
-        if status != 0 {
-            return None;
-        }
+        let mut created = None;
+        let result = (|| -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+            let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize())?;
+            if status != 0 {
+                return None;
+            }
 
-        let (status, out) =
-            self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value()))?;
-        if status != 0 || out.len() < crate::scrd::SCRD_ACM_HANDLE_LEN {
-            return None;
-        }
-        let mut acm_handle = [0u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
-        acm_handle.copy_from_slice(&out[..crate::scrd::SCRD_ACM_HANDLE_LEN]);
+            let (status, out) =
+                self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value()))?;
+            if status != 0 || out.len() < crate::scrd::SCRD_ACM_HANDLE_LEN {
+                return None;
+            }
+            let mut acm_handle = [0u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
+            acm_handle.copy_from_slice(&out[..crate::scrd::SCRD_ACM_HANDLE_LEN]);
+            created = Some(acm_handle);
 
-        let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&acm_handle))?;
-        if status != 0 {
-            return None;
-        }
+            let (status, _) =
+                self.scrd_command(&crate::scrd::scrd_context_externalize(&acm_handle))?;
+            if status != 0 {
+                return None;
+            }
 
-        let out = self.sks_send(self.sks_req_verify_secret(special, &secret, &acm_handle))?;
-        if out.reply.status != 0 {
-            return None;
-        }
+            let out = self.sks_send(self.sks_req_verify_secret(special, &secret, &acm_handle))?;
+            if out.reply.status != 0 {
+                return None;
+            }
 
-        let (status, out) =
-            self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
-        let satisfied = out.len() >= 4 && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
-        if status != 0 || !satisfied {
-            return None;
-        }
+            let (status, out) =
+                self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+            let satisfied =
+                out.len() >= 4 && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
+            if status != 0 || !satisfied {
+                return None;
+            }
 
-        Some(acm_handle)
+            Some(acm_handle)
+        })();
+
+        if result.is_none() {
+            if let Some(handle) = created {
+                if !self.delete_scrd_context(
+                    &handle,
+                    c"after failed PasscodeValidated context preparation",
+                ) {
+                    self.remember_unreleased_scrd_context(handle);
+                }
+            }
+        }
+        result
     }
 
     /// Create the ACM context the enclave's match arm requires, and bind it to the
@@ -1746,6 +1843,13 @@ impl SepData {
             );
             return false;
         }
+        if !self.release_scrd_active_context(c"before replacing the match context") {
+            dev_warn!(
+                self.dev,
+                "scrd: refusing to overlap match contexts after the old one could not be released\n"
+            );
+            return false;
+        }
         let Some(du) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) else {
             return false;
         };
@@ -1757,6 +1861,7 @@ impl SepData {
             }
         };
 
+        let mut created = None;
         let acm = (|| -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
             let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize())?;
             if status != 0 {
@@ -1769,6 +1874,7 @@ impl SepData {
             }
             let mut acm_handle = [0u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
             acm_handle.copy_from_slice(&out[..crate::scrd::SCRD_ACM_HANDLE_LEN]);
+            created = Some(acm_handle);
             let (status, _) =
                 self.scrd_command(&crate::scrd::scrd_context_externalize(&acm_handle))?;
             if status != 0 {
@@ -1788,7 +1894,8 @@ impl SepData {
             }
             Some(acm_handle)
         })();
-        if acm.is_some() {
+        if let Some(handle) = acm {
+            *self.scrd_active_context.lock() = Some(handle);
             dev_info!(
                 self.dev,
                 "scrd: match context established for user {}\n",
@@ -1796,6 +1903,11 @@ impl SepData {
             );
             true
         } else {
+            if let Some(handle) = created {
+                if !self.delete_scrd_context(&handle, c"after failed match-context preparation") {
+                    self.remember_unreleased_scrd_context(handle);
+                }
+            }
             dev_warn!(
                 self.dev,
                 "scrd: no match context for user {} (a step answered non-zero or the endpoint is absent); the enclave's match arm asserts one\n",

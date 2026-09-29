@@ -405,14 +405,17 @@ impl SepData {
         }
     }
 
-    fn begin_enrolment_attempt(&self, user: crate::sbio::UserId) -> SbioOutcome {
+    fn begin_enrolment_attempt(
+        &self,
+        user: crate::sbio::UserId,
+    ) -> (SbioOutcome, Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>) {
         // 0x03 answers 0x1 until an enrolment context exists.
         if !self.open_enrolment_context(user) {
             dev_err!(
                 self.dev,
                 "enrol: could not open the enclave enrolment context\n"
             );
-            return SbioOutcome::Other;
+            return (SbioOutcome::Other, None);
         }
 
         let Some(acm_handle) = self.establish_passcode_validated_context(user) else {
@@ -420,11 +423,11 @@ impl SepData {
                 self.dev,
                 "enrol: could not establish the PasscodeValidated SCRD credential; not falling back to a transient SKS token (a catacomb sealed under one does not survive a reboot)\n"
             );
-            return SbioOutcome::Other;
+            return (SbioOutcome::Other, None);
         };
         let op =
             crate::sbio::sbio_begin_enrol(user, crate::sbio::BE_AUTH_TYPE_ACM_CONTEXT, &acm_handle);
-        self.sbio_call(&op)
+        (self.sbio_call(&op), Some(acm_handle))
     }
 
     fn begin_enrolment_on_enclave(&self) -> Option<OpenEnrolment<'_>> {
@@ -439,22 +442,41 @@ impl SepData {
             return None;
         }
 
-        // A successful identify/verify leaves an SBIO biometric operation
-        // active even though the image context was cleaned up. GNOME performs
-        // just such an identify before EnrollStart. BEGIN_ENROL answers 0x101
-        // (already active) until operation 0x05 tears that state down.
-        if !self.cancel_biometric_operation(c"before BEGIN_ENROL") {
+        // The boot-time SCRD match credential is a tracked context. It remains
+        // active until CONTEXT_DELETE names its 16-byte handle; SBIO operation
+        // 0x05 cannot release it. BEGIN_ENROL answers 0x101 while that context
+        // remains, so release it before creating the enrolment authorization.
+        if !self.release_scrd_active_context(c"before BEGIN_ENROL") {
+            dev_err!(
+                self.dev,
+                "enrol: could not release the active match context before BEGIN_ENROL\n"
+            );
             return None;
         }
 
-        let outcome = match self.begin_enrolment_attempt(user) {
-            SbioOutcome::AlreadyActive => {
+        // Also close an abandoned SBIO operation. This is a separate state
+        // machine from SCRD, and both must be clear before enrolment starts.
+        if !self.cancel_biometric_operation(c"before BEGIN_ENROL") {
+            let _ = self.establish_scrd_match_context(user);
+            return None;
+        }
+
+        let (outcome, acm_handle) = match self.begin_enrolment_attempt(user) {
+            (SbioOutcome::AlreadyActive, first_handle) => {
                 // One bounded recovery covers a stale enrolment operation as
-                // well as a match operation that raced the first teardown.
+                // well as a state transition that raced the first teardown.
                 dev_info!(
                     self.dev,
                     "enrol: BEGIN_ENROL found an already-active operation; cancelling and retrying once\n"
                 );
+                if let Some(handle) = first_handle {
+                    if !self
+                        .delete_scrd_context(&handle, c"after refused BEGIN_ENROL authorization")
+                    {
+                        self.remember_unreleased_scrd_context(handle);
+                        return None;
+                    }
+                }
                 if !self.cancel_biometric_operation(c"before the bounded BEGIN_ENROL retry") {
                     let _ = self.establish_scrd_match_context(user);
                     return None;
@@ -466,6 +488,17 @@ impl SepData {
 
         match outcome {
             SbioOutcome::Ok(_payload) => {
+                let Some(acm_handle) = acm_handle else {
+                    dev_err!(
+                        self.dev,
+                        "enrol: BEGIN_ENROL succeeded without an owned authorization context\n"
+                    );
+                    let _ = self.cancel_biometric_operation(
+                        c"after losing the BEGIN_ENROL authorization handle",
+                    );
+                    let _ = self.establish_scrd_match_context(user);
+                    return None;
+                };
                 self.enrol_open.store(true, Relaxed);
                 dev_info!(
                     self.dev,
@@ -474,18 +507,39 @@ impl SepData {
                 Some(OpenEnrolment {
                     sep: self,
                     armed: true,
+                    acm_handle: Some(acm_handle),
                 })
             }
             SbioOutcome::AlreadyActive => {
+                let context_released = acm_handle.is_none_or(|handle| {
+                    let released =
+                        self.delete_scrd_context(&handle, c"after the bounded BEGIN_ENROL refusal");
+                    if !released {
+                        self.remember_unreleased_scrd_context(handle);
+                    }
+                    released
+                });
                 dev_err!(
                     self.dev,
                     "enrol: BEGIN_ENROL still answered already-active after one teardown retry\n"
                 );
-                let _ = self.establish_scrd_match_context(user);
+                if context_released {
+                    let _ = self.establish_scrd_match_context(user);
+                }
                 None
             }
             _ => {
-                let _ = self.establish_scrd_match_context(user);
+                let context_released = acm_handle.is_none_or(|handle| {
+                    let released = self
+                        .delete_scrd_context(&handle, c"after failed BEGIN_ENROL authorization");
+                    if !released {
+                        self.remember_unreleased_scrd_context(handle);
+                    }
+                    released
+                });
+                if context_released {
+                    let _ = self.establish_scrd_match_context(user);
+                }
                 None
             }
         }
@@ -1578,7 +1632,7 @@ impl SepData {
         };
 
         if enrolment_completed {
-            open.completed();
+            let auth_context_released = open.completed();
 
             if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
                 if !self.save_all_components(user) {
@@ -1605,9 +1659,14 @@ impl SepData {
             // longer vouches for it. Close the enrol operation and bind a new
             // context only after the changed catacomb is durable.
             if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
-                if self.cancel_biometric_operation(c"after completed enrolment")
-                    && !self.establish_scrd_match_context(user)
-                {
+                let operation_cancelled =
+                    self.cancel_biometric_operation(c"after completed enrolment");
+                if !auth_context_released || !operation_cancelled {
+                    dev_warn!(
+                        self.dev,
+                        "enrol: completed and persisted, but teardown was incomplete; not overlapping it with a new match context\n"
+                    );
+                } else if !self.establish_scrd_match_context(user) {
                     dev_warn!(
                         self.dev,
                         "enrol: completed and persisted, but verification could not be re-armed\n"
