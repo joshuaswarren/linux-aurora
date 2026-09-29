@@ -236,6 +236,8 @@ enum SbioOutcome {
     Ok(KVec<u8>),
     // status 0x01
     PrerequisiteMissing,
+    // status 0x101
+    AlreadyActive,
     // status 0x16; NOT "malformed" — that mapping is another service's status space
     Status16,
     Other,
@@ -294,8 +296,27 @@ impl Drop for OpenEnrolment<'_> {
         if !self.armed {
             return;
         }
-        let _ = self.sep.sbio_call(&crate::sbio::sbio_cancel_operation());
+        let cancelled = matches!(
+            self.sep.sbio_call(&crate::sbio::sbio_cancel_operation()),
+            SbioOutcome::Ok(_)
+        );
         self.sep.enrol_open.store(false, Relaxed);
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        if !cancelled {
+            dev_warn!(
+                self.sep.dev,
+                "enrol: cancelling the abandoned enclave operation failed; not claiming the match context was restored\n"
+            );
+            return;
+        }
+        if !self.sep.establish_scrd_match_context(user) {
+            dev_warn!(
+                self.sep.dev,
+                "enrol: cancelled, but verification could not be re-armed with a fresh match context\n"
+            );
+        }
     }
 }
 
@@ -1758,7 +1779,13 @@ impl SepData {
             if out.reply.status != 0 {
                 return None;
             }
-            self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+            let (status, out) =
+                self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+            let satisfied =
+                out.len() >= 4 && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
+            if status != 0 || !satisfied {
+                return None;
+            }
             Some(acm_handle)
         })();
         if acm.is_some() {
