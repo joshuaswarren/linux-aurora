@@ -97,6 +97,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Maximum firmware recoveries per session; 0 is unlimited",
         },
+        g17p_early_render_wake: u32 {
+            default: 0,
+            description: "Opt-in early render wake when no submitted GPU work remains",
+        },
         g17p_fw_log: u32 {
             default: 0,
             description: "Enable the GPU firmware log ring",

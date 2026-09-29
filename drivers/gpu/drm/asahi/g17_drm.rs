@@ -1587,6 +1587,10 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
             if packet.cancel_requested() { return Err(ECANCELED); }
             failure_stage = "render-attach-physical-lease";
             let render_slot = completion.attach_lease(lease)?;
+            if *module_parameters::g17p_early_render_wake.value() != 0 {
+                failure_stage = "render-early-work-doorbell";
+                self.runtime.mutex().lock().wake_pending_render_submission()?;
+            }
             let mut transition = None;
             let mut transition_attempted = false;
             let mut control_backpressure_polls = 0usize;
