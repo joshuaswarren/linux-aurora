@@ -3426,6 +3426,28 @@ pub(crate) struct G17PLiveRuntime {
 }
 
 impl G17PLiveRuntime {
+    /// Start the normal firmware work scan before preparing an eligible job.
+    /// Call only after dependency checks and physical-queue lease acquisition.
+    /// Submitted-work witnesses suppress redundant scans under sustained load;
+    /// their absence is not a claim that the firmware is physically asleep.
+    pub(crate) fn wake_pending_render_submission(&mut self) -> Result {
+        if self.is_crashed() { return Err(EIO); }
+        if self.pending_compute.is_some()
+            || self.pending_render.iter().any(Option::is_some)
+            || self.pending_render_queued.iter().flatten().next().is_some()
+            || self.async_compute_queues.iter().any(|queue| queue.active.is_some())
+            || !self.quarantined_render_completions.is_empty()
+        {
+            return Ok(());
+        }
+        let rtkit = self.gfx_rtkit.as_mut().ok_or(ENODEV)?;
+        // The firmware work-ring scan enters the wake path before reading
+        // ring cursors. No command or producer is published here; the normal
+        // final doorbell must still follow complete command publication.
+        Pin::new(rtkit).send_message(
+            g17_rtkit::ENDPOINT_GFX_INTERRUPTS, 0x0083_0000_0000_0000)
+    }
+
     pub(crate) fn attach_queue_registry(
         &mut self, registry: Arc<crate::g17_drm::G17PQueueRegistry>,
     ) -> Result {
