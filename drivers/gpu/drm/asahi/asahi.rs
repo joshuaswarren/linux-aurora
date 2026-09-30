@@ -140,6 +140,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Stage9/profile4/variant0 with minimum SMA and stall tracing: 1 fetches unchanged native VDM bytes through the Gallium-address alias. Diagnostic only. Default 0",
         },
+        g18_ppp_high_alias: u32 {
+            default: 0,
+            description: "With the stage9 high-VDM control: 1 aliases unchanged native PPP pages into the Gallium range and relocates only their VDM pointers. Diagnostic only. Default 0",
+        },
         g18_sma_ideal: u32 {
             default: 0,
             description: "Stage9 variant0 profile4 only: 1 probes native ideal graphics resource policy with 40MiB backing and precommitted directory growth. Default 0",

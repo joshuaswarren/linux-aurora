@@ -50,6 +50,14 @@ impl G18GraphicsJob {
             dev_info!(dev, "G18_RENDER_OBJECT name=vdm-address-control va={:#x} bytes={:#x} context={}\n",
                 va::GRAPHICS_HIGH_VDM, va::PAGE, program.context_id());
         }
+        if *crate::module_parameters::g18_ppp_high_alias.value() == 1 {
+            program.alias_ppp_for_address_probe()?;
+            dev_info!(dev, "G18_PPP_ADDRESS_CONTROL records=14 pages=4 contents=unchanged vdm_changes=ppp-pointers-only\n");
+            for source in va::GRAPHICS_HIGH_PPP_PAGES {
+                dev_info!(dev, "G18_RENDER_OBJECT name=ppp-address-control-{:x} va={:#x} bytes={:#x} context={}\n",
+                    source, va::GRAPHICS_HIGH_PPP_BASE - 0x58000 + source, va::PAGE, program.context_id());
+            }
+        }
         if matches!(variant, RenderVariant::TaOnly | RenderVariant::Clear) {
             program.terminate_vdm(p.encoder)?;
         }
