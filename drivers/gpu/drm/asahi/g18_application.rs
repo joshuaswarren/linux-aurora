@@ -324,7 +324,12 @@ pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
     p.aux_fb_flags = G18_AUX_FB_FLAGS;
     p.tile_config |= G18_MAIN_TILE_FLAGS;
 
-    let controls = g18_render::g18_default_controls(&p);
+    let mut controls = g18_render::g18_default_controls(&p);
+    // admit_envelope permits one sample only. The older UAPI translator's
+    // tib_blocks is storage size, whereas G18 +770 / 10051 is sample control:
+    // native run112 has zero at 1x and 0x40000 at 4x. Keep storage accounting
+    // in p.tib_blocks for the independent +4d0 metadata.
+    controls.fragment_sample_control = 0;
     Ok(G18ApplicationRender {
         parameters: p,
         controls,

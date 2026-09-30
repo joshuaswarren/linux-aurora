@@ -576,9 +576,13 @@ fn probe_t8152(
         dev_err!(pdev.as_ref(), "G18G: SMA ideal probe requires stage9 variant0 profile4 and minimum=0; refused before MMIO\n");
         return Err(EINVAL);
     }
-    if sma_minimum > 1 || (sma_minimum != 0 &&
-        (stage != crate::g18_render_stage::STAGE_RENDER || render_variant != 0 || render_profile != 4)) {
-        dev_err!(pdev.as_ref(), "G18G: SMA minimum probe requires stage9 variant0 profile4; refused before MMIO\n");
+    // Explicit fixed-minimum comparison for the retained first application
+    // draw, as well as the original H1 witness. This is not dynamic sizing.
+    let minimum_probe = render_variant == 0 &&
+        ((stage == crate::g18_render_stage::STAGE_RENDER && render_profile == 4) ||
+         (stage == g18_live_boot::STAGE_DRM && render_profile == 1));
+    if sma_minimum > 1 || (sma_minimum != 0 && !minimum_probe) {
+        dev_err!(pdev.as_ref(), "G18G: SMA minimum probe requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
         return Err(EINVAL);
     }
     let usc_statistics = *crate::module_parameters::g18_usc_statistics.value();

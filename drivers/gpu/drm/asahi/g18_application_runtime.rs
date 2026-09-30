@@ -45,7 +45,7 @@ pub(crate) fn inputs(p: &mut G17pRenderParameters, c: &mut G18RenderControls,
     // Captured gears/colour and M5 shared-runtime flag policy. These are
     // independent of the application-owned depth/PPP/sample-size fields.
     i.fragment.d08c5_flags=[1,1,0,0];
-    i.fragment.d0770=[p.tib_blocks,p.aux_fb_flags];
+    i.fragment.d0770=[c.fragment_sample_control,p.aux_fb_flags];
     i.fragment.d0780=[u64::from(p.width)|(u64::from(p.height)<<32),p.aux_fb_page_count];
     i.fragment.d0790=[p.store_pipeline_bind<<32,p.store_pipeline];
     i.fragment.d07b0=[p.partial_store_pipeline_bind<<32,p.partial_store_pipeline];

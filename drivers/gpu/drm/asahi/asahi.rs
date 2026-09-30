@@ -130,7 +130,7 @@ kernel::module_platform_driver! {
         },
         g18_sma_minimum: u32 {
             default: 0,
-            description: "Stage9 variant0 profile4 only: 1 probes native minimum TA/fragment resource words with unchanged owned backing. Default 0",
+            description: "Stage9/profile4 or stage10/profile1, variant0: 1 probes fixed native minimum TA/fragment resource words with unchanged owned backing. Default 0",
         },
         g18_sma_ideal: u32 {
             default: 0,
