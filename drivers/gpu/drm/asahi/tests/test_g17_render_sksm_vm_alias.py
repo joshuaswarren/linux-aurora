@@ -34,7 +34,7 @@ storage = resources[
 ]
 prepare = function("fn prepare_render_sksm_vm_alias(")
 new = function_at(resources.index("    fn new(", resources.index("impl G17PUserRenderStorage")))
-finish = function("pub(crate) fn new_user_render_storage(")
+finish = function("pub(crate) fn finish_user_render_storage(")
 handoff_start = manager.index("pub(crate) fn handoff_retained_render_vm(")
 handoff_pos = manager.index("{", handoff_start) + 1
 handoff_depth = 1
@@ -55,18 +55,19 @@ assert "object.map_alias_at(vm, address, prot)?" in prepare
 assert new.count("prepare_render_sksm_vm_alias(") == 2
 assert "skSM_vm_aliases" not in resources  # typo guard
 assert finish.index("stage_render_parameter_buffer_descriptor") < finish.index(
-    "vm.append_driver_mappings(storage.take_sksm_vm_aliases())?"
+    "vm.append_driver_mappings(core::mem::take(&mut prepared.driver_aliases))?"
 )
-assert "prepare_cached_reactivation(self.render_submission_ordinal)" in handoff
-assert '"handoff-prepare-immediate-cache"' in handoff
-assert "cached.storage.claim_sksm_backing(" in handoff
-assert handoff.index("cached.storage.claim_sksm_backing(") < handoff.index(
-    "self.render_storage = Some(cached.storage)"
-)
-assert "reactivated retained graph" in handoff
-assert handoff.index("reactivated retained graph") < handoff.index(
-    "incoming VM builds a new root"
-)
+# The old graph cache was replaced by acknowledged whole-graph teardown.
+# Installed QID backing remains parked on the pair, allowing a later graph
+# in this VM to reuse only aliases of that exact backing.
+assert "prepare_cached_reactivation" not in handoff
+reserve = handoff.index("self.reserve_logical_queue_teardown_graph(")
+park = handoff.index("self.park_render_sksm_backing_for_graph_rebuild(pair_slot)")
+detach = handoff.index("storage: self.render_slots.get_mut(pair_slot).storage.take()")
+retain = handoff.index(".push_within_capacity(displaced)")
+assert reserve < park < detach < retain
+assert "incoming vm={} builds a new graph" in handoff
+
 
 
 class Vm:

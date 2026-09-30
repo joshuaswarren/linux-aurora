@@ -83,6 +83,9 @@ const DESCRIPTOR_HIGH: u64 = 0xffff_fc20_c035_8000;
 
 fn command(layout: u64) -> TranslatedComputeCommand {
     TranslatedComputeCommand {
+        compute_sequence: 0,
+        render_wait_through: None,
+        render_wait_last: None,
         usc_exec_base: 0x1_0000_0000,
         control_stream_base: 0x100_0410_0000,
         control_stream_end: 0x100_0410_0030,

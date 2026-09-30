@@ -183,10 +183,10 @@ assert "storage.render_flist_id()" in begin
 assert "storage.render_flist_pointer()" in begin
 assert "storage.render_flist_operand_table()" in begin
 assert "storage.render_flist_cookie()" in begin
-assert "g17_submission::g17p_render_flist_generation(self.render_submission_ordinal)" in begin
+assert "g17_submission::g17p_render_flist_generation(slot.submission_ordinal)" in begin
 publish = block(manager, r"^    pub\(crate\) fn publish_render_usc_freelist_request\(")
-assert "self.bootstrap_uma.is_some()" not in publish
-assert "self.prepared_render_flist.ok_or(EIO)?" in publish
+assert "self.render_slots.get(pair_slot).bootstrap_uma.is_some()" not in publish
+assert "self.render_slots.get(pair_slot).prepared_render_flist.ok_or(EIO)?" in publish
 assert publish.index("lifecycle.request.is_none()") < publish.index("encode_g17p_usc_freelist_control")
 for identity in ["lifecycle.shared_control", "lifecycle.operand_table", "lifecycle.cookie"]:
     assert identity in publish

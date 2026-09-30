@@ -12,6 +12,8 @@ def function(source,marker):
 a=resources.index('const G17P_FRAGMENT_MCACHE_INLINE_END:');b=resources.index('/// Convert validated fragment write ranges',a)
 constants=resources[a:b].replace("#[cfg(not(test))]\n", "")
 encoder=function(resources,'fn encode_g17p_fragment_mcache(')
+a=resources.index('const G17P_RENDER_3D_DESCRIPTOR_STRIDE:');b=resources.index(';',a)+1
+constants+='\n'+resources[a:b]
 mapping=function(render,'pub(crate) fn encode_g17p_mcache_mapping(')
 clencoder=function(submission,'fn encode_g17p_cl_mcache(')
 unit=r'''
@@ -94,17 +96,48 @@ fn assert_unchanged_except(raw:&[u8],range:std::ops::Range<usize>){for(i,b)in ra
  let attachments:Vec<_>=(0..16).map(att).collect();let mut raw=[0xa5;0x2350];assert_eq!(run(&attachments,1,&mut raw).unwrap().unwrap().count,17);
  let attachments:Vec<_>=(0..17).map(att).collect();let mut raw=[0xa5;0x4000];assert_eq!(run(&attachments,1,&mut raw),Err(EINVAL));assert_eq!(raw,[0xa5;0x4000]);
 }
+#[test]fn live_generations_keep_private_spill_and_publish_all_bytes(){
+ let attachments:Vec<_>=(0..16).map(att).collect();
+ let stride=G17P_RENDER_3D_DESCRIPTOR_STRIDE;
+ assert_eq!(stride%64,0);assert!(stride>=G17P_FRAGMENT_MCACHE_SPILL_END);
+ let mut live=vec![0xa5;stride*32];
+ // Cold construction must accept the entire UAPI domain in its live slot.
+ let cold=run(&attachments,1,&mut live[..stride]).unwrap().unwrap();
+ assert_eq!(cold.address,BASE+0x2240);
+ assert!(live[stride..].iter().all(|b|*b==0xa5));
+ // Restaging must publish every byte addressed by KSM, including the tail,
+ // without modifying either neighbour or the final allocation boundary.
+ for slot in [1,15,31] {
+  let mut staging=[0x5a;0x4000];
+  let aperture=run(&attachments,1,&mut staging).unwrap().unwrap();
+  let n=g17p_fragment_copy_size(Some(&aperture));assert_eq!(n,0x2350);
+  let before=live.clone();live[slot*stride..slot*stride+n].copy_from_slice(&staging[..n]);
+  assert_eq!(&live[slot*stride+0x2240..slot*stride+n],&staging[0x2240..n]);
+  assert_eq!(&live[..slot*stride],&before[..slot*stride]);
+  assert_eq!(&live[slot*stride+n..],&before[slot*stride+n..]);
+ }
+ let mut staging=[0;0x4000];
+ let inline=run(&attachments[..15],1,&mut staging).unwrap().unwrap();
+ assert_eq!(g17p_fragment_copy_size(Some(&inline)),0x2240);
+ assert_eq!(g17p_fragment_copy_size(None),0x2240);
+}
 #[test]fn disabled_empty_and_default_selector(){
  let mut raw=[0xa5;0x4000];assert_eq!(run(&[],1,&mut raw),Ok(None));
  assert_eq!(encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,BASE,0x6a0,0,1,3,1,&mut raw),Ok(None));assert_eq!(raw,[0xa5;0x4000]);
  let a=encode_g17p_fragment_mcache(&[att(0)],INTERNAL,INTERNAL_BYTES,BASE,0x6a0,24,1,64,1,&mut raw).unwrap().unwrap();assert_eq!(a.count,2);assert_eq!((u64::from_le_bytes(raw[0x6a0..0x6a8].try_into().unwrap())>>41)&63,1);
 }
 '''
+assert '* g17_render::FRAGMENT_DESCRIPTOR_SIZE as u64' not in resources
+assert resources.count('* G17P_RENDER_3D_DESCRIPTOR_STRIDE as u64') == 3
+assert '.get_mut(..G17P_RENDER_3D_DESCRIPTOR_STRIDE).ok_or(ERANGE)?' in resources
+assert 'g17p_render_descriptor_views(destination, submission_ordinal)' in resources
+assert 'let fragment_copy_size = g17p_fragment_copy_size(fragment_mcache.as_ref());' not in resources
+assert 'source[0x4000..0x4000 + fragment_copy_size]' not in resources
 # The support overlays are explicitly a different BO from descriptor storage.
 assert 'const G17P_RENDER_PACKED_SHARED: usize = 0x1c000;' in resources
 assert 'support_va + G17P_RENDER_PACKED_SHARED as u64' in resources
 assert 'support.with_bytes_mut' in resources
-assert 'let (tiling, fragment) = next_descriptors.split_at_mut(0x4000);' in resources
+assert 'next_descriptors' not in resources
 assert 'raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);' in render
 assert 'const G17P_RENDER_DESCRIPTOR_SLOT_COUNT: usize = 32;' in resources
 assert 'G17P_RENDER_TA_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT' in resources

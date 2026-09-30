@@ -32,6 +32,80 @@ pub(crate) struct RenderStageTimes {
     pub(crate) flist_request_ns: u64,
     pub(crate) tvb_blocks: u32,
     pub(crate) retained: bool,
+    /// Finer split of the publication path, recorded only for renders that
+    /// carry a timing-buffer marker (record type 4). Indices are the
+    /// `SUB_*` constants below; values are nanoseconds.
+    pub(crate) sub_ns: [u32; SUB_COUNT],
+    /// Lap origin for `lap`; `None` whenever sub-stage timing is off.
+    pub(crate) lap_origin: Option<LapInstant>,
+    /// ARM generic-timer counts (24 MHz) at the doorbell send, for joining
+    /// host publication to the firmware's pass-start/pass-end ticks.
+    pub(crate) doorbell_cntvct: u64,
+    /// Exact selected item publication, captured only with existing timing.
+    pub(crate) config_present: [bool; 2],
+    pub(crate) item_targets: [u32; 2],
+    pub(crate) item_plan_valid: bool,
+}
+
+/// Sub-stage indices of `RenderStageTimes::sub_ns`.
+pub(crate) const SUB_FRONT: usize = 0; // entry: slot select, recovery settle
+pub(crate) const SUB_DEPS: usize = 1; // recycle check, dependency snapshot
+pub(crate) const SUB_BEGIN: usize = 2; // HWBID, TVB checks, region views
+pub(crate) const SUB_FLIST: usize = 3; // PB retarget, FList owner, lease token
+pub(crate) const SUB_SKSM: usize = 4; // SKSM queue staging (tag-15 groups)
+pub(crate) const SUB_CONFIG: usize = 5; // tag-15 headers, QoS, pair configure
+pub(crate) const SUB_OPENING: usize = 6; // PM op, partial-opening pair publish
+pub(crate) const SUB_TRACKER: usize = 7; // mapping audits, tracker push
+pub(crate) const SUB_POST: usize = 8; // power release, completion install
+pub(crate) const SUB_DOORBELL: usize = 9; // producer publish + RTKit doorbell
+pub(crate) const SUB_COMMIT: usize = 10; // commit and return
+pub(crate) const SUB_COUNT: usize = 11;
+
+#[cfg(not(test))]
+pub(crate) type LapInstant = kernel::time::Instant<kernel::time::Monotonic>;
+#[cfg(test)]
+pub(crate) type LapInstant = std::time::Instant;
+
+#[cfg(not(test))]
+fn lap_now() -> LapInstant { LapInstant::now() }
+#[cfg(test)]
+fn lap_now() -> LapInstant { std::time::Instant::now() }
+
+#[cfg(not(test))]
+fn lap_ns(origin: LapInstant) -> u64 { origin.elapsed().as_nanos().max(0) as u64 }
+#[cfg(test)]
+fn lap_ns(origin: LapInstant) -> u64 { origin.elapsed().as_nanos() as u64 }
+
+impl RenderStageTimes {
+    /// Begin sub-stage timing; a no-op unless this render is traced.
+    #[inline]
+    pub(crate) fn lap_start(&mut self) {
+        if self.enabled && self.lap_origin.is_none() {
+            self.lap_origin = Some(lap_now());
+        }
+    }
+
+    /// Restart the lap without charging it: the interval is measured by one
+    /// of the pre-existing stage fields and must not be counted twice.
+    #[inline]
+    pub(crate) fn skip(&mut self) {
+        if self.lap_origin.is_some() {
+            self.lap_origin = Some(lap_now());
+        }
+    }
+
+    /// Charge the time since the previous lap to `index` and restart the lap.
+    #[inline]
+    pub(crate) fn lap(&mut self, index: usize) {
+        if let Some(origin) = self.lap_origin {
+            let ns = lap_ns(origin);
+            let now = lap_now();
+            if let Some(slot) = self.sub_ns.get_mut(index) {
+                *slot = slot.saturating_add(u32::try_from(ns).unwrap_or(u32::MAX));
+            }
+            self.lap_origin = Some(now);
+        }
+    }
 }
 
 /// Backoff schedule for a completion poll loop.

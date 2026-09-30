@@ -41,7 +41,7 @@ class CaptureLifecycle(unittest.TestCase):
         body = function(self.live, "submit_translated_render")
         begin = body.index(".begin_translated_render(")
         scan = body.index(".capture_prepared_render_trace(")
-        flist = body.index("self.publish_render_usc_freelist_request()")
+        flist = body.index("self.publish_render_usc_freelist_request(render_slot)")
         self.assertLess(begin, scan)
         self.assertLess(scan, flist)
         self.assertEqual(body.count(".capture_prepared_render_trace("), 1)
@@ -58,12 +58,23 @@ class CaptureLifecycle(unittest.TestCase):
             self.assertNotIn(forbidden, body)
 
     def test_unprepared_boot_archive_follows_first_real_slot(self):
-        source = self.manager
-        start = source.index("let unattached = self.trace_capture.as_ref()")
-        decision = source[start:start + 340]
-        self.assertIn("!capture.prepared", decision)
-        self.assertIn("if !unattached || state.trace_capture.is_some()", decision)
-        self.assertIn("core::mem::swap(&mut self.trace_capture", decision)
+        # The boot archive stays with the session until a render prepares
+        # it. Preparing attaches it to the selected slot, and every later
+        # observation or export reads only that slot's archive, so it
+        # travels with that graph and no other slot ever sees it.
+        body = function(self.manager, "capture_prepared_render_trace")
+        attach = body.index("if self.render_slots.get(pair_slot).trace_capture.is_none()")
+        decision = body[attach:attach + 340]
+        self.assertIn("self.trace_capture.take()", decision)
+        self.assertIn("self.render_slots.get_mut(pair_slot).trace_capture = Some(capture)", decision)
+        self.assertLess(attach, body.index("if capture.prepared { return Ok(()); }"))
+        self.assertLess(body.index("if capture.prepared { return Ok(()); }"),
+                        body.index("capture.prepared = true"))
+        for name in ("capture_render_trace_observation", "finish_render_trace"):
+            self.assertNotIn("self.trace_capture", function(self.manager, name))
+        select = self.manager[self.manager.index("impl G17PRenderSlots {"):]
+        select = select[:select.index("\n}\n")]
+        self.assertNotIn("trace_capture", select)
 
     def test_halt_scan_after_validation_before_ack(self):
         body = function(self.live, "complete_primary_real_recovery")
@@ -85,7 +96,12 @@ class CaptureLifecycle(unittest.TestCase):
         drain = body.index("manager.drain_ktrace_ring(role, verbose, budget)")
         sample = body.index("manager.read_compute_completion()")
         self.assertLess(drain, sample)
-        self.assertLess(body.index("if g17p_ktrace_enabled()"), drain)
+        # v89: the consumer runs by default (native drainFirmwareRings); the
+        # capture mask only gates printing. Trace precedes statistics.
+        self.assertLess(body.index("if native_rings || g17p_ktrace_enabled()"), drain)
+        statistics = body.index("manager.drain_statistics_ring_native(role)")
+        self.assertLess(drain, statistics)
+        self.assertLess(statistics, sample)
         legacy_pending = body.index("if self.pending_compute.is_some()")
         self.assertLess(legacy_pending, sample)
         self.assertNotIn("read_compute_completion", body[drain:legacy_pending])
@@ -97,13 +113,13 @@ class CaptureLifecycle(unittest.TestCase):
         for chunk in chunks:
             self.assertIn("Phase::AfterPairRetirement", chunk)
             self.assertLess(chunk.index("Phase::AfterPairRetirement"),
-                            chunk.index(".retire_render_usc_freelist_at_completion()?"))
+                            chunk.index(".retire_render_usc_freelist_at_completion(render_slot)?"))
 
     def test_terminal_export_takes_owner_and_seals_before_return(self):
         body = function(self.manager, "finish_render_trace")
         self.assertIn("trace::Phase::AfterPairRetirement | trace::Phase::RecoveryBeforeAck", body)
         self.assertIn("capture.prepared", body)
-        self.assertLess(body.index("self.capture_render_trace_observation"), body.index("self.trace_capture.take()"))
+        self.assertLess(body.index("self.capture_render_trace_observation"), body.index("self.render_slots.get_mut(pair_slot).trace_capture.take()"))
         self.assertLess(body.index("archive.seal()"), body.index("Ok(Some(capture))"))
         self.assertNotIn("GFP_", body)
 
@@ -140,7 +156,7 @@ class CaptureLifecycle(unittest.TestCase):
 
         source = (SOURCE / "g17_resources.rs").read_text()
         owner = source[source.index("impl G17ResourceOwner {"):]
-        constructor = function(owner, "new_user_render_storage")
+        constructor = function(source[source.index("impl G17PUninstalledRenderGraph {"):], "build")
         self.assertIn("context.matches(vm)", constructor)
         self.assertIn("context.context_id()", constructor)
         restage = function(source, "restage_command")

@@ -37,9 +37,8 @@ assert drop.index(
 ) < drop.index("self.registry.release_render_owner(self.id)")
 assert "released_render_contexts |= 1u64 << context" in release
 assert "reclaim_released_superseded_render_graphs()" in release
-assert "take_active_render_slot_state()" in release
-assert "install_active_render_slot_state(active)" in release
-assert "parked_render_slots.iter_mut().flatten()" in release
+assert "self.render_slots.active_mut()" in release
+assert "self.render_slots.parked_mut()" in release
 assert "release_render_slot_context_owner" in release
 assert "snapshot.job_list_empty" in release_slot
 assert "state.storage.take()" not in release_slot
@@ -54,7 +53,7 @@ assert "Self::retired_render_graph_reclaimable(" in preserve
 assert "manager.release_render_context_owner(context)" in runtime_release
 complete = function(manager, "fn complete_render_context_update_retirement(")
 assert complete.index("complete_context_update()") < complete.index(
-    "self.render_context_retirement = None"
+    "self.render_slots.active_mut().context_retirement = None"
 )
 assert "self.reclaim_released_superseded_render_graphs()" in complete
 

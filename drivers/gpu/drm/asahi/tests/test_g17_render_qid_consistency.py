@@ -118,6 +118,6 @@ for prerequisite in (
 assert "g17p_render_direct_config" not in MODULE
 
 direct_call = begin.index("self.configure_fresh_nonbootstrap_render_pair(")
-assert direct_call < begin.index("let pm_submission =") < outer
+assert direct_call < begin.index("let (pm_submission, flist_submission) =") < outer
 assert "!execution_context.matches(vm) || !execution_context.is_current()" in MANAGER
 print("g17 render QID consistency validation: PASS")

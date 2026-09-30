@@ -33,9 +33,9 @@ assert handoff.index("self.require_retired_render_owner()") < handoff.index(
 )
 assert '"handoff-require-retired-owner"' in handoff
 for owner in (
-    "self.render_bind.take().ok_or(EIO)?",
-    "self.render_context_aliases.take()",
-    "self.render_storage.take().ok_or(ENODEV)?",
+    "self.render_slots.active_mut().bind.take().ok_or(EIO)?",
+    "self.render_slots.active_mut().context_aliases.take()",
+    "self.render_slots.active_mut().storage.take().ok_or(ENODEV)?",
 ):
     assert owner in handoff
 assert "release_client_context" not in handoff

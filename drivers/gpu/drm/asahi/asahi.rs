@@ -26,17 +26,24 @@ mod g17_completion;
 mod g17_config;
 mod g17_compute;
 mod g17_drm;
+mod g17_dvfs_parity;
+mod g17_dvfs_policy;
 mod g17_firmware;
 mod g17_initdata;
 mod g17_job;
 mod g17_status;
 mod g17_queue_limits;
+mod g17_work_state;
 mod g17_channel;
 mod g17_lifecycle;
+mod g17_preparation;
 mod g17_live_boot;
 mod g17_manager;
 mod g17_perf;
 mod g17_timing_buffer;
+mod g17_e2e;
+mod g17_host_path;
+mod g17_store;
 mod g17_power_preflight;
 mod g17_render;
 mod g17_resources;
@@ -178,10 +185,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Maximum firmware recoveries per session; 0 is unlimited",
         },
-        g17p_early_render_wake: u32 {
-            default: 0,
-            description: "Opt-in early render wake when no submitted GPU work remains",
-        },
         g17p_fw_log: u32 {
             default: 0,
             description: "Enable the GPU firmware log ring",
@@ -189,6 +192,10 @@ kernel::module_platform_driver! {
         g17p_fw_trace: u32 {
             default: 0,
             description: "Firmware trace class mask; 0 disables capture",
+        },
+        g17p_native_ring_drain: u32 {
+            default: 1,
+            description: "Native drainFirmwareRings parity: every event-worker turn consumes both roles' trace (0x200) and statistics (0x100) rings entry by entry; 0 restores the diagnostic-gated consumers (A/B only)",
         },
         g17p_binary_capture: u32 {
             default: 0,
@@ -219,11 +226,43 @@ kernel::module_platform_driver! {
         },
         g17p_fault_report: u32 {
             default: 0,
-            description: "Fault diagnostics: bit 0 includes submission dumps; bit 1 enables recovery-only register snapshots; bit 2 captures fault-only B1 scheduler/FList DRAM",
+            description: "Fault diagnostics: bit 0 includes submission dumps; bit 1 enables recovery-only register snapshots; bit 2 captures fault-only B1 scheduler/FList DRAM; bit 3 enables post-timeout power-held scoreboard diagnostic",
         },
         g17p_render_dump_descriptor: u32 {
             default: 0,
             description: "Dump render descriptor bytes",
+        },
+        g17p_mcache_dsid_probe: u32 {
+            default: 0,
+            description: "Diagnostic: allocate non-reused native-range render MCache IDs per logical owner; reboot to reset pool",
+        },
+        g17p_ta_previous_fragment_probe: u32 {
+            default: 0,
+            description: "Diagnostic: 1 ordinal TA flag; 2 coherent idle-gated TA/FRG scratch; 0 preserves current policy",
+        },
+        g17p_render_single_pair: u32 {
+            default: 0,
+            description: "Diagnostic: 1 keeps each render queue on one physical TA/3D pair (no sibling pair); 0 preserves the two-pair policy",
+        },
+        g17p_frg_hwdsid_clear: u32 {
+            default: 0,
+            description: "Diagnostic: 1 writes FRG descriptor +0x222d as 0 (native light captures); 0 preserves 1",
+        },
+        g17p_disable_idle_core_off: u32 {
+            default: 0,
+            description: "Diagnostic: 1 writes RegionC+0x30 (idle core power-off enable) as 0 at init; 0 keeps the encoded 1",
+        },
+        g17p_timer_cswitch_mask: u32 {
+            default: 2,
+            description: "RegionC+0x0 TimerCSwitch per-DM resume mask (bit0 TA, bit1 FRG, bit2 CL); 0 disables",
+        },
+        g17p_fender_delay: u32 {
+            default: 0,
+            description: "Diagnostic: RegionC+0x9bc idle-off (fender) delay override; 0 keeps the native 40",
+        },
+        g17p_cswitch_timer_multiplier: u32 {
+            default: 16,
+            description: "RegionC+0x6a CSwitchTimerMultiplier: 1 ms engine walks per TimerCSwitch resume; 0 keeps the encoded 1",
         },
         g17p_dump_state: u32 {
             default: 0,
@@ -236,18 +275,6 @@ kernel::module_platform_driver! {
         g17p_perf_window: u32 {
             default: 0,
             description: "Submissions per throughput report; 0 disables accounting",
-        },
-        g17p_render_transition_probe: u32 {
-            default: 0,
-            description: "Diagnostic render mutation reason logging; 0=off, 1=observe (no drain unless a single class is selected)",
-        },
-        g17p_render_transition_class: u32 {
-            default: 0,
-            description: "Diagnostic single class: 0=observe, 1=registration, 2=context handoff, 4=new PB graph, 8=FList init, 16=TVB growth, 32=desync; compound or unknown reasons never drain",
-        },
-        g17p_compute_burst_probe: u32 {
-            default: 0,
-            description: "Diagnostic: 0=off, 1=log steady compute publication timing, 2=rendezvous 3 steady queues before admission (20ms abort, at most 64 cohorts); no execution cap",
         },
         g17p_mixed_resource_probe: u32 {
             default: 0,
@@ -290,10 +317,6 @@ kernel::module_platform_driver! {
         g17p_completion_trace: u32 {
             default: 0,
             description: "Completion logging level: 0 off, 1 summary, 2 detailed",
-        },
-        g17p_flist_fast_poll: u32 {
-            default: 1,
-            description: "Poll the first eight pending render FList releases at 100us; 0 restores 1ms polling",
         },
     },
 }

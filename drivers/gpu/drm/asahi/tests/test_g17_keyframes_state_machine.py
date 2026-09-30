@@ -257,7 +257,7 @@ def test_production_completion_gates_are_source_coupled() -> None:
     assert "let retired = tiling.complete && fragment.complete;" in paired
     assert "let complete = retired && execution.observed();" in paired
 
-    poll = function(manager, "pub(crate) fn poll_translated_render_completion(")
+    poll = function(manager, "pub(crate) fn commit_render_observation(")
     assert "if !event_control.unlinked()" in poll
     assert "fragment_stamp != expected_stamp" in poll
     assert "G17PRenderPollOutcome::Complete(completion)" in poll
@@ -265,7 +265,7 @@ def test_production_completion_gates_are_source_coupled() -> None:
     events = function(runtime, "fn service_async_render_completions(")
     assert "g17p_render_type1_complete(*observed, expected)" in events
     settle = function(runtime, "fn settle_deferred_render_completion(")
-    assert "signal.complete(Ok(observed))" in settle
+    assert "self.defer_render_completion(signal, observed)" in settle
     signal = function(drm, "pub(crate) fn complete(")
     assert "if !completion.complete" in signal
     assert signal.index("drop(self.lease.lock().take())") < signal.index(

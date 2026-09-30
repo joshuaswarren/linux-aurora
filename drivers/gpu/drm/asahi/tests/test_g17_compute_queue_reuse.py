@@ -26,13 +26,14 @@ prepare = block(runtime, "    pub(crate) fn prepare_async_compute_queue(")
 matches = block(runtime, "    pub(crate) fn async_compute_queue_matches(")
 release = block(runtime, "    pub(crate) fn release_async_compute_queue(")
 service = block(runtime, "    fn service_async_compute_completions_matching(")
-needs_install = block(runtime, "    pub(crate) fn async_compute_needs_install(")
+# (serialization audit) a queue's first install is an ordinary reader lease; the
+# async_compute_needs_install predicate and the install drain no longer exist.
 predicate = block(limits, "pub(crate) const fn reusable_idle_compute_graph(")
 rebindable = block(limits, "pub(crate) const fn rebindable_released_compute_graph(")
 stop = block(manager, "    pub(crate) fn release_runtime_objects_after_processor_stop(")
 runtime_stop = block(live, "    fn release_runtime_objects(&mut self)")
 
-for field in ["q.owner.is_none()", "q.active.is_none()", "q.binding.is_none()", "q.context.is_none()"]:
+for field in ["q.owner.is_none()", "q.inflight.is_none()", "q.binding.is_none()", "q.context.is_none()"]:
     assert field in prepare
 assert "q.quarantined" in prepare
 selection = prepare[: prepare.index("let index =")]
@@ -41,7 +42,7 @@ assert "!q.queue.requires_first_install()" in selection
 assert "crate::g17_config::ASYNC_COMPUTE_REBIND == 0" in selection
 assert "pub(crate) const ASYNC_COMPUTE_REBIND: u32 = 1;" in config
 assert "rebindable_released_compute_graph(" in selection
-for field in ["q.owner.is_none()", "q.active.is_none()", "q.released", "q.quarantined"]:
+for field in ["q.owner.is_none()", "q.inflight.is_none()", "q.released", "q.quarantined"]:
     assert field in selection
 assert "retaining previous binding until completion" in prepare
 assert "q.previous_binding.is_none()" in selection
@@ -56,17 +57,16 @@ for identity in [
 assert "q.released" in matches and "q.quarantined" in matches
 assert "owner_free && active_free && binding_free && context_free && !quarantined" in predicate
 assert "owner_free && active_free && released && !quarantined" in rebindable
-assert "q.active.is_none() && !q.quarantined" in release
+assert "q.inflight.is_none() && !q.quarantined" in release
 # The claim is given up at close; the binding and context are NOT, because the
 # firmware still has the QID installed and sweeps its record pointer. They are
 # retained until processor stop -- see
 # test_g17_async_release_retains_firmware_state.
 assert release.index("q.released = true") < release.index("q.owner = None")
 assert "q.binding = None" not in release
-assert service.index("q.active.take()") < service.index("if q.released")
+assert service.index("q.inflight.take()") < service.index("if q.released && q.inflight.is_none()")
 assert "q.binding = None" not in service
 assert "q.binding.take()" in prepare and "q.context.take()" in prepare
-assert "q.queue.requires_first_install()" in needs_install
 assert "self.channel_ids = g17p_initial_channel_table()" in stop
 assert "self.next_channel_identity =" not in stop
 for stale_session_field in [

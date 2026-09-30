@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the actual retained-FList release lifecycle and admission gate."""
+"""Exercise the actual retained-FList release lifecycle: fire-and-forget 0x2e, carried witnesses, backpressure."""
 from pathlib import Path
 import re
 import subprocess
@@ -61,6 +61,9 @@ lease_part = "\n".join([
         "bootstrap_release_stays_ready_until_backpressure_clears",
         "shared_flist_holds_both_render_pairs_until_the_last_retirement",
         "retained_flist_leases_grow_once_and_release_every_captured_generation",
+        "reacquire_before_release_consumption_carries_the_witness",
+        "presized_render_flist_first_lease_is_warm",
+        "private_render_flist_owner_grows_once_then_reacquires_warm",
     ]],
 ])
 body = ("#![allow(dead_code)]\nmod g17_submission {" + submission_part +
@@ -71,16 +74,25 @@ with tempfile.TemporaryDirectory(prefix="g17-flist-backpressure-") as temp:
                    input=body, text=True, check=True)
     subprocess.run([str(binary)], check=True)
 
-settle = block(runtime, r"^    fn settle_render_usc_freelist_release_before_submission\(")
+settle = block(runtime, r"^    pub\(crate\) fn settle_render_usc_freelist_release_before_submission\(")
 assert "settle_consumed_render_usc_freelist_releases()?" in settle
 assert "fsleep" not in settle
-slot_pending = block(runtime, r"^    pub\(crate\) fn render_usc_freelist_release_pending_for_slot\(")
-assert "render_slot_flist_release_sent(slot)" in slot_pending
+# No per-slot "release still pending" predicate exists any more: the next
+# kick never waits for firmware to consume a 0x2e release.
+assert "render_usc_freelist_release_pending_for_slot" not in runtime
+assert "render_slot_flist_release_sent" not in manager
 submit = block(runtime, r"^    pub\(crate\) fn submit_translated_render\(")
 assert "settle_render_usc_freelist_release_before_submission()?" not in submit
+gate = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\(")
+# Pending growth is an independent lease, not a render admission barrier.
+assert "matches!(owner.state, G17PBootstrapUmaRequestState::Submitted)" not in gate
+assert "G17PBootstrapUmaRequestState::Sent" not in gate
+grow = block(runtime, r"^    fn publish_render_usc_freelist_request\(")
+assert grow.index("Ok(None) => return Ok(())") < grow.index("Err(error) if error == EAGAIN")
+assert "flush_pending_primary_device_control()?" in grow and "flush_pending_render_usc_freelist_release()?" in grow
 completion = block(runtime, r"^    fn settle_deferred_render_completion\(")
 assert "Err(error) if error == EAGAIN" in completion
-assert completion.index("Err(error) if error == EAGAIN") < completion.index("recover_persistent_runtime")
+assert completion.index("Err(error) if error == EAGAIN") < completion.index("rebuild_session_or_defer")
 worker = block(runtime, r"^    pub\(crate\) fn service_primary_firmware_events\(")
 assert worker.index("flush_pending_primary_device_control()?") < worker.index("flush_pending_render_usc_freelist_release()?")
 assert worker.index("flush_pending_render_usc_freelist_release()?") < worker.index("notifications_pending")
@@ -98,8 +110,17 @@ assert release_service.index("Err(error) if error == EAGAIN") < release_service.
 assert "settle_consumed_render_usc_freelist_releases()?" in release_service
 assert "fsleep" not in release_service
 publish = block(drm, r"^    fn publish\(&self, packet: Arc<g17_job::G17PRenderJobPacket>\)")
-pressure = publish.index("runtime.primary_device_control_backpressured()")
-assert pressure < publish.index("drop(runtime);", pressure) < publish.index("fsleep(Delta::from_millis(1))", pressure)
-slot_pressure = publish.index("runtime.render_usc_freelist_release_pending_for_slot(render_slot)?")
-assert slot_pressure < pressure
-print("retained FList release target, wrap-safe settlement and owner-local backpressure PASS")
+# The render publish path waits on nothing firmware-ordered: no release poll,
+# no control poll. Its one sleep is context-local state-capacity back-pressure
+# on the adaptive completion-poll schedule; other contexts cannot consume it.
+assert "primary_device_control_backpressured" not in publish
+assert "render_usc_freelist_release_pending_for_slot" not in publish
+assert publish.count("fsleep(") == 1
+exhausted = publish.index("match completion.work_state().acquire()")
+# Capacity waits and node initialization finish before taking device exclusion.
+assert exhausted < publish.index("fsleep(", exhausted) < publish.index("self.runtime.mutex().lock()", exhausted)
+assert "Err(error) if error == EBUSY" in publish
+assert "Err(error) => return Err(error)" in publish
+assert "crate::g17_perf::PollSchedule::new(0)" in publish
+assert publish.index("settle_render_usc_freelist_release_before_submission()?") < publish.index("submit_translated_render(")
+print("retained FList release: fire-and-forget 0x2e, carried witnesses, wrap-safe settlement, capacity-only publish wait PASS")

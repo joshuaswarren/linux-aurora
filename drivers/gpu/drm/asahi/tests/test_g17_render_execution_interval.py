@@ -64,9 +64,9 @@ with tempfile.TemporaryDirectory() as directory:
                     "-o", str(executable)], check=True)
     subprocess.run([str(executable), "--test-threads=1"], check=True)
 
-poll = block(manager, "    pub(crate) fn poll_translated_render_completion(")
+poll = block(manager, "    pub(crate) fn commit_render_observation(")
 log = poll.index('"G17P render: GPU-INTERVAL')
-promote_tracker = poll.index("self.render_tracker = self.render_queued_tracker.take()")
+promote_tracker = poll.index("self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take()")
 assert log < promote_tracker
 assert "render_gpu_interval" in poll
 assert "binding.vm_id()" in poll and "binding.root()" in poll

@@ -38,6 +38,12 @@ pub(crate) trait DrmGpu: Send + Sync {
     fn ids(&self) -> &gpu::SequenceIDs;
     fn is_crashed(&self) -> bool;
     fn supports_vm_status(&self) -> bool { false }
+    /// v87: a VM-status mirror word is exact, i.e. `submission_error()` can
+    /// never become non-zero, so a group 1 query never adds anything beyond
+    /// the VM's own sticky status that the mirror carries.
+    fn supports_vm_status_mirror(&self) -> bool { false }
+    /// Every hardware command in one ioctl retains and checks all input fences.
+    fn supports_per_command_input_syncs(&self) -> bool { false }
     fn independent_queue_limits(&self) -> Option<[u8; 16]> { None }
     /// Permanent submission-domain failure; querying must not reset firmware.
     fn submission_error(&self) -> i32 { 0 }

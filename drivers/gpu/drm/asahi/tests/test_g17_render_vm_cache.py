@@ -18,6 +18,7 @@ methods='\n'.join(function(s, marker) for marker in [
     '    pub(crate) fn render_pool_tvb_blocks(',
     '    pub(crate) fn append_render_pool_mappings(',
     '    pub(crate) fn clear_render_pool_mappings(',
+    '    pub(crate) fn clear_render_pool_mappings_if_owner(',
     '    pub(crate) fn compute_pool_mappings_match(',
     '    pub(crate) fn install_compute_pool_mappings(',
     '    pub(crate) fn clear_compute_pool_mappings(',
@@ -69,6 +70,18 @@ fn unmap_range(&self,start:u64,size:u64)->Result{self.unmapped.lock().unwrap().p
 '''
 tests=r'''
 fn main(){
+// A delayed old-graph teardown must not unmap a newly installed owner.
+let vm=Vm::new();let drops=Arc::new(AtomicUsize::new(0));
+vm.install_driver_mappings(vec![],vec![]).unwrap();
+vm.install_render_pool_mappings(7,70,1,vec![vm.mapping(16..32,&drops)]).unwrap();
+vm.clear_render_pool_mappings_if_owner(7,70);assert_eq!(drops.load(Ordering::SeqCst),1);
+vm.install_render_pool_mappings(7,71,1,vec![vm.mapping(16..32,&drops)]).unwrap();
+for (slot,id) in [(7,70),(7,0),(6,71),(255,71)] {vm.clear_render_pool_mappings_if_owner(slot,id);}
+assert!(vm.render_pool_mappings_match(7,71));assert_eq!(drops.load(Ordering::SeqCst),1);
+vm.clear_render_pool_mappings_if_owner(7,71);assert_eq!(drops.load(Ordering::SeqCst),2);
+vm.clear_render_pool_mappings_if_owner(7,71);assert_eq!(drops.load(Ordering::SeqCst),2);
+drop(vm);
+
 let drops=Arc::new(AtomicUsize::new(0));let vm=Vm::new();
 assert!(!vm.render_pool_mappings_match(0,1));assert!(!vm.render_pool_mappings_match(1,1));vm.clear_render_pool_mappings(0);
 assert_eq!(vm.install_render_pool_mappings(2,1,1,vec![vm.mapping(96..112,&drops)]),Err(EINVAL));assert_eq!(drops.load(Ordering::SeqCst),1);

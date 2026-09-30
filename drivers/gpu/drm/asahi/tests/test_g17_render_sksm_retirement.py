@@ -25,10 +25,10 @@ def block(text, pattern):
     return text[match.start():end]
 
 
-poll = block(manager, r"^    pub\(crate\) fn poll_translated_render_completion\(")
+poll = block(manager, r"^    pub\(crate\) fn commit_render_observation\(")
 complete = block(poll, r"^            if completion\.complete\s*")
 start = complete.index("let retired_sksm =")
-end = complete.index("self.render_tracker = self.render_queued_tracker.take();")
+end = complete.index("self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take();")
 transaction = complete[start:end]
 # The real observer establishes queue retirement, timestamps and native list
 # unlink before entering this transaction. Pending does not retire occupancy.
@@ -36,7 +36,7 @@ assert poll.index("observe_paired_render_window_depth(") < poll.index("if comple
 assert poll.count("complete_g17p_cl_kicks(") == complete.count("complete_g17p_cl_kicks(") == 2
 assert transaction.index("queues.fragment.producer, 1)?") < transaction.index("queues.tiling.producer = ta;")
 assert complete.index("queues.fragment.producer = fragment;") < complete.index(
-    "self.render_tracker = self.render_queued_tracker.take();"
+    "self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take();"
 )
 
 derive = "#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n"
@@ -66,10 +66,10 @@ impl Storage {
         self.retired=true;Ok(())
     }
 }
-struct Resources;
+struct Resources { qos_releases: u32 }
 impl Resources {
     fn complete_qos_queue_records(&mut self,records:&[(u8,u8,u8)])->Result {
-        assert_eq!(records,&[(0,0,0),(1,0,1)]);Ok(())
+        assert_eq!(records,&[(0,0,0),(1,0,1)]);self.qos_releases+=1;Ok(())
     }
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -85,16 +85,26 @@ impl Ids {
     }
 }
 struct Manager {
-    render_storage:Option<Storage>,resources:Resources,
-    render_sksm: Option<Queues>, render_submission_ordinal: u32,
+    render_slots:Slots,resources:Resources,
+    render_submission_ordinal: u32,
     render_hardware_buffer_id: Option<u32>, render_hardware_buffer_ids: Ids,
 }
+struct Tracker { qos_pending: bool }
+struct Slot { storage:Option<Box<Storage>>,sksm:Option<Queues>,tracker:Option<Tracker> }
+struct Slots { current:Slot }
+impl Slots {
+    fn get(&self,_slot:u8)->&Slot{&self.current}
+    fn get_mut(&mut self,_slot:u8)->&mut Slot{&mut self.current}
+}
 impl Manager {
-    fn release_render_command_buffer_state(&mut self,_word:u32) -> Result {
+    fn release_render_command_buffer_state(&mut self,_slot:u8,_word:u32) -> Result {
         Ok(())
     }
-
+''',
+    block(manager, r"^    fn retire_tracked_render_qos\("),
+    r'''
     fn actual_retirement_transaction(&mut self) -> Result {
+        let pair_slot=0;
         let hardware_buffer_id=self.render_hardware_buffer_id.ok_or(EIO)?;
         let command_buffer_state_word=0;
         let ordinal=u64::from(self.render_submission_ordinal);
@@ -111,9 +121,10 @@ fn producer(qid: u8, submitted: u32) -> G17PClKickProducerState {
         previous_valid: true, previous_timestamp: 0x2233445566 }
 }
 fn manager(ta: u32, fragment: u32) -> Manager {
-    Manager { render_storage:Some(Storage{retired:false}),resources:Resources,
-        render_sksm: Some(Queues { tiling: Queue { producer: producer(0, ta) },
-        fragment: Queue { producer: producer(1, fragment) } }),
+    Manager { render_slots:Slots{current:Slot{storage:Some(Box::new(Storage{retired:false})),
+        tracker:Some(Tracker{qos_pending:true}),
+        sksm: Some(Queues { tiling: Queue { producer: producer(0, ta) },
+        fragment: Queue { producer: producer(1, fragment) } })}},resources:Resources{qos_releases:0},
         render_submission_ordinal: 999, render_hardware_buffer_id: Some(0),
         render_hardware_buffer_ids: Ids { fail: false, releases: 0 } }
 }
@@ -122,12 +133,13 @@ fn manager(ta: u32, fragment: u32) -> Manager {
 fn actual_pair_retires_one_each_without_resetting_any_history() {
     for (ta, fragment) in [(1, 1), (7, 13), (u32::MAX, u32::MAX)] {
         let mut m = manager(ta, fragment);
-        let mut expected = m.render_sksm.unwrap();
+        let mut expected = m.render_slots.get(0).sksm.unwrap();
         expected.tiling.producer.submitted -= 1;
         expected.fragment.producer.submitted -= 1;
         m.actual_retirement_transaction().unwrap();
-        assert_eq!(m.render_sksm, Some(expected));
+        assert_eq!(m.render_slots.get(0).sksm, Some(expected));
         assert_eq!(m.render_hardware_buffer_ids.releases, 1);
+        assert_eq!(m.resources.qos_releases, 1);
     }
 }
 
@@ -135,10 +147,11 @@ fn actual_pair_retires_one_each_without_resetting_any_history() {
 fn either_queue_underflow_aborts_before_both_mutations_and_id_release() {
     for (ta, fragment) in [(0, 1), (1, 0), (0, 0)] {
         let mut m = manager(ta, fragment);
-        let before = m.render_sksm;
+        let before = m.render_slots.get(0).sksm;
         assert_eq!(m.actual_retirement_transaction(), Err(EIO));
-        assert_eq!(m.render_sksm, before);
+        assert_eq!(m.render_slots.get(0).sksm, before);
         assert_eq!(m.render_hardware_buffer_ids.releases, 0);
+        assert_eq!(m.resources.qos_releases, 0);
     }
 }
 
@@ -150,9 +163,9 @@ fn failed_prerequisites_do_not_partially_retire_prepared_queue_states() {
             0 => m.render_hardware_buffer_id = None,
             _ => m.render_hardware_buffer_ids.fail = true,
         }
-        let before = m.render_sksm;
+        let before = m.render_slots.get(0).sksm;
         assert_eq!(m.actual_retirement_transaction(), Err(EIO));
-        assert_eq!(m.render_sksm, before);
+        assert_eq!(m.render_slots.get(0).sksm, before);
         assert_eq!(m.render_hardware_buffer_ids.releases, 0);
     }
 }
@@ -161,10 +174,22 @@ fn failed_prerequisites_do_not_partially_retire_prepared_queue_states() {
 fn a_completed_pair_cannot_decrement_again_without_new_published_work() {
     let mut m = manager(1, 1);
     m.actual_retirement_transaction().unwrap();
-    let before = m.render_sksm;
+    let before = m.render_slots.get(0).sksm;
     assert_eq!(m.actual_retirement_transaction(), Err(EIO));
-    assert_eq!(m.render_sksm, before);
+    assert_eq!(m.render_slots.get(0).sksm, before);
     assert_eq!(m.render_hardware_buffer_ids.releases, 1);
+}
+
+#[test]
+fn retry_after_hardware_id_failure_does_not_release_qos_twice() {
+    let mut m=manager(1,1);
+    m.render_hardware_buffer_ids.fail=true;
+    assert_eq!(m.actual_retirement_transaction(),Err(EIO));
+    assert_eq!(m.resources.qos_releases,1);
+    m.render_hardware_buffer_ids.fail=false;
+    m.actual_retirement_transaction().unwrap();
+    assert_eq!(m.resources.qos_releases,1);
+    assert_eq!(m.render_hardware_buffer_ids.releases,1);
 }
 ''',
 ])

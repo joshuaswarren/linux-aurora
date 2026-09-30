@@ -56,7 +56,7 @@ assert "stale_recovery_records" in drain
 
 # --- every route into is_crashed() names itself --------------------------
 # The RTKit crash callback and the rebuild-failed site already log; the two
-# event-chain stores and both session_recovery_pending writers go through the
+# event-chain stores and all session_recovery_pending writers go through the
 # helpers, so `G17PMARK session-crashed` finds all of them.
 assert "note_state_crashed(" in events
 assert "note_state_crashed(" in recovery
@@ -68,12 +68,13 @@ asyncc = (root / "g17_async_compute.rs").read_text()
 # wedge class: the session was marked crashed with nothing in the log.
 assert live.count("session_recovery_pending = true;") == 0
 assert asyncc.count("session_recovery_pending = true;") == 0
-assert live.count("note_session_recovery_pending(") == 3  # definition + 2 writers
-assert asyncc.count("note_session_recovery_pending(") == 4
+assert live.count("note_session_recovery_pending(") == 4  # definition + 3 writers, including deferred rebuild requests
+# The two client-scoped fan-out routes (render-completion-failed-with-vm,
+# async-compute-vm-fanout-quarantine) no longer escalate: quarantining the
+# slot/queue is the whole containment (first-submit hang, 2026-09-26).
+assert asyncc.count("note_session_recovery_pending(") == 2
 for reason in (
     "async-compute-completion-unclassifiable",
-    "render-completion-failed-with-vm",
-    "async-compute-vm-fanout-quarantine",
     "async-compute-submission-quarantined",
 ):
     assert f'"{reason}"' in asyncc, reason
@@ -81,11 +82,11 @@ for step in (
     "settle-primary-empty-recovery",
     "drain-gfx1-event-ring",
     "queue-gfx1-recovery",
-    "async-render-completions",
     "async-compute-completions",
     "render-usc-freelist-release",
 ):
     assert f'"{step}"' in events, step
+assert '"async-render-completions"' in item(live, "    pub(crate) fn note_render_observation_error(")
 for step in ("complete-real-recovery", "complete-pending-recovery"):
     assert f'"{step}"' in recovery, step
 

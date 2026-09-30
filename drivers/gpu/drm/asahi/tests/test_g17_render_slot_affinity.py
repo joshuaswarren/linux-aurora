@@ -31,6 +31,7 @@ methods = '\n'.join(item(n) for n in [
     '    pub(crate) fn release_retained_owners_after_processor_stop(',
     '    fn quarantine_render_slot(',
     '    fn rehabilitate_render_slot_after_processor_stop(',
+    '    fn compute_poison_is_device_wide(',
 ])
 render_backend = item('impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {')
 assert 'self.registry.acquire_lease(self.owner)?' in render_backend
@@ -46,23 +47,18 @@ queue_drop = item('impl Drop for G17PQueue {')
 assert 'release_render_claim' not in queue_drop, \
     'destroying one logical queue unexpectedly clears registry affinity'
 assert queue_drop.index(
-    '.release_render_owner(self.id, self.context.context_id() as u16)'
+    '.release_render_owner(self.id, &self.context)'
 ) < queue_drop.index('self.registry.release_render_owner(self.id)'), \
     'registry exposed a released physical pair before manager context retirement'
 
 manager = (Path(__file__).resolve().parents[1] / 'g17_manager.rs').read_text()
 handoff_start = manager.index('pub(crate) fn handoff_retained_render_vm(')
-handoff_end = manager.index('    fn preserve_immediate_retired_render_graph(', handoff_start)
-handoff = manager[handoff_start:handoff_end]
+handoff = manager[handoff_start:manager.index('    /// Close one logical queue', handoff_start)]
 assert 'execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>' in handoff
 assert 'u16::try_from(execution_context.context_id())' in handoff
-assert 'retained_graph_matches_vm(graph, vm)' in handoff
-matcher_start = manager.index('fn retained_graph_matches_vm(')
-matcher_end = manager.index('    /// The retained graph and global aliases', matcher_start)
-matcher = manager[matcher_start:matcher_end]
-assert 'graph.bind.matches(vm)' in matcher
-assert 'graph.storage.descriptor_context_id() ==' not in matcher
-assert 'vm.render_pool_mappings_match(' in matcher
+assert 'retarget_retained_render_context(pair_slot, vm, execution_context.clone())' in handoff
+assert 'reserve_logical_queue_teardown_graph(' in handoff
+assert 'G17PRetiredRenderGraph {' in handoff
 
 # The lease is what decides which retained graph a submission lands on, so the
 # real methods are compiled; everything below them is host-side scaffolding.
@@ -76,8 +72,9 @@ type Result<T=()>=std::result::Result<T,i32>;
 const EINVAL:i32=22;const ENOSPC:i32=28;const EIO:i32=5;const EBUSY:i32=16;const ERESTARTSYS:i32=512;
 macro_rules! pr_warn{($($t:tt)*)=>{{}}}
 #[derive(Default)]struct G17PComputeBurstState;
-mod g17_resources { pub const G17P_RENDER_MAX_IN_FLIGHT:usize=2; pub struct G17PRenderQueuePair; impl G17PRenderQueuePair { pub const SLOT_COUNT:u8=64; } }
-mod g17_queue_limits { pub const MAX_IN_FLIGHT_PER_QUEUE:u32=2; }
+mod g17_resources { pub const G17P_RENDER_MAX_IN_FLIGHT:usize=16; pub struct G17PRenderQueuePair; impl G17PRenderQueuePair { pub const SLOT_COUNT:u8=64; } }
+mod g17_queue_limits { pub const MAX_IN_FLIGHT_PER_QUEUE:u32=2; pub const RENDER_KICKS_PER_PAIR:u32=crate::g17_resources::G17P_RENDER_MAX_IN_FLIGHT as u32; }
+mod g17_config {pub const QUARANTINE_SCOPE:u32=3;}
 struct Mutex<T>(std::sync::Mutex<T>);
 struct Guard<'a,T>(Option<std::sync::MutexGuard<'a,T>>);
 impl<T>Mutex<T>{fn lock(&self)->Guard<'_,T>{Guard(Some(self.0.lock().unwrap()))}}
@@ -189,14 +186,15 @@ tests = r'''
  assert_ne!(first.slot(),second.slot());
 }
 
-#[test]fn same_owner_admits_two_on_distinct_pairs_then_waits(){
+#[test]fn same_owner_admits_full_depth_on_distinct_pairs_then_waits(){
  let r=G17PQueueRegistry::new();let a=r.acquire_lease(11).unwrap();let b=r.acquire_lease(11).unwrap();let slot=a.slot();
  assert_ne!(b.slot(),slot,"two admitted renders reused one physical QID pair");
+ let rest:Vec<_>=(2..2*g17_resources::G17P_RENDER_MAX_IN_FLIGHT).map(|_|r.acquire_lease(11).unwrap()).collect();
  let(tx,rx)=std::sync::mpsc::channel();let rr=r.clone();
  let worker=std::thread::spawn(move||{tx.send(rr.acquire_lease(11).map(|l|l.slot())).unwrap();});
  assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
  let other=r.acquire_lease(22).unwrap();assert_ne!(other.slot(),slot);assert_ne!(other.slot(),b.slot());
- drop(a);assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Ok(slot));worker.join().unwrap();drop(b);
+ drop(a);assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Ok(slot));worker.join().unwrap();drop(b);drop(rest);
 }
 
 #[test]fn same_owner_rotates_distinct_pairs_for_more_than_ten_thousand_turns(){
@@ -215,11 +213,17 @@ tests = r'''
 }
 #[test]fn idle_owners_are_not_evicted_and_capacity_is_reported(){
  let r=G17PQueueRegistry::new();
- let leases:Vec<_>=(1..=63).map(|owner|r.acquire_lease(owner).unwrap()).collect();
- assert_eq!(r.lease.lock().render_slots,u64::MAX-1);
- assert_eq!(r.acquire_lease(64).err(),Some(ENOSPC));drop(leases);
- for owner in (1..=63).rev(){assert_eq!(r.acquire_lease(owner).unwrap().slot(),owner as u8);}
- assert_eq!(r.acquire_lease(64).err(),Some(ENOSPC));
+ let mut leases=Vec::new();let mut slots=Vec::new();
+ for owner in 1..=G17P_ACTIVE_RENDER_SLOTS as u64 {
+  match r.acquire_lease(owner){Ok(lease)=>{slots.push((owner,lease.slot()));leases.push(lease);},Err(error)=>{assert_eq!(error,ENOSPC);break;}}
+ }
+ // Creation claims two physical pairs where available, including the idle sibling.
+ let pairs=g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE as usize;
+ assert_eq!(slots.len(),(G17P_ACTIVE_RENDER_SLOTS-1+pairs-1)/pairs);
+ assert_eq!(r.lease.lock().render_owner.iter().filter(|id|**id!=0).count(),G17P_ACTIVE_RENDER_SLOTS-1);
+ drop(leases);
+ for (owner,slot) in slots.iter().rev(){assert_eq!(r.acquire_lease(*owner).unwrap().slot(),*slot);}
+ assert_eq!(r.acquire_lease(10000).err(),Some(ENOSPC));
  assert_eq!(r.acquire_lease(0).err(),Some(EINVAL));
 }
 #[test]fn a_quarantined_owner_cannot_migrate_to_an_empty_slot(){
@@ -232,7 +236,9 @@ tests = r'''
  let r=G17PQueueRegistry::new();let first=r.acquire_lease(11).unwrap();let slot=first.slot();
  r.release_render_owner(11);
  let mut concurrent=Vec::new();
- for offset in 0..(G17P_ACTIVE_RENDER_SLOTS-2){let lease=r.acquire_lease(22+offset as u64).unwrap();assert_ne!(lease.slot(),slot);concurrent.push(lease);}
+ for offset in 0..G17P_ACTIVE_RENDER_SLOTS{
+  match r.acquire_lease(22+offset as u64){Ok(lease)=>{assert_ne!(lease.slot(),slot);concurrent.push(lease);},Err(error)=>{assert_eq!(error,ENOSPC);break;}}
+ }
  drop(first);
  let replacement=r.acquire_lease(10_000).unwrap();assert_eq!(replacement.slot(),slot);
  assert_eq!(r.lease.lock().render_owner[slot as usize],10_000);
@@ -253,28 +259,22 @@ tests = r'''
  assert!(r.acquire_lease(12_289).is_ok());
 }
 
-/// Queue creation consumes an app context BEFORE render admission. Closed
-/// graphs keep their old roots until replacement completion, so a fresh-first
-/// policy exhausts the 58 contexts before reaching its 63-slot reuse fallback.
-#[test]fn three_client_turnover_cannot_exhaust_contexts_before_slot_reuse(){
- let r=G17PQueueRegistry::new();let mut roots=[0u8;G17P_RENDER_SLOTS];
- let mut contexts=0;let mut peak=0;
+/// Registry turnover reuses released slots. This does not model or claim
+/// anything about firmware acknowledgement or the VM graph's lifetime.
+#[test]fn three_client_turnover_reuses_released_slots(){
+ let r=G17PQueueRegistry::new();let mut seen=std::collections::BTreeSet::new();
  for round in 0..4001u64{
-  contexts+=3;peak=peak.max(contexts);
-  assert!(contexts<=58,"QUEUE_CREATE exhausted app contexts at round {}",round);
   let mut leases=Vec::new();
   for worker in 0..3u64{
    let owner=1+round*3+worker;let lease=r.acquire_lease(owner).unwrap();
    let slot=lease.slot() as usize;
-   // Cross-VM handoff keeps current+previous graphs. Reusing the previous
-   // graph on the next handoff releases its old root, after eligibility checks.
-   if roots[slot]==2{contexts-=1;}else{roots[slot]+=1;}
+   seen.insert(slot);
    leases.push((owner,lease));
   }
-  assert_eq!(contexts,if round==0{3}else{6});
+  assert_eq!(seen.len(),3);
   for (owner,lease) in leases{r.release_render_owner(owner);drop(lease);}
  }
- assert_eq!(peak,9);assert_eq!(roots.iter().filter(|r|**r!=0).count(),3);
+ assert_eq!(r.lease.lock().render_refs.iter().sum::<u8>(),0);
 }
 
 /// Releasing a frame must not erase its queue's retained ownership.
@@ -291,10 +291,11 @@ tests = r'''
 
 #[test]fn quarantine_wakes_a_same_owner_waiter(){
  let r=G17PQueueRegistry::new();let first=r.acquire_lease(11).unwrap();let second=r.acquire_lease(11).unwrap();let slot=first.slot();
+ let rest:Vec<_>=(2..2*g17_resources::G17P_RENDER_MAX_IN_FLIGHT).map(|_|r.acquire_lease(11).unwrap()).collect();
  let(tx,rx)=std::sync::mpsc::channel();let rr=r.clone();
  let worker=std::thread::spawn(move||{tx.send(rr.acquire_lease(11).err()).unwrap();});
  assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());r.quarantine_render_slot(slot);
- assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Some(EIO));worker.join().unwrap();drop(second);
+ assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Some(EIO));worker.join().unwrap();drop(second);drop(rest);
 }
 
 /// A proven processor stop discards the abandoned hardware graph. Clear its

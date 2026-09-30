@@ -9,10 +9,27 @@ source = (pathlib.Path(__file__).resolve().parents[1] / "g17_live_boot.rs").read
 start = source.index("const fn g17p_notification_log_due(")
 end = source.index("\n}", start) + 2
 predicate = source[start:end]
+# One shared helper counts a notification, whichever RTKit callback took it.
+helper = source[source.index("    fn note_firmware_event_notification("):]
+helper = helper[:helper.index("\n    }\n") + 6]
+assert ".firmware_event_notifications\n            .fetch_add(1, Ordering::Relaxed)" in helper
+assert ".firmware_event_notifications_total\n            .fetch_add(1, Ordering::Relaxed)" in helper
+assert "if g17p_notification_log_due(total)" in helper
 callback = source[source.index("fn recv_message("):source.index("} else if endpoint == g17_rtkit::ENDPOINT_GFX_INTERRUPTS")]
-assert ".firmware_event_notifications_total\n                .fetch_add(1, Ordering::Relaxed)" in callback
-assert "if g17p_notification_log_due(total)" in callback
-assert "queue_g17p_firmware_event_worker" in callback
+early = source[source.index("fn recv_message_early("):source.index("fn crashed(")]
+for name, body in (("recv_message", callback), ("recv_message_early", early)):
+    assert "note_firmware_event_notification()" in body, name
+    assert "queue_g17p_firmware_event_worker" in body, name
+    # Never counted twice: neither callback touches the counters directly.
+    assert ".fetch_add(" not in body, name
+# The hard-IRQ path consumes the notification only for an armed worker; it
+# counts, queues the worker and then tells the RTKit core the message is
+# handled. Anything else still goes to the workqueue callback.
+assert early.index("data.event_worker_armed.load(Ordering::Acquire)") < early.index(
+    "decode_g17p_firmware_event_notification(endpoint, message)")
+assert (early.index("data.note_firmware_event_notification();")
+        < early.index("queue_g17p_firmware_event_worker")
+        < early.index("true\n                } else {\n                    false"))
 assert ".firmware_event_notifications\n        .swap(0, Ordering::AcqRel)" in source
 assert ".firmware_event_notifications_total\n        .swap" not in source
 
@@ -47,4 +64,4 @@ with tempfile.TemporaryDirectory(prefix="g17-notification-budget-") as temp:
     subprocess.run([shutil.which("rustc") or "rustc", "--edition=2021", "--test",
                     "-", "-o", binary], input=predicate + tests, text=True, check=True)
     subprocess.run([binary], check=True)
-print("actual notification budget and independent service-counter wiring PASS")
+print("actual notification budget, shared exact-once counting and IRQ-path wake wiring PASS")

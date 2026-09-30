@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render dependencies retire before a physical slot is acquired."""
+"""Input/publication dependencies precede acquiring a physical slot."""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -20,7 +20,10 @@ def function(text, marker):
 submit = function(source, "    fn submit_render_async(")
 backend = function(source, "impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend")
 assert submit.index("dependencies.push(fence") < submit.index(".enqueue(packet, dependencies)?")
-assert submit.index("dependencies.push(prior.clone()") < submit.index(".enqueue(packet, dependencies)?")
+assert submit.index("append_render_prefix_dependencies(") < submit.index(".enqueue(packet, dependencies)?")
+prefix = function(source, "fn append_render_prefix_dependencies(")
+assert "dependencies.push(fence.published.clone()" in prefix
+assert "checked_dependencies.push(fence.completed.clone()" in prefix
 assert "acquire_lease" not in submit, "submit ioctl still consumes a physical render slot"
 assert backend.index("for fence in packet.input_fences()") < backend.index(
     "self.registry.acquire_lease(self.owner)?"

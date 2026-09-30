@@ -56,13 +56,13 @@ assert inner.index('"new-user-render-storage"') < inner.index(".reserve(id)"), \
     "a fresh storage's ID is not reserved for the storage's lifetime"
 
 desync = block(manager, r"^    fn recycle_desynced_render_storage\(")
-assert "self.render_storage.take()" in desync
+assert "self.render_slots.active_mut().storage.take()" in desync
 assert "if !retained_firmware_state" in desync
 assert desync.index("if !retained_firmware_state") < desync.index("unreserve(id)")
 stop = block(manager, r"^    pub\(crate\) fn release_runtime_objects_after_processor_stop\(")
 assert "unreserve_render_storage_hardware_buffer_id" in stop
 assert stop.index("unreserve_render_storage_hardware_buffer_id") < stop.index(
-    "self.render_storage = None"
+    "self.render_slots.active_mut().storage = None"
 )
 
 # A cross-VM handoff deliberately retains one completed generation and its
@@ -88,7 +88,7 @@ assert "pm.hardware_buffer_id" in getter
 retire = block(manager, r"^    pub\(crate\) fn retire_abandoned_render_if_firmware_retired\(")
 for needle in ["completion.retired", "state.job_list_empty", "execution.observed()",
                ".release(hardware_buffer_id)",
-               "self.render_tracker = self.render_queued_tracker.take();",
+               "self.render_slots.active_mut().tracker = self.render_slots.active_mut().queued_tracker.take();",
                ".retire_command_generation(ordinal)?"]:
     assert needle in retire, needle
 assert retire.index("return Ok(false)") < retire.index("complete_g17p_cl_kicks("), \

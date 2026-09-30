@@ -71,7 +71,7 @@ failed_jobs_after_observation = block(
 assert "active = None" not in failed_jobs_after_observation and \
     ".fail_while_owned(error)" in failed_jobs_after_observation
 release_compute = block(ASYNC, "    pub(crate) fn release_async_compute_queue(")
-assert "q.active.is_none() && !q.quarantined" in release_compute
+assert "q.inflight.is_none() && !q.quarantined" in release_compute
 stop_compute = block(ASYNC, "    fn release_async_compute_after_processor_stop(")
 assert stop_compute.index("completion.complete(Err(EIO))") < stop_compute.index(
     "completion.release_after_processor_stop()"

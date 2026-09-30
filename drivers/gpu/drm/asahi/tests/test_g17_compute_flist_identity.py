@@ -35,11 +35,23 @@ assert "compute_flist: Option" not in manager
 assert "_flist: mmu::KernelMapping" in manager
 quarantine = block(manager, "pub(crate) fn quarantine(self)")
 assert quarantine.count("_flist") == 2
-for marker in ["pub(crate) fn stage_initial_channel_group_without_fallback_event(",
-               "pub(crate) fn stage_repeat_config_update("]:
+# The first bind encodes its tag-15 record in the queue graph's optional
+# window; a repeat encodes its own record slot and never writes that window
+# (the first bind's ring entry may still name it). Both carry the cookie.
+for marker, cookie in [
+    ("pub(crate) fn stage_initial_channel_group_without_fallback_event(",
+     "COMPUTE_OPTIONAL + 0x3e, u64::from(flist_generation)"),
+    ("pub(crate) fn stage_repeat_config_update(",
+     "put_u64(&mut record, 0x3e, u64::from(flist_generation))"),
+]:
     stage = block(resources, marker)
     assert "flist_generation: u32" in stage
-    assert "COMPUTE_OPTIONAL + 0x3e, u64::from(flist_generation)" in stage
+    assert cookie in stage, marker
+repeat_stage = block(resources, "pub(crate) fn stage_repeat_config_update(")
+assert "encode_compute_config_update_record(" in repeat_stage
+assert "queue_graph.with_bytes_mut" in repeat_stage and "get(0x48..0x4c)" in repeat_stage
+assert "COMPUTE_OPTIONAL" not in repeat_stage.split("if rewind")[0].replace("COMPUTE_OPTIONAL_SIZE", ""), \
+    "a repeat must not write the queue graph's tag-15 window"
 assert "flist_generation: g17p_allocate_object_id()?" in resources
 # Three descriptor builds plus the fall-through path's exact preflight
 # register-program checkpoint derivation all use the retained physical pool.

@@ -58,6 +58,7 @@ impl Bytes { fn with_bytes_mut<T>(&mut self,f:impl FnOnce(&mut[u8])->Result<T>)-
 struct Resources{qos_resource:Bytes}
 struct Owner{resources:Resources,qos_in_flight:[u32;128],qos_dm_in_flight:[u64;4],qos_dm_by_qid:[u8;128]}
 ''' + "#[derive(Debug,Copy,Clone)]\n" + item(resources, "pub(crate) struct G17PQosPublication {")
+code += resources[resources.index("fn g17p_live_word_bounds("):resources.index("fn put_u32(")]
 code += "\nimpl Owner {\n" + methods + r'''
 fn new()->Self{Self{resources:Resources{qos_resource:Bytes{raw:vec![0;0xe40],fail:false}},qos_in_flight:[0;128],qos_dm_in_flight:[0;4],qos_dm_by_qid:[0;128]}}
 fn submit(&mut self,qid:u8,hbid:u8,dm:u8)->G17PQosPublication{self.publish_qos_queue_record(qid,hbid,15,0x100000+hbid as u64*0x4000,dm,2000).unwrap()}

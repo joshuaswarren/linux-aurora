@@ -32,6 +32,8 @@ context = "\n".join(item(resources, marker) for marker in [
     "impl G17PLogicalQueueContext {",
     "impl core::ops::Deref for G17PLogicalQueueContext {",
 ])
+# This harness models backing addresses, not firmware-mutated memory reads.
+context = context.replace(item(resources, "    fn tsq_head_snapshot("), "")
 retarget = item(resources, "    pub(crate) fn retarget_command_context(")
 compute_retarget = item(resources, "    pub(crate) fn retarget_channel_control(")
 bind = item(manager, "    pub(crate) fn bind_logical_channel_control(")
@@ -49,8 +51,11 @@ for name in ["stage_fragment", "stage_fragment_prefix", "prepare_late_tiling"]:
         body = item(resources, "    pub(crate) fn " + name + "(")
         assert "self.qos_hardware_buffer_id()?" in body, name
 assert "if self.qos_update_pending { put_u32(&mut bytes.optional, 0x52, 1); }" in resources
-assert "logical_channel_controls.push(control" in manager
-assert "logical_channel_controls.push(context" not in manager
+prepare = item(manager, "    pub(crate) fn prepare_logical_queue_context(")
+assert "G17PLogicalQueueContext::new(" in prepare
+assert "execution, control, qos, owner_pid" in prepare
+assert "channel_control: Option<Arc<g17_resources::G17PClChannelControl>>" in item(manager, "struct G17PRenderSlotState {")
+assert "logical_channel_controls.push" not in manager, "retained pages must be bounded by graph owners"
 
 rust = r'''
 #![allow(dead_code, unused_variables)]
@@ -63,13 +68,15 @@ impl<T> Clone for Arc<T>{fn clone(&self)->Self{Self(self.0.clone())}}
 impl<T> Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 impl<T> Arc<T>{fn new(value:T,_flags:u32)->Result<Self>{if FAIL_ALLOC.with(|f|f.replace(false)){Err(EIO)}else{Ok(Self(std::sync::Arc::new(value)))}}}
 mod kernel{pub mod sync{pub struct Mutex<T>(pub std::sync::Mutex<T>);impl<T> Mutex<T>{pub fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}}}
-mod mmu{
+mod mmu{pub const UAT_PGSZ:usize=0x4000;
  pub struct Vm{pub id:u64}
  pub struct T8140ComputeExecutionContext{pub vm:Vm,pub id:u32,pub current:bool}
  impl T8140ComputeExecutionContext{pub fn context_id(&self)->u32{self.id}pub fn matches(&self,vm:&Vm)->bool{self.vm.id==vm.id}pub fn is_current(&self)->bool{self.current}}
 }
-struct G17PClChannelControl{address:u64,firmware_byte:Cell<u8>}
-impl G17PClChannelControl{fn gpu_va(&self)->u64{self.address}}
+struct G17PWorkStateStorage{storage:TestAddress}
+struct TestAddress(u64);impl TestAddress{fn iova(&self)->u64{self.0}}
+struct G17PClChannelControl{address:u64,firmware_byte:Cell<u8>,published:Cell<bool>}
+impl G17PClChannelControl{fn gpu_va(&self)->u64{self.address}fn mark_published(&self){self.published.set(true)}}
 ''' + lease + context + r'''
 mod g17_resources{pub(super) use super::{G17PLogicalQueueContext,G17PLogicalQosLease,G17PClChannelControl};}
 struct Bytes{raw:Vec<u8>,fail:bool}
@@ -97,9 +104,9 @@ impl Manager{''' + b2 + r'''}
 fn allocator()->Arc<kernel::sync::Mutex<u128>>{Arc::new(kernel::sync::Mutex(std::sync::Mutex::new(3u128)),0).unwrap()}
 fn context(ids:&Arc<kernel::sync::Mutex<u128>>,id:u32,address:u64)->Arc<G17PLogicalQueueContext>{
  let root=Arc::new(mmu::T8140ComputeExecutionContext{vm:mmu::Vm{id:7},id,current:true},0).unwrap();
- let page=Arc::new(G17PClChannelControl{address,firmware_byte:Cell::new(0xff)},0).unwrap();
+ let page=Arc::new(G17PClChannelControl{address,firmware_byte:Cell::new(0xff),published:Cell::new(false)},0).unwrap();
  let qos=G17PLogicalQosLease::new(ids.clone()).unwrap();
- Arc::new(G17PLogicalQueueContext::new(root,page,qos,0x10000+id),0).unwrap()
+ Arc::new(G17PLogicalQueueContext::new(root,page,qos,0x10000+id,Arc::new(kernel::sync::Mutex(std::sync::Mutex::new(G17PWorkStateStorage{storage:TestAddress(address+0x10000)})),0).unwrap()),0).unwrap()
 }
 fn compute()->G17PSksmQueue{G17PSksmQueue{channel_control_gpu_va:0,logical_channel_control:None,logical_qos:None,compute:Compute{queue_graph:Bytes{raw:vec![0xa5;0x400],fail:false}},producer:Producer{qos:Qos{queue_byte_32:0}}}}
 fn render()->Render{Render{graph:Bytes{raw:vec![0x5a;0x400],fail:false},logical_channel_control:None,logical_qos:None,_command_context:None,descriptor_context_id:0,render_root_slot:0,context_update_pending:false,qos_update_pending:false,ta_hardware_buffer_id:73,owner_pid:0}}
@@ -108,12 +115,14 @@ fn render()->Render{Render{graph:Bytes{raw:vec![0x5a;0x400],fail:false},logical_
  cl.bind_logical_channel_control(&owner).unwrap();r.retarget_command_context(&mmu::Vm{id:7},owner.clone()).unwrap();
  assert_eq!(word(&cl.compute.queue_graph.raw,0x9c),0x12340000);
  for at in [0x9c,0xc0+0x9c]{assert_eq!(word(&r.graph.raw,at),0x12340000);}
- for i in 0..before.len(){if !(0x9c..0xa4).contains(&i)&&!(0x15c..0x164).contains(&i)&&!(0x48..0x4c).contains(&i)&&!(0x108..0x10c).contains(&i){assert_eq!(r.graph.raw[i],before[i]);}}
+ for at in [0x10,0xd0]{assert_eq!(word(&r.graph.raw,at),owner.tsq_head_gpu_va());}
+ assert_eq!(word(&cl.compute.queue_graph.raw,0x10),owner.tsq_head_gpu_va());
+ for i in 0..before.len(){if !(0x10..0x18).contains(&i)&&!(0xd0..0xd8).contains(&i)&&!(0x9c..0xa4).contains(&i)&&!(0x15c..0x164).contains(&i)&&!(0x48..0x4c).contains(&i)&&!(0x108..0x10c).contains(&i){assert_eq!(r.graph.raw[i],before[i]);}}
  assert_eq!(pid(&cl.compute.queue_graph.raw,0x48),owner.owner_pid);
  for at in [0x48,0x108]{assert_eq!(pid(&r.graph.raw,at),owner.owner_pid);}
  assert_eq!(r.owner_pid,owner.owner_pid);
  assert_eq!(r.qos_hardware_buffer_id().unwrap(),u16::from(cl.producer.qos.queue_byte_32));assert_eq!(r.ta_hardware_buffer_id,73);
- owner.channel_control.firmware_byte.set(17);cl.bind_logical_channel_control(&owner).unwrap();r.retarget_command_context(&mmu::Vm{id:7},owner.clone()).unwrap();assert_eq!(owner.channel_control.firmware_byte.get(),17);
+ owner.channel_control.firmware_byte.set(17);cl.bind_logical_channel_control(&owner).unwrap();r.retarget_command_context(&mmu::Vm{id:7},owner.clone()).unwrap();assert_eq!(owner.channel_control.firmware_byte.get(),17);assert!(owner.channel_control.published.get());
  let other=context(&ids,10,0x56780000);assert_ne!(owner.qos.id(),other.qos.id());assert_ne!(owner.channel_control_gpu_va(),other.channel_control_gpu_va());
 }
 #[test]fn old_qos_credit_survives_each_engine_reference_but_not_inert_page_retention(){
@@ -142,7 +151,7 @@ fn render()->Render{Render{graph:Bytes{raw:vec![0x5a;0x400],fail:false},logical_
  for at in [0x48,0x108]{assert_eq!(pid(&r.graph.raw,at),owner.owner_pid);}}
 }
 #[test]fn logical_switches_do_not_rewrite_bootstrap_b2(){
- let ids=allocator();let mut q=compute();let mut m=Manager{resources:B2Resources{raw:vec![0;0x4000],writes:0},compute_b2_activation:g17_submission::G17PClB2ActivationState::Pending,compute_channel_control:Some(G17PClChannelControl{address:0x99990000,firmware_byte:Cell::new(0xff)})};
+ let ids=allocator();let mut q=compute();let mut m=Manager{resources:B2Resources{raw:vec![0;0x4000],writes:0},compute_b2_activation:g17_submission::G17PClB2ActivationState::Pending,compute_channel_control:Some(G17PClChannelControl{address:0x99990000,firmware_byte:Cell::new(0xff),published:Cell::new(false)})};
  for (id,address) in [(9,0x11110000),(10,0x22220000)]{q.bind_logical_channel_control(&context(&ids,id,address)).unwrap();m.publish_compute_b2_once(&mut q).unwrap();assert_eq!(word(&m.resources.raw,0x808),0x99990000);assert_eq!(q.channel_control_gpu_va,address);}
  assert_eq!(m.resources.writes,1);
 }
@@ -179,6 +188,16 @@ mod g17_submission {
  fn put_u32_le(b:&mut[u8],at:usize,v:u32){b[at..at+4].copy_from_slice(&v.to_le_bytes());}
 ''' + constants + "\n#[derive(Copy,Clone)]\n" + addresses + "\n" + native_b2 + "\n}\n"
 rust = native_b2 + rust.replace('#![allow(dead_code, unused_variables)]', '')
+rust = r"""
+use std::sync::atomic::{AtomicU32,Ordering};
+macro_rules! pr_info { ($($arg:tt)*) => {{}}; }
+mod module_parameters {
+ pub struct Param; impl Param { pub fn value(&self)->&u32 { &0 } }
+ #[allow(non_upper_case_globals)] pub static g17p_mcache_dsid_probe:Param=Param;
+}
+static G17P_MCACHE_PROBE_NEXT:AtomicU32=AtomicU32::new(96);
+""" + item(resources, "fn g17p_mcache_probe_reserve(") + rust
+rust += f'\n#[path = "{root / "g17_work_state.rs"}"] mod g17_work_state;\n'
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory)
     test = path / "logical_owner.rs"

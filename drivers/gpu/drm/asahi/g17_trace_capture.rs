@@ -73,6 +73,8 @@ pub(crate) enum Kind {
     ClOperandTable = 53,
     /// Opt-in boot-time upper-root bytes; identity must be verified offline.
     FirmwareCodeWindow = 54,
+    /// Separate CPU-WB render ConfigUpdate pool, with its own DVA/provenance.
+    RenderConfigUpdates = 55,
     // Coverage declarations, intentionally omitted in first-stage capture.
     ClientObjects = 0x100,
     TvbPayload = 0x101,

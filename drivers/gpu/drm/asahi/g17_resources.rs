@@ -46,6 +46,237 @@ use core::{
 
 use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 
+/// Diagnostic allocator only: native G17P Shared IDs occupy 96..192.
+/// Never recycle an ID without the firmware's DSID retirement transaction.
+/// This one-boot probe fails new render owners on exhaustion; it is not the
+/// production allocator or a substitute for implementing retirement.
+#[cfg(not(test))]
+static G17P_MCACHE_PROBE_NEXT: AtomicU32 = AtomicU32::new(96);
+
+// ---------------------------------------------------------------------------
+// v90: pooled firmware-cached command objects.
+//
+// Native maps its firmware-consumed command objects cached (bit41 map option
+// 0x20900000084 -> UAT attribute 0): ChannelState (AGXFirmwareResourceStack),
+// TA/FRG/ConfigUpdate command pools (`PoolClass<..>::createBacking`) and the
+// CommandBufferState/TSQ node backing. Those backings are created once and
+// their elements are recycled; the firmware maintains its own copies with
+// `__rtk_cache_clean_invalidate` (b100 28ad0) around each use (descriptor
+// 0x2240 and node 0xc8 at the start path b2dc..b2f8 and at completion
+// service), and native's unmap route issues only a TLBI (prepareFWUnmap)
+// because the HAL200 ASC L2 invalidation it forwards to is a no-op.
+//
+// Linux therefore never unmaps these cached objects while firmware runs:
+// when the owner is dropped (after the firmware-acknowledged teardown that
+// already gates every owner drop) the whole owning mapping, backing and VA
+// return to a bounded per-family pool and are reused, zeroed, by the next
+// owner of the same family, like a native pool element. Pools are released
+// only after the firmware is stopped (`g17p_fw_pool_release_all`). An
+// object whose attribute change could not be proven is never reused and never
+// unmapped (bounded leak, counted). Fresh allocations only; runtime diag bits
+// 27..30 select families for A/B.
+// ---------------------------------------------------------------------------
+
+/// Family bits (diag knobs bits 27..30 >> 27).
+pub(crate) const G17P_FW_FAMILY_DESCRIPTOR: u32 = 1;
+pub(crate) const G17P_FW_FAMILY_TSQ_NODE: u32 = 2;
+pub(crate) const G17P_FW_FAMILY_CHANNEL_STATE: u32 = 4;
+pub(crate) const G17P_FW_FAMILY_CONFIG_UPDATE: u32 = 8;
+const G17P_FW_POOL_POISON: u8 = 0x80;
+const G17P_FW_POOL_SLOTS: usize = 64;
+/// Total bytes ever given the cached attribute; beyond it fresh objects stay
+/// uncached (never an allocation failure).
+const G17P_FW_POOL_CACHED_LIMIT: u64 = 128 * 1024 * 1024;
+
+pub(crate) const fn g17p_fw_pool_index(family: u32) -> Option<usize> {
+    match family {
+        G17P_FW_FAMILY_DESCRIPTOR => Some(0),
+        G17P_FW_FAMILY_TSQ_NODE => Some(1),
+        G17P_FW_FAMILY_CHANNEL_STATE => Some(2),
+        G17P_FW_FAMILY_CONFIG_UPDATE => Some(3),
+        _ => None,
+    }
+}
+
+/// Lock-free bounded pool of owned entries (raw `KBox` pointers). `put`
+/// hands the entry back when every slot is occupied; `take` returns null
+/// when empty. Each slot holds at most one entry; ownership moves with the
+/// successful CAS/swap, so an entry is never shared or lost.
+pub(crate) struct G17PFwPoolSlots<T, const N: usize> {
+    slots: [core::sync::atomic::AtomicPtr<T>; N],
+}
+
+impl<T, const N: usize> G17PFwPoolSlots<T, N> {
+    pub(crate) const fn new() -> Self {
+        Self { slots: [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; N] }
+    }
+
+    pub(crate) fn put(&self, entry: *mut T) -> core::result::Result<(), *mut T> {
+        if entry.is_null() { return Err(entry); }
+        for slot in &self.slots {
+            if slot.compare_exchange(core::ptr::null_mut(), entry,
+                Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(entry)
+    }
+
+    pub(crate) fn take(&self) -> *mut T {
+        for slot in &self.slots {
+            let entry = slot.swap(core::ptr::null_mut(), Ordering::AcqRel);
+            if !entry.is_null() { return entry; }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+#[cfg(not(test))]
+struct G17PPooledFwObject {
+    mapping: mmu::KernelMapping,
+    gem: kernel::sync::aref::ARef<gem::Object>,
+    iova: u64,
+    logical_size: usize,
+    cpu_wc: bool,
+}
+
+#[cfg(not(test))]
+static G17P_FW_POOLS: [G17PFwPoolSlots<G17PPooledFwObject, G17P_FW_POOL_SLOTS>; 4] =
+    [const { G17PFwPoolSlots::new() }; 4];
+#[cfg(not(test))]
+static G17P_FW_POOL_CACHED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// fresh, reused, returned, leaked (bounded, never-unmapped) counts.
+#[cfg(not(test))]
+static G17P_FW_POOL_STATS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+#[cfg(not(test))]
+fn g17p_fw_pool_stat(index: usize) -> u32 { G17P_FW_POOL_STATS[index].load(Ordering::Relaxed) }
+
+#[cfg(not(test))]
+fn g17p_fw_pool_bump(index: usize) { G17P_FW_POOL_STATS[index].fetch_add(1, Ordering::Relaxed); }
+
+/// Keep a cached owning mapping alive forever: never an early unmap.
+#[cfg(not(test))]
+fn g17p_fw_pool_leak(mapping: mmu::KernelMapping) {
+    core::mem::forget(mapping);
+    g17p_fw_pool_bump(3);
+}
+
+#[cfg(not(test))]
+impl Drop for MappedObject {
+    fn drop(&mut self) {
+        if self.fw_pool == 0 { return; }
+        let family = self.fw_pool;
+        self.fw_pool = 0;
+        let Some(mapping) = self.mapping.take() else { return; };
+        let index = if family & G17P_FW_POOL_POISON != 0 { None }
+                    else { g17p_fw_pool_index(u32::from(family)) };
+        let Some(index) = index else { g17p_fw_pool_leak(mapping); return; };
+        // Allocate the pool node before moving the mapping into it, so an
+        // allocation failure can never drop (unmap) the cached mapping.
+        let node = match KBox::<G17PPooledFwObject>::new_uninit(GFP_KERNEL) {
+            Ok(node) => node,
+            Err(_) => { g17p_fw_pool_leak(mapping); return; }
+        };
+        let entry = KBox::write(node, G17PPooledFwObject {
+            mapping,
+            gem: self.object.gem.clone(),
+            iova: self.iova,
+            logical_size: self.logical_size,
+            cpu_wc: self.cpu_wc,
+        });
+        match G17P_FW_POOLS[index].put(KBox::into_raw(entry)) {
+            Ok(()) => g17p_fw_pool_bump(2),
+            Err(raw) => {
+                // SAFETY: `raw` came from KBox::into_raw above and was not
+                // published (the put failed).
+                let entry = KBox::into_inner(unsafe { KBox::from_raw(raw) });
+                g17p_fw_pool_leak(entry.mapping);
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn g17p_fw_pool_take(index: usize) -> Option<MappedObject> {
+    let raw = G17P_FW_POOLS.get(index)?.take();
+    if raw.is_null() { return None; }
+    // SAFETY: every pooled pointer is a KBox::into_raw published exactly once.
+    let entry = KBox::into_inner(unsafe { KBox::from_raw(raw) });
+    Some(MappedObject {
+        iova: entry.iova,
+        object: gem::ObjectRef::new(entry.gem),
+        mapping: Some(entry.mapping),
+        object_offset: 0,
+        logical_size: entry.logical_size,
+        cpu_wc: entry.cpu_wc,
+        fw_pool: 0,
+    })
+}
+
+/// Release every pooled object. Call only after the firmware is stopped: the
+/// mappings then unmap with a TLB flush exactly like native's commitUnmaps.
+#[cfg(not(test))]
+pub(crate) fn g17p_fw_pool_release_all() {
+    for pool in &G17P_FW_POOLS {
+        loop {
+            let raw = pool.take();
+            if raw.is_null() { break; }
+            // SAFETY: see g17p_fw_pool_take.
+            drop(unsafe { KBox::from_raw(raw) });
+        }
+    }
+}
+
+#[cfg(not(test))]
+/// RegionC TimerCSwitch configuration, applied after `encode_region_c` and
+/// before firmware boot. RegionC+0 is native `AGXFirmware::setTimerCSwitch`
+/// (kext 8880900) and +0x6a `setCSwitchTimerMultiplier` (889f4e4). B1 copies
+/// both only at init or on notes 0x16/0x2a/0x2f (`3470`, gated by `177808`),
+/// so a later store to the shared page has no effect. Every +0x6a-th 1 ms
+/// engine walk (bundle+0xed0), each DM bit in +0 resumes that DM's installed
+/// QIDs through group 3 (`23fc4..24020` -> `a2a8(3)`): a hardware
+/// re-arbitration handshake plus re-add of any QID removed after an A==B park.
+/// Without it a FRG queue parked under multi-client contention is re-added
+/// only when the GPU drains, which Neo measured as 2 s stalls and
+/// DEVICE_LOST. FRG with multiplier 16 passed four-client qualification with
+/// no single-client cost; multiplier 1 cost 23% light-render throughput.
+/// The native runtime TimerCSwitch value is not established.
+fn g17p_apply_region_c_diagnostic_overrides(bytes: &mut [u8]) -> Result {
+    use crate::module_parameters as params;
+    if *params::g17p_disable_idle_core_off.value() != 0 {
+        // B1 copies RegionC+0x30 to 177838 at init (34f8); 7ca0(1) powers the
+        // GPU cores off in the idle descent only when it is nonzero.
+        bytes.get_mut(0x30..0x34).ok_or(EINVAL)?.copy_from_slice(&0u32.to_le_bytes());
+        pr_info!("G17P RegionC diagnostic: idle core power-off disabled (RegionC+0x30 = 0)\n");
+    }
+    let fender = *params::g17p_fender_delay.value();
+    if fender != 0 {
+        bytes.get_mut(0x9bc..0x9c0).ok_or(EINVAL)?.copy_from_slice(&fender.to_le_bytes());
+        pr_info!("G17P RegionC diagnostic: fender delay RegionC+0x9bc = {}\n", fender);
+    }
+    let mask = *params::g17p_timer_cswitch_mask.value();
+    let multiplier = *params::g17p_cswitch_timer_multiplier.value();
+    if mask != 0 {
+        bytes.get_mut(0..4).ok_or(EINVAL)?.copy_from_slice(&mask.to_le_bytes());
+    }
+    if multiplier != 0 {
+        *bytes.get_mut(0x6a).ok_or(EINVAL)? = u8::try_from(multiplier).map_err(|_| EINVAL)?;
+    }
+    if mask != 0 || multiplier != 0 {
+        pr_info!("G17P RegionC diagnostic overrides: TimerCSwitch={:#x} CSwitchTimerMultiplier={:#x}\n",
+            mask, multiplier);
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn g17p_mcache_probe_reserve(next: &AtomicU32) -> Option<u8> {
+    next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+        (id >= 96 && id < 192).then_some(id.saturating_add(1))
+    }).ok().and_then(|id| u8::try_from(id).ok())
+}
+
 /// Nonzero object IDs shared by pool owners and render commands.
 /// Keep IDs unique across retained graphs, clients and firmware resets.
 #[cfg(not(test))]
@@ -172,67 +403,117 @@ pub(crate) struct G17PComputeCompletionCandidate {
     pub(crate) timestamps: [u64; 2],
     /// Coherent pair-B interval used only for execution-time diagnostics.
     pub(crate) interval: Option<[u64; 2]>,
+    /// Raw pair A and pair B, masked, for the opt-in timing buffer only.
+    pub(crate) pairs: [u64; 4],
 }
 
+/// One in-flight kick a completion-service transaction looks for, named by
+/// its exact queue timestamp (the identity the record's control word carries)
+/// and its descriptor.
 #[derive(Debug, Copy, Clone)]
-struct G17PComputeCompletionBatchSlot {
+struct G17PComputeCompletionRequest {
+    queue_id: u8,
     expected_descriptor: u64,
-    last_consumed_end: u64,
+    kick_timestamp: u64,
     pair_a_start: u64,
+    pair_a_end: u64,
     pair_b_start: u64,
     pair_b_end: u64,
 }
 
+/// Requests of one QID are contiguous in `requests`.
+#[derive(Debug, Copy, Clone)]
+struct G17PComputeCompletionBatchSlot {
+    first: u16,
+    count: u16,
+}
+
 impl G17PComputeCompletionBatchSlot {
-    const EMPTY: Self = Self {
-        expected_descriptor: 0,
-        last_consumed_end: 0,
-        pair_a_start: 0,
-        pair_b_start: 0,
-        pair_b_end: 0,
-    };
+    const EMPTY: Self = Self { first: 0, count: 0 };
 }
 
 /// Heap-resident scratch index for one completion-service transaction.
 ///
 /// The manager owns this table so an IRQ never allocates and never places a
-/// 5-KiB descriptor index on the kernel stack. Requests are keyed by physical
-/// QID; the shared completion ring is then decoded once and the newest exact
-/// descriptor record for each requested queue is retained.
+/// large descriptor index on the kernel stack. Every published, unretired
+/// compute kick whose record the host has not latched yet is requested by
+/// its exact queue timestamp and descriptor, grouped by physical QID; the
+/// shared completion ring is then decoded once and the matching record of
+/// each request is captured.
+///
+/// The ring is a firmware-internal KSM -> firmware transport, not a history:
+/// Neo 2026-09-26 19:56 showed slots out of time order (12..23 older than
+/// 9..11, 0..8 newest) with every slot populated, so a record can be
+/// overwritten long before 2048 later completions. The caller therefore
+/// latches a record the first time any scan sees it and never needs it again.
 pub(crate) struct G17PComputeCompletionBatch {
     slots: [G17PComputeCompletionBatchSlot; G17P_COMPUTE_COMPLETION_QID_COUNT],
+    requests: KVVec<G17PComputeCompletionRequest>,
+    /// QID whose requests are currently being appended; its run must stay
+    /// contiguous.
+    open_queue: Option<u8>,
 }
 
+/// Every completion QID may have its full compute depth in flight, so a
+/// request can never be refused for capacity (allocated once, at manager
+/// construction; about 112 KiB).
+const G17P_COMPUTE_COMPLETION_REQUEST_CAPACITY: usize = G17P_COMPUTE_COMPLETION_QID_COUNT
+    * crate::g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize;
+
 impl G17PComputeCompletionBatch {
-    pub(crate) const fn new() -> Self {
-        Self {
-            slots: [G17PComputeCompletionBatchSlot::EMPTY;
-                G17P_COMPUTE_COMPLETION_QID_COUNT],
-        }
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            slots: [G17PComputeCompletionBatchSlot::EMPTY; G17P_COMPUTE_COMPLETION_QID_COUNT],
+            requests: KVVec::with_capacity(G17P_COMPUTE_COMPLETION_REQUEST_CAPACITY, GFP_KERNEL)?,
+            open_queue: None,
+        })
     }
 
     pub(crate) fn clear(&mut self) {
         self.slots.fill(G17PComputeCompletionBatchSlot::EMPTY);
+        self.requests.clear();
+        self.open_queue = None;
     }
 
+    /// Request one in-flight kick. All requests of a QID must be made
+    /// consecutively; requesting a QID again after another QID is refused.
     pub(crate) fn request(
         &mut self,
         queue_id: u8,
         expected_descriptor: u64,
-        last_consumed_end: u64,
+        kick_timestamp: u64,
     ) -> Result {
-        if expected_descriptor == 0 {
+        if expected_descriptor == 0 || kick_timestamp == 0 {
             return Err(EINVAL);
         }
+        let index = self.requests.len();
         let slot = self.slots.get_mut(usize::from(queue_id)).ok_or(EINVAL)?;
-        if slot.expected_descriptor != 0 {
+        if slot.count != 0 && self.open_queue != Some(queue_id) {
             return Err(EBUSY);
         }
-        *slot = G17PComputeCompletionBatchSlot {
-            expected_descriptor,
-            last_consumed_end,
-            ..G17PComputeCompletionBatchSlot::EMPTY
+        // Never allocate here: capacity covers every queue at full depth.
+        if index >= self.requests.capacity()
+            || usize::from(slot.count) >= crate::g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize
+        {
+            return Err(ENOSPC);
+        }
+        let first = if slot.count == 0 {
+            u16::try_from(index).map_err(|_| EOVERFLOW)?
+        } else {
+            slot.first
         };
+        self.requests.push_within_capacity(G17PComputeCompletionRequest {
+            queue_id,
+            expected_descriptor,
+            kick_timestamp,
+            pair_a_start: 0,
+            pair_a_end: 0,
+            pair_b_start: 0,
+            pair_b_end: 0,
+        }).map_err(|_| ENOSPC)?;
+        slot.first = first;
+        slot.count += 1;
+        self.open_queue = Some(queue_id);
         Ok(())
     }
 
@@ -246,44 +527,69 @@ impl G17PComputeCompletionBatch {
                     .try_into().map_err(|_| EINVAL)?,
             ))
         };
-        let queue_id = g17_completion::g17p_ksm_completion_queue_id(field(0x00)?);
-        let slot = self.slots.get_mut(usize::from(queue_id)).ok_or(EINVAL)?;
-        if slot.expected_descriptor == 0 {
+        let control = field(0x00)?;
+        let queue_id = g17_completion::g17p_ksm_completion_queue_id(control);
+        let slot = *self.slots.get(usize::from(queue_id)).ok_or(EINVAL)?;
+        if slot.count == 0 {
             return Ok(());
         }
         let descriptor = field(0x30)? & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
-        if descriptor != slot.expected_descriptor || field(0x38)? == 0 {
+        if descriptor == 0 || field(0x38)? == 0 {
             return Ok(());
         }
+        // Exact identity: the kick timestamp is unique per QID for 2^40
+        // kicks, so neither descriptor-slot reuse (every 256 kicks) nor a
+        // retirement floor is needed to reject an older lap's record.
+        let kick_timestamp = g17_completion::g17p_ksm_completion_timestamp(control);
+        let first = usize::from(slot.first);
+        let requests = self.requests
+            .get_mut(first..first + usize::from(slot.count))
+            .ok_or(ERANGE)?;
+        let Some(request) = requests.iter_mut()
+            .find(|request| request.expected_descriptor == descriptor
+                && request.kick_timestamp == kick_timestamp)
+        else {
+            return Ok(());
+        };
         let pair_a_start = field(0x10)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+        let pair_a_end = field(0x18)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
         let pair_b_start = field(0x20)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
         let pair_b_end = field(0x28)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
-        if pair_a_start == 0
-            || pair_b_end <= slot.last_consumed_end
-            || (slot.pair_b_end != 0 && pair_b_end <= slot.pair_b_end)
+        // A claimed-but-unstamped record carries tag bits only.
+        if pair_a_start == 0 || pair_b_end == 0
+            || (request.pair_b_end != 0 && pair_b_end <= request.pair_b_end)
         {
             return Ok(());
         }
-        slot.pair_a_start = pair_a_start;
-        slot.pair_b_start = pair_b_start;
-        slot.pair_b_end = pair_b_end;
+        request.pair_a_start = pair_a_start;
+        request.pair_a_end = pair_a_end;
+        request.pair_b_start = pair_b_start;
+        request.pair_b_end = pair_b_end;
         Ok(())
     }
 
+    /// Consume the observation for one exact requested kick.
     pub(crate) fn take(
         &mut self,
         queue_id: u8,
         expected_descriptor: u64,
-        last_consumed_end: u64,
+        kick_timestamp: u64,
     ) -> Result<Option<G17PComputeCompletionCandidate>> {
-        let slot = self.slots.get_mut(usize::from(queue_id)).ok_or(EINVAL)?;
-        if slot.expected_descriptor != expected_descriptor
-            || slot.last_consumed_end != last_consumed_end
-        {
-            return Err(EIO);
-        }
-        let captured = *slot;
-        *slot = G17PComputeCompletionBatchSlot::EMPTY;
+        let slot = *self.slots.get(usize::from(queue_id)).ok_or(EINVAL)?;
+        let first = usize::from(slot.first);
+        let requests = self.requests
+            .get_mut(first..first + usize::from(slot.count))
+            .ok_or(EIO)?;
+        let request = requests.iter_mut()
+            .find(|request| request.queue_id == queue_id
+                && request.expected_descriptor == expected_descriptor
+                && request.kick_timestamp == kick_timestamp)
+            .ok_or(EIO)?;
+        let captured = *request;
+        request.pair_a_start = 0;
+        request.pair_a_end = 0;
+        request.pair_b_start = 0;
+        request.pair_b_end = 0;
         if captured.pair_b_end == 0 {
             return Ok(None);
         }
@@ -293,6 +599,8 @@ impl G17PComputeCompletionBatch {
         Ok(Some(G17PComputeCompletionCandidate {
             timestamps: [captured.pair_a_start, captured.pair_b_end],
             interval,
+            pairs: [captured.pair_a_start, captured.pair_a_end,
+                captured.pair_b_start, captured.pair_b_end],
         }))
     }
 }
@@ -314,6 +622,23 @@ impl G17PComputeCompletionBatch {
 /// So the stamp store is the first host-visible event that is ordered AFTER
 /// the flush, which is precisely the property a completion needs.
 const G17P_COMPUTE_STAMP_SUPPORT_OFFSET: u64 = 0x300;
+
+/// Per-publication channel-command slots. Offsets keep each body at the
+/// same 0x400 alignment its queue-graph window had.
+const G17P_COMPUTE_RECORD_SLOT_STRIDE: usize = 0x1000;
+const G17P_COMPUTE_RECORD_CONFIG: usize = 0x000;
+const G17P_COMPUTE_RECORD_EVENT: usize = 0x400;
+const G17P_COMPUTE_RECORD_ADD_KICKS: usize = 0x800;
+const G17P_COMPUTE_RECORD_STORAGE_SIZE: usize =
+    G17P_COMPUTE_RECORD_SLOT_STRIDE * crate::g17_queue_limits::COMPUTE_RECORD_SLOTS;
+const _: () = assert!(G17P_COMPUTE_RECORD_CONFIG + g17_compute::COMPUTE_OPTIONAL_SIZE
+    <= G17P_COMPUTE_RECORD_EVENT);
+const _: () = assert!(G17P_COMPUTE_RECORD_EVENT + g17_compute::COMPUTE_EVENT_SIZE
+    <= G17P_COMPUTE_RECORD_ADD_KICKS);
+const _: () = assert!(G17P_COMPUTE_RECORD_ADD_KICKS + g17_compute::COMPUTE_ADD_KICKS_SIZE
+    <= G17P_COMPUTE_RECORD_SLOT_STRIDE);
+const _: () = assert!(g17_submission::G17P_KSM_ADD_KICKS_COMMAND_FETCH_SIZE
+    <= g17_compute::COMPUTE_ADD_KICKS_SIZE);
 
 pub(crate) const G17P_CL_ENTRY_STORAGE_SIZE: usize =
     g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.backing_size();
@@ -422,10 +747,13 @@ const G17P_RENDER_USER_ALIAS_SLOT_COUNT: u64 =
     G17PRenderQueuePair::LEGACY_SLOT_COUNT as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR;
 const G17P_RENDER_USER_ALIAS_END: u64 = G17P_RENDER_USER_ALIAS_START
     + G17P_RENDER_USER_ALIAS_SLOT_COUNT * G17P_RENDER_USER_ALIAS_SLOT_SIZE;
-/// Native RTMemory+0x130..+0x290 contains four 0x58-byte event records. Keep
-/// four backing regions live so each record's TMAP/HMTA memory survives until
-/// three later channel-event completions have made that record reusable.
-const G17P_RENDER_RT_EVENT_RECORD_COUNT: usize = 4;
+/// Native RTMemory+0x130..+0x290 contains four 0x58-byte event records per
+/// render-target memory object, and every render target owns its own object.
+/// Here one TMAP/HMTA arena serves every render queued on a physical pair, so
+/// it carries one record per render the pair can hold in flight: a record is
+/// reused only after its exact owner retires. Ring distance alone does not
+/// prove completion; prepare_rt_slot checks the retained owner explicitly.
+const G17P_RENDER_RT_EVENT_RECORD_COUNT: usize = G17P_RENDER_MAX_IN_FLIGHT;
 /// The tail-pointer cache and the rotating TMAP/HMTA record are both sized by
 /// `g17p_render_state_layout` as
 ///
@@ -694,20 +1022,37 @@ const G17P_COMPUTE_ADD3_RESOURCE_TABLE: usize = 0x14a0;
 pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
 pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
 pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
+#[cfg(test)]
 const G17P_RENDER_DESCRIPTOR_IMAGE_SIZE: usize = 0x8000;
 const G17P_RENDER_DESCRIPTOR_SLOT_COUNT: usize = 32;
-/// Two complete command-resource generations are addressable per retained
-/// physical pair.  This is independent of the 32 descriptor slots: the
-/// descriptor ring is deeper, while DEFLAKE/AXFB/status backing has two
-/// disjoint client aliases and therefore bounds safe host-side publication.
-pub(crate) const G17P_RENDER_MAX_IN_FLIGHT: usize = 4;
+/// Renders one physical TA/3D pair holds in flight. AGXG17P pipelines up to
+/// 80 commands on each of its two AGX3DWorkQueues and orders them only with
+/// firmware kick parents; nothing waits for a retirement before the next
+/// kick is published. Every per-render resource of a retained pair is sized
+/// from this one constant: command generations (render state, DEFLAKE/AXFB
+/// aliases, fragment status), TMAP/HMTA records, the queued-tracker FIFO and
+/// the scheduler credits. The 32-slot descriptor/timestamp ring, the 35
+/// pool-A event records, the 80 PM scenes, the 256-stamp SKSM kick ring and
+/// the 0x500-item queue ring each exceed it; the const asserts below keep it
+/// that way.
+pub(crate) const G17P_RENDER_MAX_IN_FLIGHT: usize = 16;
 /// Fixed-placement (bootstrap) pairs carry two alias generations per pair.
 const G17P_RENDER_LEGACY_GENERATIONS: usize = 2;
 /// Renders that may queue behind the front render of one pair.
 pub(crate) const G17P_RENDER_QUEUED_PER_PAIR: usize = G17P_RENDER_MAX_IN_FLIGHT - 1;
 const _: () = assert!(G17P_RENDER_RT_EVENT_RECORD_COUNT >= G17P_RENDER_MAX_IN_FLIGHT);
+const _: () = assert!(G17P_RENDER_DESCRIPTOR_SLOT_COUNT >= G17P_RENDER_MAX_IN_FLIGHT);
+// Pool-A records are reused only after firmware unlinks them; keep headroom
+// beyond the in-flight renders for firmware's retirement lag.
+const _: () = assert!(35 >= 2 * G17P_RENDER_MAX_IN_FLIGHT);
+const _: () = assert!(G17P_PM_SCENE_COUNT >= G17P_RENDER_MAX_IN_FLIGHT);
 const G17P_RENDER_TA_DESCRIPTOR_STRIDE: usize = g17_render::TA_DESCRIPTOR_SIZE;
-const G17P_RENDER_3D_DESCRIPTOR_STRIDE: usize = g17_render::FRAGMENT_DESCRIPTOR_SIZE;
+// Each live generation owns its explicit MCache spill table as well as the
+// hardware descriptor. Preserve descriptor alignment without padding to a page.
+const G17P_RENDER_3D_DESCRIPTOR_STRIDE: usize =
+    (g17_render::FRAGMENT_DESCRIPTOR_SIZE
+        + (g17_uapi::UAPI_MAX_ATTACHMENTS + 1) * g17_render::G17P_MCACHE_MAPPING_SIZE
+        + 0x3f) & !0x3f;
 const G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE: usize =
     (G17P_RENDER_TA_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT
         + mmu::UAT_PGSZ - 1) & !(mmu::UAT_PGSZ - 1);
@@ -821,6 +1166,39 @@ const G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA: u64 = 0x70_0009_8000;
 fn g17p_render_descriptor_slot(submission_ordinal: u64) -> usize {
     submission_ordinal as usize % G17P_RENDER_DESCRIPTOR_SLOT_COUNT
 }
+
+fn g17p_render_descriptor_backing_valid(size: usize, cpu_wc: bool) -> bool {
+    size == G17P_RENDER_DESCRIPTOR_STORAGE_SIZE && !cpu_wc
+}
+
+/// Observe device-owned bytes without compiler reuse or alignment assumptions.
+/// This does not make the multi-byte sample atomic or perform cache maintenance.
+fn g17p_render_device_bytes<const N: usize>(raw: &[u8], offset: usize) -> Option<[u8; N]> {
+    let source = raw.get(offset..offset.checked_add(N)?)?;
+    let mut out = [0u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        // SAFETY: source contains exactly N readable bytes in its retained mapping.
+        *byte = unsafe { core::ptr::read_volatile(source.as_ptr().add(index)) };
+    }
+    Some(out)
+}
+
+/// Select disjoint complete TA/FRG generations before a direct build. The
+/// caller owns this inactive ordinal until commit or cancellation; no producer
+/// is changed here. Repeated builds reset the complete command prefixes.
+fn g17p_render_descriptor_views(raw: &mut [u8], ordinal: u64)
+    -> Option<(&mut [u8], &mut [u8])>
+{
+    let ta = g17p_render_ta_descriptor_offset(ordinal);
+    let fragment = g17p_render_3d_descriptor_offset(ordinal);
+    let ta_end = ta.checked_add(g17_render::TA_DESCRIPTOR_SIZE)?;
+    let fragment_end = fragment.checked_add(G17P_RENDER_3D_DESCRIPTOR_STRIDE)?;
+    if ta_end > fragment || fragment_end > raw.len() { return None; }
+    let (prefix, suffix) = raw.split_at_mut(fragment);
+    Some((prefix.get_mut(ta..ta_end)?,
+        suffix.get_mut(..G17P_RENDER_3D_DESCRIPTOR_STRIDE)?))
+}
+
 
 fn g17p_render_ta_descriptor_offset(submission_ordinal: u64) -> usize {
     g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_TA_DESCRIPTOR_STRIDE
@@ -1605,13 +1983,28 @@ fn positive_half_f32_bits(value: u32) -> Option<u32> {
     Some(((highest + 126) << 23) | (significand & 0x7f_ffff))
 }
 
+fn g17p_fragment_mcache_probe_hwsid(command_flags: u32, hwsid: u32) -> u32 {
+    // A private matched-workload experiment, not a general coherency policy.
+    // Native final benchmark commands publish no KSM aperture (pointer/count
+    // zero). All existing TSQ maintenance and dependency gates remain intact.
+    if cfg!(g17p_mcache_aperture_probe) && command_flags & (1 << 30) != 0 {
+        0
+    } else {
+        hwsid
+    }
+}
+
 fn g17p_aux_fb_flags(command_flags: u32) -> u64 {
     // The G17P kext copies this field from per-command segment data instead
-    // of supplying a generation-wide constant. Native Neon writes 0xc000;
+    // of supplying a generation-wide constant. The base here is 0xc000;
     // bit 18 is the integer-depth-bias selector and remains in bit 18. Bit 0
     // is a separate small-known-primitive optimization which the UAPI does
     // not describe, so leave it clear instead of enabling it universally.
-    0xc000 | u64::from(command_flags & G17P_RENDER_DBIAS_IS_INT)
+    // Bit31 is accepted only by the explicit diagnostic kernel build and is
+    // sent only by a benchmark process opting in through its private Mesa.
+    // It is not a supported userspace promise or a production workload test.
+    let small_probe = cfg!(g17p_aux_fb_small_probe) && command_flags & (1 << 31) != 0;
+    0xc000 | u64::from(command_flags & G17P_RENDER_DBIAS_IS_INT) | u64::from(small_probe)
 }
 
 fn encode_g17p_render_runtime_state(
@@ -1664,34 +2057,86 @@ fn apply_g17p_viewport(width: u32, height: u32, page: &mut [u8]) -> Option<()> {
     Some(())
 }
 
-/// Snapshot a firmware-owned ring record after observing its producer cursor.
-/// The caller must retain the consumer slot until this copy is complete; word
-/// loads do not make the complete record atomic. Natural-width volatile loads
-/// keep strict-alignment builds from fusing the byte decoder into a sequence
-/// of uncached byte reads against the firmware mapping.
+// Live shared control words are read asynchronously by firmware, including while
+// older kicks retire. Byte copies are not a single-copy publication on strict-
+// alignment builds. The Runtime lock serializes host RMWs; volatile accesses
+// preserve native aligned LDR/STR width, not an atomic RMW across processors.
 #[inline]
-fn g17p_snapshot_fw_record(bytes: &[u8], offset: usize, output: &mut [u8]) -> Result {
-    if output.is_empty() || output.len() & 3 != 0
-        || offset.checked_add(output.len()).is_none_or(|end| end > bytes.len())
+fn g17p_live_word_bounds(bytes: &[u8], offset: usize, width: usize) -> Result {
+    if !matches!(width, 4 | 8)
+        || offset.checked_add(width).is_none_or(|end| end > bytes.len())
         || (bytes.as_ptr() as usize).checked_add(offset)
-            .is_none_or(|address| address & 3 != 0)
+            .is_none_or(|address| address & (width - 1) != 0)
     {
         return Err(EINVAL);
-    }
-    for (index, word) in output.chunks_exact_mut(4).enumerate() {
-        // SAFETY: the complete range and its four-byte alignment were checked
-        // before any load. The caller keeps this allocation mapped and the
-        // producer-published slot owned until all words have been copied.
-        let value = unsafe {
-            core::ptr::read_volatile(bytes.as_ptr().add(offset + index * 4).cast::<u32>())
-        };
-        word.copy_from_slice(&value.to_ne_bytes());
     }
     Ok(())
 }
 
+#[inline]
+fn g17p_live_read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    g17p_live_word_bounds(bytes, offset, 4)?;
+    // SAFETY: checked bounds and natural alignment; allocation remains mapped.
+    Ok(u32::from_le(unsafe {
+        core::ptr::read_volatile(bytes.as_ptr().add(offset).cast::<u32>())
+    }))
+}
+
+#[inline]
+fn g17p_live_read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    g17p_live_word_bounds(bytes, offset, 8)?;
+    // SAFETY: checked bounds and natural alignment; allocation remains mapped.
+    Ok(u64::from_le(unsafe {
+        core::ptr::read_volatile(bytes.as_ptr().add(offset).cast::<u64>())
+    }))
+}
+
+/// Snapshot a producer-published firmware record before returning its slot.
+/// Volatile word loads prevent strict-alignment codegen from expanding the
+/// subsequent byte-oriented decoder into individual uncached byte reads.
+/// This is not an atomic whole-record snapshot: callers must first observe
+/// the producer cursor and retain the slot until the snapshot is complete.
+#[inline]
+fn g17p_snapshot_fw_record(bytes: &[u8], offset: usize, output: &mut [u8]) -> Result {
+    if output.is_empty() || output.len() & 3 != 0
+        || offset.checked_add(output.len()).is_none_or(|end| end > bytes.len())
+    {
+        return Err(EINVAL);
+    }
+    g17p_live_word_bounds(bytes, offset, 4)?;
+    for (index, word) in output.chunks_exact_mut(4).enumerate() {
+        let value = g17p_live_read_u32(bytes, offset + index * 4)?;
+        word.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+#[inline]
+fn g17p_live_write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result {
+    g17p_live_word_bounds(bytes, offset, 4)?;
+    // SAFETY: checked bounds and natural alignment; host owns this shared word.
+    unsafe { core::ptr::write_volatile(bytes.as_mut_ptr().add(offset).cast::<u32>(), value.to_le()) };
+    Ok(())
+}
+
+#[inline]
+fn g17p_live_write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result {
+    g17p_live_word_bounds(bytes, offset, 8)?;
+    // SAFETY: checked bounds and natural alignment; host owns this shared word.
+    unsafe { core::ptr::write_volatile(bytes.as_mut_ptr().add(offset).cast::<u64>(), value.to_le()) };
+    Ok(())
+}
+
+#[cfg(test)]
 fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+// v91 WORD_STORES: aligned fields use one store (see g17_store).
+#[cfg(not(test))]
+#[inline(always)]
+fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+    crate::g17_store::put_u32(raw, offset, value)
 }
 
 #[cfg(test)]
@@ -1699,8 +2144,23 @@ fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
     raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+// v91 WORD_STORES: aligned fields use one store (see g17_store).
+#[cfg(not(test))]
+#[inline(always)]
+fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
+    crate::g17_store::put_u16(raw, offset, value)
+}
+
+#[cfg(test)]
 fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+// v91 WORD_STORES: aligned fields use one store (see g17_store).
+#[cfg(not(test))]
+#[inline(always)]
+fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
+    crate::g17_store::put_u64(raw, offset, value)
 }
 
 /// Apply one native AGXChannel command-pointer transition to the retained
@@ -1714,19 +2174,9 @@ fn apply_g17p_initial_command_pointer(
     let state = g17_compute::COMPUTE_QUEUE_POINTERS;
     let producer_offset = state.checked_add(0x40)?;
     let count_offset = state.checked_add(0x60)?;
-    let consumer = u32::from_le_bytes(graph.get(state..state + 4)?.try_into().ok()?);
-    let producer = u32::from_le_bytes(
-        graph
-            .get(producer_offset..producer_offset + 4)?
-            .try_into()
-            .ok()?,
-    );
-    let count = u32::from_le_bytes(
-        graph
-            .get(count_offset..count_offset + 4)?
-            .try_into()
-            .ok()?,
-    );
+    let consumer = g17p_live_read_u32(graph, state).ok()?;
+    let producer = g17p_live_read_u32(graph, producer_offset).ok()?;
+    let count = g17p_live_read_u32(graph, count_offset).ok()?;
     // Compare against the size actually programmed into the graph, not a
     // literal. Hard-coding `0x500` here is why `g17p_ring_limit` failed on the
     // FIRST submission rather than at a wrap: every publish was refused the
@@ -1742,13 +2192,18 @@ fn apply_g17p_initial_command_pointer(
         .checked_add(producer as usize * core::mem::size_of::<u64>())?;
     let ring_end = g17_compute::COMPUTE_ITEM_RING.checked_add(g17_compute::COMPUTE_ITEM_RING_SIZE)?;
     if slot.checked_add(8)? > ring_end
-        || u64::from_le_bytes(graph.get(slot..slot + 8)?.try_into().ok()?) != 0
+        || g17p_live_read_u64(graph, slot).ok()? != 0
     {
         return None;
     }
-    put_u64(graph, slot, command_gpu_va);
+    // Both words were bounds/alignment checked by the loads above, before
+    // the first mutation. Firmware must never observe a torn ring pointer or
+    // producer; the barrier separately orders pointer before producer.
+    g17p_live_write_u64(graph, slot, command_gpu_va).ok()?;
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    put_u32(graph, producer_offset, next);
+    g17p_live_write_u32(graph, producer_offset, next).ok()?;
+    crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_CHANNEL,
+        producer as u64, command_gpu_va, next as u64);
     Some(next)
 }
 
@@ -2195,6 +2650,79 @@ pub(crate) struct G17PKtraceDrainStats {
     pub(crate) last_pause_mask: u64,
     pub(crate) producer: u32,
     pub(crate) consumer_before: u32,
+    /// Native-drain mode stopped at an illegal type/cursor (not published).
+    pub(crate) quarantined: bool,
+}
+
+/// Outcome of one native statistics-ring drain for one role.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PNativeRingDrainStats {
+    pub(crate) consumer_before: u32,
+    pub(crate) producer: u32,
+    /// Entries released, one published consumer step each.
+    pub(crate) consumed: u32,
+    /// The consumer is quarantined (now or earlier this load).
+    pub(crate) quarantined: bool,
+}
+
+/// Per-load quarantine of native ring consumers after a transport fault:
+/// bit 0/1 trace primary/secondary, bit 2/3 statistics primary/secondary.
+/// Native asserts on these conditions; the host instead stops writing that
+/// cursor rather than guess a layout, and reports it once.
+pub(crate) static G17P_NATIVE_RING_QUARANTINE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+pub(crate) const fn g17p_native_ring_quarantine_bit(role: InstanceRole, statistics: bool) -> u32 {
+    let role_bit = match role {
+        InstanceRole::Primary => 0,
+        InstanceRole::Secondary => 1,
+    };
+    1 << (role_bit + if statistics { 2 } else { 0 })
+}
+
+fn g17p_native_ring_quarantine(
+    dev: &kernel::device::Device,
+    role: InstanceRole,
+    statistics: bool,
+    consumer: u32,
+    producer: u32,
+    entry_type: Option<u32>,
+) {
+    let bit = g17p_native_ring_quarantine_bit(role, statistics);
+    let previous = G17P_NATIVE_RING_QUARANTINE.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    if previous & bit == 0 {
+        dev_err!(
+            dev,
+            "G17P native ring drain: {} {:?} quarantined (consumer={} producer={} type={:?}); cursor left unpublished\n",
+            if statistics { "statistics" } else { "trace" },
+            role,
+            consumer,
+            producer,
+            entry_type,
+        );
+    }
+}
+
+/// Any other native-drain failure (mapping/address error) also quarantines
+/// that consumer: the drain runs on every event turn and must neither spin
+/// nor repeat a report.
+pub(crate) fn g17p_native_ring_note_error(
+    dev: &kernel::device::Device,
+    role: InstanceRole,
+    statistics: bool,
+    error: Error,
+) {
+    let bit = g17p_native_ring_quarantine_bit(role, statistics);
+    let previous = G17P_NATIVE_RING_QUARANTINE.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    if previous & bit == 0 {
+        dev_err!(
+            dev,
+            "G17P native ring drain: {} {:?} failed ({:?}); consumer quarantined\n",
+            if statistics { "statistics" } else { "trace" },
+            role,
+            error,
+        );
+    }
 }
 
 /// Coherent raw cause fields published by A000 before it notifies the host of
@@ -2452,6 +2980,10 @@ struct MappedObject {
     /// Records the existing owning CPU mapping; capture never creates a
     /// physical alias or upgrades a WB observation to GPU-coherent evidence.
     cpu_wc: bool,
+    /// v90: nonzero for a pooled firmware-cached command object (family
+    /// bit, or `G17P_FW_POOL_POISON` when its attribute state is unproven).
+    /// Such an owning mapping is never unmapped while the firmware runs.
+    fw_pool: u8,
 }
 
 /// Address metadata remains with the shared render graph; owning mappings
@@ -2812,6 +3344,12 @@ fn map_fixed_wc_object(
 }
 
 #[cfg(not(test))]
+struct G17PRetiredRenderTargetBacking {
+    _backing: MappedObject,
+    owners: [Option<u64>; G17P_RENDER_MAX_IN_FLIGHT],
+}
+
+#[cfg(not(test))]
 struct G17PRenderTargetMemory {
     queue_pair: G17PRenderQueuePair,
     rt_memory: MappedObject,
@@ -2820,6 +3358,7 @@ struct G17PRenderTargetMemory {
     /// command's layout and grown, never shrunk, by `ensure_capacity`.
     record_stride: usize,
     rt_slot_ordinals: [Option<u64>; G17P_RENDER_RT_EVENT_RECORD_COUNT],
+    retired_backings: KVec<G17PRetiredRenderTargetBacking>,
 }
 
 #[cfg(not(test))]
@@ -2830,13 +3369,9 @@ impl G17PRenderTargetMemory {
         layout: &G17PRenderStateLayout,
     ) -> Result<G17PRenderTargetAddresses> {
         let slot = submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT;
-        if self.rt_slot_ordinals[slot].is_some_and(|previous| {
-            submission_ordinal
-                .checked_sub(previous)
-                .is_none_or(|distance| {
-                    distance != 0 && distance < G17P_RENDER_RT_EVENT_RECORD_COUNT as u64
-                })
-        }) {
+        // Ring distance is not retirement proof. The exact owner must be
+        // cleared by completion before a different ordinal reuses its bytes.
+        if self.rt_slot_ordinals[slot].is_some_and(|previous| previous != submission_ordinal) {
             return Err(EBUSY);
         }
         let used = layout
@@ -2849,8 +3384,17 @@ impl G17PRenderTargetMemory {
         }
         let offset = self.record_offset(submission_ordinal);
         let stride = self.record_stride;
+        // The record stride is floored at 256 KiB and only ever grows to the
+        // largest target this graph has served, so zeroing the whole stride
+        // made a 16x16 pass clear a full-screen-or-larger TMAP/HMTA record in
+        // write-combined memory under the runtime mutex. This render's
+        // descriptors reference only tilemap..heapmeta+heapmeta_size (`used`,
+        // checked against the stride above); a later, larger layout on this
+        // record zeroes its own span before use. Keep page granularity so the
+        // span is never narrower than the page the layout ends in.
+        let span = page_align(used).ok_or(EOVERFLOW)?.min(stride);
         self.rt_memory.with_bytes_mut(|raw| {
-            raw.get_mut(offset..offset + stride)
+            raw.get_mut(offset..offset + span)
                 .ok_or(ERANGE)?
                 .fill(0);
             Ok(())
@@ -2871,24 +3415,25 @@ impl G17PRenderTargetMemory {
         g17p_render_rt_record_slot(submission_ordinal) * self.record_stride
     }
 
-    /// Grow the tail-pointer cache and the rotating TMAP/HMTA records to what
-    /// `layout` needs, in place, at the addresses this graph already owns.
+    /// Grow the tail-pointer cache and rotating TMAP/HMTA records to what
+    /// `layout` needs, retaining backing still referenced by live commands.
     ///
     /// Both sizes scale with framebuffer area, so a retained graph whose next
     /// command has a larger render target must resize rather than refuse: the
     /// previous refusal was a bare `ERANGE` that reached Mesa as
     /// `VK_ERROR_DEVICE_LOST` for every target above 4096x4096.
     ///
-    /// `restage_command` has already proved the previous group is complete --
-    /// empty job list, both queues done == read == write -- before it calls
-    /// this, so no firmware work refers to either object while it is replaced.
-    /// Each replacement allocates its new backing BEFORE releasing the old
-    /// aperture, so a failed allocation leaves the graph exactly as it was.
+    /// Dynamic client graphs may have earlier commands in flight. Each old
+    /// allocation retains a snapshot of those exact owners until retirement.
+    /// Allocate each replacement before changing its corresponding object;
+    /// an earlier successful replacement is retained if a later step fails.
+    /// The static bootstrap placement retains its separate regrow path.
     fn ensure_capacity(
         &mut self,
         dev: &AsahiDevice,
         vm: &mmu::Vm,
         layout: &G17PRenderStateLayout,
+        owners: &[Option<u64>; G17P_RENDER_MAX_IN_FLIGHT],
     ) -> Result<bool> {
         let tpc_size = g17p_render_tpc_capacity(layout)?;
         let record_stride = g17p_render_rt_region_stride(layout)?;
@@ -2906,9 +3451,19 @@ impl G17PRenderTargetMemory {
             let address = self.tpc.iova();
             let previous = self.tpc.logical_size;
             if self.queue_pair.dynamic_placement {
-                self.tpc = MappedObject::new_wc_render_owned(
+                // Old descriptors retain the old VA until their exact
+                // command generations retire. Reserve before replacing it.
+                let retain = owners.iter().any(Option::is_some);
+                if retain { self.retired_backings.reserve(1, GFP_KERNEL)?; }
+                let replacement = MappedObject::new_wc_render_owned(
                     dev, vm, self.queue_pair, Some(address), tpc_size, mmu::PROT_GPU_FW_SHARED_RW,
                 )?;
+                let old = core::mem::replace(&mut self.tpc, replacement);
+                if retain {
+                    self.retired_backings.push_within_capacity(G17PRetiredRenderTargetBacking {
+                        _backing: old, owners: *owners,
+                    }).map_err(|_| ENOMEM)?;
+                }
             } else {
                 self.tpc.regrow_wc_at(dev, vm, address, tpc_size)?;
             }
@@ -2937,9 +3492,19 @@ impl G17PRenderTargetMemory {
                 .ok_or(EOVERFLOW)?;
             let previous = self.record_stride;
             if self.queue_pair.dynamic_placement {
-                self.rt_memory = MappedObject::new_wc_render_owned(
+                // Old descriptors retain the old VA until their exact
+                // command generations retire. Reserve before replacing it.
+                let retain = owners.iter().any(Option::is_some);
+                if retain { self.retired_backings.reserve(1, GFP_KERNEL)?; }
+                let replacement = MappedObject::new_wc_render_owned(
                     dev, vm, self.queue_pair, Some(address), size, mmu::PROT_GPU_FW_SHARED_RW,
                 )?;
+                let old = core::mem::replace(&mut self.rt_memory, replacement);
+                if retain {
+                    self.retired_backings.push_within_capacity(G17PRetiredRenderTargetBacking {
+                        _backing: old, owners: *owners,
+                    }).map_err(|_| ENOMEM)?;
+                }
             } else {
                 self.rt_memory.regrow_wc_at(dev, vm, address, size)?;
             }
@@ -3049,6 +3614,7 @@ fn new_g17p_render_target_memory(
             tpc,
             record_stride,
             rt_slot_ordinals: [None; G17P_RENDER_RT_EVENT_RECORD_COUNT],
+            retired_backings: KVec::new(),
         },
         GFP_KERNEL,
     )?)
@@ -3070,7 +3636,7 @@ impl MappedObject {
         )?;
         let iova = mapping.iova();
         Ok(Self { mapping: Some(mapping), object, iova, object_offset: 0,
-            logical_size: size, cpu_wc: true })
+            logical_size: size, cpu_wc: true, fw_pool: 0 })
     }
 
     fn new_wc_in_range(
@@ -3092,6 +3658,7 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: true,
+            fw_pool: 0,
         })
     }
 
@@ -3130,6 +3697,7 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: true,
+            fw_pool: 0,
         })
     }
 
@@ -3148,6 +3716,10 @@ impl MappedObject {
     ) -> Result {
         if size <= self.logical_size {
             return Ok(());
+        }
+        // A pooled firmware-cached mapping is never replaced (early unmap).
+        if self.fw_pool != 0 {
+            return Err(EBUSY);
         }
         let mut object = gem::new_kernel_object_wc(dev, size)?;
         object.vmap()?.memset(0);
@@ -3181,6 +3753,7 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: false,
+            fw_pool: 0,
         })
     }
 
@@ -3219,7 +3792,77 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: false,
+            fw_pool: 0,
         })
+    }
+
+    /// v90: a firmware-cached command object of `family` with its first
+    /// `prefix` bytes cached, taken zeroed from the family pool or created by
+    /// `alloc` and proven. Falls back to the plain uncached object when the
+    /// family is not enabled, the cached-byte cap is reached, or the attribute
+    /// change is refused before any PTE mutation. Must run before any pointer
+    /// into the object is published.
+    fn new_fw_pooled(
+        dev: &AsahiDevice,
+        family: u32,
+        size: usize,
+        prefix: usize,
+        cpu_wc: bool,
+        alloc: impl FnOnce() -> Result<Self>,
+    ) -> Result<Self> {
+        if crate::g17_timing_buffer::fw_cached_family_mask() & family == 0 {
+            return alloc();
+        }
+        let index = g17p_fw_pool_index(family).ok_or(EINVAL)?;
+        if let Some(mut object) = g17p_fw_pool_take(index) {
+            if object.logical_size == size && object.cpu_wc == cpu_wc {
+                // Same contract as a fresh object: zero before publication.
+                object.fw_pool = family as u8;
+                object.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+                core::sync::atomic::fence(Ordering::SeqCst);
+                g17p_fw_pool_bump(1);
+                dev_info!(dev.as_ref(),
+                    "G17P fw-cached object: family={} va={:#x} reused fresh={} reused={} returned={} leaked={}\n",
+                    family, object.iova, g17p_fw_pool_stat(0), g17p_fw_pool_stat(1),
+                    g17p_fw_pool_stat(2), g17p_fw_pool_stat(3));
+                return Ok(object);
+            }
+            // Never unmap a cached object early, even a mismatched one.
+            object.fw_pool = G17P_FW_POOL_POISON;
+            drop(object);
+        }
+        let mut object = alloc()?;
+        let size = object.logical_size as u64;
+        if G17P_FW_POOL_CACHED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |used| used.checked_add(size).filter(|n| *n <= G17P_FW_POOL_CACHED_LIMIT)).is_err()
+        {
+            return Ok(object);
+        }
+        let Some(mapping) = object.mapping.as_ref() else { return Ok(object); };
+        // SAFETY: `alloc` just created this object; nothing has been published.
+        let (proof, mutated) = unsafe { mapping.set_fw_cached_prefix(prefix) };
+        match proof {
+            Ok(ptes) => {
+                object.fw_pool = family as u8;
+                g17p_fw_pool_bump(0);
+                dev_info!(dev.as_ref(),
+                    "G17P fw-cached object: family={} va={:#x} size={:#x} prefix={:#x} ptes={:#x}/{:#x} fresh={} reused={} returned={} leaked={}\n",
+                    family, object.iova, object.logical_size, prefix, ptes[0], ptes[1],
+                    g17p_fw_pool_stat(0), g17p_fw_pool_stat(1), g17p_fw_pool_stat(2), g17p_fw_pool_stat(3));
+                Ok(object)
+            }
+            Err(error) if mutated => {
+                // Attribute state unproven: never publish, reuse or unmap it.
+                object.fw_pool = G17P_FW_POOL_POISON;
+                dev_err!(dev.as_ref(), "G17P fw-cached object: family={} PTE proof failed ({:?}); retained\n",
+                    family, error);
+                Err(error)
+            }
+            Err(_) => {
+                G17P_FW_POOL_CACHED_BYTES.fetch_sub(size, Ordering::Relaxed);
+                Ok(object)
+            }
+        }
     }
 
     fn iova(&self) -> u64 {
@@ -3251,6 +3894,7 @@ impl MappedObject {
             object_offset: parent.object_offset.checked_add(offset).ok_or(EOVERFLOW)?,
             logical_size,
             cpu_wc: parent.cpu_wc,
+            fw_pool: 0,
         })
     }
 
@@ -3295,6 +3939,11 @@ impl MappedObject {
         self.capture_trace_range(archive, meta, 0, self.logical_size, clock)
     }
 
+    fn read_live_u32(&mut self, address: u64) -> Result<u32> {
+        let offset: usize = address.checked_sub(self.iova()).ok_or(EINVAL)?.try_into()?;
+        self.with_bytes_mut(|bytes| g17p_live_read_u32(bytes, offset))
+    }
+
     fn read_u32(&mut self, address: u64) -> Result<u32> {
         let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
         let end = offset.checked_add(4).ok_or(EINVAL)?;
@@ -3322,15 +3971,8 @@ impl MappedObject {
     }
 
     fn write_u32(&mut self, address: u64, value: u32) -> Result {
-        let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
-        let end = offset.checked_add(4).ok_or(EINVAL)?;
-        if end > self.logical_size {
-            return Err(EINVAL);
-        }
-        self.with_bytes_mut(|bytes| {
-            bytes[offset..end].copy_from_slice(&value.to_le_bytes());
-            Ok(())
-        })
+        let offset: usize = address.checked_sub(self.iova()).ok_or(EINVAL)?.try_into()?;
+        self.with_bytes_mut(|bytes| g17p_live_write_u32(bytes, offset, value))
     }
 
     fn map_alias_at(
@@ -3523,7 +4165,7 @@ fn read_control_counters(object: &mut MappedObject, state_grid: u64) -> Result<[
         let address = base
             .checked_add(index as u64 * g17_initdata::CHANNEL_STATE_SPACING as u64)
             .ok_or(EINVAL)?;
-        *counter = object.read_u32(address)?;
+        *counter = object.read_live_u32(address)?;
     }
     Ok(counters)
 }
@@ -3608,11 +4250,24 @@ fn map_t8140_register_windows(
     Ok(mappings)
 }
 
-/// Session-owned control page for the one physical CL_2 channel.
+/// One logical queue's scheduler-state page (`_AGFISchedulerState`, native
+/// AGXCommandQueue `+0x8a0`). Its static image is byte-for-byte what
+/// `AGXCommandQueue::allocateSchedulerState` writes: `0xffff` at `+0`, `1` at
+/// `+5`, the class byte at `+0x26` and `0xff` at `+0x33`.
+///
+/// Once a kick has named this page, firmware keeps it on its scheduler lists
+/// until the host submits the `0x14` scheduler-state release and the control
+/// ring consumer passes that record. That release is the queue teardown's
+/// witness; the page itself stays mapped for as long as any installed QID
+/// still names it (the manager keeps the last owner of every render pair,
+/// and a compute queue keeps its context until the next owner rebinds it).
 #[cfg(not(test))]
 pub(crate) struct G17PClChannelControl {
     storage: MappedObject,
-    session_retained: AtomicBool,
+    /// Set the first time a render graph or CL binding names this page in a
+    /// firmware-visible record; never cleared. A page that was never
+    /// published is unknown to firmware and needs no release.
+    published: AtomicBool,
     /// Non-repeating owner generation, independent of numeric context/QoS ID.
     flist_generation: u32,
 }
@@ -3632,7 +4287,7 @@ impl G17PClChannelControl {
                 .map_err(|_| EINVAL)
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(Self { storage, session_retained: AtomicBool::new(false),
+        Ok(Self { storage, published: AtomicBool::new(false),
             flist_generation: g17p_allocate_object_id()? })
     }
 
@@ -3646,14 +4301,22 @@ impl G17PClChannelControl {
         self.snapshot_bytes()
     }
 
-    pub(crate) fn is_session_retained(&self) -> bool {
-        self.session_retained.load(Ordering::Acquire)
+    pub(crate) fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
     }
 
-    /// Only the runtime-mutex owner changes retention. Clear only after both
-    /// firmware processors stop; a fence or queue close is insufficient.
-    pub(crate) fn set_session_retained(&self, retained: bool) {
-        self.session_retained.store(retained, Ordering::Release);
+    /// Record that a firmware-visible record has named this page. Called
+    /// under the runtime mutex by the render and CL binding paths.
+    pub(crate) fn mark_published(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+
+    /// The four identity bytes the scheduler-state release carries back to
+    /// firmware: page bytes `[0]`, `[1]`, `[4]` and `[0x26]`, read live because
+    /// firmware rewrites the `0xffff` sentinel at `+0` once it adopts the page.
+    pub(crate) fn release_identity(&self) -> Result<[u8; 4]> {
+        let prefix = self.snapshot_bytes::<0x38>()?;
+        Ok([prefix[0x00], prefix[0x01], prefix[0x04], prefix[0x26]])
     }
 
     fn snapshot_bytes<const N: usize>(&self) -> Result<[u8; N]> {
@@ -3676,11 +4339,17 @@ impl G17PClChannelControl {
 /// One logical command queue's stable address-space and scheduler identities.
 /// Native AGXCommandQueue +0x618 -> reclaimable +0xe0 supplies the same page
 /// to TA, 3D and CL. Physical graph reuse must not substitute another owner.
-/// The manager separately retains scheduler pages until firmware processor stop
-/// because the native scheduler-context detach command is not implemented yet.
+/// Logical teardown publishes opcode 0x14 and waits for control-ring consumption.
+/// Installed and previous bindings hold additional references through replacement;
+/// uncertain references are retained until the firmware processors stop.
 #[cfg(not(test))]
 pub(crate) struct G17PLogicalQueueContext {
+    /// Zero means the opt-in, non-reusing diagnostic pool was exhausted.
+    render_mcache_hwsid: u32,
     execution: Arc<mmu::T8140ComputeExecutionContext>,
+    work_states: crate::g17_work_state::WorkStatePool,
+    tsq: Arc<kernel::sync::Mutex<G17PWorkStateStorage>>,
+    tsq_base: u64,
     /// Creating process TGID; never substitute the scheduler worker's PID.
     pub(crate) owner_pid: u32,
     pub(crate) channel_control: Arc<G17PClChannelControl>,
@@ -3694,12 +4363,255 @@ impl G17PLogicalQueueContext {
         channel_control: Arc<G17PClChannelControl>,
         qos: Arc<G17PLogicalQosLease>,
         owner_pid: u32,
+        tsq: Arc<kernel::sync::Mutex<G17PWorkStateStorage>>,
     ) -> Self {
-        Self { execution, owner_pid, channel_control, qos }
+        let tsq_base = tsq.lock().storage.iova();
+        let render_mcache_hwsid = if *crate::module_parameters::g17p_mcache_dsid_probe.value() != 0 {
+            let id = g17p_mcache_probe_reserve(&G17P_MCACHE_PROBE_NEXT).map_or(0, u32::from);
+            pr_info!("G17P MCache diagnostic: owner-pid={} hwdsid={} non-reusing-pool=96..191\n", owner_pid, id);
+            id
+        } else { crate::g17_config::RENDER_MCACHE_HWSID };
+        Self {
+            execution, owner_pid, channel_control, qos, tsq, tsq_base, render_mcache_hwsid,
+            work_states: crate::g17_work_state::WorkStatePool::new(),
+        }
     }
 
     pub(crate) fn channel_control_gpu_va(&self) -> u64 {
         self.channel_control.gpu_va()
+    }
+
+    pub(crate) fn tsq_head_gpu_va(&self) -> u64 {
+        self.tsq_base + (mmu::UAT_PGSZ + 0x400) as u64
+    }
+
+    fn tsq_head_snapshot(&self) -> Result<[u64; 2]> {
+        let storage = self.tsq.lock();
+        let view = storage.storage.object.gem.vmap::<u8>()?;
+        let mut head = [0; 2];
+        for (index, word) in head.iter_mut().enumerate() {
+            // SAFETY: two u64-aligned fields in the retained second UAT page.
+            *word = u64::from_le(unsafe { core::ptr::read_volatile(
+                view.as_mut_ptr().add(mmu::UAT_PGSZ + 0x400 + index * 8).cast::<u64>()) });
+        }
+        core::sync::atomic::fence(Ordering::Acquire);
+        Ok(head)
+    }
+
+    pub(crate) fn work_states_exhausted(&self) -> bool {
+        !self.work_states.has_free()
+    }
+}
+
+/// One stable TSQ node and submitted-count cell per live work-state identity.
+/// Firmware may mutate the node after publication; only the pointed-to count
+/// remains host-owned. This context-local lock protects host initialization and
+/// accounting, and is never held while waiting for GPU work or another context.
+#[cfg(not(test))]
+pub(crate) struct G17PWorkStateStorage {
+    storage: MappedObject,
+    words: [Option<u32>; crate::g17_work_state::TSQ_STATE_COUNT],
+    counts: [u32; crate::g17_work_state::TSQ_STATE_COUNT],
+    render_slots: crate::g17_work_state::RenderTsqSlots,
+}
+
+#[cfg(not(test))]
+impl G17PWorkStateStorage {
+    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat)
+        -> Result<Arc<kernel::sync::Mutex<Self>>>
+    {
+        if crate::g17_work_state::TSQ_STATE_COUNT * crate::g17_work_state::TSQ_NODE_STRIDE
+            > mmu::UAT_PGSZ
+        {
+            return Err(EINVAL);
+        }
+        // Native CommandBufferState/TSQ nodes are firmware-cached; the second
+        // page (submitted counters/head) stays uncached, as native's
+        // AGFITimeStampQueue. v90 family bit 2.
+        let mut storage = MappedObject::new_fw_pooled(
+            dev, G17P_FW_FAMILY_TSQ_NODE, 2 * mmu::UAT_PGSZ, mmu::UAT_PGSZ, true,
+            || MappedObject::new_wc(
+                dev, uat, 2 * mmu::UAT_PGSZ, mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            ),
+        )?;
+        let head = storage.iova() + (mmu::UAT_PGSZ + 0x400) as u64;
+        storage.with_bytes_mut(|raw| {
+            put_u64(raw, mmu::UAT_PGSZ + 0x400, 0);
+            put_u64(raw, mmu::UAT_PGSZ + 0x408, head);
+            put_u32(raw, mmu::UAT_PGSZ + 0x410, 0);
+            put_u32(raw, mmu::UAT_PGSZ + 0x414, 0);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(Ordering::Release);
+        Arc::pin_init(kernel::new_mutex!(Self {
+            storage,
+            words: [None; crate::g17_work_state::TSQ_STATE_COUNT],
+            counts: [0; crate::g17_work_state::TSQ_STATE_COUNT],
+            render_slots: crate::g17_work_state::RenderTsqSlots::new(),
+        }, "G17 work-state TSQ storage"), GFP_KERNEL)
+    }
+
+    fn initialize(&mut self, word: u32) -> Result {
+        let slot = (word & 63) as usize;
+        if slot >= self.words.len() { return Err(EINVAL); }
+        let node_offset = slot * crate::g17_work_state::TSQ_NODE_STRIDE;
+        let count_offset = mmu::UAT_PGSZ + slot * 4;
+        let count_address = self.storage.iova() + count_offset as u64;
+        self.storage.with_bytes_mut(|bytes| {
+            // The WorkStatePool lease proves no prior group can still own
+            // this slot. List-unlinked or counter equality alone cannot.
+            if !crate::g17_work_state::initialize_tsq_node(
+                &mut bytes[node_offset..], count_address, word, 0x50,
+            ) { return Err(EINVAL); }
+            bytes[count_offset..count_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+            Ok(())
+        })?;
+        self.words[slot] = Some(word);
+        self.counts[slot] = 0;
+        core::sync::atomic::fence(Ordering::Release);
+        Ok(())
+    }
+
+    fn change_count(&mut self, word: u32, kicks: u32, add: bool) -> Result<u32> {
+        let slot = (word & 63) as usize;
+        if self.words.get(slot) != Some(&Some(word)) { return Err(EINVAL); }
+        let count = if add { self.counts[slot].checked_add(kicks) }
+            else { self.counts[slot].checked_sub(kicks) }.ok_or(EOVERFLOW)?;
+        let address = self.storage.iova() + mmu::UAT_PGSZ as u64 + (slot * 4) as u64;
+        self.storage.write_u32(address, count)?;
+        self.counts[slot] = count;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(count)
+    }
+
+    fn counters(&self, word: u32) -> Result<[u32; 2]> {
+        let slot = (word & 63) as usize;
+        if self.words.get(slot) != Some(&Some(word)) { return Err(EINVAL); }
+        let vmap = self.storage.object.gem.vmap::<u8>()?;
+        let offsets = [mmu::UAT_PGSZ + slot * 4,
+            slot * crate::g17_work_state::TSQ_NODE_STRIDE + 0xc];
+        let mut counters = [0; 2];
+        for (counter, offset) in counters.iter_mut().zip(offsets) {
+            // SAFETY: construction retains two aligned UAT pages; both
+            // offsets are aligned u32 fields within them. Firmware owns the
+            // completion word, so take a volatile snapshot without a mutable
+            // reference to the surrounding firmware-owned node.
+            *counter = u32::from_le(unsafe {
+                core::ptr::read_volatile(vmap.as_mut_ptr().add(offset).cast::<u32>())
+            });
+        }
+        core::sync::atomic::fence(Ordering::Acquire);
+        Ok(counters)
+    }
+}
+
+/// One register-state identity retained through exact command retirement.
+/// Publication failure keeps this with the command whenever firmware may
+/// have seen it. Error signalling alone must never drop this lease.
+#[cfg(not(test))]
+pub(crate) struct G17PWorkStateLease {
+    context: Arc<G17PLogicalQueueContext>,
+    word: AtomicU32,
+}
+
+#[cfg(not(test))]
+impl G17PWorkStateLease {
+    pub(crate) fn new(context: Arc<G17PLogicalQueueContext>) -> Result<Self> {
+        let state = Self::deferred(context);
+        state.acquire()?;
+        Ok(state)
+    }
+
+    /// Queued submits consume no hardware state until their first publication.
+    pub(crate) fn deferred(context: Arc<G17PLogicalQueueContext>) -> Self {
+        Self { context, word: AtomicU32::new(u32::MAX) }
+    }
+
+    pub(crate) fn acquire(&self) -> Result<u32> {
+        let current = self.word.load(Ordering::Acquire);
+        if current != u32::MAX { return Ok(current); }
+        let Some(candidate) = self.context.work_states.allocate() else {
+            // A concurrent engine may have acquired the last pool slot for
+            // this very submit after our first load. Reuse its installed key.
+            let installed = self.word.load(Ordering::Acquire);
+            return if installed != u32::MAX { Ok(installed) } else { Err(EBUSY) };
+        };
+        if let Err(error) = self.context.tsq.lock().initialize(candidate) {
+            let released = self.context.work_states.release(candidate);
+            debug_assert!(released);
+            return Err(error);
+        }
+        match self.word.compare_exchange(u32::MAX, candidate, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(candidate),
+            Err(installed) => {
+                let released = self.context.work_states.release(candidate);
+                debug_assert!(released);
+                Ok(installed)
+            }
+        }
+    }
+
+    pub(crate) fn word(&self) -> u32 { self.word.load(Ordering::Acquire) }
+
+    pub(crate) fn tsq_gpu_va(&self) -> Result<u64> {
+        let word = self.word();
+        if word == u32::MAX { return Err(EINVAL); }
+        Ok(self.context.tsq_base
+            + u64::from(word & 63) * crate::g17_work_state::TSQ_NODE_STRIDE as u64)
+    }
+
+    /// Reserve only kicks which this publication will expose. In particular,
+    /// do not pre-count an entire ioctl before finite-capacity chunking: its
+    /// first chunk must remain drainable while later chunks await capacity.
+    pub(crate) fn add_submitted_kicks(&self, kicks: u32) -> Result<u32> {
+        self.context.tsq.lock().change_count(self.word(), kicks, true)
+    }
+
+    /// Roll back only a publication proven invisible to firmware. A failure
+    /// after possible publication must retain the count and quarantine owner.
+    pub(crate) fn cancel_unpublished_kicks(&self, kicks: u32) -> Result<u32> {
+        self.context.tsq.lock().change_count(self.word(), kicks, false)
+    }
+
+    /// Aggregate diagnostics only: completions from other engines must not
+    /// stand in for this command's execution or visibility stamp.
+    pub(crate) fn tsq_counters(&self) -> Result<[u32; 2]> {
+        self.context.tsq.lock().counters(self.word())
+    }
+
+    /// Fault-only owner-wide list observation; never a retirement predicate.
+    pub(crate) fn tsq_list_diagnostic(&self) -> Result<(u64, [u64; 2])> {
+        Ok((self.context.tsq_head_gpu_va(), self.context.tsq_head_snapshot()?))
+    }
+
+    pub(crate) fn render_tsq_slot(&self, pair: u8) -> Result<crate::g17_work_state::TsqSlot> {
+        self.context.tsq.lock().render_slots.get_or_assign(pair).ok_or(ENOSPC)
+    }
+
+    pub(crate) fn bind_compute_descriptor(&self, descriptor: &mut [u8]) -> Result {
+        let slot = crate::g17_work_state::TsqSlot::new(0).ok_or(EINVAL)?;
+        if !slot.bind_compute(descriptor, self.tsq_gpu_va()?) { return Err(EINVAL); }
+        Ok(())
+    }
+
+    pub(crate) fn bind_render_descriptors(
+        &self, pair: u8, ta: &mut [u8], fragment: &mut [u8],
+    ) -> Result {
+        let slot = self.render_tsq_slot(pair)?;
+        if !slot.bind_render(ta, fragment, self.tsq_gpu_va()?) { return Err(EINVAL); }
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for G17PWorkStateLease {
+    fn drop(&mut self) {
+        // A stale/double release leaves the newer owner intact.
+        let word = self.word.load(Ordering::Acquire);
+        if word == u32::MAX { return; }
+        let released = self.context.work_states.release(word);
+        debug_assert!(released);
     }
 }
 
@@ -3707,6 +4619,20 @@ impl G17PLogicalQueueContext {
 impl core::ops::Deref for G17PLogicalQueueContext {
     type Target = mmu::T8140ComputeExecutionContext;
     fn deref(&self) -> &Self::Target { &self.execution }
+}
+
+/// T8140 firmware QoS accounting uses a 24 MHz timebase with the zero epoch
+/// adjustments encoded by our HWData. Live accounting-clock snapshots verified
+/// that domain independently of command timestamps. Linux CNTPCT can run at
+/// 1 GHz; raw architectural ticks cannot be mixed with firmware busy times.
+fn g17p_qos_time_from_host(counter: u64, frequency: u64) -> Result<u64> {
+    const FIRMWARE_HZ: u64 = 24_000_000;
+    // CNTFRQ_EL0's implemented frequency field is 32 bits. Bounding it also
+    // keeps the remainder product in u64 without compiler 128-bit division.
+    if frequency == 0 || frequency > u64::from(u32::MAX) { return Err(EINVAL); }
+    let whole = (counter / frequency).checked_mul(FIRMWARE_HZ).ok_or(EOVERFLOW)?;
+    let fraction = (counter % frequency) * FIRMWARE_HZ / frequency;
+    whole.checked_add(fraction).ok_or(EOVERFLOW)
 }
 
 /// QoS has its own native HardwareBufferIDManager, distinct from PB and FList.
@@ -3899,9 +4825,9 @@ impl G17PRenderFlist {
         )?;
         control_inner.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            bytes[..8].copy_from_slice(
-                &g17_initdata::CONTROL_SHARED_INNER_PRESENTED.to_le_bytes(),
-            );
+            // Native updateSubmitInfo increments this submitted-work counter.
+            // A fresh pool has no submitted or completed engine commands.
+            bytes[..8].copy_from_slice(&0u64.to_le_bytes());
             Ok(())
         })?;
         let inner_va = control_inner.iova();
@@ -3984,12 +4910,16 @@ impl G17PRenderFlist {
             return Ok(());
         }
         let page_list_va = self.page_list_va();
-        let shared_image = Self::control_shared_image(
+        let mut shared_image = Self::control_shared_image(
             self.id,
             page_list_va,
             self.run_table_va(),
             self._control_inner.iova(),
         )?;
+        // Only a released pool can be repopulated. Native initializes the
+        // completed counter to the current submitted counter, not zero.
+        let submitted = self.prepare_submitted_operations(0)?.next;
+        put_u64(&mut shared_image, 0x54, submitted);
         // One kernel mapping per object; every write is bounds- and
         // alignment-checked against that object's logical size.
         let write_all = |object: &MappedObject,
@@ -4018,12 +4948,6 @@ impl G17PRenderFlist {
             })?;
             result
         })?;
-        write_all(&self._control_inner, &mut |put| {
-            for at in (0..mmu::UAT_PGSZ).step_by(8) {
-                put(at, if at == 0 { g17_initdata::CONTROL_SHARED_INNER_PRESENTED } else { 0 })?;
-            }
-            Ok(())
-        })?;
         write_all(&self.control_shared, &mut |put| {
             for (index, chunk) in shared_image.chunks(8).enumerate() {
                 let mut word = [0u8; 8];
@@ -4034,6 +4958,32 @@ impl G17PRenderFlist {
         })?;
         core::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    fn prepare_submitted_operations(&self, kicks: u32) -> Result<G17PFlistSubmittedOperation<'_>> {
+        let object = &self._control_inner;
+        let offset = object.object_offset;
+        let size = object.object.size();
+        let vmap = object.object.gem.vmap::<u8>()?;
+        let raw = unsafe {
+            // SAFETY: the VMap covers this owned object; the helper checks
+            // the complete counter range before publication can write it.
+            core::slice::from_raw_parts(vmap.as_ptr(), size)
+        };
+        let next = g17p_flist_submitted_next(raw, offset, kicks).ok_or(ERANGE)?;
+        Ok(G17PFlistSubmittedOperation { vmap, size, offset, next })
+    }
+
+    fn completion_counters(&self) -> Result<[u64; 2]> {
+        let submitted = self.prepare_submitted_operations(0)?.next;
+        let vmap = self.control_shared.object.gem.vmap::<u8>()?;
+        let mut bytes = [0u8; 8];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            // SAFETY: state+54..5c is within this retained control object.
+            *byte = unsafe { core::ptr::read_volatile(vmap.as_ptr().add(
+                self.control_shared.object_offset + 0x54 + i)) };
+        }
+        Ok([submitted, u64::from_le_bytes(bytes)])
     }
 
     pub(crate) fn id(&self) -> u16 { self.id }
@@ -4085,25 +5035,6 @@ impl G17PRenderFlist {
             total_pages: read_u32(0x2c)?,
         })
     }
-
-    fn store_uma_state(&self, state: g17_submission::G17PUmaPagePoolState) -> Result {
-        let vmap = self.control_shared.object.gem.vmap::<u8>()?;
-        for (offset, value) in [
-            (0x20, state.counter_a),
-            (0x24, state.counter_b),
-            (0x28, state.empty),
-            (0x2c, state.total_pages),
-        ] {
-            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-                // SAFETY: these fields are within the retained control
-                // object. The caller has retired TA, 3D and FList references
-                // before transferring the physical pool slot to another owner.
-                unsafe { core::ptr::write_volatile(vmap.as_mut_ptr().add(offset + index), byte) };
-            }
-        }
-        core::sync::atomic::fence(Ordering::SeqCst);
-        Ok(())
-    }
 }
 
 /// Queue-owned mappings retained from SKSM registration through completion.
@@ -4141,6 +5072,12 @@ pub(crate) struct G17PComputeDescriptorStorage {
     queue_graph: MappedObject,
     queue_context_low: MappedObject,
     queue_context_high: MappedObject,
+    /// Per-publication tag-15/16/14 channel-command bodies, one
+    /// `G17P_COMPUTE_RECORD_SLOT_STRIDE` slot per publication in rotation.
+    records: MappedObject,
+    /// Item-ring producer after each slot's last publication (its tag-16),
+    /// or `None` for a slot never used.
+    record_slot_end: [Option<u32>; crate::g17_queue_limits::COMPUTE_RECORD_SLOTS],
     /// Host-only cursor: item-ring slots below this (mod the ring count) have
     /// been zeroed since the firmware consumed them. Recycling is what makes
     /// submission depth unbounded -- see `recycle_consumed_ring_slots`.
@@ -4200,8 +5137,6 @@ pub(crate) struct G17PComputeRingState {
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct G17PComputeSubmissionSnapshot {
     pub(crate) descriptor: u64,
-    pub(crate) cdm_base: Option<u64>,
-    pub(crate) cdm_terminator: u64,
     pub(crate) selector: u32,
     pub(crate) context: u32,
     /// B1 selector-3 resource-reclaim inputs. These are retained DRAM bytes,
@@ -4349,42 +5284,6 @@ struct G17PRenderCommandGeneration {
 
 #[cfg(not(test))]
 impl G17PRenderCommandGeneration {
-    fn prepare_vm_rebind(
-        &mut self,
-        vm: &mmu::Vm,
-    ) -> Result<(mmu::KernelMapping, G17PRenderUserAliases, mmu::KernelMapping)> {
-        let Self {
-            render_state,
-            render_layout,
-            render_user_aliases,
-            fragment_status_low,
-            fragment_status,
-            ..
-        } = self;
-        let render_state_iova = render_state.iova();
-        let render_state_mapping = render_state.object.map_at(
-            vm,
-            render_state_iova,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            false,
-        ).map_err(|error| {
-            pr_err!("G17P render rebind: vm={} alias=alternate-render-state addr={:#x} size={:#x} failed ({:?})\n",
-                vm.id(), render_state_iova, render_state.object.size(), error);
-            error
-        })?;
-        let aliases = render_user_aliases.remap(render_state, vm, render_layout)?;
-        let status_iova = fragment_status_low.iova();
-        let status_mapping = fragment_status.map_alias_at(
-            vm,
-            status_iova,
-            mmu::PROT_GPU_SHARED_RW,
-        ).map_err(|error| {
-            pr_err!("G17P render rebind: vm={} alias=alternate-fragment-status addr={:#x} size={:#x} failed ({:?})\n",
-                vm.id(), status_iova, fragment_status.object.size(), error);
-            error
-        })?;
-        Ok((render_state_mapping, aliases, status_mapping))
-    }
 }
 
 #[cfg(not(test))]
@@ -4460,40 +5359,6 @@ impl G17PRenderUserAliases {
             )
     }
 
-    fn remap(
-        &self,
-        render_state: &mut MappedObject,
-        vm: &mmu::Vm,
-        render_layout: &G17PRenderStateLayout,
-    ) -> Result<Self> {
-        let deflake = render_state.object.map_range_into_range(
-            vm,
-            G17P_RENDER_STATE_DEFLAKE..G17P_RENDER_STATE_DEFLAKE + mmu::UAT_PGSZ,
-            self.deflake.iova()..self.deflake.iova() + mmu::UAT_PGSZ as u64,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            false,
-        ).map_err(|error| {
-            pr_err!("G17P render rebind: vm={} alias=deflake addr={:#x} size={:#x} failed ({:?})\n",
-                vm.id(), self.deflake.iova(), self.deflake.size(), error);
-            error
-        })?;
-        let aux_fb = render_state.object.map_range_into_range(
-            vm,
-            render_layout.aux_fb
-                ..render_layout.aux_fb + G17P_RENDER_STATE_AUX_FB_SIZE,
-            self.aux_fb.iova()
-                ..self.aux_fb.iova() + G17P_RENDER_STATE_AUX_FB_SIZE as u64,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            false,
-        ).map_err(|error| {
-            pr_err!("G17P render rebind: vm={} alias=aux-fb addr={:#x} size={:#x} failed ({:?})\n",
-                vm.id(), self.aux_fb.iova(), self.aux_fb.size(), error);
-            error
-        })?;
-        Ok(Self { deflake, aux_fb })
-    }
 }
 
 #[cfg(not(test))]
@@ -4636,6 +5501,156 @@ fn prepare_render_sksm_vm_alias(
     Ok((alias, Some(mapping)))
 }
 
+/// A cold graph whose allocation and descriptor encoding are complete, but whose
+/// pool aliases and device-global PBDesc have not been installed. Dropping this
+/// transaction removes only its tentative aliases and backing. The caller must
+/// retain its pair/session reservation until installation or cancellation.
+#[cfg(not(test))]
+pub(crate) struct G17PUninstalledRenderGraph {
+    // Remove tentative aliases before releasing the graph they name.
+    driver_aliases: KVec<mmu::KernelMapping>,
+    storage: G17PUserRenderStorage,
+    vm: mmu::Vm,
+    had_retained_sksm_backing: bool,
+    // Drop this after all graph mappings and the VM reference. The session
+    // preparation lease separately excludes in-place root/table resets.
+    _uat: Arc<KBox<mmu::Uat>>,
+}
+
+#[cfg(not(test))]
+impl G17PUninstalledRenderGraph {
+    pub(crate) fn into_storage(self) -> G17PUserRenderStorage { self.storage }
+
+    /// An aborted build must return the retained ring of an installed QID.
+    /// Fresh backing remains with the aborted graph and is simply dropped.
+    pub(crate) fn reclaim_retained_sksm_backing(
+        &mut self, destination: &mut Option<G17PRenderSksmBacking>,
+    ) -> Result {
+        if self.had_retained_sksm_backing {
+            if destination.is_some() { return Err(EIO); }
+            *destination = Some(self.storage.take_sksm_backing()?);
+            self.had_retained_sksm_backing = false;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn build(
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        uat: Arc<KBox<mmu::Uat>>,
+        parameter_metrics: G17PPmPageMetricsBinding,
+        queue_pair: G17PRenderQueuePair,
+        execution_context: Option<Arc<crate::g17_resources::G17PLogicalQueueContext>>,
+        descriptor_context_id: u16,
+        // TTBAT context the caller has already bound this VM to, for the
+        // ordinary job path. `None` is the driver-owned bootstrap render,
+        // which acquires its own binding below.
+        render_root_slot: Option<u8>,
+        command: &g17_uapi::TranslatedRenderCommand,
+        num_clusters: u32,
+        command_buffer_state_words: [u32; 2],
+        submission_ordinal: u64,
+        parameter_manager_generation: Option<u64>,
+        retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
+    ) -> Result<Self> {
+        // The caller reserved an idle physical pair and pinned its session.
+        // Validate the context before changing this pair's private VM mappings.
+        //
+        // `flush_t8140_vm_contexts` used to be the first place the condition
+        // was tested, deep inside `finish` -- by which point the render pool
+        // had been cleared unconditionally and the job-context aliases had been
+        // appended to the VM. Its failure path cannot undo either: its idea of
+        // undoing the pool is to clear it a second time, and it removes no
+        // aliases. So a VM with no TTBAT context holding its root was left
+        // worse off by every attempt, and a client retrying went round that
+        // loop once per try.
+        //
+        // The lookup reads only, so running it here costs one scan of 64 words
+        // and turns the whole stage into a clean refusal.
+        if let Err(error) = uat.require_t8140_vm_context(vm) {
+            // Sticky, and deliberately recorded on the VM rather than returned
+            // alone: with no context holding this VM's root, every later
+            // submission against it is undispatchable -- the firmware accepts
+            // the kick, the GPU never runs it, no completion record is ever
+            // written, and the client waits out a full timeout before the
+            // session is quarantined. Failing those submissions honestly turns
+            // a desktop-wide wedge into one application failing to start.
+            vm.status().record(error.to_errno());
+            dev_err!(
+                dev.as_ref(),
+                "G17P render: VM {} has no TTBAT context holding its root ({:?}); refusing render storage before any mapping is touched, and failing this VM's later submissions\n",
+                vm.id(),
+                error,
+            );
+            return Err(error);
+        }
+        vm.clear_render_pool_mappings(queue_pair.slot());
+        uat.install_t8140_job_context_aliases(vm)?;
+        let command = *command;
+        let owner_pid = match execution_context.as_ref() {
+            Some(context) => context.owner_pid,
+            None => u32::try_from(kernel::current!().group_leader().pid())
+                .map_err(|_| EOVERFLOW)?,
+        };
+        dev_info!(
+            dev.as_ref(),
+            "G17P render channel owner: process pid={}\n",
+            owner_pid
+        );
+        let render_flist = Arc::new(
+            G17PRenderFlist::new(dev, &uat, queue_pair.slot())?,
+            GFP_KERNEL,
+        )?;
+        let mut driver_aliases = KVec::with_capacity(1, GFP_KERNEL)?;
+        driver_aliases.push(render_flist.map_user_backing(vm)?, GFP_KERNEL)?;
+        let (command_context, render_root_slot) = if let Some(context) = execution_context {
+            if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
+                return Err(EINVAL);
+            }
+            (
+                G17PRenderCommandContext::Job(context),
+                render_root_slot.ok_or(EINVAL)?,
+            )
+        } else {
+            let render_bind = uat.bind(vm)?;
+            let slot = u8::try_from(render_bind.slot()).map_err(|_| EINVAL)?;
+            (
+                G17PRenderCommandContext::Bootstrap(
+                    uat.allocate_t8140_app_context(&render_bind)?,
+                ),
+                slot,
+            )
+        };
+        dev_info!(
+            dev.as_ref(),
+            "G17P render app-GART allocation: command context {} descriptor context {} root slot {}\n",
+            command_context.context_id(),
+            descriptor_context_id,
+            render_root_slot,
+        );
+        let had_retained_sksm_backing = retained_sksm_backing.is_some();
+        let storage = G17PUserRenderStorage::new(
+            dev,
+            &uat,
+            parameter_metrics,
+            queue_pair,
+            vm,
+            &command,
+            num_clusters,
+            owner_pid,
+            command_context,
+            descriptor_context_id,
+            render_root_slot,
+            render_flist,
+            command_buffer_state_words,
+            submission_ordinal,
+            parameter_manager_generation,
+            retained_sksm_backing,
+        )?;
+        Ok(Self { driver_aliases, storage, vm: vm.clone(), had_retained_sksm_backing, _uat: uat })
+    }
+}
+
 #[cfg(not(test))]
 pub(crate) struct G17PUserRenderStorage {
     /// Bounded physical queue ownership for this job.  Queue records, tag-15,
@@ -4648,28 +5663,27 @@ pub(crate) struct G17PUserRenderStorage {
     /// second AGXContextIDManager allocation is a refcounted lookup of this
     /// same GART, not a second hardware context.
     _command_context: Option<G17PRenderCommandContext>,
-    /// Logical queue state survives physical graph/pair selection. Kept even
-    /// when release_client_context drops a retired graph's UAT root lease.
+    /// Logical queue state survives physical graph/pair selection. The
+    /// scheduler page this graph's kicks name; freed with the graph once its
+    /// owner's scheduler-state release has been acknowledged.
     logical_channel_control: Option<Arc<G17PClChannelControl>>,
     logical_qos: Option<Arc<G17PLogicalQosLease>>,
     /// Hardware context carried by this queue's submitted TA/3D descriptors.
-    /// Native allocates this independently of the command-GART context.
+    /// The ordinary path uses the logical queue's command-GART context here too.
     descriptor_context_id: u16,
     /// A fresh graph must update the physical channel's cached GART context
     /// even when it reuses an already-installed QID at a nonzero ordinal.
-    /// Cleared only after the first pair using this graph completes.
+    /// Cleared after successful publication and tracker installation. The tracker
+    /// separately retains the old root until the replacement pair retires.
     context_update_pending: bool,
     /// Scheduler/QoS owner changed independently of QID installation. Native
     /// tag-15 +0x52 carries this transition, including retained graph reuse.
     qos_update_pending: bool,
     /// TTBAT context this render's VM is bound to (`VmBind::slot`).
     ///
-    /// Distinct from `descriptor_context_id`: the descriptors execute in the
-    /// queue's own application context, while the fragment MCache write-range
-    /// selector names the bound root. With one bindable context this was
-    /// always 1; with a bind pool a concurrent second client is elsewhere and
-    /// emitting the wrong one would point its write ranges at another
-    /// client's page tables.
+    /// The ordinary path derives this and `descriptor_context_id` from the same
+    /// logical execution context. Keep the MCache selector tied to that root when
+    /// a retained graph is retargeted to another logical queue.
     render_root_slot: u8,
     /// Complete USC allocator state for this retained context-domain graph.
     /// It must travel through retirement/cache handoff with the descriptors;
@@ -4686,6 +5700,12 @@ pub(crate) struct G17PUserRenderStorage {
     /// Native advances through descriptor arrays instead of rewriting the
     /// command at the address firmware and RCE have already consumed.
     descriptor_ordinal: u64,
+    /// Opt-in coherent native idle/seed snapshot, TA then fragment.
+    scratch_handoff: Option<[Option<u64>; 2]>,
+    render_publication: G17PRenderPublicationState,
+    // Reused scratch for a reserved entry's explicit dependency snapshot.
+    // The preparer temporarily owns it with this graph; no per-submit alloc.
+    sksm_dependency_buffer: Option<KBox<crate::g17_manager::G17PRenderDependencies>>,
     /// Entries-only diagnostic mirror of the descriptor-embedded 3D RCE
     /// programs. Native KSM never binds this incomplete mirror.
     fragment_rce: MappedObject,
@@ -4712,6 +5732,8 @@ pub(crate) struct G17PUserRenderStorage {
     /// transition. Empty when this VM already retained the exact pair.
     sksm_vm_aliases: KVec<mmu::KernelMapping>,
     graph: MappedObject,
+    /// CPU-WB, UAT shared-attribute ConfigUpdate records, retained with this graph.
+    config_updates: MappedObject,
     support: MappedObject,
     /// EventControl record and exact submitted-kick target owned by the
     /// currently published TA group. Queue cursors alone do not release this
@@ -4724,14 +5746,17 @@ pub(crate) struct G17PUserRenderStorage {
     /// generation, so switching is a set of pointer/value swaps and never an
     /// allocation in the publication or retirement path.
     render_command_generation: u8,
-    reachability_cache: G17PRenderReachabilityCache,
+    /// Boxed: both per-generation arrays scale with G17P_RENDER_MAX_IN_FLIGHT,
+    /// and this storage is built and moved by value on the publication path's
+    /// kernel stack (new_user_render_storage -> begin_translated_render).
+    reachability_cache: KBox<G17PRenderReachabilityCache>,
     last_reachability_cache_hit: bool,
     /// Every retained command generation other than the selected one. A
     /// firmware-owned render keeps its render state, aliases and status page
     /// while later kicks on the same pair are staged into other generations.
     alternate_render_commands: KVec<KBox<G17PRenderCommandGeneration>>,
     command_generation_count: usize,
-    render_command_ordinals: [Option<u64>; G17P_RENDER_MAX_IN_FLIGHT],
+    render_command_ordinals: KBox<[Option<u64>; G17P_RENDER_MAX_IN_FLIGHT]>,
     render_tvb: Option<G17PRenderTvb>,
     render_user_aliases: G17PRenderUserAliases,
     /// Native retains one render-target-memory owner. TMAP/HMTA rotate through
@@ -4742,6 +5767,9 @@ pub(crate) struct G17PUserRenderStorage {
     /// Native's persistent GPU-only discard object at 0x1000180000.
     discard: Option<MappedObject>,
     parameter_management: Option<G17PParameterManagement>,
+    /// Page-metrics entry the graph above was encoded against; released
+    /// with this storage.
+    parameter_metrics_lease: Option<G17PPmPageMetricsLease>,
     /// Captured by the TA HardwareBufferID lease allocator, not the submit ordinal.
     parameter_buffer_token: u64,
     /// USC FList generation the next staged group publishes at tag-15 `+0x3e`.
@@ -4768,9 +5796,6 @@ pub(crate) struct G17PUserRenderStorage {
     /// reservation. Every restaged command pair keeps this predecessor while
     /// receiving fresh, consecutive 3D/TA current IDs.
     lifecycle_predecessor: u32,
-    /// CPU-only staging; firmware sees only the final `descriptors` copy.
-    /// Keep scratch in cached RAM, without a GEM object or GPU mapping.
-    staging_descriptors: Option<KVec<u8>>,
 }
 
 #[cfg(not(test))]
@@ -4781,12 +5806,35 @@ enum G17PRenderCommandContext {
 
 #[cfg(not(test))]
 impl G17PRenderCommandContext {
+    fn mcache_hwsid(&self) -> Result<u32> {
+        match self {
+            Self::Bootstrap(_) => Ok(crate::g17_config::RENDER_MCACHE_HWSID),
+            Self::Job(context) if context.render_mcache_hwsid != 0 => Ok(context.render_mcache_hwsid),
+            Self::Job(_) => Err(ENOSPC),
+        }
+    }
+
+    fn generation(&self) -> u8 {
+        match self {
+            Self::Bootstrap(context) => context.generation(),
+            Self::Job(context) => context.generation(),
+        }
+    }
+
     fn context_id(&self) -> u32 {
         match self {
             Self::Bootstrap(context) => context.context_id(),
             Self::Job(context) => context.context_id(),
         }
     }
+}
+
+/// Admission needs only queue cursors, never TSQ ownership or timestamps.
+#[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G17PRenderQueueIndices {
+    pub(crate) tiling: g17_completion::QueueIndices,
+    pub(crate) fragment: g17_completion::QueueIndices,
 }
 
 #[cfg(not(test))]
@@ -4811,8 +5859,8 @@ pub(crate) struct G17PUserRenderQueueState {
     pub(crate) fragment_timestamps: [u64; 2],
 }
 
-/// The install-relevant header of one render tag-15 ConfigUpdate, read back
-/// from the bytes the driver actually published.
+/// The install-relevant fields of one render tag-15 ConfigUpdate. The direct
+/// writer returns its exact final store values; diagnostic paths decode bytes.
 ///
 /// The compute firmware RE says the per-queue slot `0x127628 + qid*0x28` is
 /// written -- and the `0x40` KTrace receipt emitted -- only when `+0x1a` is
@@ -4827,7 +5875,8 @@ pub(crate) struct G17PRenderConfigUpdateHeader {
     pub(crate) install: u16,
     pub(crate) priority: u16,
     pub(crate) data_master: u16,
-    pub(crate) graphics: u16,
+    pub(crate) scratch_seed_valid: u32,
+    pub(crate) scratch_seed: u64,
     pub(crate) context_id: u16,
     pub(crate) flist_pointer: u64,
     pub(crate) flist_generation: u64,
@@ -4839,6 +5888,147 @@ pub(crate) struct G17PRenderConfigUpdateHeader {
     pub(crate) parameter_buffer_token: u64,
     pub(crate) parameter_buffer_id: u32,
     pub(crate) parameter_buffer_bit: u32,
+}
+
+/// Write the final ConfigUpdate directly into its mapped destination. Native
+/// fills the selected command slot in place; do not stage a second byte image
+/// or read WC memory back to recover values the host already owns. The returned
+/// fields are the very same values used by these stores, scoped to this write.
+/// Legacy encoders/decoder remain independent byte-equivalence references.
+/// Semantic final fields, not an encoded record image. Both TA and FRG
+/// retain these exact values from staging through synchronous publication.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PRenderConfigUpdateFields {
+    header: G17PRenderConfigUpdateHeader,
+    owner_pid: u32,
+    qos_update: u32,
+}
+
+const G17P_RENDER_CONFIG_POOL_SIZE: usize = 0x8000;
+const G17P_RENDER_CONFIG_FRAGMENT_BASE: usize = 0x4000;
+
+fn g17p_render_config_pool_reachable(
+    address: u64, size: usize, cpu_wc: bool, mut covers: impl FnMut(u64, u64) -> bool,
+) -> bool {
+    size == G17P_RENDER_CONFIG_POOL_SIZE && !cpu_wc && covers(address, size as u64)
+}
+
+fn g17p_render_config_mapping_changed(address: u64, size: u64, change: core::ops::Range<u64>) -> bool {
+    address.checked_add(size).map_or(true, |end| {
+        size == 0 || change.start < end && address < change.end
+    })
+}
+
+fn g17p_render_config_offset(tiling: bool, ordinal: u64) -> usize {
+    (if tiling { 0 } else { G17P_RENDER_CONFIG_FRAGMENT_BASE })
+        + g17p_render_descriptor_slot(ordinal) * G17P_RENDER_OPTIONAL_STRIDE
+}
+
+fn prepare_g17p_render_config_update(
+    stage: g17_submission::G17PColdOpeningStage,
+    addresses: g17_submission::G17PColdOpeningOptionalAddresses,
+    ordinal: u64, flist_generation: u64, bias_generation: bool,
+    queue_id: u16, partner_queue_id: u16, qos_id: u16, install: u16,
+    context_id: u16, context_update: bool, qos_update: bool,
+    scratch_handoff: Option<Option<u64>>,
+) -> G17PRenderConfigUpdateFields {
+    let tiling = stage == g17_submission::G17PColdOpeningStage::Tiling;
+    let override_dm = if tiling { crate::g17_config::RENDER_TA_DM }
+        else { crate::g17_config::RENDER_3D_DM };
+    let generation = (ordinal as u16).wrapping_add(u16::from(bias_generation));
+    let (scratch_seed_valid, scratch_seed) = match scratch_handoff {
+        Some(seed) => (u32::from(seed.is_some()), seed.unwrap_or(0)),
+        None => (1, u64::from(generation) | (u64::from(generation << 8) << 32)),
+    };
+    let header = G17PRenderConfigUpdateHeader {
+        selector: 0x0f,
+        entry_low: addresses.context_scratch,
+        entry_high: addresses.firmware_scratch,
+        queue_id,
+        install: if ordinal == 0 { install } else { 0 },
+        priority: u16::from(g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY),
+        data_master: if override_dm == 0xff { u16::from(!tiling) } else { override_dm as u16 },
+        scratch_seed_valid, scratch_seed, context_id,
+        flist_pointer: addresses.usc_priv_mem_flist,
+        flist_generation,
+        flist_id: addresses.usc_freelist_hardware_buffer_id,
+        scheduler_state: addresses.channel_control,
+        field_56: qos_id,
+        context_update: u16::from(context_update),
+        parameter_buffer_object: if tiling { addresses.tiling_shared_object } else { 0 },
+        parameter_buffer_token: if tiling { addresses.parameter_buffer_token } else { u64::MAX },
+        parameter_buffer_id: if tiling { addresses.ta_hardware_buffer_id } else { u32::MAX },
+        parameter_buffer_bit: if tiling { u32::from(partner_queue_id) } else { u32::MAX },
+    };
+    G17PRenderConfigUpdateFields { header, owner_pid: addresses.owner_pid,
+        qos_update: u32::from(ordinal == 0 || qos_update) }
+}
+
+fn store_g17p_render_config_update(fields: &G17PRenderConfigUpdateFields, out: &mut [u8])
+    -> Result<G17PRenderConfigUpdateHeader>
+{
+    if out.len() != g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE { return Err(EINVAL); }
+    let header = fields.header;
+    // Firmware record bases/strides are eight-byte aligned. Pack fields into
+    // aligned words so strict-align kernel codegen emits wide stores, instead
+    // of scattering each unaligned wire field into individual byte stores.
+    // There is no encoded staging image. The fallback supports arbitrary
+    // caller slice alignment and is exercised against the independent codec.
+    let aligned = out.as_ptr() as usize & 7 == 0;
+    macro_rules! store {
+        ($offset:expr, $value:expr) => {{
+            let value: u64 = $value;
+            if aligned {
+                // SAFETY: exact extent was checked before any store; every
+                // offset below is a multiple of eight inside that extent.
+                // The alignment check covers the base, and &mut excludes
+                // other CPU references during the write. Firmware publication
+                // and its barriers remain the caller's responsibility.
+                unsafe { out.as_mut_ptr().add($offset).cast::<u64>().write(value.to_le()); }
+            } else {
+                put_u64(out, $offset, value);
+            }
+        }};
+    }
+    store!(0x00, u64::from(header.selector));
+    store!(0x08, u64::from(header.entry_low));
+    store!(0x10, u64::from(header.entry_high));
+    store!(0x18, (u64::from(header.queue_id) & 0xffff) | ((u64::from(header.install) & 0xffff) << 16) | ((u64::from(header.priority) & 0xffff) << 48));
+    store!(0x20, ((u64::from(header.data_master) & 0xffff) << 16) | ((u64::from(header.scratch_seed_valid) & 0xffff) << 48));
+    store!(0x28, ((u64::from(header.scratch_seed_valid) >> 16) & 0xffff) | ((u64::from(header.scratch_seed) & 0xffffffffffff) << 16));
+    store!(0x30, ((u64::from(header.scratch_seed) >> 48) & 0xffff) | ((u64::from(header.context_id) & 0xffff) << 16) | ((u64::from(header.flist_pointer) & 0xffff) << 48));
+    store!(0x38, ((u64::from(header.flist_pointer) >> 16) & 0xffffffffffff) | ((u64::from(header.flist_generation) & 0xffff) << 48));
+    store!(0x40, ((u64::from(header.flist_generation) >> 16) & 0xffffffffffff) | ((u64::from(header.flist_id) & 0xffff) << 48));
+    store!(0x48, ((u64::from(header.flist_id) >> 16) & 0xffff) | ((u64::from(header.scheduler_state) & 0xffffffffffff) << 16));
+    store!(0x50, ((u64::from(header.scheduler_state) >> 48) & 0xffff) | ((u64::from(fields.qos_update) & 0xffffffff) << 16) | ((u64::from(header.field_56) & 0xffff) << 48));
+    store!(0x58, ((u64::from(fields.owner_pid) & 0xffffffff) << 16) | ((u64::from(g17_submission::G17P_NATIVE_RENDER_POLICY) & 0xffff) << 48));
+    store!(0x60, ((u64::from(header.context_update) & 0xffff) << 16) | ((u64::from(1u16) & 0xffff) << 48));
+    store!(0x68, (u64::from(header.parameter_buffer_object) & 0xffff) << 48);
+    store!(0x70, ((u64::from(header.parameter_buffer_object) >> 16) & 0xffffffffffff) | ((u64::from(header.parameter_buffer_token) & 0xffff) << 48));
+    store!(0x78, ((u64::from(header.parameter_buffer_token) >> 16) & 0xffffffffffff) | ((u64::from(header.parameter_buffer_id) & 0xffff) << 48));
+    store!(0x80, ((u64::from(header.parameter_buffer_id) >> 16) & 0xffff) | ((u64::from(header.parameter_buffer_bit) & 0xffffffff) << 16));
+    store!(0x88, 0);
+    store!(0x90, 0);
+    store!(0x98, 0);
+    store!(0xa0, 0);
+    store!(0xa8, 0);
+    store!(0xb0, 0);
+    store!(0xb8, 0);
+    Ok(header)
+}
+
+fn write_g17p_render_config_update(
+    stage: g17_submission::G17PColdOpeningStage,
+    addresses: g17_submission::G17PColdOpeningOptionalAddresses,
+    ordinal: u64, flist_generation: u64, bias_generation: bool,
+    queue_id: u16, partner_queue_id: u16, qos_id: u16, install: u16,
+    context_id: u16, context_update: bool, qos_update: bool,
+    scratch_handoff: Option<Option<u64>>, out: &mut [u8],
+) -> Result<G17PRenderConfigUpdateHeader> {
+    let fields = prepare_g17p_render_config_update(stage, addresses, ordinal,
+        flist_generation, bias_generation, queue_id, partner_queue_id, qos_id,
+        install, context_id, context_update, qos_update, scratch_handoff);
+    store_g17p_render_config_update(&fields, out)
 }
 
 fn decode_g17p_render_config_update(raw: &[u8]) -> Option<G17PRenderConfigUpdateHeader> {
@@ -4865,7 +6055,8 @@ fn decode_g17p_render_config_update(raw: &[u8]) -> Option<G17PRenderConfigUpdate
         install: u16_at(0x1a),
         priority: u16_at(0x1e),
         data_master: u16_at(0x22),
-        graphics: u16_at(0x26),
+        scratch_seed_valid: u32_at(0x26),
+        scratch_seed: u64_at(0x2a),
         context_id: u16_at(0x32),
         flist_pointer: u64_at(0x36),
         flist_generation: u64_at(0x3e),
@@ -4890,6 +6081,9 @@ struct G17PRenderItemPlan {
     prefix_end: u32,
     final_end: u32,
     capacity: u32,
+    prefix_count: u32,
+    config_present: bool,
+    tag16: bool,
 }
 
 impl G17PRenderItemPlan {
@@ -4921,7 +6115,36 @@ impl G17PRenderItemPlan {
                 prefix_end = producer;
             }
         }
-        Some(Self { base, count, prefix_end, final_end: producer, capacity })
+        Some(Self { base, count, prefix_end, final_end: producer, capacity,
+            prefix_count: 2, config_present: true, tag16 })
+    }
+
+    /// Native append plan from the actual committed lane cursor. No ordinal
+    /// multiplication, padding pointer or NOP hides an omitted configuration.
+    fn from_cursor(base: u32, config_present: bool, tag16: bool) -> Option<Self> {
+        let capacity = Self::CAPACITY;
+        let prefix_count = 1 + u32::from(config_present);
+        let count = prefix_count + 1 + u32::from(tag16);
+        if base >= capacity { return None; }
+        Some(Self { base, count, prefix_count, config_present, tag16, capacity,
+            prefix_end: (base + prefix_count) % capacity,
+            final_end: (base + count) % capacity })
+    }
+
+    /// Preflight the entire append before any live pointer or cursor store.
+    fn validate_items(self, graph: &[u8], ring_offset: usize, first_item: u32,
+        byte_count: usize) -> Option<()> {
+        if self.capacity == 0 || self.base >= self.capacity || byte_count % 8 != 0
+            || first_item.checked_add(u32::try_from(byte_count / 8).ok()?)? > self.count
+        { return None; }
+        let ring_len = usize::try_from(self.capacity).ok()?.checked_mul(8)?;
+        graph.get(ring_offset..ring_offset.checked_add(ring_len)?)?;
+        for index in 0..byte_count / 8 {
+            let slot = ((u64::from(self.base) + u64::from(first_item) + index as u64)
+                % u64::from(self.capacity)) as usize;
+            g17p_live_word_bounds(graph, ring_offset.checked_add(slot.checked_mul(8)?)?, 8).ok()?;
+        }
+        Some(())
     }
 
     /// Copy only this group's requested item pointers. Check the complete
@@ -4938,18 +6161,103 @@ impl G17PRenderItemPlan {
         {
             return None;
         }
-        let ring_len = usize::try_from(self.capacity).ok()?.checked_mul(8)?;
-        let ring_end = ring_offset.checked_add(ring_len)?;
-        // Validate the whole advertised ring before either copy. A bad range
-        // cannot leave half a wrapped group behind.
-        let ring = graph.get_mut(ring_offset..ring_end)?;
-        let slot = ((u64::from(self.base) + u64::from(first_item))
-            % u64::from(self.capacity)) as usize;
-        let start = slot.checked_mul(8)?;
-        let first_len = items.len().min(ring_len.checked_sub(start)?);
-        ring[start..start + first_len].copy_from_slice(&items[..first_len]);
-        ring[..items.len() - first_len].copy_from_slice(&items[first_len..]);
+        self.validate_items(graph, ring_offset, first_item, items.len())?;
+        for (index, item) in items.chunks_exact(8).enumerate() {
+            let slot = ((u64::from(self.base) + u64::from(first_item) + index as u64)
+                % u64::from(self.capacity)) as usize;
+            let at = ring_offset + slot * 8;
+            let value = u64::from_le_bytes(item.try_into().expect("exact eight-byte ring pointer"));
+            g17p_live_write_u64(graph, at, value).expect("prevalidated ring pointer");
+        }
         Some(())
+    }
+}
+
+/// Fields compared as durable installed state. Transient update requests
+/// still force a record, but clearing such a request is not itself a change.
+fn g17p_render_config_identity(mut fields: G17PRenderConfigUpdateFields)
+    -> G17PRenderConfigUpdateFields
+{
+    fields.header.install = 0;
+    fields.header.context_update = 0;
+    fields.header.scratch_seed_valid = 0;
+    fields.header.scratch_seed = 0;
+    fields.qos_update = 0;
+    fields
+}
+
+fn g17p_render_config_required(previous: Option<G17PRenderConfigUpdateFields>,
+    fields: G17PRenderConfigUpdateFields) -> bool
+{
+    fields.header.install != 0 || fields.header.context_update != 0
+        || fields.header.scratch_seed_valid != 0 || fields.qos_update != 0
+        || previous.map(g17p_render_config_identity) != Some(g17p_render_config_identity(fields))
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PRenderPublicationPlan {
+    ordinal: u64,
+    lanes: [G17PRenderItemPlan; 2],
+    fields: [G17PRenderConfigUpdateFields; 2],
+}
+
+#[derive(Default, Clone)]
+struct G17PRenderPublicationState {
+    recovery_generation: u64,
+    cursors: [u32; 2],
+    installed: [Option<G17PRenderConfigUpdateFields>; 2],
+    pending: Option<G17PRenderPublicationPlan>,
+    published: Option<G17PRenderPublicationPlan>,
+}
+
+impl G17PRenderPublicationState {
+    /// An accepted recovery invalidates firmware binding knowledge, not the
+    /// owned ring positions. A cross-generation pending transaction must be
+    /// recovered with its owners intact rather than silently replanned.
+    fn update_recovery_generation(&mut self, generation: u64) -> bool {
+        if self.recovery_generation == generation { return true; }
+        if self.pending.is_some() { return false; }
+        self.installed = [None; 2];
+        self.recovery_generation = generation;
+        true
+    }
+
+    fn prepare(&mut self, ordinal: u64, fields: [G17PRenderConfigUpdateFields; 2],
+        tag16: bool) -> Option<G17PRenderPublicationPlan>
+    {
+        if ordinal >= G17P_RETAINED_RENDER_ORDINALS { return None; }
+        if let Some(pending) = self.pending {
+            return (pending.ordinal == ordinal && pending.fields == fields
+                && pending.lanes[0].tag16 == tag16).then_some(pending);
+        }
+        if self.published.is_some_and(|p| p.ordinal.checked_add(1) != Some(ordinal)) {
+            return None;
+        }
+        let lanes = [
+            G17PRenderItemPlan::from_cursor(self.cursors[0], g17p_render_config_required(self.installed[0], fields[0]), tag16)?,
+            G17PRenderItemPlan::from_cursor(self.cursors[1], g17p_render_config_required(self.installed[1], fields[1]), tag16)?,
+        ];
+        let pending = G17PRenderPublicationPlan { ordinal, lanes, fields };
+        self.pending = Some(pending);
+        Some(pending)
+    }
+
+    fn current(&self, ordinal: u64) -> Option<G17PRenderPublicationPlan> {
+        self.pending.filter(|p| p.ordinal == ordinal)
+            .or_else(|| self.published.filter(|p| p.ordinal == ordinal))
+    }
+
+    /// Called only after both outer limits have been authorized. A failed
+    /// prepare, map, KSM encode or partial outer transaction never calls this.
+    fn commit(&mut self, ordinal: u64) -> bool {
+        let Some(plan) = self.pending.filter(|p| p.ordinal == ordinal) else { return false; };
+        self.cursors = [plan.lanes[0].final_end, plan.lanes[1].final_end];
+        for lane in 0..2 {
+            if plan.lanes[lane].config_present { self.installed[lane] = Some(plan.fields[lane]); }
+        }
+        self.published = Some(plan);
+        self.pending = None;
+        true
     }
 }
 
@@ -5001,9 +6309,7 @@ impl G17PEventControlKick {
             return None;
         }
         let slot_offset = G17P_RENDER_POOL_A_SLOTS.checked_add(record_index.checked_mul(4)?)?;
-        let previous = u32::from_le_bytes(
-            support.get(slot_offset..slot_offset.checked_add(4)?)?.try_into().ok()?,
-        );
+        let previous = g17p_live_read_u32(support, slot_offset).ok()?;
         Some(Self { slot_offset, next: previous.wrapping_add(1) })
     }
 
@@ -5014,9 +6320,9 @@ impl G17PEventControlKick {
         let kick = Self::prepare(support, record_index)?;
         let record_offset = G17P_RENDER_POOL_A.checked_add(record_index.checked_mul(0x100)?)?;
         let record = support.get(record_offset..record_offset.checked_add(0x98)?)?;
-        let slot_va = u64::from_le_bytes(record.get(..8)?.try_into().ok()?);
-        let completed = u32::from_le_bytes(record.get(0x0c..0x10)?.try_into().ok()?);
-        let membership = u32::from_le_bytes(record.get(0x94..0x98)?.try_into().ok()?);
+        let slot_va = g17p_live_read_u64(record, 0).ok()?;
+        let completed = g17p_live_read_u32(record, 0x0c).ok()?;
+        let membership = g17p_live_read_u32(record, 0x94).ok()?;
         if slot_va != support_va.checked_add(kick.slot_offset as u64)?
             || completed != kick.next.wrapping_sub(1)
             || membership != 0
@@ -5027,7 +6333,7 @@ impl G17PEventControlKick {
     }
 
     fn apply(self, support: &mut [u8]) {
-        put_u32(support, self.slot_offset, self.next);
+        g17p_live_write_u32(support, self.slot_offset, self.next).expect("prevalidated EventControl count");
     }
 
     /// Exact per-field reason a Pool-A record is not reusable. Returned in the
@@ -5042,9 +6348,9 @@ impl G17PEventControlKick {
         let kick = Self::prepare(support, record_index)?;
         let record_offset = G17P_RENDER_POOL_A.checked_add(record_index.checked_mul(0x100)?)?;
         let record = support.get(record_offset..record_offset.checked_add(0x98)?)?;
-        let slot_va = u64::from_le_bytes(record.get(..8)?.try_into().ok()?);
-        let completed = u32::from_le_bytes(record.get(0x0c..0x10)?.try_into().ok()?);
-        let membership = u32::from_le_bytes(record.get(0x94..0x98)?.try_into().ok()?);
+        let slot_va = g17p_live_read_u64(record, 0).ok()?;
+        let completed = g17p_live_read_u32(record, 0x0c).ok()?;
+        let membership = g17p_live_read_u32(record, 0x94).ok()?;
         Some((
             slot_va,
             support_va.checked_add(kick.slot_offset as u64)?,
@@ -5055,6 +6361,7 @@ impl G17PEventControlKick {
     }
 }
 
+#[cfg(test)]
 struct G17PLateTilingBytes {
     item_group: [u8; 32],
     items: G17PRenderItemPlan,
@@ -5068,6 +6375,7 @@ struct G17PLateTilingBytes {
     shared_inner_value: u32,
 }
 
+#[cfg(test)]
 impl G17PLateTilingBytes {
     fn apply(&self, graph: &mut [u8], support: &mut [u8]) {
         let items = self.items.count as usize * 8;
@@ -5141,6 +6449,7 @@ impl G17PLateTilingBytes {
     }
 }
 
+#[cfg(test)]
 fn build_g17p_late_tiling_bytes(
     descriptor: u64,
     graph: u64,
@@ -5228,23 +6537,200 @@ fn build_g17p_late_tiling_bytes(
     Ok(bytes)
 }
 
+struct G17PLateTilingFields {
+    item_group: [u8; 32],
+    items: G17PRenderItemPlan,
+    entry_signal: [u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
+    config: G17PRenderConfigUpdateFields,
+    event: [u8; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+    event_offset: usize,
+    pool_a_slot_offset: usize,
+    pool_a_slot_value: u32,
+    shared_inner_value: u32,
+}
+
+impl G17PLateTilingFields {
+    fn validate_publication(&self, graph: &[u8], support: &[u8], config: &[u8]) -> Result {
+        self.items.validate_items(graph, G17P_USER_TILING_RING, 0,
+            self.items.count as usize * 8).ok_or(EINVAL)?;
+        g17p_live_word_bounds(graph, G17P_USER_TILING_POINTERS + 0x40, 4)?;
+        g17p_live_word_bounds(support, self.pool_a_slot_offset, 4)?;
+        g17p_live_word_bounds(support, G17P_RENDER_SHARED_CONTROL_INNER, 4)?;
+        graph.get(self.event_offset..self.event_offset.checked_add(self.event.len()).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        if self.items.tag16 {
+            graph.get(G17P_USER_TILING_ENTRY_SIGNAL..G17P_USER_TILING_ENTRY_SIGNAL
+                + self.entry_signal.len()).ok_or(EINVAL)?;
+        }
+        if self.items.config_present {
+            // This owned ConfigUpdate record must keep its natural word alignment.
+            if config.len() != g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE
+                || config.as_ptr() as usize & 7 != 0 { return Err(EINVAL); }
+        }
+        Ok(())
+    }
+
+    fn apply(&self, graph: &mut [u8], support: &mut [u8], config: &mut [u8]) {
+        let items = self.items.count as usize * 8;
+        // The plan is bounded by the advertised ring capacity and the caller
+        // acquired the complete graph before publishing either producer.
+        self.items
+            .copy_items(graph, G17P_USER_TILING_RING, 0, &self.item_group[..items])
+            .expect("bounded retained TA item ring");
+        if self.items.tag16 {
+            graph[G17P_USER_TILING_ENTRY_SIGNAL
+                ..G17P_USER_TILING_ENTRY_SIGNAL + self.entry_signal.len()]
+                .copy_from_slice(&self.entry_signal);
+        }
+        if self.items.config_present {
+            store_g17p_render_config_update(&self.config, config).expect("validated ConfigUpdate record");
+        }
+        graph[self.event_offset..self.event_offset + self.event.len()]
+            .copy_from_slice(&self.event);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        g17p_live_write_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.final_end).expect("prevalidated TA live word");
+        g17p_live_write_u32(support, self.pool_a_slot_offset, self.pool_a_slot_value).expect("prevalidated TA live word");
+        g17p_live_write_u32(support, G17P_RENDER_SHARED_CONTROL_INNER, self.shared_inner_value).expect("prevalidated TA live word");
+    }
+
+    /// Native's TA submission is split around its SKSM publication. Publish
+    /// only the descriptor/tag-15 prefix and its item producer here; the
+    /// outer producer is still retained, so firmware cannot dispatch a
+    /// half-group before the caller completes the transaction.
+    fn apply_native_prefix(&self, graph: &mut [u8], config: &mut [u8]) {
+        self.items
+            .copy_items(graph, G17P_USER_TILING_RING, 0, &self.item_group[..self.items.prefix_count as usize * 8])
+            .expect("bounded retained TA prefix");
+        if self.items.config_present {
+            store_g17p_render_config_update(&self.config, config).expect("validated ConfigUpdate record");
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        g17p_live_write_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.prefix_end).expect("prevalidated TA live word");
+    }
+
+    /// Publish tag-14 (and optional tag-16) after the TA SKSM entry exists.
+    /// The Pool-A transition is intentionally separate: the exact native
+    /// chronology advances it only after the TA outer producer is visible.
+    fn apply_native_kick(&self, graph: &mut [u8]) {
+        let items = self.items.count as usize * 8;
+        self.items
+            .copy_items(graph, G17P_USER_TILING_RING, self.items.prefix_count, &self.item_group[self.items.prefix_count as usize * 8..items])
+            .expect("bounded retained TA kick");
+        if self.items.tag16 {
+            graph[G17P_USER_TILING_ENTRY_SIGNAL
+                ..G17P_USER_TILING_ENTRY_SIGNAL + self.entry_signal.len()]
+                .copy_from_slice(&self.entry_signal);
+        }
+        graph[self.event_offset..self.event_offset + self.event.len()]
+            .copy_from_slice(&self.event);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        g17p_live_write_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.final_end).expect("prevalidated TA live word");
+    }
+
+    fn apply_native_pool_transition(&self, support: &mut [u8]) {
+        g17p_live_write_u32(support, self.pool_a_slot_offset, self.pool_a_slot_value).expect("prevalidated TA live word");
+        g17p_live_write_u32(support, G17P_RENDER_SHARED_CONTROL_INNER, self.shared_inner_value).expect("prevalidated TA live word");
+    }
+}
+
+fn build_g17p_late_tiling_fields(
+    descriptor: u64,
+    graph: u64,
+    queue_pair: G17PRenderQueuePair,
+    hardware_buffer_id: u16,
+    optional_addresses: g17_submission::G17PColdOpeningOptionalAddresses,
+    ta_tag15_context_id: u16,
+    submission_ordinal: u64,
+    flist_generation: u64,
+    entry_stamp: u64,
+    tag16: bool,
+    native_pool_a_first_record: bool,
+    pool_a_slot_value: u32,
+    context_update: bool,
+    config_gpu_va: u64,
+    qos_update: bool,
+    scratch_handoff: Option<Option<u64>>,
+    planned_items: Option<G17PRenderItemPlan>,
+) -> core::result::Result<G17PLateTilingFields, g17_submission::SubmissionError> {
+    let record_a = g17_submission::g17p_render_pool_a_record_index(
+        submission_ordinal,
+        native_pool_a_first_record,
+    );
+    let event_offset = g17p_render_event_offset(true, submission_ordinal);
+    let mut bytes = G17PLateTilingFields {
+        item_group: [0; 32],
+        items: match planned_items {
+            Some(items) => items,
+            None => G17PRenderItemPlan::new(submission_ordinal, tag16)
+                .ok_or(g17_submission::SubmissionError::PartialOpeningQueueHeadOutOfRange)?,
+        },
+        entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
+        config: prepare_g17p_render_config_update(
+            g17_submission::G17PColdOpeningStage::Tiling, optional_addresses,
+            submission_ordinal, flist_generation, g17p_render_generation_bias_enabled(),
+            queue_pair.tiling, queue_pair.fragment, hardware_buffer_id,
+            g17p_render_install(true), ta_tag15_context_id, context_update,
+            qos_update, scratch_handoff,
+        ),
+        event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+        event_offset,
+        // Native cold record index 1 points at slot-page +0x04. There is no
+        // additional reserved-word bias in this array.
+        pool_a_slot_offset: G17P_RENDER_POOL_A_SLOTS + record_a * 4,
+        // Captured from this record's owned slot before publication. On its
+        // first use this is 2; after natural unlink and reuse it is 4, 6, ...
+        pool_a_slot_value,
+        shared_inner_value: submission_ordinal
+            .checked_add(1)
+            .map(|value| (value as u32).wrapping_mul(2))
+            .ok_or(g17_submission::SubmissionError::PartialOpeningQueueHeadOutOfRange)?,
+    };
+    let event = graph
+        .checked_add(event_offset as u64)
+        .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
+    put_u64(&mut bytes.item_group, 0, descriptor);
+    if bytes.items.config_present { put_u64(&mut bytes.item_group, 8, config_gpu_va); }
+    put_u64(&mut bytes.item_group, bytes.items.prefix_count as usize * 8, event);
+    if tag16 {
+        let entry_signal = graph
+            .checked_add(G17P_USER_TILING_ENTRY_SIGNAL as u64)
+            .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
+        put_u64(&mut bytes.item_group, (bytes.items.prefix_count as usize + 1) * 8, entry_signal);
+        g17_submission::encode_g17p_compute_optional_event(
+            g17_submission::G17PComputeOptionalEvent {
+                queue_id: queue_pair.tiling,
+                // See the fragment sites: this field is the previous stamp.
+                old_timestamp: entry_stamp.wrapping_sub(1) & g17_submission::KICK_TS_MASK,
+            },
+            &mut bytes.entry_signal,
+        )?;
+    }
+    g17_submission::apply_g17p_retained_event_with_stamp(
+        g17_submission::G17PColdOpeningStage::Tiling,
+        entry_stamp,
+        queue_pair.tiling,
+        &mut bytes.event,
+    )?;
+    Ok(bytes)
+}
+
 /// All fallible mapping and byte construction finishes before this object is
-/// created. `publish` performs only the six measured late TA memory copies.
+/// created. ConfigUpdate is stored directly from final semantic fields. All
+/// three backing mappings remain owned by the same graph/epoch reservation.
 #[cfg(not(test))]
 pub(crate) struct G17PLateTilingPublication {
     graph: *mut u8,
     support: *mut u8,
-    bytes: G17PLateTilingBytes,
+    config: *mut u8,
+    bytes: G17PLateTilingFields,
 }
 
 #[cfg(not(test))]
 impl G17PLateTilingPublication {
-    /// The TA queue's tag-15 ConfigUpdate header, read out of the bytes this
-    /// publication is about to apply. The TA record is not in the graph yet at
-    /// staging time -- the outer publisher copies it in between the two ring
-    /// slots -- so it has to be read from here.
+    /// Exact semantic header retained for this publication. No mapped read or
+    /// encoded temporary image is needed before the direct TA record stores.
     pub(crate) fn config_update_header(&self) -> Option<G17PRenderConfigUpdateHeader> {
-        decode_g17p_render_config_update(&self.bytes.optional)
+        Some(self.bytes.config.header)
     }
 
     pub(crate) fn publish(self) {
@@ -5258,7 +6744,12 @@ impl G17PLateTilingPublication {
             // acquired VMap for the same transaction.
             core::slice::from_raw_parts_mut(self.support, G17P_RENDER_SUPPORT_SIZE)
         };
-        self.bytes.apply(graph, support);
+        let config = unsafe {
+            // SAFETY: preparation validated this exact record; graph reservation
+            // retains its WB backing until the whole publication transaction ends.
+            core::slice::from_raw_parts_mut(self.config, g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
+        };
+        self.bytes.apply(graph, support, config);
     }
 
     pub(crate) fn publish_native_prefix(&self) {
@@ -5267,7 +6758,11 @@ impl G17PLateTilingPublication {
             // VMap for the complete synchronous publication transaction.
             core::slice::from_raw_parts_mut(self.graph, G17P_RENDER_QUEUE_GRAPH_SIZE)
         };
-        self.bytes.apply_native_prefix(graph);
+        let config = unsafe {
+            // SAFETY: same checked record and owning graph reservation as publish.
+            core::slice::from_raw_parts_mut(self.config, g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
+        };
+        self.bytes.apply_native_prefix(graph, config);
     }
 
     pub(crate) fn publish_native_kick(&self) {
@@ -5292,8 +6787,10 @@ impl G17PLateTilingPublication {
 
 #[cfg(not(test))]
 impl G17PComputeDescriptorStorage {
-    pub(crate) fn retarget_channel_control(&mut self, address: u64, owner_pid: u32) -> Result {
+    pub(crate) fn retarget_channel_control(&mut self, address: u64, owner_pid: u32, tsq_head: u64) -> Result {
         self.queue_graph.with_bytes_mut(|raw| {
+            put_u64(raw, 0x10, tsq_head);
+            put_u32(raw, 0x38, 0);
             put_u32(raw, 0x48, owner_pid);
             put_u64(raw, 0x9c, address);
             Ok(())
@@ -5389,6 +6886,14 @@ impl G17PComputeDescriptorStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
+        // Same mapping class as the queue graph whose windows these replace.
+        let records = MappedObject::new_wc(
+            dev,
+            uat,
+            G17P_COMPUTE_RECORD_STORAGE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
 
         Ok(Self {
             descriptors,
@@ -5400,9 +6905,89 @@ impl G17PComputeDescriptorStorage {
             queue_graph,
             queue_context_low,
             queue_context_high,
+            records,
+            record_slot_end: [None; crate::g17_queue_limits::COMPUTE_RECORD_SLOTS],
             ring_reclaimed: 0,
             ring_reclaimed_total: 0,
         })
+    }
+
+    /// Refuse to reuse a channel-record slot whose previous publication firmware
+    /// has not consumed. Not a wait: the slot's previous owner published
+    /// `COMPUTE_RECORD_SLOTS` kicks ago and has retired, and retirement proves
+    /// its records were consumed, so this can only fire on a host accounting
+    /// defect.
+    pub(crate) fn ensure_record_slot_consumed(&mut self, slot: usize) -> Result {
+        let end = *self.record_slot_end.get(slot).ok_or(EINVAL)?;
+        let Some(end) = end else { return Ok(()); };
+        let ring = self.read_compute_ring_state()?;
+        if ring.count == 0 {
+            return Err(ERANGE);
+        }
+        let count = ring.count;
+        let producer = ring.producer % count;
+        let unconsumed = (producer + count - ring.consumer % count) % count;
+        let published_after = (producer + count - end % count) % count;
+        if unconsumed > published_after {
+            return Err(EBUSY);
+        }
+        Ok(())
+    }
+
+    fn record_gpu_va(&self, slot: usize, offset: usize) -> Result<u64> {
+        if slot >= crate::g17_queue_limits::COMPUTE_RECORD_SLOTS {
+            return Err(EINVAL);
+        }
+        let byte = slot
+            .checked_mul(G17P_COMPUTE_RECORD_SLOT_STRIDE)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(EOVERFLOW)?;
+        Ok(self.records.iova() + byte as u64)
+    }
+
+    fn write_record(&mut self, slot: usize, offset: usize, window: usize, bytes: &[u8]) -> Result<u64> {
+        if bytes.len() > window {
+            return Err(EINVAL);
+        }
+        let address = self.record_gpu_va(slot, offset)?;
+        let start = slot * G17P_COMPUTE_RECORD_SLOT_STRIDE + offset;
+        self.records.with_bytes_mut(|raw| {
+            let record = raw.get_mut(start..start + window).ok_or(ERANGE)?;
+            // Firmware handlers cache-invalidate and read a fixed width that
+            // may exceed the host-written prefix (tag 14 reads 0x18 of 0x15).
+            record.fill(0);
+            record[..bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(address)
+    }
+
+    /// Place this publication's tag-16 EntrySignal in its slot. The window is
+    /// the queue graph's full event window, zeroed as the graph's is.
+    pub(crate) fn stage_record_entry_signal(
+        &mut self,
+        slot: usize,
+        entry_signal: &[u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
+    ) -> Result<u64> {
+        self.write_record(slot, G17P_COMPUTE_RECORD_EVENT,
+            g17_compute::COMPUTE_EVENT_SIZE, entry_signal)
+    }
+
+    /// Place this publication's tag-14 AddKicks in its slot.
+    pub(crate) fn stage_record_add_kicks(
+        &mut self,
+        slot: usize,
+        add_kicks: &[u8; g17_submission::G17P_KSM_ADD_KICKS_COMMAND_SIZE],
+    ) -> Result<u64> {
+        self.write_record(slot, G17P_COMPUTE_RECORD_ADD_KICKS,
+            g17_compute::COMPUTE_ADD_KICKS_SIZE, add_kicks)
+    }
+
+    pub(crate) fn note_record_slot_published(&mut self, slot: usize, ring_end: u32) {
+        if let Some(end) = self.record_slot_end.get_mut(slot) {
+            *end = Some(ring_end);
+        }
     }
 
     pub(crate) fn descriptor_gpu_vas(&self, slot: u8) -> (u64, u64) {
@@ -5513,16 +7098,16 @@ impl G17PComputeDescriptorStorage {
     /// only at the next publication.
     pub(crate) fn read_compute_submitted_counters(&mut self) -> Result<[u32; 2]> {
         let base = self.support.iova();
-        let target = self.support.read_u32(base + mmu::UAT_PGSZ as u64 + 4)?;
-        let completed = self.support.read_u32(base + 0x10c)?;
+        let target = self.support.read_live_u32(base + mmu::UAT_PGSZ as u64 + 4)?;
+        let completed = self.support.read_live_u32(base + 0x10c)?;
         Ok([target, completed])
     }
 
     pub(crate) fn publish_compute_submitted_count(&mut self, count: u32) -> Result<[u32; 2]> {
         let base = self.support.iova();
         let target = base + mmu::UAT_PGSZ as u64 + 4;
-        let previous = self.support.read_u32(target)?;
-        let completed = self.support.read_u32(base + 0x10c)?;
+        let previous = self.support.read_live_u32(target)?;
+        let completed = self.support.read_live_u32(base + 0x10c)?;
         self.support.write_u32(target, count)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok([previous, completed])
@@ -5546,7 +7131,7 @@ impl G17PComputeDescriptorStorage {
     /// Returns what it discarded.
     pub(crate) fn arm_compute_stamp(&mut self) -> Result<u32> {
         let base = self.support.iova() + G17P_COMPUTE_STAMP_SUPPORT_OFFSET;
-        let previous = self.support.read_u32(base)?;
+        let previous = self.support.read_live_u32(base)?;
         self.support.write_u32(base, 0)?;
         self.support.write_u32(base + 4, 0)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -5557,7 +7142,7 @@ impl G17PComputeDescriptorStorage {
     pub(crate) fn read_compute_stamp(&mut self) -> Result<u32> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let base = self.support.iova() + G17P_COMPUTE_STAMP_SUPPORT_OFFSET;
-        self.support.read_u32(base)
+        self.support.read_live_u32(base)
     }
 
     pub(crate) fn dispatch_b_gpu_va(&self) -> u64 {
@@ -5757,7 +7342,6 @@ impl G17PComputeDescriptorStorage {
         let mut snapshot = self.descriptors.with_bytes_mut(|bytes| {
             let raw = bytes.get(offset..end).ok_or(ERANGE)?;
             let mut work_key = None;
-            let mut cdm_base = None;
             // The Linux builder emits forty 12-byte primary RCE entries at
             // +0x40, or forty-one when the kick carries an SCS scratch
             // request. Report the encoded 0x10201 value, not a reconstructed
@@ -5768,9 +7352,6 @@ impl G17PComputeDescriptorStorage {
                 let at = 0x40 + index * 12;
                 if read_u32(raw, at)? == 0x10201 {
                     work_key = Some(read_u64(raw, at + 4)?);
-                }
-                if read_u32(raw, at)? == 0x1a420 {
-                    cdm_base = Some(read_u64(raw, at + 4)?);
                 }
             }
             let resource_index = read_u16(raw, 0xfb0)?;
@@ -5783,7 +7364,6 @@ impl G17PComputeDescriptorStorage {
                 None
             };
             Ok(G17PComputeSubmissionSnapshot {
-                cdm_base, cdm_terminator: read_u64(raw, 0xee0)?,
                 descriptor, selector: read_u32(raw, 0)?, context: read_u32(raw, 0x0c)?,
                 resource_state: read_u16(raw, 0x22)?,
                 primary_register_count: read_u16(raw, 0x748)?,
@@ -5798,8 +7378,8 @@ impl G17PComputeDescriptorStorage {
             })
         })?;
         let base = self.support.iova();
-        snapshot.tsq = [self.support.read_u32(base + mmu::UAT_PGSZ as u64 + 4)?,
-            self.support.read_u32(base + 0x10c)?, self.read_compute_stamp()?];
+        snapshot.tsq = [self.support.read_live_u32(base + mmu::UAT_PGSZ as u64 + 4)?,
+            self.support.read_live_u32(base + 0x10c)?, self.read_compute_stamp()?];
         self.queue_graph.with_bytes_mut(|raw| {
             for (index, word) in snapshot.tag15.iter_mut().enumerate() {
                 *word = read_u64(raw, g17_compute::COMPUTE_OPTIONAL + index * 8)?;
@@ -5953,6 +7533,7 @@ impl G17PComputeDescriptorStorage {
     /// last configuration actually published on this physical QID.
     pub(crate) fn stage_repeat_config_update(
         &mut self,
+        record_slot: usize,
         sksm_entries: g17_compute::ComputeSksmEntryAliases,
         shared_control: u64,
         channel_control: u64,
@@ -5964,31 +7545,49 @@ impl G17PComputeDescriptorStorage {
         flist_generation: u32,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
-        let optional = queue
-            .checked_add(g17_compute::COMPUTE_OPTIONAL as u64)
-            .ok_or(EINVAL)?;
         let event = queue
             .checked_add(g17_compute::COMPUTE_EVENT as u64)
             .ok_or(EINVAL)?;
-        self.queue_graph.with_bytes_mut(|graph| {
-            g17_compute::encode_compute_config_update(
-                graph,
-                sksm_entries,
-                shared_control,
-                channel_control,
-                queue_id,
-                hardware_buffer_id,
-                // A repeat is by definition not a first bind, so the install
-                // flag is clear -- which is also what every captured macOS
-                // steady-state submission sends.
-                false,
-                updates,
-                context_id,
-            )
-            .map_err(|_| EINVAL)?;
-            put_u64(graph, g17_compute::COMPUTE_OPTIONAL + 0x3e, u64::from(flist_generation));
-            Ok(())
+        // The repeat's tag-15 record is encoded straight into this
+        // publication's own slot. The queue graph's optional window is the
+        // FIRST bind's record, and the first bind's ring entry names it until
+        // the firmware consumes that entry -- which, with kicks stacked
+        // without a host retirement in between, can be after this repeat is
+        // staged. Rewriting the window here (install flag 0) under that
+        // unconsumed pointer skipped the queue install and crashed the
+        // firmware's tag-16 handler on the unpopulated slot (Neo, 2026-09-26
+        // 19:41, pc=0x1190c far=0x140). Only the owner PID is read from the
+        // graph; nothing in it is written.
+        let owner_pid = self.queue_graph.with_bytes_mut(|graph| {
+            Ok(u32::from_le_bytes(
+                graph.get(0x48..0x4c).ok_or(ERANGE)?.try_into().map_err(|_| ERANGE)?,
+            ))
         })?;
+        let mut record = [0u8; g17_compute::COMPUTE_OPTIONAL_SIZE];
+        g17_compute::encode_compute_config_update_record(
+            &mut record,
+            owner_pid,
+            sksm_entries,
+            shared_control,
+            channel_control,
+            queue_id,
+            hardware_buffer_id,
+            // A repeat is by definition not a first bind, so the install
+            // flag is clear -- which is also what every captured macOS
+            // steady-state submission sends.
+            false,
+            updates,
+            context_id,
+        )
+        .map_err(|_| EINVAL)?;
+        // B1 compares the full cookie before replacing row context.
+        put_u64(&mut record, 0x3e, u64::from(flist_generation));
+        let optional = self.write_record(
+            record_slot,
+            G17P_COMPUTE_RECORD_CONFIG,
+            g17_compute::COMPUTE_OPTIONAL_SIZE,
+            &record,
+        )?;
         if rewind {
             // Reuse ring slots 0..3 instead of appending: zero them and put the
             // producer back to 0, so the four records land exactly where the
@@ -6411,19 +8010,32 @@ pub(crate) fn g17p_render_install(tiling: bool) -> u16 {
 
 /// The first embedded RCE trailer starts at +0x7a0. The native MCache
 /// table begins at +0x6a0 and may use only the intervening 16 entries.
-#[cfg(not(test))]
 const G17P_FRAGMENT_MCACHE_INLINE_END: usize = 0x7a0;
 /// KSM encodes an explicit 32-byte-aligned table pointer and count 1..64.
-/// Reserve the already mapped descriptor-page padding for the full UAPI
+/// Reserve a private tail in every live descriptor stride for the full UAPI
 /// domain (16 attachments plus the internal range). All descriptor fields
 /// end at 0x2240; Pool-A/B/shared objects live in the separate support BO.
-#[cfg(not(test))]
 const G17P_FRAGMENT_MCACHE_SPILL_OFFSET: usize = g17_render::FRAGMENT_DESCRIPTOR_SIZE;
 #[cfg(not(test))]
 const G17P_FRAGMENT_MCACHE_MAX_ENTRIES: usize = g17_uapi::UAPI_MAX_ATTACHMENTS + 1;
 #[cfg(not(test))]
 const G17P_FRAGMENT_MCACHE_SPILL_END: usize = G17P_FRAGMENT_MCACHE_SPILL_OFFSET
     + G17P_FRAGMENT_MCACHE_MAX_ENTRIES * g17_render::G17P_MCACHE_MAPPING_SIZE;
+
+/// Legacy staging-copy extent retained only as an independent byte-test oracle.
+/// Production encodes directly into its owned descriptor and spill generation.
+#[cfg(test)]
+fn g17p_fragment_copy_size(aperture: Option<&g17_submission::G17PClMcacheAperture>) -> usize {
+    match aperture {
+        Some(aperture) if usize::from(aperture.count) * g17_render::G17P_MCACHE_MAPPING_SIZE
+            > G17P_FRAGMENT_MCACHE_INLINE_END - g17_render::G17P_FRAGMENT_MCACHE_OFFSET =>
+        {
+            G17P_FRAGMENT_MCACHE_SPILL_OFFSET
+                + usize::from(aperture.count) * g17_render::G17P_MCACHE_MAPPING_SIZE
+        }
+        _ => g17_render::FRAGMENT_DESCRIPTOR_SIZE,
+    }
+}
 
 /// Convert validated fragment write ranges into the native MCache encoding.
 /// Stage the entire table before touching the descriptor so a bad later range
@@ -6478,7 +8090,7 @@ fn encode_g17p_fragment_mcache(
     let table_offset = if inline_end <= G17P_FRAGMENT_MCACHE_INLINE_END {
         mcache_offset
     } else {
-        // The command owns a full 16-KiB fragment page, including this padding.
+        // The command owns the spill tail within its descriptor stride.
         // Relocating only the explicitly addressed table preserves every RCE
         // byte and needs neither an extra allocation nor another cache flush.
         G17P_FRAGMENT_MCACHE_SPILL_OFFSET
@@ -6553,16 +8165,88 @@ fn apply_g17p_fragment_mcache(
     descriptor_low: u64,
     mcache_offset: usize,
     render_root_slot: u8,
+    hwsid: u32,
     fragment: &mut [u8],
 ) -> Result<Option<g17_submission::G17PClMcacheAperture>> {
-    encode_g17p_fragment_mcache(
+    let aperture = encode_g17p_fragment_mcache(
         attachments.as_slice(), fragment_internal_address, fragment_internal_size,
         descriptor_low, mcache_offset,
-        crate::g17_config::RENDER_MCACHE_HWSID,
+        hwsid,
         crate::g17_config::RENDER_MCACHE_MODE,
         crate::g17_config::RENDER_MCACHE_SELECTOR,
         render_root_slot, fragment,
-    )
+    )?;
+    if let Some(aperture) = aperture {
+        if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_MCACHE_SELECTOR_NATIVE) {
+            g17p_mcache_selector_override(fragment, descriptor_low, aperture, G17P_MCACHE_NATIVE_SELECTOR)?;
+        }
+    }
+    Ok(aperture)
+}
+
+/// v92d diagnostic selector value (native's captured +0x6a0 selector).
+const G17P_MCACHE_NATIVE_SELECTOR: u8 = 1;
+/// MCache mapping qword 0 selector field, bits 41..46 (halMCacheApertureSetup).
+const G17P_MCACHE_SELECTOR_MASK: u64 = 0x3f << 41;
+
+/// Patch the selector field of an encoded fragment MCache table in place and
+/// prove by read-back that nothing else changed: every qword 1 and every
+/// qword-0 bit outside 41..46 must equal the default encoding. On any
+/// mismatch the default table is restored and EIO is returned.
+fn g17p_mcache_selector_override(
+    fragment: &mut [u8],
+    descriptor_low: u64,
+    aperture: g17_submission::G17PClMcacheAperture,
+    selector: u8,
+) -> Result {
+    if selector > 0x3f {
+        return Err(EINVAL);
+    }
+    let offset = usize::try_from(aperture.address.checked_sub(descriptor_low).ok_or(EINVAL)?)
+        .map_err(|_| EINVAL)?;
+    let count = usize::from(aperture.count);
+    let size = count.checked_mul(g17_render::G17P_MCACHE_MAPPING_SIZE).ok_or(EOVERFLOW)?;
+    let end = offset.checked_add(size).ok_or(EOVERFLOW)?;
+    if count == 0 || count > G17P_FRAGMENT_MCACHE_MAX_ENTRIES || end > fragment.len() {
+        return Err(EINVAL);
+    }
+    let mut before = [0u8; G17P_FRAGMENT_MCACHE_MAX_ENTRIES * g17_render::G17P_MCACHE_MAPPING_SIZE];
+    before[..size].copy_from_slice(&fragment[offset..end]);
+    let word = |bytes: &[u8], at: usize| -> u64 {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[at..at + 8]);
+        u64::from_le_bytes(raw)
+    };
+    for entry in 0..count {
+        let at = offset + entry * g17_render::G17P_MCACHE_MAPPING_SIZE;
+        let q0 = word(fragment, at);
+        let patched = (q0 & !G17P_MCACHE_SELECTOR_MASK) | (u64::from(selector) << 41);
+        fragment[at..at + 8].copy_from_slice(&patched.to_le_bytes());
+    }
+    // Read-back proof.
+    let mut ok = true;
+    for entry in 0..count {
+        let local = entry * g17_render::G17P_MCACHE_MAPPING_SIZE;
+        let at = offset + local;
+        let (q0, q0_before) = (word(fragment, at), word(&before, local));
+        let (q1, q1_before) = (word(fragment, at + 8), word(&before, local + 8));
+        ok &= (q0 ^ q0_before) & !G17P_MCACHE_SELECTOR_MASK == 0
+            && (q0 & G17P_MCACHE_SELECTOR_MASK) >> 41 == u64::from(selector)
+            && q1 == q1_before;
+    }
+    if !ok {
+        fragment[offset..end].copy_from_slice(&before[..size]);
+        pr_err!("G17P MCache selector override: read-back mismatch; default table restored\n");
+        return Err(EIO);
+    }
+    static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        pr_info!(
+            "G17P MCache selector override (diag bit23): {} entries, selector {} -> {}, only bits 41..46 of qword 0 changed\n",
+            count, (word(&before, 0) & G17P_MCACHE_SELECTOR_MASK) >> 41, selector,
+        );
+    }
+    Ok(())
 }
 
 /// Native G17P PM geometry, joined from `pmblocks-gfx.txt`, `pbdesc2.txt`, and
@@ -6655,6 +8339,25 @@ fn g17p_pm_control_cursors(raw: &[u8], base: usize) -> Option<G17PPmControlCurso
         committed: word(G17P_PM_SHARED_COMMITTED_CURSOR)?,
         read: word(G17P_PM_SHARED_READ_CURSOR)?,
     })
+}
+
+/// One host producer owns this graph through preparation. Live firmware can
+/// consume already committed blocks while pages are allocated: native grow
+/// checks capacity before allocation and leaves +8 untouched at commit. Only
+/// retired-scene page-list rebuilding needs an unchanged consumer snapshot.
+fn g17p_pm_growth_commit_matches(
+    before: G17PPmControlCursors, after: G17PPmControlCursors, synchronous: bool,
+) -> bool {
+    let capacity = G17P_PM_MAX_BLOCKS as u32;
+    if [before.total, before.committed, before.read, after.total, after.committed, after.read]
+        .into_iter().any(|cursor| cursor >= capacity)
+        || before.total != after.total || before.committed != after.committed {
+        return false;
+    }
+    if !synchronous { return before == after; }
+    let advance = (after.read + capacity - before.read) % capacity;
+    let available = (before.committed + capacity - before.read) % capacity;
+    advance <= available
 }
 
 /// One validated bulk equivalent of native create/commit during TVB growth.
@@ -6752,6 +8455,107 @@ pub(crate) fn g17p_pm_manager_generation_plan(current: u64) -> Result<(u64, u64)
     Ok((current, current.checked_add(1).ok_or(EOVERFLOW)?))
 }
 const G17P_PM_PAGE_METRICS_SIZE: usize = G17P_PM_SCENE_COUNT * 4;
+/// Native `AGXGart::requestPMPageMetricsBuffer` (AGXG17P 353.14,
+/// 0xfffffe00088d5610) hands every `AGXParameterManagement` its own entry of
+/// the gart's page-metrics resource stack (`AGXFirmwareResourceStack<uchar,
+/// AGXParameterManagement, 64, 64>`: first free bit of the block bitmap,
+/// `entry = bit + block * 64`, region offset `entry_size * (entry %
+/// entries_per_block)`), and every Scene of that graph names `entry + scene *
+/// 4`. The captured `T8140_PARAMETER_METRICS_LOW_VA` object is the first
+/// block of that stack: its entry 0 is exactly the address this driver used
+/// to publish for EVERY graph on the device, so two physical pairs of one
+/// logical queue -- and two clients -- indexed one 80-word array with their
+/// own Scene ordinals. Each parameter-management graph now leases its own
+/// entry for its lifetime. Entry 0 keeps the historical bytes for the first
+/// graph of a session, so a single client publishes what it always did.
+const G17P_PM_METRICS_REGION_SIZE: usize = 0x8000;
+const G17P_PM_METRICS_SLOT_STRIDE: usize = G17P_PM_PAGE_METRICS_SIZE;
+const G17P_PM_METRICS_SLOT_COUNT: usize =
+    G17P_PM_METRICS_REGION_SIZE / G17P_PM_METRICS_SLOT_STRIDE;
+const _: () = assert!(G17P_PM_METRICS_REGION_SIZE == mmu::T8140_PARAMETER_METRICS_SIZE);
+const _: () = assert!(G17P_PM_METRICS_SLOT_COUNT <= 128);
+const _: () = assert!(G17P_PM_METRICS_SLOT_COUNT >= G17PRenderQueuePair::SLOT_COUNT as usize);
+
+/// Both views (firmware-high, client-low) of one leased page-metrics entry.
+fn g17p_pm_metrics_slot_vas(base: [u64; 2], slot: usize) -> Option<[u64; 2]> {
+    if slot >= G17P_PM_METRICS_SLOT_COUNT {
+        return None;
+    }
+    let offset = (slot * G17P_PM_METRICS_SLOT_STRIDE) as u64;
+    Some([base[0].checked_add(offset)?, base[1].checked_add(offset)?])
+}
+
+/// Lowest free entry, as native's first-free-bit scan; `None` when every
+/// entry is leased.
+fn g17p_pm_metrics_slot_acquire(used: &mut u128) -> Option<u8> {
+    let slot = used.trailing_ones() as usize;
+    if slot >= G17P_PM_METRICS_SLOT_COUNT {
+        return None;
+    }
+    *used |= 1u128 << slot;
+    Some(slot as u8)
+}
+
+fn g17p_pm_metrics_slot_release(used: &mut u128, slot: u8) {
+    if usize::from(slot) < G17P_PM_METRICS_SLOT_COUNT {
+        *used &= !(1u128 << slot);
+    }
+}
+
+/// A newly leased graph starts with empty metrics, including when its slot
+/// previously belonged to a retired graph. Never touch another live lease.
+fn g17p_pm_metrics_slot_clear(bytes: &mut [u8], slot: usize) -> Option<()> {
+    if slot >= G17P_PM_METRICS_SLOT_COUNT {
+        return None;
+    }
+    let start = slot * G17P_PM_METRICS_SLOT_STRIDE;
+    bytes.get_mut(start..start + G17P_PM_METRICS_SLOT_STRIDE)?.fill(0);
+    Some(())
+}
+
+/// One leased page-metrics entry. It travels with the render storage whose
+/// parameter-management graph was encoded against it and is returned only
+/// when that storage is dropped, never between two submissions.
+#[cfg(not(test))]
+pub(crate) struct G17PPmPageMetricsLease {
+    allocator: Arc<kernel::sync::Mutex<u128>>,
+    slot: u8,
+}
+
+#[cfg(not(test))]
+impl G17PPmPageMetricsLease {
+    fn new(allocator: Arc<kernel::sync::Mutex<u128>>) -> Option<Self> {
+        let slot = {
+            let mut used = allocator.lock();
+            g17p_pm_metrics_slot_acquire(&mut used)?
+        };
+        Some(Self { allocator, slot })
+    }
+
+    pub(crate) fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    /// Byte offset of this entry inside the shared page-metrics object.
+    pub(crate) fn offset(&self) -> usize {
+        usize::from(self.slot) * G17P_PM_METRICS_SLOT_STRIDE
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for G17PPmPageMetricsLease {
+    fn drop(&mut self) {
+        g17p_pm_metrics_slot_release(&mut self.allocator.lock(), self.slot);
+    }
+}
+
+/// The page-metrics addresses one parameter-management graph publishes in
+/// its Scene entries, with the lease that keeps them exclusive.
+#[cfg(not(test))]
+pub(crate) struct G17PPmPageMetricsBinding {
+    lease: Option<G17PPmPageMetricsLease>,
+    vas: [u64; 2],
+}
 /// `DevicePMConfig` gives 36 reusable scene scratch slots. The complete valid
 /// Scene table proves a 0x20-byte stride, wrapping at slot 36; the selected
 /// cold Scene1 therefore carries 0x178020 at +0x28, matching reg 0x1ca28.
@@ -6759,6 +8563,54 @@ const G17P_PM_SCENE_SCRATCH_SLOT_COUNT: usize = 0x24;
 const G17P_PM_SCENE_SCRATCH_STRIDE: usize = 0x20;
 const G17P_PM_SCENE_SCRATCH_SIZE: usize = 0x8000;
 const G17P_PM_DISCARD_SIZE: usize = 0x8000;
+
+/// Scene entries alias a shorter scratch ring. Track both as one ownership
+/// unit: ordinal modulo 80 alone collides at the wrap (Scenes 72 and 0 use
+/// scratch slot 0 only eight commands apart). Completion, not a later
+/// publication, releases an ordinal's scratch and Scene.
+struct G17PSceneOwnership {
+    ordinals: [Option<u64>; G17P_PM_SCENE_SCRATCH_SLOT_COUNT],
+    scenes: [u8; G17P_PM_SCENE_SCRATCH_SLOT_COUNT],
+    next: usize,
+}
+
+impl G17PSceneOwnership {
+    fn new() -> Self {
+        Self {
+            ordinals: [None; G17P_PM_SCENE_SCRATCH_SLOT_COUNT],
+            scenes: [0; G17P_PM_SCENE_SCRATCH_SLOT_COUNT],
+            next: G17P_PM_SELECTED_SCENE,
+        }
+    }
+
+    /// Planning does not reserve anything. The owning storage remains
+    /// exclusively borrowed until descriptor preparation commits the plan.
+    fn select(&self, ordinal: u64) -> Option<usize> {
+        if let Some(slot) = self.ordinals.iter().position(|owner| *owner == Some(ordinal)) {
+            return Some(self.scenes[slot] as usize);
+        }
+        (0..G17P_PM_SCENE_COUNT).map(|offset| (self.next + offset) % G17P_PM_SCENE_COUNT)
+            .find(|scene| self.ordinals[scene % G17P_PM_SCENE_SCRATCH_SLOT_COUNT].is_none())
+    }
+
+    fn commit(&mut self, ordinal: u64, scene: usize) -> bool {
+        if self.select(ordinal) != Some(scene) { return false; }
+        let slot = scene % G17P_PM_SCENE_SCRATCH_SLOT_COUNT;
+        // Re-preparing a cold/warm first command keeps its existing lease.
+        if self.ordinals[slot] == Some(ordinal) { return true; }
+        self.ordinals[slot] = Some(ordinal);
+        self.scenes[slot] = scene as u8;
+        self.next = (scene + 1) % G17P_PM_SCENE_COUNT;
+        true
+    }
+
+    fn release(&mut self, ordinal: u64) -> bool {
+        let Some(slot) = self.ordinals.iter().position(|owner| *owner == Some(ordinal))
+            else { return false; };
+        self.ordinals[slot] = None;
+        true
+    }
+}
 
 /// Native processRenderSetup advances the Scene ring owned by one parameter
 /// buffer manager. Queue producer ordinals survive a VM handoff, while the PM
@@ -6827,12 +8679,11 @@ fn prepare_g17p_retained_scene(
     let selected = raw.get_mut(at..end).ok_or(ERANGE)?;
     put_u32(selected, 0x48, 0);
     put_u64(selected, 0x4c, manager_generation);
-    // Native loadPBDesc copies the command's allocated HardwareBufferID into
-    // PBState +0x0c immediately before every submission.  This word is not a
-    // constructor invariant: firmware reuses the retained PBState and may
-    // leave other state there between commands.  Reassert the ID together
-    // with the Scene generation so the completion path cannot interpret a
-    // stale byte count as a PBDesc-table index.
+    // Legacy policy reasserts the retained HardwareBufferID here. Native
+    // 25G83 loadPBDesc (88dc320..370) writes it only on the first-user
+    // transition, and completion (88ffdc0..88ffe24) clears it on last-user
+    // retirement. No firmware overwrite with a byte count is established.
+    // The exact native first/last-user policy remains to be integrated.
     put_u32(raw, layout.hwpb_state + 0x0c, hardware_buffer_id);
     Ok(())
 }
@@ -7026,30 +8877,41 @@ struct G17PParameterManagement {
     page_list_vas: [u64; 2],
     metrics_vas: [u64; 2],
     hardware_buffer_id: u32,
-    /// Queue ordinal of the first submission encoded against this manager.
-    /// Scene selection is relative to this value, not to the retained queue's
-    /// session-global producer ordinal.
-    first_submission_ordinal: u64,
+    scene_ownership: KBox<G17PSceneOwnership>,
     selected_scene: usize,
     manager_generation: u64,
 }
 
-/// Firmware may retain parameter-buffer manager and workqueue-support pointers
-/// after the owning userspace queue has drained and its TA/3D pair has
-/// completed. Keep those opaque high mappings alive without retaining the
-/// client VM, bind context or fixed low aliases. The stopped-processor boundary
-/// is currently the first proven point at which these background firmware
-/// references are gone.
+/// Submitted engine commands, independent of FList lease/token generations.
+/// Zero is used only to snapshot the baseline of a released pool.
+fn g17p_flist_submitted_next(raw: &[u8], offset: usize, kicks: u32) -> Option<u64> {
+    if kicks > 2 || offset % 8 != 0 { return None; }
+    Some(g17p_live_read_u64(raw, offset).ok()?.wrapping_add(u64::from(kicks)))
+}
+
+/// Prepared before publication, committed once at the infallible producer
+/// boundary. Dropping an unpublished plan leaves the submitted count intact.
 #[cfg(not(test))]
-pub(crate) struct G17PRetiredParameterManagement {
-    _backing: MappedObject,
-    _support: Option<MappedObject>,
-    hardware_buffer_id: u32,
+pub(crate) struct G17PFlistSubmittedOperation<'a> {
+    vmap: kernel::drm::gem::shmem::VMapRef<'a, gem::AsahiObject, u8>,
+    size: usize,
+    offset: usize,
+    next: u64,
 }
 
 #[cfg(not(test))]
-impl G17PRetiredParameterManagement {
-    pub(crate) fn hardware_buffer_id(&self) -> u32 { self.hardware_buffer_id }
+impl G17PFlistSubmittedOperation<'_> {
+    pub(crate) fn commit(self) {
+        let raw = unsafe {
+            // SAFETY: preparation validated this retained VMap's range.
+            // The runtime serializes host counter publications; firmware
+            // reads this counter and writes only its separate state+54.
+            core::slice::from_raw_parts_mut(self.vmap.as_mut_ptr(), self.size)
+        };
+        // One aligned u64 store: firmware samples this counter concurrently.
+        unsafe { core::ptr::write_volatile(raw.as_mut_ptr().add(self.offset).cast::<u64>(), self.next) };
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -7062,8 +8924,7 @@ fn prepare_g17p_pm_submitted_operation(
     raw: &[u8],
     offset: usize,
 ) -> Option<G17PPmSubmittedOperationPlan> {
-    let bytes = raw.get(offset..offset.checked_add(4)?)?;
-    let previous = u32::from_le_bytes(bytes.try_into().ok()?);
+    let previous = g17p_live_read_u32(raw, offset).ok()?;
     Some(G17PPmSubmittedOperationPlan { offset, next: previous.wrapping_add(1) })
 }
 
@@ -7090,7 +8951,7 @@ impl G17PPmSubmittedOperation<'_> {
             // held through this synchronous publication transaction.
             core::slice::from_raw_parts_mut(self.vmap.as_mut_ptr(), self.size)
         };
-        put_u32(raw, self.plan.offset, self.plan.next);
+        g17p_live_write_u32(raw, self.plan.offset, self.plan.next).expect("prevalidated PM submitted count");
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -7185,6 +9046,10 @@ impl G17PParameterManagement {
             )
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let mut scene_ownership = KBox::new(G17PSceneOwnership::new(), GFP_KERNEL)?;
+        if !scene_ownership.commit(first_submission_ordinal, G17P_PM_SELECTED_SCENE) {
+            return Err(EIO);
+        }
         Ok(Self {
             _page_list_low: page_list_low,
             backing,
@@ -7193,7 +9058,7 @@ impl G17PParameterManagement {
             page_list_vas,
             metrics_vas,
             hardware_buffer_id: ta_hardware_buffer_id,
-            first_submission_ordinal,
+            scene_ownership,
             selected_scene: G17P_PM_SELECTED_SCENE,
             manager_generation,
         })
@@ -7206,22 +9071,23 @@ impl G17PParameterManagement {
         page_list_vas: [u64; 2],
         render_layout: &G17PRenderStateLayout,
     ) -> Result {
-        // This retained pool already owns its PBDesc slot and fixed TVB
-        // backing. A resize/new ID requires a real allocation/update lifetime,
-        // not rewriting the live table as if it were cold state.
+        // Keep the retained PM identity and validate its actual inventory.
+        // The next target's sizing estimate need not already be resident:
+        // a busy PM grows through firmware type 6, with PBDesc adoption owned
+        // by firmware. Preparing a scene neither rebuilds that table nor
+        // indexes the estimated number of pages. Requiring the estimate here
+        // rejected larger targets before firmware could request growth.
         if render_layout.tvb_blocks < G17P_PM_BLOCK_COUNT
+            || render_layout.tvb_blocks > G17P_PM_MAX_OWNED_BLOCKS
             || self.hardware_buffer_id != hardware_buffer_id
             || self.page_list_vas != page_list_vas
-            || render_layout.tvb_blocks.checked_mul(G17P_PM_PAGES_PER_BLOCK)
-                .is_none_or(|pages| pages > self.page_count as usize)
+            || (self.page_count as usize) < G17P_PM_BLOCK_COUNT * G17P_PM_PAGES_PER_BLOCK
+            || (self.page_count as usize) > G17P_PM_MAX_OWNED_BLOCKS * G17P_PM_PAGES_PER_BLOCK
+            || self.page_count as usize % G17P_PM_PAGES_PER_BLOCK != 0
         {
             return Err(ENOTSUPP);
         }
-        let scene = g17p_render_scene_index(
-            self.first_submission_ordinal,
-            submission_ordinal,
-        )
-        .ok_or(EINVAL)?;
+        let scene = self.scene_ownership.select(submission_ordinal).ok_or(ENOSPC)?;
         self.backing.with_bytes_mut(|raw| {
             prepare_g17p_retained_scene(
                 raw,
@@ -7297,11 +9163,6 @@ pub(crate) fn g17p_render_tvb_enabled() -> bool {
     crate::g17_config::RENDER_TVB != 0
 }
 
-/// Reuse cached CPU scratch across render submissions.
-fn g17p_retain_staging() -> bool {
-    crate::g17_config::RETAIN_STAGING != 0
-}
-
 fn g17p_render_cycle_pointer(scene_scratch_va: u64) -> Result<u64> {
     scene_scratch_va
         .checked_sub(G17P_RENDER_USER_BASE)
@@ -7363,23 +9224,6 @@ impl G17PUserRenderStorage {
         self.sksm_backing.take().ok_or(EIO)
     }
 
-    pub(crate) fn sksm_backing_detached(&self) -> bool { self.sksm_backing.is_none() }
-
-    pub(crate) fn claim_sksm_backing(
-        &mut self,
-        backing: &mut Option<G17PRenderSksmBacking>,
-    ) -> Result {
-        if self.sksm_backing.is_some()
-            || !backing
-                .as_ref()
-                .is_some_and(|backing| backing.matches_queue_pair(self.queue_pair))
-        {
-            return Err(EIO);
-        }
-        self.reachability_cache.invalidate();
-        self.sksm_backing = backing.take();
-        Ok(())
-    }
 
     fn descriptor_context_valid(context_id: u16) -> bool {
         // A descriptor context is a queue execution context. The bind band and
@@ -7539,6 +9383,7 @@ impl G17PUserRenderStorage {
         }
         for (kind, object, object_context) in [
             (TraceKind::RenderQueueGraph, &mut self.graph, 0),
+            (TraceKind::RenderConfigUpdates, &mut self.config_updates, 0),
             (TraceKind::RenderSupport, &mut self.support, 0),
             (TraceKind::RenderState, &mut self.render_state, context),
             (TraceKind::RenderTimestamps, &mut self.timestamps, 0),
@@ -7735,19 +9580,56 @@ impl G17PUserRenderStorage {
             // slice below is bounds-checked against logical_size.
             core::slice::from_raw_parts(vmap.as_ptr(), self.descriptors.logical_size)
         };
-        if offset + length > bytes.len() {
-            return;
-        }
+        if offset.checked_add(length).is_none_or(|end| end > bytes.len()) { return; }
         for row in 0..(length / 16) {
             let at = offset + row * 16;
+            let Some(row_bytes) = g17p_render_device_bytes::<16>(bytes, at) else { return; };
             dev_info!(
                 dev.as_ref(),
                 "G17PDUMP {} {} {:#05x} {:02x?}\n",
                 who,
                 label,
                 row * 16,
-                &bytes[at..at + 16],
+                row_bytes,
             );
+        }
+    }
+
+    /// Snapshot the current record from its actual separate ConfigUpdate
+    /// allocation. Each row uses volatile bytes; rows are not an atomic device
+    /// snapshot and printing may overlap firmware progress.
+    pub(crate) fn dump_config_update_region(
+        &mut self, dev: &AsahiDevice, tiling: bool, label: &str,
+    ) {
+        if self.variable_render_items() {
+            if let Some(plan) = self.render_publication.current(self.descriptor_ordinal) {
+                if !plan.lanes[usize::from(!tiling)].config_present {
+                    dev_info!(dev.as_ref(), "G17P config-update[{}] ordinal={} omitted (installed state unchanged)\n", label, self.descriptor_ordinal);
+                    return;
+                }
+            }
+        }
+
+        let offset = g17p_render_config_offset(tiling, self.descriptor_ordinal);
+        let size = g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE;
+        let Some(end) = offset.checked_add(size) else { return; };
+        if end > self.config_updates.logical_size { return; }
+        let dva = self.config_updates.iova() + offset as u64;
+        let who = if tiling { "opt-TA" } else { "opt-3D" };
+        let Ok(vmap) = self.config_updates.object.vmap() else { return; };
+        dev_info!(dev.as_ref(),
+            "G17P config snapshot[{}]: ordinal={} tiling={} dva={:#x} (bounded non-atomic rows)\n",
+            label, self.descriptor_ordinal, tiling, dva);
+        for row in 0..size / 16 {
+            let mut bytes = [0u8; 16];
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                // SAFETY: mapping owns the bounds-checked complete record;
+                // byte access supports its native unaligned scalar fields.
+                *byte = unsafe { core::ptr::read_volatile(
+                    vmap.as_ptr().add(offset + row * 16 + index)) };
+            }
+            dev_info!(dev.as_ref(), "G17PDUMP {} {} {:#05x} {:02x?}\n",
+                who, label, row * 16, bytes);
         }
     }
 
@@ -7863,13 +9745,23 @@ impl G17PUserRenderStorage {
         self.queue_pair.record_offset(tiling)
     }
 
-    pub(crate) fn prepare_pm_submitted_operation(
+    pub(crate) fn prepare_render_submitted_operations(
         &mut self,
-    ) -> Result<Option<G17PPmSubmittedOperation<'_>>> {
-        self.parameter_management
+        kicks: u32,
+    ) -> Result<(Option<G17PPmSubmittedOperation<'_>>, G17PFlistSubmittedOperation<'_>)> {
+        let flist = self.render_flist.prepare_submitted_operations(kicks)?;
+        let pm = self.parameter_management
             .as_mut()
             .map(G17PParameterManagement::prepare_submitted_operation)
-            .transpose()
+            .transpose()?;
+        Ok((pm, flist))
+    }
+
+    pub(crate) fn prepare_flist_submitted_operation(
+        &self,
+        kicks: u32,
+    ) -> Result<G17PFlistSubmittedOperation<'_>> {
+        self.render_flist.prepare_submitted_operations(kicks)
     }
 
     pub(crate) fn fragment_mcache(&self) -> Option<g17_submission::G17PClMcacheAperture> {
@@ -7894,22 +9786,26 @@ impl G17PUserRenderStorage {
                 .iova()
                 .checked_add(
                     g17p_render_descriptor_slot(self.descriptor_ordinal) as u64
-                        * g17_render::FRAGMENT_DESCRIPTOR_SIZE as u64,
+                        * G17P_RENDER_3D_DESCRIPTOR_STRIDE as u64,
                 )
                 .ok_or(EOVERFLOW)
         }
     }
 
     pub(crate) fn descriptor_high_va(&self, tiling: bool) -> Result<u64> {
+        self.descriptor_high_va_at(tiling, self.descriptor_ordinal)
+    }
+
+    pub(crate) fn descriptor_high_va_at(&self, tiling: bool, ordinal: u64) -> Result<u64> {
         if tiling {
             self.descriptors
                 .iova()
-                .checked_add(g17p_render_ta_descriptor_offset(self.descriptor_ordinal) as u64)
+                .checked_add(g17p_render_ta_descriptor_offset(ordinal) as u64)
                 .ok_or(EOVERFLOW)
         } else {
             self.descriptors
                 .iova()
-                .checked_add(g17p_render_3d_descriptor_offset(self.descriptor_ordinal) as u64)
+                .checked_add(g17p_render_3d_descriptor_offset(ordinal) as u64)
                 .ok_or(EOVERFLOW)
         }
     }
@@ -7927,13 +9823,88 @@ impl G17PUserRenderStorage {
         Ok(start..end)
     }
 
+    fn config_update_gpu_va(&self, tiling: bool, ordinal: u64) -> Result<u64> {
+        let offset = g17p_render_config_offset(tiling, ordinal);
+        if offset.checked_add(g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
+            .filter(|end| *end <= self.config_updates.logical_size).is_none() { return Err(EINVAL); }
+        self.config_updates.iova().checked_add(offset as u64).ok_or(EOVERFLOW)
+    }
+
+    fn final_config_update(&self, tiling: bool, ordinal: u64) -> Result<G17PRenderConfigUpdateFields> {
+        Ok(prepare_g17p_render_config_update(
+            if tiling { g17_submission::G17PColdOpeningStage::Tiling }
+                else { g17_submission::G17PColdOpeningStage::Fragment },
+            self.optional_addresses(tiling), ordinal, self.flist_generation,
+            g17p_render_generation_bias_enabled(),
+            if tiling { self.queue_pair.tiling } else { self.queue_pair.fragment },
+            if tiling { self.queue_pair.fragment } else { self.queue_pair.tiling },
+            self.qos_hardware_buffer_id()?, g17p_render_install(tiling),
+            self.descriptor_context_id, self.context_update_pending, self.qos_update_pending,
+            self.scratch_handoff.map(|seeds| seeds[usize::from(!tiling)]),
+        ))
+    }
+
+    fn variable_render_items(&self) -> bool {
+        self.has_shared_tsq() && crate::g17_config::RENDER_SKSM != 0
+            && crate::g17_config::RENDER_NATIVE_DOORBELLS == 0
+            && crate::g17_config::RENDER_SPLIT_LAUNCH == 0
+    }
+
+    fn render_item_bases(&self, ordinal: u64) -> Result<[u32; 2]> {
+        if self.variable_render_items() { return Ok(self.render_publication.cursors); }
+        let plan = G17PRenderItemPlan::new(ordinal, g17p_render_tag16_enabled()).ok_or(EINVAL)?;
+        Ok([plan.base; 2])
+    }
+
+    fn prepare_render_items(&mut self, ordinal: u64) -> Result<G17PRenderPublicationPlan> {
+        let fields = [self.final_config_update(true, ordinal)?, self.final_config_update(false, ordinal)?];
+        if self.variable_render_items() {
+            self.render_publication.prepare(ordinal, fields, g17p_render_tag16_enabled()).ok_or(EINVAL)
+        } else {
+            let plan = G17PRenderItemPlan::new(ordinal, g17p_render_tag16_enabled()).ok_or(EINVAL)?;
+            Ok(G17PRenderPublicationPlan { ordinal, lanes: [plan; 2], fields })
+        }
+    }
+
+    pub(crate) fn current_render_item_windows(&self, ordinal: u64)
+        -> Result<[g17_completion::RenderQueueWindow; 2]>
+    {
+        let lanes = if self.variable_render_items() {
+            self.render_publication.current(ordinal).ok_or(EINVAL)?.lanes
+        } else {
+            [G17PRenderItemPlan::new(ordinal, g17p_render_tag16_enabled()).ok_or(EINVAL)?; 2]
+        };
+        Ok([
+            g17_completion::RenderQueueWindow::new(lanes[0].base, lanes[0].count, lanes[0].capacity).map_err(|_| EINVAL)?,
+            g17_completion::RenderQueueWindow::new(lanes[1].base, lanes[1].count, lanes[1].capacity).map_err(|_| EINVAL)?,
+        ])
+    }
+
+    pub(crate) fn current_render_config_present(&self, ordinal: u64) -> Result<[bool; 2]> {
+        if !self.variable_render_items() { return Ok([true; 2]); }
+        let plan = self.render_publication.current(ordinal).ok_or(EINVAL)?;
+        Ok([plan.lanes[0].config_present, plan.lanes[1].config_present])
+    }
+
+    /// Call before planning this publication with the manager's accepted
+    /// firmware recovery generation. This never changes published cursors.
+    pub(crate) fn update_render_recovery_generation(&mut self, generation: u64) -> Result {
+        if !self.variable_render_items() { return Ok(()); }
+        if !self.render_publication.update_recovery_generation(generation) { return Err(EINVAL); }
+        Ok(())
+    }
+
+    pub(crate) fn commit_render_publication(&mut self, ordinal: u64) -> Result {
+        if !self.variable_render_items() { return Ok(()); }
+        if !self.render_publication.commit(ordinal) { return Err(EINVAL); }
+        Ok(())
+    }
+
     pub(crate) fn work_item_gpu_vas(&self, tiling: bool) -> Result<[u64; 3]> {
         let graph = self.graph.iova();
         Ok([
             self.descriptor_high_va(tiling)?,
-            graph
-                .checked_add(g17p_render_optional_offset(tiling, self.descriptor_ordinal) as u64)
-                .ok_or(EOVERFLOW)?,
+            self.config_update_gpu_va(tiling, self.descriptor_ordinal)?,
             graph
                 .checked_add(g17p_render_event_offset(tiling, self.descriptor_ordinal) as u64)
                 .ok_or(EOVERFLOW)?,
@@ -7947,7 +9918,7 @@ impl G17PUserRenderStorage {
     fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,
-        parameter_metrics_vas: [u64; 2],
+        parameter_metrics: G17PPmPageMetricsBinding,
         queue_pair: G17PRenderQueuePair,
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
@@ -8118,12 +10089,17 @@ impl G17PUserRenderStorage {
         // pointers resolve through this job's application GART. Native's
         // context-0 descriptor coordinates overlap the process-root FList;
         // allocate disjoint per-job low aliases and publish their actual VAs.
-        let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc(
-            dev,
-            uat,
-            G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
+        // Native TA/FRG command pools are firmware-cached (bit41). v90 bit 1.
+        let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_fw_pooled(
+            dev, G17P_FW_FAMILY_DESCRIPTOR, G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+            G17P_RENDER_DESCRIPTOR_STORAGE_SIZE, false,
+            || MappedObject::new(
+                dev,
+                uat,
+                G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            ),
         ));
         let descriptor_ta_high_va = descriptors.iova();
         let descriptor_3d_high_va = descriptors
@@ -8160,12 +10136,33 @@ impl G17PUserRenderStorage {
                         + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
             )
         );
-        let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_wc(
-            dev,
-            uat,
-            G17P_RENDER_QUEUE_GRAPH_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
+        // Native ChannelState (0xc0 per QID) is firmware-cached; the pointer
+        // blocks and rings after the 0x8000 record prefix stay uncached.
+        // v90 bit 4.
+        if 128 * G17P_RENDER_QUEUE_RECORD_SIZE > G17P_RENDER_QUEUE_METADATA_BASE {
+            return Err(EINVAL);
+        }
+        let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_fw_pooled(
+            dev, G17P_FW_FAMILY_CHANNEL_STATE, G17P_RENDER_QUEUE_GRAPH_SIZE,
+            G17P_RENDER_QUEUE_METADATA_BASE, true,
+            || MappedObject::new_wc(
+                dev,
+                uat,
+                G17P_RENDER_QUEUE_GRAPH_SIZE,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            ),
+        ));
+        // Do not add a CPU-WB alias of the WC graph. This separate object
+        // has one CPU mapping policy and the existing firmware-shared UAT attribute.
+        // Native ConfigUpdate pools use the same bit41 cached option. v90 bit 8.
+        let config_updates = bootstrap_stage!("ConfigUpdate allocation", MappedObject::new_fw_pooled(
+            dev, G17P_FW_FAMILY_CONFIG_UPDATE, G17P_RENDER_CONFIG_POOL_SIZE,
+            G17P_RENDER_CONFIG_POOL_SIZE, false,
+            || MappedObject::new(
+                dev, uat, G17P_RENDER_CONFIG_POOL_SIZE, mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            ),
         ));
         let mut support = bootstrap_stage!("support allocation", MappedObject::new_wc(
             dev,
@@ -8365,6 +10362,7 @@ impl G17PUserRenderStorage {
         let render_state_va = render_state.iova();
         let timestamp_va = timestamps.iova();
         let mut translated = *command;
+        translated.parameters.context_generation = command_context.generation();
         let bootstrap_vdm = translated.parameters.encoder == G17P_BOOTSTRAP_VDM_VA;
         translated.parameters.context_base = G17P_RENDER_USER_BASE;
         translated.parameters.usc_flist_hardware_buffer_id =
@@ -8389,12 +10387,13 @@ impl G17PUserRenderStorage {
             // is in something it POINTS AT. Log every address it binds.
             dev_info!(
                 dev.as_ref(),
-                "G17P parameter-management binds: tvb={:#x} scene_scratch={:#x} discard={:#x} metrics=[{:#x},{:#x}] hwbuf={}\n",
+                "G17P parameter-management binds: tvb={:#x} scene_scratch={:#x} discard={:#x} metrics=[{:#x},{:#x}] metrics-entry={:?} hwbuf={}\n",
                 tvb_va,
                 scene_scratch_va,
                 discard_va,
-                parameter_metrics_vas[0],
-                parameter_metrics_vas[1],
+                parameter_metrics.vas[0],
+                parameter_metrics.vas[1],
+                parameter_metrics.lease.as_ref().map(G17PPmPageMetricsLease::slot),
                 translated.parameters.ta_hardware_buffer_id,
             );
             Some(bootstrap_stage!(
@@ -8404,7 +10403,7 @@ impl G17PUserRenderStorage {
                     uat,
                     vm,
                     queue_pair,
-                    parameter_metrics_vas,
+                    parameter_metrics.vas,
                     &render_tvb.as_ref().ok_or(EINVAL)?.block_addresses,
                     tvb_va,
                     scene_scratch_va,
@@ -8446,6 +10445,8 @@ impl G17PUserRenderStorage {
         translated.parameters.layermeta = render_target_addresses.layermeta;
         translated.parameters.heapmeta = render_target_addresses.heapmeta;
         translated.parameters.tpc = render_target_memory.tpc_va();
+        if render_layout.tpc_size > render_target_memory.tpc.logical_size { return Err(EINVAL); }
+        translated.parameters.tpc_size = render_layout.tpc_size as u64;
         translated.parameters.aux_fb = render_user_aliases.aux_fb_va();
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
@@ -8697,6 +10698,7 @@ impl G17PUserRenderStorage {
         } else {
             objects
         };
+        let mcache_hwsid = command_context.mcache_hwsid()?;
         let logical_channel_control = match &command_context {
             G17PRenderCommandContext::Job(context) => Some(context.channel_control.clone()),
             G17PRenderCommandContext::Bootstrap(_) => None,
@@ -8899,7 +10901,7 @@ impl G17PUserRenderStorage {
             let (ta_array, fragment_array) = raw.split_at_mut(G17P_RENDER_3D_DESCRIPTOR_OFFSET);
             let tiling = ta_array.get_mut(..g17_render::TA_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
             let fragment = fragment_array
-                .get_mut(..g17_render::FRAGMENT_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
+                .get_mut(..G17P_RENDER_3D_DESCRIPTOR_STRIDE).ok_or(ERANGE)?;
             g17_render::build_cold_opening_ta_descriptor(
                 &translated.parameters,
                 tiling_objects,
@@ -8986,10 +10988,14 @@ impl G17PUserRenderStorage {
                 descriptor_3d_rce_va,
                 g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
                 render_root_slot,
+                g17p_fragment_mcache_probe_hwsid(translated.flags, mcache_hwsid),
                 fragment,
             )?;
-            // The valid cold class-0 trace publishes the two-range aperture on
-            // 3D only. TA has neither a descriptor table nor KSM header bit58.
+            // Preserve the existing FRG-only aperture policy. The saved final
+            // native benchmark records have pointer/count zero despite stale
+            // nonzero table bytes; table contents alone do not prove use.
+            // The opt-in matched-workload probe above tests omission without
+            // generalizing its coherency contract to arbitrary applications.
             let tiling_mcache = None;
             if *crate::module_parameters::g17p_render_dump_descriptor.value() != 0 {
                 dev_info!(
@@ -9055,7 +11061,11 @@ impl G17PUserRenderStorage {
         let tiling_queue_offset = queue_pair.record_offset(true);
         let fragment_queue_offset = queue_pair.record_offset(false);
         bootstrap_stage!("queue encoding", graph.with_bytes_mut(|raw| {
-            let job_list = graph_va + Self::JOB_LIST as u64;
+            let private_job_list = graph_va + Self::JOB_LIST as u64;
+            let job_list = match &command_context {
+                G17PRenderCommandContext::Job(context) => context.tsq_head_gpu_va(),
+                G17PRenderCommandContext::Bootstrap(_) => private_job_list,
+            };
             g17_submission::apply_g17p_cold_opening_queue_record(
                 g17_submission::G17PColdOpeningQueueAddresses {
                     pointers: graph_va + Self::TILING_POINTERS as u64,
@@ -9089,7 +11099,7 @@ impl G17PUserRenderStorage {
                     ..Self::FRAGMENT_POINTERS + G17P_RENDER_POINTER_BLOCK_SIZE],
             )
             .map_err(|_| render_build_fail(24))?;
-            put_u64(raw, Self::JOB_LIST + 0x08, job_list);
+            put_u64(raw, Self::JOB_LIST + 0x08, private_job_list);
             Ok(())
         }));
 
@@ -9111,19 +11121,27 @@ impl G17PUserRenderStorage {
         // byte build above completed while a retained backing still lived in
         // the caller's Option, so failure cannot destroy an installed QID's
         // ring. Success moves that same backing into the replacement graph.
+        // Allocate the boxed per-generation arrays before the SKSM backing
+        // leaves the caller's Option, so an allocation failure here cannot
+        // drop an installed QID's ring either.
+        let mut render_command_ordinals =
+            KBox::new([None; G17P_RENDER_MAX_IN_FLIGHT], GFP_KERNEL)?;
+        if submission_ordinal == 0 {
+            render_command_ordinals[usize::from(render_command_generation)] = Some(0);
+        }
+        let reachability_cache = KBox::new(G17PRenderReachabilityCache::new(), GFP_KERNEL)?;
         let sksm_backing = retained_sksm_backing
             .take()
             .or_else(|| allocated_sksm_backing.take())
             .ok_or(EIO)?;
-        let mut render_command_ordinals = [None; G17P_RENDER_MAX_IN_FLIGHT];
-        if submission_ordinal == 0 {
-            render_command_ordinals[usize::from(render_command_generation)] = Some(0);
-        }
         Ok(Self {
             queue_pair,
             render_operand_aliases,
             descriptors,
             descriptor_ordinal: 0,
+            scratch_handoff: None,
+            render_publication: G17PRenderPublicationState::default(),
+            sksm_dependency_buffer: None,
             fragment_rce,
             descriptor_ta_low,
             _descriptor_ta_global: descriptor_ta_global,
@@ -9135,6 +11153,7 @@ impl G17PUserRenderStorage {
             fragment_context_low,
             sksm_vm_aliases,
             graph,
+            config_updates,
             support,
             pool_a_record_index,
             // The selected cold slot starts at one and the late TA
@@ -9143,7 +11162,7 @@ impl G17PUserRenderStorage {
             render_state,
             render_layout,
             render_command_generation,
-            reachability_cache: G17PRenderReachabilityCache::new(),
+            reachability_cache,
             last_reachability_cache_hit: false,
             alternate_render_commands,
             command_generation_count,
@@ -9154,6 +11173,7 @@ impl G17PUserRenderStorage {
             scene_scratch,
             discard,
             parameter_management,
+            parameter_metrics_lease: parameter_metrics.lease,
             parameter_buffer_token: 0,
             flist_generation: g17_submission::g17p_render_flist_generation(submission_ordinal),
             fragment_status_low: fragment_status_low_info,
@@ -9172,7 +11192,6 @@ impl G17PUserRenderStorage {
             qos_update_pending: true,
             render_root_slot,
             render_flist,
-            staging_descriptors: None,
         })
     }
 
@@ -9238,8 +11257,11 @@ impl G17PUserRenderStorage {
         let tiling = self.queue_record_offset(true);
         let fragment = self.queue_record_offset(false);
         self.graph.with_bytes_mut(|raw| {
-            // Retarget host-owned identity only. Producer counters, job-list
-            // links and all firmware-owned channel fields survive.
+            // The old physical pair is retired before rebind. The new head
+            // is stable across all this owner's channels; never reset its
+            // live links or rewrite any producer/consumer counters.
+            put_u64(raw, tiling + 0x10, context.tsq_head_gpu_va());
+            put_u64(raw, fragment + 0x10, context.tsq_head_gpu_va());
             put_u32(raw, tiling + 0x48, owner_pid);
             put_u32(raw, fragment + 0x48, owner_pid);
             put_u64(raw, tiling + 0x9c, address);
@@ -9335,27 +11357,9 @@ impl G17PUserRenderStorage {
         let mut membership = 0;
         let mut slot_word = 0;
         self.support.with_bytes_mut(|support| {
-            slot_word = u32::from_le_bytes(
-                support
-                    .get(slot_offset..slot_offset + 4)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| EINVAL)?,
-            );
-            completed = u32::from_le_bytes(
-                support
-                    .get(record + 0x0c..record + 0x10)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| EINVAL)?,
-            );
-            membership = u32::from_le_bytes(
-                support
-                    .get(record + 0x94..record + 0x98)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| EINVAL)?,
-            );
+            slot_word = g17p_live_read_u32(support, slot_offset)?;
+            completed = g17p_live_read_u32(support, record + 0x0c)?;
+            membership = g17p_live_read_u32(support, record + 0x94)?;
             Ok(())
         })?;
         Ok(G17PRenderEventControlState {
@@ -9365,6 +11369,53 @@ impl G17PUserRenderStorage {
             completed,
             membership,
         })
+    }
+
+    /// Bind both staged engines to the submit's retained maintenance state.
+    /// Called for cold and retained graphs before any outer producer is exposed.
+    pub(crate) fn has_shared_tsq(&self) -> bool {
+        matches!(self._command_context, Some(G17PRenderCommandContext::Job(_)))
+    }
+
+    pub(crate) fn bind_shared_work_state(&mut self, owner: &G17PWorkStateLease) -> Result {
+        // Only ordinary per-submit shared TSQ ownership is covered by this
+        // probe. Private bootstrap/legacy event records keep their old policy.
+        let native_ta_drain = (crate::g17_config::RENDER_NATIVE_TA_DRAIN_PROBE
+            || crate::g17_timing_buffer::diag_knob(
+                crate::g17_timing_buffer::DIAG_NATIVE_TA_DRAIN))
+            && self.has_shared_tsq()
+            && crate::g17_config::RENDER_NATIVE_DOORBELLS == 0
+            && crate::g17_config::RENDER_SPLIT_LAUNCH == 0;
+        let ta = g17p_render_ta_descriptor_offset(self.descriptor_ordinal);
+        let fragment = g17p_render_3d_descriptor_offset(self.descriptor_ordinal);
+        let pair = self.queue_pair.slot();
+        let slot = owner.render_tsq_slot(pair)?;
+        let queues = [self.queue_record_offset(false), self.queue_record_offset(true)];
+        self.graph.with_bytes_mut(|raw| {
+            for queue in queues {
+                if !slot.write(raw, queue.checked_add(0x38).ok_or(EOVERFLOW)?) {
+                    return Err(ERANGE);
+                }
+            }
+            Ok(())
+        })?;
+        self.descriptors.with_bytes_mut(|raw| {
+            if fragment > raw.len() { return Err(ERANGE); }
+            let (prefix, suffix) = raw.split_at_mut(fragment);
+            let ta = prefix.get_mut(ta..ta + g17_render::TA_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
+            let fragment = suffix.get_mut(..G17P_RENDER_3D_DESCRIPTOR_STRIDE).ok_or(ERANGE)?;
+            // Reuse the slot selected above; re-locking the TSQ table cannot
+            // change this retained physical pair's assignment.
+            if !slot.bind_render(ta, fragment, owner.tsq_gpu_va()?) { return Err(EINVAL); }
+            // Native TA+8c2 is pending IO-fence-count !=0, not priority. Normal
+            // captured render has zero. Shared submitted/completed equality
+            // still drains both lanes after mandatory cache maintenance; GPU
+            // parents use KSM timestamps, never this final-memory stamp.
+            if native_ta_drain { put_u32(ta, 0x8c2, 0); }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(Ordering::Release);
+        Ok(())
     }
 
     /// Read the context IDs from the TA and 3D descriptors actually staged
@@ -9437,56 +11488,6 @@ impl G17PUserRenderStorage {
         u64::from(self.lifecycle_predecessor)
     }
 
-    pub(crate) fn take_retired_parameter_management(
-        &mut self,
-    ) -> Option<G17PRetiredParameterManagement> {
-        self.reachability_cache.invalidate();
-        self.parameter_management.take().map(|manager| {
-            // The client page-list presentation is rooted through the
-            // retiring VmBind and is not what the firmware crash named.
-            // Destructure the manager so that only its firmware-high backing
-            // survives; all scalar metadata and the low alias are released.
-            let G17PParameterManagement {
-                _page_list_low,
-                backing,
-                ..
-            } = manager;
-            drop(_page_list_low);
-            G17PRetiredParameterManagement {
-                _backing: backing,
-                _support: None,
-                hardware_buffer_id: manager.hardware_buffer_id,
-            }
-        })
-    }
-
-    /// Split the firmware-retained portion out of a graph whose client roots
-    /// have a positive context-update retirement witness. GFX PC 0x24144
-    /// faulted inside `support` after that witness, while the earlier PC 0x95f0
-    /// fault named the PM backing. Both therefore outlive the VM-facing graph.
-    pub(crate) fn into_retired_parameter_management(
-        self,
-    ) -> Option<G17PRetiredParameterManagement> {
-        let G17PUserRenderStorage {
-            support,
-            parameter_management,
-            ..
-        } = self;
-        parameter_management.map(|manager| {
-            let G17PParameterManagement {
-                _page_list_low,
-                backing,
-                ..
-            } = manager;
-            drop(_page_list_low);
-            G17PRetiredParameterManagement {
-                _backing: backing,
-                _support: Some(support),
-                hardware_buffer_id: manager.hardware_buffer_id,
-            }
-        })
-    }
-
     fn take_persistent_client_mappings(&mut self) -> Result<KVec<mmu::KernelMapping>> {
         let mut aliases = core::mem::take(&mut self.render_operand_aliases);
         for object in [self.scene_scratch.as_mut(), self.discard.as_mut(),
@@ -9534,301 +11535,10 @@ impl G17PUserRenderStorage {
         Ok(aliases)
     }
 
-    /// Name the exclusive alias that contains `address`, and say whether this
-    /// driver maps it read-only.
-    ///
-    /// A `reason=3` GMMU fault is ReadOnly, not Unmapped -- the firmware wrote
-    /// through a leaf we mapped without write permission -- so the leaf's
-    /// permission is the whole diagnosis, and the fault line previously named
-    /// only the owning VM. Several of these aliases ARE read-only by
-    /// construction (`fragment_rce`, the 3D descriptor), so a write landing in
-    /// one of those is the answer rather than a coincidence.
-    pub(crate) fn name_alias_containing(&self, address: u64) -> Option<(&'static str, bool)> {
-        let hit = |base: u64, size: u64| address >= base && address < base.saturating_add(size);
-        let entries: [(&'static str, u64, u64, bool); 10] = [
-            ("render-state", self.render_state.iova(), self.render_state.logical_size as u64, false),
-            ("deflake", self.render_user_aliases.deflake.iova(), self.render_user_aliases.deflake.size() as u64, false),
-            ("aux-fb", self.render_user_aliases.aux_fb.iova(), self.render_user_aliases.aux_fb.size() as u64, false),
-            ("rt-memory", self.render_target_memory.rt_memory.iova(), self.render_target_memory.rt_memory.logical_size as u64, false),
-            ("tpc", self.render_target_memory.tpc.iova(), self.render_target_memory.tpc.logical_size as u64, false),
-            ("descriptor-ta", self.descriptor_ta_low.iova(), self.descriptor_ta_low.size() as u64, false),
-            ("descriptor-3d", self.descriptor_3d_low.iova(), self.descriptor_3d_low.size() as u64, false),
-            ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.logical_size as u64, true),
-            ("descriptor-3d-diagnostic", self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64, true),
-            ("fragment-status", self.fragment_status_low.iova(), self.fragment_status_low.size() as u64, false),
-        ];
-        for (name, base, size, read_only) in entries {
-            if hit(base, size) {
-                return Some((name, read_only));
-            }
-        }
-        None
-    }
-
-    /// Cross-VM reuse preserves embedded GPU addresses. Check the complete
-    /// exclusive alias set before selecting a cached graph; a different VM
-    /// may already use those addresses for its other render pair or compute.
-    pub(crate) fn client_rebind_addresses_available(&self, vm: &mmu::Vm) -> bool {
-        let available = |name: &str, address: u64, size: u64| {
-            let mask = mmu::UAT_PGMSK as u64;
-            let start = address & !mask;
-            let Some(end) = address.checked_add(size)
-                .and_then(|end| end.checked_add(mask))
-                .map(|end| end & !mask)
-            else { return false; };
-            match vm.first_occupied_alias_range(start..end) {
-                Ok(None) => true,
-                Ok(Some(occupied)) => {
-                    pr_info!(
-                        "G17P graph cache: vm={} pair={} cannot reuse {} at {:#x}+{:#x}; occupied {:#x}..{:#x}\n",
-                        vm.id(), self.queue_pair.slot(), name, address, size,
-                        occupied.start, occupied.end,
-                    );
-                    false
-                }
-                Err(_) => false,
-            }
-        };
-        for (name, address, size) in [
-            ("render-state", self.render_state.iova(), self.render_state.object.size() as u64),
-            ("deflake", self.render_user_aliases.deflake.iova(), self.render_user_aliases.deflake.size() as u64),
-            ("aux-fb", self.render_user_aliases.aux_fb.iova(), self.render_user_aliases.aux_fb.size() as u64),
-            ("rt-memory", self.render_target_memory.rt_memory.iova(), self.render_target_memory.rt_memory.object.size() as u64),
-            ("tpc", self.render_target_memory.tpc.iova(), self.render_target_memory.tpc.object.size() as u64),
-            ("descriptor-ta", self.descriptor_ta_low.iova(), self.descriptor_ta_low.size() as u64),
-            ("descriptor-3d", self.descriptor_3d_low.iova(), self.descriptor_3d_low.size() as u64),
-            ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.object.size() as u64),
-            ("descriptor-3d-diagnostic", self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64),
-            ("fragment-status", self.fragment_status_low.iova(), self.fragment_status_low.size() as u64),
-        ] {
-            if !available(name, address, size) { return false; }
-        }
-        for alternate in self.alternate_render_commands.iter() {
-            for (name, address, size) in [
-                ("alternate-render-state", alternate.render_state.iova(),
-                    alternate.render_state.object.size() as u64),
-                ("alternate-deflake", alternate.render_user_aliases.deflake.iova(),
-                    alternate.render_user_aliases.deflake.size() as u64),
-                ("alternate-aux-fb", alternate.render_user_aliases.aux_fb.iova(),
-                    alternate.render_user_aliases.aux_fb.size() as u64),
-                ("alternate-fragment-status", alternate.fragment_status_low.iova(),
-                    alternate.fragment_status_low.size() as u64),
-            ] {
-                if !available(name, address, size) { return false; }
-            }
-        }
-        for object in [self.scene_scratch.as_ref(), self.discard.as_ref()].into_iter().flatten() {
-            if !available("scene/discard", object.iova(), object.object.size() as u64) {
-                return false;
-            }
-        }
-        if let Some(pm) = self.parameter_management.as_ref() {
-            if !available("page-list", pm.page_list_low_va(), G17P_PM_PAGE_LIST_SIZE as u64) {
-                return false;
-            }
-        }
-        if let Some(tvb) = self.render_tvb.as_ref() {
-            for index in 0..tvb.block_count {
-                let Some(address) = tvb.block_addresses.get(index).copied() else {
-                    return false;
-                };
-                if !available("tvb", address, G17P_RENDER_TVB_BLOCK_SIZE as u64) {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    /// Rebind every client-root view of an idle cached graph to a different
-    /// VM without rebuilding any firmware-high queue, descriptor, support, PM
-    /// or TVB object. The complete mapping set is prepared before ownership is
-    /// changed, matching BufferManager's stable-slot reuse on M1/M2.
-    pub(crate) fn rebind_client_vm_aliases(
-        &mut self,
-        uat: &mmu::Uat,
-        vm: &mmu::Vm,
-        sksm_backing: &mut G17PRenderSksmBacking,
-    ) -> Result<(KVec<mmu::KernelMapping>, KVec<mmu::KernelMapping>)> {
-        // The transaction can fail after replacing some storage aliases.
-        // Never retain either command generation's proof across an attempt.
-        self.reachability_cache.invalidate();
-        let pair = self.queue_pair.slot();
-        // A failed cross-VM rebind is pre-publication, but the caller must
-        // know which exact alias refused admission before considering reuse.
-        // Log only on error; successful handoffs retain their existing path.
-        macro_rules! rebind_step {
-            ($stage:literal, $operation:expr) => {
-                $operation.map_err(|error| {
-                    pr_err!(
-                        "G17P render rebind: vm={} pair={} alias={} failed ({:?})\n",
-                        vm.id(), pair, $stage, error,
-                    );
-                    error
-                })?
-            };
-        }
-        if !sksm_backing.matches_queue_pair(self.queue_pair) {
-            pr_err!(
-                "G17P render rebind: vm={} graph pair={} backing pair={} TA={:#x} 3D={:#x}\n",
-                vm.id(), self.queue_pair.slot(), sksm_backing.queue_pair.slot(),
-                sksm_backing.ta_context.iova(), sksm_backing.fragment_context.iova(),
-            );
-            return Err(EFAULT);
-        }
-
-        let render_state_mapping = rebind_step!("render-state", self.render_state.object.map_at(
-            vm, self.render_state.iova(), mmu::PROT_GPU_FW_SHARED_RW, false,
-        ));
-        let render_user_aliases = rebind_step!("render-user-aliases", self.render_user_aliases.remap(
-            &mut self.render_state, vm, &self.render_layout,
-        ));
-        let mut alternate_rebinds = rebind_step!("alternate-render-command-list",
-            KVec::with_capacity(self.alternate_render_commands.len(), GFP_KERNEL).map_err(|_| ENOMEM));
-        for alternate in self.alternate_render_commands.iter_mut() {
-            let rebound = rebind_step!("alternate-render-command", alternate.prepare_vm_rebind(vm));
-            rebind_step!("alternate-render-command-push",
-                alternate_rebinds.push(rebound, GFP_KERNEL).map_err(|_| ENOMEM));
-        }
-        let rt_memory_iova = self.render_target_memory.rt_memory.iova();
-        let rt_memory_mapping = rebind_step!("rt-memory", self.render_target_memory.rt_memory.object.map_at(
-            vm,
-            rt_memory_iova,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            false,
-        ));
-        let tpc_iova = self.render_target_memory.tpc.iova();
-        let tpc_mapping = rebind_step!("tpc", self.render_target_memory.tpc.object.map_at(
-            vm,
-            tpc_iova,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            false,
-        ));
-        let descriptor_ta_low = rebind_step!("descriptor-ta", self.descriptors.object.map_range_into_range(
-            vm,
-            0..G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
-            self.descriptor_ta_low.iova()
-                ..self.descriptor_ta_low.iova() + G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE as u64,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_SHARED_RO,
-            false,
-        ));
-        let descriptor_3d_low = rebind_step!("descriptor-3d", self.descriptors.object.map_range_into_range(
-            vm,
-            G17P_RENDER_3D_DESCRIPTOR_OFFSET
-                ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
-            self.descriptor_3d_low.iova()
-                ..self.descriptor_3d_low.iova() + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE as u64,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_SHARED_RO,
-            false,
-        ));
-        let scene_mapping = rebind_step!("scene-scratch", self.scene_scratch.as_mut().map(|object| {
-            object.map_alias_at(vm, object.iova(), mmu::PROT_GPU_SHARED_RW)
-        }).transpose());
-        let discard_mapping = rebind_step!("discard", self.discard.as_mut().map(|object| {
-            object.map_alias_at(vm, object.iova(), mmu::PROT_GPU_SHARED_RW)
-        }).transpose());
-        let page_list_mapping = rebind_step!("page-list", self.parameter_management.as_mut().map(|pm| {
-            let size = page_align(G17P_PM_PAGE_LIST_SIZE).ok_or(EINVAL)?;
-            pm.backing.object.map_range_into_range(
-                vm,
-                pm.layout.page_list..pm.layout.page_list.checked_add(size).ok_or(EOVERFLOW)?,
-                pm.page_list_low_va()
-                    ..pm.page_list_low_va().checked_add(size as u64).ok_or(EOVERFLOW)?,
-                G17P_PM_PAGE_SIZE as u64,
-                mmu::PROT_GPU_FW_SHARED_RW,
-                false,
-            )
-        }).transpose());
-        let tvb_mappings = rebind_step!("tvb", self.render_tvb.as_mut()
-            .map(|tvb| tvb.map_cached_blocks(vm))
-            .transpose())
-            .unwrap_or_else(KVec::new);
-        let fragment_rce_mapping = rebind_step!("fragment-rce", self.fragment_rce.map_alias_at(
-            vm, self.fragment_rce.iova(), mmu::PROT_GPU_SHARED_RO,
-        ));
-        let descriptor_3d_render_mapping = rebind_step!("descriptor-3d-diagnostic", self.descriptors.object.map_range_into_range(
-            vm,
-            G17P_RENDER_3D_DESCRIPTOR_OFFSET
-                ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + mmu::UAT_PGSZ,
-            self.descriptor_3d_render.iova()
-                ..self.descriptor_3d_render.iova() + self.descriptor_3d_render.size() as u64,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_SHARED_RO,
-            false,
-        ));
-        let fragment_status_mapping = rebind_step!("fragment-status", self.fragment_status.map_alias_at(
-            vm, self.fragment_status_low.iova(), mmu::PROT_GPU_SHARED_RW,
-        ));
-        let render_peer_prot = if crate::g17_config::RENDER_SKSM != 0 {
-            mmu::PROT_GPU_SHARED_RW
-        } else {
-            mmu::PROT_GPU_SHARED_RO
-        };
-        let (ta_context_low, ta_context_mapping) = rebind_step!("ta-sksm", prepare_render_sksm_vm_alias(
-            uat, vm, &mut sksm_backing.ta_context, sksm_backing._ta_context_global.iova(),
-            render_peer_prot, crate::g17_config::RENDER_SKSM != 0,
-        ));
-        let (fragment_context_low, fragment_context_mapping) = rebind_step!("fragment-sksm", prepare_render_sksm_vm_alias(
-            uat, vm, &mut sksm_backing.fragment_context, sksm_backing._fragment_context_global.iova(),
-            render_peer_prot, crate::g17_config::RENDER_SKSM != 0,
-        ));
-
-        self.render_state.mapping = Some(render_state_mapping);
-        self.render_user_aliases = render_user_aliases;
-        for (alternate, (state_mapping, user_aliases, status_mapping)) in self
-            .alternate_render_commands
-            .iter_mut()
-            .zip(alternate_rebinds.into_iter())
-        {
-            alternate.render_state.mapping = Some(state_mapping);
-            alternate.render_user_aliases = user_aliases;
-            alternate._fragment_status_mapping = status_mapping;
-        }
-        self.render_target_memory.rt_memory.mapping = Some(rt_memory_mapping);
-        self.render_target_memory.tpc.mapping = Some(tpc_mapping);
-        self.descriptor_ta_low = descriptor_ta_low;
-        self.descriptor_3d_low = descriptor_3d_low;
-        if let (Some(object), Some(mapping)) = (self.scene_scratch.as_mut(), scene_mapping) {
-            object.mapping = Some(mapping);
-        }
-        if let (Some(object), Some(mapping)) = (self.discard.as_mut(), discard_mapping) {
-            object.mapping = Some(mapping);
-        }
-        if let (Some(pm), Some(mapping)) = (self.parameter_management.as_mut(), page_list_mapping) {
-            pm._page_list_low = mapping;
-        }
-        if let Some(tvb) = self.render_tvb.as_mut() {
-            tvb.block_mappings = tvb_mappings;
-        }
-        self.fragment_rce.mapping = Some(fragment_rce_mapping);
-        self.render_operand_aliases = KVec::with_capacity(2, GFP_KERNEL)?;
-        self.render_operand_aliases.push(descriptor_3d_render_mapping, GFP_KERNEL)?;
-        self.render_operand_aliases.push(fragment_status_mapping, GFP_KERNEL)?;
-        self.ta_context_low = ta_context_low;
-        self.fragment_context_low = fragment_context_low;
-
-        let pool_mappings = self.take_persistent_client_mappings()?;
-        let mut sksm_mappings = KVec::with_capacity(2, GFP_KERNEL)?;
-        if let Some(mapping) = ta_context_mapping {
-            sksm_mappings.push(mapping, GFP_KERNEL)?;
-        }
-        if let Some(mapping) = fragment_context_mapping {
-            sksm_mappings.push(mapping, GFP_KERNEL)?;
-        }
-        Ok((pool_mappings, sksm_mappings))
-    }
-
-    /// Called only after semantic paired completion and FList release.
-    pub(crate) fn release_client_context(&mut self) {
-        self._command_context = None;
-    }
-
-    /// A cross-VM handoff builds a fresh queue graph while the physical QID
-    /// producer remains monotonic. Move the empty graph's three cursors to the
-    /// retained producer before staging the next group, so firmware never
-    /// walks the intentionally empty slots preceding that group.
+    /// A cross-VM handoff builds a fresh graph while physical KSM timestamps
+    /// remain monotonic. Ordinary variable-item graphs start all cursors at
+    /// zero independently of that timestamp; legacy fixed-group diagnostics
+    /// rebase to their ordinal-derived position before staging the first group.
     pub(crate) fn rebase_empty_queue_cursors(
         &mut self,
         submission_ordinal: u64,
@@ -9836,14 +11546,10 @@ impl G17PUserRenderStorage {
         if submission_ordinal == 0 {
             return Err(EINVAL);
         }
-        let plan = G17PRenderItemPlan::new(
-            submission_ordinal,
-            g17p_render_tag16_enabled(),
-        )
-        .ok_or(EINVAL)?;
+        let bases = self.render_item_bases(submission_ordinal)?;
         core::sync::atomic::fence(Ordering::Acquire);
         let previous = self.snapshot(submission_ordinal)?;
-        if !previous.job_list_empty
+        if (!self.has_shared_tsq() && !previous.job_list_empty)
             || !previous.tiling.idle()
             || !previous.fragment.idle()
             || previous.tiling.write != 0
@@ -9866,49 +11572,13 @@ impl G17PUserRenderStorage {
             return Err(EBUSY);
         }
         self.graph.with_bytes_mut(|raw| {
-            for pointers in [Self::TILING_POINTERS, Self::FRAGMENT_POINTERS] {
-                put_u32(raw, pointers, plan.base);
-                put_u32(raw, pointers + 0x30, plan.base);
-                put_u32(raw, pointers + 0x40, plan.base);
+            for (lane, pointers) in [Self::TILING_POINTERS, Self::FRAGMENT_POINTERS].into_iter().enumerate() {
+                put_u32(raw, pointers, bases[lane]);
+                put_u32(raw, pointers + 0x30, bases[lane]);
+                put_u32(raw, pointers + 0x40, bases[lane]);
             }
             Ok(())
         })?;
-        core::sync::atomic::fence(Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Reactivate a completed graph cached across a VM handoff. Its private
-    /// ring may end at an older physical-QID prefix, but no job or queue item
-    /// remains live. Advance all three cursors together to the current shared
-    /// producer and require a fresh context update when this graph is selected
-    /// again; no mapping or descriptor backing is rebuilt.
-    pub(crate) fn prepare_cached_reactivation(
-        &mut self,
-        submission_ordinal: u64,
-    ) -> Result {
-        let plan = G17PRenderItemPlan::new(
-            submission_ordinal,
-            g17p_render_tag16_enabled(),
-        )
-        .ok_or(EINVAL)?;
-        core::sync::atomic::fence(Ordering::Acquire);
-        let previous = self.snapshot(submission_ordinal)?;
-        if !previous.job_list_empty
-            || !previous.tiling.idle()
-            || !previous.fragment.idle()
-        {
-            return Err(EBUSY);
-        }
-        self.graph.with_bytes_mut(|raw| {
-            for pointers in [Self::TILING_POINTERS, Self::FRAGMENT_POINTERS] {
-                put_u32(raw, pointers, plan.base);
-                put_u32(raw, pointers + 0x30, plan.base);
-                put_u32(raw, pointers + 0x40, plan.base);
-            }
-            Ok(())
-        })?;
-        self.context_update_pending = true;
-        self.qos_update_pending = true;
         core::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }
@@ -9938,17 +11608,13 @@ impl G17PUserRenderStorage {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Ok(false);
         }
-        let Some(plan) =
-            G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
-        else {
-            return Ok(false);
-        };
+        let bases = self.render_item_bases(submission_ordinal)?;
         core::sync::atomic::fence(Ordering::Acquire);
         let previous = self.snapshot(submission_ordinal)?;
         Ok(previous.job_list_empty
             && previous.tiling.idle()
             && previous.fragment.idle()
-            && (previous.tiling.write != plan.base || previous.fragment.write != plan.base))
+            && (previous.tiling.write != bases[0] || previous.fragment.write != bases[1]))
     }
 
     /// Describe the drift for the log that reports it.
@@ -9956,11 +11622,10 @@ impl G17PUserRenderStorage {
     pub(crate) fn restage_admission_cursors(
         &mut self,
         submission_ordinal: u64,
-    ) -> Result<(u32, u32, u32)> {
-        let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
-            .ok_or(EINVAL)?;
+    ) -> Result<([u32; 2], u32, u32)> {
+        let bases = self.render_item_bases(submission_ordinal)?;
         let previous = self.snapshot(submission_ordinal)?;
-        Ok((plan.base, previous.tiling.write, previous.fragment.write))
+        Ok((bases, previous.tiling.write, previous.fragment.write))
     }
 
     fn select_render_command_generation(&mut self, submission_ordinal: u64) -> Result {
@@ -9991,16 +11656,50 @@ impl G17PUserRenderStorage {
         if self.render_command_ordinals[generation] != Some(submission_ordinal) {
             return Err(EIO);
         }
+        if let Some(pm) = self.parameter_management.as_mut() {
+            if !pm.scene_ownership.release(submission_ordinal) { return Err(EIO); }
+        }
         self.render_command_ordinals[generation] = None;
-        self.render_target_memory.rt_slot_ordinals[
+        let rt_slot = &mut self.render_target_memory.rt_slot_ordinals[
             submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT
-        ] = None;
+        ];
+        if *rt_slot == Some(submission_ordinal) { *rt_slot = None; }
+        let retired = &mut self.render_target_memory.retired_backings;
+        let mut index = 0;
+        while index < retired.len() {
+            for owner in &mut retired[index].owners {
+                if *owner == Some(submission_ordinal) { *owner = None; }
+            }
+            if retired[index].owners.iter().all(Option::is_none) {
+                drop(retired.remove(index)?);
+            } else {
+                index += 1;
+            }
+        }
         Ok(())
     }
 
-    /// Refresh the canonical queue group's command-owned objects. Up to two
-    /// consecutive groups may remain firmware-owned; each uses its own
-    /// DEFLAKE/AXFB/status generation and timestamp pair.
+    /// Undo CPU preparation that never staged an inner producer or AddKicks.
+    /// The shared-work-state path does not apply a private Pool-A kick; only
+    /// this unpublished generation's Scene/RT ownership needs cancelling.
+    /// Ordinal zero is the constructor's warm-opening image and stays seeded.
+    pub(crate) fn cancel_unpublished_command(&mut self, ordinal: u64) -> Result {
+        if ordinal == 0 { return Ok(()); }
+        let generation = ordinal as usize % self.command_generation_count;
+        if self.render_command_ordinals[generation] == Some(ordinal) {
+            return self.retire_command_generation(ordinal);
+        }
+        // A fallible preparation can reserve RT space before committing Scene
+        // ownership. Never clear a preceding live command's generation.
+        let rt_slot = &mut self.render_target_memory.rt_slot_ordinals[
+            ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT];
+        if *rt_slot == Some(ordinal) { *rt_slot = None; }
+        Ok(())
+    }
+
+    /// Refresh command-owned objects within the configured generation bound.
+    /// Each live group retains its own DEFLAKE/AXFB/status generation and
+    /// timestamp pair until paired completion permits reuse.
     pub(crate) fn restage_command(
         &mut self,
         dev: &AsahiDevice,
@@ -10011,6 +11710,7 @@ impl G17PUserRenderStorage {
         num_clusters: u32,
         command_buffer_state_words: [u32; 2],
         submission_ordinal: u64,
+        shared_work_state: bool,
     ) -> Result {
         macro_rules! restage_step {
             ($name:literal, $expression:expr) => {
@@ -10029,25 +11729,46 @@ impl G17PUserRenderStorage {
                 }
             };
         }
-        if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
+        // v91 fine laps (e2e option bit4); 0 when disabled.
+        let mut fine = [crate::g17_e2e::fine(), 0, 0, 0, 0];
+        if submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
+            return Err(EINVAL);
+        }
+        // Ordinal 0 on a retained graph is the FIRST kick of a pair that was
+        // constructed without a render: a sibling warmed by
+        // `warm_render_pair_storage` before its owner's first doorbell (the
+        // native two-work-queues-at-creation model), or a cold first
+        // publication that failed before anything became firmware-visible.
+        // Generation 0 then still holds the constructor's cold-opening image,
+        // encoded from a template command. Re-encode it from THIS command in
+        // the same cold-opening shape (`cold_opening = true`, the cold
+        // builders, the constructor's pool-A record and slot, INNER=1,
+        // FLAG=1), so the pair's first kick is byte-for-byte what the
+        // constructor would have produced with this command. Measured on Neo
+        // 2026-09-26 09:08: refusing ordinal 0 here failed every render that
+        // landed on a warmed pair with EINVAL (1,202 in one boot).
+        let mcache_hwsid = self._command_context.as_ref().ok_or(EIO)?.mcache_hwsid()?;
+        let warm_first_kick = submission_ordinal == 0;
+        if warm_first_kick
+            && (self.descriptor_ordinal != 0 || self.render_command_ordinals[0] != Some(0))
+        {
             return Err(EINVAL);
         }
         if !Self::descriptor_context_valid(descriptor_context_id) {
             return Err(EINVAL);
         }
         let generation = submission_ordinal as usize % self.command_generation_count;
-        if self.render_command_ordinals[generation].is_some() {
+        if !warm_first_kick && self.render_command_ordinals[generation].is_some() {
             return Err(EBUSY);
         }
         self.select_render_command_generation(submission_ordinal)?;
         // The retained graph keeps its VM's binding for its whole lifetime,
         // so the bound root cannot move between submissions on it.
         let render_root_slot = self.render_root_slot;
-        let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
-            .ok_or(EINVAL)?;
+        let bases = self.render_item_bases(submission_ordinal)?;
         core::sync::atomic::fence(Ordering::Acquire);
         let previous = self.snapshot(submission_ordinal)?;
-        if previous.tiling.write != plan.base || previous.fragment.write != plan.base
+        if previous.tiling.write != bases[0] || previous.fragment.write != bases[1]
         {
             // This is the one place a render is refused because the PREVIOUS
             // group on this retained storage has not finished. It used to
@@ -10064,7 +11785,7 @@ impl G17PUserRenderStorage {
                 self.queue_pair.tiling,
                 self.queue_pair.fragment,
                 submission_ordinal,
-                plan.base,
+                bases[0],
                 previous.job_list_empty,
                 previous.tiling.done,
                 previous.tiling.read,
@@ -10072,24 +11793,10 @@ impl G17PUserRenderStorage {
                 previous.fragment.done,
                 previous.fragment.read,
                 previous.fragment.write,
-                plan.base,
+                bases[1],
             );
             return Err(EBUSY);
         }
-        // Preserve a zeroed builder input on reuse and after failed restaging.
-        let mut next_descriptors = match self.staging_descriptors.take() {
-            Some(mut retained) if g17p_retain_staging() => {
-                retained.fill(0);
-                retained
-            }
-            _ => {
-                let mut bytes = KVec::new();
-                restage_step!("descriptor staging allocation",
-                    bytes.resize(G17P_RENDER_DESCRIPTOR_IMAGE_SIZE, 0, GFP_KERNEL)
-                        .map_err(|_| ENOMEM));
-                bytes
-            }
-        };
         let render_layout =
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
         // The tail-pointer cache and the TMAP/HMTA records scale with the
@@ -10099,7 +11806,7 @@ impl G17PUserRenderStorage {
         // with a bare ERANGE, which Mesa reports as VK_ERROR_DEVICE_LOST.
         restage_step!(
             "render-target capacity",
-            self.render_target_memory.ensure_capacity(dev, vm, &render_layout)
+            self.render_target_memory.ensure_capacity(dev, vm, &render_layout, &self.render_command_ordinals)
         );
         let render_target_addresses = restage_step!(
             "render-target-memory record",
@@ -10134,8 +11841,13 @@ impl G17PUserRenderStorage {
         }
         if g17p_render_tvb_enabled() {
             let tvb = self.render_tvb.as_mut().ok_or(EIO)?;
-            if tvb.logical_size < render_layout.tvb_size
-                || render_layout.tvb_blocks > tvb.block_count
+            // Mode 1 has no PM demand-growth protocol and must fit its fixed
+            // backing. Modes >=2 retain the actual PM inventory and let
+            // firmware request more blocks when necessary. Target-dependent
+            // TMAP/HMTA/TPC capacity was checked separately above.
+            if g17p_render_tvb_mode() < 2
+                && (tvb.logical_size < render_layout.tvb_size
+                    || render_layout.tvb_blocks > tvb.block_count)
             {
                 // The last bare refusal on this path. Name it: an anonymous
                 // ERANGE out of `restage_command` is indistinguishable in
@@ -10194,6 +11906,8 @@ impl G17PUserRenderStorage {
         translated.parameters.layermeta = render_target_addresses.layermeta;
         translated.parameters.heapmeta = render_target_addresses.heapmeta;
         translated.parameters.tpc = self.render_target_memory.tpc_va();
+        if render_layout.tpc_size > self.render_target_memory.tpc.logical_size { return Err(EINVAL); }
+        translated.parameters.tpc_size = render_layout.tpc_size as u64;
         translated.parameters.aux_fb = aux_fb_va;
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
@@ -10276,6 +11990,7 @@ impl G17PUserRenderStorage {
             }
             Ok(())
         })?;
+        if fine[0] != 0 { fine[1] = crate::g17_e2e::now(); }
 
         // Pool-A record selection must be grounded in firmware state, not in the
         // ordinal alone. A record is reusable only once firmware has completed
@@ -10288,7 +12003,12 @@ impl G17PUserRenderStorage {
         // asynchronous submission is preserved and EBUSY is reported only when
         // firmware genuinely owns every record.
         let support_va = self.support.iova();
-        let record_a_index = {
+        // A first kick keeps the cold-opening record the constructor chose and
+        // seeded (`g17p_render_pool_a_record_index(0, native_first)`); the
+        // reuse search below is for records firmware has completed.
+        let record_a_index = if warm_first_kick || shared_work_state {
+            usize::from(self.pool_a_record_index)
+        } else {
             let view = self.support.object.vmap()?;
             let support_ro = unsafe {
                 core::slice::from_raw_parts(view.as_ptr(), G17P_RENDER_SUPPORT_SIZE)
@@ -10438,25 +12158,92 @@ impl G17PUserRenderStorage {
             .iova()
             .checked_add(
                 g17p_render_descriptor_slot(submission_ordinal) as u64
-                    * g17_render::FRAGMENT_DESCRIPTOR_SIZE as u64,
+                    * G17P_RENDER_3D_DESCRIPTOR_STRIDE as u64,
             )
             .ok_or(EOVERFLOW)?;
+        // This generation is reserved and unpublished. Map both owners and
+        // validate both descriptor extents before the first descriptor write.
+        // Builders may fail after touching this inactive generation; the caller
+        // returns the graph and cancels its exact reservation before publication.
+        // A retry rebuilds both prefixes and all referenced spill bytes in full.
+        if !g17p_render_descriptor_backing_valid(
+            self.descriptors.logical_size, self.descriptors.cpu_wc)
+            || self.support.logical_size < G17P_RENDER_SUPPORT_SIZE
+        { return Err(ERANGE); }
+        let destination_mapping = self.descriptors.object.vmap()?;
+        let support_mapping = self.support.object.vmap()?;
+        let destination = unsafe {
+            core::slice::from_raw_parts_mut(destination_mapping.as_mut_ptr(),
+                G17P_RENDER_DESCRIPTOR_STORAGE_SIZE)
+        };
+        let support = unsafe {
+            core::slice::from_raw_parts_mut(support_mapping.as_mut_ptr(),
+                G17P_RENDER_SUPPORT_SIZE)
+        };
+        let (tiling, fragment) = g17p_render_descriptor_views(destination, submission_ordinal)
+            .ok_or(ERANGE)?;
+        // A first kick reuses nothing: the constructor seeded its record
+        // and slot word for the cold opening, and they stay as written.
+        g17p_live_word_bounds(support, G17P_RENDER_SHARED_CONTROL_INNER, 4)?;
+        g17p_live_word_bounds(support, G17P_RENDER_FLAG, 4)?;
+        g17p_live_word_bounds(support, G17P_RENDER_POOL_A + record_a_index * 0x100 + 0x10, 4)?;
+        let pool_a_kick = if warm_first_kick || shared_work_state { None } else { Some(match G17PEventControlKick::prepare_reuse(
+            support,
+            support_va,
+            record_a_index,
+        ) {
+            Some(kick) => kick,
+            None => {
+                // The graph stays exclusively reserved, but firmware may
+                // advance its record state while preparation runs off Runtime.
+                // Refuse before writing descriptors if reuse no longer holds.
+                if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
+                    G17PEventControlKick::reuse_fields(support, support_va, record_a_index)
+                {
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17P render restage: selected pool-A record {} became unusable ordinal={} slot_va={:#x} expected={:#x} completed={} expected={} membership={:#x}\n",
+                        record_a_index,
+                        submission_ordinal,
+                        slot_va,
+                        want_slot_va,
+                        completed,
+                        want_completed,
+                        membership,
+                    );
+                }
+                return Err(EBUSY);
+            }
+        }) };
+        if fine[0] != 0 { fine[2] = crate::g17_e2e::now(); }
         let fragment_rce = &mut self.fragment_rce;
         let fragment_mcache = {
-            let (tiling, fragment) = next_descriptors.split_at_mut(0x4000);
-            g17_render::build_ta_descriptor(
-                &translated.parameters,
-                tiling_objects,
-                g17_render::RenderDescriptorMetadata {
-                    context_id: u32::from(descriptor_context_id),
-                    submission_ordinal,
-                    command_buffer_state_word: command_buffer_state_words[0],
-                    ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
-                    submit_sequence: submission_ordinal as u64 * 2 + 1,
-                },
-                tiling,
-            )
-            .map_err(|_| EINVAL)?;
+            if warm_first_kick {
+                // The constructor's shape for a pair's first kick.
+                g17_render::build_cold_opening_ta_descriptor(
+                    &translated.parameters,
+                    tiling_objects,
+                    u32::from(descriptor_context_id),
+                    command_buffer_state_words[0],
+                    translated.parameters.ta_hardware_buffer_id,
+                    tiling,
+                )
+                .map_err(|_| EINVAL)?;
+            } else {
+                g17_render::build_ta_descriptor(
+                    &translated.parameters,
+                    tiling_objects,
+                    g17_render::RenderDescriptorMetadata {
+                        context_id: u32::from(descriptor_context_id),
+                        submission_ordinal,
+                        command_buffer_state_word: command_buffer_state_words[0],
+                        ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
+                        submit_sequence: submission_ordinal as u64 * 2 + 1,
+                    },
+                    tiling,
+                )
+                .map_err(|_| EINVAL)?;
+            }
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
                 descriptor_ta_rce_va,
@@ -10464,24 +12251,36 @@ impl G17PUserRenderStorage {
                 self.queue_pair.tiling as u8,
                 self.queue_pair.fragment as u8,
                 submission_ordinal,
-                false,
+                warm_first_kick,
                 g17p_render_native_pm_bytes(),
                 tiling,
             )
             .map_err(|_| EINVAL)?;
-            g17_render::build_fragment_descriptor(
-                &translated.parameters,
-                objects,
-                g17_render::RenderDescriptorMetadata {
-                    context_id: u32::from(descriptor_context_id),
-                    submission_ordinal,
-                    command_buffer_state_word: command_buffer_state_words[1],
-                    ta_hardware_buffer_id: 0,
-                    submit_sequence: submission_ordinal as u64 * 2,
-                },
-                fragment,
-            )
-            .map_err(|_| EINVAL)?;
+            if fine[0] != 0 { fine[3] = crate::g17_e2e::now(); }
+            if warm_first_kick {
+                g17_render::build_cold_opening_fragment_descriptor(
+                    &translated.parameters,
+                    objects,
+                    u32::from(descriptor_context_id),
+                    command_buffer_state_words[1],
+                    fragment,
+                )
+                .map_err(|_| EINVAL)?;
+            } else {
+                g17_render::build_fragment_descriptor(
+                    &translated.parameters,
+                    objects,
+                    g17_render::RenderDescriptorMetadata {
+                        context_id: u32::from(descriptor_context_id),
+                        submission_ordinal,
+                        command_buffer_state_word: command_buffer_state_words[1],
+                        ta_hardware_buffer_id: 0,
+                        submit_sequence: submission_ordinal as u64 * 2,
+                    },
+                    fragment,
+                )
+                .map_err(|_| EINVAL)?;
+            }
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
                 descriptor_3d_rce_va,
@@ -10489,20 +12288,27 @@ impl G17PUserRenderStorage {
                 self.queue_pair.fragment as u8,
                 self.queue_pair.fragment as u8,
                 submission_ordinal,
-                false,
+                warm_first_kick,
                 g17p_render_native_pm_bytes(),
                 fragment,
             )
             .map_err(|_| EINVAL)?;
-            fragment_rce.with_bytes_mut(|rce| {
-                g17_render::stage_g17p_fragment_rce_programs(
-                    fragment,
-                    fragment_rce_va,
-                    rce,
-                )
-                .map_err(|_| EINVAL)
-            })?;
+            // The job descriptor carries the RCE arrays firmware executes
+            // (descriptor-local RegisterArrays at +0xa0/+0x7c0/+0xee0/+0x1600,
+            // see the SKSM mode-3 witness and audit_fragment_rce_mapping,
+            // which compares the descriptor, not this buffer). fragment_rce is
+            // a diagnostic mirror staged once at construction; refreshing it
+            // cost a 16 KiB write-combined clear plus copy on every render.
+            // Keep it current only for the descriptor-dump diagnostic.
             if *crate::module_parameters::g17p_render_dump_descriptor.value() != 0 {
+                fragment_rce.with_bytes_mut(|rce| {
+                    g17_render::stage_g17p_fragment_rce_programs(
+                        fragment,
+                        fragment_rce_va,
+                        rce,
+                    )
+                    .map_err(|_| EINVAL)
+                })?;
                 fragment_rce.with_bytes_mut(|rce| {
                     let dump_size = (4 * g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE)
                         as usize;
@@ -10539,79 +12345,34 @@ impl G17PUserRenderStorage {
                 descriptor_3d_rce_va,
                 g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
                 render_root_slot,
+                g17p_fragment_mcache_probe_hwsid(translated.flags, mcache_hwsid),
                 fragment,
             )?
         };
-
-        // Only the destination and support graph are firmware-visible.
+        if fine[0] != 0 { fine[4] = crate::g17_e2e::now(); }
         {
-            let source = &next_descriptors[..];
-            let destination = self.descriptors.object.vmap()?;
-            let support = self.support.object.vmap()?;
-            let destination = unsafe {
-                core::slice::from_raw_parts_mut(
-                    destination.as_mut_ptr(),
-                    G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
-                )
-            };
-            let support = unsafe {
-                core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
-            };
-            let pool_a_kick = match G17PEventControlKick::prepare_reuse(
-                support,
-                support_va,
-                record_a_index,
-            ) {
-                Some(kick) => kick,
-                None => {
-                    // The record was reusable when it was selected above and the
-                    // manager lock is held throughout, so this can only mean
-                    // firmware relinked it underneath us. Report the exact fields.
-                    if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
-                        G17PEventControlKick::reuse_fields(support, support_va, record_a_index)
-                    {
-                        dev_err!(
-                            dev.as_ref(),
-                            "G17P render restage: selected pool-A record {} became unusable ordinal={} slot_va={:#x} expected={:#x} completed={} expected={} membership={:#x}\n",
-                            record_a_index,
-                            submission_ordinal,
-                            slot_va,
-                            want_slot_va,
-                            completed,
-                            want_completed,
-                            membership,
-                        );
-                    }
-                    return Err(EBUSY);
-                }
-            };
-            let ta_offset = g17p_render_ta_descriptor_offset(submission_ordinal);
-            let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
-            destination
-                .get_mut(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
-                .ok_or(ERANGE)?
-                .copy_from_slice(&source[..g17_render::TA_DESCRIPTOR_SIZE]);
-            destination
-                .get_mut(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
-                .ok_or(ERANGE)?
-                .copy_from_slice(
-                    &source[0x4000..0x4000 + g17_render::FRAGMENT_DESCRIPTOR_SIZE],
-                );
             let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
             g17_render::set_render_event_control_generation(
                 &mut support[record_a..],
                 command_buffer_state_words[0],
             )
             .map_err(|_| EINVAL)?;
-            put_u32(support, record_a + 0x10, 0x50);
-            pool_a_kick.apply(support);
-            put_u32(
-                support,
-                G17P_RENDER_SHARED_CONTROL_INNER,
-                (submission_ordinal as u32).wrapping_mul(2).wrapping_add(1),
-            );
-            put_u32(support, G17P_RENDER_FLAG, (submission_ordinal as u32).wrapping_add(1));
+            if let Some(pool_a_kick) = pool_a_kick {
+                // Retained kicks only: the cold-opening leaf pages already hold
+                // the first kick's slot word, INNER (1) and FLAG (1), and the
+                // constructor's record image must not be re-linked.
+                g17p_live_write_u32(support, record_a + 0x10, 0x50).expect("prevalidated EventControl flags");
+                pool_a_kick.apply(support);
+                g17p_live_write_u32(support, G17P_RENDER_SHARED_CONTROL_INNER,
+                    (submission_ordinal as u32).wrapping_mul(2).wrapping_add(1))
+                    .expect("prevalidated shared submitted count");
+                g17p_live_write_u32(support, G17P_RENDER_FLAG, (submission_ordinal as u32).wrapping_add(1)).expect("prevalidated render flag");
+            }
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        if fine[0] != 0 {
+            crate::g17_e2e::record(crate::g17_e2e::K_FINE_RESTAGE, 0,
+                u64::from(self.queue_pair.slot()) << 32 | submission_ordinal, fine);
         }
 
         self.render_layout = render_layout;
@@ -10621,10 +12382,12 @@ impl G17PUserRenderStorage {
         self.descriptor_ordinal = submission_ordinal;
         self.flist_generation = g17_submission::g17p_render_flist_generation(submission_ordinal);
         self.descriptor_context_id = descriptor_context_id;
-        self.render_command_ordinals[generation] = Some(submission_ordinal);
-        if g17p_retain_staging() {
-            self.staging_descriptors = Some(next_descriptors);
+        if let Some(pm) = self.parameter_management.as_mut() {
+            if !pm.scene_ownership.commit(submission_ordinal, pm.selected_scene) {
+                return Err(EIO);
+            }
         }
+        self.render_command_ordinals[generation] = Some(submission_ordinal);
         Ok(())
     }
 
@@ -10690,6 +12453,168 @@ impl G17PUserRenderStorage {
         ) {
             self.log_render_target_state(dev, label);
         }
+    }
+
+    /// Pool ownership survives the last host tracker. A fault can name such
+    /// an idle retained context, so its counters must be observable without
+    /// inventing a live command ordinal or selecting another owner's buffers.
+    pub(crate) fn log_fault_pool(&self, dev: &AsahiDevice) {
+        dev_err!(dev.as_ref(),
+            "G17P fault render pool: id={} context={} backing={:#x}..{:#x} run-table={:#x} state={:x?}\n",
+            self.render_flist.id(), self.render_root_slot,
+            self.render_flist.backing.iova(),
+            self.render_flist.backing.iova() + self.render_flist.backing.logical_size as u64,
+            self.render_flist.run_table_va(), self.render_flist.uma_state());
+        dev_err!(dev.as_ref(), "G17P fault FList counters: id={} submitted/completed={:x?}\n",
+            self.render_flist.id(), self.render_flist.completion_counters());
+    }
+
+    /// Fault-only snapshot of a retained command, not the last staged one.
+    /// All offsets refer to driver-owned mappings kept by its generation lease.
+    pub(crate) fn log_fault_command(&mut self, dev: &AsahiDevice, ordinal: u64) -> Result {
+        self.log_fault_pool(dev);
+        fn words(object: &mut MappedObject, offset: usize) -> Result<[u64; 8]> {
+            let mut out = [0; 8];
+            object.with_bytes_mut(|raw| {
+                let bytes = g17p_render_device_bytes::<64>(raw, offset).ok_or(ERANGE)?;
+                for (word, bytes) in out.iter_mut().zip(bytes.chunks_exact(8)) {
+                    *word = u64::from_le_bytes(bytes.try_into().map_err(|_| EINVAL)?);
+                }
+                Ok(())
+            })?;
+            Ok(out)
+        }
+        // Heads alone cannot distinguish empty metadata from a layout whose
+        // first populated tile is later in the record. Fault-only, exact-owner
+        // scans stay inside the descriptor layout and report counts/offsets.
+        fn region_summary(object: &mut MappedObject, offset: usize, size: usize)
+            -> Result<(usize, usize, Option<usize>, Option<usize>)>
+        {
+            object.with_bytes_mut(|raw| {
+                let bytes = raw.get(offset..offset.checked_add(size).ok_or(EOVERFLOW)?)
+                    .ok_or(ERANGE)?;
+                Ok((size, bytes.iter().filter(|byte| **byte != 0).count(),
+                    bytes.iter().position(|byte| *byte != 0),
+                    bytes.iter().rposition(|byte| *byte != 0)))
+            })
+        }
+        let generation = ordinal as usize % self.command_generation_count;
+        if self.render_command_ordinals[generation] != Some(ordinal) { return Err(ENOENT); }
+        let (state, status, layout, status_low) = if self.render_command_generation as usize == generation {
+            (&mut self.render_state, &mut self.fragment_status, self.render_layout, self.fragment_status_low.iova())
+        } else {
+            let alternate = self.alternate_render_commands.iter_mut()
+                .find(|entry| entry.generation as usize == generation).ok_or(EIO)?;
+            let alternate = &mut **alternate;
+            (&mut alternate.render_state, &mut alternate.fragment_status, alternate.render_layout, alternate.fragment_status_low.iova())
+        };
+        dev_err!(dev.as_ref(),
+            "G17P fault command: ordinal={} generation={} TA-status={:x?} 3D-status={:x?} timestamps={:x?}\n",
+            ordinal, generation, words(state, G17P_RENDER_STATE_TA_STATUS),
+            words(status, 0), words(&mut self.timestamps, g17p_render_descriptor_slot(ordinal) * 16));
+        dev_err!(dev.as_ref(),
+            "G17P fault command private: ordinal={} state={:#x} status={:#x} deflake={:x?} AXFB-head={:x?} AXFB-480={:x?}\n",
+            ordinal, state.iova(), status.iova(), words(state, G17P_RENDER_STATE_DEFLAKE),
+            words(state, layout.aux_fb), words(state, layout.aux_fb + 0x480));
+        // The routine target scan follows the most recently staged descriptor.
+        // Here read only the blamed command's still-owned record. Growth can
+        // move an older command into retained backing; do not label the new
+        // allocation as that command's data when its exact lease is absent.
+        let rt = &mut self.render_target_memory;
+        let slot = ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT;
+        if rt.rt_slot_ordinals[slot] == Some(ordinal) {
+            let offset = rt.record_offset(ordinal);
+            let heapmeta = offset.checked_add(
+                layout.heapmeta.checked_sub(layout.tilemap).ok_or(EINVAL)?
+            ).ok_or(EOVERFLOW)?;
+            let tilemap_words = words(&mut rt.rt_memory, offset);
+            let heapmeta_words = words(&mut rt.rt_memory, heapmeta);
+            dev_err!(dev.as_ref(),
+                "G17P fault command RT: ordinal={} slot={} backing={:#x} offset={:#x} stride={:#x} TMAP={:x?} HMTA={:x?}\n",
+                ordinal, slot, rt.rt_memory.iova(), offset, rt.record_stride,
+                tilemap_words, heapmeta_words);
+            dev_err!(dev.as_ref(),
+                "G17P fault command RT spans: ordinal={} (bytes,nonzero,first,last) TMAP={:?} HMTA={:?}\n",
+                ordinal, region_summary(&mut rt.rt_memory, offset, layout.tilemap_size),
+                region_summary(&mut rt.rt_memory, heapmeta, layout.heapmeta_size));
+        } else {
+            dev_err!(dev.as_ref(),
+                "G17P fault command RT unavailable in current backing: ordinal={} slot={} current-owner={:?} retained-backings={}\n",
+                ordinal, slot, rt.rt_slot_ordinals[slot], rt.retired_backings.len());
+        }
+        // TPC is shared by the pair, not private command output. If growth
+        // retained an allocation, the old command's TPC address is unverified.
+        if rt.retired_backings.is_empty() {
+            dev_err!(dev.as_ref(),
+                "G17P fault command shared TPC: ordinal={} address={:#x} words={:x?}\n",
+                ordinal, rt.tpc.iova(), words(&mut rt.tpc, 0));
+        }
+        let tiling = g17p_render_ta_descriptor_offset(ordinal);
+        dev_err!(dev.as_ref(),
+            "G17P fault command TA descriptor: ordinal={} address={:#x} TA+790={:x?} TA+8a0={:x?}\n",
+            ordinal, self.descriptors.iova() + tiling as u64,
+            words(&mut self.descriptors, tiling + 0x790),
+            words(&mut self.descriptors, tiling + 0x8a0));
+        let fragment = g17p_render_3d_descriptor_offset(ordinal);
+        // Decode only the retained command's fixed register entries. Keep both
+        // the register number and value so a layout error is visible too.
+        dev_err!(dev.as_ref(),
+            "G17P fault command status aliases: ordinal={} expected-TA={:#x} expected-3D-low={:#x}\n",
+            ordinal, state.iova() + G17P_RENDER_STATE_TA_STATUS as u64, status_low);
+        for (engine, base, offsets) in [
+            ("TA", tiling, &[0x300usize, 0x36c, 0x378, 0x384, 0x390, 0x39c][..]),
+            ("3D", fragment, &[0x454usize, 0x46c, 0x478, 0x484, 0x490][..]),
+        ] {
+            for offset in offsets {
+                let entry = self.descriptors.with_bytes_mut(|raw| -> Result<(u32, u64)> {
+                    let at = base.checked_add(*offset).ok_or(EOVERFLOW)?;
+                    let bytes = raw.get(at..at.checked_add(12).ok_or(EOVERFLOW)?).ok_or(ERANGE)?;
+                    Ok((u32::from_le_bytes(bytes[..4].try_into().map_err(|_| EINVAL)?),
+                        u64::from_le_bytes(bytes[4..].try_into().map_err(|_| EINVAL)?)))
+                });
+                dev_err!(dev.as_ref(),
+                    "G17P fault command register: ordinal={} engine={} offset={:#x} entry={:x?}\n",
+                    ordinal, engine, offset, entry);
+            }
+        }
+        for offset in [0usize, 0x40, 0x80, 0x2000, 0x2140, 0x2180] {
+            dev_err!(dev.as_ref(),
+                "G17P fault command descriptor: ordinal={} 3D+{:#x}={:x?}\n",
+                ordinal, offset, words(&mut self.descriptors, fragment + offset));
+        }
+        // Opt-in comparison with a complete native publication capture. The
+        // generation lease was checked above; never dump the latest staged
+        // command in place of the blamed ordinal. All reads remain within the
+        // two descriptor extents, including their embedded RCE/MCache tables.
+        // This is a CPU snapshot during fault reporting, not an atomic image
+        // of fields the firmware may still update. No submission-path work.
+        #[cfg(g17p_render_full_descriptor_probe)]
+        for (engine, base, size) in [
+            ("TA", tiling, g17_render::TA_DESCRIPTOR_SIZE),
+            ("3D", fragment, g17_render::FRAGMENT_DESCRIPTOR_SIZE),
+        ] {
+            for offset in (0..size).step_by(64) {
+                dev_err!(dev.as_ref(),
+                    "G17P fault complete descriptor: ordinal={} engine={} base={:#x} size={:#x} offset={:#x} words={:x?}\n",
+                    ordinal, engine, self.descriptors.iova() + base as u64,
+                    size, offset, words(&mut self.descriptors, base + offset));
+            }
+        }
+        if let Some(pm) = self.parameter_management.as_mut() {
+            let scratch = pm.scene_ownership.ordinals.iter()
+                .position(|owner| *owner == Some(ordinal)).ok_or(EIO)?;
+            let scene = pm.scene_ownership.scenes[scratch] as usize;
+            dev_err!(dev.as_ref(),
+                "G17P fault command PM: ordinal={} scene={} scratch={} hwpb={:x?} scene-head={:x?} scene-tail={:x?}\n",
+                ordinal, scene, scratch, words(&mut pm.backing, pm.layout.hwpb_state),
+                words(&mut pm.backing, pm.layout.scene_states + scene * G17P_PM_SCENE_ENTRY_SIZE),
+                words(&mut pm.backing, pm.layout.scene_states + scene * G17P_PM_SCENE_ENTRY_SIZE + 0x40));
+            if let Some(object) = self.scene_scratch.as_mut() {
+                dev_err!(dev.as_ref(), "G17P fault command scratch: ordinal={} words={:x?}\n",
+                    ordinal, words(object, scratch * G17P_PM_SCENE_SCRATCH_STRIDE));
+            }
+        }
+        Ok(())
     }
 
     /// Dump the fixed-function render targets for diagnostic checkpoints.
@@ -11011,7 +12936,10 @@ impl G17PUserRenderStorage {
         let ranges_ok = layout.all_referenced_ranges_reachable(
             |address, size| uat.kernel_vm().covers_range(address, size, true, true),
             |address, size| vm.covers_range(address, size, true, true),
-        ) && self.render_user_aliases.all_reachable_from(vm)
+        ) && g17p_render_config_pool_reachable(self.config_updates.iova(),
+                self.config_updates.logical_size, self.config_updates.cpu_wc,
+                |address, size| uat.kernel_vm().covers_range(address, size, true, true))
+            && self.render_user_aliases.all_reachable_from(vm)
             && self.scene_scratch.as_ref().map_or(true, |scene| {
                 g17p_render_compact_address_matches(self.queue_pair, scene.iova(), scene.logical_size, g17p_render_scene_scratch_va(self.queue_pair).unwrap_or(0))
                     && scene.logical_size == G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE
@@ -11195,6 +13123,8 @@ impl G17PUserRenderStorage {
         if kernel {
             return intersects(self.descriptors.iova(), G17P_RENDER_DESCRIPTOR_STORAGE_SIZE as u64)
                 || intersects(self.graph.iova(), G17P_RENDER_QUEUE_GRAPH_SIZE as u64)
+                || g17p_render_config_mapping_changed(self.config_updates.iova(),
+                    self.config_updates.logical_size as u64, change.clone())
                 || intersects(self.support.iova(), G17P_RENDER_SUPPORT_SIZE as u64)
                 || intersects(self.timestamps.iova(), G17P_PAGE_SIZE as u64)
                 || self.sksm_backing.as_ref().map_or(true, |backing| {
@@ -11337,7 +13267,10 @@ impl G17PUserRenderStorage {
             |address, size| vm.covers_range(address, size, true, true),
         );
 
-        let checks: [(&'static str, bool); 26] = [
+        let checks: [(&'static str, bool); 27] = [
+            ("config-update-pool", g17p_render_config_pool_reachable(self.config_updates.iova(),
+                self.config_updates.logical_size, self.config_updates.cpu_wc,
+                |address, size| uat.kernel_vm().covers_range(address, size, true, true))),
             ("storage-va-layout", layout_ok),
             (
                 "compact-render-state-aliases",
@@ -11388,7 +13321,8 @@ impl G17PUserRenderStorage {
             ),
             (
                 "descriptor-ta-high-identity",
-                self.descriptors.logical_size == G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+                g17p_render_descriptor_backing_valid(
+                    self.descriptors.logical_size, self.descriptors.cpu_wc),
             ),
             (
                 "descriptor-ta-high-mapped",
@@ -11685,87 +13619,50 @@ impl G17PUserRenderStorage {
         self.parameter_management.as_ref().map(|pm| pm.selected_scene).ok_or(ENODEV)
     }
 
+    /// Byte offset of this graph's leased entry inside the shared metrics object.
+    pub(crate) fn parameter_metrics_offset(&self) -> usize {
+        self.parameter_metrics_lease
+            .as_ref()
+            .map_or(0, G17PPmPageMetricsLease::offset)
+    }
+
     pub(crate) fn stage_fragment(&mut self, submission_ordinal: u64) -> Result {
-        let graph_va = self.graph.iova();
-        let optional_offset = g17p_render_optional_offset(false, submission_ordinal);
-        let event_offset = g17p_render_event_offset(false, submission_ordinal);
-        let items = [
-            self.descriptors
-                .iova()
-                .checked_add(g17p_render_3d_descriptor_offset(submission_ordinal) as u64)
-                .ok_or(EOVERFLOW)?,
-            graph_va + optional_offset as u64,
-            graph_va + event_offset as u64,
-        ];
-        let optional_addresses = self.optional_addresses(false);
-        let hardware_buffer_id = self.qos_hardware_buffer_id()?;
-        let flist_generation = self.flist_generation;
-        let tag16 = g17p_render_tag16_enabled();
-        let plan = G17PRenderItemPlan::new(submission_ordinal, tag16).ok_or(EINVAL)?;
-        // The stamp this path's tag-14 announces is `ordinal + 1`
-        // (`apply_g17p_retained_event`), which is the 1 the firmware reported
-        // in its 0x41 receipt. Tag-16 must name that same stamp.
-        let entry_stamp = submission_ordinal.checked_add(1).ok_or(EINVAL)?
-            & g17_submission::KICK_TS_MASK;
-        let entry_signal_va = graph_va + Self::FRAGMENT_ENTRY_SIGNAL as u64;
-        self.graph.with_bytes_mut(|raw| {
-            let mut group = [0u8; 32];
-            for (index, address) in items.iter().enumerate() {
-                put_u64(&mut group, index * 8, *address);
-            }
-            g17_submission::apply_g17p_retained_optional_with_flist_generation_and_context_update(
-                g17_submission::G17PColdOpeningStage::Fragment,
-                optional_addresses,
-                submission_ordinal,
-                flist_generation,
-                g17p_render_generation_bias_enabled(),
-                self.queue_pair.fragment,
-                self.queue_pair.tiling,
-                hardware_buffer_id,
-                g17p_render_install(false),
-                self.descriptor_context_id,
-                self.context_update_pending,
-                &mut raw[optional_offset
-                    ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
-            )
-            .map_err(|_| EINVAL)?;
-            if self.qos_update_pending { put_u32(raw, optional_offset + 0x52, 1); }
-            g17_submission::apply_g17p_retained_event(
-                g17_submission::G17PColdOpeningStage::Fragment,
-                submission_ordinal,
-                self.queue_pair.fragment,
-                &mut raw[event_offset
-                    ..event_offset + g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
-            )
-            .map_err(|_| EINVAL)?;
-            if tag16 {
-                g17_submission::encode_g17p_compute_optional_event(
-                    g17_submission::G17PComputeOptionalEvent {
-                        queue_id: self.queue_pair.fragment,
-                        // `old_timestamp` means the PREVIOUS stamp, not this
-                        // submission's own. Compute's depth wall was exactly
-                        // this field naming the stamp being queued, which let
-                        // the firmware retire the entry before the dispatch
-                        // ran; see the tag-16 fix that took compute to 100/100.
-                        old_timestamp: entry_stamp.wrapping_sub(1) & g17_submission::KICK_TS_MASK,
-                    },
-                    &mut raw[Self::FRAGMENT_ENTRY_SIGNAL
-                        ..Self::FRAGMENT_ENTRY_SIGNAL
-                            + g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
-                )
-                .map_err(|_| EINVAL)?;
-                put_u64(&mut group, 3 * 8, entry_signal_va);
-            }
-            plan.copy_items(raw, Self::FRAGMENT_RING, 0, &group[..plan.count as usize * 8])
-                .ok_or(EINVAL)?;
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            put_u32(
-                raw,
-                Self::FRAGMENT_POINTERS + 0x40,
-                plan.final_end,
-            );
-            Ok(())
-        })
+        self.stage_fragment_config_group(submission_ordinal, true).map(|_| ())
+    }
+
+    pub(crate) fn ensure_sksm_dependency_buffer(&mut self) -> Result {
+        if self.sksm_dependency_buffer.is_none() {
+            self.sksm_dependency_buffer = Some(KBox::new(
+                crate::g17_manager::G17PRenderDependencies {
+                    entries: [g17_submission::G17PClBarrierDependency {
+                        native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
+                    }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX],
+                    count: 0,
+                }, GFP_KERNEL,
+            )?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_sksm_dependency_buffer(&mut self)
+        -> KBox<crate::g17_manager::G17PRenderDependencies> {
+        self.sksm_dependency_buffer.take().expect("reserved dependency buffer")
+    }
+
+    pub(crate) fn return_sksm_dependency_buffer(&mut self,
+        buffer: KBox<crate::g17_manager::G17PRenderDependencies>) {
+        debug_assert!(self.sksm_dependency_buffer.is_none());
+        self.sksm_dependency_buffer = Some(buffer);
+    }
+
+    /// Logical-owner payload independent of the retained physical ordinal.
+    pub(crate) fn logical_channel_payload(&self, ordinal: u64) -> Result<u8> {
+        match self._command_context.as_ref().ok_or(EIO)? {
+            G17PRenderCommandContext::Bootstrap(_) =>
+                Ok(g17_submission::g17p_serialized_render_scratch_payload(ordinal)),
+            G17PRenderCommandContext::Job(context) => context.tsq.lock().render_slots
+                .channel_payload(self.queue_pair.slot(), ordinal).ok_or(EINVAL),
+        }
     }
 
     /// Bind the emitted 3D command to the exact timestamp the physical SKSM
@@ -11787,6 +13684,12 @@ impl G17PUserRenderStorage {
         .map_err(|_| EINVAL)?;
         let ta_offset = g17p_render_ta_descriptor_offset(self.descriptor_ordinal);
         let fragment_offset = g17p_render_3d_descriptor_offset(self.descriptor_ordinal);
+        // Saved native queued-render captures clear +0x7a4 on each pair's
+        // first TA and set it on later TAs. The host producer's full policy
+        // is still under investigation: keep this comparison opt-in.
+        let previous_fragment_probe =
+            *crate::module_parameters::g17p_ta_previous_fragment_probe.value() != 0
+                && self.descriptor_ordinal != 0;
         self.descriptors.with_bytes_mut(|raw| {
             // Validate both descriptor ranges before mutating either one.
             // A truncated fragment view must not leave new TA scratch behind.
@@ -11799,14 +13702,52 @@ impl G17PUserRenderStorage {
                 raw.get_mut(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
                     .ok_or(ERANGE)?,
             ).map_err(|_| EINVAL)?;
+            if previous_fragment_probe {
+                put_u32(raw, ta_offset + 0x7a4, 1);
+            }
             let fragment = raw
                 .get_mut(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
                 .ok_or(ERANGE)?;
             put_u64(fragment, 0x2160, value);
+            // Native STRB at 8837e70 mirrors the same channel payload getter
+            // used by +2160. It resets with the logical channel and wraps as
+            // a byte; the physical timestamp/descriptor ordinal is not it.
+            fragment[0x90] = channel_payload;
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             Ok(())
         })?;
         Ok(value)
+    }
+
+    /// Keep TA backpressure and both ConfigUpdate scratch seeds tied to one
+    /// pre-publication snapshot. Native processRenderSetup uses independent
+    /// channel-idle predicates (88735d4 and 88742c4); a busy channel must not
+    /// overwrite firmware's completion scratch table from ConfigUpdate.
+    pub(crate) fn stage_render_scratch_handoff(
+        &mut self,
+        seeds: [Option<u64>; 2],
+    ) -> Result {
+        let ta = g17p_render_ta_descriptor_offset(self.descriptor_ordinal);
+        self.descriptors.with_bytes_mut(|raw| {
+            raw.get(ta..ta + g17_render::TA_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
+            put_u32(raw, ta + 0x7a4, u32::from(seeds[1].is_none()));
+            Ok(())
+        })?;
+        self.scratch_handoff = Some(seeds);
+        Ok(())
+    }
+
+    pub(crate) fn scratch_handoff_matches(
+        &self, tiling: bool, header: G17PRenderConfigUpdateHeader,
+    ) -> bool {
+        match self.scratch_handoff {
+            Some(seeds) => {
+                let seed = seeds[usize::from(!tiling)];
+                header.scratch_seed_valid == u32::from(seed.is_some())
+                    && header.scratch_seed == seed.unwrap_or(0)
+            }
+            None => header.scratch_seed_valid == 1,
+        }
     }
 
     /// Dump the fragment descriptor after every submission-time mutation has
@@ -11830,7 +13771,7 @@ impl G17PUserRenderStorage {
             .iova()
             .checked_add(
                 g17p_render_descriptor_slot(submission_ordinal) as u64
-                    * g17_render::FRAGMENT_DESCRIPTOR_SIZE as u64,
+                    * G17P_RENDER_3D_DESCRIPTOR_STRIDE as u64,
             )
             .ok_or(EOVERFLOW)?;
         let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
@@ -11930,6 +13871,83 @@ impl G17PUserRenderStorage {
         Ok(())
     }
 
+    /// Read the exact owned pass envelope after the caller has observed both
+    /// required post-maintenance lanes (and their acquire barrier). Unlike a
+    /// preceding queue snapshot, these values may be exported to userspace.
+    /// The pair is stable through generation retirement; no queue/list scan.
+    pub(crate) fn render_pass_timestamps(&mut self, ordinal: u64) -> Result<[u64; 2]> {
+        if self.command_generation_count == 0
+            || self.render_command_ordinals.get(ordinal as usize % self.command_generation_count)
+                != Some(&Some(ordinal))
+        {
+            return Err(EINVAL);
+        }
+        let offset = g17p_render_descriptor_slot(ordinal)
+            .checked_mul(16).ok_or(EOVERFLOW)?;
+        self.timestamps.with_bytes_mut(|raw| {
+            let end = offset.checked_add(16).ok_or(EOVERFLOW)?;
+            let pair = raw.get(offset..end).ok_or(ERANGE)?;
+            // SAFETY: page-aligned mapping, 16-byte slot stride and checked
+            // pair extent. Read each firmware-owned u64 exactly once. These
+            // are two scalar loads, not an atomic multiword device snapshot.
+            Ok(unsafe { [
+                u64::from_le(core::ptr::read_volatile(pair.as_ptr().cast::<u64>())),
+                u64::from_le(core::ptr::read_volatile(pair.as_ptr().add(8).cast::<u64>())),
+            ] })
+        })
+    }
+
+    /// Diagnostic identity only, with the exact still-owned generation.
+    /// Does not follow the firmware pointers or alter any retirement gate.
+    pub(crate) fn render_tsq_pointers(&self, ordinal: u64) -> Result<[u64; 4]> {
+        if self.command_generation_count == 0
+            || self.render_command_ordinals.get(ordinal as usize % self.command_generation_count)
+                != Some(&Some(ordinal)) { return Err(EINVAL); }
+        let ta = g17p_render_ta_descriptor_offset(ordinal);
+        let frg = g17p_render_3d_descriptor_offset(ordinal);
+        let view = self.descriptors.object.gem.vmap::<u8>()?;
+        let mut values = [self.descriptors.iova() + ta as u64,
+            self.descriptors.iova() + frg as u64, 0, 0];
+        for (target, offset) in values[2..].iter_mut().zip([ta + 0x10, frg + 0x20]) {
+            if offset.checked_add(8).ok_or(EOVERFLOW)? > self.descriptors.logical_size
+                || (view.as_mut_ptr() as usize + offset) & 7 != 0 { return Err(ERANGE); }
+            // SAFETY: exact owner, retained mapping, aligned checked extent.
+            *target = u64::from_le(unsafe { core::ptr::read_volatile(
+                view.as_mut_ptr().add(offset).cast::<u64>()) });
+        }
+        core::sync::atomic::fence(Ordering::Acquire);
+        Ok(values)
+    }
+
+    /// Read the latest qualifying firmware timestamp segments of an exact
+    /// still-owned descriptor generation. The caller must first observe the
+    /// post-maintenance retirement stamps and prevent reuse until this returns.
+    /// B1 stores adjusted pair B at type0 TA+956 and FRG+21f0 only for qualifying
+    /// status/flags; rearm may overwrite them and final status4 need not do so.
+    /// These are not accumulated active time or shader-only durations. Zeros
+    /// are preserved, and the already-applied firmware bias is not added again.
+    pub(crate) fn render_device_segments(&mut self, ordinal: u64) -> Result<[u64; 6]> {
+        if self.command_generation_count == 0
+            || self.render_command_ordinals.get(ordinal as usize % self.command_generation_count)
+                != Some(&Some(ordinal))
+        {
+            return Err(EINVAL);
+        }
+        let ta = g17p_render_ta_descriptor_offset(ordinal);
+        let fragment = g17p_render_3d_descriptor_offset(ordinal);
+        let base = self.descriptors.iova();
+        self.descriptors.with_bytes_mut(|raw| {
+            let ta_pair = g17p_render_device_bytes::<16>(raw, ta + 0x956).ok_or(ERANGE)?;
+            let fragment_pair = g17p_render_device_bytes::<16>(raw, fragment + 0x21f0).ok_or(ERANGE)?;
+            Ok([base + ta as u64, base + fragment as u64,
+                u64::from_le_bytes(ta_pair[..8].try_into().map_err(|_| EINVAL)?),
+                u64::from_le_bytes(ta_pair[8..].try_into().map_err(|_| EINVAL)?),
+                u64::from_le_bytes(fragment_pair[..8].try_into().map_err(|_| EINVAL)?),
+                u64::from_le_bytes(fragment_pair[8..].try_into().map_err(|_| EINVAL)?),
+            ])
+        })
+    }
+
     /// Read descriptor +0x20f0 without assigning it activation semantics.
     /// The complete valid trace proves a native 3D submission can execute and
     /// retire while this word remains zero before and after, so it is not a
@@ -11939,10 +13957,7 @@ impl G17PUserRenderStorage {
         self.descriptors.with_bytes_mut(|raw| {
             let offset = fragment_offset.checked_add(0x20f0).ok_or(EOVERFLOW)?;
             Ok(u32::from_le_bytes(
-                raw.get(offset..offset + 4)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| ERANGE)?,
+                g17p_render_device_bytes::<4>(raw, offset).ok_or(ERANGE)?,
             ))
         })
     }
@@ -11967,39 +13982,19 @@ impl G17PUserRenderStorage {
                 .get(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
                 .ok_or(ERANGE)?;
             let ta_qid = u32::from_le_bytes(
-                tiling
-                    .get(0x079c..0x07a0)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| ERANGE)?,
+                g17p_render_device_bytes::<4>(tiling, 0x079c).ok_or(ERANGE)?,
             );
             let ta_stamp = u64::from_le_bytes(
-                tiling
-                    .get(0x07a8..0x07b0)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| ERANGE)?,
+                g17p_render_device_bytes::<8>(tiling, 0x07a8).ok_or(ERANGE)?,
             );
             let sku_reserved = u32::from_le_bytes(
-                fragment
-                    .get(0x079c..0x07a0)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| ERANGE)?,
+                g17p_render_device_bytes::<4>(fragment, 0x079c).ok_or(ERANGE)?,
             );
             let sku_pointer = u64::from_le_bytes(
-                fragment
-                    .get(0x07a0..0x07a8)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| ERANGE)?,
+                g17p_render_device_bytes::<8>(fragment, 0x07a0).ok_or(ERANGE)?,
             );
             let sku_header = u64::from_le_bytes(
-                fragment
-                    .get(0x07a8..0x07b0)
-                    .ok_or(ERANGE)?
-                    .try_into()
-                    .map_err(|_| ERANGE)?,
+                g17p_render_device_bytes::<8>(fragment, 0x07a8).ok_or(ERANGE)?,
             );
             Ok((ta_qid, ta_stamp, sku_reserved, sku_pointer, sku_header))
         })
@@ -12018,11 +14013,7 @@ impl G17PUserRenderStorage {
                 .ok_or(ERANGE)?;
             let u32_at = |offset: usize| -> Result<u32> {
                 Ok(u32::from_le_bytes(
-                    tiling
-                        .get(offset..offset + 4)
-                        .ok_or(ERANGE)?
-                        .try_into()
-                        .map_err(|_| ERANGE)?,
+                    g17p_render_device_bytes::<4>(tiling, offset).ok_or(ERANGE)?,
                 ))
             };
             Ok([
@@ -12030,63 +14021,85 @@ impl G17PUserRenderStorage {
                 u32_at(0x0866)?,
                 u32_at(0x0892)?,
                 u32_at(0x08ba)?,
-                u32::from(*tiling.get(0x08cb).ok_or(ERANGE)?),
+                u32::from(g17p_render_device_bytes::<1>(tiling, 0x08cb).ok_or(ERANGE)?[0]),
             ])
         })
     }
 
-    /// The first half of a 3D group: item 0 (the fragment command record) and
-    /// item 1 (the tag-15 ConfigUpdate), with the queue's item producer left at
-    /// this group's base + 2. Native's `AGX3DChannelSKSM::submitBuffer`
-    /// publishes exactly these two
-    /// pointers, then configures the QID and writes the KSM kick entry, and
-    /// only then publishes the AddKicks that takes item 2 -- so the split is
-    /// what lets the SKSM half sit where the captures put it.
-    pub(crate) fn stage_fragment_prefix(&mut self, submission_ordinal: u64) -> Result {
+    /// Publish the fragment descriptor and, when required by the selected
+    /// lane plan, ConfigUpdate. Native submits this prefix before encoding
+    /// the KSM entry, then announces that entry with AddKicks. The retained
+    /// prefix contains one or two pointers without padding.
+    pub(crate) fn stage_fragment_prefix(&mut self, submission_ordinal: u64) -> Result<G17PRenderConfigUpdateHeader> {
+        self.stage_fragment_config_group(submission_ordinal, false)
+    }
+
+    fn stage_fragment_config_group(&mut self, ordinal: u64, full: bool) -> Result<G17PRenderConfigUpdateHeader> {
+        let config_offset = g17p_render_config_offset(false, ordinal);
+        let config_va = self.config_update_gpu_va(false, ordinal)?;
+        let publication = self.prepare_render_items(ordinal)?;
+        let fields = publication.fields[1];
+        let plan = publication.lanes[1];
+        let descriptor = self.descriptors.iova()
+            .checked_add(g17p_render_3d_descriptor_offset(ordinal) as u64).ok_or(EOVERFLOW)?;
         let graph_va = self.graph.iova();
-        let optional_offset = g17p_render_optional_offset(false, submission_ordinal);
-        let items = [
-            self.descriptors
-                .iova()
-                .checked_add(g17p_render_3d_descriptor_offset(submission_ordinal) as u64)
-                .ok_or(EOVERFLOW)?,
-            graph_va + optional_offset as u64,
-        ];
-        let optional_addresses = self.optional_addresses(false);
-        let hardware_buffer_id = self.qos_hardware_buffer_id()?;
-        let flist_generation = self.flist_generation;
-        let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
-            .ok_or(EINVAL)?;
-        self.graph.with_bytes_mut(|raw| {
-            let mut group = [0u8; 16];
-            for (index, address) in items.iter().enumerate() {
-                put_u64(&mut group, index * 8, *address);
+        let event_offset = g17p_render_event_offset(false, ordinal);
+        let event_va = graph_va.checked_add(event_offset as u64).ok_or(EOVERFLOW)?;
+        let signal_va = graph_va.checked_add(Self::FRAGMENT_ENTRY_SIGNAL as u64).ok_or(EOVERFLOW)?;
+        let mut group = [0u8; 32];
+        put_u64(&mut group, 0, descriptor);
+        if plan.config_present { put_u64(&mut group, 8, config_va); }
+        put_u64(&mut group, plan.prefix_count as usize * 8, event_va);
+        if plan.tag16 { put_u64(&mut group, (plan.prefix_count as usize + 1) * 8, signal_va); }
+        let mut event = [0u8; g17_submission::G17P_COLD_OPENING_EVENT_SIZE];
+        let mut signal = [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        if full {
+            let stamp = ordinal.checked_add(1).ok_or(EINVAL)? & g17_submission::KICK_TS_MASK;
+            g17_submission::apply_g17p_retained_event_with_stamp(
+                g17_submission::G17PColdOpeningStage::Fragment, stamp,
+                self.queue_pair.fragment, &mut event).map_err(|_| EINVAL)?;
+            if plan.tag16 {
+                g17_submission::encode_g17p_compute_optional_event(
+                    g17_submission::G17PComputeOptionalEvent { queue_id: self.queue_pair.fragment,
+                        old_timestamp: stamp.wrapping_sub(1) & g17_submission::KICK_TS_MASK },
+                    &mut signal).map_err(|_| EINVAL)?;
             }
-            plan.copy_items(raw, Self::FRAGMENT_RING, 0, &group).ok_or(EINVAL)?;
-            g17_submission::apply_g17p_retained_optional_with_flist_generation_and_context_update(
-                g17_submission::G17PColdOpeningStage::Fragment,
-                optional_addresses,
-                submission_ordinal,
-                flist_generation,
-                g17p_render_generation_bias_enabled(),
-                self.queue_pair.fragment,
-                self.queue_pair.tiling,
-                hardware_buffer_id,
-                g17p_render_install(false),
-                self.descriptor_context_id,
-                self.context_update_pending,
-                &mut raw[optional_offset
-                    ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
-            )
-            .map_err(|_| EINVAL)?;
-            if self.qos_update_pending { put_u32(raw, optional_offset + 0x52, 1); }
-            put_u32(raw, Self::FRAGMENT_POINTERS + 0x40, plan.prefix_end);
-            Ok(())
+        }
+        // Both mappings and all extents are checked before touching either
+        // object. A failed map cannot leave a partially advanced pointer stream.
+        let graph = &mut self.graph;
+        self.config_updates.with_bytes_mut(|pool| {
+            let config = pool.get_mut(config_offset..config_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
+                .ok_or(EINVAL)?;
+            graph.with_bytes_mut(|raw| {
+                if raw.len() != G17P_RENDER_QUEUE_GRAPH_SIZE { return Err(EINVAL); }
+                let count = if full { plan.count as usize } else { plan.prefix_count as usize };
+                g17p_live_word_bounds(raw, Self::FRAGMENT_POINTERS + 0x40, 4)?;
+                if plan.config_present && config.as_ptr() as usize & 7 != 0 { return Err(EINVAL); }
+                plan.copy_items(raw, Self::FRAGMENT_RING, 0, &group[..count * 8]).ok_or(EINVAL)?;
+                if plan.config_present {
+                    store_g17p_render_config_update(&fields, config).expect("checked ConfigUpdate extent");
+                }
+                let header = fields.header;
+                if full {
+                    raw[event_offset..event_offset + event.len()].copy_from_slice(&event);
+                    if plan.tag16 {
+                        raw[Self::FRAGMENT_ENTRY_SIGNAL..Self::FRAGMENT_ENTRY_SIGNAL + signal.len()]
+                            .copy_from_slice(&signal);
+                    }
+                }
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                g17p_live_write_u32(raw, Self::FRAGMENT_POINTERS + 0x40,
+                    if full { plan.final_end } else { plan.prefix_end })
+                    .expect("prevalidated FRG producer");
+                Ok(header)
+            })
         })
     }
 
-    /// The second half of a 3D group: item 2 (the tag-14 AddKicks announcing
-    /// `entry_stamp`) and the item producer transition base+2 -> base+3/4.
+    /// Publish AddKicks announcing `entry_stamp`, followed by an optional
+    /// EntrySignal, at this lane's selected prefix end. Advance to its exact
+    /// final cursor rather than an ordinal-derived fixed group position.
     pub(crate) fn stage_fragment_kick(
         &mut self,
         submission_ordinal: u64,
@@ -12097,8 +14110,17 @@ impl G17PUserRenderStorage {
         let event_va = graph_va + event_offset as u64;
         let entry_signal_va = graph_va + Self::FRAGMENT_ENTRY_SIGNAL as u64;
         let tag16 = g17p_render_tag16_enabled();
-        let plan = G17PRenderItemPlan::new(submission_ordinal, tag16).ok_or(EINVAL)?;
+        let plan = if self.variable_render_items() {
+            self.render_publication.current(submission_ordinal).ok_or(EINVAL)?.lanes[1]
+        } else { G17PRenderItemPlan::new(submission_ordinal, tag16).ok_or(EINVAL)? };
         self.graph.with_bytes_mut(|raw| {
+            g17p_live_word_bounds(raw, Self::FRAGMENT_POINTERS + 0x40, 4)?;
+            plan.validate_items(raw, Self::FRAGMENT_RING, plan.prefix_count,
+                (plan.count - plan.prefix_count) as usize * 8).ok_or(EINVAL)?;
+            raw.get(event_offset..event_offset + g17_submission::G17P_COLD_OPENING_EVENT_SIZE)
+                .ok_or(EINVAL)?;
+            if tag16 { raw.get(Self::FRAGMENT_ENTRY_SIGNAL..Self::FRAGMENT_ENTRY_SIGNAL
+                + g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE).ok_or(EINVAL)?; }
             let mut group = [0u8; 16];
             put_u64(&mut group, 0, event_va);
             g17_submission::apply_g17p_retained_event_with_stamp(
@@ -12132,14 +14154,11 @@ impl G17PUserRenderStorage {
                 .map_err(|_| EINVAL)?;
                 put_u64(&mut group, 8, entry_signal_va);
             }
-            plan.copy_items(raw, Self::FRAGMENT_RING, 2, &group[..(plan.count - 2) as usize * 8])
+            plan.copy_items(raw, Self::FRAGMENT_RING, plan.prefix_count, &group[..(plan.count - plan.prefix_count) as usize * 8])
                 .ok_or(EINVAL)?;
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            put_u32(
-                raw,
-                Self::FRAGMENT_POINTERS + 0x40,
-                plan.final_end,
-            );
+            g17p_live_write_u32(raw, Self::FRAGMENT_POINTERS + 0x40, plan.final_end)
+                .expect("prevalidated FRG producer");
             Ok(())
         })
     }
@@ -12164,6 +14183,14 @@ impl G17PUserRenderStorage {
         entry_stamp: u64,
     ) -> Result<G17PLateTilingPublication> {
         let graph_va = self.graph.iova();
+        let config_va = self.config_update_gpu_va(true, submission_ordinal)?;
+        let config_offset = g17p_render_config_offset(true, submission_ordinal);
+        // Mapping may fail, so obtain it before creating any publication.
+        let config = unsafe {
+            // SAFETY: checked config_update_gpu_va bounds; owned mapping is
+            // retained by this graph through the synchronous transaction.
+            self.config_updates.object.vmap()?.as_mut_ptr().add(config_offset)
+        };
         // `restage_command` may have selected a reusable fallback instead of
         // the ordinal-preferred record. Both descriptors already name that
         // retained selection, so the late TA half must advance the same
@@ -12179,7 +14206,7 @@ impl G17PUserRenderStorage {
             };
             G17PEventControlKick::prepare(raw, record_a_index).ok_or(EINVAL)?
         };
-        let mut bytes = build_g17p_late_tiling_bytes(
+        let mut bytes = build_g17p_late_tiling_fields(
             self.descriptors
                 .iova()
                 .checked_add(g17p_render_ta_descriptor_offset(submission_ordinal) as u64)
@@ -12196,36 +14223,61 @@ impl G17PUserRenderStorage {
             g17p_render_native_pool_a_first_record_enabled(),
             pool_a_kick.next,
             self.context_update_pending,
+            config_va, self.qos_update_pending,
+            self.scratch_handoff.map(|seeds| seeds[0]),
+            if self.variable_render_items() {
+                Some(self.render_publication.current(submission_ordinal).ok_or(EINVAL)?.lanes[0])
+            } else { None },
         )
         .map_err(|_| EINVAL)?;
-        if self.qos_update_pending { put_u32(&mut bytes.optional, 0x52, 1); }
+        if self.variable_render_items() {
+            let publication = self.render_publication.current(submission_ordinal).ok_or(EINVAL)?;
+            if bytes.items != publication.lanes[0] || bytes.config != publication.fields[0] {
+                return Err(EINVAL);
+            }
+        }
         bytes.pool_a_slot_offset = G17P_RENDER_POOL_A_SLOTS
             .checked_add(record_a_index.checked_mul(4).ok_or(EOVERFLOW)?)
             .ok_or(EOVERFLOW)?;
         // This is the second descriptor's increment and therefore the final
         // submitted target firmware must complete before unlinking the record.
-        self.pool_a_submitted = pool_a_kick.next;
-
-        if bytes.event_offset + bytes.event.len() > self.graph.logical_size
+        if self.graph.logical_size != G17P_RENDER_QUEUE_GRAPH_SIZE
+            || self.support.logical_size < G17P_RENDER_SUPPORT_SIZE
+            || bytes.pool_a_slot_offset + 4 > self.support.logical_size
+            || bytes.event_offset + bytes.event.len() > self.graph.logical_size
             || G17P_RENDER_SHARED_CONTROL_INNER + 4 > self.support.logical_size
         {
             return Err(EINVAL);
         }
+        // All mappings and live word alignments are checked before publication
+        // becomes infallible and before changing the host submitted-count mirror.
+        bytes.validate_publication(
+            unsafe { core::slice::from_raw_parts(graph, self.graph.logical_size) },
+            unsafe { core::slice::from_raw_parts(support, self.support.logical_size) },
+            unsafe { core::slice::from_raw_parts(config,
+                g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE) },
+        )?;
+        self.pool_a_submitted = pool_a_kick.next;
         Ok(G17PLateTilingPublication {
+            config,
             graph,
             support,
             bytes,
         })
     }
 
-    /// Read back the 3D queue's tag-15 ConfigUpdate header from the graph, as
-    /// actually published. Measured, not assumed.
+    /// Effective exact configuration for the current planned/published group.
+    /// An omitted tag15 has no current record bytes: use its retained semantic
+    /// fields, not stale pool contents. Legacy paths still decode their record.
     pub(crate) fn fragment_config_update_header(
         &mut self,
     ) -> Result<G17PRenderConfigUpdateHeader> {
+        if self.variable_render_items() {
+            return Ok(self.render_publication.current(self.descriptor_ordinal).ok_or(EINVAL)?.fields[1].header);
+        }
         let mut header = None;
-        let optional_offset = g17p_render_optional_offset(false, self.descriptor_ordinal);
-        self.graph.with_bytes_mut(|raw| {
+        let optional_offset = g17p_render_config_offset(false, self.descriptor_ordinal);
+        self.config_updates.with_bytes_mut(|raw| {
             header = decode_g17p_render_config_update(
                 raw.get(optional_offset
                     ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
@@ -12239,9 +14291,12 @@ impl G17PUserRenderStorage {
     pub(crate) fn tiling_config_update_header(
         &mut self,
     ) -> Result<G17PRenderConfigUpdateHeader> {
+        if self.variable_render_items() {
+            return Ok(self.render_publication.current(self.descriptor_ordinal).ok_or(EINVAL)?.fields[0].header);
+        }
         let mut header = None;
-        let optional_offset = g17p_render_optional_offset(true, self.descriptor_ordinal);
-        self.graph.with_bytes_mut(|raw| {
+        let optional_offset = g17p_render_config_offset(true, self.descriptor_ordinal);
+        self.config_updates.with_bytes_mut(|raw| {
             header = decode_g17p_render_config_update(
                 raw.get(optional_offset
                     ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
@@ -12286,6 +14341,25 @@ impl G17PUserRenderStorage {
         )
     }
 
+    /// One mapping, six cursor reads. Do not acquire the logical context's
+    /// TSQ lock or map timestamp storage merely to anchor a new submission.
+    pub(crate) fn admission_queue_indices(&mut self) -> Result<G17PRenderQueueIndices> {
+        self.graph.with_bytes_mut(|raw| {
+            let read = |offset: usize| -> Result<u32> {
+                g17p_live_read_u32(raw, offset)
+            };
+            let indices = |base: usize| -> Result<g17_completion::QueueIndices> {
+                Ok(g17_completion::QueueIndices {
+                    done: read(base)?, read: read(base + 0x30)?, write: read(base + 0x40)?,
+                })
+            };
+            Ok(G17PRenderQueueIndices {
+                tiling: indices(Self::TILING_POINTERS)?,
+                fragment: indices(Self::FRAGMENT_POINTERS)?,
+            })
+        })
+    }
+
     pub(crate) fn snapshot(
         &mut self,
         submission_ordinal: u64,
@@ -12310,9 +14384,7 @@ impl G17PUserRenderStorage {
         let graph_va = self.graph.iova();
         self.graph.with_bytes_mut(|raw| {
             let read = |offset: usize| -> Result<u32> {
-                Ok(u32::from_le_bytes(
-                    raw[offset..offset + 4].try_into().map_err(|_| EINVAL)?,
-                ))
+                g17p_live_read_u32(raw, offset)
             };
             state.tiling = g17_completion::QueueIndices {
                 done: read(Self::TILING_POINTERS)?,
@@ -12324,21 +14396,18 @@ impl G17PUserRenderStorage {
                 read: read(Self::FRAGMENT_POINTERS + 0x30)?,
                 write: read(Self::FRAGMENT_POINTERS + 0x40)?,
             };
-            let first = u64::from_le_bytes(
-                raw[Self::JOB_LIST..Self::JOB_LIST + 8]
-                    .try_into()
-                    .map_err(|_| EINVAL)?,
-            );
-            let last = u64::from_le_bytes(
-                raw[Self::JOB_LIST + 8..Self::JOB_LIST + 16]
-                    .try_into()
-                    .map_err(|_| EINVAL)?,
-            );
+            let first = g17p_live_read_u64(raw, Self::JOB_LIST)?;
+            let last = g17p_live_read_u64(raw, Self::JOB_LIST + 8)?;
             state.job_list = [first, last];
             state.job_list_head_va = graph_va + Self::JOB_LIST as u64;
             state.job_list_empty = first == 0 && last == state.job_list_head_va;
             Ok(())
         })?;
+        if let Some(G17PRenderCommandContext::Job(context)) = &self._command_context {
+            state.job_list = context.tsq_head_snapshot()?;
+            state.job_list_head_va = context.tsq_head_gpu_va();
+            state.job_list_empty = state.job_list == [0, state.job_list_head_va];
+        }
         let timestamp_offset = g17p_render_descriptor_slot(submission_ordinal)
             .checked_mul(16)
             .ok_or(EOVERFLOW)?;
@@ -12694,6 +14763,9 @@ struct G17MappedResources {
     sksm_qid_resource: MappedObject,
     parameter_metrics: MappedObject,
     parameter_metrics_low_va: u64,
+    /// Leased page-metrics entries of `parameter_metrics`, one bit per
+    /// `G17P_PM_METRICS_SLOT_STRIDE` bytes.
+    parameter_metrics_slots: Arc<kernel::sync::Mutex<u128>>,
     fwctl: MappedObject,
     control_shared: MappedObject,
     control_shared_inner: MappedObject,
@@ -12795,7 +14867,7 @@ struct G17MappedResourcesConstruction {
 
 #[cfg(not(test))]
 struct G17UatOwner {
-    uat: KBox<mmu::Uat>,
+    uat: Arc<KBox<mmu::Uat>>,
 }
 
 /// Retirement ticket for a QoS willSubmit whose command producer is hidden.
@@ -12819,6 +14891,31 @@ enum G17PFListBackingOwner {
     Render,
 }
 
+/// Idle PM ownership is retained from capture through shared descriptor commit.
+/// This contains no reference to the device-global descriptor mapping.
+#[cfg(not(test))]
+pub(crate) struct G17PHostTvbGrow {
+    hardware_buffer_id: u32,
+    blocks: usize,
+    descriptor: [u32; 4],
+    updated: bool,
+}
+
+#[cfg(not(test))]
+impl G17PHostTvbGrow {
+    pub(crate) fn grow(&mut self, dev: &AsahiDevice,
+        storage: &mut G17PUserRenderStorage, vm: &mmu::Vm) -> Result {
+        if storage.retained_hardware_buffer_id() != Some(self.hardware_buffer_id) {
+            return Err(EINVAL);
+        }
+        let before = storage.tvb_capacity();
+        G17ResourceOwner::grow_render_tvb_owned(dev, storage, vm, self.blocks,
+            false, Some(&mut self.descriptor))?;
+        self.updated = storage.tvb_capacity() > before;
+        Ok(())
+    }
+}
+
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub(crate) struct G17ResourceOwner {
@@ -12833,6 +14930,11 @@ pub(crate) struct G17ResourceOwner {
     qos_in_flight: [u32; G17P_QOS_QUEUE_COUNT],
     qos_dm_in_flight: [u64; 4],
     qos_dm_by_qid: [u8; G17P_QOS_QUEUE_COUNT],
+    /// v87 RING_CACHE: per role (primary, secondary), the channel-13 cursor
+    /// and ring pointers last read back from main-config and checked equal to
+    /// their derivation, and the drains left before the next read-back.
+    /// Runtime-lock protected like every firmware-event ring access.
+    event_ring_checked: [(u64, u64, u32); 2],
 }
 
 #[cfg(not(test))]
@@ -12943,17 +15045,40 @@ impl G17ResourceOwner {
     }
 
     /// Read the real shared page-metrics object referenced by the PB
-    /// descriptor. The per-submit render backing has an unused placeholder
-    /// with the same shape, but firmware never consumes that copy.
-    pub(crate) fn selected_parameter_metric(&mut self, scene: usize) -> Result<u32> {
-        if scene >= G17P_PM_SCENE_COUNT {
+    /// descriptor, at the graph's leased entry (`offset`, see
+    /// `G17PUserRenderStorage::parameter_metrics_offset`). The per-submit
+    /// render backing has an unused placeholder with the same shape, but
+    /// firmware never consumes that copy.
+    pub(crate) fn selected_parameter_metric(&mut self, offset: usize, scene: usize) -> Result<u32> {
+        if scene >= G17P_PM_SCENE_COUNT || offset % G17P_PM_METRICS_SLOT_STRIDE != 0 {
             return Err(EINVAL);
         }
         self.resources.parameter_metrics.with_bytes_mut(|bytes| {
-            let at = scene * 4;
+            let at = offset.checked_add(scene * 4).ok_or(ERANGE)?;
             let raw = bytes.get(at..at + 4).ok_or(ERANGE)?;
             Ok(u32::from_le_bytes(raw.try_into().map_err(|_| ERANGE)?))
         })
+    }
+
+    /// Lease one page-metrics entry for a new parameter-management graph,
+    /// as native `AGXGart::requestPMPageMetricsBuffer` does per
+    /// `AGXParameterManagement`. Exhaustion must fail construction: falling
+    /// back to entry 0 would alias a live graph and undo the ownership fix.
+    pub(crate) fn acquire_parameter_metrics_region(
+        &mut self,
+    ) -> Result<G17PPmPageMetricsBinding> {
+        let base = [
+            self.resources.parameter_metrics.iova(),
+            self.resources.parameter_metrics_low_va,
+        ];
+        let lease = G17PPmPageMetricsLease::new(self.resources.parameter_metrics_slots.clone())
+            .ok_or(ENOSPC)?;
+        let slot = lease.slot();
+        let vas = g17p_pm_metrics_slot_vas(base, usize::from(slot)).ok_or(ERANGE)?;
+        self.resources.parameter_metrics.with_bytes_mut(|bytes| {
+            g17p_pm_metrics_slot_clear(bytes, usize::from(slot)).ok_or(ERANGE)
+        })?;
+        Ok(G17PPmPageMetricsBinding { lease: Some(lease), vas })
     }
 
     /// Compute's counterpart to `log_status_pages`.
@@ -13062,6 +15187,8 @@ impl G17ResourceOwner {
         Ok((ordinal_0, ordinal_2))
     }
 
+    pub(crate) fn owned_dev(&self) -> AsahiDevRef { self.dev.clone() }
+
     pub(crate) fn dev(&self) -> &AsahiDevice {
         &self.dev
     }
@@ -13076,7 +15203,11 @@ impl G17ResourceOwner {
     /// hardware.
     #[inline(never)]
     pub(crate) fn new_with_uat(dev: &AsahiDevice, uat: KBox<mmu::Uat>) -> Result<KBox<Self>> {
-        let address_space = G17UatOwner { uat };
+        // The boxed UAT stays at its original address. A cold builder can own
+        // its translation service without borrowing the mutable resource owner.
+        fn require_shared<T: Send + Sync>() {}
+        require_shared::<mmu::Uat>();
+        let address_space = G17UatOwner { uat: Arc::new(uat, GFP_KERNEL)? };
         let mut staged = KBox::init(init!(G17MappedResourcesConstruction {
             native_private_cluster: None,
             partial_computed: None,
@@ -13782,6 +15913,7 @@ impl G17ResourceOwner {
             logical_size: mmu::T8140_PARAMETER_METRICS_SIZE,
             // Uat::new_t8140 owns this object via new_kernel_object_wc.
             cpu_wc: true,
+            fw_pool: 0,
         });
         parameter_metrics.with_bytes_mut(|bytes| {
             bytes.fill(0);
@@ -14083,8 +16215,10 @@ impl G17ResourceOwner {
             )
             .map_err(|_| EINVAL)
         })?;
-        region_c
-            .with_bytes_mut(|bytes| g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL))?;
+        region_c.with_bytes_mut(|bytes| {
+            g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL)?;
+            g17p_apply_region_c_diagnostic_overrides(bytes)
+        })?;
         write_status_block_at(
             &mut primary_state,
             PRIMARY_STATUS_A_STATE_GRID_OFFSET as usize,
@@ -14161,6 +16295,10 @@ impl G17ResourceOwner {
                 sksm_qid_resource: staged.sksm_qid_resource.take().ok_or(EINVAL)?,
                 parameter_metrics: staged.parameter_metrics.take().ok_or(EINVAL)?,
                 parameter_metrics_low_va,
+                parameter_metrics_slots: Arc::pin_init(
+                    kernel::new_mutex!(0u128, "G17P PM page-metrics entries"),
+                    GFP_KERNEL,
+                )?,
                 fwctl: staged.fwctl.take().ok_or(EINVAL)?,
                 control_shared: staged.control_shared.take().ok_or(EINVAL)?,
                 control_shared_inner: staged.control_shared_inner.take().ok_or(EINVAL)?,
@@ -14203,6 +16341,7 @@ impl G17ResourceOwner {
             qos_in_flight: [0; G17P_QOS_QUEUE_COUNT],
             qos_dm_in_flight: [0; 4],
             qos_dm_by_qid: [0; G17P_QOS_QUEUE_COUNT],
+            event_ring_checked: [(0, 0, 0); 2],
         }), GFP_KERNEL)
     }
 
@@ -14212,6 +16351,10 @@ impl G17ResourceOwner {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         &self.address_space.uat
+    }
+
+    pub(crate) fn owned_uat(&self) -> Arc<KBox<mmu::Uat>> {
+        self.address_space.uat.clone()
     }
 
     pub(crate) fn mark_firmware_cache_flush_ready(&self) {
@@ -14432,17 +16575,26 @@ impl G17ResourceOwner {
             .checked_add(data_master.checked_mul(8).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
         let submit_time: u64;
-        // Native stores mach_absolute_time(), which is the architectural
-        // physical counter on arm64. Read that same counter rather than a
-        // nanosecond-converted Linux clock or a captured fixture literal.
-        // SAFETY: CNTPCT_EL0 is enabled for kernel reads and this assembly has
-        // no memory side effects.
-        unsafe {
-            core::arch::asm!(
-                "mrs {counter}, CNTPCT_EL0",
-                counter = out(reg) submit_time,
-                options(nomem, nostack, preserves_flags),
-            );
+        // Firmware combines QoS+e08 busy starts with its own adjusted 24 MHz
+        // counter. Read/convert only on the idle-to-busy transition; overlapping
+        // submissions must preserve the existing interval start.
+        if starts_busy_period {
+            let counter: u64;
+            let frequency: u64;
+            // SAFETY: both architectural timer registers are readable at EL1
+            // and have no memory side effects.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {counter}, CNTPCT_EL0",
+                    "mrs {frequency}, CNTFRQ_EL0",
+                    counter = out(reg) counter,
+                    frequency = out(reg) frequency,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            submit_time = g17p_qos_time_from_host(counter, frequency)?;
+        } else {
+            submit_time = 0; // Not stored outside the transition below.
         }
         let mut published = G17PQosPublication {
             record: [0; 8], qid: queue_id, hbid: hardware_buffer_id as u8,
@@ -14451,7 +16603,7 @@ impl G17ResourceOwner {
         self.resources.qos_resource.with_bytes_mut(|bytes| {
             // Validate before the first store: a failed host preparation must
             // leave both the shared counters and host accounting unchanged.
-            if bytes.len() < 0xe40 {
+            if bytes.len() < 0xe40 || bytes.as_ptr() as usize & 7 != 0 {
                 return Err(EINVAL);
             }
             if self.qos_in_flight[qid] != 0 && (bytes[offset] != hardware_buffer_id as u8
@@ -14463,14 +16615,17 @@ impl G17ResourceOwner {
             record[0] = hardware_buffer_id as u8;
             record[1] = qos_class;
             published.record.copy_from_slice(record);
-            bytes
-                .get_mut(scheduler_state_offset..scheduler_state_offset + 8)
-                .ok_or(EINVAL)?
-                .copy_from_slice(&scheduler_state.to_le_bytes());
-            bytes
-                .get_mut(share_offset..share_offset + 4)
-                .ok_or(EINVAL)?
-                .copy_from_slice(&share.to_le_bytes());
+            g17p_live_write_u64(bytes, scheduler_state_offset, scheduler_state)?;
+            g17p_live_write_u32(bytes, share_offset, share)?;
+            // Native willSubmit 88e7434..744c publishes an inactive QID's
+            // row (and, for a newly active QoS owner, pointer/share), then DMB
+            // before incrementing any submitted count at 88e7258 onward.
+            // Firmware may sample accounting independently of this kick's
+            // outer producer. Preserve that identity-before-count boundary;
+            // an already-active QID does not take the extra native barrier.
+            if self.qos_in_flight[qid] == 0 {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
             // `AGXQOSQueue::willSubmit(qid, dm)` @ 0xfffffe0008b7a248 also
             // updates its monotonic accounting in this object. Decoded from
             // the kext and checked against the valid cold native capture:
@@ -14491,45 +16646,33 @@ impl G17ResourceOwner {
             let submit_counter_offset = 0x400usize
                 .checked_add(usize::from(queue_id).checked_mul(4).ok_or(EINVAL)?)
                 .ok_or(EINVAL)?;
-            let counter = bytes
-                .get_mut(submit_counter_offset..submit_counter_offset + 4)
-                .ok_or(EINVAL)?;
-            let bumped = u32::from_le_bytes(counter.try_into().map_err(|_| EINVAL)?)
-                .wrapping_add(1);
-            counter.copy_from_slice(&bumped.to_le_bytes());
+            let bumped = g17p_live_read_u32(bytes, submit_counter_offset)?.wrapping_add(1);
+            g17p_live_write_u32(bytes, submit_counter_offset, bumped)?;
 
             let hardware_buffer_counter_offset = 0x600usize
                 .checked_add(hardware_buffer_id.checked_mul(4).ok_or(EINVAL)?)
                 .ok_or(EINVAL)?;
-            let counter = bytes
-                .get_mut(hardware_buffer_counter_offset..hardware_buffer_counter_offset + 4)
-                .ok_or(EINVAL)?;
-            let bumped = u32::from_le_bytes(counter.try_into().map_err(|_| EINVAL)?)
-                .wrapping_add(1);
-            counter.copy_from_slice(&bumped.to_le_bytes());
+            let bumped = g17p_live_read_u32(bytes, hardware_buffer_counter_offset)?.wrapping_add(1);
+            g17p_live_write_u32(bytes, hardware_buffer_counter_offset, bumped)?;
 
             // Native compares shared DM submitted with HOST DM completed.
             // Only the idle -> busy edge starts a new timing interval and
             // increments +e00 (8b7a334..33c, 3f4..448). Concurrent submissions
             // on the same engine must not keep moving that interval's start.
             if starts_busy_period {
-                let total = bytes.get_mut(0xe00..0xe08).ok_or(EINVAL)?;
-                let bumped = u64::from_le_bytes(total.try_into().map_err(|_| EINVAL)?)
-                    .wrapping_add(1);
-                total.copy_from_slice(&bumped.to_le_bytes());
-                bytes
-                    .get_mut(data_master_time_offset..data_master_time_offset + 8)
-                    .ok_or(EINVAL)?
-                    .copy_from_slice(&submit_time.to_le_bytes());
+                g17p_live_write_u64(bytes, data_master_time_offset, submit_time)?;
             }
 
-            let per_dm = bytes
-                .get_mut(data_master_count_offset..data_master_count_offset + 8)
-                .ok_or(EINVAL)?;
-            let bumped = u64::from_le_bytes(per_dm.try_into().map_err(|_| EINVAL)?)
-                .wrapping_add(1);
-            per_dm.copy_from_slice(&bumped.to_le_bytes());
+            let bumped = g17p_live_read_u64(bytes, data_master_count_offset)?.wrapping_add(1);
+            g17p_live_write_u64(bytes, data_master_count_offset, bumped)?;
             published.dm_submitted = bumped;
+            if starts_busy_period {
+                // Native idle-to-busy order: time (88e73a4), DM submitted
+                // (73c8), interval count (73d4), then the final DMB (7304).
+                // These are separate words, not an atomic multiword snapshot.
+                let intervals = g17p_live_read_u64(bytes, 0xe00)?.wrapping_add(1);
+                g17p_live_write_u64(bytes, 0xe00, intervals)?;
+            }
             Ok(())
         })?;
         self.qos_in_flight[qid] = next_qid;
@@ -14910,13 +17053,121 @@ impl G17ResourceOwner {
                 .and_then(|address| address.checked_add(index as u64 * 8))
                 .ok_or(EINVAL)?;
             raw_state_pointers[index] = self.resources.shared_cluster.read_u64(address)?;
-            state_values[index] = self.resources.primary_state.read_u32(raw_state_pointers[index])?;
+            state_values[index] = self.resources.primary_state.read_live_u32(raw_state_pointers[index])?;
         }
         Ok(G17PControlPointerSnapshot {
             main_config,
             raw_state_pointers,
             expected_state_pointers: expected.states,
             state_values,
+        })
+    }
+
+    /// Native `AGXArmFirmware::updateSubmitInProgress`: RegionC+0x7c counts
+    /// host submissions in progress and +0x80 counts submissions. GFX1 reads
+    /// both live (fw1 e5cc/e600/102f4) and latches +0x80 (f588/279c0). The
+    /// host is the only writer, so ordered stores suffice; the CPU mapping is
+    /// cached, so clean both lines to the point of coherency.
+    pub(crate) fn publish_submit_in_progress(&mut self, in_progress: u32, submits: u32) -> Result {
+        self.resources.region_c.with_bytes_mut(|bytes| {
+            g17p_live_write_u32(bytes, 0x80, submits)?;
+            g17p_live_write_u32(bytes, 0x7c, in_progress)?;
+            for offset in [0x7c_usize, 0x80] {
+                // SAFETY: bounds were checked by the writes above.
+                let line = unsafe { bytes.as_ptr().add(offset) };
+                unsafe {
+                    core::arch::asm!("dc cvac, {line}", line = in(reg) line,
+                        options(nostack, preserves_flags));
+                }
+            }
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+            Ok(())
+        })
+    }
+
+    /// Opt-in `g17p_dvfs_parity` bit1: the exact native bracket order.
+    /// `AGXArmFirmware::updateSubmitInProgress(true)` (kext 88a7f24..88a7f3c)
+    /// increments +0x7c, then +0x80; `(false)` (88a8074) decrements +0x7c
+    /// only. The host serialises submissions under Runtime, so in-progress is
+    /// 0/1 and the stored values equal native's atomic results.
+    pub(crate) fn publish_native_submit_bracket(&mut self, open: bool, submits: u32) -> Result {
+        self.resources.region_c.with_bytes_mut(|bytes| {
+            if open {
+                g17p_live_write_u32(bytes, 0x7c, 1)?;
+                g17p_live_write_u32(bytes, 0x80, submits)?;
+            } else {
+                g17p_live_write_u32(bytes, 0x7c, 0)?;
+            }
+            for offset in [0x7c_usize, 0x80] {
+                // SAFETY: bounds were checked by the writes above.
+                let line = unsafe { bytes.as_ptr().add(offset) };
+                unsafe {
+                    core::arch::asm!("dc cvac, {line}", line = in(reg) line,
+                        options(nostack, preserves_flags));
+                }
+            }
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+            Ok(())
+        })
+    }
+
+    /// Opt-in `g17p_dvfs_parity` bit0: the live RegionC+0xe4 word, so a
+    /// session re-encode (which writes 0) is detected instead of trusted.
+    pub(crate) fn read_clpc_effort(&mut self) -> Result<u32> {
+        self.resources.region_c.with_bytes_mut(|bytes| g17p_live_read_u32(bytes, 0xe4))
+    }
+
+    /// Opt-in `g17p_dvfs_parity` bit2: one word of the GFX1-written stats
+    /// object (kext `fw+0xcd8`, GFX1 `[0x1738c8]` = secondary root +0xb8 =
+    /// primary status A - 0x6c0 = primary state + 0xe780). Read-only.
+    pub(crate) fn read_gfx1_stats_u32(&mut self, offset: usize) -> Result<u32> {
+        if offset & 3 != 0 || offset + 4 > crate::g17_dvfs_policy::GFX1_STATS_SIZE {
+            return Err(EINVAL);
+        }
+        let absolute = crate::g17_dvfs_policy::GFX1_STATS_OFFSET + offset;
+        self.resources.primary_state.with_bytes_mut(|bytes| g17p_live_read_u32(bytes, absolute))
+    }
+
+    /// Diagnostic: copy the start of the live hardware-data block.
+    /// Diagnostic: RegionC+0xe4 CLPC deadline control effort (16.16) and
+    /// +0xe8 override (0 = derive from effort), cleaned to the point of coherency.
+    pub(crate) fn publish_clpc_effort(&mut self, effort: u32) -> Result {
+        self.resources.region_c.with_bytes_mut(|bytes| {
+            g17p_live_write_u32(bytes, 0xe8, 0)?;
+            g17p_live_write_u32(bytes, 0xe4, effort)?;
+            // SAFETY: bounds were checked by the writes above.
+            let line = unsafe { bytes.as_ptr().add(0xe4) };
+            unsafe {
+                core::arch::asm!("dc cvac, {line}", "dsb sy", line = in(reg) line,
+                    options(nostack, preserves_flags));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn snapshot_hw_data(&mut self, out: &[AtomicU64]) -> Result {
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            for (index, slot) in out.iter().take(0x4000 / 8).enumerate() {
+                let Some(word) = bytes.get(index * 8..index * 8 + 8) else { break; };
+                // SAFETY: in-bounds 8-byte slice; volatile because firmware may write it.
+                let value = unsafe { core::ptr::read_volatile(word.as_ptr().cast::<[u8; 8]>()) };
+                slot.store(u64::from_le_bytes(value), Ordering::Relaxed);
+            }
+            Ok(())
+        })
+    }
+
+    /// Diagnostic: copy the start of the host-owned primary state grid.
+    pub(crate) fn snapshot_primary_state_prefix(&mut self, out: &[AtomicU64]) -> Result {
+        self.resources.primary_state.with_bytes_mut(|bytes| {
+            for (index, slot) in out.iter().enumerate() {
+                let Some(word) = bytes.get(index * 8..index * 8 + 8) else { break; };
+                // SAFETY: `word` is an 8-byte in-bounds slice of the mapping;
+                // the firmware may write it concurrently, so read it volatile.
+                let value = unsafe { core::ptr::read_volatile(word.as_ptr().cast::<[u8; 8]>()) };
+                slot.store(u64::from_le_bytes(value), Ordering::Relaxed);
+            }
+            Ok(())
         })
     }
 
@@ -14949,7 +17200,7 @@ impl G17ResourceOwner {
             return Err(EINVAL);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let scan_active = self.resources.primary_state.read_u32(scan_address)?;
+        let scan_active = self.resources.primary_state.read_live_u32(scan_address)?;
         let raw = self.resources.primary_state.read_u64(address)?;
         Ok(G17PStatusASnapshot::decode(
             scan_address,
@@ -15056,6 +17307,50 @@ impl G17ResourceOwner {
         Ok(G17PFirmwareDm1SlotSnapshot { slot, address, raw })
     }
 
+    /// Read the native host-watchdog counter from retained Status-B memory.
+    /// This measures global TA/compute progress, not a particular FRG fence.
+    /// Never use Linux Region-C: the firmware root +0xb0 names Status-B.
+    /// Read errors or a concurrent recovery epoch change are not progress.
+    pub(crate) fn firmware_gpu_progress_snapshot(&mut self) -> Result<(u64, u32)> {
+        let status_b = self.handoff.primary.instance.status_b;
+        let expected = self.handoff.primary.state_grid
+            .checked_add(g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET as u64)
+            .ok_or(EINVAL)?;
+        if status_b != expected { return Err(EINVAL); }
+        let epoch_address = status_b
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_EPOCH_OFFSET).ok_or(EINVAL)?;
+        let progress_address = status_b.checked_add(0x4920).ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let epoch = self.resources.primary_state.read_u64(epoch_address)?;
+        let progress = self.resources.primary_state.read_live_u32(progress_address)?;
+        if self.resources.primary_state.read_u64(epoch_address)? != epoch {
+            return Err(EAGAIN);
+        }
+        Ok((epoch, progress))
+    }
+
+    /// v87 STATE_WORD: only the handshake state word, validated exactly as
+    /// `firmware_recovery_handshake_snapshot` validates its address. Callers
+    /// that test `.state` alone need not read the epoch and power-callback
+    /// words (two further uncached loads from the private cluster).
+    pub(crate) fn firmware_recovery_state(&mut self) -> Result<u32> {
+        let status_b = self.handoff.primary.instance.status_b;
+        let expected_status_b = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET as u64)
+            .ok_or(EINVAL)?;
+        if status_b != expected_status_b {
+            return Err(EINVAL);
+        }
+        let state_address = status_b
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        self.resources.primary_state.read_live_u32(state_address)
+    }
+
     pub(crate) fn firmware_recovery_handshake_snapshot(
         &mut self,
     ) -> Result<G17PFirmwareRecoveryHandshakeSnapshot> {
@@ -15084,11 +17379,11 @@ impl G17ResourceOwner {
             .ok_or(EINVAL)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let epoch = self.resources.primary_state.read_u64(epoch_address)?;
-        let state = self.resources.primary_state.read_u32(state_address)?;
+        let state = self.resources.primary_state.read_live_u32(state_address)?;
         let power_callback_count = self
             .resources
             .primary_state
-            .read_u32(power_callback_count_address)?;
+            .read_live_u32(power_callback_count_address)?;
         Ok(G17PFirmwareRecoveryHandshakeSnapshot::decode(
             status_b,
             epoch_address,
@@ -15128,6 +17423,19 @@ impl G17ResourceOwner {
             role, state_grid, status_a, main_config,
             self.handoff.shared.hw_data_bundle,
         )[PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX];
+        let role_index = usize::from(matches!(role, InstanceRole::Secondary));
+        // v87 RING_CACHE: the pointer pair is host-authored main-config state.
+        // Once it has been read back equal to this derivation, the next
+        // RING_REVALIDATE drains use the derived pair without the two
+        // uncached read-backs; the full check then runs again.
+        let (cursor_address, ring_address) = if crate::g17_host_path::ring_cache_hit(
+            &mut self.event_ring_checked[role_index],
+            (expected.states[0], expected.states[1]),
+            crate::g17_host_path::enabled(crate::g17_host_path::RING_CACHE),
+        ) {
+            crate::g17_host_path::count(&crate::g17_host_path::RING_CACHE_HITS);
+            (expected.states[0], expected.states[1])
+        } else {
         let cursor_address = self.resources.shared_cluster.read_u64(
             main_config
                 .checked_add(entry.start as u64)
@@ -15140,6 +17448,7 @@ impl G17ResourceOwner {
                 .ok_or(EINVAL)?,
         )?;
         if cursor_address != expected.states[0] || ring_address != expected.states[1] {
+            self.event_ring_checked[role_index] = (0, 0, 0);
             dev_err!(
                 self.dev().as_ref(),
                 "G17P firmware-event ring: pointer mismatch cursor={:#x}/{:#x} ring={:#x}/{:#x}\n",
@@ -15150,10 +17459,14 @@ impl G17ResourceOwner {
             );
             return Err(EINVAL);
         }
+        crate::g17_host_path::ring_checked(
+            &mut self.event_ring_checked[role_index], (cursor_address, ring_address));
+        (cursor_address, ring_address)
+        };
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let consumer = self.ktrace_object(role).read_u32(cursor_address)?;
-        let producer = self.ktrace_object(role).read_u32(
+        let consumer = self.ktrace_object(role).read_live_u32(cursor_address)?;
+        let producer = self.ktrace_object(role).read_live_u32(
             cursor_address
                 .checked_add(g17_completion::G17P_FIRMWARE_EVENT_PRODUCER_OFFSET as u64)
                 .ok_or(EINVAL)?,
@@ -15183,10 +17496,31 @@ impl G17ResourceOwner {
         let record_offset = record_address
             .checked_sub(self.ktrace_object(role).iova())
             .ok_or(EINVAL)? as usize;
+        let record_end = record_offset
+            .checked_add(g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE)
+            .ok_or(EINVAL)?;
         let mut raw = [0u8; g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE];
         self.ktrace_object(role).with_bytes_mut(|bytes| {
-            g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
+            if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_WORD_FW_RECORDS) {
+                g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
+            } else {
+                raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+                Ok(())
+            }
         })?;
+        if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_MSGLOG) {
+            let qword = |index: usize| {
+                let mut word = [0u8; 8];
+                word.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+                u64::from_le_bytes(word)
+            };
+            crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_EVENT,
+                matches!(role, InstanceRole::Secondary) as u64
+                    | (consumer as u64) << 8 | (producer as u64) << 32,
+                qword(0), qword(1));
+            crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_EVENT_TAIL,
+                qword(2), qword(3), qword(4));
+        }
         let event_type = u32::from_le_bytes(raw[0..4].try_into().map_err(|_| EIO)?);
         let validation = match event_type {
             // Type 1 has had a decoder in g17_completion since the completion
@@ -15276,7 +17610,7 @@ impl G17ResourceOwner {
         let mut read_u32 = |offset: u64| {
             self.resources
                 .primary_state
-                .read_u32(status_b.checked_add(offset).ok_or(EINVAL)?)
+                .read_live_u32(status_b.checked_add(offset).ok_or(EINVAL)?)
         };
         let zero_0 = read_u32(PRIMARY_STATUS_B_RECOVERY_ZERO_0_OFFSET)?;
         let detected_source_count =
@@ -15319,7 +17653,7 @@ impl G17ResourceOwner {
         let mut first_valid_index = None;
         let mut first_valid_flags = 0u32;
         for index in 0..PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_COUNT {
-            let flags = self.resources.primary_state.read_u32(
+            let flags = self.resources.primary_state.read_live_u32(
                 status_b
                     .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET)
                     .and_then(|address| {
@@ -15338,7 +17672,7 @@ impl G17ResourceOwner {
                 }
             }
         }
-        let emitted_entry_count = self.resources.primary_state.read_u32(
+        let emitted_entry_count = self.resources.primary_state.read_live_u32(
             status_b
                 .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_EMITTED_COUNT_OFFSET)
                 .ok_or(EINVAL)?,
@@ -15374,9 +17708,9 @@ impl G17ResourceOwner {
         // which is when the firmware samples this word.
         let primary = self.handoff.primary.instance.status_a;
         let secondary = self.handoff.secondary.instance.status_a;
-        let before_primary = self.resources.primary_state.read_u32(primary)?;
+        let before_primary = self.resources.primary_state.read_live_u32(primary)?;
         self.resources.primary_state.write_u32(primary, mask)?;
-        let after_primary = self.resources.primary_state.read_u32(primary)?;
+        let after_primary = self.resources.primary_state.read_live_u32(primary)?;
         let before_secondary = self.resources.secondary_status_a.read_u32(secondary)?;
         self.resources
             .secondary_status_a
@@ -15453,6 +17787,48 @@ impl G17ResourceOwner {
         Ok(previous)
     }
 
+    /// Bounded firmware-owned table sample, not an atomic device snapshot.
+    /// HWData is the beginning of the retained shared_cluster allocation.
+    fn capture_completion_consumer_metadata(&self, metadata_base: usize) -> Result {
+        let object = &self.resources.shared_cluster;
+        let view = object.object.gem.vmap::<u8>()?;
+        // SAFETY: the retained mapping spans this object's logical allocation;
+        // the reader below validates every fixed offset and u32 alignment.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(view.as_mut_ptr(), object.logical_size)
+        };
+        let words = g17p_snapshot_completion_consumer_table(bytes)?;
+        for (index, word) in words.into_iter().enumerate() {
+            crate::g17_timing_buffer::completion_snapshot_meta(
+                metadata_base + index, u64::from(word));
+        }
+        Ok(())
+    }
+
+    /// Explicit bounded diagnostic, never an ordinary retirement scan.
+    pub(crate) fn capture_completion_ring_snapshot(&mut self) -> Result {
+        self.capture_completion_consumer_metadata(9)?;
+        for (which, object) in [
+            (0usize, &mut self.resources.completion_ordinal_0),
+            (1usize, &mut self.resources.completion_ordinal_2),
+        ] {
+            const SIZE: usize = 2048 * 64;
+            if object.logical_size < SIZE { return Err(ERANGE); }
+            crate::g17_timing_buffer::completion_snapshot_meta(6 + which, object.iova());
+            // One mapping/lock for the entire bounded ring; no allocation,
+            // MMIO, consumer writes or descriptor-pointer dereferences.
+            object.with_bytes_mut(|bytes| {
+                let bytes = bytes.get(..SIZE).ok_or(ERANGE)?;
+                g17p_capture_completion_words(bytes, |index, words, changed| {
+                    crate::g17_timing_buffer::store_completion_snapshot(
+                        which * 2048 + index, words, changed);
+                })
+            })?;
+        }
+        self.capture_completion_consumer_metadata(25)?;
+        Ok(())
+    }
+
     /// Read KSM completion ordinal 0, rejecting a record that is not the one
     /// the caller is waiting for.
     ///
@@ -15482,8 +17858,13 @@ impl G17ResourceOwner {
     /// would have written a record no code path ever looked at, and would have
     /// been indistinguishable from one that never ran.
     pub(crate) fn dump_completion_records(&mut self, label: &'static str) -> Result {
-        self.dump_completion_ordinal(label, 0)?;
-        self.dump_completion_ordinal(label, 2)
+        self.dump_completion_ordinal(label, 0, None)?;
+        self.dump_completion_ordinal(label, 2, None)
+    }
+
+    pub(crate) fn dump_completion_target(&mut self, label: &'static str, target: (u8, u64)) -> Result {
+        self.dump_completion_ordinal(label, 0, Some(target))?;
+        self.dump_completion_ordinal(label, 2, Some(target))
     }
 
     /// Whether either hardware completion ring still names a descriptor in
@@ -15526,10 +17907,11 @@ impl G17ResourceOwner {
         Ok(false)
     }
 
-    fn dump_completion_ordinal(&mut self, label: &'static str, ordinal: u8) -> Result {
+    fn dump_completion_ordinal(&mut self, label: &'static str, ordinal: u8, target: Option<(u8, u64)>) -> Result {
         let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE as u64;
-        let mut rows: [(u64, u64, u64, u64); 24] = [(0, 0, 0, 0); 24];
+        let mut rows: [(u64, [u64; 8]); 24] = [(0, [0; 8]); 24];
         let mut n = 0usize;
+        let mut matched = 0usize;
         let (base, slots) = {
             let object = if ordinal == 0 {
                 &mut self.resources.completion_ordinal_0
@@ -15537,20 +17919,33 @@ impl G17ResourceOwner {
                 &mut self.resources.completion_ordinal_2
             };
             let base = object.iova();
-            let slots = (object.logical_size as u64 / stride).min(24);
+            let capacity = (object.logical_size as u64 / stride)
+                .min(g17_initdata::G17P_KSM_COMPLETION_CAPACITY as u64);
+            let slots = if target.is_some() { capacity } else { capacity.min(24) };
             for slot in 0..slots {
                 let rec = base + slot * stride;
-                let descriptor =
-                    object.read_u64(rec + 0x30)? & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
-                let queue = object.read_u64(rec + 0x38)?;
-                // Pair B, masked -- the window a completion actually reports.
-                let start =
-                    object.read_u64(rec + 0x20)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
-                let end =
-                    object.read_u64(rec + 0x28)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
-                if descriptor != 0 || queue != 0 || end != 0 {
-                    rows[n] = (slot, descriptor, start, end);
-                    n += 1;
+                let control = object.read_u64(rec)?;
+                if let Some((qid, stamp)) = target {
+                    if g17_completion::g17p_ksm_completion_queue_id(control) != qid
+                        || g17_completion::g17p_ksm_completion_timestamp(control) != stamp {
+                        continue;
+                    }
+                }
+                // Keep status/engine/stamp, both timestamp pairs, tagged
+                // descriptor and metadata. An address plus masked pair B
+                // cannot distinguish terminal completion from an intermediate
+                // hardware execution/rearm. Fault-only, bounded snapshot;
+                // firmware may still update these records while sampled.
+                let mut words = [0u64; 8];
+                for (index, word) in words.iter_mut().enumerate() {
+                    *word = object.read_u64(rec + index as u64 * 8)?;
+                }
+                if words[6] != 0 || words[7] != 0 || words[5] != 0 {
+                    matched += 1;
+                    if n < rows.len() {
+                        rows[n] = (slot, words);
+                        n += 1;
+                    }
                 }
             }
             (base, slots)
@@ -15558,23 +17953,24 @@ impl G17ResourceOwner {
         let dev = self.dev();
         dev_info!(
             dev.as_ref(),
-            "G17P completion ring[{}] ordinal={} base={:#x} slots={} populated={}\n",
+            "G17P completion ring[{}] ordinal={} base={:#x} slots={} populated={} matched={} target={:x?}\n",
             label,
             ordinal,
             base,
             slots,
-            n
+            n, matched, target
         );
         for row in rows.iter().take(n) {
             dev_info!(
                 dev.as_ref(),
-                "G17P completion ring[{}] ordinal={} slot {} desc={:#x} start={:#x} end={:#x}\n",
+                "G17P completion ring[{}] ordinal={} slot {} desc={:#x} start={:#x} end={:#x} raw={:016x?}\n",
                 label,
                 ordinal,
                 row.0,
-                row.1,
-                row.2,
-                row.3
+                row.1[6] & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK,
+                row.1[4] & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK,
+                row.1[5] & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK,
+                row.1
             );
         }
         Ok(())
@@ -15754,6 +18150,7 @@ impl G17ResourceOwner {
         &mut self,
         label: &'static str,
         expected_descriptor: u64,
+        queue_filter: Option<u8>,
     ) -> Result {
         const LOG_LIMIT: usize = 24;
         let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE as u64;
@@ -15796,14 +18193,16 @@ impl G17ResourceOwner {
                 if expected_descriptor != 0 && descriptor == expected_descriptor {
                     matched = Some(slot);
                 }
-                if logged < LOG_LIMIT {
-                    // `control` (+0x00) is the word `G17PComputeCompletionBatch::
-                    // fold_record` routes on, and `route_qid` is the queue it
-                    // routes to. Nothing printed them before, so a record the
-                    // batch reader dropped for routing to a different (or an
-                    // unrequested) slot looked identical here to one it folded.
-                    let control = object.read_u64(rec + 0x00)?;
-                    let route_qid = g17_completion::g17p_ksm_completion_queue_id(control);
+                // `control` (+0x00) is the word `G17PComputeCompletionBatch::
+                // fold_record` routes on, and `route_qid` is the queue it
+                // routes to. Nothing printed them before, so a record the
+                // batch reader dropped for routing to a different (or an
+                // unrequested) slot looked identical here to one it folded.
+                let control = object.read_u64(rec + 0x00)?;
+                let route_qid = g17_completion::g17p_ksm_completion_queue_id(control);
+                // A queue-scoped dump (compute timeout) lists that queue's
+                // records, not the first 24 populated slots of every client.
+                if logged < LOG_LIMIT && queue_filter.is_none_or(|qid| qid == route_qid) {
                     lines[logged] =
                         (slot, descriptor, queue, a_start, start, end, routing, control, route_qid);
                     logged += 1;
@@ -15815,7 +18214,7 @@ impl G17ResourceOwner {
         for entry in lines.iter().take(logged) {
             dev_info!(
                 dev.as_ref(),
-                "G17P completion[{}]: rec {} descriptor {:#x} queue {:#x} a-start {:#x} b-start {:#x} b-end {:#x} route {:#x} control {:#x} route-qid {}\n",
+                "G17P completion[{}]: rec {} descriptor {:#x} queue {:#x} a-start {:#x} b-start {:#x} b-end {:#x} route {:#x} control {:#x} route-qid {} kick-ts {:#x}\n",
                 label,
                 entry.0,
                 entry.1,
@@ -15825,12 +18224,13 @@ impl G17ResourceOwner {
                 entry.5,
                 entry.6,
                 entry.7,
-                entry.8
+                entry.8,
+                g17_completion::g17p_ksm_completion_timestamp(entry.7)
             );
         }
         dev_info!(
             dev.as_ref(),
-            "G17P completion[{}]: base {:#x} size {:#x} stride {:#x} slots {} populated {} logged {} expected-descriptor {:#x} matched-rec {:?} newest-rec {:?}\n",
+            "G17P completion[{}]: base {:#x} size {:#x} stride {:#x} slots {} populated {} logged {} (queue filter {:?}) expected-descriptor {:#x} matched-rec {:?} newest-rec {:?}\n",
             label,
             base,
             logical_size,
@@ -15838,6 +18238,7 @@ impl G17ResourceOwner {
             slots,
             populated,
             logged,
+            queue_filter,
             expected_descriptor,
             matched,
             newest.map(|(slot, _)| slot)
@@ -15926,11 +18327,11 @@ impl G17ResourceOwner {
             let control = status_a
                 .checked_add(CONTROL_BASE + ring * CONTROL_STRIDE)
                 .ok_or(EINVAL)?;
-            let read_ptr = self.resources.primary_state.read_u32(control)?;
+            let read_ptr = self.resources.primary_state.read_live_u32(control)?;
             let write_ptr = self
                 .resources
                 .primary_state
-                .read_u32(control.checked_add(0x20).ok_or(EINVAL)?)?;
+                .read_live_u32(control.checked_add(0x20).ok_or(EINVAL)?)?;
             if write_ptr == 0 && read_ptr == 0 {
                 continue;
             }
@@ -15953,7 +18354,7 @@ impl G17ResourceOwner {
                     .ok_or(EINVAL)?;
                 let mut text = [0u8; 0x60];
                 for (i, byte) in text.iter_mut().enumerate() {
-                    let word = self.resources.primary_state.read_u32(
+                    let word = self.resources.primary_state.read_live_u32(
                         record
                             .checked_add(RECORD_TEXT + (i as u64 & !3))
                             .ok_or(EINVAL)?,
@@ -16079,9 +18480,9 @@ impl G17ResourceOwner {
             .ok_or(EINVAL)?;
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let mut consumer = self.ktrace_object(role).read_u32(consumer_address)?;
-        let producer = self.ktrace_object(role).read_u32(producer_address)?;
-        let fwlog_write = self.ktrace_object(role).read_u32(fwlog_write_address)?;
+        let mut consumer = self.ktrace_object(role).read_live_u32(consumer_address)?;
+        let producer = self.ktrace_object(role).read_live_u32(producer_address)?;
+        let fwlog_write = self.ktrace_object(role).read_live_u32(fwlog_write_address)?;
         let mut stats = G17PReportDrainStats {
             producer,
             consumer_before: consumer,
@@ -16246,6 +18647,139 @@ impl G17ResourceOwner {
         Ok(stats)
     }
 
+    /// Native `AGXFirmware::drainFirmwareStatisticsRing` (0xfffffe00088815d8)
+    /// for one role, entry by entry exactly as its `fetchNextEntry` loop:
+    ///
+    /// * snapshot consumer `state+0` and producer `state+0x20` once; both must
+    ///   be below the validator capacity 0x100 (native asserts, we refuse
+    ///   without writing);
+    /// * for each entry of that observed prefix: read the entry type word and
+    ///   require `(0x5fff0000 >> type) & 1` (native asserts); advance the
+    ///   consumer `(c + 1) % 0x100`; barrier (native `dmb ish`); publish it;
+    /// * entries published after the snapshot wait for the next drain.
+    ///
+    /// Native then hands each copied entry to
+    /// `AGXStatistics::recordStatisticsEntryFromFW`, whose only callees are
+    /// kernel IOReporting imports (host accounting). Linux has no reporter, so
+    /// the telemetry is not parsed. An illegal type or cursor is a transport
+    /// fault: stop without publishing past it and quarantine this role's
+    /// statistics consumer for the rest of the load (never guess a layout).
+    pub(crate) fn drain_statistics_ring_native(
+        &mut self,
+        role: InstanceRole,
+    ) -> Result<G17PNativeRingDrainStats> {
+        let quarantine = g17p_native_ring_quarantine_bit(role, true);
+        if G17P_NATIVE_RING_QUARANTINE.load(core::sync::atomic::Ordering::Relaxed) & quarantine != 0 {
+            return Ok(G17PNativeRingDrainStats { quarantined: true, ..Default::default() });
+        }
+        let status_a = match role {
+            InstanceRole::Primary => self.handoff.primary.instance.status_a,
+            InstanceRole::Secondary => self.handoff.secondary.instance.status_a,
+        };
+        let state = status_a
+            .checked_add(g17_completion::G17P_STATISTICS_STATE_STATUS_A_OFFSET)
+            .ok_or(EINVAL)?;
+        let ring = status_a
+            .checked_add(g17_completion::G17P_STATISTICS_RING_STATUS_A_OFFSET)
+            .ok_or(EINVAL)?;
+        let producer_address = state
+            .checked_add(g17_completion::G17P_KTRACE_PRODUCER_OFFSET)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut consumer = self.ktrace_object(role).read_live_u32(state)?;
+        let producer = self.ktrace_object(role).read_live_u32(producer_address)?;
+        // Entries are read only after the producer that covers them.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut stats = G17PNativeRingDrainStats {
+            consumer_before: consumer,
+            producer,
+            ..Default::default()
+        };
+        let pending = match g17_completion::g17p_native_ring_pending(
+            consumer, producer, g17_completion::G17P_STATISTICS_CAPACITY,
+        ) {
+            Ok(pending) => pending,
+            Err(_) => {
+                g17p_native_ring_quarantine(self.dev().as_ref(), role, true, consumer, producer, None);
+                return Err(EIO);
+            }
+        };
+        for _ in 0..pending {
+            let entry = ring
+                .checked_add(u64::from(consumer) * g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE as u64)
+                .ok_or(EINVAL)?;
+            let entry_type = self.ktrace_object(role).read_live_u32(entry)?;
+            if !g17_completion::g17p_ring_type_legal(
+                g17_completion::G17P_STATISTICS_TYPE_MASK, entry_type,
+            ) {
+                g17p_native_ring_quarantine(
+                    self.dev().as_ref(), role, true, consumer, producer, Some(entry_type));
+                return Err(EIO);
+            }
+            let next = g17_completion::g17p_native_ring_next(
+                consumer, g17_completion::G17P_STATISTICS_CAPACITY);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            self.ktrace_object(role).write_u32(state, next)?;
+            consumer = next;
+            stats.consumed = stats.consumed.saturating_add(1);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(stats)
+    }
+
+    /// Diagnostic statistics ring: channel 14's second state/ring pair
+    /// (state `status_a + 0x280`, ring `status_a + 0xafac0`, 0x48-byte
+    /// entries). Native drains it for both roles on every interrupt
+    /// (`AGXFirmware::drainFirmwareStatisticsRing`); Linux never has. Logs the
+    /// cursor pair and, when `consume`, the record at the consumer, then
+    /// publishes consumer = producer. Capacity-agnostic: no wrap arithmetic.
+    pub(crate) fn drain_stats_ring(&mut self, role: InstanceRole, consume: bool) -> Result<(u32, u32)> {
+        let status_a = match role {
+            InstanceRole::Primary => self.handoff.primary.instance.status_a,
+            InstanceRole::Secondary => self.handoff.secondary.instance.status_a,
+        };
+        let offsets = g17_initdata::REPORT_STATE_STATUS_A_OFFSETS[1];
+        let state = status_a.checked_add(offsets[2] as u64).ok_or(EINVAL)?;
+        let ring = status_a
+            .checked_add(g17_initdata::REPORT_RING_STATUS_A_OFFSETS[1] as u64)
+            .ok_or(EINVAL)?;
+        let producer_address = state
+            .checked_add(g17_completion::G17P_KTRACE_PRODUCER_OFFSET)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let consumer = self.ktrace_object(role).read_live_u32(state)?;
+        let producer = self.ktrace_object(role).read_live_u32(producer_address)?;
+        let role_bit = matches!(role, InstanceRole::Secondary) as u64;
+        crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_STATS,
+            role_bit | (consumer as u64) << 8 | (producer as u64) << 32, consume as u64, 0);
+        if !consume || consumer == producer || consumer >= 0x1000 || producer >= 0x1000 {
+            return Ok((consumer, producer));
+        }
+        let record_address = ring
+            .checked_add(consumer as u64 * g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE as u64)
+            .ok_or(EINVAL)?;
+        let object = self.ktrace_object(role);
+        let record_offset = record_address.checked_sub(object.iova()).ok_or(EINVAL)? as usize;
+        let mut raw = [0u8; 0x18];
+        let copied = object.with_bytes_mut(|bytes| {
+            raw.copy_from_slice(bytes.get(record_offset..record_offset + 0x18).ok_or(EINVAL)?);
+            Ok(())
+        });
+        if copied.is_ok() {
+            let qword = |index: usize| {
+                let mut word = [0u8; 8];
+                word.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+                u64::from_le_bytes(word)
+            };
+            crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_STATS_RECORD,
+                qword(0), qword(1), qword(2));
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.ktrace_object(role).write_u32(state, producer)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok((consumer, producer))
+    }
+
     /// Cross-check the published channel-14 KTrace pointer pair against the
     /// channel-table derivation. Cheap; meant to run once per boot so a
     /// mis-encode does not masquerade as "the firmware never traced".
@@ -16337,14 +18871,35 @@ impl G17ResourceOwner {
             .checked_add(g17_completion::G17P_KTRACE_PRODUCER_OFFSET)
             .ok_or(EINVAL)?;
 
+        // Native drainFirmwareRings parity (v89): the trace consumer runs on
+        // every event turn, so a transport fault quarantines this cursor
+        // instead of being retried (and reported) on every interrupt.
+        let native_strict = *crate::module_parameters::g17p_native_ring_drain.value() != 0
+            && !crate::g17_timing_buffer::diag_knob(
+                crate::g17_timing_buffer::DIAG_NATIVE_RING_DRAIN_OFF);
+        let quarantine = g17p_native_ring_quarantine_bit(role, false);
+        if native_strict
+            && G17P_NATIVE_RING_QUARANTINE.load(core::sync::atomic::Ordering::Relaxed) & quarantine != 0
+        {
+            return Ok(G17PKtraceDrainStats { quarantined: true, ..G17PKtraceDrainStats::default() });
+        }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let mut consumer = self.ktrace_object(role).read_u32(consumer_address)?;
-        let producer = self.ktrace_object(role).read_u32(producer_address)?;
+        let mut consumer = self.ktrace_object(role).read_live_u32(consumer_address)?;
+        let producer = self.ktrace_object(role).read_live_u32(producer_address)?;
+        // Entries are read only after the producer that covers them.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let mut stats = G17PKtraceDrainStats {
             producer,
             consumer_before: consumer,
             ..G17PKtraceDrainStats::default()
         };
+        if native_strict
+            && g17_completion::g17p_native_ring_pending(
+                consumer, producer, g17_completion::G17P_KTRACE_CAPACITY).is_err()
+        {
+            g17p_native_ring_quarantine(self.dev().as_ref(), role, false, consumer, producer, None);
+            return Err(EIO);
+        }
         if producer >= g17_completion::G17P_KTRACE_CAPACITY
             || consumer >= g17_completion::G17P_KTRACE_CAPACITY
         {
@@ -16384,10 +18939,31 @@ impl G17ResourceOwner {
             let record_offset = record_address
                 .checked_sub(self.ktrace_object(role).iova())
                 .ok_or(EINVAL)? as usize;
+            let record_end = record_offset
+                .checked_add(g17_completion::G17P_KTRACE_ENTRY_SIZE)
+                .ok_or(EINVAL)?;
             let mut raw = [0u8; g17_completion::G17P_KTRACE_ENTRY_SIZE];
             self.ktrace_object(role).with_bytes_mut(|bytes| {
-                g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
+                if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_WORD_FW_RECORDS) {
+                    g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
+                } else {
+                    raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+                    Ok(())
+                }
             })?;
+            if native_strict {
+                // Native fetchNextEntry asserts `(0x20 >> type) & 1` before it
+                // advances the consumer; never release an illegal slot.
+                let entry_type = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                if !g17_completion::g17p_ring_type_legal(
+                    g17_completion::G17P_KTRACE_TYPE_MASK, entry_type,
+                ) {
+                    g17p_native_ring_quarantine(
+                        self.dev().as_ref(), role, false, consumer, producer, Some(entry_type));
+                    stats.quarantined = true;
+                    break;
+                }
+            }
 
             // Publish before decoding or printing. dev_info! is slow and the
             // firmware watches this word to decide whether to nudge or stall.
@@ -16402,10 +18978,27 @@ impl G17ResourceOwner {
                 Ok(record) => record,
                 Err(_) => {
                     stats.skipped = stats.skipped.saturating_add(1);
+                    if cfg!(g17p_tsq_ktrace_window) {
+                        g17p_record_tsq_ktrace_window(role, 0xffff, 0,
+                            [u64::from(consumer), u64::from(producer),
+                             u64::from(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])), 0],
+                            0, 0);
+                    }
                     continue;
                 }
             };
             let key = record.key();
+            if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_MSGLOG) {
+                crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_KTRACE,
+                    record.timestamp,
+                    key as u64 | (record.thread as u64) << 16
+                        | (matches!(role, InstanceRole::Secondary) as u64) << 24
+                        | (record.flag as u64) << 32,
+                    record.args[0]);
+                crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_KTRACE_ARGS,
+                    record.args[1], record.args[2], record.args[3]);
+                continue;
+            }
             let lost_marker = key == g17_completion::G17P_KTRACE_LOST_KEY;
             if lost_marker {
                 stats.lost_windows = stats.lost_windows.saturating_add(1);
@@ -16417,7 +19010,17 @@ impl G17ResourceOwner {
             if key == g17_completion::G17P_KTRACE_PAUSE_REASON_KEY {
                 stats.last_pause_mask = record.args[2];
             }
-            let wanted = verbose || g17_completion::g17p_ktrace_key_is_interesting(key);
+            if cfg!(g17p_tsq_ktrace_window) {
+                // Keep consuming/acknowledging BOTH firmware rings even when
+                // timing is unarmed. The diagnostic never printk's records.
+                g17p_record_tsq_ktrace_window(role, key, record.timestamp,
+                    record.args, record.thread, record.flag);
+                continue;
+            }
+            // The consumer always runs (native parity); printing stays a
+            // trace-capture diagnostic.
+            let wanted = *crate::module_parameters::g17p_fw_trace.value() != 0
+                && (verbose || g17_completion::g17p_ktrace_key_is_interesting(key));
             if wanted && printing.allow(key, print_budget) {
                 let name = g17_completion::g17p_ktrace_key_name(key);
                 dev_info!(
@@ -16463,7 +19066,7 @@ impl G17ResourceOwner {
         for base in [0x4890u64, 0x48b0, 0x48d0, 0x48f0] {
             let mut words = [0u32; 8];
             for (i, word) in words.iter_mut().enumerate() {
-                *word = self.resources.primary_state.read_u32(
+                *word = self.resources.primary_state.read_live_u32(
                     status_b
                         .checked_add(base)
                         .and_then(|a| a.checked_add((i as u64).checked_mul(4)?))
@@ -16479,7 +19082,7 @@ impl G17ResourceOwner {
         }
         let mut entries = [0u32; 8];
         for (i, word) in entries.iter_mut().enumerate() {
-            *word = self.resources.primary_state.read_u32(
+            *word = self.resources.primary_state.read_live_u32(
                 status_b
                     .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET)
                     .and_then(|a| a.checked_add((i as u64).checked_mul(4)?))
@@ -16546,7 +19149,7 @@ impl G17ResourceOwner {
             .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET)
             .ok_or(EINVAL)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        if self.resources.primary_state.read_u32(state_address)? != expected {
+        if self.resources.primary_state.read_live_u32(state_address)? != expected {
             return Err(EBUSY);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -17003,6 +19606,8 @@ impl G17ResourceOwner {
         }
         let producer_after =
             producer_before.wrapping_add(1) & g17_initdata::CONTROL_RING_INDEX_MASK;
+        crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_DEVICE_CONTROL,
+            opcode as u64, arg as u64, producer_before as u64 | (consumer_before as u64) << 32);
         if producer_after == consumer_before {
             return Err(EAGAIN);
         }
@@ -17097,13 +19702,15 @@ impl G17ResourceOwner {
             )
         };
 
+        g17p_live_word_bounds(state_bytes, state_offset, 4)?;
         shared_bytes[offset..end].copy_from_slice(record);
         if asserts_gpu_power {
+            // Region-C's native tally is packed at +0xe51. It cannot use
+            // the naturally aligned live-word accessor. Preserve its byte
+            // layout; the separately aligned producer below publishes it.
             let power_before = u32::from_le_bytes([
-                region_c_bytes[power_offset],
-                region_c_bytes[power_offset + 1],
-                region_c_bytes[power_offset + 2],
-                region_c_bytes[power_offset + 3],
+                region_c_bytes[power_offset], region_c_bytes[power_offset + 1],
+                region_c_bytes[power_offset + 2], region_c_bytes[power_offset + 3],
             ]);
             region_c_bytes[power_offset..power_end]
                 .copy_from_slice(&power_before.wrapping_add(1).to_le_bytes());
@@ -17111,7 +19718,7 @@ impl G17ResourceOwner {
         // Native publishes record, then the matching host power-assert tally,
         // and only then advances the host-owned ring producer.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        state_bytes[state_offset..state_end].copy_from_slice(&producer_after.to_le_bytes());
+        g17p_live_write_u32(state_bytes, state_offset, producer_after)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(G17PDeviceControlPublication {
             opcode,
@@ -17332,7 +19939,8 @@ impl G17ResourceOwner {
         })?;
         self.resources.region_c.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL)
+            g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL)?;
+            g17p_apply_region_c_diagnostic_overrides(bytes)
         })?;
         self.resources.primary_b2_sentinel.with_bytes_mut(|bytes| {
             bytes.fill(0);
@@ -17734,20 +20342,29 @@ impl G17ResourceOwner {
     /// info (+0x2140) at 0x16ea0. Page B is firmware-private bookkeeping;
     /// page A is the host-visible completion witness, as on M1/M2.
     pub(crate) fn render_fragment_completion_stamp(
-        &mut self,
-        pair: G17PRenderQueuePair,
+        &mut self, pair: G17PRenderQueuePair,
     ) -> Result<u32> {
-        let offset = usize::from(pair.fragment) * core::mem::size_of::<u32>();
+        Ok(self.render_completion_stamps(pair)?[1])
+    }
+
+    /// Each engine publishes its own post-maintenance witness. Aggregate TSQ
+    /// counters cannot prove either member visible independently.
+    pub(crate) fn render_completion_stamps(
+        &mut self, pair: G17PRenderQueuePair,
+    ) -> Result<[u32; 2]> {
         self.resources.bootstrap_descriptor_zero_a.with_bytes_mut(|bytes| {
-            let word = bytes.get(offset..offset + 4).ok_or(ERANGE)?;
-            // SAFETY: this WC-mapped allocation is page aligned, each QID's
-            // lane is u32 aligned, and the checked slice covers that lane.
-            // Firmware updates it with one aligned u32 store. The acquire
-            // load orders subsequent CPU reads after the completion witness.
-            let stamp = unsafe {
-                &*word.as_ptr().cast::<core::sync::atomic::AtomicU32>()
-            };
-            Ok(u32::from_le(stamp.load(core::sync::atomic::Ordering::Acquire)))
+            let mut stamps = [0; 2];
+            for (stamp, qid) in stamps.iter_mut().zip([pair.tiling, pair.fragment]) {
+                let offset = usize::from(qid) * core::mem::size_of::<u32>();
+                let word = bytes.get(offset..offset + 4).ok_or(ERANGE)?;
+                // SAFETY: page-aligned WC mapping and bounds-checked aligned
+                // u32 lane. Firmware publishes each lane with one u32 store.
+                *stamp = u32::from_le(unsafe {
+                    core::ptr::read_volatile(word.as_ptr().cast::<u32>())
+                });
+            }
+            core::sync::atomic::fence(Ordering::Acquire);
+            Ok(stamps)
         })
     }
 
@@ -17789,7 +20406,7 @@ impl G17ResourceOwner {
         storage: &mut G17PUserRenderStorage,
     ) -> Result {
         self.stage_render_parameter_buffer_page_list(storage)?;
-        let Some((index, page_list_address, page_count)) =
+        let Some((index, page_list_address, allocated_page_count)) =
             storage.parameter_buffer_descriptor()? else { return Ok(()); };
         let offset = g17_submission::g17p_pbdesc_offset(index);
         self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
@@ -17801,11 +20418,18 @@ impl G17ResourceOwner {
                 let at = offset + word * 4;
                 *value = u32::from_le_bytes(bytes[at..at + 4].try_into().map_err(|_| EINVAL)?);
             }
+            // growImmediately expands the owned block inventory without
+            // rebuilding PBState+0x34 or the live PBDesc. Only a locally idle
+            // buildPageList/loadPBDesc loads the enlarged scene inventory.
+            // Count is therefore a loaded inventory bounded by owned backing,
+            // not part of the immutable page-list address identity.
+            let loaded_page_count = previous[1] & 0x003f_ffff;
+            if loaded_page_count > allocated_page_count { return Err(EIO); }
             let expected = g17_submission::encode_g17p_pbdesc(
-                previous, page_list_address, page_count,
+                previous, page_list_address, loaded_page_count,
                 g17_submission::decode_g17p_pbdesc(previous),
             );
-            // A different address/count means the retained identity was lost.
+            // A different address means the retained identity was lost.
             // Do not repair it while firmware may retain that other owner.
             if previous != expected { return Err(EIO); }
             Ok(())
@@ -17877,19 +20501,6 @@ impl G17ResourceOwner {
         storage: &G17PUserRenderStorage,
     ) -> Result {
         self.stage_render_uma_owner(&storage.render_flist)
-    }
-
-    /// Pair the UMA load with a store at the retired graph boundary. The
-    /// shared FList object is not updated by GPU allocation or async growth;
-    /// reloading it unchanged would reset cursors and forget grown pages.
-    pub(crate) fn save_user_render_uma(&mut self, storage: &G17PUserRenderStorage) -> Result {
-        let owner = &storage.render_flist;
-        let state = owner.uma_state()?;
-        let descriptor = self.snapshot_compute_uma(owner.id() as u8)?;
-        if descriptor[0] != g17_submission::encode_g17p_umadesc([0; 4], state)[0] {
-            return Err(EIO);
-        }
-        owner.store_uma_state(g17_submission::decode_g17p_umadesc(descriptor, state))
     }
 
     pub(crate) fn stage_render_uma_page_pool_descriptor(&mut self) -> Result {
@@ -18034,112 +20645,46 @@ impl G17ResourceOwner {
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<G17PUserRenderStorage> {
-        let parameter_metrics_vas = [
-            self.resources.parameter_metrics.iova(),
-            self.resources.parameter_metrics_low_va,
-        ];
-        let command = *command;
-        let owner_pid = match execution_context.as_ref() {
-            Some(context) => context.owner_pid,
-            None => u32::try_from(kernel::current!().group_leader().pid())
-                .map_err(|_| EOVERFLOW)?,
-        };
-        dev_info!(
-            dev.as_ref(),
-            "G17P render channel owner: process pid={}\n",
-            owner_pid
-        );
-        // Nothing above this line has touched the VM. Prove the TTBAT lookup
-        // this constructor will need while that is still true.
-        //
-        // `flush_t8140_vm_contexts` used to be the first place the condition
-        // was tested, deep inside `finish` -- by which point the render pool
-        // had been cleared unconditionally and the job-context aliases had been
-        // appended to the VM. Its failure path cannot undo either: its idea of
-        // undoing the pool is to clear it a second time, and it removes no
-        // aliases. So a VM with no TTBAT context holding its root was left
-        // worse off by every attempt, and a client retrying went round that
-        // loop once per try.
-        //
-        // The lookup reads only, so running it here costs one scan of 64 words
-        // and turns the whole stage into a clean refusal.
-        if let Err(error) = self.address_space.uat.require_t8140_vm_context(vm) {
-            // Sticky, and deliberately recorded on the VM rather than returned
-            // alone: with no context holding this VM's root, every later
-            // submission against it is undispatchable -- the firmware accepts
-            // the kick, the GPU never runs it, no completion record is ever
-            // written, and the client waits out a full timeout before the
-            // session is quarantined. Failing those submissions honestly turns
-            // a desktop-wide wedge into one application failing to start.
-            vm.status().record(error.to_errno());
-            dev_err!(
-                dev.as_ref(),
-                "G17P render: VM {} has no TTBAT context holding its root ({:?}); refusing render storage before any mapping is touched, and failing this VM's later submissions\n",
-                vm.id(),
-                error,
-            );
-            return Err(error);
-        }
-        vm.clear_render_pool_mappings(queue_pair.slot());
-        let render_flist = Arc::new(
-            G17PRenderFlist::new(dev, &self.address_space.uat, queue_pair.slot())?,
-            GFP_KERNEL,
+        let parameter_metrics = self.acquire_parameter_metrics_region()?;
+        let prepared = G17PUninstalledRenderGraph::build(
+            dev, vm, self.address_space.uat.clone(), parameter_metrics, queue_pair,
+            execution_context, descriptor_context_id, render_root_slot, command,
+            num_clusters, command_buffer_state_words, submission_ordinal,
+            parameter_manager_generation, retained_sksm_backing,
         )?;
-        let mut render_operand_aliases = self.stage_user_render_flist(vm, &render_flist)?;
-        let job_context_aliases = self
-            .address_space
-            .uat
-            .install_t8140_job_context_aliases(vm)?;
-        for mapping in job_context_aliases {
-            render_operand_aliases.push(mapping, GFP_KERNEL)?;
-        }
-        vm.append_driver_mappings(render_operand_aliases)?;
-        let (command_context, render_root_slot) = if let Some(context) = execution_context {
-            if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
-                return Err(EINVAL);
-            }
-            (
-                G17PRenderCommandContext::Job(context),
-                render_root_slot.ok_or(EINVAL)?,
-            )
-        } else {
-            let render_bind = self.address_space.uat.bind(vm)?;
-            let slot = u8::try_from(render_bind.slot()).map_err(|_| EINVAL)?;
-            (
-                G17PRenderCommandContext::Bootstrap(
-                    self.address_space.uat.allocate_t8140_app_context(&render_bind)?,
-                ),
-                slot,
-            )
-        };
-        dev_info!(
-            dev.as_ref(),
-            "G17P render app-GART allocation: command context {} descriptor context {} root slot {}\n",
-            command_context.context_id(),
-            descriptor_context_id,
-            render_root_slot,
-        );
-        let had_retained_sksm_backing = retained_sksm_backing.is_some();
-        let mut storage = G17PUserRenderStorage::new(
-            dev,
-            &self.address_space.uat,
-            parameter_metrics_vas,
-            queue_pair,
-            vm,
-            &command,
-            num_clusters,
-            owner_pid,
-            command_context,
-            descriptor_context_id,
-            render_root_slot,
-            render_flist,
-            command_buffer_state_words,
-            submission_ordinal,
-            parameter_manager_generation,
-            retained_sksm_backing,
-        )?;
+        self.install_user_render_storage(prepared, retained_sksm_backing)
+    }
+
+    /// The only cold-graph phase that mutates the shared PBDesc table or
+    /// permanently retains this graph's VM aliases. Pair/session validation
+    /// must precede this call when preparation moves outside runtime exclusion.
+    fn install_user_render_storage(
+        &mut self, mut prepared: G17PUninstalledRenderGraph,
+        retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
+    ) -> Result<G17PUserRenderStorage> {
+        self.finish_user_render_storage(&mut prepared, retained_sksm_backing)?;
+        Ok(prepared.into_storage())
+    }
+
+    /// Commit shared tables while keeping a failed graph in its caller's
+    /// transaction. Its allocations and tentative aliases can then drop after
+    /// Runtime is released, before the preparation epoch is relinquished.
+    pub(crate) fn finish_user_render_storage(
+        &mut self, prepared: &mut G17PUninstalledRenderGraph,
+        retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
+    ) -> Result {
+        let vm = &prepared.vm;
+        let storage = &mut prepared.storage;
+        let queue_pair = storage.queue_pair;
         let mut staged_descriptor = None;
         let finish = (|| -> Result {
+            // Reserve the combined alias list before touching shared tables.
+            // On failure the transaction still owns the FList aliases; unlike
+            // the former constructor they were not retained by the VM early.
+            prepared.driver_aliases.reserve(storage.sksm_vm_aliases.len(), GFP_KERNEL)?;
+            for alias in storage.take_sksm_vm_aliases() {
+                prepared.driver_aliases.push(alias, GFP_KERNEL)?;
+            }
             let aliases = storage.take_persistent_client_mappings()?;
             vm.install_render_pool_mappings(queue_pair.slot(), storage.render_pool_id(),
                 storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)?;
@@ -18149,7 +20694,7 @@ impl G17ResourceOwner {
             // publish this replacement to every TTBAT context carrying the
             // same root before any descriptor can name it.
             self.address_space.uat.flush_t8140_vm_contexts(vm)?;
-            self.stage_render_parameter_buffer_page_list(&mut storage)?;
+            self.stage_render_parameter_buffer_page_list(storage)?;
             staged_descriptor = self.stage_render_parameter_buffer_descriptor(
                 storage.parameter_buffer_descriptor()?,
             )?;
@@ -18158,7 +20703,7 @@ impl G17ResourceOwner {
             // graph handoff. Commit them only after every other fallible stage
             // so a constructor failure cannot strand an alias whose high
             // backing was never retained.
-            vm.append_driver_mappings(storage.take_sksm_vm_aliases())?;
+            vm.append_driver_mappings(core::mem::take(&mut prepared.driver_aliases))?;
             Ok(())
         })();
         if let Err(error) = finish {
@@ -18176,14 +20721,15 @@ impl G17ResourceOwner {
                 vm.status().record(error.to_errno());
             }
             let restore = self.restore_render_parameter_buffer_descriptor(staged_descriptor);
-            vm.clear_render_pool_mappings(queue_pair.slot());
+            vm.clear_render_pool_mappings_if_owner(queue_pair.slot(), storage.render_pool_id());
             restore?;
-            if had_retained_sksm_backing {
+            if prepared.had_retained_sksm_backing {
                 *retained_sksm_backing = Some(storage.take_sksm_backing()?);
+                prepared.had_retained_sksm_backing = false;
             }
             return Err(error);
         }
-        Ok(storage)
+        Ok(())
     }
 
     /// Prepare the incoming VM without changing the active execution root.
@@ -18209,9 +20755,67 @@ impl G17ResourceOwner {
         Ok(storage.tvb_capacity() > before)
     }
 
+    /// Capture the exact idle pool's descriptor. Allocation and owner-local
+    /// PM/page-list construction can then run without the device lock.
+    pub(crate) fn prepare_host_tvb_grow(
+        &mut self, storage: &G17PUserRenderStorage, blocks: usize,
+    ) -> Result<G17PHostTvbGrow> {
+        let hardware_buffer_id = storage.retained_hardware_buffer_id().ok_or(EIO)?;
+        let offset = g17_submission::g17p_pbdesc_offset(hardware_buffer_id);
+        let descriptor = self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let raw = bytes.get(offset..offset + 16).ok_or(ERANGE)?;
+            let mut words = [0; 4];
+            for (word, value) in words.iter_mut().enumerate() {
+                *value = u32::from_le_bytes(raw[word * 4..word * 4 + 4].try_into().map_err(|_| EINVAL)?);
+            }
+            Ok(words)
+        })?;
+        Ok(G17PHostTvbGrow { hardware_buffer_id, blocks, descriptor, updated: false })
+    }
+
+    /// The pair remains exclusively borrowed and retired through this short
+    /// shared-table commit, including when subsequent restaging failed.
+    pub(crate) fn commit_host_tvb_grow(&mut self, grow: &G17PHostTvbGrow) -> Result {
+        if !grow.updated { return Ok(()); }
+        let offset = g17_submission::g17p_pbdesc_offset(grow.hardware_buffer_id);
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let raw = bytes.get_mut(offset..offset + 16).ok_or(ERANGE)?;
+            for (word, value) in grow.descriptor.iter().enumerate() {
+                raw[word * 4..word * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            core::sync::atomic::fence(Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
     fn grow_render_tvb_inner(
         &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm, blocks: usize,
         synchronous: bool,
+    ) -> Result {
+        if synchronous {
+            return Self::grow_render_tvb_owned(&self.dev, storage, vm, blocks, true, None);
+        }
+        let mut grow = self.prepare_host_tvb_grow(storage, blocks)?;
+        grow.grow(&self.dev, storage, vm)?;
+        self.commit_host_tvb_grow(&grow)
+    }
+
+    /// Firmware pauses this pool's allocator until opcode 8. Its borrowed
+    /// graph owns every allocation touched here; synchronous growth never
+    /// writes the shared PBDesc table or needs the device Runtime lock.
+    pub(crate) fn grow_render_tvb_offlock(
+        dev: &AsahiDevice, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm,
+    ) -> Result<bool> {
+        let before = storage.tvb_capacity();
+        let target = g17p_tvb_grow_target(before, G17P_PM_MAX_OWNED_BLOCKS);
+        if target <= before { return Ok(false); }
+        Self::grow_render_tvb_owned(dev, storage, vm, target, true, None)?;
+        Ok(storage.tvb_capacity() > before)
+    }
+
+    fn grow_render_tvb_owned(
+        dev: &AsahiDevice, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm,
+        blocks: usize, synchronous: bool, descriptor: Option<&mut [u32; 4]>,
     ) -> Result {
         let pool_id=storage.render_pool_id();
         let render_slot=storage.queue_pair.slot();
@@ -18224,7 +20828,7 @@ impl G17ResourceOwner {
         if vm.render_pool_tvb_blocks(render_slot, pool_id) != Some(previous_blocks) || !tvb.all_reachable_from(vm) {
             return Err(EFAULT);
         }
-        let growth=tvb.prepare_growth(self.dev(),vm,blocks)?.ok_or(EINVAL)?;
+        let growth=tvb.prepare_growth(dev,vm,blocks)?.ok_or(EINVAL)?;
         let pm=storage.parameter_management.as_mut().ok_or(EIO)?;
         let page_count=blocks.checked_mul(G17P_PM_PAGES_PER_BLOCK)
             .and_then(|count| u32::try_from(count).ok()).ok_or(EOVERFLOW)?;
@@ -18273,28 +20877,20 @@ impl G17ResourceOwner {
                 Ok(())
             })?;
         }
-        let descriptor_offset=g17_submission::g17p_pbdesc_offset(pm.hardware_buffer_id);
         let page_list_address=pm.page_list_low_va();
-        let descriptor=&mut self.resources.pb_descriptor_table;
         pm.backing.with_bytes_mut(|pm_raw| {
-            let commit = |desc_raw: Option<&mut [u8]>| {
+            let commit = |desc_raw: Option<&mut [u32; 4]>| {
                     if pm_raw.len()<pm_layout.total_size
                         || tvb.extensions.len()==tvb.extensions.capacity()
                     { return Err(ERANGE); }
-                    if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
+                    if !g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)
+                        .is_some_and(|current| g17p_pm_growth_commit_matches(control, current, synchronous)) {
                         return Err(EAGAIN);
                     }
                     // Only a retired scene may rebuild PBDesc. A synchronous
                     // request leaves its current firmware-owned words alone.
                     let descriptor_update = if let Some(desc_raw) = desc_raw {
-                        let descriptor_end=descriptor_offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EOVERFLOW)?;
-                        if descriptor_end>desc_raw.len() { return Err(ERANGE); }
-                        let mut previous=[0u32;4];
-                        for (word,value) in previous.iter_mut().enumerate() {
-                            let at=descriptor_offset+word*4;
-                            *value=u32::from_le_bytes(desc_raw[at..at+4].try_into().map_err(|_| EINVAL)?);
-                        }
-                        let encoded=g17_submission::encode_g17p_pbdesc(previous,page_list_address,page_count,
+                        let encoded=g17_submission::encode_g17p_pbdesc(*desc_raw,page_list_address,page_count,
                             g17_submission::G17PPbDescRingState::default());
                         Some((desc_raw, encoded))
                     } else {
@@ -18327,9 +20923,7 @@ impl G17ResourceOwner {
                         put_u32(pm_raw,state+0x3c,ring.target_cursor as u32);
                         put_u32(pm_raw,state+0x40,ring.read_cursor as u32);
                         put_u32(pm_raw,state+0x54,page_count-1);
-                        for (word,value) in encoded.into_iter().enumerate() {
-                            put_u32(desc_raw,descriptor_offset+word*4,value);
-                        }
+                        *desc_raw = encoded;
                     }
                     let length=tvb.extensions.len();
                     tvb.extensions.spare_capacity_mut()[0].write(growth.extension);
@@ -18352,12 +20946,12 @@ impl G17ResourceOwner {
                 // descriptor CPU view must not prevent a live TVB allocation.
                 commit(None)
             } else {
-                descriptor.with_bytes_mut(|desc_raw| commit(Some(desc_raw)))
+                commit(Some(descriptor.ok_or(EINVAL)?))
             }
         })?;
         pm.page_count=page_count;
         core::sync::atomic::fence(Ordering::SeqCst);
-        dev_info!(self.dev().as_ref(),"G17P render TVB grew: blocks {} -> {} pages={} retained-backing=true\n",
+        dev_info!(dev.as_ref(),"G17P render TVB grew: blocks {} -> {} pages={} retained-backing=true\n",
             previous_blocks,blocks,page_count);
         Ok(())
     }
@@ -18380,60 +20974,6 @@ impl G17ResourceOwner {
         )?;
         vm.install_render_pool_mappings(render_slot, storage.render_pool_id(),
             storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)
-    }
-
-    pub(crate) fn rebind_cached_render_vm(
-        &mut self,
-        storage: &mut G17PUserRenderStorage,
-        vm: &mmu::Vm,
-        sksm_backing: &mut G17PRenderSksmBacking,
-    ) -> Result {
-        self.address_space.uat.require_t8140_vm_context(vm)?;
-        let render_slot = storage.queue_pair.slot();
-        vm.clear_render_pool_mappings(render_slot);
-        let (pool_mappings, sksm_mappings) = match storage.rebind_client_vm_aliases(
-            &self.address_space.uat, vm, sksm_backing,
-        ) {
-            Ok(mappings) => mappings,
-            Err(error) => {
-                // Successful local mappings have dropped on the error path.
-                // If this is still clear, the refusal came from an alias the
-                // cache preflight does not cover rather than an old graph's
-                // fixed address which was occupied before this transaction.
-                let preflight_clear = storage.client_rebind_addresses_available(vm);
-                dev_err!(self.dev().as_ref(),
-                    "G17P render rebind: vm={} pair={} stage=graph-aliases preflight-clear-after-failure={} ({:?})\n",
-                    vm.id(), render_slot, preflight_clear, error);
-                return Err(error);
-            }
-        };
-        let job_context_mappings = self
-            .address_space
-            .uat
-            .install_t8140_job_context_aliases(vm).map_err(|error| {
-                dev_err!(self.dev().as_ref(),
-                    "G17P render rebind: vm={} pair={} stage=native-context-aliases ({:?})\n",
-                    vm.id(), render_slot, error);
-                error
-            })?;
-        vm.append_driver_mappings(job_context_mappings)?;
-        let flist_mappings = self
-            .stage_user_render_flist(vm, &storage.render_flist)
-            .map_err(|error| {
-            dev_err!(self.dev().as_ref(),
-                "G17P render rebind: vm={} pair={} stage=flist-aliases ({:?})\n",
-                vm.id(), render_slot, error);
-            error
-            })?;
-        vm.append_driver_mappings(flist_mappings)?;
-        vm.install_render_pool_mappings(
-            render_slot,
-            storage.render_pool_id(),
-            storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count),
-            pool_mappings,
-        )?;
-        vm.append_driver_mappings(sksm_mappings)?;
-        self.address_space.uat.flush_t8140_vm_contexts(vm).map(|_| ())
     }
 
     /// Upgrade an ordinary compute-capable client VM to the complete native
@@ -19051,10 +21591,10 @@ impl G17ResourceOwner {
         let channel = channels[g17_submission::G17P_COMPUTE_CHANNEL_TABLE_INDEX as usize];
         let state = g17_submission::G17PPartialOpeningOuterChannelState {
             consumers: [
-                self.resources.primary_state.read_u32(channel.states[0])?,
-                self.resources.primary_state.read_u32(channel.states[1])?,
+                self.resources.primary_state.read_live_u32(channel.states[0])?,
+                self.resources.primary_state.read_live_u32(channel.states[1])?,
             ],
-            producer: self.resources.primary_state.read_u32(
+            producer: self.resources.primary_state.read_live_u32(
                 channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
             )?,
             queue_gpu_va,
@@ -19105,11 +21645,11 @@ impl G17ResourceOwner {
                 self.resources.primary_state.logical_size,
             )
         };
+        g17p_live_word_bounds(state, producer_offset, 4)?;
         ring[slot_offset..slot_offset + prepared.outer.slot.len()]
             .copy_from_slice(&prepared.outer.slot);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        state[producer_offset..producer_offset + 4]
-            .copy_from_slice(&prepared.outer.next_producer.to_le_bytes());
+        g17p_live_write_u32(state, producer_offset, prepared.outer.next_producer)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(prepared)
     }
@@ -19126,9 +21666,9 @@ impl G17ResourceOwner {
         let channel = channels[table_index as usize];
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let cursors = [
-            self.resources.primary_state.read_u32(channel.states[0])?,
-            self.resources.primary_state.read_u32(channel.states[1])?,
-            self.resources.primary_state.read_u32(channel.states[2])?,
+            self.resources.primary_state.read_live_u32(channel.states[0])?,
+            self.resources.primary_state.read_live_u32(channel.states[1])?,
+            self.resources.primary_state.read_live_u32(channel.states[2])?,
         ];
         let slot_index = cursors[2].wrapping_sub(1) as u8;
         let slot_gpu_va = channel
@@ -19225,9 +21765,9 @@ impl G17ResourceOwner {
             .enumerate()
         {
             let cursors = [
-                self.resources.primary_state.read_u32(channel.states[0])?,
-                self.resources.primary_state.read_u32(channel.states[1])?,
-                self.resources.primary_state.read_u32(channel.states[2])?,
+                self.resources.primary_state.read_live_u32(channel.states[0])?,
+                self.resources.primary_state.read_live_u32(channel.states[1])?,
+                self.resources.primary_state.read_live_u32(channel.states[2])?,
             ];
             let current_slot_index = cursors[0] as u8;
             let slot_gpu_va = channel
@@ -19306,9 +21846,9 @@ impl G17ResourceOwner {
             .zip([binding.fragment_channel, binding.tiling_channel])
         {
             *output = [
-                self.resources.primary_state.read_u32(channel.states[0])?,
-                self.resources.primary_state.read_u32(channel.states[1])?,
-                self.resources.primary_state.read_u32(channel.states[2])?,
+                self.resources.primary_state.read_live_u32(channel.states[0])?,
+                self.resources.primary_state.read_live_u32(channel.states[1])?,
+                self.resources.primary_state.read_live_u32(channel.states[2])?,
             ];
         }
         Ok(counters)
@@ -19342,7 +21882,7 @@ impl G17ResourceOwner {
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair>
     where
         F: FnOnce(),
-        G: FnOnce(),
+        G: FnOnce() -> Result,
     {
         if fragment_queue_gpu_va == 0 || tiling_queue_gpu_va == 0 {
             return Err(EINVAL);
@@ -19352,15 +21892,15 @@ impl G17ResourceOwner {
             consumers: [
                 self.resources
                     .primary_state
-                    .read_u32(binding.fragment_channel.states[0])?,
+                    .read_live_u32(binding.fragment_channel.states[0])?,
                 self.resources
                     .primary_state
-                    .read_u32(binding.fragment_channel.states[1])?,
+                    .read_live_u32(binding.fragment_channel.states[1])?,
             ],
             producer: self
                 .resources
                 .primary_state
-                .read_u32(binding.fragment_channel.states[2])?,
+                .read_live_u32(binding.fragment_channel.states[2])?,
             queue_gpu_va: fragment_queue_gpu_va,
             queue_write_index: fragment_queue_write_index,
         };
@@ -19368,15 +21908,15 @@ impl G17ResourceOwner {
             consumers: [
                 self.resources
                     .primary_state
-                    .read_u32(binding.tiling_channel.states[0])?,
+                    .read_live_u32(binding.tiling_channel.states[0])?,
                 self.resources
                     .primary_state
-                    .read_u32(binding.tiling_channel.states[1])?,
+                    .read_live_u32(binding.tiling_channel.states[1])?,
             ],
             producer: self
                 .resources
                 .primary_state
-                .read_u32(binding.tiling_channel.states[2])?,
+                .read_live_u32(binding.tiling_channel.states[2])?,
             queue_gpu_va: tiling_queue_gpu_va,
             queue_write_index: tiling_queue_write_index,
         };
@@ -19463,6 +22003,8 @@ impl G17ResourceOwner {
             )
         };
 
+        g17p_live_word_bounds(state, fragment_producer_offset, 4)?;
+        g17p_live_word_bounds(state, tiling_producer_offset, 4)?;
         shared[fragment_slot_offset..fragment_slot_offset + prepared.fragment.slot.len()]
             .copy_from_slice(&prepared.fragment.slot);
         // The render VM's own hardware context is acquired and held by the
@@ -19478,14 +22020,13 @@ impl G17ResourceOwner {
         // No fallible operation remains. Commit native PM usage exactly once
         // before either outer producer can expose the corresponding command.
         // A failed mapping, ring check or context bind above consumes no count.
-        commit_submitted_operation();
+        commit_submitted_operation()?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         if !matches!(
             deferred_outer,
             G17PDeferredOuterPublication::Fragment | G17PDeferredOuterPublication::Both
         ) {
-            state[fragment_producer_offset..fragment_producer_offset + 4]
-                .copy_from_slice(&prepared.fragment.next_producer.to_le_bytes());
+            g17p_live_write_u32(state, fragment_producer_offset, prepared.fragment.next_producer).expect("prevalidated outer producer");
         }
 
         publish_late_tiling_state();
@@ -19496,8 +22037,7 @@ impl G17ResourceOwner {
             deferred_outer,
             G17PDeferredOuterPublication::Tiling | G17PDeferredOuterPublication::Both
         ) {
-            state[tiling_producer_offset..tiling_producer_offset + 4]
-                .copy_from_slice(&prepared.tiling.next_producer.to_le_bytes());
+            g17p_live_write_u32(state, tiling_producer_offset, prepared.tiling.next_producer).expect("prevalidated outer producer");
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -19531,7 +22071,7 @@ impl G17ResourceOwner {
         for index in 0..2 {
             let plan = plans[index];
             let channel = channels[index];
-            let current_producer = self.resources.primary_state.read_u32(
+            let current_producer = self.resources.primary_state.read_live_u32(
                 channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
             )?;
             if !g17p_deferred_outer_plan_ready(
@@ -19585,13 +22125,15 @@ impl G17ResourceOwner {
             )
         };
 
+        for offset in producer_offsets {
+            g17p_live_word_bounds(state, offset, 4)?;
+        }
         for index in 0..2 {
             shared[slot_offsets[index]..slot_ends[index]].copy_from_slice(&plans[index].slot);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         for index in 0..2 {
-            state[producer_offsets[index]..producer_ends[index]]
-                .copy_from_slice(&plans[index].next_producer.to_le_bytes());
+            g17p_live_write_u32(state, producer_offsets[index], plans[index].next_producer).expect("prevalidated outer producer");
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         }
         Ok(())
@@ -19638,7 +22180,7 @@ impl G17ResourceOwner {
         channel: g17_initdata::ChannelEntry,
         channel_table_index: u8,
     ) -> Result {
-        let current_producer = self.resources.primary_state.read_u32(
+        let current_producer = self.resources.primary_state.read_live_u32(
             channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
         )?;
         if !g17p_deferred_outer_plan_ready(plan, channel_table_index, current_producer) {
@@ -19682,9 +22224,10 @@ impl G17ResourceOwner {
                 self.resources.primary_state.logical_size,
             )
         };
+        g17p_live_word_bounds(state, producer_offset, 4)?;
         shared[slot_offset..slot_end].copy_from_slice(&plan.slot);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        state[producer_offset..producer_end].copy_from_slice(&plan.next_producer.to_le_bytes());
+        g17p_live_write_u32(state, producer_offset, plan.next_producer)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
@@ -19728,14 +22271,14 @@ mod tests {
     }
 
     #[test]
-    fn retained_reachability_keeps_both_command_generations() {
+    fn retained_reachability_keeps_all_command_generations() {
         let mut cache = G17PRenderReachabilityCache::new();
         let key = Some(reachability_test_key());
-        assert!(!cache.matches(0, key));
-        cache.record_success(0, key, key);
-        assert!(cache.matches(0, key));
-        assert!(!cache.matches(1, key));
-        cache.record_success(1, key, key);
+        for generation in 0..G17P_RENDER_MAX_IN_FLIGHT {
+            assert!(!cache.matches(generation, key));
+            cache.record_success(generation, key, key);
+            assert!(cache.matches(generation, key));
+        }
         for ordinal in 0..128 {
             assert!(cache.matches(ordinal % G17P_RENDER_MAX_IN_FLIGHT, key));
         }
@@ -19776,16 +22319,18 @@ mod tests {
     }
 
     #[test]
-    fn retained_reachability_topology_invalidation_clears_both_generations() {
+    fn retained_reachability_topology_invalidation_clears_all_generations() {
         let mut cache = G17PRenderReachabilityCache::new();
         let key = Some(reachability_test_key());
-        cache.record_success(0, key, key);
-        cache.record_success(1, key, key);
+        for generation in 0..G17P_RENDER_MAX_IN_FLIGHT {
+            cache.record_success(generation, key, key);
+        }
         // SKSM detach/claim, PM extraction, TVB growth, and VM alias rebind
         // invalidate before the mutation, including a failed rebind attempt.
         cache.invalidate();
-        assert!(!cache.matches(0, key));
-        assert!(!cache.matches(1, key));
+        for generation in 0..G17P_RENDER_MAX_IN_FLIGHT {
+            assert!(!cache.matches(generation, key));
+        }
         cache.record_success(1, key, key);
         assert!(!cache.matches(0, key));
         assert!(cache.matches(1, key));
@@ -19996,14 +22541,14 @@ mod tests {
         assert_eq!(g17p_render_ta_descriptor_offset(0), 0);
         assert_eq!(g17p_render_ta_descriptor_offset(1), 0x9c0);
         assert_eq!(g17p_render_3d_descriptor_offset(0), 0x14000);
-        assert_eq!(g17p_render_3d_descriptor_offset(1), 0x16240);
+        assert_eq!(g17p_render_3d_descriptor_offset(1), 0x16380);
         assert_eq!(
             g17p_render_ta_descriptor_high_va(1),
             Some(g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE + 0x9c0),
         );
         assert_eq!(
             g17p_render_3d_descriptor_low_va(1),
-            Some(G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + 0x2240),
+            Some(G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + 0x2380),
         );
         assert_eq!(G17P_RENDER_QUEUE_GRAPH_SIZE, 0x1c000);
         assert_eq!(g17p_render_optional_offset(true, 1), 0x14180);
@@ -20202,12 +22747,12 @@ mod tests {
         assert_eq!(G17P_CL_LOW_VA_END, 0x71_0000_0000);
         assert_eq!(G17P_RENDER_USER_ALIAS_START, 0x10_0200_0000);
         assert_eq!(G17P_RENDER_USER_ALIAS_END, 0x10_0220_0000);
-        assert_eq!(G17P_RENDER_RT_EVENT_RECORD_COUNT, 4);
+        assert_eq!(G17P_RENDER_RT_EVENT_RECORD_COUNT, G17P_RENDER_MAX_IN_FLIGHT);
         assert_eq!(G17P_RENDER_RT_REGION_FLOOR, 0x4_0000);
         assert_eq!(G17P_RENDER_TPC_FLOOR, 0x3_0000);
         assert_eq!(G17P_RENDER_RT_DYNAMIC_START, 0x10_5000_0000);
-        assert_eq!(G17P_RENDER_RT_DYNAMIC_PAIR_STRIDE, 0x400_0000);
-        assert_eq!(G17P_RENDER_RT_DYNAMIC_END, 0x10_5800_0000);
+        assert_eq!(G17P_RENDER_RT_DYNAMIC_PAIR_STRIDE, 0xa00_0000);
+        assert_eq!(G17P_RENDER_RT_DYNAMIC_END, 0x10_6400_0000);
         // The dynamic arena must clear both TVB growth arenas below it and the
         // descending Honeykrisp VDM alias tail above it.
         assert!(
@@ -20245,12 +22790,14 @@ mod tests {
         assert_eq!(g17p_render_alias_slot(pair1, 1), Some(3));
         assert_eq!(g17p_render_alias_slot(pair1, 2), Some(2));
         assert_eq!(g17p_render_tpc_va(pair0), Some(0x10_5000_0000));
-        assert_eq!(g17p_render_tpc_va(pair1), Some(0x10_5400_0000));
+        assert_eq!(g17p_render_tpc_va(pair1), Some(0x10_5a00_0000));
         assert_eq!(g17p_render_rt_memory_va(pair0), Some(0x10_5200_0000));
-        assert_eq!(g17p_render_rt_memory_va(pair1), Some(0x10_5600_0000));
+        assert_eq!(g17p_render_rt_memory_va(pair1), Some(0x10_5c00_0000));
         assert_eq!(g17p_render_rt_record_slot(0), 0);
         assert_eq!(g17p_render_rt_record_slot(3), 3);
-        assert_eq!(g17p_render_rt_record_slot(4), 0);
+        assert_eq!(g17p_render_rt_record_slot(G17P_RENDER_MAX_IN_FLIGHT as u64 - 1),
+            G17P_RENDER_MAX_IN_FLIGHT - 1);
+        assert_eq!(g17p_render_rt_record_slot(G17P_RENDER_MAX_IN_FLIGHT as u64), 0);
         assert_eq!(g17p_render_scene_scratch_va(pair0), Some(0x10_0017_8000));
         assert_eq!(g17p_render_discard_va(pair0), Some(0x10_0018_0000));
         assert_eq!(g17p_render_page_list_va(pair0), Some(0x10_0019_0000));
@@ -22169,4 +24716,74 @@ mod tests {
         handoff.primary.instance.secondary_extras[0] = KERN + 0x8000;
         assert_eq!(validate_handoff(&handoff), Err(ResourceError::RoleLayout));
     }
+}
+
+/// Default-off diagnostic sink. Existing ring drain/ACK owns the consumer;
+/// this only saves selected decoded records while the one-shot buffer is armed.
+/// Kind9: role,key,FWticks,args[4],thread,flag,hostDrainCounter,hostHz.
+/// Keyffff reports malformed records; key011c carries native record loss.
+fn g17p_record_tsq_ktrace_window(
+    role: InstanceRole, key: u16, timestamp: u64, args: [u64; 4], thread: u8, flag: u32,
+) {
+    if !crate::g17_timing_buffer::enabled()
+        || !matches!(key, 0x0043 | 0x010a | 0x010b | 0x000c | 0x011c | 0xffff)
+    { return; }
+    let mut words = [0; crate::g17_timing_buffer::WORDS];
+    words[0] = 9;
+    words[1] = match role { InstanceRole::Primary => 0, InstanceRole::Secondary => 1 };
+    words[2] = u64::from(key);
+    words[3] = timestamp;
+    words[4..8].copy_from_slice(&args);
+    words[8] = u64::from(thread);
+    words[9] = u64::from(flag);
+    words[10] = crate::g17_timing_buffer::arch_counter();
+    words[11] = crate::g17_timing_buffer::arch_frequency();
+    crate::g17_timing_buffer::record(words);
+}
+
+/// Raw completion-table rows for ordinals 0/2, using aligned u32 loads:
+/// HWData+0x2614 is four-byte aligned, not necessarily eight-byte aligned.
+/// The row's last word is firmware's next-read cursor (B1 db84..db98).
+/// Never follows the captured pointers or treats these rows as atomic.
+fn g17p_snapshot_completion_consumer_table(bytes: &[u8]) -> Result<[u32; 16]> {
+    const TABLE: usize = 0x2614;
+    const ROW_STRIDE: usize = 0x20;
+    const REQUIRED: usize = TABLE + 2 * ROW_STRIDE + ROW_STRIDE;
+    if bytes.len() < REQUIRED { return Err(ERANGE); }
+    if bytes.as_ptr() as usize & 3 != 0 { return Err(EINVAL); }
+    let mut words = [0u32; 16];
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+    for (row, ordinal) in [0usize, 2usize].into_iter().enumerate() {
+        for index in 0..8 {
+            let offset = TABLE + ordinal * ROW_STRIDE + index * 4;
+            // SAFETY: fixed bounds checked above; base and every offset are
+            // u32 aligned. Volatile observes firmware-owned cursor mutation.
+            words[row * 8 + index] = u32::from_le(unsafe {
+                core::ptr::read_volatile(bytes.as_ptr().add(offset).cast::<u32>())
+            });
+        }
+    }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+    Ok(words)
+}
+
+/// Read exactly2048 records from ONE ring. Reread identity after
+/// each row and mark changes; equal identity does not prove an atomic row.
+fn g17p_capture_completion_words(bytes: &[u8], mut store: impl FnMut(usize, [u64; 8], bool)) -> Result {
+    const SIZE: usize = 2048 * 64;
+    if bytes.len() != SIZE || bytes.as_ptr() as usize & 7 != 0 { return Err(EINVAL); }
+    core::sync::atomic::fence(Ordering::Acquire);
+    for slot in 0..2048 {
+        let base = slot * 64;
+        let read = |index: usize| -> u64 {
+            // SAFETY: exact aligned extent above bounds every volatile u64.
+            u64::from_le(unsafe { core::ptr::read_volatile(
+                bytes.as_ptr().add(base + index * 8).cast::<u64>()) })
+        };
+        let words = core::array::from_fn(read);
+        core::sync::atomic::fence(Ordering::Acquire);
+        let changed = read(0) != words[0] || read(6) != words[6] || read(7) != words[7];
+        store(slot, words, changed);
+    }
+    Ok(())
 }

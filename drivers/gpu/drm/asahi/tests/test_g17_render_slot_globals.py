@@ -45,7 +45,7 @@ assert "g17p_render_pair_first_outer_submit(" in inner
 assert "queue_pair.slot()," in inner
 publish = inner[inner.index(".publish_partial_opening_pair("):inner.index("move || {", inner.index(".publish_partial_opening_pair("))]
 assert "first_outer_submit," in publish
-assert inner.index("self.render_hardware_buffer_published = true;") \
+assert inner.index("self.render_slots.get_mut(pair_slot).hardware_buffer_published = true;") \
     < inner.index("self.render_outer_channels_started[usize::from(queue_pair.slot())] = true;")
 stop = block(manager, "release_runtime_objects_after_processor_stop")
 assert "self.render_outer_channels_started = [false; 64];" in stop
@@ -73,8 +73,8 @@ for name in ["stage_fragment", "stage_fragment_prefix", "prepare_late_tiling_pub
     assert "self.context_update_pending" in block(resources, name), name
 consistency = block(manager, "validate_render_queue_consistency")
 assert "header.context_update != u16::from(context_update)" in consistency
-completion = block(manager, "poll_translated_render_completion")
-assert "complete_render_context_update_retirement(true)?" in completion
+completion = block(manager, "commit_render_observation")
+assert "complete_render_context_update_retirement(pair_slot, true)?" in completion
 context_retirement = block(manager, "complete_render_context_update_retirement")
 assert "complete_context_update()" in context_retirement
 

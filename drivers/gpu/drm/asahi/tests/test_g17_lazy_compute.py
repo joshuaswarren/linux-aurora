@@ -57,7 +57,9 @@ impl Manager {
         Ok(4)
     }
 }
+struct Preparations;impl Preparations{fn reopen(&self)->bool{true}}
 struct Runtime {
+    preparations: Preparations,
     test_stage: G17PTestStage,
     queue: Option<u8>,
     drm: Option<u32>,
@@ -68,7 +70,7 @@ struct Runtime {
 }
 impl Runtime {
     fn new(stage: G17PTestStage) -> Self {
-        Self { test_stage: stage, queue: None, drm: Some(1), session_recovery_pending: false,
+        Self { preparations: Preparations, test_stage: stage, queue: None, drm: Some(1), session_recovery_pending: false,
                manager: Some(Manager::default()),
                queue_setup_pending: stage.prepares_qid4_at_startup(),
                accepting_submissions: stage.enables_compute_uapi() }

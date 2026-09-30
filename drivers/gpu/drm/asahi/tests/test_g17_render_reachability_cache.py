@@ -21,10 +21,10 @@ def item(prefix):
 
 
 tests = [
-    "retained_reachability_keeps_both_command_generations",
+    "retained_reachability_keeps_all_command_generations",
     "retained_reachability_rejects_each_changed_vm_input",
     "retained_reachability_does_not_cache_overlapping_or_unavailable_epochs",
-    "retained_reachability_topology_invalidation_clears_both_generations",
+    "retained_reachability_topology_invalidation_clears_all_generations",
 ]
 constant = next(line for line in source.splitlines()
                 if line.startswith("pub(crate) const G17P_RENDER_MAX_IN_FLIGHT:"))

@@ -4,7 +4,13 @@
 struct G17PAsyncComputeActive {
     packet: Arc<crate::g17_job::G17PComputeJobPacket>,
     _lease: crate::g17_drm::G17PComputeLeaseGuard,
+    _work_state: Arc<crate::g17_resources::G17PWorkStateLease>,
     retirement: Option<G17PAsyncComputeRetirementTicket>,
+    /// This kick's KSM completion record, latched the first time any scan saw
+    /// it. The ring slot can be reused before the kick is retireable (its
+    /// stamp store may still be pending), so retirement must never depend on
+    /// finding the record in the ring a second time.
+    observed: Option<crate::g17_resources::G17PComputeCompletionCandidate>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -27,6 +33,23 @@ struct G17PAsyncComputePreviousBinding {
     publication: Option<(u64, u64)>,
 }
 
+/// Published, unretired compute jobs of one queue, oldest first.
+///
+/// Firmware orders them: each CL kick names the previous kick of its QID as
+/// its implicit parent, so they execute and retire in publication order and
+/// the host never waits for one to retire before publishing the next.
+type G17PAsyncComputeInflight = g17_completion::PairFifo<
+    G17PAsyncComputeActive,
+    { crate::g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize },
+>;
+
+/// Admission guards kept after a quarantined queue's packets were released
+/// on the retirement witness (`release_firmware_retired_quarantined_compute`).
+type G17PAsyncComputeRetiredLeases = g17_completion::PairFifo<
+    crate::g17_drm::G17PComputeLeaseGuard,
+    { crate::g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize },
+>;
+
 /// Installed queue graphs survive logical queue destruction. Firmware retains
 /// their addresses; exact command retirement permits rebinding, not freeing.
 struct G17PAsyncComputeQueue {
@@ -35,7 +58,7 @@ struct G17PAsyncComputeQueue {
     binding: Option<g17_manager::G17PComputeUserBinding>,
     context: Option<Arc<crate::g17_resources::G17PLogicalQueueContext>>,
     previous_binding: Option<G17PAsyncComputePreviousBinding>,
-    active: Option<G17PAsyncComputeActive>,
+    inflight: G17PAsyncComputeInflight,
     released: bool,
     /// The most recent publication passed every queue-local retirement gate.
     /// Consumed when ownership changes or another command is published.
@@ -46,6 +69,27 @@ struct G17PAsyncComputeQueue {
     /// failed unpublished-owner restore, which remains quarantined separately.
     retired_by_teardown: bool,
     terminal_fanout: Option<(Arc<crate::g17_status::VmStatus>, Error)>,
+    /// The oldest in-flight kick has finished on the GPU (record latched or
+    /// firmware counters complete) but was not retireable at the last scan,
+    /// typically because its stamp store was not visible yet. Such a queue is
+    /// re-evaluated on every later completion event, not only on events that
+    /// name its QID, so a late stamp costs one event interval instead of the
+    /// scheduler's 2 s timeout.
+    retire_pending: bool,
+    /// Quarantined with a published, ticketed command whose exact firmware
+    /// retirement has not been observed yet (zero-duration retire or
+    /// scheduler timeout). While set, the queue-local terminal words are
+    /// re-read at recovery completion, owner release, the next client's
+    /// preparation and completion-event batches. Only that command's packet
+    /// and VM pin are released on the witness; the installed graph (QID,
+    /// SKSM entry aliases, context root) stays quarantined as before.
+    awaiting_retirement_witness: bool,
+    /// Admission guards of quarantined commands whose packets were released
+    /// on that witness, one per released kick. Kept so admission accounting
+    /// and the processor-stop rehabilitation are exactly what they were while
+    /// the packets were held. A quarantined queue admits nothing new, so the
+    /// in-flight bound also bounds this.
+    retired_leases: G17PAsyncComputeRetiredLeases,
 }
 
 /// Type-1 firmware events identify completed stamp/QID slots in a 128-bit
@@ -59,18 +103,38 @@ const fn g17p_async_completion_mask_contains(masks: [u64; 2], queue_id: u8) -> b
     masks[word] & (1u64 << (queue_id as usize % 64)) != 0
 }
 
+/// Whether the oldest in-flight kick of `q` has already finished on the GPU:
+/// its completion record was latched, or firmware's completed counter and
+/// item-ring consumption have passed it. Used only to decide whether the
+/// queue needs re-examination on the next event of any QID.
+fn g17p_async_compute_front_finished(
+    manager: &mut g17_manager::G17PManagerConstruction,
+    q: &mut G17PAsyncComputeQueue,
+) -> bool {
+    let Some((observed, ticket)) = q.inflight.front()
+        .map(|front| (front.observed.is_some(), front.retirement)) else { return false; };
+    if observed {
+        return true;
+    }
+    let Some(ticket) = ticket else { return false; };
+    manager.independent_compute_kick_finished(&mut q.queue, &ticket.firmware).unwrap_or(false)
+}
+
 impl G17PLiveRuntime {
     /// Both firmware CPUs must have stopped before this is called. Queue
     /// destruction alone cannot settle the scheduler's retained hardware
     /// fences, and a later timeout cannot find a queue we have removed.
     fn release_async_compute_after_processor_stop(&mut self) {
         for q in &self.async_compute_queues {
-            if let Some(active) = &q.active {
+            for active in q.inflight.iter() {
                 if let Ok(completion) = active.packet.completion() {
                     completion.complete(Err(EIO));
                     completion.release_after_processor_stop();
                 }
                 active._lease.rehabilitate_after_processor_stop();
+            }
+            for lease in q.retired_leases.iter() {
+                lease.rehabilitate_after_processor_stop();
             }
         }
         self.async_compute_queues.clear();
@@ -106,13 +170,14 @@ impl G17PLiveRuntime {
         if let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) {
             return Ok((q.queue.queue_id(), q.context.as_ref().ok_or(EIO)?.clone()));
         }
+        self.release_firmware_retired_quarantined_compute("client-prepare");
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.stage_compute_flist_state()?;
         let free = self.async_compute_queues.iter().position(|q|
             q.queue.requires_first_install() && q.previous_binding.is_none() &&
             crate::g17_queue_limits::reusable_idle_compute_graph(
                 q.owner.is_none(),
-                q.active.is_none(),
+                q.inflight.is_none(),
                 q.binding.is_none(),
                 q.context.is_none(),
                 q.quarantined,
@@ -128,7 +193,7 @@ impl G17PLiveRuntime {
                         && q.retirement_ready
                         && crate::g17_queue_limits::rebindable_released_compute_graph(
                             q.owner.is_none(),
-                            q.active.is_none(),
+                            q.inflight.is_none(),
                             q.released,
                             q.quarantined,
                         )
@@ -147,11 +212,15 @@ impl G17PLiveRuntime {
             self.queue_setup_pending = false;
             let index = self.async_compute_queues.len();
             self.async_compute_queues.push(G17PAsyncComputeQueue {
-                owner: None, queue, binding: None, context: None, active: None,
+                owner: None, queue, binding: None, context: None,
+                inflight: G17PAsyncComputeInflight::new(),
                 previous_binding: None,
                 released: false, retirement_ready: false,
                 quarantined: false, retired_by_teardown: false,
                 terminal_fanout: None,
+                retire_pending: false,
+                awaiting_retirement_witness: false,
+                retired_leases: G17PAsyncComputeRetiredLeases::new(),
             }, GFP_KERNEL)?;
             index
         };
@@ -159,11 +228,10 @@ impl G17PLiveRuntime {
         if q.binding.is_some() != q.context.is_some() {
             return Err(EIO);
         }
-        // Finish QID/graph allocation before retaining the incoming page:
-        // ENOSPC must not pin a new unused control on every failed prepare.
-        // This still precedes fresh alias binding and same-VM retargeting;
-        // any failure after pointer exposure keeps the page through stop.
-        manager.retain_logical_channel_control(&context.channel_control)?;
+        // From here the incoming page can be named by a firmware-visible CL
+        // record, so the queue's close must release it through the firmware
+        // (`bind_logical_channel_control` marks it again at the exact bind).
+        context.channel_control.mark_published();
         // Same-VM reuse keeps the existing aliases, but logical queue identity
         // is independent of VM identity. Install the incoming root/scheduler
         // owner and retain the old root until replacement work completes.
@@ -278,33 +346,34 @@ impl G17PLiveRuntime {
         Ok(())
     }
 
-    pub(crate) fn async_compute_needs_install(&self, owner: u64) -> Result<bool> {
-        let q = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)).ok_or(EINVAL)?;
-        Ok(q.queue.requires_first_install())
-    }
-
-    pub(crate) fn async_compute_dependency(&self, owner: u64) -> Option<kernel::dma_fence::Fence> {
-        self.async_compute_queues.iter().find(|q| q.owner == Some(owner) && !q.quarantined)?
-            .active.as_ref()?.packet.completion().ok().map(|c| c.fence())
-    }
-
     /// The runtime lock serializes this snapshot against publication and
     /// retirement. Keep the published QID stamp, never predict the next kick.
     pub(crate) fn async_compute_native_dependency(
         &mut self, owner: u64, status: &Arc<crate::g17_status::VmStatus>,
+        wait_through: Option<u64>,
     ) -> Result<Option<g17_submission::G17PClBarrierDependency>> {
+        // BARRIER_NONE permits independent engines to overlap, as on AGX2.
+        // Do not turn a live compute queue into an implicit execution barrier.
+        if wait_through.is_none() {
+            return Ok(None);
+        }
         let handshake = self.manager.as_mut().ok_or(ENODEV)?
             .firmware_recovery_handshake_snapshot()?;
         let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) else {
             return Ok(None);
         };
-        let Some(active) = q.active.as_ref() else { return Ok(None); };
+        // Only kicks inside the requested logical prefix may be parents.
+        // One QID orders its own kicks, so the newest covered kick subsumes
+        // older ones without waiting for later independent work.
+        let Some(active) = q.inflight.iter().filter(|active|
+            g17_submission::g17p_render_prefix_contains(
+                wait_through, active.packet.command().compute_sequence,
+            )).last() else { return Ok(None); };
         let completion = active.packet.completion()?;
         if !Arc::ptr_eq(&completion.status, status) { return Err(EIO); }
         let ticket = active.retirement.as_ref().ok_or(EIO)?;
         // Publication settles any open recovery first. A closed recovery since
         // this compute's publication leaves its native stamp meaningful.
-        let _ = ticket;
         if q.quarantined || handshake.state != 0 {
             return Err(EIO);
         }
@@ -315,28 +384,43 @@ impl G17PLiveRuntime {
         ) };
         if state < 0 { return Err(Error::from_errno(state)); }
         if state > 0 { return Ok(None); }
-        Ok(Some(q.queue.published_compute_dependency()?))
-    }
-
-    /// A burst experiment must not include first install or a newly rebound
-    /// graph. These checks are diagnostic eligibility, not execution capacity.
-    pub(crate) fn async_compute_burst_steady(&self, owner: u64) -> bool {
-        self.async_compute_queues.iter().find(|q| q.owner == Some(owner))
-            .is_some_and(|q| !q.queue.requires_first_install()
-                && q.previous_binding.is_none() && q.binding.is_some()
-                && q.context.as_ref().is_some_and(|context| context.is_current())
-                && q.active.is_none() && !q.released && !q.quarantined)
+        let timestamp = ticket.firmware.kick_timestamp();
+        let mut dependency = g17_submission::g17p_render_barrier_from_timestamp(
+            timestamp, q.queue.queue_id(),
+        ).map_err(|_| EIO)?;
+        dependency.native_timestamp = Some(timestamp);
+        Ok(Some(dependency))
     }
 
     pub(crate) fn publish_async_compute(
         &mut self, owner: u64, packet: Arc<crate::g17_job::G17PComputeJobPacket>,
         lease: crate::g17_drm::G17PComputeLeaseGuard,
     ) -> Result {
+        crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_SUBMIT,
+            1 << 32, 0, 0);
+        self.submit_accounting_begin();
+        let result = self.publish_async_compute_inner(owner, packet, lease);
+        self.submit_accounting_end();
+        crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_SUBMIT,
+            1 << 32, 1, result.is_ok() as u64);
+        result
+    }
+
+    fn publish_async_compute_inner(
+        &mut self, owner: u64, packet: Arc<crate::g17_job::G17PComputeJobPacket>,
+        lease: crate::g17_drm::G17PComputeLeaseGuard,
+    ) -> Result {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
+        if packet.completion()?.status.get() != 0 { return Err(EIO); }
+        if !packet.context().is_current() { return Err(EFAULT); }
+        let trace_entry_ns = if crate::g17_timing_buffer::enabled() {
+            crate::g17_timing_buffer::now()
+        } else { 0 };
         self.settle_open_recovery_before_publication()?;
         let mut dependencies = [g17_submission::G17PClBarrierDependency {
             native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
         }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
+        let mut dependency_sequences = [0; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
         let mut dependency_count = 0;
         for predecessor in Iterator::chain(
             self.pending_render.iter().flatten(),
@@ -346,17 +430,24 @@ impl G17PLiveRuntime {
                 owner, &packet.completion()?.status,
                 packet.command().render_wait_through, packet.command().render_wait_last,
             )? {
-                *dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)? = dependency;
-                dependency_count += 1;
+                g17_submission::g17p_insert_prefix_dependency(
+                    &mut dependencies, &mut dependency_sequences, &mut dependency_count,
+                    predecessor.render_sequence(), dependency,
+                ).map_err(|_| EOVERFLOW)?;
             }
         }
         // Render jobs now retain independent application-GART roots and
         // job-private low views.  Compute QID4+ has no render context lease to
         // reclaim, so publication may proceed while either render slot runs.
+        self.sync_g17p_idle_hold();
         if crate::g17_config::POWER_WIRE == 1 { self.wire_g17p_submit_gpu_power()?; }
         let index = self.async_compute_queues.iter().position(|q| q.owner == Some(owner)).ok_or(EINVAL)?;
         let q = &mut self.async_compute_queues[index];
-        if q.active.is_some() || q.quarantined || q.released { return Err(EBUSY); }
+        // No host-retirement edge: an earlier kick of this queue may still be
+        // executing. The CL entry's implicit parent orders this kick after it
+        // in firmware. Only the host bookkeeping bound (equal to the DRM
+        // scheduler's credits) limits how many are outstanding.
+        if !q.inflight.has_room() || q.quarantined || q.released { return Err(EBUSY); }
         if q.queue.queue_id() != packet.hardware_queue_id()
             || q.context.as_ref().ok_or(EIO)?.context_id() != packet.context().context_id()
         { return Err(EINVAL); }
@@ -367,19 +458,30 @@ impl G17PLiveRuntime {
         let publication_handshake = self.manager.as_mut().ok_or(ENODEV)?
             .firmware_recovery_handshake_snapshot()?;
         if publication_handshake.state != 0 { return Err(EBUSY); }
+        let work_state = packet.completion()?.work_state();
+        // The backend reserves/initializes this context-owned node before
+        // acquiring the runtime. Commit only consumes the installed identity.
+        let work_state_word = work_state.word();
+        if work_state_word == u32::MAX { return Err(EINVAL); }
         // From this point, every error retains the packet, mappings and root.
         // A failed notification does not prove the firmware missed the kick.
         q.retirement_ready = false;
-        q.active = Some(G17PAsyncComputeActive {
-            packet: packet.clone(), _lease: lease, retirement: None,
-        });
+        q.inflight.push(G17PAsyncComputeActive {
+            packet: packet.clone(), _lease: lease, _work_state: work_state.clone(),
+            retirement: None, observed: None,
+        }).map_err(|_| EBUSY)?;
+        let mut tsq_reserved = false;
         let result = (|| {
+            work_state.add_submitted_kicks(1)?;
+            tsq_reserved = true;
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             let notifications = manager.submit_translated_compute(
                 self.registers.as_ref().ok_or(ENODEV)?, &mut q.queue,
                 &state.submission_phase, q.binding.as_ref().ok_or(ENODEV)?, packet.command(),
                 g17_manager::G17PComputeSubmissionContext {
                     context_id: packet.context().context_id(),
+                    work_state_word,
+                    work_state: Some(&work_state),
                     dispatch_identity: 0x0100_01d7_0200_01dc,
                     timestamps: g17_uapi::ComputeTimestampAddresses { start: timestamp_start, end: timestamp_end },
                     descriptor_flag_4c: false,
@@ -389,7 +491,7 @@ impl G17PLiveRuntime {
                 },
             )?;
             let firmware = manager
-                .capture_independent_compute_retirement_ticket(&mut q.queue)?;
+                .capture_independent_compute_retirement_ticket(&mut q.queue, &work_state)?;
             let accepted = manager.firmware_recovery_handshake_snapshot()?;
             if accepted.state != 0 || accepted.epoch != publication_handshake.epoch {
                 return Err(EIO);
@@ -402,26 +504,44 @@ impl G17PLiveRuntime {
                 firmware,
             };
             let publication = (retirement.submission, retirement.recovery_epoch);
-            q.active.as_mut().ok_or(EIO)?.retirement = Some(retirement);
+            q.inflight.back_mut().ok_or(EIO)?.retirement = Some(retirement);
+            // The FIRST publication under the replacement binding is the
+            // witness that releases the superseded one; later publications
+            // stacked behind it retire after it.
             if let Some(previous) = q.previous_binding.as_mut() {
-                previous.publication = Some(publication);
+                if previous.publication.is_none() {
+                    previous.publication = Some(publication);
+                }
             }
             if let Some(notifications) = notifications {
                 for message in [notifications.activation, notifications.direct_kick].into_iter().flatten() {
                     fence(Ordering::SeqCst);
                     Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
-                        .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, message)?;
+                        .send_message_logged(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, message)?;
                 }
             }
             Ok(())
         })();
         if let Err(error) = result {
             if state.submission_phase.load(Ordering::Acquire) == g17_manager::G17P_SUBMIT_PHASE_IDLE {
+                if tsq_reserved {
+                    if let Err(accounting_error) = work_state.cancel_unpublished_kicks(1) {
+                        // Accounting failure must not leave an apparently live
+                        // queue whose retained packet has no retirement ticket.
+                        self.quarantine_async_compute(owner, packet.submission_id(), accounting_error);
+                        return Err(accounting_error);
+                    }
+                }
                 // No firmware-facing publication occurred: release this packet
                 // and permit a later valid job to retry the prepared queue.
-                self.async_compute_queues[index].active = None;
-                if let Some(previous) = self.async_compute_queues[index].previous_binding.as_mut() {
-                    previous.publication = None;
+                let q = &mut self.async_compute_queues[index];
+                drop(q.inflight.pop_back());
+                if let Some(previous) = q.previous_binding.as_mut() {
+                    if previous.publication.is_some_and(|(submission, _)|
+                        submission == packet.submission_id())
+                    {
+                        previous.publication = None;
+                    }
                 }
             } else {
                 self.quarantine_async_compute(owner, packet.submission_id(), error);
@@ -434,9 +554,33 @@ impl G17PLiveRuntime {
                 return Err(error);
             }
         }
+        if trace_entry_ns != 0 {
+            let q = &self.async_compute_queues[index];
+            if let Some(ticket) = q.inflight.back().and_then(|active| active.retirement) {
+                let encode = |d: &g17_submission::G17PClBarrierDependency| {
+                    d.native_timestamp.unwrap_or(u64::from(d.event_word) | (d.shared_stamp << 32))
+                        | (u64::from(d.queue_id) << 56)
+                };
+                let mut words = [0; crate::g17_timing_buffer::WORDS];
+                words[..17].copy_from_slice(&[
+                    crate::g17_timing_buffer::KIND_COMPUTE_PUBLISH, owner, packet.submission_id(),
+                    u64::from(q.queue.queue_id()), trace_entry_ns, crate::g17_timing_buffer::now(),
+                    crate::g17_timing_buffer::arch_counter(), crate::g17_timing_buffer::arch_frequency(),
+                    q.queue.published_compute_dependency().ok()
+                        .and_then(|d| d.native_timestamp).unwrap_or(0),
+                    q.inflight.len() as u64, dependency_count as u64,
+                    dependencies.first().filter(|_| dependency_count > 0).map_or(0, encode),
+                    dependencies.get(1).filter(|_| dependency_count > 1).map_or(0, encode),
+                    u64::from(ticket.firmware.submitted_target()),
+                    u64::from(ticket.firmware.item_producer()),
+                    ticket.firmware.descriptor(), ticket.recovery_epoch,
+                ]);
+                crate::g17_timing_buffer::record(words);
+            }
+        }
         let pdev = self.pdev.as_ref().ok_or(ENODEV)?;
         if crate::util::g17p_verbose() {
-            let outstanding = self.async_compute_queues.iter().filter(|q| q.active.is_some()).count();
+            let outstanding: usize = self.async_compute_queues.iter().map(|q| q.inflight.len()).sum();
             dev_info!(pdev.as_ref(),
                 "G17P async compute: PUBLISHED submission={} owner={} qid={} context={} root={:#x} outstanding={}\n",
                 packet.submission_id(), owner, packet.hardware_queue_id(),
@@ -473,200 +617,325 @@ impl G17PLiveRuntime {
     ) -> Result {
         let pdev = self.pdev.as_ref();
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
+        // Retired kicks are signalled after the runtime mutex is released
+        // (`G17PDeferredCompletion`); borrowed apart from `manager` and the
+        // queues so the retirement loop can push and kick in place.
+        let deferred = &mut self.deferred_completions;
+        let drain_owned = self.deferred_completion_drain_owned;
+        let gfx_state = self.gfx_state.as_ref();
         manager.begin_independent_compute_completion_batch();
         let mut requested = false;
+        // Quarantined commands awaiting a retirement witness are skipped by
+        // the scan below; note them in the same pass so a healthy session
+        // pays no extra walk for this.
+        let mut witness_pending = false;
+        // A queue is examined when the event names its QID (or the batch has
+        // no QID identity), when its client tore down (its watchdog is gone),
+        // or when its oldest kick already finished on the GPU and only waited
+        // for its stamp (`retire_pending`): that last case must not depend on
+        // another event for the same QID, which may never come.
+        let selected = |q: &G17PAsyncComputeQueue| -> bool {
+            q.retired_by_teardown || q.retire_pending || masks.is_none_or(|masks| {
+                g17p_async_completion_mask_contains(masks, q.queue.queue_id())
+            })
+        };
         for q in &self.async_compute_queues {
-            if q.active.is_none() || q.quarantined { continue; }
-            // Its scheduler watchdog is gone after cancellation. Observe a
-            // retained teardown on later event batches even if its own edge
-            // preceded the final stamp's visibility. Healthy queues retain
-            // the normal QID-filtered scan.
-            if !q.retired_by_teardown && masks.is_some_and(|masks| {
-                !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
-            }) {
-                continue;
+            witness_pending |= q.awaiting_retirement_witness;
+            if q.inflight.is_none() || q.quarantined || !selected(q) { continue; }
+            // Request every in-flight kick whose record has not been latched
+            // yet, oldest first, by its exact queue timestamp: firmware may
+            // report several of them in one batch. A kick without a ticket is
+            // not requested; the retirement loop classifies it for this queue.
+            for active in q.inflight.iter() {
+                let Some(ticket) = active.retirement else { break; };
+                if active.observed.is_some() { continue; }
+                requested |= manager.stage_independent_compute_completion(
+                    &q.queue, &ticket.firmware,
+                )?;
             }
-            requested |= manager.stage_independent_compute_completion(&q.queue)?;
         }
-        if !requested {
-            return Ok(());
+        if requested {
+            manager.scan_independent_compute_completion_batch()?;
         }
-        manager.scan_independent_compute_completion_batch()?;
         for q in &mut self.async_compute_queues {
-            if q.active.is_none() || q.quarantined { continue; }
-            if !q.retired_by_teardown && masks.is_some_and(|masks| {
-                !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
-            }) {
-                continue;
-            }
-            let completion = q.active.as_ref().and_then(|active| active.retirement)
-                .ok_or_else(|| {
-                    if let Some(pdev) = pdev {
-                        dev_err!(pdev.as_ref(),
-                            "G17P async compute: retirement-invariant qid={} cause=missing-ticket\n",
-                            q.queue.queue_id());
-                    }
-                    EIO
-                })
-                .and_then(|ticket| {
-                    let active = q.active.as_ref().ok_or(EIO)?;
-                    if q.owner != Some(ticket.owner)
-                        || active.packet.submission_id() != ticket.submission
-                        || active.packet.context().context_id() != ticket.context
-                    {
-                        if let Some(pdev) = pdev {
+            if q.inflight.is_none() || q.quarantined || !selected(q) { continue; }
+            // Latch every record this scan captured, for every in-flight kick,
+            // before deciding retirement: a later kick's record is also the
+            // upper bound of an earlier recordless kick's interval.
+            if requested {
+                for active in q.inflight.iter_mut() {
+                    let Some(ticket) = active.retirement else { break; };
+                    if active.observed.is_some() { continue; }
+                    match manager.take_staged_independent_compute_observation(&q.queue, &ticket.firmware) {
+                        Ok(observed) => active.observed = observed,
+                        // Every kick taken here was requested above under the
+                        // same selection; a miss is a host invariant failure,
+                        // kept to this queue (the kick stays unobserved).
+                        Err(error) => if let Some(pdev) = pdev {
                             dev_err!(pdev.as_ref(),
-                                "G17P async compute: retirement-invariant qid={} cause=ticket-identity owner={:?}/{} submission={}/{} context={}/{}\n",
-                                q.queue.queue_id(), q.owner, ticket.owner,
-                                active.packet.submission_id(), ticket.submission,
-                                active.packet.context().context_id(), ticket.context);
-                        }
-                        return Err(EIO);
-                    }
-                    // J700 firmware routinely raises fault-free recoveries. An
-                    // open one says nothing about this job yet: keep it armed
-                    // and let the recovery settle first. Once the handshake is
-                    // closed, a changed epoch only means a recovery happened
-                    // while the job was live; the exact descriptor, stamp and
-                    // ring checks below still decide completed, zero-duration
-                    // or pending. Failing here killed healthy sessions.
-                    let handshake = manager.firmware_recovery_handshake_snapshot()?;
-                    if handshake.state != 0 {
-                        return Err(EAGAIN);
-                    }
-                    if handshake.epoch != ticket.recovery_epoch && crate::util::g17p_verbose() {
-                        if let Some(pdev) = pdev {
-                            dev_info!(pdev.as_ref(),
-                                "G17P async compute: qid={} retiring across recovery epoch {}/{}\n",
-                                q.queue.queue_id(), handshake.epoch, ticket.recovery_epoch);
-                        }
-                    }
-                    let completion = manager.poll_staged_independent_compute_completion(
-                        &mut q.queue, &ticket.firmware,
-                    ).map_err(|error| {
-                        if error != EAGAIN {
-                            if let Some(pdev) = pdev {
-                                dev_err!(pdev.as_ref(),
-                                    "G17P async compute: retirement-invariant qid={} cause=poll errno={}\n",
-                                    q.queue.queue_id(), error.to_errno());
-                            }
-                        }
-                        error
-                    })?;
-                    if completion.is_some()
-                        && q.previous_binding.as_ref().is_some_and(|previous|
-                            previous.publication
-                                != Some((ticket.submission, ticket.recovery_epoch)))
-                    {
-                        if let Some(pdev) = pdev {
-                            dev_err!(pdev.as_ref(),
-                                "G17P async compute: retirement-invariant qid={} cause=previous-binding-publication expected=({},{}) actual={:?}\n",
-                                q.queue.queue_id(), ticket.submission, ticket.recovery_epoch,
-                                q.previous_binding.as_ref().and_then(|previous| previous.publication));
-                        }
-                        return Err(EIO);
-                    }
-                    Ok(completion)
-                });
-            match completion {
-                Ok(Some(timestamps)) => {
-                    let active = q.active.take().ok_or(EIO)?;
-                    q.retirement_ready = true;
-                    // Only the poller's exact descriptor/fresh timestamp/final
-                    // stamp success in the publication epoch can release the
-                    // superseded aliases. Current binding stays queue-owned.
-                    drop(q.previous_binding.take());
-                    if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
-                        dev_info!(pdev.as_ref(),
-                            "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={}\n",
-                            active.packet.submission_id(), q.queue.queue_id(),
-                            active.packet.context().context_id(), timestamps[0], timestamps[1]);
-                    }
-                    let completion = active.packet.completion()?;
-                    if q.retired_by_teardown {
-                        completion.release_after_retirement();
-                    }
-                    completion.complete(Ok(timestamps));
-                    drop(active);
-                    if q.released {
-                        // Retain `binding` and `context`. The firmware still has
-                        // this QID installed, so its SKSM entry mapping and
-                        // context root may not be dropped here -- see
-                        // `rebindable_released_compute_graph`.
-                        q.owner = None;
+                                "G17P async compute: UNCLASSIFIABLE qid={} cause=batch-request kick-ts={:#x} ({:?})\n",
+                                q.queue.queue_id(), ticket.firmware.kick_timestamp(), error);
+                        },
                     }
                 }
-                // An RTKit edge may precede the final descriptor/stamp cache
-                // lines. Leave the job armed; the scheduler's finite timeout
-                // performs one final DRAM observation before quarantine.
-                Ok(None) => {}
-                Err(error) if error == EAGAIN => {}
-                Err(error) => {
-                    // Zero-duration recovery may retire this queue without
-                    // entering quarantine_async_compute. Capture admission
-                    // before that path consumes the active packet/lease too.
-                    if let (Some(pdev), Some(active)) = (self.pdev.as_ref(), q.active.as_ref()) {
-                        dev_info!(pdev.as_ref(),
-                            "G17P async compute: admission-at-retirement-error qid={} submission={} errno={} leases(compute,render-mask,install,render-transition,render-quarantine)={:?}\n",
-                            q.queue.queue_id(), active.packet.submission_id(), error.to_errno(),
-                            active._lease.admission_snapshot());
-                    }
-                    // This queue is still firmware-owned and cannot be made
-                    // reusable from an error fence. Make the proven
-                    // processor-stop recovery reachable by the next client.
-                    //
-                    // Measured 2026-09-11: this killed a device 90s into a boot
-                    // whose recovery had just reported sources=0, dm-slot-mask=0,
-                    // both render queues at 1057/1057/1057, job list empty, both
-                    // fwctl pointers matching and `final clear acknowledged;
-                    // state=0 epoch=1`. The hardware was fine. `g17p_quarantine_scope`
-                    // bit 0 already means "retire this queue and fail its client,
-                    // leave the session up for everyone else"; that is the same
-                    // judgement this route needs, so let the one flag cover both.
-                    // ENODATA is the zero-duration retire: a submission that
-                    // retired without executing, which `g17p_zero_duration`
-                    // documents as the expected shape after a fault-blamed
-                    // firmware recovery and whose default of 1 means "fail the
-                    // submission but do NOT rebuild the firmware session". The
-                    // poller used to return EIO for it, so this arm escalated a
-                    // documented-expected outcome into a device-wide crash --
-                    // every new client ENODEV, and a rebuild known to end in
-                    // apple_rtkit_boot ETIME. The queue is still firmware-owned,
-                    // so it is retired exactly as before; only the session-wide
-                    // escalation is skipped.
-                    let submission_scoped = error == ENODATA;
-                    if submission_scoped {
-                        if let Some(pdev) = &self.pdev {
-                            dev_info!(pdev.as_ref(),
-                                "G17P async compute: queue retired after a zero-duration retire qid={} -- the client fails, the session stays up\n",
+            }
+            // Retire in publication order and stop at the first kick still
+            // pending: a later kick cannot have executed before it.
+            //
+            // A finished kick with no latched record is retired on firmware
+            // counters and stamp only after one earlier pass already saw it
+            // finished, or on an identity-less/final scan: that grace keeps
+            // the real record's timestamps whenever the record merely trails
+            // the event, at the cost of one event interval when it is lost.
+            let finished_before = q.retire_pending;
+            q.retire_pending = false;
+            let mut oldest_of_pass = true;
+            loop {
+                let Some(front) = q.inflight.front() else { break; };
+                let completion = front.retirement
+                    .ok_or_else(|| {
+                        if let Some(pdev) = pdev {
+                            dev_err!(pdev.as_ref(),
+                                "G17P async compute: retirement-invariant qid={} cause=missing-ticket\n",
                                 q.queue.queue_id());
                         }
-                    } else if crate::g17_config::QUARANTINE_SCOPE & 1 == 0 {
-                        crate::g17_live_boot::note_session_recovery_pending(
-                            &mut self.session_recovery_pending,
-                            self.pdev.as_ref(),
-                            "async-compute-completion-unclassifiable",
-                        );
-                    } else if let Some(pdev) = &self.pdev {
-                        dev_err!(pdev.as_ref(),
-                            "G17PMARK quarantine-scoped unclassifiable-completion qid={} ({:?}) -- queue retired, client fails, session stays up\n",
-                            q.queue.queue_id(), error);
+                        EIO
+                    })
+                    .and_then(|ticket| {
+                        if q.owner != Some(ticket.owner)
+                            || front.packet.submission_id() != ticket.submission
+                            || front.packet.context().context_id() != ticket.context
+                        {
+                            if let Some(pdev) = pdev {
+                                dev_err!(pdev.as_ref(),
+                                    "G17P async compute: retirement-invariant qid={} cause=ticket-identity owner={:?}/{} submission={}/{} context={}/{}\n",
+                                    q.queue.queue_id(), q.owner, ticket.owner,
+                                    front.packet.submission_id(), ticket.submission,
+                                    front.packet.context().context_id(), ticket.context);
+                            }
+                            return Err(EIO);
+                        }
+                        // J700 firmware routinely raises fault-free recoveries. An
+                        // open one says nothing about this job yet: keep it armed
+                        // and let the recovery settle first. Once the handshake is
+                        // closed, a changed epoch only means a recovery happened
+                        // while the job was live; the exact descriptor, stamp and
+                        // ring checks below still decide completed, zero-duration
+                        // or pending. Failing here killed healthy sessions.
+                        let handshake = manager.firmware_recovery_handshake_snapshot()?;
+                        if handshake.state != 0 {
+                            return Err(EAGAIN);
+                        }
+                        if handshake.epoch != ticket.recovery_epoch && crate::util::g17p_verbose() {
+                            if let Some(pdev) = pdev {
+                                dev_info!(pdev.as_ref(),
+                                    "G17P async compute: qid={} retiring across recovery epoch {}/{}\n",
+                                    q.queue.queue_id(), handshake.epoch, ticket.recovery_epoch);
+                            }
+                        }
+                        // Earliest recorded end among later kicks: they run
+                        // after this one, so it bounds this kick's end.
+                        let fallback_end = q.inflight.iter().skip(1)
+                            .find_map(|later| later.observed.map(|record| record.timestamps[1]));
+                        // Only the oldest kick of a pass may use the grace:
+                        // a later one was not seen finished on its own. An
+                        // identity-less (final/timeout) scan allows all.
+                        let recordless = if handshake.epoch != ticket.recovery_epoch {
+                            g17_manager::G17PComputeRecordless::CrossedRecovery
+                        } else if masks.is_none() || (finished_before && oldest_of_pass) {
+                            g17_manager::G17PComputeRecordless::Allowed
+                        } else {
+                            g17_manager::G17PComputeRecordless::NotYet
+                        };
+                        let completion = manager.poll_staged_independent_compute_completion(
+                            &mut q.queue, &ticket.firmware, &front._work_state, front.observed,
+                            recordless, fallback_end,
+                        ).map_err(|error| {
+                            if error != EAGAIN {
+                                if let Some(pdev) = pdev {
+                                    dev_err!(pdev.as_ref(),
+                                        "G17P async compute: retirement-invariant qid={} cause=poll errno={}\n",
+                                        q.queue.queue_id(), error.to_errno());
+                                }
+                            }
+                            error
+                        })?;
+                        if completion.is_some()
+                            && q.previous_binding.as_ref().is_some_and(|previous|
+                                previous.publication
+                                    != Some((ticket.submission, ticket.recovery_epoch)))
+                        {
+                            if let Some(pdev) = pdev {
+                                dev_err!(pdev.as_ref(),
+                                    "G17P async compute: retirement-invariant qid={} cause=previous-binding-publication expected=({},{}) actual={:?}\n",
+                                    q.queue.queue_id(), ticket.submission, ticket.recovery_epoch,
+                                    q.previous_binding.as_ref().and_then(|previous| previous.publication));
+                            }
+                            return Err(EIO);
+                        }
+                        Ok(completion)
+                    });
+                oldest_of_pass = false;
+                match completion {
+                    Ok(Some(retired)) => {
+                        let active = q.inflight.take().ok_or(EIO)?;
+                        let timestamps = retired.timestamps;
+                        if q.inflight.is_none() {
+                            q.retirement_ready = true;
+                        }
+                        // Only the poller's exact descriptor/fresh timestamp/final
+                        // stamp success in the publication epoch can release the
+                        // superseded aliases. Current binding stays queue-owned.
+                        drop(q.previous_binding.take());
+                        if crate::g17_timing_buffer::enabled() {
+                            let mut words = [0; crate::g17_timing_buffer::WORDS];
+                            words[..15].copy_from_slice(&[
+                                crate::g17_timing_buffer::KIND_COMPUTE_RETIRE,
+                                q.owner.unwrap_or(0), active.packet.submission_id(),
+                                u64::from(q.queue.queue_id()), crate::g17_timing_buffer::now(),
+                                crate::g17_timing_buffer::arch_counter(),
+                                retired.pairs[0], retired.pairs[1], retired.pairs[2], retired.pairs[3],
+                                u64::from(retired.counters[0]), u64::from(retired.counters[1]),
+                                u64::from(retired.stamp), u64::from(retired.in_flight_after),
+                                masks.map_or(0, |_| 1),
+                            ]);
+                            crate::g17_timing_buffer::record(words);
+                        }
+                        if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
+                            dev_info!(pdev.as_ref(),
+                                "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={} in-flight={}\n",
+                                active.packet.submission_id(), q.queue.queue_id(),
+                                active.packet.context().context_id(), timestamps[0], timestamps[1],
+                                q.inflight.len());
+                        }
+                        let completion = active.packet.completion()?;
+                        if q.retired_by_teardown {
+                            completion.release_after_retirement();
+                        }
+                        // Proven retired: the fence is signalled once the
+                        // runtime mutex is released. The admission lease in
+                        // `active` is still dropped here, under the mutex and
+                        // before that fence wakes userspace.
+                        crate::g17_drm::G17PDeferredCompletion::Compute {
+                            packet: active.packet.clone(),
+                            timestamps,
+                        }
+                        .defer_into(deferred);
+                        kick_deferred_completion_drain_from(deferred, gfx_state, drain_owned);
+                        drop(active);
+                        if q.released && q.inflight.is_none() {
+                            // Retain `binding` and `context`. The firmware still has
+                            // this QID installed, so its SKSM entry mapping and
+                            // context root may not be dropped here -- see
+                            // `rebindable_released_compute_graph`.
+                            q.owner = None;
+                        }
                     }
-                    q.retired_by_teardown = false;
-                    q.quarantined = true;
-                    // A zero-duration retire is the documented outcome after a
-                    // firmware recovery on a live, reset firmware. Retire this
-                    // queue and fail its client, but do not raise the device
-                    // admission poison: nothing is stuck, and the latch would
-                    // outlive the recovery that already cleared it.
-                    if submission_scoped {
-                        q.active.as_mut().ok_or(EIO)?._lease.release_retired_admission();
-                    } else {
-                        q.active.as_ref().ok_or(EIO)?._lease.quarantine();
+                    // An RTKit edge may precede the kick's stamp store. Leave
+                    // the job armed; if it has already finished on the GPU,
+                    // `retire_pending` re-examines it on the next event of any
+                    // QID, and the scheduler timeout still performs one final
+                    // DRAM observation before quarantine.
+                    Ok(None) => {
+                        q.retire_pending = g17p_async_compute_front_finished(manager, q);
+                        break;
                     }
-                    let completion = q.active.as_ref().ok_or(EIO)?.packet.completion()?;
-                    completion.fail_while_owned(error);
-                    q.terminal_fanout = Some((completion.status.clone(), error));
+                    Err(error) if error == EAGAIN => {
+                        q.retire_pending = g17p_async_compute_front_finished(manager, q);
+                        break;
+                    }
+                    Err(error) => {
+                        // Zero-duration recovery may retire this queue without
+                        // entering quarantine_async_compute. Capture admission
+                        // before that path consumes the active packet/lease too.
+                        if let (Some(pdev), Some(active)) = (self.pdev.as_ref(), q.inflight.front()) {
+                            dev_info!(pdev.as_ref(),
+                                "G17P async compute: admission-at-retirement-error qid={} submission={} errno={} in-flight={} leases(compute,render-mask,render-quarantine)={:?}\n",
+                                q.queue.queue_id(), active.packet.submission_id(), error.to_errno(),
+                                q.inflight.len(), active._lease.admission_snapshot());
+                        }
+                        // This queue is still firmware-owned and cannot be made
+                        // reusable from an error fence. Make the proven
+                        // processor-stop recovery reachable by the next client.
+                        //
+                        // Measured 2026-09-11: this killed a device 90s into a boot
+                        // whose recovery had just reported sources=0, dm-slot-mask=0,
+                        // both render queues at 1057/1057/1057, job list empty, both
+                        // fwctl pointers matching and `final clear acknowledged;
+                        // state=0 epoch=1`. The hardware was fine. `g17p_quarantine_scope`
+                        // bit 0 already means "retire this queue and fail its client,
+                        // leave the session up for everyone else"; that is the same
+                        // judgement this route needs, so let the one flag cover both.
+                        // ENODATA is the zero-duration retire: a submission that
+                        // retired without executing, which `g17p_zero_duration`
+                        // documents as the expected shape after a fault-blamed
+                        // firmware recovery and whose default of 1 means "fail the
+                        // submission but do NOT rebuild the firmware session". The
+                        // poller used to return EIO for it, so this arm escalated a
+                        // documented-expected outcome into a device-wide crash --
+                        // every new client ENODEV, and a rebuild known to end in
+                        // apple_rtkit_boot ETIME. The queue is still firmware-owned,
+                        // so it is retired exactly as before; only the session-wide
+                        // escalation is skipped.
+                        let submission_scoped = error == ENODATA;
+                        if submission_scoped {
+                            if let Some(pdev) = &self.pdev {
+                                dev_info!(pdev.as_ref(),
+                                    "G17P async compute: queue retired after a zero-duration retire qid={} -- the client fails, the session stays up\n",
+                                    q.queue.queue_id());
+                            }
+                        } else if crate::g17_config::QUARANTINE_SCOPE & 1 == 0 {
+                            crate::g17_live_boot::note_session_recovery_pending(
+                                &mut self.session_recovery_pending,
+                                self.pdev.as_ref(),
+                                "async-compute-completion-unclassifiable",
+                            );
+                        } else if let Some(pdev) = &self.pdev {
+                            dev_err!(pdev.as_ref(),
+                                "G17PMARK quarantine-scoped unclassifiable-completion qid={} ({:?}) -- queue retired, client fails, session stays up\n",
+                                q.queue.queue_id(), error);
+                        }
+                        q.retired_by_teardown = false;
+                        q.quarantined = true;
+                        // Every kick of the queue shares its fate: the queue is no
+                        // longer observed, so a kick left armed behind the front
+                        // would never signal. Packets, mappings and roots stay
+                        // retained with the quarantined queue until processor stop.
+                        //
+                        // A zero-duration retire is the documented outcome after a
+                        // firmware recovery on a live, reset firmware; kicks queued
+                        // behind it crossed the same recovery. Return their
+                        // admission share instead of raising the device admission
+                        // poison: nothing is stuck, and the latch would outlive the
+                        // recovery that already cleared it.
+                        let mut terminal = None;
+                        for active in q.inflight.iter_mut() {
+                            if submission_scoped {
+                                active._lease.release_retired_admission();
+                            } else {
+                                active._lease.quarantine();
+                            }
+                            let completion = active.packet.completion()?;
+                            completion.fail_while_owned(error);
+                            terminal.get_or_insert_with(|| completion.status.clone());
+                        }
+                        if submission_scoped {
+                            // The zero-duration record names the front kick's
+                            // exact descriptor, but the ENODATA return precedes
+                            // the stamp, counter and ring checks. Keep every
+                            // stacked packet and its VM pin until those
+                            // queue-local words prove the whole queue retired;
+                            // before this, nothing but a processor stop ever
+                            // released them, so every recovered client kept
+                            // its whole VM.
+                            witness_pending = true;
+                            q.awaiting_retirement_witness = true;
+                        }
+                        if let Some(status) = terminal {
+                            q.terminal_fanout = Some((status, error));
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -682,7 +951,118 @@ impl G17PLiveRuntime {
             };
             self.fail_outstanding_jobs_for_vm_after_compute_observation(&pending.0, pending.1);
         }
+        if witness_pending {
+            self.release_firmware_retired_quarantined_compute("event");
+        }
         Ok(())
+    }
+
+    /// Release the packet and VM pin of every quarantined compute command that
+    /// firmware has provably retired.
+    ///
+    /// Before this, a queue quarantined by a zero-duration retire (the shape
+    /// every in-flight command takes after a stamp-blamed firmware recovery)
+    /// or by a scheduler timeout kept `active` -- and with it the command's
+    /// `T8140VmJobGuard` -- until both firmware processors stopped. Scoped
+    /// quarantine keeps the session up, so that stop never comes: the guard
+    /// keeps `job_lifetime.active` non-zero, file close parks the whole user
+    /// range in `close_ranges` and every closed BO in `closed_objects`, and
+    /// the client's entire VM stays pinned (~700 MB per recovered bench
+    /// process on Neo) for the rest of the boot.
+    ///
+    /// Release point: the firmware recovery handshake is closed and the
+    /// queue-local terminal words show exactly this ticket retired (see
+    /// `independent_compute_retired_by_firmware`). That is the witness the
+    /// ordinary completion path already requires before it drops the same
+    /// packet, minus the shared completion-ring record: the zero-duration
+    /// path has already consumed that record, and a timed-out command may
+    /// have had its record overwritten in the 24-slot ring. Nothing here
+    /// touches the installed graph -- binding, context root, SKSM aliases and
+    /// the QID remain retained exactly as before, because firmware still has
+    /// the QID installed and sweeps it. A command that is still executing
+    /// (runaway shader) never satisfies the test and stays pinned.
+    fn release_firmware_retired_quarantined_compute(&mut self, reason: &'static str) {
+        if !self.async_compute_queues.iter().any(|q| q.awaiting_retirement_witness) {
+            return;
+        }
+        let pdev = self.pdev.as_ref();
+        let Some(manager) = self.manager.as_mut() else { return; };
+        match manager.firmware_recovery_handshake_snapshot() {
+            Ok(handshake) if handshake.state == 0 => {}
+            _ => return,
+        }
+        for q in self.async_compute_queues.iter_mut() {
+            if !q.awaiting_retirement_witness {
+                continue;
+            }
+            // Kicks of one QID retire in publication order, so the NEWEST
+            // ticket's target and item-ring producer cover every older kick
+            // still stacked on the queue; every stacked kick must still be
+            // identifiable before any of them is released.
+            let identity = q.inflight.iter().all(|active| {
+                active.retirement.is_some_and(|ticket| {
+                    q.owner == Some(ticket.owner)
+                        && active.packet.submission_id() == ticket.submission
+                        && active.packet.context().context_id() == ticket.context
+                })
+            });
+            let newest = q.inflight.back().and_then(|active| active.retirement);
+            let (true, Some(ticket)) = (identity, newest) else {
+                // Not provable any more: keep everything until processor stop.
+                q.awaiting_retirement_witness = false;
+                if let Some(pdev) = pdev {
+                    dev_err!(pdev.as_ref(),
+                        "G17P async compute: retirement-witness qid={} lost its ticket identity; retaining {} command(s) until processor stop\n",
+                        q.queue.queue_id(), q.inflight.len());
+                }
+                continue;
+            };
+            let in_flight = q.inflight.len() as u32;
+            match manager.independent_compute_retired_by_firmware(
+                &mut q.queue, &ticket.firmware, in_flight,
+            ) {
+                Ok(false) => {}
+                Ok(true) => {
+                    q.awaiting_retirement_witness = false;
+                    let mut released = 0usize;
+                    while let Some(active) = q.inflight.take() {
+                        let packet = active.packet;
+                        let lease = active._lease;
+                        if let Ok(completion) = packet.completion() {
+                            // The fence already carries the error from
+                            // `fail_while_owned`; only the VM pin is outstanding.
+                            completion.release_after_retirement();
+                        }
+                        // A quarantined queue admits nothing new, so the
+                        // retired-lease FIFO (same bound as the in-flight
+                        // FIFO) always has room for the lease leaving it.
+                        if let Err(lease) = q.retired_leases.push(lease) {
+                            if let Some(pdev) = pdev {
+                                dev_err!(pdev.as_ref(),
+                                    "G17P async compute: retirement-witness qid={} retired-lease FIFO full; dropping one admission guard\n",
+                                    q.queue.queue_id());
+                            }
+                            drop(lease);
+                        }
+                        released += 1;
+                        drop(packet);
+                    }
+                    if let Some(pdev) = pdev {
+                        dev_info!(pdev.as_ref(),
+                            "G17P async compute: quarantined qid={} owner={} newest-submission={} retired by firmware ({}) -- released {} packet(s) and their VM pin; the graph stays quarantined\n",
+                            q.queue.queue_id(), ticket.owner, ticket.submission, reason, released);
+                    }
+                }
+                Err(error) => {
+                    q.awaiting_retirement_witness = false;
+                    if let Some(pdev) = pdev {
+                        dev_err!(pdev.as_ref(),
+                            "G17P async compute: retirement-witness qid={} invariant failed ({:?}); retaining {} command(s) until processor stop\n",
+                            q.queue.queue_id(), error, q.inflight.len());
+                    }
+                }
+            }
+        }
     }
 
     /// Settle one VM after its compute completion state was already observed.
@@ -713,11 +1093,16 @@ impl G17PLiveRuntime {
             if !matches {
                 continue;
             }
-            crate::g17_live_boot::note_session_recovery_pending(
-                &mut self.session_recovery_pending,
-                self.pdev.as_ref(),
-                "render-completion-failed-with-vm",
-            );
+            // A failure scoped to ONE client's VM must stay scoped. This used
+            // to raise `session_recovery_pending` ("render-completion-failed-
+            // with-vm") for every sibling render of the failed VM, which turned
+            // the loss of one client into a device-wide `session-crashed` -- and
+            // on G17P a crashed session never rebuilds (4/4 RTKit HELLO ETIME),
+            // so the GPU was dead for everyone until reboot. Measured on Neo
+            // 2026-09-26 08:54 with the render-loss settle already scoped: the
+            // client's OTHER pair took this path and killed the session anyway.
+            // `fail_while_owned` below already quarantines the slot and pins the
+            // mappings firmware may still name; nothing here needs a rebuild.
             let newly_failed = self.pending_render[slot as usize]
                 .as_ref()
                 .is_some_and(|completion| completion.fail_while_owned(error));
@@ -741,7 +1126,8 @@ impl G17PLiveRuntime {
                 if q.quarantined {
                     None
                 } else {
-                    q.active.as_ref().and_then(|active| {
+                    // Every in-flight kick of a queue belongs to its one owner.
+                    q.inflight.iter().find_map(|active| {
                         let completion = active.packet.completion().ok()?;
                         if !Arc::ptr_eq(&completion.status, status) {
                             return None;
@@ -755,26 +1141,30 @@ impl G17PLiveRuntime {
                 }
             };
             let Some((submission, queue_id, context)) = identity else { continue };
-            {
-                crate::g17_live_boot::note_session_recovery_pending(
-                    &mut self.session_recovery_pending,
-                    self.pdev.as_ref(),
-                    "async-compute-vm-fanout-quarantine",
-                );
+            let in_flight = {
+                // Same rule as the render sweep above: quarantining this
+                // client's compute queue (and its admission lease, which
+                // QUARANTINE_SCOPE bit 0 keeps client-scoped) is the whole
+                // containment. It must not declare the session crashed
+                // (first-submit hang, measured on Neo 2026-09-26 08:54: the
+                // sibling escalation killed a healthy session).
                 let q = &mut self.async_compute_queues[index];
                 q.quarantined = true;
-                let Some(active) = q.active.as_ref() else { continue };
-                active._lease.quarantine();
-                if let Ok(completion) = active.packet.completion() {
-                    completion.fail_while_owned(error);
+                for active in q.inflight.iter() {
+                    active._lease.quarantine();
+                    if let Ok(completion) = active.packet.completion() {
+                        completion.fail_while_owned(error);
+                    }
                 }
-            }
-            failed += 1;
+                q.inflight.len()
+            };
+            failed += in_flight;
             if let Some(pdev) = &self.pdev {
                 dev_err!(
                     pdev.as_ref(),
-                    "G17P async compute: FAILING submission={} qid={} context={} after its VM was lost ({:?})\n",
+                    "G17P async compute: FAILING submission={} (+{} queued) qid={} context={} after its VM was lost ({:?})\n",
                     submission,
+                    in_flight.saturating_sub(1),
                     queue_id,
                     context,
                     error,
@@ -848,9 +1238,13 @@ impl G17PLiveRuntime {
     /// A prepared replacement is also retained until its exact successful
     /// publication completes; preparing aliases alone does not switch roots.
     pub(crate) fn release_async_compute_queue(&mut self, owner: u64) {
+        // A departing client is the usual last event for a recovered queue:
+        // its error fence woke it, and its file close has just parked the VM
+        // teardown behind the quarantined command's job guard.
+        self.release_firmware_retired_quarantined_compute("owner-release");
         if let Some(index) = self.async_compute_queues.iter().position(|q| q.owner == Some(owner)) {
             let q = &self.async_compute_queues[index];
-            if q.active.is_none() && !q.quarantined && q.previous_binding.is_none()
+            if q.inflight.is_none() && !q.quarantined && q.previous_binding.is_none()
                 && self.manager.as_mut().is_some_and(|manager|
                     manager.cancel_unpublished_compute_queue(&q.queue))
             {
@@ -862,7 +1256,7 @@ impl G17PLiveRuntime {
             }
             let q = &mut self.async_compute_queues[index];
             q.released = true;
-            if q.active.is_none() && !q.quarantined {
+            if q.inflight.is_none() && !q.quarantined {
                 // A client may disappear before its first publication (or
                 // after a definitely-unpublished failure). Cancel only that
                 // preparation, restoring the still-installed old binding.
@@ -908,8 +1302,9 @@ impl G17PLiveRuntime {
         let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) else {
             return false;
         };
-        let Some(active) = q.active.as_ref() else { return false; };
-        if active.packet.submission_id() != submission { return false; }
+        // Any published kick may be pending at teardown, not only the oldest.
+        let Some(active) = q.inflight.iter().find(|active|
+            active.packet.submission_id() == submission) else { return false; };
         // A real hardware fault already owns its quarantine decision. Queue
         // teardown must neither undo that nor signal the same fence twice.
         if q.quarantined { return true; }
@@ -936,14 +1331,17 @@ impl G17PLiveRuntime {
         let _ = self.service_async_compute_completions();
         let mut matched = false;
         let mut terminal_status = None;
+        let mut diagnostic_qids = 0u128;
         if let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) {
-            if let Some(active) = &q.active {
-                if active.packet.submission_id() == submission {
+            if let Some(active) = q.inflight.iter().find(|active|
+                active.packet.submission_id() == submission)
+            {
+                {
                     matched = true;
                     if !q.quarantined {
                         if let Some(pdev) = &self.pdev {
                             dev_info!(pdev.as_ref(),
-                                "G17P async compute: admission-at-quarantine qid={} submission={} leases(compute,render-mask,install,render-transition,render-quarantine)={:?}\n",
+                                "G17P async compute: admission-at-quarantine qid={} submission={} leases(compute,render-mask,render-quarantine)={:?}\n",
                                 q.queue.queue_id(), submission,
                                 active._lease.admission_snapshot());
                         }
@@ -963,6 +1361,14 @@ impl G17PLiveRuntime {
                                 owner, q.queue.queue_id());
                         }
                         q.quarantined = true;
+                        // A command with a publication ticket can still be
+                        // retired by firmware later (a late completion, or a
+                        // recovery that retires it); re-observe it so its VM
+                        // pin is not held until a processor stop that scoped
+                        // quarantine never performs. Without a ticket the
+                        // publication itself is unproven: retain as before.
+                        q.awaiting_retirement_witness =
+                            q.inflight.iter().all(|queued| queued.retirement.is_some());
                         active._lease.quarantine();
                         if let Some(pdev) = &self.pdev {
                             dev_err!(pdev.as_ref(),
@@ -972,20 +1378,44 @@ impl G17PLiveRuntime {
                                 active.packet.context().is_current(),
                                 self.gfx_state.as_ref().map(|s| s.submission_phase.load(Ordering::Acquire)), error);
                         }
+                        if let Some(pdev) = &self.pdev {
+                            // This lease owns the firmware's real shared TSQ.
+                            // Legacy per-graph counters below are not its counts.
+                            dev_err!(pdev.as_ref(),
+                                "G17P async-timeout shared-state: qid={} word={:#x} node={:x?} counts(submitted,completed)={:x?} list(head,links)={:x?}\n",
+                                q.queue.queue_id(), active._work_state.word(),
+                                active._work_state.tsq_gpu_va(),
+                                active._work_state.tsq_counters(),
+                                active._work_state.tsq_list_diagnostic());
+                        }
                         if let Some(manager) = self.manager.as_mut() {
                             // Sample the actual retained owner, not the legacy
                             // boot queue. Do this before the completion dump's
                             // console output delays the cursor observation.
-                            manager.log_async_compute_timeout(&mut q.queue);
-                            let _ = manager.dump_compute_completion_records("async-timeout");
+                            diagnostic_qids = manager.log_async_compute_timeout(&mut q.queue);
+                            let _ = manager.dump_queue_compute_completion_records("async-timeout", &mut q.queue);
                         }
                         if let Ok(completion) = active.packet.completion() {
                             terminal_status = Some(completion.status.clone());
-                            completion.fail_while_owned(error);
+                        }
+                        // The quarantined queue is never observed again, so
+                        // every kick queued on it -- older or newer than the one
+                        // that timed out -- fails now, while its packet and
+                        // mappings stay retained until processor stop.
+                        for queued in q.inflight.iter() {
+                            if queued.packet.submission_id() != submission {
+                                queued._lease.quarantine();
+                            }
+                            if let Ok(completion) = queued.packet.completion() {
+                                completion.fail_while_owned(error);
+                            }
                         }
                     }
                 }
             }
+        }
+        if diagnostic_qids != 0 {
+            self.log_timeout_scoreboard_after_power_hold(diagnostic_qids);
         }
         if let Some(status) = terminal_status {
             self.fail_outstanding_jobs_for_vm(&status, error);

@@ -101,14 +101,19 @@ def source_guards():
         RESOURCES.index("fn optional_addresses(&self"):
         RESOURCES.index("pub(crate) fn set_parameter_buffer_lease_token")
     ]
-    swap = MANAGER[MANAGER.index("fn swap_active_render_slot_state"):]
-    assert "bootstrap_uma" in swap[:5000]
-    assert "prepared_render_flist" in swap[:5000]
-    assert "next_render_flist_sequence" in swap[:5000]
+    # The FList lifecycle is per physical pair: it lives in the slot state.
+    slot = MANAGER[MANAGER.index("struct G17PRenderSlotState {"):]
+    assert "bootstrap_uma" in slot[:5000]
+    assert "prepared_render_flist" in slot[:5000]
+    assert "next_render_flist_sequence" in slot[:5000]
     assert "checked_sub(129)" in MANAGER
     assert "stage_user_render_uma" in MANAGER
     assert "settle_consumed_render_usc_freelist_releases" in MANAGER
-    assert "render_slot_flist_release_sent" in MANAGER
+    # A sent release never gates the next kick: no per-slot "release sent"
+    # predicate exists, the successor lease carries the consumption witness.
+    assert "render_slot_flist_release_sent" not in MANAGER
+    assert "carried_release_producer_after" in MANAGER
+    assert "fn released_for_reacquire" in MANAGER
     assert "g17p_control_ring_target_consumed" in MANAGER
 
 
