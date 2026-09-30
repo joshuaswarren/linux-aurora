@@ -4,12 +4,16 @@
 //! Flags 3 use a sparse directory: a page at each USC stride plus the final
 //! page, with hardware addressing starting one KiB before the first page end.
 //! Initial mappings reserve their trailing holes using the existing fixed
-//! mapping guards. Populating those holes for runtime growth is not implemented.
+//! mapping guards. The fixed ideal-witness probe precommits native tail extents
+//! before publication; runtime growth is not implemented.
 //! The state must be fully encoded before a caller may bind or submit work.
 //! A job's pool also needs its hardware UMA descriptor loaded into the table
 //! slot before the tag15 that names the pool is published.
 
 #![allow(dead_code)]
+
+#[path = "g18_application_pool.rs"]
+mod application;
 
 use super::MappedObject;
 use crate::{driver::AsahiDevice, g18_uma, mmu};
@@ -62,6 +66,7 @@ pub(crate) struct G18UmaPoolMemory {
     scratch: KVec<MappedObject>,
     scratch_plan: Option<g18_uma::G18ComputeScratchPlan>,
     directory: KVec<MappedObject>,
+    directory_growth: KVec<MappedObject>,
     block_list: MappedObject,
     state: MappedObject,
     // Firmware dereferences state+0x88 during pool retirement. Keep the
@@ -71,6 +76,7 @@ pub(crate) struct G18UmaPoolMemory {
     layout: g18_uma::G18UmaSparseDirectory,
     encoded: bool,
     descriptor_loaded: bool,
+    render: bool,
 }
 
 impl G18UmaPoolMemory {
@@ -80,6 +86,22 @@ impl G18UmaPoolMemory {
         high_range: Range<u64>,
         uscs: u32,
     ) -> Result<Self> {
+        Self::new_with_guard(dev, uat, high_range, uscs, true, false)
+    }
+
+    /// `guard` reserves one unmapped page after each firmware-view object.
+    /// The render pool packs its 16 objects into the fixed 0x40000 window
+    /// of g18_address_map (list/state/counter at +0x34000/+0x38000/+0x3c000),
+    /// which has no room for guards: with them the directory pages alone
+    /// exhaust the window (stage33 H1, ENOSPC). Compute keeps its guards.
+    fn new_with_guard(
+        dev: &AsahiDevice,
+        uat: &mmu::Uat,
+        high_range: Range<u64>,
+        uscs: u32,
+        guard: bool,
+        ideal: bool,
+    ) -> Result<Self> {
         if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != 0x4000 {
             return Err(ENODEV);
         }
@@ -88,12 +110,19 @@ impl G18UmaPoolMemory {
         let geometry = g18_uma::g18_uma_geometry(0x8000_0000, 0x10_0000,
                                                 uscs, false, true, 14).ok_or(EINVAL)?;
         let layout = g18_uma::g18_uma_sparse_directory(&geometry, uscs, 14).ok_or(EINVAL)?;
+        use crate::{g18_address_map as va, g18_render_policy as policy};
+        if ideal && (guard || uscs != 12 || geometry.directory_bytes_per_usc != 0x158000
+            || layout.initial_page_count != 13 || layout.page_bytes != 0x4000) {
+            return Err(EINVAL);
+        }
         if DIRECTORY_BASE.checked_add(layout.reservation_bytes).ok_or(EOVERFLOW)? > BLOCK_LIST_BASE {
             return Err(EINVAL);
         }
-        let fixed = |size| MappedObject::new_wc_in_range(dev, uat.kernel_vm(),
-            high_range.clone(), size, mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW);
+        let fixed = |size| MappedObject::new_wc_in_range_with_guards(dev, uat.kernel_vm(),
+            high_range.clone(), size, mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW,
+            usize::from(guard));
         let mut directory = KVec::new();
+        let mut directory_growth = KVec::new();
         let mut aliases = KVec::new();
         for index in 0..layout.initial_page_count {
             let offset = layout.page_offset(index).ok_or(EINVAL)?;
@@ -101,6 +130,7 @@ impl G18UmaPoolMemory {
                 layout.reservation_bytes
             } else {
                 layout.page_offset(index + 1).ok_or(EINVAL)?
+                    - if ideal { policy::IDEAL_GROWTH_BYTES } else { 0 }
             };
             let guards: usize = ((end - offset - layout.page_bytes) / layout.page_bytes).try_into()?;
             let mut page = fixed(mmu::UAT_PGSZ)?;
@@ -112,12 +142,32 @@ impl G18UmaPoolMemory {
             }
             directory.push(page, GFP_KERNEL)?;
         }
+        if ideal {
+            // Original 8c8b8f8..8c8ba08 selects 21 tail pages per USC for
+            // 40 one-MiB blocks. Preserve the guarded middle of every stride.
+            for index in 0..12u64 {
+                let high = va::GRAPHICS_UMA_GROWTH + index * policy::IDEAL_GROWTH_BYTES;
+                let low = DIRECTORY_BASE + index * geometry.directory_bytes_per_usc
+                    + policy::IDEAL_GROWTH_OFFSET;
+                let mut extent = MappedObject::new_wc_at(dev, uat.kernel_vm(), high,
+                    policy::IDEAL_GROWTH_BYTES as usize, mmu::PROT_FW_SHARED_RW)?;
+                aliases.push(extent.map_alias_at(uat.kernel_lower_vm(), low,
+                    mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+                for offset in (0..policy::IDEAL_GROWTH_BYTES).step_by(mmu::UAT_PGSZ) {
+                    if uat.kernel_vm().translate_iova(high + offset)?
+                        != uat.kernel_lower_vm().translate_iova(low + offset)? { return Err(EFAULT); }
+                }
+                directory_growth.push(extent, GFP_KERNEL)?;
+            }
+        }
         // Validate every PTE in the aperture, including the intentionally
         // absent entries. Do this before a firmware owner can see any address.
         let mut holes = 0usize;
         for offset in (0..layout.reservation_bytes).step_by(mmu::UAT_PGSZ) {
             let mapped = uat.kernel_lower_vm().translate_iova(DIRECTORY_BASE + offset).is_ok();
-            let expected = offset % geometry.directory_bytes_per_usc == 0;
+            let expected = offset % geometry.directory_bytes_per_usc == 0
+                || (ideal && offset < 12 * geometry.directory_bytes_per_usc
+                    && offset % geometry.directory_bytes_per_usc >= policy::IDEAL_GROWTH_OFFSET);
             if mapped != expected { return Err(EFAULT); }
             if !mapped { holes += 1; }
         }
@@ -125,7 +175,9 @@ impl G18UmaPoolMemory {
         // owner inside both the first and last gap. On unexpected success,
         // dropping the temporary alias unwinds it before returning an error.
         if geometry.directory_bytes_per_usc > layout.page_bytes {
-            for offset in [layout.page_bytes, layout.reservation_bytes - 2 * layout.page_bytes] {
+            let last_hole = if ideal { 11 * geometry.directory_bytes_per_usc + layout.page_bytes }
+                else { layout.reservation_bytes - 2 * layout.page_bytes };
+            for offset in [layout.page_bytes, last_hole] {
                 match directory[0].map_alias_at(uat.kernel_lower_vm(),
                                                DIRECTORY_BASE + offset, mmu::PROT_GPU_SHARED_RW) {
                     Err(error) if error == EBUSY || error == ENOSPC => {},
@@ -174,9 +226,72 @@ impl G18UmaPoolMemory {
         Ok(Self {
             process_aliases: KVec::new(),
             aliases, scratch_aliases: KVec::new(), scratch: KVec::new(), scratch_plan: None,
-            directory, block_list, state, preempt_counter, geometry, layout, encoded: false,
+            directory, directory_growth, block_list, state, preempt_counter, geometry, layout, encoded: false,
             descriptor_loaded: false,
+            render: false,
         })
+    }
+
+    /// Separate deterministic owner for H1. The firmware-memory constructor
+    /// selects this INSTEAD OF the compute pool; their low windows cannot
+    /// coexist. All compute constructor and backing policy remain unchanged.
+    pub(crate) fn new_render(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+        use crate::g18_address_map as va;
+        let mut owner = Self::new_with_guard(dev, uat,
+            va::GRAPHICS_UMA_HIGH..va::GRAPHICS_UMA_HIGH + 0x40000, 12, false,
+            crate::g18_render_policy::ideal_enabled())?;
+        if owner.state.iova() != va::GRAPHICS_UMA_STATE
+            || owner.block_list.iova() != va::GRAPHICS_UMA_LIST
+            || owner.preempt_counter.iova() != va::GRAPHICS_UMA_COUNTER { return Err(EFAULT); }
+        owner.render = true;
+        Ok(owner)
+    }
+
+    pub(crate) fn prepare_render_backing(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
+        vm: &mmu::Vm) -> Result {
+        use crate::{g18_address_map as va, g18_render_policy as policy};
+        let blocks = policy::uma_blocks();
+        let directory_ready = if policy::ideal_enabled() {
+            blocks == 40 && self.directory_growth.len() == 12
+                && self.directory_growth.iter().all(|extent| extent.logical_size == policy::IDEAL_GROWTH_BYTES as usize)
+                && self.geometry.directory_bytes_per_usc == 0x158000
+        } else {
+            self.directory_growth.is_empty()
+                && g18_uma::g18_initial_directory_fits(blocks, 0x100000, 12, 3, 14) == Some(true)
+        };
+        if !self.render || self.encoded || self.scratch_plan.is_some() || !directory_ready {
+            return Err(EINVAL);
+        }
+        let mut entries = KVec::new();
+        for index in 0..blocks {
+            let low = policy::block_base() + u64::from(index) * BLOCK_DATA_STRIDE;
+            let high = va::GRAPHICS_UMA_BACKING + u64::from(index) * 0x100000;
+            let mut block = MappedObject::new_wc_at(dev, uat.kernel_vm(), high, 0x100000,
+                mmu::PROT_FW_SHARED_RW)?;
+            let alias = block.map_alias_at_with_guards(uat.kernel_lower_vm(), low,
+                mmu::PROT_GPU_SHARED_RW, 1)?;
+            for offset in (0..0x100000).step_by(mmu::UAT_PGSZ) {
+                if uat.kernel_vm().translate_iova(high + offset)?
+                    != uat.kernel_lower_vm().translate_iova(low + offset)? { return Err(EFAULT); }
+            }
+            entries.push(g18_uma::g18_uma_block_entry(low, 0).ok_or(EINVAL)?, GFP_KERNEL)?;
+            self.scratch_aliases.push(alias, GFP_KERNEL)?;
+            self.scratch.push(block, GFP_KERNEL)?;
+        }
+        self.block_list.with_bytes_mut(|out| {
+            for (index, value) in entries.iter().enumerate() {
+                out[index*4..index*4+4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        self.scratch_plan = Some(g18_uma::G18ComputeScratchPlan {
+            block_bytes: 0x100000, block_count: blocks,
+            register_pair: policy::resource_pairs()[0], chunk_counters: policy::uma_chunks(),
+        });
+        self.alias_into_process(dev, uat, vm)?;
+        dev_info!(dev.as_ref(), "G18_RENDER_UMA backing={}MiB chunks={:?} resource_pairs={:?} ideal={} growth_extents={}; mapped in job context\n",
+            blocks, policy::uma_chunks(), policy::resource_pairs(), policy::ideal_enabled(), self.directory_growth.len());
+        Ok(())
     }
 
     /// Retain the exact addition fixture's initial backing before publication.
@@ -264,11 +379,18 @@ impl G18UmaPoolMemory {
             aliases.push(page.map_alias_at(vm, gpu, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
             ranges.push((gpu, mmu::UAT_PGSZ as u64), GFP_KERNEL)?;
         }
+        for (index, extent) in self.directory_growth.iter_mut().enumerate() {
+            let gpu = DIRECTORY_BASE + index as u64 * self.geometry.directory_bytes_per_usc
+                + crate::g18_render_policy::IDEAL_GROWTH_OFFSET;
+            aliases.push(extent.map_alias_at(vm, gpu, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+            ranges.push((gpu, extent.logical_size as u64), GFP_KERNEL)?;
+        }
         aliases.push(self.block_list.map_alias_at(vm, BLOCK_LIST_BASE, mmu::PROT_GPU_SHARED_RW)?,
                      GFP_KERNEL)?;
         ranges.push((BLOCK_LIST_BASE, block_list_bytes), GFP_KERNEL)?;
+        let block_base = if self.render { crate::g18_render_policy::block_base() } else { BLOCK_DATA_BASE };
         for (index, block) in self.scratch.iter_mut().enumerate() {
-            let gpu = BLOCK_DATA_BASE + index as u64 * BLOCK_DATA_STRIDE;
+            let gpu = block_base + index as u64 * BLOCK_DATA_STRIDE;
             aliases.push(block.map_alias_at(vm, gpu, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
             ranges.push((gpu, plan.block_bytes), GFP_KERNEL)?;
         }
@@ -288,7 +410,7 @@ impl G18UmaPoolMemory {
         self.process_aliases = aliases;
         dev_info!(dev.as_ref(),
             "G18 UMA pool aliased into the job VM: {} mappings, {} pages verified (directory {:#x}, block list {:#x}, blocks {:#x}+{}x{:#x})\n",
-            ranges.len(), pages, DIRECTORY_BASE, BLOCK_LIST_BASE, BLOCK_DATA_BASE,
+            ranges.len(), pages, DIRECTORY_BASE, BLOCK_LIST_BASE, block_base,
             self.scratch.len(), BLOCK_DATA_STRIDE);
         Ok(())
     }
@@ -324,7 +446,7 @@ impl G18UmaPoolMemory {
             sma_mode: 0,
             preempt_counter_gpu: counter_address,
             preempt_counter: counter,
-            compute: true,
+            compute: !self.render,
             // Fresh Pool::init clears +0x1f0; prepareBufferResources writes 1.
             policy_value: 1,
         });
@@ -405,6 +527,49 @@ impl G18UmaPoolMemory {
 
     pub(crate) fn directory_page_high(&self, index: usize) -> Option<u64> {
         self.directory.get(index).map(MappedObject::iova)
+    }
+
+    pub(crate) fn verify_render_descriptor(&mut self, table: &mut MappedObject,
+        device_config: [u64; 4]) -> Result<[u64; 16]> {
+        if !self.render || !self.descriptor_loaded { return Err(EINVAL); }
+        let state: [u8; g18_uma::G18_UMA_STATE_BYTES] = self.state.with_bytes_mut(|out|
+            out[..g18_uma::G18_UMA_STATE_BYTES].try_into().map_err(|_| EINVAL))?;
+        if u32::from_le_bytes(state[8..12].try_into().map_err(|_| EINVAL)?) != G18_UMA_HARDWARE_SLOT { return Err(EIO); }
+        let expected = g18_uma::pack_g18_uma_descriptor(&state, device_config);
+        let mut actual = [0u64; 16];
+        for (i, value) in actual.iter_mut().enumerate() { *value = table.read_u64(table.iova() + i as u64 * 8)?; }
+        if actual != expected || actual == [0; 16] { return Err(EIO); }
+        Ok(actual)
+    }
+
+    pub(crate) fn render_state(&mut self) -> Result<[u8; STATE_BYTES]> {
+        self.state.with_bytes_mut(|out| out.try_into().map_err(|_| EINVAL))
+    }
+
+    pub(crate) fn audit_render_mappings(&self, uat: &mmu::Uat, vm: &mmu::Vm) -> Result<usize> {
+        if !self.render || self.scratch.len() != crate::g18_render_policy::uma_blocks() as usize { return Err(EINVAL); }
+        let mut pages = 0;
+        let mut audit = |high: u64, low: u64, bytes: usize| -> Result {
+            for offset in (0..bytes).step_by(mmu::UAT_PGSZ) {
+                let pa = uat.kernel_vm().translate_iova(high + offset as u64)?;
+                if vm.translate_iova(low + offset as u64)? != pa
+                    || uat.kernel_lower_vm().translate_iova(low + offset as u64)? != pa { return Err(EFAULT); }
+                pages += 1;
+            }
+            Ok(())
+        };
+        for (i, page) in self.directory.iter().enumerate() {
+            audit(page.iova(), DIRECTORY_BASE + self.layout.page_offset(i as u32).ok_or(EINVAL)?, mmu::UAT_PGSZ)?;
+        }
+        for (i, extent) in self.directory_growth.iter().enumerate() {
+            audit(extent.iova(), DIRECTORY_BASE + i as u64 * self.geometry.directory_bytes_per_usc
+                + crate::g18_render_policy::IDEAL_GROWTH_OFFSET, extent.logical_size)?;
+        }
+        audit(self.block_list.iova(), BLOCK_LIST_BASE, self.block_list.logical_size)?;
+        for (i, block) in self.scratch.iter().enumerate() {
+            audit(block.iova(), crate::g18_render_policy::block_base() + i as u64 * BLOCK_DATA_STRIDE, block.logical_size)?;
+        }
+        Ok(pages)
     }
 
     pub(crate) fn view(&self) -> G18UmaPoolView {

@@ -37,6 +37,31 @@ pub(crate) struct G18SchedulerMemory {
 }
 
 impl G18SchedulerMemory {
+    pub(crate) fn print_render_digests(&mut self, dev: &AsahiDevice) -> Result {
+        for (name, object) in [("scheduler", &mut self.records), ("submitted-pre-kick", &mut self.counters)] {
+            object.with_bytes_mut(|bytes| {
+                dev_info!(dev.as_ref(), "G18_RENDER_DIGEST name={} fnv={:#018x}\n",name,crate::g18_graphics_payload::fnv64(bytes));
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+    /// Runtime's deterministic reservation, separate from the legacy compute
+    /// scheduler. Counters and records are independent uncached FW mappings.
+    pub(crate) fn new_render(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+        use crate::g18_address_map::GRAPHICS_SCHEDULER_START as BASE;
+        if !uat.is_t8152_geometry() { return Err(ENODEV); }
+        let counters = MappedObject::new_wc_at(dev, uat.kernel_vm(), BASE,
+            G18_SCHEDULER_COUNTER_BYTES, mmu::PROT_FW_SHARED_RW)?;
+        let mut records = MappedObject::new_wc_at(dev, uat.kernel_vm(), BASE + 0x4000,
+            G18_SCHEDULER_RECORD_BYTES, mmu::PROT_FW_SHARED_RW)?;
+        records.with_bytes_mut(|out| initialize_g18_scheduler_records(
+            out.try_into().map_err(|_| EINVAL)?, counters.iova()).ok_or(EINVAL))?;
+        fence(Ordering::SeqCst);
+        Ok(Self { records, counters, armed: 0,
+            sequences: [0; G18_SCHEDULER_RECORD_COUNT], submitted: [0; G18_SCHEDULER_RECORD_COUNT] })
+    }
+
     pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, high_range: Range<u64>) -> Result<Self> {
         if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != 0x4000 {
             return Err(ENODEV);

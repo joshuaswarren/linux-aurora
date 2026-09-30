@@ -248,6 +248,8 @@ impl DriverObject for AsahiObject {
     type Args = AsahiObjConfig;
 
     const HAS_EXPORT: bool = true;
+    const PRIME_IMPORT: Option<drm::gem::PrimeImportFn> =
+        Some(crate::g18_drm::asahi_gem_prime_import);
 
     /// Callback to create the inner data of a GEM object
     fn new(_dev: &AsahiDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {

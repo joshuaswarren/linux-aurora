@@ -34,6 +34,9 @@
 //! pub(crate) mod g18;
 //! ```
 
+#[path = "g18_application_resources.rs"]
+mod application;
+
 use super::MappedObject;
 use super::g18_pool::{G18UmaPoolBinding, G18UmaPoolMemory};
 use super::g18_scheduler::G18SchedulerMemory;
@@ -185,6 +188,7 @@ impl G18FirmwareMemory {
         dev: &AsahiDevice,
         uat: Arc<mmu::Uat>,
         boot_timestamp: u64,
+        render: bool,
     ) -> Result<KBox<Self>> {
         if !uat.is_t8152_geometry() {
             return Err(ENODEV);
@@ -273,8 +277,10 @@ impl G18FirmwareMemory {
             init::G17P_QOS_RESOURCE_SIZE, mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW)?;
         let mut aon = MappedObject::new_wc_in_range(dev, uat.kernel_vm(), dynamic,
             init::G18G_26A428_AON_PTD_SIZE, mmu::UAT_PGSZ as u64, mmu::PROT_FW_PRIV_RW)?;
-        let uma_pool = G18UmaPoolMemory::new(dev, &uat, DYNAMIC_START..DYNAMIC_END,
-            crate::hw::agx3::T8152_REGISTRY.num_cores)?;
+        let uma_pool = if render { G18UmaPoolMemory::new_render(dev, &uat)? } else {
+            G18UmaPoolMemory::new(dev, &uat, DYNAMIC_START..DYNAMIC_END,
+                crate::hw::agx3::T8152_REGISTRY.num_cores)?
+        };
         let scheduler = G18SchedulerMemory::new(dev, &uat, DYNAMIC_START..DYNAMIC_END)?;
         let facts = crate::hw::agx3::T8152_REGISTRY;
         let compute = G18ComputeMemory::new(dev, &uat, DYNAMIC_START..DYNAMIC_END,
@@ -372,6 +378,62 @@ impl G18FirmwareMemory {
     }
 
     pub(crate) fn uma_pool(&self) -> &G18UmaPoolMemory { &self.uma_pool }
+
+    pub(crate) fn prepare_render(&mut self, dev: &AsahiDevice,
+        job: &mut super::g18_graphics_job::G18GraphicsJob) -> Result<G18UmaPoolBinding> {
+        self.uma_pool.prepare_render_backing(dev, &self.uat, job.vm())?;
+        let pool = self.uma_pool.prepare_binding()?;
+        self.uma_pool.load_hardware_descriptor(dev, &mut self.uma, pool, j873_sma_device_words(2, 6)?)?;
+        job.parameter_buffer().load_row(&mut self.pbdesc)?;
+        job.encode_h1(dev)?;
+        Ok(pool)
+    }
+
+    pub(crate) fn audit_render(&mut self, dev: &AsahiDevice,
+        job: &mut super::g18_graphics_job::G18GraphicsJob) -> Result {
+        let pb = job.parameter_buffer().verify_before_kick(&mut self.pbdesc)?;
+        if pb.counter != 1 { return Err(EIO); }
+        let uma = self.uma_pool.verify_render_descriptor(&mut self.uma, j873_sma_device_words(2, 6)?)?;
+        let pages = self.uma_pool.audit_render_mappings(&self.uat, job.vm())?;
+        job.audit_h1(dev, &self.uat, &pb, &uma)?;
+        let state = self.uma_pool.render_state()?;
+        dev_info!(dev.as_ref(), "G18_RENDER_DIGEST name=uma-state fnv={:#018x}\n",
+            crate::g18_graphics_payload::fnv64(&state));
+        dev_info!(dev.as_ref(), "G18_RENDER_AUDIT_UMA pages={} row=match state-slot=0\n", pages);
+        Ok(())
+    }
+
+    /// Batched CL_2 publication. Both queue records become visible through one
+    /// producer write, after every byte and every counter has been validated.
+    /// Used only by stage 9; the existing compute publication stays unchanged.
+    pub(crate) fn publish_outer_records(&mut self, records: &[[u8; 24]]) -> Result<u32> {
+        if records.len() != 2 || self.control_counters()? != [[2; 3], [1; 3]] { return Err(EINVAL); }
+        let before = self.compute_outer_counters()?;
+        let head = before[0];
+        if before != [head; 3] || head > 6 || head & 1 != 0 { return Err(EBUSY); }
+        for (i, record) in records.iter().enumerate() {
+            let qid = record[22];
+            let address = u64::from_le_bytes(record[8..16].try_into().map_err(|_| EINVAL)?);
+            if qid != if i == 0 {10} else {9}
+                || address != crate::g18_address_map::GRAPHICS_QUEUE_HIGH + if qid == 9 {0} else {0x100}
+                || record[16..20] != 2u32.to_le_bytes() || record[23] != 1 { return Err(EINVAL); }
+        }
+        self.shared.with_bytes_mut(|out| {
+            let start = init::G18G_26A428_WORK_RING_BUNDLE_OFFSETS[8] + head as usize * 24;
+            let slots = out.get_mut(start..start + 48).ok_or(EINVAL)?;
+            if slots.iter().any(|&b| b != 0) { return Err(EBUSY); }
+            for (out, record) in slots.chunks_exact_mut(24).zip(records) { out.copy_from_slice(record); }
+            Ok(())
+        })?;
+        // No producer moved while the batch was being stored.
+        if self.compute_outer_counters()? != before { return Err(EBUSY); }
+        fence(Ordering::SeqCst);
+        let address = PRIVATE_BASE + (init::G18G_26A428_PRIVATE_STATE_GRIDS[0]
+            + init::WORK_STATE_GRID_OFFSETS[8] + 0x20) as u64;
+        self.private.write_u32(address, head + 2)?;
+        fence(Ordering::SeqCst);
+        Ok(head + 2)
+    }
 
     pub(crate) fn scheduler(&mut self) -> &mut G18SchedulerMemory { &mut self.scheduler }
 

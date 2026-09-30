@@ -107,6 +107,11 @@ pub(crate) const STAGE_SCHEDULER_BIND: u32 = 6;
 pub(crate) const STAGE_POOL_BIND: u32 = 7;
 /// One captured addition with retained resources and independent completion/output gates.
 pub(crate) const STAGE_COMPUTE_ADD: u32 = 8;
+pub(crate) const STAGE_RENDER: u32 = crate::g18_render_stage::STAGE_RENDER;
+pub(crate) const STAGE_DRM: u32 = 10;
+#[path = "g18_application_session.rs"]
+mod application;
+pub(crate) use application::start_drm;
 /// REQUIRES USER APPROVAL: PMGR2 PSD power-on request for sgx (service 3)
 /// only. Standalone; no other stage requests PSD power.
 pub(crate) const STAGE_PSD_POWER_ON: u32 = 90;
@@ -130,6 +135,8 @@ pub(crate) const fn stage_is_known(stage: u32) -> bool {
             | STAGE_SCHEDULER_BIND
             | STAGE_POOL_BIND
             | STAGE_COMPUTE_ADD
+            | STAGE_RENDER
+            | STAGE_DRM
             | STAGE_PSD_POWER_ON
             | STAGE_PSD_POWER_ON_GFX
             | STAGE_PSD_POWER_ON_GFX1
@@ -156,7 +163,7 @@ const fn stage_writes_psd(stage: u32) -> bool {
 /// G18G firmware receipt and the 42-bit DMA mask.
 pub(crate) const fn stage_runs_firmware(stage: u32) -> bool {
     matches!(stage, STAGE_RTKIT | STAGE_INITDATA | STAGE_HEARTBEAT
-        | STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD)
+        | STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD | STAGE_RENDER | STAGE_DRM)
 }
 
 /// Set once any firmware stage reached its first ASC CPU start request.
@@ -326,7 +333,9 @@ impl G18Role {
 
 // Compile-time guards on the stage gates and the fixed J873 facts.
 const _: () = {
-    assert!(!stage_is_known(0) && !stage_is_known(9) && !stage_is_known(89) && !stage_is_known(94));
+    assert!(!stage_is_known(0) && !stage_is_known(11) && !stage_is_known(89) && !stage_is_known(94));
+    assert!(stage_is_known(STAGE_RENDER) && stage_runs_firmware(STAGE_RENDER));
+    assert!(!stage_writes_psd(STAGE_RENDER));
     assert!(stage_is_known(STAGE_READ_ONLY) && stage_is_known(STAGE_PSD_POWER_ON));
     assert!(stage_is_known(STAGE_PSD_POWER_ON_GFX) && stage_is_known(STAGE_PSD_POWER_ON_GFX1));
     assert!(stage_is_known(STAGE_PSD_RESTORE_IDLE));
@@ -1040,6 +1049,8 @@ struct G18Session {
     states: [Arc<G18RoleState>; 2],
     memory: Option<KBox<G18FirmwareMemory>>,
     queue_probe: Option<G18QueueProbe>,
+    render_job: Option<KBox<crate::g17_resources::g18_graphics_job::G18GraphicsJob>>,
+    application_job: Option<KBox<crate::g17_resources::g18_graphics_job::application::ApplicationJob>>,
     uat: Arc<mmu::Uat>,
     _registers: regs::Resources,
     dev: ARef<AsahiDevice>,
@@ -1076,6 +1087,10 @@ impl G18Session {
 
     /// Fault check used by every wait loop.
     fn check_faults(&mut self, label: &str) -> Result {
+        // No host SGX MMIO here: firmware power-gates SGX at will, and a
+        // gated read is a synchronous external abort (stage34 oops at
+        // SGX+0xd8c0 during root publication). A GMMU fault reaches us as a
+        // firmware recovery event; read 0x58000d8c0/8 from userspace after.
         if self.drain()? {
             dev_err!(self.device(), "G18 {}: firmware posted a recovery event\n", label);
             return Err(EIO);
@@ -1123,6 +1138,12 @@ impl G18Session {
     }
 
     fn run(&mut self) -> Result {
+        // Defense in depth for any future caller that bypasses driver probe.
+        if self.stage == STAGE_RENDER {
+            crate::g18_render_stage::admit(self.device(),
+                *crate::module_parameters::g18_render_variant.value(),
+                *crate::module_parameters::g18_render_profile.value())?;
+        }
         self.boot_rtkit()?;
         if self.stage == STAGE_RTKIT {
             self.syslog_window()?;
@@ -1150,6 +1171,8 @@ impl G18Session {
             self.bind_pool(pool)?;
             self.submit_addition(command, pool)?;
         }
+        if self.stage == STAGE_RENDER { self.submit_render()?; }
+        if self.stage == STAGE_DRM {return Ok(());}
         self.heartbeat()
     }
 
@@ -1231,8 +1254,13 @@ impl G18Session {
     /// for G18G yet).
     fn build_initdata(&mut self) -> Result {
         let roots = self.uat.prepare_t8140_firmware_high_roots()?;
-        let memory = G18FirmwareMemory::new_with_uat(&self.dev, self.uat.clone(), cntvct())?;
+        let memory = G18FirmwareMemory::new_with_uat(&self.dev, self.uat.clone(), cntvct(), matches!(self.stage, STAGE_RENDER | STAGE_DRM))?;
         self.memory = Some(memory);
+        if matches!(self.stage, STAGE_RENDER | STAGE_DRM) {
+            self.render_job = Some(crate::g18_render_stage::prepare(&self.dev, &self.uat)?);
+            self.memory.as_mut().ok_or(EIO)?.prepare_render(&self.dev,
+                self.render_job.as_mut().ok_or(EIO)?)?;
+        }
         if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD) {
             self.queue_probe = Some(G18QueueProbe::new(&self.dev, &self.uat,
                 matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD))?);
@@ -1240,7 +1268,7 @@ impl G18Session {
         self.uat.confirm_t8140_primary_high_root(roots)?;
         self.uat.mirror_t8140_secondary_high_root()?;
         let memory = self.memory.as_mut().ok_or(EIO)?;
-        if self.stage == STAGE_COMPUTE_ADD {
+        if matches!(self.stage, STAGE_COMPUTE_ADD | STAGE_RENDER | STAGE_DRM) {
             memory.use_firmware_queue_programming(&self.dev)?;
         }
         memory.log_summary(&self.dev);
@@ -1514,7 +1542,79 @@ impl G18Session {
         Err(ETIMEDOUT)
     }
 
-    /// Stage 4..8: passive drain of both roles' event and trace rings. Sends
+    /// A single bounded H1 pass; all owners already live in the retained session.
+    fn submit_render(&mut self) -> Result {
+        let pass = self.render_job.as_ref().ok_or(EIO)?.pass()?;
+        if self.memory.as_ref().ok_or(EIO)?.completion_masks()!=[0;2] {return Err(EBUSY);}
+        for phase in 1..=3 {
+            self.check_faults("render binding")?;
+            let queues = self.render_job.as_mut().ok_or(EIO)?.queues();
+            let records = match phase {
+                1 => queues.install_records(&pass)?,
+                2 => queues.scheduler_records(&pass)?,
+                _ => queues.pool_records(&pass)?,
+            };
+            self.memory.as_mut().ok_or(EIO)?.publish_outer_records(&records)?;
+            Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
+                .send_message(EP_GFX_INTERRUPTS, 0x0083_0000_0000_000a)?;
+            let mut passed = false;
+            for _ in 0..CONTROL_POLLS {
+                self.check_faults("render binding")?;
+                let outer=self.memory.as_mut().ok_or(EIO)?.compute_outer_counters()?;
+                if outer==[phase*2;3] && self.render_job.as_mut().ok_or(EIO)?.queues().stage_gate(phase,&pass)? {
+                    dev_info!(self.device(), "G18_RENDER_BIND_PASS phase={} outer={:?} stages=0,1\n",phase,outer);
+                    passed=true;break;
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            if !passed {
+                let outer=self.memory.as_mut().ok_or(EIO)?.compute_outer_counters()?;
+                let job=self.render_job.as_mut().ok_or(EIO)?;
+                dev_err!(self.dev.as_ref(), "G18_RENDER_BIND_FAIL phase={} outer={:?} inner={:?} firmware={:x?} pool_pb={:x?}\n",
+                    phase,outer,job.queues().counters()?,job.queues().firmware_status()?,job.queues().pool_and_pb_status(0,0)?);
+                return Err(ETIMEDOUT);
+            }
+        }
+        let job=self.render_job.as_mut().ok_or(EIO)?;
+        if job.parameter_buffer().count_submitted_render()?!=1 {return Err(EIO);}
+        self.memory.as_mut().ok_or(EIO)?.audit_render(&self.dev,job)?;
+        job.queues().prepare_pass(&pass)?;
+        job.queues().audit_prepared_pass(&self.dev,&pass)?;
+        self.check_faults("render pre-kick")?;
+        let job=self.render_job.as_mut().ok_or(EIO)?;
+        let roots=job.publish_h1()?;
+        let records=job.queues().publish_pass()?;
+        self.memory.as_mut().ok_or(EIO)?.publish_outer_records(&records)?;
+        Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
+            .send_message(EP_GFX_INTERRUPTS, 0x0083_0000_0000_000a)?;
+        dev_info!(self.device(), "G18_RENDER_KICK context={} roots={:x?} order=3D,TA submitted=2 barrier=1 PB-generation=1\n",pass.context_id,roots);
+        for step in 0..10_000 {
+            self.check_faults("render completion")?;
+            let memory=self.memory.as_mut().ok_or(EIO)?;
+            let outer=memory.compute_outer_counters()?;let masks=memory.completion_masks();
+            let job=self.render_job.as_mut().ok_or(EIO)?;
+            let inner=job.queues().counters()?;let stamps=job.stamps()?;
+            let scheduler=job.scheduler_snapshot()?;let list=job.queues().completion_list()?;
+            if outer==[8;3] && inner==[[6;3];2] && stamps==[0x100;2]
+                && scheduler.submitted==2 && scheduler.completed==2 && scheduler.linked==0
+                && list==[0,job.queues().job_list()] && masks[0]&0x600==0x600 {
+                let pixels=job.pixels()?;
+                dev_info!(self.dev.as_ref(), "G18_RENDER_COMPLETION outer={:?} inner={:?} stamps={:x?} masks={:x?} scheduler={:?} list={:x?}\n",outer,inner,stamps,masks,scheduler,list);
+                dev_info!(self.dev.as_ref(), "G18_RENDER_PIXELS sha256={:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x} background={} poison={}\n",
+                    pixels.0[0],pixels.0[1],pixels.0[2],pixels.0[3],pixels.0[4],pixels.0[5],pixels.0[6],pixels.0[7],pixels.1,pixels.2);
+                self.check_faults("render pixels")?;
+                dev_info!(self.device(), "G18_RENDER_H1_PASS variant={} completion=independent pixels=exact owners=retained\n",*crate::module_parameters::g18_render_variant.value());
+                return Ok(());
+            }
+            if step%1000==999 {
+                dev_info!(self.dev.as_ref(), "G18_RENDER_WAIT ms={} outer={:?} inner={:?} stamps={:x?} masks={:x?} scheduler={:?} list={:x?}\n",step+1,outer,inner,stamps,masks,scheduler,list);
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        Err(ETIMEDOUT)
+    }
+
+    /// Stage 4..9: passive drain of both roles' event and trace rings. Sends
     /// nothing. This is the milestone-1 heartbeat.
     fn heartbeat(&mut self) -> Result {
         dev_info!(self.device(), "G18_HEARTBEAT passive drain for {} ms, no host messages\n", HEARTBEAT_MS);
@@ -1796,7 +1896,7 @@ fn stage_psd_restore_idle(pdev: &platform::Device<Core>) -> Result {
 // Stages 2..6
 // ---------------------------------------------------------------------------
 
-fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Arc<dyn G18Runtime>> {
+fn prepare_firmware_session(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Retained> {
     let dev: &kernel::device::Device<Core> = pdev.as_ref();
     let stage = probe.stage;
     dev_warn!(dev, "G18 stage {}: starts the GPU ASC CPUs (REQUIRES USER APPROVAL)\n", stage);
@@ -1910,6 +2010,8 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
         states,
         memory: None,
         queue_probe: None,
+        render_job: None,
+        application_job: None,
         uat,
         _registers: probe.registers,
         dev: drm,
@@ -1921,11 +2023,43 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
     G18_FIRMWARE_ATTEMPTED.store(true, Ordering::Release);
     // SAFETY: THIS_MODULE is this module; the reference is never dropped.
     unsafe { bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
-    let mut retained = Retained(Some(session));
+    Ok(Retained(Some(session)))
+}
+
+fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Arc<dyn G18Runtime>> {
+    let dev: &kernel::device::Device<Core> = pdev.as_ref();
+    let stage = probe.stage;
+    let mut retained = prepare_firmware_session(pdev, probe)?;
+    if stage == STAGE_RENDER {
+        // A shallow workqueue stack avoids nesting render builders beneath
+        // platform probe/module loading. The closure owns the retained session
+        // before any ASC start, including on spawn failure and every exit.
+        kernel::workqueue::system_long().try_spawn(GFP_KERNEL, move || {
+            let result = match retained.0.as_mut() {
+                Some(session) => session.run(), None => Err(EIO),
+            };
+            if let Some(session) = retained.0.as_mut() {
+                dev_info!(session.device(), "G18_RENDER_STAGE_DONE result={:?} owners=retained\n", result);
+                if result.is_err() {
+                    dev_err!(session.device(), "G18_RENDER_H1_FAIL result={:?} owners=retained no-retry\n", result);
+                    session.dump_fault_evidence("render worker");
+                }
+            }
+            let _ = retained.stop("render worker end");
+            if let Some(session) = retained.0.as_mut() {
+                for _ in 0..4 { if session.drain().is_err() { break; } }
+                if let Some(memory) = session.memory.as_ref() { memory.log_trace_journal(&session.dev); }
+            }
+            drop(retained);
+        })?;
+        dev_info!(dev, "G18_RENDER_WORKER queued; ENODEV is diagnostic, watch G18_RENDER_H1_PASS/FAIL and G18_RENDER_STAGE_DONE\n");
+        return Err(ENODEV);
+    }
     let session = retained.0.as_mut().ok_or(EIO)?;
     let result = session.run();
     dev_info!(dev, "G18 stage {} transaction result={:?}\n", stage, result);
     if result.is_err() {
+        if stage == STAGE_RENDER { dev_err!(dev, "G18_RENDER_H1_FAIL result={:?} owners=retained no-retry\n", result); }
         session.dump_fault_evidence("failed stage");
     }
     let _ = retained.stop("stage end");
