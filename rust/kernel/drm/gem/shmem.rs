@@ -345,7 +345,7 @@ impl<T: DriverObject, C: DeviceContext> driver::AllocImpl for Object<T, C> {
         gem_create_object: None,
         prime_handle_to_fd: None,
         prime_fd_to_handle: None,
-        gem_prime_import: None,
+        gem_prime_import: T::PRIME_IMPORT,
         gem_prime_import_sg_table: Some(bindings::drm_gem_shmem_prime_import_sg_table),
         dumb_create: Some(bindings::drm_gem_shmem_dumb_create),
         dumb_map_offset: None,

@@ -547,7 +547,7 @@ fn probe_t8152(
     if !g18_live_boot::stage_is_known(stage) {
         dev_err!(
             pdev.as_ref(),
-            "G18G: g18_initdata_test={} is not a known stage (1-7, 90-93); refused before any MMIO\n",
+            "G18G: g18_initdata_test={} is not a known stage (1-9, 90-93); refused before any MMIO\n",
             stage
         );
         return Err(EINVAL);
@@ -561,8 +561,75 @@ fn probe_t8152(
         );
         return Err(EINVAL);
     }
+    let render_variant = *crate::module_parameters::g18_render_variant.value();
+    let render_profile = *crate::module_parameters::g18_render_profile.value();
+    let sma_minimum = *crate::module_parameters::g18_sma_minimum.value();
+    let sma_ideal = *crate::module_parameters::g18_sma_ideal.value();
+    let native_barrier = *crate::module_parameters::g18_native_barrier.value();
+    if native_barrier > 1 || (native_barrier != 0 && (sma_ideal != 1 || sma_minimum != 0 ||
+        stage != crate::g18_render_stage::STAGE_RENDER || render_variant != 0 || render_profile != 4)) {
+        dev_err!(pdev.as_ref(), "G18G: native barrier probe requires ideal SMA stage9 variant0 profile4; refused before MMIO\n");
+        return Err(EINVAL);
+    }
+    if sma_ideal > 1 || (sma_ideal != 0 && (sma_minimum != 0 ||
+        stage != crate::g18_render_stage::STAGE_RENDER || render_variant != 0 || render_profile != 4)) {
+        dev_err!(pdev.as_ref(), "G18G: SMA ideal probe requires stage9 variant0 profile4 and minimum=0; refused before MMIO\n");
+        return Err(EINVAL);
+    }
+    if sma_minimum > 1 || (sma_minimum != 0 &&
+        (stage != crate::g18_render_stage::STAGE_RENDER || render_variant != 0 || render_profile != 4)) {
+        dev_err!(pdev.as_ref(), "G18G: SMA minimum probe requires stage9 variant0 profile4; refused before MMIO\n");
+        return Err(EINVAL);
+    }
+    let usc_statistics = *crate::module_parameters::g18_usc_statistics.value();
+    if usc_statistics > 1 || (usc_statistics != 0 &&
+        (stage != crate::g18_render_stage::STAGE_RENDER || render_variant != 0)) {
+        dev_err!(pdev.as_ref(), "G18G: USC statistics require the stage9 colour fixture; refused before MMIO\n");
+        return Err(EINVAL);
+    }
+    if stage == crate::g18_render_stage::STAGE_RENDER {
+        crate::g18_render_stage::admit(pdev.as_ref(), render_variant, render_profile)?;
+    } else if render_variant != 0 || render_profile != 1 {
+        return Err(EINVAL);
+    }
+    if stage == g18_live_boot::STAGE_DRM {
+        if *crate::module_parameters::g18_admit_compute.value() != 0 {return Err(ENOTSUPP);}
+        return probe_t8152_drm(pdev, soc, stage);
+    }
     let probe = prepare_t8152_device(pdev, soc, stage)?;
     g18_live_boot_start(pdev, probe)
+}
+
+/// Register the G18 DRM render node over a started G18 session.
+fn probe_t8152_drm(
+    pdev: &platform::Device<Core>,
+    soc: &'static hw::agx3::SocConfig,
+    stage: u32,
+) -> Result<Arc<dyn G18Runtime>> {
+    let mut probe = prepare_t8152_device(pdev, soc, stage)?;
+    let drm = probe.drm.clone();
+    let observed = probe.observed.take();
+    let (owner, runtime) = g18_live_boot::start_drm(pdev, probe)?;
+    let config = crate::g18_drm::G18DrmConfig {
+        admit_compute: *crate::module_parameters::g18_admit_compute.value() != 0,
+    };
+    let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
+        crate::g18_drm::G18DrmGpu::new(runtime, observed.as_ref(), config)?,
+        GFP_KERNEL,
+    )?;
+    let data = try_pin_init!(AsahiData {
+        gpu, pdev: pdev.into(), resources: None, g17_runtime: None,
+        g17_event_work <- new_work!("AsahiData::g17_event_work"),
+        g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
+    });
+    let ptr: *const AsahiData = &raw const **drm;
+    // SAFETY: prepare_t8152_device leaves this data slot uninitialized. This
+    // is its sole initialization, before registration exposes file operations.
+    unsafe { data.__pinned_init(ptr as *mut AsahiData)?; }
+    (*drm).gpu.init()?;
+    drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
+    dev_info!(pdev.as_ref(), "G18_DRM registered render node (asahi, apple,agx-t8152)\n");
+    Ok(owner)
 }
 
 fn prepare_t8152_device(

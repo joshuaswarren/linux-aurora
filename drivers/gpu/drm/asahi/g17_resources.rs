@@ -66,6 +66,18 @@ pub(crate) mod g18_compute;
 pub(crate) mod g18_compute_payload;
 
 #[cfg(not(test))]
+#[path = "g18_graphics_memory.rs"]
+pub(crate) mod g18_graphics_memory;
+
+#[cfg(not(test))]
+#[path = "g18_graphics_job.rs"]
+pub(crate) mod g18_graphics_job;
+
+#[cfg(not(test))]
+#[path = "g18_graphics_queues.rs"]
+pub(crate) mod g18_graphics_queues;
+
+#[cfg(not(test))]
 #[path = "g18_queue_probe.rs"]
 pub(crate) mod g18_queue;
 

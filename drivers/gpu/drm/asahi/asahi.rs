@@ -46,6 +46,19 @@ mod g18_compute_state;
 mod g18_compute_payload;
 mod g18_compute_triangle;
 mod g18_graphics_payload;
+mod g18_address_map;
+mod g18_render;
+mod g18_application;
+mod g18_drm;
+mod g18_application_runtime;
+mod g18_render_command;
+mod g18_render_assembly;
+mod g18_render_stage;
+mod g18_render_passthrough;
+mod g18_render_policy;
+mod g18_render_pixels;
+mod g18_parameter_buffer;
+use g17_resources::g18_graphics_queues;
 mod g18_scheduler;
 mod g18_live_boot;
 mod g18_uma;
@@ -93,11 +106,39 @@ kernel::module_platform_driver! {
         },
         g18_initdata_test: u32 {
             default: 0,
-            description: "T8152/J873 G18G bring-up stage. 0 refuses before MMIO/DMA. 1=read-only powered-resource probe. 2=RTKit. 3=initdata ACKs. 4=openings, idle policy, 60 s observation. 5=empty queue. 6=queue plus scheduler binding. 7=owned empty UMA pool binding. Stages 5/6/7 then observe without GPU jobs. Firmware stages require prior power, loader receipt and apple_mailbox.ascwrap_v8_cpu_control=1; all owners remain retained until reboot. 90=SGX power-on; 92=GFX1 power-on; 91=GFX power-on; 93=idle requests. Power stages are never implied. Mutating stages require user-authorized bring-up. Other values refused",
+            description: "T8152/J873 G18G bring-up stage. 0 refuses before MMIO/DMA. 1=read-only powered-resource probe. 2=RTKit. 3=initdata ACKs. 4=openings, idle policy, 60 s observation. 5=empty queue. 6=queue plus scheduler binding. 7=owned empty UMA pool binding. 8=compute diagnostic. 9=H1 render replay. 10=firmware plus application DRM render node. Stages 5/6/7 then observe without GPU jobs. Firmware stages require prior power, loader receipt and apple_mailbox.ascwrap_v8_cpu_control=1; all owners remain retained until reboot. 90=SGX power-on; 92=GFX1 power-on; 91=GFX power-on; 93=idle requests. Power stages are never implied. Mutating stages require user-authorized bring-up. Other values refused",
         },
         g18_compute_variant: u32 {
             default: 0,
             description: "Stage 8 compute diagnostic. 0=captured compute-add. 1=empty stream: captured barrier and terminate replace the launch; all output must remain poisoned. 2=64x64 compute triangle using a separately verified private shader patch; no TA/3D or Mesa. Variants 1 and 2 require g18_initdata_test=8. Other values are refused",
+        },
+        g18_render_variant: u32 {
+            default: 0,
+            description: "Stage 9 H1 diagnostic: 0=colour, 2=terminated VDM plus background clear. Other variants refused before MMIO. One asynchronous worker pass, captured/M5 H1 policy, all owners retained; see G18-RENDER-RUNTIME.md",
+        },
+        g18_render_profile: u32 {
+            default: 1,
+            description: "Stage 9 G18GFX01 v2 profile: 1=colour-a, 2=colour-b, 4=fragment-witness (colour only). Gears profile3 is offline only and refused by H1. Stage0 remains the default",
+        },
+        g18_admit_compute: u32 {
+            default: 0,
+            description: "G18 DRM adapter: 1 admits single-dispatch compute commands (K1). 0 refuses them",
+        },
+        g18_usc_statistics: u32 {
+            default: 0,
+            description: "Stage 9 colour fixture only: 1 enables owned TA/3D SMAPP statistics pages. Raw memory statistics, not shader invocation counts. Default 0",
+        },
+        g18_sma_minimum: u32 {
+            default: 0,
+            description: "Stage9 variant0 profile4 only: 1 probes native minimum TA/fragment resource words with unchanged owned backing. Default 0",
+        },
+        g18_sma_ideal: u32 {
+            default: 0,
+            description: "Stage9 variant0 profile4 only: 1 probes native ideal graphics resource policy with 40MiB backing and precommitted directory growth. Default 0",
+        },
+        g18_native_barrier: u32 {
+            default: 0,
+            description: "Stage9 variant0 profile4 with ideal SMA only: 1 probes the native same-group TA-to-3D barrier kind3. Default 0",
         },
         m5_graphics_frames: u32 {
             default: 1,

@@ -82,11 +82,11 @@ pub(crate) use impl_aref_for_gem_obj;
 /// [`DriverFile`]: drm::file::DriverFile
 pub type DriverFile<T> = drm::File<<<T as DriverObject>::Driver as drm::Driver>::File>;
 
-/// A type alias for retrieving the current [`AllocImpl`] for a given [`DriverObject`].
-///
-/// [`Driver`]: drm::Driver
-pub type DriverAllocImpl<T, Ctx = Registered> =
-    <<T as DriverObject>::Driver as drm::Driver>::Object<Ctx>;
+/// `drm_driver.gem_prime_import` callback type.
+pub type PrimeImportFn = unsafe extern "C" fn(
+    *mut bindings::drm_device,
+    *mut bindings::dma_buf,
+) -> *mut bindings::drm_gem_object;
 
 /// GEM object functions, which must be implemented by drivers.
 #[vtable]
@@ -111,6 +111,9 @@ pub trait DriverObject: Sync + Send + Sized {
 
     /// Close a handle to an existing object, associated with a File.
     fn close(_obj: &<Self::Driver as drm::Driver>::Object, _file: &DriverFile<Self>) {}
+
+    /// Optional `drm_driver.gem_prime_import` for this object type.
+    const PRIME_IMPORT: Option<PrimeImportFn> = None;
 
     /// Optional handle for exporting a gem object.
     fn export(
