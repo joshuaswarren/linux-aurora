@@ -40,6 +40,23 @@ use std::{cell::Cell,ops::Deref};
 type Result<T=()>=std::result::Result<T,i32>;
 const EFAULT:i32=14;const EIO:i32=5;const GFP_KERNEL:u32=0;
 macro_rules! dev_info {($($t:tt)*)=>{()}}
+macro_rules! pr_info {($($t:tt)*)=>{()}}
+use std::sync::atomic::{AtomicU32,Ordering};
+mod kernel{pub mod sync{pub struct Mutex<T>(pub std::sync::Mutex<T>);impl<T>Mutex<T>{pub fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}}}
+mod module_parameters{pub struct P(pub u32);impl P{pub fn value(&self)->&u32{&self.0}}pub static g17p_mcache_dsid_probe:P=P(0);}
+mod g17_config{pub const RENDER_MCACHE_HWSID:u32=24;}
+static G17P_MCACHE_PROBE_NEXT:AtomicU32=AtomicU32::new(96);
+''' + item(resources, "fn g17p_mcache_probe_reserve(") + r'''
+// v92d: each split context owns a fresh TSQ node page. Only its identity and
+// the head-snapshot mapping shape are modelled.
+struct TsqView(std::cell::UnsafeCell<Vec<u8>>);impl TsqView{fn as_mut_ptr(&self)->*mut u8{unsafe{(*self.0.get()).as_mut_ptr()}}}
+struct TsqGem;impl TsqGem{fn vmap<T>(&self)->Result<TsqView>{Ok(TsqView(std::cell::UnsafeCell::new(vec![0;0x8000])))}}
+struct TsqObject{gem:TsqGem}struct TsqMapping{iova:u64,object:TsqObject}impl TsqMapping{fn iova(&self)->u64{self.iova}}
+pub struct G17PWorkStateStorage{storage:TsqMapping}
+thread_local!{static TSQ_NEXT:Cell<u64>=const{Cell::new(0x70000)};}
+impl G17PWorkStateStorage{fn new(_dev:&(),_uat:&Uat)->Result<Arc<kernel::sync::Mutex<Self>>>{
+ let iova=TSQ_NEXT.with(|n|{let v=n.get();n.set(v+0x8000);v});
+ Arc::new(kernel::sync::Mutex(std::sync::Mutex::new(Self{storage:TsqMapping{iova,object:TsqObject{gem:TsqGem}}})),0)}}
 thread_local!{static FAIL_ARC:Cell<bool>=const{Cell::new(false)};}
 struct Arc<T>(std::sync::Arc<T>);
 impl<T> Clone for Arc<T>{fn clone(&self)->Self{Self(self.0.clone())}}
@@ -54,12 +71,13 @@ mod mmu{
   pub fn matches(&self,v:&Vm)->bool{self.vm.id==v.id&&self.vm.root==v.root}
   pub fn is_current(&self)->bool{self.current}
  }
+ pub const UAT_PGSZ:usize=0x4000;
  impl Drop for T8140ComputeExecutionContext{fn drop(&mut self){self.drops.set(self.drops.get()+1)}}
 }
 struct G17PClChannelControl{address:u64}impl G17PClChannelControl{fn gpu_va(&self)->u64{self.address}}
 struct G17PLogicalQosLease{id:u8}
 ''' + context + r'''
-mod g17_resources{pub(super)use super::G17PLogicalQueueContext;}
+mod g17_resources{pub(super)use super::{G17PLogicalQueueContext,G17PWorkStateStorage};}
 struct Uat{calls:Cell<u32>,fail:bool,id:u32,wrong_vm:bool,drops:std::rc::Rc<Cell<u32>>}
 impl Uat{fn allocate_t8140_compute_execution_context(&self,v:&mmu::Vm)->Result<Arc<mmu::T8140ComputeExecutionContext>>{
  self.calls.set(self.calls.get()+1);if self.fail{return Err(EIO)}
@@ -67,16 +85,18 @@ impl Uat{fn allocate_t8140_compute_execution_context(&self,v:&mmu::Vm)->Result<A
  // Root allocation success is separate from logical wrapper allocation.
  Ok(Arc(std::sync::Arc::new(mmu::T8140ComputeExecutionContext{vm,id:self.id,current:true,drops:self.drops.clone()})))
 }}
-struct Manager{uat:Uat}impl Manager{fn uat(&self)->&Uat{&self.uat}
+struct Res;impl Res{fn dev(&self)->&(){&()}}
+struct Manager{uat:Uat,resources:Res}impl Manager{fn uat(&self)->&Uat{&self.uat}
 ''' + prepare + r'''
 }
 fn fixture()->(Manager,Arc<G17PLogicalQueueContext>){
  let drops=std::rc::Rc::new(Cell::new(0));
- let m=Manager{uat:Uat{calls:Cell::new(0),fail:false,id:6,wrong_vm:false,drops:drops.clone()}};
+ let m=Manager{uat:Uat{calls:Cell::new(0),fail:false,id:6,wrong_vm:false,drops:drops.clone()},resources:Res};
  let c=Arc::new(G17PLogicalQueueContext::new(
   Arc::new(mmu::T8140ComputeExecutionContext{vm:mmu::Vm{id:8,root:0x1001234000},id:5,current:true,drops},0).unwrap(),
   Arc::new(G17PClChannelControl{address:0xfffffc2180048000},0).unwrap(),
-  Arc::new(G17PLogicalQosLease{id:3},0).unwrap(),0x12345678),0).unwrap();(m,c)
+  Arc::new(G17PLogicalQosLease{id:3},0).unwrap(),0x12345678,
+  G17PWorkStateStorage::new(&(),&m.uat).unwrap()),0).unwrap();(m,c)
 }
 #[test]fn default_preserves_exact_arc_without_allocating(){let(mut m,c)=fixture();let d=m.prepare_compute_execution_context(&c,false).unwrap();assert!(std::sync::Arc::ptr_eq(&c.0,&d.0));assert_eq!(m.uat.calls.get(),0);}
 #[test]fn split_changes_only_execution_slot_and_retains_shared_owners(){
@@ -84,6 +104,7 @@ fn fixture()->(Manager,Arc<G17PLogicalQueueContext>){
  assert_eq!((c.context_id(),d.context_id()),(5,6));assert!(d.matches(c.vm()));
  assert!(std::sync::Arc::ptr_eq(&c.channel_control.0,&d.channel_control.0));
  assert!(std::sync::Arc::ptr_eq(&c.qos.0,&d.qos.0));assert_eq!(c.owner_pid,d.owner_pid);
+ assert_ne!(c.tsq_base,d.tsq_base,"split context has its own TSQ page");
  let page=std::sync::Arc::downgrade(&c.channel_control.0);let qos=std::sync::Arc::downgrade(&c.qos.0);
  drop(c);assert_eq!(m.uat.drops.get(),1);assert!(page.upgrade().is_some());assert!(qos.upgrade().is_some());
  drop(d);assert_eq!(m.uat.drops.get(),2);assert!(page.upgrade().is_none());assert!(qos.upgrade().is_none());

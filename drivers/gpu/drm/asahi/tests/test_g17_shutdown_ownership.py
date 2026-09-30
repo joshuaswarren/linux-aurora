@@ -74,6 +74,11 @@ host_only.add('queue_registry')
 host_only.update(('platform_removed', 'session_rebuild_requested', 'preparations'))
 # Timing-buffer sample and drain-ownership flag: plain host state.
 host_only.update(('trace_service_entry_counter', 'deferred_completion_drain_owned'))
+# v83-v92d host policy/bookkeeping (plain values, no DMA): submit bracket and
+# counter, DVFS/CE parity policy and bracket flags, idle-hold publication flag,
+# deferred-render-timeout slot mask.
+host_only.update(('submit_open', 'submit_count', 'dvfs_native_bracket', 'clpc_effort',
+                  'dvfs_ce', 'idle_hold_published', 'deferred_render_timeouts'))
 options = 'pdev drm registers manager cpus gfx_state gfx_rtkit gfx1_state gfx1_rtkit queue compute_binding compute_timestamps pending_compute'.split()
 vectors = 'retired_queues quarantined_bindings pending_render pending_render_queued quarantined_render_completions'.split()
 # Completions the firmware has already retired, waiting for their fence to be

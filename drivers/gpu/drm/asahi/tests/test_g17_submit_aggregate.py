@@ -53,13 +53,15 @@ lease = '\n'.join(block(marker) for marker in [
     'impl Drop for G17PWorkStateLease {',
 ])
 source = saved_source
+# The e2e timeline ring is disarmed here (stamp() == 0), as by default.
+preamble += '\nmod g17_e2e {pub const K_AGG_SIGNAL:u8=19;pub fn stamp()->u64{0}pub fn now()->u64{0}pub fn record(_:u8,_:u32,_:u64,_:[u64;5]){}}\n'
 preamble += f'\n#[path = "{root / "g17_work_state.rs"}"] mod g17_work_state;\n'
 preamble += tsq_backing()
 preamble += 'mod g17_resources {use super::*;pub struct G17PLogicalQueueContext {pub work_states:g17_work_state::WorkStatePool,pub tsq:TsqLock,pub tsq_base:u64}\n' + lease + '\nimpl G17PLogicalQueueContext {pub fn tsq_head_gpu_va(&self)->u64{0x18000}pub fn tsq_head_snapshot(&self)->Result<[u64;2]>{Ok([0,0])}}\n}\n'
 tests = r'''
 fn context()->Arc<g17_resources::G17PLogicalQueueContext>{Arc::new(g17_resources::G17PLogicalQueueContext{work_states:g17_work_state::WorkStatePool::new(),tsq:TsqLock::new(),tsq_base:0x10000},()).unwrap()}
 fn aggregate_with_context(c:Arc<g17_resources::G17PLogicalQueueContext>)->Arc<G17PSubmitCompletion>{G17PSubmitCompletion::new(UserFence{
- state:std::sync::Arc::new(Signals::default()),_p:std::marker::PhantomData},c).unwrap()}
+ state:std::sync::Arc::new(Signals::default()),_p:std::marker::PhantomData},c,0).unwrap()}
 fn aggregate()->Arc<G17PSubmitCompletion>{aggregate_with_context(context())}
 #[test]fn concurrent_engine_acquisition_installs_one_key_and_returns_losing_reservations(){
  let context=context();let state=g17_resources::G17PWorkStateLease::deferred(context.clone());

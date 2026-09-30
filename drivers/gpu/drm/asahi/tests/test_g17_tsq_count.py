@@ -9,9 +9,15 @@ mock=r'''
 type Result<T=()> = std::result::Result<T,i32>;
 mod mmu{pub const UAT_PGSZ:usize=0x4000;}
 struct Memory{bytes:Vec<u8>,fail:bool,writes:Vec<(u64,u32)>}
-impl Memory{fn iova(&self)->u64{0x100000}fn read_u32(&self,a:u64)->Result<u32>{let i=(a-self.iova())as usize;Ok(u32::from_le_bytes(self.bytes[i..i+4].try_into().unwrap()))}fn write_u32(&mut self,a:u64,v:u32)->Result{if self.fail{return Err(-14)}let i=(a-self.iova())as usize;self.bytes[i..i+4].copy_from_slice(&v.to_le_bytes());self.writes.push((a,v));Ok(())}}
+impl Memory{fn iova(&self)->u64{0x100000}fn read_u32(&self,a:u64)->Result<u32>{let i=(a-self.iova())as usize;Ok(u32::from_le_bytes(self.bytes[i..i+4].try_into().unwrap()))}fn read_live_u32(&mut self,a:u64)->Result<u32>{let i=(a-self.iova())as usize;g17p_live_read_u32(&self.bytes,i)}fn write_u32(&mut self,a:u64,v:u32)->Result{if self.fail{return Err(-14)}let i=(a-self.iova())as usize;self.bytes[i..i+4].copy_from_slice(&v.to_le_bytes());self.writes.push((a,v));Ok(())}}
 struct Compute{support:Memory}
 '''
+def block(src, marker):
+    a=src.index(marker); i=src.index('{',a)+1; depth=1
+    while depth:
+        depth+=(src[i]=='{')-(src[i]=='}'); i+=1
+    return src[a:i]
+mock+='const EINVAL:i32=22;\n'+block(s,'fn g17p_live_word_bounds(')+'\n'+block(s,'fn g17p_live_read_u32(')+'\n'
 tests=r'''
 #[cfg(test)]mod tests{use super::*;
 fn state()->Compute{let mut c=Compute{support:Memory{bytes:vec![0xa5;0xc000],fail:false,writes:vec![]}};c.support.bytes[0x4004..0x4008].copy_from_slice(&1u32.to_le_bytes());c.support.bytes[0x10c..0x110].copy_from_slice(&0u32.to_le_bytes());c}
@@ -52,6 +58,11 @@ assert native_gate(2,3)==0
 assert native_gate(3,3)==1
 assert native_gate(81,1,(80,0,0))==1, 'native batching threshold remains intact'
 print('PASS saved B1 instruction predicate: old target defers repeat, matching target retires, incomplete batch stays pending, threshold unchanged')
-manager=(p/'g17_manager.rs').read_text();arm=manager[manager.index('    fn arm_compute_completion('):];assert arm.index('publish_compute_submitted_count(count)')<arm.index('arm_compute_stamp()')
+manager=(p/'g17_manager.rs').read_text();arm=block(manager,'    fn arm_compute_completion(')
+# Independent queues count kicks on the shared submit-owned TSQ node
+# (test_g17_tsq_accounting.py); arm must not rewrite the per-queue node.
+assert 'publish_compute_submitted_count' not in arm and 'Never\n        // rewrite or compare the obsolete per-queue node' in arm
+commit=(p/'g17_async_compute.rs').read_text();commit=commit[commit.index('work_state.add_submitted_kicks(1)?;')-2000:]
+assert commit.index('work_state.add_submitted_kicks(1)?;')<commit.index('manager.submit_translated_compute(')
 repeat=manager[manager.index('    fn submit_translated_repeat_channel('):];assert repeat.index('self.arm_compute_completion(')<repeat.index('let after_command = self.publish_repeat_record(')
-print('PASS production ordering: submitted target before stamp arm and first firmware-visible repeat record')
+print('PASS production ordering: shared TSQ kick count before the first firmware-visible record; stamp arm before repeat record')

@@ -69,7 +69,11 @@ timeout_start = live_source.index("    pub(crate) fn timeout_deferred_render(")
 timeout_end = live_source.index("    pub(crate) fn abandon_deferred_render(", timeout_start)
 timeout = live_source[timeout_start:timeout_end]
 settle_render = live_block("    fn settle_deferred_render_completion(")
-assert timeout.index("if !self.render_fence_state.pending(render_slot)") \
+# v92d gates on the exact completion Arc, which install_render_completion
+# records together with render_fence_state.arm() only after preparation.
+install_render = live_block("    fn install_render_completion(")
+assert install_render.index("self.render_fence_state.arm(render_slot)") < install_render.index("*pending = Some(completion);")
+assert timeout.index("if !self.render_completion_pending(render_slot, completion) { return; }") \
     < timeout.index("self.poll_deferred_render_completion(render_slot)"), \
     'pre-publication failures incorrectly enter the hardware watchdog path'
 assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
@@ -83,8 +87,14 @@ assert settle_render.index("self.defer_render_completion(signal, observed);") \
 assert settle_render.index("retire_render_usc_freelist_at_completion(render_slot)") \
     < settle_render.index("rebuild_session_or_defer()"), \
     'failed retained cleanup can be reused without a processor-stop boundary'
-assert ") -> bool {" not in timeout and "return !retired;" not in timeout, \
+# v92d: the watchdog entry itself returns nothing and hands the exact
+# still-pending owner to one failure sink after its final observation.
+exact_timeout = live_block("    pub(crate) fn timeout_deferred_render(")
+assert ") -> bool {" not in exact_timeout and "return !retired;" not in exact_timeout, \
     'watchdog still delegates a late registry quarantine to its caller'
+assert exact_timeout.index("self.poll_deferred_render_completion(render_slot)") \
+    < exact_timeout.index("self.fail_render_after_final_observation(")
+timeout = live_block("    fn fail_render_after_final_observation(")
 signal_error = timeout.index("signal.fail_while_owned(error);")
 quarantine = timeout.index("quarantined_render_completions", signal_error)
 assert signal_error < quarantine
@@ -110,14 +120,18 @@ assert "&mut self.quarantined_render_completions" in retain_failure
 # before permanently retiring a physical slot. A successful one-frame process
 # can close while its already-completed watch job is still queued.
 watch = block("impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {")
-for marker in ("fn timed_out(", "fn cancel("):
-    body = watch[watch.index(marker):]
+# v92d: the trait methods release the scheduler backlog and delegate to
+# *_inner; publish delegates to publish_with (v84 early lease on the ioctl).
+for trait_fn, inner in (("fn timed_out(", "    fn timed_out_inner("), ("fn cancel(", "    fn cancel_inner(")):
+    body = watch[watch.index(trait_fn):]
     body = body[:body.index("\n    }", body.index("{"))]
-    assert "timeout_deferred_render(" in body, marker
-    assert "quarantine_render_slot(" not in body, marker
-    assert "if quarantine" not in body, marker
+    assert inner.strip()[3:] in body, trait_fn
+    body = block(inner)
+    assert "timeout_deferred_render(" in body, inner
+    assert "quarantine_render_slot(" not in body, inner
+    assert "if quarantine" not in body, inner
 
-render_publish = watch[watch.index("fn publish("):watch.index("fn timed_out(")]
+render_publish = block("    fn publish_with(")
 assert "if quarantine" not in render_publish
 assert "quarantine_render_slot(" not in render_publish
 assert render_publish.count("timeout_deferred_render(") == 1

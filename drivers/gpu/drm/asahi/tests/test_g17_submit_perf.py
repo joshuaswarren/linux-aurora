@@ -47,26 +47,16 @@ ran = re.search(r"(\d+) passed", completed.stdout)
 assert ran and int(ran.group(1)) >= 6, completed.stdout
 assert "0 failed" in completed.stdout, completed.stdout
 
-# --- the retained staging image is scratch only ----------------------------
+# --- descriptors are encoded straight into the selected generation ---------
+# v91 direct descriptors replace j700's staging image and copy
+# (test_g17_direct_render_descriptors.py covers the encoding). Builders still
+# zero exactly their prefixes, so no byte carries a previous submission.
 restage = block(resources, "    pub(crate) fn restage_command(")
-assert "self.staging_descriptors.take()" in restage
-assert "self.staging_descriptors = Some(next_descriptors);" in restage
-# A reused buffer is not cleared: only the TA_DESCRIPTOR_SIZE and
-# fragment descriptor plus active MCache spill reach firmware. Builders zero
-# exactly their prefixes and the spill encoder writes its active extent, so no byte carries the
-# previous submission's contents.
-reset = restage[restage.index("self.staging_descriptors.take()"):]
-assert "Some(retained) if g17p_retain_staging() => retained," in reset[: reset.index("};")]
+assert "staging_descriptors" not in restage
+assert "self.select_render_command_generation(submission_ordinal)?" in restage
 render = (root / "g17_render.rs").read_text()
 assert "raw[..TA_DESCRIPTOR_SIZE].fill(0);" in block(render, "pub(crate) fn build_ta_descriptor(")
 assert "raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);" in block(render, "pub(crate) fn build_fragment_descriptor(")
-assert ".copy_from_slice(&source[..g17_render::TA_DESCRIPTOR_SIZE]);" in restage
-assert "let fragment_copy_size = g17p_fragment_copy_size(fragment_mcache.as_ref());" in restage
-assert "&source[0x4000..0x4000 + fragment_copy_size]," in restage
-assert "next_descriptors.object" not in restage
-# And its own address must never be published: the only addresses that go into
-# the command come from the retained storage and the freshly mapped state.
-assert "next_descriptors.iova()" not in restage
 assert "render_state_va = self.render_state.iova()" in restage
 
 # --- nothing per-submission logs unconditionally ---------------------------

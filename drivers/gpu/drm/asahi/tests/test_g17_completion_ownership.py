@@ -24,7 +24,9 @@ live = (root / 'g17_live_boot.rs').read_text()
 compute = (root / 'g17_async_compute.rs').read_text()
 render_impl = item(drm, 'impl G17PRenderCompletion {')
 compute_impl = item(job, 'impl G17PJobCompletion {')
-timeout = item(live, '    fn settle_failed_deferred_render(')
+# v92d: settle_failed_deferred_render delegates the exact failure to this sink.
+assert 'self.fail_render_after_final_observation(' in item(live, '    fn settle_failed_deferred_render(')
+timeout = item(live, '    fn fail_render_after_final_observation(')
 assert 'if retired {\n                signal.complete(Err(EIO));\n            } else {' in timeout
 assert 'signal.fail_while_owned(error);' in timeout
 assert timeout.index('note_session_recovery_pending(') < timeout.index(
@@ -57,6 +59,9 @@ source = r'''
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, AtomicBool, AtomicI32, Ordering};
 macro_rules! pr_info { ($($arg:tt)*) => { let _ = format_args!($($arg)*); }; }
+// v81/v87 instrumentation: e2e ring disarmed, feed-perf detector a no-op here.
+mod g17_e2e { pub const K_COMPLETE:u8=18; pub fn stamp()->u64{0} pub fn record(_:u8,_:u32,_:u64,_:[u64;5]){} }
+mod g17_host_path { pub fn note_render_pass(_:u64,_:u64){} }
 static G17P_RENDER_TIMING_RECORDS: AtomicU32 = AtomicU32::new(0);
 mod g17_timing_buffer {pub const WORDS:usize=24;pub const KIND_RENDER_ADMISSION:u64=1;pub const KIND_RENDER_COMPLETION:u64=2;pub const KIND_RENDER_PUBLISH_STAGES:u64=5;pub const RENDER_COMPLETION_LAYOUT:u64=3;pub fn now()->u64{0} pub fn arch_counter()->u64{0} pub fn record(_words:[u64;24]){}}
 mod module_parameters {

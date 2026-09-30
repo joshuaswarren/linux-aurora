@@ -30,7 +30,9 @@ for engine, frontier, prefix in [
 ]:
     body = function(source, '    fn submit_' + engine + '_async(')
     assert '&self.' + frontier + ', translated.' + prefix in body
-    assert body.index('append_render_prefix_dependencies(') < body.index('.enqueue(packet, dependencies)?')
+    # v84: the render enqueue also takes the early-publication decision.
+    enqueue = '.enqueue(packet, dependencies)?' if engine == 'compute' else '.enqueue(packet, dependencies, early_allowed)?'
+    assert body.index('append_render_prefix_dependencies(') < body.index(enqueue)
     assert 'for sync in syncs {' in body
     assert 'checked_dependencies.push(fence.clone()' in body
     assert 'dependencies.push(fence.clone()' in body
@@ -39,12 +41,15 @@ for engine, frontier, prefix in [
 # Requested prefixes wait for publication, with hardware errors checked separately.
 append = function(source, 'fn append_render_prefix_dependencies(')
 assert 'checked_dependencies.push(fence.completed.clone()' in append
-assert 'dependencies.push(fence.published.clone()' in append
+assert 'dependencies.push(fence.ready.clone()' in append  # j700 b23cfb38f: ready = completed for host timestamps
 for trait, implementation, publish in [
     ('G17PQueueBackend', 'G17PAsyncQueueBackend', 'publish_async_compute('),
     ('G17PRenderQueueBackend', 'G17PRenderQueueBackend', 'submit_translated_render('),
 ]:
     body = function(source, 'impl g17_job::' + trait + ' for ' + implementation)
+    if implementation == 'G17PRenderQueueBackend':
+        # v84: the trait publish delegates to publish_with (early ioctl lease).
+        body = function(source, '    fn publish_with(')
     assert body.index('for fence in packet.input_fences()') < body.index(publish)
     assert body.index('for fence in packet.firmware_fences()') < body.index(publish)
 
