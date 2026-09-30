@@ -157,4 +157,6 @@ config APPLE_PMP
 
 endmenu
 
+source "drivers/soc/apple/neo/Kconfig"
+
 endif

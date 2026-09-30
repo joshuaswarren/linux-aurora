@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "Apple T8140 (J700) platform power and fabric"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on ARM64
+
+config APPLE_T8140_MCC
+	tristate "Apple T8140 system-level cache allocation owner"
+	default y if ARCH_APPLE
+	help
+	  Enable system-level-cache allocation at boot on J700 (T8140), as the
+	  native AppleT8140MCC driver does (mccEnableCacheMode step 3: AMCC
+	  +0x82c = 0 on every plane, only when every plane already reports its
+	  ways enabled and powered). Resume re-applies it and reboot, poweroff
+	  and kexec run the native quiesce cache flush. On other machines the
+	  driver does nothing.
+
+	  Measured on J700: CPU memory latency ~100 -> 30 ns, and GPU depth-1
+	  and depth-2 throughput +19-33%. Opt out with neo_mcc.enable=0.
+
+endmenu
