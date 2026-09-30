@@ -62,7 +62,7 @@ for term in (
     "0xc00usize",
     "0x400usize",
     "0x600usize",
-    "0xe00..0xe08",
+    "g17p_live_read_u64(bytes, 0xe00)",
     "0xe08usize",
     "0xe20usize",
     "record[0] = hardware_buffer_id as u8",
@@ -101,9 +101,12 @@ complete = block(MANAGER, "pub(crate) fn poll_staged_independent_compute_complet
 assert complete.index("read_compute_stamp()?") < complete.index("complete_qos_queue_records(")
 assert complete.index("complete_qos_queue_records(") < complete.index("queue.completion_descriptor = 0")
 paired = MANAGER[MANAGER.index("let retired_sksm ="):]
-assert paired.index("complete_qos_queue_records(") < paired.index(
-    "self.render_tracker = self.render_queued_tracker.take()"
+assert paired.index("self.retire_tracked_render_qos(pair_slot)?") < paired.index(
+    "self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take()"
 )
+tracked = block(MANAGER, "fn retire_tracked_render_qos(", "pub(crate) fn retire_abandoned_render_if_firmware_retired(")
+assert tracked.index("if !self.render_slots.get(pair_slot).tracker.as_ref().ok_or(ENODEV)?.qos_pending") < tracked.index("complete_qos_queue_records(")
+assert tracked.index("complete_qos_queue_records(") < tracked.index("qos_pending = false")
 retire = block(RESOURCES, "pub(crate) fn complete_qos_queue_records(", "/// Dump the QOS resource regions")
 assert retire.index("row[0] != hbid") < retire.index("bytes[offset] = 0xff")
 assert "owners[..index]" in retire

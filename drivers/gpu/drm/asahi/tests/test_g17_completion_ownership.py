@@ -42,9 +42,15 @@ for marker in ('    fn service_async_compute_completions_matching(',
     body = item(compute, marker)
     assert '.complete(Err(' not in body, marker
     assert '.fail_while_owned(error)' in body, marker
-    assert body.index('note_session_recovery_pending(') < body.index(
-        '.fail_while_owned(error)'
-    ), marker
+    # A VM-scoped fan-out never declares the session crashed (first-submit
+    # hang, 2026-09-26): only the two completion-classification routes still
+    # escalate, and only with QUARANTINE_SCOPE bit 0 clear.
+    if marker != '    fn fail_outstanding_jobs_for_vm_after_compute_observation(':
+        assert body.index('note_session_recovery_pending(') < body.index(
+            '.fail_while_owned(error)'
+        ), marker
+    else:
+        assert 'note_session_recovery_pending(' not in body, marker
 
 source = r'''
 #![allow(dead_code)]
@@ -52,7 +58,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, AtomicBool, AtomicI32, Ordering};
 macro_rules! pr_info { ($($arg:tt)*) => { let _ = format_args!($($arg)*); }; }
 static G17P_RENDER_TIMING_RECORDS: AtomicU32 = AtomicU32::new(0);
-mod g17_timing_buffer {pub const WORDS:usize=24;pub fn now()->u64{0} pub fn record(_words:[u64;24]){}}
+mod g17_timing_buffer {pub const WORDS:usize=24;pub const KIND_RENDER_ADMISSION:u64=1;pub const KIND_RENDER_COMPLETION:u64=2;pub const KIND_RENDER_PUBLISH_STAGES:u64=5;pub const RENDER_COMPLETION_LAYOUT:u64=3;pub fn now()->u64{0} pub fn arch_counter()->u64{0} pub fn record(_words:[u64;24]){}}
 mod module_parameters {
  pub struct Param(u32); impl Param {pub fn value(&self)->&u32{&self.0}}
  pub static g17p_trace_depth:Param=Param(0);
@@ -101,7 +107,7 @@ impl Destination {fn write(&self,_timestamp:u64)->Result{Ok(())}}
 '''
 
 for name, impl, extra in [
-    ('Render', render_impl, 'lease:Mutex<Option<Lease>>,timestamps:[Option<Destination>;4],created:std::time::Instant,trace_created_ns:u64, trace_attach_ns:AtomicU64, attached_ns:AtomicU64,published_ns:AtomicU64,submission_id:u64,vdm_base:u64,owner:u64,render_slot:AtomicU32,'),
+    ('Render', render_impl, 'lease:Mutex<Option<Lease>>,timestamps:[Option<Destination>;4],created:std::time::Instant,trace_created_ns:u64, trace_attach_ns:AtomicU64, trace_service_counters:[AtomicU64;4], attached_ns:AtomicU64,published_ns:AtomicU64,submission_id:u64,vdm_base:u64,owner:u64,render_slot:AtomicU32,'),
     ('Compute', compute_impl, 'destinations:[Option<Destination>;2],'),
 ]:
     source += f'''struct {name} {{ fence:Fence,status:Arc<Status>,vm_job:Mutex<Option<VmGuard>>,signalled:AtomicU32,aggregate_member:Aggregate,{extra}}}
@@ -118,7 +124,7 @@ impl {name} {{
 
 source += r'''
 fn render(m:&Arc<Memory>,released:&Arc<AtomicUsize>)->Arc<Render>{
- let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),aggregate_member:Aggregate,timestamps:[None,None,None,None],lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0}))),created:std::time::Instant::now(),trace_created_ns:0,trace_attach_ns:AtomicU64::new(0),attached_ns:AtomicU64::new(0),published_ns:AtomicU64::new(0),submission_id:1,vdm_base:0,owner:0,render_slot:AtomicU32::new(0)})
+ let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),aggregate_member:Aggregate,timestamps:[None,None,None,None],lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0}))),created:std::time::Instant::now(),trace_created_ns:0,trace_attach_ns:AtomicU64::new(0),trace_service_counters:Default::default(),attached_ns:AtomicU64::new(0),published_ns:AtomicU64::new(0),submission_id:1,vdm_base:0,owner:0,render_slot:AtomicU32::new(0)})
 }
 fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::new(Compute{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),aggregate_member:Aggregate,destinations:[None,None]})}
 #[test] fn render_error_keeps_mapping_and_slot_through_file_and_scheduler_close(){

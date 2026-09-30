@@ -36,8 +36,8 @@ assert "g17p_render_rt_memory_va(queue_pair)" in heap_constructor
 target_owner = block("struct G17PRenderTargetMemory {")
 prepare_slot = block("    fn prepare_rt_slot(", source[source.index("impl G17PRenderTargetMemory {") :])
 assert "rt_slot_ordinals: [Option<u64>; G17P_RENDER_RT_EVENT_RECORD_COUNT]" in target_owner
-assert ".checked_sub(previous)" in prepare_slot
-assert "distance != 0 && distance < G17P_RENDER_RT_EVENT_RECORD_COUNT as u64" in prepare_slot
+assert "previous != submission_ordinal" in prepare_slot
+assert ".checked_sub(previous)" not in prepare_slot
 assert '"persistent render-target-memory allocation"' in constructor
 assert "new_g17p_render_target_memory(dev, vm, queue_pair, &render_layout)" in constructor
 assert "translated.parameters.tpc = render_target_memory.tpc_va();" in constructor

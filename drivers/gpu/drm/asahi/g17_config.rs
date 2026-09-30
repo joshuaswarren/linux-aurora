@@ -72,7 +72,22 @@ pub(crate) const REPORT_DRAIN: u32 = 0;
 pub(crate) const REPORT_DRAIN_BUDGET: u32 = 0;
 pub(crate) const RENDER_RECOVERY_RETIRE: u32 = 0;
 pub(crate) const COMPUTE_CONFIG_CONTEXT: u32 = 1;
-pub(crate) const QUARANTINE_SCOPE: u32 = 1;
+// bit0: scope a faulted async-compute queue's admission poison to its own
+//       client instead of the whole device (landed with f6a71e767d55a).
+// bit1: scope a lost render submission the same way. When a firmware
+//       stamp-blamed recovery is serviced to a clean final clear (state=0,
+//       epoch=1) but the driver cannot prove the exact lost render was
+//       firmware-retired, fail ONLY that client's VM and retire its physical
+//       slot; keep the session up for every other client. Without this bit the
+//       render settle path calls note_session_recovery_pending and the whole
+//       GPU session is declared crashed -- and on G17P a crashed session's
+//       rebuild never re-runs the RTKit HELLO handshake (4/4 ETIME), so the
+//       GPU is dead until reboot. Measured 2026-09-26 (07:48, 07:54, and the
+//       real desktop at 08:12): a single unprivileged client's first render
+//       submission killed the GPU for everyone. Both scopings are the correct
+//       fault-containment default, not a diagnostic opt-in: they never touch
+//       the healthy path's batching or concurrency.
+pub(crate) const QUARANTINE_SCOPE: u32 = 3;
 pub(crate) const RENDER_NATIVE_REGS: u32 = 0;
 pub(crate) const RENDER_NATIVE_BYTES: u32 = 0;
 pub(crate) const RENDER_TVB: u32 = 2;
@@ -87,7 +102,6 @@ pub(crate) const RENDER_POPULATED_HIGH_ROOT: u32 = 0;
 pub(crate) const RENDER_SKSM: u32 = 3;
 pub(crate) const IRQ_COMPLETION: u32 = 1;
 pub(crate) const RING_NORMALIZE: u32 = 0;
-pub(crate) const REPEAT_SETTLE_US: u32 = 0;
 pub(crate) const RING_LIMIT: u32 = 0;
 pub(crate) const RING_WRAP: u32 = 0;
 pub(crate) const COMPUTE_SCS_PAGES: u32 = 0;
@@ -114,3 +128,10 @@ pub(crate) const ASC_GATE_SETTLE_MS: u32 = 10;
 pub(crate) const ASC_TEARDOWN: u32 = 0;
 pub(crate) const ABANDON_RECOVERY: u32 = 1;
 pub(crate) const SKSM_MMIO: u32 = 0;
+
+/// Default-off diagnostic: ordinary Job graphs with a shared per-submit TSQ
+/// use native pending-IO-fence-free TA policy. This defers the early TA drain;
+/// it does not remove maintenance or relax any post-maintenance fence gate.
+/// Bootstrap/private-node paths retain their qualified policy. Do not promote
+/// without mixed/failure/chunking liveness and throughput qualification.
+pub(crate) const RENDER_NATIVE_TA_DRAIN_PROBE: bool = cfg!(g17p_native_ta_drain_probe);

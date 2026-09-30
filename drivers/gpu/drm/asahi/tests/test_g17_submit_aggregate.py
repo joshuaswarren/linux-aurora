@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the actual counted aggregate with fake fences; no GPU or wait thread."""
 from pathlib import Path
+from g17_work_state_test_support import tsq_backing
 import subprocess
 import tempfile
 
@@ -24,7 +25,8 @@ use std::sync::atomic::{AtomicU32,AtomicI32,Ordering};
 #[derive(Clone,Copy,Debug,PartialEq)]struct Error(i32);
 impl Error {fn to_errno(self)->i32{self.0}fn from_errno(e:i32)->Self{Self(e)}}
 type Result<T=()>=std::result::Result<T,Error>;
-const ECANCELED:Error=Error(-125);const GFP_KERNEL:()=();
+const EINVAL:Error=Error(-22);const ENOSPC:Error=Error(-28);const EOVERFLOW:Error=Error(-75);
+const ECANCELED:Error=Error(-125);const EBUSY:Error=Error(-16);const GFP_KERNEL:()=();
 struct Arc<T>(std::sync::Arc<T>);
 impl<T>Arc<T>{fn new(value:T,_flags:())->Result<Self>{Ok(Self(std::sync::Arc::new(value)))}}
 impl<T>Clone for Arc<T>{fn clone(&self)->Self{Self(self.0.clone())}}
@@ -44,9 +46,42 @@ actual = '\n'.join(block(marker) for marker in [
     'pub(crate) struct G17PSubmitCompletionMember {', 'impl G17PSubmitCompletionMember {',
     'impl Drop for G17PSubmitCompletionMember {',
 ])
+saved_source = source
+source = (root / 'g17_resources.rs').read_text()
+lease = '\n'.join(block(marker) for marker in [
+    'pub(crate) struct G17PWorkStateLease {', 'impl G17PWorkStateLease {',
+    'impl Drop for G17PWorkStateLease {',
+])
+source = saved_source
+preamble += f'\n#[path = "{root / "g17_work_state.rs"}"] mod g17_work_state;\n'
+preamble += tsq_backing()
+preamble += 'mod g17_resources {use super::*;pub struct G17PLogicalQueueContext {pub work_states:g17_work_state::WorkStatePool,pub tsq:TsqLock,pub tsq_base:u64}\n' + lease + '\nimpl G17PLogicalQueueContext {pub fn tsq_head_gpu_va(&self)->u64{0x18000}pub fn tsq_head_snapshot(&self)->Result<[u64;2]>{Ok([0,0])}}\n}\n'
 tests = r'''
-fn aggregate()->Arc<G17PSubmitCompletion>{G17PSubmitCompletion::new(UserFence{
- state:std::sync::Arc::new(Signals::default()),_p:std::marker::PhantomData}).unwrap()}
+fn context()->Arc<g17_resources::G17PLogicalQueueContext>{Arc::new(g17_resources::G17PLogicalQueueContext{work_states:g17_work_state::WorkStatePool::new(),tsq:TsqLock::new(),tsq_base:0x10000},()).unwrap()}
+fn aggregate_with_context(c:Arc<g17_resources::G17PLogicalQueueContext>)->Arc<G17PSubmitCompletion>{G17PSubmitCompletion::new(UserFence{
+ state:std::sync::Arc::new(Signals::default()),_p:std::marker::PhantomData},c).unwrap()}
+fn aggregate()->Arc<G17PSubmitCompletion>{aggregate_with_context(context())}
+#[test]fn concurrent_engine_acquisition_installs_one_key_and_returns_losing_reservations(){
+ let context=context();let state=g17_resources::G17PWorkStateLease::deferred(context.clone());
+ let barrier=std::sync::Barrier::new(16);
+ std::thread::scope(|scope| {let mut workers=Vec::new();for _ in 0..16 {
+  let state=&state;let barrier=&barrier;workers.push(scope.spawn(move||{barrier.wait();state.acquire().unwrap()}));
+ }let keys:Vec<_>=workers.into_iter().map(|worker|worker.join().unwrap()).collect();assert!(keys.iter().all(|key|*key==state.word()));});
+ let rest:Vec<_>=(0..62).map(|_|g17_resources::G17PWorkStateLease::new(context.clone()).unwrap()).collect();
+ assert!(!context.work_states.has_free());drop(state);assert!(context.work_states.has_free());drop(rest);
+}
+#[test]fn engines_share_one_lazy_key_and_error_fence_does_not_release_it(){
+ let context=context();let a=aggregate_with_context(context.clone());
+ let render=G17PSubmitCompletionMember::new(a.clone());let compute=G17PSubmitCompletionMember::new(a.clone());
+ let untouched:Vec<_>=(0..63).map(|_|g17_resources::G17PWorkStateLease::new(context.clone()).unwrap()).collect();drop(untouched);
+ let key=render.work_state().acquire().unwrap();assert_eq!(compute.work_state().acquire(),Ok(key));
+ let runtime_owner=render.work_state();
+ a.finish_enqueue(Ok(()));render.complete(Err(Error(-5)));compute.complete(Err(Error(-5)));
+ assert_eq!(signals(&a),1);drop(render);drop(compute);drop(a);
+ let others:Vec<_>=(0..62).map(|_|g17_resources::G17PWorkStateLease::new(context.clone()).unwrap()).collect();
+ assert!(!context.work_states.has_free());drop(runtime_owner);
+ assert!(g17_resources::G17PWorkStateLease::new(context.clone()).is_ok());drop(others);
+}
 fn signals(a:&G17PSubmitCompletion)->u32{a.fence.state.signals.load(Ordering::Acquire)}
 fn error(a:&G17PSubmitCompletion)->i32{a.fence.state.error.load(Ordering::Acquire)}
 #[test]fn all_commands_across_both_engines_must_complete_in_any_order(){

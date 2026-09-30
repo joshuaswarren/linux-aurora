@@ -11,13 +11,14 @@ production='\n'.join(block(x) for x in [
  'struct T8140ContextRootLease {','pub(crate) struct T8140ComputeExecutionContext {',
  'impl T8140ComputeExecutionContext {','impl Drop for T8140ContextRootLease {'])
 method=block('    pub(crate) fn allocate_t8140_compute_execution_context(')+block('    pub(crate) fn allocate_t8140_app_context(')
-limits=(Path(__file__).resolve().parents[1]/'g17_queue_limits.rs').read_text().replace('//!','//')
+from g17_queue_limits_test_support import queue_limits_source
+limits=queue_limits_source()
 constants='\n'.join(re.search(r'const '+n+r': [^;]+;',s)[0] for n in [
  'T8140_APP_CONTEXT_START','T8140_APP_CONTEXT_RESERVED_MASK','T8140_APP_CONTEXT_AVAILABLE_MASK'])
 mock=r'''
 #![allow(dead_code,unused_variables)]
 use std::sync::{Mutex,MutexGuard};
-use std::sync::atomic::{AtomicU64,AtomicBool,Ordering,fence};
+use std::sync::atomic::{AtomicU8,AtomicU64,AtomicBool,Ordering,fence};
 use std::ops::Deref;
 type Result<T=()> = std::result::Result<T,i32>;
 const EINVAL:i32=22;const ENOSPC:i32=28;const EBUSY:i32=16;const GFP_KERNEL:u32=0;
@@ -35,7 +36,7 @@ struct Handoff;
 impl Handoff{fn lock(&self){}fn unlock(&self){}fn current_slot(&self)->Option<u32>{None}}
 struct State{table:Vec<TTBS>}
 impl State{fn ttbs(&self)->&[TTBS]{&self.table}fn handoff(&self)->Handoff{Handoff}}
-struct UatInner{state:Mutex<State>,t8140_app_contexts:AtomicU64}
+struct UatInner{state:Mutex<State>,t8140_app_contexts:AtomicU64,t8140_context_generations:[AtomicU8;64]}
 impl UatInner{fn lock(&self)->MutexGuard<'_,State>{self.state.lock().unwrap()}}
 #[derive(PartialEq)]enum UatConfig{T8140,Other}
 struct VmOwner{is_kernel:bool,uat_inner:Arc<UatInner>}
@@ -48,7 +49,7 @@ fn t8140_tagged_root(root:u64,id:usize)->u64{root|1|((id as u64)<<48)}
 mod mem{use std::sync::Mutex;pub static TLBIS:Mutex<Vec<u8>>=Mutex::new(Vec::new());pub fn tlbi_asid(i:u8){TLBIS.lock().unwrap().push(i)}pub fn sync(){}}
 impl Uat{
  fn install_t8140_app_context_alias(&self,b:&VmBind,id:usize)->Result<(u64,u64)>{let low=t8140_tagged_root(b.0.ttb(),id);let high=t8140_tagged_root(self.kernel_vm.ttb(),id);let state=self.inner.lock();state.ttbs()[id].ttb0.store(low,Ordering::Release);state.ttbs()[id].ttb1.store(high,Ordering::Release);Ok((low,high))}
- fn new()->Self{let inner=Arc::new(UatInner{state:Mutex::new(State{table:(0..64).map(|_|TTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}).collect()}),t8140_app_contexts:AtomicU64::new(31)},0).unwrap();let kernel_vm=Self::vm_in(&inner,0,0xff0000,true);Self{cfg:UatConfig::T8140,inner,kernel_vm}}
+ fn new()->Self{let inner=Arc::new(UatInner{state:Mutex::new(State{table:(0..64).map(|_|TTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}).collect()}),t8140_app_contexts:AtomicU64::new(31),t8140_context_generations:core::array::from_fn(|_|AtomicU8::new(0))},0).unwrap();let kernel_vm=Self::vm_in(&inner,0,0xff0000,true);Self{cfg:UatConfig::T8140,inner,kernel_vm}}
  fn vm_in(inner:&Arc<UatInner>,id:u64,root:u64,is_kernel:bool)->Vm{Vm{id,root,inner:Arc::new(GpuVm{owner:Mutex::new(VmOwner{is_kernel,uat_inner:inner.clone()})},0).unwrap()}}
  fn vm(&self,id:u64)->Vm{Self::vm_in(&self.inner,id,id*0x10000,false)}
  fn roots(&self,i:usize)->(u64,u64){let s=self.inner.lock();(s.ttbs()[i].ttb0.load(Ordering::Acquire),s.ttbs()[i].ttb1.load(Ordering::Acquire))}
@@ -61,10 +62,12 @@ tests=r'''
  let a=u.allocate_t8140_compute_execution_context(&u.vm(1)).unwrap();
  let b=u.allocate_t8140_compute_execution_context(&u.vm(2)).unwrap();
  assert_eq!((a.context_id(),b.context_id()),(5,6));assert_ne!(a.root(),b.root());
+ assert_eq!((a.generation(),b.generation()),(1,1));
  assert_eq!(u.roots(1),(0x12340001,0x56780001));
  let job_a=a.clone();drop(a);assert_ne!(u.roots(5),(0,0));
  drop(b);assert_eq!(u.roots(6),(0,0));assert_ne!(u.roots(5),(0,0));
  let c=u.allocate_t8140_compute_execution_context(&u.vm(3)).unwrap();assert_eq!(c.context_id(),6);
+ assert_eq!((job_a.generation(),c.generation()),(1,2));
  let before=mem::TLBIS.lock().unwrap().len();drop(job_a);assert_eq!(u.roots(5),(0,0));assert_eq!(mem::TLBIS.lock().unwrap().len(),before+1);
  assert_eq!(u.roots(1),(0x12340001,0x56780001));drop(c);
  assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);
@@ -74,7 +77,7 @@ tests=r'''
  let u=Uat::new();
  for generation in 0..10_001u64{
   let c=u.allocate_t8140_compute_execution_context(&u.vm(generation+1)).unwrap();
-  assert_eq!(c.context_id(),5);assert!(c.is_current());drop(c);
+  assert_eq!(c.context_id(),5);assert!(c.is_current());assert_eq!(c.generation(),(generation+1) as u8);drop(c);
   assert_eq!(u.roots(5),(0,0));
  }
  assert_eq!(mem::TLBIS.lock().unwrap().iter().filter(|&&id|id==5).count(),20_002);

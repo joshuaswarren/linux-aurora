@@ -79,7 +79,7 @@ def test_production_owns_and_transfers_the_hardware_visible_backing():
     slot = manager[manager.index("struct G17PRenderSlotState {"):]
     slot = slot[:slot.index("}\n")]
     assert slot.index("bind: Option<G17PRenderRootOwner>") < slot.index(
-        "storage: Option<g17_resources::G17PUserRenderStorage>"
+        "storage: Option<KBox<g17_resources::G17PUserRenderStorage>>"
     )
     assert slot.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < slot.index(
         "sksm: Option<G17PRenderSksmQueues>"

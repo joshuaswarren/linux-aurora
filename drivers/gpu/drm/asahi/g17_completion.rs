@@ -228,6 +228,52 @@ pub(crate) const G17P_KTRACE_STATE_STATUS_A_OFFSET: u64 = 0x0_0240;
 pub(crate) const G17P_KTRACE_RING_STATUS_A_OFFSET: u64 = 0xa_6ac0;
 pub(crate) const G17P_KTRACE_ENTRY_SIZE: usize = 0x48;
 pub(crate) const G17P_KTRACE_CAPACITY: u32 = 0x200;
+/// Native `AGXFirmwareRingValidator` type mask for the trace ring
+/// (`Firmware::init` constant 0xfffffe0007135e00 = {0x20, 0x200}): only
+/// record type 5 is legal. `fetchNextEntry` asserts `(mask >> type) & 1`.
+pub(crate) const G17P_KTRACE_TYPE_MASK: u64 = 0x20;
+/// Native statistics validator (constant 0xfffffe0007135e10 = {0x5fff0000,
+/// 0x100}, stored at role +0x7f0/+0xa30): 0x100 entries of 0x48 bytes, legal
+/// types 0x10..=0x1c and 0x1e.
+pub(crate) const G17P_STATISTICS_CAPACITY: u32 = 0x100;
+pub(crate) const G17P_STATISTICS_TYPE_MASK: u64 = 0x5fff_0000;
+/// Report channel 14 statistics cursor object (consumer `+0`, producer
+/// `+0x20`) and ring, as offsets from status A
+/// (`g17_initdata::REPORT_STATE_STATUS_A_OFFSETS[1][2]`,
+/// `REPORT_RING_STATUS_A_OFFSETS[1]`).
+pub(crate) const G17P_STATISTICS_STATE_STATUS_A_OFFSET: u64 = 0x280;
+pub(crate) const G17P_STATISTICS_RING_STATUS_A_OFFSET: u64 = 0xa_fac0;
+
+/// `(mask >> type) & 1` exactly as native `fetchNextEntry` tests it; types
+/// outside the 64-bit mask are illegal rather than wrapped.
+pub(crate) const fn g17p_ring_type_legal(mask: u64, entry_type: u32) -> bool {
+    entry_type < 64 && (mask >> entry_type) & 1 != 0
+}
+
+/// Native drain prologue: both snapshotted cursors must be below the
+/// validator capacity (native asserts otherwise). Returns the number of
+/// entries in the observed prefix; entries published after the snapshot are
+/// left for the next drain, as native does.
+pub(crate) const fn g17p_native_ring_pending(
+    consumer: u32,
+    producer: u32,
+    capacity: u32,
+) -> Result<u32, CompletionDecodeError> {
+    if capacity == 0 || consumer >= capacity || producer >= capacity {
+        return Err(CompletionDecodeError::FirmwareEventCursor);
+    }
+    Ok(if producer >= consumer {
+        producer - consumer
+    } else {
+        capacity - consumer + producer
+    })
+}
+
+/// Native `fetchNextEntry` consumer step: `(consumer + 1) % capacity`.
+pub(crate) const fn g17p_native_ring_next(consumer: u32, capacity: u32) -> u32 {
+    (consumer + 1) % capacity
+}
+
 /// Host-written read pointer, `state + 0x00`.
 pub(crate) const G17P_KTRACE_CONSUMER_OFFSET: u64 = 0x00;
 /// Firmware-written write pointer, `state + 0x20`.
@@ -249,6 +295,22 @@ pub(crate) const G17P_KTRACE_PAUSE_REASON_KEY: u16 = 0x0046;
 /// predicate. A zero result must not be called an idle shader or completion.
 pub(crate) const fn g17p_slot_has_progress_selector(state: u64) -> bool {
     state & 1 != 0 && state & 0x3c == 0x0c && (state >> 24) & 3 != 0
+}
+
+/// B1 tables45550/45568, registered7118..713c: two plain DM0
+/// progress reads and one namespace-1 read. No a010/a088 write is needed.
+pub(crate) const G17P_DM0_MONITOR_READS: [(u64, u64); 3] = [
+    (0x1678, 0),
+    (0x1c0e0, 0),
+    (0xa088, (1u64 << 42) | (1u64 << 40)),
+];
+
+pub(crate) fn g17p_monitor_reads(data_master: u32) -> Option<&'static [(u64, u64)]> {
+    match data_master {
+        0 => Some(&G17P_DM0_MONITOR_READS),
+        1 => Some(&G17P_DM1_MONITOR_READS),
+        _ => None,
+    }
 }
 
 /// Exact DM1 sample ranges in B1 tables45580/4558c. The second tuple member
@@ -273,7 +335,7 @@ pub(crate) const fn g17p_dm1_monitor_selector_index(state: u64) -> Option<u64> {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PHaltedSlot0Gate {
+pub(crate) struct G17PHaltedSlotGate {
     pub(crate) handshake_state: u32,
     pub(crate) epoch: u64,
     pub(crate) expected_epoch: u64,
@@ -299,15 +361,22 @@ pub(crate) const fn g17p_halted_gmmu_sample_allowed(
         && host_requested == 0 && reason == 3
 }
 
-impl G17PHaltedSlot0Gate {
+impl G17PHaltedSlotGate {
     /// c020/c078 are common scheduler-slot records for both render data
     /// masters.  They are safe to sample while either DM0 (TA) or DM1 (3D)
     /// is explicitly selected by the halted firmware report.
     pub(crate) const fn allows_generic_sample(self) -> bool {
         self.handshake_state == 1 && self.epoch == self.expected_epoch
             && self.report_state == 2 && self.host_requested == 0
-            && self.slot_present == 1 && self.slot == 0
+            && self.slot_present == 1 && self.slot < 16
             && self.data_master_present == 1 && self.data_master <= 1
+    }
+
+    /// Additional observation during a TA-blamed halt, selected only by a
+    /// populated DM1 nonprogress record. This does not change fault blame.
+    pub(crate) const fn allows_dm1_peer_sample(self, slot: u32, state: u32) -> bool {
+        self.allows_generic_sample() && self.data_master == 0
+            && slot < 16 && slot != self.slot && state == 2
     }
 
     /// B1's additional eight selected-progress reads are specific to DM1.
@@ -418,7 +487,7 @@ pub(crate) const fn g17p_ktrace_key_name(key: u16) -> &'static str {
         0x0046 => "pause-reason set/bit/mask",
         0x004b => "cfg qid/old/new",
         0x0057 => "tag16-signal qid/stamp/value",
-        0x000a | 0x000c | 0x000e => "stamp-update value/index/uuid/ctx",
+        0x000a | 0x000c | 0x000e => "stamp-update value/index/record-id/completion-associated",
         0x0020 => "devctl-retired",
         0x011c => "RECORDS-LOST count/window",
         0x0110 => "monitor-sample dm/slot/threshold",
@@ -507,6 +576,16 @@ const KSM_PARENT_MASK: u64 = 0x003f_ffff_ffff_ffff;
 /// batch scan must be able to skip without treating them as transport errors.
 pub(crate) const fn g17p_ksm_completion_queue_id(control: u64) -> u8 {
     ((control >> 9) as u8) & KSM_QID_MASK
+}
+
+/// Extract the 40-bit kick timestamp (stamp and stamp index) a KSM completion
+/// control word reports. Same encoding as `decode_ksm_completion_entry`: the
+/// stamp in bits 16..47 and the index in bits 48..55; bit 57 is a flag, not
+/// index. Measured on Neo (2026-09-26 19:56): qid 13's records at slots 9-11
+/// decode to 0x3625..0x3627 while the queue's producer had published through
+/// 0x3629, i.e. this is the exact per-kick identity.
+pub(crate) const fn g17p_ksm_completion_timestamp(control: u64) -> u64 {
+    (((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff)) & KSM_TIMESTAMP_MASK
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -820,7 +899,7 @@ pub(crate) fn decode_ksm_completion_entry(
         3 => KsmCompletionCommandType::Type3,
         _ => return Err(CompletionDecodeError::CompletionCommandType),
     };
-    let timestamp = ((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff);
+    let timestamp = g17p_ksm_completion_timestamp(control);
     let tagged_object = get_u64(raw, 0x30);
     Ok(G17pKsmCompletionEntry {
         completion_selector,
@@ -1536,7 +1615,7 @@ impl RenderQueueWindow {
     pub(crate) fn new(base: u32, count: u32, capacity: u32)
         -> Result<Self, CompletionDecodeError>
     {
-        if base >= capacity || !matches!(count, 3 | 4) || count >= capacity {
+        if base >= capacity || !matches!(count, 2..=4) || count >= capacity {
             return Err(CompletionDecodeError::RenderWindow);
         }
         Ok(Self { base, count, capacity })
@@ -1581,39 +1660,72 @@ impl RenderQueueWindow {
 /// oldest first. Fixed capacity, so admission and retirement never allocate.
 pub(crate) struct PairFifo<T, const N: usize> {
     slots: [Option<T>; N],
+    head: usize,
     len: usize,
 }
 
 impl<T, const N: usize> PairFifo<T, N> {
     pub(crate) const fn new() -> Self {
-        Self { slots: [const { None }; N], len: 0 }
+        Self { slots: [const { None }; N], head: 0, len: 0 }
     }
 
-    /// True when anything is queued.
     pub(crate) fn is_some(&self) -> bool { self.len != 0 }
-
     pub(crate) fn is_none(&self) -> bool { self.len == 0 }
-
     pub(crate) fn has_room(&self) -> bool { self.len < N }
+    pub(crate) fn len(&self) -> usize { self.len }
+
+    // Called only with an occupied index or after proving room for a push.
+    // In particular an N=0 FIFO never indexes storage or divides by zero.
+    fn index(&self, logical: usize) -> usize {
+        let index = self.head + logical;
+        if index >= N { index - N } else { index }
+    }
 
     pub(crate) fn front(&self) -> Option<&T> {
-        if self.len == 0 { None } else { self.slots[0].as_ref() }
+        if self.len == 0 { None } else { self.slots[self.head].as_ref() }
+    }
+
+    pub(crate) fn back(&self) -> Option<&T> {
+        if self.len == 0 { None } else { self.slots[self.index(self.len - 1)].as_ref() }
+    }
+
+    pub(crate) fn back_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 { return None; }
+        let index = self.index(self.len - 1);
+        self.slots[index].as_mut()
+    }
+
+    /// Roll back only the newest unpublished member, preserving every older
+    /// hardware-owned command and its FIFO position across storage wrap.
+    pub(crate) fn pop_back(&mut self) -> Option<T> {
+        if self.len == 0 { return None; }
+        self.len -= 1;
+        let index = self.index(self.len);
+        self.slots[index].take()
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> core::iter::Flatten<core::iter::Chain<
+        core::slice::IterMut<'_, Option<T>>, core::slice::IterMut<'_, Option<T>>,
+    >> {
+        let first = self.len.min(N - self.head);
+        let (before, after) = self.slots.split_at_mut(self.head);
+        after[..first].iter_mut().chain(before[..self.len - first].iter_mut()).flatten()
     }
 
     pub(crate) fn push(&mut self, item: T) -> core::result::Result<(), T> {
         if self.len >= N { return Err(item); }
-        self.slots[self.len] = Some(item);
+        let index = self.index(self.len);
+        self.slots[index] = Some(item);
         self.len += 1;
         Ok(())
     }
 
-    /// Remove and return the oldest queued item.
+    /// Constant-time retirement. Moving every successor used to copy entire
+    /// tracker/compute-owner arrays while holding the device runtime mutex.
     pub(crate) fn take(&mut self) -> Option<T> {
         if self.len == 0 { return None; }
-        let item = self.slots[0].take();
-        for index in 1..self.len {
-            self.slots[index - 1] = self.slots[index].take();
-        }
+        let item = self.slots[self.head].take();
+        self.head = if self.head + 1 == N { 0 } else { self.head + 1 };
         self.len -= 1;
         item
     }
@@ -1622,8 +1734,12 @@ impl<T, const N: usize> PairFifo<T, N> {
         while self.take().is_some() {}
     }
 
-    pub(crate) fn iter(&self) -> core::iter::Flatten<core::slice::Iter<'_, Option<T>>> {
-        self.slots[..self.len].iter().flatten()
+    pub(crate) fn iter(&self) -> core::iter::Flatten<core::iter::Chain<
+        core::slice::Iter<'_, Option<T>>, core::slice::Iter<'_, Option<T>>,
+    >> {
+        let first = self.len.min(N - self.head);
+        self.slots[self.head..self.head + first].iter()
+            .chain(self.slots[..self.len - first].iter()).flatten()
     }
 }
 
@@ -1633,7 +1749,9 @@ impl<T, const N: usize> Default for PairFifo<T, N> {
 
 impl<'a, T, const N: usize> IntoIterator for &'a PairFifo<T, N> {
     type Item = &'a T;
-    type IntoIter = core::iter::Flatten<core::slice::Iter<'a, Option<T>>>;
+    type IntoIter = core::iter::Flatten<core::iter::Chain<
+        core::slice::Iter<'a, Option<T>>, core::slice::Iter<'a, Option<T>>,
+    >>;
     fn into_iter(self) -> Self::IntoIter { self.iter() }
 }
 
@@ -1709,9 +1827,91 @@ pub(crate) fn observe_paired_render_window_depth(
     Ok(result)
 }
 
+/// Observe independently sized TA and fragment groups. ConfigUpdate is optional
+/// per engine, so neither ring's cursor can be derived from a render ordinal.
+/// Later groups may contain up to four entries even when this group has two.
+/// Keep the exact two targets while bounding modular ambiguity by that maximum.
+pub(crate) fn observe_paired_render_windows_depth(
+    windows: [RenderQueueWindow; 2],
+    max_groups: u32,
+    tiling_previous: QueueIndices,
+    tiling_current: QueueIndices,
+    fragment_previous: QueueIndices,
+    fragment_current: QueueIndices,
+    execution: RenderExecutionState,
+) -> Result<PairedRenderCompletion, CompletionDecodeError> {
+    let groups = max_groups.max(1);
+    let back = 4u32.checked_mul(groups - 1)
+        .ok_or(CompletionDecodeError::RenderWindow)?;
+    let limit = 4u32.checked_mul(groups)
+        .and_then(|ahead| ahead.checked_add(back))
+        .ok_or(CompletionDecodeError::RenderWindow)?;
+    let normalize = |window: RenderQueueWindow, previous, current| {
+        if limit >= window.capacity {
+            return Err(CompletionDecodeError::RenderWindow);
+        }
+        let anchored = RenderQueueWindow {
+            base: ((u64::from(window.base) + u64::from(window.capacity) - u64::from(back))
+                % u64::from(window.capacity)) as u32,
+            count: window.count,
+            capacity: window.capacity,
+        };
+        Ok((anchored.normalize_with_limit(previous, limit)?,
+            anchored.normalize_with_limit(current, limit)?, back + window.count))
+    };
+    let (ta_previous, ta_current, ta_prefix) = normalize(windows[0], tiling_previous, tiling_current)?;
+    let (frg_previous, frg_current, frg_prefix) = normalize(windows[1], fragment_previous, fragment_current)?;
+    let mut result = observe_paired_render_completion(
+        ta_previous, ta_current, ta_prefix, frg_previous, frg_current, frg_prefix, execution,
+    )?;
+    result.tiling.indices = tiling_current;
+    result.fragment.indices = fragment_current;
+    result.tiling.published_prefix = windows[0].target();
+    result.fragment.published_prefix = windows[1].target();
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variable_render_groups_keep_independent_targets_through_wrap() {
+        let execution = RenderExecutionState {
+            job_list_empty: true, tiling_timestamps: [1, 2], fragment_timestamps: [1, 2],
+        };
+        let q = |v| QueueIndices { done: v, read: v, write: v };
+        let mut bases = [1278, 1279];
+        for ordinal in 0..4096 {
+            let counts = [2 + ordinal % 3, 2 + (ordinal / 3) % 3];
+            let windows = [RenderQueueWindow::new(bases[0], counts[0], 1280).unwrap(),
+                RenderQueueWindow::new(bases[1], counts[1], 1280).unwrap()];
+            let targets = windows.map(|w| w.target());
+            let current = targets.map(|target| QueueIndices {
+                done: target, read: (target + 12) % 1280, write: (target + 12) % 1280,
+            });
+            let result = observe_paired_render_windows_depth(windows, 32,
+                q(bases[0]), current[0], q(bases[1]), current[1], execution).unwrap();
+            assert!(result.complete);
+            assert_eq!(result.tiling.published_prefix, targets[0]);
+            assert_eq!(result.fragment.published_prefix, targets[1]);
+            for lane in 0..2 {
+                let mut unfinished = current;
+                unfinished[lane].done = (targets[lane] + 1279) % 1280;
+                assert!(!observe_paired_render_windows_depth(windows, 32,
+                    q(bases[0]), unfinished[0], q(bases[1]), unfinished[1], execution)
+                    .unwrap().complete);
+                let mut stale = current;
+                stale[lane].done = (bases[lane] + 1280 - 125) % 1280;
+                assert!(observe_paired_render_windows_depth(windows, 32,
+                    q(bases[0]), stale[0], q(bases[1]), stale[1], execution).is_err());
+            }
+            bases = targets;
+        }
+        let windows = [RenderQueueWindow::new(0, 2, 1280).unwrap(); 2];
+        assert!(observe_paired_render_windows_depth(windows, u32::MAX,
+            q(0), q(2), q(0), q(2), execution).is_err());
+    }
 
     #[test]
     fn render_fences_retire_out_of_order_once() {
@@ -1827,7 +2027,7 @@ mod tests {
             ).is_err(), "invalid done={done}");
         }
         for (base, count, capacity) in [(0, 3, 0), (0, 3, 3), (1280, 3, 1280),
-                                       (0, 2, 1280), (0, 5, 1280)] {
+                                       (0, 1, 1280), (0, 5, 1280)] {
             assert!(RenderQueueWindow::new(base, count, capacity).is_err());
         }
     }
@@ -1884,26 +2084,29 @@ mod tests {
 
     #[test]
     fn halted_slot_gate_rejects_every_wrong_state_or_identity() {
-        let valid = G17PHaltedSlot0Gate {
+        let valid = G17PHaltedSlotGate {
             handshake_state: 1, epoch: 7, expected_epoch: 7,
             report_state: 2, host_requested: 0, slot_present: 1, slot: 0,
             data_master_present: 1, data_master: 1,
         };
         assert!(valid.allows_generic_sample());
         assert!(valid.allows_dm1_progress_sample());
-        let dm0 = G17PHaltedSlot0Gate { data_master: 0, ..valid };
+        for slot in 0..16 {
+            assert!(G17PHaltedSlotGate { slot, ..valid }.allows_dm1_progress_sample());
+        }
+        let dm0 = G17PHaltedSlotGate { data_master: 0, ..valid };
         assert!(dm0.allows_generic_sample());
         assert!(!dm0.allows_dm1_progress_sample());
         for wrong in [
-            G17PHaltedSlot0Gate { handshake_state: 0, ..valid },
-            G17PHaltedSlot0Gate { handshake_state: 2, ..valid },
-            G17PHaltedSlot0Gate { epoch: 8, ..valid },
-            G17PHaltedSlot0Gate { report_state: 0, ..valid },
-            G17PHaltedSlot0Gate { host_requested: 1, ..valid },
-            G17PHaltedSlot0Gate { slot_present: 0, ..valid },
-            G17PHaltedSlot0Gate { slot: 1, ..valid },
-            G17PHaltedSlot0Gate { data_master_present: 0, ..valid },
-            G17PHaltedSlot0Gate { data_master: 2, ..valid },
+            G17PHaltedSlotGate { handshake_state: 0, ..valid },
+            G17PHaltedSlotGate { handshake_state: 2, ..valid },
+            G17PHaltedSlotGate { epoch: 8, ..valid },
+            G17PHaltedSlotGate { report_state: 0, ..valid },
+            G17PHaltedSlotGate { host_requested: 1, ..valid },
+            G17PHaltedSlotGate { slot_present: 0, ..valid },
+            G17PHaltedSlotGate { slot: 16, ..valid },
+            G17PHaltedSlotGate { data_master_present: 0, ..valid },
+            G17PHaltedSlotGate { data_master: 2, ..valid },
         ] {
             assert!(!wrong.allows_generic_sample());
             assert!(!wrong.allows_dm1_progress_sample());
@@ -2686,4 +2889,12 @@ mod tests {
             Err(CompletionDecodeError::PublishedPrefixBeyondWrite)
         );
     }
+}
+
+/// B1 23230..23274 uses 128 static TA callbacks, stride 0x38. Accept
+/// only exact object starts, never an arbitrary firmware-supplied pointer.
+pub(crate) fn g17p_ta_callback_index(pointer: u64) -> Option<usize> {
+    let offset = pointer.checked_sub(0xffff_fc00_0005_9948)?;
+    if offset >= 128 * 0x38 || offset % 0x38 != 0 { return None; }
+    Some((offset / 0x38) as usize)
 }

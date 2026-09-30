@@ -29,7 +29,7 @@ control = "--negative-control" in sys.argv
 if control:
     # Put the lookup back after the first mutation.
     resources = resources.replace(
-        "if let Err(error) = self.address_space.uat.require_t8140_vm_context(vm) {",
+        "if let Err(error) = uat.require_t8140_vm_context(vm) {",
         "if false {")
 
 
@@ -43,16 +43,15 @@ def item(text: str, marker: str) -> str:
     return text[start:pos]
 
 
-ctor = item(resources, "    pub(crate) fn new_user_render_storage(")
+ctor = item(resources[resources.index("impl G17PUninstalledRenderGraph {"):], "    pub(crate) fn build(")
 
 # --- the lookup runs before ANY mutation of the VM ------------------------
 guard = ctor.index("require_t8140_vm_context(vm)")
 for mutation in (
     "vm.clear_render_pool_mappings(",
-    "stage_user_render_flist(",
+    "G17PUserRenderStorage::new(",
     "install_t8140_job_context_aliases(vm)",
-    "vm.append_driver_mappings(",
-    "flush_t8140_vm_contexts(vm)",
+
 ):
     assert guard < ctor.index(mutation), mutation
 
@@ -62,7 +61,8 @@ assert "return Err(error);" in refusal
 assert "vm.status().record(error.to_errno());" in refusal
 
 # --- the late path records the same permanent condition -------------------
-tail = ctor[ctor.index("if let Err(error) = finish {"):]
+commit = item(resources, "    pub(crate) fn finish_user_render_storage(")
+tail = commit[commit.index("if let Err(error) = finish {"): ]
 assert "if error == ENOENT" in tail
 assert "vm.status().record(error.to_errno());" in tail
 

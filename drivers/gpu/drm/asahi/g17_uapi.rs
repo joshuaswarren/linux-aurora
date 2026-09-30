@@ -60,7 +60,10 @@ const RENDER_FLAGS: u32 = RENDER_VERTEX_SCRATCH
     | RENDER_PROCESS_EMPTY_TILES
     | RENDER_NO_VERTEX_CLUSTERING
     | RENDER_RSRC_SPEC_HI
-    | RENDER_DBIAS_IS_INT;
+    | RENDER_DBIAS_IS_INT
+    // Private, opt-in matched-workload diagnostic. Ordinary builds reject it.
+    | if cfg!(g17p_aux_fb_small_probe) { 1 << 31 } else { 0 }
+    | if cfg!(g17p_mcache_aperture_probe) { 1 << 30 } else { 0 };
 
 const SAMPLER_SIZE: u64 = 8;
 const MAX_SAMPLERS: u32 = 1024;
@@ -673,9 +676,11 @@ pub(crate) struct TranslatedRenderCommand {
     pub(crate) render_order: g17_submission::G17PRenderOrder,
     /// Original UAPI render index, retained through admission.
     pub(crate) render_barrier: u16,
-    /// UAPI CDM barrier. Cross-engine ordering is currently enforced by the
-    /// scheduler dependency, but retain the exact request with the packet.
+    /// Original UAPI compute index, retained through admission.
     pub(crate) compute_barrier: u16,
+    /// Exact compute prefix resolved at ioctl admission. Later independent
+    /// compute commands must not become parents of this render.
+    pub(crate) compute_wait_through: Option<u64>,
     pub(crate) flags: u32,
     pub(crate) vdm_base: u64,
     pub(crate) parameters: G17pRenderParameters,
@@ -951,6 +956,7 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
         render_order: g17_submission::G17PRenderOrder::default(),
         render_barrier: UAPI_BARRIER_NONE,
         compute_barrier: UAPI_BARRIER_NONE,
+        compute_wait_through: None,
         flags: command.flags,
         vdm_base: command.vdm_base,
         parameters,
@@ -985,6 +991,8 @@ pub(crate) fn build_render_descriptors(
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedComputeCommand {
+    /// Monotonic logical index, independent of the hardware timestamp.
+    pub(crate) compute_sequence: u64,
     pub(crate) render_wait_through: Option<u64>,
     pub(crate) render_wait_last: Option<u64>,
     pub(crate) usc_exec_base: u64,
@@ -1064,6 +1072,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         None
     };
     Ok(TranslatedComputeCommand {
+        compute_sequence: 0,
         render_wait_through: None,
         render_wait_last: None,
         usc_exec_base: queue.base,

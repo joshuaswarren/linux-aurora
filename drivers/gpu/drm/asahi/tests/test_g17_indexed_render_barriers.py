@@ -96,15 +96,16 @@ fn encoded(dependency:G17PClBarrierDependency) -> u64 {
     let mut leases=super::G17PQueueLeaseState::default();
     leases.render_owner[4]=7; leases.render_owner[5]=7;
     let mut live=Vec::new();
+    let capacity=2*super::g17_resources::G17P_RENDER_MAX_IN_FLIGHT;
     for sequence in 1..=64 {
-        if live.len()==2 { let (slot,_)=live.remove(0); leases.release_render_slot(slot); }
+        if live.len()==capacity { let (slot,_)=live.remove(0); leases.release_render_slot(slot); }
         let slot=leases.acquire_render_slot(7).unwrap(); live.push((slot,sequence));
-        assert!(live.len()<=2);
+        assert!(live.len()<=capacity);
     }
     let order=g17p_render_order(0,64,64).unwrap();
-    assert_eq!(live.len(),2);
-    assert_eq!(live.iter().filter(|(slot,n)|native(order,*n,*slot+7,*n).is_some()).count(),2);
-    // Admission of the next command cannot create a third live physical pair.
+    assert_eq!(live.len(),capacity);
+    assert_eq!(live.iter().filter(|(slot,n)|native(order,*n,*slot+7,*n).is_some()).count(),capacity);
+    // Full depth cannot create a third physical pair or overwrite a live slot.
     assert_eq!(leases.acquire_render_slot(7),None);
 }
 #[test] fn compute_prefix_covers_independent_renders_across_ioctl_zero_snapshot() {
@@ -138,7 +139,8 @@ fn encoded(dependency:G17PClBarrierDependency) -> u64 {
 live = (root / 'g17_live_boot.rs').read_text()
 manager = (root / 'g17_manager.rs').read_text()
 assert 'completion.predecessor_dependency(predecessor)?' in live
-assert 'self.pending_render.iter(), self.pending_render_queued.iter(),' in live
+assert 'self.pending_render.iter().flatten(),' in live
+assert 'self.pending_render_queued.iter().flatten(),' in live
 assert 'get_mut(dependency_count).ok_or(EOVERFLOW)?' in live
 assert '&render_dependencies[..dependency_count]' in live
 assert 'command.render_barrier != g17_uapi::UAPI_BARRIER_NONE' not in manager

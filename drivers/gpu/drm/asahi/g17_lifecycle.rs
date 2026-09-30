@@ -289,12 +289,14 @@ pub(crate) trait DriverUnbindQuiesce {
     fn disarm_ingress(&self);
     fn cancel_event_work(&self);
     fn cancel_recovery_work(&self);
+    fn cancel_reclaim_work(&self);
 }
 
 pub(crate) fn quiesce_driver_unbind<T: DriverUnbindQuiesce>(owner: &T) {
     owner.disarm_ingress();
     owner.cancel_event_work();
     owner.cancel_recovery_work();
+    owner.cancel_reclaim_work();
 }
 
 /// Start GFX then GFX1, run `body`, and stop GFX1 then GFX.
@@ -333,6 +335,7 @@ mod tests {
         Disarm,
         CancelEvent,
         CancelRecovery,
+        CancelReclaim,
     }
 
     struct MockUnbind {
@@ -355,6 +358,11 @@ mod tests {
             assert!(!self.armed.get());
             self.trace.borrow_mut().push(UnbindEvent::CancelRecovery);
         }
+
+        fn cancel_reclaim_work(&self) {
+            assert!(!self.armed.get());
+            self.trace.borrow_mut().push(UnbindEvent::CancelReclaim);
+        }
     }
 
     #[test]
@@ -370,6 +378,7 @@ mod tests {
                 UnbindEvent::Disarm,
                 UnbindEvent::CancelEvent,
                 UnbindEvent::CancelRecovery,
+                UnbindEvent::CancelReclaim,
             ]
         );
     }

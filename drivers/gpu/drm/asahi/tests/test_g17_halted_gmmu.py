@@ -41,7 +41,7 @@ assert "storage.descriptor_context_id() == u16::from(descriptor_context_id)" in 
 # Context-retirement owners no longer have storage, so their retained root slot
 # is the only identity still available and is expected in those two branches.
 assert selector.count(".root_slot()") == 2
-assert "self.render_bind.as_ref().vm()" not in manager
+assert "self.render_slots.active().bind.as_ref().vm()" not in manager
 assert "snapshot.info_before >> 17" in live
 assert "snapshot.fault_info >> 17" in live
 assert 'then_some((context, "active-compute"))' in live

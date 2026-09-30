@@ -109,7 +109,7 @@ for use in (
     "render_slot,\n                    true,",
     "timeout_deferred_render(\n                        render_slot, submission_id, completion, error,",
 ):
-    assert use in drm_submit, use
+    assert re.sub(r"\s+", "", use) in re.sub(r"\s+", "", drm_submit), use
 
 
 # Execute the real allocator and record/mask encoders instead of a fixed-pair

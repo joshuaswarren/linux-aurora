@@ -93,6 +93,7 @@ fn fixture()->(Manager,Arc<G17PLogicalQueueContext>){
 #[test]fn duplicate_id_or_wrong_vm_rejected(){for duplicate in [true,false]{let(mut m,c)=fixture();if duplicate{m.uat.id=5}else{m.uat.wrong_vm=true}assert!(m.prepare_compute_execution_context(&c,true).is_err());assert_eq!(m.uat.drops.get(),1);}}
 #[test]fn stale_original_rejected_before_allocation(){let(mut m,mut c)=fixture();std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut c.0).unwrap().execution.0).unwrap().current=false;assert!(m.prepare_compute_execution_context(&c,true).is_err());assert_eq!(m.uat.calls.get(),0);}
 '''
+rust += f'\n#[path = "{root / "g17_work_state.rs"}"] mod g17_work_state;\n'
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory)
     source = path / "probe.rs"

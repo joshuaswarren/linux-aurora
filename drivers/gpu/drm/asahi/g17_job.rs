@@ -18,6 +18,11 @@ use kernel::{
 };
 use crate::{driver::AsahiDevice, g17_uapi, mmu};
 
+// Fault-injection build only; this deliberately makes deep heavy rendering
+// exceed the watchdog. It is never a performance setting or default policy.
+const SCHEDULER_TIMEOUT_MS: kernel::time::Msecs =
+    if cfg!(g17p_short_timeout_probe) { 100 } else { 2000 };
+
 /// Host-sealed bytes in a job-private command allocation. The builder consumes
 /// its owning mapping, copies the encoded command, and exposes only its GPU
 /// address afterward. Another job cannot restage this wrapper's allocation.
@@ -82,6 +87,10 @@ pub(crate) struct G17PJobCompletion {
 }
 
 impl G17PJobCompletion {
+    pub(crate) fn work_state(&self) -> Arc<crate::g17_resources::G17PWorkStateLease> {
+        self.aggregate_member.work_state()
+    }
+
     pub(crate) fn new(
         fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
         timestamps: mmu::KernelMapping,
@@ -242,7 +251,7 @@ impl G17PComputeJobPacket {
 
     pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
     pub(crate) fn hardware_queue_id(&self) -> u8 { self.hardware_queue_id }
-    pub(crate) fn context(&self) -> &crate::g17_resources::G17PLogicalQueueContext { &self.context }
+    pub(crate) fn context(&self) -> &Arc<crate::g17_resources::G17PLogicalQueueContext> { &self.context }
     pub(crate) fn command(&self) -> &g17_uapi::TranslatedComputeCommand { &self.command }
     pub(crate) fn command_images(&self) -> &[G17PSealedCommand] { &self.command_images }
     pub(crate) fn input_fences(&self) -> &[Fence] { &self.input_fences }
@@ -258,7 +267,25 @@ impl G17PComputeJobPacket {
 /// until that queue has retired or a proven device-stop boundary is reached.
 /// This follows the legacy driver's per-job VmBind/command/fence contract;
 /// it is not implemented by the single-graph synchronous G17P runtime.
+// Opt-in diagnostic only. Keep renewal bounded so unrelated busy queues
+// cannot hide a permanently stuck fragment indefinitely. At most three extra
+// scheduler intervals; no claim this cap or interval matches Apple's policy.
+fn renew_progress_timeout(previous: &mut Option<(u64, u32)>, renewals: &mut u8,
+                          current: Option<(u64, u32)>) -> bool {
+    let old = *previous;
+    *previous = current;
+    match (old, current) {
+        (Some((old_epoch, old_count)), Some((epoch, count)))
+            if old_epoch == epoch && old_count != count && *renewals < 3 => {
+                *renewals += 1;
+                true
+            }
+        _ => false,
+    }
+}
+
 pub(crate) trait G17PQueueBackend: Send + Sync {
+    fn timeout_progress(&self) -> Option<(u64, u32)> { None }
     fn prepare(&self, packet: &G17PComputeJobPacket) -> Option<Fence>;
     fn publish(&self, packet: Arc<G17PComputeJobPacket>) -> Result<Fence>;
     fn timed_out(&self, packet: Arc<G17PComputeJobPacket>) -> sched::Status;
@@ -268,21 +295,52 @@ pub(crate) trait G17PQueueBackend: Send + Sync {
 pub(crate) struct G17PScheduledJob<B: G17PQueueBackend> {
     backend: Arc<B>,
     packet: Arc<G17PComputeJobPacket>,
+    timeout_progress: Option<(u64, u32)>,
+    timeout_renewals: u8,
 }
 
 impl<B: G17PQueueBackend> sched::JobImpl for G17PScheduledJob<B> {
+    const MANAGED_TIMEOUT_RECOVERY: bool = true;
+    fn false_timeout(job: &mut sched::Job<Self>) -> bool {
+        if !cfg!(g17p_progress_timeout_probe) { return false; }
+        let current = job.backend.timeout_progress();
+        let mut previous = job.timeout_progress;
+        let mut renewals = job.timeout_renewals;
+        let renew = renew_progress_timeout(&mut previous, &mut renewals, current);
+        job.timeout_progress = previous;
+        job.timeout_renewals = renewals;
+        if renew {
+            pr_info!("G17P timeout progress probe: renewal={} snapshot={:?}\n", renewals, current);
+        }
+        renew
+    }
+
     fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
         job.backend.prepare(&job.packet)
     }
 
     fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+        if cfg!(g17p_progress_timeout_probe) {
+            job.timeout_progress = job.backend.timeout_progress();
+        }
         // Return the unsignalled hardware fence immediately. DRM retains the
         // job's immutable packet while other independent queues can publish.
         job.backend.publish(job.packet.clone()).inspect_err(|error| {
             // DRM also signals its finished fence when run_job fails before
             // publication; that failure must be visible through the same API.
+            // A publish that never became firmware-visible obeys the same
+            // VM-poison policy as `note_submission_failure`: only EIO /
+            // ETIMEDOUT / ENODEV mean the device is gone for this VM. EBUSY
+            // (contention), ECANCELED and EINVAL leave a healthy VM, and
+            // recording them here made the client's very next submission
+            // refuse at `stage=vm-status` (measured on Neo 2026-09-26: a
+            // Chromium launch was poisoned this way). The fence still
+            // carries the exact error to this one submission.
+            // A second measured poison at this site: a transient EBUSY from a
+            // TVB pre-grow while the render tracker was busy was recorded
+            // here and retired the whole client.
             if let Ok(completion) = job.packet.completion() {
-                completion.status.record(error.to_errno());
+                completion.status.record_if_device_loss(error.to_errno());
             }
         }).map(Some)
     }
@@ -320,6 +378,13 @@ pub(crate) struct G17PRenderJobPacket {
     completion: Arc<crate::g17_drm::G17PRenderCompletion>,
     publication_state: AtomicU32,
     cancel_requested: AtomicU32,
+    /// v84 early publication from the submit ioctl: 0 not attempted/declined,
+    /// 1 published, 2 failed with `early_errno`. Written once, before the DRM
+    /// scheduler job is pushed, so run_job always observes it.
+    early_state: AtomicU32,
+    early_errno: core::sync::atomic::AtomicI32,
+    /// This packet occupies one unit of its backend's scheduler backlog.
+    backlog_counted: core::sync::atomic::AtomicBool,
 }
 
 impl G17PRenderJobPacket {
@@ -335,8 +400,36 @@ impl G17PRenderJobPacket {
             submission_id, command, input_fences, firmware_fences, completion,
             publication_state: AtomicU32::new(0),
             cancel_requested: AtomicU32::new(0),
+            early_state: AtomicU32::new(0),
+            early_errno: core::sync::atomic::AtomicI32::new(0),
+            backlog_counted: core::sync::atomic::AtomicBool::new(false),
         }, GFP_KERNEL)?)
     }
+
+    /// Record the result of an early (submit-ioctl) publication attempt that
+    /// reached `begin_publication`. Declined attempts record nothing.
+    pub(crate) fn set_early_outcome(&self, result: Result) {
+        match result {
+            Ok(()) => self.early_state.store(1, Ordering::Release),
+            Err(error) => {
+                self.early_errno.store(error.to_errno(), Ordering::Relaxed);
+                self.early_state.store(2, Ordering::Release);
+            }
+        }
+    }
+
+    /// `Some` when the submit ioctl already owned this packet's publication.
+    pub(crate) fn early_outcome(&self) -> Option<Result> {
+        match self.early_state.load(Ordering::Acquire) {
+            1 => Some(Ok(())),
+            2 => Some(Err(Error::from_errno(self.early_errno.load(Ordering::Relaxed)))),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn mark_backlog_counted(&self) { self.backlog_counted.store(true, Ordering::Release); }
+    /// True exactly once for a counted packet.
+    pub(crate) fn take_backlog_counted(&self) -> bool { self.backlog_counted.swap(false, Ordering::AcqRel) }
 
     pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
     pub(crate) fn command(&self) -> &g17_uapi::TranslatedRenderCommand { &self.command }
@@ -377,23 +470,56 @@ impl G17PRenderJobPacket {
 }
 
 pub(crate) trait G17PRenderQueueBackend: Send + Sync {
+    /// Transfer an expired timeout to the exact host transaction currently
+    /// owning its graph. It must classify on return, not at another timer tick.
+    fn defer_timeout_if_borrowed(&self, _packet: &G17PRenderJobPacket) -> bool { false }
+    fn timeout_progress(&self) -> Option<(u64, u32)> { None }
     fn prepare(&self, packet: &G17PRenderJobPacket) -> Option<Fence>;
     fn publish(&self, packet: Arc<G17PRenderJobPacket>) -> Result<Fence>;
     fn timed_out(&self, packet: Arc<G17PRenderJobPacket>) -> sched::Status;
     fn cancel(&self, packet: Arc<G17PRenderJobPacket>);
+    /// v84: publish from the submit ioctl before the job is pushed. Returns
+    /// true when the packet's publication was attempted (success or failure
+    /// is then recorded in the packet); false leaves it for run_job.
+    fn try_publish_early(&self, _packet: &Arc<G17PRenderJobPacket>) -> bool { false }
+    /// v84: account a packet that run_job will publish.
+    fn count_backlog(&self, _packet: &G17PRenderJobPacket) {}
 }
 
 pub(crate) struct G17PRenderScheduledJob<B: G17PRenderQueueBackend> {
     backend: Arc<B>,
     packet: Arc<G17PRenderJobPacket>,
+    timeout_progress: Option<(u64, u32)>,
+    timeout_renewals: u8,
 }
 
 impl<B: G17PRenderQueueBackend> sched::JobImpl for G17PRenderScheduledJob<B> {
+    const MANAGED_TIMEOUT_RECOVERY: bool = true;
+    fn false_timeout(job: &mut sched::Job<Self>) -> bool {
+        // This hook precedes drm_sched_stop. The C core reinserts the job even
+        // if graph return settles its fence before this callback returns.
+        if job.backend.defer_timeout_if_borrowed(&job.packet) { return true; }
+        if !cfg!(g17p_progress_timeout_probe) { return false; }
+        let current = job.backend.timeout_progress();
+        let mut previous = job.timeout_progress;
+        let mut renewals = job.timeout_renewals;
+        let renew = renew_progress_timeout(&mut previous, &mut renewals, current);
+        job.timeout_progress = previous;
+        job.timeout_renewals = renewals;
+        if renew {
+            pr_info!("G17P timeout progress probe: renewal={} snapshot={:?}\n", renewals, current);
+        }
+        renew
+    }
+
     fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
         job.backend.prepare(&job.packet)
     }
 
     fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+        if cfg!(g17p_progress_timeout_probe) {
+            job.timeout_progress = job.backend.timeout_progress();
+        }
         job.backend.publish(job.packet.clone()).map(Some)
     }
 
@@ -416,7 +542,7 @@ impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {
     pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>, credits: u32) -> Result<Self> {
         if credits == 0 { return Err(EINVAL); }
         let scheduler = sched::Scheduler::new(
-            dev.as_ref(), 1, credits, 0, 2000, c_str!("asahi_g17p_render"),
+            dev.as_ref(), 1, credits, 0, SCHEDULER_TIMEOUT_MS, c_str!("asahi_g17p_render"),
         )?;
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
         Ok(Self { entity, _scheduler: scheduler, backend })
@@ -424,6 +550,7 @@ impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {
 
     pub(crate) fn enqueue(
         &mut self, packet: Arc<G17PRenderJobPacket>, dependencies: KVec<Fence>,
+        early_allowed: bool,
     ) -> Result<G17PCommandFences> {
         // Userspace completion must follow the exact hardware retirement
         // fence, not drm_sched's secondary finished wrapper. The scheduler
@@ -433,14 +560,22 @@ impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {
         // completed. Every pre-publication cancellation and failure path
         // signals the packet fence as well, so it is complete on all paths.
         let hardware = packet.fence();
+        let early_packet = early_allowed.then(|| packet.clone());
+        let counted_packet = packet.clone();
         let mut job = self.entity.new_job(1, G17PRenderScheduledJob {
-            backend: self.backend.clone(), packet,
+            backend: self.backend.clone(), packet, timeout_progress: None, timeout_renewals: 0,
         })?;
         for dependency in dependencies { job.add_dependency(dependency)?; }
         let mut job = job.arm();
         let published = job.fences().scheduled();
+        // v84: every fallible scheduler step is done; publish from the ioctl
+        // before push when the backend accepts the packet without waiting.
+        // run_job then returns the recorded outcome and the scheduler keeps
+        // timeout, credit and teardown ownership of the job.
+        let early = early_packet.is_some_and(|packet| self.backend.try_publish_early(&packet));
+        if !early { self.backend.count_backlog(&counted_packet); }
         job.push();
-        Ok(G17PCommandFences { ready: published, completed: hardware })
+        Ok(G17PCommandFences { published, completed: hardware })
     }
 }
 
@@ -448,7 +583,7 @@ impl<B: G17PQueueBackend> G17PJobScheduler<B> {
     pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>, credits: u32) -> Result<Self> {
         if credits == 0 { return Err(EINVAL); }
         let scheduler = sched::Scheduler::new(
-            dev.as_ref(), 1, credits, 0, 2000, c_str!("asahi_g17p_sched"),
+            dev.as_ref(), 1, credits, 0, SCHEDULER_TIMEOUT_MS, c_str!("asahi_g17p_sched"),
         )?;
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
         Ok(Self { entity, _scheduler: scheduler, backend })
@@ -459,22 +594,20 @@ impl<B: G17PQueueBackend> G17PJobScheduler<B> {
     ) -> Result<G17PCommandFences> {
         let hardware = packet.completion()?.fence();
         let mut job = self.entity.new_job(1, G17PScheduledJob {
-            backend: self.backend.clone(), packet,
+            backend: self.backend.clone(), packet, timeout_progress: None, timeout_renewals: 0,
         })?;
         for dependency in dependencies { job.add_dependency(dependency)?; }
         let mut job = job.arm();
         let published = job.fences().scheduled();
         job.push();
-        Ok(G17PCommandFences { ready: published, completed: hardware })
+        Ok(G17PCommandFences { published, completed: hardware })
     }
 }
 
-/// Consumer readiness normally follows scheduler publication. Commands with
-/// user timestamp destinations instead use `completed` for `ready`: retirement
-/// copies the timestamps before signalling that fence. Firmware tokens alone
-/// cannot order those CPU writes. Only `completed` may satisfy user output.
+/// Publication readiness is distinct from GPU retirement. The scheduler signals
+/// `published` after run_job returns; only `completed` may satisfy user output.
 #[derive(Clone)]
 pub(crate) struct G17PCommandFences {
-    pub(crate) ready: Fence,
+    pub(crate) published: Fence,
     pub(crate) completed: Fence,
 }

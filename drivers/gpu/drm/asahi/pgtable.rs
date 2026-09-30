@@ -1193,6 +1193,18 @@ impl LiveFirmwareU64Probe {
         self.page.set_bits_u64(self.offset, bits)
     }
 
+    /// DIAGNOSTIC. Read `out.len()` consecutive qwords from the probed qword
+    /// onwards, within its page, after invalidating their AP cachelines. Not
+    /// an atomic snapshot of the run.
+    pub(crate) fn read_run(&self, out: &mut [u64]) -> Result {
+        let size = out.len().checked_mul(size_of::<u64>()).ok_or(EOVERFLOW)?;
+        self.page.invalidate_live_range(self.offset, size)?;
+        for (index, value) in out.iter_mut().enumerate() {
+            *value = self.page.read_u64(self.offset + index * size_of::<u64>())?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn observe_mask(
         &self,
         mask: u64,

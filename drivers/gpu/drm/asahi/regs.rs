@@ -365,7 +365,7 @@ pub(crate) struct G17PHaltedGmmuSnapshot {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PHaltedSlot0Snapshot {
+pub(crate) struct G17PHaltedSlotSnapshot {
     pub(crate) gpc_state: u32,
     pub(crate) state_before: u64,
     pub(crate) key: u64,
@@ -1268,20 +1268,26 @@ impl Resources {
         let tag = reg | (qid << 43) | tag_flags;
         // The tag store and data load form one ordered transaction. Apple's
         // host uses a device-memory STR/LDR pair; Linux's ordered writeq/readq
-        // provides the corresponding MMIO ordering. Relaxed accesses returned
-        // opaque values for 0x21028 and hid the TA -> 3D dependency frontier.
+        // provides the corresponding MMIO ordering. Even ordered, power-held
+        // reads of 0x21028 returned opaque values on the 2026-09-27 timeout
+        // capture, including queues with proven completed work. Do not treat
+        // this port's 0x21028 value as a validated dependency timestamp yet.
         sgx.try_write64(tag, 0x4090)?;
         sgx.try_read64(0x4098)
     }
 
     /// Caller must own the runtime mutex and have just verified the firmware
-    /// is stopped at the pre-ACK recovery handshake with DM0 or DM1 slot0
+    /// is stopped at the pre-ACK recovery handshake with a valid DM0 or DM1 slot
     /// selected. This is not an admission probe and must never run before
-    /// that halt. `read_dm1_progress` must only be true for a DM1 report.
-    pub(crate) fn g17p_halted_slot0_snapshot(
+    /// that halt. `data_master` selects the native DM0 or DM1 read table.
+    pub(crate) fn g17p_halted_slot_snapshot(
         &self,
-        read_dm1_progress: bool,
-    ) -> Result<Option<G17PHaltedSlot0Snapshot>> {
+        slot: u32,
+        data_master: u32,
+    ) -> Result<Option<G17PHaltedSlotSnapshot>> {
+        // B1 0x8794..0x8828 walks hardware selectors 0..15.
+        if slot >= 16 { return Err(EINVAL); }
+        let reads = crate::g17_completion::g17p_monitor_reads(data_master).ok_or(EINVAL)?;
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let _guard = self.sksm_fifo.lock();
         // The GPC summary is in the always-on range. A halted firmware need
@@ -1291,39 +1297,29 @@ impl Resources {
             return Ok(None);
         }
         // B1 FUN_6a20 uses the bit42 namespace for c020, but not c078.
-        // Index 0 is a hardware SLOT, never the fragment's physical QID.
+        // The firmware-selected index is a SLOT, never a physical QID.
         // The host port at4090 is distinct from B1's seven thread ports
         // (4080,40a0,40b0,40c0,40d0,40e0,40f0; table45c78).
-        let state_before = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
-        let key = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;
+        let state_before = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, u64::from(slot), 1u64 << 42)?;
+        let key = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, u64::from(slot), 0)?;
         let mut progress = [0u64; 8];
         let mut progress_count = 0;
         let mut progress_errno = 0;
-        if read_dm1_progress {
-            if let Some(selector) =
-                crate::g17_completion::g17p_dm1_monitor_selector_index(state_before)
-            {
-                // These are the eight reads B1 FUN_6a20 performs for DM1,
-                // through the selected progress port. Do not write10400/10408
-                // or touch any bank absent from the native sample table.
-                for (index, (register, flags)) in crate::g17_completion::G17P_DM1_MONITOR_READS
-                    .iter().enumerate()
-                {
-                    match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
-                        Ok(value) => {
-                            progress[index] = value;
-                            progress_count += 1;
-                        }
-                        Err(error) => {
-                            progress_errno = error.to_errno();
-                            break;
-                        }
-                    }
+        if let Some(selector) =
+            crate::g17_completion::g17p_dm1_monitor_selector_index(state_before)
+        {
+            // FUN6a20 uses the same selector predicate for both render
+            // engines. Read only that engine's native table, without wakes
+            // or additional writes to the sampled register banks.
+            for (index, (register, flags)) in reads.iter().enumerate() {
+                match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
+                    Ok(value) => { progress[index] = value; progress_count += 1; }
+                    Err(error) => { progress_errno = error.to_errno(); break; }
                 }
             }
         }
-        let state_after = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
-        Ok(Some(G17PHaltedSlot0Snapshot {
+        let state_after = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, u64::from(slot), 1u64 << 42)?;
+        Ok(Some(G17PHaltedSlotSnapshot {
             gpc_state,
             state_before,
             key,
@@ -1354,6 +1350,24 @@ impl Resources {
             *word = registers.try_read32(base + index * 4)?;
         }
         Ok(())
+    }
+
+    /// Explicit bounded diagnostic: native reads completion counts without
+    /// acknowledgement (B1 deb8..df68). Never wakes the GPU or writes ACK.
+    pub(crate) fn g17p_completion_pending_snapshot(&self) -> Result<[u64; 2]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let _guard = self.sksm_fifo.lock();
+        // Final powered witness is UNDER the same lock as both tag/data reads.
+        // The GPC summary is always-on. No power request, polling or retry.
+        if sgx.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf == 0 {
+            return Err(EAGAIN);
+        }
+        Ok([
+            Self::g17p_sksm_port_read_locked(
+                &sgx, T8140_KSM_WORK_CHANNEL_0, 0, 1u64 << 42)?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx, T8140_KSM_WORK_CHANNEL_2, 0, 1u64 << 42)?,
+        ])
     }
 
     pub(crate) fn g17p_render_ksm_admission_snapshot(

@@ -26,6 +26,8 @@ mod module_parameters {
 mod g17_submission { pub const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u32 = 0; }
 '''
 names = [
+    "tpc_extent_survives_cold_and_retained_descriptor_construction",
+    "rce_boundaries_survive_retained_descriptor_rebuilds",
     "shared_usc_flist_id_drives_both_stage_registers_independently_of_pm_id",
     "descriptor_context_and_state_word_drive_every_native_work_key",
     "fragment_parameter_buffer_owner_is_independent_of_perf_map_and_tail",
@@ -66,6 +68,33 @@ fn changing_pb_owner_changes_only_the_fragment_rce_owner_value() {
     }
 }
 '''
+    source += r'''
+#[test]
+fn fragment_ptc_probe_changes_only_ptc_high_word() {
+    use g17_render::*;
+    for dimension in [32, 512, 1024] {
+        let mut p = G17pRenderParameters::source_rsrc8();
+        p.width = dimension; p.height = dimension;
+        p.native_ta_registers = 0;
+        let ta = build_ta_registers(&p).unwrap();
+        let frag = build_fragment_registers(&p).unwrap();
+        p.native_ta_registers = 8;
+        assert_eq!(ta, build_ta_registers(&p).unwrap());
+        let changed = build_fragment_registers(&p).unwrap();
+        let mut deltas = 0;
+        for (before, after) in frag.iter().zip(changed.iter()) {
+            assert_eq!(before.number, after.number);
+            if before != after {
+                deltas += 1;
+                assert_eq!(before.number, 0x0a5a9);
+                assert_eq!(before.value, 0x0000006000400020);
+                assert_eq!(after.value, 0x000000d500400020);
+            }
+        }
+        assert_eq!(deltas, 1);
+    }
+}
+'''
     subprocess.run(["rustc", "-Awarnings", "--edition=2021", "--test", "-", "-o", exe],
                    input=with_g17_config(source), text=True, check=True)
     listing = subprocess.check_output([exe, "--list"], text=True)
@@ -79,4 +108,5 @@ fn changing_pb_owner_changes_only_the_fragment_rce_owner_value() {
         for name in names:
             subprocess.run([exe, "g17_render::tests::" + name, "--exact"], check=True)
         subprocess.run([exe, "changing_pb_owner_changes_only_the_fragment_rce_owner_value", "--exact"], check=True)
+        subprocess.run([exe, "fragment_ptc_probe_changes_only_ptc_high_word", "--exact"], check=True)
 print("actual PB-owner builders, exact delta and independent hardware-tail sources PASS")

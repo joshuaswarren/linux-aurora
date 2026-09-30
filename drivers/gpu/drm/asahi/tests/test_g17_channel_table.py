@@ -41,6 +41,7 @@ const EOVERFLOW: Error = Error::Overflow;
 const ENOSPC: Error = Error::NoSpace;
 const EINVAL: Error = Error::Invalid;
 const EIO: Error = Error::Io;
+const ENODEV: Error = Error::Invalid;
 type Result<T> = core::result::Result<T, Error>;
 const G17P_COMPUTE_QUEUE_ID_BASE: u8 = 4;
 {item('fn g17p_reserve_bootstrap_channels(')}
@@ -56,6 +57,7 @@ struct Manager {{ channel_ids: g17_channel::ChannelTable, next_channel_identity:
     render_channel_leases:[Option<[g17_channel::Lease;2]>;64] }}
 impl Manager {{ {item('fn allocate_compute_queue_id(')}
     {item('pub(crate) fn render_queue_pair(')}
+    {item('fn retained_render_queue_pair(')}
     {item('pub(crate) fn render_slot_for_qid(')}
 }}
 fn manager() -> Manager {{

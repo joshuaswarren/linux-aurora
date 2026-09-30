@@ -44,7 +44,7 @@ assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_ENABLE_IDLE" in release
 # registration precondition fails. The old ordering moved this owner only
 # after outer publication, leaving storage-without-root and poisoning the next
 # attempt with EBUSY.
-bind_install = construct.index("self.render_bind = Some(G17PRenderRootOwner::Job")
+bind_install = construct.index("self.render_slots.get_mut(pair_slot).bind = Some(G17PRenderRootOwner::Job")
 direct = construct.index("self.configure_fresh_nonbootstrap_render_pair(")
 outer = construct.index(".publish_partial_opening_pair(")
 assert bind_install < direct < outer

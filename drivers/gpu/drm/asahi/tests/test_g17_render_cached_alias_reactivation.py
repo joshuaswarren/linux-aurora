@@ -64,10 +64,10 @@ assert "self.render_state.with_bytes_mut(" in restage
 assert "const G17P_RENDER_STATE_AUX_FB: usize = G17P_RENDER_STATE_DYNAMIC" in resources
 assert "(scene_scratch, discard, tvb, after_aux_fb)" in resources
 for owner in (
-    "self.render_storage",
+    "self.render_slots.active()",
     "retired_render_handoff_graph",
     "retired_render_handoff_graphs",
-    "self.parked_render_slots",
+    "self.render_slots.parked()",
 ):
     assert owner in lookup
 

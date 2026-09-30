@@ -702,6 +702,62 @@ const PAGETABLES_SIZE: usize = UAT_PGSZ;
 // changes without walking every retained PTE on each submission.
 const MAPPING_VALIDATION_HISTORY: usize = 128;
 
+/// Read-mostly mapping proof version. Writers hold this VM's GPUVM exec lock;
+/// nested leaf helpers keep the version unavailable until the outermost exits.
+/// u64::MAX permanently refuses cached proofs after epoch overflow.
+struct MappingValidationState {
+    visible: AtomicU64,
+    pending: AtomicU64,
+    writers: AtomicU32,
+}
+
+impl MappingValidationState {
+    fn new() -> Self {
+        Self { visible: AtomicU64::new(0), pending: AtomicU64::new(0),
+            writers: AtomicU32::new(0) }
+    }
+
+    fn begin(&self) {
+        self.writers.fetch_add(1, Ordering::Relaxed);
+        // Acquire orders the following leaf writes after invalidation; Release
+        // orders any previous transaction before this one becomes unavailable.
+        self.visible.swap(u64::MAX, Ordering::AcqRel);
+    }
+
+    fn record(&self, epoch: Option<u64>) {
+        self.pending.store(epoch.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    fn finish(&self) {
+        if self.writers.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.visible.store(self.pending.load(Ordering::Relaxed), Ordering::Release);
+        }
+    }
+
+    fn snapshot(&self) -> Option<u64> {
+        let epoch = self.visible.load(Ordering::Acquire);
+        (epoch != u64::MAX).then_some(epoch)
+    }
+}
+
+/// Must be dropped before releasing the corresponding GPUVM exec lock, also
+/// on partial failure. It owns no PTEs and cannot authorize mapping changes.
+#[must_use = "retain the mutation guard until leaf writes and invalidations finish"]
+struct MappingValidationMutation(Option<Arc<MappingValidationState>>);
+
+impl MappingValidationMutation {
+    fn new(state: Option<Arc<MappingValidationState>>) -> Self {
+        if let Some(state) = state.as_ref() { state.begin(); }
+        Self(state)
+    }
+}
+
+impl Drop for MappingValidationMutation {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.as_ref() { state.finish(); }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MappingValidationChange {
     epoch: u64,
@@ -719,6 +775,7 @@ struct VmInner {
     /// GPUVM exec lock is held. A failed attempt may invalidate a cached
     /// reachability result conservatively. Overflow disables caching.
     mapping_validation_epoch: Option<u64>,
+    mapping_validation: Option<Arc<MappingValidationState>>,
     mapping_validation_changes: Option<KBox<[Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY]>>,
     mm: mm::Allocator<(), KernelMappingInner>,
     uat_inner: Arc<UatInner>,
@@ -727,7 +784,8 @@ struct VmInner {
 }
 
 impl VmInner {
-    fn note_mapping_validation_change(&mut self, range: Range<u64>) {
+    fn note_mapping_validation_change(&mut self, range: Range<u64>) -> MappingValidationMutation {
+        let mutation = MappingValidationMutation::new(self.mapping_validation.clone());
         self.mapping_validation_epoch = self.mapping_validation_epoch
             .and_then(|epoch| epoch.checked_add(1));
         // A PTE covers the whole page. Record that leaf even if the caller's
@@ -749,6 +807,10 @@ impl VmInner {
                     end: end.unwrap(),
                 });
         }
+        if let Some(state) = self.mapping_validation.as_ref() {
+            state.record(self.mapping_validation_epoch);
+        }
+        mutation
     }
 }
 
@@ -870,7 +932,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         // GPUVM cannot see driver-owned KernelMappings.  Preflight the full
         // object range in the authoritative page table and allocate every
         // intermediate table before the first scatterlist leaf is written.
-        self.note_mapping_validation_change(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?);
+        let _validation_change = self.note_mapping_validation_change(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?);
         self.page_table
             .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
 
@@ -990,7 +1052,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         let va = op.va().expect("step_unmap: missing VA");
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
 
-        self.note_mapping_validation_change(va.addr()..va.addr().checked_add(va.range()).ok_or(EOVERFLOW)?);
+        let _validation_change = self.note_mapping_validation_change(va.addr()..va.addr().checked_add(va.range()).ok_or(EOVERFLOW)?);
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
@@ -1035,7 +1097,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let unmap_range = unmap_end - unmap_start;
 
-        self.note_mapping_validation_change(unmap_start..unmap_end);
+        let _validation_change = self.note_mapping_validation_change(unmap_start..unmap_end);
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
         self.tlbi_live_contexts(unmap_start, unmap_range);
@@ -1129,7 +1191,7 @@ impl VmInner {
             .ok_or(EOVERFLOW)?;
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
-        self.note_mapping_validation_change(iova..mapping_end);
+        let _validation_change = self.note_mapping_validation_change(iova..mapping_end);
         self.page_table.prepare_map(iova..mapping_end)?;
         let guard = node.bo.as_ref().ok_or(EINVAL)?.get()?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
@@ -1204,10 +1266,14 @@ impl VmInner {
 #[derive(Clone)]
 pub(crate) struct Vm {
     id: u64,
+    mapping_validation: Option<Arc<MappingValidationState>>,
     inner: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
     driver_mappings: Arc<Mutex<Option<VmDriverMappings>>>,
+    /// Only the lazy, VM-wide context alias installation transaction. Pair
+    /// graph allocation and command preparation never take this gate.
+    t8140_context_alias_install: Option<Arc<Mutex<()>>>,
     job_lifetime: Arc<Mutex<T8140VmJobLifetime>>,
     mapping_gate: Arc<T8140VmMappingGate>,
     status: Arc<crate::g17_status::VmStatus>,
@@ -1577,6 +1643,7 @@ impl Clone for VmBind {
 struct T8140ContextRootLease {
     inner: Arc<UatInner>,
     context_id: u8,
+    generation: u8,
     low: u64,
     high: u64,
 }
@@ -1590,6 +1657,7 @@ no_debug!(T8140AppContextLease);
 
 impl T8140AppContextLease {
     pub(crate) fn context_id(&self) -> u32 { u32::from(self.root.context_id) }
+    pub(crate) fn generation(&self) -> u8 { self.root.generation }
     pub(crate) fn matches(&self, bind: &VmBind) -> bool {
         self._bind.matches(&bind.0) && self._bind.root() == bind.root()
     }
@@ -1610,6 +1678,9 @@ no_debug!(T8140ComputeExecutionContext);
 
 impl T8140ComputeExecutionContext {
     pub(crate) fn context_id(&self) -> u32 { u32::from(self.root.context_id) }
+    /// Native ContextIDManager increments this byte on allocation/reassignment,
+    /// not on submission. Every engine using this lease carries the same byte.
+    pub(crate) fn generation(&self) -> u8 { self.root.generation }
     pub(crate) fn vm(&self) -> &Vm { &self.vm }
     pub(crate) fn root(&self) -> u64 { self.vm.ttb() }
     pub(crate) fn vm_id(&self) -> u64 { self.vm.id }
@@ -1812,6 +1883,67 @@ impl KernelMapping {
         )
     }
 
+    /// v90: give the first `prefix` bytes of a fresh, unpublished kernel
+    /// mapping the firmware-cached attribute (UAT memattr 0), as native maps
+    /// its pooled command objects (bit41 option 0x20900000084). The mapping's
+    /// recorded `prot` stays uncached, so a later drop never enters the
+    /// unsupported G17 fwctl flush; the caller owns that lifecycle (pooled
+    /// reuse, never an early unmap). Every PTE is read back: the prefix may
+    /// differ only in attribute bit 3, all other PTEs must be byte-identical.
+    /// Returns `(proof, mutated)`; on error `mutated` says whether a PTE may
+    /// already carry the cached attribute (then the caller must never
+    /// release the mapping for reuse or unmap it early).
+    ///
+    /// # Safety
+    /// No pointer into this mapping may have been published to firmware/GPU.
+    pub(crate) unsafe fn set_fw_cached_prefix(&self, prefix: usize) -> (Result<[u64; 2]>, bool) {
+        let mut mutated = false;
+        let result = (|| {
+            if !self.0.uat_inner.t8140 || self.size() == 0 || prefix == 0 || prefix > self.size()
+                || (prefix | self.size()) & (UAT_PGSZ - 1) != 0
+                || self.size() > 32 * UAT_PGSZ {
+                return Err(EINVAL);
+            }
+            let mut owner = self.0.owner.exec_lock(None, false)?;
+            if !owner.is_kernel { return Err(EINVAL); }
+            let pages = self.size() / UAT_PGSZ;
+            let cached_pages = prefix / UAT_PGSZ;
+            let mut before = [0u64; 32];
+            for (index, value) in before[..pages].iter_mut().enumerate() {
+                let start = self.iova() + (index * UAT_PGSZ) as u64;
+                let mut ranges = [pgtable::MappedRange::default(); 1];
+                let (count, truncated) = owner.page_table.collect_mapped_ranges(
+                    start..start + UAT_PGSZ as u64, &mut ranges)?;
+                if count != 1 || truncated || (ranges[0].pte >> 2) & 7 != 2 {
+                    return Err(EINVAL);
+                }
+                *value = ranges[0].pte;
+            }
+            let range = self.iova()..self.iova() + prefix as u64;
+            let _validation = owner.note_mapping_validation_change(range.clone());
+            mutated = true;
+            owner.page_table.reprot_pages(range, PROT_GPU_FW_PRIV_RW)?;
+            fence(Ordering::SeqCst);
+            mem::tlbi_all();
+            mem::sync();
+            let mut after = [0u64; 32];
+            for (index, value) in after[..pages].iter_mut().enumerate() {
+                let start = self.iova() + (index * UAT_PGSZ) as u64;
+                let mut ranges = [pgtable::MappedRange::default(); 1];
+                let (count, truncated) = owner.page_table.collect_mapped_ranges(
+                    start..start + UAT_PGSZ as u64, &mut ranges)?;
+                if count != 1 || truncated { return Err(EFAULT); }
+                *value = ranges[0].pte;
+            }
+            for index in 0..pages {
+                let expected_xor = if index < cached_pages { 8 } else { 0 };
+                if before[index] ^ after[index] != expected_xor { return Err(EFAULT); }
+            }
+            Ok([after[0], after[cached_pages.min(pages - 1)]])
+        })();
+        (result, mutated)
+    }
+
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
     /// coprocessor cache. This is required to safely unmap cached/private mappings.
     fn remap_uncached_and_flush(&mut self) {
@@ -1831,7 +1963,7 @@ impl KernelMapping {
         // Remap in-place as uncached.
         // Do not try to unmap the guard page (-1)
         let prot = self.0.prot.as_uncached();
-        owner.note_mapping_validation_change(self.iova_range());
+        let _validation_change = owner.note_mapping_validation_change(self.iova_range());
         if owner
             .page_table
             .reprot_pages(self.iova_range(), prot)
@@ -2000,7 +2132,7 @@ impl Drop for KernelMapping {
             self.size()
         );
 
-        owner.note_mapping_validation_change(self.iova_range());
+        let _validation_change = owner.note_mapping_validation_change(self.iova_range());
         if owner.page_table.unmap_pages(self.iova_range()).is_err() {
             dev_err!(
                 owner.dev.as_ref(),
@@ -2087,6 +2219,9 @@ struct UatInner {
     /// claimed before their TTBAT roots become visible and released only
     /// after lease teardown invalidates the corresponding ASID.
     t8140_app_contexts: AtomicU64,
+    /// Per-ID allocation history survives lease release. Native wraps through
+    /// zero; this byte is not a validity flag or the queue's submission count.
+    t8140_context_generations: [AtomicU8; UAT_NUM_CTX],
     /// T8140 publishes one page-table root in contexts other than a VM's bind
     /// slot, so unmapping must invalidate every context naming that root.
     t8140: bool,
@@ -2367,8 +2502,14 @@ impl Vm {
             None
         };
         let binding_clone = binding.clone();
+        let mapping_validation = if cfg == UatConfig::T8140 {
+            Some(Arc::new(MappingValidationState::new(), GFP_KERNEL)?)
+        } else {
+            None
+        };
         Ok(Vm {
             id,
+            mapping_validation: mapping_validation.clone(),
             dummy_obj: dummy_obj.gem.clone(),
             inner: gpuvm::GpuVm::new(
                 c_str!("Asahi::GpuVm"),
@@ -2384,6 +2525,7 @@ impl Vm {
                     is_kernel,
                     page_table,
                     mapping_validation_epoch: Some(0),
+                    mapping_validation,
                     mapping_validation_changes,
                     mm,
                     uat_inner,
@@ -2409,6 +2551,11 @@ impl Vm {
                 }),
                 GFP_KERNEL,
             )?,
+            t8140_context_alias_install: if cfg == UatConfig::T8140 {
+                Some(Arc::pin_init(new_mutex!((), "T8140ContextAliasInstall"), GFP_KERNEL)?)
+            } else {
+                None
+            },
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
                     new_mutex!(
@@ -2605,6 +2752,18 @@ impl Vm {
         Ok(())
     }
 
+    /// Keep validation, mapping and permanent retention in one VM-local
+    /// transaction. A competing pair must never accept a tentative mapping
+    /// whose owner can still be dropped by a failed builder. Failure drops
+    /// the unpublished aliases before this guard permits the next builder.
+    fn retain_job_context_aliases(
+        &self,
+        build: impl FnOnce() -> Result<KVec<KernelMapping>>,
+    ) -> Result {
+        let _install = self.t8140_context_alias_install.as_ref().ok_or(EINVAL)?.lock();
+        self.append_driver_mappings(build()?)
+    }
+
     /// Whether this VM already retains aliases of the exact render-pool
     /// generation. The caller allocates pool IDs monotonically, never from a
     /// recyclable GPU address, so a new firmware session cannot reuse stale
@@ -2684,6 +2843,22 @@ impl Vm {
             let mut retained = self.driver_mappings.lock();
             Option::as_mut(&mut *retained)
                 .and_then(|driver| driver.render_pools.get_mut(render_slot as usize))
+                .and_then(Option::take)
+        };
+        drop(previous);
+    }
+
+    /// Retire only the named graph's aliases. A delayed teardown or failed
+    /// install must not remove a successor that already owns the same pair.
+    /// Keep the identity check and removal in one mapping-cache transaction;
+    /// unmapping still happens after releasing that lock.
+    pub(crate) fn clear_render_pool_mappings_if_owner(&self, render_slot: u8, pool_id: u64) {
+        if pool_id == 0 { return; }
+        let previous = {
+            let mut retained = self.driver_mappings.lock();
+            Option::as_mut(&mut *retained)
+                .and_then(|driver| driver.render_pools.get_mut(render_slot as usize))
+                .filter(|pool| pool.as_ref().is_some_and(|owner| owner.pool_id == pool_id))
                 .and_then(Option::take)
         };
         drop(previous);
@@ -2908,6 +3083,31 @@ impl Vm {
         Self::covers_range_locked(&mut inner, address, size, need_read, need_write)
     }
 
+    /// v91 VALIDATE_PROOF: evaluate several `(address, size, read, write)`
+    /// coverage predicates against one consistent page-table snapshot, i.e.
+    /// under a single GPUVM exec lock instead of one per range, and return the
+    /// mapping-validation epoch read under that same lock. Every predicate is
+    /// the exact `covers_range_locked` test `covers_range` applies. Writers
+    /// hold the exec lock and publish the epoch before releasing it, so the
+    /// returned epoch names exactly the snapshot that was validated (`None`
+    /// when this VM keeps no epoch or it overflowed).
+    /// `ranges` holds `(address, size, access)` with access bit0 = read and
+    /// bit1 = write.
+    pub(crate) fn covers_ranges_batch(
+        &self,
+        ranges: &[(u64, u64, u8)],
+    ) -> (bool, Option<u64>) {
+        let mut inner = match self.inner.exec_lock(None, false) {
+            Ok(inner) => inner,
+            Err(_) => return (false, None),
+        };
+        let epoch = inner.mapping_validation_epoch;
+        let covered = ranges.iter().all(|&(address, size, access)| {
+            Self::covers_range_locked(&mut inner, address, size, access & 1 != 0, access & 2 != 0)
+        });
+        (covered, epoch)
+    }
+
     /// Evaluate a sparse block/guard set against one consistent page-table
     /// snapshot. The old loop acquired the GPUVM exec lock twice per block.
     pub(crate) fn covers_sparse_blocks_with_guards(
@@ -2933,11 +3133,12 @@ impl Vm {
         })
     }
 
-    /// A conservative stamp for cached reachability checks. Taking the exec
-    /// lock makes a lookup wait for any in-progress leaf transaction, including
-    /// one that partially failed. `None` means the caller must validate fully.
+    /// Cached-proof lookup never takes the GPUVM exec lock. An in-progress or
+    /// uncacheable mutation returns None, forcing the existing locked walk.
+    /// Readers still double-collect both VMs' versions around proof reuse;
+    /// normal job/mapping ownership governs changes after validation.
     pub(crate) fn mapping_validation_epoch(&self) -> Option<u64> {
-        self.inner.exec_lock(None, false).ok()?.mapping_validation_epoch
+        self.mapping_validation.as_ref()?.snapshot()
     }
 
     /// Report whether mutations since `previous` touched a dependency.
@@ -3016,23 +3217,6 @@ impl Vm {
     ) -> Result<(usize, bool)> {
         let mut inner = self.inner.exec_lock(None, false)?;
         inner.page_table.collect_mapped_ranges(range, out)
-    }
-
-    /// Test a fixed-address kernel alias against both translated pages and
-    /// GPUVA reservations. A mapped-range census alone misses the unmapped
-    /// guard at the end of a `map_in_range(..., guard=true)` allocation, while
-    /// `map_at` still rejects that guard through drm_mm with ENOSPC.
-    pub(crate) fn first_occupied_alias_range(
-        &self,
-        range: Range<u64>,
-    ) -> Result<Option<Range<u64>>> {
-        let mut inner = self.inner.exec_lock(None, false)?;
-        let mut mapped = [pgtable::MappedRange::default(); 1];
-        let (count, _) = inner.page_table.collect_mapped_ranges(range.clone(), &mut mapped)?;
-        if count != 0 {
-            return Ok(Some(mapped[0].start..mapped[0].end));
-        }
-        inner.mm.first_overlap(range)
     }
 
     /// Read GPU-visible bytes out of this VM.
@@ -3622,12 +3806,13 @@ impl Vm {
             0,
         )?;
 
-        inner.note_mapping_validation_change(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
+        let validation_change = inner.note_mapping_validation_change(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
         let prepared = inner
             .page_table
             .prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
         if let Err(error) = prepared {
             // Drop the VM lock before the reserved node and its owner refs.
+            drop(validation_change);
             core::mem::drop(inner);
             return Err(error);
         }
@@ -3639,6 +3824,7 @@ impl Vm {
         );
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
+        drop(validation_change);
         core::mem::drop(inner);
         ret?;
         Ok(KernelMapping(node))
@@ -4172,7 +4358,7 @@ impl Uat {
     pub(crate) fn install_t8140_job_context_aliases(
         &self,
         source: &Vm,
-    ) -> Result<KVec<KernelMapping>> {
+    ) -> Result {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
@@ -4249,68 +4435,109 @@ impl Uat {
             }
         }
 
-        let mut mappings = KVec::with_capacity(1, GFP_KERNEL)?;
-        let view = T8140_CLIENT_NULL_VIEW;
-        let (gem, object_offset) = snapshot.first().ok_or(EINVAL)?;
-        if !source.covers_range(
-            view.source_address,
-            view.size as u64,
-            true,
-            view.requires_source_write,
-        ) {
-            dev_err!(self.dev.as_ref(),
-                "MMU: T8140 job context VM {} null source={:#x}+{:#x} lacks required permissions (write={})\n",
-                source.id, view.source_address, view.size, view.requires_source_write);
-            return Err(EFAULT);
-        }
-        let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
-        if object_end > gem.size() {
-            return Err(ERANGE);
-        }
-        // The null view is VM-owned, not render-storage-owned. A single
-        // process may create another render queue while its first storage is
-        // still alive, in which case append_driver_mappings() already retains
-        // this exact alias. Never create a second KernelMapping over those
-        // leaves: map_in_range correctly rejects the overlap, and a duplicate
-        // owner would later erase the first storage's live mapping on Drop.
-        //
-        // Accept only the complete, physically identical presentation. A
-        // partial range or another backing at the reserved address remains a
-        // hard error rather than being mistaken for idempotent installation.
-        let mut existing_pages = 0usize;
-        let mut offset = 0u64;
-        while offset < view.size as u64 {
-            let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
-            let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
-            if source.covers_range(
-                low,
-                UAT_PGSZ as u64,
+        source.retain_job_context_aliases(|| {
+            let mut mappings = KVec::with_capacity(1, GFP_KERNEL)?;
+            let view = T8140_CLIENT_NULL_VIEW;
+            let (gem, object_offset) = snapshot.first().ok_or(EINVAL)?;
+            if !source.covers_range(
+                view.source_address,
+                view.size as u64,
                 true,
                 view.requires_source_write,
             ) {
-                existing_pages = existing_pages.checked_add(1).ok_or(EOVERFLOW)?;
-                if source.translate_iova(high)? != source.translate_iova(low)? {
+                dev_err!(self.dev.as_ref(),
+                    "MMU: T8140 job context VM {} null source={:#x}+{:#x} lacks required permissions (write={})\n",
+                    source.id, view.source_address, view.size, view.requires_source_write);
+                return Err(EFAULT);
+            }
+            let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
+            if object_end > gem.size() {
+                return Err(ERANGE);
+            }
+            // The null view is VM-owned, not render-storage-owned. A single
+            // process may create another render queue while its first storage is
+            // still alive, in which case this VM transaction already retains
+            // this exact alias. Never create a second KernelMapping over those
+            // leaves: map_in_range correctly rejects the overlap, and a duplicate
+            // owner would later erase the first storage's live mapping on Drop.
+            //
+            // Accept only the complete, physically identical presentation. A
+            // partial range or another backing at the reserved address remains a
+            // hard error rather than being mistaken for idempotent installation.
+            let mut existing_pages = 0usize;
+            let mut offset = 0u64;
+            while offset < view.size as u64 {
+                let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
+                let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
+                if source.covers_range(
+                    low,
+                    UAT_PGSZ as u64,
+                    true,
+                    view.requires_source_write,
+                ) {
+                    existing_pages = existing_pages.checked_add(1).ok_or(EOVERFLOW)?;
+                    if source.translate_iova(high)? != source.translate_iova(low)? {
+                        dev_err!(
+                            self.dev.as_ref(),
+                            "MMU: T8140 retained client null view backing mismatch at +{:#x}\n",
+                            offset,
+                        );
+                        return Err(EFAULT);
+                    }
+                }
+                offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
+            }
+            let expected_pages = view.size / UAT_PGSZ;
+            if existing_pages != 0 {
+                if existing_pages != expected_pages {
                     dev_err!(
                         self.dev.as_ref(),
-                        "MMU: T8140 retained client null view backing mismatch at +{:#x}\n",
-                        offset,
+                        "MMU: T8140 retained client null view is only partially mapped ({}/{})\n",
+                        existing_pages,
+                        expected_pages,
                     );
                     return Err(EFAULT);
                 }
+                if source
+                    .t8140_native_context_bindings
+                    .as_ref()
+                    .ok_or(EINVAL)?
+                    .lock()
+                    .generation
+                    != source_generation
+                {
+                    return Err(EAGAIN);
+                }
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.dev.as_ref(),
+                        "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
+                        T8140_NATIVE_CONTEXT_VIEW_COUNT,
+                        source.id,
+                        source_generation,
+                    );
+                }
+                return Ok(mappings);
             }
-            offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
-        }
-        let expected_pages = view.size / UAT_PGSZ;
-        if existing_pages != 0 {
-            if existing_pages != expected_pages {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "MMU: T8140 retained client null view is only partially mapped ({}/{})\n",
-                    existing_pages,
-                    expected_pages,
-                );
-                return Err(EFAULT);
+            let mapping = source.map_in_range(
+                &**gem,
+                *object_offset..object_end,
+                UAT_PGSZ as u64,
+                view.context_address..view.context_address + view.size as u64,
+                view.context_prot,
+                false,
+            )?;
+            let mut offset = 0u64;
+            while offset < view.size as u64 {
+                let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
+                let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
+                if source.translate_iova(high)? != source.translate_iova(low)? {
+                    return Err(EFAULT);
+                }
+                offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
             }
+            mappings.push(mapping, GFP_KERNEL)?;
+
             if source
                 .t8140_native_context_bindings
                 .as_ref()
@@ -4324,53 +4551,14 @@ impl Uat {
             if crate::util::g17p_verbose() {
                 dev_info!(
                     self.dev.as_ref(),
-                    "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
-                    T8140_NATIVE_CONTEXT_VIEW_COUNT,
+                    "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
+                    T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
                     source.id,
                     source_generation,
                 );
             }
-            return Ok(mappings);
-        }
-        let mapping = source.map_in_range(
-            &**gem,
-            *object_offset..object_end,
-            UAT_PGSZ as u64,
-            view.context_address..view.context_address + view.size as u64,
-            view.context_prot,
-            false,
-        )?;
-        let mut offset = 0u64;
-        while offset < view.size as u64 {
-            let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
-            let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
-            if source.translate_iova(high)? != source.translate_iova(low)? {
-                return Err(EFAULT);
-            }
-            offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
-        }
-        mappings.push(mapping, GFP_KERNEL)?;
-
-        if source
-            .t8140_native_context_bindings
-            .as_ref()
-            .ok_or(EINVAL)?
-            .lock()
-            .generation
-            != source_generation
-        {
-            return Err(EAGAIN);
-        }
-        if crate::util::g17p_verbose() {
-            dev_info!(
-                self.dev.as_ref(),
-                "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
-                T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
-                source.id,
-                source_generation,
-            );
-        }
-        Ok(mappings)
+            Ok(mappings)
+        })
     }
 
     /// Invalidate every live T8140 context rooted in `vm` after adding or
@@ -5305,6 +5493,8 @@ impl Uat {
         Ok(T8140AppContextLease {
             root: T8140ContextRootLease {
                 inner: self.inner.clone(), context_id: context_id as u8, low, high,
+                generation: self.inner.t8140_context_generations[context_id]
+                    .fetch_add(1, Ordering::Relaxed).wrapping_add(1),
             },
             _bind: bind.clone(),
         })
@@ -5334,11 +5524,16 @@ impl Uat {
         };
         let low = t8140_tagged_root(vm.ttb(), context_id);
         let high = t8140_tagged_root(self.kernel_vm.ttb(), context_id);
+        // The context bit is exclusively claimed. Independent context IDs do
+        // not share an epoch lock; outstanding jobs retain this immutable lease.
+        let generation = self.inner.t8140_context_generations[context_id]
+            .fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         // Allocate every host owner before publishing either TTBAT half.
         // Root-lease Drop handles allocation failure with an empty table.
         let context = Arc::new(T8140ComputeExecutionContext {
             root: T8140ContextRootLease {
                 inner: self.inner.clone(), context_id: context_id as u8, low, high,
+                generation,
             },
             vm: vm.clone(),
         }, GFP_KERNEL)?;
@@ -5740,6 +5935,7 @@ impl Uat {
                     T8140_APP_CONTEXT_RESERVED_MASK
                         | crate::g17_queue_limits::BIND_CONTEXT_MASK,
                 ),
+                t8140_context_generations: core::array::from_fn(|_| AtomicU8::new(0)),
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
                 }),

@@ -4,7 +4,8 @@ from pathlib import Path
 import re,subprocess,tempfile
 p=Path(__file__).resolve().parents[1]
 s=(p/'g17_resources.rs').read_text()
-limits=(p/'g17_queue_limits.rs').read_text().replace('//!','//')
+from g17_queue_limits_test_support import queue_limits_source
+limits=queue_limits_source()
 names=['G17P_CL_DYNAMIC_LOW_VA_START','G17P_CL_CLIENT_LOW_VA_START','G17P_CL_LOW_VA_END']
 constants='\n'.join(re.search(r'(?:pub\(crate\) )?const '+n+r': u64 = [^;]+;',s)[0] for n in names)
 initdata=(p/'g17_initdata.rs').read_text()

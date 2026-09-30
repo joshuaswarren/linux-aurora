@@ -244,6 +244,18 @@ pub(crate) const CONTROL_OPENING_PRIMARY_REGISTER_OPCODE: u32 = 0x20;
 pub(crate) const CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE: u32 = 0x22;
 /// Hardware-buffer release emitted after the opening UMA grow request retires.
 pub(crate) const CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE: u32 = 0x2e;
+/// Scheduler-state (channel control) release.
+///
+/// Decoded from AGXG17P 353.14 (25G83) `AGXArmFirmware::submitReleaseResource`
+/// at `0xfffffe00088a722c`: the record's first word is `0x14` on this image
+/// (the G17X image audited in `G17_NATIVE_DETACH_IMPLEMENTATION_PLAN.md`
+/// carries `0x13`; the G17P opcode route table at `0xfffffe0007136180` sends
+/// `0x14` to ring 0, the same primary control ring as `0x2e`, and `0x13` to
+/// ring 1). `AGXCommandQueue::freeReclaimableResources` (`0xfffffe0008865354`)
+/// submits it with the four identity bytes read back from the live scheduler
+/// state page and then waits for the ring consumer to pass the record before
+/// it frees the work queues and their parameter management.
+pub(crate) const CONTROL_SCHEDULER_STATE_RELEASE_OPCODE: u32 = 0x14;
 /// Device-control ring capacity. FW_PROVEN (b1
 /// `AGFAcceleratorDrainDeviceControlRing` @ `0xfffffc0000003a74`): the drain
 /// walks `ring + index * 0x40` and advances its consumer with
@@ -593,6 +605,31 @@ pub(crate) fn encode_bootstrap_uma_release_record(
     put_u32(out, 0, CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE);
     put_u64(out, 0x04, sequence);
     put_u32(out, 0x0c, hardware_buffer_id);
+    Ok(())
+}
+
+/// Encode the scheduler-state release record exactly as
+/// `AGXArmFirmware::submitReleaseResource(va, a, b, c, d)` writes it into its
+/// 64-byte device-control entry: opcode at `+0`, zero at `+4`, byte `d` at
+/// `+8`, `a` at `+9`, `b` at `+0xa`, `c` at `+0xb`, and the resource's
+/// firmware VA as an unaligned u64 at `+0xc`. `identity` is `[a, b, c, d]`,
+/// i.e. bytes `[0]`, `[1]`, `[4]` and `[0x26]` of the live scheduler-state
+/// page, as `freeReclaimableResources` loads them at `0xfffffe0008865398`.
+pub(crate) fn encode_scheduler_state_release_record(
+    resource_va: u64,
+    identity: [u8; 4],
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, CONTROL_SCHEDULER_STATE_RELEASE_OPCODE);
+    out[0x08] = identity[3];
+    out[0x09] = identity[0];
+    out[0x0a] = identity[1];
+    out[0x0b] = identity[2];
+    put_u64(out, 0x0c, resource_va);
     Ok(())
 }
 
@@ -1501,8 +1538,9 @@ impl ChannelEntry {
     };
 }
 
-/// The primary's global region views at main `+0x2d0`: a high-only blank
-/// sentinel, then the high halves of two low/high alias pairs (the low halves
+/// The primary's global region views at main `+0x2d0`: a globally retained,
+/// initially zero HWDSID accounting table (256 pairs of u32), followed by
+/// the high halves of two low/high alias pairs (the low halves
 /// are the fixed context-0 addresses in
 /// [`REGION_VIEW_LOW_ADDRS`]). Each pair must map one physical page from both
 /// address spaces — an invariant of the UAT mapping layer that cannot be
@@ -3314,6 +3352,26 @@ mod tests {
             assert_eq!(get_u32(&tail, base + 0x30), 0);
             assert_eq!(get_u32(&tail, base + 0x34), 1);
         }
+    }
+
+    #[test]
+    fn scheduler_state_release_record_is_exact() {
+        let mut record = [0xa5; CONTROL_RECORD_SIZE];
+        encode_scheduler_state_release_record(
+            0xffff_fc20_0123_4000,
+            [0x11, 0x22, 0x33, 0x44],
+            &mut record,
+        )
+        .unwrap();
+        assert_eq!(get_u32(&record, 0), 0x14);
+        assert_eq!(get_u32(&record, 4), 0);
+        assert_eq!(record[0x08], 0x44);
+        assert_eq!(record[0x09], 0x11);
+        assert_eq!(record[0x0a], 0x22);
+        assert_eq!(record[0x0b], 0x33);
+        assert_eq!(get_u64(&record, 0x0c), 0xffff_fc20_0123_4000);
+        assert!(record[0x14..].iter().all(|byte| *byte == 0));
+        assert!(device_control_asserts_gpu_power(0x14) == Some(true));
     }
 
     #[test]

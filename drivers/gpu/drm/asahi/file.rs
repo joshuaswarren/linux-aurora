@@ -400,6 +400,9 @@ impl File {
         if data.param_group == crate::g17_status::PARAM_GROUP_VM_STATUS {
             return Self::get_vm_status(device, data, file);
         }
+        if data.param_group == crate::g17_status::PARAM_GROUP_VM_STATUS_MIRROR {
+            return Self::register_vm_status_mirror(device, data, file);
+        }
         if data.param_group == crate::g17_queue_limits::PARAM_GROUP_QUEUE_LIMITS {
             if data.pad != 0 || data.size < crate::g17_queue_limits::QUEUE_LIMITS_SIZE as u64 {
                 return Err(EINVAL);
@@ -448,6 +451,12 @@ impl File {
 
         if gpu.supports_vm_status() {
             params.features |= crate::g17_status::FEATURE_VM_STATUS;
+            if gpu.supports_vm_status_mirror() {
+                params.features |= crate::g17_status::FEATURE_VM_STATUS_MIRROR;
+            }
+        }
+        if gpu.supports_per_command_input_syncs() {
+            params.features |= crate::g17_queue_limits::FEATURE_PER_COMMAND_INPUT_SYNCS;
         }
         if gpu.independent_queue_limits().is_some() {
             params.features |= crate::g17_queue_limits::FEATURE_INDEPENDENT_QUEUES;
@@ -507,6 +516,50 @@ impl File {
         }
         let bytes = encode_response(vm_id, status.get());
         UserSlice::new(user, VM_STATUS_SIZE).writer().write_slice(&bytes)?;
+        Ok(0)
+    }
+
+    /// v87: register a userspace word mirroring this file's VM status, so a
+    /// successful syncobj wait can be checked with a load instead of a group
+    /// 1 query per wait. Refused (EOPNOTSUPP) unless the mirror is exact and
+    /// `g17p_host_path` bit8 is set; userspace then keeps querying.
+    fn register_vm_status_mirror(device: &AsahiDevice, data: &uapi::drm_asahi_get_params,
+                                 file: &DrmFile) -> Result<u32> {
+        use crate::g17_status::{decode_mirror_request, VM_STATUS_MIRROR_SIZE};
+        if !device.gpu.supports_vm_status() || !device.gpu.supports_vm_status_mirror()
+            || !crate::g17_host_path::enabled(crate::g17_host_path::VM_STATUS_MIRROR)
+        {
+            // EOPNOTSUPP; the kernel crate declares no constant for it.
+            return Err(Error::from_errno(-95));
+        }
+        if data.pad != 0 || data.size < VM_STATUS_MIRROR_SIZE as u64 { return Err(EINVAL); }
+        let mut bytes = [0u8; VM_STATUS_MIRROR_SIZE];
+        UserSlice::new(UserPtr::from_addr(data.pointer as _), VM_STATUS_MIRROR_SIZE)
+            .reader().read_slice(&mut bytes)?;
+        let (vm_id, handle, offset) = decode_mirror_request(&bytes).ok_or(EINVAL)?;
+        let status = {
+            let vms = file.inner().vms();
+            let guard = vms.lock();
+            let vm = guard.get(vm_id as usize).ok_or(ENOENT)?;
+            vm.vm.status().clone()
+        };
+        let mut owner = gem::ObjectRef::new(gem::Object::lookup_handle(file, handle)?);
+        let offset = offset as usize;
+        // The kernel keeps this object vmapped for the status lifetime, so
+        // bound it (userspace needs one word; Mesa passes a 16 KiB object).
+        const MIRROR_MAX_OBJECT: usize = 64 * 1024;
+        if owner.size() > MIRROR_MAX_OBJECT
+            || offset.checked_add(4).is_none_or(|end| end > owner.size())
+        {
+            return Err(EINVAL);
+        }
+        // The owned kernel mapping lives in `owner`, which the status retains;
+        // moving `owner` does not move the mapping.
+        let base = owner.vmap()?.as_mut_ptr();
+        // SAFETY: offset + 4 lies within the object, checked above.
+        let word = unsafe { base.add(offset) }.cast::<i32>();
+        status.attach_mirror(owner, word)?;
+        crate::g17_host_path::count(&crate::g17_host_path::MIRRORS);
         Ok(0)
     }
 
@@ -1120,6 +1173,11 @@ impl File {
         data: &mut uapi::drm_asahi_submit,
         file: &DrmFile,
     ) -> Result<u32> {
+        // v81 e2e diagnostic: 0 (no counter read) unless the ring is armed.
+        let e2e_entry = crate::g17_e2e::stamp();
+        // v92 PCORE_NUDGE (diagnostic, default off): one relaxed load unless
+        // enabled and the feed-perf request is applied.
+        crate::g17_host_path::nudge_feeding_thread();
         debug::update_debug_flags();
 
         if data.flags != 0 || data.pad != 0 {
@@ -1184,13 +1242,25 @@ impl File {
             data.queue_id,
             id
         );
+        let e2e_copied = crate::g17_e2e::stamp();
         let syncs =
             SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count)?;
 
         let objects = file.inner().objects();
+        let e2e_parsed = crate::g17_e2e::stamp();
+        if e2e_entry != 0 {
+            let e2e_pid = kernel::current!().group_leader().pid() as u64;
+            crate::g17_e2e::record_at(e2e_entry, crate::g17_e2e::K_IOCTL_ENTER, data.queue_id, id,
+                [u64::from(data.in_sync_count) | u64::from(data.out_sync_count) << 32,
+                 u64::from(data.cmdbuf_size), e2e_pid, e2e_copied, e2e_parsed]);
+        }
         let ret = queue
             .lock()
             .submit(id, syncs, data.in_sync_count as usize, &vec, objects);
+        if e2e_entry != 0 {
+            crate::g17_e2e::record(crate::g17_e2e::K_IOCTL_EXIT, 0, id,
+                [ret.as_ref().err().map_or(0, |error| error.to_errno() as i64 as u64), 0, 0, 0, 0]);
+        }
 
         match ret {
             Err(ERESTARTSYS) => Err(ERESTARTSYS),

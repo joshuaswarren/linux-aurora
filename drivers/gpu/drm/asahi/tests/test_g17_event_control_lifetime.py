@@ -41,7 +41,15 @@ sizes = "\n".join(
                  "G17P_COLD_OPENING_EVENT_SIZE", "G17P_COLD_OPENING_RECORD_POOL_A_COUNT"]
 )
 body = "\n".join([
-    "#![allow(dead_code)]", constants,
+    "#![allow(dead_code)]",
+"type Result<T=()> = core::result::Result<T,i32>;",
+"type LiveResult<T=()> = core::result::Result<T,i32>;", "const EINVAL:i32=22;",
+    block(r"^fn g17p_live_word_bounds\("),
+    block(r"^fn g17p_live_read_u32\("),
+    block(r"^fn g17p_live_read_u64\("),
+    block(r"^fn g17p_live_write_u32\("),
+    block(r"^fn g17p_live_write_u64\("),
+ constants,
     "mod g17_submission {", sizes, native_channel_helpers(submission),
     block(r"^pub\(crate\) const fn g17p_render_pool_a_record_index\(", submission), "}",
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
@@ -215,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix="g17-event-control-") as temp:
 
 restage = block(r"^    pub\(crate\) fn restage_command\(")
 assert "G17PEventControlKick::prepare_reuse(" in restage
-assert restage.index("G17PEventControlKick::prepare_reuse") < restage.index(".copy_from_slice(&source")
+assert restage.index("G17PEventControlKick::prepare_reuse") < restage.index("g17_render::build_cold_opening_ta_descriptor(")
 assert restage.count("pool_a_kick.apply(support);") == 1
 prepare = block(r"^    pub\(crate\) fn prepare_late_tiling_publication_with_stamp\(")
 assert prepare.count("G17PEventControlKick::prepare(raw, record_a_index)") == 1
@@ -225,7 +233,7 @@ assert "self.pool_a_submitted = pool_a_kick.next" in prepare
 assert "g17p_render_pool_a_record_index(" not in prepare
 assert "quiesce_completed_job_list" not in source + manager
 assert "g17p_render_can_reset_job_list" not in source + manager
-poll = block(r"^    pub\(crate\) fn poll_translated_render_completion\(", manager)
+poll = block(r"^    pub\(crate\) fn commit_render_observation\(", manager)
 assert "job_list_empty: state.job_list_empty" in poll
 assert "render_event_control_state" in poll
 assert "event_control.unlinked()" in poll

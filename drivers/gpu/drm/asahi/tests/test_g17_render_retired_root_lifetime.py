@@ -37,7 +37,7 @@ assert "retire_after_context_epoch: u64" in pending
 drop = function(drm, "impl Drop for G17PQueue")
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
 retarget = function(manager, "fn retarget_retained_render_context(")
-poll = function(manager, "pub(crate) fn poll_translated_render_completion(")
+poll = function(manager, "pub(crate) fn commit_render_observation(")
 complete = function(manager, "fn complete_render_context_update_retirement(")
 reclaimable = function(manager, "fn retired_render_graph_reclaimable(")
 reclaim = function(manager, "fn reclaim_released_superseded_render_graphs(")
@@ -50,16 +50,16 @@ assert retarget.index(".retarget_command_context(vm, execution_context.clone())"
     ".render_bind\n                .replace"
 )
 assert "render_context_retirement = Some(G17PRenderContextRetirement" in retarget
-assert ".next_render_context_epoch(self.active_render_slot)" in handoff
+assert ".next_render_context_epoch(self.render_slots.active_slot)" in handoff
 assert '"handoff-next-context-epoch"' in handoff
 assert poll.index("if !event_control.unlinked()") < poll.index(
     "self.complete_render_context_update_retirement(true)?"
 )
 assert complete.index("if !context_update") < complete.index(".complete_context_update()")
 assert complete.index("self.render_context_epochs[slot] = next") < complete.index(
-    "self.render_context_retirement = None"
+    "self.render_slots.active_mut().context_retirement = None"
 )
-assert complete.index("self.render_context_retirement = None") < complete.index(
+assert complete.index("self.render_slots.active_mut().context_retirement = None") < complete.index(
     "self.reclaim_released_superseded_render_graphs()"
 )
 assert "*epoch >= graph.retire_after_context_epoch" in reclaimable
@@ -77,7 +77,7 @@ assert release.index("into_retired_parameter_management") < release.index(
 )
 assert release.index("ids.unreserve(id)") < release.index("drop(bind)")
 assert "complete_render_context_update_retirement" not in abandoned
-assert "self.render_context_retirement = None" in stop
+assert "self.render_slots.active_mut().context_retirement = None" in stop
 assert "self.render_context_epochs = [0; 64]" in stop
 assert "retired_firmware_render_graphs" not in manager
 

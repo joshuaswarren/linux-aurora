@@ -75,13 +75,13 @@ assert timeout.index("if !self.render_fence_state.pending(render_slot)") \
 assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
     < timeout.index("self.settle_deferred_render_completion(render_slot, observed)"), \
     'watchdog consumes the settlement gate before its final completion observation'
-assert "signal.complete(Ok(observed));" in settle_render, \
+assert "self.defer_render_completion(signal, observed);" in settle_render, \
     'watchdog cannot salvage a completion that became visible after the event edge'
-assert settle_render.index("signal.complete(Ok(observed));") \
-    < settle_render.index("retire_render_usc_freelist_at_completion()"), \
+assert settle_render.index("self.defer_render_completion(signal, observed);") \
+    < settle_render.index("retire_render_usc_freelist_at_completion(render_slot)"), \
     'fallible retained cleanup can suppress a proven render completion'
-assert settle_render.index("retire_render_usc_freelist_at_completion()") \
-    < settle_render.index("recover_persistent_runtime(self)"), \
+assert settle_render.index("retire_render_usc_freelist_at_completion(render_slot)") \
+    < settle_render.index("rebuild_session_or_defer()"), \
     'failed retained cleanup can be reused without a processor-stop boundary'
 assert ") -> bool {" not in timeout and "return !retired;" not in timeout, \
     'watchdog still delegates a late registry quarantine to its caller'
@@ -150,7 +150,7 @@ assert backend.index("completion.complete(Err(EIO));", status_gate) \
 # early fence must exist first, and that allocation failure must publish it
 # directly from the original sync list before returning.
 guarded = block('    fn submit_guarded(')
-fence_create = guarded.index('let early_output_fence:')
+fence_create = guarded.index('let early_output_fence = new_independent_submission_fence(')
 output_alloc = guarded.index('KVec::with_capacity(output_count')
 alloc_failure = guarded.index('Err(_) => {', output_alloc)
 alloc_return = guarded.index('return Err(Self::stage_fail(', alloc_failure)

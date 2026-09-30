@@ -21,14 +21,14 @@ def function(text: str, marker: str) -> str:
     return text[start:pos]
 
 
-poll_manager = function(manager, "    pub(crate) fn poll_translated_render_completion(")
+poll_manager = function(manager, "    pub(crate) fn commit_render_observation(")
 poll_runtime = function(live, "    pub(crate) fn poll_deferred_render_completion(")
 settle = function(live, "    fn settle_deferred_render_completion(")
 service = function(live, "    fn service_async_render_completions(")
 timeout = function(live, "    fn settle_failed_deferred_render(")
 
 # Manager completion is a one-way commit: a cleanup failure cannot re-poll it.
-assert poll_manager.index("self.render_tracker = self.render_queued_tracker.take();") < poll_manager.index(
+assert poll_manager.index("self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take();") < poll_manager.index(
     "return Ok(G17PRenderPollOutcome::Complete(completion));"
 )
 assert "retire_render_usc_freelist_at_completion" not in poll_runtime
@@ -43,9 +43,12 @@ assert "self.settle_deferred_render_completion(render_slot, observed)" in timeou
 assert settle.index("self.pending_render.get(index)") < settle.index(
     "self.render_fence_state.settle(render_slot)"
 )
-signal = settle.index("signal.complete(Ok(observed));")
-retire = settle.index("retire_render_usc_freelist_at_completion()")
-recover = settle.index("recover_persistent_runtime(self)")
+# The proven completion is committed (deferred for signalling with the runtime
+# mutex released) before the fallible FList cleanup and any rebuild.
+signal = settle.index("self.defer_render_completion(signal, observed);")
+assert "signal.complete(Ok(" not in settle
+retire = settle.index("retire_render_usc_freelist_at_completion(render_slot)")
+recover = settle.index("rebuild_session_or_defer()")
 assert signal < retire < recover
 
 # Executable state-machine oracle. The manager first commits paired retirement

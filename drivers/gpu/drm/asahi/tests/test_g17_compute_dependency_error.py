@@ -27,7 +27,9 @@ assert check < backend.index("self.registry.acquire_compute(")
 assert check < backend.index("publish_async_compute(")
 submit = block(drm, "    fn submit_compute_async(")
 assert "checked_dependencies.push(fence.clone()" in submit
-assert "checked_dependencies.push(prior.clone()" in submit
+assert "append_render_prefix_dependencies(" in submit
+assert "&self.render_frontier, translated.render_wait_through" in submit
+assert "for fence in packet.firmware_fences()" in backend
 assert submit.index("checked_dependencies.push(fence.clone()") < submit.index(
     ".enqueue(packet, dependencies)?"
 )

@@ -3,6 +3,10 @@
 //! Every accepted DRM queue owns an execution context; hardware compute graphs
 //! are allocated lazily when that logical queue first submits compute.
 pub(crate) const FEATURE_INDEPENDENT_QUEUES: u64 = 1 << 2;
+/// GET_PARAMS feature shared with DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS.
+/// Input fences gate every hardware command, including error propagation;
+/// userspace need not serialize independent commands behind the first one.
+pub(crate) const FEATURE_PER_COMMAND_INPUT_SYNCS: u64 = 1 << 3;
 pub(crate) const PARAM_GROUP_QUEUE_LIMITS: u32 = 2;
 pub(crate) const QUEUE_LIMITS_SIZE: usize = 16;
 pub(crate) const TTBAT_CONTEXT_COUNT: u32 = 64;
@@ -28,7 +32,22 @@ pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 2;
 /// generation of its render storage.
 pub(crate) const RENDER_KICKS_PER_PAIR: u32 =
     crate::g17_resources::G17P_RENDER_MAX_IN_FLIGHT as u32;
-pub(crate) const MAX_COMPUTE_IN_FLIGHT_PER_QUEUE: u32 = 1;
+/// Compute kicks one logical queue may have published and unretired at once.
+///
+/// Every CL kick entry carries an implicit dependency on the previous kick of
+/// its own QID (`prepare_g17p_cl_kick_entry`, the same implicit parent native
+/// AGXKSMKickQueueG16 encodes), and cross-engine order is carried by explicit
+/// native stamp barriers. So firmware, not host retirement, orders
+/// consecutive compute jobs: the host publishes kick n+1 without waiting for
+/// kick n to retire. This bound only sizes host bookkeeping (the in-flight
+/// FIFO, completion requests and per-publication channel records); it is far
+/// below the queue's 256 stamps and 320 item-ring publications.
+pub(crate) const MAX_COMPUTE_IN_FLIGHT_PER_QUEUE: u32 = 16;
+/// Per-publication tag-14/15/16 record slots. A slot is reused only
+/// `COMPUTE_RECORD_SLOTS` publications later, by which time its owner has
+/// retired, and retirement requires firmware to have consumed its records.
+pub(crate) const COMPUTE_RECORD_SLOTS: usize = 2 * MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize;
+const _: () = assert!(COMPUTE_RECORD_SLOTS > MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize);
 /// Two GiB boundary inside the existing four GiB runtime reservation. In
 /// addition to descriptor arrays, each independently executing CL graph owns
 /// a 23-MiB private-memory pool. Keep room for every advertised queue without

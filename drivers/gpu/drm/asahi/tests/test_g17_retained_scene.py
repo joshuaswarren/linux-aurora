@@ -9,10 +9,11 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import os
 
 
 source_dir = Path(__file__).resolve().parent.parent
-source = (source_dir / "g17_resources.rs").read_text()
+source = Path(os.environ.get("G17_SCENE_RESOURCE_SOURCE", str(source_dir / "g17_resources.rs"))).read_text()
 
 
 def braced(text, start):
@@ -40,7 +41,7 @@ def constant(name):
 
 constants = [
     "G17P_RENDER_USER_BASE", "G17P_PM_PAGE_SIZE", "G17P_PM_PAGES_PER_BLOCK",
-    "G17P_PM_MAX_BLOCKS", "G17P_PM_BLOCK_COUNT", "G17P_PM_HWPB_STATE_SIZE", "G17P_PM_PAGE_LIST_SIZE",
+    "G17P_PM_MAX_BLOCKS", "G17P_PM_MAX_OWNED_BLOCKS", "G17P_PM_BLOCK_COUNT", "G17P_PM_HWPB_STATE_SIZE", "G17P_PM_PAGE_LIST_SIZE",
     "G17P_PM_BLOCK_PAGE_BASE_TABLE_SIZE", "G17P_PM_SHARED_CONTROL_SIZE",
     "G17P_PM_COUNTER_SIZE", "G17P_PM_SCENE_COUNT", "G17P_PM_SCENE_ENTRY_SIZE",
     "G17P_PM_SCENE_TRAILER_SIZE", "G17P_PM_SCENE_ALLOCATION_SIZE",
@@ -55,6 +56,7 @@ methods = [
 body = "\n".join([
     "#![allow(dead_code)]",
     "type Result<T = ()> = core::result::Result<T, i32>;",
+    "type KBox<T> = Box<T>; const ENOSPC: i32 = 28;",
     "const EINVAL: i32 = 22; const ERANGE: i32 = 34;",
     "const ENOTSUPP: i32 = 95; const EIO: i32 = 5;",
     *(constant(name) for name in constants),
@@ -69,6 +71,8 @@ body = "\n".join([
     block(r"^fn prepare_g17p_retained_scene\("),
     block(r"^fn put_u32\("),
     block(r"^fn put_u64\("),
+    block(r"^struct G17PSceneOwnership\s*"),
+    block(r"^impl G17PSceneOwnership\s*"),
     block(r"^struct G17PParameterManagement\s+"),
     "impl G17PParameterManagement {",
     *(block(r"^    fn " + name + r"\(") for name in methods),
@@ -102,6 +106,8 @@ fn render_layout(blocks: usize) -> G17PRenderStateLayout {
 }
 fn new_pm_at(first_submission_ordinal: u64) -> G17PParameterManagement {
     let layout = g17p_parameter_management_layout().unwrap();
+    let mut scene_ownership = Box::new(G17PSceneOwnership::new());
+    assert!(scene_ownership.commit(first_submission_ordinal, G17P_PM_SELECTED_SCENE));
     G17PParameterManagement {
         _page_list_low: mmu::KernelMapping,
         backing: MappedObject {
@@ -110,7 +116,7 @@ fn new_pm_at(first_submission_ordinal: u64) -> G17PParameterManagement {
         },
         layout, page_count: 128, page_list_vas: [0xffff_fc20_0010_0000, 0x70_0247_8000],
         metrics_vas: [0xffff_fc20_001f_0000, METRICS], hardware_buffer_id: 0,
-        first_submission_ordinal,
+        scene_ownership,
         selected_scene: G17P_PM_SELECTED_SCENE,
         manager_generation: G17P_PM_INITIAL_HWPB_MANAGER_GENERATION,
     }
@@ -162,7 +168,7 @@ fn all_scene_and_scratch_positions_match_native_ring_selection() {
 }
 
 #[test]
-fn replacement_managers_rebase_the_retained_queue_ordinal() {
+fn replacement_managers_keep_cold_ownership_and_uncommitted_plans_do_not_advance() {
     for first in [195, 2022, 1 << 24, 1 << 32, 1 << 40] {
         let mut pm = new_pm_at(first);
         pm.prepare_retained_scene(first, 0, pm.page_list_vas, &render_layout(32)).unwrap();
@@ -170,10 +176,10 @@ fn replacement_managers_rebase_the_retained_queue_ordinal() {
         pm.prepare_retained_scene(first + 1, 0, pm.page_list_vas, &render_layout(32)).unwrap();
         assert_eq!(pm.selected_scene, 2);
         pm.prepare_retained_scene(first + 79, 0, pm.page_list_vas, &render_layout(32)).unwrap();
-        assert_eq!(pm.selected_scene, 0);
-        assert_eq!(pm.prepare_retained_scene(first - 1, 0, pm.page_list_vas,
-                                             &render_layout(32)), Err(EINVAL));
-        assert_eq!(pm.selected_scene, 0);
+        assert_eq!(pm.selected_scene, 2);
+        assert_eq!(pm.scene_ownership.select(first), Some(1));
+        assert!(pm.scene_ownership.commit(first + 79, 2));
+        assert_eq!(pm.scene_ownership.select(first + 80), Some(3));
     }
 }
 
@@ -243,6 +249,8 @@ fn retained_method_keeps_pool_identity_and_runtime_contents_over_three_scene_wra
         pm.prepare_retained_scene(ordinal, 0, pm.page_list_vas, &render_layout(32)).unwrap();
         let scene = g17p_render_scene_index(0, ordinal).unwrap();
         assert_eq!(pm.selected_scene, scene);
+        assert!(pm.scene_ownership.commit(ordinal, scene));
+        assert!(pm.scene_ownership.release(ordinal - 1));
         assert_eq!(pm.selected_scene_va(), initial_hwpb + pm.layout.scene_states as u64 + scene as u64 * 0x80);
         assert_eq!(pm.pb_descriptor().unwrap(), initial_pb);
         assert_eq!(pm.hwpb_state_va(), initial_hwpb);
@@ -267,7 +275,7 @@ fn retained_pool_restrictions_are_checked_before_mapping_or_state_changes() {
             1 => pages[0] += 0x4000,
             2 => pages[1] += 0x4000,
             3 => blocks = 31,
-            4 => blocks = 33,
+            4 => blocks = G17P_PM_MAX_OWNED_BLOCKS + 1,
             5 => blocks = usize::MAX,
             _ => unreachable!(),
         }
@@ -288,10 +296,42 @@ fn grown_pool_capacity_is_reused_by_smaller_scenes() {
         assert_eq!(pm.page_count, 512);
         assert_eq!(pm.pb_descriptor().unwrap().2, 512);
     }
-    let before = pm.backing.bytes.clone();
     assert_eq!(pm.prepare_retained_scene(5, 0, pm.page_list_vas,
-        &render_layout(129)), Err(ENOTSUPP));
-    assert_eq!(pm.backing.bytes, before);
+        &render_layout(129)), Ok(()));
+    assert_eq!(pm.page_count, 512);
+}
+
+#[test]
+fn larger_target_keeps_busy_pm_inventory_until_firmware_demand_growth() {
+    let mut pm = new_pm();
+    // Chrome/compositor reproduction: existing 32-block pool, new 40-block
+    // estimate, prior scenes still owned. Do not drain them or rewrite PM.
+    for (index, blocks) in [32, 40, 64, 256, 32].into_iter().enumerate() {
+        let ordinal = index as u64 + 1;
+        let before = pm.backing.bytes.clone();
+        let descriptor = pm.pb_descriptor().unwrap();
+        pm.prepare_retained_scene(ordinal, 0, pm.page_list_vas,
+            &render_layout(blocks)).unwrap();
+        assert_only_scene_write(&before, &pm.backing.bytes,
+            pm.layout.scene_states + pm.selected_scene * G17P_PM_SCENE_ENTRY_SIZE,
+            pm.manager_generation);
+        assert_eq!(pm.pb_descriptor().unwrap(), descriptor);
+        assert_eq!(pm.page_count, 128);
+        assert!(pm.scene_ownership.commit(ordinal, pm.selected_scene));
+    }
+}
+
+#[test]
+fn corrupt_actual_inventory_is_rejected_before_scene_write() {
+    for pages in [0, 127, 129, ((G17P_PM_MAX_OWNED_BLOCKS + 1) * G17P_PM_PAGES_PER_BLOCK) as u32] {
+        let mut pm = new_pm();
+        pm.page_count = pages;
+        let before = pm.backing.bytes.clone();
+        assert_eq!(pm.prepare_retained_scene(1, 0, pm.page_list_vas,
+            &render_layout(40)), Err(ENOTSUPP));
+        assert_eq!(pm.backing.access_count, 0);
+        assert_eq!(pm.backing.bytes, before);
+    }
 }
 
 #[test]
@@ -332,8 +372,15 @@ assert "translated.parameters.record_index = record_index;" in warm
 assert "translated.parameters.cycle = cycle;" in warm
 assert "pm.selected_scene_va()" in warm
 manager = (source_dir / "g17_manager.rs").read_text()
-call = manager.index(".restage_command(")
-retained = braced(manager, manager.rfind("if retained {", 0, call))
+# The normal path now restages its exclusively borrowed graph outside Runtime.
+retained = braced(manager, manager.index("impl G17PRenderRestage {"))
 assert ".restage_command(" in retained
-assert "stage_render_parameter_buffer" not in retained
+for forbidden in ["stage_render_parameter_buffer", "G17PParameterManagement::new",
+                  "new_user_render_storage", "self.storage.parameter_management ="]:
+    assert forbidden not in retained, forbidden
+# Preserve the same invariant for the inline legacy fallback.
+start = manager.index("fn begin_translated_render_with_hardware_buffer(")
+call = manager.index(".restage_command(", start)
+legacy = braced(manager, manager.rfind("if retained {", start, call))
+assert "stage_render_parameter_buffer" not in legacy
 print("actual retained Scene helpers/methods and warm no-reinitialization callsites PASS")

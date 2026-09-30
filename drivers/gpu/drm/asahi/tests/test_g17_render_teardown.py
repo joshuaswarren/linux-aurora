@@ -48,7 +48,11 @@ assert "publication_state.store(2" in packet
 scheduler = item(job, "impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {")
 enqueue = item(scheduler, "    pub(crate) fn enqueue(")
 assert enqueue.index("let hardware = packet.fence();") < enqueue.index("self.entity.new_job")
-assert "Ok(hardware)" in enqueue
+# enqueue now returns publication and retirement witnesses separately. Keep
+# requiring the hardware fence for completion; the scheduled fence may only
+# unlock firmware dependency publication, never release the render resources.
+assert "let published = job.fences().scheduled();" in enqueue
+assert "Ok(G17PCommandFences { published, completed: hardware })" in enqueue
 assert "job.fences().finished()" not in enqueue
 
 print("PASS async render teardown: queued cancellation releases unpublished ownership; published cancellation waits before exact timeout/quarantine")

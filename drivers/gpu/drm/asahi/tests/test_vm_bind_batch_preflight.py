@@ -2,6 +2,7 @@
 """VM_BIND bounds preflight and keeps dma-resv waits interruptible."""
 
 from pathlib import Path
+import os
 import random
 import threading
 
@@ -59,8 +60,11 @@ assert "user_gpuva_ranges" not in MMU
 
 # The core GPUVM array helper acquires every request BO in one interruptible
 # wound/wait transaction. No leaf callback runs before that one acquisition.
-GPUVM = (ROOT.parents[3] / "rust/kernel/drm/gpuvm.rs").read_text()
-GPUVM_C = (ROOT.parents[3] / "drivers/gpu/drm/drm_gpuvm.c").read_text()
+# An external-module export may omit the kernel core. In that case the runner
+# must explicitly identify the source used by its prepared kernel build.
+KERNEL_SOURCE = Path(os.environ.get("G17_KERNEL_SOURCE", ROOT.parents[3]))
+GPUVM = (KERNEL_SOURCE / "rust/kernel/drm/gpuvm.rs").read_text()
+GPUVM_C = (KERNEL_SOURCE / "drivers/gpu/drm/drm_gpuvm.c").read_text()
 lock_array = block(GPUVM, "    pub fn exec_lock_array")
 assert "DRM_EXEC_INTERRUPTIBLE_WAIT" in lock_array
 assert "DRM_EXEC_IGNORE_DUPLICATES" in lock_array

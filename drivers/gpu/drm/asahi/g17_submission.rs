@@ -1009,9 +1009,15 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
 pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
-pub(crate) const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u8 = 0;
-pub(crate) const G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID: u8 =
-    if G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 { 0 } else { 2 };
+// Default-off build diagnostic: KRUSTFLAGS="--cfg g17p_render_priority_probe".
+// Native ordinary user queues captured priority/subpriority 2/2. This does
+// not establish a Linux UAPI mapping or make the profile a production fix.
+pub(crate) const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u8 =
+    if cfg!(g17p_render_priority_probe) { 2 } else { 0 };
+// HardwareBufferID is independently allocated by AGXHardwareBufferIDManager,
+// not derived from priority (native captures have priority 2 with IDs 5/6).
+// Preserve the existing Linux identity for this diagnostic.
+pub(crate) const G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID: u8 = 0;
 pub(crate) const G17P_NATIVE_RENDER_POLICY: u16 =
     if G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 { 1 } else { 2 };
 /// Mac17P submits 3D first: Fragment(1) | (priority 2 << 2) = 0x09.
@@ -1049,8 +1055,10 @@ pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 =
     g17p_work_channel_table_index(2, PipeType::Compute);
 // The compute index is the validated anchor for the rule above: it must stay 8.
 const _: () = assert!(G17P_COMPUTE_CHANNEL_TABLE_INDEX == 8);
-const _: () = assert!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX == 0);
-const _: () = assert!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX == 1);
+const _: () = assert!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX ==
+    G17P_NATIVE_RENDER_DOORBELL_PRIORITY * 3);
+const _: () = assert!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX ==
+    G17P_NATIVE_RENDER_DOORBELL_PRIORITY * 3 + 1);
 /// Compute work-submission doorbell channel. VALIDATED by 2000 consecutive
 /// passing computes. Decodes under `encode_tx_doorbell` as
 /// `pipe Compute(2) | (priority 2 << 2)` = 0x0a, which is why it is not simply
@@ -2555,15 +2563,15 @@ pub(crate) const fn encode_kick_timestamp(timestamp: KickTimestamp) -> u64 {
     ((timestamp.stamp as u64) << KICK_STAMP_SHIFT) | timestamp.stamp_index as u64
 }
 
-/// Low-byte payload of the current serialized render's 3D channel counter.
+/// Low-byte payload of the retained render channel's next submission.
 ///
-/// `AGX3DChannelSKSM::submitBuffer` increments channel +0x1d4 as a u32
-/// (89d07bc..c4); `getSKSMCompletionScratchRegPayload` reads its low byte
-/// (8a515e4). Both valid cold captures carry payloads 1, 2, 3, not a constant
-/// selector. Our retained path publishes one 3D command per completed pair,
-/// so its ordinal determines that counter while this serialization holds.
-/// This byte wraps independently of the 40-bit SKSM timestamp; it is neither
-/// the queue ID nor an address-space tag.
+/// In the inspected 25G83 kext, FRG submit increments channel +0x204
+/// (8837ae0..e8); getter 88b4ee8 returns its low byte. The counter follows
+/// channel-object lifetime, independently of its physical timestamp base.
+/// Linux retains one ordinal per physical pair across its storage handoffs,
+/// advancing once per publication; outstanding submissions need not retire
+/// before this counter advances. The byte wraps independently of the 40-bit
+/// SKSM timestamp and is neither a QID nor an address-space tag.
 pub(crate) const fn g17p_serialized_render_scratch_payload(submission_ordinal: u64) -> u8 {
     submission_ordinal.wrapping_add(1) as u8
 }
@@ -2584,6 +2592,20 @@ pub(crate) const fn encode_g17p_3d_completion_scratch(
     } else {
         Ok(timestamp | ((payload as u64) << KICK_QID_SHIFT))
     }
+}
+
+/// ConfigUpdate +0x26 gates the u64 completion seed at +0x2a (B1
+/// 11434..11470). Busy channels preserve firmware's evolving scratch value.
+/// Native emits both fields with u32/u64 stores; validate before mutation.
+pub(crate) fn apply_g17p_idle_scratch_seed(
+    out: &mut [u8], seed: Option<u64>,
+) -> Result<(), SubmissionError> {
+    if out.len() < 0x32 {
+        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
+    }
+    put_u32_le(out, 0x26, u32::from(seed.is_some()));
+    put_u64_le(out, 0x2a, seed.unwrap_or(0));
+    Ok(())
 }
 
 /// Prepare the exact entry-slot/doorbell/next-timestamp tuple for one kick.
@@ -2920,6 +2942,37 @@ pub(crate) fn g17p_live_render_dependency(
 
 pub(crate) fn g17p_render_prefix_contains(prefix: Option<u64>, sequence: u64) -> bool {
     sequence != 0 && prefix.is_some_and(|limit| sequence <= limit)
+}
+
+/// Collapse a validated logical prefix to its newest kick per hardware QID.
+/// Each QID's implicit previous-kick parent supplies the transitive order.
+/// Use logical sequence, not wrapped firmware timestamps or scan order, to
+/// choose the newest. Callers must check every covered predecessor for errors
+/// before inserting it, including predecessors this frontier will subsume.
+pub(crate) fn g17p_insert_prefix_dependency(
+    dependencies: &mut [G17PClBarrierDependency],
+    sequences: &mut [u64], count: &mut usize,
+    sequence: u64, dependency: G17PClBarrierDependency,
+) -> Result<(), SubmissionError> {
+    if *count > dependencies.len() || *count > sequences.len() {
+        return Err(SubmissionError::KickDependencyCountOutOfRange);
+    }
+    if let Some(index) = dependencies[..*count].iter()
+        .position(|prior| prior.queue_id == dependency.queue_id)
+    {
+        if sequence > sequences[index] {
+            dependencies[index] = dependency;
+            sequences[index] = sequence;
+        }
+        return Ok(());
+    }
+    if *count == dependencies.len() || *count == sequences.len() {
+        return Err(SubmissionError::KickDependencyCountOutOfRange);
+    }
+    dependencies[*count] = dependency;
+    sequences[*count] = sequence;
+    *count += 1;
+    Ok(())
 }
 
 /// Optional MCache aperture descriptor copied into entry +0x08.
@@ -8641,20 +8694,6 @@ pub(crate) const fn g17p_umadesc_offset(hardware_buffer_id: u32) -> Option<usize
         return None;
     }
     Some(hardware_buffer_id as usize * G17P_UMA_DESC_ENTRY_SIZE)
-}
-
-/// Recover the mutable pool state before its hardware slot changes owners.
-/// The address and allocation unit belong to the retained pool; word three
-/// is firmware-owned and is not part of the load/store handshake.
-pub(crate) const fn decode_g17p_umadesc(
-    descriptor: [u64; 4],
-    mut state: G17PUmaPagePoolState,
-) -> G17PUmaPagePoolState {
-    state.counter_a = ((descriptor[1] >> 5) & 0x0fff_ffff) as u32;
-    state.counter_b = ((descriptor[1] >> 33) & 0x0fff_ffff) as u32;
-    state.empty = (descriptor[1] >> 61) as u32;
-    state.total_pages = descriptor[2] as u32;
-    state
 }
 
 #[cfg(test)]

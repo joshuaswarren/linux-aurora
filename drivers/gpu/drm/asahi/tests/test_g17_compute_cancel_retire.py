@@ -5,6 +5,7 @@ The driver methods are extracted verbatim. Hardware retirement is intentionally
 not simulated as a fence signal: tests supply that independent witness later.
 """
 from pathlib import Path
+from g17_compute_inflight_test_support import completion_mod, queue_limits_mock
 import subprocess
 import tempfile
 import sys
@@ -34,14 +35,25 @@ poll = item((root / "g17_manager.rs").read_text(),
 # Preserve the independent retirement proof and its placement before pin release.
 assert service.index("poll_staged_independent_compute_completion(") < service.index("release_after_retirement()")
 assert service.index("drop(q.previous_binding.take())") < service.index("release_after_retirement()")
-assert service.count("!q.retired_by_teardown && masks.is_some_and") == 2
-for guard in ("ticket.descriptor != queue.completion_descriptor",
-              "queue.completion_last_end", "queue.compute.read_compute_stamp()? == 0",
-              "completed != ticket.submitted_target", "consumer != ticket.item_producer"):
+# A torn-down queue (its watchdog is gone) is examined on every event batch.
+assert "q.retired_by_teardown || q.retire_pending || masks.is_none_or(" in service
+assert service.count("|| !selected(q)") == 2
+manager_src = (root / "g17_manager.rs").read_text()
+finished = item(manager_src, "    pub(crate) fn independent_compute_kick_finished(")
+# In-order multi-kick retirement: the kick's own per-kick stamp value, its
+# own target and item-ring records; a latched record or, without a recovery
+# since publication, the firmware counters decide execution.
+for guard in ("g17_compute::completion_stamp_covers(stamp, ticket.kick_timestamp)",
+              "self.independent_compute_kick_finished(queue, ticket)?",
+              "None if recovery_quiet =>", "None if !crossed_recovery => return Ok(None),",
+              "if observed.is_some() {\n            queue.completion_last_end"):
     assert guard in poll, guard
+for guard in ("(completed.wrapping_sub(ticket.submitted_target) as i32) >= 0",
+              "unconsumed <= published_after"):
+    assert guard in finished, guard
 assert "handshake.epoch != ticket.recovery_epoch" in service
-assert "q.retired_by_teardown = false;\n                    q.quarantined = true;" in service
-assert "active._lease.quarantine();" in quarantine
+assert "q.retired_by_teardown = false;\n                        q.quarantined = true;" in service
+assert "queued._lease.quarantine();" in quarantine
 assert "return self.cancel_async_compute(owner, submission);" in quarantine
 assert "fail_outstanding_jobs_for_vm" not in cancel
 assert "_lease.quarantine" not in cancel
@@ -92,7 +104,9 @@ impl Packet {fn submission_id(&self)->u64{self.id} fn completion(&self)->Result<
 struct Active {packet:Packet}
 struct HardwareQueue;
 impl HardwareQueue {fn queue_id(&self)->u8{11}}
-struct Queue {owner:Option<u64>,queue:HardwareQueue,active:Option<Active>,quarantined:bool,released:bool,retired_by_teardown:bool}
+'''+completion_mod()+queue_limits_mock()+r'''
+type Inflight=g17_completion::PairFifo<Active,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
+struct Queue {owner:Option<u64>,queue:HardwareQueue,inflight:Inflight,quarantined:bool,released:bool,retired_by_teardown:bool}
 struct Device;
 impl Device {fn as_ref(&self)->&Self{self}}
 macro_rules! dev_info {($($t:tt)*)=>{()}}
@@ -101,7 +115,7 @@ impl Runtime {
  fn service_async_compute_completions(&mut self)->Result{
    self.scans+=1;
    if self.retire_in_final_scan {
-     if let Some(active)=self.async_compute_queues[0].active.take(){active.packet.completion()?.complete(Ok([1,2]));}
+     if let Some(active)=self.async_compute_queues[0].inflight.take(){active.packet.completion()?.complete(Ok([1,2]));}
    }
    Ok(())
  }
@@ -111,7 +125,8 @@ fn setup()->(Runtime,Arc<Completion>,Arc<Memory>,Arc<AtomicUsize>){
  let m=Arc::new(Memory::default());m.active.store(1,Ordering::SeqCst);
  let writes=Arc::new(AtomicUsize::new(0));
  let c=Arc::new(Completion{signalled:AtomicU32::new(0),vm_job:Mutex(StdMutex::new(Some(Pin(m.clone())))),status:Status::default(),fence:Fence::default(),aggregate_member:Aggregate::default(),destinations:[Some(Destination(writes.clone())),None]});
- let q=Queue{owner:Some(10),queue:HardwareQueue,active:Some(Active{packet:Packet{id:28522,completion:c.clone()}}),quarantined:false,released:false,retired_by_teardown:false};
+ let mut inflight=Inflight::new();if inflight.push(Active{packet:Packet{id:28522,completion:c.clone()}}).is_err(){unreachable!()}
+ let q=Queue{owner:Some(10),queue:HardwareQueue,inflight,quarantined:false,released:false,retired_by_teardown:false};
  (Runtime{async_compute_queues:vec![q],pdev:None,retire_in_final_scan:false,scans:0},c,m,writes)
 }
 #[test] fn cancellation_keeps_maps_and_fails_only_waiter(){
@@ -119,7 +134,7 @@ fn setup()->(Runtime,Arc<Completion>,Arc<Memory>,Arc<AtomicUsize>){
  assert_eq!(c.fence.error.load(Ordering::SeqCst),-125);assert_eq!(c.fence.signals.load(Ordering::SeqCst),1);
  assert_eq!(c.status.0.load(Ordering::SeqCst),0);assert!(m.blocked.load(Ordering::SeqCst));
  assert_eq!(m.active.load(Ordering::SeqCst),1);assert!(!r.async_compute_queues[0].quarantined);
- assert!(r.async_compute_queues[0].released);assert!(r.async_compute_queues[0].active.is_some());
+ assert!(r.async_compute_queues[0].released);assert!(r.async_compute_queues[0].inflight.is_some());
  m.closed.store(true,Ordering::SeqCst);assert!(!m.unmapped.load(Ordering::SeqCst));
  assert_eq!(writes.load(Ordering::SeqCst),0);
 }
