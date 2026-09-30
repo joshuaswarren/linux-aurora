@@ -457,19 +457,25 @@ impl G18FirmwareMemory {
         // b000 0x216b8 obtains GFX status-A; 0x3508 loads its first word
         // into global 0x1093e4. Bit0 gates commands/completion; bit1 gates
         // scheduling/recovery. audit-g18-trace-mask-native.py executes these
-        // exact branches. GFX1 and other trace classes remain unchanged.
-        self.private.write_u32(trace, 3)?;
+        // exact branches. Opt-in graphics diagnosis additionally enables
+        // bit9 (global 0x1093e5 bit1), the native stall diagnostic category.
+        // audit-g18-graphics-stall.py executes that original predicate.
+        let graphics_stall_trace = *crate::module_parameters::g18_graphics_stall_trace.value() == 1;
+        let trace_mask = if graphics_stall_trace { 0x203 } else { 3 };
+        self.private.write_u32(trace, trace_mask)?;
         // b000 refresh 0x352c/0x3688 copies region-C+0x9ac into
         // global 0x109488. Its compute nibble (bits8..11) selects native
         // progress sampling: mode3 only checks busy; mode2 takes the
-        // detailed sampler. Keep TA/3D nibbles and all timeout bounds.
-        // This is a diagnostic selection for the single stage8 job.
-        self.region_c.write_u32(progress, 0x233)?;
+        // detailed sampler. Graphics diagnosis also selects mode2 for TA;
+        // b000 0x890c then enters the original sampler at 0x8924 instead
+        // of the busy-bit-only path. Keep 3D and all timeout bounds.
+        let progress_policy = if graphics_stall_trace { 0x232 } else { 0x233 };
+        self.region_c.write_u32(progress, progress_policy)?;
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(),
             "G18_QUEUE_OWNER firmware: hwdata+0x2724=0 before root publication; no host KSMFE writes\n");
-        dev_info!(dev.as_ref(), "G18_TRACE_MASK GFX status-A=3 before root publication\n");
-        dev_info!(dev.as_ref(), "G18_PROGRESS_POLICY region-C+0x9ac=0x233 before publication; timeout bounds unchanged\n");
+        dev_info!(dev.as_ref(), "G18_TRACE_MASK GFX status-A={:#x} before root publication\n", trace_mask);
+        dev_info!(dev.as_ref(), "G18_PROGRESS_POLICY region-C+0x9ac={:#x} before publication; timeout bounds unchanged\n", progress_policy);
         Ok(())
     }
 

@@ -1090,7 +1090,8 @@ impl G18Session {
         // No host SGX MMIO here: firmware power-gates SGX at will, and a
         // gated read is a synchronous external abort (stage34 oops at
         // SGX+0xd8c0 during root publication). A GMMU fault reaches us as a
-        // firmware recovery event; read 0x58000d8c0/8 from userspace after.
+        // firmware recovery event. Read retained DRAM for diagnosis; a
+        // userspace read of power-gated SGX registers is unsafe as well.
         if self.drain()? {
             dev_err!(self.device(), "G18 {}: firmware posted a recovery event\n", label);
             return Err(EIO);
