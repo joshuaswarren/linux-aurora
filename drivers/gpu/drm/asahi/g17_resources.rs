@@ -11535,6 +11535,37 @@ impl G17PUserRenderStorage {
         Ok(aliases)
     }
 
+    /// Name the exclusive alias that contains `address`, and say whether this
+    /// driver maps it read-only.
+    ///
+    /// A `reason=3` GMMU fault is ReadOnly, not Unmapped -- the firmware wrote
+    /// through a leaf we mapped without write permission -- so the leaf's
+    /// permission is the whole diagnosis, and the fault line previously named
+    /// only the owning VM. Several of these aliases ARE read-only by
+    /// construction (`fragment_rce`, the 3D descriptor), so a write landing in
+    /// one of those is the answer rather than a coincidence.
+    pub(crate) fn name_alias_containing(&self, address: u64) -> Option<(&'static str, bool)> {
+        let hit = |base: u64, size: u64| address >= base && address < base.saturating_add(size);
+        let entries: [(&'static str, u64, u64, bool); 10] = [
+            ("render-state", self.render_state.iova(), self.render_state.logical_size as u64, false),
+            ("deflake", self.render_user_aliases.deflake.iova(), self.render_user_aliases.deflake.size() as u64, false),
+            ("aux-fb", self.render_user_aliases.aux_fb.iova(), self.render_user_aliases.aux_fb.size() as u64, false),
+            ("rt-memory", self.render_target_memory.rt_memory.iova(), self.render_target_memory.rt_memory.logical_size as u64, false),
+            ("tpc", self.render_target_memory.tpc.iova(), self.render_target_memory.tpc.logical_size as u64, false),
+            ("descriptor-ta", self.descriptor_ta_low.iova(), self.descriptor_ta_low.size() as u64, false),
+            ("descriptor-3d", self.descriptor_3d_low.iova(), self.descriptor_3d_low.size() as u64, false),
+            ("fragment-rce", self.fragment_rce.iova(), self.fragment_rce.logical_size as u64, true),
+            ("descriptor-3d-diagnostic", self.descriptor_3d_render.iova(), self.descriptor_3d_render.size() as u64, true),
+            ("fragment-status", self.fragment_status_low.iova(), self.fragment_status_low.size() as u64, false),
+        ];
+        for (name, base, size, read_only) in entries {
+            if hit(base, size) {
+                return Some((name, read_only));
+            }
+        }
+        None
+    }
+
     /// A cross-VM handoff builds a fresh graph while physical KSM timestamps
     /// remain monotonic. Ordinary variable-item graphs start all cursors at
     /// zero independently of that timestamp; legacy fixed-group diagnostics

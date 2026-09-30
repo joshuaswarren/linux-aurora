@@ -8890,6 +8890,33 @@ impl G17PManagerConstruction {
             root,
             fault_vm_slot,
         );
+        // reason=3 is ReadOnly, so the leaf's write permission IS the
+        // diagnosis. Name the exclusive alias the address lands in and say
+        // whether this driver maps it read-only; several of them are RO by
+        // construction, and a firmware write into one of those is the answer.
+        for (pair_slot, slot) in self.render_slots.slots.iter().enumerate() {
+            let Some(storage) = slot.as_deref().and_then(|slot| slot.storage.as_deref()) else {
+                continue;
+            };
+            for (name, candidate) in [
+                ("raw", addr_word),
+                ("shift6", (addr_word & ((1u64 << 42) - 1)) << 6),
+                ("shift6-masked", (addr_word << 6) & ((1u64 << 42) - 1)),
+            ] {
+                if let Some((alias, read_only)) = storage.name_alias_containing(candidate) {
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17PMARK fault alias[{}]: {} candidate {:#x} lands in pair {} alias {} mapped {} -- a reason=3 fault here means the firmware WROTE through it\n",
+                        label,
+                        name,
+                        candidate,
+                        pair_slot,
+                        alias,
+                        if read_only { "READ-ONLY" } else { "read-write" },
+                    );
+                }
+            }
+        }
         let candidates = [
             ("raw", addr_word),
             ("shift6", (addr_word & ((1u64 << 42) - 1)) << 6),
