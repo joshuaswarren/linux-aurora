@@ -3124,10 +3124,38 @@ fn boot_initial_session(
         ),
         GFP_KERNEL,
     )?;
-    let mut gfx_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
-    let gfx1_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
+    // The mailbox provider resumes its genpd in apple_mbox_start().  A GFX
+    // power-on that does not settle fails that resume with ETIMEDOUT; the
+    // provider then clears the runtime PM error, which used to turn every
+    // later attempt into EINVAL. A failed constructor releases its RX claim,
+    // and neither ASC has started, so a bounded retry is safe here.
+    let new_rtkit = |index, state: Arc<G17PRoleRtkitState>| {
+        for attempt in 1..=3 {
+            match rtkit::RtKit::<G17PRtkitOps>::new_g17p(
+                drm.as_ref(), None, index, state.clone(),
+            ) {
+                Ok(rtkit) => return Ok(rtkit),
+                Err(error) => {
+                    dev_err!(pdev.as_ref(),
+                        "G17P initial session: RTKit receiver {} constructor attempt {} failed ({:?})\n",
+                        index, attempt, error);
+                    if error != EINVAL && error != ETIMEDOUT {
+                        return Err(error);
+                    }
+                    if attempt == 3 {
+                        dev_err!(pdev.as_ref(),
+                            "G17P initial session: RTKit receiver {} still failing ({:?}); deferring probe until providers settle\n",
+                            index, error);
+                        return Err(EPROBE_DEFER);
+                    }
+                    fsleep(Delta::from_millis(20));
+                }
+            }
+        }
+        Err(EPROBE_DEFER)
+    };
+    let mut gfx_rtkit = new_rtkit(0, gfx_state.clone())?;
+    let gfx1_rtkit = new_rtkit(1, gfx1_state.clone())?;
     dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
     registers.validate_t8140_axi_transition()?;
