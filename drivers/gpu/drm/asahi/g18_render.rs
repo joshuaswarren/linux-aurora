@@ -57,6 +57,9 @@ pub(crate) struct G18RenderControls {
     /// Native descriptor +ac8 & 0x7f, emitted at 8c3c208..8c3c230.
     /// Independent of work-key low bits (+988) and utile dimensions.
     pub(crate) fragment_control: u64,
+    /// Native +770 / register 10051 sample control. This is independent of
+    /// the application's tile-storage block count used by metadata +4d0.
+    pub(crate) fragment_sample_control: u64,
     /// Native +8cb and device +10aa4; first 160a8, final has bit 5 set.
     pub(crate) fragment_dispatch_control: u64,
     /// Native +7a0/+7a8. The second EOT binding is independent of +790/+798.
@@ -324,6 +327,7 @@ fn fragment_main(
             0x16060 => v = p.layermeta,
             0x16138 => v = c.fragment_tile_control,
             0x101e9 => v = c.fragment_control & 0x7f,
+            0x10051 => v = c.fragment_sample_control,
             0x1ca28 => v &= !15,
             0x16068 => {
                 tiles += 1;
@@ -434,6 +438,8 @@ pub(crate) fn g18_default_controls(p: &G17pRenderParameters) -> G18RenderControl
         fragment_tile_control: 0x8860,
         // Original a/b/g1 user descriptors and working native run 112.
         fragment_control: 0x1c,
+        // Capture parameters already carry native sample control here.
+        fragment_sample_control: p.tib_blocks,
         fragment_dispatch_control: 0,
         store_pipeline_2_bind: p.store_pipeline_bind,
         store_pipeline_2: p.store_pipeline,
