@@ -5121,6 +5121,13 @@ impl G17PManagerConstruction {
             );
             return Err(EFAULT);
         }
+        // The slot is idle, but its UMA descriptor contains firmware-updated
+        // cursors and growth. Save them with this graph before another pool
+        // overwrites the slot; reloading the constructor values loses pages.
+        if crate::g17_config::RENDER_USC_FREELIST != 0 {
+            let storage = self.render_slots.get(pair_slot).storage.as_deref().ok_or(EIO)?;
+            self.resources.save_user_render_uma(storage)?;
+        }
         let backing = self.render_slots.get_mut(pair_slot).storage.as_deref_mut().ok_or(EIO)?.take_sksm_backing()?;
         self.render_slots.get_mut(pair_slot).sksm.as_mut().ok_or(EIO)?.backing = Some(backing);
         Ok(())
