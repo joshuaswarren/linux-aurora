@@ -48,15 +48,16 @@ pub(crate) fn target_plan_for_kind(p: &G17pRenderParameters, kind: u32) -> Optio
     Some(TargetPlan { layout, sizes, offsets, native })
 }
 
-/// All kernel-owned target pointers use the zero-based compact view. The
-/// owner maps identical backing at these VAs and at COMPACT_BIAS+VA.
+/// Native 3D uses full target VAs; TA subtracts the mapping's context base.
+/// The owner maps identical backing at the compact and biased views.
 pub(crate) fn apply_target_plan(p: &mut G17pRenderParameters, plan: &TargetPlan) {
     let a = plan.offsets.map(|offset| va::GRAPHICS_TARGET_OFFSET + offset);
-    p.context_base = 0;
-    p.tilemap = a[0];
-    p.heapmeta = a[0] + plan.layout.heapmeta_offset as u64;
+    p.context_base = va::COMPACT_BIAS;
+    p.tilemap = va::COMPACT_BIAS + a[0];
+    p.heapmeta = p.tilemap + plan.layout.heapmeta_offset as u64;
     p.layermeta = p.heapmeta;
-    p.tpc = a[1];
+    p.tpc = va::COMPACT_BIAS + a[1];
+    // Deflake has a separate task-address encoding; keep these compact.
     p.deflake_3 = a[2]; p.deflake_2 = a[2] + 0xc0; p.deflake_1 = a[2] + 0x980;
     p.ta_status = a[3]; p.fragment_status = a[4]; p.aux_fb = a[5];
     // Generator does not admit timestamp registers yet; command timestamp
@@ -69,7 +70,7 @@ pub(crate) fn apply_target_controls(p: &mut G17pRenderParameters,
     c: &mut regs::G18RenderControls, plan: &TargetPlan) {
     if let Some(n) = plan.native {
         let pointer = |i: usize| if n.slice_sizes[i] == 0 { 0 }
-            else { p.tpc + n.slice_offsets[i] as u64 };
+            else { p.tpc - p.context_base + n.slice_offsets[i] as u64 };
         c.ta_cluster_tilemap = pointer(1);
         c.ta_cluster_layermeta = pointer(2);
         c.ta_cluster_meta = [pointer(4), pointer(5), pointer(6), pointer(7)];

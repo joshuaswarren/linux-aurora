@@ -32,7 +32,7 @@ pub(crate) struct G18RenderStageControls {
     /// Native literal window triple (TA a109/a129/a149; fragment a101/a121/a141).
     /// 8c4f4d4..8c4f56c / 8c3b358..8c3b3f0; no descriptor read.
     pub(crate) address_windows: [u64; 3],
-    /// (TA +12c4 / fragment +154) << 8 | (+12d0 / +ac8) & 63.
+    /// (TA +12c4 / fragment +154) << 8 | (+12d0 / +988) & 63.
     pub(crate) work_key: u64,
     /// Optional USC statistics mapping from +1468 / +bb0 pointee chain.
     /// Native helper 8c4bdb8: absent -> 0, present -> VA & 7ffffffffc0,
@@ -54,6 +54,9 @@ pub(crate) struct G18RenderControls {
     pub(crate) fragment_tile_flags: u64,
     /// Native fragment +982/+983 and device +4d4/+6b9; baseline 8860.
     pub(crate) fragment_tile_control: u64,
+    /// Native descriptor +ac8 & 0x7f, emitted at 8c3c208..8c3c230.
+    /// Independent of work-key low bits (+988) and utile dimensions.
+    pub(crate) fragment_control: u64,
     /// Native +8cb and device +10aa4; first 160a8, final has bit 5 set.
     pub(crate) fragment_dispatch_control: u64,
     /// Native +7a0/+7a8. The second EOT binding is independent of +790/+798.
@@ -235,6 +238,9 @@ pub(crate) fn build_g18_ta_program_into(program: &mut G18Program<91>,
         match n {
             0x1748 | 0xd499 | 0xd419 | 0xa5a1 | 0xd471 | 0x14320 | 0x1740 => continue,
             0x1c8f8 => out.push(0xa5e9, c.ta.resource_word)?,
+            // Fixed J873 device capability, independent of user PPP flags.
+            // Native device +6b0 bit 16 is emitted as bit 9 (8c4f004).
+            0x10121 => v |= 0x200,
             0x1c079 | 0x1c9d8 => {
                 v = p
                     .layermeta
@@ -317,8 +323,7 @@ fn fragment_main(
             0x15321 => out.push(0xa5f1, c.fragment.resource_word)?,
             0x16060 => v = p.layermeta,
             0x16138 => v = c.fragment_tile_control,
-            // Native prepare-time utile dimensions +4d4/+4d8 select this.
-            0x101e9 => v = 0,
+            0x101e9 => v = c.fragment_control & 0x7f,
             0x1ca28 => v &= !15,
             0x16068 => {
                 tiles += 1;
@@ -427,6 +432,8 @@ pub(crate) fn g18_default_controls(p: &G17pRenderParameters) -> G18RenderControl
         fragment_raster_control: 0x200000ff03ef,
         fragment_tile_flags: 0x20_0003_6011,
         fragment_tile_control: 0x8860,
+        // Original a/b/g1 user descriptors and working native run 112.
+        fragment_control: 0x1c,
         fragment_dispatch_control: 0,
         store_pipeline_2_bind: p.store_pipeline_bind,
         store_pipeline_2: p.store_pipeline,
@@ -486,7 +493,9 @@ pub(crate) fn g18_capture_parameters(
     p.aux_fb = aux;
     p.utile_config = 0xa000;
     p.multisample_control = 0x88;
-    p.ppp_control = 2;
+    // Native J873 device +6b0 bit 16 becomes PPP bit 9 (8c4f004).
+    // Keep the same 0x202 used by live native draws.
+    p.ppp_control = 0x202;
     p.tib_blocks = 0;
     p.tile_config = 0xc10280;
     p.aux_fb_flags = if capture == G18Capture::GearsG1 {
