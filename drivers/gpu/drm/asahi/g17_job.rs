@@ -575,7 +575,7 @@ impl<B: G17PRenderQueueBackend> G17PRenderScheduler<B> {
         let early = early_packet.is_some_and(|packet| self.backend.try_publish_early(&packet));
         if !early { self.backend.count_backlog(&counted_packet); }
         job.push();
-        Ok(G17PCommandFences { published, completed: hardware })
+        Ok(G17PCommandFences { ready: published, completed: hardware })
     }
 }
 
@@ -600,14 +600,16 @@ impl<B: G17PQueueBackend> G17PJobScheduler<B> {
         let mut job = job.arm();
         let published = job.fences().scheduled();
         job.push();
-        Ok(G17PCommandFences { published, completed: hardware })
+        Ok(G17PCommandFences { ready: published, completed: hardware })
     }
 }
 
-/// Publication readiness is distinct from GPU retirement. The scheduler signals
-/// `published` after run_job returns; only `completed` may satisfy user output.
+/// Consumer readiness normally follows scheduler publication. Commands with
+/// user timestamp destinations instead use `completed` for `ready`: retirement
+/// copies the timestamps before signalling that fence. Firmware tokens alone
+/// cannot order those CPU writes. Only `completed` may satisfy user output.
 #[derive(Clone)]
 pub(crate) struct G17PCommandFences {
-    pub(crate) published: Fence,
+    pub(crate) ready: Fence,
     pub(crate) completed: Fence,
 }

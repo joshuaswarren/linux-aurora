@@ -919,11 +919,12 @@ fn append_render_prefix_dependencies(
 ) -> Result {
     for (sequence, fence) in frontier {
         if crate::g17_submission::g17p_render_prefix_contains(prefix, *sequence) {
-            // Queue publication is ordered by scheduled fences. Keep every
-            // hardware status separately: a scheduled fence does not propagate
-            // a failed run_job, and native tokens carry the actual GPU waits.
+            // Native tokens order GPU execution, but user timestamps are
+            // copied by the host after retirement. Such producers must finish
+            // that copy before a consumer can publish. Keep hardware status
+            // separately so publication cannot hide a failed run_job.
             checked_dependencies.push(fence.completed.clone(), GFP_KERNEL)?;
-            dependencies.push(fence.published.clone(), GFP_KERNEL)?;
+            dependencies.push(fence.ready.clone(), GFP_KERNEL)?;
         }
     }
     Ok(())
@@ -2874,6 +2875,7 @@ impl G17PQueue {
                 dependencies.push(fence.clone(), GFP_KERNEL)?;
             }
         }
+        let host_timestamps = destinations.iter().any(Option::is_some);
         let completion = g17_job::G17PJobCompletion::new(
             output,
             timestamps,
@@ -2888,7 +2890,12 @@ impl G17PQueue {
             KVec::new(), KVec::new(), checked_dependencies, firmware_fences,
             Some(completion),
         )?;
-        let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
+        let mut finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
+        // Firmware dependency tokens precede the CPU timestamp copy. A
+        // consumer must not copy the query sentinel before that write lands.
+        if host_timestamps {
+            finished.ready = finished.completed.clone();
+        }
         // The job is queued and owns its completion from here: give userspace
         // the fence that signals when the GPU has actually run it.
         self.compute_sequence = compute_sequence;
@@ -2935,6 +2942,7 @@ impl G17PQueue {
         self.e2e_fine[7] = crate::g17_e2e::fine();
         let hardware_fence = new_independent_submission_fence(&self.fence_contexts)
             .map_err(|error| Self::stage_fail(submission_id, "new-render-fence", error))?;
+        let host_timestamps = timestamps.iter().any(Option::is_some);
         let completion = G17PRenderCompletion::new(
             hardware_fence,
             timestamps,
@@ -2976,8 +2984,13 @@ impl G17PQueue {
         // scheduler path, identical to v84 with bit0 clear.
         let early_allowed = crate::g17_host_path::early_publish_allowed(
             self.render_frontier.len(), !dependencies.is_empty());
-        let finished = self.render_scheduler.as_mut().ok_or(ENODEV)?
+        let mut finished = self.render_scheduler.as_mut().ok_or(ENODEV)?
             .enqueue(packet, dependencies, early_allowed)?;
+        // Firmware dependency tokens precede the CPU timestamp copy. A
+        // consumer must not copy the query sentinel before that write lands.
+        if host_timestamps {
+            finished.ready = finished.completed.clone();
+        }
         if let Some(counts) = e2e_counts {
             crate::g17_e2e::record(crate::g17_e2e::K_SCHED_PUSHED, 0, submission_id,
                 [counts[0], counts[1], counts[2], translated.render_order.sequence, 0]);

@@ -52,7 +52,7 @@ assert enqueue.index("let hardware = packet.fence();") < enqueue.index("self.ent
 # requiring the hardware fence for completion; the scheduled fence may only
 # unlock firmware dependency publication, never release the render resources.
 assert "let published = job.fences().scheduled();" in enqueue
-assert "Ok(G17PCommandFences { published, completed: hardware })" in enqueue
+assert "Ok(G17PCommandFences { ready: published, completed: hardware })" in enqueue
 assert "job.fences().finished()" not in enqueue
 
 print("PASS async render teardown: queued cancellation releases unpublished ownership; published cancellation waits before exact timeout/quarantine")
