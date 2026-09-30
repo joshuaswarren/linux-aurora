@@ -581,6 +581,11 @@ fn probe_t8152(
     let minimum_probe = render_variant == 0 &&
         ((stage == crate::g18_render_stage::STAGE_RENDER && render_profile == 4) ||
          (stage == g18_live_boot::STAGE_DRM && render_profile == 1));
+    let stall_trace = *crate::module_parameters::g18_graphics_stall_trace.value();
+    if stall_trace > 1 || (stall_trace != 0 && !minimum_probe) {
+        dev_err!(pdev.as_ref(), "G18G: graphics stall tracing requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
+        return Err(EINVAL);
+    }
     if sma_minimum > 1 || (sma_minimum != 0 && !minimum_probe) {
         dev_err!(pdev.as_ref(), "G18G: SMA minimum probe requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
         return Err(EINVAL);
