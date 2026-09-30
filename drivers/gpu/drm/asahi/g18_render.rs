@@ -151,11 +151,10 @@ fn validate(p: &G17pRenderParameters) -> Result<(), G18RenderError> {
         || p.absolute_pointers
         || p.native_ta_registers != 0
         || p.bg_resource_prefix != 0
-        || p.stencil_buffer != 0
         || p.stencil_aux_buffer != 0
         || p.stencil_stride != 0
         || p.stencil_aux_stride != 0
-        || p.stencil_clear_value != 0
+        || p.stencil_clear_value > 0xff
     {
         return Err(G18RenderError::UnsupportedFeature);
     }
@@ -418,6 +417,24 @@ fn fragment_partials(
         &m5_render::build_partial_load_registers(p, &load_mc)?,
         0x1600,
     )?;
+    // Native G18 partial helpers retain main stencil flags and add the
+    // transfer required by each program when a plane is present. The
+    // ordinary main list already forwards these fields unchanged.
+    fn stencil_flags<const N: usize>(program: &mut G18Program<N>,
+        p: &G17pRenderParameters, transfer: u64, store: bool) {
+        let mask = (1 << 4) | (1 << 8) | (1 << 14) | (1 << 18);
+        let flags = (p.depth_flags & mask)
+            | if p.stencil_buffer != 0 { transfer } else { 0 }
+            | if store && p.stencil_aux_buffer != 0 { 1 << 8 } else { 0 };
+        for register in &mut program.registers {
+            if register.number == 0x15319 {
+                register.value = (register.value & !mask) | flags;
+            }
+        }
+    }
+    stencil_flags(&mut programs.store, p, 1 << 18, true);
+    stencil_flags(&mut programs.resume, p, (1 << 14) | (1 << 18), true);
+    stencil_flags(&mut programs.load, p, 1 << 14, false);
     Ok(())
 }
 
