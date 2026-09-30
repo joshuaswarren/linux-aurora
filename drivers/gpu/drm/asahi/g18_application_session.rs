@@ -125,7 +125,9 @@ impl G18Session {
         let records=job.job.queues().publish_application_pass(frame)?;
         self.memory.as_mut().ok_or(EIO)?.publish_application_outer(&records,frame)?;
         Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit).send_message(EP_GFX_INTERRUPTS,0x0083_0000_0000_000a)?;
-        if frame.generation<=3 {
+        // The gallery needs a kick/retirement pair for every isolated client.
+        // Keep normal logging sparse; explicit stall tracing records each job.
+        if frame.generation<=3 || *crate::module_parameters::g18_graphics_stall_trace.value()!=0 {
             dev_info!(self.device(),"G18_APP_KICK frame={} context={} roots={:x?} order=3D,TA stamp={:#x}\n",frame.generation,pass.context_id,roots,frame.stamp());
         }
         for step in 0..10_000 {
@@ -141,7 +143,8 @@ impl G18Session {
                 && list==[0,job.job.queues().job_list()] && masks[0]&0x600==0x600 {
                 self.check_faults("application retired")?;
                 self.application_job.as_mut().ok_or(EIO)?.retired();
-                if frame.generation<=3 || frame.generation%256==0 {
+                if frame.generation<=3 || frame.generation%256==0
+                    || *crate::module_parameters::g18_graphics_stall_trace.value()!=0 {
                     dev_info!(self.device(),"G18_APP_FRAME_PASS frame={} stamp={:#x} scheduler={} outer={} inner={}\n",
                         frame.generation,frame.stamp(),frame.submitted(),frame.outer_after(),frame.inner_after());
                 }
