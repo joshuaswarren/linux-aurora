@@ -592,6 +592,11 @@ fn probe_t8152(
         dev_err!(pdev.as_ref(), "G18G: high VDM alias requires stage9/profile4/variant0, minimum SMA and stall tracing; refused before MMIO\n");
         return Err(EINVAL);
     }
+    let high_ppp = *crate::module_parameters::g18_ppp_high_alias.value();
+    if high_ppp > 1 || (high_ppp != 0 && high_vdm != 1) {
+        dev_err!(pdev.as_ref(), "G18G: high PPP aliases require the bounded high VDM control; refused before MMIO\n");
+        return Err(EINVAL);
+    }
     if sma_minimum > 1 || (sma_minimum != 0 && !minimum_probe) {
         dev_err!(pdev.as_ref(), "G18G: SMA minimum probe requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
         return Err(EINVAL);

@@ -12,6 +12,7 @@ pub(crate) struct G18GraphicsMemory {
     context: mmu::M5ExecutionContext,
     aliases: KVec<mmu::KernelMapping>,
     vdm_alias: Option<(u64, u64)>,
+    ppp_aliased: bool,
     pages: KVec<MappedObject>,
     capture: payload::Capture,
     body_digest: u64,
@@ -65,7 +66,7 @@ impl G18GraphicsMemory {
         }
         let mut command = KVec::new();
         command.extend_from_slice(input.command(), GFP_KERNEL)?;
-        let owner = Self { context, aliases, vdm_alias: None, pages, capture: input.capture(), command,
+        let owner = Self { context, aliases, vdm_alias: None, ppp_aliased: false, pages, capture: input.capture(), command,
             body_digest: input.body_digest(), command_digest: payload::fnv64(input.command()) };
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(), "G18_RENDER_PAYLOAD profile={} pages={} low_aliases={} body_fnv={:#018x} command_fnv={:#018x} context={} roots={:x?}; unpublished\n",
@@ -107,7 +108,61 @@ impl G18GraphicsMemory {
                 checked += 1;
             }
         }
+        if self.ppp_aliased {
+            for source in va::GRAPHICS_HIGH_PPP_PAGES {
+                let target = va::GRAPHICS_HIGH_PPP_BASE - 0x58000 + source;
+                for offset in [0, va::PAGE - 1] {
+                    if self.vm().translate_iova(source + offset)? !=
+                        self.vm().translate_iova(target + offset)? { return Err(EFAULT); }
+                    checked += 1;
+                }
+            }
+        }
         Ok(checked)
+    }
+
+    /// Isolate PPP address encoding using the pinned native witness. Only the
+    /// pointer bits in its 14 PPP records change; the pages themselves alias
+    /// their original backing. No shader or PPP payload is rewritten.
+    pub(crate) fn alias_ppp_for_address_probe(&mut self) -> Result {
+        if self.context.is_current() || self.ppp_aliased { return Err(EBUSY); }
+        if self.capture != payload::Capture::FragmentWitness ||
+            self.vdm_alias != Some((0x18000, va::GRAPHICS_HIGH_VDM)) { return Err(EINVAL); }
+        const RECORDS: [(usize, u32, u32); 14] = [
+            (0x00, 0x58000, 6), (0x08, 0x58018, 33), (0x10, 0x5809c, 33),
+            (0x34, 0x40, 5), (0x3c, 0x58120, 7), (0x44, 0x5813c, 6),
+            (0x4c, 0x58154, 5), (0x54, 0x58168, 7), (0x5c, 0x58184, 5),
+            (0x64, 0x6ac00, 10), (0x6c, 0x58198, 3), (0x74, 0x581a4, 2),
+            (0x7c, 0x48000, 5), (0x84, 0x581ac, 3),
+        ];
+        self.pages.iter_mut().find(|p| p.iova() == 0x18000).ok_or(EFAULT)?
+            .with_bytes_mut(|bytes| {
+                if payload::fnv64(bytes) != 0x6f21_d211_cfaf_7af1 { return Err(EINVAL); }
+                for (offset, pointer, words) in RECORDS {
+                    if bytes[offset..offset + 4] != (words << 8).to_le_bytes() ||
+                        bytes[offset + 4..offset + 8] != pointer.to_le_bytes() { return Err(EINVAL); }
+                }
+                Ok(())
+            })?;
+        let vm = self.context.vm();
+        for source in va::GRAPHICS_HIGH_PPP_PAGES {
+            let target = va::GRAPHICS_HIGH_PPP_BASE - 0x58000 + source;
+            let page = self.pages.iter_mut().find(|p| p.iova() == source).ok_or(EFAULT)?;
+            self.aliases.push(page.map_alias_at(vm, target, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+        }
+        self.ppp_aliased = true;
+        self.audit()?;
+        self.pages.iter_mut().find(|p| p.iova() == 0x18000).ok_or(EFAULT)?
+            .with_bytes_mut(|bytes| {
+                for (offset, pointer, words) in RECORDS {
+                    let compact = va::GRAPHICS_HIGH_PPP_BASE - 0x58000 - va::COMPACT_BIAS + u64::from(pointer);
+                    bytes[offset..offset + 4].copy_from_slice(&((words << 8) | (compact >> 32) as u32).to_le_bytes());
+                    bytes[offset + 4..offset + 8].copy_from_slice(&(compact as u32).to_le_bytes());
+                }
+                Ok(())
+            })?;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Retain a second mapping of the unchanged native VDM page. This isolates
