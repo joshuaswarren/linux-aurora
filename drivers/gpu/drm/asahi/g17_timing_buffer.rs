@@ -739,8 +739,8 @@ static MSGLOG_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
 /// Opt-in bit14: request a work-ring scan before eligible render preparation.
 pub(crate) const DIAG_EARLY_RENDER_DOORBELL: u32 = 1 << 14;
 
-/// Opt-in bit15: snapshot published firmware records with aligned word reads.
-pub(crate) const DIAG_WORD_FW_RECORDS: u32 = 1 << 15;
+/// Retired bit15: published firmware records are always snapshotted with
+/// aligned word reads (g17p_snapshot_fw_record); the bit is ignored.
 
 /// Opt-in bit16: early work scan only when host tracks no submitted GPU work.
 pub(crate) const DIAG_IDLE_RENDER_DOORBELL: u32 = 1 << 16;

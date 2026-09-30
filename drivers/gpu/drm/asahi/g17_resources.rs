@@ -17546,17 +17546,9 @@ impl G17ResourceOwner {
         let record_offset = record_address
             .checked_sub(self.ktrace_object(role).iova())
             .ok_or(EINVAL)? as usize;
-        let record_end = record_offset
-            .checked_add(g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE)
-            .ok_or(EINVAL)?;
         let mut raw = [0u8; g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE];
         self.ktrace_object(role).with_bytes_mut(|bytes| {
-            if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_WORD_FW_RECORDS) {
-                g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
-            } else {
-                raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
-                Ok(())
-            }
+            g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
         })?;
         if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_MSGLOG) {
             let qword = |index: usize| {
@@ -18989,17 +18981,9 @@ impl G17ResourceOwner {
             let record_offset = record_address
                 .checked_sub(self.ktrace_object(role).iova())
                 .ok_or(EINVAL)? as usize;
-            let record_end = record_offset
-                .checked_add(g17_completion::G17P_KTRACE_ENTRY_SIZE)
-                .ok_or(EINVAL)?;
             let mut raw = [0u8; g17_completion::G17P_KTRACE_ENTRY_SIZE];
             self.ktrace_object(role).with_bytes_mut(|bytes| {
-                if crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_WORD_FW_RECORDS) {
-                    g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
-                } else {
-                    raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
-                    Ok(())
-                }
+                g17p_snapshot_fw_record(bytes, record_offset, &mut raw)
             })?;
             if native_strict {
                 // Native fetchNextEntry asserts `(0x20 >> type) & 1` before it
