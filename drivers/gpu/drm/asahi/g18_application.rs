@@ -24,11 +24,10 @@
 //!   G18 captures (`g18_render.rs:489`, tile_config 0xc10280), dropped by the
 //!   partial helper (`g18_render.rs:396`). The UAPI cannot express them.
 //! - Single-layer ZLS array strides are zeroed, as on M5 (`m5_drm.rs:238-241`).
-//! - An inert stencil plane (no load/store, bits 14/18 clear) is stripped:
-//!   `g18_render` has no stencil witness and refuses any stencil field
-//!   (`g18_render.rs:148-152`). `isp_bgobjvals` 0x300 is the constant the
-//!   register builder re-asserts (`g17_render.rs:800`), so it is normalised
-//!   to zero; a real stencil clear value is refused.
+//! - Uncompressed S8 stencil planes retain their validated full backing.
+//!   Inert compressed stencil is stripped until its transfer path is ready.
+//!   `isp_bgobjvals` 0x300 is re-asserted by the register builder; its low
+//!   byte carries the application's stencil clear value.
 //!
 //! Pure: no allocation, MMIO, firmware or VM access. The job boundary at the
 //! end of the file is the only kernel-typed item (`hv/tools/
@@ -118,7 +117,7 @@ pub(crate) struct G18ApplicationRender {
     /// Attachment ranges Mesa declared (render targets and PBE images).
     pub(crate) vertex_attachments: g17_uapi::UapiAttachmentList,
     pub(crate) fragment_attachments: g17_uapi::UapiAttachmentList,
-    /// An inert stencil plane was attached and removed (see module doc).
+    /// An inert compressed stencil plane was removed (see module doc).
     pub(crate) stencil_stripped: bool,
     /// UAPI render flags: only PROCESS_EMPTY_TILES and RSRC_SPEC_HI remain.
     pub(crate) flags: u32,
@@ -265,10 +264,11 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand) -> Result<(), G18Applic
     if command.occlusion_query_base != 0 {
         return Err(R::OcclusionQuery);
     }
-    if command.zls_control & ZLS_STENCIL_TRANSFER != 0 {
+    if command.zls_control & ZLS_STENCIL_TRANSFER != 0
+        && (command.stencil.base == 0 || command.stencil.compression_base != 0) {
         return Err(R::StencilTransfer(command.zls_control));
     }
-    if command.stencil_clear & !ISP_BGOBJVALS_BASE != 0 {
+    if command.stencil_clear & !(ISP_BGOBJVALS_BASE | 0xff) != 0 {
         return Err(R::StencilClear(command.stencil_clear));
     }
     Ok(())
@@ -288,7 +288,27 @@ pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
     admit_envelope(command)?;
     // Z32F only: validate_m5_reference_depth also admits Z16, which has no
     // G18 witness (G18 captures are D32F, `g18_render.rs:505-511`).
-    g17_uapi::validate_m5_reference_depth(command, address_space).map_err(R::Depth)?;
+    // Retain the existing depth validation while admitting stencil's own
+    // load/store bits. Its full uncompressed S8 range is checked separately.
+    let mut depth_command = *command;
+    depth_command.zls_control &= !ZLS_STENCIL_TRANSFER;
+    g17_uapi::validate_m5_reference_depth(&depth_command, address_space).map_err(R::Depth)?;
+    if command.stencil.base != 0 && command.stencil.compression_base == 0 {
+        let width = u64::from(command.width);
+        let height = u64::from(command.height);
+        // S8 uses 128x128 tiles of 16 KiB; small levels are power-of-two
+        // miptails rounded to the 128-byte cacheline, as in AIL.
+        let bytes = if width >= 128 && height >= 128 {
+            width.div_ceil(128) * height.div_ceil(128) * 0x4000
+        } else {
+            (width.next_power_of_two() * height.next_power_of_two()).div_ceil(128) * 128
+        };
+        if command.stencil.base & 0x7f != 0
+            || command.stencil.base.checked_add(bytes).is_none()
+            || !address_space.covers(command.stencil.base, bytes, g17_uapi::GpuAccess::ReadWrite) {
+            return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressRange));
+        }
+    }
     if command.depth.base != 0 && command.zls_control & ZLS_DEPTH_FORMAT != 0 {
         return Err(R::DepthFormat(command.zls_control));
     }
@@ -303,7 +323,9 @@ pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
     // data/metadata ranges were validated above (m5_drm.rs:238-241).
     p.depth_stride = 0;
     p.depth_aux_stride = 0;
-    let stencil_stripped = p.stencil_buffer != 0;
+    p.stencil_stride = 0;
+    p.stencil_aux_stride = 0;
+    let stencil_stripped = p.stencil_aux_buffer != 0;
     if stencil_stripped {
         p.stencil_buffer = 0;
         p.stencil_aux_buffer = 0;
@@ -318,9 +340,8 @@ pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
             p.depth_dimensions = 0;
         }
     }
-    // ISP_BGOBJVALS: the builder writes value | 0x300 (g17_render.rs:800),
-    // so the Mesa constant maps to zero; admit_envelope refused anything else.
-    p.stencil_clear_value = 0;
+    // ISP_BGOBJVALS: retain the S8 clear value and normalize the fixed bits.
+    p.stencil_clear_value = command.stencil_clear & 0xff;
     p.aux_fb_flags = G18_AUX_FB_FLAGS;
     p.tile_config |= G18_MAIN_TILE_FLAGS;
 
