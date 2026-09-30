@@ -11,6 +11,7 @@ pub(crate) struct G18GraphicsMemory {
     // during construction before publication.
     context: mmu::M5ExecutionContext,
     aliases: KVec<mmu::KernelMapping>,
+    vdm_alias: Option<(u64, u64)>,
     pages: KVec<MappedObject>,
     capture: payload::Capture,
     body_digest: u64,
@@ -64,7 +65,7 @@ impl G18GraphicsMemory {
         }
         let mut command = KVec::new();
         command.extend_from_slice(input.command(), GFP_KERNEL)?;
-        let owner = Self { context, aliases, pages, capture: input.capture(), command,
+        let owner = Self { context, aliases, vdm_alias: None, pages, capture: input.capture(), command,
             body_digest: input.body_digest(), command_digest: payload::fnv64(input.command()) };
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(), "G18_RENDER_PAYLOAD profile={} pages={} low_aliases={} body_fnv={:#018x} command_fnv={:#018x} context={} roots={:x?}; unpublished\n",
@@ -99,7 +100,32 @@ impl G18GraphicsMemory {
                 checked += 1;
             }
         }
+        if let Some((source, target)) = self.vdm_alias {
+            for offset in [0, va::PAGE - 1] {
+                if self.vm().translate_iova(source + offset)? !=
+                    self.vm().translate_iova(target + offset)? { return Err(EFAULT); }
+                checked += 1;
+            }
+        }
         Ok(checked)
+    }
+
+    /// Retain a second mapping of the unchanged native VDM page. This isolates
+    /// the address used for fetching commands from their contents and backing.
+    pub(crate) fn alias_vdm_for_address_probe(&mut self, address: u64) -> Result<u64> {
+        if self.context.is_current() || self.vdm_alias.is_some() {
+            return Err(EBUSY);
+        }
+        if self.capture != payload::Capture::FragmentWitness || address != 0x18000 ||
+            va::GRAPHICS_HIGH_VDM & (va::PAGE - 1) != 0 { return Err(EINVAL); }
+        let vm = self.context.vm();
+        let page = self.pages.iter_mut().find(|page| page.iova() == address).ok_or(EFAULT)?;
+        let alias = page.map_alias_at(vm, va::GRAPHICS_HIGH_VDM,
+            mmu::PROT_GPU_SHARED_RW)?;
+        self.aliases.push(alias, GFP_KERNEL)?;
+        self.vdm_alias = Some((address, va::GRAPHICS_HIGH_VDM));
+        self.audit()?;
+        Ok(va::GRAPHICS_HIGH_VDM - va::COMPACT_BIAS)
     }
 
     /// The caller supplies the register builder's decoded VDM stream address.

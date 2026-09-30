@@ -7,6 +7,8 @@
 pub(crate) const PAGE: u64 = 0x4000;
 pub(crate) const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 pub(crate) const COMPACT_BIAS: u64 = 0x10_0000_0000;
+// Optional H1 control: the first Gallium VDM address from retained run123.
+pub(crate) const GRAPHICS_HIGH_VDM: u64 = 0x5f_ffe2_8000;
 pub(crate) const PB_TABLE: u64 = KERNEL_BASE + 0x015e_0000;
 pub(crate) const UMA_TABLE: u64 = KERNEL_BASE + 0x015e_8000;
 pub(crate) const COMPUTE_GRAPH: u64 = KERNEL_BASE + 0xc000_0000;
@@ -68,6 +70,7 @@ const fn r(name: &'static str, base: u64, bytes: u64) -> Region { Region { name,
 pub(crate) const REGIONS: &[Region] = &[
     r("capture-compact", 0, 0x78000),
     r("capture-compact-biased", COMPACT_BIAS, 0x78000),
+    r("capture-high-vdm-control", GRAPHICS_HIGH_VDM, PAGE),
     r("capture-data", 0x100_0000_0000, 0x3d8000),
     r("init-private-roots-fwctl", KERNEL_BASE + 0x20000, 0x1a4000),
     r("pb-table", PB_TABLE, 0x4000), r("uma-table", UMA_TABLE, 0x8000),

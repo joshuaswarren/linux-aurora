@@ -586,6 +586,13 @@ fn probe_t8152(
         dev_err!(pdev.as_ref(), "G18G: graphics stall tracing requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
         return Err(EINVAL);
     }
+    let high_vdm = *crate::module_parameters::g18_vdm_high_alias.value();
+    if high_vdm > 1 || (high_vdm != 0 &&
+        (stage != crate::g18_render_stage::STAGE_RENDER || render_variant != 0 ||
+         render_profile != 4 || sma_minimum != 1 || sma_ideal != 0 || stall_trace != 1)) {
+        dev_err!(pdev.as_ref(), "G18G: high VDM alias requires stage9/profile4/variant0, minimum SMA and stall tracing; refused before MMIO\n");
+        return Err(EINVAL);
+    }
     if sma_minimum > 1 || (sma_minimum != 0 && !minimum_probe) {
         dev_err!(pdev.as_ref(), "G18G: SMA minimum probe requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
         return Err(EINVAL);

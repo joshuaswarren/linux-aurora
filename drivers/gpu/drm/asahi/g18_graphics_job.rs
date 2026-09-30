@@ -42,6 +42,14 @@ impl G18GraphicsJob {
             crate::g18_graphics_payload::Capture::FragmentWitness => regs::G18Capture::FragmentWitness,
         };
         let (mut p, mut controls) = regs::g18_capture_parameters(capture);
+        if *crate::module_parameters::g18_vdm_high_alias.value() == 1 {
+            let source = p.encoder;
+            p.encoder = program.alias_vdm_for_address_probe(source)?;
+            dev_info!(dev, "G18_VDM_ADDRESS_CONTROL source={:#x} alias={:#x} compact={:#x} bytes=16384 contents=unchanged\n",
+                source, va::GRAPHICS_HIGH_VDM, p.encoder);
+            dev_info!(dev, "G18_RENDER_OBJECT name=vdm-address-control va={:#x} bytes={:#x} context={}\n",
+                va::GRAPHICS_HIGH_VDM, va::PAGE, program.context_id());
+        }
         if matches!(variant, RenderVariant::TaOnly | RenderVariant::Clear) {
             program.terminate_vdm(p.encoder)?;
         }
@@ -174,7 +182,12 @@ impl G18GraphicsJob {
         // Validate all enabled direct register pointer inputs; bind/flag words
         // and shader offsets are not mistaken for full addresses.
         let p = &self.parameters;
-        for address in [p.encoder,p.tilemap,p.heapmeta,p.layermeta,p.tpc,p.deflake_1,p.deflake_2,p.deflake_3,
+        // The register carries a compact VDM offset, not a full GPU VA.
+        // The low fixture alias used to hide this distinction in the audit.
+        let vdm_address = va::COMPACT_BIAS.checked_add(p.encoder).ok_or(EINVAL)?;
+        self.vm().translate_iova(vdm_address)?;
+        pages += 1;
+        for address in [p.tilemap,p.heapmeta,p.layermeta,p.tpc,p.deflake_1,p.deflake_2,p.deflake_3,
             p.ta_status,p.fragment_status,p.scissor_array,p.depth_bias_array,p.aux_fb,
             p.occlusion_query_base,p.depth_buffer,p.stencil_buffer,p.depth_aux_buffer,p.stencil_aux_buffer,
             p.sampler_array,p.cycle,p.record_index & !1,p.load_pipeline,p.store_pipeline,
