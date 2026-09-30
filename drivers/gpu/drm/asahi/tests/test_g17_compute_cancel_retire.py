@@ -48,9 +48,10 @@ for guard in ("g17_compute::completion_stamp_covers(stamp, ticket.kick_timestamp
               "None if recovery_quiet =>", "None if !crossed_recovery => return Ok(None),",
               "if observed.is_some() {\n            queue.completion_last_end"):
     assert guard in poll, guard
-for guard in ("(completed.wrapping_sub(ticket.submitted_target) as i32) >= 0",
-              "unconsumed <= published_after"):
-    assert guard in finished, guard
+# Shared TSQ counts include other engines' completions (test_g17_tsq_accounting),
+# so only the kick's own item-ring position proves its in-order retirement.
+assert "unconsumed <= published_after" in finished
+assert "submitted_target" not in finished
 assert "handshake.epoch != ticket.recovery_epoch" in service
 assert "q.retired_by_teardown = false;\n                        q.quarantined = true;" in service
 assert "queued._lease.quarantine();" in quarantine

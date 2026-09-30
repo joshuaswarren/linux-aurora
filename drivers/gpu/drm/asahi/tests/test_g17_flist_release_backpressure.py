@@ -109,13 +109,19 @@ release_service = block(runtime, r"^    fn service_render_usc_freelist_release\(
 assert release_service.index("Err(error) if error == EAGAIN") < release_service.index("queue_primary_control_continuation")
 assert "settle_consumed_render_usc_freelist_releases()?" in release_service
 assert "fsleep" not in release_service
-publish = block(drm, r"^    fn publish\(&self, packet: Arc<g17_job::G17PRenderJobPacket>\)")
+assert "self.publish_with(" in block(drm, r"^    fn publish\(&self, packet: Arc<g17_job::G17PRenderJobPacket>\)")
+publish = block(drm, r"^    fn publish_with\(")
 # The render publish path waits on nothing firmware-ordered: no release poll,
 # no control poll. Its one sleep is context-local state-capacity back-pressure
 # on the adaptive completion-poll schedule; other contexts cannot consume it.
 assert "primary_device_control_backpressured" not in publish
 assert "render_usc_freelist_release_pending_for_slot" not in publish
-assert publish.count("fsleep(") == 1
+# v92c adds one bounded owner-change wait: the FList takeover guard sleeps only
+# while the pair still carries another owner's unconsumed 0x2e release (1 s cap).
+assert publish.count("fsleep(") == 2
+guard = publish.index("render_flist_takeover_ready(")
+assert publish.index("fsleep(Delta::from_micros(200))", guard) < publish.index("takeover_polls += 1", guard) + 200
+assert "takeover_polls >= 5000" in publish
 exhausted = publish.index("match completion.work_state().acquire()")
 # Capacity waits and node initialization finish before taking device exclusion.
 assert exhausted < publish.index("fsleep(", exhausted) < publish.index("self.runtime.mutex().lock()", exhausted)

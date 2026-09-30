@@ -38,7 +38,7 @@ class CaptureLifecycle(unittest.TestCase):
         self.assertRegex(ktrace[:300], r"default:\s*0,")
 
     def test_prepared_scan_precedes_flist_wake(self):
-        body = function(self.live, "submit_translated_render")
+        body = function(self.live, "submit_translated_render_inner")  # v92d body
         begin = body.index(".begin_translated_render(")
         scan = body.index(".capture_prepared_render_trace(")
         flist = body.index("self.publish_render_usc_freelist_request(render_slot)")
@@ -149,7 +149,7 @@ class CaptureLifecycle(unittest.TestCase):
     def test_render_submission_uses_the_logical_queue_execution_context(self):
         # Render publication runs in the queue's scheduler backend after the
         # ioctl has installed dependencies and returned.
-        body = function(self.drm, "publish")
+        body = function(self.drm, "publish_with")  # v84: trait publish delegates here
         call = body[body.index(".submit_translated_render("):]
         self.assertRegex(call[:800], r"\.context\s*\.clone\(\)")
         self.assertNotIn("RENDER_APP_CONTEXT", call[:800])
@@ -169,7 +169,7 @@ class CaptureLifecycle(unittest.TestCase):
         start = self.live.index("g17_manager::G17PManagerConstruction::new_with_uat(")
         self.assertLess(start, self.live.index("let handoff = manager.handoff();", start))
         self.assertLess(self.live.index("let handoff = manager.handoff();", start),
-                        self.live.index(".send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)", start))
+                        self.live.index(".send_message_logged(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)", start))
         self.assertIn("trace::Phase::BootConstructed", function(self.manager[self.manager.index("impl G17PTraceDump"):], "new"))
 
     def test_pm_low_aliases_are_explicit_context_zero_owners(self):

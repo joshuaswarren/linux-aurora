@@ -65,9 +65,11 @@ sweep_after_observation = item(
     async_compute, '    fn fail_outstanding_jobs_for_vm_after_compute_observation(')
 completion_service = item(async_compute, '    fn service_async_compute_completions_matching(')
 quarantine_compute = item(async_compute, '    pub(crate) fn quarantine_async_compute(')
+# v92d: the watchdog and the recovery settle share one final-observation sink.
 timeout_wrapper = item(live, '    pub(crate) fn timeout_deferred_render(')
-assert 'self.settle_failed_deferred_render(' in timeout_wrapper
-timeout_render = item(live, '    fn settle_failed_deferred_render(')
+assert 'self.fail_render_after_final_observation(' in timeout_wrapper
+assert 'self.fail_render_after_final_observation(' in item(live, '    fn settle_failed_deferred_render(')
+timeout_render = item(live, '    fn fail_render_after_final_observation(')
 publish_compute = item(drm, '    fn publish(&self, packet: Arc<g17_job::G17PComputeJobPacket>)')
 # The packet stays retained: firmware may still be executing it.
 assert 'inflight = ' not in sweep_after_observation and \

@@ -18,7 +18,9 @@ def function(source: str, marker: str) -> str:
     return source[start:pos]
 
 
-submit = function(runtime, "pub(crate) fn submit_translated_render(")
+# v92d: the published body lives in submit_translated_render_inner.
+assert "submit_translated_render_inner(" in function(runtime, "pub(crate) fn submit_translated_render(")
+submit = function(runtime, "fn submit_translated_render_inner(")
 ensure = function(runtime, "fn ensure_g17p_render_registration_power(")
 release = function(runtime, "fn release_g17p_render_registration_power(")
 construct = function(manager, "fn begin_translated_render_with_hardware_buffer(")

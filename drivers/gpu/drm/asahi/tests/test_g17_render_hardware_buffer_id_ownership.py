@@ -44,10 +44,12 @@ def constant(source, name):
 
 
 # --- the manager's use of the allocator ------------------------------------
-begin = block(manager, r"^    pub\(crate\) fn begin_translated_render\(")
+# v92d: per-pair storage. The reservation consults the retained storage's own
+# ID before any fresh allocation.
+begin = block(manager, r"^    fn reserve_translated_render\(")
 assert "retained_hardware_buffer_id" in begin, "a retained storage's own ID is not consulted"
 assert ".acquire_reserved_with_token(" in begin and ".allocate_with_token()" in begin
-assert begin.index("self.recycle_desynced_render_storage()") < begin.index(".acquire_reserved_with_token(")
+assert begin.index("self.recycle_desynced_render_storage(pair_slot)?") < begin.index(".acquire_reserved_with_token(")
 assert begin.index(".acquire_reserved_with_token(") < begin.index(".allocate_with_token()"), \
     "the retained path must be tried before a fresh allocation"
 
@@ -55,27 +57,20 @@ inner = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\("
 assert inner.index('"new-user-render-storage"') < inner.index(".reserve(id)"), \
     "a fresh storage's ID is not reserved for the storage's lifetime"
 
+# A desynced graph keeps its ID while it waits in its queue's teardown; the ID
+# returns to the free list only when that teardown settles.
 desync = block(manager, r"^    fn recycle_desynced_render_storage\(")
-assert "self.render_slots.active_mut().storage.take()" in desync
-assert "if !retained_firmware_state" in desync
-assert desync.index("if !retained_firmware_state") < desync.index("unreserve(id)")
+assert "storage.take()" in desync and "logical_queue_teardowns" in desync
+assert "unreserve" not in desync
+settle = block(manager, r"^    pub\(crate\) fn settle_logical_queue_teardowns\(")
+assert "render_hardware_buffer_ids.unreserve(id)" in settle
 stop = block(manager, r"^    pub\(crate\) fn release_runtime_objects_after_processor_stop\(")
 assert "unreserve_render_storage_hardware_buffer_id" in stop
 assert stop.index("unreserve_render_storage_hardware_buffer_id") < stop.index(
-    "self.render_slots.active_mut().storage = None"
+    "self.render_slots.get_mut(pair_slot).storage = None"
 )
-
-# A cross-VM handoff deliberately retains one completed generation and its
-# reserved ID. This prevents the incoming graph from immediately reusing the
-# same PBDesc slot; the previous quarantine is returned before it is dropped.
-handoff = block(manager, r"^    pub\(crate\) fn handoff_retained_render_vm\(")
-assert "self.retired_render_handoff_graph = Some(retired)" in handoff
-assert "unreserve_render_storage_hardware_buffer_id" not in handoff
-release_retired = block(manager, r"^    fn release_retired_handoff_graph\(")
-assert "storage.into_retired_parameter_management()" in release_retired
-assert release_retired.index("if !retained_firmware_state") < release_retired.index(
-    "ids.unreserve(id)"
-)
+# j700's cross-VM retired-handoff graph (handoff_retained_render_vm) is not part
+# of the per-pair design; test_g17_per_pair_invariants.py covers owner change.
 
 # The identity gate stays: the fix satisfies it, it does not bypass it.
 scene = block(resources, r"^    fn prepare_retained_scene\(")
@@ -88,7 +83,7 @@ assert "pm.hardware_buffer_id" in getter
 retire = block(manager, r"^    pub\(crate\) fn retire_abandoned_render_if_firmware_retired\(")
 for needle in ["completion.retired", "state.job_list_empty", "execution.observed()",
                ".release(hardware_buffer_id)",
-               "self.render_slots.active_mut().tracker = self.render_slots.active_mut().queued_tracker.take();",
+               "tracker = ",
                ".retire_command_generation(ordinal)?"]:
     assert needle in retire, needle
 assert retire.index("return Ok(false)") < retire.index("complete_g17p_cl_kicks("), \
@@ -98,12 +93,13 @@ assert "-> Result<bool>" in abandon
 assert "retire_failed_deferred_render(render_slot, true)" in abandon
 abandon = block(runtime, r"^    fn retire_failed_deferred_render\(")
 assert "retire_abandoned_render_if_firmware_retired(" in abandon
-assert "retire_render_usc_freelist_at_completion()" in abandon
+assert "retire_render_usc_freelist_at_completion(" in abandon
 assert abandon.index("retire_abandoned_render_if_firmware_retired(") \
     < abandon.index("abandon_render_submission_after_timeout()")
+# v92d: watchdog and recovery settle share the final-observation sink.
 timeout = block(runtime, r"^    pub\(crate\) fn timeout_deferred_render\(")
-assert "settle_failed_deferred_render(" in timeout
-timeout = block(runtime, r"^    fn settle_failed_deferred_render\(")
+assert "fail_render_after_final_observation(" in timeout
+timeout = block(runtime, r"^    fn fail_render_after_final_observation\(")
 assert ".retire_failed_deferred_render(render_slot, submission_id.is_some())" in timeout
 assert timeout.index("if retired") < timeout.index("signal.complete(Err(EIO))")
 assert timeout.index("signal.complete(Err(EIO))") < timeout.index("signal.fail_while_owned(error)")

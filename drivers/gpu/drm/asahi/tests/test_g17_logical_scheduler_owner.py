@@ -45,12 +45,16 @@ qos_id = item(resources, "    pub(crate) fn qos_hardware_buffer_id(")
 optional = item(resources, "    fn optional_addresses(")
 assert "addresses.channel_control = control.gpu_va()" in optional
 assert "self.ta_hardware_buffer_id," in optional
-for name in ["stage_fragment", "stage_fragment_prefix", "prepare_late_tiling"]:
-    # The last method is named separately on some branches; checked below.
-    if "    pub(crate) fn " + name + "(" in resources:
-        body = item(resources, "    pub(crate) fn " + name + "(")
-        assert "self.qos_hardware_buffer_id()?" in body, name
-assert "if self.qos_update_pending { put_u32(&mut bytes.optional, 0x52, 1); }" in resources
+# v92d: both stages' config updates carry the logical QoS HardwareBufferID
+# through final_config_update (reached via prepare_render_items); late tiling
+# passes it directly.
+assert "self.qos_hardware_buffer_id()?" in item(resources, "    fn final_config_update(")
+assert "self.prepare_render_items(ordinal)?" in item(resources, "    fn stage_fragment_config_group(")
+assert "self.qos_hardware_buffer_id()?" in item(resources, "    pub(crate) fn prepare_late_tiling_publication_with_stamp(")
+# v91 WORD_STORES: the +0x52 QoS-update word is part of the aligned +0x50 store.
+assert "((u64::from(fields.qos_update) & 0xffffffff) << 16)" in resources
+assert "qos_update: u32::from(ordinal == 0 || qos_update) }" in resources
+assert "self.descriptor_context_id, self.context_update_pending, self.qos_update_pending," in resources
 prepare = item(manager, "    pub(crate) fn prepare_logical_queue_context(")
 assert "G17PLogicalQueueContext::new(" in prepare
 assert "execution, control, qos, owner_pid" in prepare

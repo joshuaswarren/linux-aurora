@@ -48,11 +48,13 @@ source += "mod g17_compute {\n" + "\n".join(constant(compute, name) for name in 
 source += "\n".join(constant(resources, name) for name in [
     "G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE", "G17P_COMPUTE_STAMP_SUPPORT_OFFSET"])
 source += r'''
+''' + block(resources, "fn g17p_live_word_bounds(") + "\n" + block(resources, "fn g17p_live_read_u32(") + r'''
 #[derive(Clone,PartialEq,Eq,Debug)]struct Bytes{base:u64,raw:Vec<u8>}
 impl Bytes {
  fn iova(&self)->u64{self.base}
  fn with_bytes_mut<T>(&mut self,f:impl FnOnce(&mut[u8])->Result<T>)->Result<T>{f(&mut self.raw)}
  fn read_u32(&self,va:u64)->Result<u32>{let at=va.checked_sub(self.base).ok_or(ERANGE)? as usize;Ok(u32::from_le_bytes(self.raw.get(at..at+4).ok_or(ERANGE)?.try_into().unwrap()))}
+ fn read_live_u32(&mut self,va:u64)->Result<u32>{let at=va.checked_sub(self.base).ok_or(EINVAL)? as usize;g17p_live_read_u32(&self.raw,at)}
  fn read_u64(&mut self,va:u64)->Result<u64>{let at=va.checked_sub(self.base).ok_or(ERANGE)? as usize;Ok(u64::from_le_bytes(self.raw.get(at..at+8).ok_or(ERANGE)?.try_into().unwrap()))}
 }
 struct Storage{descriptors:Bytes,descriptors_high:Bytes,support:Bytes,queue_graph:Bytes,entries:Bytes,ring_reclaimed:u32,ring_reclaimed_total:u64}
