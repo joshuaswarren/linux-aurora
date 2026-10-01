@@ -267,7 +267,7 @@ kernel::prelude::module! {
             description: "Diagnostic: allocate non-reused native-range render MCache IDs per logical owner; reboot to reset pool",
         },
         g17p_ta_previous_fragment_probe: u32 {
-            default: 0,
+            default: 2,
             description: "Diagnostic: 1 ordinal TA flag; 2 coherent idle-gated TA/FRG scratch; 0 preserves current policy",
         },
         g17p_render_single_pair: u32 {
