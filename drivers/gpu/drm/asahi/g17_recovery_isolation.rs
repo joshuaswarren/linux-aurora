@@ -45,6 +45,13 @@
 //!        ADMISSION_WAIT_MS for the release instead of refusing VM_BIND, and
 //!        a compute submit waits up to SUBMIT_WAIT_MS for the retirement
 //!        witness of its own spared queue. Poisoned VMs still refuse at once.
+//!        (iso3) A render submit whose owner has every pair quarantined
+//!        waits up to ADMISSION_WAIT_MS for the reclaim that returns the
+//!        pair, instead of Y's immediate EIO, which poisons the VM through
+//!        `fail_unpublished`. Field case: boot d324fcdd 05:38:44, spared VM
+//!        2559's pair (slot 11) was quarantined at .370767, its next render
+//!        failed at .371211 and poisoned the VM, and the reclaim returned the
+//!        pair at .373928. An owner with a healthy pair never waits here.
 //!   bit2 SETTLE_CANCELLED: spared renders the firmware listed as CANCELLED
 //!        (bit2, not bit1) are settled at the end of the recovery through the
 //!        same exact-once settle the blamed slot uses, instead of waiting for
@@ -74,6 +81,21 @@
 //! first job guard of a submission takes exactly Y's path unless Y's path
 //! refuses it (no extra locking on the hot path).
 //!
+//! v3 (iso3) bit5 ATTRIBUTION (default on): the firmware's blame is the
+//! first set bit of the hardware-slot fault masks (B1 `FUN_5450`, see
+//! `PRIMARY_STATUS_B_RECOVERY_SLOT_MASK_OFFSET`), scanned TA first (inferred
+//! from captures), not the slot that stalled.
+//! With two or more sources, if the blamed slot's pass provably never
+//! started (its tiler never stamped the pass start, and no DM1 progress
+//! record exists for it), the culprit is re-attributed to the other sources
+//! whose pass provably started (stamped pass start). If none did, no client
+//! is guilty. A blamed source
+//! with any execution evidence, a single-source fault and every page fault
+//! (reason 3) keep the firmware's blame. Field case: 06:02:19 boot d324fcdd,
+//! mask 0x11: slot 0 = quickshell TA qid 9 (pass start 0, no record) was
+//! blamed; slot 4 = Minecraft 3D qid 27 (pass started, DM1 record state 2)
+//! had stalled.
+//!
 //! Memory safety is unchanged in every mode: packets, VM-job guards and
 //! quarantined pairs are retained and released only by the existing
 //! witnesses (exact retirement, firmware drain/reclaim, processor stop).
@@ -87,10 +109,12 @@ pub(crate) const ADMISSION_WAIT: u32 = 1 << 1;
 pub(crate) const SETTLE_CANCELLED: u32 = 1 << 2;
 pub(crate) const GUILTY_GRACE: u32 = 1 << 3;
 pub(crate) const RESUME_DOORBELL: u32 = 1 << 4;
-const ALL_BITS: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | GUILTY_GRACE | RESUME_DOORBELL;
+pub(crate) const ATTRIBUTION: u32 = 1 << 5;
+const ALL_BITS: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | GUILTY_GRACE | RESUME_DOORBELL
+    | ATTRIBUTION;
 /// Correctness/containment fixes with no hot-path cost are on; the guilty
 /// grace changes the guilty client's semantics and stays opt-in.
-pub(crate) const DEFAULT_MASK: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED;
+pub(crate) const DEFAULT_MASK: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | ATTRIBUTION;
 
 pub(crate) const ADMISSION_WAIT_MS: u32 = 1000;
 pub(crate) const SUBMIT_WAIT_MS: u32 = 200;
@@ -152,6 +176,100 @@ pub(crate) const fn classify(guilty: bool, grace: bool, now_ns: u64, last_grace_
     (CLASS_GUILTY, false)
 }
 
+// ---- fault-source attribution (bit5) ---------------------------------------
+
+/// One hardware slot of the recovery's fault mask, sampled while firmware is
+/// halted: the slot's cached key (qid << 40 | stamp), its DM1 progress-monitor
+/// state (0 = never written), and whether its pass had started (None = not a
+/// render pass the host can resolve).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FaultSource {
+    pub(crate) slot: u8,
+    pub(crate) qid: Option<u8>,
+    pub(crate) stamp: u64,
+    pub(crate) monitor_state: u32,
+    pub(crate) started: Option<bool>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Attribution {
+    /// Keep the firmware's guilty set (blamed stamp + table bit1).
+    Firmware,
+    /// The blamed slot never ran; these QIDs' owners are guilty instead.
+    Reattributed(u128),
+    /// The blamed slot never ran and no other source shows execution.
+    NoCulprit,
+}
+
+pub(crate) const fn decode_slot_key(key: u64) -> (Option<u8>, u64) {
+    if key == 0 { return (None, 0); }
+    let qid = (key >> 40) & 0xff;
+    (if qid < 128 { Some(qid as u8) } else { None }, key & 0xff_ffff_ffff)
+}
+
+/// `blamed_qid` is the QID of the firmware's stamp-blamed request. Across 13
+/// saved recoveries the blamed slot is the lowest faulting slot of the first
+/// data master, in TA, 3D, CDM order, that has one (e.g. 06:02:19 mask 0x11
+/// blamed TA slot 0 over 3D slot 4; 03:18:16 mask 0x3 blamed 3D slot 1 over
+/// compute slot 0) -- an inference from captures, so the blamed source is
+/// matched by QID, never by bit position.
+pub(crate) fn attribute(reason: u32, blamed_qid: Option<u8>, mask: u32, sources: &[FaultSource]) -> Attribution {
+    // Page faults name the faulting VM directly; one source leaves no choice.
+    if reason == 3 || mask.count_ones() < 2 { return Attribution::Firmware; }
+    let Some(blamed_qid) = blamed_qid else { return Attribution::Firmware; };
+    let Some(blamed) = sources.iter().find(|source| source.qid == Some(blamed_qid)) else {
+        return Attribution::Firmware;
+    };
+    let blamed_slot = blamed.slot;
+    if blamed.started != Some(false) || blamed.monitor_state != 0 {
+        return Attribution::Firmware;
+    }
+    let mut qids = 0u128;
+    // A culprit must have provably run: its pass start is stamped. A DM1
+    // progress record alone is not used for a culprit (records are historical
+    // DRAM and slots are shared across data masters, so a record may be stale).
+    for source in sources.iter().filter(|source| source.slot != blamed_slot) {
+        if source.started != Some(true) { continue; }
+        if let Some(qid) = source.qid { qids |= 1u128 << (qid & 0x7f); }
+    }
+    if qids != 0 { Attribution::Reattributed(qids) } else { Attribution::NoCulprit }
+}
+
+pub(crate) const MAX_SOURCES: usize = 16;
+static SRC_MASK: AtomicU32 = AtomicU32::new(0);
+static SRC_REASON: AtomicU32 = AtomicU32::new(0);
+static SRC_KEY: [AtomicU64; MAX_SOURCES] = [const { AtomicU64::new(0) }; MAX_SOURCES];
+static SRC_MONITOR: [AtomicU32; MAX_SOURCES] = [const { AtomicU32::new(0) }; MAX_SOURCES];
+
+/// Store the halted-firmware sample (`keys`/`monitors` indexed by slot).
+pub(crate) fn store_sources(reason: u32, mask: u32, keys: &[u64; MAX_SOURCES], monitors: &[u32; MAX_SOURCES]) {
+    for slot in 0..MAX_SOURCES {
+        SRC_KEY[slot].store(keys[slot], Ordering::Relaxed);
+        SRC_MONITOR[slot].store(monitors[slot], Ordering::Relaxed);
+    }
+    SRC_REASON.store(reason, Ordering::Relaxed);
+    SRC_MASK.store(mask, Ordering::Release);
+}
+
+pub(crate) fn clear_sources() { SRC_MASK.store(0, Ordering::Release); }
+
+/// (reason, mask, sources without `started`) of the last stored sample.
+pub(crate) fn sources(out: &mut [FaultSource; MAX_SOURCES]) -> (u32, u32, usize) {
+    let mask = SRC_MASK.load(Ordering::Acquire);
+    let reason = SRC_REASON.load(Ordering::Relaxed);
+    let mut used = 0;
+    for slot in 0..MAX_SOURCES {
+        if mask & (1u32 << slot) == 0 { continue; }
+        let (qid, stamp) = decode_slot_key(SRC_KEY[slot].load(Ordering::Relaxed));
+        out[used] = FaultSource {
+            slot: slot as u8, qid, stamp,
+            monitor_state: SRC_MONITOR[slot].load(Ordering::Relaxed), started: None,
+        };
+        used += 1;
+    }
+    (reason, mask, used)
+}
+
 // ---- recovery-info snapshot ------------------------------------------------
 
 pub(crate) const MAX_ENTRIES: usize = 64;
@@ -205,11 +323,13 @@ pub(crate) static SUBMIT_WAITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SUBMIT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RESUME_DOORBELLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static COLLATERAL: AtomicU64 = AtomicU64::new(0);
+pub(crate) static REATTRIBUTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NO_CULPRIT: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }
 
-static COUNTERS: [(&str, &AtomicU64); 19] = [
+static COUNTERS: [(&str, &AtomicU64); 21] = [
     ("recoveries", &RECOVERIES), ("unresolved", &UNRESOLVED),
     ("spared-renders", &SPARED_RENDERS), ("spared-compute", &SPARED_COMPUTE),
     ("guilty-marked", &GUILTY_MARKED), ("graced", &GRACED),
@@ -219,7 +339,7 @@ static COUNTERS: [(&str, &AtomicU64); 19] = [
     ("first-kicks-failed", &FIRST_KICKS_FAILED), ("admission-waits", &ADMISSION_WAITS),
     ("admission-timeouts", &ADMISSION_TIMEOUTS), ("submit-waits", &SUBMIT_WAITS),
     ("submit-timeouts", &SUBMIT_TIMEOUTS), ("resume-doorbells", &RESUME_DOORBELLS),
-    ("collateral", &COLLATERAL),
+    ("collateral", &COLLATERAL), ("reattributed", &REATTRIBUTED), ("no-culprit", &NO_CULPRIT),
 ];
 
 // ---- parameter -----------------------------------------------------------------

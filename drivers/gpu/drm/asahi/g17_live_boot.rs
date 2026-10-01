@@ -1511,6 +1511,7 @@ fn complete_primary_real_recovery(
     manager.validate_empty_primary_firmware_recovery(generation)?;
     // Recovery isolation classifies against THIS recovery's table only.
     crate::g17_recovery_isolation::clear_entries();
+    crate::g17_recovery_isolation::clear_sources();
     // The scheduler-empty precondition is UNSATISFIABLE for a render-blamed
     // recovery. The firmware raises the restart request during the render
     // wait, so `render_storage`/`render_tracker` are populated by construction
@@ -1576,6 +1577,21 @@ fn complete_primary_real_recovery(
         handshake.epoch,
     );
     let cause = manager.primary_firmware_recovery_cause_snapshot()?;
+    // Recovery isolation bit5: sample every fault-mask slot while firmware is
+    // still halted (keys and DM1 progress records are historical DRAM).
+    crate::g17_recovery_isolation::clear_sources();
+    if crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::ATTRIBUTION) {
+        let mut keys = [0u64; crate::g17_recovery_isolation::MAX_SOURCES];
+        let mut monitors = [0u32; crate::g17_recovery_isolation::MAX_SOURCES];
+        for slot in 0..crate::g17_recovery_isolation::MAX_SOURCES {
+            if (cause.slot_mask as u64) & (1u64 << slot) == 0 { continue; }
+            keys[slot] = g17_manager::G17PManagerConstruction::firmware_ksm_slot_key(slot).unwrap_or(0);
+            monitors[slot] = manager.firmware_dm1_slot_snapshot(slot)
+                .map(|snapshot| snapshot.state()).unwrap_or(0);
+        }
+        let reason = manager.firmware_fault_report_snapshot().map(|report| report.reason).unwrap_or(0);
+        crate::g17_recovery_isolation::store_sources(reason, cause.slot_mask as u32, &keys, &monitors);
+    }
     let slot_mask_population = cause.slot_mask.count_ones();
     let lowest_blamed_slot = match cause.slot_mask {
         0 => None,

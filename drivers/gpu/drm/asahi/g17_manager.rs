@@ -9334,6 +9334,29 @@ impl G17PManagerConstruction {
             .map(|sample| sample.first)
     }
 
+    /// Recovery isolation bit5: the cached key (qid << 40 | stamp) of one
+    /// hardware KSM slot (firmware DATA `0x1774b8 + slot * 8`, the same word
+    /// the B1 DM1 slot diagnostic prints). Read-only.
+    pub(crate) fn firmware_ksm_slot_key(slot: usize) -> Option<u64> {
+        if slot >= 16 { return None; }
+        Self::read_firmware_data_u64(0xffff_fc00_0017_74b8 + slot as u64 * 8).ok()
+    }
+
+    /// Recovery isolation bit5: whether the tracked pass with firmware stamp
+    /// `stamp` (ordinal + 1) on `pair_slot` had started, i.e. its tiler
+    /// stamped the pass start. None if that stamp is not a tracked pass.
+    pub(crate) fn render_pass_started(&mut self, pair_slot: u8, stamp: u64) -> Option<bool> {
+        if !self.render_slot_allocated(pair_slot) { return None; }
+        const STAMP_MASK: u64 = 0xff_ffff_ffff;
+        let slot = self.render_slots.get_mut(pair_slot);
+        let matches = |ordinal: u64| ordinal.wrapping_add(1) & STAMP_MASK == stamp & STAMP_MASK;
+        let ordinal = Iterator::chain(slot.tracker.iter(), slot.queued_tracker.iter())
+            .map(|tracker| tracker.ordinal)
+            .find(|ordinal| matches(*ordinal))?;
+        let state = slot.storage.as_deref_mut()?.snapshot(ordinal).ok()?;
+        Some(state.tiling_timestamps[0] != 0)
+    }
+
     /// v97d: the firmware's completed stamp for `qid` when its dependency
     /// record is valid.
     pub(crate) fn firmware_dependency_completed(qid: u8) -> Option<u64> {
