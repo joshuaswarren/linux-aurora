@@ -267,6 +267,8 @@ struct G17PHardwareBufferIdAllocator {
     /// never be handed to a different owner: it leaves this set only when the
     /// storage is dropped.
     reserved: [u64; 2],
+    /// Graph lifetime holds, separate from all 255 submission-reference slots.
+    owner_refs: [u64; 2],
 }
 
 impl G17PHardwareBufferIdAllocator {
@@ -284,6 +286,7 @@ impl G17PHardwareBufferIdAllocator {
             stack_len: G17P_TA_HARDWARE_BUFFER_ID_COUNT,
             next_parameter_buffer_token: 0,
             reserved: [0; 2],
+            owner_refs: [0; 2],
         }
     }
 
@@ -372,27 +375,45 @@ impl G17PHardwareBufferIdAllocator {
         Err(G17PHardwareBufferIdError::Exhausted)
     }
 
-    /// Mark `id` as owned by a live retained storage. Usually called while the
-    /// storage's first submission still holds the ID; tolerated at any time.
+    /// Legacy reservation without a counted owner, retained for diagnostics.
     fn reserve(&mut self, id: u32) -> core::result::Result<(), G17PHardwareBufferIdError> {
+        self.reserve_with_owner_ref(id, false)
+    }
+
+    /// Reserve the ID for this graph and optionally count its existing owner
+    /// lifetime. This does not reserve another ID or another GPU allocation.
+    /// The mode is captured here: later changes to the diagnostic mask cannot
+    /// change how this graph's last reference is released.
+    fn reserve_with_owner_ref(&mut self, id: u32, counted: bool)
+        -> core::result::Result<(), G17PHardwareBufferIdError>
+    {
         let index = id as usize;
         if index >= G17P_TA_HARDWARE_BUFFER_ID_COUNT {
             return Err(G17PHardwareBufferIdError::InvalidId);
+        }
+        if self.is_reserved(id) { return Ok(()); }
+        if counted {
+            if self.is_free(id) {
+                self.free[index / 64] &= !(1u64 << (index % 64));
+                self.tokens[index] = self.next_token();
+            }
+            self.owner_refs[index / 64] |= 1u64 << (index % 64);
         }
         self.reserved[index / 64] |= 1u64 << (index % 64);
         self.remove_from_stack(id);
         Ok(())
     }
 
-    /// End a storage's ownership of `id`. If no submission holds it, it goes
-    /// back on the free list for the next owner. A no-op for an unreserved ID.
+    /// End the retained graph's ownership at its existing retirement/stop
+    /// boundary. Outstanding submission holds, if any, still keep the ID live.
     fn unreserve(&mut self, id: u32) {
-        if !self.is_reserved(id) {
-            return;
-        }
+        if !self.is_reserved(id) { return; }
         let index = id as usize;
-        self.reserved[index / 64] &= !(1u64 << (index % 64));
-        if self.is_free(id) {
+        let bit = 1u64 << (index % 64);
+        self.reserved[index / 64] &= !bit;
+        self.owner_refs[index / 64] &= !bit;
+        if self.refs[index] == 0 {
+            self.free[index / 64] |= bit;
             self.push_stack(id);
         }
     }
@@ -408,7 +429,9 @@ impl G17PHardwareBufferIdAllocator {
         }
         if self.is_free(id) {
             self.free[index / 64] &= !(1u64 << (index % 64));
-        } else if self.refs[index] == 0 {
+        } else if self.refs[index] == 0
+            && self.owner_refs[index / 64] & (1u64 << (index % 64)) == 0
+        {
             return Err(G17PHardwareBufferIdError::DoubleFree);
         }
         self.refs[index] += 1;
@@ -464,11 +487,14 @@ impl G17PHardwareBufferIdAllocator {
         if index >= G17P_TA_HARDWARE_BUFFER_ID_COUNT {
             return Err(G17PHardwareBufferIdError::InvalidId);
         }
+        // Submission references cannot consume the separate graph hold.
         if self.is_free(id) || self.refs[index] == 0 {
             return Err(G17PHardwareBufferIdError::DoubleFree);
         }
         self.refs[index] -= 1;
-        if self.refs[index] != 0 {
+        if self.refs[index] != 0
+            || self.owner_refs[index / 64] & (1u64 << (index % 64)) != 0
+        {
             return Ok(());
         }
         self.free[index / 64] |= 1u64 << (index % 64);
@@ -6937,7 +6963,7 @@ impl G17PManagerConstruction {
             .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
         {
             self.render_hardware_buffer_ids
-                .reserve(id)
+                .reserve_with_owner_ref(id, crate::g17_host_path::enabled(crate::g17_host_path::PB_OWNER_REF))
                 .map_err(|_| Self::render_stage_fail("reserve-hardware-buffer-id", EIO))?;
         }
         if self.render_slots.get(pair_slot).submission_ordinal != 0 {
@@ -7875,7 +7901,7 @@ impl G17PManagerConstruction {
                 .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
             {
                 self.render_hardware_buffer_ids
-                    .reserve(id)
+                    .reserve_with_owner_ref(id, crate::g17_host_path::enabled(crate::g17_host_path::PB_OWNER_REF))
                     .map_err(|_| Self::render_stage_fail("reserve-hardware-buffer-id", EIO))?;
             }
             if self.render_slots.get(pair_slot).submission_ordinal != 0 {
