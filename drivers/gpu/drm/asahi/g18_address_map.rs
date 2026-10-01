@@ -24,6 +24,11 @@ pub(crate) const POOL_DIRECTORY: u64 = 0x70_0200_0000;
 pub(crate) const POOL_BLOCK_LIST: u64 = 0x70_0400_0000;
 pub(crate) const POOL_BLOCKS: u64 = 0x70_0500_0000;
 pub(crate) const POOL_BLOCK_STRIDE: u64 = 0x20_0000;
+// Job-VM-only 0x1a510 object for g18_app_preempt_mode=1: the first pages of
+// the VM_CREATE auxiliary driver arena (m5_vm::auxiliary_range), which
+// gem_bind refuses to userspace. Native uses a 48 KiB process object.
+pub(crate) const APPLICATION_COMPUTE_PREEMPT_DRIVER: u64 = COMPACT_BIAS + (1 << 32);
+pub(crate) const APPLICATION_COMPUTE_PREEMPT_DRIVER_BYTES: u64 = 0xc000;
 
 // Graphics reservations are beyond both the compute graph and its low arena.
 // Queue/PB owner integration must consume these, or update this table as one
@@ -95,6 +100,15 @@ pub(crate) const REGIONS: &[Region] = &[
     r("completion-low", 0x70_0184_8000, 4 * 0x28000),
     r("pool-directory-reservation", POOL_DIRECTORY, 0x2000000),
     r("pool-block-list", POOL_BLOCK_LIST, PAGE),
+    r("application-compute-directory", POOL_DIRECTORY + 0x40000000, 0x2000000),
+    r("application-compute-block-list", POOL_BLOCK_LIST + 0x40000000, PAGE),
+    r("application-compute-block0", POOL_BLOCKS + 0x40000000, 0x204000),
+    r("application-compute-block1", POOL_BLOCKS + 0x40300000, 0x204000),
+    r("application-compute-block2", POOL_BLOCKS + 0x40600000, 0x204000),
+    r("application-compute-block3", POOL_BLOCKS + 0x40900000, 0x204000),
+    r("application-compute-preempt", 0x70_5000_0000, PAGE),
+    r("application-compute-preempt-driver", APPLICATION_COMPUTE_PREEMPT_DRIVER,
+        APPLICATION_COMPUTE_PREEMPT_DRIVER_BYTES + PAGE),
     r("pool-block0-guard", POOL_BLOCKS, 0x104000),
     r("pool-block1-guard", POOL_BLOCKS + POOL_BLOCK_STRIDE, 0x104000),
     r("pool-block2-guard", POOL_BLOCKS + 2 * POOL_BLOCK_STRIDE, 0x104000),

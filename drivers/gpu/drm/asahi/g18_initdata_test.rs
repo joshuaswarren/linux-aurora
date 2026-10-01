@@ -1076,7 +1076,7 @@ fn g18g_private_cluster_carries_status_links_producers_and_relocated_config() {
     for poll in G18G_26A428_STATUS_CONFIG_SUBMIT_POLLS {
         assert_eq!(get_u32(&private, config + poll), 0);
     }
-    for field in [G18G_26A428_STATUS_B_FWCTL_HANDSHAKE, G18G_26A428_STATUS_B_RECOVERY_EPOCH] {
+    for field in [G18G_26A428_STATUS_B_RECOVERY_EPOCH, G18G_26A428_STATUS_B_RECOVERY_STATE] {
         assert_eq!(get_u64(&private, status_b + field), 0);
     }
     // Status config stays inside its 0x6d0 allocation, status B inside 0xe730.

@@ -286,7 +286,8 @@ pub(crate) fn g18_uma_block_entry(gpu_address: u64, previous: u32) -> Option<u32
 pub(crate) fn g18_initial_directory_fits(
     blocks: u32, block_bytes: u64, uscs: u32, flags: u32, page_shift: u32,
 ) -> Option<bool> {
-    if blocks == 0 || block_bytes != 0x10_0000 || uscs != 12 || flags != 3 || page_shift != 14 {
+    if blocks == 0 || !matches!(block_bytes, 0x10_0000 | 0x20_0000)
+        || uscs != 12 || flags != 3 || page_shift != 14 {
         return None;
     }
     let units = (block_bytes >> 16).checked_mul(u64::from(blocks))?;

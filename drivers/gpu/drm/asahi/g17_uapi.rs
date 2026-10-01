@@ -1112,6 +1112,11 @@ pub(crate) struct TranslatedComputeCommand {
     pub(crate) g17p_add3_buffers: Option<[u64; 3]>,
     pub(crate) timestamps: UapiTimestamps,
     pub(crate) scs_layout: u64,
+    /// G18 only: the command carried `DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE`.
+    /// [`translate_compute_command`] refuses that bit like any other unknown
+    /// one and leaves this false; the G18 adapter admits the bit, strips it
+    /// before translation and sets this afterwards.
+    pub(crate) g18_texture_state: bool,
 }
 
 pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
@@ -1189,6 +1194,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         g17p_add3_buffers,
         timestamps: command.timestamps,
         scs_layout: command.scs_layout,
+        g18_texture_state: false,
     })
 }
 

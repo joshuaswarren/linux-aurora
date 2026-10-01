@@ -128,6 +128,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "G18 DRM adapter: 1 admits single-dispatch compute commands (K1). 0 refuses them",
         },
+        g18_admit_msaa4: u32 {
+            default: 0,
+            description: "G18 DRM adapter (g18_initdata_test=10 only): 1 admits exactly the native 4x MSAA render (4 samples, 32x16 utiles, sample positions 0xeaa26e26, 8-byte samples, one layer, no depth/stencil) with its native 4x command fields; Mesa needs AGX_G18_MSAA4=1 to submit it. 0 refuses every multisampled render (default)",
+        },
         g18_usc_statistics: u32 {
             default: 0,
             description: "Stage 9 colour fixture only: 1 enables owned TA/3D SMAPP statistics pages. Raw memory statistics, not shader invocation counts. Default 0",
@@ -218,7 +222,10 @@ kernel::module_platform_driver! {
         // set on the insmod command line. Looking for one in sysfs and not
         // finding it does not mean the build lacks it; check
         // `strings asahi.ko | grep parmtype=` instead. This cost a hardware
-        // cycle once already.
+        // cycle once already. The exceptions are registered outside this
+        // block: the 0644 g18_app_* application-compute knobs
+        // (g18_application_compute_resources.rs) ARE in sysfs and are read
+        // at every compute submission.
         g17p_vm_probe_va: u64 {
             default: 0,
             description: "Diagnostic GPU virtual address to inspect; 0 disables the probe",

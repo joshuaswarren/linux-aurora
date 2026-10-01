@@ -36,6 +36,9 @@
 
 #[path = "g18_application_resources.rs"]
 mod application;
+#[path = "g18_application_compute_resources.rs"]
+mod application_compute;
+use application_compute::ApplicationCompute;
 
 use super::MappedObject;
 use super::g18_pool::{G18UmaPoolBinding, G18UmaPoolMemory};
@@ -155,6 +158,7 @@ pub(crate) struct G18FirmwareMemory {
     scheduler: G18SchedulerMemory,
     compute: G18ComputeMemory,
     compute_payload: Option<G18ComputePayloadMemory>,
+    application_compute: Option<KBox<ApplicationCompute>>,
     completions: KVec<MappedObject>,
     aliases: KVec<mmu::KernelMapping>,
     registers: KVec<mmu::KernelMapping>,
@@ -177,6 +181,35 @@ pub(crate) struct G18StatusLinks {
     pub(crate) status_config_word: u32,
     pub(crate) status_config_pointer: u64,
 }
+
+/// The status-B recovery handshake words.
+#[derive(Debug, Copy, Clone, Default)]
+pub(crate) struct G18RecoveryWord {
+    pub(crate) epoch: u64,
+    pub(crate) state: u32,
+    pub(crate) host: u32,
+}
+
+/// What the firmware published about one recovery: the status-B cause words,
+/// the valid recovery-info entries, and the shared recovery-request block.
+#[derive(Debug, Copy, Clone, Default)]
+pub(crate) struct G18RecoveryCause {
+    pub(crate) emitted: u32,
+    pub(crate) source_count: u32,
+    pub(crate) command: u32,
+    pub(crate) reason: u32,
+    pub(crate) detail: u64,
+    pub(crate) slot_mask: u64,
+    pub(crate) valid_entries: u32,
+    pub(crate) first_entry: Option<(u32, u64)>,
+    /// The first valid entries as (index, raw). Upstream's 13.5 layout for
+    /// the same 256 x 8 table (`pending_stamps`) is info u32 (bit 0 valid,
+    /// flags 3:0, stamp slot 10:4) then the awaited stamp value u32.
+    pub(crate) pending: [(u16, u64); G18_RECOVERY_PENDING_LOGGED],
+    pub(crate) request: [u32; init::G18G_26A428_RECOVERY_REQUEST_WORDS],
+}
+
+pub(crate) const G18_RECOVERY_PENDING_LOGGED: usize = 8;
 
 impl G18FirmwareMemory {
     /// Allocate, map and encode the complete G18G init-data graph while both
@@ -371,6 +404,7 @@ impl G18FirmwareMemory {
         KBox::init(try_init!(Self {
             primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
             pbdesc, uma, uma_pool, scheduler, compute, compute_payload: None,
+            application_compute: None,
             completions, aliases, registers,
             report_counts: [[0; 2]; 2], completion_masks: [0; 2], trace_printed: [0; 2], uat,
             trace_journal, trace_dropped: [0; 2],
@@ -539,7 +573,9 @@ impl G18FirmwareMemory {
         };
         registers.context_id = context_id;
         registers.pool_slot = pool.slot;
-        registers.pool_generation = pool.generation;
+        // The passing fixture ran with a zero SMA result (0x10241 = slot).
+        // The pool binding generation is the separate FList field (tag15).
+        registers.sma_units = 0;
         registers.d550 = scratch.register_pair[0];
         registers.d558 = scratch.register_pair[1];
         let prepared = self.compute.prepare(scheduler, &command, &registers)?;
@@ -679,6 +715,96 @@ impl G18FirmwareMemory {
             )?;
         }
         Ok(cursors)
+    }
+
+    /// Current recovery handshake words. Host DRAM only; no SGX MMIO.
+    pub(crate) fn recovery_word(&mut self) -> Result<G18RecoveryWord> {
+        let status_b = PRIVATE_BASE + init::G18G_26A428_PRIVATE_LAYOUT.status_b as u64;
+        fence(Ordering::Acquire);
+        Ok(G18RecoveryWord {
+            epoch: self.private.read_u64(status_b + init::G18G_26A428_STATUS_B_RECOVERY_EPOCH as u64)?,
+            state: self.private.read_u32(status_b + init::G18G_26A428_STATUS_B_RECOVERY_STATE as u64)?,
+            host: self.private.read_u32(status_b + init::G18G_26A428_STATUS_B_RECOVERY_HOST as u64)?,
+        })
+    }
+
+    /// The cause and info the firmware published for the current recovery.
+    /// Like macOS, count entries by their valid bit rather than trusting the
+    /// emitted count.
+    pub(crate) fn recovery_cause(&mut self) -> Result<G18RecoveryCause> {
+        let status_b = PRIVATE_BASE + init::G18G_26A428_PRIVATE_LAYOUT.status_b as u64;
+        fence(Ordering::Acquire);
+        let word = |memory: &mut Self, offset: usize| memory.private.read_u32(status_b + offset as u64);
+        let mut cause = G18RecoveryCause {
+            emitted: word(self, init::G18G_26A428_STATUS_B_RECOVERY_EMITTED)?,
+            source_count: word(self, init::G18G_26A428_STATUS_B_RECOVERY_SOURCE_COUNT)?,
+            command: word(self, init::G18G_26A428_STATUS_B_RECOVERY_COMMAND)?,
+            reason: word(self, init::G18G_26A428_STATUS_B_RECOVERY_REASON)?,
+            detail: self.private.read_u64(status_b + init::G18G_26A428_STATUS_B_RECOVERY_DETAIL as u64)?,
+            slot_mask: self.private.read_u64(status_b + init::G18G_26A428_STATUS_B_RECOVERY_SLOT_MASK as u64)?,
+            ..Default::default()
+        };
+        for index in 0..init::G18G_26A428_STATUS_B_RECOVERY_INFO_ENTRIES {
+            let entry = self.private.read_u64(status_b
+                + (init::G18G_26A428_STATUS_B_RECOVERY_INFO + index * 8) as u64)?;
+            if entry & 1 != 0 {
+                if let Some(slot) = cause.pending.get_mut(cause.valid_entries as usize) {
+                    *slot = (index as u16, entry);
+                }
+                cause.valid_entries += 1;
+                cause.first_entry.get_or_insert((index as u32, entry));
+            }
+        }
+        let request = SHARED_BASE + init::G18G_26A428_SHARED_LAYOUT.block_68 as u64;
+        for (index, value) in cause.request.iter_mut().enumerate() {
+            *value = self.shared.read_u32(request + (index * 4) as u64)?;
+        }
+        Ok(cause)
+    }
+
+    /// One QID's last-submitted entry: (valid, stamp).
+    pub(crate) fn queue_progress(&mut self, qid: usize) -> Result<(u32, u64)> {
+        if qid >= init::G18G_26A428_QUEUE_PROGRESS_ENTRIES {
+            return Err(EINVAL);
+        }
+        let entry = SHARED_BASE + (init::G18G_26A428_SHARED_LAYOUT.block_800
+            + qid * init::G18G_26A428_QUEUE_PROGRESS_STRIDE) as u64;
+        fence(Ordering::Acquire);
+        Ok((self.shared.read_u32(entry)?, self.shared.read_u64(entry + 8)?))
+    }
+
+    /// Publish one QID's last-submitted entry for the firmware's restart.
+    pub(crate) fn publish_queue_progress(&mut self, qid: usize, valid: u32, stamp: u64) -> Result {
+        if qid >= init::G18G_26A428_QUEUE_PROGRESS_ENTRIES {
+            return Err(EINVAL);
+        }
+        let entry = SHARED_BASE + (init::G18G_26A428_SHARED_LAYOUT.block_800
+            + qid * init::G18G_26A428_QUEUE_PROGRESS_STRIDE) as u64;
+        self.shared.write_u32(entry, valid)?;
+        self.shared.write_u32(entry + 4, 0)?;
+        self.shared.write_u32(entry + 8, stamp as u32)?;
+        self.shared.write_u32(entry + 12, (stamp >> 32) as u32)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Take the host's half of one handshake edge: 1 -> 2 lets the halted
+    /// firmware recover, 3 -> 0 is the final clear. Any other edge, or a
+    /// state other than `expected`, is refused without writing.
+    pub(crate) fn acknowledge_recovery(&mut self, expected: u32, next: u32) -> Result {
+        if !matches!((expected, next), (1, 2) | (3, 0)) {
+            return Err(EINVAL);
+        }
+        let state = PRIVATE_BASE + (init::G18G_26A428_PRIVATE_LAYOUT.status_b
+            + init::G18G_26A428_STATUS_B_RECOVERY_STATE) as u64;
+        fence(Ordering::Acquire);
+        if self.private.read_u32(state)? != expected {
+            return Err(EBUSY);
+        }
+        fence(Ordering::SeqCst);
+        self.private.write_u32(state, next)?;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Read back the new status cross-links from the host mapping (plan step

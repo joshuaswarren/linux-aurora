@@ -24,6 +24,9 @@
 //!   G18 captures (`g18_render.rs:489`, tile_config 0xc10280), dropped by the
 //!   partial helper (`g18_render.rs:396`). The UAPI cannot express them.
 //! - Single-layer ZLS array strides are zeroed, as on M5 (`m5_drm.rs:238-241`).
+//! - msaa163, only with `g18_admit_msaa4=1`: the native 4x render set
+//!   (`is_msaa4_command`) is admitted with the native sample control
+//!   0x40000; every other multisampled command keeps its refusal.
 //! - Uncompressed S8 stencil planes retain their validated full backing.
 //!   Inert compressed stencil is stripped until its transfer path is ready.
 //!   `isp_bgobjvals` 0x300 is re-asserted by the register builder; its low
@@ -35,12 +38,12 @@
 
 use crate::{g17_render::G17pRenderParameters, g17_uapi, g18_render, m5_vm};
 
-/// Largest admitted framebuffer side. The job's target plan
-/// (`g18_render_assembly::target_plan`, 2x M5 sizing at two clusters) grows
-/// with both sides; 2048x2048 (16x16 four-tile macrotiles) exactly fills its
-/// 0x20000-byte TPC slot and 2049x2049 overflows it. Thinner targets past
-/// 2048 would fit but are not admitted.
-pub(crate) const G18_MAX_RENDER_DIMENSION: u32 = 2048;
+/// Largest framebuffer side the target layouts and merge coefficients encode.
+/// Whether a target fits is the job's own target plan
+/// (`g18_render_assembly::target_plan`), which admission also requires: its
+/// TPC slot is 0x20000 bytes, which the conformance FBO surface (64 x
+/// GL_MAX_RENDERBUFFER_SIZE = 64x16384, 4x128 macrotiles) fills exactly.
+pub(crate) const G18_MAX_RENDER_DIMENSION: u32 = 16384;
 /// Indexed multi-draw auxiliary framebuffer flags (gears-g1 capture).
 pub(crate) const G18_AUX_FB_FLAGS: u64 = 0x30c000;
 /// Native main-pass tile flags (+8d2/+8d3), witnessed in colour-a/b and gears-g1.
@@ -230,9 +233,26 @@ pub(crate) fn g18_vdm_compact(vdm_base: u64) -> Option<u64> {
     Some(offset)
 }
 
+/// msaa163: whether `command` is exactly the native 4x render set (see
+/// `g18_render::G18_MSAA4_UTILE`): four samples, 32x16 utiles, sample
+/// positions 0xeaa26e26, eight-byte samples, one layer and no depth or
+/// stencil plane (none is witnessed at 4x). Everything else stays refused.
+fn is_msaa4_command(command: &g17_uapi::UapiRenderCommand) -> bool {
+    command.samples == g18_render::G18_MSAA4_SAMPLES
+        && (command.utile_width, command.utile_height) == g18_render::G18_MSAA4_UTILE
+        && command.multisample_control == g18_render::G18_MSAA4_MULTISAMPLE_CONTROL
+        && command.sample_size == g18_render::G18_MSAA4_SAMPLE_SIZE
+        && command.layers == 1
+        && command.depth.base == 0
+        && command.stencil.base == 0
+}
+
 /// The envelope checks that need only the raw command. Order matters for
-/// diagnostics only; every check is independent.
-fn admit_envelope(command: &g17_uapi::UapiRenderCommand) -> Result<(), G18ApplicationRefusal> {
+/// diagnostics only; every check is independent. `msaa4` admits exactly the
+/// native 4x set (module parameter `g18_admit_msaa4`); refusal classes are
+/// unchanged for everything else.
+fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
+    -> Result<(), G18ApplicationRefusal> {
     use G18ApplicationRefusal as R;
     if command.flags & !G18_RENDER_FLAGS != 0 {
         return Err(R::Flags(command.flags));
@@ -249,14 +269,16 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand) -> Result<(), G18Applic
     if command.layers != 1 {
         return Err(R::Layers(command.layers));
     }
-    if command.samples != 1 {
-        return Err(R::Samples(command.samples));
-    }
-    if (command.utile_width, command.utile_height) != (32, 32) {
-        return Err(R::Utile(command.utile_width, command.utile_height));
-    }
-    if command.multisample_control != G18_MULTISAMPLE_CONTROL {
-        return Err(R::MultisampleControl(command.multisample_control));
+    if !(msaa4 && is_msaa4_command(command)) {
+        if command.samples != 1 {
+            return Err(R::Samples(command.samples));
+        }
+        if (command.utile_width, command.utile_height) != (32, 32) {
+            return Err(R::Utile(command.utile_width, command.utile_height));
+        }
+        if command.multisample_control != G18_MULTISAMPLE_CONTROL {
+            return Err(R::MultisampleControl(command.multisample_control));
+        }
     }
     if command.sampler_heap != 0 || command.sampler_count != 0 {
         return Err(R::Samplers { heap: command.sampler_heap, count: command.sampler_count });
@@ -276,6 +298,10 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand) -> Result<(), G18Applic
 
 /// Translate one render command for the G18 job. `address_space` must answer
 /// for the submitting VM; `window` is the queue's validated USC window.
+/// Multisampled commands are refused (`g18_admit_msaa4=0` behaviour). The
+/// adapter calls [`translate_g18_render_admitting`]; this form is kept for
+/// the host parity tools (`hv/tools/check-g18-drm-application.py`).
+#[allow(dead_code)]
 #[inline(never)]
 pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
     command: &g17_uapi::UapiRenderCommand,
@@ -284,8 +310,23 @@ pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
     window: g17_uapi::QueueUscWindow,
     address_space: &A,
 ) -> Result<G18ApplicationRender, G18ApplicationRefusal> {
+    translate_g18_render_admitting(command, vertex_attachments, fragment_attachments,
+        window, address_space, false)
+}
+
+/// [`translate_g18_render`], additionally admitting the native 4x render set
+/// when `msaa4` is true (module parameter `g18_admit_msaa4=1`, msaa163).
+#[inline(never)]
+pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
+    command: &g17_uapi::UapiRenderCommand,
+    vertex_attachments: g17_uapi::UapiAttachmentList,
+    fragment_attachments: g17_uapi::UapiAttachmentList,
+    window: g17_uapi::QueueUscWindow,
+    address_space: &A,
+    msaa4: bool,
+) -> Result<G18ApplicationRender, G18ApplicationRefusal> {
     use G18ApplicationRefusal as R;
-    admit_envelope(command)?;
+    admit_envelope(command, msaa4)?;
     // Z32F only: validate_m5_reference_depth also admits Z16, which has no
     // G18 witness (G18 captures are D32F, `g18_render.rs:505-511`).
     // Retain the existing depth validation while admitting stencil's own
@@ -345,12 +386,22 @@ pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
     p.aux_fb_flags = G18_AUX_FB_FLAGS;
     p.tile_config |= G18_MAIN_TILE_FLAGS;
 
+    // The job plans every target inside its fixed target window; refuse here
+    // what it could not plan rather than fail the job.
+    if crate::g18_render_assembly::target_plan(&p).is_none() {
+        return Err(R::Dimensions { width: command.width, height: command.height });
+    }
+
     let mut controls = g18_render::g18_default_controls(&p);
-    // admit_envelope permits one sample only. The older UAPI translator's
-    // tib_blocks is storage size, whereas G18 +770 / 10051 is sample control:
-    // native run112 has zero at 1x and 0x40000 at 4x. Keep storage accounting
-    // in p.tib_blocks for the independent +4d0 metadata.
-    controls.fragment_sample_control = 0;
+    // The older UAPI translator's tib_blocks is storage size, whereas G18
+    // +770 / 10051 is sample control: native run112 has zero at 1x and
+    // 0x40000 at 4x. Keep storage accounting in p.tib_blocks for the
+    // independent +4d0 metadata. msaa163: the admitted 4x render (utile
+    // 32x16, utile_config 0x6002 and positions from the UAPI; p.samples
+    // stays 1, see g18_render::G18_MSAA4_UTILE) takes the native 0x40000.
+    let msaa4_render = msaa4 && is_msaa4_command(command) && g18_render::g18_msaa4(&p);
+    controls.fragment_sample_control =
+        if msaa4_render { g18_render::G18_MSAA4_SAMPLE_CONTROL } else { 0 };
     Ok(G18ApplicationRender {
         parameters: p,
         controls,
@@ -359,7 +410,7 @@ pub(crate) fn translate_g18_render<A: g17_uapi::GpuAddressSpace>(
             height: p.height,
             layers: p.layers,
             utile: (p.utile_width, p.utile_height),
-            samples: p.samples,
+            samples: if msaa4_render { g18_render::G18_MSAA4_SAMPLES } else { p.samples },
         },
         vdm_base: command.vdm_base,
         vertex_attachments: translated.vertex_attachments,

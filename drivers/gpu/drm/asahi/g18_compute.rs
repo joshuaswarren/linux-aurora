@@ -42,7 +42,9 @@ pub(crate) struct G18ComputeRegisterInputs {
     pub d630: u32,
     pub context_id: u32,
     pub pool_slot: u32,
-    pub pool_generation: u64,
+    /// 0x10241[63:16]: AGXUMADataRec+0x100, the per-dispatch SMA result
+    /// (kext 8c4bdb8 kind 2). Not the pool binding's FList generation.
+    pub sma_units: u64,
     pub operands: [u64; 2],
     pub support_control: u64,
     pub clusters: u32,
@@ -395,7 +397,7 @@ pub(crate) fn encode_g18_compute_registers(
     emit!(0x10428, context);
     emit!(
         0x10241,
-        (p.pool_slot as i32 as i64 as u64) | p.pool_generation << 16
+        (p.pool_slot as i32 as i64 as u64) | p.sma_units << 16
     );
     emit!(0xa611, 0);
     emit!(

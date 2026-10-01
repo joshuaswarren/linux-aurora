@@ -85,6 +85,52 @@ mod parameter {
 #[cfg(not(CONFIG_RUST))]
 pub(crate) static HOST_TARGET_KIND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
+// Fragment resource word 0xa5f1 for the admitted 4x render. Apple's run112
+// renders use 0xb0022 (34,11) at 1x and 0xd002e (46,13) at 4x: the size class
+// grows by log2(samples). With the 1x minimum word (9,11) the 4x draw faulted
+// into firmware recovery (run164). Default (9,13): the minimum count at the 4x
+// size class. 0 keeps the 1x word. 0644 (C uint ops, like the g18_app_*
+// knobs), read at every 4x render.
+#[cfg(CONFIG_RUST)]
+mod msaa4_fragment {
+    use kernel::{bindings, module_param::KernelParam};
+    pub(super) static VALUE: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0xd_0009);
+    #[link_section = "__param"]
+    #[used(compiler)]
+    static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
+        name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
+            c"g18_msaa4_fragment_word"
+        } else { c"asahi.g18_msaa4_fragment_word" }),
+        #[cfg(MODULE)]
+        mod_: &raw mut bindings::__this_module,
+        #[cfg(not(MODULE))]
+        mod_: core::ptr::null_mut(),
+        // SAFETY: exported vmlinux ops; they access `arg` as an unsigned int
+        // under the parameter lock, which AtomicU32 represents exactly.
+        ops: unsafe { core::ptr::from_ref(&bindings::param_ops_uint) },
+        perm: 0o644, level: -1, flags: 0,
+        __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 {
+            arg: core::ptr::from_ref(&VALUE).cast_mut().cast(),
+        },
+    });
+    #[link_section = ".modinfo"]
+    #[used(compiler)]
+    static TYPE: [u8; b"parmtype=g18_msaa4_fragment_word:uint\0".len()] =
+        *b"parmtype=g18_msaa4_fragment_word:uint\0";
+    #[link_section = ".modinfo"]
+    #[used(compiler)]
+    static DESCRIPTION: [u8; b"parm=g18_msaa4_fragment_word:0xa5f1 for the admitted 4x render, count|log2<<16 (default 0xd0009; native 0xd002e; 0 = 1x word)\0".len()] =
+        *b"parm=g18_msaa4_fragment_word:0xa5f1 for the admitted 4x render, count|log2<<16 (default 0xd0009; native 0xd002e; 0 = 1x word)\0";
+}
+
+pub(crate) fn msaa4_fragment_word() -> u64 {
+    #[cfg(CONFIG_RUST)]
+    { u64::from(msaa4_fragment::VALUE.load(core::sync::atomic::Ordering::Relaxed)) }
+    #[cfg(not(CONFIG_RUST))]
+    { 0xd_0009 }
+}
+
 pub(crate) fn target_kind() -> u32 {
     #[cfg(CONFIG_RUST)] { *parameter::VALUE.value() }
     #[cfg(not(CONFIG_RUST))] { HOST_TARGET_KIND.load(core::sync::atomic::Ordering::Relaxed) }
@@ -110,6 +156,11 @@ pub(crate) fn owned_inputs(mut i: G18RenderCommandInputs, context: u32,
     let pairs = resource_pairs();
     c.ta.resource_word = pairs[0][0] | pairs[0][1] << 16;
     c.fragment.resource_word = pairs[1][0] | pairs[1][1] << 16;
+    // Only the admitted 4x render carries a sample control (msaa163).
+    let msaa4_word = msaa4_fragment_word();
+    if c.fragment_sample_control != 0 && msaa4_word != 0 {
+        c.fragment.resource_word = msaa4_word;
+    }
     i.context_id = context; i.scheduler_record = va::GRAPHICS_SCHEDULER_START + 0x4000;
     i.fragment.sequence = 0; i.ta.sequence = 1; i.fragment.pass = 1;
     for stage in 0..2 {
@@ -148,16 +199,24 @@ pub(crate) fn owned_inputs(mut i: G18RenderCommandInputs, context: u32,
     if plan.native.is_some() {
         let tx = (p.width + 31) / 32;
         let ty = (p.height + 31) / 32;
-        let mx = ((tx + 3) / 4 + 3) & !3;
-        let my = ((ty + 3) / 4 + 3) & !3;
         i.fragment.d08f8 = 0; // target +0x20: native single-sample value
-        i.fragment.d0900 = u32::from(p.samples);
-        i.fragment.d0908 = (mx << 16) | my;
+        // msaa163: same values as g18_application_runtime (4 / 0x40008 for
+        // the admitted 4x render; unchanged otherwise).
+        i.fragment.d0900 = crate::g18_render::g18_sample_count(p);
+        i.fragment.d0908 = crate::g18_render::g18_macro_size(p);
         i.fragment.d0910 = [0, u64::from(p.merge_upper_x_bits) | (u64::from(p.merge_upper_y_bits) << 32)];
         i.fragment.d0930 = tx * ty;
     }
     i.ta.d08a4 = 1; i.ta.d08a8 = 0; i.ta.d08ac = 0;
     i.fragment.d08a4 = 1; i.fragment.d08a8 = 0; i.fragment.d08ac = 0;
+    // Passes per scene, as native (hv/tools/audit-g18-pb-h1-output.py):
+    // dc98 = pass count, dc9c = 1 for a single pass. The encoder copies dc98
+    // to 3D +0x21f9; firmware adds it to PB state +0x00 per 3D completion and
+    // adds 1 to +0x14 per TA completion (b000 0xcc1c, 0xd214). The PB is
+    // idle, and one a recovery flagged can be reset, only while the two
+    // balance (0xcca8, 0x11c94). Zero here left every flushed scene's PB
+    // blocking the render queues for the rest of the boot.
+    i.fragment.dc98 = 1; i.fragment.dc9c = 1;
     // M5 TA activation bit; no optional policy/event/history payloads.
     i.ta.d11a4 = 1;
     i.ta.d08b0 = va::GRAPHICS_SIGNALS + 0xc000;

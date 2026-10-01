@@ -7,7 +7,7 @@
 //! M6 adds 12 bytes at config +0x6e; never use M5's 0x86-byte packet here.
 
 use super::MappedObject;
-use super::g18_pool::{G18UmaPoolBinding, G18_UMA_HARDWARE_SLOT};
+use super::g18_pool::G18UmaPoolBinding;
 use super::g18_compute::G18PreparedComputeCommand;
 use crate::{driver::AsahiDevice, mmu};
 use core::sync::atomic::{fence, Ordering};
@@ -28,11 +28,8 @@ const CONFIG: usize = 0x1800;
 const DATA_SIZE: usize = 0xbc000;
 const SLOT: usize = 0xb90b8 - 0x50000 + QUEUE_ID as usize * 0x28;
 const SCHEDULER: usize = 0xb7468 - 0x50000 + QUEUE_ID as usize * 8;
-const POOL_SLOT: usize = 0x5f660 - 0x50000; // owned slot 0, native stride 0x100
+const POOL_SLOT: usize = 0x5f660 - 0x50000; // native slot stride 0x100
 const QUEUE_POOLS: usize = 0x6f660 - 0x50000 + QUEUE_ID as usize * 0x38;
-// POOL_SLOT, the first membership word and pool_bound's bit assume the
-// firmware pool slot equals the hardware UMA slot that the host loaded.
-const _: () = assert!(G18_UMA_HARDWARE_SLOT == 0);
 
 /// Reserved GFX DATA, never written by the host. No native snapshot pointers
 /// are used: the current DT reservation is the only physical address source.
@@ -99,6 +96,8 @@ pub(crate) struct G18QueueProbe {
     graph: MappedObject,
     firmware: FirmwareDataView,
     compute_prepared: bool,
+    compute_generation: u32,
+    pool_slot: u32,
 }
 
 fn put32(out: &mut [u8], offset: usize, value: u32) {
@@ -171,10 +170,26 @@ impl G18QueueProbe {
         })?;
         fence(Ordering::SeqCst);
         Ok(Self { _entry_alias: entry_alias, _entry: entry, graph,
-            firmware: FirmwareDataView::new(dev)?, compute_prepared: false })
+            firmware: FirmwareDataView::new(dev)?, compute_prepared: false,
+            compute_generation: 0, pool_slot: 0 })
     }
 
     pub(crate) fn queue_address(&self) -> u64 { GRAPH_BASE }
+
+    /// The addition fixture owns context3. In DRM mode the retained graphics
+    /// owner already holds it, so compute must install the context it actually
+    /// acquired before its first descriptor is queued. The later context-update
+    /// command follows that descriptor and cannot repair the initial binding.
+    pub(crate) fn prepare_initial_context(&mut self, context: u32) -> Result {
+        if !(3..64).contains(&context) || self.counters()? != [0, 0, 1]
+            || self.slot() != [0; 5] { return Err(EBUSY); }
+        self.graph.with_bytes_mut(|out| {
+            put32(out, CONFIG + 0x32, context);
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
 
     pub(crate) fn counters(&mut self) -> Result<[u32; 3]> {
         Ok([self.graph.read_u32(GRAPH_BASE + POINTERS as u64)?,
@@ -223,20 +238,23 @@ impl G18QueueProbe {
     /// Observe both directions of firmware-owned pool membership, in addition
     /// to the state/generation tuple. Retirement alone is not a binding proof.
     pub(crate) fn pool_status(&self) -> [u64; 9] {
-        let header = self.firmware.words::<3>(POOL_SLOT);
-        let members = self.firmware.words::<2>(POOL_SLOT + 0x78);
-        let flags = self.firmware.words::<1>(POOL_SLOT + 0xe0);
-        let growth = self.firmware.words::<2>(POOL_SLOT + 0xf0);
+        let slot = POOL_SLOT + self.pool_slot as usize * 0x100;
+        let header = self.firmware.words::<3>(slot);
+        let members = self.firmware.words::<2>(slot + 0x78);
+        let flags = self.firmware.words::<1>(slot + 0xe0);
+        let growth = self.firmware.words::<2>(slot + 0xf0);
         let queues = self.firmware.words::<1>(QUEUE_POOLS);
         [header[0], header[1], header[2], members[0], members[1], flags[0],
          growth[0], growth[1], queues[0]]
     }
 
     pub(crate) fn prepare_pool_bind(&mut self, binding: G18UmaPoolBinding) -> Result {
+        if binding.slot > 1 { return Err(EINVAL); }
+        self.pool_slot = binding.slot;
         let before = self.pool_status();
         if self.counters()? != [2; 3] || !Self::installed(self.slot())
             || !Self::scheduler_bound(self.scheduler_status()?)
-            || binding.slot != G18_UMA_HARDWARE_SLOT || binding.generation != 0
+            || binding.slot > 1 || binding.generation != 0
             || binding.state < KERNEL_BASE || binding.state & 0x3fff != 0
             || before[0] != 0 || before[3..5] != [0; 2]
             || before[6..9] != [0; 3] {
@@ -264,8 +282,14 @@ impl G18QueueProbe {
     }
 
     pub(crate) fn pool_bound(status: [u64; 9], binding: G18UmaPoolBinding) -> bool {
-        status == [binding.state, binding.generation, (2u64 << 32) | 3,
-                   1u64 << QUEUE_ID, 0, 1, 0, 0, 1]
+        Self::pool_bound_for_context(status, binding, 3)
+    }
+
+    pub(crate) fn pool_bound_for_context(status: [u64; 9], binding: G18UmaPoolBinding,
+        context: u32) -> bool {
+        (3..64).contains(&context)
+            && status == [binding.state, binding.generation, (2u64 << 32) | u64::from(context),
+                   1u64 << QUEUE_ID, 0, 1, 0, 0, 1u64 << binding.slot]
     }
 
     /// Store an unpublished SKSM entry and its three inner commands. The
@@ -275,18 +299,27 @@ impl G18QueueProbe {
     /// M6 0x98-byte form; never substitute the shorter M5 configuration.
     pub(crate) fn prepare_compute_job(&mut self, command: G18PreparedComputeCommand,
                                      pool: G18UmaPoolBinding) -> Result {
+        self.prepare_application_compute(command, pool, 1)
+    }
+
+    pub(crate) fn prepare_application_compute(&mut self, command: G18PreparedComputeCommand,
+        pool: G18UmaPoolBinding, generation: u32) -> Result {
         use crate::m5_sksm as sksm;
-        if self.compute_prepared || self.counters()? != [3; 3]
+        if generation == 0 || generation > 0x00ff_ffff
+            || generation != self.compute_generation + 1 { return Err(EINVAL); }
+        let before = (3 + (generation - 1) * 3) % 256;
+        if self.compute_prepared || self.counters()? != [before; 3]
             || !Self::installed(self.slot())
-            || !Self::scheduler_bound(self.scheduler_status()?)
-            || !Self::pool_bound(self.pool_status(), pool)
-            || !(3..64).contains(&command.context_id) || command.expected_stamp != 0x100
+            || !Self::scheduler_usable(self.scheduler_status()?)
+            || !Self::pool_bound_for_context(self.pool_status(), pool, command.context_id)
+            || !(3..64).contains(&command.context_id) || command.expected_stamp != generation << 8
             || command.firmware_address < KERNEL_BASE
             || command.registers.main_count > 127 || command.registers.secondary_count != 4 {
             return Err(EINVAL);
         }
         let entry = sksm::prepare_m5_sksm_entry(sksm::M5SksmQueue {
-            id: QUEUE_ID, priority: 2, current_stamp: 1, submitted: 0, previous_stamp: None,
+            id: QUEUE_ID, priority: 2, current_stamp: u64::from(generation), submitted: 0,
+            previous_stamp: if generation == 1 { None } else { Some(u64::from(generation - 1)) },
         }, sksm::M5SksmOperands {
             barriers: &[], first_predecessor: 0, implicit_dependency_type: 1,
             mcache: None, flag_bit1: false, flag_bit61: false, flag_bit63: false,
@@ -303,16 +336,16 @@ impl G18QueueProbe {
         }).map_err(|_| EINVAL)?;
         // Original 26A428 submitBuffer 8be481c..8be4848 writes this same
         // packed 21-byte form: type14, qid, count, priority, stamp, DM2.
-        let kick = sksm::encode_m5_sksm_add_kicks(QUEUE_ID, 2, 1, 1).map_err(|_| EINVAL)?;
+        let kick = sksm::encode_m5_sksm_add_kicks(QUEUE_ID, 2, u64::from(generation), 1).map_err(|_| EINVAL)?;
         self._entry.with_bytes_mut(|out| {
             let bytes = &mut out[entry.offset as usize..entry.offset as usize + entry.bytes.len()];
-            if bytes.iter().any(|v| *v != 0) { return Err(EBUSY); }
+            if generation < 256 && bytes.iter().any(|v| *v != 0) { return Err(EBUSY); }
             bytes.copy_from_slice(&entry.bytes);
             Ok(())
         })?;
         self.graph.with_bytes_mut(|out| {
-            if out[CONFIG + 0x300..CONFIG + 0x500].iter().any(|v| *v != 0)
-                || out[ITEMS + 24..ITEMS + 48].iter().any(|v| *v != 0) {
+            if generation == 1 && (out[CONFIG + 0x300..CONFIG + 0x500].iter().any(|v| *v != 0)
+                || out[ITEMS + 24..ITEMS + 48].iter().any(|v| *v != 0)) {
                 return Err(EBUSY);
             }
             out.copy_within(CONFIG + 0x200..CONFIG + 0x298, CONFIG + 0x300);
@@ -324,23 +357,64 @@ impl G18QueueProbe {
             for (index, address) in [command.firmware_address,
                 GRAPH_BASE + CONFIG as u64 + 0x300,
                 GRAPH_BASE + CONFIG as u64 + 0x400].into_iter().enumerate() {
-                put64(out, ITEMS + (index + 3) * 8, address);
+                put64(out, ITEMS + ((index + before as usize) % 256) * 8, address);
             }
             Ok(())
         })?;
         fence(Ordering::SeqCst);
         self.compute_prepared = true;
+        self.compute_generation = generation;
         Ok(())
     }
 
     /// Publish only after process roots and submitted-counter are ready.
     /// A later failure cannot authorize resetting the shared ring or entry.
     pub(crate) fn publish_compute_job(&mut self) -> Result {
-        if !self.compute_prepared || self.counters()? != [3; 3] { return Err(EBUSY); }
+        if !self.compute_prepared || self.compute_generation == 0 { return Err(EBUSY); }
+        let before = (3 + (self.compute_generation - 1) * 3) % 256;
+        if self.counters()? != [before; 3] { return Err(EBUSY); }
         fence(Ordering::SeqCst);
-        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40, 6)?;
+        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40,
+            (before + 3) % 256)?;
         fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    /// The scheduler state a submission needs once bound: the published
+    /// control, allocated indices, state 4 and QID 11's membership. Unlike
+    /// [`Self::scheduler_bound`] (the bind gate, checked against the first
+    /// observed header) it does not pin header bytes 3..7: a recovery clears
+    /// byte 5, and render's equivalent check never required them.
+    pub(crate) fn scheduler_usable([pointer, header, low, high]: [u64; 4]) -> bool {
+        pointer == GRAPH_BASE + CONTROL as u64 && header & 0xff != 0xff
+            && (header >> 8) & 0xff != 0xff && (header >> 16) & 0xff == 4
+            && low == 1u64 << QUEUE_ID && high == 0
+    }
+
+    pub(crate) fn retire_application_compute(&mut self, generation: u32) -> Result {
+        if !self.compute_prepared || self.compute_generation != generation
+            || self.counters()? != [(3 + generation * 3) % 256; 3] { return Err(EBUSY); }
+        self.compute_prepared = false;
+        Ok(())
+    }
+
+    /// The first firmware-owned precondition of
+    /// [`Self::prepare_application_compute`] that does not hold, if any. A
+    /// firmware recovery can reset queue state the next job requires.
+    pub(crate) fn compute_unready(&mut self, pool: G18UmaPoolBinding, context: u32,
+        generation: u32) -> Result<Option<&'static str>> {
+        let before = (3 + generation.wrapping_sub(1) * 3) % 256;
+        Ok(if self.compute_prepared { Some("prepared") }
+            else if self.counters()? != [before; 3] { Some("counters") }
+            else if !Self::installed(self.slot()) { Some("installed") }
+            else if !Self::scheduler_usable(self.scheduler_status()?) { Some("scheduler") }
+            else if !Self::pool_bound_for_context(self.pool_status(), pool, context) { Some("pool") }
+            else { None })
+    }
+
+    /// Every word [`Self::compute_unready`] reads, for the kernel log.
+    pub(crate) fn compute_state(&mut self) -> Result<([u32; 3], [u64; 5], [u64; 4], [u64; 9])> {
+        Ok((self.counters()?, self.slot(), self.scheduler_status()?, self.pool_status()))
     }
 
     pub(crate) fn installed(slot: [u64; 5]) -> bool {

@@ -257,6 +257,21 @@ impl G18GraphicsJob {
         Ok([self.signals.read_u32(va::GRAPHICS_SIGNALS+0x4000+9*4)?,
             self.signals.read_u32(va::GRAPHICS_SIGNALS+0x4000+10*4)?])
     }
+    /// A firmware recovery ended this frame after its queues consumed it, so
+    /// no stage will write its stamps. Publish them from the host; a stage
+    /// that already wrote its own must have written exactly `stamp`.
+    pub(crate) fn publish_recovered_stamps(&mut self, previous: u32, stamp: u32) -> Result {
+        for slot in [9u64,10] {
+            let address=va::GRAPHICS_SIGNALS+0x4000+slot*4;
+            match self.signals.read_u32(address)? {
+                value if value==stamp => {}
+                value if value==previous => self.signals.write_u32(address,stamp)?,
+                _ => return Err(EIO),
+            }
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
     pub(crate) fn pixels(&mut self) -> Result<([u32;8],u32,u32)> {
         self.program.verify_pixels(self.variant==RenderVariant::Clear)
     }

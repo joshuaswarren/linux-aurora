@@ -13,6 +13,8 @@ pub(crate) struct ApplicationJob {
     scene: [u8;0x80],
     generation: u32,
     retired: bool,
+    /// Frames of the current client VM, counting this one.
+    client_frames: u32,
 }
 
 impl ApplicationJob {
@@ -23,14 +25,19 @@ impl ApplicationJob {
         // payload and PB backing stay retained but no capture bytes execute.
         job.aliases.clear();
         Ok(KBox::new(Self {job,storage,user_aliases:KVec::new(),pool_aliases:KVec::new(),
-            guard:None,scene,generation:0,retired:true},GFP_KERNEL)?)
+            guard:None,scene,generation:0,retired:true,client_frames:0},GFP_KERNEL)?)
     }
     pub(crate) fn frame(&self) -> Frame {Frame::new(self.generation).expect("admitted frame")}
+    /// The last frame kicked to both graphics queues (0 before the first).
+    pub(crate) fn submitted_generation(&self) -> u32 {self.generation}
     pub(crate) fn quarantine(&mut self) {
         if let Some(guard)=&self.guard {guard.quarantine();}
         self.job.vm().status().record(EIO.to_errno());
     }
     pub(crate) fn retired(&mut self) {self.retired=true;self.guard=None;}
+    /// One of the first frames of its client: logged even when job logging
+    /// is sparse, so every isolated client leaves a kick/retirement pair.
+    pub(crate) fn traced(&self) -> bool {self.client_frames<=3}
 
     #[inline(never)]
     pub(crate) fn prepare(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
@@ -39,7 +46,8 @@ impl ApplicationJob {
         let frame=Frame::new(self.generation.checked_add(1).ok_or(EOVERFLOW)?).ok_or(EOVERFLOW)?;
         let plan=assembly::target_plan(&render.parameters).ok_or(EINVAL)?;
         let guard=vm.retain_t8140_job()?;
-        let remap=self.generation==0 || !self.job.program.matches_vm(vm)
+        let new_client=!self.job.program.matches_vm(vm);
+        let remap=self.generation==0 || new_client
             || self.job.targets.iter().zip(plan.sizes).any(|(target,size)|target.logical_size<size);
         if remap {
             self.job.program.rebind_retired(&self.storage)?;
@@ -74,6 +82,7 @@ impl ApplicationJob {
         // publication. Retain the mappings when the actual VM is unchanged.
         self.job.program.rebind_retired(vm)?;
         self.guard=Some(guard);self.generation=frame.generation;self.retired=false;
+        self.client_frames=if new_client {1} else {self.client_frames.saturating_add(1)};
         if remap {
             dev_info!(dev.as_ref(),"G18_APP_VM frame={} vm={} context={} target={}x{} aliases={}\n",
                 frame.generation,vm.id(),self.job.context_id(),render.target.width,render.target.height,self.user_aliases.len());

@@ -47,6 +47,29 @@ impl G18GraphicsQueues {
         fence(Ordering::SeqCst);self.step=4;Ok(())
     }
 
+    /// The first firmware-owned precondition of the next frame's
+    /// [`Self::prepare_application_pass`] that does not hold after `frame`
+    /// retired, if any. A firmware recovery can reset queue state.
+    pub(crate) fn render_unready(&mut self, pass: &G18QueuedPass, frame: Frame) -> Result<Option<&'static str>> {
+        let status=self.firmware_status()?;
+        let pb=pass.parameter_buffer.ok_or(EINVAL)?;
+        let (pool,slot)=self.pool_and_pb_status(pass.uma.slot,pb.slot)?;
+        Ok(if self.counters()? != [[frame.inner_after();3];2] {Some("counters")}
+            else if self.completion_list()? != [0,self.job_list()] {Some("completion-list")}
+            else if !Self::installed(&status,&self.addresses) {Some("installed")}
+            else if !self.scheduler_bound(&status) {Some("scheduler")}
+            else if pool != [pass.uma.state,pass.uma.generation.ok_or(EINVAL)?,(2u64<<32)|3,0x600,0] {Some("pool")}
+            else if slot != [pb.state,pb.generation,u64::from(pass.context_id),0x200,0,0x400] {Some("parameter-buffer")}
+            else {None})
+    }
+
+    /// Every firmware word [`Self::render_unready`] reads, for the kernel log.
+    pub(crate) fn render_state(&mut self, pass: &G18QueuedPass) -> Result<(G18GraphicsFirmwareStatus, [u64;5], [u64;6])> {
+        let pb=pass.parameter_buffer.ok_or(EINVAL)?;
+        let (pool,slot)=self.pool_and_pb_status(pass.uma.slot,pb.slot)?;
+        Ok((self.firmware_status()?,pool,slot))
+    }
+
     pub(crate) fn publish_application_pass(&mut self, frame: Frame) -> Result<[[u8;24];2]> {
         if self.step!=4 || self.counters()?!=[[frame.inner_before();3];2] {return Err(EBUSY);}
         let mut records=[[0;24];2];
@@ -78,6 +101,20 @@ impl G18ParameterBuffer {
         }
         Ok(aliases)
     }
+
+    /// The PB words a recovery can leave behind: the firmware-visible state
+    /// (ring cursors, free list, the +0x1c flag firmware sets when a recovery
+    /// flushes a render using this PB, b000 0xfd58-0xfd9c), the active scene
+    /// record, the submitted-render counter and the scene index.
+    pub(crate) fn recovery_words(&mut self) -> Result<([u32;G18_PB_STATE_FIRMWARE_BYTES/4],[u32;SCENE_BYTES/4],u32,u32)> {
+        let state: [u8;G18_PB_STATE_FIRMWARE_BYTES]=self.state.with_bytes_mut(|out|out[..G18_PB_STATE_FIRMWARE_BYTES].try_into().map_err(|_|EINVAL))?;
+        let start=SCENES+self.policy.scene as usize*SCENE_BYTES;
+        let scene: [u8;SCENE_BYTES]=self.graph.with_bytes_mut(|out|out[start..start+SCENE_BYTES].try_into().map_err(|_|EINVAL))?;
+        let word=|b:&[u8],i:usize|u32::from_le_bytes(b[i*4..i*4+4].try_into().unwrap_or([0;4]));
+        let counter=self.graph.read_u32(self.addresses.graph_high+COUNTER as u64)?;
+        Ok((core::array::from_fn(|i|word(&state,i)),core::array::from_fn(|i|word(&scene,i)),counter,self.policy.scene))
+    }
+
 
     pub(crate) fn application_scene(&mut self, template: Option<&[u8;SCENE_BYTES]>) -> Result<[u8;SCENE_BYTES]> {
         let start=SCENES+self.policy.scene as usize*SCENE_BYTES;

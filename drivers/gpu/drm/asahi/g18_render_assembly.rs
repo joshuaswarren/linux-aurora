@@ -26,10 +26,19 @@ pub(crate) fn target_plan(p: &G17pRenderParameters) -> Option<TargetPlan> {
 }
 
 pub(crate) fn target_plan_for_kind(p: &G17pRenderParameters, kind: u32) -> Option<TargetPlan> {
-    if p.layers != 1 || p.samples != 1 || (p.utile_width, p.utile_height) != (32, 32) {
+    // msaa163: the admitted 4x render (32x16 utiles) plans only with the
+    // native single-target layout, whose TPC/tilemap scale with its utiles;
+    // the legacy (kind 0) and clustered (kind 2) layouts have no 4x witness.
+    let msaa4 = regs::g18_msaa4(p);
+    if p.layers != 1 || p.samples != 1
+        || (!msaa4 && (p.utile_width, p.utile_height) != (32, 32))
+        || (msaa4 && kind != 1) {
         return None;
     }
-    let native = if kind == 0 { None } else { Some(regs::g18_native_target_layout(p.width, p.height, kind)?) };
+    let native = if kind == 0 { None } else {
+        Some(regs::g18_native_target_layout(p.width, p.height, kind,
+            (p.utile_width, p.utile_height))?)
+    };
     let layout = if let Some(n) = native { n.layout } else {
         regs::g18_render_target_layout(p.width, p.height, p.layers,
             (p.utile_width, p.utile_height), p.samples, 2)?

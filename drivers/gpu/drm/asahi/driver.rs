@@ -612,8 +612,13 @@ fn probe_t8152(
     } else if render_variant != 0 || render_profile != 1 {
         return Err(EINVAL);
     }
+    let admit_msaa4 = *crate::module_parameters::g18_admit_msaa4.value();
+    if admit_msaa4 > 1 || (admit_msaa4 != 0 && stage != g18_live_boot::STAGE_DRM) {
+        dev_err!(pdev.as_ref(), "G18G: g18_admit_msaa4={} needs 0, or 1 with g18_initdata_test=10; refused before MMIO\n", admit_msaa4);
+        return Err(EINVAL);
+    }
     if stage == g18_live_boot::STAGE_DRM {
-        if *crate::module_parameters::g18_admit_compute.value() != 0 {return Err(ENOTSUPP);}
+        if *crate::module_parameters::g18_admit_compute.value() > 1 {return Err(EINVAL);}
         return probe_t8152_drm(pdev, soc, stage);
     }
     let probe = prepare_t8152_device(pdev, soc, stage)?;
@@ -632,6 +637,7 @@ fn probe_t8152_drm(
     let (owner, runtime) = g18_live_boot::start_drm(pdev, probe)?;
     let config = crate::g18_drm::G18DrmConfig {
         admit_compute: *crate::module_parameters::g18_admit_compute.value() != 0,
+        admit_msaa4: *crate::module_parameters::g18_admit_msaa4.value() != 0,
     };
     let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
         crate::g18_drm::G18DrmGpu::new(runtime, observed.as_ref(), config)?,
