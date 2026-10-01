@@ -31,6 +31,12 @@ const USER_END: u64 = (1 << 42) - 2 * mmu::UAT_PGSZ as u64;
 /// Compute stream bytes admitted: one direct dispatch plus terminator, the
 /// M5 profile (`m5_drm.rs:16-20`). Only reachable with `admit_compute`.
 const G18_COMPUTE_STREAM_BYTES: u64 = 48;
+/// `DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE`: the dispatch binds texture or image
+/// state, so the command takes the native texture compute mode (d62a,
+/// `g18_application_compute_resources.rs`). The only compute flag G18 admits.
+/// Spelled as its value, `(1 << 1)` in include/uapi/drm/asahi_drm.h, because
+/// the incremental module build reuses pinned bindgen output that predates it.
+const G18_COMPUTE_TEXTURE_STATE: u32 = 1 << 1;
 
 // Identity Mesa's G18G bring-up gate accepts (`agx_chip.c:471-477`) and the
 // drm-shim `g18g` profile publishes (`asahi_noop.c:129-147`), measured on
@@ -106,6 +112,10 @@ pub(crate) fn map_timestamp_buffer_in(uat: &mmu::Uat, mut bo: gem::ObjectRef,
 pub(crate) struct G18DrmConfig {
     /// Admit compute commands (module parameter `g18_admit_compute`, default 0).
     pub(crate) admit_compute: bool,
+    /// Admit exactly the native 4x MSAA render set (module parameter
+    /// `g18_admit_msaa4`, default 0; msaa163). Off refuses every
+    /// multisampled render as before.
+    pub(crate) admit_msaa4: bool,
 }
 
 pub(crate) struct G18DrmGpu {
@@ -312,7 +322,9 @@ impl TimestampSlot {
             bytes.get_mut(self.offset..end).ok_or(EINVAL)?
                 .copy_from_slice(&value.to_le_bytes());
             Ok(())
-        })?;
+        }).inspect_err(|error| pr_err!(
+            "G18 timestamp not published: {:?} offset={:#x} mapping={:#x}\n",
+            error, self.offset, self.mapping.size()))?;
         fence(Ordering::Release);
         Ok(())
     }
@@ -378,42 +390,55 @@ impl G18Queue {
         // own register builders on this stack.
         let admitted = self.admit(cmdbuf_raw, objects)?;
         let _serialized = self.submit_lock.lock();
-        if self.runtime.is_crashed() { return Err(ENODEV); }
-        let t0 = counter_ticks();
-        match admitted {
-            Admitted::Render(render, slots) => {
-                let retired = self.runtime.submit_render(&self.vm, &render)?;
-                let t1 = counter_ticks();
-                publish_timestamps(&slots, &retired.stage_ticks.unwrap_or([t0, t1, t0, t1]))
-            }
-            Admitted::Compute(command, slots) => {
-                let retired = self.runtime.submit_compute(&self.vm, &command)?;
-                let t1 = counter_ticks();
-                let [start, _, _, end] = retired.stage_ticks.unwrap_or([t0, t1, t0, t1]);
-                publish_timestamps(&slots, &[start, end])
+        // Commands run in submission order and each retires before the next
+        // starts, so every barrier (an earlier command of this submission, or
+        // any earlier submission) has completed when its waiter begins.
+        for command in admitted {
+            if self.runtime.is_crashed() { return Err(ENODEV); }
+            let t0 = counter_ticks();
+            match command {
+                Admitted::Render(render, slots) => {
+                    let retired = self.runtime.submit_render(&self.vm, &render)?;
+                    let t1 = counter_ticks();
+                    publish_timestamps(&slots, &retired.stage_ticks.unwrap_or([t0, t1, t0, t1]))?;
+                }
+                Admitted::Compute(command, slots) => {
+                    let retired = self.runtime.submit_compute(&self.vm, &command)?;
+                    let t1 = counter_ticks();
+                    let [start, _, _, end] = retired.stage_ticks.unwrap_or([t0, t1, t0, t1]);
+                    publish_timestamps(&slots, &[start, end])?;
+                }
             }
         }
+        Ok(())
     }
 
-    /// Parse exactly one hardware command, apply the G18 admission rules and
-    /// resolve its timestamp destinations. Nothing here touches the GPU.
+    /// Parse every hardware command of a submission, apply the G18 admission
+    /// rules and resolve their timestamp destinations, all before any runs:
+    /// a submission is admitted whole or not at all. Nothing here touches
+    /// the GPU. A compute prepass and the render that consumes it (transform
+    /// feedback, geometry and tessellation draws) arrive as one submission.
     #[inline(never)]
     fn admit(&self, cmdbuf_raw: &[u8], objects: Pin<&xarray::XArray<KBox<file::Object>>>)
-        -> Result<Admitted> {
+        -> Result<KVec<Admitted>> {
+        let malformed = |error: g17_uapi::UapiTranslateError| {
+            pr_err!("G18 submit admission rejected: {:?}\n", error);
+            EINVAL
+        };
         let mut parser = g17_uapi::UapiCommandParser::new(cmdbuf_raw);
-        let command = parser.next_hardware().map_err(|_| EINVAL)?.ok_or(EINVAL)?;
-        if parser.next_hardware().map_err(|_| EINVAL)?.is_some() {
-            pr_err!("G18 submit admission rejected: more than one hardware command\n");
-            return Err(ENOTSUPP);
+        let mut admitted = KVec::new();
+        while let Some(command) = parser.next_hardware().map_err(malformed)? {
+            let command = match command {
+                g17_uapi::ParsedHardwareCommand::Render {
+                    payload, vertex_attachments, fragment_attachments, ..
+                } => self.admit_render(&payload, vertex_attachments, fragment_attachments, objects)?,
+                g17_uapi::ParsedHardwareCommand::Compute { payload, attachments, .. } =>
+                    self.admit_compute(&payload, attachments, objects)?,
+            };
+            admitted.push(command, GFP_KERNEL)?;
         }
-        parser.finish().map_err(|_| EINVAL)?;
-        match command {
-            g17_uapi::ParsedHardwareCommand::Render {
-                payload, vertex_attachments, fragment_attachments, ..
-            } => self.admit_render(&payload, vertex_attachments, fragment_attachments, objects),
-            g17_uapi::ParsedHardwareCommand::Compute { payload, attachments, .. } =>
-                self.admit_compute(&payload, attachments, objects),
-        }
+        parser.finish().map_err(malformed)?;
+        Ok(admitted)
     }
 
     #[inline(never)]
@@ -422,11 +447,13 @@ impl G18Queue {
         fragment_attachments: g17_uapi::UapiAttachmentList,
         objects: Pin<&xarray::XArray<KBox<file::Object>>>) -> Result<Admitted> {
         let address_space = UserAddressSpace { vm: &self.vm };
-        let render = g18_application::translate_g18_render(payload, vertex_attachments,
-            fragment_attachments, self.window, &address_space)
+        let render = g18_application::translate_g18_render_admitting(payload,
+            vertex_attachments, fragment_attachments, self.window, &address_space,
+            self.config.admit_msaa4)
             .map_err(|refusal| refuse_render(payload, refusal))?;
         let render = KBox::new(render, GFP_KERNEL)?;
         if !g18_application::job_owned_fields_clear(&render.parameters, &render.controls) {
+            pr_err!("G18 render admission rejected: job-owned fields set\n");
             return Err(EINVAL);
         }
         let slots = [
@@ -447,16 +474,27 @@ impl G18Queue {
             return Err(ENOTSUPP);
         }
         let stream_bytes = payload.control_stream_end.saturating_sub(payload.control_stream_base);
-        if payload.flags != 0 || payload.sampler_heap != 0 || payload.sampler_count != 0
-            || stream_bytes > G18_COMPUTE_STREAM_BYTES {
+        // The only flag G18 admits is its own texture-state bit; every other
+        // bit, ADD3 included, is still refused.
+        if payload.flags & !G18_COMPUTE_TEXTURE_STATE != 0 || payload.sampler_heap != 0
+            || payload.sampler_count != 0 || stream_bytes > G18_COMPUTE_STREAM_BYTES {
             pr_err!("G18 compute admission rejected flags={:#x} sampler_heap={:#x} samplers={} stream_bytes={} (profile admits one dispatch, {})\n",
                 payload.flags, payload.sampler_heap, payload.sampler_count, stream_bytes,
                 G18_COMPUTE_STREAM_BYTES);
             return Err(ENOTSUPP);
         }
+        // The shared G17 translator refuses every bit but ADD3, so it sees
+        // the command without the G18 bit, which travels on beside it.
+        let mut untagged = *payload;
+        untagged.flags &= !G18_COMPUTE_TEXTURE_STATE;
         let address_space = UserAddressSpace { vm: &self.vm };
-        let translated = g17_uapi::translate_compute_command(*payload, attachments,
-            self.window, &address_space).map_err(|_| EINVAL)?;
+        let mut translated = g17_uapi::translate_compute_command(untagged, attachments,
+            self.window, &address_space).map_err(|error| {
+                pr_err!("G18 compute admission rejected {:?}: helper={:#x}/{:#x}/{:#x} flags={:#x}\n",
+                    error, payload.helper.binary, payload.helper.config, payload.helper.data, payload.flags);
+                EINVAL
+            })?;
+        translated.g18_texture_state = payload.flags & G18_COMPUTE_TEXTURE_STATE != 0;
         let slots = [
             TimestampSlot::resolve(objects, payload.timestamps.start)?,
             TimestampSlot::resolve(objects, payload.timestamps.end)?,

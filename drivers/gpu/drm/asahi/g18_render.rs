@@ -130,14 +130,66 @@ impl<'a, const N: usize> List<'a, N> {
     }
 }
 
+/// msaa163: the one multisample render the G18 path admits, Apple's 4x
+/// render of run112 workload 8 (hv/private/diag-compute-162/msaa-scope
+/// NOTES.md section 2): 32x16 utiles and four samples (register 0x10009 =
+/// 0x6002), the rotated-grid sample table 0xeaa26e26 (0x10019 / 3D +0x48),
+/// eight-byte samples (3D +0x1fb0 = 8). Only `g18_application` admits it,
+/// and only with `g18_admit_msaa4=1`. `p.samples` stays 1: that field is
+/// the unused `set_samples` convention (32x32 utiles, Y-doubled geometry),
+/// whereas the UAPI already names the halved utile.
+pub(crate) const G18_MSAA4_UTILE: (u8, u8) = (32, 16);
+pub(crate) const G18_MSAA4_UTILE_CONFIG: u64 = 0x6002;
+pub(crate) const G18_MSAA4_MULTISAMPLE_CONTROL: u64 = 0xeaa2_6e26;
+pub(crate) const G18_MSAA4_SAMPLES: u8 = 4;
+pub(crate) const G18_MSAA4_SAMPLE_SIZE: u8 = 8;
+/// Register 0x10051 / 3D +0x1f38: samples << 16 (native 0x40000 at 4x).
+pub(crate) const G18_MSAA4_SAMPLE_CONTROL: u64 = (G18_MSAA4_SAMPLES as u64) << 16;
+/// Partial-load list 0x10039 bit 16: native 0x200280 at 1x, 0x210280 at 4x.
+pub(crate) const G18_MSAA4_LOAD_TILE_FLAG: u64 = 0x1_0000;
+
+/// Whether `p` is the admitted 4x render (see [`G18_MSAA4_UTILE`]).
+pub(crate) fn g18_msaa4(p: &G17pRenderParameters) -> bool {
+    (p.utile_width, p.utile_height) == G18_MSAA4_UTILE
+        && p.utile_config == G18_MSAA4_UTILE_CONFIG
+        && p.multisample_control == G18_MSAA4_MULTISAMPLE_CONTROL
+        && p.samples == 1
+        && p.layers == 1
+}
+
+/// Rasterization samples (3D +0x50): 4 for the admitted 4x render, else the
+/// existing `p.samples`.
+pub(crate) fn g18_sample_count(p: &G17pRenderParameters) -> u32 {
+    if g18_msaa4(p) { u32::from(G18_MSAA4_SAMPLES) } else { u32::from(p.samples) }
+}
+
+/// 3D +0x54 macro size in utiles, (x << 16) | y: the register builders'
+/// macro_size (g17_render.rs geometry). 4x splits the utile in Y, so y
+/// doubles (native 0x40004 -> 0x40008); 32x32 renders keep the one-utile
+/// formula unchanged.
+pub(crate) fn g18_macro_size(p: &G17pRenderParameters) -> u32 {
+    let tiles_x = (p.width + 31) / 32;
+    let tiles_y = (p.height + 31) / 32;
+    let macro_x = ((tiles_x + 3) / 4 + 3) & !3;
+    let macro_y = ((tiles_y + 3) / 4 + 3) & !3;
+    if g18_msaa4(p) {
+        let utiles_x = 32 / u32::from(G18_MSAA4_UTILE.0);
+        let utiles_y = 32 / u32::from(G18_MSAA4_UTILE.1);
+        ((macro_x * utiles_x) << 16) | (macro_y * utiles_y)
+    } else {
+        (macro_x << 16) | macro_y
+    }
+}
+
 fn validate(p: &G17pRenderParameters) -> Result<(), G18RenderError> {
     if !(1..=16384).contains(&p.width)
         || !(1..=16384).contains(&p.height)
         || p.layers != 1
         || p.samples != 1
-        || (p.utile_width, p.utile_height) != (32, 32)
-        || p.utile_config != 0xa000
-        || p.multisample_control != 0x88
+        || (!g18_msaa4(p)
+            && ((p.utile_width, p.utile_height) != (32, 32)
+                || p.utile_config != 0xa000
+                || p.multisample_control != 0x88))
     {
         return Err(G18RenderError::UnsupportedGeometry);
     }
@@ -417,6 +469,16 @@ fn fragment_partials(
         &m5_render::build_partial_load_registers(p, &load_mc)?,
         0x1600,
     )?;
+    // msaa163: native 4x keeps tile_config bit 16 in the partial-load list
+    // (0x10039 = 0x210280 against 0x200280 at 1x, MSAA notes s2.1; the M5
+    // 4x load word +0x161c moves the same way). Store/resume do not move.
+    if g18_msaa4(p) {
+        for register in &mut programs.load.registers {
+            if register.number == 0x10039 {
+                register.value |= G18_MSAA4_LOAD_TILE_FLAG;
+            }
+        }
+    }
     // Native G18 partial helpers retain main stencil flags and add the
     // transfer required by each program when a plane is present. The
     // ordinary main list already forwards these fields unchanged.
@@ -569,18 +631,32 @@ pub(crate) struct G18NativeTargetLayout {
     pub cluster_control: [u64; 3],
 }
 
-pub(crate) fn g18_native_target_layout(w: u32, h: u32, kind: u32) -> Option<G18NativeTargetLayout> {
+/// Native target layout for one layer. msaa163: `utile` is the render's
+/// utile. The tilemap and the TPC slice scale with utiles per 32x32 tile, the
+/// M5 rule (`m5_render_target.rs:36-43`) and the same term that doubles
+/// size1/size3 (TA 0x1c0b1/0x1c850/0x1c0a9). Native 4x (32x16) measures TA
+/// +0x788 = 0x2000 against 0x1000 at 1x (MSAA notes s2.2). Only the witnessed
+/// 32x16 single-target layout (kind 1) is admitted besides 32x32, which is
+/// unchanged.
+pub(crate) fn g18_native_target_layout(w: u32, h: u32, kind: u32, utile: (u8, u8))
+    -> Option<G18NativeTargetLayout> {
     if !(1..=16384).contains(&w) || !(1..=16384).contains(&h) || !(1..=2).contains(&kind) {
         return None;
     }
+    let utiles = match utile {
+        (32, 32) => 1,
+        G18_MSAA4_UTILE if kind == 1 => (32 / G18_MSAA4_UTILE.0 as usize)
+            * (32 / G18_MSAA4_UTILE.1 as usize),
+        _ => return None,
+    };
     let mx = ((((w as usize + 31) / 32 + 3) / 4) + 3) & !3;
     let my = ((((h as usize + 31) / 32 + 3) / 4) + 3) & !3;
-    let tilemap = 5 * 16 * mx * my;
+    let tilemap = 5 * 16 * mx * my * utiles;
     // Explicit experiment policy, not inferred live macOS configuration:
     // segment mode 4 (native table gives 64), range differences zero, 8 PB
     // blocks of 512 KiB. The original generators receive these same inputs.
     let mut slice_sizes = [0; 8];
-    slice_sizes[0] = 2 * 128 * mx * my;
+    slice_sizes[0] = 2 * 128 * mx * my * utiles;
     if kind == 2 {
         slice_sizes[1] = tilemap * 64;
         slice_sizes[4] = 0x680 + 2 * 0x300;

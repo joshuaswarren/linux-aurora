@@ -24,15 +24,39 @@ impl G18FirmwareMemory {
         self.completion_masks=[0;2];Ok(())
     }
 
-    pub(crate) fn publish_application_outer(&mut self, records: &[[u8;24];2], frame: Frame) -> Result {
-        let before=frame.outer_before();
-        if self.control_counters()?!=[[2;3],[1;3]] || self.compute_outer_counters()?!=[before;3] {return Err(EBUSY);}
+    pub(crate) fn publish_application_outer(&mut self, records: &[[u8;24];2], frame: Frame) -> Result<u32> {
         for (index,record) in records.iter().enumerate() {
             let qid=if index==0 {10} else {9};
             if record[22]!=qid || record[23]!=1 || record[16..20]!=2u32.to_le_bytes()
                 || record[20..22]!=(frame.inner_after() as u16).to_le_bytes()
                 || record[8..16]!=(crate::g18_address_map::GRAPHICS_QUEUE_HIGH+if qid==9 {0} else {0x100}).to_le_bytes() {return Err(EINVAL);}
         }
+        self.publish_application_records(records)
+    }
+
+    /// Graphics and compute share this outer ring but have independent inner
+    /// sequences. Only publish from a fully retired observed outer position.
+    pub(crate) fn publish_application_records(&mut self, records: &[[u8;24]]) -> Result<u32> {
+        if records.is_empty() || records.len()>2 || self.control_counters()?!=[[2;3],[1;3]] {
+            return Err(EINVAL);
+        }
+        let counters=self.compute_outer_counters()?;let before=counters[0];
+        if before>=256 || counters!=[before;3] {return Err(EBUSY);}
+        for record in records {
+            let address=u64::from_le_bytes(record[8..16].try_into().map_err(|_|EINVAL)?);
+            let expected=match record[22] {
+                9=>crate::g18_address_map::GRAPHICS_QUEUE_HIGH,
+                10=>crate::g18_address_map::GRAPHICS_QUEUE_HIGH+0x100,
+                11=>crate::g18_address_map::COMPUTE_GRAPH,
+                _=>return Err(EINVAL),
+            };
+            if address!=expected || record[..8]!=[0;8] || record[23]!=1
+                || record[16..20]!=2u32.to_le_bytes()
+                || u16::from_le_bytes(record[20..22].try_into().map_err(|_|EINVAL)?)>=256 {
+                return Err(EINVAL);
+            }
+        }
+        let after=(before+records.len() as u32)%256;
         self.shared.with_bytes_mut(|out| {
             for (index,record) in records.iter().enumerate() {
                 let start=init::G18G_26A428_WORK_RING_BUNDLE_OFFSETS[8]+((before as usize+index)%256)*24;
@@ -42,7 +66,17 @@ impl G18FirmwareMemory {
         if self.compute_outer_counters()?!=[before;3] {return Err(EBUSY);}
         fence(Ordering::SeqCst);
         self.private.write_u32(PRIVATE_BASE+(init::G18G_26A428_PRIVATE_STATE_GRIDS[0]
-            +init::WORK_STATE_GRID_OFFSETS[8]+0x20) as u64,frame.outer_after())?;
-        fence(Ordering::SeqCst);Ok(())
+            +init::WORK_STATE_GRID_OFFSETS[8]+0x20) as u64,after)?;
+        fence(Ordering::SeqCst);Ok(after)
+    }
+
+    pub(crate) fn publish_application_compute_outer(&mut self, inner: u32) -> Result<u32> {
+        if inner>=256 {return Err(EINVAL);}
+        let mut record=[0;24];
+        record[8..16].copy_from_slice(&crate::g18_address_map::COMPUTE_GRAPH.to_le_bytes());
+        record[16..20].copy_from_slice(&2u32.to_le_bytes());
+        record[20..22].copy_from_slice(&(inner as u16).to_le_bytes());
+        record[22]=11;record[23]=1;
+        self.publish_application_records(&[record])
     }
 }

@@ -57,6 +57,30 @@ struct G18ComputeProcess {
 }
 
 impl G18ComputeMemory {
+    /// The application owner calls this only after the complete queue,
+    /// scheduler and stamp gate, while it still retains the submitted VM.
+    pub(crate) fn retire_application(&mut self, stamp: u32) -> Result {
+        let completed = self.completion_snapshot()?;
+        if completed.stamps[0] != stamp || completed.timestamps[0] == 0
+            || completed.timestamps[1] < completed.timestamps[0] { return Err(EBUSY); }
+        self.release_application()
+    }
+
+    /// Release a dispatch that a firmware recovery ended after its queue
+    /// consumed it: the GPU was reset, so no stamp or timestamp will come.
+    pub(crate) fn retire_recovered(&mut self) -> Result {
+        if !self.prepared { return Err(EINVAL); }
+        self.release_application()
+    }
+
+    fn release_application(&mut self) -> Result {
+        self.process = None;
+        self.prepared = false;
+        self.command.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+        self.support.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+        Ok(())
+    }
+
     pub(crate) fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,

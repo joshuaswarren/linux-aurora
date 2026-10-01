@@ -2860,11 +2860,42 @@ pub(crate) const G18G_26A428_FWCTL_RING_OFFSET: usize = 0x40;
 /// and ring pointers.
 pub(crate) const G18G_26A428_STATUS_B_FWCTL_STATE: usize = 0x4ac0;
 pub(crate) const G18G_26A428_STATUS_B_FWCTL_RING: usize = 0x4ac8;
-/// FW_PROVEN: EP 0x21 type 6 compares its payload with this word (b000
-/// 0x255b0-0x255dc; 25G76 +0x48f0). Firmware-owned; starts zero.
-pub(crate) const G18G_26A428_STATUS_B_FWCTL_HANDSHAKE: usize = 0x4ad0;
-/// FW_PROVEN (b000 0x7fd0/0x80f4; 25G76 +0x4900). Starts zero.
-pub(crate) const G18G_26A428_STATUS_B_RECOVERY_EPOCH: usize = 0x4ae0;
+/// FW_PROVEN u64 recovery epoch (25G76 +0x48f0). The recovery routine
+/// (b000 0x6ef0) increments it as it halts (0x7fb8-0x7fc4), and posts the
+/// value it had before as the type-4 event's first payload word
+/// (0x79ac/0x7df0). EP 0x21 type 6 (b000 0x255b0-0x255dc) requests a host
+/// recovery only when its low 44 bits equal it. Starts zero.
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_EPOCH: usize = 0x4ad0;
+/// FW_PROVEN u32 recovery handshake state (25G76 +0x4900). Firmware writes 1
+/// and spins until the host writes 2 (b000 0x7fb0-0x7fe0), recovers, then
+/// writes 3 and spins until the host writes 0 (0x80fc-0x8114). Starts zero.
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_STATE: usize = 0x4ae0;
+/// FW_PROVEN u32: nonzero when the host requested the recovery (b000 0x7fa8
+/// stores w25 = block 0x68 +4 != 0; 25G76 +0x4910). A host recovery posts
+/// no type-4 event.
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_HOST: usize = 0x4af0;
+/// FW_PROVEN: 256 x 8-byte recovery-info entries (bit 0 = valid) and the
+/// cause words after them. The routine clears 0x828 bytes from +0x4298 before
+/// each firmware-detected recovery (b000 0x7df8-0x7e08) and writes the cause
+/// at +0x4a9c..+0x4abf (0x7eb0-0x7ee8); 25G76 +0x40b8..+0x48df.
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_INFO: usize = 0x4298;
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_INFO_ENTRIES: usize = 0x100;
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_EMITTED: usize = 0x4a98;
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_SOURCE_COUNT: usize = 0x4aa0;
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_COMMAND: usize = 0x4aa8;
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_REASON: usize = 0x4aac;
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_DETAIL: usize = 0x4ab0;
+pub(crate) const G18G_26A428_STATUS_B_RECOVERY_SLOT_MASK: usize = 0x4ab8;
+/// FW_PROVEN: the 0x68-byte shared block published at main +0x26c is the
+/// recovery request (b000 0x6f18-0x6f44, 0x255c8-0x255dc): +0 dispatcher
+/// state, +4 host request, +0xc firmware request, +0x20..+0x4b cause.
+pub(crate) const G18G_26A428_RECOVERY_REQUEST_WORDS: usize = 0x68 / 4;
+/// The 0x800-byte shared block published at main +0x274: one
+/// `{u32 valid, u32 pad, u64 stamp}` last-submitted entry per QID. Native
+/// `restartWorkQueue` writes it before resuming a halted firmware, which
+/// rebuilds queue progress from it (G17 analysis, g17_resources.rs).
+pub(crate) const G18G_26A428_QUEUE_PROGRESS_ENTRIES: usize = 128;
+pub(crate) const G18G_26A428_QUEUE_PROGRESS_STRIDE: usize = 0x10;
 /// FW_PROVEN: the region-C loader reads it (b000 0x36a0/0x377c); KEXT_PROVEN
 /// value 1 (25G76 +0xe434).
 pub(crate) const G18G_26A428_STATUS_B_CONFIG_HEADER: usize = 0xe714;

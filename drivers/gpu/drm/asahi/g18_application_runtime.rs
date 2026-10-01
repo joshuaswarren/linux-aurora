@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Pure application frame policy shared with the three-frame host replay.
 //! Ring storage wraps; event stamps remain unique until their native u24 limit.
-use crate::{g17_render::G17pRenderParameters, g18_render::G18RenderControls,
+use crate::{g17_render::G17pRenderParameters, g18_render::{self, G18RenderControls},
     g18_render_command::{G18RenderCommandInputs, G18StageCompletion}, g18_render_policy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,17 +44,22 @@ pub(crate) fn inputs(p: &mut G17pRenderParameters, c: &mut G18RenderControls,
     i.fragment.d0728=p.depth_aux_buffer;
     // Captured gears/colour and M5 shared-runtime flag policy. These are
     // independent of the application-owned depth/PPP/sample-size fields.
-    i.fragment.d08c5_flags=[1,1,0,0];
+    // msaa163: +0x212c (flag 2) is 1 in native 4x (M5: 1 at 2x and 4x).
+    let msaa4=g18_render::g18_msaa4(p);
+    i.fragment.d08c5_flags=[1,1,u8::from(msaa4),0];
     i.fragment.d0770=[c.fragment_sample_control,p.aux_fb_flags];
     i.fragment.d0780=[u64::from(p.width)|(u64::from(p.height)<<32),p.aux_fb_page_count];
     i.fragment.d0790=[p.store_pipeline_bind<<32,p.store_pipeline];
     i.fragment.d07b0=[p.partial_store_pipeline_bind<<32,p.partial_store_pipeline];
     i.fragment.d07d8=u64::from(p.depth_clear_value_bits)|(0x300<<32);
-    i.fragment.d04d0=(p.tib_blocks<<1) as u32;
-    i.fragment.d0900=u32::from(p.samples);
+    // msaa163: +0x1fb0 is the sample size in bytes (native 8 at 1x and 4x,
+    // M5 0x20 for eight targets); tib_blocks<<1 equals it only while
+    // utile pixels x samples == 1024, which 4x (32x16x4) breaks.
+    i.fragment.d04d0=if msaa4 {u32::from(g18_render::G18_MSAA4_SAMPLE_SIZE)} else {(p.tib_blocks<<1) as u32};
+    // msaa163: +0x50 samples (native 4) and +0x54 macro size (0x40008).
+    i.fragment.d0900=g18_render::g18_sample_count(p);
     let tiles_x=(p.width+31)/32;let tiles_y=(p.height+31)/32;
-    let macro_x=((tiles_x+3)/4+3)&!3;let macro_y=((tiles_y+3)/4+3)&!3;
-    i.fragment.d0908=(macro_x<<16)|macro_y;
+    i.fragment.d0908=g18_render::g18_macro_size(p);
     i.fragment.d0910=[0,u64::from(p.merge_upper_x_bits)|(u64::from(p.merge_upper_y_bits)<<32)];
     i.fragment.d0930=tiles_x*tiles_y;
     i

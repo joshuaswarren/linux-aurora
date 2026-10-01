@@ -1262,9 +1262,10 @@ impl G18Session {
             self.memory.as_mut().ok_or(EIO)?.prepare_render(&self.dev,
                 self.render_job.as_mut().ok_or(EIO)?)?;
         }
-        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD) {
+        if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD)
+            || (self.stage == STAGE_DRM && *crate::module_parameters::g18_admit_compute.value() == 1) {
             self.queue_probe = Some(G18QueueProbe::new(&self.dev, &self.uat,
-                matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD))?);
+                matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD | STAGE_DRM))?);
         }
         self.uat.confirm_t8140_primary_high_root(roots)?;
         self.uat.mirror_t8140_secondary_high_root()?;
