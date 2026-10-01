@@ -20738,7 +20738,7 @@ impl G17ResourceOwner {
             let mut previous = [0u32; 4];
             for (word, value) in previous.iter_mut().enumerate() {
                 let at = offset + word * 4;
-                *value = u32::from_le_bytes(bytes[at..at + 4].try_into().map_err(|_| EINVAL)?);
+                *value = g17p_live_read_u32(bytes, at)?;
             }
             // growImmediately expands the owned block inventory without
             // rebuilding PBState+0x34 or the live PBDesc. Only a locally idle
@@ -20764,18 +20764,18 @@ impl G17ResourceOwner {
     ) -> Result {
         let pm = storage.parameter_management.as_mut().ok_or(EINVAL)?;
         let page_list_offset = pm.layout.page_list;
+        // The first eight words are diagnostic output, not a page-list
+        // validator. Preserve the extent check without mapping/reading WC
+        // memory for a disabled log on every retained-owner switch.
+        let end = page_list_offset.checked_add(8 * 4).ok_or(ERANGE)?;
+        if end > pm.backing.logical_size { return Err(ERANGE); }
+        if !crate::util::g17p_verbose() { return Ok(()); }
         let page_list_vas = pm.page_list_vas;
         let mut first = [0u32; 8];
         pm.backing.with_bytes_mut(|bytes| {
             for (index, value) in first.iter_mut().enumerate() {
                 let offset = page_list_offset + index * 4;
-                *value = u32::from_le_bytes(
-                    bytes
-                        .get(offset..offset + 4)
-                        .ok_or(ERANGE)?
-                        .try_into()
-                        .map_err(|_| EINVAL)?,
-                );
+                *value = g17p_live_read_u32(bytes, offset)?;
             }
             Ok(())
         })?;

@@ -90,6 +90,7 @@ fn get(m:&Manager,i:usize)->[u32;4]{std::array::from_fn(|j|u32::from_le_bytes(m.
  assert_eq!(g17_submission::decode_g17p_pbdesc(get(&m,1)),Default::default());
 }
 '''
+source += '\n' + item(r, 'fn g17p_live_word_bounds(') + '\n' + item(r, 'fn g17p_live_read_u32(')
 with tempfile.TemporaryDirectory() as d:
  f=Path(d)/'test.rs';f.write_text(source);exe=Path(d)/'test'
  subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True)
