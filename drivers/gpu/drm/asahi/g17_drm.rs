@@ -1046,9 +1046,24 @@ pub(crate) struct G17PRenderCompletion {
     /// An already expired deadline awaiting return of this exact host-borrowed
     /// graph. This is not a renewed GPU timeout; Runtime resolves it on return.
     deferred_timeout_error: AtomicU32,
+    /// `g17p_recovery_isolation`: class assigned while servicing a recovery
+    /// (`g17_recovery_isolation::CLASS_*`). Only SPARED changes behaviour.
+    recovery_class: core::sync::atomic::AtomicU8,
 }
 
 impl G17PRenderCompletion {
+    /// Recovery isolation: record this render's class for the recovery being
+    /// serviced. A later recovery may reclassify it.
+    pub(crate) fn set_recovery_class(&self, class: u8) {
+        self.recovery_class.store(class, Ordering::Release);
+    }
+
+    /// Cancelled by another client's recovery (or graced): its failure fails
+    /// this fence only and never writes the VM's sticky status.
+    pub(crate) fn recovery_spared(&self) -> bool {
+        self.recovery_class.load(Ordering::Acquire) == crate::g17_recovery_isolation::CLASS_SPARED
+    }
+
     pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
 
     pub(crate) fn defer_timeout(&self, error: Error) {
@@ -1113,6 +1128,7 @@ impl G17PRenderCompletion {
             published_ns: AtomicU64::new(0),
             signalled: AtomicU32::new(0),
             deferred_timeout_error: AtomicU32::new(0),
+            recovery_class: core::sync::atomic::AtomicU8::new(0),
         }, GFP_KERNEL)?)
     }
 
@@ -1289,7 +1305,14 @@ impl G17PRenderCompletion {
         if let Some(lease) = self.lease.lock().as_ref() {
             lease.registry.quarantine_render_slot(lease.slot);
         }
-        self.status.record(error.to_errno());
+        // Recovery isolation: another client's recovery cancelled this render.
+        // Its guards and the pair quarantine above are retained exactly as
+        // before; only the VM-wide sticky status is not written.
+        if self.recovery_spared() {
+            crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::POISON_SKIPPED);
+        } else {
+            self.status.record(error.to_errno());
+        }
         self.fence.set_error(error);
         // Retain BOTH guards: dropping the lease here also lets a waiter
         // reacquire this physical slot before quarantine is recorded.
@@ -1401,7 +1424,13 @@ impl G17PRenderCompletion {
             );
         }
         if let Err(error) = result {
-            self.status.record(error.to_errno());
+            // Recovery isolation: a spared render's failure is reported on
+            // its own fence only (firmware retirement is already proven here).
+            if self.recovery_spared() {
+                crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::POISON_SKIPPED);
+            } else {
+                self.status.record(error.to_errno());
+            }
             self.fence.set_error(error);
         }
         let e2e_written = crate::g17_e2e::stamp();
@@ -2706,6 +2735,26 @@ impl G17PQueue {
     }
 
     fn ensure_async_compute_queue(&mut self) -> Result {
+        // Recovery isolation: a spared queue is returned to service by its
+        // firmware-retirement witness, normally within the recovery's own
+        // event pass. Give that witness a bounded chance before the queue
+        // check below would refuse (and so poison) this healthy client.
+        if crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::ADMISSION_WAIT) {
+            let mut waited = false;
+            let mut pending = false;
+            for _ in 0..crate::g17_recovery_isolation::SUBMIT_WAIT_MS {
+                pending = self.runtime.mutex().lock().spared_compute_pending(self.id);
+                if !pending { break; }
+                if !waited {
+                    waited = true;
+                    crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::SUBMIT_WAITS);
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            if pending {
+                crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::SUBMIT_TIMEOUTS);
+            }
+        }
         match (&self.async_backend, &self.async_scheduler) {
             (Some(backend), Some(_)) => {
                 if self.runtime.mutex().lock().async_compute_queue_matches(
@@ -3758,7 +3807,7 @@ impl G17PQueue {
         // Pin every userspace mapping before translating raw GPU addresses.
         // GEM-handle close and VM teardown defer their unmaps behind this
         // guard; a successfully published render/compute packet inherits it.
-        let parse_guard = self.vm.retain_t8140_job()?;
+        let parse_guard = self.vm.retain_first_t8140_job()?;
         let window = g17_uapi::QueueUscWindow {
             base: self.usc_exec_base,
             user_start: self.user_range.start,

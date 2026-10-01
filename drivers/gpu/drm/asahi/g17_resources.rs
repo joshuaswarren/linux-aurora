@@ -18131,6 +18131,31 @@ impl G17ResourceOwner {
         })
     }
 
+    /// `g17p_recovery_isolation`: raw (word0, word1) of up to `out.len()`
+    /// VALID entries of the 256-entry Status-B recovery-info table, in table
+    /// order. Host DRAM reads only, taken while firmware holds state 3.
+    pub(crate) fn primary_recovery_info_entries(
+        &mut self,
+        out: &mut [(u32, u32)],
+    ) -> Result<usize> {
+        let status_b = self.handoff.primary.instance.status_b;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut used = 0usize;
+        for index in 0..PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_COUNT {
+            if used >= out.len() { break; }
+            let at = status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET)
+                .and_then(|a| a.checked_add((index as u64).checked_mul(PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_STRIDE)?))
+                .ok_or(EINVAL)?;
+            let word0 = self.resources.primary_state.read_live_u32(at)?;
+            if word0 & 1 == 0 { continue; }
+            let word1 = self.resources.primary_state.read_live_u32(at.checked_add(4).ok_or(EINVAL)?)?;
+            out[used] = (word0, word1);
+            used += 1;
+        }
+        Ok(used)
+    }
+
     /// Dump the raw recovery cause block that follows the recovery-info table
     /// (`status_b + 0x48b8` onward, where the emitted count lives) plus the
     /// first few table entries. The driver only decodes a handful of named

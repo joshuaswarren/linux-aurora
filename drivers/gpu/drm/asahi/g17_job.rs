@@ -134,9 +134,22 @@ pub(crate) struct G17PJobCompletion {
     vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
     signalled: AtomicU32,
     aggregate_member: crate::g17_drm::G17PSubmitCompletionMember,
+    /// `g17p_recovery_isolation`: class assigned while servicing a recovery.
+    recovery_class: core::sync::atomic::AtomicU8,
 }
 
 impl G17PJobCompletion {
+    /// Recovery isolation: record this command's class for the recovery
+    /// being serviced. A later recovery may reclassify it.
+    pub(crate) fn set_recovery_class(&self, class: u8) {
+        self.recovery_class.store(class, Ordering::Release);
+    }
+
+    /// Cancelled by another client's recovery (or graced).
+    pub(crate) fn recovery_spared(&self) -> bool {
+        self.recovery_class.load(Ordering::Acquire) == crate::g17_recovery_isolation::CLASS_SPARED
+    }
+
     pub(crate) fn work_state(&self) -> Arc<crate::g17_resources::G17PWorkStateLease> {
         self.aggregate_member.work_state()
     }
@@ -163,6 +176,7 @@ impl G17PJobCompletion {
             vm_job,
             signalled: AtomicU32::new(0),
             aggregate_member,
+            recovery_class: core::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -191,7 +205,14 @@ impl G17PJobCompletion {
         if let Some(vm_job) = self.vm_job.lock().as_ref() {
             vm_job.quarantine();
         }
-        self.status.record(error.to_errno());
+        // Recovery isolation: a command another client's recovery cancelled
+        // keeps its VM pin (above) until the retirement witness, but does not
+        // retire its whole VM.
+        if self.recovery_spared() {
+            crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::POISON_SKIPPED);
+        } else {
+            self.status.record(error.to_errno());
+        }
         self.fence.set_error(error);
         self.fence.signal();
         self.aggregate_member.complete(Err(error));
@@ -237,7 +258,7 @@ impl G17PJobCompletion {
             // syncobj considers an error fence signaled, so waits query this.
             // An unsubmitted job cancelled during scheduler destruction has
             // no hardware failure to publish to sibling queues in this VM.
-            if error != ECANCELED {
+            if error != ECANCELED && !self.recovery_spared() {
                 self.status.record(error.to_errno());
             }
             self.fence.set_error(error);

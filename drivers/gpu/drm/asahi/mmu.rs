@@ -2703,7 +2703,7 @@ impl Vm {
             )?,
             binding,
             driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
-            status: Arc::new(crate::g17_status::VmStatus::new(), GFP_KERNEL)?,
+            status: Arc::new(crate::g17_status::VmStatus::new_for(id), GFP_KERNEL)?,
             job_lifetime: Arc::pin_init(new_mutex!(T8140VmJobLifetime {
                 active: 0, quarantined: false, draining: false, closed: false,
                 close_ranges: None, deferred_unmaps: KVec::new(),
@@ -3079,6 +3079,41 @@ impl Vm {
                 driver.iter_mappings().map(KernelMapping::iova_range),
             ) || any_range_overlaps(range, driver.reserved_ranges.iter().cloned())
         })
+    }
+
+    /// The first job guard of a submission (no other guard held by the
+    /// caller). Recovery isolation `ADMISSION_WAIT`: a VM whose status is
+    /// clean but whose admission is blocked by retained (quarantined) work
+    /// waits a bounded time for the last guard's drain instead of failing
+    /// the submission with EIO (which would poison it as a lost device).
+    pub(crate) fn retain_first_t8140_job(&self) -> Result<T8140VmJobGuard> {
+        if !crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::ADMISSION_WAIT) {
+            return self.retain_t8140_job();
+        }
+        let mut remaining = kernel::time::msecs_to_jiffies(
+            crate::g17_recovery_isolation::ADMISSION_WAIT_MS);
+        let mut counted = false;
+        let mut gate = self.mapping_gate.state.lock();
+        loop {
+            let blocked = gate.blocked;
+            let clean = self.status.get() == 0 && !self.job_lifetime.lock().closed;
+            if !(blocked && clean) || remaining == 0 { break; }
+            if !counted {
+                counted = true;
+                crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::ADMISSION_WAITS);
+                pr_info!("G17P VM job admission waiting for quarantine release: vm={}\n", self.id);
+            }
+            match self.mapping_gate.idle.wait_interruptible_timeout(&mut gate, remaining) {
+                kernel::sync::CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                kernel::sync::CondVarTimeoutResult::Timeout => {
+                    remaining = 0;
+                    crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::ADMISSION_TIMEOUTS);
+                }
+                kernel::sync::CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+            }
+        }
+        core::mem::drop(gate);
+        self.retain_t8140_job()
     }
 
     pub(crate) fn retain_t8140_job(&self) -> Result<T8140VmJobGuard> {
@@ -3759,9 +3794,44 @@ impl Vm {
         let mut gate = self.mapping_gate.state.lock();
         let mut waited = false;
         let mut wait_started = 0u64;
+        // Recovery isolation: remaining bounded wait for a healthy VM whose
+        // mappings are blocked only by retained (quarantined) work.
+        let mut transient_budget: Option<kernel::time::Jiffies> = None;
         loop {
             let state = self.job_lifetime.lock();
             let status = self.status.get();
+            let transient = status == 0 && !state.closed
+                && (gate.blocked || (state.active != 0 && state.quarantined));
+            if transient && crate::g17_recovery_isolation::enabled(
+                crate::g17_recovery_isolation::ADMISSION_WAIT)
+            {
+                let remaining = *transient_budget.get_or_insert_with(|| {
+                    crate::g17_recovery_isolation::count(
+                        &crate::g17_recovery_isolation::ADMISSION_WAITS);
+                    pr_info!(
+                        "G17P VM map admission waiting for quarantine release: vm={} blocked={} active={} quarantined={}\n",
+                        self.id, gate.blocked, state.active, state.quarantined
+                    );
+                    kernel::time::msecs_to_jiffies(crate::g17_recovery_isolation::ADMISSION_WAIT_MS)
+                });
+                if remaining != 0 {
+                    core::mem::drop(state);
+                    // Woken by the last job guard's drain (gate -> lifetime,
+                    // then notify_all), exactly as the draining wait below.
+                    match self.mapping_gate.idle.wait_interruptible_timeout(&mut gate, remaining) {
+                        kernel::sync::CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                        kernel::sync::CondVarTimeoutResult::Timeout => {
+                            transient_budget = Some(0);
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::ADMISSION_TIMEOUTS);
+                        }
+                        kernel::sync::CondVarTimeoutResult::Woken { jiffies } => {
+                            transient_budget = Some(jiffies);
+                        }
+                    }
+                    continue;
+                }
+            }
             if status != 0 || state.closed || gate.blocked
                 || (state.active != 0 && state.quarantined)
             {
