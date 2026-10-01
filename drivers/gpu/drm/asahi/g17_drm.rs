@@ -1714,7 +1714,7 @@ impl G17PRangeRequests {
     }
 }
 
-/// v91 VALIDATE_PROOF: request tuples proven covered by this queue's VM at
+/// VALIDATE_PROOF: request tuples proven covered by this queue's VM at
 /// one mapping-validation epoch. The epoch advances on every attempted leaf
 /// or permission mutation (under the GPUVM exec lock) and reads `None` while
 /// one is in progress, the same rule the retained-graph reachability cache
@@ -1735,6 +1735,18 @@ impl G17PValidationProof {
     }
 
     pub(crate) fn record(&mut self, epoch: Option<u64>, requests: &G17PRangeRequests) {
+        // Keep proofs for alternating in-flight buffers. Replacing the set on
+        // every miss makes a depth-two stream evict its own previous buffer.
+        // Only union exact tuples proved under the SAME stable mapping epoch;
+        // any mutation, unavailable epoch, or incomplete set discards reuse.
+        if epoch.is_some() && self.epoch == epoch && !requests.overflow {
+            for &request in requests.as_slice() {
+                self.requests.push(request);
+            }
+            if !self.requests.overflow { return; }
+        }
+        // Bounded storage: on union overflow retain the latest complete set.
+        // Never leave an incomplete union marked reusable.
         self.epoch = if requests.overflow { None } else { epoch };
         self.requests = *requests;
     }

@@ -211,6 +211,71 @@ mod v91 {
     fn set_mask(on: bool) { g17_host_path::MASK.store(if on { g17_host_path::VALIDATE_PROOF } else { 0 }, Ordering::Relaxed); }
 
     #[test]
+    fn alternating_buffers_reuse_both_proofs_until_mutation() {
+        set_mask(true);
+        let (mut p, v, f) = render_parts();
+        let vm = mmu::Vm::new();
+        vm.map(0x1_0000, 0x20_0000, true, true);
+        vm.map(0x11_0000_0000, 0x12_0000_0000, true, true);
+        vm.map(0x100_0000, 0x200_0000, true, true);
+        let mut proof = G17PValidationProof::new();
+        for i in 0..100 {
+            p.scissor_base = 0x10_0000 + (i % 2) * 0x100;
+            let mut o = G17PProofOutcome::default();
+            assert!(g17p_translate_with_proof(&vm, USER, &mut proof, &mut o,
+                |s| translate_render(s, p, v, f)).is_ok());
+            assert_eq!(o.hit, i >= 2);
+        }
+        assert_eq!(vm.locks.get(), 2);
+        vm.unmap_all();
+        for i in 0..2 {
+            p.scissor_base = 0x10_0000 + i * 0x100;
+            let mut o = G17PProofOutcome::default();
+            let got = g17p_translate_with_proof(&vm, USER, &mut proof, &mut o,
+                |s| translate_render(s, p, v, f));
+            assert_eq!(got, Err(g17_uapi::UapiTranslateError::AddressRange));
+            assert!(!o.hit && o.fallback);
+        }
+    }
+
+    #[test]
+    fn accumulated_proofs_keep_exact_permissions_and_epoch() {
+        let mut a = G17PRangeRequests::new(); a.push((0x4000, 0x1000, 1));
+        let mut b = G17PRangeRequests::new(); b.push((0x8000, 0x1000, 2));
+        let mut proof = G17PValidationProof::new();
+        proof.record(Some(7), &a); proof.record(Some(7), &b);
+        assert!(proof.covers(Some(7), a.as_slice()));
+        assert!(proof.covers(Some(7), b.as_slice()));
+        assert!(!proof.covers(Some(7), &[(0x4000, 0x1000, 3)]));
+        assert!(!proof.covers(Some(7), &[(0x4000, 0x2000, 1)]));
+        assert!(!proof.covers(None, a.as_slice()));
+        proof.record(Some(8), &b);
+        assert!(!proof.covers(Some(8), a.as_slice()));
+        assert!(proof.covers(Some(8), b.as_slice()));
+        proof.record(None, &a);
+        assert!(!proof.covers(None, a.as_slice()));
+        assert!(!proof.covers(Some(8), b.as_slice()));
+    }
+
+    #[test]
+    fn accumulated_proof_overflow_replaces_with_complete_latest_set() {
+        let mut a = G17PRangeRequests::new();
+        for i in 0..G17P_PROOF_RANGES { a.push((0x4000 + i as u64 * 0x1000, 0x1000, 1)); }
+        let mut b = G17PRangeRequests::new(); b.push((0x100000, 0x1000, 3));
+        let mut proof = G17PValidationProof::new();
+        proof.record(Some(7), &a); proof.record(Some(7), &a);
+        assert!(proof.covers(Some(7), a.as_slice()));
+        proof.record(Some(7), &b);
+        assert!(proof.covers(Some(7), b.as_slice()));
+        assert!(!proof.covers(Some(7), a.as_slice()));
+        assert!(!proof.requests.overflow);
+        a.push((0x200000, 0x1000, 1));
+        proof.record(Some(7), &a);
+        assert!(!proof.covers(Some(7), a.as_slice()));
+        assert!(!proof.covers(Some(7), b.as_slice()));
+    }
+
+    #[test]
     fn proof_equals_per_range_translation_over_random_histories() {
         set_mask(true);
         let (base, v0, f0) = render_parts();
