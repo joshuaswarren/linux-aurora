@@ -584,6 +584,13 @@ static G17P_GROW_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// v96: FList-ID takeovers observed (diagnostic log budget).
 static G17P_FLIST_TAKEOVERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+#[cfg(not(test))]
+fn g17p_new_render_flist_owners() -> Result<KVec<Option<G17PBootstrapUmaLifecycle>>> {
+    let mut owners = KVec::with_capacity(256, GFP_KERNEL)?;
+    for _ in 0..256 { owners.push(None, GFP_KERNEL)?; }
+    Ok(owners)
+}
+
 /// One command-pair lease on a retained FList. Pool bytes outlive this lease.
 /// Native updateSubmitInfo increments pending command updates independently
 /// of optional async growth; final reference retirement emits one 0x2e using
@@ -1578,6 +1585,11 @@ pub(crate) struct G17PManagerConstruction {
     /// byte-critical publication code single-copy; the other pairs stay in
     /// place while their independent queue pairs execute.
     render_slots: G17PRenderSlots,
+    /// One authoritative lifecycle per independent FList ID. This table stores
+    /// no mappings: logical contexts and teardown graphs retain their pools
+    /// until the exact release consumer (or both firmware CPUs stopped).
+    render_flist_owners: KVec<Option<G17PBootstrapUmaLifecycle>>,
+    render_flist_scan: [u64; 4],
     render_channel_leases: [Option<[crate::g17_channel::Lease; 2]>; 64],
     accepted_firmware_recovery_generation: u64,
     /// Coalesced firmware recovery: host generation, record count, and the
@@ -1682,13 +1694,15 @@ struct G17PRenderSlotState {
     /// A pre-publication construction failure can return its ID immediately;
     /// a post-publication failure must retain it until the CPUs stop.
     hardware_buffer_published: bool,
-    /// Native's per-workqueue `AGXUSCPrivMemFList::updateSubmitInfo` owner.
-    /// A type-13 tuple is actionable only while this retained owner exists.
-    bootstrap_uma: Option<G17PBootstrapUmaLifecycle>,
-    /// Captured before restaging; becomes the active lease at FList publication.
+    /// Pool identity follows the graph even while its storage is borrowed.
+    flist_index: usize,
+    /// Unpublished snapshot; read, encode and commit stay under Runtime.
     prepared_render_flist: Option<G17PBootstrapUmaLifecycle>,
-    /// Next FList lifecycle sequence for this render ownership domain.
-    next_render_flist_sequence: u64,
+    /// Exact publication membership: another pair's references cannot satisfy
+    /// this pair's completion, nor can duplicate retirement consume its next.
+    flist_leases: g17_completion::PairFifo<(u64, u64, u32), { g17_resources::G17P_RENDER_QUEUED_PER_PAIR + 1 }>,
+    flist_retired_ordinal: Option<u64>,
+
 }
 
 #[cfg(not(test))]
@@ -1711,9 +1725,10 @@ impl G17PRenderSlotState {
             auxiliary_timestamp: 0,
             hardware_buffer_id: None,
             hardware_buffer_published: false,
-            bootstrap_uma: None,
+            flist_index: 0,
             prepared_render_flist: None,
-            next_render_flist_sequence: G17P_BOOTSTRAP_UMA_SEQUENCE,
+            flist_leases: g17_completion::PairFifo::new(),
+            flist_retired_ordinal: None,
         }), GFP_KERNEL)
     }
 }
@@ -3078,6 +3093,8 @@ impl G17PManagerConstruction {
                     g17_resources::G17P_PM_INITIAL_HWPB_MANAGER_GENERATION,
                 render_parameter_buffer_owner: 0,
                 render_slots: G17PRenderSlots::new()?,
+                render_flist_owners: g17p_new_render_flist_owners()?,
+                render_flist_scan: [0; 4],
                 render_channel_leases: [None; 64],
                 accepted_firmware_recovery_generation: 0,
                 pending_primary_recovery: None,
@@ -4123,20 +4140,17 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    pub(crate) fn pending_render_usc_freelist_release(
-        &self,
-    ) -> Option<G17PBootstrapUmaRelease> {
-        let pair_slot = 0;
-        self.render_slots.get(pair_slot).bootstrap_uma
-            .as_ref()
-            .and_then(G17PBootstrapUmaLifecycle::pending_release)
-            .or_else(|| {
-                self.render_slots.parked(pair_slot).find_map(|state| {
-                    state.bootstrap_uma
-                        .as_ref()
-                        .and_then(G17PBootstrapUmaLifecycle::pending_release)
-                })
-            })
+    pub(crate) fn pending_render_usc_freelist_release(&self) -> Option<G17PBootstrapUmaRelease> {
+        for bank in 0..4 {
+            let mut bits = self.render_flist_scan[bank];
+            while bits != 0 {
+                let index = bank * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(release) = self.render_flist_owners[index].as_ref()
+                    .and_then(G17PBootstrapUmaLifecycle::pending_release) { return Some(release); }
+            }
+        }
+        None
     }
 
     pub(crate) fn note_flist_release_backpressure(&mut self) -> Result {
@@ -4254,7 +4268,7 @@ impl G17PManagerConstruction {
             let slot = self.render_slots.get_mut(index);
             assert!(slot.preparing && slot.storage.is_none());
             let storage = grow.storage.take().expect("grow owns borrowed graph");
-            if slot.bootstrap_uma.as_ref().is_some_and(|owner|
+            if self.render_flist_owners[slot.flist_index].as_ref().is_some_and(|owner|
                 owner.request.is_some() && matches!(owner.state, G17PBootstrapUmaRequestState::Ready)
                     && owner.matches_owner(storage.render_flist_id(), storage.render_flist_pointer(),
                         storage.render_flist_operand_table(), storage.render_flist_cookie())) {
@@ -4416,11 +4430,16 @@ impl G17PManagerConstruction {
         if self.render_slots.get(pair_slot).storage.is_none() {
             return Err(EINVAL);
         }
+        if !self.render_slots.get(pair_slot).flist_leases.has_room() { return Err(EBUSY); }
         let mut lifecycle = self.render_slots.get(pair_slot).prepared_render_flist.ok_or(EIO)?;
         lifecycle.retire_prepare_reference().map_err(|_| EIO)?;
         if lifecycle.request.is_none() || lifecycle.request_published {
-            self.render_slots.get_mut(pair_slot).next_render_flist_sequence = lifecycle.sequence.checked_add(1).ok_or(EOVERFLOW)?;
-            self.render_slots.get_mut(pair_slot).bootstrap_uma = Some(lifecycle);
+            let ordinal = self.render_slots.get(pair_slot).submission_ordinal;
+            self.render_slots.get_mut(pair_slot).flist_leases
+                .push((ordinal, lifecycle.sequence, lifecycle.hardware_buffer_id)).map_err(|_| EIO)?;
+            self.render_flist_owners[self.render_slots.get(pair_slot).flist_index] = Some(lifecycle);
+            let index = lifecycle.hardware_buffer_id as usize;
+            self.render_flist_scan[index / 64] |= 1u64 << (index % 64);
             self.render_slots.get_mut(pair_slot).prepared_render_flist = None;
             return Ok(None);
         }
@@ -4445,9 +4464,13 @@ impl G17PManagerConstruction {
             .resources
             .publish_primary_device_control_raw(&record)?;
         lifecycle.request_published = true;
-        self.render_slots.get_mut(pair_slot).bootstrap_uma = Some(lifecycle);
+        let ordinal = self.render_slots.get(pair_slot).submission_ordinal;
+        self.render_slots.get_mut(pair_slot).flist_leases
+            .push((ordinal, lifecycle.sequence, lifecycle.hardware_buffer_id)).map_err(|_| EIO)?;
+        self.render_flist_owners[self.render_slots.get(pair_slot).flist_index] = Some(lifecycle);
+        let index = lifecycle.hardware_buffer_id as usize;
+        self.render_flist_scan[index / 64] |= 1u64 << (index % 64);
         self.render_slots.get_mut(pair_slot).prepared_render_flist = None;
-        self.render_slots.get_mut(pair_slot).next_render_flist_sequence = lifecycle.sequence.checked_add(1).ok_or(EOVERFLOW)?;
         Ok(Some(publication))
     }
 
@@ -4456,23 +4479,18 @@ impl G17PManagerConstruction {
     pub(crate) fn match_render_usc_freelist_completion(
         &mut self, completion: G17PBootstrapUmaCompletion,
     ) -> Result {
-        let slot = completion.hardware_buffer_id.checked_sub(129)
-            .and_then(|slot| u8::try_from(slot).ok())
-            .filter(|slot| *slot < g17_resources::G17PRenderQueuePair::SLOT_COUNT)
-            .ok_or(EINVAL)?;
-        // A completion cannot create an owner. Match the already retained pair.
-        let owner = self.render_slots.allocated(slot)?;
-        if owner.storage.is_none() && !owner.preparing { return Err(EIO); }
-        self.render_slots.get_mut(slot).bootstrap_uma.as_mut().ok_or(EIO)?
-            .match_completion(completion).map_err(|_| EIO)?;
-        let owner = self.render_slots.get(slot);
-        if let Some(storage) = owner.storage.as_deref() {
-            storage.mark_render_flist_grown();
-        } else if !owner.preparing {
-            return Err(EIO);
+        let lifecycle = self.render_flist_owners.get_mut(completion.hardware_buffer_id as usize)
+            .and_then(Option::as_mut).ok_or(EIO)?;
+        lifecycle.match_completion(completion).map_err(|_| EIO)?;
+        for state in self.render_slots.slots.iter().flatten() {
+            if let Some(storage) = state.storage.as_deref() {
+                if lifecycle.matches_owner(storage.render_flist_id(), storage.render_flist_pointer(),
+                    storage.render_flist_operand_table(), storage.render_flist_cookie()) {
+                    storage.mark_render_flist_grown();
+                }
+            }
         }
-        // A preparer retains this exact graph through its epoch. Its return
-        // applies the atomic grown flag; type 13 never touches borrowed memory.
+        // Borrowed graphs apply the same matched tuple when they return.
         Ok(())
     }
 
@@ -4480,7 +4498,7 @@ impl G17PManagerConstruction {
     /// reference. TA/3D references intentionally remain live until paired
     /// render completion.
     pub(crate) fn render_usc_freelist_grow_matched(&self, pair_slot: u8) -> bool {
-        self.render_slots.get(pair_slot).bootstrap_uma
+        self.render_flist_owners[self.render_slots.get(pair_slot).flist_index]
             .as_ref()
             .is_some_and(|lifecycle| lifecycle.state == G17PBootstrapUmaRequestState::Ready)
     }
@@ -4490,31 +4508,19 @@ impl G17PManagerConstruction {
     pub(crate) fn retire_render_usc_freelist_at_completion(
         &mut self, pair_slot: u8,
     ) -> Result<Option<G17PBootstrapUmaRelease>> {
-        let Some(lifecycle) = self.render_slots.get_mut(pair_slot).bootstrap_uma.as_mut() else {
-            return Ok(None);
-        };
-        let owned = lifecycle.hardware_buffer_owned;
-        let references = lifecycle.hardware_buffer_references;
-        let pending = lifecycle.pending_release_count;
-        match lifecycle.retire_render_references() {
-            Ok(release) => Ok(release),
-            Err(error) => {
-                // This used to collapse every lifecycle state into a bare EIO,
-                // which is what the render now fails with AFTER its paired
-                // completion fires -- i.e. after the GPU has done the whole
-                // render and both stages have stamped real timestamps. Name
-                // the phase so the failure is diagnosable from one run.
-                dev_warn!(
-                    self.resources.dev().as_ref(),
-                    "G17P render: FList retire refused ({:?}) owned={} references={} pending={}\n",
-                    error,
-                    owned,
-                    references,
-                    pending,
-                );
-                Err(EIO)
-            }
-        }
+        if crate::g17_config::RENDER_USC_FREELIST == 0 { return Ok(None); }
+        let state = self.render_slots.get(pair_slot);
+        let ordinal = state.flist_retired_ordinal.ok_or(EIO)?;
+        let (expected, sequence, id) = *state.flist_leases.front().ok_or(EIO)?;
+        if ordinal != expected || id as usize != state.flist_index { return Err(EIO); }
+        let mut owner = self.render_flist_owners[id as usize].ok_or(EIO)?;
+        if owner.sequence != sequence { return Err(EIO); }
+        let release = owner.retire_render_references().map_err(|_| EIO)?;
+        self.render_flist_owners[id as usize] = Some(owner);
+        let state = self.render_slots.get_mut(pair_slot);
+        state.flist_leases.take();
+        state.flist_retired_ordinal = None;
+        Ok(release)
     }
 
     /// Publish the release generated by this pair's final reference drop.
@@ -4523,18 +4529,12 @@ impl G17PManagerConstruction {
         &mut self,
         release: G17PBootstrapUmaRelease,
     ) -> Result<g17_resources::G17PDeviceControlPublication> {
-        let target_slot = release.hardware_buffer_id
-            .checked_sub(129)
-            .and_then(|slot| u8::try_from(slot).ok())
-            .filter(|slot| *slot < g17_resources::G17PRenderQueuePair::SLOT_COUNT)
-            .ok_or(EINVAL)?;
-        self.render_slots.allocated(target_slot)?;
-        let pair_slot = target_slot;
+        let index = release.hardware_buffer_id as usize;
+        if index >= self.render_flist_owners.len() { return Err(EINVAL); }
         if self.pending_primary_control.is_some() {
             return Err(EAGAIN);
         }
-        let pending = self.render_slots.get(pair_slot)
-            .bootstrap_uma
+        let pending = self.render_flist_owners[index]
             .as_ref()
             .and_then(G17PBootstrapUmaLifecycle::pending_release);
         if pending != Some(release) {
@@ -4556,7 +4556,7 @@ impl G17PManagerConstruction {
         let publication = self
             .resources
             .publish_primary_device_control_raw(&record)?;
-        self.render_slots.get_mut(pair_slot).bootstrap_uma
+        self.render_flist_owners[index]
             .as_mut()
             .ok_or(EIO)?
             .mark_published(release)
@@ -4567,18 +4567,12 @@ impl G17PManagerConstruction {
     }
 
     pub(crate) fn mark_render_usc_freelist_release_sent(
-        &mut self,
-        release: G17PBootstrapUmaRelease,
-        producer_after: u32,
+        &mut self, release: G17PBootstrapUmaRelease, producer_after: u32,
     ) -> Result {
-        let slot = release.hardware_buffer_id.checked_sub(129)
-            .and_then(|slot| u8::try_from(slot).ok()).ok_or(EINVAL)?;
-        self.render_slots.allocated(slot)?;
-        self.render_slots.get_mut(slot).bootstrap_uma
-            .as_mut()
-            .ok_or(EIO)?
-            .mark_sent(producer_after)
-            .map_err(|_| EIO)
+        let owner = self.render_flist_owners.get_mut(release.hardware_buffer_id as usize)
+            .and_then(Option::as_mut).ok_or(EIO)?;
+        if owner.sequence != release.sequence { return Err(EIO); }
+        owner.mark_sent(producer_after).map_err(|_| EIO)
     }
 
     /// v92c FList takeover guard. True when `pair_slot` still carries an
@@ -4591,21 +4585,13 @@ impl G17PManagerConstruction {
     /// same context already owns keeps its own image; an unallocated pair has
     /// no witness.
     pub(crate) fn render_flist_takeover_blocked(
-        &self,
-        pair_slot: u8,
-        context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        &self, _pair_slot: u8,
+        _context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
     ) -> bool {
-        let Ok(state) = self.render_slots.allocated(pair_slot) else { return false };
-        let witness = state
-            .bootstrap_uma
-            .as_ref()
-            .is_some_and(G17PBootstrapUmaLifecycle::has_release_witness);
-        if !witness {
-            return false;
-        }
-        !state.bind.as_ref().is_some_and(|bind| {
-            matches!(bind, G17PRenderRootOwner::Job { context: owner } if Arc::ptr_eq(owner, context))
-        })
+        // An incoming pool receives an independent ID; physical pair reuse
+        // cannot replace the old pool's UMA row. Its context/teardown still
+        // retains that pool until its own release is consumed.
+        false
     }
 
     /// v92c: primary device-control ring (consumer, producer) snapshot.
@@ -4620,24 +4606,26 @@ impl G17PManagerConstruction {
     /// Settle every sent owner against one coherent control-ring snapshot.
     /// This is allocation-free, sleep-free and independent of slot selection.
     pub(crate) fn settle_consumed_render_usc_freelist_releases(&mut self) -> Result<u32> {
-        let pair_slot = 0;
         let counters = self.resources.control_counters()?;
         let consumer = counters.primary[g17_initdata::CHANNEL_STATE_CONSUMER];
         let producer = counters.primary[g17_initdata::CHANNEL_STATE_PRODUCER];
         let mut settled = 0u32;
-        let mut settle = |lifecycle: &mut Option<G17PBootstrapUmaLifecycle>| -> Result {
-            let Some(lifecycle) = lifecycle.as_mut().filter(|owner| owner.has_release_witness()) else {
-                return Ok(());
-            };
-            let observed = lifecycle
-                .settle_release_witnesses(consumer, producer)
-                .map_err(|_| EIO)?;
-            settled = settled.checked_add(observed).ok_or(EOVERFLOW)?;
-            Ok(())
-        };
-        settle(&mut self.render_slots.get_mut(pair_slot).bootstrap_uma)?;
-        for state in self.render_slots.parked_mut(pair_slot) {
-            settle(&mut state.bootstrap_uma)?;
+        for bank in 0..4 {
+            let mut bits = self.render_flist_scan[bank];
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                let index = bank * 64 + bit as usize;
+                let owner = self.render_flist_owners[index].as_mut().ok_or(EIO)?;
+                if owner.has_release_witness() {
+                    settled = settled.checked_add(owner.settle_release_witnesses(consumer, producer)
+                        .map_err(|_| EIO)?).ok_or(EOVERFLOW)?;
+                }
+                if owner.state == G17PBootstrapUmaRequestState::Completed
+                    && !owner.hardware_buffer_owned && !owner.has_release_witness() {
+                    self.render_flist_scan[bank] &= !(1u64 << bit);
+                }
+            }
         }
         Ok(settled)
     }
@@ -4950,11 +4938,14 @@ impl G17PManagerConstruction {
         // with it, root first.
         self.logical_queue_teardowns.clear();
         self.render_slots.get_mut(pair_slot).sksm = None;
-        self.render_slots.get_mut(pair_slot).bootstrap_uma = None;
+        self.render_flist_owners.fill(None);
+        self.render_flist_scan = [0; 4];
+        self.render_slots.get_mut(pair_slot).flist_index = 0;
+        self.render_slots.get_mut(pair_slot).flist_leases.clear();
+        self.render_slots.get_mut(pair_slot).flist_retired_ordinal = None;
         self.render_slots.get_mut(pair_slot).prepared_render_flist = None;
         self.render_slots.get_mut(pair_slot).submission_ordinal = 0;
         self.render_slots.get_mut(pair_slot).auxiliary_timestamp = 0;
-        self.render_slots.get_mut(pair_slot).next_render_flist_sequence = G17P_BOOTSTRAP_UMA_SEQUENCE;
         self.next_render_pm_manager_generation =
             g17_resources::G17P_PM_INITIAL_HWPB_MANAGER_GENERATION;
         self.render_parameter_buffer_owner = 0;
@@ -5108,7 +5099,9 @@ impl G17PManagerConstruction {
         &mut self, pair_slot: u8,
         handoff: Option<(&mmu::Vm, u16)>,
     ) -> Result {
-        if self.render_slots.get(pair_slot).preparing { return Err(EBUSY); }
+        let state = self.render_slots.get(pair_slot);
+        if state.preparing || state.flist_leases.is_some()
+            || state.flist_retired_ordinal.is_some() { return Err(EBUSY); }
         // A graph the warm second pair built for an owner that closed before
         // kicking on it: nothing was ever published on this pair, so there is
         // no paired retirement to witness and nothing firmware could hold.
@@ -5251,7 +5244,9 @@ impl G17PManagerConstruction {
             self.render_slots.get_mut(pair_slot).storage
                 .as_deref_mut()
                 .ok_or(ENODEV)?
-                .retarget_command_context(vm, execution_context.clone())?;
+                .retarget_command_context(self.resources.dev(), self.resources.uat(), vm, execution_context.clone())?;
+            self.render_slots.get_mut(pair_slot).flist_index = self.render_slots.get(pair_slot)
+                .storage.as_deref().ok_or(ENODEV)?.render_flist_id() as usize;
             let previous_bind = self.render_slots.get_mut(pair_slot)
                 .bind
                 .replace(G17PRenderRootOwner::Job {
@@ -5284,7 +5279,14 @@ impl G17PManagerConstruction {
         vm: &mmu::Vm,
         execution_context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
     ) -> Result {
-        if self.render_slots.get(pair_slot).preparing { return Err(EBUSY); }
+        let state = self.render_slots.get(pair_slot);
+        if state.preparing || state.flist_retired_ordinal.is_some() { return Err(EBUSY); }
+        if state.flist_leases.is_some()
+            && !state.bind.as_ref().is_some_and(|bind| matches!(bind,
+                G17PRenderRootOwner::Job { context } if Arc::ptr_eq(context, &execution_context))) {
+            // Live commands permit same-owner pipelining, never pool handoff.
+            return Err(EBUSY);
+        }
         if !execution_context.matches(vm) || !execution_context.is_current() {
             return Err(EFAULT);
         }
@@ -5459,6 +5461,7 @@ impl G17PManagerConstruction {
     fn render_slot_idle_for_context(
         state: &mut G17PRenderSlotState,
         descriptor_context_id: u16,
+        _owners: &[Option<G17PBootstrapUmaLifecycle>],
     ) -> Result<bool> {
         if state.preparing {
             return Ok(!state.bind.as_ref().is_some_and(|bind|
@@ -5485,10 +5488,7 @@ impl G17PManagerConstruction {
             || state.hardware_buffer_published
             || state.prepared_render_flist.is_some()
             || state.submission_ordinal == 0
-            || state.bootstrap_uma.as_ref().is_some_and(|lifecycle| {
-                lifecycle.state != G17PBootstrapUmaRequestState::Completed
-                    || lifecycle.hardware_buffer_owned
-            })
+            || state.flist_leases.is_some() || state.flist_retired_ordinal.is_some()
         {
             return Ok(false);
         }
@@ -5516,50 +5516,44 @@ impl G17PManagerConstruction {
             && state.hardware_buffer_id.is_none()
             && !state.hardware_buffer_published
             && state.prepared_render_flist.is_none()
+            && state.flist_leases.is_none() && state.flist_retired_ordinal.is_none()
     }
 
     fn render_pairs_idle_for_context(&mut self, descriptor_context_id: u16) -> Result<bool> {
         let pair_slot = 0;
         let active_idle = Self::render_slot_idle_for_context(
-            self.render_slots.get_mut(pair_slot), descriptor_context_id);
+            self.render_slots.get_mut(pair_slot), descriptor_context_id, &self.render_flist_owners);
         if !active_idle? {
             return Ok(false);
         }
         for state in self.render_slots.parked_mut(pair_slot) {
-            if !Self::render_slot_idle_for_context(state, descriptor_context_id)? {
+            if !Self::render_slot_idle_for_context(state, descriptor_context_id, &self.render_flist_owners)? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    /// A graph a successor displaced into a teardown still owns its FList
-    /// object. Firmware keeps that pool registered until the pair's `0x2e`
-    /// release for it has been consumed, so it may be freed only once the
-    /// pair's FList lifecycle no longer names it, or names it fully released
-    /// (`Completed`, HardwareBufferID no longer owned). The successor's own
-    /// FList can take the pair's ID only from that released state, so a
-    /// lifecycle naming a different object also proves the release.
+    /// Pool release is independent of physical-pair ownership. Also inspect
+    /// the strong context's pools when a same-VM successor reused its graph.
     fn displaced_graphs_flists_released(&self, index: usize) -> bool {
         let Some(teardown) = self.logical_queue_teardowns.get(index) else { return false };
-        teardown.graphs.iter().all(|graph| {
-            let slot = graph.storage.queue_pair().slot();
-            let lifecycle = self
-                .render_slots
-                .allocated(slot)
-                .ok()
-                .and_then(|state| state.bootstrap_uma.as_ref());
-            let Some(lifecycle) = lifecycle else { return true };
-            let names_this_pool = lifecycle.matches_owner(
-                graph.storage.render_flist_id(),
-                graph.storage.render_flist_pointer(),
-                graph.storage.render_flist_operand_table(),
-                graph.storage.render_flist_cookie(),
-            );
-            !names_this_pool
-                || (lifecycle.state == G17PBootstrapUmaRequestState::Completed
-                    && !lifecycle.hardware_buffer_owned)
-        })
+        let released = |id: u32, pointer: u64| {
+            match self.render_flist_owners.get(id as usize).and_then(Option::as_ref) {
+                None => true, // This independently leased pool never published.
+                Some(owner) if owner.shared_control != pointer => {
+                    // Only a never-published new pool can still see the old
+                    // occupant's row; ID reuse requires its complete release.
+                    owner.state == G17PBootstrapUmaRequestState::Completed
+                        && !owner.hardware_buffer_owned && !owner.has_release_witness()
+                }
+                Some(owner) => owner.state == G17PBootstrapUmaRequestState::Completed
+                    && !owner.hardware_buffer_owned && !owner.has_release_witness(),
+            }
+        };
+        teardown.context.render_flists_released(released)
+            && teardown.graphs.iter().all(|graph|
+                released(graph.storage.render_flist_id(), graph.storage.render_flist_pointer()))
     }
 
     /// The first `Draining` teardown at or after `from` whose render pairs are
@@ -5637,6 +5631,7 @@ impl G17PManagerConstruction {
         descriptor_context_id: u16,
         ids: &mut G17PHardwareBufferIdAllocator,
         out: &mut KVec<G17PRetiredRenderGraph>,
+        owners: &[Option<G17PBootstrapUmaLifecycle>],
     ) -> Result {
         if state.preparing {
             return if state.bind.as_ref().is_some_and(|bind|
@@ -5651,7 +5646,7 @@ impl G17PManagerConstruction {
         if !owned {
             return Ok(());
         }
-        if !Self::render_slot_idle_for_context(state, descriptor_context_id)? {
+        if !Self::render_slot_idle_for_context(state, descriptor_context_id, owners)? {
             return Err(EBUSY);
         }
         out.reserve(1, GFP_KERNEL)?;
@@ -5704,13 +5699,13 @@ impl G17PManagerConstruction {
         let mut graphs = KVec::new();
         let result = Self::detach_render_slot_graph(
             self.render_slots.get_mut(pair_slot), context, descriptor_context_id,
-            &mut self.render_hardware_buffer_ids, &mut graphs,
+            &mut self.render_hardware_buffer_ids, &mut graphs, &self.render_flist_owners,
         );
         result?;
         for state in self.render_slots.parked_mut(pair_slot) {
             Self::detach_render_slot_graph(
                 state, context, descriptor_context_id,
-                &mut self.render_hardware_buffer_ids, &mut graphs,
+                &mut self.render_hardware_buffer_ids, &mut graphs, &self.render_flist_owners,
             )?;
         }
         Ok(graphs)
@@ -5750,6 +5745,7 @@ impl G17PManagerConstruction {
             let context = self.logical_queue_teardowns[index].context.clone();
             let descriptor_context_id = self.logical_queue_teardowns[index].descriptor_context_id;
             settled.reserve(1, GFP_KERNEL)?;
+            if !self.displaced_graphs_flists_released(index) { index += 1; continue; }
             let detached = match self.detach_render_graphs_of_context(&context, descriptor_context_id) {
                 Ok(detached) => detached,
                 Err(error) if error == EBUSY => {
@@ -6979,8 +6975,13 @@ impl G17PManagerConstruction {
             context: execution_context.clone(),
         });
         if crate::g17_config::RENDER_USC_FREELIST != 0 {
+            let id = self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?.render_flist_id() as usize;
+            if id >= self.render_flist_owners.len() { return Err(EINVAL); }
+            if self.render_slots.get(pair_slot).flist_index != id
+                && self.render_slots.get(pair_slot).flist_leases.is_some() { return Err(EBUSY); }
+            self.render_slots.get_mut(pair_slot).flist_index = id;
             let storage = self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?;
-            let owner_matches = self.render_slots.get(pair_slot).bootstrap_uma.as_ref().is_some_and(|owner| {
+            let owner_matches = self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().is_some_and(|owner| {
                 owner.matches_owner(
                     storage.render_flist_id(),
                     storage.render_flist_pointer(),
@@ -6989,12 +6990,15 @@ impl G17PManagerConstruction {
                 )
             });
             if !owner_matches {
+                if self.render_flist_owners[id].as_ref().is_some_and(|old|
+                    old.state != G17PBootstrapUmaRequestState::Completed
+                        || old.hardware_buffer_owned || old.has_release_witness()) { return Err(EBUSY); }
                 // Warming may prepare a descriptor but does not acquire a
                 // firmware lease. Apply the same ownership preflight as the
                 // submission path before touching the global UMA slot.
                 G17PBootstrapUmaLifecycle::acquire_owner(
-                    self.render_slots.get(pair_slot).bootstrap_uma.as_ref(),
-                    self.render_slots.get(pair_slot).next_render_flist_sequence,
+                    self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref(),
+                    self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().map_or(Ok(G17P_BOOTSTRAP_UMA_SEQUENCE), |owner| owner.sequence.checked_add(1).ok_or(EOVERFLOW))?,
                     storage.render_flist_id(),
                     storage.render_flist_pointer(),
                     storage.render_flist_operand_table(),
@@ -7215,7 +7219,7 @@ impl G17PManagerConstruction {
         // while preparing. No fallible exit may discard this installed graph.
         debug_assert!(slot.preparing && slot.storage.is_none());
         debug_assert_eq!(slot.submission_ordinal, reservation.ordinal);
-        if slot.bootstrap_uma.as_ref().is_some_and(|owner|
+        if self.render_flist_owners[slot.flist_index].as_ref().is_some_and(|owner|
             owner.request.is_some() && matches!(owner.state, G17PBootstrapUmaRequestState::Ready)
                 && owner.matches_owner(storage.render_flist_id(),
                     storage.render_flist_pointer(), storage.render_flist_operand_table(),
@@ -7257,7 +7261,7 @@ impl G17PManagerConstruction {
         }
         let Some(tracker) = slot.tracker.as_ref() else { return Ok(None); };
         // UMA completion writes this graph; preserve the existing grow owner.
-        if slot.bootstrap_uma.as_ref().is_some_and(|owner|
+        if self.render_flist_owners[slot.flist_index].as_ref().is_some_and(|owner|
             matches!(owner.state, G17PBootstrapUmaRequestState::Submitted)) {
             crate::g17_timing_buffer::record_render_gate(pair_slot, tracker.ordinal,
                 3, 0, [0; 2], [0; 4]);
@@ -7418,7 +7422,7 @@ impl G17PManagerConstruction {
                 slot.hardware_buffer_id, slot.hardware_buffer_published,
                 slot.tracker.as_ref().map(|tracker| (tracker.hardware_buffer_id, tracker.ordinal)),
                 slot.queued_tracker.iter().count(), slot.submission_ordinal,
-                slot.bootstrap_uma.as_ref().map(|owner| (owner.sequence, owner.state,
+                self.render_flist_owners[slot.flist_index].as_ref().map(|owner| (owner.sequence, owner.state,
                     owner.hardware_buffer_references, owner.pending_release_count)));
         }
         // Firmware-owned parameter-buffer state of every unborrowed pair:
@@ -7943,8 +7947,13 @@ impl G17PManagerConstruction {
             });
         }
         if crate::g17_config::RENDER_USC_FREELIST != 0 {
+            let id = self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?.render_flist_id() as usize;
+            if id >= self.render_flist_owners.len() { return Err(EINVAL); }
+            if self.render_slots.get(pair_slot).flist_index != id
+                && self.render_slots.get(pair_slot).flist_leases.is_some() { return Err(EBUSY); }
+            self.render_slots.get_mut(pair_slot).flist_index = id;
             let storage = self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?;
-            let owner_matches = self.render_slots.get(pair_slot).bootstrap_uma.as_ref().is_some_and(|owner| {
+            let owner_matches = self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().is_some_and(|owner| {
                 owner.matches_owner(
                     storage.render_flist_id(),
                     storage.render_flist_pointer(),
@@ -7956,8 +7965,8 @@ impl G17PManagerConstruction {
             // the global UMA descriptor. A rejected owner/sequence must leave
             // the preceding owner's published image untouched.
             let prepared = G17PBootstrapUmaLifecycle::acquire_owner(
-                self.render_slots.get(pair_slot).bootstrap_uma.as_ref(),
-                self.render_slots.get(pair_slot).next_render_flist_sequence,
+                self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref(),
+                self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().map_or(Ok(G17P_BOOTSTRAP_UMA_SEQUENCE), |owner| owner.sequence.checked_add(1).ok_or(EOVERFLOW))?,
                 storage.render_flist_id(),
                 storage.render_flist_pointer(),
                 storage.render_flist_operand_table(),
@@ -7965,6 +7974,9 @@ impl G17PManagerConstruction {
                 storage.render_flist_needs_grow(),
             ).map_err(|_| EBUSY)?;
             if !owner_matches {
+                if self.render_flist_owners[id].as_ref().is_some_and(|old|
+                    old.state != G17PBootstrapUmaRequestState::Completed
+                        || old.hardware_buffer_owned || old.has_release_witness()) { return Err(EBUSY); }
                 // A different pool takes over this pair's FList ID. The
                 // preflight above validates the predecessor's release state;
                 // a sent release witness may still be carried by `prepared`.
@@ -10144,7 +10156,7 @@ impl G17PManagerConstruction {
             g17_completion::PairedRenderCompletion)>,
     ) -> Result<G17PRenderPollOutcome> {
         if self.render_slots.get(pair_slot).preparing { return Ok(G17PRenderPollOutcome::Retry); }
-        if self.render_slots.get(pair_slot).bootstrap_uma.as_ref().is_some_and(|owner|
+        if self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().is_some_and(|owner|
             owner.state == G17PBootstrapUmaRequestState::Submitted) {
             return Ok(G17PRenderPollOutcome::Retry);
         }
@@ -10427,7 +10439,13 @@ impl G17PManagerConstruction {
                     queues.tiling.producer = ta;
                     queues.fragment.producer = fragment;
                 }
-                self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take();
+                if crate::g17_config::RENDER_USC_FREELIST != 0 {
+            let state = self.render_slots.get_mut(pair_slot);
+            if state.flist_retired_ordinal.is_some()
+                || state.flist_leases.front().map(|lease| lease.0) != Some(ordinal) { return Err(EIO); }
+            state.flist_retired_ordinal = Some(ordinal);
+        }
+        self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take();
                 if crate::util::g17p_verbose() {
                     dev_info!(
                         self.resources.dev().as_ref(),
@@ -10672,6 +10690,12 @@ impl G17PManagerConstruction {
         if let (Some(queues), Some((ta, fragment))) = (self.render_slots.get_mut(pair_slot).sksm.as_mut(), retired_sksm) {
             queues.tiling.producer = ta;
             queues.fragment.producer = fragment;
+        }
+        if crate::g17_config::RENDER_USC_FREELIST != 0 {
+            let state = self.render_slots.get_mut(pair_slot);
+            if state.flist_retired_ordinal.is_some()
+                || state.flist_leases.front().map(|lease| lease.0) != Some(ordinal) { return Err(EIO); }
+            state.flist_retired_ordinal = Some(ordinal);
         }
         self.render_slots.get_mut(pair_slot).tracker = self.render_slots.get_mut(pair_slot).queued_tracker.take();
         let pair = self.render_slots.get(pair_slot)
@@ -11514,7 +11538,7 @@ impl G17PManagerConstruction {
         let tsq = g17_resources::G17PWorkStateStorage::new(dev, self.uat())?;
         let context = Arc::new(g17_resources::G17PLogicalQueueContext::new(
             execution, control, qos, owner_pid, tsq,
-        ), GFP_KERNEL)?;
+        )?, GFP_KERNEL)?;
         Ok(context)
     }
 
@@ -11536,7 +11560,7 @@ impl G17PManagerConstruction {
         let compute = Arc::new(g17_resources::G17PLogicalQueueContext::new(
             execution, context.channel_control.clone(), context.qos.clone(), context.owner_pid,
             tsq,
-        ), GFP_KERNEL)?;
+        )?, GFP_KERNEL)?;
         dev_info!(
             self.resources.dev().as_ref(),
             "G17P split-execution-ID probe: pid={} vm={} root={:#x} render-context={} compute-context={} scheduler={:#x} qos={} -- diagnostic only; extra root slot, no execution gating\n",
@@ -12975,7 +12999,7 @@ impl G17PManagerConstruction {
             self.render_hardware_buffer_ids.reserved,
             self.logical_queue_teardowns.len(),
             self.logical_queue_teardowns.iter().map(|teardown| teardown.graphs.len()).sum::<usize>(),
-            self.render_slots.get(pair_slot).bootstrap_uma);
+            self.render_flist_owners[self.render_slots.get(pair_slot).flist_index]);
         let active_slot = pair_slot;
         let slot = self.render_slots.get_mut(pair_slot);
         Self::log_mixed_render_owner(

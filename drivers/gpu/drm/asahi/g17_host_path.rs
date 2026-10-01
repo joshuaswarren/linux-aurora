@@ -137,7 +137,10 @@ pub(crate) const WAIT_UTIL_HINT: u32 = 1 << 16;
 pub(crate) const PRODUCER_READS: u32 = 1 << 17;
 /// Count the retained graph as a PB owner, preserving its binding token.
 pub(crate) const PB_OWNER_REF: u32 = 1 << 18;
-const ALL_BITS: u32 = (1 << 19) - 1;
+/// Native pool sharing. Captured at logical-context creation, never changes a
+/// live pool. Clearing this bit is a same-kernel per-pair allocation control.
+pub(crate) const SHARED_FLIST: u32 = 1 << 19;
+const ALL_BITS: u32 = (1 << 20) - 1;
 
 /// Production default for this candidate. v84-final had FEED_PERF only; v87
 /// added bits 2-8 and v91 bits 9-11. `g17p_host_path=0x1fe` is exactly the
@@ -149,7 +152,7 @@ const ALL_BITS: u32 = (1 << 19) - 1;
 // the original full snapshots for an otherwise identical comparison.
 const DEFAULT_MASK: u32 = FEED_PERF | EARLY_SHALLOW | STATE_WORD | SETTLE_ONCE
     | RING_CACHE | WORKER_TAIL | OBS_SKIP | VM_STATUS_MIRROR
-    | VALIDATE_PROOF | PENDING_EXACT | WORD_STORES | WAIT_UTIL_HINT | PRODUCER_READS | PB_OWNER_REF;
+    | VALIDATE_PROOF | PENDING_EXACT | WORD_STORES | WAIT_UTIL_HINT | PRODUCER_READS | PB_OWNER_REF | SHARED_FLIST;
 static MASK: AtomicU32 = AtomicU32::new(DEFAULT_MASK);
 static FEED_PCT: AtomicU32 = AtomicU32::new(50);
 /// v92 per-cluster overrides of FEED_PCT (0 = inherit).

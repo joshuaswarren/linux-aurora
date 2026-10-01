@@ -4482,6 +4482,8 @@ impl G17PClChannelControl {
 pub(crate) struct G17PLogicalQueueContext {
     /// Zero means the opt-in, non-reusing diagnostic pool was exhausted.
     render_mcache_hwsid: u32,
+    render_flists: Arc<kernel::sync::Mutex<KVec<Option<Arc<G17PRenderFlist>>>>>,
+    shared_render_flist: bool,
     execution: Arc<mmu::T8140ComputeExecutionContext>,
     work_states: crate::g17_work_state::WorkStatePool,
     tsq: Arc<kernel::sync::Mutex<G17PWorkStateStorage>>,
@@ -4500,17 +4502,43 @@ impl G17PLogicalQueueContext {
         qos: Arc<G17PLogicalQosLease>,
         owner_pid: u32,
         tsq: Arc<kernel::sync::Mutex<G17PWorkStateStorage>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let tsq_base = tsq.lock().storage.iova();
         let render_mcache_hwsid = if *crate::module_parameters::g17p_mcache_dsid_probe.value() != 0 {
             let id = g17p_mcache_probe_reserve(&G17P_MCACHE_PROBE_NEXT).map_or(0, u32::from);
             pr_info!("G17P MCache diagnostic: owner-pid={} hwdsid={} non-reusing-pool=96..191\n", owner_pid, id);
             id
         } else { crate::g17_config::RENDER_MCACHE_HWSID };
-        Self {
+        let shared_render_flist = crate::g17_host_path::enabled(crate::g17_host_path::SHARED_FLIST);
+        let count = if shared_render_flist { 1 } else { 64 };
+        let mut render_flists = KVec::with_capacity(count, GFP_KERNEL)?;
+        for _ in 0..count { render_flists.push(None, GFP_KERNEL)?; }
+        Ok(Self {
+            shared_render_flist,
             execution, owner_pid, channel_control, qos, tsq, tsq_base, render_mcache_hwsid,
             work_states: crate::g17_work_state::WorkStatePool::new(),
-        }
+            render_flists: Arc::pin_init(kernel::new_mutex!(render_flists, "G17 logical render pool"), GFP_KERNEL)?,
+        })
+    }
+
+    /// Cold graph construction only; publication counters remain serialized
+    /// by Runtime. This strong logical-owner identity is deliberately narrower
+    /// than assuming that native AGXShared means a VM or process.
+    fn render_flist(&self, dev: &AsahiDevice, uat: &mmu::Uat, pair_slot: u8) -> Result<Arc<G17PRenderFlist>> {
+        if !self.is_current() { return Err(EFAULT); }
+        let index = if self.shared_render_flist { 0 } else { pair_slot as usize };
+        let mut pools = self.render_flists.lock();
+        let pool = pools.get_mut(index).ok_or(EINVAL)?;
+        if let Some(pool) = pool.as_ref() { return Ok(pool.clone()); }
+        let created = Arc::new(G17PRenderFlist::new(dev, uat, self.vm())?, GFP_KERNEL)?;
+        *pool = Some(created.clone());
+        Ok(created)
+    }
+
+    /// Teardown-only lookup. The context owns this pool without a reverse Arc.
+    pub(crate) fn render_flists_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
+        self.render_flists.lock().iter().flatten().all(|pool|
+            released(u32::from(pool.id()), pool.control_shared_va()))
     }
 
     pub(crate) fn channel_control_gpu_va(&self) -> u64 {
@@ -4901,17 +4929,47 @@ impl G17PComputeFlist {
     }
 }
 
-/// One render ownership domain's USC private-memory pool.
-///
-/// B1's registration table stores exactly one context for each FList ID.  A
-/// device-global ID/backing therefore cannot be handed between live clients:
-/// the later tag-15 overwrites the row while the older queue still refers to
-/// it.  Keep the complete mutable allocator state with the retained render
-/// graph.  IDs 129..192 are disjoint from compute's QID+1 range 1..128 and are
-/// reused only at the physical render-slot retirement boundary.
+// Render and compute use the same 256-row firmware namespace. Compute owns
+// 1..128; dynamic render pools own 129..255. Reserve the spare bitmap bit.
+// The lease follows the pool, never the first physical pair using it.
+#[cfg(not(test))]
+static G17P_RENDER_FLIST_IDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(1 << 63)];
+
+#[cfg(not(test))]
+struct G17PRenderFlistId(u16);
+#[cfg(not(test))]
+impl G17PRenderFlistId {
+    fn new() -> Result<Self> {
+        for (bank, used) in G17P_RENDER_FLIST_IDS.iter().enumerate() {
+            let mut value = used.load(Ordering::Acquire);
+            loop {
+                let bit = value.trailing_ones();
+                if bit == 64 { break; }
+                match used.compare_exchange_weak(value, value | (1u64 << bit), Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return Ok(Self(129 + bank as u16 * 64 + bit as u16)),
+                    Err(now) => value = now,
+                }
+            }
+        }
+        Err(ENOSPC)
+    }
+}
+#[cfg(not(test))]
+impl Drop for G17PRenderFlistId {
+    fn drop(&mut self) {
+        let bit = self.0 as usize - 129;
+        G17P_RENDER_FLIST_IDS[bit / 64].fetch_and(!(1u64 << (bit % 64)), Ordering::Release);
+    }
+}
+
+/// Shared by one strong logical context's render pairs. The context and its
+/// retained graphs/teardown keep the pool and ID alive through release ACK.
 #[cfg(not(test))]
 pub(crate) struct G17PRenderFlist {
     id: u16,
+    // One client alias per pool, removed before its backing or ID lease.
+    _client_backing: mmu::KernelMapping,
+    client_vm: mmu::Vm,
     backing: MappedObject,
     /// Context 1 owns firmware-side FList service. Its lower root is a
     /// retained render-global VM, not a live view of later kernel-low leaves.
@@ -4922,13 +4980,14 @@ pub(crate) struct G17PRenderFlist {
     grown: AtomicBool,
     /// Set once the pool has been handed to an owner.
     served: AtomicBool,
+    _id_lease: G17PRenderFlistId,
 }
 
 #[cfg(not(test))]
 impl G17PRenderFlist {
-    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, render_slot: u8) -> Result<Self> {
-        if render_slot >= 64 { return Err(EINVAL); }
-        let id = 129u16.checked_add(u16::from(render_slot)).ok_or(EOVERFLOW)?;
+    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm) -> Result<Self> {
+        let id_lease = G17PRenderFlistId::new()?;
+        let id = id_lease.0;
         const PAGE_LIST: usize = G17P_CONTROL_OPERAND_PAGE_LIST_SIZE;
         const RUN_TABLE: usize = G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE;
         const BUFFERS: usize = PAGE_LIST + RUN_TABLE;
@@ -4955,6 +5014,10 @@ impl G17PRenderFlist {
                 mmu::PROT_GPU_SHARED_RW,
             )?
         };
+        let client_backing = {
+            let mapping = backing.mapping.as_ref().ok_or(EINVAL)?;
+            mapping.map_alias_into_range(vm, mapping.iova_range(), mmu::PROT_GPU_SHARED_RW)?
+        };
         let mut control_inner = MappedObject::new_wc(
             dev, uat, mmu::UAT_PGSZ, mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -4979,6 +5042,9 @@ impl G17PRenderFlist {
         core::sync::atomic::fence(Ordering::SeqCst);
         Ok(Self {
             id,
+            _client_backing: client_backing,
+            client_vm: vm.clone(),
+            _id_lease: id_lease,
             backing,
             _render_global_backing: render_global_backing,
             control_shared,
@@ -5733,12 +5799,12 @@ impl G17PUninstalledRenderGraph {
             "G17P render channel owner: process pid={}\n",
             owner_pid
         );
-        let render_flist = Arc::new(
-            G17PRenderFlist::new(dev, &uat, queue_pair.slot())?,
-            GFP_KERNEL,
-        )?;
-        let mut driver_aliases = KVec::with_capacity(1, GFP_KERNEL)?;
-        driver_aliases.push(render_flist.map_user_backing(vm)?, GFP_KERNEL)?;
+        let render_flist = match execution_context.as_ref() {
+            Some(context) if context.matches(vm) => context.render_flist(dev, &uat, queue_pair.slot())?,
+            Some(_) => return Err(EFAULT),
+            None => Arc::new(G17PRenderFlist::new(dev, &uat, vm)?, GFP_KERNEL)?,
+        };
+        let driver_aliases = KVec::new();
         let (command_context, render_root_slot) = if let Some(context) = execution_context {
             if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
                 return Err(EINVAL);
@@ -11421,12 +11487,15 @@ impl G17PUserRenderStorage {
     /// queue-owned pieces and are restaged before the next publication.
     pub(crate) fn retarget_command_context(
         &mut self,
+        dev: &AsahiDevice,
+        uat: &mmu::Uat,
         vm: &mmu::Vm,
         context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
     ) -> Result {
         if !context.matches(vm) || !context.is_current() {
             return Err(EFAULT);
         }
+        let render_flist = context.render_flist(dev, uat, self.queue_pair.slot())?;
         let context_id = u16::try_from(context.context_id()).map_err(|_| EOVERFLOW)?;
         if !Self::descriptor_context_valid(context_id) {
             return Err(EINVAL);
@@ -11449,6 +11518,7 @@ impl G17PUserRenderStorage {
             put_u64(raw, fragment + 0x9c, address);
             Ok(())
         })?;
+        self.render_flist = render_flist;
         self.logical_channel_control = Some(channel_control);
         self.owner_pid = owner_pid;
         self.logical_qos = Some(context.qos.clone());
@@ -21407,8 +21477,8 @@ impl G17ResourceOwner {
         vm: &mmu::Vm,
         render_flist: &Arc<G17PRenderFlist>,
     ) -> Result<KVec<mmu::KernelMapping>> {
-        let mut aliases = KVec::with_capacity(1, GFP_KERNEL)?;
-        aliases.push(render_flist.map_user_backing(vm)?, GFP_KERNEL)?;
+        if render_flist.client_vm.id() != vm.id() { return Err(EFAULT); }
+        let aliases = KVec::new();
         if crate::util::g17p_verbose() {
             dev_info!(
                 self.dev().as_ref(),
