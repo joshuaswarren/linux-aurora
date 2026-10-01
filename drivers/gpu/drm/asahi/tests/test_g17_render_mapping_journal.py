@@ -332,4 +332,4 @@ with tempfile.TemporaryDirectory(prefix="g17p-mapping-journal-") as directory:
     (path / "journal.rs").write_text(program)
     subprocess.run(["rustc", "--edition=2021", "--test", str(path / "journal.rs"),
                     "-o", str(path / "journal-tests")], check=True)
-    subprocess.run([str(path / "journal-tests")], check=True)
+    subprocess.run([str(path / "journal-tests"), "--test-threads=1"], check=True)  # shared MEM_STATS counters

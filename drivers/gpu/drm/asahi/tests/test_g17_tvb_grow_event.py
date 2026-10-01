@@ -62,6 +62,21 @@ use std::rc::Rc;
 impl<T:Copy> Cell<T>{fn new(v:T)->Self{Self(Rc::new(StdCell::new(v)))}fn get(&self)->T{self.0.get()}fn set(&self,v:T){self.0.set(v)}}
 type AsahiDevice=();type KBox<T>=Box<T>;
 mod driver{pub fn queue_g17p_tvb_grow_worker(_:()) {}}
+// v96 grow accounting (the real counters/budget; the mask stays 0 here, and
+// the re-kick itself is exercised by test_g17_v96_grow_rekick.py).
+mod g17_recovery_path{
+ use std::sync::atomic::{AtomicU32,AtomicU64,Ordering};
+ pub const GROW_REKICK:u32=1<<2;
+ pub static MASK:AtomicU32=AtomicU32::new(0);
+ pub fn enabled(bit:u32)->bool{MASK.load(Ordering::Relaxed)&bit!=0}
+ pub static GROW_INGRESS:AtomicU64=AtomicU64::new(0);pub static GROW_DEFERRED:AtomicU64=AtomicU64::new(0);
+ pub static GROW_PARKED_AT_RETURN:AtomicU64=AtomicU64::new(0);pub static GROW_REKICKS:AtomicU64=AtomicU64::new(0);
+ pub static GROW_REPLIED:AtomicU64=AtomicU64::new(0);
+ pub fn log_budget(counter:u64,first:u64,every:u64)->bool{counter<=first||counter%every==0}
+ pub static WATCHED:AtomicU64=AtomicU64::new(0);
+ pub fn watch_grow_reply(producer_after:u32,buffer_slot:u32){WATCHED.store(1<<63|u64::from(producer_after)<<32|u64::from(buffer_slot),Ordering::Relaxed);}
+}
+static G17P_GROW_TAKEN:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
 
 use std::sync::atomic::Ordering;
 type Result<T=()> = std::result::Result<T, i32>;
@@ -162,7 +177,7 @@ mod g17_resources {
   }
  }
  struct Resources{pb_descriptor_table:Object}
- #[derive(Debug,Copy,Clone,PartialEq,Eq)]pub struct G17PDeviceControlPublication;
+ #[derive(Debug,Copy,Clone,PartialEq,Eq)]pub struct G17PDeviceControlPublication{pub producer_after:u32}
  type MappedObject=Object;
  pub struct G17ResourceOwner{dev:AsahiDevice,resources:Resources,pub replies:Vec<[u8;64]>,pub credit:bool}
  impl G17ResourceOwner {
@@ -171,7 +186,7 @@ mod g17_resources {
   pub fn owned_dev(&self){}
   pub fn publish_primary_device_control_raw(&mut self,record:&[u8;64])->Result<G17PDeviceControlPublication>{
    if !self.credit{return Err(EAGAIN)} self.credit=false;
-   self.replies.push(*record);Ok(G17PDeviceControlPublication)
+   self.replies.push(*record);Ok(G17PDeviceControlPublication{producer_after:self.replies.len() as u32})
   }
 ''' + '\n'.join(item('g17_resources.rs', m) for m in [
     '    pub(crate) fn grow_render_tvb_synchronously(',
@@ -352,7 +367,7 @@ impl Manager{
  fn new()->Self{Self{active_render_grow:None,pending_render_grows:KVec::with_capacity(128,()).unwrap(),resources:g17_resources::G17ResourceOwner::new(),accepted_firmware_recovery_generation:9,
  pending_primary_control:None,render_slots:RenderSlots{slots:[Some(Box::new(Parked{bootstrap_uma:None,preparing:false,tracker:Some(Tracker{hardware_buffer_id:2}),queued_tracker:None,hardware_buffer_id:Some(2),storage:Some(Box::new(g17_resources::G17PUserRenderStorage::new(2,32,0))),bind:Some(G17PRenderRootOwner{context:10,vm:mmu::Vm{blocks:Cell::new(32),fail:Cell::new(false)}}),hardware_buffer_published:true})),Some(Box::new(Parked{bootstrap_uma:None,preparing:false,tracker:Some(Tracker{hardware_buffer_id:3}),queued_tracker:None,hardware_buffer_id:Some(3),storage:Some(Box::new(g17_resources::G17PUserRenderStorage::new(3,32,1))),bind:Some(G17PRenderRootOwner{context:11,vm:mmu::Vm{blocks:Cell::new(32),fail:Cell::new(false)}}),hardware_buffer_published:true}))]}}}
  fn pending_render_usc_freelist_release(&self)->Option<()>{None}
-''' + '\n'.join(item('g17_manager.rs',m) for m in ['    pub(crate) fn queue_render_tvb_grow(', '    pub(crate) fn take_render_grow(', '    pub(crate) fn return_render_grow(', '    fn publish_render_tvb_grow_reply(']) + item('g17_manager.rs', '    pub(crate) fn primary_device_control_backpressured(') + item('g17_manager.rs', '    pub(crate) fn flush_pending_primary_device_control(') + item('g17_manager.rs', '    pub(crate) fn note_primary_device_control_backpressure(') + item('g17_manager.rs', '    fn render_grow_owner_preparing(') + item('g17_manager.rs', '    pub(crate) fn replay_prepared_render_grows(') + item('g17_manager.rs', '    pub(crate) fn service_render_tvb_grow(') + r'''
+''' + '\n'.join(item('g17_manager.rs',m) for m in ['    pub(crate) fn queue_render_tvb_grow(', '    pub(crate) fn take_render_grow(', '    pub(crate) fn return_render_grow(', '    fn publish_render_tvb_grow_reply(']) + item('g17_manager.rs', '    pub(crate) fn primary_device_control_backpressured(') + item('g17_manager.rs', '    pub(crate) fn flush_pending_primary_device_control(') + item('g17_manager.rs', '    pub(crate) fn note_primary_device_control_backpressure(') + item('g17_manager.rs', '    fn render_grow_owner_preparing(') + item('g17_manager.rs', '    pub(crate) fn replay_prepared_render_grows(') + item('g17_manager.rs', '    pub(crate) fn service_render_tvb_grow(') + item('g17_manager.rs', '    pub(crate) fn rekick_parked_render_grows(') + r'''
 }''' + item('g17_manager.rs','pub(crate) struct G17PRenderGrow {') + item('g17_manager.rs','impl G17PRenderGrow {') + r'''
 fn request()->g17_completion::G17PFirmwareTvbGrowEvent{g17_completion::G17PFirmwareTvbGrowEvent{vm_slot:10,buffer_slot:2,counter:0x12345678,subpipe:63,halt_count:9}}
 #[test]fn detached_grow_keeps_event_queue_live_deduplicates_active_and_restores_exact_graph(){
