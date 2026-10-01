@@ -3539,6 +3539,8 @@ pub(crate) struct G17PLiveRuntime {
     submit_open: bool,
     /// `DIAG_CLPC_EFFORT`: last effort published to RegionC+0xe4.
     clpc_effort: u32,
+    /// Last GPU power budget published to RegionC+0x84 (0 = none yet).
+    power_target_mw: u32,
     /// Opt-in `g17p_dvfs_parity` bit0: work-tied effort state.
     dvfs_ce: crate::g17_dvfs_policy::CePolicy,
     /// Opt-in `g17p_dvfs_parity`: the open bracket used the native order.
@@ -3588,6 +3590,7 @@ impl G17PLiveRuntime {
     pub(crate) fn shutdown(&mut self) {
         if self.platform_removed { return; }
         self.platform_removed = true;
+        crate::g17_gpu_power::unregister();
         self.session_rebuild_requested = false;
         self.disarm_firmware_event_worker();
         g17_lifecycle::teardown_persistent_runtime(self);
@@ -6760,6 +6763,7 @@ impl G17PLiveRuntime {
     /// this performs no RegionC write and sends no message, as in v68.
     fn submit_accounting_begin(&mut self) {
         use crate::g17_dvfs_policy as policy;
+        self.gpu_power_sync();
         let parity = crate::g17_dvfs_parity::config();
         if parity.mask & policy::PARITY_CE != 0 {
             // Native CLPC-driven RegionC+0xe4, approximated from real work:
@@ -6853,6 +6857,32 @@ impl G17PLiveRuntime {
                 let _ = Pin::new(rtkit).send_message_logged(
                     g17_rtkit::ENDPOINT_GFX_INTERRUPTS, 0x0087_0000_0000_0010);
             }
+        }
+    }
+
+    /// GPU power budget (native MaxGPUAbsolutePower): register with the
+    /// optional thermal shim once, then publish its latched budget to
+    /// RegionC+0x84/+0x9c. The live word is read back so a session
+    /// re-encode (which restores the encoded default) is republished.
+    fn gpu_power_sync(&mut self) {
+        use crate::g17_gpu_power as power;
+        let Some(manager) = self.manager.as_mut() else { return; };
+        if !power::attempted() {
+            if let Ok(default_mw) = manager.read_power_target() {
+                power::register_once(default_mw);
+            }
+        }
+        let want = power::TARGET_MW.load(Ordering::Acquire);
+        if want == 0 {
+            return;
+        }
+        if self.power_target_mw == want && manager.read_power_target().ok() == Some(want) {
+            return;
+        }
+        let reason = power::REASON.load(Ordering::Relaxed);
+        if manager.publish_power_target(want, reason).is_ok() {
+            self.power_target_mw = want;
+            power::PUBLISHES.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -10102,6 +10132,7 @@ impl G17PLiveRuntime {
             submit_count: 1,
             submit_open: false,
             clpc_effort: 0,
+            power_target_mw: 0,
             dvfs_ce: crate::g17_dvfs_policy::CePolicy::new(),
             dvfs_native_bracket: false,
             completion_signal,
