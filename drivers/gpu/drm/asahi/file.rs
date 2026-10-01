@@ -1277,6 +1277,14 @@ impl File {
         let ret = queue
             .lock()
             .submit(id, syncs, data.in_sync_count as usize, &vec, objects);
+        // The queue lock is dropped and only accepted work refreshes this
+        // client's short-lived wait hint. Errors cannot extend a boost.
+        if ret.is_ok() {
+            let wait_util_min = crate::g17_host_path::feeder_wait_util_min();
+            if wait_util_min != 0 {
+                file.set_syncobj_wait_hint(wait_util_min, 8);
+            }
+        }
         if e2e_entry != 0 {
             crate::g17_e2e::record(crate::g17_e2e::K_IOCTL_EXIT, 0, id,
                 [ret.as_ref().err().map_or(0, |error| error.to_errno() as i64 as u64), 0, 0, 0, 0]);

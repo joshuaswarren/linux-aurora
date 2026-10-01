@@ -80,6 +80,11 @@
 //!        status checks (FW_DEPS aggregates, prefix hardware fences); it still
 //!        declines any unsignalled host dependency, a scheduler backlog or an
 //!        unavailable lease, so the ioctl never waits for a dependency.
+//!   bit16 WAIT_UTIL_HINT: tag accepted feeder work for 8 ms while the
+//!        existing starvation detector requests CPU performance. A blocking
+//!        syncobj wait uses a scheduler capacity hint of 512 only until it
+//!        returns. User clamps, cgroup limits and CPU affinity remain intact.
+//!        Default on; clearing this bit is the same-kernel A/B control.
 //!
 //! v92 per-cluster feed levels: `g17p_feed_perf_pct_p` / `g17p_feed_perf_pct_e`
 //! (0 = inherit `g17p_feed_perf_pct`) set the floor of the highest-capacity
@@ -127,16 +132,19 @@ pub(crate) const PCORE_NUDGE: u32 = 1 << 12;
 pub(crate) const FW_DEPS: u32 = 1 << 13;
 pub(crate) const AGG_FIRST: u32 = 1 << 14;
 pub(crate) const EARLY_DEPS: u32 = 1 << 15;
-const ALL_BITS: u32 = (1 << 16) - 1;
+pub(crate) const WAIT_UTIL_HINT: u32 = 1 << 16;
+const ALL_BITS: u32 = (1 << 17) - 1;
 
 /// Production default for this candidate. v84-final had FEED_PERF only; v87
 /// added bits 2-8 and v91 bits 9-11. `g17p_host_path=0x1fe` is exactly the
 /// v90 behaviour and `=2` the v84-final behaviour, for same-boot A/B.
-/// v93 bits 13-15 stay off by default (0xffe is exactly v92d) until the lab
-/// qualifies them; `0xeffe` enables all three.
+/// v93 bits 13-15 stay off. The scoped wait hint adds bit16 to the default;
+/// `0xffe` disables only that hint for same-kernel comparison. `0xeffe`
+/// enables the older three probes without the scoped hint.
+// Scoped wait hints extend the prior 0xffe baseline to 0x10ffe.
 const DEFAULT_MASK: u32 = FEED_PERF | EARLY_SHALLOW | STATE_WORD | SETTLE_ONCE
     | RING_CACHE | WORKER_TAIL | OBS_SKIP | VM_STATUS_MIRROR
-    | VALIDATE_PROOF | PENDING_EXACT | WORD_STORES;
+    | VALIDATE_PROOF | PENDING_EXACT | WORD_STORES | WAIT_UTIL_HINT;
 static MASK: AtomicU32 = AtomicU32::new(DEFAULT_MASK);
 static FEED_PCT: AtomicU32 = AtomicU32::new(50);
 /// v92 per-cluster overrides of FEED_PCT (0 = inherit).
@@ -520,6 +528,15 @@ pub(crate) fn nudge_feeding_thread() {
     // SAFETY: as above; restores the exact effective mask read before.
     let restored = unsafe { bindings::set_cpus_allowed_ptr(task, &saved) };
     if restored != 0 { count(&NUDGE_FAILS); } else { count(&NUDGES); }
+}
+
+/// Capacity hint for a client actively replenishing a CPU-starved GPU.
+/// A per-file expiry and a scoped syncobj wait keep this out of idle/non-GPU
+/// work. No task attribute, affinity or saved userspace clamp is rewritten.
+pub(crate) fn feeder_wait_util_min() -> u32 {
+    if !cfg!(CONFIG_UCLAMP_TASK) { return 0; }
+    if enabled(WAIT_UTIL_HINT) && wanted()
+        && REQS.applied_pct.load(Ordering::Relaxed) != 0 { 512 } else { 0 }
 }
 
 fn wanted() -> bool {
