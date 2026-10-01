@@ -6565,6 +6565,27 @@ impl G17PLiveRuntime {
         self.fail_render_after_final_observation(render_slot, submission_id, blamed_stamp, error);
     }
 
+    /// Fail a published render without releasing anything firmware may name.
+    /// Both the blamed pair and VM-loss siblings use the same retained-owner
+    /// collection, whose release requires whole-pair drain or processor stop.
+    fn quarantine_failed_render_completion(
+        &mut self,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+        error: Error,
+    ) -> bool {
+        let newly_failed = completion.fail_while_owned(error);
+        if let Err(error) = self.quarantined_render_completions.push_within_capacity(completion) {
+            // Capacity covers every in-flight member of every physical pair.
+            // If that invariant is violated, leak rather than unmap memory
+            // firmware may still dereference.
+            core::mem::forget(error.0);
+            pr_err!(
+                "G17P render: completion quarantine exhausted; retaining VM mappings permanently\n"
+            );
+        }
+        newly_failed
+    }
+
     fn fail_render_after_final_observation(&mut self, render_slot: u8,
         submission_id: Option<u64>, blamed_stamp: Option<u8>, error: Error) {
         if self.render_fence_state.settle(render_slot) {
@@ -6628,31 +6649,9 @@ impl G17PLiveRuntime {
                         render_slot,
                     );
                 }
-                signal.fail_while_owned(error);
-                if let Err(error) = self
-                    .quarantined_render_completions
-                    .push_within_capacity(signal)
-                {
-                    // There can be at most one unresolved owner per
-                    // quarantined physical slot. If that invariant is ever
-                    // violated, intentionally leak rather than unmap memory
-                    // firmware may still dereference.
-                    core::mem::forget(error.0);
-                    pr_err!(
-                        "G17P render: completion quarantine exhausted; retaining VM mappings permanently\n"
-                    );
-                }
+                self.quarantine_failed_render_completion(signal, error);
                 while let Some(queued) = queued_signals.take() {
-                    queued.fail_while_owned(error);
-                    if let Err(error) = self
-                        .quarantined_render_completions
-                        .push_within_capacity(queued)
-                    {
-                        core::mem::forget(error.0);
-                        pr_err!(
-                            "G17P render: queued completion quarantine exhausted; retaining VM mappings permanently\n"
-                        );
-                    }
+                    self.quarantine_failed_render_completion(queued, error);
                 }
             }
             self.fail_outstanding_jobs_for_vm(&status, error);

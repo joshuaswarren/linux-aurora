@@ -18,6 +18,7 @@ Two failure modes this must avoid while fixing that:
     interrupted wait and a malformed command buffer all leave a healthy VM.
 """
 from pathlib import Path
+from g17_render_fanout_test_support import fence_state_source, retention_method, KVEC
 from g17_compute_inflight_test_support import completion_mod, queue_limits_mock
 import subprocess, tempfile
 
@@ -87,7 +88,7 @@ assert completion_service.index('completion.fail_while_owned(error)') < \
 assert quarantine_compute.index('completion.fail_while_owned(error)') < \
     quarantine_compute.index('self.fail_outstanding_jobs_for_vm(&status, error)'), \
     'a terminal compute timeout does not fan out to its VM peers'
-assert timeout_render.index('signal.fail_while_owned(error)') < \
+assert timeout_render.index('self.quarantine_failed_render_completion(signal, error)') < \
     timeout_render.index('self.fail_outstanding_jobs_for_vm(&status, error)'), \
     'a terminal render timeout does not fan out to its VM peers'
 assert '.fail_outstanding_jobs_for_vm(&status, *error)' in publish_compute, \
@@ -113,6 +114,7 @@ const EINVAL:Error=Error(-22);
 const ERESTARTSYS:Error=Error(-512);
 const ECANCELED:Error=Error(-125);
 macro_rules! dev_err{($($t:tt)*)=>{{}}}
+macro_rules! pr_err{($($t:tt)*)=>{{}}}
 
 // `crate::g17_status::VmStatus` is what the extracted code names, and in a
 // standalone test crate `crate` is this file.
@@ -160,7 +162,9 @@ impl Lease{fn quarantine(&self){self.quarantined.fetch_add(1,Ordering::SeqCst);}
 struct G17PAsyncComputeActive{packet:Arc<Packet>,_lease:Lease,retirement:Option<()>}
 struct Queue(u8);
 impl Queue{fn queue_id(&self)->u8{self.0}}
-'''+completion_mod()+queue_limits_mock()+r'''
+'''+completion_mod(fence_state_source())+queue_limits_mock()+KVEC+r'''
+mod g17_drm{pub(super) type G17PRenderCompletion=super::Completion;}
+type RenderFifo=g17_completion::PairFifo<Arc<Completion>,15>;
 type Inflight=g17_completion::PairFifo<G17PAsyncComputeActive,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
 fn one(active:G17PAsyncComputeActive)->Inflight{let mut f=Inflight::new();if f.push(active).is_err(){unreachable!()}f}
 struct G17PAsyncComputeQueue{queue:Queue,inflight:Inflight,quarantined:bool,awaiting_retirement_witness:bool}
@@ -181,7 +185,8 @@ struct G17PLiveRuntime{
  serviced:u32,
  render_observations:u32,
  render_completed:[bool;2],
- pending_render:[Option<Completion>;2],
+ pending_render:[Option<Arc<Completion>>;2],
+ pending_render_queued:[RenderFifo;2],render_fence_state:g17_completion::RenderFenceState,render_event_masks:[[u32;2];2],quarantined_render_completions:KVec<Arc<Completion>>,
  session_recovery_pending:bool,
 }
 impl G17PLiveRuntime{
@@ -236,12 +241,12 @@ fn runtime(owners:&[Arc<crate::g17_status::VmStatus>])->(G17PLiveRuntime,Vec<Arc
   });
  }
  (G17PLiveRuntime{async_compute_queues:queues,pdev:Some(Pdev),serviced:0,
-   render_observations:0,render_completed:[false;2],pending_render:[None,None],
+   render_observations:0,render_completed:[false;2],pending_render:[None,None],pending_render_queued:std::array::from_fn(|_|RenderFifo::new()),render_fence_state:Default::default(),render_event_masks:[[0;2];2],quarantined_render_completions:KVec::with_capacity(32),
    session_recovery_pending:false},leases)
 }
 
-fn completion(status:Arc<crate::g17_status::VmStatus>)->Completion{
- Completion{status,signalled:RefCell::new(None),status_at_signal:RefCell::new(0)}
+fn completion(status:Arc<crate::g17_status::VmStatus>)->Arc<Completion>{
+ Arc::new(Completion{status,signalled:RefCell::new(None),status_at_signal:RefCell::new(0)})
 }
 
 #[test]fn only_the_lost_vm_s_jobs_are_failed(){
@@ -266,7 +271,7 @@ fn completion(status:Arc<crate::g17_status::VmStatus>)->Completion{
  let (mut rt,leases)=runtime(&[lost.clone(),healthy.clone()]);
  rt.pending_render=[Some(completion(lost.clone())),Some(completion(healthy.clone()))];
  assert_eq!(rt.fail_outstanding_jobs_for_vm(&lost,ETIMEDOUT),2);
- assert_eq!(*rt.pending_render[0].as_ref().unwrap().signalled.borrow(),Some(ETIMEDOUT.to_errno()));
+ assert_eq!(*rt.quarantined_render_completions[0].signalled.borrow(),Some(ETIMEDOUT.to_errno()));
  assert_eq!(*rt.pending_render[1].as_ref().unwrap().signalled.borrow(),None);
  assert_eq!(leases[0].load(Ordering::SeqCst),1);
  assert_eq!(leases[1].load(Ordering::SeqCst),0);
@@ -293,7 +298,7 @@ fn completion(status:Arc<crate::g17_status::VmStatus>)->Completion{
  assert_eq!(rt.async_compute_queues.iter().map(|q|q.quarantined).collect::<Vec<_>>(),
   vec![true,true,false]);
  assert_eq!(leases.iter().map(|l|l.load(Ordering::SeqCst)).collect::<Vec<_>>(),vec![1,1,0]);
- assert_eq!(*rt.pending_render[0].as_ref().unwrap().signalled.borrow(),Some(EIO.to_errno()));
+ assert_eq!(*rt.quarantined_render_completions[0].signalled.borrow(),Some(EIO.to_errno()));
  assert_eq!(*rt.pending_render[1].as_ref().unwrap().signalled.borrow(),None);
  assert_eq!(healthy.get(),0,"the completion-poll failure poisoned a peer VM");
 }
@@ -389,7 +394,7 @@ fn queue(status:Arc<crate::g17_status::VmStatus>,jobs:&[Arc<crate::g17_status::V
 }
 '''
 
-code = preamble + sweep_after_observation + sweep + harness + note_impl + tests
+code = preamble + retention_method(SOURCE) + sweep_after_observation + sweep + harness + note_impl + tests
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
     f = d / 'teardown.rs'
