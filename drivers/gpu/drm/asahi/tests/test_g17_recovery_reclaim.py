@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-live = (root / "g17_live_boot.rs").read_text()
+live = Path(os.environ.get("NEO_RECLAIM_LIVE", root / "g17_live_boot.rs")).read_text()
 manager = (root / "g17_manager.rs").read_text()
 compute = (root / "g17_compute.rs").read_text()
 recovery = (root / "g17_recovery_path.rs").read_text()
@@ -128,13 +128,35 @@ struct Runtime {
     serviced: u32,
     releases: Vec<u8>,
     release_result: Result,
+    service_effect: u8,
+    release_invalidates_drain: bool,
 }
 impl Runtime {
     fn is_crashed(&self) -> bool { self.crashed }
     fn primary_recovery_pending(&self) -> bool { self.recovery }
-    fn service_firmware_events_inline(&mut self) -> Result<u32> { self.serviced += 1; Ok(0) }
+    fn service_firmware_events_inline(&mut self) -> Result<u32> {
+        self.serviced += 1;
+        match self.service_effect {
+            1 => return Err(EIO),
+            2 => self.recovery = true,
+            3 => self.crashed = true,
+            4 => for s in self.manager.as_mut().unwrap().slots.values_mut() {
+                s.drained = Some(Some(ReclaimBlock::Stamps));
+            },
+            _ => {},
+        }
+        Ok(0)
+    }
     fn service_render_usc_freelist_release(&mut self, release: u8) -> Result {
-        self.releases.push(release); self.release_result
+        self.releases.push(release);
+        if self.release_invalidates_drain {
+            // Firmware can enter recovery while the host publishes a control
+            // message; model its drain/handshake read returning blocked.
+            for s in self.manager.as_mut().unwrap().slots.values_mut() {
+                s.drained = Some(Some(ReclaimBlock::Recovery));
+            }
+        }
+        self.release_result
     }
     fn defer_completion(&mut self, completion: g17_drm::G17PDeferredCompletion) { self.deferred.push(completion); }
     fn run_deferred(&mut self) {
@@ -159,7 +181,8 @@ fn fixture(mask: u32, groups: &[(u8, &[Group], Option<ReclaimBlock>)]) -> (Runti
     }
     (Runtime { quarantined_render_completions: vec![], reclaim_pending_since: None,
         manager: Some(Manager { slots, drain_error: false }), pdev: None, crashed: false, recovery: false,
-        deferred: vec![], serviced: 0, releases: vec![], release_result: Ok(()) }, guard)
+        deferred: vec![], serviced: 0, releases: vec![], release_result: Ok(()),
+        service_effect: 0, release_invalidates_drain: false }, guard)
 }
 fn released(c: &Arc<g17_drm::G17PRenderCompletion>) -> u32 { c.released.load(Ordering::SeqCst) }
 const HANG: &[Group] = &[Group::Skipped, Group::Executed, Group::Executed, Group::Executed];
@@ -266,6 +289,71 @@ fn flist_release_backpressure_is_tolerated_but_errors_keep_the_quarantine() {
     rt.run_deferred();
     assert_eq!(released(&c), 0);
     assert_eq!(rt.quarantined_render_completions.len(), 1);
+}
+#[test]
+fn failed_event_service_cannot_reclaim_any_pair() {
+    let (mut rt, _g) = fixture(1, &[(7, HANG, None), (8, HANG, None)]);
+    let a = completion(Some(7));
+    let b = completion(Some(8));
+    rt.quarantined_render_completions.extend([a.clone(), b.clone()]);
+    rt.service_effect = 1;
+    rt.reclaim_drained_quarantined_render_slots();
+    rt.run_deferred();
+    assert_eq!(released(&a), 0);
+    assert_eq!(released(&b), 0);
+    let m = rt.manager.as_ref().unwrap();
+    assert_eq!(m.slots[&7].groups.len(), HANG.len());
+    assert_eq!(m.slots[&8].groups.len(), HANG.len());
+}
+#[test]
+fn rechecks_recovery_opened_by_event_service() {
+    let (mut rt, _g) = fixture(1, &[(7, HANG, None)]);
+    let c = completion(Some(7));
+    rt.quarantined_render_completions.push(c.clone());
+    rt.service_effect = 2;
+    rt.reclaim_drained_quarantined_render_slots();
+    rt.run_deferred();
+    assert_eq!(released(&c), 0);
+    assert_eq!(rt.manager.as_ref().unwrap().slots[&7].groups.len(), HANG.len());
+}
+#[test]
+fn rechecks_session_failure_during_event_service() {
+    let (mut rt, _g) = fixture(1, &[(7, HANG, None)]);
+    let c = completion(Some(7));
+    rt.quarantined_render_completions.push(c.clone());
+    rt.service_effect = 3;
+    rt.reclaim_drained_quarantined_render_slots();
+    rt.run_deferred();
+    assert_eq!(released(&c), 0);
+    assert_eq!(rt.manager.as_ref().unwrap().slots[&7].groups.len(), HANG.len());
+}
+#[test]
+fn rechecks_drain_proof_after_event_service() {
+    let (mut rt, _g) = fixture(1, &[(7, HANG, None)]);
+    let c = completion(Some(7));
+    rt.quarantined_render_completions.push(c.clone());
+    rt.service_effect = 4;
+    rt.reclaim_drained_quarantined_render_slots();
+    rt.run_deferred();
+    assert_eq!(released(&c), 0);
+    assert_eq!(rt.manager.as_ref().unwrap().slots[&7].groups.len(), HANG.len());
+}
+#[test]
+fn flist_service_cannot_invalidate_the_final_reclaim_proof() {
+    let (mut rt, _g) = fixture(1, &[(7, HANG, None)]);
+    let c = completion(Some(7));
+    rt.quarantined_render_completions.push(c.clone());
+    rt.release_invalidates_drain = true;
+    rt.reclaim_drained_quarantined_render_slots();
+    rt.run_deferred();
+    assert_eq!(released(&c), 0);
+    // The retired trackers stay retired; only releasing their guards waits.
+    assert!(rt.manager.as_ref().unwrap().slots[&7].groups.is_empty());
+    rt.manager.as_mut().unwrap().slots.get_mut(&7).unwrap().drained = Some(None);
+    rt.release_invalidates_drain = false;
+    rt.reclaim_drained_quarantined_render_slots();
+    rt.run_deferred();
+    assert_eq!(released(&c), 1);
 }
 #[test]
 fn predicate_errors_keep_the_quarantine() {

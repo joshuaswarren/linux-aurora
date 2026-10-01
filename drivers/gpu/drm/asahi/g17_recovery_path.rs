@@ -35,8 +35,9 @@
 //!        outstanding work, a 4 ms delayed work reads the firmware per-QID
 //!        dependency records (firmware DATA, read-only) of every busy pair.
 //!        A 3D queue is a stall candidate when its TA's completed stamp has
-//!        passed the 3D's next stamp (its TA parent is complete) while no 3D
-//!        queue of any pair has advanced for >= STALL_MS. The first sample of
+//!        passed the 3D's next stamp (its TA parent is complete) while that
+//!        queue has not advanced for >= STALL_MS. Other clients' progress
+//!        must not hide starvation of this queue. The first sample of
 //!        a stall logs the dependency records, the B1 scheduler masks
 //!        (requested/sampled/deferred/next), the runnable mask and the park
 //!        record. Log and count only: no firmware write, no message.
@@ -144,7 +145,7 @@ pub(crate) const STALL_MS: u64 = 20;
 /// Per-pair watch state, owned by the Runtime lock (atomics only for
 /// static storage). `since` = ns when the pair became a candidate with this
 /// 3D completed stamp (0 = not a candidate); `stage` 0 none, 1 detected,
-/// 2 paired doorbell sent, 3 Fragment doorbell sent.
+/// 2 paired doorbell sent, 3 Fragment doorbell sent, 4 send failed.
 pub(crate) struct StallSlot {
     pub(crate) fragment_completed: AtomicU64,
     pub(crate) since: AtomicU64,
@@ -156,11 +157,6 @@ pub(crate) static STALL_SLOT: [StallSlot; STALL_SLOTS] = [const {
     StallSlot { fragment_completed: AtomicU64::new(u64::MAX), since: AtomicU64::new(0),
         stage: AtomicU32::new(0), acted_at: AtomicU64::new(0) }
 }; STALL_SLOTS];
-/// Sum of every busy pair's 3D completed stamp at the previous poll, and the
-/// ns at which any 3D queue last advanced.
-pub(crate) static STALL_FRAGMENT_SUM: AtomicU64 = AtomicU64::new(0);
-pub(crate) static STALL_DM1_PROGRESS: AtomicU64 = AtomicU64::new(0);
-
 /// A 3D queue is a stall candidate when it has published work beyond its
 /// completed stamp and the paired TA queue (same stamp numbering) has
 /// completed at least the 3D's next stamp: its TA parent is complete.
@@ -173,13 +169,45 @@ pub(crate) fn stall_candidate(ta_completed: u64, fragment_completed: u64, latest
     })
 }
 
+/// Forget an interrupted observation without claiming the work completed.
+/// A borrowed/absent graph or an unreadable dependency record is not a
+/// retirement witness. A later sample must start a new contiguous interval.
+pub(crate) fn discard_stall_observation(slot: &StallSlot) {
+    slot.since.store(0, Ordering::Relaxed);
+    slot.stage.store(0, Ordering::Relaxed);
+    slot.acted_at.store(0, Ordering::Relaxed);
+    slot.fragment_completed.store(u64::MAX, Ordering::Relaxed);
+}
+
+/// Observe one queue independently of every other queue's progress. Only a
+/// changed completion stamp counts as clearance. Losing the candidate
+/// predicate or its graph cannot establish that a doorbell rescued it.
+pub(crate) fn sample_stall_slot(slot: &StallSlot, now: u64,
+    fragment_completed: u64, candidate: bool) -> bool {
+    if slot.fragment_completed.swap(fragment_completed, Ordering::Relaxed) != fragment_completed {
+        note_stall_cleared(slot, now);
+    }
+    if !candidate {
+        discard_stall_observation(slot);
+        return false;
+    }
+    let since = slot.since.load(Ordering::Relaxed);
+    if since == 0 {
+        slot.since.store(now, Ordering::Relaxed);
+        return false;
+    }
+    now.saturating_sub(since) >= STALL_MS * 1_000_000
+}
+
 pub(crate) fn note_stall_cleared(slot: &StallSlot, now: u64) {
     let since = slot.since.swap(0, Ordering::Relaxed);
     let stage = slot.stage.swap(0, Ordering::Relaxed);
     if stage == 0 || since == 0 { return; }
     let lasted = now.saturating_sub(since);
     STALL_MAX_NS.fetch_max(lasted, Ordering::Relaxed);
-    if stage >= 2 {
+    // "After" is temporal association, never proof of a causal rescue.
+    // Failed sends are deliberately not credited as sent doorbells.
+    if matches!(stage, 2 | 3) {
         STALL_CLEARED_AFTER_DOORBELL.fetch_add(1, Ordering::Relaxed);
     } else {
         STALL_CLEARED_UNAIDED.fetch_add(1, Ordering::Relaxed);

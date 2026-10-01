@@ -157,13 +157,13 @@ impl Packet{
 #[derive(Default)]
 struct Lease{quarantined:Arc<AtomicU32>}
 impl Lease{fn quarantine(&self){self.quarantined.fetch_add(1,Ordering::SeqCst);}}
-struct G17PAsyncComputeActive{packet:Arc<Packet>,_lease:Lease}
+struct G17PAsyncComputeActive{packet:Arc<Packet>,_lease:Lease,retirement:Option<()>}
 struct Queue(u8);
 impl Queue{fn queue_id(&self)->u8{self.0}}
 '''+completion_mod()+queue_limits_mock()+r'''
 type Inflight=g17_completion::PairFifo<G17PAsyncComputeActive,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
 fn one(active:G17PAsyncComputeActive)->Inflight{let mut f=Inflight::new();if f.push(active).is_err(){unreachable!()}f}
-struct G17PAsyncComputeQueue{queue:Queue,inflight:Inflight,quarantined:bool}
+struct G17PAsyncComputeQueue{queue:Queue,inflight:Inflight,quarantined:bool,awaiting_retirement_witness:bool}
 mod g17_resources{
  pub struct G17PRenderQueuePair;
  impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}
@@ -230,9 +230,9 @@ fn runtime(owners:&[Arc<crate::g17_status::VmStatus>])->(G17PLiveRuntime,Vec<Arc
      context:Context(10+index as u32),
      completion:Some(Completion{status:status.clone(),signalled:RefCell::new(None),status_at_signal:RefCell::new(0)}),
     }),
-    _lease:Lease{quarantined:flag},
+    _lease:Lease{quarantined:flag},retirement:Some(()),
    }),
-   quarantined:false,
+   quarantined:false,awaiting_retirement_witness:false,
   });
  }
  (G17PLiveRuntime{async_compute_queues:queues,pdev:Some(Pdev),serviced:0,
@@ -305,7 +305,7 @@ fn completion(status:Arc<crate::g17_status::VmStatus>)->Completion{
  for k in 1..3u64 {
   let extra=G17PAsyncComputeActive{packet:Arc::new(Packet{submission:100+10*k,context:Context(10),
    completion:Some(Completion{status:lost.clone(),signalled:RefCell::new(None),status_at_signal:RefCell::new(0)})}),
-   _lease:Lease{quarantined:flag.clone()}};
+   _lease:Lease{quarantined:flag.clone()},retirement:Some(())};
   if rt.async_compute_queues[0].inflight.push(extra).is_err(){unreachable!()}
  }
  assert_eq!(rt.fail_outstanding_jobs_for_vm(&lost,EIO),3);
