@@ -6745,7 +6745,27 @@ impl G17PLiveRuntime {
             // Recovery isolation: a spared render fails its own fence (and,
             // unretired, keeps its pair quarantined) but does not take the
             // rest of its VM down with it.
-            let spared = signal.recovery_spared();
+            //
+            // iso3.1: the whole failing group shares that class. Work the
+            // spared client queued on this pair after the recovery's
+            // classification (class unset) fails only because the spared
+            // head ahead of it never ran; marking it spared keeps its
+            // `fail_while_owned` from writing the sticky VM status. Measured:
+            // boot 9701621a 07:18:04.19, spared VM 89's slot 6 head timed
+            // out 1.9 s after the recovery and a queued successor poisoned
+            // the VM with ETIMEDOUT at g17_drm.rs:1353 just before the
+            // "its VM keeps running" line.
+            let spared = signal.recovery_spared()
+                || queued_signals.iter().any(|queued| queued.recovery_spared());
+            if spared {
+                signal.set_recovery_class(crate::g17_recovery_isolation::CLASS_SPARED);
+                for queued in queued_signals.iter() {
+                    if !queued.recovery_spared() {
+                        queued.set_recovery_class(crate::g17_recovery_isolation::CLASS_SPARED);
+                        crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::SPARED_SUCCESSORS);
+                    }
+                }
+            }
             if retired {
                 signal.complete(Err(EIO));
             } else {

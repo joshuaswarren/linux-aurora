@@ -325,11 +325,13 @@ pub(crate) static RESUME_DOORBELLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static COLLATERAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REATTRIBUTED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NO_CULPRIT: AtomicU64 = AtomicU64::new(0);
+/// iso3.1: unclassified renders queued behind a spared head, failed with it.
+pub(crate) static SPARED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }
 
-static COUNTERS: [(&str, &AtomicU64); 21] = [
+static COUNTERS: [(&str, &AtomicU64); 22] = [
     ("recoveries", &RECOVERIES), ("unresolved", &UNRESOLVED),
     ("spared-renders", &SPARED_RENDERS), ("spared-compute", &SPARED_COMPUTE),
     ("guilty-marked", &GUILTY_MARKED), ("graced", &GRACED),
@@ -340,6 +342,7 @@ static COUNTERS: [(&str, &AtomicU64); 21] = [
     ("admission-timeouts", &ADMISSION_TIMEOUTS), ("submit-waits", &SUBMIT_WAITS),
     ("submit-timeouts", &SUBMIT_TIMEOUTS), ("resume-doorbells", &RESUME_DOORBELLS),
     ("collateral", &COLLATERAL), ("reattributed", &REATTRIBUTED), ("no-culprit", &NO_CULPRIT),
+    ("spared-successors", &SPARED_SUCCESSORS),
 ];
 
 // ---- parameter -----------------------------------------------------------------
