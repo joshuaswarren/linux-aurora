@@ -210,6 +210,10 @@ kernel::module_platform_driver! {
             default: 32,
             description: "Maximum ordinary KTrace records printed per drain",
         },
+        g17p_fastdie_target_cc: u32 {
+            default: 0,
+            description: "Diagnostic: GPU firmware fast-die target in 0.01 C, lower-only 8500..=11000; 0 keeps the native 11000 (110.00 C)",
+        },
         // NOTE: every `permissions:` line in this block is commented out, so
         // the macro gives each parameter permissions 0. That means NONE of
         // these appear under /sys/module/asahi/parameters -- they can only be

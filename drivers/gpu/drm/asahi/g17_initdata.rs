@@ -2443,6 +2443,127 @@ pub(crate) fn encode_secondary_root_extra_1(out: &mut [u8]) -> Result<(), Initda
     Ok(())
 }
 
+// --- GPU firmware fast-die controller (GFX1) --------------------------------
+//
+// KEXT_PROVEN (25G83 AGXG17P):
+// - AGXAcceleratorG17P::populateFastDieDeviceConfigData (0x88c7af0) sets target
+//   110.0 C and sensor mask 0xaa0 when accel[0x4a0] == 0x1f, else 0x82a.  It
+//   zeroes the per-sensor array for each mask bit.  It panics ("Not all MTR
+//   Sensors required for FastDie are enabled") only when the host MTR-enable word
+//   accel[0xe978] is non-zero and lacks a required bit.
+// - The base populate (0x883d41c) takes optional ADT gpu-fast-die0-sensor-mask64/
+//   -sensor-mask/-target (default 101.0 C, overridden above).  setupConfig reads
+//   the optional gpu-fast-die0-release-temp/-prop-tgt-delta/-proportional-gain/
+//   -integral-gain and gpu-fastdie-mrc-period.  The J700 ADT carries none of
+//   them.
+// - initPowerAndPerformanceData copies the staged values into
+//   - the GFX1 power object: `[[fw+0x2d8]+0x6678]`; GFX1 reaches it through
+//     secondary main +0x471 = bundle view 2 + 0xe40;
+//   - the 0x6a8-byte secondary-root +0xb8 object (`fw+0xcd8`), which Linux
+//     places at primary status B + 0xe440.
+// FW_PROVEN (fw1 25G83 b100, 0x174d0):
+// - When the +0xb8 object's +0xc4 flag is set, GFX1 copies its +0xc8..+0xe4
+//   fields into the power object.  Native updateLifetimeServoTempTarget and
+//   updateFastDieController set that flag after writing the fields.
+// - GFX1 takes the lower of that target and an external target, then programs
+//   each masked MTR sensor's threshold registers (stride 0x200, +0x1000/+0x1004/
+//   +0x1014) at (target - delta) / 100 C.
+// The recorded Linux runs already carry every non-zero value native publishes
+// here (see the test `fast_die_config_matches_native`).
+
+/// Offset of the GFX1 power object inside the hardware-data bundle.
+pub(crate) const FASTDIE_OBJECT_BUNDLE_OFFSET: usize =
+    BUNDLE_VIEW_OFFSETS[SECONDARY_EXTRA_VIEW_INDEX] + SECONDARY_EXTRA_VIEW_OFFSET;
+pub(crate) const FASTDIE_OBJ_MASK: usize = 0x2310;
+pub(crate) const FASTDIE_OBJ_RELEASE_CC: usize = 0x2318;
+pub(crate) const FASTDIE_OBJ_KI_DT: usize = 0x233c;
+pub(crate) const FASTDIE_OBJ_KP: usize = 0x234c;
+pub(crate) const FASTDIE_OBJ_DELTA_CC: usize = 0x2364;
+pub(crate) const FASTDIE_OBJ_TARGET_CC: usize = 0x236c;
+pub(crate) const FASTDIE_OBJ_STATE: usize = 0x25bc;
+/// Offsets inside the secondary-root +0xb8 object (status B + 0xe440 here).
+pub(crate) const FASTDIE_LIVE_UPDATE: usize = 0xc4;
+pub(crate) const FASTDIE_LIVE_TARGET_CC: usize = 0xc8;
+pub(crate) const FASTDIE_LIVE_RELEASE_CC: usize = 0xcc;
+pub(crate) const FASTDIE_LIVE_KP: usize = 0xd8;
+pub(crate) const FASTDIE_LIVE_KI_DT: usize = 0xdc;
+/// Native G17P target, 0.01 C.
+pub(crate) const FASTDIE_NATIVE_TARGET_CC: u32 = 11_000;
+/// Diagnostic overrides may only lower the target, never below this, so the
+/// recorded 80.00 C release stays below it.
+pub(crate) const FASTDIE_MIN_TARGET_CC: u32 = 8_500;
+
+/// Effective fast-die configuration as encoded (raw words; floats as bits).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct FastDieConfig {
+    pub(crate) mask: u64,
+    pub(crate) target_cc: u32,
+    pub(crate) release_cc: u32,
+    pub(crate) delta_cc: u32,
+    pub(crate) kp_bits: u32,
+    pub(crate) ki_dt_bits: u32,
+    pub(crate) state: u32,
+    pub(crate) live_target_cc: u32,
+    pub(crate) live_release_cc: u32,
+    pub(crate) live_kp_bits: u32,
+    pub(crate) live_ki_dt_bits: u32,
+    pub(crate) live_update: u32,
+}
+
+/// Read the fast-die fields from an encoded bundle and status-B object.
+pub(crate) fn fast_die_config(bundle: &[u8], status_b: &[u8]) -> Result<FastDieConfig, InitdataError> {
+    let o = FASTDIE_OBJECT_BUNDLE_OFFSET;
+    let l = PRIMARY_STATUS_B_CONFIG_OFFSET;
+    if bundle.len() < o + FASTDIE_OBJ_STATE + 4 || status_b.len() < l + FASTDIE_LIVE_KI_DT + 4 {
+        return Err(InitdataError::BufferSize);
+    }
+    Ok(FastDieConfig {
+        mask: get_u64(bundle, o + FASTDIE_OBJ_MASK),
+        target_cc: get_u32(bundle, o + FASTDIE_OBJ_TARGET_CC),
+        release_cc: get_u32(bundle, o + FASTDIE_OBJ_RELEASE_CC),
+        delta_cc: get_u32(bundle, o + FASTDIE_OBJ_DELTA_CC),
+        kp_bits: get_u32(bundle, o + FASTDIE_OBJ_KP),
+        ki_dt_bits: get_u32(bundle, o + FASTDIE_OBJ_KI_DT),
+        state: get_u32(bundle, o + FASTDIE_OBJ_STATE),
+        live_target_cc: get_u32(status_b, l + FASTDIE_LIVE_TARGET_CC),
+        live_release_cc: get_u32(status_b, l + FASTDIE_LIVE_RELEASE_CC),
+        live_kp_bits: get_u32(status_b, l + FASTDIE_LIVE_KP),
+        live_ki_dt_bits: get_u32(status_b, l + FASTDIE_LIVE_KI_DT),
+        live_update: get_u32(status_b, l + FASTDIE_LIVE_UPDATE),
+    })
+}
+
+/// Validate a diagnostic target: 0 keeps native; otherwise lower-only within
+/// [`FASTDIE_MIN_TARGET_CC`]..=[`FASTDIE_NATIVE_TARGET_CC`].
+pub(crate) fn fast_die_target_override(requested_cc: u32) -> Result<Option<u32>, InitdataError> {
+    match requested_cc {
+        0 => Ok(None),
+        t if (FASTDIE_MIN_TARGET_CC..=FASTDIE_NATIVE_TARGET_CC).contains(&t) => Ok(Some(t)),
+        _ => Err(InitdataError::BufferSize),
+    }
+}
+
+/// Apply a validated target to the power object copy (pre-boot encode only).
+pub(crate) fn apply_fast_die_target_bundle(bundle: &mut [u8], target_cc: u32) -> Result<(), InitdataError> {
+    let at = FASTDIE_OBJECT_BUNDLE_OFFSET + FASTDIE_OBJ_TARGET_CC;
+    if bundle.len() < at + 4 {
+        return Err(InitdataError::BufferSize);
+    }
+    put_u32(bundle, at, target_cc);
+    Ok(())
+}
+
+/// Apply a validated target to the +0xb8 live object copy (pre-boot encode
+/// only; no update flag: firmware starts from these words).
+pub(crate) fn apply_fast_die_target_status_b(status_b: &mut [u8], target_cc: u32) -> Result<(), InitdataError> {
+    let at = PRIMARY_STATUS_B_CONFIG_OFFSET + FASTDIE_LIVE_TARGET_CC;
+    if status_b.len() < at + 4 {
+        return Err(InitdataError::BufferSize);
+    }
+    put_u32(status_b, at, target_cc);
+    Ok(())
+}
+
 /// Validate the cross-instance invariants established before either ASC is
 /// kicked. The two roots are not placed freely: the secondary's sits exactly
 /// [`SECONDARY_ROOT_DELTA`] above the primary's.
@@ -2925,6 +3046,51 @@ mod tests {
     use super::*;
 
     const KERN: u64 = 0xffff_fc20_0000_0000;
+
+    fn encoded_fast_die() -> FastDieConfig {
+        let mut bundle = vec![0u8; HW_DATA_BUNDLE_MIN_ALLOC];
+        encode_bundle_static(KERN + 0x1000, &mut bundle).unwrap();
+        let mut status_b = vec![0u8; PRIMARY_STATUS_B_OBJECT_SIZE];
+        encode_primary_status_b(KERN + 0x2000, KERN + 0x2040, &mut status_b).unwrap();
+        fast_die_config(&bundle, &status_b).unwrap()
+    }
+
+    #[test]
+    fn fast_die_config_matches_native() {
+        let c = encoded_fast_die();
+        assert_eq!(FASTDIE_OBJECT_BUNDLE_OFFSET, 0x5240);
+        assert_eq!(c.mask, 0x82a); // G17P mask for accel[0x4a0] != 0x1f
+        assert_eq!(c.target_cc, FASTDIE_NATIVE_TARGET_CC); // 110.00 C
+        assert_eq!(c.release_cc, 8000);
+        assert_eq!(c.delta_cc, 0);
+        assert_eq!(c.kp_bits, 0x41a2_b852);
+        assert_eq!(c.ki_dt_bits, 0x4116_0419);
+        assert_eq!(c.state, 0x4200_0006); // fw1 0x174fc constant
+        assert_eq!(c.live_target_cc, c.target_cc);
+        assert_eq!(c.live_release_cc, c.release_cc);
+        assert_eq!(c.live_kp_bits, c.kp_bits);
+        assert_eq!(c.live_ki_dt_bits, c.ki_dt_bits);
+        assert_eq!(c.live_update, 0);
+        // Same object g17_dvfs_policy::GFX1_STATS_OFFSET (primary state + 0xe780) reads.
+        assert_eq!(PRIMARY_STATUS_B_STATE_GRID_OFFSET + PRIMARY_STATUS_B_CONFIG_OFFSET, 0xe780);
+    }
+
+    #[test]
+    fn fast_die_target_override_is_lower_only() {
+        assert_eq!(fast_die_target_override(0).unwrap(), None);
+        assert_eq!(fast_die_target_override(10_000).unwrap(), Some(10_000));
+        assert_eq!(fast_die_target_override(8_500).unwrap(), Some(8_500));
+        assert!(fast_die_target_override(11_001).is_err());
+        assert!(fast_die_target_override(8_499).is_err());
+        let mut bundle = vec![0u8; HW_DATA_BUNDLE_MIN_ALLOC];
+        encode_bundle_static(KERN + 0x1000, &mut bundle).unwrap();
+        let mut status_b = vec![0u8; PRIMARY_STATUS_B_OBJECT_SIZE];
+        encode_primary_status_b(KERN + 0x2000, KERN + 0x2040, &mut status_b).unwrap();
+        apply_fast_die_target_bundle(&mut bundle, 10_000).unwrap();
+        apply_fast_die_target_status_b(&mut status_b, 10_000).unwrap();
+        let c = fast_die_config(&bundle, &status_b).unwrap();
+        assert_eq!((c.target_cc, c.live_target_cc, c.release_cc, c.mask), (10_000, 10_000, 8000, 0x82a));
+    }
 
 
     fn native_compute_bytes(bytes: &[u8]) -> Vec<u8> {
