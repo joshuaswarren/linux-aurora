@@ -48,14 +48,14 @@ set_fields = '\n'.join(
     f'm.render_slots.get_mut(slot).{f}=Some(token.clone());' if fields[f].startswith('Option<') else
     f'm.render_slots.get_mut(slot).{f}.push(token.clone());' if fields[f].startswith('g17_completion::PairFifo<') else
     f'm.render_slots.get_mut(slot).{f}=true;' if fields[f] == 'bool' else
-    f'm.render_slots.get_mut(slot).{f}=u64::from(slot)+1;'
+    f'm.render_slots.get_mut(slot).{f}={fields[f]}::from(slot)+1;'
     for f in fields
 )
 check_fields = '\n'.join(
     f'assert_eq!(m.render_slots.get(slot).{f}.as_ref().unwrap().owner,slot);' if fields[f].startswith('Option<') else
     f'assert_eq!(m.render_slots.get(slot).{f}.len(),1); assert_eq!(m.render_slots.get(slot).{f}[0].owner,slot);' if fields[f].startswith('g17_completion::PairFifo<') else
     f'assert!(m.render_slots.get(slot).{f});' if fields[f] == 'bool' else
-    f'assert_eq!(m.render_slots.get(slot).{f},u64::from(slot)+1);'
+    f'assert_eq!(m.render_slots.get(slot).{f},{fields[f]}::from(slot)+1);'
     for f in fields
 )
 code = r'''

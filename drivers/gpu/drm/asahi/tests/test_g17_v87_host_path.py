@@ -24,6 +24,7 @@ test_g17_vm_status.py. Covered:
 """
 from pathlib import Path
 import re, subprocess, tempfile
+from g17_recovery_isolation_test_support import recovery_isolation_mod
 
 p = Path(__file__).resolve().parents[1]
 
@@ -115,6 +116,7 @@ pub mod g17_resources {
 }
 pub mod g17_manager { #[derive(Debug, PartialEq)] pub struct G17PRenderObservation(pub u8); }
 pub mod g17_status { @@STATUS@@ }
+@@RECOVERY_ISOLATION@@
 
 // ---- prune_render_frontier + EARLY_SHALLOW -------------------------------
 pub mod bindings {
@@ -179,6 +181,7 @@ impl Owner {
 '''
 for key, value in {
     'HOST_PATH': host_path, 'TYPE1': type1, 'GRID': grid, 'STATUS': status,
+    'RECOVERY_ISOLATION': recovery_isolation_mod(),
     'PRUNE': prune, 'POSSIBLE': possible, 'NEXT_OBS': next_obs, 'SETTLE_ONCE': settle_once,
     'CONSTS': consts, 'SNAP_STRUCT': snap_struct, 'SNAP_IMPL': snap_impl,
     'STATE_WORD_FN': state_word, 'SNAPSHOT_FN': snapshot,

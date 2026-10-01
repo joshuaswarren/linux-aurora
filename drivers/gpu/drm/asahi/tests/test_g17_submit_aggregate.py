@@ -125,10 +125,16 @@ fn error(a:&G17PSubmitCompletion)->i32{a.fence.state.error.load(Ordering::Acquir
 '''
 
 # Production callback wiring and failure gate, including both engines.
+# v93 AGG_FIRST (g17p_host_path bit14, default off) orders the aggregate
+# before or after the hardware fence: two exclusive call sites in complete().
 render = block('impl G17PRenderCompletion {')
-assert render.count('self.aggregate_member.complete(') == 3
+assert render.count('self.aggregate_member.complete(') == 4
 compute = (root / 'g17_job.rs').read_text()
-assert compute.count('self.aggregate_member.complete(') == 3
+assert compute.count('self.aggregate_member.complete(') == 4
+for engine in (render, compute):
+    first = engine.index('crate::g17_host_path::enabled(crate::g17_host_path::AGG_FIRST)')
+    ordered = engine[first:first + 900]
+    assert ordered.count('self.aggregate_member.complete(') == 2 and '} else {' in ordered
 assert 'self.aggregate_member.complete(Err(ECANCELED));' in compute
 guard = block("impl Drop for G17POutputFencePublication<'_> {")
 assert 'aggregate.finish_enqueue(if self.succeeded { Ok(()) } else { Err(self.failure) });' in guard

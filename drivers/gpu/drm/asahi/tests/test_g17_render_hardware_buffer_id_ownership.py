@@ -54,7 +54,8 @@ assert begin.index(".acquire_reserved_with_token(") < begin.index(".allocate_wit
     "the retained path must be tried before a fresh allocation"
 
 inner = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\(")
-assert inner.index('"new-user-render-storage"') < inner.index(".reserve(id)"), \
+# PB_OWNER_REF (g17p_host_path bit18) reserves the ID with its owner reference.
+assert inner.index('"new-user-render-storage"') < inner.index(".reserve_with_owner_ref(id,"), \
     "a fresh storage's ID is not reserved for the storage's lifetime"
 
 # A desynced graph keeps its ID while it waits in its queue's teardown; the ID
@@ -102,8 +103,10 @@ assert "fail_render_after_final_observation(" in timeout
 timeout = block(runtime, r"^    fn fail_render_after_final_observation\(")
 assert ".retire_failed_deferred_render(render_slot, submission_id.is_some())" in timeout
 assert timeout.index("if retired") < timeout.index("signal.complete(Err(EIO))")
-assert timeout.index("signal.complete(Err(EIO))") < timeout.index("signal.fail_while_owned(error)")
-assert "quarantined_render_completions" in timeout, \
+assert timeout.index("signal.complete(Err(EIO))") < timeout.index("self.quarantine_failed_render_completion(signal, error)")
+# Stability patch 0006: the unretired group and its queued siblings are
+# retained through one helper.
+assert "quarantined_render_completions" in block(runtime, r"^    fn quarantine_failed_render_completion\("), \
     "only an unretired group may retain and quarantine its physical slot"
 
 # --- the allocator itself ----------------------------------------------------

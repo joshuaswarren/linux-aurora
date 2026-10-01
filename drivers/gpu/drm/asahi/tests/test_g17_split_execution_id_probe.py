@@ -38,11 +38,23 @@ rust = r'''
 #![allow(dead_code)]
 use std::{cell::Cell,ops::Deref};
 type Result<T=()>=std::result::Result<T,i32>;
-const EFAULT:i32=14;const EIO:i32=5;const GFP_KERNEL:u32=0;
+const EFAULT:i32=14;const EIO:i32=5;const EINVAL:i32=22;const GFP_KERNEL:u32=0;
 macro_rules! dev_info {($($t:tt)*)=>{()}}
 macro_rules! pr_info {($($t:tt)*)=>{()}}
 use std::sync::atomic::{AtomicU32,Ordering};
-mod kernel{pub mod sync{pub struct Mutex<T>(pub std::sync::Mutex<T>);impl<T>Mutex<T>{pub fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}}}
+mod kernel{pub mod sync{pub struct Mutex<T>(pub std::sync::Mutex<T>);impl<T>Mutex<T>{pub fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}}
+ macro_rules! new_mutex{($v:expr,$n:expr)=>{$crate::kernel::sync::Mutex(std::sync::Mutex::new($v))}}
+ pub(crate) use new_mutex;}
+// Shared FList: a logical context owns its render FList pool(s); a split
+// execution context gets its own (it is a separate strong owner).
+struct KVec<T>(Vec<T>);
+impl<T> KVec<T>{fn with_capacity(n:usize,_:u32)->Result<Self>{Ok(Self(Vec::with_capacity(n)))}fn push(&mut self,v:T,_:u32)->Result{self.0.push(v);Ok(())}}
+impl<T> Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
+impl<T> std::ops::DerefMut for KVec<T>{fn deref_mut(&mut self)->&mut Vec<T>{&mut self.0}}
+struct AsahiDevice;
+struct G17PRenderFlist{id:u16}
+impl G17PRenderFlist{fn new(_:&AsahiDevice,_:&mmu::Uat,_:&mmu::Vm)->Result<Self>{Ok(Self{id:129})}fn id(&self)->u16{self.id}fn control_shared_va(&self)->u64{0}}
+mod g17_host_path{pub const SHARED_FLIST:u32=1<<19;pub fn enabled(bit:u32)->bool{bit==SHARED_FLIST}}
 mod module_parameters{pub struct P(pub u32);impl P{pub fn value(&self)->&u32{&self.0}}pub static g17p_mcache_dsid_probe:P=P(0);}
 mod g17_config{pub const RENDER_MCACHE_HWSID:u32=24;}
 static G17P_MCACHE_PROBE_NEXT:AtomicU32=AtomicU32::new(96);
@@ -61,9 +73,11 @@ thread_local!{static FAIL_ARC:Cell<bool>=const{Cell::new(false)};}
 struct Arc<T>(std::sync::Arc<T>);
 impl<T> Clone for Arc<T>{fn clone(&self)->Self{Self(self.0.clone())}}
 impl<T> Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.0}}
-impl<T> Arc<T>{fn new(v:T,_flags:u32)->Result<Self>{if FAIL_ARC.with(|f|f.replace(false)){Err(EIO)}else{Ok(Self(std::sync::Arc::new(v)))}}}
+impl<T> Arc<T>{fn new(v:T,_flags:u32)->Result<Self>{if FAIL_ARC.with(|f|f.replace(false)){Err(EIO)}else{Ok(Self(std::sync::Arc::new(v)))}}
+ fn pin_init(v:T,flags:u32)->Result<Self>{Self::new(v,flags)}}
 mod mmu{
  use super::*;
+ pub(crate) use super::Uat;
  #[derive(Clone)]pub struct Vm{pub id:u64,pub root:u64}
  pub struct T8140ComputeExecutionContext{pub vm:Vm,pub id:u32,pub current:bool,pub drops:std::rc::Rc<Cell<u32>>}
  impl T8140ComputeExecutionContext{
@@ -96,7 +110,7 @@ fn fixture()->(Manager,Arc<G17PLogicalQueueContext>){
   Arc::new(mmu::T8140ComputeExecutionContext{vm:mmu::Vm{id:8,root:0x1001234000},id:5,current:true,drops},0).unwrap(),
   Arc::new(G17PClChannelControl{address:0xfffffc2180048000},0).unwrap(),
   Arc::new(G17PLogicalQosLease{id:3},0).unwrap(),0x12345678,
-  G17PWorkStateStorage::new(&(),&m.uat).unwrap()),0).unwrap();(m,c)
+  G17PWorkStateStorage::new(&(),&m.uat).unwrap()).unwrap(),0).unwrap();(m,c)
 }
 #[test]fn default_preserves_exact_arc_without_allocating(){let(mut m,c)=fixture();let d=m.prepare_compute_execution_context(&c,false).unwrap();assert!(std::sync::Arc::ptr_eq(&c.0,&d.0));assert_eq!(m.uat.calls.get(),0);}
 #[test]fn split_changes_only_execution_slot_and_retains_shared_owners(){

@@ -45,17 +45,18 @@ enum G17PBootstrapUmaRequestState{Submitted,Ready}
 struct Uma{request:Option<()>,state:G17PBootstrapUmaRequestState,id:u32}
 impl Uma{fn matches_owner(&self,id:u32,_:u64,_:u64,_:u64)->bool{self.id==id}}
 struct Slot{sksm:Option<Queues>,storage:Option<Box<g17_resources::G17PUserRenderStorage>>,preparing:bool,restaged:Option<G17PRenderReservation>,
- bootstrap_uma:Option<Uma>,submission_ordinal:u64,hardware_buffer_id:Option<u32>,hardware_buffer_published:bool,prepared_render_flist:Option<()>,auxiliary_timestamp:u64}
+ flist_index:usize,submission_ordinal:u64,hardware_buffer_id:Option<u32>,hardware_buffer_published:bool,prepared_render_flist:Option<()>,auxiliary_timestamp:u64}
 struct Slots(Vec<Slot>);
 impl Slots{fn allocated(&self,s:u8)->Result<&Slot>{self.0.get(s as usize).ok_or(EIO)}fn get(&self,s:u8)->&Slot{&self.0[s as usize]}fn get_mut(&mut self,s:u8)->&mut Slot{&mut self.0[s as usize]}}
 struct Ids(Vec<u32>);impl Ids{fn release(&mut self,id:u32)->Result{self.0.push(id);Ok(())}}
 ''' + item(m,'pub(crate) struct G17PRenderDependencies {') + '#[derive(Clone,Copy)]\n' + item(m,'struct G17PRenderPreparedSksm {') + item(m,'struct G17PRenderReservation {') + item(m,'pub(crate) struct G17PRenderRestage {') + r'''
 struct Resources{fail_commit:bool,commits:usize}impl Resources{fn commit_host_tvb_grow(&mut self,_:&g17_resources::G17PHostTvbGrow)->Result{self.commits+=1;if self.fail_commit{Err(EIO)}else{Ok(())}}fn owned_uat(&self)->Arc<KBox<mmu::Uat>>{Arc::new(Box::new(mmu::Uat))}}
-struct Manager{resources:Resources,render_slots:Slots,num_clusters:u32,render_hardware_buffer_ids:Ids,released_states:usize}
+// Shared FList: the UMA lifecycle lives in the manager, indexed by each pair's FList pool.
+struct Manager{resources:Resources,render_slots:Slots,num_clusters:u32,render_hardware_buffer_ids:Ids,released_states:usize,render_flist_owners:Vec<Option<Uma>>}
 impl Manager{
  // v96: borrow ends retry parked firmware TVB grows (tested in test_g17_v96_grow_rekick.py).
  fn rekick_parked_render_grows(&self,_pair:Option<u8>){}
- fn new(drops:Arc<std::sync::atomic::AtomicUsize>)->Self{Self{resources:Resources{fail_commit:false,commits:0},render_slots:Slots((0..2).map(|i|Slot{sksm:None,storage:Some(Box::new(g17_resources::G17PUserRenderStorage{id:i,generation:None,grown:std::cell::Cell::new(false),drops:drops.clone()})),preparing:false,restaged:None,bootstrap_uma:None,submission_ordinal:7,hardware_buffer_id:None,hardware_buffer_published:false,prepared_render_flist:None,auxiliary_timestamp:0}).collect()),num_clusters:1,render_hardware_buffer_ids:Ids(vec![]),released_states:0}}
+ fn new(drops:Arc<std::sync::atomic::AtomicUsize>)->Self{Self{resources:Resources{fail_commit:false,commits:0},render_slots:Slots((0..2).map(|i|Slot{sksm:None,storage:Some(Box::new(g17_resources::G17PUserRenderStorage{id:i,generation:None,grown:std::cell::Cell::new(false),drops:drops.clone()})),preparing:false,restaged:None,flist_index:i as usize,submission_ordinal:7,hardware_buffer_id:None,hardware_buffer_published:false,prepared_render_flist:None,auxiliary_timestamp:0}).collect()),num_clusters:1,render_hardware_buffer_ids:Ids(vec![]),released_states:0,render_flist_owners:vec![None,None]}}
  fn reserve_translated_render(&mut self,_:&AsahiDevice,_:&mmu::Vm,p:g17_resources::G17PRenderQueuePair,c:Arc<g17_resources::G17PLogicalQueueContext>,_:Arc<g17_resources::G17PWorkStateLease>,cmd:&g17_uapi::TranslatedRenderCommand)->Result<G17PRenderReservation>{let s=self.render_slots.get_mut(p.slot());s.hardware_buffer_id=Some(p.slot() as u32);Ok(G17PRenderReservation{hardware_buffer_id:p.slot() as u32,parameter_buffer_token:1,command_buffer_state_word:1,descriptor_context_id:1,execution_context:c,queue_pair:p,ordinal:s.submission_ordinal,prepared_sksm:None,host_tvb_grow:None})}
  fn release_active_render_command_buffer_states(&mut self,_:u8)->Result{self.released_states+=1;Ok(())}
 ''' + item(m,'    pub(crate) fn take_render_restage(') + item(m,'    pub(crate) fn return_render_restage(') + item(m,'    pub(crate) fn cancel_render_restage(') + r'''
@@ -88,14 +89,14 @@ fn take(m:&mut Manager,slot:u8)->Result<Option<G17PRenderRestage>>{m.take_render
  m.cancel_render_restage(0).unwrap();assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst),0);
  assert_eq!(m.render_slots.get(0).storage.as_ref().unwrap().generation,None);
 }
-#[test]fn pending_uma_allows_owned_preparation_without_dropping_graph(){let drops=Arc::new(std::sync::atomic::AtomicUsize::new(0));let mut m=Manager::new(drops);m.render_slots.get_mut(0).bootstrap_uma=Some(Uma{request:Some(()),state:G17PBootstrapUmaRequestState::Submitted,id:0});let graph=take(&mut m,0).unwrap().unwrap();assert!(m.render_slots.get(0).storage.is_none());assert!(m.render_slots.get(0).preparing);m.return_render_restage(graph);assert!(m.render_slots.get(0).storage.is_some());}
+#[test]fn pending_uma_allows_owned_preparation_without_dropping_graph(){let drops=Arc::new(std::sync::atomic::AtomicUsize::new(0));let mut m=Manager::new(drops);m.render_flist_owners[0]=Some(Uma{request:Some(()),state:G17PBootstrapUmaRequestState::Submitted,id:0});let graph=take(&mut m,0).unwrap().unwrap();assert!(m.render_slots.get(0).storage.is_none());assert!(m.render_slots.get(0).preparing);m.return_render_restage(graph);assert!(m.render_slots.get(0).storage.is_some());}
 #[test]fn failed_preparation_returns_installed_graph_before_cancellation(){let drops=Arc::new(std::sync::atomic::AtomicUsize::new(0));let mut m=Manager::new(drops.clone());let mut graph=take(&mut m,0).unwrap().unwrap();graph.storage.generation=Some(7);m.return_render_restage(graph);m.cancel_render_restage(0).unwrap();assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst),0);assert!(m.render_slots.get(0).storage.is_some());assert!(!m.render_slots.get(0).preparing);}
 #[test]fn grow_completion_during_borrow_marks_only_the_same_returned_owner(){
  for identity in [0,99]{
   let drops=Arc::new(std::sync::atomic::AtomicUsize::new(0));let mut m=Manager::new(drops);
-  m.render_slots.get_mut(0).bootstrap_uma=Some(Uma{request:Some(()),state:G17PBootstrapUmaRequestState::Submitted,id:identity});
+  m.render_flist_owners[0]=Some(Uma{request:Some(()),state:G17PBootstrapUmaRequestState::Submitted,id:identity});
   let graph=take(&mut m,0).unwrap().unwrap();assert!(!graph.storage.grown.get());
-  m.render_slots.get_mut(0).bootstrap_uma.as_mut().unwrap().state=G17PBootstrapUmaRequestState::Ready;
+  m.render_flist_owners[0].as_mut().unwrap().state=G17PBootstrapUmaRequestState::Ready;
   assert!(!graph.storage.grown.get());m.return_render_restage(graph);
   assert_eq!(m.render_slots.get(0).storage.as_ref().unwrap().grown.get(),identity==0);
  }

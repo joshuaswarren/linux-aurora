@@ -163,7 +163,7 @@ fn ioctl(q: &mut G17PQueue, renders: u64, computes: u64) -> (*mut dma_fence, Vec
     for _ in 0..renders + computes {
         let f = plain(0);
         let fence = Fence::of(f);
-        q.note_ioctl_command(&fence);   // the ring slot takes its own reference
+        q.note_ioctl_command(&fence, false);   // the ring slot takes its own reference
         drop(fence);
         hw.push(f);
     }
@@ -281,7 +281,7 @@ fn counts() -> [u64; 3] {
     // Command-list allocation failure: the slot stays empty, list restored.
     q.ioctl_commands.as_mut().unwrap().clear();
     FAIL_PUSH.store(true, Ordering::SeqCst);
-    q.note_ioctl_command(&Fence::of(plain(0)));
+    q.note_ioctl_command(&Fence::of(plain(0)), false);
     FAIL_PUSH.store(false, Ordering::SeqCst);
     assert!(q.ioctl_commands.is_none());
     let lost = plain(0);
@@ -291,6 +291,27 @@ fn counts() -> [u64; 3] {
     assert_eq!(ptrs(&q.plan_input_syncs(&[sync(lost)]).unwrap().host), vec![lost]);
     // Slot vectors are reused: the ring never grows beyond FW_DEP_RECENT.
     assert_eq!(q.recent.len(), g17_host_path::FW_DEP_RECENT);
+}
+
+// j700 c209c3dc5: a command with host-copied user timestamps is ready for a
+// consumer only at completion (the CPU copy precedes it), so FW_DEPS must never
+// turn a wait on its ioctl into firmware ordering.
+#[test] fn a_command_with_host_timestamps_keeps_its_ioctl_a_host_wait() {
+    let mut q = queue();
+    let (rb, cb) = (q.render_sequence, q.compute_sequence);
+    q.ioctl_commands.as_mut().unwrap().clear();
+    q.note_ioctl_command(&Fence::of(plain(0)), false);
+    q.note_ioctl_command(&Fence::of(plain(0)), true);
+    q.note_ioctl_command(&Fence::of(plain(0)), false);
+    assert!(q.ioctl_commands.is_none());
+    q.render_sequence += 3;
+    let agg = plain(0);
+    q.note_recent_submission(Fence::of(agg), rb, cb);
+    assert!(q.ioctl_commands.is_some());
+    assert_eq!(ptrs(&q.plan_input_syncs(&[sync(agg)]).unwrap().host), vec![agg]);
+    // The next ioctl without host timestamps converts as usual.
+    let (b, _) = ioctl(&mut q, 1, 0);
+    assert!(q.plan_input_syncs(&[sync(b)]).unwrap().host.is_empty());
 }
 
 #[test] fn agg_first_depth_counts_a_render_retired_once_its_aggregate_signals() {
@@ -509,7 +530,10 @@ run('v93_c', program_c)
 default = re.search(r'const DEFAULT_MASK: u32 = (.*?);', HP, re.S).group(1)
 for bit in ['FW_DEPS', 'AGG_FIRST', 'EARLY_DEPS']:
     assert bit not in default, bit                      # v92d behaviour by default
-assert 'const ALL_BITS: u32 = (1 << 16) - 1;' in HP
+# Later stages append bits 16.. above the v93 bits; all three stay defined.
+assert int(re.search(r'const ALL_BITS: u32 = \(1 << (\d+)\) - 1;', HP).group(1)) >= 16
+for bit, shift in [('FW_DEPS', 13), ('AGG_FIRST', 14), ('EARLY_DEPS', 15)]:
+    assert f'pub(crate) const {bit}: u32 = 1 << {shift};' in HP
 
 render_complete = block(DRM, '    pub(crate) fn complete(\n        &self,\n        result: Result<g17_completion::PairedRenderCompletion>,')
 order = ['destination.write(timestamp)?', 'self.status.record(error.to_errno())', 'drop(self.lease.lock().take())',
@@ -562,7 +586,7 @@ publish = block(DRM, '    fn publish_with(')
 assert publish.count('completion.vm_status().get() != 0') >= 3
 assert publish.index('for fence in packet.firmware_fences()') < publish.index('acquire_lease')
 fail_final = block(LIVE, '    fn fail_render_after_final_observation(')
-assert 'queued.fail_while_owned(error)' in fail_final
+assert 'self.quarantine_failed_render_completion(queued, error);' in fail_final  # stability 0006
 assert 'self.fail_outstanding_jobs_for_vm(&status, error);' in fail_final
 fail_vm = block(COMP, '    fn fail_outstanding_jobs_for_vm_after_compute_observation(')
 assert 'completion.belongs_to_vm(status)' in fail_vm and 'completion.fail_while_owned(error)' in fail_vm
