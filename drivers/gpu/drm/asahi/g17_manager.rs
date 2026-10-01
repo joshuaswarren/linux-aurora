@@ -5205,9 +5205,23 @@ impl G17PManagerConstruction {
         // The slot is idle, but its UMA descriptor contains firmware-updated
         // cursors and growth. Save them with this graph before another pool
         // overwrites the slot; reloading the constructor values loses pages.
+        //
+        // A logical context keeps its FList pool across graph rebuilds, and
+        // with g17p_host_path SHARED_FLIST both of its pairs use one pool.
+        // If another installed pair still names this pool, the pool is not
+        // leaving with this graph and may be live there: leave its control
+        // object to that pair instead of rewriting it from here.
         if crate::g17_config::RENDER_USC_FREELIST != 0 {
             let storage = self.render_slots.get(pair_slot).storage.as_deref().ok_or(EIO)?;
-            self.resources.save_user_render_uma(storage)?;
+            let pool = (storage.render_flist_id(), storage.render_flist_pointer());
+            let shared_elsewhere = self.render_slots.slots.iter().enumerate().any(|(other, slot)| {
+                other != usize::from(pair_slot)
+                    && slot.as_deref().and_then(|slot| slot.storage.as_deref()).is_some_and(|other|
+                        (other.render_flist_id(), other.render_flist_pointer()) == pool)
+            });
+            if !shared_elsewhere {
+                self.resources.save_user_render_uma(storage)?;
+            }
         }
         let backing = self.render_slots.get_mut(pair_slot).storage.as_deref_mut().ok_or(EIO)?.take_sksm_backing()?;
         self.render_slots.get_mut(pair_slot).sksm.as_mut().ok_or(EIO)?.backing = Some(backing);
