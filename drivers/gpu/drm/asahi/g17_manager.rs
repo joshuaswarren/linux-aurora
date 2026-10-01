@@ -3195,6 +3195,14 @@ impl G17PManagerConstruction {
         self.resources.read_clpc_effort()
     }
 
+    pub(crate) fn publish_power_target(&mut self, mw: u32, reason: u32) -> Result {
+        self.resources.publish_power_target(mw, reason)
+    }
+
+    pub(crate) fn read_power_target(&mut self) -> Result<u32> {
+        self.resources.read_power_target()
+    }
+
     pub(crate) fn read_gfx1_stats_u32(&mut self, offset: usize) -> Result<u32> {
         self.resources.read_gfx1_stats_u32(offset)
     }

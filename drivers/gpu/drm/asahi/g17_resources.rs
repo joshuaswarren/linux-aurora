@@ -17148,6 +17148,31 @@ impl G17ResourceOwner {
         self.resources.region_c.with_bytes_mut(|bytes| g17p_live_read_u32(bytes, 0xe4))
     }
 
+    /// Native `AGXFirmware::updatePowerInterfaceTarget(0, mW, reason)`
+    /// (kext 0x8884440): RegionC+0x84 = GPU power budget (mW), then
+    /// +0x9c = reason; no firmware message. GFX1 reads +0x84 live (fw1
+    /// 0184e4). Both words share one cache line; clean it to the PoC.
+    pub(crate) fn publish_power_target(&mut self, mw: u32, reason: u32) -> Result {
+        self.resources.region_c.with_bytes_mut(|bytes| {
+            g17p_live_write_u32(bytes, 0x84, mw)?;
+            g17p_live_write_u32(bytes, 0x9c, reason)?;
+            for offset in [0x84_usize, 0x9c] {
+                // SAFETY: bounds were checked by the writes above.
+                let line = unsafe { bytes.as_ptr().add(offset) };
+                unsafe {
+                    core::arch::asm!("dc cvac, {line}", line = in(reg) line,
+                        options(nostack, preserves_flags));
+                }
+            }
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+            Ok(())
+        })
+    }
+
+    pub(crate) fn read_power_target(&mut self) -> Result<u32> {
+        self.resources.region_c.with_bytes_mut(|bytes| g17p_live_read_u32(bytes, 0x84))
+    }
+
     /// Opt-in `g17p_dvfs_parity` bit2: one word of the GFX1-written stats
     /// object (kext `fw+0xcd8`, GFX1 `[0x1738c8]` = secondary root +0xb8 =
     /// primary status A - 0x6c0 = primary state + 0xe780). Read-only.
