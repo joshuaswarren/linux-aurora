@@ -273,7 +273,7 @@ kernel::prelude::module! {
         },
         g17p_render_single_pair: u32 {
             default: 0,
-            description: "Diagnostic: 1 keeps each render queue on one physical TA/3D pair (no sibling pair); 0 preserves the two-pair policy",
+            description: "Opt-in mitigation: 1 keeps each render queue on one physical TA/3D pair (no sibling pair). It avoided the hard hang under concurrent render-pair construction and was faster at depth 2, but raised the per-pass 3D-stall hazard and is not native (macOS alternates two pairs); 0 (default) keeps the two-pair policy",
         },
         g17p_frg_hwdsid_clear: u32 {
             default: 0,
