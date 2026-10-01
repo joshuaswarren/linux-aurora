@@ -11841,6 +11841,15 @@ impl G17PUserRenderStorage {
         }
         let bases = self.render_item_bases(submission_ordinal)?;
         core::sync::atomic::fence(Ordering::Acquire);
+        // This is only a rejection prefilter: matching producer cursors
+        // cannot require desync recovery, regardless of the live TSQ or
+        // completion timestamps. A mismatch still takes the original full
+        // snapshot and proves both queues idle before returning true.
+        if crate::g17_host_path::enabled(crate::g17_host_path::PRODUCER_READS)
+            && self.render_producer_indices()? == bases
+        {
+            return Ok(false);
+        }
         let previous = self.snapshot(submission_ordinal)?;
         Ok(previous.job_list_empty
             && previous.tiling.idle()
@@ -11998,9 +12007,16 @@ impl G17PUserRenderStorage {
         let render_root_slot = self.render_root_slot;
         let bases = self.render_item_bases(submission_ordinal)?;
         core::sync::atomic::fence(Ordering::Acquire);
-        let previous = self.snapshot(submission_ordinal)?;
-        if previous.tiling.write != bases[0] || previous.fragment.write != bases[1]
-        {
+        let producers = if crate::g17_host_path::enabled(crate::g17_host_path::PRODUCER_READS) {
+            self.render_producer_indices()?
+        } else {
+            let previous = self.snapshot(submission_ordinal)?;
+            [previous.tiling.write, previous.fragment.write]
+        };
+        if producers != bases {
+            // Full state is diagnostic here; retirement still uses its
+            // separate complete snapshot and ownership checks.
+            let previous = self.snapshot(submission_ordinal)?;
             // This is the one place a render is refused because the PREVIOUS
             // group on this retained storage has not finished. It used to
             // return a bare EBUSY, which reaches Mesa as VK_ERROR_DEVICE_LOST
@@ -14686,6 +14702,17 @@ impl G17PUserRenderStorage {
                 tiling: indices(Self::TILING_POINTERS)?,
                 fragment: indices(Self::FRAGMENT_POINTERS)?,
             })
+        })
+    }
+
+    /// The host writes these producer words under the pair's publication
+    /// ownership. Reading them grants no completion or retirement authority.
+    fn render_producer_indices(&mut self) -> Result<[u32; 2]> {
+        self.graph.with_bytes_mut(|raw| {
+            Ok([
+                g17p_live_read_u32(raw, Self::TILING_POINTERS + 0x40)?,
+                g17p_live_read_u32(raw, Self::FRAGMENT_POINTERS + 0x40)?,
+            ])
         })
     }
 
