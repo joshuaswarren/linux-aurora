@@ -3626,12 +3626,6 @@ impl G17PLiveRuntime {
         self.session_rebuild_requested = false;
         self.disarm_firmware_event_worker();
         g17_lifecycle::teardown_persistent_runtime(self);
-        // v90: pooled firmware-cached objects outlive their owners by design;
-        // release them only once the firmware CPU pair is stopped (the
-        // manager is dropped only on that path; a failed stop retains all).
-        if self.manager.is_none() {
-            g17_resources::g17p_fw_pool_release_all();
-        }
         drop(self.drm.take());
         drop(self.registers.take());
         drop(self.pdev.take());
@@ -11006,7 +11000,15 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
     }
 
     fn drop_manager(&mut self) {
+        if let Some(manager) = self.manager.as_ref() {
+            manager.uat().mark_firmware_cache_stopped();
+        }
         drop(self.manager.take());
+        // This callback is reached only after teardown_persistent_runtime has
+        // proven the CPU pair stopped and released its queue/transport owners.
+        // manager == None is not a stop witness: failed-stop retention also
+        // takes that handle while deliberately keeping firmware memory alive.
+        g17_resources::g17p_fw_pool_release_all();
     }
 }
 

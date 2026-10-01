@@ -72,8 +72,8 @@ static G17P_MCACHE_PROBE_NEXT: AtomicU32 = AtomicU32::new(96);
 // return to a bounded per-family pool and are reused, zeroed, by the next
 // owner of the same family, like a native pool element. Pools are released
 // only after the firmware is stopped (`g17p_fw_pool_release_all`). An
-// object whose attribute change could not be proven is never reused and never
-// unmapped (bounded leak, counted). Fresh allocations only; runtime diag bits
+// object whose attribute change could not be proven is never reused and stays
+// owned until a proven final firmware stop. Fresh allocations only; runtime diag bits
 // 27..30 select families for A/B.
 // ---------------------------------------------------------------------------
 
@@ -84,7 +84,7 @@ pub(crate) const G17P_FW_FAMILY_CHANNEL_STATE: u32 = 4;
 pub(crate) const G17P_FW_FAMILY_CONFIG_UPDATE: u32 = 8;
 const G17P_FW_POOL_POISON: u8 = 0x80;
 const G17P_FW_POOL_SLOTS: usize = 64;
-/// Total bytes ever given the cached attribute; beyond it fresh objects stay
+/// Bytes retained with the cached attribute; beyond this cap fresh objects stay
 /// uncached (never an allocation failure).
 const G17P_FW_POOL_CACHED_LIMIT: u64 = 128 * 1024 * 1024;
 
@@ -133,98 +133,136 @@ impl<T, const N: usize> G17PFwPoolSlots<T, N> {
 
 #[cfg(not(test))]
 struct G17PPooledFwObject {
-    mapping: mmu::KernelMapping,
-    gem: kernel::sync::aref::ARef<gem::Object>,
+    mapping: Option<mmu::KernelMapping>,
+    gem: Option<kernel::sync::aref::ARef<gem::Object>>,
     iova: u64,
     logical_size: usize,
+    prefix: usize,
     cpu_wc: bool,
+    family: u8,
+}
+
+#[cfg(not(test))]
+kernel::sync::global_lock! {
+    // SAFETY: initialized once in DriverModule::init before driver registration.
+    unsafe(uninit) static G17P_FW_POOL_LOCK: Mutex<()> = ();
+}
+
+/// Called exactly once, before platform driver registration can create a UAT.
+#[cfg(not(test))]
+pub(crate) unsafe fn g17p_fw_pool_init() {
+    // SAFETY: caller guarantees module initialization, before any pool access.
+    unsafe { G17P_FW_POOL_LOCK.init() };
 }
 
 #[cfg(not(test))]
 static G17P_FW_POOLS: [G17PFwPoolSlots<G17PPooledFwObject, G17P_FW_POOL_SLOTS>; 4] =
     [const { G17PFwPoolSlots::new() }; 4];
+/// Reservations include active, pooled and poisoned entries. A cached object
+/// always owns its return node and one slot of capacity before PTE mutation.
+#[cfg(not(test))]
+static G17P_FW_POOL_RESERVED: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 #[cfg(not(test))]
 static G17P_FW_POOL_CACHED_BYTES: AtomicU64 = AtomicU64::new(0);
-/// fresh, reused, returned, leaked (bounded, never-unmapped) counts.
+/// fresh, reused, returned, poisoned conversion counts.
 #[cfg(not(test))]
 static G17P_FW_POOL_STATS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
-
 #[cfg(not(test))]
 fn g17p_fw_pool_stat(index: usize) -> u32 { G17P_FW_POOL_STATS[index].load(Ordering::Relaxed) }
-
 #[cfg(not(test))]
 fn g17p_fw_pool_bump(index: usize) { G17P_FW_POOL_STATS[index].fetch_add(1, Ordering::Relaxed); }
 
-/// Keep a cached owning mapping alive forever: never an early unmap.
-#[cfg(not(test))]
-fn g17p_fw_pool_leak(mapping: mmu::KernelMapping) {
-    core::mem::forget(mapping);
-    g17p_fw_pool_bump(3);
-}
-
+/// Pool transfers alone use this mutex, never submission or completion work.
+/// No mapping destruction or allocation occurs while it is held.
 #[cfg(not(test))]
 impl Drop for MappedObject {
     fn drop(&mut self) {
         if self.fw_pool == 0 { return; }
-        let family = self.fw_pool;
+        let mut entry = self.fw_node.take().expect("cached object owns return node");
+        entry.family = self.fw_pool;
         self.fw_pool = 0;
-        let Some(mapping) = self.mapping.take() else { return; };
-        let index = if family & G17P_FW_POOL_POISON != 0 { None }
-                    else { g17p_fw_pool_index(u32::from(family)) };
-        let Some(index) = index else { g17p_fw_pool_leak(mapping); return; };
-        // Allocate the pool node before moving the mapping into it, so an
-        // allocation failure can never drop (unmap) the cached mapping.
-        let node = match KBox::<G17PPooledFwObject>::new_uninit(GFP_KERNEL) {
-            Ok(node) => node,
-            Err(_) => { g17p_fw_pool_leak(mapping); return; }
-        };
-        let entry = KBox::write(node, G17PPooledFwObject {
-            mapping,
-            gem: self.object.gem.clone(),
-            iova: self.iova,
-            logical_size: self.logical_size,
-            cpu_wc: self.cpu_wc,
-        });
-        match G17P_FW_POOLS[index].put(KBox::into_raw(entry)) {
-            Ok(()) => g17p_fw_pool_bump(2),
-            Err(raw) => {
-                // SAFETY: `raw` came from KBox::into_raw above and was not
-                // published (the put failed).
-                let entry = KBox::into_inner(unsafe { KBox::from_raw(raw) });
-                g17p_fw_pool_leak(entry.mapping);
-            }
+        entry.mapping = self.mapping.take();
+        entry.gem = Some(self.object.gem.clone());
+        entry.iova = self.iova;
+        let index = g17p_fw_pool_index(u32::from(entry.family & !G17P_FW_POOL_POISON))
+            .expect("cached object owns family reservation");
+        let guard = G17P_FW_POOL_LOCK.lock();
+        if entry.mapping.as_ref().expect("cached owning mapping")
+            .firmware_cache_owner().stopped() {
+            G17P_FW_POOL_RESERVED[index].fetch_sub(1, Ordering::Relaxed);
+            G17P_FW_POOL_CACHED_BYTES.fetch_sub(entry.logical_size as u64, Ordering::Relaxed);
+            drop(guard);
+            drop(entry);
+            return;
         }
+        // Every outstanding cached object reserves a slot, so a returning
+        // object's slot capacity cannot be consumed by another allocation.
+        G17P_FW_POOLS[index].put(KBox::into_raw(entry))
+            .expect("reserved firmware pool capacity");
+        g17p_fw_pool_bump(2);
     }
 }
 
 #[cfg(not(test))]
-fn g17p_fw_pool_take(index: usize) -> Option<MappedObject> {
-    let raw = G17P_FW_POOLS.get(index)?.take();
-    if raw.is_null() { return None; }
-    // SAFETY: every pooled pointer is a KBox::into_raw published exactly once.
-    let entry = KBox::into_inner(unsafe { KBox::from_raw(raw) });
-    Some(MappedObject {
-        iova: entry.iova,
-        object: gem::ObjectRef::new(entry.gem),
-        mapping: Some(entry.mapping),
-        object_offset: 0,
-        logical_size: entry.logical_size,
-        cpu_wc: entry.cpu_wc,
-        fw_pool: 0,
-    })
+fn g17p_fw_pool_take(index: usize, uat: &mmu::Uat, size: usize,
+                     prefix: usize, cpu_wc: bool) -> Option<MappedObject> {
+    let guard = G17P_FW_POOL_LOCK.lock();
+    for slot in &G17P_FW_POOLS.get(index)?.slots {
+        let raw = slot.load(Ordering::Relaxed);
+        if raw.is_null() { continue; }
+        // SAFETY: all production slot ownership transfers hold the pool mutex.
+        let entry = unsafe { &*raw };
+        if entry.family & G17P_FW_POOL_POISON != 0 || entry.logical_size != size
+            || entry.prefix != prefix || entry.cpu_wc != cpu_wc
+            || !entry.mapping.as_ref()?.firmware_cache_owner().matches(uat) {
+            continue;
+        }
+        slot.store(core::ptr::null_mut(), Ordering::Relaxed);
+        // SAFETY: removed under the lock, exclusively owned by this caller.
+        let mut entry = unsafe { KBox::from_raw(raw) };
+        drop(guard);
+        return Some(MappedObject {
+            iova: entry.iova,
+            object: gem::ObjectRef::new(entry.gem.take().expect("pooled GEM")),
+            mapping: entry.mapping.take(),
+            object_offset: 0,
+            logical_size: entry.logical_size,
+            cpu_wc: entry.cpu_wc,
+            fw_pool: entry.family,
+            fw_node: Some(entry),
+        });
+    }
+    None
 }
 
-/// Release every pooled object. Call only after the firmware is stopped: the
-/// mappings then unmap with a TLB flush exactly like native's commitUnmaps.
+/// Bounded sweep: live foreign owners are never removed or restored. Stop
+/// sets its witness before this lock; a returning object either publishes
+/// before the sweep or observes the witness and frees outside the lock.
 #[cfg(not(test))]
 pub(crate) fn g17p_fw_pool_release_all() {
-    for pool in &G17P_FW_POOLS {
-        loop {
-            let raw = pool.take();
-            if raw.is_null() { break; }
-            // SAFETY: see g17p_fw_pool_take.
-            drop(unsafe { KBox::from_raw(raw) });
+    let mut retired = [core::ptr::null_mut(); 4 * G17P_FW_POOL_SLOTS];
+    let mut count = 0;
+    {
+        let _guard = G17P_FW_POOL_LOCK.lock();
+        for (index, pool) in G17P_FW_POOLS.iter().enumerate() {
+            for slot in &pool.slots {
+                let raw = slot.load(Ordering::Relaxed);
+                if raw.is_null() { continue; }
+                // SAFETY: entries cannot move or be freed while locked.
+                let entry = unsafe { &*raw };
+                if !entry.mapping.as_ref().expect("pooled mapping")
+                    .firmware_cache_owner().stopped() { continue; }
+                slot.store(core::ptr::null_mut(), Ordering::Relaxed);
+                G17P_FW_POOL_RESERVED[index].fetch_sub(1, Ordering::Relaxed);
+                G17P_FW_POOL_CACHED_BYTES.fetch_sub(entry.logical_size as u64, Ordering::Relaxed);
+                retired[count] = raw;
+                count += 1;
+            }
         }
+    }
+    for raw in &retired[..count] {
+        // SAFETY: detached under the pool mutex, each pointer exclusively owned.
+        drop(unsafe { KBox::from_raw(*raw) });
     }
 }
 
@@ -3065,6 +3103,7 @@ struct MappedObject {
     /// bit, or `G17P_FW_POOL_POISON` when its attribute state is unproven).
     /// Such an owning mapping is never unmapped while the firmware runs.
     fw_pool: u8,
+    fw_node: Option<KBox<G17PPooledFwObject>>,
 }
 
 /// Address metadata remains with the shared render graph; owning mappings
@@ -3717,7 +3756,7 @@ impl MappedObject {
         )?;
         let iova = mapping.iova();
         Ok(Self { mapping: Some(mapping), object, iova, object_offset: 0,
-            logical_size: size, cpu_wc: true, fw_pool: 0 })
+            logical_size: size, cpu_wc: true, fw_pool: 0, fw_node: None })
     }
 
     fn new_wc_in_range(
@@ -3739,7 +3778,7 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: true,
-            fw_pool: 0,
+            fw_pool: 0, fw_node: None,
         })
     }
 
@@ -3778,7 +3817,7 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: true,
-            fw_pool: 0,
+            fw_pool: 0, fw_node: None,
         })
     }
 
@@ -3834,7 +3873,7 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: false,
-            fw_pool: 0,
+            fw_pool: 0, fw_node: None,
         })
     }
 
@@ -3873,7 +3912,7 @@ impl MappedObject {
             object_offset: 0,
             logical_size: size,
             cpu_wc: false,
-            fw_pool: 0,
+            fw_pool: 0, fw_node: None,
         })
     }
 
@@ -3885,6 +3924,7 @@ impl MappedObject {
     /// into the object is published.
     fn new_fw_pooled(
         dev: &AsahiDevice,
+        uat: &mmu::Uat,
         family: u32,
         size: usize,
         prefix: usize,
@@ -3895,31 +3935,40 @@ impl MappedObject {
             return alloc();
         }
         let index = g17p_fw_pool_index(family).ok_or(EINVAL)?;
-        if let Some(mut object) = g17p_fw_pool_take(index) {
-            if object.logical_size == size && object.cpu_wc == cpu_wc {
-                // Same contract as a fresh object: zero before publication.
-                object.fw_pool = family as u8;
-                object.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
-                core::sync::atomic::fence(Ordering::SeqCst);
-                g17p_fw_pool_bump(1);
-                dev_info!(dev.as_ref(),
-                    "G17P fw-cached object: family={} va={:#x} reused fresh={} reused={} returned={} leaked={}\n",
-                    family, object.iova, g17p_fw_pool_stat(0), g17p_fw_pool_stat(1),
-                    g17p_fw_pool_stat(2), g17p_fw_pool_stat(3));
-                return Ok(object);
-            }
-            // Never unmap a cached object early, even a mismatched one.
-            object.fw_pool = G17P_FW_POOL_POISON;
-            drop(object);
-        }
-        let mut object = alloc()?;
-        let size = object.logical_size as u64;
-        if G17P_FW_POOL_CACHED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-            |used| used.checked_add(size).filter(|n| *n <= G17P_FW_POOL_CACHED_LIMIT)).is_err()
-        {
+        if let Some(mut object) = g17p_fw_pool_take(index, uat, size, prefix, cpu_wc) {
+            object.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+            core::sync::atomic::fence(Ordering::SeqCst);
+            g17p_fw_pool_bump(1);
+            dev_info!(dev.as_ref(),
+                "G17P fw-cached object: family={} va={:#x} reused fresh={} reused={} returned={} poisoned={}\n",
+                family, object.iova, g17p_fw_pool_stat(0), g17p_fw_pool_stat(1),
+                g17p_fw_pool_stat(2), g17p_fw_pool_stat(3));
             return Ok(object);
         }
+        let mut object = alloc()?;
         let Some(mapping) = object.mapping.as_ref() else { return Ok(object); };
+        let size = object.logical_size as u64;
+        // Allocate return storage before changing any PTE. Memory pressure or
+        // a peak above cache capacity uses ordinary uncached objects, with no
+        // reduced concurrency and no cached mapping lost on a close path.
+        let node = match KBox::new(G17PPooledFwObject {
+            mapping: None, gem: None, iova: object.iova,
+            logical_size: object.logical_size, prefix, cpu_wc, family: family as u8,
+        }, GFP_KERNEL) {
+            Ok(node) => node,
+            Err(_) => return Ok(object),
+        };
+        {
+            let _guard = G17P_FW_POOL_LOCK.lock();
+            let used = G17P_FW_POOL_CACHED_BYTES.load(Ordering::Relaxed);
+            if G17P_FW_POOL_RESERVED[index].load(Ordering::Relaxed) as usize >= G17P_FW_POOL_SLOTS
+                || used.checked_add(size).is_none_or(|n| n > G17P_FW_POOL_CACHED_LIMIT) {
+                return Ok(object);
+            }
+            G17P_FW_POOL_RESERVED[index].fetch_add(1, Ordering::Relaxed);
+            G17P_FW_POOL_CACHED_BYTES.fetch_add(size, Ordering::Relaxed);
+        }
+        object.fw_node = Some(node);
         // SAFETY: `alloc` just created this object; nothing has been published.
         let (proof, mutated) = unsafe { mapping.set_fw_cached_prefix(prefix) };
         match proof {
@@ -3927,20 +3976,26 @@ impl MappedObject {
                 object.fw_pool = family as u8;
                 g17p_fw_pool_bump(0);
                 dev_info!(dev.as_ref(),
-                    "G17P fw-cached object: family={} va={:#x} size={:#x} prefix={:#x} ptes={:#x}/{:#x} fresh={} reused={} returned={} leaked={}\n",
+                    "G17P fw-cached object: family={} va={:#x} size={:#x} prefix={:#x} ptes={:#x}/{:#x} fresh={} reused={} returned={} poisoned={}\n",
                     family, object.iova, object.logical_size, prefix, ptes[0], ptes[1],
                     g17p_fw_pool_stat(0), g17p_fw_pool_stat(1), g17p_fw_pool_stat(2), g17p_fw_pool_stat(3));
                 Ok(object)
             }
             Err(error) if mutated => {
                 // Attribute state unproven: never publish, reuse or unmap it.
-                object.fw_pool = G17P_FW_POOL_POISON;
+                object.fw_pool = family as u8 | G17P_FW_POOL_POISON;
+                g17p_fw_pool_bump(3);
                 dev_err!(dev.as_ref(), "G17P fw-cached object: family={} PTE proof failed ({:?}); retained\n",
                     family, error);
                 Err(error)
             }
             Err(_) => {
-                G17P_FW_POOL_CACHED_BYTES.fetch_sub(size, Ordering::Relaxed);
+                {
+                    let _guard = G17P_FW_POOL_LOCK.lock();
+                    G17P_FW_POOL_RESERVED[index].fetch_sub(1, Ordering::Relaxed);
+                    G17P_FW_POOL_CACHED_BYTES.fetch_sub(size, Ordering::Relaxed);
+                }
+                object.fw_node = None;
                 Ok(object)
             }
         }
@@ -3975,7 +4030,7 @@ impl MappedObject {
             object_offset: parent.object_offset.checked_add(offset).ok_or(EOVERFLOW)?,
             logical_size,
             cpu_wc: parent.cpu_wc,
-            fw_pool: 0,
+            fw_pool: 0, fw_node: None,
         })
     }
 
@@ -4510,7 +4565,7 @@ impl G17PWorkStateStorage {
         // page (submitted counters/head) stays uncached, as native's
         // AGFITimeStampQueue. v90 family bit 2.
         let mut storage = MappedObject::new_fw_pooled(
-            dev, G17P_FW_FAMILY_TSQ_NODE, 2 * mmu::UAT_PGSZ, mmu::UAT_PGSZ, true,
+            dev, uat, G17P_FW_FAMILY_TSQ_NODE, 2 * mmu::UAT_PGSZ, mmu::UAT_PGSZ, true,
             || MappedObject::new_wc(
                 dev, uat, 2 * mmu::UAT_PGSZ, mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_FW_SHARED_RW,
@@ -10224,7 +10279,7 @@ impl G17PUserRenderStorage {
         // allocate disjoint per-job low aliases and publish their actual VAs.
         // Native TA/FRG command pools are firmware-cached (bit41). v90 bit 1.
         let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_fw_pooled(
-            dev, G17P_FW_FAMILY_DESCRIPTOR, G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+            dev, uat, G17P_FW_FAMILY_DESCRIPTOR, G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
             G17P_RENDER_DESCRIPTOR_STORAGE_SIZE, false,
             || MappedObject::new(
                 dev,
@@ -10276,7 +10331,7 @@ impl G17PUserRenderStorage {
             return Err(EINVAL);
         }
         let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_fw_pooled(
-            dev, G17P_FW_FAMILY_CHANNEL_STATE, G17P_RENDER_QUEUE_GRAPH_SIZE,
+            dev, uat, G17P_FW_FAMILY_CHANNEL_STATE, G17P_RENDER_QUEUE_GRAPH_SIZE,
             G17P_RENDER_QUEUE_METADATA_BASE, true,
             || MappedObject::new_wc(
                 dev,
@@ -10290,7 +10345,7 @@ impl G17PUserRenderStorage {
         // has one CPU mapping policy and the existing firmware-shared UAT attribute.
         // Native ConfigUpdate pools use the same bit41 cached option. v90 bit 8.
         let config_updates = bootstrap_stage!("ConfigUpdate allocation", MappedObject::new_fw_pooled(
-            dev, G17P_FW_FAMILY_CONFIG_UPDATE, G17P_RENDER_CONFIG_POOL_SIZE,
+            dev, uat, G17P_FW_FAMILY_CONFIG_UPDATE, G17P_RENDER_CONFIG_POOL_SIZE,
             G17P_RENDER_CONFIG_POOL_SIZE, false,
             || MappedObject::new(
                 dev, uat, G17P_RENDER_CONFIG_POOL_SIZE, mmu::UAT_PGSZ as u64,
@@ -16187,7 +16242,7 @@ impl G17ResourceOwner {
             logical_size: mmu::T8140_PARAMETER_METRICS_SIZE,
             // Uat::new_t8140 owns this object via new_kernel_object_wc.
             cpu_wc: true,
-            fw_pool: 0,
+            fw_pool: 0, fw_node: None,
         });
         parameter_metrics.with_bytes_mut(|bytes| {
             bytes.fill(0);
