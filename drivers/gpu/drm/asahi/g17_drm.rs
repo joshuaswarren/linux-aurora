@@ -780,6 +780,15 @@ impl G17PQueueRegistry {
     fn acquire_lease(self: &Arc<Self>, owner: u64) -> Result<G17PLeaseGuard> {
         if owner == 0 { return Err(EINVAL); }
         let mut held = self.lease.lock();
+        // Recovery isolation ADMISSION_WAIT: bounded wait for the reclaim of
+        // an owner's quarantined pair (boot d324fcdd 05:38:44: spared VM
+        // 2559's next render hit EIO here and `fail_unpublished` poisoned it,
+        // 2.7 ms before the reclaim returned the pair).
+        let isolate = crate::g17_recovery_isolation::enabled(
+            crate::g17_recovery_isolation::ADMISSION_WAIT);
+        let mut quarantine_budget = kernel::time::msecs_to_jiffies(
+            crate::g17_recovery_isolation::ADMISSION_WAIT_MS);
+        let mut quarantine_waited = false;
         let slot = loop {
             if self.compute_faulted.load(Ordering::Acquire) != 0
                 && self.compute_poison_is_device_wide()
@@ -792,7 +801,38 @@ impl G17PQueueRegistry {
                 return Err(EIO);
             }
             match held.render_owner.iter().position(|id| *id == owner) {
-                Some(slot) if held.render_quarantined & (1u64 << slot) != 0 => return Err(EIO),
+                Some(slot) if held.render_quarantined & (1u64 << slot) != 0 => {
+                    // Y refuses when the owner's first pair is quarantined. With
+                    // isolation, an owner still holding a healthy pair uses it,
+                    // and an owner whose every pair is quarantined waits a
+                    // bounded time for the reclaim before Y's refusal.
+                    if !isolate { return Err(EIO); }
+                    let usable = (0..G17P_RENDER_SLOTS).any(|other|
+                        held.render_owner[other] == owner
+                            && held.render_quarantined & (1u64 << other) == 0);
+                    if !usable {
+                        if quarantine_budget == 0 { return Err(EIO); }
+                        if !quarantine_waited {
+                            quarantine_waited = true;
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::ADMISSION_WAITS);
+                            pr_info!("G17P render lease waiting for quarantine release: owner={} slot={}\n",
+                                owner, slot);
+                        }
+                        match self.lease_free.wait_interruptible_timeout(&mut held, quarantine_budget) {
+                            kernel::sync::CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                            kernel::sync::CondVarTimeoutResult::Timeout => {
+                                quarantine_budget = 0;
+                                crate::g17_recovery_isolation::count(
+                                    &crate::g17_recovery_isolation::ADMISSION_TIMEOUTS);
+                                pr_warn!("G17P render lease quarantine wait timed out: owner={} slot={}\n",
+                                    owner, slot);
+                            }
+                            kernel::sync::CondVarTimeoutResult::Woken { jiffies } => quarantine_budget = jiffies,
+                        }
+                        continue;
+                    }
+                }
                 None if !held.render_owner[1..].contains(&0)
                     && (held.render_released
                         & !held.render_slots

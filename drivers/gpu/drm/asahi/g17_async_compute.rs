@@ -1603,13 +1603,43 @@ impl G17PLiveRuntime {
         iso::count(&iso::RECOVERIES);
         let mut table = [iso::RecoveryEntry { qid: 0, flags: 0, stamp: 0 }; iso::MAX_ENTRIES];
         let used = iso::entries(&mut table);
-        let (guilty_qids, listed_qids, cancelled_qids) = iso::qid_masks(&table[..used], blamed_stamp);
+        let (firmware_guilty_qids, listed_qids, cancelled_qids) = iso::qid_masks(&table[..used], blamed_stamp);
+        // bit5: re-attribute when the firmware's lowest-slot blame names a
+        // pass that never started (see g17_recovery_isolation).
+        let mut sources = [iso::FaultSource::default(); iso::MAX_SOURCES];
+        let (reason, fault_mask, source_count) = iso::sources(&mut sources);
+        let mut attribution = iso::Attribution::Firmware;
+        if iso::enabled(iso::ATTRIBUTION) && source_count != 0 {
+            for source in sources[..source_count].iter_mut() {
+                let (Some(qid), Some(manager)) = (source.qid, self.manager.as_mut()) else { continue };
+                if let Some(pair) = manager.render_slot_for_qid(qid) {
+                    source.started = manager.render_pass_started(pair, source.stamp);
+                }
+            }
+            attribution = iso::attribute(reason, blamed_stamp, fault_mask, &sources[..source_count]);
+            if let Some(pdev) = self.pdev.as_ref() {
+                for source in sources[..source_count].iter() {
+                    dev_info!(pdev.as_ref(),
+                        "G17P recovery isolation: fault source slot={} qid={:?} stamp={:#x} dm1-monitor={} pass-started={:?}\n",
+                        source.slot, source.qid, source.stamp, source.monitor_state, source.started);
+                }
+                dev_info!(pdev.as_ref(),
+                    "G17P recovery isolation: attribution reason={} mask={:#x} firmware-guilty-qids={:#x} -> {:?}\n",
+                    reason, fault_mask, firmware_guilty_qids, attribution);
+            }
+        }
+        let guilty_qids = match attribution {
+            iso::Attribution::Firmware => firmware_guilty_qids,
+            iso::Attribution::Reattributed(qids) => { iso::count(&iso::REATTRIBUTED); qids }
+            iso::Attribution::NoCulprit => { iso::count(&iso::NO_CULPRIT); 0 }
+        };
+        let no_culprit = matches!(attribution, iso::Attribution::NoCulprit);
 
         // Resolve every guilty QID to the VM statuses of its in-flight work.
         const MAX_VMS: usize = 8;
         let mut guilty: [Option<Arc<crate::g17_status::VmStatus>>; MAX_VMS] = Default::default();
         let mut guilty_count = 0usize;
-        let mut unresolved = guilty_qids == 0;
+        let mut unresolved = guilty_qids == 0 && !no_culprit;
         // v2 collateral: a guilty QID whose OLDEST in-flight work was already
         // spared by an earlier recovery is that earlier recovery's collateral
         // (iso-b1 03:18:24/25: VM 57's kick 0x16110 was queued behind three
@@ -1667,7 +1697,7 @@ impl G17PLiveRuntime {
         }
         // Collateral-only blame resolves to "nobody guilty": every in-flight
         // completion is spared again.
-        if unresolved || (guilty_count == 0 && collateral_qids == 0) {
+        if unresolved || (guilty_count == 0 && collateral_qids == 0 && !no_culprit) {
             iso::count(&iso::UNRESOLVED);
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_warn!(pdev.as_ref(),
