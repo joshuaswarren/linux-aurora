@@ -68,6 +68,12 @@
 //! accounting of a cancelled kick are not yet established on hardware. The
 //! `first-kicks-*` counters measure the former on every returned queue.
 //!
+//! v2 (iso2): a recovery that blames a queue whose OLDEST in-flight work was
+//! already spared by an earlier recovery treats it as that recovery's
+//! collateral and spares its owner again (counter `collateral`); and the
+//! first job guard of a submission takes exactly Y's path unless Y's path
+//! refuses it (no extra locking on the hot path).
+//!
 //! Memory safety is unchanged in every mode: packets, VM-job guards and
 //! quarantined pairs are retained and released only by the existing
 //! witnesses (exact retirement, firmware drain/reclaim, processor stop).
@@ -198,11 +204,12 @@ pub(crate) static ADMISSION_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SUBMIT_WAITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SUBMIT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RESUME_DOORBELLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static COLLATERAL: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }
 
-static COUNTERS: [(&str, &AtomicU64); 18] = [
+static COUNTERS: [(&str, &AtomicU64); 19] = [
     ("recoveries", &RECOVERIES), ("unresolved", &UNRESOLVED),
     ("spared-renders", &SPARED_RENDERS), ("spared-compute", &SPARED_COMPUTE),
     ("guilty-marked", &GUILTY_MARKED), ("graced", &GRACED),
@@ -212,6 +219,7 @@ static COUNTERS: [(&str, &AtomicU64); 18] = [
     ("first-kicks-failed", &FIRST_KICKS_FAILED), ("admission-waits", &ADMISSION_WAITS),
     ("admission-timeouts", &ADMISSION_TIMEOUTS), ("submit-waits", &SUBMIT_WAITS),
     ("submit-timeouts", &SUBMIT_TIMEOUTS), ("resume-doorbells", &RESUME_DOORBELLS),
+    ("collateral", &COLLATERAL),
 ];
 
 // ---- parameter -----------------------------------------------------------------

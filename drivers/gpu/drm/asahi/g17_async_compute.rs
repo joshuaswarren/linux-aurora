@@ -1610,6 +1610,14 @@ impl G17PLiveRuntime {
         let mut guilty: [Option<Arc<crate::g17_status::VmStatus>>; MAX_VMS] = Default::default();
         let mut guilty_count = 0usize;
         let mut unresolved = guilty_qids == 0;
+        // v2 collateral: a guilty QID whose OLDEST in-flight work was already
+        // spared by an earlier recovery is that earlier recovery's collateral
+        // (iso-b1 03:18:24/25: VM 57's kick 0x16110 was queued behind three
+        // kicks recovery A cancelled; the host published nothing to qid 13
+        // in between, yet it stalled on the CDM and recovery B blamed it).
+        // Its owner is not made guilty for it; work of one QID runs in order,
+        // so the oldest in-flight item is the one the firmware stalled on.
+        let mut collateral_qids = 0u128;
         let mut push = |guilty: &mut [Option<Arc<crate::g17_status::VmStatus>>; MAX_VMS],
                         count: &mut usize, status: Arc<crate::g17_status::VmStatus>| -> bool {
             if guilty[..*count].iter().flatten().any(|known| Arc::ptr_eq(known, &status)) {
@@ -1626,13 +1634,25 @@ impl G17PLiveRuntime {
             if let Some(slot) = self.manager.as_ref().and_then(|manager| manager.render_slot_for_qid(qid)) {
                 let index = usize::from(slot);
                 let pending = self.pending_render.get(index).and_then(Option::as_ref);
-                let queued = self.pending_render_queued.get(index);
-                for completion in Iterator::chain(pending.into_iter(), queued.into_iter().flat_map(|fifo| fifo.iter())) {
+                if pending.is_some_and(|front| front.recovery_spared()) {
                     found = true;
-                    if !push(&mut guilty, &mut guilty_count, completion.vm_status()) { unresolved = true; }
+                    collateral_qids |= 1u128 << qid;
+                } else {
+                    let queued = self.pending_render_queued.get(index);
+                    for completion in Iterator::chain(pending.into_iter(), queued.into_iter().flat_map(|fifo| fifo.iter())) {
+                        found = true;
+                        if !push(&mut guilty, &mut guilty_count, completion.vm_status()) { unresolved = true; }
+                    }
                 }
             }
             for q in self.async_compute_queues.iter().filter(|q| q.queue.queue_id() == qid) {
+                if q.inflight.front().and_then(|front| front.packet.completion().ok())
+                    .is_some_and(|front| front.recovery_spared())
+                {
+                    found = true;
+                    collateral_qids |= 1u128 << qid;
+                    continue;
+                }
                 for active in q.inflight.iter() {
                     if let Ok(completion) = active.packet.completion() {
                         found = true;
@@ -1642,7 +1662,12 @@ impl G17PLiveRuntime {
             }
             unresolved |= !found;
         }
-        if unresolved || guilty_count == 0 {
+        if collateral_qids != 0 {
+            iso::count(&iso::COLLATERAL);
+        }
+        // Collateral-only blame resolves to "nobody guilty": every in-flight
+        // completion is spared again.
+        if unresolved || (guilty_count == 0 && collateral_qids == 0) {
             iso::count(&iso::UNRESOLVED);
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_warn!(pdev.as_ref(),
@@ -1727,7 +1752,7 @@ impl G17PLiveRuntime {
         // excluded by construction.
         if let Some(manager) = self.manager.as_ref() {
             for qid in 0..128u8 {
-                if cancelled_qids & !guilty_qids & (1u128 << qid) == 0 { continue; }
+                if cancelled_qids & !(guilty_qids & !collateral_qids) & (1u128 << qid) == 0 { continue; }
                 if let Some(slot) = manager.render_slot_for_qid(qid) {
                     if spared_slots & (1u64 << (slot & 63)) != 0 {
                         spared_cancelled |= 1u128 << qid;
@@ -1741,8 +1766,8 @@ impl G17PLiveRuntime {
                 *id = status.as_ref().map_or(0, |status| status.vm_id());
             }
             dev_info!(pdev.as_ref(),
-                "G17P recovery isolation: blamed stamp {:?} guilty-qids={:#x} listed-qids={:#x} cancelled-qids={:#x} guilty-vms={:?} graced={} spared-vms={:?} renders spared={} guilty={} compute spared={} guilty={}\n",
-                blamed_stamp, guilty_qids, listed_qids, cancelled_qids, &guilty_ids[..guilty_count], graced,
+                "G17P recovery isolation: blamed stamp {:?} guilty-qids={:#x} collateral-qids={:#x} listed-qids={:#x} cancelled-qids={:#x} guilty-vms={:?} graced={} spared-vms={:?} renders spared={} guilty={} compute spared={} guilty={}\n",
+                blamed_stamp, guilty_qids, collateral_qids, listed_qids, cancelled_qids, &guilty_ids[..guilty_count], graced,
                 &spared_ids[..spared_id_count],
                 spared_renders, guilty_renders, spared_compute, guilty_compute);
         }

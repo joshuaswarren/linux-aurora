@@ -3087,22 +3087,22 @@ impl Vm {
     /// waits a bounded time for the last guard's drain instead of failing
     /// the submission with EIO (which would poison it as a lost device).
     pub(crate) fn retain_first_t8140_job(&self) -> Result<T8140VmJobGuard> {
-        if !crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::ADMISSION_WAIT) {
-            return self.retain_t8140_job();
+        // Hot path: exactly Y. Only a refusal (gate blocked) of a VM whose
+        // status is clean takes the bounded wait below.
+        match self.retain_t8140_job() {
+            Err(error) if error == EIO
+                && self.status.get() == 0
+                && crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::ADMISSION_WAIT) => {}
+            result => return result,
         }
         let mut remaining = kernel::time::msecs_to_jiffies(
             crate::g17_recovery_isolation::ADMISSION_WAIT_MS);
-        let mut counted = false;
+        crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::ADMISSION_WAITS);
+        pr_info!("G17P VM job admission waiting for quarantine release: vm={}\n", self.id);
         let mut gate = self.mapping_gate.state.lock();
         loop {
             let blocked = gate.blocked;
-            let clean = self.status.get() == 0 && !self.job_lifetime.lock().closed;
-            if !(blocked && clean) || remaining == 0 { break; }
-            if !counted {
-                counted = true;
-                crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::ADMISSION_WAITS);
-                pr_info!("G17P VM job admission waiting for quarantine release: vm={}\n", self.id);
-            }
+            if !blocked || self.status.get() != 0 || remaining == 0 { break; }
             match self.mapping_gate.idle.wait_interruptible_timeout(&mut gate, remaining) {
                 kernel::sync::CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
                 kernel::sync::CondVarTimeoutResult::Timeout => {
