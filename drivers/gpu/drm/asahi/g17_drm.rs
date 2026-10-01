@@ -2393,7 +2393,9 @@ impl G17PRenderQueueBackend {
                         crate::g17_e2e::record(crate::g17_e2e::K_PUB_STAGES,
                             u32::from(render_slot) | u32::from(stages.retained) << 8
                                 | u32::from(stages.reachability_cache_hit) << 9
-                                | u32::from(result.is_ok()) << 10,
+                                | u32::from(result.is_ok()) << 10
+                                | u32::from(stages.config_present[0]) << 11
+                                | u32::from(stages.config_present[1]) << 12,
                             submission_id,
                             [e2e_t[5], pair(stages.runtime_lock_ns, state_polls as u64),
                              pair(stages.prepare_ns, stages.restage_ns),
