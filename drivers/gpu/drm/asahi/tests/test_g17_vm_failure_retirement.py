@@ -41,7 +41,7 @@ render_methods = "\n".join(block(drm, marker) for marker in [
     "    pub(crate) fn belongs_to_vm(", "    pub(crate) fn vm_status(",
     "    pub(crate) fn fail_while_owned(", "    pub(crate) fn release_after_processor_stop(",
     "    pub(crate) fn release_after_firmware_drain(",
-    "    pub(crate) fn recovery_spared(",
+    "    pub(crate) fn recovery_spared(", "    pub(crate) fn set_recovery_class(",
 ])
 aggregate_done = block(drm, "    fn member_done(")
 member_complete = block(block(drm, "impl G17PSubmitCompletionMember {"), "    pub(crate) fn complete(")

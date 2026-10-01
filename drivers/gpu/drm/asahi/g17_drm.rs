@@ -802,15 +802,14 @@ impl G17PQueueRegistry {
             }
             match held.render_owner.iter().position(|id| *id == owner) {
                 Some(slot) if held.render_quarantined & (1u64 << slot) != 0 => {
-                    // Y refuses when the owner's first pair is quarantined. With
-                    // isolation, an owner still holding a healthy pair uses it,
-                    // and an owner whose every pair is quarantined waits a
-                    // bounded time for the reclaim before Y's refusal.
+                    // Y refuses when the owner's first pair is quarantined.
+                    // With isolation the owner waits a bounded time for the
+                    // reclaim that returns that pair, then refuses as Y does.
+                    // (iso3.1: no fall-through onto a healthy sibling pair --
+                    // a sibling kick may name the abandoned group as its
+                    // cross-pair parent.)
                     if !isolate { return Err(EIO); }
-                    let usable = (0..G17P_RENDER_SLOTS).any(|other|
-                        held.render_owner[other] == owner
-                            && held.render_quarantined & (1u64 << other) == 0);
-                    if !usable {
+                    {
                         if quarantine_budget == 0 { return Err(EIO); }
                         if !quarantine_waited {
                             quarantine_waited = true;
