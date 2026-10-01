@@ -1104,13 +1104,18 @@ impl G17PLiveRuntime {
             // client's OTHER pair took this path and killed the session anyway.
             // `fail_while_owned` below already quarantines the slot and pins the
             // mappings firmware may still name; nothing here needs a rebuild.
-            let newly_failed = self.pending_render[slot as usize]
-                .as_ref()
-                .is_some_and(|completion| completion.fail_while_owned(error));
-            if !newly_failed {
-                continue;
+            // Every queued member has the same pair owner. Settle every fence,
+            // but retain all owners until the existing whole-pair drain proof
+            // (or processor stop) permits release. Leaving a failed head in the
+            // normal FIFO strands successors and bypasses quarantine reclaim.
+            self.render_fence_state.settle(slot);
+            self.render_event_masks[slot as usize] = [0; 2];
+            if let Some(completion) = self.pending_render[slot as usize].take() {
+                failed += usize::from(self.quarantine_failed_render_completion(completion, error));
             }
-            failed += 1;
+            while let Some(completion) = self.pending_render_queued[slot as usize].take() {
+                failed += usize::from(self.quarantine_failed_render_completion(completion, error));
+            }
             if let Some(pdev) = &self.pdev {
                 dev_err!(
                     pdev.as_ref(),
