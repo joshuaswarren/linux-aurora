@@ -526,6 +526,18 @@ impl G17PQueueLeaseState {
     /// with no free slot leaves the owner on one pair, stacking kicks on it,
     /// which is the same depth the busy path already allows.
     fn claim_sibling_render_slot(&mut self, owner: u64) {
+        // Opt-in `g17p_render_single_pair=1` (default 0) leaves every render
+        // queue on one physical pair, stacking its kicks there. Measured on
+        // Neo 2026-10-01, both ways:
+        // - it avoided the hard hang (watchdog reset) when 8..16 clients
+        //   construct render pairs at once: 8x20 and 16x10 passed (boots
+        //   79600be8, d5dedb62) where two pairs hung in round 1, and it was
+        //   about 3.5% faster at depth 2 (2.3% in Minecraft);
+        // - it raised the per-pass tabench 3D-stall hazard about 1.5x
+        //   (9.3e-3..1.22e-2 vs 6.2e-3..6.5e-3), and it is not native: the
+        //   2026-09-28 macOS capture alternates two pairs per process (3D
+        //   qids 16/18 switch on nearly every command buffer).
+        // A mitigation, not parity; the cause of the two-pair hang is open.
         if *crate::module_parameters::g17p_render_single_pair.value() != 0 { return; }
         let owned = self.render_owner.iter().filter(|id| **id == owner).count();
         if owned >= crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE as usize {
