@@ -242,6 +242,64 @@ pub(crate) fn g17p_fw_pool_release_all() {
 /// DEVICE_LOST. FRG with multiplier 16 passed four-client qualification with
 /// no single-client cost; multiplier 1 cost 23% light-render throughput.
 /// The native runtime TimerCSwitch value is not established.
+/// Opt-in diagnostic `g17p_fastdie_target_cc`: lower the GPU firmware
+/// fast-die target (native 11000 = 110.00 C, recorded in the bundle and the
+/// secondary +0xb8 object) before the firmware boots.  0 keeps native.
+fn g17p_fastdie_target() -> Option<u32> {
+    let requested = *crate::module_parameters::g17p_fastdie_target_cc.value();
+    match g17_initdata::fast_die_target_override(requested) {
+        Ok(target) => target,
+        Err(_) => {
+            pr_warn!(
+                "G17P fast-die: g17p_fastdie_target_cc={} outside {}..={} (lower-only); native kept\n",
+                requested,
+                g17_initdata::FASTDIE_MIN_TARGET_CC,
+                g17_initdata::FASTDIE_NATIVE_TARGET_CC
+            );
+            None
+        }
+    }
+}
+
+fn g17p_fastdie_apply_status_b(status_b: &mut [u8]) -> Result {
+    match g17p_fastdie_target() {
+        Some(target) => g17_initdata::apply_fast_die_target_status_b(status_b, target).map_err(|_| EINVAL),
+        None => Ok(()),
+    }
+}
+
+fn g17p_fastdie_apply_bundle(bundle: &mut [u8]) -> Result {
+    match g17p_fastdie_target() {
+        Some(target) => g17_initdata::apply_fast_die_target_bundle(bundle, target).map_err(|_| EINVAL),
+        None => Ok(()),
+    }
+}
+
+/// Log the GPU fast-die configuration as handed to the firmware.
+fn g17p_fastdie_log(bundle: &mut MappedObject, primary_state: &mut MappedObject) -> Result {
+    let mut status_b = KVec::<u8>::new();
+    primary_state.with_bytes_mut(|bytes| {
+        let start = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
+        let end = start + g17_initdata::PRIMARY_STATUS_B_OBJECT_SIZE;
+        status_b.extend_from_slice(bytes.get(start..end).ok_or(EINVAL)?, GFP_KERNEL)?;
+        Ok(())
+    })?;
+    bundle.with_bytes_mut(|bytes| {
+        let c = g17_initdata::fast_die_config(bytes, &status_b).map_err(|_| EINVAL)?;
+        let origin = if c.target_cc == g17_initdata::FASTDIE_NATIVE_TARGET_CC {
+            "native"
+        } else {
+            "DIAGNOSTIC override"
+        };
+        pr_info!(
+            "G17P fast-die: mask {:#x} target {} release {} delta {} (0.01 C) kp {:#010x} ki_dt {:#010x} state {:#x} | live target {} release {} kp {:#010x} ki_dt {:#010x} update {} ({})\n",
+            c.mask, c.target_cc, c.release_cc, c.delta_cc, c.kp_bits, c.ki_dt_bits, c.state,
+            c.live_target_cc, c.live_release_cc, c.live_kp_bits, c.live_ki_dt_bits, c.live_update, origin
+        );
+        Ok(())
+    })
+}
+
 fn g17p_apply_region_c_diagnostic_overrides(bytes: &mut [u8]) -> Result {
     use crate::module_parameters as params;
     if *params::g17p_disable_idle_core_off.value() != 0 {
@@ -16282,7 +16340,8 @@ impl G17ResourceOwner {
                 fwctl.iova() + g17_initdata::CONTROL_RECORD_SIZE as u64,
                 &mut bytes[status_b..end],
             )
-            .map_err(|_| EINVAL)
+            .map_err(|_| EINVAL)?;
+            g17p_fastdie_apply_status_b(&mut bytes[status_b..end])
         })?;
         secondary_state.with_bytes_mut(|bytes| {
             let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
@@ -16296,8 +16355,10 @@ impl G17ResourceOwner {
                 secondary_state.iova() + SECONDARY_HWDATA_STATE_OFFSET,
                 bytes,
             )
-            .map_err(|_| EINVAL)
+            .map_err(|_| EINVAL)?;
+            g17p_fastdie_apply_bundle(bytes)
         })?;
+        g17p_fastdie_log(&mut shared_cluster, &mut primary_state)?;
         shared_cluster.write_main_configs(
             &shared,
             &handoff.primary,
@@ -20200,7 +20261,8 @@ impl G17ResourceOwner {
                 fwctl + g17_initdata::CONTROL_RECORD_SIZE as u64,
                 &mut bytes[status_b..end],
             )
-            .map_err(|_| EINVAL)
+            .map_err(|_| EINVAL)?;
+            g17p_fastdie_apply_status_b(&mut bytes[status_b..end])
         })?;
         self.resources.secondary_state.with_bytes_mut(|bytes| {
             let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
@@ -20214,7 +20276,8 @@ impl G17ResourceOwner {
                 secondary.state_grid + SECONDARY_HWDATA_STATE_OFFSET,
                 bytes,
             )
-            .map_err(|_| EINVAL)
+            .map_err(|_| EINVAL)?;
+            g17p_fastdie_apply_bundle(bytes)
         })?;
         let primary_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: self.resources.primary_b2_sentinel.iova(),
