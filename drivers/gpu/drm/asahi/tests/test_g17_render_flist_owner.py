@@ -101,12 +101,16 @@ def source_guards():
         RESOURCES.index("fn optional_addresses(&self"):
         RESOURCES.index("pub(crate) fn set_parameter_buffer_lease_token")
     ]
-    # The FList lifecycle is per physical pair: it lives in the slot state.
+    # Shared FList (g17p_host_path bit19): the lifecycle is indexed by the
+    # pool's own FList ID in the manager. A physical pair records which pool
+    # it uses, its leases and its prepared (not yet published) acquisition;
+    # each owner's sequence follows its predecessor's.
+    assert "render_flist_owners: KVec<Option<G17PBootstrapUmaLifecycle>>" in MANAGER
     slot = MANAGER[MANAGER.index("struct G17PRenderSlotState {"):]
-    assert "bootstrap_uma" in slot[:5000]
+    assert "flist_index" in slot[:5000]
+    assert "flist_leases" in slot[:5000]
     assert "prepared_render_flist" in slot[:5000]
-    assert "next_render_flist_sequence" in slot[:5000]
-    assert "checked_sub(129)" in MANAGER
+    assert "owner.sequence.checked_add(1)" in MANAGER
     assert "stage_user_render_uma" in MANAGER
     assert "settle_consumed_render_usc_freelist_releases" in MANAGER
     # A sent release never gates the next kick: no per-slot "release sent"

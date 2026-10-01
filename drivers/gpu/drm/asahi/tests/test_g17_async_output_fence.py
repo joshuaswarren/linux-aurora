@@ -95,9 +95,12 @@ assert ") -> bool {" not in exact_timeout and "return !retired;" not in exact_ti
 assert exact_timeout.index("self.poll_deferred_render_completion(render_slot)") \
     < exact_timeout.index("self.fail_render_after_final_observation(")
 timeout = live_block("    fn fail_render_after_final_observation(")
-signal_error = timeout.index("signal.fail_while_owned(error);")
-quarantine = timeout.index("quarantined_render_completions", signal_error)
-assert signal_error < quarantine
+# Stability patch 0006: the failed render and every queued sibling go through
+# one helper that fails the fence while owned, then retains it in quarantine.
+signal_error = timeout.index("self.quarantine_failed_render_completion(signal, error);")
+quarantine_helper = live_block("    fn quarantine_failed_render_completion(")
+assert quarantine_helper.index("completion.fail_while_owned(error)") \
+    < quarantine_helper.index("quarantined_render_completions")
 assert "lease.registry.quarantine_render_slot(lease.slot);" in render_completion, \
     'error fence can wake before its physical slot is quarantined'
 assert "if retired {\n                signal.complete(Err(EIO));\n            } else {" in timeout[:signal_error], \

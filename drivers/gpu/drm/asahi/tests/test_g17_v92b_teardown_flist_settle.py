@@ -53,7 +53,11 @@ SETTLE = 'settle_consumed_render_usc_freelist_releases()'
 poll_settles = SETTLE in service and service.index(SETTLE) < service.index('logical_queue_teardown_render_ready(')
 
 gate = code(item(MANAGER, 'fn render_slot_idle_for_context('))
-assert 'G17PBootstrapUmaRequestState::Completed' in gate and 'hardware_buffer_owned' in gate, \
+# Shared FList: a pair is idle only without FList leases or an unretired FList
+# ordinal; the teardown separately waits for each of its pools' lifecycles.
+assert 'flist_leases.is_some()' in gate and 'flist_retired_ordinal.is_some()' in gate
+pools = code(item(MANAGER, 'fn displaced_graphs_flists_released('))
+assert 'G17PBootstrapUmaRequestState::Completed' in pools and 'hardware_buffer_owned' in pools, \
     'teardown gate still waits for a Completed FList lifecycle'
 settle_fn = code(item(MANAGER, 'pub(crate) fn settle_consumed_render_usc_freelist_releases('))
 assert 'settle_release_witnesses' in settle_fn and 'control_counters()' in settle_fn

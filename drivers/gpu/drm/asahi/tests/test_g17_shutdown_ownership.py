@@ -79,6 +79,9 @@ host_only.update(('trace_service_entry_counter', 'deferred_completion_drain_owne
 # deferred-render-timeout slot mask.
 host_only.update(('submit_open', 'submit_count', 'dvfs_native_bracket', 'clpc_effort',
                   'dvfs_ce', 'idle_hold_published', 'deferred_render_timeouts'))
+# v92e published GPU power budget (a u32) and the v93r drained-pair reclaim
+# poll start (an Instant): plain host values.
+host_only.update(('power_target_mw', 'reclaim_pending_since'))
 options = 'pdev drm registers manager cpus gfx_state gfx_rtkit gfx1_state gfx1_rtkit queue compute_binding compute_timestamps pending_compute'.split()
 vectors = 'retired_queues quarantined_bindings pending_render pending_render_queued quarantined_render_completions'.split()
 # Completions the firmware has already retired, waiting for their fence to be

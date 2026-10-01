@@ -78,7 +78,13 @@ for knobs in (0x9000, 0x4009000):
     assert all(not (knobs >> b) & 1 for b in bits.values()), 'lab knob writes keep every guard on'
 
 blocked = code(item(MANAGER, 'pub(crate) fn render_flist_takeover_blocked('))
-assert 'has_release_witness' in blocked and 'Arc::ptr_eq(owner, context)' in blocked
+# Shared FList: each pool leases its own FList ID and keeps it, with its
+# context or teardown, through its release ACK. A successor therefore never
+# takes over a predecessor's ID, which removes the stale-pool hazard above at
+# its source; the per-pair guard is inert (always false) but stays wired in.
+assert blocked.split('{', 1)[1].split() == ['false', '}'], blocked
+assert 'Ok(Self(129 + bank as u16 * 64 + bit as u16))' in RES
+assert 'keep the pool and ID alive through release ACK' in RES
 ready = code(item(LIVE, 'pub(crate) fn render_flist_takeover_ready('))
 assert ready.index('DIAG_FLIST_TAKEOVER_GUARD_OFF') < ready.index('settle_consumed_render_usc_freelist_releases()')
 assert 'reannounce_pending_primary_control' in ready

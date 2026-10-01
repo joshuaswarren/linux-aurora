@@ -68,7 +68,7 @@ struct Bind(u64);impl Bind{fn vm_id(&self)->u64{self.0}}
 struct Slot {
  retired_handoff_graph:Option<()>,submission_ordinal:u64,tracker:Option<()>,hardware_buffer_id:Option<u32>,
  hardware_buffer_published:bool,bind:Option<Bind>,storage:Option<Box<g17_resources::G17PUserRenderStorage>>,
- bootstrap_uma:Option<u32>,
+ flist_index:usize,
 }
 struct RenderSlots{slots:[Option<Slot>;2],active_slot:u8}
 impl RenderSlots {
@@ -93,22 +93,24 @@ impl ComputeStorage{
 struct G17PSksmQueue{queue_id:u8,hardware_buffer_id:u8,submission_ordinal:u32,storage:ComputeStorage}
 impl G17PSksmQueue{fn qos_hardware_buffer_id(&self)->u8{self.hardware_buffer_id}fn new()->Self{Self{queue_id:14,hardware_buffer_id:12,submission_ordinal:16,storage:ComputeStorage::default()}}}
 struct Teardown{graphs:Vec<()>}
+// Shared FList: the UMA lifecycle lives in the manager, indexed by each pair's pool.
 struct Manager {
  render_slots:RenderSlots,render_hardware_buffer_ids:HardwareIds,logical_queue_teardowns:Vec<Teardown>,
- resources:Resources,
+ resources:Resources,render_flist_owners:Vec<Option<u32>>,
 }
 impl Manager {
  fn new(active:u8)->Self {
   let mut slots=[None,None];slots[usize::from(1-active)]=Some(Slot{
    retired_handoff_graph:Some(()),submission_ordinal:3,tracker:None,hardware_buffer_id:None,
-   hardware_buffer_published:false,bind:Some(Bind(43)),storage:Some(Box::new(storage())),bootstrap_uma:None,
+   hardware_buffer_published:false,bind:Some(Bind(43)),storage:Some(Box::new(storage())),flist_index:usize::from(1-active),
   });
   slots[usize::from(active)]=Some(Slot{
    retired_handoff_graph:None,submission_ordinal:4,tracker:Some(()),hardware_buffer_id:Some(8),
-   hardware_buffer_published:true,bind:Some(Bind(42)),storage:Some(Box::new(storage())),bootstrap_uma:Some(4),
+   hardware_buffer_published:true,bind:Some(Bind(42)),storage:Some(Box::new(storage())),flist_index:usize::from(active),
   });
   Self{render_slots:RenderSlots{slots,active_slot:active},render_hardware_buffer_ids:HardwareIds{free:[1,2],reserved:[3,4]},
-   logical_queue_teardowns:vec![Teardown{graphs:vec![()]}],resources:Resources::default()}
+   logical_queue_teardowns:vec![Teardown{graphs:vec![()]}],resources:Resources::default(),
+   render_flist_owners:{let mut o=vec![None,None];o[usize::from(active)]=Some(4);o}}
  }
 }
 fn mode(v:u32){module_parameters::g17p_mixed_resource_probe.0.store(v,Ordering::SeqCst);LOG.lock().unwrap().clear();}

@@ -15,6 +15,7 @@ import tempfile
 from test_g17_compute_scs_encoding import block
 from g17_render_fanout_test_support import fence_state_source, retention_method, KVEC
 from g17_compute_inflight_test_support import completion_mod, queue_limits_mock
+from g17_recovery_isolation_test_support import recovery_isolation_mod
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(os.environ.get("NEO_FANOUT_SOURCE", ROOT))
@@ -28,7 +29,10 @@ methods = "\n".join(block(compute, marker) for marker in [
 completion_methods = "\n".join(block(job, marker) for marker in [
     "    pub(crate) fn fail_while_owned(",
     "    pub(crate) fn release_after_retirement(",
+    "    pub(crate) fn recovery_spared(",
 ])
+# Recovery isolation (iso1): spared zero-duration queues fail their fences here.
+spared_helper = block(compute, "fn fail_spared_deferred(").replace("G17PAsyncComputeQueue", "Queue")
 
 drm = (SOURCE / "g17_drm.rs").read_text()
 live = (SOURCE / "g17_live_boot.rs").read_text()
@@ -37,6 +41,7 @@ render_methods = "\n".join(block(drm, marker) for marker in [
     "    pub(crate) fn belongs_to_vm(", "    pub(crate) fn vm_status(",
     "    pub(crate) fn fail_while_owned(", "    pub(crate) fn release_after_processor_stop(",
     "    pub(crate) fn release_after_firmware_drain(",
+    "    pub(crate) fn recovery_spared(",
 ])
 aggregate_done = block(drm, "    fn member_done(")
 member_complete = block(block(drm, "impl G17PSubmitCompletionMember {"), "    pub(crate) fn complete(")
@@ -47,6 +52,7 @@ use std::sync::atomic::{AtomicI32,AtomicU32,AtomicUsize,Ordering};
 #[derive(Debug,Copy,Clone,PartialEq,Eq)] struct Error(i32);
 impl Error {fn to_errno(self)->i32{self.0} fn from_errno(n:i32)->Self{Self(n)}}
 const EIO:Error=Error(-5);
+const ENODATA:Error=Error(-61);
 type Result<T=()> = std::result::Result<T,Error>;
 macro_rules! dev_info {($($t:tt)*)=>{()}}
 macro_rules! dev_err {($($t:tt)*)=>{()}}
@@ -73,9 +79,11 @@ impl Fence {
 }
 #[derive(Default)] struct Aggregate(AtomicUsize);
 impl Aggregate {fn complete(&self,_:Result){self.0.fetch_add(1,Ordering::SeqCst);}}
-struct Completion {signalled:AtomicU32,vm_job:Mutex<Option<Pin>>,status:Arc<g17_status::VmStatus>,fence:Fence,aggregate_member:Aggregate}
+struct Completion {signalled:AtomicU32,vm_job:Mutex<Option<Pin>>,status:Arc<g17_status::VmStatus>,fence:Fence,aggregate_member:Aggregate,recovery_class:std::sync::atomic::AtomicU8}
 impl Completion {
 ''' + completion_methods + r'''
+ // Only reached for a spared queue (recovery isolation): fail and release.
+ fn complete(&self,r:Result){if let Err(e)=r{self.fence.set_error(e)}self.signalled.store(1,Ordering::SeqCst);drop(self.vm_job.lock().take());self.fence.signal();self.aggregate_member.complete(r);}
 }
 struct Context(u32);
 impl Context {fn context_id(&self)->u32{self.0}}
@@ -96,7 +104,11 @@ type Inflight=g17_completion::PairFifo<Active,{g17_queue_limits::MAX_COMPUTE_IN_
 type RetiredLeases=g17_completion::PairFifo<Lease,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
 struct HardwareQueue(u8);
 impl HardwareQueue {fn queue_id(&self)->u8{self.0}}
-struct Queue {owner:Option<u64>,queue:HardwareQueue,inflight:Inflight,quarantined:bool,awaiting_retirement_witness:bool,retired_leases:RetiredLeases,_graph:Graph}
+struct Previous {publication:Option<()>}
+struct Queue {owner:Option<u64>,queue:HardwareQueue,inflight:Inflight,quarantined:bool,awaiting_retirement_witness:bool,retired_leases:RetiredLeases,_graph:Graph,
+ previous_binding:Option<Previous>,retirement_ready:bool,retire_pending:bool,spared_quarantine:bool,first_kick_watch:bool,spared_deferred:bool}
+''' + spared_helper + r'''
+''' + recovery_isolation_mod() + r'''
 struct Device;
 impl Device {fn as_ref(&self)->&Self{self}}
 mod g17_resources {
@@ -120,7 +132,7 @@ impl Registry {
 }
 struct RenderLease {slot:u8,registry:Arc<Registry>,counts:Arc<Counts>}
 impl Drop for RenderLease {fn drop(&mut self){self.counts.leases_dropped.fetch_add(1,Ordering::SeqCst);}}
-struct Render {id:u64,status:Arc<g17_status::VmStatus>,signalled:AtomicU32,vm_job:Mutex<Option<Pin>>,lease:Mutex<Option<RenderLease>>,fence:Fence,aggregate_member:RenderMember}
+struct Render {recovery_class:std::sync::atomic::AtomicU8,id:u64,status:Arc<g17_status::VmStatus>,signalled:AtomicU32,vm_job:Mutex<Option<Pin>>,lease:Mutex<Option<RenderLease>>,fence:Fence,aggregate_member:RenderMember}
 impl Render {
 ''' + render_methods + r'''
  fn render_slot(&self)->Option<u8>{self.lease.lock().as_ref().map(|l|l.slot)}
@@ -161,6 +173,7 @@ impl Manager {
  fn independent_compute_retired_by_firmware(&mut self,q:&mut HardwareQueue,t:&FirmwareTicket,n:u32)->Result<bool>{
   self.queries.push((q.0,t.0,n));self.proof
  }
+ fn return_witnessed_compute_queue(&mut self,_:&mut HardwareQueue,_:u32)->Result{Ok(())}
 }
 struct Runtime {async_compute_queues:Vec<Queue>,pending_render:[Option<Arc<Render>>;2],pending_render_queued:[RenderFifo;2],render_fence_state:g17_completion::RenderFenceState,render_event_masks:[[u32;2];2],quarantined_render_completions:KVec<Arc<Render>>,render_ready:[bool;2],reclaim_pending_since:Option<kernel::time::Instant<kernel::time::Monotonic>>,session_recovery_pending:bool,reclaim_queries:Vec<u8>,deferred:Vec<Arc<Render>>,manager:Option<Manager>,pdev:Option<Device>,scans:usize}
 impl Runtime {
@@ -196,12 +209,12 @@ fn fixture()->(Runtime,Arc<g17_status::VmStatus>,Arc<Counts>,Vec<Arc<Completion>
  let mut inflight=Inflight::new();let mut completions=Vec::new();
  for id in [100,101] {
   counts.pins.fetch_add(1,Ordering::SeqCst);
-  let c=Arc::new(Completion{signalled:AtomicU32::new(0),vm_job:Mutex(StdMutex::new(Some(Pin(counts.clone())))),status:status.clone(),fence:Fence::default(),aggregate_member:Aggregate::default()});
+  let c=Arc::new(Completion{signalled:AtomicU32::new(0),vm_job:Mutex(StdMutex::new(Some(Pin(counts.clone())))),status:status.clone(),fence:Fence::default(),aggregate_member:Aggregate::default(),recovery_class:Default::default()});
   completions.push(c.clone());
   let active=Active{packet:Arc::new(Packet{id,context:Context(10),completion:c}),_lease:Lease(counts.clone()),retirement:Some(Ticket{owner:65,submission:id,context:10,firmware:FirmwareTicket(id)})};
   assert!(inflight.push(active).is_ok());
  }
- let q=Queue{owner:Some(65),queue:HardwareQueue(13),inflight,quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(counts.clone())};
+ let q=Queue{owner:Some(65),queue:HardwareQueue(13),inflight,quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(counts.clone()),previous_binding:None,retirement_ready:false,retire_pending:false,spared_quarantine:false,first_kick_watch:false,spared_deferred:false};
  (Runtime{async_compute_queues:vec![q],pending_render:[None,None],pending_render_queued:std::array::from_fn(|_|RenderFifo::new()),render_fence_state:Default::default(),render_event_masks:[[0;2];2],quarantined_render_completions:KVec::with_capacity(32),render_ready:[false;2],reclaim_pending_since:None,session_recovery_pending:false,reclaim_queries:Vec::new(),deferred:Vec::new(),manager:Some(Manager{state:0,proof:Ok(false),queries:Vec::new()}),pdev:None,scans:0},status,counts,completions)
 }
 fn check_retained(rt:&Runtime,c:&Counts){
@@ -278,7 +291,7 @@ fn check_retained(rt:&Runtime,c:&Counts){
  assert_eq!(rt.fail_outstanding_jobs_for_vm(&other,EIO),0);check_retained(&rt,&c);
  assert!(!rt.async_compute_queues[0].quarantined);
  assert!(!rt.async_compute_queues[0].awaiting_retirement_witness);
- let empty=Queue{owner:None,queue:HardwareQueue(14),inflight:Inflight::new(),quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(c.clone())};
+ let empty=Queue{owner:None,queue:HardwareQueue(14),inflight:Inflight::new(),quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(c.clone()),previous_binding:None,retirement_ready:false,retire_pending:false,spared_quarantine:false,first_kick_watch:false,spared_deferred:false};
  rt.async_compute_queues.push(empty);
  assert_eq!(rt.fail_outstanding_jobs_for_vm(&other,EIO),0);
  assert!(!rt.async_compute_queues[1].awaiting_retirement_witness);
@@ -296,7 +309,7 @@ fn render_pair(rt:&mut Runtime,status:Arc<g17_status::VmStatus>,slot:u8,n:usize)
  let mut completions=Vec::new();
  for id in 0..n {
   counts.pins.fetch_add(1,Ordering::SeqCst);
-  let c=Arc::new(Render{id:id as u64,status:status.clone(),signalled:AtomicU32::new(0),vm_job:Mutex(StdMutex::new(Some(Pin(counts.clone())))),lease:Mutex(StdMutex::new(Some(RenderLease{slot,registry:registry.clone(),counts:counts.clone()}))),fence:Fence::default(),aggregate_member:RenderMember{aggregate:aggregate.clone(),completed:AtomicU32::new(0)}});
+  let c=Arc::new(Render{recovery_class:Default::default(),id:id as u64,status:status.clone(),signalled:AtomicU32::new(0),vm_job:Mutex(StdMutex::new(Some(Pin(counts.clone())))),lease:Mutex(StdMutex::new(Some(RenderLease{slot,registry:registry.clone(),counts:counts.clone()}))),fence:Fence::default(),aggregate_member:RenderMember{aggregate:aggregate.clone(),completed:AtomicU32::new(0)}});
   if id==0{rt.pending_render[slot as usize]=Some(c.clone());}else{assert!(rt.pending_render_queued[slot as usize].push(c.clone()).is_ok());}
   completions.push(c);
  }

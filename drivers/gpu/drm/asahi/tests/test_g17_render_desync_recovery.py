@@ -107,11 +107,21 @@ struct G17PUserRenderQueueState{
 }
 ''' + plan + r'''
 
+// g17p_host_path PRODUCER_READS (bit17): a per-thread mask so one test can
+// run the same scenarios with the producer-only prefilter enabled.
+mod g17_host_path {
+ pub const PRODUCER_READS:u32=1<<17;
+ thread_local!{pub static MASK:std::cell::Cell<u32>=const{std::cell::Cell::new(0)};}
+ pub fn enabled(bit:u32)->bool{MASK.with(|m|m.get()&bit!=0)}
+}
+
 // Fixed-item plans (variable_render_items false), as with RENDER_SKSM items.
 struct Storage{state:G17PUserRenderQueueState,render_publication:RenderPublication}
 impl Storage{
  fn variable_render_items(&self)->bool{false}
  fn snapshot(&mut self,_ordinal:u64)->Result<G17PUserRenderQueueState>{Ok(self.state)}
+ // The two producer words the full snapshot also reports.
+ fn render_producer_indices(&mut self)->Result<[u32;2]>{Ok([self.state.tiling.write,self.state.fragment.write])}
 ''' + predicate + r'''
 }
 
@@ -158,6 +168,14 @@ fn base(ordinal:u64)->u32{G17PRenderItemPlan::new(ordinal,false).unwrap().base}
  // Job list not empty: same.
  let mut s=storage(base(ordinal+1),base(ordinal+1),false,false);
  assert!(!s.restage_admission_desynced(ordinal).unwrap());
+}
+
+#[test]fn producer_read_prefilter_gives_the_same_answers(){
+ g17_host_path::MASK.with(|m|m.set(g17_host_path::PRODUCER_READS));
+ an_aligned_graph_is_not_desynced();
+ a_staged_but_unpublished_group_is_desynced();
+ only_one_queue_needs_to_have_drifted();
+ a_running_group_is_never_reported_as_desync();
 }
 
 #[test]fn an_unusable_ordinal_is_never_a_desync(){

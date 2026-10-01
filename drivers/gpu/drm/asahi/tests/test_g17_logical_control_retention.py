@@ -122,14 +122,18 @@ struct Manager {
  pending_primary_control:Option<()>,resources:Resources,
  render_hardware_buffer_ids:HardwareIds,detach_calls:usize,detach_busy:bool,
  detached:KVec<G17PRetiredRenderGraph>,
+ // Shared FList: settlement also waits until the teardown's pools are
+ // released (production predicate displaced_graphs_flists_released).
+ flists_released:bool,
 }
 impl Manager {
  fn new(cursor:u32)->Self{Self{
   logical_queue_teardowns:KVec::new(),pending_primary_control:None,
   resources:Resources{consumer:cursor,producer:cursor,full:false,records:vec![]},
   render_hardware_buffer_ids:HardwareIds{unreserved:vec![]},detach_calls:0,
-  detach_busy:false,detached:KVec::new(),
+  detach_busy:false,detached:KVec::new(),flists_released:true,
  }}
+ fn displaced_graphs_flists_released(&self,_:usize)->bool{self.flists_released}
  fn detach_render_graphs_of_context(&mut self,_:&Arc<G17PLogicalQueueContext>,_:u16)
    ->Result<KVec<G17PRetiredRenderGraph>>{
   self.detach_calls+=1;if self.detach_busy{return Err(EBUSY)}
@@ -224,6 +228,14 @@ fn context(id:u32,published:bool)->Arc<G17PLogicalQueueContext>{
  for teardown in settled.iter(){teardown.release_retired_vm_mappings();}
  assert_eq!(vm.cleared.get(),1);assert!(w.upgrade().is_some());drop(settled);
  assert!(w.upgrade().is_none());assert_eq!(m.render_hardware_buffer_ids.unreserved,vec![3]);
+}
+#[test]fn unreleased_pool_keeps_a_consumed_teardown_draining(){
+ let mut m=Manager::new(0);let c=context(9,true);
+ m.release_render_context_owner(&c).unwrap();m.publish_logical_queue_release(0).unwrap();
+ m.resources.consumer=1;m.flists_released=false;
+ assert!(m.settle_logical_queue_teardowns().unwrap().is_empty());
+ assert_eq!(m.detach_calls,0);assert_eq!(m.logical_queue_teardowns.len(),1);
+ m.flists_released=true;assert_eq!(m.settle_logical_queue_teardowns().unwrap().len(),1);
 }
 #[test]fn malformed_control_indices_do_not_detach(){
  let mut m=Manager::new(0);let c=context(9,true);

@@ -9,6 +9,7 @@ from g17_compute_inflight_test_support import completion_mod, queue_limits_mock
 import subprocess
 import tempfile
 import sys
+from g17_recovery_isolation_test_support import HOST_PATH_V93, recovery_isolation_mod
 
 root = Path(__file__).resolve().parents[1]
 
@@ -61,7 +62,10 @@ assert "_lease.quarantine" not in cancel
 assert ".cancel_async_compute(self.owner, packet.submission_id());" in drm
 
 methods = "\n".join(item(job, "    pub(crate) fn " + name + "(") for name in
-                    ("cancel_while_owned", "release_after_retirement", "fail_while_owned", "complete"))
+                    ("cancel_while_owned", "release_after_retirement", "fail_while_owned", "complete",
+                     "recovery_spared"))
+# Recovery isolation (iso1): spared zero-duration queues fail their fences here.
+spared_helper = item(compute, "fn fail_spared_deferred(").replace("G17PAsyncComputeQueue", "Queue")
 if "--negative-control" in sys.argv:
     # Reproduce the former sticky-VM-poison half of hardware quarantine.
     methods = methods.replace("self.fence.set_error(ECANCELED);",
@@ -96,7 +100,9 @@ struct Destination(Arc<AtomicUsize>);
 impl Destination {fn write(&self,_v:u64)->Result {self.0.fetch_add(1,Ordering::SeqCst);Ok(())}}
 #[derive(Default)] struct Aggregate {calls:AtomicUsize,error:AtomicI32}
 impl Aggregate {fn complete(&self,r:Result){self.calls.fetch_add(1,Ordering::SeqCst);if let Err(e)=r{self.error.store(e.0,Ordering::SeqCst);}}}
-struct Completion {signalled:AtomicU32,vm_job:Mutex<Option<Pin>>,status:Status,fence:Fence,aggregate_member:Aggregate,destinations:[Option<Destination>;2]}
+struct Completion {signalled:AtomicU32,vm_job:Mutex<Option<Pin>>,status:Status,fence:Fence,aggregate_member:Aggregate,destinations:[Option<Destination>;2],recovery_class:std::sync::atomic::AtomicU8}
+mod g17_host_path {'''+HOST_PATH_V93+r'''}
+'''+recovery_isolation_mod()+r'''
 impl Completion {
 '''+methods+r'''
 }
@@ -107,7 +113,8 @@ struct HardwareQueue;
 impl HardwareQueue {fn queue_id(&self)->u8{11}}
 '''+completion_mod()+queue_limits_mock()+r'''
 type Inflight=g17_completion::PairFifo<Active,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
-struct Queue {owner:Option<u64>,queue:HardwareQueue,inflight:Inflight,quarantined:bool,released:bool,retired_by_teardown:bool}
+struct Queue {owner:Option<u64>,queue:HardwareQueue,inflight:Inflight,quarantined:bool,released:bool,retired_by_teardown:bool,spared_deferred:bool}
+'''+spared_helper+r'''
 struct Device;
 impl Device {fn as_ref(&self)->&Self{self}}
 macro_rules! dev_info {($($t:tt)*)=>{()}}
@@ -125,9 +132,9 @@ impl Runtime {
 fn setup()->(Runtime,Arc<Completion>,Arc<Memory>,Arc<AtomicUsize>){
  let m=Arc::new(Memory::default());m.active.store(1,Ordering::SeqCst);
  let writes=Arc::new(AtomicUsize::new(0));
- let c=Arc::new(Completion{signalled:AtomicU32::new(0),vm_job:Mutex(StdMutex::new(Some(Pin(m.clone())))),status:Status::default(),fence:Fence::default(),aggregate_member:Aggregate::default(),destinations:[Some(Destination(writes.clone())),None]});
+ let c=Arc::new(Completion{signalled:AtomicU32::new(0),vm_job:Mutex(StdMutex::new(Some(Pin(m.clone())))),status:Status::default(),fence:Fence::default(),aggregate_member:Aggregate::default(),destinations:[Some(Destination(writes.clone())),None],recovery_class:Default::default()});
  let mut inflight=Inflight::new();if inflight.push(Active{packet:Packet{id:28522,completion:c.clone()}}).is_err(){unreachable!()}
- let q=Queue{owner:Some(10),queue:HardwareQueue,inflight,quarantined:false,released:false,retired_by_teardown:false};
+ let q=Queue{owner:Some(10),queue:HardwareQueue,inflight,quarantined:false,released:false,retired_by_teardown:false,spared_deferred:false};
  (Runtime{async_compute_queues:vec![q],pdev:None,retire_in_final_scan:false,scans:0},c,m,writes)
 }
 #[test] fn cancellation_keeps_maps_and_fails_only_waiter(){

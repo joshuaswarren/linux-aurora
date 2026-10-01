@@ -17,7 +17,9 @@ code path that provides it:
   3. the completed counter is set to the current submitted counter, not zero
      (native populateInitialFirmwareState, per the RE in repopulate());
   4. a pool that never served an owner is not rewritten (served flag);
-  5. no takeover while another owner's 0x2e release is unconsumed (v92c guard);
+  5. a pool's FList ID is leased until the pool drops and a teardown settles
+     only after its pools' 0x2e releases are consumed (shared FList; the v92c
+     takeover guard is now inert because IDs are never shared);
   6. a retained graph never serves a different VM or root slot (EBUSY);
   7. a new context's graph is built fresh (take_warm_render_graph refuses a pair
      that still holds storage, a root binding or trackers).
@@ -53,7 +55,8 @@ for marker in ["    pub(crate) fn begin_translated_render(",
     body = item(manager, marker)
     start = 0
     while (index := body.find("if !owner_matches {", start)) >= 0:
-        branch = body[index:index + 2000]
+        # v96 logs each takeover (counters) between the guard and repopulate.
+        branch = body[index:index + 4000]
         assert branch.index("storage.repopulate_render_flist()") \
             < branch.index("self.resources.stage_user_render_uma(storage)"), marker
         sites += 1
@@ -61,7 +64,8 @@ for marker in ["    pub(crate) fn begin_translated_render(",
 assert sites == 2, sites
 
 repopulate = item(resources, "    pub(crate) fn repopulate(&self) -> Result {")
-constructor = item(resources, "    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, render_slot: u8) -> Result<Self> {")
+# Shared FList: a pool is built for a logical context and maps its client VM.
+constructor = item(resources, "    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm) -> Result<Self> {")
 # 2. The same generator writes the constructor image and the repopulated one.
 assert "Self::for_each_pool_word(page_list_va, |at, value| put_u64(bytes, at, value))" in constructor
 assert "Self::for_each_pool_word(page_list_va, |at, value|" in repopulate
@@ -72,11 +76,16 @@ assert "put_u64(&mut shared_image, 0x54, submitted);" in repopulate
 # 4. A never-served pool keeps its constructor image.
 assert repopulate.index("if !self.served.swap(true, Ordering::AcqRel)") < repopulate.index("write_all(")
 
-# 5. v92c takeover guard: the submit path waits (bounded) for another owner's
-# unconsumed 0x2e before any graph for the pair is taken.
+# 5. Shared FList: every pool leases its own FList ID (129..255), so reusing a
+# physical pair can no longer replace another pool's UMA row and the v92c
+# takeover guard never blocks. Instead the old pool keeps its ID until the pool
+# drops, and a teardown settles only after its pools' releases are consumed.
 guard = item(manager, "    pub(crate) fn render_flist_takeover_blocked(")
-assert "G17PBootstrapUmaLifecycle::has_release_witness" in guard
-assert "Arc::ptr_eq(owner, context)" in guard
+assert guard.rstrip().endswith("false\n    }") or guard.rstrip().endswith("false\n    }".rstrip())
+assert "independent ID" in guard
+assert "let bit = self.0 as usize - 129;" in item(resources, "impl Drop for G17PRenderFlistId {")
+settle = item(manager, "    pub(crate) fn settle_logical_queue_teardowns(")
+assert "self.displaced_graphs_flists_released(index)" in settle
 publish = item(drm, "    fn publish_with(")
 assert publish.index("render_flist_takeover_ready(") < publish.index("take_warm_render_graph(")
 ready = item(live, "    pub(crate) fn render_flist_takeover_ready(")

@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from g17_recovery_isolation_test_support import recovery_isolation_mod
 
 s = (Path(__file__).resolve().parents[1] / "mmu.rs").read_text()
 
@@ -128,6 +129,20 @@ impl CondVar {
         self.1.load(Ordering::SeqCst)
     }
     fn notify_all(&self) { self.0.notify_all(); }
+    // Recovery isolation ADMISSION_WAIT: bounded interruptible wait.
+    fn wait_interruptible_timeout<T>(&self,guard:&mut Guard<'_,T>,jiffies:u64)->kernel::sync::CondVarTimeoutResult {
+        use kernel::sync::CondVarTimeoutResult as R;
+        if self.1.load(Ordering::SeqCst) { return R::Signal{jiffies}; }
+        let held=guard.0.take().unwrap();
+        let (held,result)=self.0.wait_timeout(held,std::time::Duration::from_millis(jiffies)).unwrap();
+        guard.0=Some(held);
+        if self.1.load(Ordering::SeqCst) { R::Signal{jiffies:0} }
+        else if result.timed_out() { R::Timeout } else { R::Woken{jiffies:jiffies.saturating_sub(1)} }
+    }
+}
+mod kernel {
+    pub mod time { pub type Jiffies=u64; pub fn msecs_to_jiffies(ms:u32)->u64{ms as u64} }
+    pub mod sync { pub enum CondVarTimeoutResult { Signal{jiffies:u64}, Timeout, Woken{jiffies:u64} } }
 }
 mod gem{#[derive(Clone)]pub struct Object(pub u64);}
 struct PreparedUserUnmap{iova:u64,size:u64}
@@ -396,7 +411,7 @@ fn import_rechecks_failure_after_retirement_wakeup() {
 
 with tempfile.TemporaryDirectory() as d:
     f = Path(d) / "test.rs"
-    f.write_text(source)
+    f.write_text(source + recovery_isolation_mod())
     exe = Path(d) / "test"
     subprocess.run(["rustc", "--edition=2021", "--test", str(f), "-o", str(exe)], check=True)
     subprocess.run([str(exe), "--test-threads=1", *sys.argv[1:]], check=True)

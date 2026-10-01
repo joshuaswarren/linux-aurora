@@ -4,6 +4,7 @@ from pathlib import Path
 from g17_config_test_support import with_g17_config
 from g17_compute_inflight_test_support import completion_mod, queue_limits_mock, TIMING_BUFFER_MOCK, KVEC_MOCK
 import subprocess,tempfile,sys
+from g17_recovery_isolation_test_support import recovery_isolation_mod
 p=Path(__file__).resolve().parents[1]
 def item(s,needle):
  a=s.index(needle);start=s.index('{',a);depth=1;i=start+1
@@ -47,6 +48,8 @@ methods='\n'.join(item(r,n) for n in [
  '    pub(crate) fn cancel_async_compute(',
  '    pub(crate) fn quarantine_async_compute(',
  '    fn release_firmware_retired_quarantined_compute('])
+# Recovery isolation (iso1): spared zero-duration queues fail their fences here.
+spared_helper=item(r,'fn fail_spared_deferred(')
 publish = item(r, '    pub(crate) fn publish_async_compute(')
 service = item(r, '    fn service_async_compute_completions_matching(')
 assert 'queue_g17p_firmware_event_worker' not in publish
@@ -148,6 +151,7 @@ impl Manager {
  fn log_compute_usage_slot(&mut self,_q:&mut G17PSksmQueue,_phase:&str){}
  fn dump_compute_completion_records(&mut self,_label:&str)->Result{Ok(())}
  fn dump_queue_compute_completion_records(&mut self,_label:&str,_q:&mut G17PSksmQueue)->Result{Ok(())}
+ fn return_witnessed_compute_queue(&mut self,_q:&mut G17PSksmQueue,_n:u32)->Result{Ok(())}
 '''+manager_batch+r'''
 }
 mod g17_status { pub struct VmStatus; }
@@ -163,7 +167,7 @@ mod module_parameters { pub struct P; impl P { pub fn value(&self)->&'static u32
   pub static g17p_quarantine_scope: P = P; }
 mod g17_live_boot { pub fn note_session_recovery_pending(pending:&mut bool,_pdev:Option<&()>,_reason:&'static str){ *pending = true; } }
 struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>,retired:AtomicUsize}
-impl Completion{fn complete(&self,r:Result<[u64;2]>){if self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst).is_ok() && r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}fn cancel_while_owned(&self){self.complete(Err(ECANCELED));}fn release_after_retirement(&self){self.retired.fetch_add(1,Ordering::SeqCst);}}
+impl Completion{fn recovery_spared(&self)->bool{false}fn complete(&self,r:Result<[u64;2]>){if self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst).is_ok() && r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}fn cancel_while_owned(&self){self.complete(Err(ECANCELED));}fn release_after_retirement(&self){self.retired.fetch_add(1,Ordering::SeqCst);}}
 #[derive(Clone)]struct Context{context_id:u32}impl Context{fn context_id(&self)->u32{self.context_id}}
 #[derive(Clone)]struct Packet{id:u64,context:Context,completion:Arc<Completion>}
 impl Packet{fn submission_id(&self)->u64{self.id}fn context(&self)->&Context{&self.context}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
@@ -175,7 +179,9 @@ type Inflight=g17_completion::PairFifo<Active,{g17_queue_limits::MAX_COMPUTE_IN_
 fn one(active:Active)->Inflight{let mut f=Inflight::new();if f.push(active).is_err(){unreachable!()}f}
 type RetiredLeases=g17_completion::PairFifo<Hold,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
 type G17PAsyncComputeQueue=Queue;
-struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,previous_binding:Option<Previous>,inflight:Inflight,released:bool,retirement_ready:bool,quarantined:bool,retired_by_teardown:bool,terminal_fanout:Option<(Arc<g17_status::VmStatus>,Error)>,retire_pending:bool,awaiting_retirement_witness:bool,retired_leases:RetiredLeases}
+struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,previous_binding:Option<Previous>,inflight:Inflight,released:bool,retirement_ready:bool,quarantined:bool,retired_by_teardown:bool,terminal_fanout:Option<(Arc<g17_status::VmStatus>,Error)>,retire_pending:bool,awaiting_retirement_witness:bool,retired_leases:RetiredLeases,
+ spared_quarantine:bool,first_kick_watch:bool,spared_deferred:bool}
+'''+spared_helper+'\n'+recovery_isolation_mod()+r'''
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
 mod g17_drm { use super::*; pub enum G17PDeferredCompletion { Compute { packet: Packet, timestamps: [u64;2] } }
  impl G17PDeferredCompletion { pub fn signal(self){ match self { Self::Compute{packet,timestamps} => packet.completion().unwrap().complete(Ok(timestamps)) } }
@@ -191,7 +197,7 @@ impl G17PLiveRuntime {
  fn fail_outstanding_jobs_for_vm(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}
 '''+methods+r'''
 }
-fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus),retired:AtomicUsize::new(0)});DESC_TS.with(|m|m.borrow_mut().insert((owner as u8,descriptor),1));let firmware=G17PComputeRetirementTicket{tsq_node:descriptor as u64,queue_id:owner as u8,descriptor,kick_timestamp:1,submitted_target:1,item_producer:1,item_count:8};let retirement=G17PAsyncComputeRetirementTicket{owner,submission:owner,context:owner as u32,recovery_epoch:0,firmware};(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0,[1,1],(1,1,8)),producer:Producer{submitted:1,previous_valid:true,previous_timestamp:1,geometry:Geometry},storage:Storage},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),previous_binding:None,inflight:one(Active{_work_state:g17_resources::G17PWorkStateLease{node:descriptor,counters:[1,1]},packet:Packet{id:owner,context:Context{context_id:owner as u32},completion:c.clone()},_lease:Hold(d.clone()),retirement:Some(retirement),observed:None}),released:false,retirement_ready:false,quarantined:false,retired_by_teardown:false,terminal_fanout:None,retire_pending:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new()},c)}
+fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus),retired:AtomicUsize::new(0)});DESC_TS.with(|m|m.borrow_mut().insert((owner as u8,descriptor),1));let firmware=G17PComputeRetirementTicket{tsq_node:descriptor as u64,queue_id:owner as u8,descriptor,kick_timestamp:1,submitted_target:1,item_producer:1,item_count:8};let retirement=G17PAsyncComputeRetirementTicket{owner,submission:owner,context:owner as u32,recovery_epoch:0,firmware};(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0,[1,1],(1,1,8)),producer:Producer{submitted:1,previous_valid:true,previous_timestamp:1,geometry:Geometry},storage:Storage},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),previous_binding:None,inflight:one(Active{_work_state:g17_resources::G17PWorkStateLease{node:descriptor,counters:[1,1]},packet:Packet{id:owner,context:Context{context_id:owner as u32},completion:c.clone()},_lease:Hold(d.clone()),retirement:Some(retirement),observed:None}),released:false,retirement_ready:false,quarantined:false,retired_by_teardown:false,terminal_fanout:None,retire_pending:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),spared_quarantine:false,first_kick_watch:false,spared_deferred:false},c)}
 #[test]fn exact_retirement_is_handed_to_the_deferral_list(){
  let d=Arc::new(AtomicUsize::new(0));let(a,c)=q(1,0x100,&d);
  let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(1,0x100,[2,3])])),async_compute_queues:vec![a],session_recovery_pending:false,deferred_completions:Vec::new(),deferred_completion_drain_owned:false,gfx_state:None};
