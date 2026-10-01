@@ -47,6 +47,7 @@ defer_batch = item("    fn defer_blocked_user_bind_batch(")
 commit_batch = item("    pub(crate) fn commit_prepared_user_bind_batch(")
 enter_commit = item("    fn enter_user_mapping_commit(")
 drop_object = item("    pub(crate) fn drop_mappings(")
+release_idle = item("    fn release_idle_closed_objects(")
 
 assert "self.vm.unmap_user_ranges_now" in guard
 assert "self.vm.drop_mappings_now" in guard
@@ -89,6 +90,23 @@ const EOVERFLOW:i32=75;
 const GFP_KERNEL:u32=0;
 macro_rules! pr_err{($($t:tt)*)=>{()}}
 macro_rules! pr_info{($($t:tt)*)=>{()}}
+// This harness covers the production default-off policy; async scheduling
+// itself needs a dedicated workqueue test before that opt-in is qualified.
+mod g17_mem_path {
+    pub struct Stat; impl Stat { pub fn since(&self, _:u64) {} }
+    pub const ASYNC_CLOSED_DRAIN:u32=1;
+    pub static DRAIN_INLINE:Stat=Stat;
+    pub static DRAIN_OBJECTS:()=(); pub static PARKED:()=();
+    pub static RETAIN_WAIT:Stat=Stat; pub static ADMISSION_WAIT:Stat=Stat;
+    pub fn enabled(_:u32)->bool {false}
+    pub fn stamp()->u64 {0} pub fn count(_: &(), _:u64) {}
+}
+struct T8140ClosedObjectDrain;
+impl T8140ClosedObjectDrain {
+    fn queue(_:Vm, _:KVec<ARef<gem::Object>>)->std::result::Result<(),KVec<ARef<gem::Object>>> {
+        panic!("async drain must remain disabled in default policy tests")
+    }
+}
 struct KVec<T>(Vec<T>);
 impl<T>KVec<T>{fn new()->Self{Self(vec![])} fn push(&mut self,v:T,_f:u32)->Result{self.0.push(v);Ok(())}}
 impl<T>Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
@@ -129,7 +147,7 @@ struct Vm {
     block_cleanup:Arc<AtomicBool>,
     cleanup_gate:Arc<(std::sync::Mutex<(bool,bool)>,StdCondvar)>,
 }
-''' + state + "\n" + gate_state + "\n" + gate_type + "\n" + guard + "\nimpl Vm {\n" + retain + "\n" + admit_map + "\n" + unmap_users + "\n" + drop_object + r'''
+''' + state + "\n" + gate_state + "\n" + gate_type + "\n" + guard + "\nimpl Vm {\n" + retain + "\n" + admit_map + "\n" + unmap_users + "\n" + drop_object + "\n" + release_idle + r'''
     fn unmap_user_ranges_now(&self,_user:Range<u64>,_kernel:Range<u64>)->Result {
         self.unmaps.fetch_add(1,Ordering::SeqCst);
         self.maybe_block_cleanup();

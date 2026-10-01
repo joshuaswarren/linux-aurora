@@ -277,6 +277,11 @@ pub(crate) enum G17PDeferredCompletion {
         packet: Arc<g17_job::G17PComputeJobPacket>,
         timestamps: [u64; 2],
     },
+    /// v93r: a quarantined render whose pair the firmware provably drained.
+    /// Its fence was already failed; only its retained guards are released.
+    ReleaseAfterDrain {
+        completion: Arc<G17PRenderCompletion>,
+    },
 }
 
 impl G17PDeferredCompletion {
@@ -290,6 +295,7 @@ impl G17PDeferredCompletion {
                     completion.complete(Ok(timestamps));
                 }
             }
+            Self::ReleaseAfterDrain { completion } => completion.release_after_firmware_drain(),
         }
     }
 
@@ -1456,6 +1462,16 @@ impl G17PRenderCompletion {
                 .rehabilitate_render_slot_after_processor_stop(lease.slot);
         }
         drop(lease);
+    }
+
+    /// v93r `g17p_recovery_path` bit0: the same release as
+    /// `release_after_processor_stop`, at the other boundary that ends
+    /// firmware ownership of this job: the runtime has proven, under the
+    /// runtime mutex with the recovery closed, that the firmware drained the
+    /// job's physical pair and has retired the pair's trackers
+    /// (`reclaim_drained_quarantined_render_slots`). The VM stays poisoned.
+    pub(crate) fn release_after_firmware_drain(&self) {
+        self.release_after_processor_stop();
     }
 }
 

@@ -11281,6 +11281,12 @@ impl G17PUserRenderStorage {
         self.render_root_slot
     }
 
+    /// v93r: the pair FList's host-submitted and firmware-completed kick
+    /// counters (the same pair the fault report prints).
+    pub(crate) fn render_flist_completion_counters(&self) -> Result<[u64; 2]> {
+        self.render_flist.completion_counters()
+    }
+
     pub(crate) fn render_flist_id(&self) -> u32 {
         u32::from(self.render_flist.id())
     }
@@ -19968,6 +19974,9 @@ impl G17ResourceOwner {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         g17p_live_write_u32(state_bytes, state_offset, producer_after)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // v93r g17p_recovery_path bit1: remember the record for re-announce
+        // diagnostics (one relaxed load when off).
+        crate::g17_recovery_path::note_control_publish(slot, opcode, arg);
         Ok(G17PDeviceControlPublication {
             opcode,
             arg,

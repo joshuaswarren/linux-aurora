@@ -1193,6 +1193,15 @@ impl LiveFirmwareU64Probe {
         self.page.set_bits_u64(self.offset, bits)
     }
 
+    /// DIAGNOSTIC (v93r). `set_bits` on a freshly invalidated line, then
+    /// clean it to the point of coherency so the coprocessor sees the bits.
+    pub(crate) fn set_bits_visible(&self, bits: u64) -> Result<(u64, u64)> {
+        self.page.invalidate_live_range(self.offset, size_of::<u64>())?;
+        let result = self.page.set_bits_u64(self.offset, bits)?;
+        self.page.clean_written_range(self.offset, size_of::<u64>())?;
+        Ok(result)
+    }
+
     /// DIAGNOSTIC. Read `out.len()` consecutive qwords from the probed qword
     /// onwards, within its page, after invalidating their AP cachelines. Not
     /// an atomic snapshot of the run.
