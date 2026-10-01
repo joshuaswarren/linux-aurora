@@ -168,13 +168,17 @@ mod module_parameters { pub struct P; impl P { pub fn value(&self)->&'static u32
   pub static g17p_quarantine_selftest: P = P; }
 mod g17_live_boot { pub fn note_session_recovery_pending(pending:&mut bool,_pdev:Option<&()>,_reason:&'static str){ *pending = true; } }
 struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>,retired:AtomicUsize}
-impl Completion{fn recovery_spared(&self)->bool{false}fn complete(&self,r:Result<[u64;2]>){if self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst).is_ok() && r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}fn cancel_while_owned(&self){self.complete(Err(ECANCELED));}fn release_after_retirement(&self){self.retired.fetch_add(1,Ordering::SeqCst);}}
+impl Completion{fn recovery_spared(&self)->bool{false}fn complete(&self,r:Result<[u64;2]>){if self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst).is_ok() && r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}fn cancel_while_owned(&self){self.complete(Err(ECANCELED));}fn release_after_retirement(&self){self.retired.fetch_add(1,Ordering::SeqCst);}
+ // iso4 REPLAY inputs: this harness's kicks are never spared, so its
+ // queues are never replay candidates (see test_g17_compute_replay.py).
+ fn replay_witness_words(&self)->Option<[u64;2]>{None}}
 #[derive(Clone)]struct Context{context_id:u32}impl Context{fn context_id(&self)->u32{self.context_id}}
 #[derive(Clone)]struct Packet{id:u64,context:Context,completion:Arc<Completion>}
 impl Packet{fn submission_id(&self)->u64{self.id}fn context(&self)->&Context{&self.context}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
 #[derive(Clone)]struct Hold(Arc<AtomicUsize>);impl Hold{fn quarantine(&self){}fn release_retired_admission(&mut self){}fn retarget_logical_context(&mut self,_context:Hold)->Result{Ok(())}}impl Drop for Hold{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
 #[derive(Debug,Copy,Clone,PartialEq,Eq)]struct G17PAsyncComputeRetirementTicket{owner:u64,submission:u64,context:u32,recovery_epoch:u64,firmware:G17PComputeRetirementTicket}
 struct Active{_work_state:g17_resources::G17PWorkStateLease,packet:Packet,_lease:Hold,retirement:Option<G17PAsyncComputeRetirementTicket>,observed:Option<G17PComputeCompletionCandidate>}
+struct G17PAsyncComputeReplay{packet:Packet,lease:Hold}
 struct Previous{_binding:Option<Hold>,_context:Hold,publication:Option<(u64,u64)>}
 type Inflight=g17_completion::PairFifo<Active,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
 fn one(active:Active)->Inflight{let mut f=Inflight::new();if f.push(active).is_err(){unreachable!()}f}
@@ -193,6 +197,7 @@ fn kick_deferred_completion_drain_from(_deferred:&Vec<g17_drm::G17PDeferredCompl
 struct G17PLiveRuntime{pdev:Option<()>,manager:Option<Manager>,async_compute_queues:Vec<Queue>,session_recovery_pending:bool,deferred_completions:Vec<g17_drm::G17PDeferredCompletion>,deferred_completion_drain_owned:bool,gfx_state:Option<Arc<()>>}
 '''+mask_helper+"\n"+front_finished+r'''
 impl G17PLiveRuntime {
+ fn replay_spared_compute(&mut self,_owner:u64,kept:KVec<G17PAsyncComputeReplay>){assert!(kept.is_empty(),"no replay in this harness");}
  fn log_timeout_scoreboard_after_power_hold(&mut self,_qids:u128){}
  fn fail_outstanding_jobs_for_vm_after_compute_observation(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}
  fn fail_outstanding_jobs_for_vm(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}

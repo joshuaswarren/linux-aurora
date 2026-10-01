@@ -924,6 +924,15 @@ impl G17PComputeLeaseGuard {
         self.released = true;
     }
 
+    /// Recovery isolation REPLAY: a spared never-started kick is published
+    /// again under the guard whose share `release_retired_admission` returned
+    /// at the zero-duration retire. Take the share back for that publication.
+    pub(crate) fn rearm_admission(&mut self) {
+        if !self.released { return; }
+        self.registry.compute_readers.fetch_add(1, Ordering::AcqRel);
+        self.released = false;
+    }
+
     /// Fault-only host admission snapshot. The render fields are coherent;
     /// the compute count is an independent atomic observation. These are leases, not a
     /// hardware execution-slot count: admitted work may still be queued, and
@@ -2668,6 +2677,14 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
                 G17PQueue::check_firmware_fence(fence)?;
             }
             let hardware_fence = completion.fence();
+            // iso4 REPLAY: while this queue awaits the retirement witness of a
+            // spared recovery, its older never-started kicks are about to be
+            // republished. Wait (bounded) so this newer job neither overtakes
+            // them nor meets the quarantine and fails. Costs one owner scan
+            // under the lock already taken; waits only after a recovery.
+            let mut replay_wait_ms = if crate::g17_recovery_isolation::enabled(
+                crate::g17_recovery_isolation::REPLAY,
+            ) { crate::g17_recovery_isolation::SUBMIT_WAIT_MS } else { 0 };
             // The same context-local allocator serves TA, 3D and CL. Its
             // initialization must not take place under the device mutex.
             loop {
@@ -2678,6 +2695,21 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
                 let mut runtime = self.runtime.mutex().lock();
                 if preparation.finish().is_err() {
                     drop(runtime);
+                    continue;
+                }
+                if replay_wait_ms != 0 && runtime.spared_compute_pending(self.owner) {
+                    drop(runtime);
+                    drop(lease);
+                    if replay_wait_ms == crate::g17_recovery_isolation::SUBMIT_WAIT_MS {
+                        crate::g17_recovery_isolation::count(
+                            &crate::g17_recovery_isolation::REPLAY_ORDER_WAITS);
+                    }
+                    replay_wait_ms -= 1;
+                    if replay_wait_ms == 0 {
+                        crate::g17_recovery_isolation::count(
+                            &crate::g17_recovery_isolation::REPLAY_ORDER_TIMEOUTS);
+                    }
+                    fsleep(Delta::from_millis(1));
                     continue;
                 }
                 runtime.publish_async_compute(self.owner, packet, lease)?;

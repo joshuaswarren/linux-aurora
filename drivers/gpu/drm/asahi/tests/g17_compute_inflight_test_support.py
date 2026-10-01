@@ -53,15 +53,20 @@ KVEC_MOCK = r'''
 const GFP_KERNEL: u32 = 0;
 /// Host stand-in for the kernel KVec: fixed capacity, never grows.
 struct KVec<T>(Vec<T>);
+/// The kernel's `kvec::PushError`: the rejected value is field `.0`.
+struct PushError<T>(T);
 impl<T> KVec<T> {
+ fn new() -> Self { Self(Vec::new()) }
  fn with_capacity(n: usize, _flags: u32) -> std::result::Result<Self, i32> { Ok(Self(Vec::with_capacity(n))) }
+ fn reserve(&mut self, n: usize, _flags: u32) -> std::result::Result<(), i32> { self.0.reserve(n); Ok(()) }
  fn len(&self) -> usize { self.0.len() }
  fn capacity(&self) -> usize { self.0.capacity() }
  fn clear(&mut self) { self.0.clear() }
- fn push_within_capacity(&mut self, v: T) -> std::result::Result<(), T> {
-  if self.0.len() < self.0.capacity() { self.0.push(v); Ok(()) } else { Err(v) }
+ fn push_within_capacity(&mut self, v: T) -> std::result::Result<(), PushError<T>> {
+  if self.0.len() < self.0.capacity() { self.0.push(v); Ok(()) } else { Err(PushError(v)) }
  }
 }
+impl<T> IntoIterator for KVec<T> { type Item = T; type IntoIter = std::vec::IntoIter<T>; fn into_iter(self) -> Self::IntoIter { self.0.into_iter() } }
 impl<T> std::ops::Deref for KVec<T> { type Target = [T]; fn deref(&self) -> &[T] { &self.0 } }
 impl<T> std::ops::DerefMut for KVec<T> { fn deref_mut(&mut self) -> &mut [T] { &mut self.0 } }
 type KVVec<T> = KVec<T>;

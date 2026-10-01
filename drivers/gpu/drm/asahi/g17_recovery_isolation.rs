@@ -70,10 +70,34 @@
 //!        the 2 s after the recovery. Whether a doorbell activates it is the
 //!        question this bit answers; it is not established.
 //!
-//! Replay of cancelled work is deliberately NOT done here (see the report):
-//! the firmware state of a cancelled QID after recovery and the work-state
-//! accounting of a cancelled kick are not yet established on hardware. The
-//! `first-kicks-*` counters measure the former on every returned queue.
+//!   bit6 REPLAY (iso4, default on): Vulkan has no per-command-buffer error
+//!        (native Metal reports InnocentVictim per command buffer; a Vulkan
+//!        client can only be told "device lost" or be handed wrong results),
+//!        so a spared command that provably never started is published again
+//!        instead of failing. Compute: a spared zero-duration queue's kicks
+//!        are kept across the retirement witness; only if EVERY kept kick's
+//!        own completion words still show start == end (firmware retired it
+//!        without executing, or never reached it) after the witness, and the
+//!        queue was returned to service, are they published again, oldest
+//!        first, before any newer submission of that queue (the compute
+//!        backend waits up to SUBMIT_WAIT_MS for the witness). Fences stay
+//!        unsignalled and CLASS_SPARED throughout, so nothing on this path
+//!        can poison the VM; a refused or failed replay fails that kick and
+//!        all its successors exactly as before (ENODATA, spared). A command
+//!        is replayed at most MAX_REPLAYS times, and each replay grants its
+//!        scheduler job one fresh timeout period (the recovery consumed the
+//!        old one). A replayed front kick is never treated as an earlier
+//!        recovery's collateral: if a later recovery blames its QID, it ran on
+//!        its own after the replay and its owner is guilty (no replay loop).
+//!        Renders are NOT replayed yet; spared renders failed after
+//!        firmware retirement are counted by whether their pass started
+//!        (`spared-render-started/-unstarted`) to size that work.
+//!        Evidence level: "start == end means never executed" is the driver's
+//!        existing zero-duration interpretation (`g17p_zero_duration`), and
+//!        kicks of one QID run in publication order, so a zero-duration front
+//!        kick implies none behind it ran. It is not independently decoded
+//!        from native firmware. Every in-flight kick snapshotted at recovery
+//!        in the saved logs (199 snapshots) had page words [0, 0].
 //!
 //! v2 (iso2): a recovery that blames a queue whose OLDEST in-flight work was
 //! already spared by an earlier recovery treats it as that recovery's
@@ -110,13 +134,16 @@ pub(crate) const SETTLE_CANCELLED: u32 = 1 << 2;
 pub(crate) const GUILTY_GRACE: u32 = 1 << 3;
 pub(crate) const RESUME_DOORBELL: u32 = 1 << 4;
 pub(crate) const ATTRIBUTION: u32 = 1 << 5;
+pub(crate) const REPLAY: u32 = 1 << 6;
 const ALL_BITS: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | GUILTY_GRACE | RESUME_DOORBELL
-    | ATTRIBUTION;
+    | ATTRIBUTION | REPLAY;
 /// Correctness/containment fixes with no hot-path cost are on; the guilty
 /// grace changes the guilty client's semantics and stays opt-in.
-pub(crate) const DEFAULT_MASK: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | ATTRIBUTION;
+pub(crate) const DEFAULT_MASK: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | ATTRIBUTION | REPLAY;
 
 pub(crate) const ADMISSION_WAIT_MS: u32 = 1000;
+/// iso4 REPLAY: publications of one command beyond its first.
+pub(crate) const MAX_REPLAYS: u8 = 3;
 pub(crate) const SUBMIT_WAIT_MS: u32 = 200;
 pub(crate) const GRACE_WINDOW_NS: u64 = 60_000_000_000;
 
@@ -124,6 +151,65 @@ static MASK: AtomicU32 = AtomicU32::new(DEFAULT_MASK);
 
 #[inline(always)]
 pub(crate) fn enabled(bit: u32) -> bool { MASK.load(Ordering::Relaxed) & bit != 0 }
+
+#[inline(always)]
+pub(crate) fn mask() -> u32 { MASK.load(Ordering::Relaxed) }
+
+// ---- REPLAY decision (bit6) ---------------------------------------------------
+
+/// Host state of one quarantined compute queue at its retirement witness.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComputeReplayQueue {
+    /// Every lost kick was spared and its fence is still unsignalled.
+    pub(crate) spared_deferred: bool,
+    /// The queue will be returned to service by this witness.
+    pub(crate) spared_quarantine: bool,
+    /// The owner has released (closed) the queue.
+    pub(crate) released: bool,
+    /// The queue still belongs to the witness ticket's owner.
+    pub(crate) owner_matches: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ComputeReplay {
+    /// Not a spared deferred queue, or the bits are off: unchanged path.
+    NotCandidate,
+    /// A candidate whose kicks cannot all be proven unexecuted: they fail
+    /// exactly as before (ENODATA, spared).
+    Refused,
+    /// Every kick provably never executed: keep them and publish again,
+    /// oldest first, once the queue is back in service.
+    Replay,
+}
+
+/// A kick's own completion words, read after the retirement witness, prove
+/// it never executed when start == end: firmware's zero-duration retirement
+/// shape, or both words still at the zeroed allocation value.
+pub(crate) const fn never_executed(words: [u64; 2]) -> bool { words[0] == words[1] }
+
+/// `kicks` yields, oldest first, each kick's completion words, or None when
+/// its fence is already signalled or the words are unreadable.
+pub(crate) fn compute_replay_decision<I>(mask: u32, queue: ComputeReplayQueue, kicks: I) -> ComputeReplay
+where I: IntoIterator<Item = Option<[u64; 2]>> {
+    if mask & (REPLAY | INNOCENT) != (REPLAY | INNOCENT)
+        || !queue.spared_deferred || !queue.spared_quarantine
+        || queue.released || !queue.owner_matches
+    {
+        return ComputeReplay::NotCandidate;
+    }
+    let mut any = false;
+    for words in kicks {
+        any = true;
+        match words {
+            Some(words) if never_executed(words) => {}
+            _ => return ComputeReplay::Refused,
+        }
+    }
+    if any { ComputeReplay::Replay } else { ComputeReplay::NotCandidate }
+}
+
+/// One more publication of a command that has been replayed `replays` times.
+pub(crate) const fn replay_budget_left(replays: u8) -> bool { replays < MAX_REPLAYS }
 
 /// Per-completion classification, written only while servicing a recovery.
 pub(crate) const CLASS_NONE: u8 = 0;
@@ -327,11 +413,24 @@ pub(crate) static REATTRIBUTED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NO_CULPRIT: AtomicU64 = AtomicU64::new(0);
 /// iso3.1: unclassified renders queued behind a spared head, failed with it.
 pub(crate) static SPARED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
+/// iso4 REPLAY: spared never-started compute kicks published again, and
+/// spared kicks that had to fail instead (ran, unprovable, or republish failed).
+pub(crate) static REPLAYED_COMPUTE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static REPLAY_REFUSED_COMPUTE: AtomicU64 = AtomicU64::new(0);
+/// iso4: spared renders failed after firmware retirement, split by whether
+/// the pass ever started (pass-start stamp) -- the render replay candidates.
+pub(crate) static SPARED_RENDER_UNSTARTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SPARED_RENDER_STARTED: AtomicU64 = AtomicU64::new(0);
+/// iso4: replayed compute jobs given a fresh scheduler timeout, and compute
+/// publications that waited for their own queue's witness/replay first.
+pub(crate) static REPLAY_TIMEOUT_RENEWED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static REPLAY_ORDER_WAITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static REPLAY_ORDER_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }
 
-static COUNTERS: [(&str, &AtomicU64); 22] = [
+static COUNTERS: [(&str, &AtomicU64); 29] = [
     ("recoveries", &RECOVERIES), ("unresolved", &UNRESOLVED),
     ("spared-renders", &SPARED_RENDERS), ("spared-compute", &SPARED_COMPUTE),
     ("guilty-marked", &GUILTY_MARKED), ("graced", &GRACED),
@@ -343,6 +442,10 @@ static COUNTERS: [(&str, &AtomicU64); 22] = [
     ("submit-timeouts", &SUBMIT_TIMEOUTS), ("resume-doorbells", &RESUME_DOORBELLS),
     ("collateral", &COLLATERAL), ("reattributed", &REATTRIBUTED), ("no-culprit", &NO_CULPRIT),
     ("spared-successors", &SPARED_SUCCESSORS),
+    ("replayed-compute", &REPLAYED_COMPUTE), ("replay-refused-compute", &REPLAY_REFUSED_COMPUTE),
+    ("spared-render-unstarted", &SPARED_RENDER_UNSTARTED), ("spared-render-started", &SPARED_RENDER_STARTED),
+    ("replay-timeout-renewed", &REPLAY_TIMEOUT_RENEWED), ("replay-order-waits", &REPLAY_ORDER_WAITS),
+    ("replay-order-timeouts", &REPLAY_ORDER_TIMEOUTS),
 ];
 
 // ---- parameter -----------------------------------------------------------------
