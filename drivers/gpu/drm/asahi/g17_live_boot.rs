@@ -1508,6 +1508,8 @@ fn complete_primary_real_recovery(
         return Err(EIO);
     }
     manager.validate_empty_primary_firmware_recovery(generation)?;
+    // Recovery isolation classifies against THIS recovery's table only.
+    crate::g17_recovery_isolation::clear_entries();
     // The scheduler-empty precondition is UNSATISFIABLE for a render-blamed
     // recovery. The firmware raises the restart request during the render
     // wait, so `render_storage`/`render_tracker` are populated by construction
@@ -1775,6 +1777,18 @@ fn complete_primary_real_recovery(
         return Err(ETIMEDOUT);
     }
     let recovery_info = manager.primary_firmware_recovery_info_snapshot()?;
+    // Recovery isolation: keep the decoded table for classification after the
+    // final clear (which may reset it). A read failure leaves it empty, and an
+    // empty table only removes the guilty-bit source, never adds innocence.
+    if crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::INNOCENT) {
+        let mut raw = [(0u32, 0u32); crate::g17_recovery_isolation::MAX_ENTRIES];
+        match manager.primary_recovery_info_entries(&mut raw) {
+            Ok(used) => crate::g17_recovery_isolation::store_entries(&raw[..used]),
+            Err(error) => dev_warn!(pdev.as_ref(),
+                "G17P recovery isolation: recovery-info read failed ({:?}); guilty set from the blamed stamp only\n",
+                error),
+        }
+    }
     dev_info!(
         pdev.as_ref(),
         "G17P recovery info: emitted={} valid={} first-valid-index={:?} first-valid-flags={:#x}\n",
@@ -4561,8 +4575,20 @@ impl G17PLiveRuntime {
                 return Err(error);
             }
         };
+        // Recovery isolation: classify every in-flight completion against this
+        // recovery's guilty set BEFORE anything below can fail it.
+        let spared_cancelled = if crate::g17_recovery_isolation::enabled(
+            crate::g17_recovery_isolation::INNOCENT)
+        {
+            self.classify_recovery_victims(blamed_stamp)
+        } else { 0 };
         if let Some(stamp) = blamed_stamp {
             self.settle_render_blamed_by_recovery(stamp, EIO);
+        }
+        if spared_cancelled != 0 && crate::g17_recovery_isolation::enabled(
+            crate::g17_recovery_isolation::SETTLE_CANCELLED)
+        {
+            self.settle_spared_cancelled_renders(spared_cancelled);
         }
         // The recovery acknowledged its final clear at state 0: the firmware
         // is alive and reset. Release the compute admission poison here;
@@ -4607,6 +4633,24 @@ impl G17PLiveRuntime {
         // continuation here covers both the workqueue and inline callers.
         if !self.is_crashed() && !self.primary_recovery_pending() {
             self.preparations.reopen();
+            // Recovery isolation bit4 (opt-in): one paired doorbell when a
+            // spared render the firmware did not cancel is still pending.
+            if crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::RESUME_DOORBELL)
+                && self.pending_render.iter().flatten().any(|completion| completion.recovery_spared())
+            {
+                let sent = match self.gfx_rtkit.as_mut() {
+                    Some(rtkit) => Pin::new(rtkit).send_message_logged(
+                        g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+                        g17_submission::G17P_PARTIAL_OPENING_PAIRED_DOORBELL),
+                    None => Err(ENODEV),
+                };
+                if sent.is_ok() {
+                    crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::RESUME_DOORBELLS);
+                }
+                dev_info!(pdev.as_ref(),
+                    "G17P recovery isolation: post-recovery paired doorbell for pending spared renders result={:?}\n",
+                    sent.map(|_| ()));
+            }
         }
         crate::driver::queue_g17p_firmware_event_worker(state.dev.clone());
         result
@@ -6622,6 +6666,10 @@ impl G17PLiveRuntime {
                 );
             }
             let status = signal.vm_status();
+            // Recovery isolation: a spared render fails its own fence (and,
+            // unretired, keeps its pair quarantined) but does not take the
+            // rest of its VM down with it.
+            let spared = signal.recovery_spared();
             if retired {
                 signal.complete(Err(EIO));
             } else {
@@ -6648,7 +6696,16 @@ impl G17PLiveRuntime {
                     self.quarantine_failed_render_completion(queued, error);
                 }
             }
-            self.fail_outstanding_jobs_for_vm(&status, error);
+            if spared {
+                crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::FANOUT_SKIPPED);
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_info!(pdev.as_ref(),
+                        "G17P recovery isolation: spared render slot {} failed ({:?}, firmware-retired={}); its VM keeps running\n",
+                        render_slot, error, retired);
+                }
+            } else {
+                self.fail_outstanding_jobs_for_vm(&status, error);
+            }
         }
     }
 

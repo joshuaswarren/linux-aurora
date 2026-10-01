@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! CPU-owned sticky VM failure reporting. No GPU mapping or firmware access.
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use kernel::prelude::*;
 
 pub(crate) const PARAM_GROUP_VM_STATUS: u32 = 1;
@@ -36,6 +36,11 @@ pub(crate) struct VmStatus {
     mirror: AtomicPtr<i32>,
     mirror_claimed: AtomicBool,
     mirror_owner: UnsafeCell<Option<MirrorOwner>>,
+    /// `g17p_recovery_isolation` bit3: monotonic ns of the last recovery in
+    /// which this VM was guilty but spared (0 = never).
+    recovery_grace_ns: AtomicU64,
+    /// VM id for diagnostics only (0 = unknown).
+    vm_id: u64,
 }
 // SAFETY: `mirror_owner` is written once, by the single thread that won
 // `mirror_claimed`, before `mirror` is published; it is otherwise only
@@ -45,13 +50,32 @@ unsafe impl Sync for VmStatus {}
 unsafe impl Send for VmStatus {}
 
 impl VmStatus {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> Self { Self::new_for(0) }
+
+    /// Status of VM `vm_id`; the id only names the VM in diagnostics.
+    pub(crate) fn new_for(vm_id: u64) -> Self {
         Self {
             error: AtomicI32::new(0),
             mirror: AtomicPtr::new(core::ptr::null_mut()),
             mirror_claimed: AtomicBool::new(false),
             mirror_owner: UnsafeCell::new(None),
+            recovery_grace_ns: AtomicU64::new(0),
+            vm_id,
         }
+    }
+
+    pub(crate) fn vm_id(&self) -> u64 { self.vm_id }
+
+    /// Classify this VM for one recovery (see `g17_recovery_isolation`).
+    /// Consumes the guilty grace when it is granted.
+    pub(crate) fn recovery_class(&self, guilty: bool, grace: bool, now_ns: u64) -> u8 {
+        let last = self.recovery_grace_ns.load(Ordering::Acquire);
+        let (class, consumed) =
+            crate::g17_recovery_isolation::classify(guilty, grace, now_ns, last);
+        if consumed {
+            self.recovery_grace_ns.store(now_ns.max(1), Ordering::Release);
+        }
+        class
     }
 
     /// Register the mirror word. `word` must point to a 4-byte-aligned i32
@@ -136,7 +160,8 @@ impl VmStatus {
                 self.publish_mirror(error);
                 let loc = core::panic::Location::caller();
                 pr_err!(
-                    "G17PMARK vm-status POISONED err={} by {}:{}\n",
+                    "G17PMARK vm-status POISONED vm={} err={} by {}:{}\n",
+                    self.vm_id,
                     error,
                     loc.file(),
                     loc.line(),

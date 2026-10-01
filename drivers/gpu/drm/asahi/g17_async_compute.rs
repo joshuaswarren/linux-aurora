@@ -91,6 +91,16 @@ struct G17PAsyncComputeQueue {
     /// the packets were held. A quarantined queue admits nothing new, so the
     /// in-flight bound also bounds this.
     retired_leases: G17PAsyncComputeRetiredLeases,
+    /// `g17p_recovery_isolation`: every command this queue was quarantined
+    /// for was spared by a recovery (cancelled for another client). Once the
+    /// retirement witness releases them the queue returns to service.
+    spared_quarantine: bool,
+    /// Log and count the first retirement after a return to service.
+    first_kick_watch: bool,
+    /// Spared zero-duration kicks whose fences are NOT yet signalled: they
+    /// complete (with an error, no VM status) at the retirement witness, so
+    /// no VM-job quarantine ever blocks the innocent VM's admission.
+    spared_deferred: bool,
 }
 
 /// Type-1 firmware events identify completed stamp/QID slots in a 128-bit
@@ -222,6 +232,9 @@ impl G17PLiveRuntime {
                 retire_pending: false,
                 awaiting_retirement_witness: false,
                 retired_leases: G17PAsyncComputeRetiredLeases::new(),
+                spared_quarantine: false,
+                first_kick_watch: false,
+                spared_deferred: false,
             }, GFP_KERNEL)?;
             index
         };
@@ -802,6 +815,18 @@ impl G17PLiveRuntime {
                             ]);
                             crate::g17_timing_buffer::record(words);
                         }
+                        if q.first_kick_watch {
+                            q.first_kick_watch = false;
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::FIRST_KICKS_OK);
+                            if let Some(pdev) = self.pdev.as_ref() {
+                                dev_info!(pdev.as_ref(),
+                                    "G17P recovery isolation: qid={} first kick after return retired submission={} start={} end={} duration={}\n",
+                                    q.queue.queue_id(), active.packet.submission_id(),
+                                    timestamps[0], timestamps[1],
+                                    timestamps[1].wrapping_sub(timestamps[0]));
+                            }
+                        }
                         if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
                             dev_info!(pdev.as_ref(),
                                 "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={} in-flight={}\n",
@@ -879,6 +904,16 @@ impl G17PLiveRuntime {
                         // so it is retired exactly as before; only the session-wide
                         // escalation is skipped.
                         let submission_scoped = error == ENODATA;
+                        if q.first_kick_watch {
+                            q.first_kick_watch = false;
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::FIRST_KICKS_FAILED);
+                            if let Some(pdev) = &self.pdev {
+                                dev_err!(pdev.as_ref(),
+                                    "G17P recovery isolation: qid={} first kick after return FAILED ({:?})\n",
+                                    q.queue.queue_id(), error);
+                            }
+                        }
                         if submission_scoped {
                             if let Some(pdev) = &self.pdev {
                                 dev_info!(pdev.as_ref(),
@@ -910,6 +945,20 @@ impl G17PLiveRuntime {
                         // poison: nothing is stuck, and the latch would outlive the
                         // recovery that already cleared it.
                         let mut terminal = None;
+                        // Recovery isolation: a queue whose every failed kick
+                        // was spared fails those fences only (no VM status, no
+                        // VM-wide fan-out) and may return after the witness.
+                        let mut all_spared = q.inflight.is_some();
+                        // A spared zero-duration queue defers its fences to the
+                        // retirement witness: firmware never started these kicks,
+                        // and completing them only after the witness needs no
+                        // VM-job quarantine (which would refuse the innocent
+                        // VM's next submission while its other work drains).
+                        let defer = submission_scoped
+                            && crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::INNOCENT)
+                            && q.inflight.is_some()
+                            && q.inflight.iter().all(|active| active.packet.completion()
+                                .is_ok_and(|completion| completion.recovery_spared()));
                         for active in q.inflight.iter_mut() {
                             if submission_scoped {
                                 active._lease.release_retired_admission();
@@ -917,8 +966,25 @@ impl G17PLiveRuntime {
                                 active._lease.quarantine();
                             }
                             let completion = active.packet.completion()?;
-                            completion.fail_while_owned(error);
-                            terminal.get_or_insert_with(|| completion.status.clone());
+                            let spared = completion.recovery_spared();
+                            all_spared &= spared;
+                            if !defer {
+                                completion.fail_while_owned(error);
+                            }
+                            if !spared {
+                                terminal.get_or_insert_with(|| completion.status.clone());
+                            }
+                        }
+                        q.spared_quarantine = all_spared && submission_scoped;
+                        q.spared_deferred = defer;
+                        if all_spared {
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::FANOUT_SKIPPED);
+                            if let Some(pdev) = &self.pdev {
+                                dev_info!(pdev.as_ref(),
+                                    "G17P recovery isolation: qid={} spared after {:?}; failing its {} kick(s) only, VM status untouched\n",
+                                    q.queue.queue_id(), error, q.inflight.len());
+                            }
                         }
                         if submission_scoped {
                             // The zero-duration record names the front kick's
@@ -1011,6 +1077,7 @@ impl G17PLiveRuntime {
             let (true, Some(ticket)) = (identity, newest) else {
                 // Not provable any more: keep everything until processor stop.
                 q.awaiting_retirement_witness = false;
+                fail_spared_deferred(q, EIO);
                 if let Some(pdev) = pdev {
                     dev_err!(pdev.as_ref(),
                         "G17P async compute: retirement-witness qid={} lost its ticket identity; retaining {} command(s) until processor stop\n",
@@ -1030,9 +1097,17 @@ impl G17PLiveRuntime {
                         let packet = active.packet;
                         let lease = active._lease;
                         if let Ok(completion) = packet.completion() {
-                            // The fence already carries the error from
-                            // `fail_while_owned`; only the VM pin is outstanding.
-                            completion.release_after_retirement();
+                            if q.spared_deferred {
+                                // Recovery isolation: firmware retired this
+                                // never-started kick (the witness above); fail
+                                // its fence now. A spared completion records no
+                                // VM status and drops its pin without quarantine.
+                                completion.complete(Err(ENODATA));
+                            } else {
+                                // The fence already carries the error from
+                                // `fail_while_owned`; only the VM pin is outstanding.
+                                completion.release_after_retirement();
+                            }
                         }
                         // A quarantined queue admits nothing new, so the
                         // retired-lease FIFO (same bound as the in-flight
@@ -1048,14 +1123,62 @@ impl G17PLiveRuntime {
                         released += 1;
                         drop(packet);
                     }
+                    q.spared_deferred = false;
                     if let Some(pdev) = pdev {
                         dev_info!(pdev.as_ref(),
                             "G17P async compute: quarantined qid={} owner={} newest-submission={} retired by firmware ({}) -- released {} packet(s) and their VM pin; the graph stays quarantined\n",
                             q.queue.queue_id(), ticket.owner, ticket.submission, reason, released);
                     }
+                    // Recovery isolation: the cancelled kicks were all spared
+                    // and the witness proves firmware retired every one of
+                    // them, which is exactly the state an ordinary retirement
+                    // of the same kicks would leave. Settle the host-side
+                    // accounting those retirements would have settled and
+                    // return the queue to its owner.
+                    if q.spared_quarantine
+                        && crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::INNOCENT)
+                    {
+                        q.spared_quarantine = false;
+                        match manager.return_witnessed_compute_queue(&mut q.queue, in_flight) {
+                            Ok(()) => {
+                                q.quarantined = false;
+                                q.retire_pending = false;
+                                q.retirement_ready = true;
+                                // Every publication made with the replacement
+                                // binding is among the witnessed kicks.
+                                if q.previous_binding.as_ref().is_some_and(|previous|
+                                    previous.publication.is_some())
+                                {
+                                    drop(q.previous_binding.take());
+                                }
+                                // Their admission shares were already released.
+                                while let Some(lease) = q.retired_leases.take() {
+                                    drop(lease);
+                                }
+                                q.first_kick_watch = true;
+                                crate::g17_recovery_isolation::count(
+                                    &crate::g17_recovery_isolation::QUEUES_RETURNED);
+                                if let Some(pdev) = pdev {
+                                    dev_info!(pdev.as_ref(),
+                                        "G17P recovery isolation: qid={} owner={} returned to service after a spared recovery ({} kick(s) witnessed retired)\n",
+                                        q.queue.queue_id(), ticket.owner, in_flight);
+                                }
+                            }
+                            Err(error) => {
+                                crate::g17_recovery_isolation::count(
+                                    &crate::g17_recovery_isolation::QUEUE_RETURN_FAILED);
+                                if let Some(pdev) = pdev {
+                                    dev_err!(pdev.as_ref(),
+                                        "G17P recovery isolation: qid={} could not be returned to service ({:?}); it stays quarantined\n",
+                                        q.queue.queue_id(), error);
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     q.awaiting_retirement_witness = false;
+                    fail_spared_deferred(q, EIO);
                     if let Some(pdev) = pdev {
                         dev_err!(pdev.as_ref(),
                             "G17P async compute: retirement-witness qid={} invariant failed ({:?}); retaining {} command(s) until processor stop\n",
@@ -1319,7 +1442,17 @@ impl G17PLiveRuntime {
             active.packet.submission_id() == submission) else { return false; };
         // A real hardware fault already owns its quarantine decision. Queue
         // teardown must neither undo that nor signal the same fence twice.
-        if q.quarantined { return true; }
+        if q.quarantined {
+            if q.spared_deferred {
+                q.spared_deferred = false;
+                for queued in q.inflight.iter() {
+                    if let Ok(completion) = queued.packet.completion() {
+                        completion.cancel_while_owned();
+                    }
+                }
+            }
+            return true;
+        }
         q.released = true;
         q.retired_by_teardown = true;
         if let Ok(completion) = active.packet.completion() {
@@ -1345,6 +1478,12 @@ impl G17PLiveRuntime {
         let mut terminal_status = None;
         let mut diagnostic_qids = 0u128;
         if let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) {
+            // A spared zero-duration queue awaiting its witness has not
+            // signalled its fences yet; the watchdog fails them now
+            // (retaining their pins, still without VM status).
+            if q.inflight.iter().any(|active| active.packet.submission_id() == submission) {
+                fail_spared_deferred(q, error);
+            }
             if let Some(active) = q.inflight.iter().find(|active|
                 active.packet.submission_id() == submission)
             {
@@ -1410,6 +1549,18 @@ impl G17PLiveRuntime {
                         if let Ok(completion) = active.packet.completion() {
                             terminal_status = Some(completion.status.clone());
                         }
+                        // Recovery isolation: when every kick on the queue was
+                        // spared, fail their fences only and let the witness
+                        // return the queue; otherwise today's VM loss.
+                        let all_spared = q.inflight.iter().all(|queued|
+                            queued.packet.completion().is_ok_and(|completion|
+                                completion.recovery_spared()));
+                        q.spared_quarantine = all_spared && q.awaiting_retirement_witness;
+                        if all_spared {
+                            terminal_status = None;
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::FANOUT_SKIPPED);
+                        }
                         // The quarantined queue is never observed again, so
                         // every kick queued on it -- older or newer than the one
                         // that timed out -- fails now, while its packet and
@@ -1433,5 +1584,211 @@ impl G17PLiveRuntime {
             self.fail_outstanding_jobs_for_vm(&status, error);
         }
         matched
+    }
+}
+
+// ---- g17p_recovery_isolation (see g17_recovery_isolation.rs) ---------------
+impl G17PLiveRuntime {
+    /// Classify every in-flight render and compute completion for the recovery
+    /// being serviced: completions of a VM that owns a guilty queue keep
+    /// today's behaviour (CLASS_GUILTY, unless the opt-in grace spares it);
+    /// every other VM's completions are CLASS_SPARED. Returns the QID mask of
+    /// queues the firmware listed as cancelled whose owners were spared.
+    ///
+    /// Fail-safe: if the guilty set is empty or any guilty QID has no
+    /// in-flight owner the host can name, nothing is marked (today's
+    /// behaviour for this recovery).
+    fn classify_recovery_victims(&mut self, blamed_stamp: Option<u8>) -> u128 {
+        use crate::g17_recovery_isolation as iso;
+        iso::count(&iso::RECOVERIES);
+        let mut table = [iso::RecoveryEntry { qid: 0, flags: 0, stamp: 0 }; iso::MAX_ENTRIES];
+        let used = iso::entries(&mut table);
+        let (guilty_qids, listed_qids, cancelled_qids) = iso::qid_masks(&table[..used], blamed_stamp);
+
+        // Resolve every guilty QID to the VM statuses of its in-flight work.
+        const MAX_VMS: usize = 8;
+        let mut guilty: [Option<Arc<crate::g17_status::VmStatus>>; MAX_VMS] = Default::default();
+        let mut guilty_count = 0usize;
+        let mut unresolved = guilty_qids == 0;
+        let mut push = |guilty: &mut [Option<Arc<crate::g17_status::VmStatus>>; MAX_VMS],
+                        count: &mut usize, status: Arc<crate::g17_status::VmStatus>| -> bool {
+            if guilty[..*count].iter().flatten().any(|known| Arc::ptr_eq(known, &status)) {
+                return true;
+            }
+            if *count >= MAX_VMS { return false; }
+            guilty[*count] = Some(status);
+            *count += 1;
+            true
+        };
+        for qid in 0..128u8 {
+            if guilty_qids & (1u128 << qid) == 0 { continue; }
+            let mut found = false;
+            if let Some(slot) = self.manager.as_ref().and_then(|manager| manager.render_slot_for_qid(qid)) {
+                let index = usize::from(slot);
+                let pending = self.pending_render.get(index).and_then(Option::as_ref);
+                let queued = self.pending_render_queued.get(index);
+                for completion in Iterator::chain(pending.into_iter(), queued.into_iter().flat_map(|fifo| fifo.iter())) {
+                    found = true;
+                    if !push(&mut guilty, &mut guilty_count, completion.vm_status()) { unresolved = true; }
+                }
+            }
+            for q in self.async_compute_queues.iter().filter(|q| q.queue.queue_id() == qid) {
+                for active in q.inflight.iter() {
+                    if let Ok(completion) = active.packet.completion() {
+                        found = true;
+                        if !push(&mut guilty, &mut guilty_count, completion.status.clone()) { unresolved = true; }
+                    }
+                }
+            }
+            unresolved |= !found;
+        }
+        if unresolved || guilty_count == 0 {
+            iso::count(&iso::UNRESOLVED);
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_warn!(pdev.as_ref(),
+                    "G17P recovery isolation: blamed stamp {:?} guilty-qids={:#x} entries={} -- guilty owner not resolvable; isolation off for this recovery\n",
+                    blamed_stamp, guilty_qids, used);
+            }
+            return 0;
+        }
+
+        // One class per VM for this recovery (the grace is consumed once).
+        let grace = iso::enabled(iso::GUILTY_GRACE);
+        let now = crate::g17_timing_buffer::now();
+        let mut classes = [iso::CLASS_GUILTY; MAX_VMS];
+        let mut graced = 0u32;
+        for (index, status) in guilty[..guilty_count].iter().enumerate() {
+            if let Some(status) = status {
+                classes[index] = status.recovery_class(true, grace, now);
+                if classes[index] == iso::CLASS_SPARED {
+                    graced += 1;
+                    iso::count(&iso::GRACED);
+                }
+            }
+        }
+        let class_of = |status: &Arc<crate::g17_status::VmStatus>| -> u8 {
+            guilty[..guilty_count].iter().zip(classes.iter())
+                .find(|(known, _)| known.as_ref().is_some_and(|known| Arc::ptr_eq(known, status)))
+                .map_or(iso::CLASS_SPARED, |(_, class)| *class)
+        };
+
+        let mut spared_ids = [0u64; MAX_VMS];
+        let mut spared_id_count = 0usize;
+        let mut note_spared = |id: u64| {
+            if !spared_ids[..spared_id_count].contains(&id) && spared_id_count < MAX_VMS {
+                spared_ids[spared_id_count] = id;
+                spared_id_count += 1;
+            }
+        };
+        let mut spared_renders = 0u32;
+        let mut guilty_renders = 0u32;
+        let mut spared_slots = 0u64;
+        for slot in 0..self.pending_render.len() {
+            let pending = self.pending_render[slot].as_ref();
+            let queued = self.pending_render_queued.get(slot);
+            for completion in Iterator::chain(pending.into_iter(), queued.into_iter().flat_map(|fifo| fifo.iter())) {
+                let class = class_of(&completion.vm_status());
+                completion.set_recovery_class(class);
+                if class == iso::CLASS_SPARED {
+                    spared_renders += 1;
+                    note_spared(completion.vm_status().vm_id());
+                    spared_slots |= 1u64 << (slot & 63);
+                    iso::count(&iso::SPARED_RENDERS);
+                } else {
+                    guilty_renders += 1;
+                    iso::count(&iso::GUILTY_MARKED);
+                }
+            }
+        }
+        let mut spared_compute = 0u32;
+        let mut guilty_compute = 0u32;
+        let mut spared_cancelled = 0u128;
+        for q in self.async_compute_queues.iter() {
+            for active in q.inflight.iter() {
+                let Ok(completion) = active.packet.completion() else { continue; };
+                let class = class_of(&completion.status);
+                completion.set_recovery_class(class);
+                if class == iso::CLASS_SPARED {
+                    spared_compute += 1;
+                    note_spared(completion.status.vm_id());
+                    iso::count(&iso::SPARED_COMPUTE);
+                } else {
+                    guilty_compute += 1;
+                    iso::count(&iso::GUILTY_MARKED);
+                }
+            }
+        }
+        // Render queues the firmware CANCELLED (bit2) whose owner was spared,
+        // settled promptly under SETTLE_CANCELLED (in the 00:06 capture the
+        // firmware had already retired every such group in the same pass).
+        // Listed-but-not-cancelled work (02:24: Hyprland's parked 3D, flags
+        // 0x1) is left to firmware or the watchdog: settling it now could
+        // quarantine its pair while firmware still owns it. Guilty QIDs are
+        // excluded by construction.
+        if let Some(manager) = self.manager.as_ref() {
+            for qid in 0..128u8 {
+                if cancelled_qids & !guilty_qids & (1u128 << qid) == 0 { continue; }
+                if let Some(slot) = manager.render_slot_for_qid(qid) {
+                    if spared_slots & (1u64 << (slot & 63)) != 0 {
+                        spared_cancelled |= 1u128 << qid;
+                    }
+                }
+            }
+        }
+        if let Some(pdev) = self.pdev.as_ref() {
+            let mut guilty_ids = [0u64; MAX_VMS];
+            for (id, status) in guilty_ids.iter_mut().zip(guilty[..guilty_count].iter()) {
+                *id = status.as_ref().map_or(0, |status| status.vm_id());
+            }
+            dev_info!(pdev.as_ref(),
+                "G17P recovery isolation: blamed stamp {:?} guilty-qids={:#x} listed-qids={:#x} cancelled-qids={:#x} guilty-vms={:?} graced={} spared-vms={:?} renders spared={} guilty={} compute spared={} guilty={}\n",
+                blamed_stamp, guilty_qids, listed_qids, cancelled_qids, &guilty_ids[..guilty_count], graced,
+                &spared_ids[..spared_id_count],
+                spared_renders, guilty_renders, spared_compute, guilty_compute);
+        }
+        spared_cancelled
+    }
+
+    /// SETTLE_CANCELLED: settle, through the same exact-once path the blamed
+    /// slot takes, every spared render slot the firmware listed as cancelled.
+    /// A firmware-retired group completes with an error fence and the slot
+    /// stays usable; an unproven one is failed with its pair quarantined
+    /// (released by the existing reclaim/processor-stop witnesses).
+    fn settle_spared_cancelled_renders(&mut self, cancelled_qids: u128) {
+        let mut done = 0u64;
+        for qid in 0..128u8 {
+            if cancelled_qids & (1u128 << qid) == 0 { continue; }
+            let Some(slot) = self.manager.as_ref().and_then(|manager| manager.render_slot_for_qid(qid)) else { continue; };
+            if done & (1u64 << (slot & 63)) != 0 { continue; }
+            done |= 1u64 << (slot & 63);
+            let spared = self.pending_render.get(usize::from(slot)).and_then(Option::as_ref)
+                .is_some_and(|completion| completion.recovery_spared());
+            if !spared || !self.render_fence_state.pending(slot) { continue; }
+            crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::SETTLED_CANCELLED);
+            self.settle_failed_deferred_render(slot, None, None, ECANCELED);
+        }
+    }
+
+    /// ADMISSION_WAIT for compute submits: observe the retirement witness of
+    /// `owner`'s spared quarantined queue. True while it is still pending.
+    pub(crate) fn spared_compute_pending(&mut self, owner: u64) -> bool {
+        let pending = |runtime: &Self| runtime.async_compute_queues.iter().any(|q|
+            q.owner == Some(owner) && q.quarantined && q.spared_quarantine);
+        if !pending(self) { return false; }
+        self.release_firmware_retired_quarantined_compute("client-submit");
+        pending(self)
+    }
+}
+
+/// Recovery isolation: fail the still-unsignalled fences of a spared
+/// zero-duration queue whose retirement can no longer be awaited, retaining
+/// every pin exactly as the eager path does (no VM status: they are spared).
+fn fail_spared_deferred(q: &mut G17PAsyncComputeQueue, error: Error) {
+    if !q.spared_deferred { return; }
+    q.spared_deferred = false;
+    for active in q.inflight.iter() {
+        if let Ok(completion) = active.packet.completion() {
+            completion.fail_while_owned(error);
+        }
     }
 }

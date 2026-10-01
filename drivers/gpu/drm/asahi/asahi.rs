@@ -45,6 +45,7 @@ mod g17_timing_buffer;
 mod g17_e2e;
 mod g17_host_path;
 mod g17_recovery_path;
+mod g17_recovery_isolation;
 mod g17_mem_path;
 mod g17_store;
 mod g17_power_preflight;

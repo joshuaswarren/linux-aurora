@@ -3667,6 +3667,10 @@ impl G17PManagerConstruction {
         self.resources.primary_firmware_recovery_info_snapshot()
     }
 
+    pub(crate) fn primary_recovery_info_entries(&mut self, out: &mut [(u32, u32)]) -> Result<usize> {
+        self.resources.primary_recovery_info_entries(out)
+    }
+
     /// Accept one firmware-initiated recovery before Linux has constructed a
     /// queue, fence, or user submission. Native macOS compares the packet to
     /// its host-side accepted generation and increments that generation before
@@ -11499,6 +11503,48 @@ impl G17PManagerConstruction {
         Ok(producer == ticket.item_producer % ring.count
             && consumer == ticket.item_producer % ring.count
             && queue.producer.submitted == in_flight)
+    }
+
+    /// `g17p_recovery_isolation`: return a queue whose quarantined kicks were
+    /// all cancelled by another client's recovery and are now proven retired
+    /// by `independent_compute_retired_by_firmware` (the caller has just
+    /// observed it true for the newest of exactly `in_flight` kicks).
+    ///
+    /// Settles the host accounting an ordinary retirement of those kicks
+    /// would have settled -- QoS in-flight records, the producer's submitted
+    /// count, the armed completion descriptor/stamp -- and, as the retained
+    /// queue does after every recovery (`RECOVERY_RESYNC` bit0), makes the
+    /// next kick carry the no-predecessor implicit dependency: every earlier
+    /// kick of this QID is retired, so there is nothing left to order after,
+    /// and a recovery-cancelled predecessor stamp is not relied upon.
+    /// Forward-only state (stamp sequence, ordinal, item ring) is untouched.
+    pub(crate) fn return_witnessed_compute_queue(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+        in_flight: u32,
+    ) -> Result {
+        if !queue.independent_context || in_flight == 0
+            || queue.producer.submitted != in_flight
+            || self.firmware_recovery_handshake_snapshot()?.state != 0
+        {
+            return Err(EINVAL);
+        }
+        let ring = queue.compute.read_compute_ring_state()?;
+        if ring.count == 0 || ring.consumer % ring.count != ring.producer % ring.count {
+            return Err(EBUSY);
+        }
+        for _ in 0..in_flight {
+            self.resources.complete_qos_queue_records(&[
+                (queue.queue_id, queue.qos_hardware_buffer_id(), 2),
+            ])?;
+        }
+        queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, in_flight)
+            .map_err(|_| EINVAL)?;
+        queue.completion_descriptor = 0;
+        queue.completion_stamp_armed = false;
+        queue.producer.previous_valid = false;
+        queue.producer.previous_timestamp = 0;
+        Ok(())
     }
 
     /// Allocate a stable graph identity and lease an empty slot in the common
