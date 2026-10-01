@@ -140,6 +140,8 @@ pub(crate) struct G17PJobCompletion {
     /// job may renew one timeout for the latest replay.
     replays: core::sync::atomic::AtomicU8,
     replay_timeout_credit: core::sync::atomic::AtomicU8,
+    /// iso4: a render took this kick's native token as its parent.
+    native_consumer: core::sync::atomic::AtomicBool,
 }
 
 impl G17PJobCompletion {
@@ -183,6 +185,7 @@ impl G17PJobCompletion {
             recovery_class: core::sync::atomic::AtomicU8::new(0),
             replays: core::sync::atomic::AtomicU8::new(0),
             replay_timeout_credit: core::sync::atomic::AtomicU8::new(0),
+            native_consumer: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -228,6 +231,11 @@ impl G17PJobCompletion {
     }
 
     pub(crate) fn replay_count(&self) -> u8 { self.replays.load(Ordering::Acquire) }
+
+    /// iso4: record that a render was published with this kick's native
+    /// token as its parent. Such a command is never replayed.
+    pub(crate) fn note_native_consumer(&self) { self.native_consumer.store(true, Ordering::Release); }
+    pub(crate) fn has_native_consumer(&self) -> bool { self.native_consumer.load(Ordering::Acquire) }
 
     /// Consume the timeout renewal the latest replay granted. Only an
     /// unsignalled command can use it.

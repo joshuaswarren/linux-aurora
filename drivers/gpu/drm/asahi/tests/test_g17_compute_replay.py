@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""iso4 recovery-isolation REPLAY.
+"""iso4 recovery-isolation REPLAY and inherited-error rules.
 
 Runs the production pure functions from g17_recovery_isolation.rs (through
 the stub builder) and checks the ordering of the replay path in
@@ -28,14 +28,16 @@ def item(text, marker):
 compute = (root / "g17_async_compute.rs").read_text()
 witness = item(compute, "    fn release_firmware_retired_quarantined_compute(")
 replay = item(compute, "    fn replay_spared_compute(")
+native = item(compute, "    pub(crate) fn async_compute_native_dependency(")
 
 # Kept kicks are published only after this scan, and only for a queue that
 # the witness returned to service; otherwise they fail exactly as before.
 assert witness.index("return_witnessed_compute_queue(") < witness.index("replays.push_within_capacity(")
 assert "let kept = if returned {" in witness
 assert witness.index("for (owner, kept) in replays.into_iter()") > witness.index("Err(error) => {\n                    q.awaiting_retirement_witness = false;")
-# The decision sees every kept kick's own completion words.
+# The decision sees every kept kick's own words and any native consumer.
 assert "completion.replay_witness_words()" in witness
+assert "completion.has_native_consumer()" in witness
 # Per kick: budget, then reset words, then re-arm admission, then publish.
 assert replay.index("begin_replay()") < replay.index("reset_for_replay()") \
     < replay.index("rearm_admission()") < replay.index("publish_async_compute(")
@@ -44,11 +46,16 @@ assert "Some(error) => Err(error)," in replay
 assert "completion.complete(Err(ENODATA));" in replay
 # The class is never reset: a replay stays spared (no VM status).
 assert "set_recovery_class" not in replay
+# A render ordered on a kick's native token marks it; a spared queue that is
+# still waiting for its witness fails the render without a device-loss code.
+assert native.index("completion.note_native_consumer()") > native.index("if state > 0 { return Ok(None); }")
+assert native.index("return Err(ECANCELED);") < native.index("if q.quarantined || handshake.state != 0")
 
 tests = r'''
 use g17_recovery_isolation as iso;
 const SPARED: iso::ComputeReplayQueue = iso::ComputeReplayQueue {
     spared_deferred: true, spared_quarantine: true, released: false, owner_matches: true,
+    native_consumer: false,
 };
 #[test] fn replays_only_provably_unexecuted_spared_kicks() {
     use iso::ComputeReplay::*;
@@ -61,6 +68,9 @@ const SPARED: iso::ComputeReplayQueue = iso::ComputeReplayQueue {
     assert_eq!(iso::compute_replay_decision(mask, SPARED, [Some([0u64, 0]), Some([1, 2])]), Refused);
     assert_eq!(iso::compute_replay_decision(mask, SPARED, [Some([7u64, 0])]), Refused);
     assert_eq!(iso::compute_replay_decision(mask, SPARED, [Some([0u64, 0]), None]), Refused);
+    // A render already released against a cancelled token refuses it too.
+    let consumed = iso::ComputeReplayQueue { native_consumer: true, ..SPARED };
+    assert_eq!(iso::compute_replay_decision(mask, consumed, [Some([0u64, 0])]), Refused);
     // Not a spared deferred, returning, owned queue: the old path.
     for q in [iso::ComputeReplayQueue { spared_deferred: false, ..SPARED },
               iso::ComputeReplayQueue { spared_quarantine: false, ..SPARED },
@@ -76,6 +86,15 @@ const SPARED: iso::ComputeReplayQueue = iso::ComputeReplayQueue {
     assert_eq!(iso::MAX_REPLAYS, 3);
     assert!(iso::replay_budget_left(0) && iso::replay_budget_left(2));
     assert!(!iso::replay_budget_left(3));
+}
+#[test] fn inherited_device_loss_is_not_the_consumers_own() {
+    for e in [-5, -110, -19] {
+        assert_eq!(iso::inherited_errno(iso::INNOCENT, e), -125);
+        assert_eq!(iso::inherited_errno(0, e), e);
+    }
+    for e in [-125, -61, -16, -4, -512] {
+        assert_eq!(iso::inherited_errno(iso::INNOCENT, e), e);
+    }
 }
 '''
 

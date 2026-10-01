@@ -43,6 +43,7 @@ def recovery_isolation_mod():
                    "pub(crate) enum ComputeReplay {",
                    "pub(crate) const fn never_executed(",
                    "pub(crate) fn compute_replay_decision<",
+                   "pub(crate) const fn inherited_errno(",
                    "pub(crate) const fn replay_budget_left("):
         typed = "struct" in marker or "enum" in marker
         out.append(" #[derive(Copy, Clone, Debug, PartialEq, Eq)]" if typed else "")

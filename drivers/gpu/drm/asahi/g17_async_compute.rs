@@ -394,6 +394,16 @@ impl G17PLiveRuntime {
         let completion = active.packet.completion()?;
         if !Arc::ptr_eq(&completion.status, status) { return Err(EIO); }
         let ticket = active.retirement.as_ref().ok_or(EIO)?;
+        // iso4: a queue spared by another client's recovery is waiting for its
+        // retirement witness (and replay). The render cannot be ordered after
+        // it yet; fail the render without charging its VM a device loss.
+        if q.quarantined && q.spared_quarantine
+            && crate::g17_recovery_isolation::enabled(crate::g17_recovery_isolation::INNOCENT)
+        {
+            crate::g17_recovery_isolation::count(
+                &crate::g17_recovery_isolation::INHERITED_NOT_POISONED);
+            return Err(ECANCELED);
+        }
         // Publication settles any open recovery first. A closed recovery since
         // this compute's publication leaves its native stamp meaningful.
         if q.quarantined || handshake.state != 0 {
@@ -404,8 +414,14 @@ impl G17PLiveRuntime {
         let state = unsafe { kernel::bindings::dma_fence_get_status(
             kernel::dma_fence::RawDmaFence::raw(&fence),
         ) };
-        if state < 0 { return Err(Error::from_errno(state)); }
+        if state < 0 {
+            return Err(crate::g17_drm::inherited_dependency_error(Error::from_errno(state)));
+        }
         if state > 0 { return Ok(None); }
+        // iso4: this render is ordered on the kick's native token. If another
+        // client's recovery cancels the kick, retiring it satisfies the
+        // token, so the kick must not be replayed after this render ran.
+        completion.note_native_consumer();
         let timestamp = ticket.firmware.kick_timestamp();
         let mut dependency = g17_submission::g17p_render_barrier_from_timestamp(
             timestamp, q.queue.queue_id(),
@@ -1121,6 +1137,8 @@ impl G17PLiveRuntime {
                             spared_quarantine: q.spared_quarantine,
                             released: q.released,
                             owner_matches: q.owner == Some(ticket.owner),
+                            native_consumer: q.inflight.iter().any(|active| active.packet.completion()
+                                .is_ok_and(|completion| completion.has_native_consumer())),
                         },
                         q.inflight.iter().map(|active| active.packet.completion().ok()
                             .and_then(|completion| completion.replay_witness_words())),
@@ -1135,6 +1153,17 @@ impl G17PLiveRuntime {
                         unstarted = false;
                     }
                     if replay_candidate && !unstarted {
+                        let consumed = q.inflight.iter().any(|active| active.packet.completion()
+                            .is_ok_and(|completion| completion.has_native_consumer()));
+                        if consumed {
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::REPLAY_REFUSED_CONSUMER);
+                            if let Some(pdev) = pdev {
+                                dev_info!(pdev.as_ref(),
+                                    "G17P recovery isolation: qid={} replay refused: a render was published against one of its {} cancelled kick(s)\n",
+                                    q.queue.queue_id(), q.inflight.len());
+                            }
+                        }
                         for _ in q.inflight.iter() {
                             crate::g17_recovery_isolation::count(
                                 &crate::g17_recovery_isolation::REPLAY_REFUSED_COMPUTE);

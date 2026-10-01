@@ -171,7 +171,7 @@ struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::V
 impl Completion{fn recovery_spared(&self)->bool{false}fn complete(&self,r:Result<[u64;2]>){if self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst).is_ok() && r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}fn cancel_while_owned(&self){self.complete(Err(ECANCELED));}fn release_after_retirement(&self){self.retired.fetch_add(1,Ordering::SeqCst);}
  // iso4 REPLAY inputs: this harness's kicks are never spared, so its
  // queues are never replay candidates (see test_g17_compute_replay.py).
- fn replay_witness_words(&self)->Option<[u64;2]>{None}}
+ fn replay_witness_words(&self)->Option<[u64;2]>{None}fn has_native_consumer(&self)->bool{false}}
 #[derive(Clone)]struct Context{context_id:u32}impl Context{fn context_id(&self)->u32{self.context_id}}
 #[derive(Clone)]struct Packet{id:u64,context:Context,completion:Arc<Completion>}
 impl Packet{fn submission_id(&self)->u64{self.id}fn context(&self)->&Context{&self.context}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}

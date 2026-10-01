@@ -979,6 +979,18 @@ struct G17PLeaseGuard {
     slot: u8,
 }
 
+/// iso4 `g17_recovery_isolation::inherited_errno`: a consumer that fails
+/// because its dependency failed is not charged with that dependency's
+/// device loss (with INNOCENT set). Counted when the code changes.
+pub(crate) fn inherited_dependency_error(error: Error) -> Error {
+    let errno = error.to_errno();
+    let inherited = crate::g17_recovery_isolation::inherited_errno(
+        crate::g17_recovery_isolation::mask(), errno);
+    if inherited == errno { return error; }
+    crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::INHERITED_NOT_POISONED);
+    Error::from_errno(inherited)
+}
+
 fn append_render_prefix_dependencies(
     frontier: &[(u64, g17_job::G17PCommandFences)], prefix: Option<u64>,
     dependencies: &mut KVec<Fence>, checked_dependencies: &mut KVec<Fence>,
@@ -1218,7 +1230,13 @@ impl G17PRenderCompletion {
         crate::g17_submission::g17p_live_render_dependency(
             crate::g17_submission::G17PRenderOrder { sequence: 0, wait_through: Some(sequence) },
             sequence, status, self.fragment_dependency.load(Ordering::Acquire),
-        ).map_err(|_| EIO)
+        ).map_err(|error| if error
+            == crate::g17_submission::SubmissionError::RenderBarrierPredecessorFailed
+        {
+            // iso4: the predecessor failed; that is not this render's own
+            // device loss (see `inherited_dependency_error`).
+            inherited_dependency_error(EIO)
+        } else { EIO })
     }
 
     /// Runtime publication and retirement share one mutex. Every preceding
@@ -1240,7 +1258,13 @@ impl G17PRenderCompletion {
         crate::g17_submission::g17p_live_render_dependency(
             self.render_order, predecessor.render_order.sequence, status,
             predecessor.fragment_dependency.load(Ordering::Acquire),
-        ).map_err(|_| EIO)
+        ).map_err(|error| if error
+            == crate::g17_submission::SubmissionError::RenderBarrierPredecessorFailed
+        {
+            // iso4: the predecessor failed; that is not this render's own
+            // device loss (see `inherited_dependency_error`).
+            inherited_dependency_error(EIO)
+        } else { EIO })
     }
 
     pub(crate) fn render_sequence(&self) -> u64 {
@@ -2228,10 +2252,10 @@ impl G17PRenderQueueBackend {
             if completion.vm_status().get() != 0 { return Err(EIO); }
             failure_stage = "render-input-fence";
             for fence in packet.input_fences() {
-                G17PQueue::wait_fence(fence)?;
+                G17PQueue::wait_fence(fence).map_err(inherited_dependency_error)?;
             }
             for fence in packet.firmware_fences() {
-                G17PQueue::check_firmware_fence(fence)?;
+                G17PQueue::check_firmware_fence(fence).map_err(inherited_dependency_error)?;
             }
             if packet.cancel_requested() { return Err(ECANCELED); }
             if e2e { crate::g17_e2e::record(crate::g17_e2e::K_DEPS_DONE, 0, submission_id, [0; 5]); }
@@ -2671,10 +2695,10 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
             // dependency succeeded. Consume every retained dependency status
             // before taking a hardware lease or writing queue state.
             for fence in packet.input_fences() {
-                G17PQueue::wait_fence(fence)?;
+                G17PQueue::wait_fence(fence).map_err(inherited_dependency_error)?;
             }
             for fence in packet.firmware_fences() {
-                G17PQueue::check_firmware_fence(fence)?;
+                G17PQueue::check_firmware_fence(fence).map_err(inherited_dependency_error)?;
             }
             let hardware_fence = completion.fence();
             // iso4 REPLAY: while this queue awaits the retirement witness of a
