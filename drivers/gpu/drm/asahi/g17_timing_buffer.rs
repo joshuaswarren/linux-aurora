@@ -660,6 +660,9 @@ pub(crate) const DIAG_EARLY_RENDER_KICK: u32 = 1 << 13;
 pub(crate) const MSG_KTRACE: u64 = 11;
 /// a/b/c=args 1..3 of the preceding MSG_KTRACE.
 pub(crate) const MSG_KTRACE_ARGS: u64 = 12;
+/// v93: a=record qword 3 (+0x18; GPU pstate index in type-0x10 records),
+/// b=role, c=consumer, following the MSG_STATS_RECORD of the same record.
+pub(crate) const MSG_STATS_RECORD_Q3: u64 = 13;
 const MSGLOG_ENTRIES: usize = 8192;
 static MSGLOG: [[AtomicU64; 4]; MSGLOG_ENTRIES] =
     [const { [const { AtomicU64::new(0) }; 4] }; MSGLOG_ENTRIES];
@@ -776,3 +779,146 @@ pub(crate) const DIAG_NATIVE_RING_DRAIN_OFF: u32 = 1 << 26;
 pub(crate) fn fw_cached_family_mask() -> u32 {
     (DIAG_KNOBS.load(Ordering::Relaxed) >> 27) & 0xf
 }
+
+// ---------------------------------------------------------------------------
+/// v93 statistics pstate sampler: root-only `g17p_stats_pstate`, default 0.
+///
+/// Writing 1 makes the (default, native-parity) statistics-ring drain also
+/// read four u32 words of every drained record -- +0x04/+0x08 (timestamp, as
+/// one u64) and +0x18/+0x1c (qword 3; the GPU pstate index of type-0x10
+/// records) -- before it publishes the consumer, and record them here. The
+/// drain's legality check, consumer publication and order are unchanged; a
+/// failed sample read is counted and skipped, never propagated. Written 0
+/// (default) the drain pays one relaxed load per pass. "reset" clears.
+///
+/// Reading prints cumulative counters (difference two reads for a window;
+/// the lab samples at 4 Hz), the latest type-0x10 sample, per-pstate record
+/// counts and timestamp ticks (each type-0x10 delta is attributed to the
+/// previous record's pstate, per role), then the newest ring entries.
+/// Buckets are the low byte of qword 3, 16 meaning >= 16. The pstate
+/// meaning of qword 3 is taken from native RE, not verified on Linux.
+pub(crate) const STATS_PSTATE_TYPE: u32 = 0x10;
+const PSTATE_BUCKETS: usize = 17;
+const PSTATE_RING: usize = 64;
+static PSTATE_ON: AtomicU32 = AtomicU32::new(0);
+static PSTATE_RECORDS: AtomicU64 = AtomicU64::new(0);
+static PSTATE_TYPE10: AtomicU64 = AtomicU64::new(0);
+static PSTATE_READ_FAILS: AtomicU64 = AtomicU64::new(0);
+/// Latest type-0x10 sample: timestamp, qword 3, role.
+static PSTATE_LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static PSTATE_COUNT: [AtomicU64; PSTATE_BUCKETS] = [const { AtomicU64::new(0) }; PSTATE_BUCKETS];
+static PSTATE_TICKS: [AtomicU64; PSTATE_BUCKETS] = [const { AtomicU64::new(0) }; PSTATE_BUCKETS];
+/// Per role: previous type-0x10 timestamp and bucket + 1 (0 = none yet).
+static PSTATE_PREV: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
+/// (timestamp, qword 3 with role in bit 63).
+static PSTATE_SAMPLES: [[AtomicU64; 2]; PSTATE_RING] = [const { [const { AtomicU64::new(0) }; 2] }; PSTATE_RING];
+static PSTATE_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+pub(crate) fn stats_pstate_enabled() -> bool { PSTATE_ON.load(Ordering::Relaxed) != 0 }
+
+pub(crate) fn stats_pstate_read_failed() { PSTATE_READ_FAILS.fetch_add(1, Ordering::Relaxed); }
+
+/// Pure bucket choice (low byte of qword 3; 16 = out of range).
+pub(crate) const fn stats_pstate_bucket(qword3: u64) -> usize {
+    let index = (qword3 & 0xff) as usize;
+    if index < PSTATE_BUCKETS - 1 { index } else { PSTATE_BUCKETS - 1 }
+}
+
+/// Record one drained statistics record (single writer: the drain runs
+/// under the runtime mutex; readers only load).
+pub(crate) fn stats_pstate_note(role: usize, entry_type: u32, timestamp: u64, qword3: u64) {
+    PSTATE_RECORDS.fetch_add(1, Ordering::Relaxed);
+    if entry_type != STATS_PSTATE_TYPE { return; }
+    let role = role.min(1);
+    PSTATE_TYPE10.fetch_add(1, Ordering::Relaxed);
+    let bucket = stats_pstate_bucket(qword3);
+    PSTATE_COUNT[bucket].fetch_add(1, Ordering::Relaxed);
+    let previous = PSTATE_PREV[role][1].load(Ordering::Relaxed);
+    let previous_ts = PSTATE_PREV[role][0].load(Ordering::Relaxed);
+    if previous != 0 && timestamp > previous_ts {
+        PSTATE_TICKS[(previous - 1) as usize % PSTATE_BUCKETS]
+            .fetch_add(timestamp - previous_ts, Ordering::Relaxed);
+    }
+    PSTATE_PREV[role][0].store(timestamp, Ordering::Relaxed);
+    PSTATE_PREV[role][1].store(bucket as u64 + 1, Ordering::Relaxed);
+    PSTATE_LAST[0].store(timestamp, Ordering::Relaxed);
+    PSTATE_LAST[1].store(qword3, Ordering::Relaxed);
+    PSTATE_LAST[2].store(role as u64, Ordering::Relaxed);
+    let slot = PSTATE_NEXT.fetch_add(1, Ordering::Relaxed) % PSTATE_RING;
+    PSTATE_SAMPLES[slot][0].store(timestamp, Ordering::Relaxed);
+    PSTATE_SAMPLES[slot][1].store((qword3 & !(1 << 63)) | (role as u64) << 63, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn pstate_set(value: *const core::ffi::c_char,
+    _: *const bindings::kernel_param) -> core::ffi::c_int {
+    if value.is_null() { return -22; }
+    let mut command = [0u8; 16];
+    let mut len = 0;
+    while len < command.len() {
+        // SAFETY: the parameter core supplies a NUL-terminated value.
+        let byte = unsafe { *value.add(len) } as u8;
+        if byte == 0 { break; }
+        command[len] = byte;
+        len += 1;
+    }
+    if len == command.len() { return -22; }
+    let text = match core::str::from_utf8(&command[..len]) { Ok(text) => text.trim(), Err(_) => return -22 };
+    match text {
+        "0" => PSTATE_ON.store(0, Ordering::Release),
+        "1" => PSTATE_ON.store(1, Ordering::Release),
+        "reset" => {
+            for counter in [&PSTATE_RECORDS, &PSTATE_TYPE10, &PSTATE_READ_FAILS] {
+                counter.store(0, Ordering::Relaxed);
+            }
+            for counter in PSTATE_LAST.iter().chain(PSTATE_COUNT.iter()).chain(PSTATE_TICKS.iter()) {
+                counter.store(0, Ordering::Relaxed);
+            }
+            for role in &PSTATE_PREV { role[0].store(0, Ordering::Relaxed); role[1].store(0, Ordering::Relaxed); }
+            for slot in &PSTATE_SAMPLES { slot[0].store(0, Ordering::Relaxed); slot[1].store(0, Ordering::Relaxed); }
+            PSTATE_NEXT.store(0, Ordering::Release);
+        }
+        _ => return -22,
+    }
+    0
+}
+unsafe extern "C" fn pstate_get(buf: *mut core::ffi::c_char,
+    _: *const bindings::kernel_param) -> core::ffi::c_int {
+    if buf.is_null() { return -22; }
+    // SAFETY: sysfs parameter output is PAGE_SIZE, at least 4096 bytes.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), 4000) };
+    let mut out = Output { bytes: &mut bytes[..], used: 0 };
+    let _ = writeln!(out, "on={} records={} type10={} read_fails={} last_ts={:#x} last_q3={:#x} last_role={} now={:#x}",
+        PSTATE_ON.load(Ordering::Relaxed), PSTATE_RECORDS.load(Ordering::Relaxed),
+        PSTATE_TYPE10.load(Ordering::Relaxed), PSTATE_READ_FAILS.load(Ordering::Relaxed),
+        PSTATE_LAST[0].load(Ordering::Relaxed), PSTATE_LAST[1].load(Ordering::Relaxed),
+        PSTATE_LAST[2].load(Ordering::Relaxed), arch_counter());
+    let _ = write!(out, "count");
+    for counter in &PSTATE_COUNT { let _ = write!(out, " {}", counter.load(Ordering::Relaxed)); }
+    let _ = write!(out, "\nticks");
+    for counter in &PSTATE_TICKS { let _ = write!(out, " {}", counter.load(Ordering::Relaxed)); }
+    let _ = writeln!(out);
+    let next = PSTATE_NEXT.load(Ordering::Acquire);
+    let first = next.saturating_sub(PSTATE_RING);
+    for index in first..next {
+        let slot = &PSTATE_SAMPLES[index % PSTATE_RING];
+        let _ = writeln!(out, "{:x} {:x}", slot[0].load(Ordering::Relaxed), slot[1].load(Ordering::Relaxed));
+    }
+    out.used as core::ffi::c_int
+}
+static PSTATE_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
+    flags: 0, set: Some(pstate_set), get: Some(pstate_get), free: None,
+};
+#[link_section = "__param"]
+#[used]
+static PSTATE_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
+    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
+        c"g17p_stats_pstate"
+    } else { c"asahi.g17p_stats_pstate" }),
+    #[cfg(MODULE)]
+    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
+    #[cfg(not(MODULE))]
+    mod_: core::ptr::null_mut(),
+    ops: core::ptr::from_ref(&PSTATE_OPS), perm: 0o600, level: -1, flags: 0,
+    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
+});

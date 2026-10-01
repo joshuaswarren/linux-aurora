@@ -18832,6 +18832,9 @@ impl G17ResourceOwner {
                 return Err(EIO);
             }
         };
+        // v93 `g17p_stats_pstate` (default off): one relaxed load per pass.
+        let sample = crate::g17_timing_buffer::stats_pstate_enabled();
+        let role_index = matches!(role, InstanceRole::Secondary) as usize;
         for _ in 0..pending {
             let entry = ring
                 .checked_add(u64::from(consumer) * g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE as u64)
@@ -18843,6 +18846,20 @@ impl G17ResourceOwner {
                 g17p_native_ring_quarantine(
                     self.dev().as_ref(), role, true, consumer, producer, Some(entry_type));
                 return Err(EIO);
+            }
+            if sample {
+                // Read-only, before this entry's consumer publication; a
+                // failed read is counted and never alters the drain.
+                let object = self.ktrace_object(role);
+                let mut word = |offset: u64| entry.checked_add(offset).ok_or(EINVAL)
+                    .and_then(|address| object.read_live_u32(address));
+                match (word(0x04), word(0x08), word(0x18), word(0x1c)) {
+                    (Ok(ts_lo), Ok(ts_hi), Ok(q3_lo), Ok(q3_hi)) =>
+                        crate::g17_timing_buffer::stats_pstate_note(role_index, entry_type,
+                            u64::from(ts_lo) | u64::from(ts_hi) << 32,
+                            u64::from(q3_lo) | u64::from(q3_hi) << 32),
+                    _ => crate::g17_timing_buffer::stats_pstate_read_failed(),
+                }
             }
             let next = g17_completion::g17p_native_ring_next(
                 consumer, g17_completion::G17P_STATISTICS_CAPACITY);
@@ -18888,9 +18905,11 @@ impl G17ResourceOwner {
             .ok_or(EINVAL)?;
         let object = self.ktrace_object(role);
         let record_offset = record_address.checked_sub(object.iova()).ok_or(EINVAL)? as usize;
-        let mut raw = [0u8; 0x18];
+        // v93: 0x20 bytes, so qword 3 (+0x18, the GPU pstate index of
+        // type-0x10 records) is logged too (MSG_STATS_RECORD_Q3).
+        let mut raw = [0u8; 0x20];
         let copied = object.with_bytes_mut(|bytes| {
-            raw.copy_from_slice(bytes.get(record_offset..record_offset + 0x18).ok_or(EINVAL)?);
+            raw.copy_from_slice(bytes.get(record_offset..record_offset + 0x20).ok_or(EINVAL)?);
             Ok(())
         });
         if copied.is_ok() {
@@ -18901,6 +18920,13 @@ impl G17ResourceOwner {
             };
             crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_STATS_RECORD,
                 qword(0), qword(1), qword(2));
+            crate::g17_timing_buffer::msglog(crate::g17_timing_buffer::MSG_STATS_RECORD_Q3,
+                qword(3), role_bit, consumer as u64);
+            if crate::g17_timing_buffer::stats_pstate_enabled() {
+                // Timestamp at +0x04 spans qwords 0/1.
+                crate::g17_timing_buffer::stats_pstate_note(role_bit as usize, qword(0) as u32,
+                    (qword(0) >> 32) | (qword(1) << 32), qword(3));
+            }
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.ktrace_object(role).write_u32(state, producer)?;

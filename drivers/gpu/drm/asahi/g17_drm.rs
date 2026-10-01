@@ -1414,11 +1414,28 @@ impl G17PRenderCompletion {
         // mapping.
         drop(self.vm_job.lock().take());
         let e2e_vm = crate::g17_e2e::stamp();
-        self.fence.signal();
-        let e2e_hw = crate::g17_e2e::stamp();
-        self.aggregate_member.complete(result);
+        // v93 AGG_FIRST: wake userspace (the ioctl aggregate) before the
+        // per-command hardware fence, whose inline callbacks are drm_sched
+        // job-done bookkeeping nobody outside this driver waits on. Every
+        // guarantee userspace relies on (timestamps, sticky status, slot and
+        // VM-job release) is already established above. The submit path's
+        // depth count treats a render as retired once its aggregate signals.
+        let agg_first = crate::g17_host_path::enabled(crate::g17_host_path::AGG_FIRST);
+        let e2e_hw = if agg_first {
+            crate::g17_host_path::count(&crate::g17_host_path::AGG_FIRST_TAKEN);
+            self.aggregate_member.complete(result);
+            let e2e_agg = crate::g17_e2e::stamp();
+            self.fence.signal();
+            e2e_agg
+        } else {
+            self.fence.signal();
+            let e2e_hw = crate::g17_e2e::stamp();
+            self.aggregate_member.complete(result);
+            e2e_hw
+        };
         if e2e_entry != 0 {
-            crate::g17_e2e::record(crate::g17_e2e::K_COMPLETE, 0, self.submission_id,
+            // a=1: AGG_FIRST order; word 4 is then the aggregate stamp.
+            crate::g17_e2e::record(crate::g17_e2e::K_COMPLETE, agg_first as u32, self.submission_id,
                 [e2e_entry, e2e_written, e2e_lease, e2e_vm, e2e_hw]);
         }
     }
@@ -1869,7 +1886,44 @@ struct G17PQueue {
     /// v91 fine laps (e2e option bit4) of the submission in progress; the
     /// queue mutex serialises its submissions.
     e2e_fine: [u64; 12],
+    /// v93 FW_DEPS/AGG_FIRST: this queue's most recent fully enqueued ioctls
+    /// (aggregate reference, per-command hardware fences, logical command
+    /// ranges), ring order. Slots and their vectors are reused.
+    recent: [G17PRecentSubmission; crate::g17_host_path::FW_DEP_RECENT],
+    recent_next: usize,
+    /// v93: hardware fences of the ioctl being enqueued (swapped into its
+    /// ring slot when the whole ioctl is queued); `None` after a failed push.
+    ioctl_commands: Option<KVec<Fence>>,
     id: u64,
+}
+
+/// v93: one fully enqueued ioctl of this queue. Holding the aggregate
+/// reference keeps its address unique while it is compared against inputs.
+struct G17PRecentSubmission {
+    aggregate: Option<Fence>,
+    /// Every command's hardware fence: an unpublished failure signals it with
+    /// an error and may leave the VM clean, so a converted dependent must
+    /// status-check each one at publication, not only the aggregate.
+    commands: KVec<Fence>,
+    /// Inclusive logical ranges of its commands; (0, 0) when it had none.
+    render: (u64, u64),
+    compute: (u64, u64),
+}
+
+impl G17PRecentSubmission {
+    const EMPTY: Self = Self { aggregate: None, commands: KVec::new(), render: (0, 0), compute: (0, 0) };
+}
+
+/// v93 FW_DEPS: the ioctl's input syncs split into unchanged host waits and
+/// firmware-expressed same-queue prefixes. Applied to every command.
+struct G17PSyncPlan {
+    /// Kept exactly as before: DRM scheduler dependency plus checked input.
+    host: KVec<Fence>,
+    /// Matched same-queue aggregates: status-checked at publication, never
+    /// waited (their commands are ordered by the raised prefixes).
+    firmware: KVec<Fence>,
+    render_through: u64,
+    compute_through: u64,
 }
 
 impl Drop for G17PQueue {
@@ -1973,8 +2027,14 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
     fn try_publish_early(&self, packet: &Arc<g17_job::G17PRenderJobPacket>) -> bool {
         // Never wait in the submit ioctl for a physical lease or behind an
         // earlier scheduler publication of this queue: decline instead.
-        if self.sched_backlog.load(Ordering::Acquire) != 0
-            || !packet.input_fences().is_empty() || !packet.firmware_fences().is_empty()
+        if self.sched_backlog.load(Ordering::Acquire) != 0 { return false; }
+        // v93 EARLY_DEPS: signalled inputs (consumed without sleeping by
+        // publish_with) and firmware status checks may publish early too.
+        let with_deps = !packet.input_fences().is_empty() || !packet.firmware_fences().is_empty();
+        if with_deps && (!crate::g17_host_path::enabled(crate::g17_host_path::EARLY_DEPS)
+            || packet.input_fences().iter().any(|fence|
+                // SAFETY: the packet owns each input fence for this read.
+                unsafe { bindings::dma_fence_get_status(fence.raw()) } == 0))
         {
             return false;
         }
@@ -1985,6 +2045,7 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
         let result = self.publish_with(packet.clone(), Some(lease));
         packet.set_early_outcome(result.map(|_| ()));
         crate::g17_host_path::count(&crate::g17_host_path::EARLY_TAKEN);
+        if with_deps { crate::g17_host_path::count(&crate::g17_host_path::EARLY_WITH_DEPS); }
         true
     }
 
@@ -2604,6 +2665,9 @@ impl G17PQueue {
             render_frontier: KVec::new(),
             validation_proof: G17PValidationProof::new(),
             e2e_fine: [0; 12],
+            recent: [const { G17PRecentSubmission::EMPTY }; crate::g17_host_path::FW_DEP_RECENT],
+            recent_next: 0,
+            ioctl_commands: Some(KVec::new()),
             id,
         })
     }
@@ -2820,6 +2884,184 @@ impl G17PQueue {
         }
     }
 
+    /// v93: remember a fully enqueued ioctl for FW_DEPS matching and the
+    /// AGG_FIRST depth count. Only called after every command was queued, so
+    /// an ioctl that failed part-way (whose aggregate may still carry that
+    /// failure) is never matched and keeps the host wait.
+    fn note_recent_submission(&mut self, aggregate: Fence, render_before: u64, compute_before: u64) {
+        let range = |before: u64, after: u64| if after > before { (before + 1, after) } else { (0, 0) };
+        let (render, compute) = (range(render_before, self.render_sequence),
+            range(compute_before, self.compute_sequence));
+        let index = self.recent_next % crate::g17_host_path::FW_DEP_RECENT;
+        self.recent_next = (index + 1) % crate::g17_host_path::FW_DEP_RECENT;
+        let slot = &mut self.recent[index];
+        slot.aggregate = None;
+        slot.commands.clear();
+        // An incomplete command list (allocation failure) leaves the slot
+        // empty: that ioctl is never matched and keeps the host wait.
+        let Some(commands) = self.ioctl_commands.as_mut() else {
+            self.ioctl_commands = Some(KVec::new());
+            return;
+        };
+        core::mem::swap(&mut slot.commands, commands);
+        commands.clear();
+        slot.aggregate = Some(aggregate);
+        slot.render = render;
+        slot.compute = compute;
+    }
+
+    /// v93: remember one enqueued command's hardware fence for the ring.
+    /// A command with host-copied user timestamps leaves the ioctl's list
+    /// incomplete, so FW_DEPS never converts a wait on it: firmware tokens
+    /// cannot order the CPU timestamp copy that precedes its completion.
+    fn note_ioctl_command(&mut self, fence: &Fence, host_timestamps: bool) {
+        if host_timestamps {
+            self.ioctl_commands = None;
+            return;
+        }
+        if let Some(commands) = self.ioctl_commands.as_mut() {
+            if commands.push(fence.clone(), GFP_KERNEL).is_err() {
+                self.ioctl_commands = None;
+            }
+        }
+    }
+
+    fn recent_identities(&self) -> [Option<crate::g17_host_path::FwDepRecent>; crate::g17_host_path::FW_DEP_RECENT] {
+        let mut out = [None; crate::g17_host_path::FW_DEP_RECENT];
+        for (index, entry) in self.recent.iter().enumerate() {
+            if let Some(aggregate) = &entry.aggregate {
+                out[index] = Some(crate::g17_host_path::FwDepRecent {
+                    identity: aggregate.raw() as usize,
+                    render_last: entry.render.1,
+                    compute_last: entry.compute.1,
+                });
+            }
+        }
+        out
+    }
+
+    /// v93 AGG_FIRST: a render whose recorded aggregate has signalled is
+    /// retired even if its hardware fence (signalled just after) is not yet.
+    fn render_retired_by_aggregate(&self, sequence: u64) -> bool {
+        self.recent.iter().any(|entry| {
+            entry.render.0 != 0 && entry.render.0 <= sequence && sequence <= entry.render.1
+                && entry.aggregate.as_ref().is_some_and(|aggregate|
+                    // SAFETY: the ring owns this aggregate reference.
+                    unsafe { bindings::dma_fence_get_status(aggregate.raw()) } != 0)
+        })
+    }
+
+    /// Renders counted by EARLY_SHALLOW. Without AGG_FIRST this is exactly
+    /// the pruned frontier length (v87..v92d).
+    fn outstanding_renders(&self) -> usize {
+        if !crate::g17_host_path::enabled(crate::g17_host_path::AGG_FIRST) {
+            return self.render_frontier.len();
+        }
+        self.render_frontier.iter()
+            .filter(|(sequence, _)| !self.render_retired_by_aggregate(*sequence))
+            .count()
+    }
+
+    /// v93 FW_DEPS: unwrap one input fence (timeline chain links, each
+    /// holding one leaf) and fold every leaf into `resolution`. Returns false
+    /// as soon as any leaf is not provably this queue's own recent work.
+    /// Arrays and nested containers are never unwrapped: no field binding
+    /// exists for them, so they keep the host wait.
+    fn fw_dep_walk(
+        fence: &Fence, recent: &[Option<crate::g17_host_path::FwDepRecent>],
+        resolution: &mut crate::g17_host_path::FwDepResolution,
+    ) -> bool {
+        use crate::g17_host_path::{fw_dep_step, FwDepLeaf, FW_DEP_LINKS_MAX};
+        // Exported, immutable ops tables; only their addresses are compared.
+        let chain_ops = core::ptr::addr_of!(bindings::dma_fence_chain_ops);
+        let array_ops = core::ptr::addr_of!(bindings::dma_fence_array_ops);
+        let mut node = fence.raw();
+        // SAFETY: `fence` owns a reference; this walk owns one more, which
+        // dma_fence_chain_walk consumes (returning the next link's reference
+        // or NULL) and which an early exit drops explicitly.
+        unsafe { bindings::dma_fence_get(node) };
+        let mut links = 0u32;
+        while !node.is_null() {
+            links += 1;
+            // SAFETY: `node` is referenced; a chain node's `fence` is fixed
+            // for the node's lifetime and referenced by it.
+            let leaf_ptr = unsafe {
+                if (*node).ops == chain_ops {
+                    (*node.cast::<bindings::dma_fence_chain>()).fence
+                } else {
+                    node
+                }
+            };
+            let leaf = if links > FW_DEP_LINKS_MAX || leaf_ptr.is_null() {
+                FwDepLeaf::Unsupported
+            } else {
+                // SAFETY: `leaf_ptr` is kept alive by the referenced node.
+                let ops = unsafe { (*leaf_ptr).ops };
+                if ops == chain_ops || ops == array_ops {
+                    FwDepLeaf::Unsupported
+                } else {
+                    // SAFETY: as above.
+                    match unsafe { bindings::dma_fence_get_status(leaf_ptr) } {
+                        status if status > 0 => FwDepLeaf::Signalled,
+                        status if status < 0 => FwDepLeaf::Failed,
+                        _ => FwDepLeaf::Pending(leaf_ptr as usize),
+                    }
+                }
+            };
+            if !fw_dep_step(resolution, leaf, recent) {
+                // SAFETY: drop the walk's reference to the current link.
+                unsafe { bindings::dma_fence_put(node) };
+                return false;
+            }
+            // SAFETY: consumes `node`'s reference; returns the previous link
+            // referenced, or NULL at the end (also for a non-chain fence).
+            node = unsafe { bindings::dma_fence_chain_walk(node) };
+        }
+        true
+    }
+
+    /// v93 FW_DEPS: split this ioctl's input syncs. A sync is converted only
+    /// if every leaf is signalled-OK or a pending aggregate of one of this
+    /// queue's recent fully enqueued ioctls; otherwise it stays a host wait
+    /// exactly as before. Same queue implies same owner, VM and fault domain.
+    fn plan_input_syncs(&self, syncs: &[file::SyncItem]) -> Result<G17PSyncPlan> {
+        let recent = self.recent_identities();
+        let mut plan = G17PSyncPlan {
+            host: KVec::with_capacity(syncs.len(), GFP_KERNEL)?,
+            firmware: KVec::new(),
+            render_through: 0,
+            compute_through: 0,
+        };
+        for sync in syncs {
+            let Some(fence) = &sync.fence else { continue };
+            let mut resolution = crate::g17_host_path::FwDepResolution::default();
+            if !Self::fw_dep_walk(fence, &recent, &mut resolution) {
+                crate::g17_host_path::count(&crate::g17_host_path::FW_DEP_HOST);
+                plan.host.push(fence.clone(), GFP_KERNEL)?;
+                continue;
+            }
+            if resolution.used == 0 {
+                crate::g17_host_path::count(&crate::g17_host_path::FW_DEP_SATISFIED);
+                continue;
+            }
+            crate::g17_host_path::count(&crate::g17_host_path::FW_DEP_CONVERTED);
+            plan.render_through = plan.render_through.max(resolution.render_through);
+            plan.compute_through = plan.compute_through.max(resolution.compute_through);
+            for (index, entry) in self.recent.iter().enumerate() {
+                if resolution.used & (1u32 << index) == 0 { continue; }
+                // The aggregate and every command's hardware fence: each is a
+                // status check at publication (a failure before execution
+                // must fail the dependent exactly as the host wait did).
+                for fence in Iterator::chain(entry.aggregate.iter(), entry.commands.iter()) {
+                    if !plan.firmware.iter().any(|known| known.raw() == fence.raw()) {
+                        plan.firmware.push(fence.clone(), GFP_KERNEL)?;
+                    }
+                }
+            }
+        }
+        Ok(plan)
+    }
+
     fn prune_render_frontier(&mut self) {
         // All command failure paths publish sticky VM status before signalling;
         // an errored render may be dropped here without treating it as success.
@@ -2832,13 +3074,21 @@ impl G17PQueue {
     /// Queue a compute command with its required render prefix and an owned
     /// member of the ioctl output aggregate. Input fence scope is unchanged.
     fn submit_compute_async(
-        &mut self, submission_id: u64, translated: g17_uapi::TranslatedComputeCommand,
-        syncs: &[file::SyncItem],
+        &mut self, submission_id: u64, mut translated: g17_uapi::TranslatedComputeCommand,
+        syncs: &[file::SyncItem], plan: Option<&G17PSyncPlan>, record: bool,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         aggregate_member: G17PSubmitCompletionMember,
         vm_job: mmu::T8140VmJobGuard,
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
+        // v93 FW_DEPS: same-queue input syncs become a render prefix. Earlier
+        // compute of this queue is already ordered by the QID's implicit
+        // previous-kick parent and the scheduler FIFO, so compute_through
+        // needs no encoding here; its aggregate is still status-checked.
+        if let Some(plan) = plan {
+            translated.render_wait_through = crate::g17_host_path::fw_dep_raise(
+                translated.render_wait_through, plan.render_through);
+        }
         self.compute_frontier.retain(|(_, fence)| {
             // SAFETY: the retained fence owns the pointer during this read.
             unsafe { bindings::dma_fence_get_status(fence.completed.raw()) == 0 }
@@ -2869,10 +3119,21 @@ impl G17PQueue {
             &self.render_frontier, translated.render_wait_through,
             &mut dependencies, &mut firmware_fences,
         )?;
-        for sync in syncs {
-            if let Some(fence) = &sync.fence {
-                checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
-                dependencies.push(fence.clone(), GFP_KERNEL)?;
+        match plan {
+            None => for sync in syncs {
+                if let Some(fence) = &sync.fence {
+                    checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
+                    dependencies.push(fence.clone(), GFP_KERNEL)?;
+                }
+            },
+            Some(plan) => {
+                for fence in plan.host.iter() {
+                    checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
+                    dependencies.push(fence.clone(), GFP_KERNEL)?;
+                }
+                for fence in plan.firmware.iter() {
+                    firmware_fences.push(fence.clone(), GFP_KERNEL)?;
+                }
             }
         }
         let host_timestamps = destinations.iter().any(Option::is_some);
@@ -2896,6 +3157,7 @@ impl G17PQueue {
         if host_timestamps {
             finished.ready = finished.completed.clone();
         }
+        let recorded = record.then(|| finished.completed.clone());
         // The job is queued and owns its completion from here: give userspace
         // the fence that signals when the GPU has actually run it.
         self.compute_sequence = compute_sequence;
@@ -2913,6 +3175,7 @@ impl G17PQueue {
                 self.report_perf(report);
             }
         }
+        if let Some(fence) = recorded { self.note_ioctl_command(&fence, host_timestamps); }
         Ok(())
     }
 
@@ -2920,13 +3183,23 @@ impl G17PQueue {
     /// prefix's publication. Independent engines can publish in either order;
     /// the runtime resolves only tokens inside the captured logical prefix.
     fn submit_render_async(
-        &mut self, submission_id: u64, translated: g17_uapi::TranslatedRenderCommand,
-        syncs: &[file::SyncItem],
+        &mut self, submission_id: u64, mut translated: g17_uapi::TranslatedRenderCommand,
+        syncs: &[file::SyncItem], plan: Option<&G17PSyncPlan>, record: bool,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         aggregate_member: G17PSubmitCompletionMember,
         vm_job: mmu::T8140VmJobGuard,
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
+        // v93 FW_DEPS: same-queue input syncs become render/compute prefixes,
+        // resolved exactly like an explicit barrier: render predecessors by
+        // native tokens at publication (scheduler FIFO publishes them first),
+        // compute predecessors by publication fences plus native tokens.
+        if let Some(plan) = plan {
+            translated.render_order.wait_through = crate::g17_host_path::fw_dep_raise(
+                translated.render_order.wait_through, plan.render_through);
+            translated.compute_wait_through = crate::g17_host_path::fw_dep_raise(
+                translated.compute_wait_through, plan.compute_through);
+        }
         self.prune_render_frontier();
         self.render_frontier.reserve(1, GFP_KERNEL)?;
         let timestamps = [
@@ -2964,10 +3237,21 @@ impl G17PQueue {
             &self.compute_frontier, translated.compute_wait_through,
             &mut dependencies, &mut firmware_fences,
         )?;
-        for sync in syncs {
-            if let Some(fence) = &sync.fence {
-                checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
-                dependencies.push(fence.clone(), GFP_KERNEL)?;
+        match plan {
+            None => for sync in syncs {
+                if let Some(fence) = &sync.fence {
+                    checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
+                    dependencies.push(fence.clone(), GFP_KERNEL)?;
+                }
+            },
+            Some(plan) => {
+                for fence in plan.host.iter() {
+                    checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
+                    dependencies.push(fence.clone(), GFP_KERNEL)?;
+                }
+                for fence in plan.firmware.iter() {
+                    firmware_fences.push(fence.clone(), GFP_KERNEL)?;
+                }
             }
         }
         let e2e_counts = crate::g17_e2e::armed().then(|| [dependencies.len() as u64,
@@ -2982,8 +3266,17 @@ impl G17PQueue {
         // frontier (start of this function) holds exactly the queue's
         // unsignalled earlier renders; a deeper queue takes the unchanged
         // scheduler path, identical to v84 with bit0 clear.
+        // v93 EARLY_DEPS: only an unsignalled host dependency declines; a
+        // signalled one (e.g. an already published compute prefix) cannot
+        // make the ioctl wait. v93 AGG_FIRST: see `outstanding_renders`.
+        let host_blocked = if crate::g17_host_path::enabled(crate::g17_host_path::EARLY_DEPS) {
+            // SAFETY: each owned Fence keeps its pointer alive for the read.
+            dependencies.iter().any(|fence| unsafe { bindings::dma_fence_get_status(fence.raw()) } == 0)
+        } else {
+            !dependencies.is_empty()
+        };
         let early_allowed = crate::g17_host_path::early_publish_allowed(
-            self.render_frontier.len(), !dependencies.is_empty());
+            self.outstanding_renders(), host_blocked);
         let mut finished = self.render_scheduler.as_mut().ok_or(ENODEV)?
             .enqueue(packet, dependencies, early_allowed)?;
         // Firmware dependency tokens precede the CPU timestamp copy. A
@@ -2991,6 +3284,7 @@ impl G17PQueue {
         if host_timestamps {
             finished.ready = finished.completed.clone();
         }
+        if record { self.note_ioctl_command(&finished.completed, host_timestamps); }
         if let Some(counts) = e2e_counts {
             crate::g17_e2e::record(crate::g17_e2e::K_SCHED_PUSHED, 0, submission_id,
                 [counts[0], counts[1], counts[2], translated.render_order.sequence, 0]);
@@ -3624,6 +3918,22 @@ impl G17PQueue {
         // fence which covers every already queued command plus the enqueue gate.
         Self::install_output_fences(publication.outputs.drain(..), &aggregate.fence());
         publication.aggregate = Some(aggregate.clone());
+        // v93 FW_DEPS: resolve input syncs against this queue's recent ioctls
+        // once; every command of the ioctl applies the same plan.
+        let plan = if crate::g17_host_path::enabled(crate::g17_host_path::FW_DEPS) {
+            Some(self.plan_input_syncs(&syncs)?)
+        } else {
+            None
+        };
+        let (render_before, compute_before) = (self.render_sequence, self.compute_sequence);
+        let record = crate::g17_host_path::enabled(
+            crate::g17_host_path::FW_DEPS | crate::g17_host_path::AGG_FIRST);
+        if record {
+            match self.ioctl_commands.as_mut() {
+                Some(commands) => commands.clear(),
+                None => self.ioctl_commands = Some(KVec::new()),
+            }
+        }
         self.e2e_fine[6] = crate::g17_e2e::fine();
 
         for (index, command) in pending.drain(..).enumerate() {
@@ -3639,6 +3949,8 @@ impl G17PQueue {
                     submission_id,
                     translated,
                     &syncs,
+                    plan.as_ref(),
+                    record,
                     objects,
                     G17PSubmitCompletionMember::new(aggregate.clone()),
                     vm_job,
@@ -3648,12 +3960,17 @@ impl G17PQueue {
                     submission_id,
                     translated,
                     &syncs,
+                    plan.as_ref(),
+                    record,
                     objects,
                     G17PSubmitCompletionMember::new(aggregate.clone()),
                     vm_job,
                     command_entered,
                 )?,
             }
+        }
+        if record {
+            self.note_recent_submission(aggregate.fence(), render_before, compute_before);
         }
         publication.publish_async(&aggregate.fence());
         Ok(())

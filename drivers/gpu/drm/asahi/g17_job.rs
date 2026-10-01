@@ -193,8 +193,15 @@ impl G17PJobCompletion {
         // Match render completion: once this fence wakes userspace, every
         // mapping named by the completed job must already be releasable.
         drop(self.vm_job.lock().take());
-        self.fence.signal();
-        self.aggregate_member.complete(result);
+        // v93 AGG_FIRST: as for render, the user-visible aggregate first.
+        if crate::g17_host_path::enabled(crate::g17_host_path::AGG_FIRST) {
+            crate::g17_host_path::count(&crate::g17_host_path::AGG_FIRST_TAKEN);
+            self.aggregate_member.complete(result);
+            self.fence.signal();
+        } else {
+            self.fence.signal();
+            self.aggregate_member.complete(result);
+        }
     }
 
     /// Release the VM pin of an already-signalled error completion after both
