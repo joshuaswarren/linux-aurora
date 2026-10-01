@@ -10261,6 +10261,41 @@ impl G17PManagerConstruction {
     /// are what make the bookkeeping below safe to perform; `observed()` only
     /// ever described whether the GPU did any work, which does not bear on
     /// whether the firmware still owns the group.
+    /// v93r `g17p_recovery_path` bit0: firmware evidence that every render
+    /// ever published on `pair_slot` has been consumed. `None` when drained:
+    /// both engines' post-maintenance completion stamps cover the pair's last
+    /// published ordinal (`submission_ordinal - 1`, i.e. kick timestamp
+    /// `submission_ordinal`) and the pair FList's completed-kick counter equals
+    /// its submitted counter. A pair nothing was ever published on is drained.
+    pub(crate) fn render_slot_firmware_drained(
+        &mut self, pair_slot: u8,
+    ) -> Result<Option<crate::g17_recovery_path::ReclaimBlock>> {
+        use crate::g17_recovery_path::ReclaimBlock;
+        let (published, pair, [submitted, completed]) = {
+            let slot = self.render_slots.allocated(pair_slot)?;
+            if slot.preparing { return Ok(Some(ReclaimBlock::Preparing)); }
+            if slot.submission_ordinal == 0 { return Ok(None); }
+            let storage = slot.storage.as_deref().ok_or(ENODEV)?;
+            (slot.submission_ordinal, storage.queue_pair(), storage.render_flist_completion_counters()?)
+        };
+        let stamps = self.resources.render_completion_stamps(pair)?;
+        if !stamps.into_iter().all(|stamp| g17_compute::completion_stamp_covers(stamp, published)) {
+            return Ok(Some(ReclaimBlock::Stamps));
+        }
+        if submitted != completed {
+            return Ok(Some(ReclaimBlock::Flist));
+        }
+        if self.firmware_recovery_handshake_snapshot()?.state != 0 {
+            return Ok(Some(ReclaimBlock::Recovery));
+        }
+        Ok(None)
+    }
+
+    /// v93r: whether `pair_slot` still tracks a published render group.
+    pub(crate) fn render_slot_tracked(&self, pair_slot: u8) -> Result<bool> {
+        Ok(self.render_slots.allocated(pair_slot)?.tracker.is_some())
+    }
+
     pub(crate) fn retire_abandoned_render_if_firmware_retired(
         &mut self, pair_slot: u8,
         accept_executed: bool,

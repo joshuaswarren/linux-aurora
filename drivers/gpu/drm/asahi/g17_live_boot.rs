@@ -2455,7 +2455,15 @@ impl G17PLoggedSend for Pin<&mut rtkit::RtKit<G17PRtkitOps>> {
             crate::g17_e2e::record(crate::g17_e2e::K_SEND, 0, 0, [endpoint as u64, message,
                 core::ptr::from_ref::<rtkit::RtKit<G17PRtkitOps>>(&*self) as usize as u64, 0, 0]);
         }
-        self.send_message(endpoint, message)
+        let result = self.send_message(endpoint, message);
+        // v93r g17p_recovery_path bit1: time of the last device-control
+        // announcement actually handed to the mailbox.
+        if result.is_ok() && endpoint == g17_rtkit::ENDPOINT_GFX_INTERRUPTS
+            && message == g17_rtkit::encode_primary_device_control()
+        {
+            crate::g17_recovery_path::note_control_announce();
+        }
+        result
     }
 }
 
@@ -3556,8 +3564,11 @@ pub(crate) struct G17PLiveRuntime {
     pending_render_queued: KVec<g17_completion::PairFifo<
         Arc<crate::g17_drm::G17PRenderCompletion>, { g17_resources::G17P_RENDER_QUEUED_PER_PAIR }>>,
     queue_registry: Option<Arc<crate::g17_drm::G17PQueueRegistry>>,
+    /// v93r: when a drained-pair reclaim first found work, for polling.
+    reclaim_pending_since: Option<kernel::time::Instant<kernel::time::Monotonic>>,
     /// Lost render packets whose firmware retirement was not proven. Their
-    /// VM job guards keep userspace mappings alive until both processors stop.
+    /// VM job guards keep userspace mappings alive until both processors stop
+    /// (or, with v93r g17p_recovery_path bit0, until their pair is drained).
     quarantined_render_completions:
         KVec<Arc<crate::g17_drm::G17PRenderCompletion>>,
     /// Type-1 EventMachine QID bits observed since each slot was armed.
@@ -5135,6 +5146,9 @@ impl G17PLiveRuntime {
         if self.is_crashed() {
             return Ok(KVec::new());
         }
+        // v93r g17p_recovery_path bit0: return drained quarantined pairs
+        // first, so a closed queue's teardown gate can open this turn.
+        self.reclaim_drained_quarantined_render_slots();
         let outstanding = self
             .manager
             .as_ref()
@@ -5276,6 +5290,8 @@ impl G17PLiveRuntime {
         let Some(rtkit) = self.gfx_rtkit.as_mut() else { return };
         let sent = Pin::new(rtkit).send_message_logged(
             g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
+        // v93r g17p_recovery_path bit1: name the oldest pending record.
+        let pending = crate::g17_recovery_path::describe_pending(consumer);
         if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 1_000_000_000 {
             LAST_LOG.store(now, Ordering::Relaxed);
             if let Some(pdev) = self.pdev.as_ref() {
@@ -5284,6 +5300,16 @@ impl G17PLiveRuntime {
                     "G17P control re-announce: reason={} consumer={} producer={} pending_ms={} sent={:?}\n",
                     reason, consumer, producer, now.saturating_sub(since) / 1_000_000, sent.is_ok(),
                 );
+                if let Some((opcode, arg, age, announced)) = pending {
+                    dev_info!(
+                        pdev.as_ref(),
+                        "G17P control re-announce: oldest pending slot={} opcode={:#x} arg={:#x} age_us={} announced-after-publish={}\n",
+                        consumer, opcode, arg,
+                        age.saturating_mul(1_000_000)
+                            / crate::g17_timing_buffer::arch_frequency().max(1),
+                        announced,
+                    );
+                }
             }
         }
     }
@@ -5333,10 +5359,16 @@ impl G17PLiveRuntime {
     /// young teardown that has not been acknowledged yet.
     pub(crate) fn logical_queue_teardown_polling(&self) -> bool {
         !self.is_crashed()
-            && self
+            && (self
                 .manager
                 .as_ref()
                 .is_some_and(|manager| manager.logical_queue_teardown_polling())
+                // v93r: keep the event worker polling for a bounded window
+                // while a quarantined pair awaits its firmware drain.
+                || self.reclaim_pending_since.is_some_and(|since| {
+                    crate::g17_recovery_path::enabled(crate::g17_recovery_path::RECLAIM_DRAINED)
+                        && since.elapsed().as_nanos() < 5_000_000_000
+                }))
     }
 
     /// Wake the event worker for teardown service once a queue has closed.
@@ -6027,6 +6059,146 @@ impl G17PLiveRuntime {
             .get_mut(render_slot as usize)
             .ok_or(EINVAL)?;
         queued.push(completion).map_err(|_| EBUSY)
+    }
+
+    /// v93r `g17p_recovery_path` bit0. Return every quarantined render pair
+    /// the firmware has provably drained since the recovery that failed it.
+    ///
+    /// `fail_render_after_final_observation` keeps the failed render and its
+    /// queued successors (their fences already failed) together with their
+    /// VM-job and lease guards, because at that instant firmware may still
+    /// own the group. The only release so far was processor stop, so one
+    /// stamp-blamed recovery cost a physical pair and left the client's
+    /// closed-queue teardown `Draining` for the rest of the boot. Here, under
+    /// the runtime mutex with the recovery closed, a pair is reclaimed only
+    /// when `render_slot_firmware_drained` proves every publication consumed
+    /// (stamps cover the last published ordinal, FList completed ==
+    /// submitted, handshake state 0). Its trackers are then retired in
+    /// order: an executed group through the normal paired-completion
+    /// transaction, the group the recovery skipped through the existing
+    /// firmware-retired classifier (queue cursors at target, job list
+    /// unlinked), each followed by the FList reference retirement a
+    /// completion performs. Only then are the retained guards released. Any
+    /// unmet condition leaves everything as it was for a later turn.
+    fn reclaim_drained_quarantined_render_slots(&mut self) {
+        use crate::g17_recovery_path::{self as rp, ReclaimBlock};
+        if !rp::enabled(rp::RECLAIM_DRAINED)
+            || self.quarantined_render_completions.is_empty()
+            || self.is_crashed()
+        {
+            self.reclaim_pending_since = None;
+            return;
+        }
+        if self.reclaim_pending_since.is_none() {
+            self.reclaim_pending_since =
+                Some(kernel::time::Instant::<kernel::time::Monotonic>::now());
+        }
+        rp::RECLAIM_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if self.primary_recovery_pending() {
+            rp::note_blocked(ReclaimBlock::Recovery);
+            return;
+        }
+        // Physical pairs named by the retained completions, in slot order.
+        let mut slots = 0u64;
+        for completion in self.quarantined_render_completions.iter() {
+            if let Some(slot) = completion.render_slot() {
+                slots |= 1u64 << (slot & 63);
+            }
+        }
+        let mut serviced = false;
+        while slots != 0 {
+            let slot = slots.trailing_zeros() as u8;
+            slots &= slots - 1;
+            match self.reclaim_drained_render_slot(slot, &mut serviced) {
+                Ok(None) => {
+                    let mut released = 0u64;
+                    let mut index = 0;
+                    while index < self.quarantined_render_completions.len() {
+                        if self.quarantined_render_completions[index].render_slot() == Some(slot) {
+                            let completion = self.quarantined_render_completions.swap_remove(index);
+                            // VM-job and lease guards drop after the runtime
+                            // mutex is released, like a completion's.
+                            self.defer_completion(
+                                crate::g17_drm::G17PDeferredCompletion::ReleaseAfterDrain { completion });
+                            released += 1;
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    rp::RECLAIM_PAIRS.fetch_add(1, Ordering::Relaxed);
+                    rp::RECLAIM_RELEASED.fetch_add(released, Ordering::Relaxed);
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_warn!(
+                            pdev.as_ref(),
+                            "G17P recovery reclaim: render slot {} drained by firmware; released {} quarantined completion(s) and returned the pair\n",
+                            slot, released,
+                        );
+                    }
+                }
+                Ok(Some(reason)) => rp::note_blocked(reason),
+                Err(error) => {
+                    rp::note_blocked(ReclaimBlock::Error);
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_warn!(
+                            pdev.as_ref(),
+                            "G17P recovery reclaim: render slot {} stays quarantined ({:?})\n",
+                            slot, error,
+                        );
+                    }
+                }
+            }
+        }
+        if self.quarantined_render_completions.is_empty() {
+            self.reclaim_pending_since = None;
+        }
+    }
+
+    /// One pair of `reclaim_drained_quarantined_render_slots`: `Ok(None)`
+    /// once the pair tracks nothing, `Ok(Some(reason))` to retry later.
+    fn reclaim_drained_render_slot(
+        &mut self, slot: u8, serviced: &mut bool,
+    ) -> Result<Option<crate::g17_recovery_path::ReclaimBlock>> {
+        use crate::g17_recovery_path::{self as rp, ReclaimBlock};
+        self.manager.as_mut().ok_or(ENODEV)?.ensure_render_slot(slot)?;
+        if let Some(reason) = self.manager.as_mut().ok_or(ENODEV)?
+            .render_slot_firmware_drained(slot)?
+        {
+            return Ok(Some(reason));
+        }
+        // Same ordering as a completion: pending notifications (the async
+        // grow completion owns one FList reference) before FList retirement.
+        if !*serviced {
+            *serviced = true;
+            let _ = self.service_firmware_events_inline();
+            self.manager.as_mut().ok_or(ENODEV)?.ensure_render_slot(slot)?;
+        }
+        while self.manager.as_ref().ok_or(ENODEV)?.render_slot_tracked(slot)? {
+            let retired = match self.manager.as_mut().ok_or(ENODEV)?
+                .poll_translated_render_completion(slot)?
+            {
+                g17_manager::G17PRenderPollOutcome::Complete(_) => true,
+                g17_manager::G17PRenderPollOutcome::Pending
+                | g17_manager::G17PRenderPollOutcome::Retry => self.manager.as_mut()
+                    .ok_or(ENODEV)?
+                    .retire_abandoned_render_if_firmware_retired(slot, true)?,
+            };
+            if !retired {
+                return Ok(Some(ReclaimBlock::Tracker));
+            }
+            rp::RECLAIM_TRACKERS.fetch_add(1, Ordering::Relaxed);
+            let release = self.manager.as_mut().ok_or(ENODEV)?
+                .retire_render_usc_freelist_at_completion(slot)?;
+            if let Some(release) = release {
+                match self.service_render_usc_freelist_release(release) {
+                    // EAGAIN: the lifecycle stays Ready with zero references
+                    // and event service publishes it later, as for a completion.
+                    Ok(()) => {}
+                    Err(error) if error == EAGAIN => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Release error-fence owners only after both processors are stopped.
@@ -7310,6 +7482,35 @@ impl G17PLiveRuntime {
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                         "G17P render: DIAGNOSTIC work-channel seed failed ({:?})\n",
                         error,
+                    ),
+                }
+            }
+        }
+        // v93r: boot parameter `g17p_fw_trace_classes` (bit n = KTrace class
+        // n) OR-ed into the firmware class bytes at 0x17780c/0x17780d, with
+        // the line cleaned so the coprocessor observes it. Checked on the
+        // first render and every 256th after (a recovery or rebuild may
+        // re-initialize the firmware DATA); a missing bit is re-armed.
+        let trace_classes = *module_parameters::g17p_fw_trace_classes.value() & 0xffff;
+        if trace_classes != 0 {
+            static CHECKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if CHECKS.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+                const CLASS_QWORD_LINK: u64 = 0xffff_fc00_0017_7808;
+                let bits = u64::from(trace_classes) << 32;
+                let phys = g17_manager::g17p_gfx_link_to_physical(CLASS_QWORD_LINK);
+                match crate::pgtable::LiveFirmwareU64Probe::new(phys)
+                    .and_then(|probe| probe.set_bits_visible(bits))
+                {
+                    Ok((before, after)) if before & bits != bits => dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P fw trace classes {:#06x} armed: class qword {:#018x} -> {:#018x}\n",
+                        trace_classes, before, after,
+                    ),
+                    Ok(_) => {}
+                    Err(error) => dev_warn!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P fw trace classes {:#06x}: arm failed ({:?})\n",
+                        trace_classes, error,
                     ),
                 }
             }
@@ -10141,6 +10342,7 @@ impl G17PLiveRuntime {
             pending_render_queued,
             queue_registry: None,
             quarantined_render_completions,
+            reclaim_pending_since: None,
             render_event_masks,
             deferred_render_timeouts: 0,
             render_fence_state: g17_completion::RenderFenceState::default(),

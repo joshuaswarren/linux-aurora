@@ -44,6 +44,7 @@ mod g17_perf;
 mod g17_timing_buffer;
 mod g17_e2e;
 mod g17_host_path;
+mod g17_recovery_path;
 mod g17_mem_path;
 mod g17_store;
 mod g17_power_preflight;
@@ -129,6 +130,10 @@ kernel::module_platform_driver! {
         g17p_fw_ktrace_budget: u32 {
             default: 32,
             description: "Maximum ordinary KTrace records printed per drain",
+        },
+        g17p_fw_trace_classes: u32 {
+            default: 0,
+            description: "v93r diagnostic: KTrace class-enable bits (bit n = class n, 0..15) OR-ed into the firmware class bytes at 0x17780c/0x17780d, checked at the first render and every 256th after (re-armed if cleared); 0 leaves them untouched. Class 0 submission/launch, 1 monitor sample, 9 monitor state/recovery scan. Needs g17p_fw_trace != 0 for the ring",
         },
         g17p_fastdie_target_cc: u32 {
             default: 0,
