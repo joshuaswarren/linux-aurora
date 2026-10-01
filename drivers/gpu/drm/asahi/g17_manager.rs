@@ -9241,6 +9241,93 @@ impl G17PManagerConstruction {
             hardware_slot, index, pointer, read(table).is_ok_and(|p| p == pointer), fields);
     }
 
+    /// v97d: every pair with tracked outstanding work: (pair slot, TA qid,
+    /// 3D qid, last published 3D stamp, 3D stamp count, 3D entry stride).
+    pub(crate) fn render_stall_candidates(&self) -> KVec<(u8, u8, u8, u64, u16, u32)> {
+        let mut out = KVec::new();
+        for (index, slot) in self.render_slots.slots.iter().enumerate() {
+            let Some(slot) = slot.as_deref() else { continue };
+            if slot.tracker.is_none() && slot.queued_tracker.iter().next().is_none() { continue; }
+            let Some(queues) = slot.sksm.as_ref() else { continue };
+            let geometry = queues.fragment.producer.geometry;
+            if out.push((index as u8, queues.tiling.queue_id, queues.fragment.queue_id,
+                queues.fragment.producer.previous_timestamp, geometry.stamp_count(),
+                geometry.entry_stride()), GFP_KERNEL).is_err() { break; }
+        }
+        out
+    }
+
+    /// v97d: one firmware DATA qword, read exactly like the fault-only
+    /// scheduler snapshots (cache-invalidated load, no write, no message).
+    fn read_firmware_data_u64(link: u64) -> Result<u64> {
+        pgtable::LiveFirmwareU64Probe::new(g17p_gfx_link_to_physical(link))
+            .and_then(|probe| probe.observe_mask(u64::MAX, 1))
+            .map(|sample| sample.first)
+    }
+
+    /// v97d: the firmware's completed stamp for `qid` when its dependency
+    /// record is valid.
+    pub(crate) fn firmware_dependency_completed(qid: u8) -> Option<u64> {
+        let record = G17P_DEPENDENCY_RECORD_LINK_BASE
+            + u64::from(qid) * G17P_DEPENDENCY_RECORD_STRIDE;
+        match (Self::read_firmware_data_u64(record), Self::read_firmware_data_u64(record + 8)) {
+            (Ok(valid), Ok(completed)) if valid & 0xff == 1 => Some(completed),
+            _ => None,
+        }
+    }
+
+    /// v97d: B1 scheduler state for `qids` -- the requested/sampled/deferred/
+    /// next mask pairs, the runnable mask, the per-DM active bitmaps, and per
+    /// QID the dependency record, park record (+0x3f8..+0x418: deadline at
+    /// +0x400, A/B/C bytes at +0x418), owner, queue state and flag. Returns
+    /// whether `watch_qid` is set in the requested and in the deferred mask.
+    pub(crate) fn log_b1_scheduler_state(&mut self, label: &str, qids: &[u8], watch_qid: Option<u8>)
+        -> (bool, bool) {
+        let read = Self::read_firmware_data_u64;
+        let masks: [Result<u64>; 8] = core::array::from_fn(|index|
+            read(G17P_KSM_SCHEDULER_MASKS_LINK + index as u64 * 8));
+        let runnable = [read(G17P_KSM_RUNNABLE_MASK_LINK), read(G17P_KSM_RUNNABLE_MASK_LINK + 8)];
+        let active: [Result<u64>; 6] = core::array::from_fn(|index|
+            read(G17P_DM_ACTIVE_BITMAP_LINK_BASE + (index as u64 / 2) * 0x10 + (index as u64 % 2) * 8));
+        let ready = read(G17P_READY_MASK_LINK_BASE);
+        dev_info!(self.resources.dev().as_ref(),
+            "G17P B1 scheduler[{}]: masks(requested,sampled,deferred,next)={:x?} runnable={:x?} dm-active(0,1,2)={:x?} ready={:x?}\n",
+            label, masks, runnable, active, ready);
+        for &qid in qids {
+            let qid64 = u64::from(qid);
+            let dependency = G17P_DEPENDENCY_RECORD_LINK_BASE + qid64 * G17P_DEPENDENCY_RECORD_STRIDE;
+            let park = G17P_KSM_PARK_RECORD_LINK_BASE + qid64 * 0x28;
+            let park_record: [Result<u64>; 5] = core::array::from_fn(|word| read(park + 0x3f8 + word as u64 * 8));
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P B1 queue[{}]: qid={} dep(valid,completed,status2)={:x?} park(+3f8..+418)={:x?} owner={:x?} qstate={:x?} qflag={:x?} packed-completion={:x?}\n",
+                label, qid,
+                [read(dependency), read(dependency + 8), read(dependency + 16)],
+                park_record,
+                read(G17P_QID_OWNER_LINK_BASE + qid64 * 8),
+                [read(G17P_QUEUE_STATE_LINK_BASE + qid64 * 0x28), read(G17P_QUEUE_STATE_LINK_BASE + qid64 * 0x28 + 8)],
+                read(G17P_QUEUE_FLAG_LINK_BASE + qid64 * 0x28 + 0x40),
+                read(0xffff_fc00_0012_5df0 + qid64 * 8));
+        }
+        // DM1 monitor slots: the cached c078 key (qid << 40 | stamp) and the
+        // shared 24-byte monitor record. Historical DRAM, printed if populated.
+        for slot in 0..16usize {
+            let key = read(0xffff_fc00_0017_74b8 + slot as u64 * 8);
+            let monitor = self.resources.firmware_dm1_slot_snapshot(slot).map(|sample| sample.raw);
+            let populated = key.as_ref().is_ok_and(|key| *key != 0)
+                || monitor.as_ref().is_ok_and(|raw| raw.iter().any(|word| *word != 0));
+            if populated {
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P B1 DM1 slot[{}]: slot={} key={:x?} monitor={:x?}\n",
+                    label, slot, key, monitor);
+            }
+        }
+        let Some(qid) = watch_qid else { return (false, false) };
+        let word = usize::from(qid / 64);
+        let bit = 1u64 << (qid % 64);
+        let set = |pair: usize| masks[pair * 2 + word].as_ref().is_ok_and(|value| value & bit != 0);
+        (set(0), set(2))
+    }
+
     pub(crate) fn log_render_recovery_pre_ack(&mut self, label: &'static str) {
         let blamed = self.pending_primary_recovery()
             .and_then(|(_, _, qid)| qid)
@@ -9288,6 +9375,9 @@ impl G17PManagerConstruction {
             "G17P global GPU progress[{}]: (recovery-epoch,counter)={:x?}; not per-job completion\n",
             label, progress);
         let mut next_entries = [None; 2];
+        // v97d: the completed entry of each engine, the same-queue baseline
+        // for the stalled entry after it.
+        let mut completed_entries: [Option<(u64, usize)>; 2] = [None; 2];
         let render_queues = self.render_slots.get(pair_slot).sksm.as_ref().map(|queues| {
             [
                 (
@@ -9331,6 +9421,11 @@ impl G17PManagerConstruction {
                     "G17P render admission[{}]: DM1-active={:x?}\n", label,
                     [read(G17P_DM_ACTIVE_BITMAP_LINK_BASE + 0x10),
                      read(G17P_DM_ACTIVE_BITMAP_LINK_BASE + 0x18)]);
+                // v97d: complete B1 scheduler masks and both engines' park
+                // records for this pair (the render path previously logged
+                // them only for compute timeouts).
+                let _ = self.log_b1_scheduler_state(label,
+                    &[tiling_qid as u8, fragment_qid as u8], Some(fragment_qid as u8));
                 if label == "blocked-compute-parent" {
                     // Native DM1 monitor 6b44..6bcc caches c078 separately
                     // from its shared 24-byte record. These are historical
@@ -9400,6 +9495,7 @@ impl G17PManagerConstruction {
                                 ) {
                                     let next = previous.next_timestamp;
                                     next_entries[index] = Some((next, stride));
+                                    completed_entries[index] = Some((completed, stride));
                                     dev_info!(self.resources.dev().as_ref(),
                                         "G17P render fault frontier[{}]: qid={} completed={:#x} next={:#x} latest={:#x}\n",
                                         label, qid, completed, next, latest);
@@ -9573,6 +9669,20 @@ impl G17PManagerConstruction {
                     for (index, entry) in next_entries.into_iter().enumerate() {
                         if let Some((timestamp, stride)) = entry {
                             storage.log_sksm_entry(&dev, index == 0, "after-completed",
+                                (timestamp & g17_submission::KICK_STAMP_INDEX_MASK) as usize * stride);
+                        }
+                    }
+                    // v97d: complete entries for the stalled (next) and the
+                    // completed (baseline) stamp of both engines.
+                    for (index, entry) in next_entries.into_iter().enumerate() {
+                        if let Some((timestamp, stride)) = entry {
+                            storage.log_sksm_entry_full(&dev, index == 0, "stalled-next", timestamp,
+                                (timestamp & g17_submission::KICK_STAMP_INDEX_MASK) as usize * stride);
+                        }
+                    }
+                    for (index, entry) in completed_entries.into_iter().enumerate() {
+                        if let Some((timestamp, stride)) = entry {
+                            storage.log_sksm_entry_full(&dev, index == 0, "completed-baseline", timestamp,
                                 (timestamp & g17_submission::KICK_STAMP_INDEX_MASK) as usize * stride);
                         }
                     }

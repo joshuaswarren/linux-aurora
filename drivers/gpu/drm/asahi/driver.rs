@@ -71,6 +71,10 @@ pub(crate) struct AsahiData {
     /// v84 GPU-feed CPU performance actuator (`g17_host_path`).
     #[pin]
     g17_feed_perf_work: Work<AsahiDevice, 6>,
+    /// v97d `g17p_recovery_path` bit4 3D stall watch. Never queued while the
+    /// bit is clear.
+    #[pin]
+    g17_stall_work: DelayedWork<AsahiDevice, 7>,
     #[pin]
     g17_reclaims: Mutex<KVec<KVec<g17_manager::G17PLogicalQueueTeardown>>>,
 }
@@ -88,6 +92,7 @@ impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<AsahiDevice, 5> for AsahiData { self.g17_dvfs_work }
+    impl HasDelayedWork<AsahiDevice, 7> for AsahiData { self.g17_stall_work }
 }
 
 impl WorkItem<1> for AsahiData {
@@ -207,7 +212,7 @@ fn g17p_event_worker_tail_merged(dev: &ARef<AsahiDevice>, runtime: &g17_drm::G17
                 let ms = crate::g17_dvfs_policy::recheck_ms(delay);
                 crate::g17_dvfs_parity::RECHECKS.fetch_add(1, Ordering::Relaxed);
                 let _ = workqueue::system().enqueue_delayed::<ARef<AsahiDevice>, 5>(
-                    dev.clone(), kernel::time::msecs_to_jiffies(ms));
+                    dev.clone(), kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
             }
         }
         let settled = guard.service_logical_queue_teardowns();
@@ -321,6 +326,30 @@ impl WorkItem<4> for AsahiData {
     }
 }
 
+/// v97d: 3D stall watch poll. Re-arms itself (under the Runtime mutex and
+/// the armed check) while render work is outstanding and bit4 is set.
+impl WorkItem<7> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(dev: ARef<AsahiDevice>) {
+        let Some(runtime) = dev.g17_runtime.clone() else { return; };
+        let mut guard = runtime.mutex().lock();
+        if let Some(ms) = guard.service_render_stall_watch() {
+            if guard.firmware_event_worker_armed() {
+                let _ = workqueue::system_highpri().enqueue_delayed::<ARef<AsahiDevice>, 7>(
+                    dev.clone(), kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
+            }
+        }
+        drop(guard);
+    }
+}
+
+/// Start the stall watch; already pending is fine (that run re-arms).
+pub(crate) fn arm_g17p_render_stall_watch(dev: ARef<AsahiDevice>, ms: u64) {
+    let _ = workqueue::system_highpri().enqueue_delayed::<ARef<AsahiDevice>, 7>(
+        dev, kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
+}
+
 pub(crate) fn queue_g17p_tvb_grow_worker(dev: ARef<AsahiDevice>) {
     let _ = workqueue::system_unbound().enqueue::<ARef<AsahiDevice>, 4>(dev);
 }
@@ -354,7 +383,7 @@ fn service_g17p_dvfs_parity(dev: ARef<AsahiDevice>, runtime: &g17_drm::G17PRunti
         crate::g17_dvfs_parity::RECHECKS.fetch_add(1, Ordering::Relaxed);
         // Already pending is fine: that run re-evaluates and re-arms.
         let _ = workqueue::system().enqueue_delayed::<ARef<AsahiDevice>, 5>(
-            dev, kernel::time::msecs_to_jiffies(ms));
+            dev, kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
     }
     drop(guard);
 }
@@ -438,6 +467,7 @@ impl g17_lifecycle::DriverUnbindQuiesce for G17PDriverUnbind<'_> {
         // The DVFS re-check is produced by the event worker (joined above)
         // and by itself; disabling also rejects any later self-requeue.
         disable_g17p_delayed_work::<5>(&self.drm);
+        disable_g17p_delayed_work::<7>(&self.drm);
         // The event worker is its only producer; it is disabled above.
         disable_g17p_work::<6>(&self.drm);
         crate::g17_host_path::shutdown();
@@ -770,6 +800,7 @@ fn probe_t8140_runtime(
             g17_tvb_grow_work <- new_work!("AsahiData::g17_tvb_grow_work"),
             g17_dvfs_work <- new_delayed_work!("AsahiData::g17_dvfs_work"),
             g17_feed_perf_work <- new_work!("AsahiData::g17_feed_perf_work"),
+            g17_stall_work <- new_delayed_work!("AsahiData::g17_stall_work"),
             g17_reclaims <- new_mutex!(KVec::new(), "AsahiData::g17_reclaims"),
         });
         let ptr: *const AsahiData = &raw const **drm;
@@ -1409,6 +1440,7 @@ impl platform::Driver for AsahiDriver {
             g17_tvb_grow_work <- new_work!("AsahiData::g17_tvb_grow_work"),
             g17_dvfs_work <- new_delayed_work!("AsahiData::g17_dvfs_work"),
             g17_feed_perf_work <- new_work!("AsahiData::g17_feed_perf_work"),
+            g17_stall_work <- new_delayed_work!("AsahiData::g17_stall_work"),
         g17_reclaims <- new_mutex!(KVec::new(), "AsahiData::g17_reclaims"),
         });
 

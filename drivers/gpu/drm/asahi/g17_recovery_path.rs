@@ -30,6 +30,26 @@
 //!        render was the only producer of events, nothing does. With this
 //!        bit, every end of a borrow (and every clearing of control-ring
 //!        backpressure) re-queues the worker while a request is parked.
+//!   bit3 reserved (v97 INNOCENT_VICTIM, not in this build; rejected).
+//!   bit4 STALL_WATCH (v97d, DIAGNOSTIC): while any render pair has
+//!        outstanding work, a 4 ms delayed work reads the firmware per-QID
+//!        dependency records (firmware DATA, read-only) of every busy pair.
+//!        A 3D queue is a stall candidate when its TA's completed stamp has
+//!        passed the 3D's next stamp (its TA parent is complete) while no 3D
+//!        queue of any pair has advanced for >= STALL_MS. The first sample of
+//!        a stall logs the dependency records, the B1 scheduler masks
+//!        (requested/sampled/deferred/next), the runnable mask and the park
+//!        record. Log and count only: no firmware write, no message.
+//!   bit5 STALL_REDOORBELL (v97d, DIAGNOSTIC, needs bit4): on a detected
+//!        stall re-send the exact paired render doorbell a submission ends
+//!        with (the only host action that activates a published render),
+//!        once per stall. Nothing is sent while a firmware recovery is
+//!        pending or the session is not accepting work. A doorbell names no
+//!        queue: firmware rescans its own rings, as after any submission.
+//!   bit6 STALL_FRAGMENT (v97d, DIAGNOSTIC, needs bits 4+5): if a stall is
+//!        still present STALL_MS after the paired doorbell, also send the
+//!        Fragment (3D) doorbell once. Native sends only the paired Vertex
+//!        doorbell per render, so this arm is a discriminator, never a fix.
 //! Grow ingress, deferral, re-kick and recovery-time grow state are always
 //! logged (rate-limited) and counted, independent of the mask.
 use core::fmt::{self, Write};
@@ -39,7 +59,11 @@ use kernel::{bindings, module_param::KernelParam};
 pub(crate) const RECLAIM_DRAINED: u32 = 1 << 0;
 pub(crate) const CONTROL_TRACE: u32 = 1 << 1;
 pub(crate) const GROW_REKICK: u32 = 1 << 2;
-const ALL_BITS: u32 = (1 << 3) - 1;
+pub(crate) const STALL_WATCH: u32 = 1 << 4;
+pub(crate) const STALL_REDOORBELL: u32 = 1 << 5;
+pub(crate) const STALL_FRAGMENT: u32 = 1 << 6;
+const ALL_BITS: u32 = RECLAIM_DRAINED | CONTROL_TRACE | GROW_REKICK | STALL_WATCH | STALL_REDOORBELL
+    | STALL_FRAGMENT;
 
 static MASK: AtomicU32 = AtomicU32::new(0);
 
@@ -95,6 +119,96 @@ pub(crate) static GROW_REPLIED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GROW_REPLY_WATCH: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GROW_REPLY_AT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GROW_REPLY_CONSUMED: AtomicU64 = AtomicU64::new(0);
+
+/// v97d 3D stall watch (bits 4/5). Polls, detections, detections whose 3D
+/// QID was in the B1 deferred mask, doorbells sent (paired / Fragment),
+/// stalls that cleared after a doorbell, stalls that cleared unaided, and
+/// stalls still present when a firmware recovery arrived.
+pub(crate) static STALL_POLLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_DETECTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_DEFERRED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_DOORBELLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_FRAGMENT_DOORBELLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_CLEARED_AFTER_DOORBELL: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_CLEARED_UNAIDED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_AT_RECOVERY: AtomicU64 = AtomicU64::new(0);
+/// Longest detected stall (ns from candidate start to clearance).
+pub(crate) static STALL_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Poll period and detection threshold. The native DM monitor escalates a
+/// no-progress DM1 slot after two samples ~36 ms apart (T2 hang: +34/+70 ms
+/// after the TA completed); detection must precede it.
+pub(crate) const STALL_POLL_MS: u64 = 4;
+pub(crate) const STALL_MS: u64 = 20;
+
+/// Per-pair watch state, owned by the Runtime lock (atomics only for
+/// static storage). `since` = ns when the pair became a candidate with this
+/// 3D completed stamp (0 = not a candidate); `stage` 0 none, 1 detected,
+/// 2 paired doorbell sent, 3 Fragment doorbell sent.
+pub(crate) struct StallSlot {
+    pub(crate) fragment_completed: AtomicU64,
+    pub(crate) since: AtomicU64,
+    pub(crate) stage: AtomicU32,
+    pub(crate) acted_at: AtomicU64,
+}
+pub(crate) const STALL_SLOTS: usize = 16;
+pub(crate) static STALL_SLOT: [StallSlot; STALL_SLOTS] = [const {
+    StallSlot { fragment_completed: AtomicU64::new(u64::MAX), since: AtomicU64::new(0),
+        stage: AtomicU32::new(0), acted_at: AtomicU64::new(0) }
+}; STALL_SLOTS];
+/// Sum of every busy pair's 3D completed stamp at the previous poll, and the
+/// ns at which any 3D queue last advanced.
+pub(crate) static STALL_FRAGMENT_SUM: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALL_DM1_PROGRESS: AtomicU64 = AtomicU64::new(0);
+
+/// A 3D queue is a stall candidate when it has published work beyond its
+/// completed stamp and the paired TA queue (same stamp numbering) has
+/// completed at least the 3D's next stamp: its TA parent is complete.
+/// Stamps compare as signed 40-bit values, like the firmware's barriers.
+pub(crate) fn stall_candidate(ta_completed: u64, fragment_completed: u64, latest: u64,
+    next: Option<u64>) -> bool {
+    fragment_completed != latest && next.is_some_and(|next| {
+        let delta = ta_completed.wrapping_sub(next) & 0xff_ffff_ffff;
+        delta < (1 << 39)
+    })
+}
+
+pub(crate) fn note_stall_cleared(slot: &StallSlot, now: u64) {
+    let since = slot.since.swap(0, Ordering::Relaxed);
+    let stage = slot.stage.swap(0, Ordering::Relaxed);
+    if stage == 0 || since == 0 { return; }
+    let lasted = now.saturating_sub(since);
+    STALL_MAX_NS.fetch_max(lasted, Ordering::Relaxed);
+    if stage >= 2 {
+        STALL_CLEARED_AFTER_DOORBELL.fetch_add(1, Ordering::Relaxed);
+    } else {
+        STALL_CLEARED_UNAIDED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A firmware recovery arrived: count and describe every stall still open.
+pub(crate) fn note_recovery_for_stalls() -> OpenStalls {
+    let mut open = OpenStalls::default();
+    for (index, slot) in STALL_SLOT.iter().enumerate() {
+        let stage = slot.stage.load(Ordering::Relaxed);
+        if stage != 0 {
+            STALL_AT_RECOVERY.fetch_add(1, Ordering::Relaxed);
+            if open.count < open.pairs.len() {
+                open.pairs[open.count] = (index as u8, stage as u8,
+                    slot.fragment_completed.load(Ordering::Relaxed));
+                open.count += 1;
+            }
+        }
+    }
+    open
+}
+
+/// Fixed-capacity summary of open stalls (no allocation on the event path).
+#[derive(Default)]
+pub(crate) struct OpenStalls {
+    pub(crate) pairs: [(u8, u8, u64); 4],
+    pub(crate) count: usize,
+}
 
 pub(crate) fn watch_grow_reply(producer_after: u32, buffer_slot: u32) {
     GROW_REPLY_AT.store(crate::g17_timing_buffer::arch_counter(), Ordering::Relaxed);
@@ -187,7 +301,9 @@ unsafe extern "C" fn mask_set(value: *const core::ffi::c_char, _: *const binding
         for counter in [&RECLAIM_ATTEMPTS, &RECLAIM_PAIRS, &RECLAIM_TRACKERS, &RECLAIM_RELEASED,
                         &REANNOUNCE_ANNOUNCED, &REANNOUNCE_UNANNOUNCED, &GROW_INGRESS,
                         &GROW_DEFERRED, &GROW_PARKED_AT_RETURN, &GROW_REKICKS, &GROW_REPLIED,
-                        &GROW_REPLY_CONSUMED] {
+                        &GROW_REPLY_CONSUMED, &STALL_POLLS, &STALL_DETECTED, &STALL_DEFERRED,
+                        &STALL_DOORBELLS, &STALL_FRAGMENT_DOORBELLS, &STALL_CLEARED_AFTER_DOORBELL,
+                        &STALL_CLEARED_UNAIDED, &STALL_AT_RECOVERY, &STALL_MAX_NS] {
             counter.store(0, Ordering::Relaxed);
         }
         for counter in RECLAIM_BLOCKED.iter() { counter.store(0, Ordering::Relaxed); }
@@ -216,6 +332,13 @@ unsafe extern "C" fn mask_get(buf: *mut core::ffi::c_char, _: *const bindings::k
         GROW_REPLY_CONSUMED.load(Ordering::Relaxed),
         GROW_DEFERRED.load(Ordering::Relaxed), GROW_PARKED_AT_RETURN.load(Ordering::Relaxed),
         GROW_REKICKS.load(Ordering::Relaxed));
+    let _ = write!(out, " stall polls={} detected={} deferred={} doorbells={} fragment-doorbells={} cleared-after-doorbell={} cleared-unaided={} at-recovery={} max-ms={}",
+        STALL_POLLS.load(Ordering::Relaxed), STALL_DETECTED.load(Ordering::Relaxed),
+        STALL_DEFERRED.load(Ordering::Relaxed), STALL_DOORBELLS.load(Ordering::Relaxed),
+        STALL_FRAGMENT_DOORBELLS.load(Ordering::Relaxed),
+        STALL_CLEARED_AFTER_DOORBELL.load(Ordering::Relaxed),
+        STALL_CLEARED_UNAIDED.load(Ordering::Relaxed), STALL_AT_RECOVERY.load(Ordering::Relaxed),
+        STALL_MAX_NS.load(Ordering::Relaxed) / 1_000_000);
     let _ = write!(out, " reannounce announced={} unannounced={} by-opcode:",
         REANNOUNCE_ANNOUNCED.load(Ordering::Relaxed), REANNOUNCE_UNANNOUNCED.load(Ordering::Relaxed));
     for (opcode, counter) in REANNOUNCE_BY_OPCODE.iter().enumerate() {

@@ -1315,6 +1315,13 @@ fn drain_primary_firmware_event_batch(
                     // every render using it. Record grow state before recovery
                     // settles, drops stale requests or returns pairs.
                     manager.log_render_grow_state("stamp-blamed-recovery");
+                    // v97d: did the host-side 3D stall watch see this coming?
+                    if crate::g17_recovery_path::enabled(crate::g17_recovery_path::STALL_WATCH) {
+                        let open = crate::g17_recovery_path::note_recovery_for_stalls();
+                        dev_err!(pdev.as_ref(),
+                            "G17P 3D stall watch at recovery: open-stalls(pair,stage,3d-completed)={:x?}\n",
+                            &open.pairs[..open.count]);
+                    }
                 } else {
                     manager.log_render_grow_state("recovery");
                 }
@@ -3795,6 +3802,135 @@ impl G17PLiveRuntime {
         self.manager
             .as_ref()
             .is_some_and(|manager| manager.pending_primary_recovery().is_some())
+    }
+
+    /// v97d: start the 3D stall watch after a render doorbell (bit4 only).
+    /// Enqueued under the Runtime mutex after the armed check, like the
+    /// event worker's self-requeue; unbind disables the work after disarm.
+    fn arm_render_stall_watch(&self) {
+        if !crate::g17_recovery_path::enabled(crate::g17_recovery_path::STALL_WATCH)
+            || !self.firmware_event_worker_armed()
+        {
+            return;
+        }
+        if let Some(drm) = self.drm.as_ref() {
+            crate::driver::arm_g17p_render_stall_watch(drm.clone(),
+                crate::g17_recovery_path::STALL_POLL_MS);
+        }
+    }
+
+    /// v97d STALL_WATCH / STALL_REDOORBELL / STALL_FRAGMENT (DIAGNOSTIC).
+    /// Called from the stall work with the Runtime mutex held. Returns the
+    /// re-arm delay in ms while any render pair has tracked outstanding work.
+    /// Reads only firmware DATA and host state; the only message it can send
+    /// is the render doorbell (bit5) or the Fragment doorbell (bit6).
+    pub(crate) fn service_render_stall_watch(&mut self) -> Option<u64> {
+        use crate::g17_recovery_path as rp;
+        use core::sync::atomic::Ordering::Relaxed;
+        if !rp::enabled(rp::STALL_WATCH) || !self.firmware_event_worker_armed() || self.is_crashed() {
+            return None;
+        }
+        let now = crate::g17_timing_buffer::now();
+        rp::STALL_POLLS.fetch_add(1, Relaxed);
+        let recovery_pending = self.primary_recovery_pending();
+        let candidates = self.manager.as_ref()?.render_stall_candidates();
+        if candidates.is_empty() {
+            for slot in rp::STALL_SLOT.iter() {
+                rp::note_stall_cleared(slot, now);
+                slot.fragment_completed.store(u64::MAX, Relaxed);
+            }
+            return None;
+        }
+        // (pair, TA qid, 3D qid, TA completed, 3D completed, latest 3D, next 3D)
+        let mut observed: KVec<(u8, u8, u8, u64, u64, u64, Option<u64>)> = KVec::new();
+        let mut sum = 0u64;
+        for &(pair, tiling_qid, fragment_qid, latest, count, stride) in candidates.iter() {
+            let (Some(ta_completed), Some(fragment_completed)) = (
+                g17_manager::G17PManagerConstruction::firmware_dependency_completed(tiling_qid),
+                g17_manager::G17PManagerConstruction::firmware_dependency_completed(fragment_qid),
+            ) else { continue };
+            sum = sum.wrapping_add(fragment_completed.rotate_left(u32::from(fragment_qid)));
+            let next = g17_submission::prepare_kick_submission(fragment_completed, fragment_qid, count, stride)
+                .ok().map(|prepared| prepared.next_timestamp);
+            if observed.push((pair, tiling_qid, fragment_qid, ta_completed, fragment_completed, latest, next),
+                GFP_KERNEL).is_err() { break; }
+        }
+        if rp::STALL_FRAGMENT_SUM.swap(sum, Relaxed) != sum {
+            rp::STALL_DM1_PROGRESS.store(now, Relaxed);
+        }
+        let quiet_since = rp::STALL_DM1_PROGRESS.load(Relaxed);
+        let threshold = rp::STALL_MS * 1_000_000;
+        for &(pair, tiling_qid, fragment_qid, ta_completed, fragment_completed, latest, next) in observed.iter() {
+            let slot = &rp::STALL_SLOT[usize::from(pair) % rp::STALL_SLOTS];
+            if slot.fragment_completed.swap(fragment_completed, Relaxed) != fragment_completed {
+                rp::note_stall_cleared(slot, now);
+            }
+            if !rp::stall_candidate(ta_completed, fragment_completed, latest, next) {
+                rp::note_stall_cleared(slot, now);
+                continue;
+            }
+            let since = slot.since.load(Relaxed);
+            if since == 0 {
+                slot.since.store(now, Relaxed);
+                continue;
+            }
+            if now.saturating_sub(since.max(quiet_since)) < threshold {
+                continue;
+            }
+            let stage = slot.stage.load(Relaxed);
+            if stage == 0 {
+                slot.stage.store(1, Relaxed);
+                slot.acted_at.store(now, Relaxed);
+                let detected = rp::STALL_DETECTED.fetch_add(1, Relaxed) + 1;
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_err!(pdev.as_ref(),
+                        "G17P 3D stall #{}: pair={} ta-qid={} 3d-qid={} ta-completed={:#x} 3d-completed={:#x} 3d-next={:#x?} 3d-latest={:#x} candidate-for={}us dm1-quiet={}us recovery-pending={}\n",
+                        detected, pair, tiling_qid, fragment_qid, ta_completed, fragment_completed,
+                        next, latest, now.saturating_sub(since) / 1000,
+                        now.saturating_sub(quiet_since) / 1000, recovery_pending);
+                }
+                if let Some(manager) = self.manager.as_mut() {
+                    let (requested, deferred) = manager.log_b1_scheduler_state("3d-stall",
+                        &[tiling_qid, fragment_qid], Some(fragment_qid));
+                    if deferred { rp::STALL_DEFERRED.fetch_add(1, Relaxed); }
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_err!(pdev.as_ref(),
+                            "G17P 3D stall #{}: 3d-qid={} in requested={} deferred={}\n",
+                            detected, fragment_qid, requested, deferred);
+                    }
+                }
+            }
+            if recovery_pending || !rp::enabled(rp::STALL_REDOORBELL) {
+                continue;
+            }
+            let stage = slot.stage.load(Relaxed);
+            let acted_at = slot.acted_at.load(Relaxed);
+            let message = if stage <= 1 {
+                Some((2u32, g17_submission::G17P_PARTIAL_OPENING_PAIRED_DOORBELL, "paired"))
+            } else if stage == 2 && rp::enabled(rp::STALL_FRAGMENT)
+                && now.saturating_sub(acted_at) >= threshold
+            {
+                Some((3u32, g17_submission::G17P_NATIVE_3D_DOORBELL, "fragment"))
+            } else {
+                None
+            };
+            let Some((next_stage, doorbell, kind)) = message else { continue };
+            let sent = match self.gfx_rtkit.as_mut() {
+                Some(rtkit) => Pin::new(rtkit).send_message_logged(
+                    g17_rtkit::ENDPOINT_GFX_INTERRUPTS, doorbell),
+                None => Err(ENODEV),
+            };
+            slot.stage.store(next_stage, Relaxed);
+            slot.acted_at.store(now, Relaxed);
+            let counter = if next_stage == 2 { &rp::STALL_DOORBELLS } else { &rp::STALL_FRAGMENT_DOORBELLS };
+            let count = counter.fetch_add(1, Relaxed) + 1;
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_err!(pdev.as_ref(),
+                    "G17P 3D stall: {} re-doorbell #{} message={:#018x} pair={} 3d-qid={} 3d-completed={:#x} result={:?}\n",
+                    kind, count, doorbell, pair, fragment_qid, fragment_completed, sent.map(|_| ()));
+            }
+        }
+        Some(rp::STALL_POLL_MS)
     }
 
     /// Acquire this pair's FList lease before any render doorbell. A cold
@@ -7937,6 +8073,7 @@ impl G17PLiveRuntime {
                 if let Err(error) = send {
                     return Err(self.request_session_rebuild(error));
                 }
+                self.arm_render_stall_watch();
                 if stages.enabled {
                     stages.doorbell_cntvct = crate::g17_timing_buffer::arch_counter();
                 }
@@ -8045,6 +8182,7 @@ impl G17PLiveRuntime {
                 self.abandon_render_submission_after_timeout();
                 return Err(error);
             }
+            self.arm_render_stall_watch();
             self.manager.as_mut().ok_or(ENODEV)?.commit_render_publication(render_slot)?;
             // As for paired publication, enter the servicing wait before any
             // expensive host-memory dump of the now-live fragment resources.
