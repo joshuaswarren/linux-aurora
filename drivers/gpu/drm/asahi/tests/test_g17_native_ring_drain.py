@@ -40,6 +40,10 @@ const EINVAL:i32=22; const EIO:i32=5;
 macro_rules! dev_err { ($($x:tt)*) => { REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) } }
 static REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 mod kernel { pub mod device { pub struct Device; } }
+// v93: the default-off pstate sampler (exercised in test_g17_v93_fw_deps.py).
+mod g17_timing_buffer { pub fn stats_pstate_enabled() -> bool { false }
+ pub fn stats_pstate_note(_: usize, _: u32, _: u64, _: u64) { unreachable!() }
+ pub fn stats_pstate_read_failed() { unreachable!() } }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] enum InstanceRole { Primary, Secondary }
 struct Instance { status_a:u64 }
 struct Role { instance:Instance }

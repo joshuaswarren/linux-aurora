@@ -29,6 +29,7 @@ pub type Result<T=()> = std::result::Result<T,i32>;
 pub const EBUSY:i32=-16;pub const EINVAL:i32=-22;const EOPNOTSUPP:i32=-95;const ENOENT:i32=-2;const ECANCELED:i32=-125;
 pub trait Errno{fn to_errno(&self)->i32;}impl Errno for i32{fn to_errno(&self)->i32{*self}}
 mod g17_resources {pub struct G17PWorkStateLease;}
+mod g17_host_path {pub const AGG_FIRST:u32=1<<14;pub static MASK:std::sync::atomic::AtomicU32=std::sync::atomic::AtomicU32::new(0);pub static AGG_FIRST_TAKEN:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);pub fn enabled(bit:u32)->bool{MASK.load(std::sync::atomic::Ordering::Relaxed)&bit!=0}pub fn count(c:&std::sync::atomic::AtomicU64){c.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}}
 mod g17_drm {
  pub struct G17PSubmissionFence;
  #[derive(Default)]pub struct G17PSubmitCompletionMember(pub std::sync::atomic::AtomicU32);

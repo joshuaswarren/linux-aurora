@@ -53,6 +53,33 @@
 //!        a user-visible attribute, so it exists only to measure the value of
 //!        big-core placement (what CLPC's P-core recommendation and, on Linux,
 //!        a UCLAMP_TASK kernel would provide) before any kernel change.
+//!   bit13 FW_DEPS (v93, default off until lab-qualified): an input syncobj
+//!        whose fence (after unwrapping timeline chain links) consists only of
+//!        already-signalled fences and aggregates of this same queue's recent
+//!        fully enqueued ioctls is not waited on the host. Instead the
+//!        command's logical render/compute prefixes are raised to cover those
+//!        ioctls, which the existing prefix machinery turns into firmware
+//!        barrier tokens (render->render at publish, compute<->render through
+//!        publication fences plus tokens, compute->compute through the QID's
+//!        implicit parent), and each matched aggregate is status-checked at
+//!        publication. Anything else (another queue, another VM or client, a
+//!        foreign or errored fence, a fence array, an ioctl that did not fully
+//!        enqueue, a chain deeper than FW_DEP_LINKS_MAX) keeps the unchanged
+//!        host wait for that whole sync. Same VM by construction, so a faulted
+//!        predecessor's existing fail-outstanding/quarantine paths release the
+//!        firmware waiter.
+//!   bit14 AGG_FIRST (v93, default off until lab-qualified): a completion
+//!        signals the ioctl's user-visible aggregate fence before its per-
+//!        command hardware fence (whose inline callbacks are drm_sched job-done
+//!        bookkeeping). Timestamp writes, sticky status, lease release and
+//!        VM-job release still precede both: userspace reads timestamps and
+//!        recycles BOs/VAs as soon as the aggregate signals.
+//!   bit15 EARLY_DEPS (v93, default off until lab-qualified): early
+//!        publication also admits a render whose host dependencies are all
+//!        already signalled and whose remaining dependencies are firmware
+//!        status checks (FW_DEPS aggregates, prefix hardware fences); it still
+//!        declines any unsignalled host dependency, a scheduler backlog or an
+//!        unavailable lease, so the ioctl never waits for a dependency.
 //!
 //! v92 per-cluster feed levels: `g17p_feed_perf_pct_p` / `g17p_feed_perf_pct_e`
 //! (0 = inherit `g17p_feed_perf_pct`) set the floor of the highest-capacity
@@ -97,11 +124,16 @@ pub(crate) const VALIDATE_PROOF: u32 = 1 << 9;
 pub(crate) const PENDING_EXACT: u32 = 1 << 10;
 pub(crate) const WORD_STORES: u32 = 1 << 11;
 pub(crate) const PCORE_NUDGE: u32 = 1 << 12;
-const ALL_BITS: u32 = (1 << 13) - 1;
+pub(crate) const FW_DEPS: u32 = 1 << 13;
+pub(crate) const AGG_FIRST: u32 = 1 << 14;
+pub(crate) const EARLY_DEPS: u32 = 1 << 15;
+const ALL_BITS: u32 = (1 << 16) - 1;
 
 /// Production default for this candidate. v84-final had FEED_PERF only; v87
 /// added bits 2-8 and v91 bits 9-11. `g17p_host_path=0x1fe` is exactly the
 /// v90 behaviour and `=2` the v84-final behaviour, for same-boot A/B.
+/// v93 bits 13-15 stay off by default (0xffe is exactly v92d) until the lab
+/// qualifies them; `0xeffe` enables all three.
 const DEFAULT_MASK: u32 = FEED_PERF | EARLY_SHALLOW | STATE_WORD | SETTLE_ONCE
     | RING_CACHE | WORKER_TAIL | OBS_SKIP | VM_STATUS_MIRROR
     | VALIDATE_PROOF | PENDING_EXACT | WORD_STORES;
@@ -133,6 +165,15 @@ pub(crate) static PROOF_BATCHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROOF_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NUDGES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NUDGE_FAILS: AtomicU64 = AtomicU64::new(0);
+/// v93 FW_DEPS input syncs: converted to firmware prefixes, kept as host
+/// waits, or dropped because already signalled without error.
+pub(crate) static FW_DEP_CONVERTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW_DEP_HOST: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW_DEP_SATISFIED: AtomicU64 = AtomicU64::new(0);
+/// v93 EARLY_DEPS: early publications that carried dependencies.
+pub(crate) static EARLY_WITH_DEPS: AtomicU64 = AtomicU64::new(0);
+/// v93 AGG_FIRST completions (aggregate member completed before hw fence).
+pub(crate) static AGG_FIRST_TAKEN: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }
@@ -146,6 +187,8 @@ pub(crate) const fn early_shallow_admits(outstanding_before: usize, depth: u32) 
 
 /// Whether a render submission may attempt early publication: bit0 alone
 /// (v84, any depth) or bit2 within the depth. Dependencies always decline.
+/// With v93 EARLY_DEPS the caller passes whether any host dependency is
+/// still unsignalled instead of whether one exists.
 #[inline(always)]
 pub(crate) fn early_publish_allowed(outstanding_before: usize, has_dependencies: bool) -> bool {
     if has_dependencies { return false; }
@@ -154,6 +197,75 @@ pub(crate) fn early_publish_allowed(outstanding_before: usize, has_dependencies:
     if mask & EARLY_SHALLOW == 0 { return false; }
     // No counter here: a declined (deep) submission must stay the v84 path.
     early_shallow_admits(outstanding_before, EARLY_DEPTH.load(Ordering::Relaxed))
+}
+
+/// v93 FW_DEPS: longest timeline chain walked per input sync; ring size.
+pub(crate) const FW_DEP_LINKS_MAX: u32 = 16;
+pub(crate) const FW_DEP_RECENT: usize = 8;
+
+/// One unwrapped input-fence leaf, as seen by `fw_dep_step`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FwDepLeaf {
+    /// Signalled without error: satisfies nothing further.
+    Signalled,
+    /// Signalled with an error: the host path must consume it.
+    Failed,
+    /// Unsignalled; identity is the fence address (compared, never used).
+    Pending(usize),
+    /// Nested container, fence array, missing leaf or over-long chain.
+    Unsupported,
+}
+
+/// A recent fully enqueued ioctl of this queue: aggregate identity and the
+/// inclusive logical sequence ranges of its commands (0 = none of that kind).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FwDepRecent {
+    pub(crate) identity: usize,
+    pub(crate) render_last: u64,
+    pub(crate) compute_last: u64,
+}
+
+/// Accumulated firmware expression of one input sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FwDepResolution {
+    /// Highest render / compute logical sequence that must retire first.
+    pub(crate) render_through: u64,
+    pub(crate) compute_through: u64,
+    /// Bit i: recent entry i supplied a pending leaf (status-checked later).
+    pub(crate) used: u32,
+    /// Leaves seen (Signalled included); 0 means an empty walk.
+    pub(crate) leaves: u32,
+}
+
+/// Fold one leaf into `resolution`. False means the sync is not provably
+/// expressible in firmware and must keep its original host wait.
+pub(crate) fn fw_dep_step(
+    resolution: &mut FwDepResolution, leaf: FwDepLeaf, recent: &[Option<FwDepRecent>],
+) -> bool {
+    resolution.leaves += 1;
+    let identity = match leaf {
+        FwDepLeaf::Signalled => return true,
+        FwDepLeaf::Failed | FwDepLeaf::Unsupported => return false,
+        FwDepLeaf::Pending(identity) => identity,
+    };
+    if identity == 0 { return false; }
+    let Some(index) = recent.iter().position(|entry|
+        entry.is_some_and(|entry| entry.identity == identity)) else { return false; };
+    let Some(entry) = recent[index] else { return false; };
+    resolution.render_through = resolution.render_through.max(entry.render_last);
+    resolution.compute_through = resolution.compute_through.max(entry.compute_last);
+    resolution.used |= 1u32 << index;
+    true
+}
+
+/// Raise an optional logical prefix (`None` = independent) to cover `through`.
+#[inline(always)]
+pub(crate) const fn fw_dep_raise(prefix: Option<u64>, through: u64) -> Option<u64> {
+    if through == 0 { return prefix; }
+    match prefix {
+        Some(limit) if limit >= through => Some(limit),
+        _ => Some(through),
+    }
 }
 
 /// RING_CACHE decision for one role. `entry` is (cursor, ring, drains left)
@@ -488,7 +600,7 @@ unsafe extern "C" fn mask_get(buf: *mut core::ffi::c_char, _: *const bindings::k
     // SAFETY: sysfs parameter output is PAGE_SIZE.
     let bytes = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), 1000) };
     let mut out = Output { bytes, used: 0 };
-    let _ = writeln!(out, "{:#x} pct={} applied={} streak={} idle={} busy={} starved={} fed={} boosts={} boosted_ns={} active={} policies={} depth={} early={} settle_skip={} ring_hits={} tail={} obs_skip={} mirrors={} proof_hits={} proof_batches={} proof_fallbacks={} pct_p={} pct_e={} big_cpus={:#x} applied_khz={}/{} nudges={} nudge_fails={}",
+    let _ = writeln!(out, "{:#x} pct={} applied={} streak={} idle={} busy={} starved={} fed={} boosts={} boosted_ns={} active={} policies={} depth={} early={} settle_skip={} ring_hits={} tail={} obs_skip={} mirrors={} proof_hits={} proof_batches={} proof_fallbacks={} pct_p={} pct_e={} big_cpus={:#x} applied_khz={}/{} nudges={} nudge_fails={} fwdeps={}/{}/{} early_deps={} agg_first={}",
         MASK.load(Ordering::Relaxed), FEED_PCT.load(Ordering::Relaxed), REQS.applied_pct.load(Ordering::Relaxed),
         STREAK.load(Ordering::Relaxed), IDLE_EWMA.load(Ordering::Relaxed), BUSY_EWMA.load(Ordering::Relaxed),
         STARVED.load(Ordering::Relaxed), FED.load(Ordering::Relaxed),
@@ -502,7 +614,9 @@ unsafe extern "C" fn mask_get(buf: *mut core::ffi::c_char, _: *const bindings::k
         FEED_PCT_P.load(Ordering::Relaxed), FEED_PCT_E.load(Ordering::Relaxed),
         REQS.big_cpus.load(Ordering::Relaxed), REQS.applied_khz[0].load(Ordering::Relaxed),
         REQS.applied_khz[1].load(Ordering::Relaxed), NUDGES.load(Ordering::Relaxed),
-        NUDGE_FAILS.load(Ordering::Relaxed));
+        NUDGE_FAILS.load(Ordering::Relaxed), FW_DEP_CONVERTED.load(Ordering::Relaxed),
+        FW_DEP_HOST.load(Ordering::Relaxed), FW_DEP_SATISFIED.load(Ordering::Relaxed),
+        EARLY_WITH_DEPS.load(Ordering::Relaxed), AGG_FIRST_TAKEN.load(Ordering::Relaxed));
     out.used as core::ffi::c_int
 }
 unsafe extern "C" fn pct_set(value: *const core::ffi::c_char, _: *const bindings::kernel_param) -> core::ffi::c_int {
