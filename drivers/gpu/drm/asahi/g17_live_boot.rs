@@ -3836,47 +3836,39 @@ impl G17PLiveRuntime {
         let candidates = self.manager.as_ref()?.render_stall_candidates();
         if candidates.is_empty() {
             for slot in rp::STALL_SLOT.iter() {
-                rp::note_stall_cleared(slot, now);
-                slot.fragment_completed.store(u64::MAX, Relaxed);
+                rp::discard_stall_observation(slot);
             }
             return None;
         }
         // (pair, TA qid, 3D qid, TA completed, 3D completed, latest 3D, next 3D)
         let mut observed: KVec<(u8, u8, u8, u64, u64, u64, Option<u64>)> = KVec::new();
-        let mut sum = 0u64;
+        let mut observed_slots = 0u64;
         for &(pair, tiling_qid, fragment_qid, latest, count, stride) in candidates.iter() {
             let (Some(ta_completed), Some(fragment_completed)) = (
                 g17_manager::G17PManagerConstruction::firmware_dependency_completed(tiling_qid),
                 g17_manager::G17PManagerConstruction::firmware_dependency_completed(fragment_qid),
             ) else { continue };
-            sum = sum.wrapping_add(fragment_completed.rotate_left(u32::from(fragment_qid)));
             let next = g17_submission::prepare_kick_submission(fragment_completed, fragment_qid, count, stride)
                 .ok().map(|prepared| prepared.next_timestamp);
             if observed.push((pair, tiling_qid, fragment_qid, ta_completed, fragment_completed, latest, next),
                 GFP_KERNEL).is_err() { break; }
+            observed_slots |= 1u64 << pair;
         }
-        if rp::STALL_FRAGMENT_SUM.swap(sum, Relaxed) != sum {
-            rp::STALL_DM1_PROGRESS.store(now, Relaxed);
+        // A single pair may disappear while other clients remain busy. Do
+        // not carry its old interval across a graph borrow or failed read.
+        for (index, slot) in rp::STALL_SLOT.iter().enumerate() {
+            if observed_slots & (1u64 << index) == 0 {
+                rp::discard_stall_observation(slot);
+            }
         }
-        let quiet_since = rp::STALL_DM1_PROGRESS.load(Relaxed);
         let threshold = rp::STALL_MS * 1_000_000;
         for &(pair, tiling_qid, fragment_qid, ta_completed, fragment_completed, latest, next) in observed.iter() {
             let slot = &rp::STALL_SLOT[usize::from(pair) % rp::STALL_SLOTS];
-            if slot.fragment_completed.swap(fragment_completed, Relaxed) != fragment_completed {
-                rp::note_stall_cleared(slot, now);
-            }
-            if !rp::stall_candidate(ta_completed, fragment_completed, latest, next) {
-                rp::note_stall_cleared(slot, now);
+            if !rp::sample_stall_slot(slot, now, fragment_completed,
+                rp::stall_candidate(ta_completed, fragment_completed, latest, next)) {
                 continue;
             }
             let since = slot.since.load(Relaxed);
-            if since == 0 {
-                slot.since.store(now, Relaxed);
-                continue;
-            }
-            if now.saturating_sub(since.max(quiet_since)) < threshold {
-                continue;
-            }
             let stage = slot.stage.load(Relaxed);
             if stage == 0 {
                 slot.stage.store(1, Relaxed);
@@ -3884,10 +3876,9 @@ impl G17PLiveRuntime {
                 let detected = rp::STALL_DETECTED.fetch_add(1, Relaxed) + 1;
                 if let Some(pdev) = self.pdev.as_ref() {
                     dev_err!(pdev.as_ref(),
-                        "G17P 3D stall #{}: pair={} ta-qid={} 3d-qid={} ta-completed={:#x} 3d-completed={:#x} 3d-next={:#x?} 3d-latest={:#x} candidate-for={}us dm1-quiet={}us recovery-pending={}\n",
+                        "G17P 3D stall #{}: pair={} ta-qid={} 3d-qid={} ta-completed={:#x} 3d-completed={:#x} 3d-next={:#x?} 3d-latest={:#x} candidate-for={}us recovery-pending={}\n",
                         detected, pair, tiling_qid, fragment_qid, ta_completed, fragment_completed,
-                        next, latest, now.saturating_sub(since) / 1000,
-                        now.saturating_sub(quiet_since) / 1000, recovery_pending);
+                        next, latest, now.saturating_sub(since) / 1000, recovery_pending);
                 }
                 if let Some(manager) = self.manager.as_mut() {
                     let (requested, deferred) = manager.log_b1_scheduler_state("3d-stall",
@@ -3920,10 +3911,11 @@ impl G17PLiveRuntime {
                     g17_rtkit::ENDPOINT_GFX_INTERRUPTS, doorbell),
                 None => Err(ENODEV),
             };
-            slot.stage.store(next_stage, Relaxed);
+            slot.stage.store(if sent.is_ok() { next_stage } else { 4 }, Relaxed);
             slot.acted_at.store(now, Relaxed);
             let counter = if next_stage == 2 { &rp::STALL_DOORBELLS } else { &rp::STALL_FRAGMENT_DOORBELLS };
-            let count = counter.fetch_add(1, Relaxed) + 1;
+            let count = if sent.is_ok() { counter.fetch_add(1, Relaxed) + 1 }
+                else { counter.load(Relaxed) };
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_err!(pdev.as_ref(),
                     "G17P 3D stall: {} re-doorbell #{} message={:#018x} pair={} 3d-qid={} 3d-completed={:#x} result={:?}\n",
@@ -6321,9 +6313,22 @@ impl G17PLiveRuntime {
         // Same ordering as a completion: pending notifications (the async
         // grow completion owns one FList reference) before FList retirement.
         if !*serviced {
+            self.service_firmware_events_inline()?;
             *serviced = true;
-            let _ = self.service_firmware_events_inline();
             self.manager.as_mut().ok_or(ENODEV)?.ensure_render_slot(slot)?;
+        }
+        // Event service is fallible and can open/service another recovery.
+        // A proof acquired before it cannot authorize releasing quarantined
+        // references afterwards. Keep the pair quarantined on every failure
+        // or changed recovery/drain observation, before retiring any tracker.
+        if self.is_crashed() { return Err(EIO); }
+        if self.primary_recovery_pending() {
+            return Ok(Some(ReclaimBlock::Recovery));
+        }
+        if let Some(reason) = self.manager.as_mut().ok_or(ENODEV)?
+            .render_slot_firmware_drained(slot)?
+        {
+            return Ok(Some(reason));
         }
         while self.manager.as_ref().ok_or(ENODEV)?.render_slot_tracked(slot)? {
             let retired = match self.manager.as_mut().ok_or(ENODEV)?
@@ -6351,7 +6356,13 @@ impl G17PLiveRuntime {
                 }
             }
         }
-        Ok(None)
+        // FList release publishes asynchronous firmware control records.
+        // Recheck the proof before returning quarantined ownership.
+        if self.is_crashed() { return Err(EIO); }
+        if self.primary_recovery_pending() {
+            return Ok(Some(ReclaimBlock::Recovery));
+        }
+        self.manager.as_mut().ok_or(ENODEV)?.render_slot_firmware_drained(slot)
     }
 
     /// Release error-fence owners only after both processors are stopped.

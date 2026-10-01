@@ -35,6 +35,76 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 mod tests {
     use super::*;
 
+    fn fresh_slot() -> StallSlot {
+        StallSlot { fragment_completed: AtomicU64::new(u64::MAX),
+            since: AtomicU64::new(0), stage: AtomicU32::new(0),
+            acted_at: AtomicU64::new(0) }
+    }
+
+    #[test]
+    fn another_client_cannot_hide_a_starved_queue() {
+        let stalled = fresh_slot();
+        let busy = fresh_slot();
+        let start = 1_000_000_000;
+        for tick in 0..=6 {
+            let now = start + tick * 4_000_000;
+            // Interleave a different queue's advancing completions before
+            // every sample. It must not restart this queue's elapsed time.
+            assert!(!sample_stall_slot(&busy, now, tick, true));
+            assert_eq!(sample_stall_slot(&stalled, now, 0xae43, true), tick >= 5);
+        }
+    }
+
+    #[test]
+    fn interrupted_observation_starts_a_fresh_interval() {
+        let slot = fresh_slot();
+        let start = 1_000_000_000;
+        assert!(!sample_stall_slot(&slot, start, 0xae43, true));
+        assert!(sample_stall_slot(&slot, start + 20_000_000, 0xae43, true));
+        slot.stage.store(2, Ordering::Relaxed);
+        let credited = STALL_CLEARED_AFTER_DOORBELL.load(Ordering::Relaxed);
+        // The graph was borrowed or no dependency snapshot was readable.
+        discard_stall_observation(&slot);
+        assert_eq!(STALL_CLEARED_AFTER_DOORBELL.load(Ordering::Relaxed), credited);
+        assert!(!sample_stall_slot(&slot, start + 100_000_000, 0xae43, true));
+        assert!(!sample_stall_slot(&slot, start + 116_000_000, 0xae43, true));
+        assert!(sample_stall_slot(&slot, start + 120_000_000, 0xae43, true));
+    }
+
+    #[test]
+    fn losing_the_candidate_predicate_is_not_a_rescue() {
+        let slot = fresh_slot();
+        slot.fragment_completed.store(0xae43, Ordering::Relaxed);
+        slot.since.store(1_000_000, Ordering::Relaxed);
+        slot.stage.store(2, Ordering::Relaxed);
+        let credited = STALL_CLEARED_AFTER_DOORBELL.load(Ordering::Relaxed);
+        assert!(!sample_stall_slot(&slot, 50_000_000, 0xae43, false));
+        assert_eq!(STALL_CLEARED_AFTER_DOORBELL.load(Ordering::Relaxed), credited);
+        assert_eq!(slot.since.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_send_is_not_a_sent_doorbell() {
+        let slot = fresh_slot();
+        slot.fragment_completed.store(0xae43, Ordering::Relaxed);
+        slot.since.store(1_000_000, Ordering::Relaxed);
+        slot.stage.store(4, Ordering::Relaxed);
+        let credited = STALL_CLEARED_AFTER_DOORBELL.load(Ordering::Relaxed);
+        assert!(!sample_stall_slot(&slot, 50_000_000, 0xae44, true));
+        assert_eq!(STALL_CLEARED_AFTER_DOORBELL.load(Ordering::Relaxed), credited);
+    }
+
+    #[test]
+    fn completion_progress_resets_this_queues_interval() {
+        let slot = fresh_slot();
+        let start = 1_000_000_000;
+        assert!(!sample_stall_slot(&slot, start, 0xae43, true));
+        assert!(sample_stall_slot(&slot, start + 20_000_000, 0xae43, true));
+        assert!(!sample_stall_slot(&slot, start + 24_000_000, 0xae44, true));
+        assert!(!sample_stall_slot(&slot, start + 40_000_000, 0xae44, true));
+        assert!(sample_stall_slot(&slot, start + 44_000_000, 0xae44, true));
+    }
+
     #[test]
     fn mask_accepts_stall_bits_and_rejects_reserved_bit3() {
         assert_eq!(parse_mask("0x75"), Some(0x75));
@@ -62,6 +132,9 @@ mod tests {
 
     #[test]
     fn clearance_is_attributed_to_the_doorbell_only_after_one_was_sent() {
+        STALL_CLEARED_UNAIDED.store(0, Ordering::Relaxed);
+        STALL_CLEARED_AFTER_DOORBELL.store(0, Ordering::Relaxed);
+        STALL_MAX_NS.store(0, Ordering::Relaxed);
         let slot = &STALL_SLOT[0];
         slot.since.store(1_000, Ordering::Relaxed);
         slot.stage.store(1, Ordering::Relaxed);
@@ -95,4 +168,4 @@ with tempfile.TemporaryDirectory() as tmp:
     (path / "t.rs").write_text(source)
     subprocess.run(["rustc", "--edition=2021", "--test", str(path / "t.rs"), "-o", str(path / "t")], check=True)
     subprocess.run([str(path / "t"), "--test-threads=1"], check=True)
-print("PASS v97d stall watch: mask, candidate predicate, clearance attribution, recovery accounting")
+print("PASS stall watch: 8 tests including multi-client starvation and interrupted observations")

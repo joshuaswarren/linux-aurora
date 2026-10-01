@@ -78,7 +78,8 @@ struct G17PAsyncComputeQueue {
     retire_pending: bool,
     /// Quarantined with a published, ticketed command whose exact firmware
     /// retirement has not been observed yet (zero-duration retire or
-    /// scheduler timeout). While set, the queue-local terminal words are
+    /// scheduler timeout or another job losing this VM). While set, the
+    /// queue-local terminal words are
     /// re-read at recovery completion, owner release, the next client's
     /// preparation and completion-event batches. Only that command's packet
     /// and VM pin are released on the witness; the installed graph (QID,
@@ -1150,6 +1151,12 @@ impl G17PLiveRuntime {
                 // sibling escalation killed a healthy session).
                 let q = &mut self.async_compute_queues[index];
                 q.quarantined = true;
+                // Normal completion polling skips quarantined queues. Keep
+                // the same ticketed retirement path as a scheduler timeout,
+                // or a sibling's failure pins this VM until processor stop
+                // even after firmware has retired every published kick.
+                q.awaiting_retirement_witness =
+                    q.inflight.iter().all(|active| active.retirement.is_some());
                 for active in q.inflight.iter() {
                     active._lease.quarantine();
                     if let Ok(completion) = active.packet.completion() {
