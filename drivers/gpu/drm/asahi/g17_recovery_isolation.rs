@@ -89,6 +89,8 @@
 //!        old one). A replayed front kick is never treated as an earlier
 //!        recovery's collateral: if a later recovery blames its QID, it ran on
 //!        its own after the replay and its owner is guilty (no replay loop).
+//!        A kick that a render already named as its native parent is not
+//!        replayed (see `ComputeReplayQueue::native_consumer`).
 //!        Renders are NOT replayed yet; spared renders failed after
 //!        firmware retirement are counted by whether their pass started
 //!        (`spared-render-started/-unstarted`) to size that work.
@@ -98,6 +100,13 @@
 //!        kick implies none behind it ran. It is not independently decoded
 //!        from native firmware. Every in-flight kick snapshotted at recovery
 //!        in the saved logs (199 snapshots) had page words [0, 0].
+//!   bit0 also covers inherited errors (iso4): a consumer whose dependency
+//!        failed fails with ECANCELED instead of the dependency's EIO /
+//!        ETIMEDOUT / ENODEV, so it is not charged as its own VM's device
+//!        loss. Since c209c3dc5, consumers of a producer with host-copied
+//!        timestamps wait for its completion fence, so they always see a
+//!        failed producer's error; a spared render retired by firmware
+//!        completes with EIO, which used to poison every consumer's VM.
 //!
 //! v2 (iso2): a recovery that blames a queue whose OLDEST in-flight work was
 //! already spared by an earlier recovery treats it as that recovery's
@@ -168,6 +177,11 @@ pub(crate) struct ComputeReplayQueue {
     pub(crate) released: bool,
     /// The queue still belongs to the witness ticket's owner.
     pub(crate) owner_matches: bool,
+    /// A render named one of these kicks as its native parent. Firmware
+    /// retired the cancelled kick, which satisfies that barrier, so the
+    /// render may already have run without the kick's output; a replay would
+    /// then write after its consumer read.
+    pub(crate) native_consumer: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -197,6 +211,9 @@ where I: IntoIterator<Item = Option<[u64; 2]>> {
     {
         return ComputeReplay::NotCandidate;
     }
+    if queue.native_consumer {
+        return ComputeReplay::Refused;
+    }
     let mut any = false;
     for words in kicks {
         any = true;
@@ -206,6 +223,23 @@ where I: IntoIterator<Item = Option<[u64; 2]>> {
         }
     }
     if any { ComputeReplay::Replay } else { ComputeReplay::NotCandidate }
+}
+
+/// An error a consumer inherits from a failed dependency (an input fence or
+/// a firmware-ordered parent) is not the consumer's own device loss. With
+/// INNOCENT set, the device-loss codes EIO, ETIMEDOUT and ENODEV become
+/// ECANCELED for the consumer: its job fails, its VM keeps running. Errnos
+/// are negative, as `Error::to_errno` returns them.
+pub(crate) const fn inherited_errno(mask: u32, errno: i32) -> i32 {
+    const EIO: i32 = -5;
+    const ENODEV: i32 = -19;
+    const ETIMEDOUT: i32 = -110;
+    const ECANCELED: i32 = -125;
+    if mask & INNOCENT != 0 && (errno == EIO || errno == ETIMEDOUT || errno == ENODEV) {
+        ECANCELED
+    } else {
+        errno
+    }
 }
 
 /// One more publication of a command that has been replayed `replays` times.
@@ -426,11 +460,15 @@ pub(crate) static SPARED_RENDER_STARTED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REPLAY_TIMEOUT_RENEWED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REPLAY_ORDER_WAITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REPLAY_ORDER_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// iso4: replays refused because a render had already been released
+/// against a cancelled kick; consumer failures not charged to the VM.
+pub(crate) static REPLAY_REFUSED_CONSUMER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static INHERITED_NOT_POISONED: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }
 
-static COUNTERS: [(&str, &AtomicU64); 29] = [
+static COUNTERS: [(&str, &AtomicU64); 31] = [
     ("recoveries", &RECOVERIES), ("unresolved", &UNRESOLVED),
     ("spared-renders", &SPARED_RENDERS), ("spared-compute", &SPARED_COMPUTE),
     ("guilty-marked", &GUILTY_MARKED), ("graced", &GRACED),
@@ -446,6 +484,8 @@ static COUNTERS: [(&str, &AtomicU64); 29] = [
     ("spared-render-unstarted", &SPARED_RENDER_UNSTARTED), ("spared-render-started", &SPARED_RENDER_STARTED),
     ("replay-timeout-renewed", &REPLAY_TIMEOUT_RENEWED), ("replay-order-waits", &REPLAY_ORDER_WAITS),
     ("replay-order-timeouts", &REPLAY_ORDER_TIMEOUTS),
+    ("replay-refused-consumer", &REPLAY_REFUSED_CONSUMER),
+    ("inherited-not-poisoned", &INHERITED_NOT_POISONED),
 ];
 
 // ---- parameter -----------------------------------------------------------------

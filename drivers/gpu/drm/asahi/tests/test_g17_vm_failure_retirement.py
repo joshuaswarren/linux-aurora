@@ -85,6 +85,7 @@ impl Completion {
  // iso4 REPLAY inputs. The default mask (0) never makes a replay candidate;
  // the decision itself is tested in test_g17_compute_replay.py.
  fn replay_witness_words(&self)->Option<[u64;2]>{None}
+ fn has_native_consumer(&self)->bool{false}
  // Only reached for a spared queue (recovery isolation): fail and release.
  fn complete(&self,r:Result){if let Err(e)=r{self.fence.set_error(e)}self.signalled.store(1,Ordering::SeqCst);drop(self.vm_job.lock().take());self.fence.signal();self.aggregate_member.complete(r);}
 }

@@ -15,6 +15,7 @@ Executed (production code extracted verbatim, mock kernel types):
 Static (text) checks: completion orders, knob defaults, the unchanged None
 path, fault-release wiring, early-publication gate order.
 """
+from g17_recovery_isolation_test_support import recovery_isolation_mod
 import os, re, subprocess, tempfile
 from pathlib import Path
 
@@ -352,7 +353,7 @@ program_b = r'''
 #![allow(dead_code, unused_imports)]
 use std::sync::{Arc, atomic::{AtomicI32, AtomicU64, Ordering}};
 #[derive(Debug, Copy, Clone, PartialEq)] struct Error(i32);
-impl Error { fn from_errno(e: i32) -> Self { Self(e) } }
+impl Error { fn from_errno(e: i32) -> Self { Self(e) } fn to_errno(self) -> i32 { self.0 } }
 type Result<T=()> = std::result::Result<T, Error>;
 const EIO: Error = Error(-5);
 #[derive(Clone)] struct Fence { status: Arc<AtomicI32> }
@@ -374,6 +375,10 @@ for name in ['encode_kick_word', 'decode_kick_word', 'encode_kick_timestamp',
     program_b += '\n' + citem(name)
 program_b += '\n}\n'
 program_b += '\nstruct G17PQueue; impl G17PQueue {' + block(DRM, '    fn check_firmware_fence(') + '}\n'
+# iso4: a failed predecessor is reported to the dependent through the
+# production inheritance rule (EIO with the isolation mask clear).
+program_b += block(DRM, 'pub(crate) fn inherited_dependency_error(').replace('pub(crate) ', '') + '\n'
+program_b += recovery_isolation_mod()
 program_b += r'''
 struct Render { owner: u64, status: Arc<g17_status::VmStatus>, render_order: g17_submission::G17PRenderOrder,
                 fragment_dependency: AtomicU64, fence: Fence }
@@ -401,6 +406,11 @@ fn render(vm: &Arc<g17_status::VmStatus>, seq: u64, wait: Option<u64>, qid: u8, 
     assert!(dependent.predecessor_dependency(&render(&vm, 41, None, 7, 1, 1)).unwrap().is_none());
     // Failed predecessor: publication of the dependent fails (never runs).
     assert_eq!(dependent.predecessor_dependency(&render(&vm, 41, None, 7, 1, -5)), Err(EIO));
+    // iso4 INNOCENT: the dependent fails without a device-loss code, so its
+    // own VM is not poisoned for its predecessor's failure.
+    g17_recovery_isolation::MASK.store(g17_recovery_isolation::INNOCENT, Ordering::Relaxed);
+    assert_eq!(dependent.predecessor_dependency(&render(&vm, 41, None, 7, 1, -5)), Err(Error(-125)));
+    g17_recovery_isolation::MASK.store(0, Ordering::Relaxed);
     // Another queue (owner) or VM is never matched by the scan.
     let mut other = render(&vm, 41, None, 7, 1, 0); other.owner = 8;
     assert!(dependent.predecessor_dependency(&other).unwrap().is_none());
