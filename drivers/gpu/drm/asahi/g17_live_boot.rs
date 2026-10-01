@@ -6727,6 +6727,11 @@ impl G17PLiveRuntime {
                     }
                 }
             }
+            // iso4: sample before retirement settles the tracker. Whether the
+            // head pass's tiler ever stamped its start sizes render replay.
+            let head_started = self.manager.as_mut()
+                .and_then(|manager| manager.render_slot_head_pass_started(render_slot));
+            let queued_count = queued_signals.len();
             let retired = queued_signals.is_none() && self
                 .retire_failed_deferred_render(render_slot, submission_id.is_some())
                 .unwrap_or(false);
@@ -6794,10 +6799,17 @@ impl G17PLiveRuntime {
             }
             if spared {
                 crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::FANOUT_SKIPPED);
+                match head_started {
+                    Some(false) => crate::g17_recovery_isolation::count(
+                        &crate::g17_recovery_isolation::SPARED_RENDER_UNSTARTED),
+                    Some(true) => crate::g17_recovery_isolation::count(
+                        &crate::g17_recovery_isolation::SPARED_RENDER_STARTED),
+                    None => {}
+                }
                 if let Some(pdev) = self.pdev.as_ref() {
                     dev_info!(pdev.as_ref(),
-                        "G17P recovery isolation: spared render slot {} failed ({:?}, firmware-retired={}); its VM keeps running\n",
-                        render_slot, error, retired);
+                        "G17P recovery isolation: spared render slot {} failed ({:?}, firmware-retired={}, pass-started={:?}, queued={}); its VM keeps running\n",
+                        render_slot, error, retired, head_started, queued_count);
                 }
             } else {
                 self.fail_outstanding_jobs_for_vm(&status, error);

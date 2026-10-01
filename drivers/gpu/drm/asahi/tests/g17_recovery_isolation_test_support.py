@@ -33,15 +33,23 @@ def recovery_isolation_mod():
         out.append(f" pub const {name}: {ty} = {value};")
     for name in statics:
         out.append(f" pub static {name}: AtomicU64 = AtomicU64::new(0);")
-    # The pure, production decoders and classifier, verbatim.
+    # The pure, production decoders, classifier and iso4 replay/inheritance
+    # decisions, verbatim.
     for marker in ("pub(crate) struct RecoveryEntry {",
                    "pub(crate) const fn decode_entry(",
                    "pub(crate) fn qid_masks(",
-                   "pub(crate) const fn classify("):
-        out.append(" #[derive(Copy, Clone, Debug, PartialEq, Eq)]" if "struct" in marker else "")
+                   "pub(crate) const fn classify(",
+                   "pub(crate) struct ComputeReplayQueue {",
+                   "pub(crate) enum ComputeReplay {",
+                   "pub(crate) const fn never_executed(",
+                   "pub(crate) fn compute_replay_decision<",
+                   "pub(crate) const fn replay_budget_left("):
+        typed = "struct" in marker or "enum" in marker
+        out.append(" #[derive(Copy, Clone, Debug, PartialEq, Eq)]" if typed else "")
         out.append(_block(src, marker).replace("pub(crate)", "pub"))
     out += [" pub static MASK: AtomicU32 = AtomicU32::new(0);",
             " pub fn enabled(bit: u32) -> bool { MASK.load(Ordering::Relaxed) & bit != 0 }",
+            " pub fn mask() -> u32 { MASK.load(Ordering::Relaxed) }",
             " pub fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }",
             "}"]
     return "\n".join(out) + "\n"

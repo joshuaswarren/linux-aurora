@@ -17,8 +17,11 @@ def retention_method(source):
     return block(s, "    fn quarantine_failed_render_completion(")
 
 KVEC = r'''
+const GFP_KERNEL:u32=0;
 struct KVec<T>(Vec<T>);
 impl<T> KVec<T> {
+ fn new()->Self{Self(Vec::new())}
+ fn reserve(&mut self,n:usize,_:u32)->std::result::Result<(),()>{self.0.reserve(n);Ok(())}
  fn with_capacity(n:usize)->Self{Self(Vec::with_capacity(n))}
  fn push_within_capacity(&mut self,v:T)->std::result::Result<(),(T,)> {
   if self.0.len()<self.0.capacity(){self.0.push(v);Ok(())}else{Err((v,))}
@@ -29,4 +32,5 @@ impl<T> KVec<T> {
 impl<T> std::ops::Deref for KVec<T>{type Target=[T];fn deref(&self)->&[T]{&self.0}}
 impl<T> std::ops::DerefMut for KVec<T>{fn deref_mut(&mut self)->&mut[T]{&mut self.0}}
 impl<'a,T> IntoIterator for &'a KVec<T>{type Item=&'a T;type IntoIter=std::slice::Iter<'a,T>;fn into_iter(self)->Self::IntoIter{self.0.iter()}}
+impl<T> IntoIterator for KVec<T>{type Item=T;type IntoIter=std::vec::IntoIter<T>;fn into_iter(self)->Self::IntoIter{self.0.into_iter()}}
 '''

@@ -136,6 +136,10 @@ pub(crate) struct G17PJobCompletion {
     aggregate_member: crate::g17_drm::G17PSubmitCompletionMember,
     /// `g17p_recovery_isolation`: class assigned while servicing a recovery.
     recovery_class: core::sync::atomic::AtomicU8,
+    /// iso4 REPLAY: publications beyond the first, and whether the scheduler
+    /// job may renew one timeout for the latest replay.
+    replays: core::sync::atomic::AtomicU8,
+    replay_timeout_credit: core::sync::atomic::AtomicU8,
 }
 
 impl G17PJobCompletion {
@@ -177,6 +181,8 @@ impl G17PJobCompletion {
             signalled: AtomicU32::new(0),
             aggregate_member,
             recovery_class: core::sync::atomic::AtomicU8::new(0),
+            replays: core::sync::atomic::AtomicU8::new(0),
+            replay_timeout_credit: core::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -193,6 +199,54 @@ impl G17PJobCompletion {
                 u64::from_le_bytes(raw[8..].try_into().map_err(|_| EINVAL)?),
             ])
         })
+    }
+
+    /// Recovery isolation REPLAY: this command's own completion words, the
+    /// evidence of whether firmware retired it without executing. Firmware
+    /// retires a cancelled kick by stamping start == end (the zero-duration
+    /// shape `g17p_zero_duration` documents), and a kick it never reached
+    /// leaves both at the zeroed allocation value. Any start != end means the
+    /// shader ran, and running it again could repeat side effects. Call only
+    /// after the retirement witness: the words can no longer change.
+    /// Returns the words for `g17_recovery_isolation::compute_replay_decision`,
+    /// or None when the fence is already signalled or the page is unreadable.
+    pub(crate) fn replay_witness_words(&self) -> Option<[u64; 2]> {
+        if self.signalled.load(Ordering::Acquire) != 0 { return None; }
+        self.halted_timestamp_snapshot().ok()
+    }
+
+    /// Recovery isolation REPLAY: account one more publication of this
+    /// command. False once MAX_REPLAYS are used (the caller then fails it).
+    /// Each accepted replay grants one scheduler timeout renewal.
+    pub(crate) fn begin_replay(&self) -> bool {
+        let accepted = self.replays.fetch_update(Ordering::AcqRel, Ordering::Acquire, |replays|
+            crate::g17_recovery_isolation::replay_budget_left(replays).then_some(replays + 1)).is_ok();
+        if accepted {
+            self.replay_timeout_credit.store(1, Ordering::Release);
+        }
+        accepted
+    }
+
+    pub(crate) fn replay_count(&self) -> u8 { self.replays.load(Ordering::Acquire) }
+
+    /// Consume the timeout renewal the latest replay granted. Only an
+    /// unsignalled command can use it.
+    pub(crate) fn take_replay_timeout_credit(&self) -> bool {
+        self.signalled.load(Ordering::Acquire) == 0
+            && self.replay_timeout_credit.swap(0, Ordering::AcqRel) != 0
+    }
+
+    /// Recovery isolation REPLAY: zero the completion words before the same
+    /// command is published again, so the replayed kick's timestamps (and the
+    /// zero-duration test on it) start exactly as a fresh allocation does.
+    pub(crate) fn reset_for_replay(&self) -> Result {
+        if self.signalled.load(Ordering::Acquire) != 0 { return Err(ECANCELED); }
+        self.timestamps.with_cpu_bytes(|bytes| {
+            bytes.get_mut(..16).ok_or(EINVAL)?.fill(0);
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Wake error waiters while retaining the VM-job pin in the quarantined
@@ -396,6 +450,14 @@ pub(crate) struct G17PScheduledJob<B: G17PQueueBackend> {
 impl<B: G17PQueueBackend> sched::JobImpl for G17PScheduledJob<B> {
     const MANAGED_TIMEOUT_RECOVERY: bool = true;
     fn false_timeout(job: &mut sched::Job<Self>) -> bool {
+        // iso4 REPLAY: a replayed command was published again after the
+        // recovery consumed most of its timeout; give it one fresh period.
+        if job.packet.completion().is_ok_and(|completion| completion.take_replay_timeout_credit()) {
+            crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::REPLAY_TIMEOUT_RENEWED);
+            pr_info!("G17P recovery isolation: replayed compute submission={} timeout renewed once\n",
+                job.packet.submission_id());
+            return true;
+        }
         if !cfg!(g17p_progress_timeout_probe) { return false; }
         let current = job.backend.timeout_progress();
         let mut previous = job.timeout_progress;

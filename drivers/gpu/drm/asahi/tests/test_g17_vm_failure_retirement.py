@@ -82,6 +82,9 @@ impl Aggregate {fn complete(&self,_:Result){self.0.fetch_add(1,Ordering::SeqCst)
 struct Completion {signalled:AtomicU32,vm_job:Mutex<Option<Pin>>,status:Arc<g17_status::VmStatus>,fence:Fence,aggregate_member:Aggregate,recovery_class:std::sync::atomic::AtomicU8}
 impl Completion {
 ''' + completion_methods + r'''
+ // iso4 REPLAY inputs. The default mask (0) never makes a replay candidate;
+ // the decision itself is tested in test_g17_compute_replay.py.
+ fn replay_witness_words(&self)->Option<[u64;2]>{None}
  // Only reached for a spared queue (recovery isolation): fail and release.
  fn complete(&self,r:Result){if let Err(e)=r{self.fence.set_error(e)}self.signalled.store(1,Ordering::SeqCst);drop(self.vm_job.lock().take());self.fence.signal();self.aggregate_member.complete(r);}
 }
@@ -99,6 +102,7 @@ impl Drop for Lease {fn drop(&mut self){self.0.leases_dropped.fetch_add(1,Orderi
 #[derive(Clone,Copy)] struct FirmwareTicket(u64);
 #[derive(Clone,Copy)] struct Ticket {owner:u64,submission:u64,context:u32,firmware:FirmwareTicket}
 struct Active {packet:Arc<Packet>,_lease:Lease,retirement:Option<Ticket>}
+struct G17PAsyncComputeReplay {packet:Arc<Packet>,lease:Lease}
 ''' + completion_mod(fence_state_source()) + queue_limits_mock() + KVEC + r'''
 type Inflight=g17_completion::PairFifo<Active,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
 type RetiredLeases=g17_completion::PairFifo<Lease,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
@@ -106,7 +110,7 @@ struct HardwareQueue(u8);
 impl HardwareQueue {fn queue_id(&self)->u8{self.0}}
 struct Previous {publication:Option<()>}
 struct Queue {owner:Option<u64>,queue:HardwareQueue,inflight:Inflight,quarantined:bool,awaiting_retirement_witness:bool,retired_leases:RetiredLeases,_graph:Graph,
- previous_binding:Option<Previous>,retirement_ready:bool,retire_pending:bool,spared_quarantine:bool,first_kick_watch:bool,spared_deferred:bool}
+ previous_binding:Option<Previous>,retirement_ready:bool,retire_pending:bool,spared_quarantine:bool,first_kick_watch:bool,spared_deferred:bool,released:bool}
 ''' + spared_helper + r'''
 ''' + recovery_isolation_mod() + r'''
 struct Device;
@@ -174,9 +178,11 @@ impl Manager {
   self.queries.push((q.0,t.0,n));self.proof
  }
  fn return_witnessed_compute_queue(&mut self,_:&mut HardwareQueue,_:u32)->Result{Ok(())}
+ fn render_slot_head_pass_started(&mut self,_:u8)->Option<bool>{None}
 }
 struct Runtime {async_compute_queues:Vec<Queue>,pending_render:[Option<Arc<Render>>;2],pending_render_queued:[RenderFifo;2],render_fence_state:g17_completion::RenderFenceState,render_event_masks:[[u32;2];2],quarantined_render_completions:KVec<Arc<Render>>,render_ready:[bool;2],reclaim_pending_since:Option<kernel::time::Instant<kernel::time::Monotonic>>,session_recovery_pending:bool,reclaim_queries:Vec<u8>,deferred:Vec<Arc<Render>>,manager:Option<Manager>,pdev:Option<Device>,scans:usize}
 impl Runtime {
+ fn replay_spared_compute(&mut self,_:u64,kept:KVec<G17PAsyncComputeReplay>){assert!(kept.is_empty(),"no replay in this harness");}
  fn service_async_compute_completions(&mut self)->Result{self.scans+=1;Ok(())}
  fn poll_deferred_render_completion(&mut self,slot:u8)->Result<Option<()>>{Ok(self.render_ready[slot as usize].then_some(()))}
  // Mock the already-proven success boundary; the fanout and error completion
@@ -214,7 +220,7 @@ fn fixture()->(Runtime,Arc<g17_status::VmStatus>,Arc<Counts>,Vec<Arc<Completion>
   let active=Active{packet:Arc::new(Packet{id,context:Context(10),completion:c}),_lease:Lease(counts.clone()),retirement:Some(Ticket{owner:65,submission:id,context:10,firmware:FirmwareTicket(id)})};
   assert!(inflight.push(active).is_ok());
  }
- let q=Queue{owner:Some(65),queue:HardwareQueue(13),inflight,quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(counts.clone()),previous_binding:None,retirement_ready:false,retire_pending:false,spared_quarantine:false,first_kick_watch:false,spared_deferred:false};
+ let q=Queue{owner:Some(65),queue:HardwareQueue(13),inflight,quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(counts.clone()),previous_binding:None,retirement_ready:false,retire_pending:false,spared_quarantine:false,first_kick_watch:false,spared_deferred:false,released:false};
  (Runtime{async_compute_queues:vec![q],pending_render:[None,None],pending_render_queued:std::array::from_fn(|_|RenderFifo::new()),render_fence_state:Default::default(),render_event_masks:[[0;2];2],quarantined_render_completions:KVec::with_capacity(32),render_ready:[false;2],reclaim_pending_since:None,session_recovery_pending:false,reclaim_queries:Vec::new(),deferred:Vec::new(),manager:Some(Manager{state:0,proof:Ok(false),queries:Vec::new()}),pdev:None,scans:0},status,counts,completions)
 }
 fn check_retained(rt:&Runtime,c:&Counts){
@@ -291,7 +297,7 @@ fn check_retained(rt:&Runtime,c:&Counts){
  assert_eq!(rt.fail_outstanding_jobs_for_vm(&other,EIO),0);check_retained(&rt,&c);
  assert!(!rt.async_compute_queues[0].quarantined);
  assert!(!rt.async_compute_queues[0].awaiting_retirement_witness);
- let empty=Queue{owner:None,queue:HardwareQueue(14),inflight:Inflight::new(),quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(c.clone()),previous_binding:None,retirement_ready:false,retire_pending:false,spared_quarantine:false,first_kick_watch:false,spared_deferred:false};
+ let empty=Queue{owner:None,queue:HardwareQueue(14),inflight:Inflight::new(),quarantined:false,awaiting_retirement_witness:false,retired_leases:RetiredLeases::new(),_graph:Graph(c.clone()),previous_binding:None,retirement_ready:false,retire_pending:false,spared_quarantine:false,first_kick_watch:false,spared_deferred:false,released:false};
  rt.async_compute_queues.push(empty);
  assert_eq!(rt.fail_outstanding_jobs_for_vm(&other,EIO),0);
  assert!(!rt.async_compute_queues[1].awaiting_retirement_witness);

@@ -9357,6 +9357,17 @@ impl G17PManagerConstruction {
         Some(state.tiling_timestamps[0] != 0)
     }
 
+    /// iso4: whether the head tracked pass of `pair_slot` had started (its
+    /// tiler stamped the pass start). None without a tracked pass or storage.
+    /// Read-only driver DRAM, as `render_pass_started`.
+    pub(crate) fn render_slot_head_pass_started(&mut self, pair_slot: u8) -> Option<bool> {
+        if !self.render_slot_allocated(pair_slot) { return None; }
+        let slot = self.render_slots.get_mut(pair_slot);
+        let ordinal = slot.tracker.as_ref()?.ordinal;
+        let state = slot.storage.as_deref_mut()?.snapshot(ordinal).ok()?;
+        Some(state.tiling_timestamps[0] != 0)
+    }
+
     /// v97d: the firmware's completed stamp for `qid` when its dependency
     /// record is valid.
     pub(crate) fn firmware_dependency_completed(qid: u8) -> Option<u64> {

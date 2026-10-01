@@ -13,6 +13,14 @@ struct G17PAsyncComputeActive {
     observed: Option<crate::g17_resources::G17PComputeCompletionCandidate>,
 }
 
+/// `g17p_recovery_isolation` REPLAY: one spared kick that the retirement
+/// witness proved firmware retired without executing, held (with its VM pin
+/// and its admission guard) from the witness until it is published again.
+struct G17PAsyncComputeReplay {
+    packet: Arc<crate::g17_job::G17PComputeJobPacket>,
+    lease: crate::g17_drm::G17PComputeLeaseGuard,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct G17PAsyncComputeRetirementTicket {
     owner: u64,
@@ -1058,6 +1066,9 @@ impl G17PLiveRuntime {
             Ok(handshake) if handshake.state == 0 => {}
             _ => return,
         }
+        // iso4 REPLAY: never-started spared kicks kept across the witness, per
+        // owner and in publication order, published again after this scan.
+        let mut replays: KVec<(u64, KVec<G17PAsyncComputeReplay>)> = KVec::new();
         for q in self.async_compute_queues.iter_mut() {
             if !q.awaiting_retirement_witness {
                 continue;
@@ -1092,10 +1103,60 @@ impl G17PLiveRuntime {
                 Ok(false) => {}
                 Ok(true) => {
                     q.awaiting_retirement_witness = false;
+                    // iso4 REPLAY: a Vulkan client cannot be told that one
+                    // command buffer was dropped -- any error is device loss
+                    // or silently wrong results. When every kick this queue
+                    // lost was spared AND its own completion words prove the
+                    // firmware retired it without executing (start == end,
+                    // see `replay_witness_words`), keep the packets and
+                    // publish them again, in order, once the queue is back in
+                    // service. The fences stay unsignalled throughout. If any
+                    // kick ran, the sequence cannot be repeated safely (a later
+                    // kick may already have consumed or overwritten an earlier
+                    // one's state), so all fail exactly as before.
+                    let decision = crate::g17_recovery_isolation::compute_replay_decision(
+                        crate::g17_recovery_isolation::mask(),
+                        crate::g17_recovery_isolation::ComputeReplayQueue {
+                            spared_deferred: q.spared_deferred,
+                            spared_quarantine: q.spared_quarantine,
+                            released: q.released,
+                            owner_matches: q.owner == Some(ticket.owner),
+                        },
+                        q.inflight.iter().map(|active| active.packet.completion().ok()
+                            .and_then(|completion| completion.replay_witness_words())),
+                    );
+                    let replay_candidate =
+                        decision != crate::g17_recovery_isolation::ComputeReplay::NotCandidate;
+                    let mut unstarted = decision == crate::g17_recovery_isolation::ComputeReplay::Replay;
+                    let mut kept: KVec<G17PAsyncComputeReplay> = KVec::new();
+                    if unstarted && (kept.reserve(q.inflight.len(), GFP_KERNEL).is_err()
+                        || replays.reserve(1, GFP_KERNEL).is_err())
+                    {
+                        unstarted = false;
+                    }
+                    if replay_candidate && !unstarted {
+                        for _ in q.inflight.iter() {
+                            crate::g17_recovery_isolation::count(
+                                &crate::g17_recovery_isolation::REPLAY_REFUSED_COMPUTE);
+                        }
+                    }
                     let mut released = 0usize;
                     while let Some(active) = q.inflight.take() {
                         let packet = active.packet;
                         let lease = active._lease;
+                        if unstarted {
+                            // Capacity reserved above; the packet keeps its
+                            // VM pin and its admission guard for the replay.
+                            if let Err(rejected) = kept.push_within_capacity(
+                                G17PAsyncComputeReplay { packet, lease })
+                            {
+                                if let Ok(completion) = rejected.0.packet.completion() {
+                                    completion.complete(Err(ENODATA));
+                                }
+                                drop(rejected);
+                            }
+                            continue;
+                        }
                         if let Ok(completion) = packet.completion() {
                             if q.spared_deferred {
                                 // Recovery isolation: firmware retired this
@@ -1126,9 +1187,10 @@ impl G17PLiveRuntime {
                     q.spared_deferred = false;
                     if let Some(pdev) = pdev {
                         dev_info!(pdev.as_ref(),
-                            "G17P async compute: quarantined qid={} owner={} newest-submission={} retired by firmware ({}) -- released {} packet(s) and their VM pin; the graph stays quarantined\n",
-                            q.queue.queue_id(), ticket.owner, ticket.submission, reason, released);
+                            "G17P async compute: quarantined qid={} owner={} newest-submission={} retired by firmware ({}) -- released {} packet(s) and their VM pin, kept {} never-started for replay; the graph stays quarantined\n",
+                            q.queue.queue_id(), ticket.owner, ticket.submission, reason, released, kept.len());
                     }
+                    let mut returned = false;
                     // Recovery isolation: the cancelled kicks were all spared
                     // and the witness proves firmware retired every one of
                     // them, which is exactly the state an ordinary retirement
@@ -1141,6 +1203,7 @@ impl G17PLiveRuntime {
                         q.spared_quarantine = false;
                         match manager.return_witnessed_compute_queue(&mut q.queue, in_flight) {
                             Ok(()) => {
+                                returned = true;
                                 q.quarantined = false;
                                 q.retire_pending = false;
                                 q.retirement_ready = true;
@@ -1175,6 +1238,32 @@ impl G17PLiveRuntime {
                             }
                         }
                     }
+                    if !kept.is_empty() {
+                        // Replay only onto a queue that is back in service;
+                        // the publication itself happens after this scan.
+                        let kept = if returned {
+                            // Capacity reserved with `kept`'s.
+                            match replays.push_within_capacity((ticket.owner, kept)) {
+                                Ok(()) => None,
+                                Err(rejected) => Some(rejected.0.1),
+                            }
+                        } else {
+                            Some(kept)
+                        };
+                        if let Some(kept) = kept {
+                            // Exactly the pre-REPLAY outcome for these kicks.
+                            for replay in kept.into_iter() {
+                                crate::g17_recovery_isolation::count(
+                                    &crate::g17_recovery_isolation::REPLAY_REFUSED_COMPUTE);
+                                if let Ok(completion) = replay.packet.completion() {
+                                    completion.complete(Err(ENODATA));
+                                }
+                                if let Err(lease) = q.retired_leases.push(replay.lease) {
+                                    drop(lease);
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     q.awaiting_retirement_witness = false;
@@ -1184,6 +1273,75 @@ impl G17PLiveRuntime {
                             "G17P async compute: retirement-witness qid={} invariant failed ({:?}); retaining {} command(s) until processor stop\n",
                             q.queue.queue_id(), error, q.inflight.len());
                     }
+                }
+            }
+        }
+        for (owner, kept) in replays.into_iter() {
+            self.replay_spared_compute(owner, kept);
+        }
+    }
+
+    /// `g17p_recovery_isolation` REPLAY: publish again, oldest first, the
+    /// spared kicks `owner`'s queue lost to another client's recovery that
+    /// firmware provably retired without executing. Each keeps its fence (still
+    /// unsignalled), its submission identity and its CLASS_SPARED class, so a
+    /// failure anywhere below is still never charged to the VM. The first kick
+    /// that cannot be published fails, and every later one with it: publishing
+    /// a successor without its predecessor would reorder the queue.
+    fn replay_spared_compute(&mut self, owner: u64, kept: KVec<G17PAsyncComputeReplay>) {
+        let mut failed: Option<Error> = None;
+        for replay in kept.into_iter() {
+            let G17PAsyncComputeReplay { packet, mut lease } = replay;
+            let Ok(completion) = packet.completion() else {
+                crate::g17_recovery_isolation::count(
+                    &crate::g17_recovery_isolation::REPLAY_REFUSED_COMPUTE);
+                continue;
+            };
+            let prepared = match failed {
+                Some(error) => Err(error),
+                None if !completion.begin_replay() => Err(EAGAIN),
+                None => completion.reset_for_replay(),
+            };
+            // Open question recorded per replay: whether firmware counted the
+            // cancelled kick in its work-state TSQ completed count. The replay
+            // adds one more submitted kick exactly as any publication does.
+            let tsq = completion.work_state().tsq_counters().ok();
+            let result = match prepared {
+                Ok(()) => {
+                    lease.rearm_admission();
+                    self.publish_async_compute(owner, packet.clone(), lease)
+                }
+                Err(error) => { drop(lease); Err(error) }
+            };
+            match result {
+                Ok(()) => {
+                    crate::g17_recovery_isolation::count(
+                        &crate::g17_recovery_isolation::REPLAYED_COMPUTE);
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_info!(pdev.as_ref(),
+                            "G17P recovery isolation: replayed never-started compute owner={} submission={} (replay {}) tsq(submitted,completed)-before={:?}\n",
+                            owner, packet.submission_id(), completion.replay_count(), tsq);
+                    }
+                }
+                Err(error) => {
+                    crate::g17_recovery_isolation::count(
+                        &crate::g17_recovery_isolation::REPLAY_REFUSED_COMPUTE);
+                    // A publication that reached firmware is retained (and
+                    // failed, spared) by `quarantine_async_compute`; anything
+                    // else is ours to fail exactly as the witness used to.
+                    let retained = self.async_compute_queues.iter().any(|q|
+                        q.inflight.iter().any(|active| Arc::ptr_eq(&active.packet, &packet)));
+                    if !retained {
+                        completion.complete(Err(ENODATA));
+                    }
+                    if failed.is_none() {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_warn!(pdev.as_ref(),
+                                "G17P recovery isolation: compute replay owner={} submission={} refused ({:?}); it and its successors fail as before\n",
+                                owner, packet.submission_id(), error);
+                        }
+                    }
+                    failed = Some(error);
                 }
             }
         }
@@ -1676,8 +1834,11 @@ impl G17PLiveRuntime {
                 }
             }
             for q in self.async_compute_queues.iter().filter(|q| q.queue.queue_id() == qid) {
+                // iso4: a REPLAYED front kick is not a leftover -- it was
+                // published again after its recovery and ran on its own since,
+                // so a blame on its QID is its own (no replay loop).
                 if q.inflight.front().and_then(|front| front.packet.completion().ok())
-                    .is_some_and(|front| front.recovery_spared())
+                    .is_some_and(|front| front.recovery_spared() && front.replay_count() == 0)
                 {
                     found = true;
                     collateral_qids |= 1u128 << qid;
