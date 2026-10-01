@@ -76,10 +76,60 @@ impl TimestampDestination {
     }
 }
 
+/// v94 `g17p_mem_path` bit2: retired compute completion-timestamp pages of
+/// one queue. Only the two completion words are ever written by firmware;
+/// they are cleared when a page is returned, so a reused page is exactly as
+/// the fresh allocation left it (zeroed words, same VM, driver-owned alias).
+#[pin_data]
+pub(crate) struct G17PTimestampPool {
+    #[pin]
+    pages: Mutex<KVec<mmu::KernelMapping>>,
+}
+
+/// More than the per-queue compute in-flight bound; the rest are dropped.
+const G17P_TIMESTAMP_POOL_MAX: usize =
+    2 * crate::g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize;
+
+impl G17PTimestampPool {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(pin_init!(Self {
+            pages <- new_mutex!(KVec::new(), "G17PTimestampPool::pages"),
+        }), GFP_KERNEL)
+    }
+
+    pub(crate) fn take(&self) -> Option<mmu::KernelMapping> {
+        self.pages.lock().pop()
+    }
+
+    fn put(&self, mapping: mmu::KernelMapping) {
+        let cleared = mapping.with_cpu_bytes(|bytes| {
+            bytes.get_mut(..16).ok_or(EINVAL)?.fill(0);
+            Ok(())
+        });
+        if cleared.is_err() { return; }
+        fence(Ordering::Release);
+        // Unmap a rejected page outside the pool lock.
+        let rejected = {
+            let mut pages = self.pages.lock();
+            if pages.len() >= G17P_TIMESTAMP_POOL_MAX {
+                Some(mapping)
+            } else {
+                // A failed push drops (unmaps) the page, as without the pool.
+                let _ = pages.push(mapping, GFP_KERNEL);
+                None
+            }
+        };
+        drop(rejected);
+    }
+}
+
 pub(crate) struct G17PJobCompletion {
     pub(crate) status: Arc<crate::g17_status::VmStatus>,
     fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
-    timestamps: mmu::KernelMapping,
+    /// Taken exactly once, by `Drop`, to return it to `ts_pool`.
+    timestamps: core::mem::ManuallyDrop<mmu::KernelMapping>,
+    /// v94: set when the page came from (and returns to) the queue's pool.
+    ts_pool: Option<Arc<G17PTimestampPool>>,
     destinations: [Option<TimestampDestination>; 2],
     vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
     signalled: AtomicU32,
@@ -94,6 +144,7 @@ impl G17PJobCompletion {
     pub(crate) fn new(
         fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
         timestamps: mmu::KernelMapping,
+        ts_pool: Option<Arc<G17PTimestampPool>>,
         destinations: [Option<TimestampDestination>; 2],
         status: Arc<crate::g17_status::VmStatus>,
         vm_job: mmu::T8140VmJobGuard,
@@ -106,7 +157,8 @@ impl G17PJobCompletion {
         Ok(Self {
             status,
             fence,
-            timestamps,
+            timestamps: core::mem::ManuallyDrop::new(timestamps),
+            ts_pool,
             destinations,
             vm_job,
             signalled: AtomicU32::new(0),
@@ -210,6 +262,20 @@ impl G17PJobCompletion {
     /// that fence; processor stop is the independent ownership witness.
     pub(crate) fn release_after_processor_stop(&self) {
         drop(self.vm_job.lock().take());
+    }
+}
+
+impl Drop for G17PJobCompletion {
+    fn drop(&mut self) {
+        // SAFETY: the only take of `timestamps`; `self` is being dropped.
+        // The packet owning this completion is released only after exact
+        // retirement or a proven processor stop, so firmware no longer writes
+        // the page.
+        let mapping = unsafe { core::mem::ManuallyDrop::take(&mut self.timestamps) };
+        match self.ts_pool.take() {
+            Some(pool) => pool.put(mapping),
+            None => drop(mapping),
+        }
     }
 }
 

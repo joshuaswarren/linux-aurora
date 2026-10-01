@@ -722,6 +722,26 @@ fn probe_t8140_runtime(
     };
     let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
 
+    // v94 boot-only `g17p_gem_huge`: back every GEM object created from here
+    // on with a dedicated huge tmpfs mount (1 = "within_size", 2 = "always"),
+    // as panfrost/panthor/v3d/i915 do. Must precede the first GEM object.
+    let huge = *crate::module_parameters::g17p_gem_huge.value();
+    if huge != 0 {
+        let value = if huge == 2 { c"always" } else { c"within_size" };
+        // `drm::Device` is `repr(C)` with the `drm_device` as its first field.
+        let raw = (&*drm as *const AsahiDevice).cast_mut().cast::<bindings::drm_device>();
+        // SAFETY: `raw` is this live, unregistered DRM device; no GEM object
+        // exists yet and the mount is released by a drmm action.
+        let ret = unsafe { bindings::drm_gem_huge_mnt_create(raw, value.as_ptr()) };
+        if ret == 0 {
+            crate::g17_mem_path::HUGE_MOUNT.store(huge, core::sync::atomic::Ordering::Relaxed);
+            let mode = if huge == 2 { "always" } else { "within_size" };
+            dev_info!(pdev.as_ref(), "G17P GEM: huge tmpfs mount ({}) for GEM backing\n", mode);
+        } else {
+            dev_warn!(pdev.as_ref(), "G17P GEM: huge tmpfs mount failed ({}); using shm_mnt\n", ret);
+        }
+    }
+
     let runtime = g17_live_boot::G17PLiveRuntime::start(
         pdev,
         drm.clone(),

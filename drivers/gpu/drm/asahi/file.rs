@@ -756,10 +756,13 @@ impl File {
             None
         };
 
+        let create_started = crate::g17_mem_path::stamp();
         let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj)?;
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
+        crate::g17_mem_path::GEM_CREATE.since(create_started);
+        crate::g17_mem_path::count(&crate::g17_mem_path::GEM_BYTES, data.size);
 
         mod_dev_dbg!(
             device,
@@ -812,6 +815,7 @@ impl File {
             cls_pr_debug!(Errors, "vm_bind: Unexpected headers\n");
             return Err(EINVAL);
         }
+        let bind_started = crate::g17_mem_path::stamp();
 
         let vm_id = data.vm_id.try_into()?;
         let count = usize::try_from(data.num_binds)?;
@@ -857,7 +861,10 @@ impl File {
         let mut plans = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut batch = mmu::PreparedUserBindBatch::new(count)?;
         let mut unmap_count = 0usize;
+        let prepare_started = crate::g17_mem_path::stamp();
+        crate::g17_mem_path::count(&crate::g17_mem_path::BIND_OPS, count as u64);
         for op in ops {
+            crate::g17_mem_path::count(&crate::g17_mem_path::BIND_BYTES, op.range);
             if op.range == 0
                 || (op.addr | op.range | op.offset) & mmu::UAT_PGMSK as u64 != 0
             {
@@ -934,8 +941,11 @@ impl File {
             return Err(EINVAL);
         }
 
+        crate::g17_mem_path::BIND_PREPARE.since(prepare_started);
         vm.reserve_deferred_user_unmaps(unmap_count)?;
+        let commit_started = crate::g17_mem_path::stamp();
         vm.commit_prepared_user_bind_batch(&mut batch)?;
+        crate::g17_mem_path::BIND_COMMIT.since(commit_started);
 
         // Replay registry changes only after the page-table batch commits.
         for plan in &plans {
@@ -951,6 +961,7 @@ impl File {
             }
         }
         vm.bo_deferred_cleanup();
+        crate::g17_mem_path::BIND_CALL.since(bind_started);
         Ok(0)
     }
 

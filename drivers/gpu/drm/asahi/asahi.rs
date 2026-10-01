@@ -44,6 +44,7 @@ mod g17_perf;
 mod g17_timing_buffer;
 mod g17_e2e;
 mod g17_host_path;
+mod g17_mem_path;
 mod g17_store;
 mod g17_power_preflight;
 mod g17_render;
@@ -314,6 +315,10 @@ kernel::module_platform_driver! {
         g17p_compute_usage_slot: u32 {
             default: 0,
             description: "Enable per-kick compute scratch-usage accounting",
+        },
+        g17p_gem_huge: u32 {
+            default: 0,
+            description: "v94 boot-only: back GEM objects with a huge tmpfs mount (0 off, 1 within_size, 2 always)",
         },
         g17p_completion_stamp_us: u32 {
             default: 500,

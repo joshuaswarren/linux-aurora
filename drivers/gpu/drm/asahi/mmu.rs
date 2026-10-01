@@ -713,12 +713,81 @@ struct MappingValidationState {
     visible: AtomicU64,
     pending: AtomicU64,
     writers: AtomicU32,
+    /// v94 `g17p_mem_path` bit3 (REACH_LOCKLESS): a lock-free copy of the
+    /// change history, written under the exec lock only while the bit is set.
+    /// Each entry is its own seqlock (epoch MAX while written); readers also
+    /// double-collect `visible`. A skipped or stale entry has the wrong epoch
+    /// and makes the reader refuse, so toggling the bit at runtime is safe.
+    history: [MappingHistoryEntry; MAPPING_VALIDATION_HISTORY],
+}
+
+struct MappingHistoryEntry {
+    epoch: AtomicU64,
+    start: AtomicU64,
+    end: AtomicU64,
+}
+
+impl MappingHistoryEntry {
+    const fn new() -> Self {
+        Self { epoch: AtomicU64::new(u64::MAX), start: AtomicU64::new(0), end: AtomicU64::new(0) }
+    }
+}
+
+/// Result of one history walk: the epoch walked to, whether any change
+/// touched the caller's ranges, and how many changes were examined.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MappingChangeWalk {
+    pub(crate) epoch: u64,
+    pub(crate) touched: bool,
+    pub(crate) walked: u32,
+    /// CNTPCT when the exec lock was held (0 for the lock-free walk or when
+    /// the caller did not ask for timing).
+    pub(crate) locked_at: u64,
 }
 
 impl MappingValidationState {
     fn new() -> Self {
         Self { visible: AtomicU64::new(0), pending: AtomicU64::new(0),
-            writers: AtomicU32::new(0) }
+            writers: AtomicU32::new(0),
+            history: [const { MappingHistoryEntry::new() }; MAPPING_VALIDATION_HISTORY] }
+    }
+
+    /// Writer side (exec lock held, after `begin`): publish one change.
+    fn record_history(&self, epoch: u64, start: u64, end: u64) {
+        let entry = &self.history[epoch as usize % MAPPING_VALIDATION_HISTORY];
+        entry.epoch.store(u64::MAX, Ordering::Relaxed);
+        // Orders the invalidation (and `begin`'s swap) before the new range.
+        fence(Ordering::Release);
+        entry.start.store(start, Ordering::Relaxed);
+        entry.end.store(end, Ordering::Relaxed);
+        entry.epoch.store(epoch, Ordering::Release);
+    }
+
+    /// Lock-free walk of (previous, current]: `current` must be the epoch the
+    /// caller already observed through `snapshot`. Refuses (None) on history
+    /// loss, a skipped/torn entry, or any mutation that became visible (or
+    /// started) during the walk.
+    fn changes_since(&self, previous: u64, current: u64,
+        mut intersects: impl FnMut(Range<u64>) -> bool) -> Option<MappingChangeWalk> {
+        let count = current.checked_sub(previous)?;
+        if count > MAPPING_VALIDATION_HISTORY as u64 { return None; }
+        if self.snapshot()? != current { return None; }
+        let mut touched = false;
+        let mut walked = 0u32;
+        // `count == 0` needs no entry (and `previous + 1` could overflow).
+        for epoch in (previous..current).map(|epoch| epoch + 1) {
+            let entry = &self.history[epoch as usize % MAPPING_VALIDATION_HISTORY];
+            let first = entry.epoch.load(Ordering::Acquire);
+            let start = entry.start.load(Ordering::Relaxed);
+            let end = entry.end.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            if first != epoch || entry.epoch.load(Ordering::Relaxed) != epoch { return None; }
+            walked += 1;
+            if intersects(start..end) { touched = true; break; }
+        }
+        fence(Ordering::Acquire);
+        if self.visible.load(Ordering::Relaxed) != current { return None; }
+        Some(MappingChangeWalk { epoch: current, touched, walked, locked_at: 0 })
     }
 
     fn begin(&self) {
@@ -810,6 +879,14 @@ impl VmInner {
                     start: range.start & !mask,
                     end: end.unwrap(),
                 });
+            if crate::g17_mem_path::enabled(crate::g17_mem_path::REACH_LOCKLESS) {
+                if let Some(state) = self.mapping_validation.as_ref() {
+                    state.record_history(epoch, range.start & !mask, end.unwrap());
+                }
+            }
+        }
+        if crate::g17_mem_path::enabled(crate::g17_mem_path::MEM_STATS) {
+            crate::g17_mem_path::note_vm_change(self.is_kernel, range.start);
         }
         if let Some(state) = self.mapping_validation.as_ref() {
             state.record(self.mapping_validation_epoch);
@@ -1358,11 +1435,78 @@ impl T8140VmJobGuard {
         self.vm.job_lifetime.lock().quarantined = true;
     }
 }
+/// v94 `g17p_mem_path` bit0: closed objects captured at a VM-idle instant,
+/// released on the unbound workqueue instead of inside the last job's
+/// completion and without the VM-wide `draining` admission gate.
+#[pin_data]
+struct T8140ClosedObjectDrain {
+    vm: Vm,
+    #[pin]
+    objects: Mutex<KVec<ARef<gem::Object>>>,
+    #[pin]
+    work: kernel::workqueue::Work<T8140ClosedObjectDrain>,
+}
+
+kernel::impl_has_work! {
+    impl HasWork<Self> for T8140ClosedObjectDrain { self.work }
+}
+
+impl kernel::workqueue::WorkItem for T8140ClosedObjectDrain {
+    type Pointer = Arc<T8140ClosedObjectDrain>;
+
+    fn run(this: Arc<T8140ClosedObjectDrain>) {
+        let objects = core::mem::replace(&mut *this.objects.lock(), KVec::new());
+        this.vm.release_idle_closed_objects(objects, &crate::g17_mem_path::DRAIN_ASYNC);
+    }
+}
+
+impl T8140ClosedObjectDrain {
+    /// Queue `objects`; on allocation failure hand them back to the caller.
+    fn queue(vm: Vm, objects: KVec<ARef<gem::Object>>) -> core::result::Result<(), KVec<ARef<gem::Object>>> {
+        // The initializer takes the list only once allocation has succeeded,
+        // so an allocation failure hands it back unchanged.
+        let cell = core::cell::Cell::new(Some(objects));
+        let result = {
+            let cell_ref = &cell;
+            Arc::pin_init(pin_init!(T8140ClosedObjectDrain {
+                vm,
+                objects <- new_mutex!(cell_ref.take().unwrap_or_default(), "T8140ClosedObjectDrain"),
+                work <- kernel::new_work!("T8140ClosedObjectDrain::work"),
+            }), GFP_KERNEL)
+        };
+        match result {
+            Ok(drain) => {
+                let _ = kernel::workqueue::system_unbound().enqueue(drain);
+                Ok(())
+            }
+            Err(_) => Err(cell.take().unwrap_or_default()),
+        }
+    }
+}
+
 impl Drop for T8140VmJobGuard {
     fn drop(&mut self) {
         let mut state = self.vm.job_lifetime.lock();
         state.active -= 1;
         if state.active != 0 { return; }
+        // v94 bit0: only closed objects on a healthy VM. They were closed
+        // while jobs ran and no job is active now, so none can be reached by
+        // an accepted job; release them off this completion path, ungated.
+        if crate::g17_mem_path::enabled(crate::g17_mem_path::ASYNC_CLOSED_DRAIN)
+            && !state.quarantined && !state.closed && state.close_ranges.is_none()
+            && state.deferred_unmaps.is_empty() && !state.closed_objects.is_empty()
+        {
+            let objects = core::mem::replace(&mut state.closed_objects, KVec::new());
+            core::mem::drop(state);
+            if let Err(objects) = T8140ClosedObjectDrain::queue(self.vm.clone(), objects) {
+                // No memory for the work item: release the captured (still
+                // unreachable) list here, still without the gate.
+                self.vm.release_idle_closed_objects(objects, &crate::g17_mem_path::DRAIN_INLINE);
+            }
+            return;
+        }
+        let drain_started = crate::g17_mem_path::stamp();
+        let mut drained_objects = 0u64;
         state.draining = true;
         // Keep admission blocked, but do not hold the lifetime mutex while
         // taking dma-resv locks. A VM_BIND may already own those locks and be
@@ -1385,6 +1529,7 @@ impl Drop for T8140VmJobGuard {
                     }
                 }
             }
+            drained_objects += objects.len() as u64;
             for object in objects {
                 if self.vm.drop_mappings_now(&object).is_err() {
                     pr_err!("G17P VM job retirement: deferred GEM unmap failed\n");
@@ -1414,6 +1559,10 @@ impl Drop for T8140VmJobGuard {
             break;
         }
         self.vm.bo_deferred_cleanup();
+        if drained_objects != 0 {
+            crate::g17_mem_path::DRAIN_INLINE.since(drain_started);
+            crate::g17_mem_path::count(&crate::g17_mem_path::DRAIN_OBJECTS, drained_objects);
+        }
     }
 }
 
@@ -2923,16 +3072,19 @@ impl Vm {
 
     pub(crate) fn retain_t8140_job(&self) -> Result<T8140VmJobGuard> {
         let mut gate = self.mapping_gate.state.lock();
+        let mut waited = 0u64;
         loop {
             let mut state = self.job_lifetime.lock();
             if state.closed { return Err(ENOENT); }
             if gate.blocked { return Err(EIO); }
             if state.draining {
                 core::mem::drop(state);
+                if waited == 0 { waited = crate::g17_mem_path::stamp().max(1); }
                 self.mapping_gate.idle.wait(&mut gate);
                 continue;
             }
             state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
+            if waited > 1 { crate::g17_mem_path::RETAIN_WAIT.since(waited); }
             return Ok(T8140VmJobGuard { vm: self.clone() });
         }
     }
@@ -3151,31 +3303,51 @@ impl Vm {
 
     /// Report whether mutations since `previous` touched a dependency.
     /// History loss or an unavailable lock refuses the proof.
-    pub(crate) fn mapping_changes_since(
+    /// Also reports the number of examined changes and, when `timed`, the
+    /// CNTPCT at which the exec lock was held (v94 diagnostics).
+    pub(crate) fn mapping_changes_since_counted(
         &self,
         previous: u64,
         mut intersects: impl FnMut(Range<u64>) -> bool,
-    ) -> Option<(u64, bool)> {
+        timed: bool,
+    ) -> Option<MappingChangeWalk> {
         let inner = self.inner.exec_lock(None, false).ok()?;
+        let locked_at = if timed { crate::g17_timing_buffer::arch_counter() } else { 0 };
         let changes = inner.mapping_validation_changes.as_ref()?;
         let current = inner.mapping_validation_epoch?;
         let count = current.checked_sub(previous)?;
         if count > MAPPING_VALIDATION_HISTORY as u64 {
             return None;
         }
+        let mut walk = MappingChangeWalk { epoch: current, touched: false, walked: 0, locked_at };
         if count == 0 {
-            return Some((current, false));
+            return Some(walk);
         }
         for epoch in previous + 1..=current {
             let change = changes[epoch as usize % MAPPING_VALIDATION_HISTORY]?;
             if change.epoch != epoch {
                 return None;
             }
+            walk.walked += 1;
             if intersects(change.start..change.end) {
-                return Some((current, true));
+                walk.touched = true;
+                return Some(walk);
             }
         }
-        Some((current, false))
+        Some(walk)
+    }
+
+    /// v94 REACH_LOCKLESS: the same walk without the GPUVM exec lock, from
+    /// the lock-free history. `current` is the epoch the caller already read
+    /// with `mapping_validation_epoch`. None means "use the locked walk".
+    pub(crate) fn mapping_changes_since_lockless(
+        &self,
+        previous: u64,
+        current: u64,
+        intersects: impl FnMut(Range<u64>) -> bool,
+    ) -> Option<MappingChangeWalk> {
+        if !crate::g17_mem_path::enabled(crate::g17_mem_path::REACH_LOCKLESS) { return None; }
+        self.mapping_validation.as_ref()?.changes_since(previous, current, intersects)
     }
 
     /// Resolve an IOVA through this VM's current page table. Callers use this
@@ -3592,6 +3764,7 @@ impl Vm {
     pub(crate) fn wait_for_user_map_admission(&self) -> Result {
         let mut gate = self.mapping_gate.state.lock();
         let mut waited = false;
+        let mut wait_started = 0u64;
         loop {
             let state = self.job_lifetime.lock();
             let status = self.status.get();
@@ -3606,9 +3779,11 @@ impl Vm {
                 return Err(if state.closed { ENOENT } else { EIO });
             }
             if !state.draining {
+                if wait_started != 0 { crate::g17_mem_path::ADMISSION_WAIT.since(wait_started); }
                 return Ok(());
             }
             if !waited {
+                wait_started = crate::g17_mem_path::stamp();
                 pr_info!(
                     "G17P VM map admission waiting for retirement: vm={} status={} blocked={} active={} quarantined={} draining={} closed={}\n",
                     self.id, status, gate.blocked, state.active,
@@ -3923,10 +4098,29 @@ impl Vm {
         if state.active != 0 {
             if !state.closed_objects.iter().any(|object| core::ptr::eq(&**object, gem)) {
                 state.closed_objects.push(gem.into(), GFP_KERNEL)?;
+                crate::g17_mem_path::count(&crate::g17_mem_path::PARKED, 1);
             }
             return Ok(());
         }
         self.drop_mappings_now(gem)
+    }
+
+    /// v94: unmap and release closed objects captured at a VM-idle instant
+    /// (no accepted job can reach them), then run deferred GPUVM cleanup.
+    fn release_idle_closed_objects(
+        &self, objects: KVec<ARef<gem::Object>>, stat: &crate::g17_mem_path::Stat,
+    ) {
+        let started = crate::g17_mem_path::stamp();
+        let released = objects.len() as u64;
+        for object in objects.iter() {
+            if self.drop_mappings_now(object).is_err() {
+                pr_err!("G17P VM idle release: closed GEM unmap failed\n");
+            }
+        }
+        drop(objects);
+        self.bo_deferred_cleanup();
+        stat.since(started);
+        crate::g17_mem_path::count(&crate::g17_mem_path::DRAIN_OBJECTS, released);
     }
 
     fn drop_mappings_now(&self, gem: &gem::Object) -> Result {
