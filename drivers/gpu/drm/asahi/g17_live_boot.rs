@@ -1311,6 +1311,12 @@ fn drain_primary_firmware_event_batch(
                     batch.blamed_recovery_records =
                         batch.blamed_recovery_records.saturating_add(1);
                     batch.blamed_stamp = Some(stamp);
+                    // v96: a paused pool allocator (unanswered event 6) stalls
+                    // every render using it. Record grow state before recovery
+                    // settles, drops stale requests or returns pairs.
+                    manager.log_render_grow_state("stamp-blamed-recovery");
+                } else {
+                    manager.log_render_grow_state("recovery");
                 }
                 if let Err(error) =
                     manager.validate_empty_primary_firmware_recovery(recovery.generation)
@@ -1357,6 +1363,14 @@ fn drain_primary_firmware_event_batch(
                         return Err(EIO);
                     }
                 };
+                // v96 handshake step 1: firmware event-ring arrival (raw).
+                let arrivals = GROW_ARRIVALS.fetch_add(1, Ordering::Relaxed) + 1;
+                if crate::g17_recovery_path::log_budget(arrivals, 64, 256) {
+                    dev_info!(pdev.as_ref(),
+                        "G17P TVB grow event #{}: cursor={}->{} producer={} raw={:02x?}\n",
+                        arrivals, record.consumer_before, record.consumer_published,
+                        record.producer_snapshot, &record.raw[..0x1c.min(record.raw.len())]);
+                }
                 match manager.queue_render_tvb_grow(request)? {
                     g17_manager::G17PTvbGrowDisposition::IgnoredStale => {}
                     g17_manager::G17PTvbGrowDisposition::PreparationDeferred => {}
@@ -4046,6 +4060,9 @@ impl G17PLiveRuntime {
         } else {
             false
         };
+        if let Some(manager) = self.manager.as_mut() {
+            manager.observe_grow_reply_consumption();
+        }
         if self.manager.as_ref().is_some_and(|manager| manager.preparation_grow_pending()) {
             if let Some(drm) = self.drm.as_ref() {
                 crate::driver::queue_g17p_tvb_grow_worker(drm.clone());
@@ -10852,6 +10869,9 @@ impl Drop for G17PLiveRuntime {
 }
 
 include!("g17_async_compute.rs");
+
+/// v96: firmware TVB-grow (event 6) records drained from the event ring.
+static GROW_ARRIVALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// v92c: submit-path waits taken by the FList takeover guard (diagnostic).
 pub(crate) static G17P_TAKEOVER_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

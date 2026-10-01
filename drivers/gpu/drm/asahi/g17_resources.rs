@@ -11326,6 +11326,12 @@ impl G17PUserRenderStorage {
         self.render_flist.repopulate()
     }
 
+    /// v96 takeover diagnostic: (FList id, [submitted, completed]) of this
+    /// pool before its image is rewritten for a new owner.
+    pub(crate) fn render_flist_takeover_counters(&self) -> Result<(u16, [u64; 2])> {
+        Ok((self.render_flist.id(), self.render_flist.completion_counters()?))
+    }
+
     pub(crate) fn render_flist_needs_grow(&self) -> bool {
         self.render_flist.needs_grow()
     }
@@ -21044,6 +21050,19 @@ impl G17ResourceOwner {
         if target <= before { return Ok(false); }
         self.grow_render_tvb_inner(storage, vm, target, true)?;
         Ok(storage.tvb_capacity() > before)
+    }
+
+    /// v96 recovery diagnostic: this HardwareBufferID's four PBDesc words.
+    pub(crate) fn pbdesc_words(&mut self, hardware_buffer_id: u32) -> Result<[u32; 4]> {
+        let offset = g17_submission::g17p_pbdesc_offset(hardware_buffer_id);
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let raw = bytes.get(offset..offset + 16).ok_or(ERANGE)?;
+            let mut words = [0; 4];
+            for (word, value) in words.iter_mut().enumerate() {
+                *value = u32::from_le_bytes(raw[word * 4..word * 4 + 4].try_into().map_err(|_| EINVAL)?);
+            }
+            Ok(words)
+        })
     }
 
     /// Capture the exact idle pool's descriptor. Allocation and owner-local

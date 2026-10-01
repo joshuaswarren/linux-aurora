@@ -553,6 +553,11 @@ fn g17p_control_ring_target_consumed(
     Ok(target_ahead == 0 || target_ahead > pending)
 }
 
+/// v96: firmware TVB grows taken by the allocation worker (log budget).
+static G17P_GROW_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// v96: FList-ID takeovers observed (diagnostic log budget).
+static G17P_FLIST_TAKEOVERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// One command-pair lease on a retained FList. Pool bytes outlive this lease.
 /// Native updateSubmitInfo increments pending command updates independently
 /// of optional async growth; final reference retirement emits one 0x2e using
@@ -4064,6 +4069,15 @@ impl G17PManagerConstruction {
         match self.resources.publish_primary_device_control_raw(&record) {
             Ok(publication) => {
                 self.pending_primary_control = None;
+                if u32::from_le_bytes([record[0], record[1], record[2], record[3]]) == 8 {
+                    // A deferred opcode-8 TVB grow reply (handshake step 5).
+                    crate::g17_recovery_path::watch_grow_reply(publication.producer_after,
+                        u32::from_le_bytes([record[8], record[9], record[10], record[11]]));
+                    dev_info!(self.resources.dev().as_ref(),
+                        "G17P TVB grow: deferred ack=8 published producer-after={}\n",
+                        publication.producer_after);
+                }
+                self.rekick_parked_render_grows(None);
                 Ok(G17PPendingPrimaryControlFlush::Published(publication))
             }
             Err(error) if error == EAGAIN => Ok(G17PPendingPrimaryControlFlush::Blocked),
@@ -4128,6 +4142,16 @@ impl G17PManagerConstruction {
     pub(crate) fn queue_render_tvb_grow(
         &mut self, request: g17_completion::G17PFirmwareTvbGrowEvent,
     ) -> Result<G17PTvbGrowDisposition> {
+        let ingress = crate::g17_recovery_path::GROW_INGRESS
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if crate::g17_recovery_path::log_budget(ingress, 64, 256) {
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P TVB grow request #{}: slot={} context={} counter={} subpipe={} generation={}/{} owner-preparing={} pending={} active={} backpressured={}\n",
+                ingress, request.buffer_slot, request.vm_slot, request.counter, request.subpipe,
+                request.halt_count, self.accepted_firmware_recovery_generation,
+                self.render_grow_owner_preparing(request), self.pending_render_grows.len(),
+                self.active_render_grow.is_some(), self.primary_device_control_backpressured());
+        }
         if request.halt_count != self.accepted_firmware_recovery_generation {
             return Ok(G17PTvbGrowDisposition::IgnoredStale);
         }
@@ -4149,7 +4173,23 @@ impl G17PManagerConstruction {
         loop {
             let Some(index) = self.pending_render_grows.iter().position(|request|
                 request.halt_count != self.accepted_firmware_recovery_generation
-                    || !self.render_grow_owner_preparing(*request)) else { return Ok(None); };
+                    || !self.render_grow_owner_preparing(*request)) else {
+                if !self.pending_render_grows.is_empty() {
+                    // Every parked request's pair is borrowed right now. The
+                    // worker exits; see GROW_REKICK for who retries it.
+                    let deferred = crate::g17_recovery_path::GROW_DEFERRED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    if crate::g17_recovery_path::log_budget(deferred, 32, 1024) {
+                        let first = self.pending_render_grows[0];
+                        dev_info!(self.resources.dev().as_ref(),
+                            "G17P TVB grow deferred #{}: {} request(s) parked, owner pair borrowed (first slot={} counter={} subpipe={}); rekick={}\n",
+                            deferred, self.pending_render_grows.len(), first.buffer_slot, first.counter,
+                            first.subpipe,
+                            crate::g17_recovery_path::enabled(crate::g17_recovery_path::GROW_REKICK));
+                    }
+                }
+                return Ok(None);
+            };
             let request = self.pending_render_grows.remove(index).map_err(|_| EIO)?;
             if request.halt_count != self.accepted_firmware_recovery_generation { continue; }
             let owner = self.render_slots.slots.iter().enumerate().find_map(|(index, slot)| {
@@ -4171,6 +4211,13 @@ impl G17PManagerConstruction {
                 (slot.storage.take(), Some(vm))
             } else { (None, None) };
             self.active_render_grow = Some(request);
+            let taken = G17P_GROW_TAKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if crate::g17_recovery_path::log_budget(taken, 64, 256) {
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P TVB grow take #{}: slot={} counter={} subpipe={} owner-pair={:?} still-parked={}\n",
+                    taken, request.buffer_slot, request.counter, request.subpipe, owner,
+                    self.pending_render_grows.len());
+            }
             return Ok(Some(G17PRenderGrow { request, pair_slot: owner, storage, vm }));
         }
     }
@@ -4311,7 +4358,9 @@ impl G17PManagerConstruction {
         if request.halt_count != generation { return Ok(G17PTvbGrowDisposition::IgnoredStale); }
         let record = request.reply(grew);
         match self.resources.publish_primary_device_control_raw(&record) {
-            Ok(_) => {
+            Ok(publication) => {
+                crate::g17_recovery_path::watch_grow_reply(publication.producer_after, request.buffer_slot);
+                crate::g17_recovery_path::GROW_REPLIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 dev_info!(self.resources.dev().as_ref(),
                     "G17P TVB grow: slot={} context={} counter={} subpipe={} generation={} grew={} ack=8\n",
                     request.buffer_slot, request.vm_slot, request.counter, request.subpipe,
@@ -4487,6 +4536,7 @@ impl G17PManagerConstruction {
             .mark_published(release)
             .map_err(|_| EIO)?;
         self.pending_flist_release_worker_attempts = 0;
+        self.rekick_parked_render_grows(None);
         Ok(publication)
     }
 
@@ -6932,6 +6982,16 @@ impl G17PManagerConstruction {
                     storage.render_flist_cookie(),
                     storage.render_flist_needs_grow(),
                 ).map_err(|_| EBUSY)?;
+                if let Ok((id, [submitted, completed])) = storage.render_flist_takeover_counters() {
+                    let takeovers = G17P_FLIST_TAKEOVERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    let outstanding = submitted != completed;
+                    if outstanding || crate::g17_recovery_path::log_budget(takeovers, 16, 256) {
+                        let note = if outstanding { " OUTSTANDING" } else { "" };
+                        dev_info!(self.resources.dev().as_ref(),
+                            "G17P FList takeover #{}: pair={} id={} submitted={} completed={}{}\n",
+                            takeovers, pair_slot, id, submitted, completed, note);
+                    }
+                }
                 storage.repopulate_render_flist()
                     .map_err(|error| Self::render_stage_fail("repopulate-render-flist", error))?;
                 self.resources.stage_user_render_uma(storage)
@@ -7084,6 +7144,7 @@ impl G17PManagerConstruction {
             Ok(())
         })();
         self.render_slots.get_mut(index).preparing = false;
+        self.rekick_parked_render_grows(Some(index));
         let released = self.render_hardware_buffer_ids.release(
             request.hardware_buffer_id.take().expect("warm build owns temporary HWPB reference"),
         ).map_err(|_| EIO);
@@ -7145,6 +7206,7 @@ impl G17PManagerConstruction {
         slot.storage = Some(storage);
         slot.restaged = Some(reservation);
         slot.preparing = false;
+        self.rekick_parked_render_grows(Some(pair_slot));
         // Return the installed graph before any fallible shared-table write.
         // A failed restage may already have enlarged its private PM inventory;
         // cancellation must preserve that inventory and finish its descriptor.
@@ -7254,9 +7316,112 @@ impl G17PManagerConstruction {
         debug_assert_eq!(slot.tracker.as_ref().map(|t| t.ordinal), Some(observation.ordinal));
         slot.storage = Some(observation.storage);
         slot.preparing = false;
+        let pair_slot = observation.pair_slot;
+        self.rekick_parked_render_grows(Some(pair_slot));
     }
 
     pub(crate) fn preparation_grow_pending(&self) -> bool { !self.pending_render_grows.is_empty() }
+
+    /// v96: a borrow of `pair_slot` (or control-ring backpressure) just ended.
+    /// A firmware TVB grow parked meanwhile keeps its pool's allocator paused
+    /// until opcode 8, so retry it now rather than on the next firmware event
+    /// (GROW_REKICK). Always counted, so a bit-off run measures the exposure.
+    pub(crate) fn rekick_parked_render_grows(&self, pair_slot: Option<u8>) {
+        if self.pending_render_grows.is_empty() { return; }
+        let parked = crate::g17_recovery_path::GROW_PARKED_AT_RETURN
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        let rekick = crate::g17_recovery_path::enabled(crate::g17_recovery_path::GROW_REKICK);
+        if crate::g17_recovery_path::log_budget(parked, 32, 1024) {
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P TVB grow parked #{} at borrow end (pair {:?}): {} request(s); rekick={}\n",
+                parked, pair_slot, self.pending_render_grows.len(), rekick);
+        }
+        if rekick {
+            crate::g17_recovery_path::GROW_REKICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::driver::queue_g17p_tvb_grow_worker(self.resources.owned_dev());
+        }
+    }
+
+    /// v96 handshake step 6: the firmware consumed the last opcode-8 reply.
+    /// Only reads the control cursors while a reply is being watched.
+    pub(crate) fn observe_grow_reply_consumption(&mut self) {
+        use core::sync::atomic::Ordering;
+        let watch = crate::g17_recovery_path::GROW_REPLY_WATCH.load(Ordering::Acquire);
+        if watch >> 63 == 0 { return; }
+        let target = (watch >> 32) as u32 & 0x7fff_ffff;
+        let Ok((consumer, producer)) = self.primary_control_cursors() else { return };
+        if !g17p_control_ring_target_consumed(consumer, producer, target).unwrap_or(false) { return; }
+        if crate::g17_recovery_path::GROW_REPLY_WATCH
+            .compare_exchange(watch, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() { return; }
+        let consumed = crate::g17_recovery_path::GROW_REPLY_CONSUMED.fetch_add(1, Ordering::Relaxed) + 1;
+        if crate::g17_recovery_path::log_budget(consumed, 64, 256) {
+            let ticks = crate::g17_timing_buffer::arch_counter()
+                .saturating_sub(crate::g17_recovery_path::GROW_REPLY_AT.load(Ordering::Relaxed));
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P TVB grow ack consumed #{}: slot={} producer-after={} consumer={} after {} ticks\n",
+                consumed, watch as u32, target, consumer, ticks);
+        }
+    }
+
+    /// v96 recovery diagnostics: every parked/active firmware TVB grow and
+    /// each allocated render pair's borrow, tracker, TVB capacity and FList
+    /// lease state. Read-only; called when firmware requests a recovery.
+    pub(crate) fn log_render_grow_state(&mut self, label: &str) {
+        let dev = self.resources.owned_dev();
+        let watch = crate::g17_recovery_path::GROW_REPLY_WATCH.load(core::sync::atomic::Ordering::Acquire);
+        let unconsumed_reply: i64 = if watch >> 63 != 0 { (watch >> 32) as i64 & 0x7fff_ffff } else { -1 };
+        let cursors = self.primary_control_cursors().ok();
+        dev_info!(dev.as_ref(),
+            "G17P grow state[{}]: control-cursors={:?} unconsumed-reply-producer={}\n",
+            label, cursors, unconsumed_reply);
+        dev_info!(dev.as_ref(),
+            "G17P grow state[{}]: generation={} pending={} active={:?} backpressured={} tvb-reply-pending={} counters ingress={} replied={} deferred={} parked-at-return={} rekicks={}\n",
+            label, self.accepted_firmware_recovery_generation, self.pending_render_grows.len(),
+            self.active_render_grow, self.primary_device_control_backpressured(),
+            self.primary_tvb_reply_pending(),
+            crate::g17_recovery_path::GROW_INGRESS.load(core::sync::atomic::Ordering::Relaxed),
+            crate::g17_recovery_path::GROW_REPLIED.load(core::sync::atomic::Ordering::Relaxed),
+            crate::g17_recovery_path::GROW_DEFERRED.load(core::sync::atomic::Ordering::Relaxed),
+            crate::g17_recovery_path::GROW_PARKED_AT_RETURN.load(core::sync::atomic::Ordering::Relaxed),
+            crate::g17_recovery_path::GROW_REKICKS.load(core::sync::atomic::Ordering::Relaxed));
+        for request in self.pending_render_grows.iter() {
+            dev_info!(dev.as_ref(),
+                "G17P grow state[{}]: parked slot={} context={} counter={} subpipe={} generation={} owner-preparing={}\n",
+                label, request.buffer_slot, request.vm_slot, request.counter, request.subpipe,
+                request.halt_count, self.render_grow_owner_preparing(*request));
+        }
+        for (index, slot) in self.render_slots.slots.iter().enumerate() {
+            let Some(slot) = slot.as_deref() else { continue };
+            dev_info!(dev.as_ref(),
+                "G17P grow state[{}]: pair={} preparing={} storage={} tvb-blocks={:?} hwbuf={:?} published={} tracker={:?} queued={} ordinal={} flist={:?}\n",
+                label, index, slot.preparing, slot.storage.is_some(),
+                slot.storage.as_deref().map(|storage| storage.tvb_capacity()),
+                slot.hardware_buffer_id, slot.hardware_buffer_published,
+                slot.tracker.as_ref().map(|tracker| (tracker.hardware_buffer_id, tracker.ordinal)),
+                slot.queued_tracker.iter().count(), slot.submission_ordinal,
+                slot.bootstrap_uma.as_ref().map(|owner| (owner.sequence, owner.state,
+                    owner.hardware_buffer_references, owner.pending_release_count)));
+        }
+        // Firmware-owned parameter-buffer state of every unborrowed pair:
+        // PBDesc words and the PM HWPB head, block control and Stats (page
+        // high-water). Read-only; a borrowed graph is owned by its worker.
+        let slots: KVec<u8> = self.render_slots.slots.iter().enumerate()
+            .filter_map(|(index, slot)| slot.as_deref()
+                .filter(|slot| !slot.preparing && slot.storage.is_some())
+                .map(|_| index as u8))
+            .fold(KVec::new(), |mut all, index| { let _ = all.push(index, GFP_KERNEL); all });
+        for index in slots {
+            let hardware_buffer_id = self.render_slots.get(index).storage.as_deref()
+                .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id);
+            if let Some(id) = hardware_buffer_id {
+                dev_info!(dev.as_ref(), "G17P grow state[{}]: pair={} hwbuf={} pbdesc={:x?}\n",
+                    label, index, id, self.resources.pbdesc_words(id).ok());
+            }
+            if let Some(storage) = self.render_slots.get_mut(index).storage.as_deref_mut() {
+                storage.log_parameter_management(&dev, label);
+            }
+        }
+    }
 
     pub(crate) fn cancel_render_restage(&mut self, pair_slot: u8) -> Result {
         let slot = self.render_slots.get_mut(pair_slot);
@@ -7785,6 +7950,16 @@ impl G17PManagerConstruction {
                 // preflight above validates the predecessor's release state;
                 // a sent release witness may still be carried by `prepared`.
                 // Initialize only the incoming owner's image here.
+                if let Ok((id, [submitted, completed])) = storage.render_flist_takeover_counters() {
+                    let takeovers = G17P_FLIST_TAKEOVERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    let outstanding = submitted != completed;
+                    if outstanding || crate::g17_recovery_path::log_budget(takeovers, 16, 256) {
+                        let note = if outstanding { " OUTSTANDING" } else { "" };
+                        dev_info!(self.resources.dev().as_ref(),
+                            "G17P FList takeover #{}: pair={} id={} submitted={} completed={}{}\n",
+                            takeovers, pair_slot, id, submitted, completed, note);
+                    }
+                }
                 storage.repopulate_render_flist()
                     .map_err(|error| Self::render_stage_fail("repopulate-render-flist", error))?;
                 self.resources.stage_user_render_uma(storage)

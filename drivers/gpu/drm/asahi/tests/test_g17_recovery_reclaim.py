@@ -52,14 +52,14 @@ mod g17_timing_buffer {
 mod g17_initdata { pub const CONTROL_RING_ENTRIES: usize = 0x100; }
 mod g17_recovery_path {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    pub(crate) const ALL_BITS: u32 = 3;
+    pub(crate) const ALL_BITS: u32 = 7; // v96 adds bit2 GROW_REKICK
     pub(crate) static MASK: AtomicU32 = AtomicU32::new(0);
     @CORE@
     @SHADOW@
     @PARSE@
 }
 '''.replace("@CORE@", rp_core.replace("static MASK: AtomicU32 = AtomicU32::new(0);", "")
-            .replace("const ALL_BITS: u32 = (1 << 2) - 1;", "")).replace("@SHADOW@", rp_shadow).replace("@PARSE@", "pub(crate) " + rp_parse)
+            .replace("const ALL_BITS: u32 = (1 << 3) - 1;", "")).replace("@SHADOW@", rp_shadow).replace("@PARSE@", "pub(crate) " + rp_parse)
 
 # ---------------------------------------------------------------------------
 # 1. Runtime reclaim over a mock manager.
@@ -372,7 +372,9 @@ fn names_the_pending_record_and_whether_it_was_announced() {
 fn parameter_accepts_only_known_bits() {
     assert_eq!(rp::parse_mask("0x3"), Some(3));
     assert_eq!(rp::parse_mask("1"), Some(1));
-    assert_eq!(rp::parse_mask("4"), None);
+    assert_eq!(rp::parse_mask("4"), Some(4));
+    assert_eq!(rp::parse_mask("0x7"), Some(7));
+    assert_eq!(rp::parse_mask("8"), None);
     assert_eq!(rp::parse_mask("zz"), None);
 }
 '''

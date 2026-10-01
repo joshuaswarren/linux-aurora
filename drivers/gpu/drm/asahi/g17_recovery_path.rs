@@ -22,13 +22,24 @@
 //!        primary device-control record and the time of the last EP 0x21
 //!        announcement; a control re-announce then names the oldest pending
 //!        record and whether it had been announced after its publication.
+//!   bit2 GROW_REKICK (v96): firmware event 6 (TVB grow) pauses the pool's
+//!        allocator until the opcode-8 reply. A request whose owning pair is
+//!        borrowed (`preparing`: warm-up, restage, grow, completion
+//!        observation) is parked, and the grow worker exits. Without this bit
+//!        only the next firmware event re-queues the worker; if the stalled
+//!        render was the only producer of events, nothing does. With this
+//!        bit, every end of a borrow (and every clearing of control-ring
+//!        backpressure) re-queues the worker while a request is parked.
+//! Grow ingress, deferral, re-kick and recovery-time grow state are always
+//! logged (rate-limited) and counted, independent of the mask.
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kernel::{bindings, module_param::KernelParam};
 
 pub(crate) const RECLAIM_DRAINED: u32 = 1 << 0;
 pub(crate) const CONTROL_TRACE: u32 = 1 << 1;
-const ALL_BITS: u32 = (1 << 2) - 1;
+pub(crate) const GROW_REKICK: u32 = 1 << 2;
+const ALL_BITS: u32 = (1 << 3) - 1;
 
 static MASK: AtomicU32 = AtomicU32::new(0);
 
@@ -68,6 +79,33 @@ pub(crate) static RECLAIM_PAIRS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RECLAIM_TRACKERS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RECLAIM_RELEASED: AtomicU64 = AtomicU64::new(0);
 static RECLAIM_BLOCKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// v96 TVB grow accounting: firmware requests received, requests left parked
+/// because their pair was borrowed when the worker looked, borrow ends that
+/// found a parked request, and worker re-queues issued for them (bit2).
+pub(crate) static GROW_INGRESS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GROW_DEFERRED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GROW_PARKED_AT_RETURN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GROW_REKICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GROW_REPLIED: AtomicU64 = AtomicU64::new(0);
+
+/// Handshake steps 5-6: the last opcode-8 grow reply published to the
+/// primary control ring (bit63 valid | producer_after << 32 | buffer_slot)
+/// and its CNTPCT, until the firmware consumer is observed past it.
+pub(crate) static GROW_REPLY_WATCH: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GROW_REPLY_AT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GROW_REPLY_CONSUMED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn watch_grow_reply(producer_after: u32, buffer_slot: u32) {
+    GROW_REPLY_AT.store(crate::g17_timing_buffer::arch_counter(), Ordering::Relaxed);
+    GROW_REPLY_WATCH.store(1 << 63 | u64::from(producer_after) << 32 | u64::from(buffer_slot),
+        Ordering::Release);
+}
+
+/// A bounded log budget: the first `first` events, then one in `every`.
+pub(crate) fn log_budget(counter: u64, first: u64, every: u64) -> bool {
+    counter <= first || counter % every == 0
+}
 
 pub(crate) fn note_blocked(reason: ReclaimBlock) {
     RECLAIM_BLOCKED[reason.index()].fetch_add(1, Ordering::Relaxed);
@@ -147,7 +185,9 @@ unsafe extern "C" fn mask_set(value: *const core::ffi::c_char, _: *const binding
     let text = text.trim();
     if text == "reset" {
         for counter in [&RECLAIM_ATTEMPTS, &RECLAIM_PAIRS, &RECLAIM_TRACKERS, &RECLAIM_RELEASED,
-                        &REANNOUNCE_ANNOUNCED, &REANNOUNCE_UNANNOUNCED] {
+                        &REANNOUNCE_ANNOUNCED, &REANNOUNCE_UNANNOUNCED, &GROW_INGRESS,
+                        &GROW_DEFERRED, &GROW_PARKED_AT_RETURN, &GROW_REKICKS, &GROW_REPLIED,
+                        &GROW_REPLY_CONSUMED] {
             counter.store(0, Ordering::Relaxed);
         }
         for counter in RECLAIM_BLOCKED.iter() { counter.store(0, Ordering::Relaxed); }
@@ -171,6 +211,11 @@ unsafe extern "C" fn mask_get(buf: *mut core::ffi::c_char, _: *const bindings::k
     for (name, counter) in ReclaimBlock::NAMES.iter().zip(RECLAIM_BLOCKED.iter()) {
         let _ = write!(out, " {}={}", name, counter.load(Ordering::Relaxed));
     }
+    let _ = write!(out, " tvb-grow ingress={} replied={} reply-consumed={} deferred={} parked-at-return={} rekicks={}",
+        GROW_INGRESS.load(Ordering::Relaxed), GROW_REPLIED.load(Ordering::Relaxed),
+        GROW_REPLY_CONSUMED.load(Ordering::Relaxed),
+        GROW_DEFERRED.load(Ordering::Relaxed), GROW_PARKED_AT_RETURN.load(Ordering::Relaxed),
+        GROW_REKICKS.load(Ordering::Relaxed));
     let _ = write!(out, " reannounce announced={} unannounced={} by-opcode:",
         REANNOUNCE_ANNOUNCED.load(Ordering::Relaxed), REANNOUNCE_UNANNOUNCED.load(Ordering::Relaxed));
     for (opcode, counter) in REANNOUNCE_BY_OPCODE.iter().enumerate() {

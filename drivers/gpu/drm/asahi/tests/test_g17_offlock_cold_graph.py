@@ -83,6 +83,8 @@ impl Ids{
 struct ChannelIds;impl ChannelIds{fn publish(&mut self,_:u32)->bool{true}}
 struct Manager{render_slots:Slots,resources:Resources,num_clusters:u32,render_channel_leases:[Option<[u32;2]>;2],channel_ids:ChannelIds,render_hardware_buffer_ids:Ids,generation:u64,fail_finalizer:bool}
 impl Manager{
+ // v96: borrow ends retry parked firmware TVB grows (tested in test_g17_v96_grow_rekick.py).
+ fn rekick_parked_render_grows(&self,_pair:Option<u8>){}
  fn new()->Self{Self{render_slots:Slots(std::array::from_fn(|_|Slot::default())),resources:Resources{fail:false},num_clusters:1,render_channel_leases:[None;2],channel_ids:ChannelIds,render_hardware_buffer_ids:Ids{next:0,live:[false;16],reserved:[false;16],releases:0},generation:1,fail_finalizer:false}}
  fn ensure_render_slot(&mut self,_:u8)->Result{Ok(())}
  fn render_queue_pair(&self,i:u8)->Result<G17PRenderQueuePair>{Ok(G17PRenderQueuePair(i))}
