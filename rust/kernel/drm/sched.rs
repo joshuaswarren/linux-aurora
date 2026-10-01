@@ -210,6 +210,12 @@ unsafe extern "C" fn cancel_job_cb<T: JobImpl>(sched_job: *mut bindings::drm_sch
 pub struct Job<T: JobImpl> {
     job: bindings::drm_sched_job,
     inner: T,
+    // Entity destruction can leave kill_jobs_work queued on the system
+    // workqueue or waiting for a dependency. That work still dereferences
+    // job->sched->ops after drm_sched_fini has stopped the scheduler workers.
+    // Retain only the allocation: retaining SchedulerOwner here would keep
+    // fini from running while pending jobs still need its cancellation.
+    _scheduler: Arc<SchedulerInner<T>>,
 }
 
 impl<T: JobImpl> Deref for Job<T> {
@@ -323,14 +329,15 @@ impl<'a> JobFences<'a> {
 struct EntityInner<T: JobImpl> {
     entity: bindings::drm_sched_entity,
     // TODO: Allow users to share guilty flag between entities
-    sched: Arc<SchedulerInner<T>>,
+    sched: Arc<SchedulerOwner<T>>,
     guilty: bindings::atomic_t,
     _p: PhantomData<T>,
 }
 
 impl<T: JobImpl> Drop for EntityInner<T> {
     fn drop(&mut self) {
-        // SAFETY: The EntityInner is initialized. This will cancel/free all jobs.
+        // SAFETY: The EntityInner is initialized. Jobs removed from the entity
+        // may still await kill_jobs_work; each retains the scheduler allocation.
         unsafe { bindings::drm_sched_entity_destroy(&mut self.entity) };
     }
 }
@@ -349,7 +356,7 @@ impl<T: JobImpl> Entity<T> {
         let mut entity: KBox<MaybeUninit<EntityInner<T>>> =
             KBox::new_uninit(GFP_KERNEL | __GFP_ZERO)?;
 
-        let mut sched_ptr = &sched.0.sched as *const _ as *mut _;
+        let mut sched_ptr = &sched.0.allocation.sched as *const _ as *mut _;
 
         // SAFETY: The Box is allocated above and valid.
         unsafe {
@@ -393,23 +400,42 @@ impl<T: JobImpl> Entity<T> {
         // SAFETY: The Box pointer is valid, and this initializes the inner member.
         unsafe { addr_of_mut!((*job.as_mut_ptr()).inner).write(inner) };
 
+        // SAFETY: The job allocation is valid and this initializes its last
+        // field. Arc::clone is infallible and the entity still owns the live
+        // scheduler, so every successfully initialized job retains its C
+        // callback target before it can be armed or submitted.
+        unsafe {
+            addr_of_mut!((*job.as_mut_ptr())._scheduler)
+                .write(self.0.as_ref().get_ref().sched.allocation.clone())
+        };
+
         // SAFETY: All fields of the Job<T> are now initialized.
         Ok(PendingJob(unsafe { job.assume_init() }, PhantomData))
     }
 }
 
-/// DRM scheduler inner data
+/// DRM scheduler allocation, retained by live owners and deferred job callbacks.
 pub struct SchedulerInner<T: JobImpl> {
     sched: bindings::drm_gpu_scheduler,
     _p: PhantomData<T>,
 }
 
-impl<T: JobImpl> Drop for SchedulerInner<T> {
+// Only public scheduler/entity handles keep this owner alive. Jobs retain
+// SchedulerInner instead, so outstanding work cannot prevent finalization.
+struct SchedulerOwner<T: JobImpl> {
+    allocation: Arc<SchedulerInner<T>>,
+}
+
+impl<T: JobImpl> Drop for SchedulerOwner<T> {
     fn drop(&mut self) {
         // SAFETY: fini stops submission, synchronizes the timeout worker and
         // cancels/frees remaining jobs through our synchronized cancel callback.
         // The C contract explicitly prohibits drm_sched_stop before fini.
-        unsafe { bindings::drm_sched_fini(&mut self.sched) };
+        // Deferred entity-kill callbacks are on a different workqueue and may
+        // survive this call. Their job guards retain allocation through cleanup.
+        unsafe {
+            bindings::drm_sched_fini(addr_of!(self.allocation.sched).cast_mut())
+        };
     }
 }
 
@@ -419,7 +445,7 @@ unsafe impl<T: JobImpl> Sync for SchedulerInner<T> {}
 unsafe impl<T: JobImpl> Send for SchedulerInner<T> {}
 
 /// A DRM Scheduler
-pub struct Scheduler<T: JobImpl>(Arc<SchedulerInner<T>>);
+pub struct Scheduler<T: JobImpl>(Arc<SchedulerOwner<T>>);
 
 impl<T: JobImpl> Scheduler<T> {
     const OPS: bindings::drm_sched_backend_ops = bindings::drm_sched_backend_ops {
@@ -440,6 +466,10 @@ impl<T: JobImpl> Scheduler<T> {
         name: &'static CStr,
     ) -> Result<Scheduler<T>> {
         let mut sched: UniqueArc<MaybeUninit<SchedulerInner<T>>> =
+            UniqueArc::new_uninit(GFP_KERNEL)?;
+        // Allocate the owner before starting C workers: no fallible allocation
+        // may abandon an initialized scheduler without running drm_sched_fini.
+        let owner: UniqueArc<MaybeUninit<SchedulerOwner<T>>> =
             UniqueArc::new_uninit(GFP_KERNEL)?;
 
         // SAFETY: zero sched->sched_rq as drm_sched_init() uses it to exit early withoput initialisation
@@ -470,7 +500,9 @@ impl<T: JobImpl> Scheduler<T> {
             )
         })?;
 
-        // SAFETY: All fields of SchedulerInner are now initialized.
-        Ok(Scheduler(unsafe { sched.assume_init() }.into()))
+        // SAFETY: C initialized sched and PhantomData has no stored state.
+        // No fallible operation follows successful initialization.
+        let allocation = unsafe { sched.assume_init() }.into();
+        Ok(Scheduler(owner.write(SchedulerOwner { allocation }).into()))
     }
 }
