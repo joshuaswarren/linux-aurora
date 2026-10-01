@@ -29,7 +29,7 @@ use crate::{
 const T8140_USER_START: u64 = mmu::UAT_PGSZ as u64;
 const T8140_USER_TOP: u64 = 1 << 42;
 const T8140_UNKNOWN_PAGE: u64 = T8140_USER_TOP - 2 * mmu::UAT_PGSZ as u64;
-const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> =
+pub(crate) const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> =
     crate::g17_queue_limits::CLIENT_LOW_VA_START..0x71_0000_0000;
 
 /// Bounded opt-in render timing trace. `g17p_completion_trace` enables it and
@@ -1891,6 +1891,8 @@ struct G17PQueue {
     /// ranges), ring order. Slots and their vectors are reused.
     recent: [G17PRecentSubmission; crate::g17_host_path::FW_DEP_RECENT],
     recent_next: usize,
+    /// v94 `g17p_mem_path` bit2: this queue's retired compute timestamp pages.
+    ts_pool: Arc<g17_job::G17PTimestampPool>,
     /// v93: hardware fences of the ioctl being enqueued (swapped into its
     /// ring slot when the whole ioctl is queued); `None` after a failed push.
     ioctl_commands: Option<KVec<Fence>>,
@@ -2667,6 +2669,7 @@ impl G17PQueue {
             e2e_fine: [0; 12],
             recent: [const { G17PRecentSubmission::EMPTY }; crate::g17_host_path::FW_DEP_RECENT],
             recent_next: 0,
+            ts_pool: g17_job::G17PTimestampPool::new()?,
             ioctl_commands: Some(KVec::new()),
             id,
         })
@@ -3100,7 +3103,7 @@ impl G17PQueue {
             Self::timestamp_destination(objects, translated.timestamps.start)?,
             Self::timestamp_destination(objects, translated.timestamps.end)?,
         ];
-        let timestamps = self.owned_compute_timestamps()?;
+        let (timestamps, ts_pool) = self.compute_timestamps()?;
         let output = new_independent_submission_fence(&self.fence_contexts)?;
         self.prune_render_frontier();
         let backend = self.async_backend.as_ref().ok_or(EIO)?;
@@ -3140,6 +3143,7 @@ impl G17PQueue {
         let completion = g17_job::G17PJobCompletion::new(
             output,
             timestamps,
+            ts_pool,
             destinations,
             self.vm.status().clone(),
             vm_job,
@@ -3449,9 +3453,24 @@ impl G17PQueue {
         }
     }
 
+    /// v94 `g17p_mem_path` bit2: reuse a retired page of this queue when one
+    /// is pooled; otherwise allocate exactly as before. The returned pool is
+    /// where the completion gives the page back (None: dropped as before).
+    fn compute_timestamps(&self) -> Result<(mmu::KernelMapping, Option<Arc<g17_job::G17PTimestampPool>>)> {
+        if !crate::g17_mem_path::enabled(crate::g17_mem_path::COMPUTE_TS_POOL) {
+            return Ok((self.owned_compute_timestamps()?, None));
+        }
+        if let Some(page) = self.ts_pool.take() {
+            crate::g17_mem_path::count(&crate::g17_mem_path::TS_REUSED, 1);
+            return Ok((page, Some(self.ts_pool.clone())));
+        }
+        Ok((self.owned_compute_timestamps()?, Some(self.ts_pool.clone())))
+    }
+
     fn owned_compute_timestamps(&self) -> Result<mmu::KernelMapping> {
         // Firmware writes both completion words. A WB CPU alias can keep the
         // polling core on stale zeroes even after the GPU has completed.
+        crate::g17_mem_path::count(&crate::g17_mem_path::TS_ALLOCATED, 1);
         let mut object = gem::new_kernel_object_wc(&self.dev, mmu::UAT_PGSZ)?;
         object.vmap()?.memset(0);
         object.map_into_range(

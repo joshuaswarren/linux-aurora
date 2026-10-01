@@ -130,6 +130,14 @@ pub(crate) const K_FINE_RESTAGE: u8 = 30;
 /// a=entry, b=3D QoS published, c=3D consistency validated, d=TA QoS
 /// published, e=TA consistency validated. head=pair configure done.
 pub(crate) const K_FINE_CONFIG: u8 = 31;
+/// v94 retained-graph reachability revalidation (opt bit4), one per render
+/// publication. id=render descriptor storage IOVA (per pair graph),
+/// aux=path | reason << 4 | generation << 8 (path 0 exact, 1 lock-free walk,
+/// 2 locked walk, 3 full walk; reason for a full walk 1 no proof, 2 no key,
+/// 3 refused, 4 touched, 5 key moved), a=entry, b=app changes walked | kernel
+/// changes walked << 32, c=app exec lock held (0 unlocked), d=kernel exec
+/// lock held (0 unlocked), e=walks done (all CNTPCT). head=exit.
+pub(crate) const K_FINE_REACH: u8 = 32;
 
 const CAPACITY: usize = 1 << 17;
 #[repr(C, align(64))]

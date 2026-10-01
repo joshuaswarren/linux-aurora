@@ -1695,6 +1695,29 @@ struct G17PRenderReachabilityKey {
     kernel_epoch: u64,
 }
 
+/// v94 per-publication reachability diagnostic (K_FINE_REACH / MEM_STATS).
+#[derive(Default)]
+struct G17PReachTrace {
+    entry: u64,
+    walked: [u32; 2],
+    locked: [u64; 2],
+    walks_done: u64,
+}
+
+impl G17PReachTrace {
+    fn note_walks(&mut self, app: Option<mmu::MappingChangeWalk>,
+        kernel: Option<mmu::MappingChangeWalk>, timed: bool) {
+        if !timed { return; }
+        for (index, walk) in [app, kernel].into_iter().enumerate() {
+            if let Some(walk) = walk {
+                self.walked[index] = self.walked[index].saturating_add(walk.walked);
+                if walk.locked_at != 0 { self.locked[index] = walk.locked_at; }
+            }
+        }
+        self.walks_done = crate::g17_timing_buffer::arch_counter();
+    }
+}
+
 /// Command-state generations have different mappings but remain allocated
 /// together. Keep both proofs so alternating generations does not redo a walk.
 struct G17PRenderReachabilityCache {
@@ -13301,7 +13324,12 @@ impl G17PUserRenderStorage {
         uat: &mmu::Uat,
         vm: &mmu::Vm,
     ) -> Option<&'static str> {
+        use crate::g17_mem_path as mp;
         self.last_reachability_cache_hit = false;
+        // v94 diagnostics (off: two relaxed loads). Timing never changes a decision.
+        let fine = crate::g17_e2e::fine();
+        let mut trace = G17PReachTrace { entry: if fine != 0 { fine } else { mp::stamp() }, ..G17PReachTrace::default() };
+        let timed = trace.entry != 0;
         let generation = usize::from(self.render_command_generation);
         let before = Self::reachability_key(uat, vm);
         // Double-collect the pair: a mutation between the app and kernel VM
@@ -13311,29 +13339,94 @@ impl G17PUserRenderStorage {
             && before == Self::reachability_key(uat, vm)
         {
             self.last_reachability_cache_hit = true;
+            self.finish_reach_trace(&trace, 0, 0, generation, &mp::REACH_EXACT);
             return None;
         }
-        if let (Some(previous), Some(current)) = (
-            self.reachability_cache.validated.get(generation).copied().flatten(),
-            before,
-        ) {
-            if previous.vm_id == current.vm_id && previous.kernel_vm_id == current.kernel_vm_id {
-                let app = vm.mapping_changes_since(previous.vm_epoch, |range| {
-                    self.mapping_change_touches_graph(range, false)
-                });
-                let kernel = uat.kernel_vm().mapping_changes_since(previous.kernel_epoch, |range| {
-                    self.mapping_change_touches_graph(range, true)
-                });
-                if matches!(app, Some((epoch, false)) if epoch == current.vm_epoch)
-                    && matches!(kernel, Some((epoch, false)) if epoch == current.kernel_epoch)
-                    && before == Self::reachability_key(uat, vm)
-                {
-                    self.reachability_cache.record_success(generation, before, before);
-                    self.last_reachability_cache_hit = true;
-                    return None;
+        // v94 REACH_LOCKLESS (g17p_mem_path bit3); clear = the v93f decisions.
+        let lockless = mp::enabled(mp::REACH_LOCKLESS);
+        let mut reason = 1;
+        if let Some(previous) = self.reachability_cache.validated.get(generation).copied().flatten() {
+            let same_vms = previous.vm_id == vm.id() && previous.kernel_vm_id == uat.kernel_vm().id();
+            reason = if same_vms { 2 } else { 1 };
+            if lockless && same_vms {
+                if let Some(current) = before {
+                    let app = vm.mapping_changes_since_lockless(previous.vm_epoch, current.vm_epoch,
+                        |range| self.mapping_change_touches_graph(range, false));
+                    let kernel = match app {
+                        Some(walk) if !walk.touched => uat.kernel_vm().mapping_changes_since_lockless(
+                            previous.kernel_epoch, current.kernel_epoch,
+                            |range| self.mapping_change_touches_graph(range, true)),
+                        _ => None,
+                    };
+                    trace.note_walks(app, kernel, timed);
+                    reason = 3;
+                    if let (Some(app), Some(kernel)) = (app, kernel) {
+                        if !app.touched && !kernel.touched && before == Self::reachability_key(uat, vm) {
+                            self.reachability_cache.record_success(generation, before, before);
+                            self.last_reachability_cache_hit = true;
+                            self.finish_reach_trace(&trace, 1, 0, generation, &mp::REACH_LOCKLESS_WALK);
+                            return None;
+                        }
+                    }
+                    if app.is_some_and(|walk| walk.touched) || kernel.is_some_and(|walk| walk.touched) {
+                        reason = 4;
+                    }
+                }
+                // Locked walk. Unlike v93f it also serves a publication that
+                // found a writer in progress (no key) or a key that moved
+                // before the walk: every change after the proof up to the
+                // epochs the walks reached is examined, and a final
+                // double-collect must still read exactly those epochs.
+                if reason != 4 {
+                    let app = vm.mapping_changes_since_counted(previous.vm_epoch,
+                        |range| self.mapping_change_touches_graph(range, false), timed);
+                    let kernel = uat.kernel_vm().mapping_changes_since_counted(previous.kernel_epoch,
+                        |range| self.mapping_change_touches_graph(range, true), timed);
+                    trace.note_walks(app, kernel, timed);
+                    reason = 3;
+                    if let (Some(app), Some(kernel)) = (app, kernel) {
+                        let reached = Some(G17PRenderReachabilityKey {
+                            vm_id: previous.vm_id, kernel_vm_id: previous.kernel_vm_id,
+                            vm_epoch: app.epoch, kernel_epoch: kernel.epoch,
+                        });
+                        if app.touched || kernel.touched {
+                            reason = 4;
+                        } else if reached == Self::reachability_key(uat, vm) {
+                            self.reachability_cache.record_success(generation, reached, reached);
+                            self.last_reachability_cache_hit = true;
+                            self.finish_reach_trace(&trace, 2, 0, generation, &mp::REACH_LOCKED_WALK);
+                            return None;
+                        } else {
+                            reason = 5;
+                        }
+                    }
+                }
+            } else if let Some(current) = before {
+                if same_vms {
+                    let app = vm.mapping_changes_since_counted(previous.vm_epoch, |range| {
+                        self.mapping_change_touches_graph(range, false)
+                    }, timed);
+                    let kernel = uat.kernel_vm().mapping_changes_since_counted(previous.kernel_epoch, |range| {
+                        self.mapping_change_touches_graph(range, true)
+                    }, timed);
+                    trace.note_walks(app, kernel, timed);
+                    if matches!(app, Some(walk) if !walk.touched && walk.epoch == current.vm_epoch)
+                        && matches!(kernel, Some(walk) if !walk.touched && walk.epoch == current.kernel_epoch)
+                        && before == Self::reachability_key(uat, vm)
+                    {
+                        self.reachability_cache.record_success(generation, before, before);
+                        self.last_reachability_cache_hit = true;
+                        self.finish_reach_trace(&trace, 2, 0, generation, &mp::REACH_LOCKED_WALK);
+                        return None;
+                    }
+                    reason = if app.is_some_and(|walk| walk.touched)
+                        || kernel.is_some_and(|walk| walk.touched) { 4 } else { 3 };
                 }
             }
         }
+        // A full walk records the key it started from; with REACH_LOCKLESS a
+        // key read just before the walk replaces one a writer had hidden.
+        let before = if lockless && before.is_none() { Self::reachability_key(uat, vm) } else { before };
         let failed = self.first_unreachable(uat, vm);
         if failed.is_none() {
             self.reachability_cache.record_success(
@@ -13342,7 +13435,35 @@ impl G17PUserRenderStorage {
         } else {
             self.reachability_cache.invalidate();
         }
+        if trace.entry != 0 {
+            let counter = match reason {
+                1 => &mp::REACH_FULL_NO_PROOF,
+                2 => &mp::REACH_FULL_NO_KEY,
+                4 => &mp::REACH_FULL_TOUCHED,
+                _ => &mp::REACH_FULL_REFUSED,
+            };
+            mp::count(counter, 1);
+        }
+        self.finish_reach_trace(&trace, 3, reason, generation, &mp::REACH_FULL);
         failed
+    }
+
+    fn finish_reach_trace(&self, trace: &G17PReachTrace, path: u32, reason: u32,
+        generation: usize, stat: &crate::g17_mem_path::Stat) {
+        use crate::g17_mem_path as mp;
+        if trace.entry == 0 { return; }
+        let now = crate::g17_timing_buffer::arch_counter();
+        if mp::enabled(mp::MEM_STATS) {
+            stat.add(now.saturating_sub(trace.entry));
+            mp::count(&mp::REACH_WALKED, u64::from(trace.walked[0]) + u64::from(trace.walked[1]));
+        }
+        if crate::g17_e2e::option(crate::g17_e2e::OPT_FINE) {
+            crate::g17_e2e::record_at(now, crate::g17_e2e::K_FINE_REACH,
+                path | reason << 4 | ((generation as u32) & 0xff_ffff) << 8,
+                self.descriptors.iova(),
+                [trace.entry, u64::from(trace.walked[0]) | u64::from(trace.walked[1]) << 32,
+                 trace.locked[0], trace.locked[1], trace.walks_done]);
+        }
     }
 
     pub(crate) fn last_reachability_cache_hit(&self) -> bool {

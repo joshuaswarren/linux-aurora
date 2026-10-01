@@ -22,8 +22,20 @@ def item(prefix):
 
 program = "\n".join([
     "use core::ops::Range;",
-    "use std::sync::Arc; use core::sync::atomic::{AtomicU64,AtomicU32,Ordering};",
+    "use std::sync::Arc; use core::sync::atomic::{fence,AtomicU64,AtomicU32,Ordering};",
+    # v94: g17p_mem_path bit3 (REACH_LOCKLESS) and MEM_STATS change counters.
+    "mod g17_mem_path { use core::sync::atomic::{AtomicU32,AtomicU64,Ordering};"
+    " pub const MEM_STATS: u32 = 1 << 1; pub const REACH_LOCKLESS: u32 = 1 << 3;"
+    " pub static MASK: AtomicU32 = AtomicU32::new(0);"
+    " pub static CHANGES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];"
+    " pub fn enabled(bit: u32) -> bool { MASK.load(Ordering::Relaxed) & bit != 0 }"
+    " pub fn note_vm_change(kernel: bool, _start: u64) { CHANGES[kernel as usize].fetch_add(1, Ordering::Relaxed); } }",
+    "mod g17_timing_buffer { pub fn arch_counter() -> u64 { 7 } }",
     item("struct MappingValidationState {"),
+    item("struct MappingHistoryEntry {"),
+    item("impl MappingHistoryEntry {"),
+    "#[derive(Copy, Clone, Debug, PartialEq, Eq)]",
+    item("pub(crate) struct MappingChangeWalk {"),
     item("impl MappingValidationState {"),
     next(line for line in source.splitlines() if line.startswith("struct MappingValidationMutation(")),
     item("impl MappingValidationMutation {"),
@@ -34,7 +46,7 @@ program = "\n".join([
     "#[derive(Clone, Copy)]",
     item("struct MappingValidationChange"),
     "type KBox<T> = Box<T>;",
-    "struct VmInner { mapping_validation_epoch: Option<u64>, "
+    "struct VmInner { is_kernel: bool, mapping_validation_epoch: Option<u64>, "
     "mapping_validation: Option<Arc<MappingValidationState>>, "
     "mapping_validation_changes: Option<KBox<[Option<MappingValidationChange>; MAPPING_VALIDATION_HISTORY]>> }",
     "impl VmInner {",
@@ -46,12 +58,17 @@ program = "\n".join([
     "struct Vm { inner: Lock, mapping_validation: Option<Arc<MappingValidationState>> }",
     "impl Vm {",
     item("pub(crate) fn mapping_validation_epoch("),
-    item("pub(crate) fn mapping_changes_since("),
+    item("pub(crate) fn mapping_changes_since_counted("),
+    item("pub(crate) fn mapping_changes_since_lockless("),
+    "fn mapping_changes_since(&self, previous: u64, f: impl FnMut(Range<u64>) -> bool)"
+    " -> Option<(u64, bool)> { self.mapping_changes_since_counted(previous, f, false)"
+    ".map(|walk| (walk.epoch, walk.touched)) }",
     "}",
     r'''
 fn fixture() -> Vm {
     let state = Arc::new(MappingValidationState::new());
     Vm { mapping_validation: Some(state.clone()), inner: Lock(std::cell::RefCell::new(VmInner {
+        is_kernel: false,
         mapping_validation_epoch: Some(0),
         mapping_validation: Some(state),
         mapping_validation_changes: Some(Box::new([None; MAPPING_VALIDATION_HISTORY])),
@@ -152,6 +169,151 @@ fn acquiring_a_published_epoch_observes_prior_leaf_writes() {
         }
     }
     writer.join().unwrap();assert_eq!(state.snapshot(),Some(9999));
+}
+// ---- v94 REACH_LOCKLESS -------------------------------------------------
+// The mask is process-global; every test below that needs it holds this lock.
+static MASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn with_mask<R>(mask: u32, f: impl FnOnce() -> R) -> R {
+    let _guard = MASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    g17_mem_path::MASK.store(mask, Ordering::SeqCst);
+    let result = f();
+    g17_mem_path::MASK.store(0, Ordering::SeqCst);
+    result
+}
+fn change(vm: &Vm, start: u64) { drop(vm.inner.0.borrow_mut().note_mapping_validation_change(start..start + 1)); }
+#[test]
+fn lockless_walk_equals_locked_walk() {
+    with_mask(g17_mem_path::REACH_LOCKLESS, || {
+        let vm = fixture();
+        for n in 0..40u64 { change(&vm, 0x100000 + n * 0x10000); }
+        let current = vm.mapping_validation_epoch().unwrap();
+        assert_eq!(current, 40);
+        for previous in [0u64, 1, 17, 39, 40] {
+            for hit in [None, Some(0x100000 + 25 * 0x10000u64)] {
+                let f = |range: Range<u64>| hit.is_some_and(|h| range.start <= h && h < range.end);
+                let locked = vm.mapping_changes_since_counted(previous, f, false).unwrap();
+                let free = vm.mapping_changes_since_lockless(previous, current, f).unwrap();
+                assert_eq!(locked, free, "previous {previous} hit {hit:?}");
+            }
+        }
+    });
+}
+#[test]
+fn lockless_is_off_by_default_and_refuses_unrecorded_history() {
+    let vm = fixture();
+    with_mask(0, || {
+        change(&vm, 0x10000);
+        assert_eq!(vm.mapping_changes_since_lockless(0, 1, |_| false), None);
+    });
+    with_mask(g17_mem_path::REACH_LOCKLESS, || {
+        // Epoch 1 was recorded while the bit was clear: refuse, never clean.
+        assert_eq!(vm.mapping_changes_since_lockless(0, 1, |_| false), None);
+        change(&vm, 0x20000);
+        assert_eq!(vm.mapping_changes_since_lockless(0, 2, |_| false), None);
+        let walk = vm.mapping_changes_since_lockless(1, 2, |_| false).unwrap();
+        assert_eq!((walk.epoch, walk.touched, walk.walked, walk.locked_at), (2, false, 1, 0));
+        // The locked walk is unchanged by the bit.
+        assert_eq!(vm.mapping_changes_since(0, |_| false), Some((2, false)));
+    });
+}
+#[test]
+fn lockless_refuses_writers_lost_history_and_wrong_current() {
+    with_mask(g17_mem_path::REACH_LOCKLESS, || {
+        let vm = fixture();
+        change(&vm, 0x10000);
+        assert!(vm.mapping_changes_since_lockless(0, 1, |_| false).is_some());
+        // A caller-supplied epoch that is not the visible one is refused.
+        assert_eq!(vm.mapping_changes_since_lockless(0, 2, |_| false), None);
+        assert_eq!(vm.mapping_changes_since_lockless(0, 0, |_| false), None);
+        {
+            let mut writer = vm.inner.0.borrow_mut();
+            let guard = writer.note_mapping_validation_change(0x20000..0x24000);
+            assert_eq!(vm.mapping_changes_since_lockless(0, 1, |_| false), None);
+            drop(guard);
+        }
+        assert!(vm.mapping_changes_since_lockless(0, 2, |_| false).is_some());
+        for n in 0..MAPPING_VALIDATION_HISTORY as u64 { change(&vm, 0x40000 + n * 0x4000); }
+        let current = vm.mapping_validation_epoch().unwrap();
+        assert_eq!(vm.mapping_changes_since_lockless(current - 129, current, |_| false), None);
+        assert!(vm.mapping_changes_since_lockless(current - 128, current, |_| false).is_some());
+        // A torn/stale entry (epoch mismatch) is refused.
+        let state = vm.mapping_validation.as_ref().unwrap();
+        state.history[(current as usize - 3) % MAPPING_VALIDATION_HISTORY].epoch.store(u64::MAX, Ordering::SeqCst);
+        assert_eq!(vm.mapping_changes_since_lockless(current - 5, current, |_| false), None);
+        assert!(vm.mapping_changes_since_lockless(current - 2, current, |_| false).is_some());
+        // Overflowed epochs refuse permanently.
+        vm.inner.0.borrow_mut().mapping_validation_epoch = Some(u64::MAX);
+        change(&vm, 0x10000);
+        assert_eq!(vm.mapping_validation_epoch(), None);
+        assert_eq!(vm.mapping_changes_since_lockless(current, current, |_| false), None);
+    });
+}
+#[test]
+fn lockless_touch_stops_the_walk_like_the_locked_walk() {
+    with_mask(g17_mem_path::REACH_LOCKLESS, || {
+        let vm = fixture();
+        for n in 0..10u64 { change(&vm, 0x100000 + n * 0x10000); }
+        let f = |range: Range<u64>| range.start == 0x100000 + 3 * 0x10000;
+        let walk = vm.mapping_changes_since_lockless(0, 10, f).unwrap();
+        assert_eq!((walk.touched, walk.walked), (true, 4));
+        assert_eq!(vm.mapping_changes_since_counted(0, f, false).unwrap().walked, 4);
+    });
+}
+#[test]
+fn mem_stats_counts_changes_per_vm_class() {
+    with_mask(g17_mem_path::MEM_STATS, || {
+        let before = g17_mem_path::CHANGES[0].load(Ordering::SeqCst);
+        let vm = fixture();
+        change(&vm, 0x10000);
+        change(&vm, 0x20000);
+        assert_eq!(g17_mem_path::CHANGES[0].load(Ordering::SeqCst), before + 2);
+    });
+}
+#[test]
+fn lockless_reader_never_accepts_a_torn_or_foreign_range() {
+    // Seqlock stress: one writer (the exec-lock holder) records changes whose
+    // range encodes their epoch; readers walk concurrently without any lock.
+    // Every accepted walk must have seen exactly epoch-matching ranges.
+    with_mask(g17_mem_path::REACH_LOCKLESS, || {
+        let state = Arc::new(MappingValidationState::new());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_state = state.clone();
+        let writer = std::thread::spawn(move || {
+            let mut inner = VmInner { is_kernel: false, mapping_validation_epoch: Some(0),
+                mapping_validation: Some(writer_state),
+                mapping_validation_changes: Some(Box::new([None; MAPPING_VALIDATION_HISTORY])) };
+            for epoch in 1..200_000u64 {
+                let start = epoch * UAT_PGSZ as u64;
+                drop(inner.note_mapping_validation_change(start..start + 1));
+            }
+        });
+        let readers: Vec<_> = (0..3).map(|n| {
+            let state = state.clone(); let done = done.clone();
+            std::thread::spawn(move || {
+                let (mut accepted, mut refused) = (0u64, 0u64);
+                while !done.load(Ordering::Relaxed) {
+                    let Some(current) = state.snapshot() else { refused += 1; continue; };
+                    let previous = current.saturating_sub(1 + (current + n) % 128);
+                    let mut expected = previous + 1;
+                    let walk = state.changes_since(previous, current, |range| {
+                        let ok = range.start == expected * UAT_PGSZ as u64 && range.end == range.start + UAT_PGSZ as u64;
+                        expected += 1;
+                        !ok // a foreign range reports "touched"; an accepted clean walk had none
+                    });
+                    match walk {
+                        Some(walk) => { assert!(!walk.touched, "accepted a torn range"); accepted += 1; }
+                        None => refused += 1,
+                    }
+                }
+                (accepted, refused)
+            })
+        }).collect();
+        writer.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        let mut total = 0;
+        for reader in readers { let (accepted, _) = reader.join().unwrap(); total += accepted; }
+        assert!(total > 0);
+    });
 }
 ''',
 ])
