@@ -1968,7 +1968,24 @@ pub(crate) struct KernelMappingInner {
 /// An object mapping into a [`Vm`], which reserves the address range from use by other mappings.
 pub(crate) struct KernelMapping(mm::Node<(), KernelMappingInner>);
 
+/// Keeps the originating UAT identity and its final-stop witness alive even
+/// when a cached object outlives the platform runtime.
+pub(crate) struct FirmwareCacheOwner(Arc<UatInner>);
+
+impl FirmwareCacheOwner {
+    pub(crate) fn stopped(&self) -> bool {
+        self.0.firmware_cache_stopped.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn matches(&self, uat: &Uat) -> bool {
+        core::ptr::eq(&*self.0, &*uat.inner) && !self.stopped()
+    }
+}
+
 impl KernelMapping {
+    pub(crate) fn firmware_cache_owner(&self) -> FirmwareCacheOwner {
+        FirmwareCacheOwner(self.0.uat_inner.clone())
+    }
     /// Returns the IOVA base of this mapping
     pub(crate) fn iova(&self) -> u64 {
         self.0.start()
@@ -2359,6 +2376,8 @@ unsafe impl Send for UatShared {}
 /// Inner data for the top-level UAT instance.
 #[pin_data]
 struct UatInner {
+    /// One-way final teardown witness; recovery never sets this.
+    firmware_cache_stopped: AtomicBool,
     firmware_cache_flush_ready: AtomicBool,
     /// `Vm::id` of the VM whose root is currently published at the G17P
     /// compute contexts (`T8140_COMPUTE_CTXS`), or 0 for none.
@@ -4318,6 +4337,12 @@ impl Uat {
         Ok(UatRegion { base, map })
     }
 
+    /// Final teardown only: the caller has proved both firmware CPUs stopped
+    /// and joined every publisher. Never use this for a restartable recovery.
+    pub(crate) fn mark_firmware_cache_stopped(&self) {
+        self.inner.firmware_cache_stopped.store(true, Ordering::SeqCst);
+    }
+
     /// Returns a reference to the global kernel (upper half) `Vm`
     pub(crate) fn kernel_vm(&self) -> &Vm {
         &self.kernel_vm
@@ -6161,6 +6186,7 @@ impl Uat {
 
         Arc::pin_init(
             try_pin_init!(UatInner {
+                firmware_cache_stopped: AtomicBool::new(false),
                 firmware_cache_flush_ready: AtomicBool::new(
                     handoff_mode == HandoffMode::FirmwareDekker
                 ),

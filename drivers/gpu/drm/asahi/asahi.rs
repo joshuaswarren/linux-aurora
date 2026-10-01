@@ -82,8 +82,27 @@ mod util;
 mod vm;
 mod workqueue;
 
-kernel::module_platform_driver! {
-    type: driver::AsahiDriver,
+#[kernel::prelude::pin_data]
+struct DriverModule {
+    #[pin]
+    _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiDriver>>,
+}
+
+impl kernel::InPlaceModule for DriverModule {
+    fn init(module: &'static kernel::ThisModule)
+        -> impl ::pin_init::PinInit<Self, kernel::error::Error> {
+        // SAFETY: called once before registration can probe any device.
+        unsafe { g17_resources::g17p_fw_pool_init() };
+        kernel::try_pin_init!(Self {
+            _driver <- kernel::driver::Registration::new(
+                <Self as kernel::ModuleMetadata>::NAME, module,
+            ),
+        })
+    }
+}
+
+kernel::prelude::module! {
+    type: DriverModule,
     name: "asahi",
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",

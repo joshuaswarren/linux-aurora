@@ -331,15 +331,16 @@ pub(crate) fn sample_tsq_gate() -> bool {
 
 /// Root-only runtime diagnostic knobs, `g17p_diag_knobs` (u32 bitmask,
 /// decimal or 0x hex). Read when each render descriptor/kick is built, so a
-/// change applies to the next submission and permits same-boot A/B. Zero is
-/// the unchanged production behaviour. bit0: FRG +0x222d = 0 (native light
+/// change applies to the next submission and permits same-boot A/B. Cached
+/// family bits affect fresh resource owners only. bit0: FRG +0x222d = 0 (native light
 /// captures); bit1: omit the per-pass KSM MCache aperture (native final
 /// commands carry pointer/count zero).
 /// v84 production defaults (native-matching, hardware-qualified since v64/v67
 /// under 0x9000 in every throughput and stress run): bit12 native TA
 /// force-drain value (+0x8c2 = 0) and bit15 aligned word record snapshots.
-/// Writing the knob still selects any mask for same-boot A/B.
-pub(crate) const DIAG_PRODUCTION_DEFAULT: u32 = (1 << 12) | (1 << 15);
+/// Bits27..30 cache native command-object families with reserved return storage
+/// and final-stop/UAT lifetime checks. Writing the knob still permits A/B.
+pub(crate) const DIAG_PRODUCTION_DEFAULT: u32 = (1 << 12) | (1 << 15) | (0xf << 27);
 static DIAG_KNOBS: AtomicU32 = AtomicU32::new(DIAG_PRODUCTION_DEFAULT);
 pub(crate) const DIAG_FRG_222D_CLEAR: u32 = 1 << 0;
 pub(crate) const DIAG_NO_KSM_MCACHE: u32 = 1 << 1;

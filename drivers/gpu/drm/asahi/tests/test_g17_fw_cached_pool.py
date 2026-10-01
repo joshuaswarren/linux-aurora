@@ -8,7 +8,7 @@ index, `MappedObject::new_fw_pooled`, `impl Drop for MappedObject`,
 the runtime family gate. The mocks count every KernelMapping drop (= an
 unmap). The invariant under test: a mapping that ever carried the cached
 attribute is never unmapped while pooled use continues, is reused only zeroed
-and with identical geometry, and is released only by release_all.
+and with identical geometry, and is released only after the originating firmware is proven stopped.
 """
 from pathlib import Path
 import json, subprocess, tempfile
@@ -45,9 +45,8 @@ pool_src = '\n'.join([
     item(res, 'impl<T, const N: usize> G17PFwPoolSlots<T, N> {'),
     item(res, 'struct G17PPooledFwObject {'),
     line(res, 'static G17P_FW_POOLS:'), line(res, 'static G17P_FW_POOL_CACHED_BYTES'),
-    line(res, 'static G17P_FW_POOL_STATS'),
+    line(res, 'static G17P_FW_POOL_STATS'), line(res, 'static G17P_FW_POOL_RESERVED'),
     item(res, 'fn g17p_fw_pool_stat('), item(res, 'fn g17p_fw_pool_bump('),
-    item(res, 'fn g17p_fw_pool_leak('),
     item(res, 'impl Drop for MappedObject {'),
     item(res, 'fn g17p_fw_pool_take('),
     item(res, 'pub(crate) fn g17p_fw_pool_release_all('),
@@ -55,6 +54,15 @@ pool_src = '\n'.join([
 method = item(res, '    fn new_fw_pooled(')
 prefix_method = item(mmu, '    pub(crate) unsafe fn set_fw_cached_prefix(')
 gate = item(tb, 'pub(crate) fn fw_cached_family_mask(')
+owner_struct = line(mmu, 'pub(crate) struct FirmwareCacheOwner(')
+owner_impl = item(mmu, 'impl FirmwareCacheOwner {')
+# Scheduling hook after the real production stop-load: return the sampled value,
+# while allowing another final-stop thread to start its sweep at that boundary.
+owner_impl = owner_impl.replace('self.0.firmware_cache_stopped.load(Ordering::SeqCst)',
+    '{ let sampled = self.0.firmware_cache_stopped.load(Ordering::SeqCst); '
+    'test_stop_read_hook(); sampled }')
+owner_method = item(mmu, '    pub(crate) fn firmware_cache_owner(')
+stop_method = item(mmu, '    pub(crate) fn mark_firmware_cache_stopped(')
 
 source = r'''
 #![allow(dead_code, unused_variables, unused_macros, unused_imports)]
@@ -75,39 +83,62 @@ mod g17_timing_buffer { use super::*;
 ''' + gate + r'''
 }
 mod crate_shim {}
+static STOP_READ_HOOK: std::sync::Mutex<Option<(std::sync::Arc<std::sync::Barrier>,std::sync::Arc<std::sync::Barrier>)>> = std::sync::Mutex::new(None);
+fn test_stop_read_hook() { let hook=STOP_READ_HOOK.lock().unwrap().take();if let Some((entered,resume))=hook {entered.wait();resume.wait();} }
+static FAIL_POOL_NODE:AtomicBool=AtomicBool::new(false);
+struct PoolLock(std::sync::Mutex<()>);
+impl PoolLock { fn lock(&self)->std::sync::MutexGuard<'_,()> {self.0.lock().unwrap()} }
+static G17P_FW_POOL_LOCK:PoolLock=PoolLock(std::sync::Mutex::new(()));
 struct GfpFlags; const GFP_KERNEL: GfpFlags = GfpFlags;
 struct KBox<T>(Box<T>);
+impl<T> std::ops::Deref for KBox<T> {type Target=T;fn deref(&self)->&T {&self.0}}
+impl<T> std::ops::DerefMut for KBox<T> {fn deref_mut(&mut self)->&mut T {&mut self.0}}
 impl<T> KBox<T> {
+ fn new(v:T,_:GfpFlags)->std::result::Result<Self,()> {if FAIL_POOL_NODE.swap(false,Ordering::SeqCst) {Err(())} else {Ok(KBox(Box::new(v)))}}
  fn new_uninit(_: GfpFlags) -> std::result::Result<KBox<std::mem::MaybeUninit<T>>, ()> { Ok(KBox(Box::new(std::mem::MaybeUninit::uninit()))) }
  fn into_raw(b: Self) -> *mut T { Box::into_raw(b.0) }
  unsafe fn from_raw(p: *mut T) -> Self { KBox(unsafe { Box::from_raw(p) }) }
  fn into_inner(b: Self) -> T { *b.0 }
 }
 impl<T> KBox<std::mem::MaybeUninit<T>> { fn write(b: Self, v: T) -> KBox<T> { let mut b = b.0; b.write(v); KBox(unsafe { Box::from_raw(Box::into_raw(b).cast::<T>()) }) } }
-mod kernel { pub mod sync { pub mod aref { pub type ARef<T> = std::rc::Rc<T>; } } }
-mod gem { pub struct Object; pub struct ObjectRef { pub gem: std::rc::Rc<Object> }
-  impl ObjectRef { pub fn new(gem: std::rc::Rc<Object>) -> Self { ObjectRef { gem } } } }
+mod kernel { pub mod sync { pub mod aref { pub type ARef<T> = std::sync::Arc<T>; } } }
+mod gem { pub struct Object; pub struct ObjectRef { pub gem: std::sync::Arc<Object> }
+  impl ObjectRef { pub fn new(gem: std::sync::Arc<Object>) -> Self { ObjectRef { gem } } } }
 mod mmu {
  use super::*;
- pub struct KernelMapping { pub iova: u64, pub size: usize }
+ use std::sync::Arc;
+ pub struct UatInner { pub firmware_cache_stopped: AtomicBool }
+ #[derive(Clone)] pub struct Uat { pub inner: Arc<UatInner> }
+ impl Uat {
+  pub fn new()->Self {Self{inner:Arc::new(UatInner{firmware_cache_stopped:AtomicBool::new(false)})}}
+''' + stop_method + r'''
+ }
+ pub struct MappingInner { pub iova:u64, pub size:usize, pub uat_inner:Arc<UatInner> }
+ pub struct KernelMapping(pub MappingInner);
  impl Drop for KernelMapping { fn drop(&mut self) { UNMAPS.fetch_add(1, Ordering::SeqCst); } }
+''' + owner_struct + owner_impl + r'''
  impl KernelMapping {
+''' + owner_method + r'''
   pub unsafe fn set_fw_cached_prefix(&self, prefix: usize) -> (Result<[u64; 2]>, bool) {
    PROOF_CALLS.fetch_add(1, Ordering::SeqCst);
-   assert!(prefix > 0 && prefix <= self.size);
+   assert!(prefix > 0 && prefix <= self.0.size);
    match PROOF_MODE.load(Ordering::SeqCst) { 0 => (Ok([0x40b, 0x44b]), false), 1 => (Err(EINVAL), false), _ => (Err(EFAULT), true) }
   }
  }
 }
+thread_local! {static DEFAULT_UAT:RefCell<mmu::Uat>=RefCell::new(mmu::Uat::new());}
+fn default_uat()->mmu::Uat {DEFAULT_UAT.with(|u|u.borrow().clone())}
+fn stop_default(){default_uat().mark_firmware_cache_stopped();}
+
 struct AsahiDevice; impl AsahiDevice { fn as_ref(&self) -> &Self { self } }
 struct MappedObject { mapping: Option<mmu::KernelMapping>, object: gem::ObjectRef, iova: u64,
-  object_offset: usize, logical_size: usize, cpu_wc: bool, fw_pool: u8, bytes: RefCell<Vec<u8>> }
+  object_offset: usize, logical_size: usize, cpu_wc: bool, fw_pool: u8, fw_node:Option<KBox<G17PPooledFwObject>>, bytes: RefCell<Vec<u8>> }
 impl MappedObject {
  fn plain(size: usize, cpu_wc: bool) -> Result<Self> {
   ALLOCS.fetch_add(1, Ordering::SeqCst);
   let iova = NEXT_IOVA.fetch_add(0x100000, Ordering::SeqCst);
-  Ok(MappedObject { mapping: Some(mmu::KernelMapping { iova, size }), object: gem::ObjectRef::new(std::rc::Rc::new(gem::Object)),
-     iova, object_offset: 0, logical_size: size, cpu_wc, fw_pool: 0, bytes: RefCell::new(vec![0; size]) })
+  Ok(MappedObject { mapping: Some(mmu::KernelMapping(mmu::MappingInner { iova, size, uat_inner:default_uat().inner })), object: gem::ObjectRef::new(std::sync::Arc::new(gem::Object)),
+     iova, object_offset: 0, logical_size: size, cpu_wc, fw_pool: 0, fw_node:None, bytes: RefCell::new(vec![0; size]) })
  }
  fn with_bytes_mut<R>(&mut self, f: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> { f(&mut self.bytes.borrow_mut()) }
 ''' + method + r'''
@@ -115,17 +146,20 @@ impl MappedObject {
 '''
 # The production take() constructs MappedObject without the test-only byte
 # model; give the mock a default for it.
-pool_src = pool_src.replace('        fw_pool: 0,\n    })', '        fw_pool: 0,\n        bytes: RefCell::new(vec![0xa5; entry.logical_size]),\n    })')
+pool_src = pool_src.replace('            fw_node: Some(entry),', '            bytes: RefCell::new(vec![0xa5; entry.logical_size]),\n            fw_node: Some(entry),')
 source += pool_src + r'''
 fn reset() {
+ DEFAULT_UAT.with(|u|*u.borrow_mut()=mmu::Uat::new());
  for p in &G17P_FW_POOLS { while !p.take().is_null() {} }
  UNMAPS.store(0, Ordering::SeqCst); PROOF_MODE.store(0, Ordering::SeqCst); PROOF_CALLS.store(0, Ordering::SeqCst);
  ALLOCS.store(0, Ordering::SeqCst); G17P_FW_POOL_CACHED_BYTES.store(0, Ordering::SeqCst);
+ for s in &G17P_FW_POOL_RESERVED {s.store(0,Ordering::SeqCst);}
+ FAIL_POOL_NODE.store(false,Ordering::SeqCst);
  for s in &G17P_FW_POOL_STATS { s.store(0, Ordering::SeqCst); }
 }
 fn knobs(families: u32) { DIAG_KNOBS.store(0x9000 | (families << 27), Ordering::SeqCst); }
 fn new_obj(dev: &AsahiDevice, family: u32, size: usize, prefix: usize, wc: bool) -> Result<MappedObject> {
- MappedObject::new_fw_pooled(dev, family, size, prefix, wc, || MappedObject::plain(size, wc))
+ MappedObject::new_fw_pooled(dev, &default_uat(), family, size, prefix, wc, || MappedObject::plain(size, wc))
 }
 const DEV: AsahiDevice = AsahiDevice;
 
@@ -153,7 +187,7 @@ const DEV: AsahiDevice = AsahiDevice;
  let c = new_obj(&DEV, G17P_FW_FAMILY_CONFIG_UPDATE, 2*UAT_PGSZ, 2*UAT_PGSZ, false).unwrap();
  assert_ne!(c.iova, iova); drop(c);
  assert_eq!(UNMAPS.load(Ordering::SeqCst), 0);
- g17p_fw_pool_release_all();
+ stop_default(); g17p_fw_pool_release_all();
  assert_eq!(UNMAPS.load(Ordering::SeqCst), 2, "release_all unmaps each pooled mapping once");
 }
 
@@ -173,21 +207,25 @@ const DEV: AsahiDevice = AsahiDevice;
  assert_eq!(ALLOCS.load(Ordering::SeqCst), 2, "poisoned object must not be pooled"); drop(o);
 }
 
-#[test] fn full_pool_leaks_instead_of_unmapping() {
- reset(); knobs(0xf);
- let objs: Vec<_> = (0..G17P_FW_POOL_SLOTS + 3).map(|_| new_obj(&DEV, G17P_FW_FAMILY_DESCRIPTOR, 0x14000, 0x14000, false).unwrap()).collect();
- drop(objs);
- assert_eq!(UNMAPS.load(Ordering::SeqCst), 0);
- assert_eq!((g17p_fw_pool_stat(2), g17p_fw_pool_stat(3)), (G17P_FW_POOL_SLOTS as u32, 3));
- g17p_fw_pool_release_all(); assert_eq!(UNMAPS.load(Ordering::SeqCst), G17P_FW_POOL_SLOTS);
+#[test] fn above_capacity_peaks_fall_back_before_mutation_and_release_everything() {
+ for _ in 0..32 {
+  reset(); knobs(1);
+  let objs:Vec<_>=(0..G17P_FW_POOL_SLOTS+3).map(|_|new_obj(&DEV,1,0x14000,0x14000,false).unwrap()).collect();
+  assert_eq!(PROOF_CALLS.load(Ordering::SeqCst),G17P_FW_POOL_SLOTS);
+  drop(objs);assert_eq!(UNMAPS.load(Ordering::SeqCst),3);
+  assert_eq!(g17p_fw_pool_stat(3),0);
+  stop_default();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),G17P_FW_POOL_SLOTS+3);
+  assert_eq!(G17P_FW_POOL_CACHED_BYTES.load(Ordering::SeqCst),0);
+  assert_eq!(G17P_FW_POOL_RESERVED[0].load(Ordering::SeqCst),0);
+ }
 }
 
 #[test] fn geometry_mismatch_is_poisoned_not_unmapped() {
  reset(); knobs(0xf);
  drop(new_obj(&DEV, G17P_FW_FAMILY_CONFIG_UPDATE, 2*UAT_PGSZ, 2*UAT_PGSZ, false).unwrap());
  let o = new_obj(&DEV, G17P_FW_FAMILY_CONFIG_UPDATE, 4*UAT_PGSZ, 4*UAT_PGSZ, false).unwrap();
- assert_eq!(o.logical_size, 4*UAT_PGSZ); assert_eq!(UNMAPS.load(Ordering::SeqCst), 0); assert_eq!(g17p_fw_pool_stat(3), 1);
- drop(o); g17p_fw_pool_release_all();
+ assert_eq!(o.logical_size, 4*UAT_PGSZ); assert_eq!(UNMAPS.load(Ordering::SeqCst), 0); assert_eq!(g17p_fw_pool_stat(3), 0);
+ drop(o); stop_default(); g17p_fw_pool_release_all();
 }
 
 #[test] fn cached_byte_cap_falls_back_uncached() {
@@ -206,7 +244,7 @@ const DEV: AsahiDevice = AsahiDevice;
  }
  assert_eq!(ALLOCS.load(Ordering::SeqCst), 2, "steady state reuses the peak set");
  assert_eq!(UNMAPS.load(Ordering::SeqCst), 0); assert_eq!(g17p_fw_pool_stat(3), 0);
- g17p_fw_pool_release_all(); assert_eq!(UNMAPS.load(Ordering::SeqCst), 2);
+ stop_default(); g17p_fw_pool_release_all(); assert_eq!(UNMAPS.load(Ordering::SeqCst), 2);
 }
 
 #[test] fn pool_slots_never_lose_or_duplicate_entries_under_contention() {
@@ -230,6 +268,85 @@ const DEV: AsahiDevice = AsahiDevice;
  for (f, i) in [(1u32, 0usize), (2, 1), (4, 2), (8, 3)] { assert_eq!(g17p_fw_pool_index(f), Some(i)); }
  for f in [0u32, 3, 5, 16, 0x80] { assert_eq!(g17p_fw_pool_index(f), None); }
 }
+#[test] fn failed_stop_sweep_does_not_release_unproven_firmware_owner() {
+ reset();knobs(0xf);drop(new_obj(&DEV,1,0x14000,0x14000,false).unwrap());
+ g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),0);
+ stop_default();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),1);
+}
+#[test] fn late_close_after_shutdown_releases_instead_of_refilling() {
+ reset();knobs(0xf);let o=new_obj(&DEV,2,2*UAT_PGSZ,UAT_PGSZ,true).unwrap();
+ stop_default();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),0);
+ drop(o);assert_eq!(UNMAPS.load(Ordering::SeqCst),1);assert!(G17P_FW_POOLS[1].take().is_null());
+ assert_eq!(G17P_FW_POOL_CACHED_BYTES.load(Ordering::SeqCst),0);
+}
+#[test] fn reprobe_never_reuses_previous_uat_mapping_with_identical_geometry() {
+ reset();knobs(0xf);let o=new_obj(&DEV,1,0x14000,0x14000,false).unwrap();let old=o.iova;drop(o);
+ DEFAULT_UAT.with(|u|*u.borrow_mut()=mmu::Uat::new());
+ let n=new_obj(&DEV,1,0x14000,0x14000,false).unwrap();assert_ne!(old,n.iova);
+ assert_eq!(UNMAPS.load(Ordering::SeqCst),0,"unproven old owner must remain mapped");
+ assert_eq!(g17p_fw_pool_stat(3),0);drop(n);stop_default();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),1);
+}
+#[test] fn stopping_new_owner_never_frees_old_failed_stop_pool() {
+ reset();knobs(0xf);let old_owner=default_uat();drop(new_obj(&DEV,1,0x14000,0x14000,false).unwrap());
+ DEFAULT_UAT.with(|u|*u.borrow_mut()=mmu::Uat::new());drop(new_obj(&DEV,2,2*UAT_PGSZ,UAT_PGSZ,true).unwrap());
+ stop_default();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),1);
+ assert!(!old_owner.inner.firmware_cache_stopped.load(Ordering::SeqCst));
+ old_owner.mark_firmware_cache_stopped();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),2);
+}
+#[test] fn owner_token_pins_identity_and_stop_state_after_uat_handle_drops() {
+ reset();knobs(0xf);let ua=default_uat();let o=new_obj(&DEV,1,0x14000,0x14000,false).unwrap();
+ let owner=o.mapping.as_ref().unwrap().firmware_cache_owner();
+ assert!(owner.matches(&ua));let another=mmu::Uat::new();assert!(!owner.matches(&another));
+ ua.mark_firmware_cache_stopped();drop(ua);assert!(owner.stopped());assert!(!owner.matches(&default_uat()));drop(o);
+}
+
+#[test] fn allocation_failure_is_uncached_before_any_attribute_mutation() {
+ reset();knobs(1);FAIL_POOL_NODE.store(true,Ordering::SeqCst);
+ let o=new_obj(&DEV,1,0x14000,0x14000,false).unwrap();
+ assert_eq!(o.fw_pool,0);assert_eq!(PROOF_CALLS.load(Ordering::SeqCst),0);
+ drop(o);assert_eq!(UNMAPS.load(Ordering::SeqCst),1);
+ assert_eq!(G17P_FW_POOL_CACHED_BYTES.load(Ordering::SeqCst),0);
+}
+#[test] fn poisoned_entries_are_released_at_proven_stop() {
+ reset();knobs(1);PROOF_MODE.store(2,Ordering::SeqCst);
+ assert!(new_obj(&DEV,1,0x14000,0x14000,false).is_err());
+ assert_eq!(UNMAPS.load(Ordering::SeqCst),0);
+ stop_default();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),1);
+ assert_eq!(G17P_FW_POOL_CACHED_BYTES.load(Ordering::SeqCst),0);
+ assert_eq!(G17P_FW_POOL_RESERVED[0].load(Ordering::SeqCst),0);
+}
+#[test] fn prefix_is_part_of_reuse_geometry() {
+ reset();knobs(1);let a=new_obj(&DEV,1,0x14000,0x4000,false).unwrap();let va=a.iova;drop(a);
+ let b=new_obj(&DEV,1,0x14000,0x8000,false).unwrap();assert_ne!(b.iova,va);drop(b);
+ let a=new_obj(&DEV,1,0x14000,0x4000,false).unwrap();assert_eq!(a.iova,va);drop(a);
+ stop_default();g17p_fw_pool_release_all();assert_eq!(UNMAPS.load(Ordering::SeqCst),2);
+}
+#[test] fn sweep_observing_live_owner_cannot_restore_after_that_owners_final_sweep() {
+ reset();knobs(1);let owner=default_uat();drop(new_obj(&DEV,1,0x14000,0x14000,false).unwrap());
+ let entered=std::sync::Arc::new(std::sync::Barrier::new(2));
+ let resume=std::sync::Arc::new(std::sync::Barrier::new(2));
+ *STOP_READ_HOOK.lock().unwrap()=Some((entered.clone(),resume.clone()));
+ let first=std::thread::spawn(||g17p_fw_pool_release_all());
+ entered.wait();owner.mark_firmware_cache_stopped();
+ let second=std::thread::spawn(||g17p_fw_pool_release_all());
+ resume.wait();first.join().unwrap();second.join().unwrap();
+ // No compensating cleanup sweep: the actual racing operations must finish it.
+ assert_eq!(UNMAPS.load(Ordering::SeqCst),1);
+ assert_eq!(G17P_FW_POOL_CACHED_BYTES.load(Ordering::SeqCst),0);
+ assert_eq!(G17P_FW_POOL_RESERVED[0].load(Ordering::SeqCst),0);
+}
+#[test] fn concurrent_final_stop_and_owner_drops_release_exactly_once() {
+ for _ in 0..128 {
+  reset();knobs(1);let owner=default_uat();
+  let objects:Vec<_>=(0..16).map(|_|new_obj(&DEV,1,0x14000,0x14000,false).unwrap()).collect();
+  let barrier=std::sync::Arc::new(std::sync::Barrier::new(2));let worker=barrier.clone();
+  let thread=std::thread::spawn(move||{worker.wait();drop(objects);});
+  barrier.wait();owner.mark_firmware_cache_stopped();g17p_fw_pool_release_all();thread.join().unwrap();
+  assert_eq!(UNMAPS.load(Ordering::SeqCst),16);
+  assert_eq!(G17P_FW_POOL_CACHED_BYTES.load(Ordering::SeqCst),0);assert_eq!(g17p_fw_pool_stat(3),0);
+ }
+}
+
 '''
 source = source.replace('use crate::', 'use ').replace('crate::g17_timing_buffer::', 'g17_timing_buffer::')
 
