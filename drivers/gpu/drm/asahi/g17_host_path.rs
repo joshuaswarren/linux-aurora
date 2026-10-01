@@ -133,7 +133,9 @@ pub(crate) const FW_DEPS: u32 = 1 << 13;
 pub(crate) const AGG_FIRST: u32 = 1 << 14;
 pub(crate) const EARLY_DEPS: u32 = 1 << 15;
 pub(crate) const WAIT_UTIL_HINT: u32 = 1 << 16;
-const ALL_BITS: u32 = (1 << 17) - 1;
+/// Read only producer cursors when no completion/retirement decision is made.
+pub(crate) const PRODUCER_READS: u32 = 1 << 17;
+const ALL_BITS: u32 = (1 << 18) - 1;
 
 /// Production default for this candidate. v84-final had FEED_PERF only; v87
 /// added bits 2-8 and v91 bits 9-11. `g17p_host_path=0x1fe` is exactly the
@@ -141,10 +143,11 @@ const ALL_BITS: u32 = (1 << 17) - 1;
 /// v93 bits 13-15 stay off. The scoped wait hint adds bit16 to the default;
 /// `0xffe` disables only that hint for same-kernel comparison. `0xeffe`
 /// enables the older three probes without the scoped hint.
-// Scoped wait hints extend the prior 0xffe baseline to 0x10ffe.
+// Producer-only reads extend 0x10ffe to 0x30ffe; clearing bit17 restores
+// the original full snapshots for an otherwise identical comparison.
 const DEFAULT_MASK: u32 = FEED_PERF | EARLY_SHALLOW | STATE_WORD | SETTLE_ONCE
     | RING_CACHE | WORKER_TAIL | OBS_SKIP | VM_STATUS_MIRROR
-    | VALIDATE_PROOF | PENDING_EXACT | WORD_STORES | WAIT_UTIL_HINT;
+    | VALIDATE_PROOF | PENDING_EXACT | WORD_STORES | WAIT_UTIL_HINT | PRODUCER_READS;
 static MASK: AtomicU32 = AtomicU32::new(DEFAULT_MASK);
 static FEED_PCT: AtomicU32 = AtomicU32::new(50);
 /// v92 per-cluster overrides of FEED_PCT (0 = inherit).
