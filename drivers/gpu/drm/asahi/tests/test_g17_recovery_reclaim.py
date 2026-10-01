@@ -59,7 +59,7 @@ mod g17_recovery_path {
     @PARSE@
 }
 '''.replace("@CORE@", rp_core.replace("static MASK: AtomicU32 = AtomicU32::new(0);", "")
-            .replace("const ALL_BITS: u32 = (1 << 3) - 1;", "")).replace("@SHADOW@", rp_shadow).replace("@PARSE@", "pub(crate) " + rp_parse)
+            .replace("const ALL_BITS: u32 = RECLAIM_DRAINED | CONTROL_TRACE | GROW_REKICK | STALL_WATCH | STALL_REDOORBELL\n    | STALL_FRAGMENT;", "")).replace("@SHADOW@", rp_shadow).replace("@PARSE@", "pub(crate) " + rp_parse)
 
 # ---------------------------------------------------------------------------
 # 1. Runtime reclaim over a mock manager.

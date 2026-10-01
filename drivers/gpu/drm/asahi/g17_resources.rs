@@ -9404,6 +9404,39 @@ impl G17PUserRenderStorage {
         }
     }
 
+    /// v97d: one complete 0x200-byte SKSM kick entry, eight words per row.
+    /// Host-allocated context object; a plain read of retained memory.
+    pub(crate) fn log_sksm_entry_full(
+        &mut self,
+        dev: &AsahiDevice,
+        tiling: bool,
+        label: &str,
+        stamp: u64,
+        offset: usize,
+    ) {
+        let Ok(backing) = self.sksm_backing_mut() else { return };
+        let object = if tiling { &mut backing.ta_context } else { &mut backing.fragment_context };
+        let Ok(vmap) = object.object.vmap() else { return };
+        let bytes = unsafe {
+            // SAFETY: VMap spans the object and every row is bounds checked.
+            core::slice::from_raw_parts(vmap.as_ptr(), object.logical_size)
+        };
+        for row in 0..16usize {
+            let at = offset + row * 32;
+            let Some(raw) = bytes.get(at..at + 32) else { return };
+            let word = |index: usize| u32::from_le_bytes(raw[index * 4..index * 4 + 4].try_into().unwrap());
+            dev_info!(
+                dev.as_ref(),
+                "G17P sksm full[{}] {} stamp={:#x} +{:#x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                label,
+                if tiling { "TA" } else { "3D" },
+                stamp,
+                at,
+                word(0), word(1), word(2), word(3), word(4), word(5), word(6), word(7),
+            );
+        }
+    }
+
     pub(crate) fn log_sksm_entry(
         &mut self,
         dev: &AsahiDevice,
@@ -19374,6 +19407,30 @@ impl G17ResourceOwner {
             entries[0], entries[1], entries[2], entries[3],
             entries[4], entries[5], entries[6], entries[7]
         );
+        // v97: every valid entry of the 256-entry table. Observed layout
+        // (inference from the 2026-09-30 02:19 recovery, where each value
+        // matched a cancelled queue's stamp): word0 = flags | qid << 4 with
+        // bit0 VALID, word1 = stamp << 8. Raw words are printed as well.
+        let mut logged = 0u32;
+        for index in 0..PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_COUNT {
+            let at = status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET)
+                .and_then(|a| a.checked_add((index as u64).checked_mul(PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_STRIDE)?))
+                .ok_or(EINVAL)?;
+            let flags = self.resources.primary_state.read_live_u32(at)?;
+            if flags & 1 == 0 { continue; }
+            let value = self.resources.primary_state.read_live_u32(at.checked_add(4).ok_or(EINVAL)?)?;
+            logged += 1;
+            if logged > 32 { continue; }
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P recovery info entry[{}]: raw={:#010x}/{:#010x} qid={} flags={:#x} stamp={:#x} low={:#x}\n",
+                index, flags, value, flags >> 4, flags & 0xf, value >> 8, value & 0xff
+            );
+        }
+        if logged > 32 {
+            dev_info!(self.dev().as_ref(), "G17P recovery info: {} valid entries (first 32 printed)\n", logged);
+        }
         // +0x48e0 and +0x48e8 are NOT firmware fault output and are not a
         // lead. They are `PRIMARY_STATUS_B_FWCTL_STATE` / `..._FWCTL_RING`,
         // which *this driver* writes at init via `encode_primary_status_b(
