@@ -2435,6 +2435,11 @@ struct G17PRenderSksmQueue {
     /// Set only after the tag-15 install and complete outer group are visible
     /// to firmware. It never represents a host MMIO write.
     registered: bool,
+    /// The KSMFE already has this QID enabled (a host direct configure landed
+    /// this session). Native
+    /// `configureHardware` tracks the same thing in `AGXKSMKickQueue+0xa8`
+    /// and writes the disable mask before reprogramming such a queue.
+    hardware_enabled: bool,
 }
 
 /// The render pair, TA first. Held next to `render_storage` and released with
@@ -6124,26 +6129,29 @@ impl G17PManagerConstruction {
                     )
                     .map_err(|_| Self::render_stage_fail("sksm-producer-state", EINVAL))?,
                 registered: false,
+                hardware_enabled: false,
             })
         };
+        let tiling_queue = build(
+            pair.tiling as u8,
+            g17_submission::G17P_TA_DATA_MASTER,
+            true,
+            entry_vas[0].0,
+        )?;
+        let fragment_queue = build(
+            pair.fragment as u8,
+            match crate::g17_config::RENDER_3D_DM {
+                0xff => g17_submission::G17P_3D_DATA_MASTER,
+                other => other,
+            },
+            false,
+            entry_vas[1].0,
+        )?;
         Ok(G17PRenderSksmQueues {
             scratch,
             uat_owner: self.uat().ttb_base(),
-            tiling: build(
-                pair.tiling as u8,
-                g17_submission::G17P_TA_DATA_MASTER,
-                true,
-                entry_vas[0].0,
-            )?,
-            fragment: build(
-                pair.fragment as u8,
-                match crate::g17_config::RENDER_3D_DM {
-                    0xff => g17_submission::G17P_3D_DATA_MASTER,
-                    other => other,
-                },
-                false,
-                entry_vas[1].0,
-            )?,
+            tiling: tiling_queue,
+            fragment: fragment_queue,
             backing: None,
         })
     }
@@ -6404,6 +6412,7 @@ impl G17PManagerConstruction {
             &mut queues.fragment
         };
         queue.registered = true;
+        queue.hardware_enabled = true;
     }
 
     /// Directly install both halves of a fresh non-bootstrap render pair after
@@ -6416,7 +6425,7 @@ impl G17PManagerConstruction {
     /// objects before publishing either outer command. Never expose a fresh
     /// pair after only one configuration landed.
     fn configure_fresh_nonbootstrap_render_pair(
-        &self, pair_slot: u8,
+        &mut self, pair_slot: u8,
         registers: &regs::Resources,
         fragment_install: bool,
         tiling_install: Option<bool>,
@@ -6424,7 +6433,6 @@ impl G17PManagerConstruction {
         if !fragment_install && !tiling_install.unwrap_or(false) {
             return Ok(());
         }
-        let queues = self.render_slots.get(pair_slot).sksm.as_ref().ok_or(ENODEV)?;
         let pair = self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?.queue_pair();
         if pair.slot() == 0 {
             return Ok(());
@@ -6432,15 +6440,34 @@ impl G17PManagerConstruction {
         if !fragment_install || tiling_install != Some(true) {
             return Err(Self::render_stage_fail("secondary-pair-partial-install", EINVAL));
         }
+        let disable_before_reconfigure =
+            *module_parameters::g17p_render_disable_before_reconfigure.value() != 0;
+        let fender_bracket = *module_parameters::g17p_render_fender_bracket.value() != 0;
+        let (fragment, tiling, disable) = {
+            let queues = self.render_slots.get(pair_slot).sksm.as_ref().ok_or(ENODEV)?;
+            // Native `configureHardware` on a queue it already enabled
+            // (`+0xa8` set) writes the disable mask before the tag/data pair.
+            // Production rewrote an enabled queue's routing without it (the
+            // sibling's first kick repeated its warm-up configure).
+            let already_enabled =
+                queues.fragment.hardware_enabled || queues.tiling.hardware_enabled;
+            (
+                (
+                    queues.fragment.config.write_pair(),
+                    queues.fragment.config.enable_pair,
+                ),
+                (
+                    queues.tiling.config.write_pair(),
+                    queues.tiling.config.enable_pair,
+                ),
+                (disable_before_reconfigure && already_enabled).then_some((
+                    queues.fragment.config.disable_pair,
+                    queues.tiling.config.disable_pair,
+                )),
+            )
+        };
         let issued = registers.g17p_sksm_configure_powered_render_pair(
-            (
-                queues.fragment.config.write_pair(),
-                queues.fragment.config.enable_pair,
-            ),
-            (
-                queues.tiling.config.write_pair(),
-                queues.tiling.config.enable_pair,
-            ),
+            fragment, tiling, disable, fender_bracket,
         )?;
         if !issued {
             dev_err!(
@@ -6451,11 +6478,17 @@ impl G17PManagerConstruction {
             );
             return Err(EAGAIN);
         }
+        if let Some(queues) = self.render_slots.get_mut(pair_slot).sksm.as_mut() {
+            queues.fragment.hardware_enabled = true;
+            queues.tiling.hardware_enabled = true;
+        }
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P render: pair {}/{} directly configured as one transaction before simultaneous outer publication\n",
+            "G17P render: pair {}/{} directly configured as one transaction before simultaneous outer publication{}{}\n",
             pair.tiling,
             pair.fragment,
+            if disable.is_some() { " (disable-first)" } else { "" },
+            if fender_bracket { " (fender bracket)" } else { "" },
         );
         Ok(())
     }
@@ -7093,8 +7126,13 @@ impl G17PManagerConstruction {
         // registration power, while no kick of this owner is live. The tag-15
         // install record itself stays with the first kick (`registered` is
         // left false), which repeats this configuration idempotently.
+        // `g17p_render_configure_at_warmup=0` is the native shape: creation
+        // does no KSMFE MMIO (AGXKSMKickQueue::init 0x88cc5d4 has none); the
+        // first kick configures the queue (`configureHardware` from the
+        // submitBuffer gate).
         let fresh_routes = crate::g17_config::RENDER_SKSM != 0
             && queue_pair.slot() != 0
+            && *module_parameters::g17p_render_configure_at_warmup.value() != 0
             && self.render_slots.get(pair_slot).sksm.as_ref().is_some_and(|queues| {
                 !queues.tiling.registered && !queues.fragment.registered
             });
@@ -7102,13 +7140,23 @@ impl G17PManagerConstruction {
             registration_power(self)?;
             self.configure_fresh_nonbootstrap_render_pair(pair_slot, registers, true, Some(true))?;
         }
+        let (registered, hardware_enabled) = self.render_slots.get(pair_slot).sksm.as_ref()
+            .map_or((false, false), |queues| (
+                queues.tiling.registered && queues.fragment.registered,
+                queues.tiling.hardware_enabled && queues.fragment.hardware_enabled,
+            ));
         dev_info!(
             dev.as_ref(),
-            "G17P render: pair {}/{} warmed for context {} before any kick (graph, PM, FList, SKSM queues{})\n",
+            "G17P render: pair {}/{} warmed for context {} before any kick (graph, PM, FList, SKSM queues{}) [slot {} decision: {} registered={} hardware_enabled={}]\n",
             queue_pair.tiling,
             queue_pair.fragment,
             descriptor_context_id,
             if fresh_routes { ", KSMFE routes" } else { "" },
+            pair_slot,
+            if registered { "rebind (+0x1a=0 at kick, no host KSMFE write)" }
+            else { "first-install pending (+0x1a=1 at first kick)" },
+            registered,
+            hardware_enabled,
         );
         Ok(())
     }
@@ -8275,13 +8323,59 @@ impl G17PManagerConstruction {
             // configureHardware transaction.  Do the same: reacquire immediately
             // at the transaction boundary and retry only the still-unpublished
             // four-write registration, without restaging the command.
-            if queue_pair.slot() != 0 && (fragment_install || tiling_install.unwrap_or(false)) {
+            // One log line per publication naming the install/rebind decision,
+            // so the per-session install policy can be verified from dmesg.
+            let routes_configured = self.render_slots.get(pair_slot).sksm.as_ref()
+                .is_some_and(|queues| queues.tiling.hardware_enabled && queues.fragment.hardware_enabled);
+            let first_kick_reconfigure =
+                *module_parameters::g17p_render_first_kick_reconfigure.value() != 0;
+            let first_install = fragment_install || tiling_install.unwrap_or(false);
+            dev_info!(
+                dev.as_ref(),
+                "G17P render install decision: pair {}/{} slot {} context {} ordinal {}: {} (fragment install={} tiling install={:?}, routes_configured={}, first_kick_reconfigure={})\n",
+                queue_pair.tiling,
+                queue_pair.fragment,
+                pair_slot,
+                descriptor_context_id,
+                self.render_slots.get(pair_slot).submission_ordinal,
+                if first_install { "FIRST-INSTALL tag-15 +0x1a=1" } else { "REBIND tag-15 +0x1a=0" },
+                fragment_header.install,
+                tiling_header.map(|header| header.install),
+                routes_configured,
+                first_kick_reconfigure,
+            );
+            if queue_pair.slot() != 0 && first_install && routes_configured && !first_kick_reconfigure {
+                // Native count: configureHardware runs once per queue. The
+                // warm-up transaction already enabled both routes; skip the
+                // repeat and its IdlePowerOff(0)/(1) bracket. The firmware's
+                // tag-15 install (+0x1a=1) still reprograms the queue.
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render: pair {}/{} first kick keeps the warm-up KSMFE routes (no host reconfigure, no power bracket)\n",
+                    queue_pair.tiling,
+                    queue_pair.fragment,
+                );
+            } else if queue_pair.slot() != 0 && first_install {
+                // Power guarantee modes (see `g17p_render_registration_power`):
+                // 1 production IdlePowerOff bracket; 0 native shape (no
+                // device-control record, aperture must already read powered);
+                // 2 bracket only when it reads unpowered.
+                let power_mode = *module_parameters::g17p_render_registration_power.value();
                 let mut configured = false;
-                for _ in 0..3 {
-                    registration_power(self)
-                        .map_err(|error| Self::render_stage_fail(
-                            "power-secondary-render-pair", error,
-                        ))?;
+                let mut bracketed = false;
+                for attempt in 0..3 {
+                    let bracket = match power_mode {
+                        0 => false,
+                        2 => !registers.g17p_sksm_configuration_port_powered(),
+                        _ => true,
+                    };
+                    if bracket {
+                        bracketed = true;
+                        registration_power(self)
+                            .map_err(|error| Self::render_stage_fail(
+                                "power-secondary-render-pair", error,
+                            ))?;
+                    }
                     match self.configure_fresh_nonbootstrap_render_pair(pair_slot,
                         registers,
                         fragment_install,
@@ -8289,9 +8383,21 @@ impl G17PManagerConstruction {
                     ) {
                         Ok(()) => {
                             configured = true;
+                            dev_info!(
+                                dev.as_ref(),
+                                "G17P render: pair {}/{} first-kick KSMFE configure done (power mode {}, bracket used={}, attempt {})\n",
+                                queue_pair.tiling, queue_pair.fragment, power_mode, bracketed, attempt + 1,
+                            );
                             break;
                         }
-                        Err(error) if error == EAGAIN => continue,
+                        Err(error) if error == EAGAIN => {
+                            dev_info!(
+                                dev.as_ref(),
+                                "G17P render: pair {}/{} first-kick KSMFE configure: aperture unpowered (power mode {}, attempt {})\n",
+                                queue_pair.tiling, queue_pair.fragment, power_mode, attempt + 1,
+                            );
+                            continue;
+                        }
                         Err(error) => return Err(Self::render_stage_fail(
                             "configure-secondary-render-pair", error,
                         )),

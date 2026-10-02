@@ -279,6 +279,26 @@ kernel::prelude::module! {
             default: 1,
             description: "1 (default, native restartWorkQueue): at each firmware recovery, while firmware is halted before the resume acknowledge, copy every render pair's TA/3D and every CL queue's uncached producer (+0x40) to its recovery target (+0x50). 0 = A/B only: leave the reset value 0xffffffff",
         },
+        g17p_render_configure_at_warmup: u32 {
+            default: 0,
+            description: "0 (default, native shape): pair creation performs no KSMFE MMIO; a physical TA/3D pair is configured at its first kick, like AGXKSMKickQueueG16::configureHardware from the SKSM submitBuffer gate (kext25 0x883843c/0x88fe08c), after the tag-15 record is encoded and before the kick is published. Passed 8x20 and 16x10 two-pair hard-hang tests (boot d5250d86). 1 (A/B, old shape): configure at warm-up under an IdlePowerOff bracket, before any kick, and again at first kick",
+        },
+        g17p_render_registration_power: u32 {
+            default: 2,
+            description: "Power guarantee for the first-kick KSMFE configure: 2 (default) publish the IdlePowerOff(0) disable-idle-and-wake record and IdlePowerOff(1) release only when the aperture reads unpowered (2 records per boot measured); 1 (A/B, old shape) always bracket; 0 (strict native: no device-control record) configure only if the aperture already reads powered, else fail the submission with EAGAIN after 3 tries. Native publishes no record and calls ensurePoweredHardware(true) later, in submit{TA,3D,CL}Channel",
+        },
+        g17p_render_first_kick_reconfigure: u32 {
+            default: 1,
+            description: "Only with g17p_render_configure_at_warmup=1: 1 repeats the KSMFE tag/data+enable transaction at first kick inside a second power bracket (old production shape); 0 skips the repeat when warm-up configured both routes",
+        },
+        g17p_render_disable_before_reconfigure: u32 {
+            default: 0,
+            description: "Diagnostic (off): when the host reprograms a KSMFE queue it already enabled, write the disable mask (0x21080/0x21078) first, as native configureHardware does for a queue with +0xa8 set. Only reachable with g17p_render_configure_at_warmup=1; was the sole active change on a boot that froze at teardown (b45260f3)",
+        },
+        g17p_render_fender_bracket: u32 {
+            default: 0,
+            description: "Diagnostic (off; not native on G17P, accelerator flag bits 27/28 are never set): 1 disables dynamic Fender gating (GFX 0xd06030 |= 4) around each host KSMFE pair configure and re-enables it (&= ~6) afterwards (AGXArmFenderChinook bracket)",
+        },
         g17p_frg_hwdsid_clear: u32 {
             default: 0,
             description: "Diagnostic: 1 writes FRG descriptor +0x222d as 0 (native light captures); 0 preserves 1",

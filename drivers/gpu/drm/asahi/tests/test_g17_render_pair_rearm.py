@@ -52,7 +52,7 @@ outer = construct.index(".publish_partial_opening_pair(")
 assert bind_install < direct < outer
 power = construct.index("registration_power(self)")
 assert bind_install < power < direct < outer
-assert "Err(error) if error == EAGAIN => continue" in construct
+assert "Err(error) if error == EAGAIN => {" in construct
 assert "execution_context.clone()" in construct[bind_install - 300 : bind_install + 300]
 
 
