@@ -92,7 +92,7 @@ assert begin_call < preflight
 assert begin.index("registration_power(self)") < begin.index(
     "self.configure_fresh_nonbootstrap_render_pair("
 )
-assert "Err(error) if error == EAGAIN => continue" in begin
+assert "Err(error) if error == EAGAIN => {" in begin
 
 power = LIVE[
     LIVE.index("fn ensure_g17p_render_registration_power("):

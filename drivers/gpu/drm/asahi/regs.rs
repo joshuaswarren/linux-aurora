@@ -1017,6 +1017,20 @@ impl Resources {
     /// valid masks without permitting another queue publication to interleave.
     /// Returning `false` means no write was attempted; callers must withhold
     /// both outer commands.
+    ///
+    /// `disable` carries the two queues' disable-mask pairs when the KSMFE
+    /// already has them enabled: native `AGXKSMKickQueueG16::configureHardware`
+    /// (kext25 0x88b9e78..0x88b9f20) writes `1<<qid` to 0x21080 then 0x21078
+    /// before reprogramming a queue whose `+0xa8` flag is set, then the
+    /// tag/data pair, then the enable mask (0x21070 then 0x21068). The
+    /// production four-write transaction rewrote tag/data and re-enabled
+    /// without the disable.
+    ///
+    /// `fender_bracket` is the opt-in AGXArmFenderChinook bracket
+    /// (`disableDynamicFenderGating` 0x88b737c: GFX 0xd06030 |= 4;
+    /// `enableDynamicFenderGating` 0x88b746c: &= ~6, with a read-back). Native
+    /// takes it only when accelerator flag bits 27/28 are set, which no
+    /// writer in kext25 does on G17P, so it is off by default.
     pub(crate) fn g17p_sksm_configure_powered_render_pair(
         &self,
         fragment: (
@@ -1027,6 +1041,11 @@ impl Resources {
             g17_submission::G17SksmOrderedWritePair,
             g17_submission::G17SksmOrderedWritePair,
         ),
+        disable: Option<(
+            g17_submission::G17SksmOrderedWritePair,
+            g17_submission::G17SksmOrderedWritePair,
+        )>,
+        fender_bracket: bool,
     ) -> Result<bool> {
         for (configure, enable) in [fragment, tiling] {
             if !Self::g17p_sksm_pair_fits(configure)
@@ -1034,6 +1053,13 @@ impl Resources {
                 || enable.word0 | enable.word1 == 0
             {
                 return Err(EINVAL);
+            }
+        }
+        if let Some((fragment_disable, tiling_disable)) = disable {
+            for pair in [fragment_disable, tiling_disable] {
+                if !Self::g17p_sksm_pair_fits(pair) || pair.word0 | pair.word1 == 0 {
+                    return Err(EINVAL);
+                }
             }
         }
         let _guard = self.sksm_fifo.lock();
@@ -1045,10 +1071,36 @@ impl Resources {
             return Ok(false);
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        Self::g17p_sksm_publish_locked(&sgx, fragment.0)?;
-        Self::g17p_sksm_publish_locked(&sgx, fragment.1)?;
-        Self::g17p_sksm_publish_locked(&sgx, tiling.0)?;
-        Self::g17p_sksm_publish_locked(&sgx, tiling.1)?;
+        let mut fender_before = None;
+        if fender_bracket {
+            let res = sgx.relaxed();
+            let before = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+            res.try_write32(before | 0x4, T8140_FENDER_DYNAMIC_GATING)?;
+            let _ = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+            fender_before = Some(before);
+        }
+        let result = (|| -> Result {
+            if let Some((fragment_disable, tiling_disable)) = disable {
+                // Native order per queue is disable -> tag/data -> enable;
+                // both halves are disabled before either is reprogrammed so
+                // the pair is never half-routed while enabled.
+                Self::g17p_sksm_publish_locked(&sgx, fragment_disable)?;
+                Self::g17p_sksm_publish_locked(&sgx, tiling_disable)?;
+            }
+            Self::g17p_sksm_publish_locked(&sgx, fragment.0)?;
+            Self::g17p_sksm_publish_locked(&sgx, fragment.1)?;
+            Self::g17p_sksm_publish_locked(&sgx, tiling.0)?;
+            Self::g17p_sksm_publish_locked(&sgx, tiling.1)?;
+            Ok(())
+        })();
+        if let Some(before) = fender_before {
+            let res = sgx.relaxed();
+            // enableDynamicFenderGating: clear bits 1 and 2, then read back.
+            let now = res.try_read32(T8140_FENDER_DYNAMIC_GATING).unwrap_or(before | 0x4);
+            let _ = res.try_write32(now & !0x6, T8140_FENDER_DYNAMIC_GATING);
+            let _ = res.try_read32(T8140_FENDER_DYNAMIC_GATING);
+        }
+        result?;
         Ok(true)
     }
 
