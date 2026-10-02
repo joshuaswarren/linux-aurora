@@ -256,6 +256,10 @@ pub(crate) const CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE: u32 = 0x2e;
 /// state page and then waits for the ring consumer to pass the record before
 /// it frees the work queues and their parameter management.
 pub(crate) const CONTROL_SCHEDULER_STATE_RELEASE_OPCODE: u32 = 0x14;
+/// `AGXCommandQueue::processExitTimeoutHandler` (@fffffe000886a494): kill
+/// the work of one scheduler-state page; acknowledged by firmware event 12
+/// (`kAGFIFirmwareEventTypeProcessExitComplete`) carrying the cookie.
+pub(crate) const CONTROL_CONTEXT_KILL_OPCODE: u32 = 0x29;
 /// Device-control ring capacity. FW_PROVEN (b1
 /// `AGFAcceleratorDrainDeviceControlRing` @ `0xfffffc0000003a74`): the drain
 /// walks `ring + index * 0x40` and advances its consumer with
@@ -630,6 +634,26 @@ pub(crate) fn encode_scheduler_state_release_record(
     out[0x0a] = identity[1];
     out[0x0b] = identity[2];
     put_u64(out, 0x0c, resource_va);
+    Ok(())
+}
+
+/// 64-byte process-exit kill record exactly as `processExitTimeoutHandler`
+/// builds it on its stack (record base sp+8): opcode at `+0`, the
+/// scheduler-state page VA (queue+0x8b8) as an unaligned u64 at `+4`, and
+/// the cookie as an unaligned u64 at `+0xc`; everything else zero. Firmware
+/// 0x29 (fw 0x49cc) reads exactly `[x24,#4]` and `[x24,#0xc]`.
+pub(crate) fn encode_context_kill_record(
+    scheduler_state_va: u64,
+    cookie: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, CONTROL_CONTEXT_KILL_OPCODE);
+    put_u64(out, 0x04, scheduler_state_va);
+    put_u64(out, 0x0c, cookie);
     Ok(())
 }
 

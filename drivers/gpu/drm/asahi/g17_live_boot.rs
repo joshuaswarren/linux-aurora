@@ -1441,6 +1441,24 @@ fn drain_primary_firmware_event_batch(
                 batch.completion_masks[0] |= event.masks[0];
                 batch.completion_masks[1] |= event.masks[1];
             }
+            g17_completion::G17P_FIRMWARE_EVENT_PROCESS_EXIT_TYPE => {
+                // The answer to a process-exit kill (device control 0x29).
+                // Record the cookie; the teardown turn that follows this
+                // drain matches it to its queue (`release_exit_killed_compute`).
+                // Never fatal: an unreadable record only leaves its queue
+                // retained, exactly as without the kill.
+                let cookie = g17_completion::decode_g17p_process_exit_event(&record.raw).unwrap_or(0);
+                let noted = crate::g17_exit_kill::note_ack(cookie);
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P event worker: type12 process-exit complete cookie={} cursor={}->{} producer={}{}\n",
+                    cookie,
+                    record.consumer_before,
+                    record.consumer_published,
+                    record.producer_snapshot,
+                    if noted { "" } else { " (no free acknowledgement slot; its queue stays retained)" },
+                );
+            }
             unknown => {
                 // Only recovery (type 4) and UMA-grow (type 13) were ever
                 // reachable while the firmware never executed work. Now that a
@@ -5412,6 +5430,10 @@ impl G17PLiveRuntime {
         // v93r g17p_recovery_path bit0: return drained quarantined pairs
         // first, so a closed queue's teardown gate can open this turn.
         self.reclaim_drained_quarantined_render_slots();
+        // g17p_exit_kill: settle acknowledged process-exit kills first, so a
+        // context whose compute packets they release can publish its
+        // scheduler-state release in this same turn.
+        self.release_exit_killed_compute();
         let outstanding = self
             .manager
             .as_ref()
@@ -5474,6 +5496,17 @@ impl G17PLiveRuntime {
                 continue;
             };
             if !self.compute_idle_for_context(&context) {
+                // g17p_exit_kill: the owner left with compute kicks that will
+                // not retire on their own (a quarantined or cancelled queue);
+                // ask firmware to kill the context's work, as native does.
+                let age = self.manager.as_ref().ok_or(ENODEV)?.logical_queue_teardown_age_ns(index);
+                if let Err(error) = self.publish_exit_kill_for_context(&context, age) {
+                    dev_err!(
+                        pdev.as_ref(),
+                        "G17P exit kill: publication for context {} failed ({:?}); retaining\n",
+                        context.context_id(), error,
+                    );
+                }
                 continue;
             }
             if self.primary_device_control_backpressured() {
@@ -5631,7 +5664,10 @@ impl G17PLiveRuntime {
                 || self.reclaim_pending_since.is_some_and(|since| {
                     crate::g17_recovery_path::enabled(crate::g17_recovery_path::RECLAIM_DRAINED)
                         && since.elapsed().as_nanos() < 5_000_000_000
-                }))
+                })
+                // g17p_exit_kill: a closed context's compute becoming due
+                // for the kill, or a kill awaiting event 12 (bounded).
+                || self.exit_kill_polling())
     }
 
     /// Wake the event worker for teardown service once a queue has closed.

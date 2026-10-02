@@ -109,6 +109,37 @@ struct G17PAsyncComputeQueue {
     /// complete (with an error, no VM status) at the retirement witness, so
     /// no VM-job quarantine ever blocks the innocent VM's admission.
     spared_deferred: bool,
+    /// `g17p_exit_kill`: the process-exit kill published for this queue's
+    /// context after its owner left with kicks outstanding.
+    exit_kill: Option<G17PExitKill>,
+    /// The kill was refused for this queue at least once (logged once).
+    exit_kill_refused: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PExitKillPhase {
+    /// Published; waiting for event 12 with this cookie.
+    Published,
+    /// Acknowledged, but a kick may still execute (or the recovery handshake
+    /// is open): re-evaluated on later teardown turns.
+    Acknowledged,
+    /// Packets and VM pins released.
+    Released,
+    /// Acknowledged without a kill on this page; packets retained.
+    Unproven,
+}
+
+/// `g17p_exit_kill` state of one queue (see g17_exit_kill.rs).
+struct G17PExitKill {
+    cookie: u64,
+    phase: G17PExitKillPhase,
+    /// Render pairs held out of reuse in the registry (for the session).
+    held_render_slots: u64,
+    /// QIDs the page named when the kill was published.
+    qids: u128,
+    killed_before: u32,
+    published: kernel::time::Instant<kernel::time::Monotonic>,
+    late_warned: bool,
 }
 
 /// Type-1 firmware events identify completed stamp/QID slots in a 128-bit
@@ -157,6 +188,9 @@ impl G17PLiveRuntime {
             }
         }
         self.async_compute_queues.clear();
+        // Kills outstanding at the stop are moot: forget their cookies. The
+        // registry drops their render-pair holds below.
+        crate::g17_exit_kill::forget_all_acks();
         if let Some(registry) = &self.queue_registry {
             registry.release_retained_owners_after_processor_stop();
         }
@@ -243,6 +277,8 @@ impl G17PLiveRuntime {
                 spared_quarantine: false,
                 first_kick_watch: false,
                 spared_deferred: false,
+                exit_kill: None,
+                exit_kill_refused: false,
             }, GFP_KERNEL)?;
             index
         };
@@ -2036,4 +2072,319 @@ fn fail_spared_deferred(q: &mut G17PAsyncComputeQueue, error: Error) {
             completion.fail_while_owned(error);
         }
     }
+}
+
+// ---- g17p_exit_kill (see g17_exit_kill.rs) ---------------------------------
+impl G17PLiveRuntime {
+    /// Teardown turn for a closed context whose compute queue still holds
+    /// kicks: once the teardown has waited the native process-exit timeout
+    /// (250 ms), publish the process-exit kill (device control 0x29) of the
+    /// context's scheduler page, as `AGXCommandQueue::processExitTimeoutHandler`
+    /// does for a process that exits with work outstanding. Only a queue
+    /// whose owner has released it, with every stacked packet belonging to
+    /// this context, and only when every QID the page names is this
+    /// context's alone (see `g17_exit_kill::kill_scope`). The context's
+    /// render pairs named by the kill are held out of reuse for the session.
+    /// Never sleeps; a refusal is retried on a later turn.
+    // Out of line: keeps these frames off the teardown/event-worker stack
+    // except while they actually run (see audit_g17_publication_stack.py).
+    #[inline(never)]
+    pub(crate) fn publish_exit_kill_for_context(
+        &mut self,
+        context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        teardown_age_ns: i64,
+    ) -> Result {
+        use crate::g17_exit_kill as kill;
+        if !kill::enabled() {
+            return Ok(());
+        }
+        let Some(index) = self.async_compute_queues.iter().position(|q|
+            exit_kill_candidate(q, context) && kill::kill_due(teardown_age_ns, q.quarantined)
+        ) else { return Ok(()); };
+        if self.primary_device_control_backpressured() {
+            return Ok(());
+        }
+        let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
+        let (target_qid, owner, kicks, refusal) = {
+            let q = &self.async_compute_queues[index];
+            let owner = q.owner.or_else(|| q.inflight.back()
+                .and_then(|active| active.retirement.map(|ticket| ticket.owner)));
+            let same_context = q.inflight.iter().all(|active|
+                Arc::ptr_eq(active.packet.context(), context));
+            (q.queue.queue_id(), owner, q.inflight.len(), !same_context || owner.is_none())
+        };
+        // Compute QIDs: this context's queues are its own; every other
+        // queue's QID belongs to someone else (or to nobody).
+        let mut own = 0u128;
+        let mut foreign = 0u128;
+        for q in self.async_compute_queues.iter() {
+            let bit = kill::qid_bit(q.queue.queue_id());
+            if q.context.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, context)) {
+                own |= bit;
+            } else if q.context.is_some() || q.owner.is_some() {
+                foreign |= bit;
+            }
+        }
+        let manager = self.manager.as_mut().ok_or(ENODEV)?;
+        let (render_own, render_foreign, render_slots) = manager.exit_kill_render_scope(context);
+        own |= render_own;
+        foreign |= render_foreign;
+        let view = context.channel_control.exit_kill_view()?;
+        let scope = if refusal {
+            kill::Scope::Foreign(kill::qid_bit(target_qid))
+        } else {
+            kill::kill_scope(view, target_qid, own, foreign)
+        };
+        let kill::Scope::Kill(qids) = scope else {
+            let q = &mut self.async_compute_queues[index];
+            if !q.exit_kill_refused {
+                q.exit_kill_refused = true;
+                kill::count(&kill::SCOPE_REFUSED);
+                dev_warn!(pdev.as_ref(),
+                    "G17P exit kill: context {} qid={} not killed yet ({:?}; page slot={:#x} qids={:#x} own={:#x} foreign={:#x}); retaining {} kick(s), retried each teardown turn\n",
+                    context.context_id(), target_qid, scope, view.slot, view.qids, own, foreign, kicks);
+            }
+            return Ok(());
+        };
+        // Hold exactly the pairs the kill names, in the registry, before the
+        // record becomes visible: no successor is ever handed them.
+        let mut hold = 0u64;
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            if render_slots & (1u64 << slot) == 0 { continue; }
+            let named = manager.render_slot_qids(slot) & qids;
+            if named != 0 { hold |= 1u64 << slot; }
+        }
+        let owner = owner.ok_or(EINVAL)?;
+        if hold != 0 {
+            let held = self.queue_registry.as_ref()
+                .is_some_and(|registry| registry.hold_render_slots_for_exit_kill(owner, hold));
+            if !held {
+                return Ok(());
+            }
+        }
+        let cookie = kill::next_cookie();
+        let manager = self.manager.as_mut().ok_or(ENODEV)?;
+        let publication = match manager.publish_exit_kill(context, cookie) {
+            Ok(publication) => publication,
+            Err(error) => {
+                if let Some(registry) = self.queue_registry.as_ref() {
+                    registry.release_exit_kill_hold(hold);
+                }
+                return if error == EAGAIN { Ok(()) } else { Err(error) };
+            }
+        };
+        fence(Ordering::SeqCst);
+        if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+            .send_message_logged(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control())
+        {
+            // The record stays queued; the teardown re-announce covers it.
+            dev_warn!(pdev.as_ref(),
+                "G17P exit kill: announcement for context {} failed ({:?}); the record at slot {} stays queued\n",
+                context.context_id(), error, publication.slot);
+        }
+        kill::count(&kill::PUBLISHED);
+        let q = &mut self.async_compute_queues[index];
+        q.exit_kill = Some(G17PExitKill {
+            cookie,
+            phase: G17PExitKillPhase::Published,
+            held_render_slots: hold,
+            qids,
+            killed_before: view.killed,
+            published: kernel::time::Instant::<kernel::time::Monotonic>::now(),
+            late_warned: false,
+        });
+        dev_info!(pdev.as_ref(),
+            "G17P exit kill: context {} qid={} owner={} published 0x29 page={:#x} cookie={} qids={:#x} held-render-slots={:#x} kicks={} quarantined={} after {} ms (slot {} producer {}->{})\n",
+            context.context_id(), target_qid, owner, context.channel_control.gpu_va(), cookie, qids,
+            hold, kicks, q.quarantined, teardown_age_ns / 1_000_000, publication.slot,
+            publication.producer_before, publication.producer_after);
+        Ok(())
+    }
+
+    /// Keep the event worker's millisecond teardown poll running, for a
+    /// bounded `g17_exit_kill::POLL_NS`, while a closed context's compute is
+    /// becoming due for the kill or a published kill awaits its event 12, so
+    /// neither waits for an unrelated firmware event.
+    // Out of line: keeps these frames off the teardown/event-worker stack
+    // except while they actually run (see audit_g17_publication_stack.py).
+    #[inline(never)]
+    pub(crate) fn exit_kill_polling(&self) -> bool {
+        use crate::g17_exit_kill as kill;
+        if !kill::enabled() {
+            return false;
+        }
+        if self.async_compute_queues.iter().any(|q| q.exit_kill.as_ref().is_some_and(|exit_kill|
+            exit_kill.phase == G17PExitKillPhase::Published
+                && exit_kill.published.elapsed().as_nanos() < kill::POLL_NS))
+        {
+            return true;
+        }
+        let Some(manager) = self.manager.as_ref() else { return false };
+        (0..manager.logical_queue_teardowns_outstanding()).any(|index| {
+            manager.logical_queue_teardown_age_ns(index) < kill::POLL_NS
+                && manager.logical_queue_teardown_context(index).is_some_and(|context|
+                    self.async_compute_queues.iter().any(|q| exit_kill_candidate(q, &context)))
+        })
+    }
+
+    /// Act on process-exit acknowledgements (event 12). For each queue whose
+    /// kill was acknowledged, with the recovery handshake closed and the
+    /// firmware kill task's store on the page (`+0x34 == 1`): when every
+    /// stacked kick's own completion words show it never launched or ended
+    /// (`g17_exit_kill::release_decision`), release the packets and their VM
+    /// pins exactly as the retirement witness does, and keep the graph
+    /// quarantined. A kick that may still execute keeps everything, as
+    /// before, and is looked at again on later turns.
+    // Out of line: keeps these frames off the teardown/event-worker stack
+    // except while they actually run (see audit_g17_publication_stack.py).
+    #[inline(never)]
+    pub(crate) fn release_exit_killed_compute(&mut self) {
+        use crate::g17_exit_kill as kill;
+        if !kill::any_ack_pending() {
+            return;
+        }
+        let pdev = self.pdev.as_ref();
+        let recovery_closed = self.manager.as_mut().is_some_and(|manager|
+            manager.firmware_recovery_handshake_snapshot().is_ok_and(|handshake| handshake.state == 0));
+        for q in self.async_compute_queues.iter_mut() {
+            let Some(exit_kill) = q.exit_kill.as_mut() else { continue };
+            if !matches!(exit_kill.phase, G17PExitKillPhase::Published | G17PExitKillPhase::Acknowledged) {
+                continue;
+            }
+            if !kill::acked(exit_kill.cookie) {
+                if !exit_kill.late_warned && exit_kill.published.elapsed().as_nanos() > 2_000_000_000 {
+                    exit_kill.late_warned = true;
+                    if let Some(pdev) = pdev {
+                        dev_warn!(pdev.as_ref(),
+                            "G17P exit kill: qid={} cookie={} not acknowledged after 2 s; render pairs {:#x} stay held and its kicks stay retained\n",
+                            q.queue.queue_id(), exit_kill.cookie, exit_kill.held_render_slots);
+                    }
+                }
+                continue;
+            }
+            let first_ack = exit_kill.phase == G17PExitKillPhase::Published;
+            if first_ack {
+                exit_kill.phase = G17PExitKillPhase::Acknowledged;
+            }
+            // The killed render pairs stay held (see
+            // `G17PQueueLeaseState::render_kill_hold`) for the session.
+            if q.inflight.is_none() {
+                // Every kick retired normally before the acknowledgement.
+                // The QID was still killed: never hand this graph out again.
+                exit_kill.phase = G17PExitKillPhase::Released;
+                kill::forget_ack(exit_kill.cookie);
+                q.quarantined = true;
+                q.retirement_ready = false;
+                continue;
+            }
+            let Some(context) = q.context.as_ref() else { continue };
+            let view = match context.channel_control.exit_kill_view() {
+                Ok(view) => view,
+                Err(_) => continue,
+            };
+            let decision = kill::release_decision(true, view.killed, recovery_closed,
+                q.inflight.iter().map(|active| active.packet.completion().ok()
+                    .and_then(|completion| completion.halted_timestamp_snapshot().ok())));
+            let cookie = exit_kill.cookie;
+            let qids = exit_kill.qids;
+            let elapsed_us = exit_kill.published.elapsed().as_nanos() / 1000;
+            match decision {
+                kill::Release::Pending => {}
+                kill::Release::AckWithoutKill => {
+                    exit_kill.phase = G17PExitKillPhase::Unproven;
+                    kill::forget_ack(cookie);
+                    kill::count(&kill::ACK_WITHOUT_KILL);
+                    if let Some(pdev) = pdev {
+                        dev_warn!(pdev.as_ref(),
+                            "G17P exit kill: qid={} cookie={} acknowledged but the page shows no kill (slot={:#x} +0x34={:#x}, before {:#x}); retaining {} kick(s) until processor stop\n",
+                            q.queue.queue_id(), cookie, view.slot, view.killed, exit_kill.killed_before,
+                            q.inflight.len());
+                    }
+                }
+                kill::Release::Retain { started, unknown } => {
+                    if first_ack {
+                        kill::count(&kill::RUNNING_RETAINED);
+                        if let Some(pdev) = pdev {
+                            dev_warn!(pdev.as_ref(),
+                                "G17P exit kill: qid={} cookie={} acknowledged after {} us; {} kick(s) started without an end word, {} unreadable -- retaining all {} until they end or processor stop\n",
+                                q.queue.queue_id(), cookie, elapsed_us, started, unknown, q.inflight.len());
+                        }
+                    }
+                }
+                kill::Release::Release { never_started, ended } => {
+                    exit_kill.phase = G17PExitKillPhase::Released;
+                    kill::forget_ack(cookie);
+                    let released = release_exit_killed_packets(q, pdev);
+                    kill::count(&kill::RELEASED_QUEUES);
+                    kill::RELEASED_KICKS.fetch_add(released as u64, Ordering::Relaxed);
+                    if let Some(pdev) = pdev {
+                        dev_info!(pdev.as_ref(),
+                            "G17P exit kill: qid={} cookie={} acknowledged after {} us (page +0x34=1, qids {:#x}); released {} packet(s) and their VM pin ({} never launched, {} ended); the graph stays quarantined; totals(published,acked,queues,kicks,running,refused,unproven,unmatched)={:?}\n",
+                            q.queue.queue_id(), cookie, elapsed_us, qids, released, never_started, ended,
+                            kill::totals());
+                    }
+                }
+            }
+        }
+        // An acknowledgement no queue is waiting for (a queue removed by a
+        // processor stop, or a stray cookie) is dropped.
+        for cookie in kill::pending_acks() {
+            if cookie != 0 && !self.async_compute_queues.iter().any(|q|
+                q.exit_kill.as_ref().is_some_and(|exit_kill| exit_kill.cookie == cookie
+                    && matches!(exit_kill.phase,
+                        G17PExitKillPhase::Published | G17PExitKillPhase::Acknowledged)))
+            {
+                kill::forget_ack(cookie);
+                kill::count(&kill::ACK_UNMATCHED);
+            }
+        }
+    }
+}
+
+/// A closed context's compute queue whose kicks will not retire on their
+/// own: its owner released it with kicks outstanding (quarantined, or
+/// cancelled at close) and no kill was published for it yet.
+fn exit_kill_candidate(
+    q: &G17PAsyncComputeQueue,
+    context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
+) -> bool {
+    q.context.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, context))
+        && q.released
+        && q.inflight.is_some()
+        && q.exit_kill.is_none()
+        && (q.quarantined || q.retired_by_teardown)
+}
+
+/// Release every stacked packet of an exit-killed queue: settle any fence
+/// still unsignalled (ECANCELED, or ENODATA for spared kicks, neither of
+/// which records VM status), drop its VM pin, keep its admission guard in
+/// `retired_leases` (as the retirement witness does), and leave the graph
+/// quarantined: firmware killed its QIDs and the host producer still counts
+/// the killed kicks, so it is never handed to another owner.
+fn release_exit_killed_packets(q: &mut G17PAsyncComputeQueue, pdev: Option<&ARef<platform::Device>>) -> usize {
+    let mut released = 0usize;
+    while let Some(active) = q.inflight.take() {
+        let G17PAsyncComputeActive { packet, _lease: lease, .. } = active;
+        if let Ok(completion) = packet.completion() {
+            completion.complete(Err(if q.spared_deferred { ENODATA } else { ECANCELED }));
+            completion.release_after_retirement();
+        }
+        if let Err(lease) = q.retired_leases.push(lease) {
+            if let Some(pdev) = pdev {
+                dev_err!(pdev.as_ref(),
+                    "G17P exit kill: qid={} retired-lease FIFO full; dropping one admission guard\n",
+                    q.queue.queue_id());
+            }
+            drop(lease);
+        }
+        released += 1;
+        drop(packet);
+    }
+    q.quarantined = true;
+    q.awaiting_retirement_witness = false;
+    q.spared_deferred = false;
+    q.spared_quarantine = false;
+    q.retire_pending = false;
+    q.retirement_ready = false;
+    released
 }

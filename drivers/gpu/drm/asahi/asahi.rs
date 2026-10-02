@@ -47,6 +47,7 @@ mod g17_e2e;
 mod g17_host_path;
 mod g17_recovery_path;
 mod g17_recovery_isolation;
+mod g17_exit_kill;
 mod g17_mem_path;
 mod g17_store;
 mod g17_power_preflight;
@@ -127,6 +128,10 @@ kernel::prelude::module! {
         g17p_max_recoveries: u32 {
             default: 0,
             description: "Maximum firmware recoveries per session; 0 is unlimited",
+        },
+        g17p_exit_kill: u32 {
+            default: 1,
+            description: "Process-exit kill (opcode 0x29) of a closed context's unretired compute, releasing its VM on event 12; 0 retains it until processor stop",
         },
         g17p_fw_log: u32 {
             default: 0,

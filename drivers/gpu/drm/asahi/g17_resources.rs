@@ -4484,6 +4484,14 @@ impl G17PClChannelControl {
         Ok([prefix[0x00], prefix[0x01], prefix[0x04], prefix[0x26]])
     }
 
+    /// `g17p_exit_kill`: the firmware-owned bytes the process-exit kill task
+    /// consults -- slot byte `[1]`, the QID masks at `+0x12`/`+0x1a` and the
+    /// killed word it stores at `+0x34` -- read live from the page.
+    pub(crate) fn exit_kill_view(&self) -> Result<crate::g17_exit_kill::StateView> {
+        let prefix = self.snapshot_bytes::<{ crate::g17_exit_kill::STATE_KILL_BYTES }>()?;
+        Ok(crate::g17_exit_kill::state_view(&prefix))
+    }
+
     fn snapshot_bytes<const N: usize>(&self) -> Result<[u8; N]> {
         if N > self.storage.logical_size { return Err(EINVAL); }
         // Construction established the owning CPU mapping. Acquire a shared
