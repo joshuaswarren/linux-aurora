@@ -5753,7 +5753,8 @@ fn prepare_render_sksm_vm_alias(
 pub(crate) struct G17PUninstalledRenderGraph {
     // Remove tentative aliases before releasing the graph they name.
     driver_aliases: KVec<mmu::KernelMapping>,
-    storage: G17PUserRenderStorage,
+    /// Lives in its final heap box from construction on (no stack copies).
+    storage: KBox<G17PUserRenderStorage>,
     vm: mmu::Vm,
     had_retained_sksm_backing: bool,
     // Drop this after all graph mappings and the VM reference. The session
@@ -5763,7 +5764,7 @@ pub(crate) struct G17PUninstalledRenderGraph {
 
 #[cfg(not(test))]
 impl G17PUninstalledRenderGraph {
-    pub(crate) fn into_storage(self) -> G17PUserRenderStorage { self.storage }
+    pub(crate) fn into_storage(self) -> KBox<G17PUserRenderStorage> { self.storage }
 
     /// An aborted build must return the retained ring of an installed QID.
     /// Fresh backing remains with the aborted graph and is simply dropped.
@@ -5778,6 +5779,10 @@ impl G17PUninstalledRenderGraph {
         Ok(())
     }
 
+    /// Build a graph directly into `out` (a field of a heap-allocated
+    /// owner). Returning the ~3 KiB graph by value made every caller stage a
+    /// copy on the kernel stack; `out` is written only on success.
+    #[inline(never)]
     pub(crate) fn build(
         dev: &AsahiDevice,
         vm: &mmu::Vm,
@@ -5796,7 +5801,10 @@ impl G17PUninstalledRenderGraph {
         submission_ordinal: u64,
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
-    ) -> Result<Self> {
+        // Heap box the storage is constructed in; becomes the slot's storage.
+        storage_box: KBox<core::mem::MaybeUninit<G17PUserRenderStorage>>,
+        out: &mut Option<Self>,
+    ) -> Result {
         // The caller reserved an idle physical pair and pinned its session.
         // Validate the context before changing this pair's private VM mappings.
         //
@@ -5873,7 +5881,8 @@ impl G17PUninstalledRenderGraph {
             render_root_slot,
         );
         let had_retained_sksm_backing = retained_sksm_backing.is_some();
-        let storage = G17PUserRenderStorage::new(
+        let mut storage_box = storage_box;
+        G17PUserRenderStorage::new(
             dev,
             &uat,
             parameter_metrics,
@@ -5890,8 +5899,14 @@ impl G17PUninstalledRenderGraph {
             submission_ordinal,
             parameter_manager_generation,
             retained_sksm_backing,
+            &mut storage_box,
         )?;
-        Ok(Self { driver_aliases, storage, vm: vm.clone(), had_retained_sksm_backing, _uat: uat })
+        // SAFETY: `G17PUserRenderStorage::new` returned Ok, so it initialized the box.
+        let storage = unsafe { storage_box.assume_init() };
+        // The storage already lives in its heap box, so the graph written to
+        // `out` is small. Any previous graph is dropped by the assignment.
+        *out = Some(Self { driver_aliases, storage, vm: vm.clone(), had_retained_sksm_backing, _uat: uat });
+        Ok(())
     }
 }
 
@@ -10200,6 +10215,10 @@ impl G17PUserRenderStorage {
         self.fragment_rce.iova()
     }
 
+    /// Construct directly into heap storage `dst` (the render slot's final
+    /// box): returning ~2.8 KiB by value staged it on every caller's stack.
+    /// `dst` is initialized exactly when this returns `Ok`.
+    #[inline(never)]
     fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,
@@ -10217,7 +10236,9 @@ impl G17PUserRenderStorage {
         submission_ordinal: u64,
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
-    ) -> Result<Self> {
+        // Heap storage this is constructed into; initialized exactly on Ok.
+        dst: &mut core::mem::MaybeUninit<Self>,
+    ) -> Result {
         macro_rules! bootstrap_stage {
             ($name:literal, $expression:expr) => {
                 match $expression {
@@ -11419,7 +11440,7 @@ impl G17PUserRenderStorage {
             .take()
             .or_else(|| allocated_sksm_backing.take())
             .ok_or(EIO)?;
-        Ok(Self {
+        dst.write(Self {
             queue_pair,
             render_operand_aliases,
             descriptors,
@@ -11477,7 +11498,8 @@ impl G17PUserRenderStorage {
             qos_update_pending: true,
             render_root_slot,
             render_flist,
-        })
+        });
+        Ok(())
     }
 
     /// TTBAT context this render's VM is bound to.
@@ -21218,6 +21240,7 @@ impl G17ResourceOwner {
 
     pub(crate) fn new_user_render_storage(
         &mut self,
+        storage_box: KBox<core::mem::MaybeUninit<G17PUserRenderStorage>>,
         dev: &AsahiDevice,
         vm: &mmu::Vm,
         queue_pair: G17PRenderQueuePair,
@@ -21233,14 +21256,16 @@ impl G17ResourceOwner {
         submission_ordinal: u64,
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
-    ) -> Result<G17PUserRenderStorage> {
+    ) -> Result<KBox<G17PUserRenderStorage>> {
         let parameter_metrics = self.acquire_parameter_metrics_region()?;
-        let prepared = G17PUninstalledRenderGraph::build(
+        let mut prepared = None;
+        G17PUninstalledRenderGraph::build(
             dev, vm, self.address_space.uat.clone(), parameter_metrics, queue_pair,
             execution_context, descriptor_context_id, render_root_slot, command,
             num_clusters, command_buffer_state_words, submission_ordinal,
-            parameter_manager_generation, retained_sksm_backing,
+            parameter_manager_generation, retained_sksm_backing, storage_box, &mut prepared,
         )?;
+        let prepared = prepared.ok_or(EINVAL)?;
         self.install_user_render_storage(prepared, retained_sksm_backing)
     }
 
@@ -21250,7 +21275,7 @@ impl G17ResourceOwner {
     fn install_user_render_storage(
         &mut self, mut prepared: G17PUninstalledRenderGraph,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
-    ) -> Result<G17PUserRenderStorage> {
+    ) -> Result<KBox<G17PUserRenderStorage>> {
         self.finish_user_render_storage(&mut prepared, retained_sksm_backing)?;
         Ok(prepared.into_storage())
     }

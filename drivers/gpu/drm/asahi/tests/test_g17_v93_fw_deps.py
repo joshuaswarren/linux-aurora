@@ -579,7 +579,7 @@ for name in ['    fn submit_render_async(', '    fn submit_compute_async(']:
 submit = DRM[DRM.index('    fn submit_guarded('):]
 submit = submit[:submit.index('\n    }\n}\n') if '\n    }\n}\n' in submit else len(submit)]
 assert submit.index('Self::install_output_fences(publication.outputs.drain(..), &aggregate.fence());') \
-    < submit.index('self.plan_input_syncs(&syncs)') < submit.index('for (index, command) in pending.drain(..).enumerate()') \
+    < submit.index('self.plan_input_syncs(&syncs)') < submit.index('for index in 0..command_count {') \
     < submit.index('self.note_recent_submission(aggregate.fence(), render_before, compute_before);') \
     < submit.index('publication.publish_async(&aggregate.fence());')
 

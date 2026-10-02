@@ -13,7 +13,8 @@ capture=item(manager,'    pub(crate) fn take_warm_render_graph(')
 capture=capture.replace('KBox::init(try_init!(G17PWarmRenderGraph {','Box::new(G17PWarmRenderGraph {').replace('        }), GFP_KERNEL)?;','        });')
 returned=item(manager,'    pub(crate) fn return_warm_render_graph(')
 # Kernel KBox::write consumes the allocation; std exposes the same operation as an associated function.
-returned=returned.replace('request.storage_box.take().ok_or(EIO)?.write(graph.into_storage())','Box::write(request.storage_box.take().ok_or(EIO)?, graph.into_storage())')
+# The graph's storage is constructed in its final heap box (stack depth).
+assert 'self.render_slots.get_mut(index).storage = Some(graph.into_storage());' in returned
 request=item(manager,'pub(crate) struct G17PWarmRenderGraph {')
 live=(root/'g17_live_boot.rs').read_text()
 commit=item(live,'    pub(crate) fn return_warm_render_graph(')
@@ -55,9 +56,9 @@ mod g17_resources{
  #[derive(Debug,PartialEq,Eq)]pub struct G17PRenderSksmBacking(pub u64);
  pub struct G17PUserRenderStorage{pub backing:Option<G17PRenderSksmBacking>,pub id:u32,pub dropped:Arc<AtomicUsize>}
  impl Drop for G17PUserRenderStorage{fn drop(&mut self){self.dropped.fetch_add(1,Ordering::SeqCst);}}
- pub struct G17PUninstalledRenderGraph{pub storage:G17PUserRenderStorage,pub retained:bool}
+ pub struct G17PUninstalledRenderGraph{pub storage:Box<G17PUserRenderStorage>,pub retained:bool}
  impl G17PUninstalledRenderGraph{
-  pub fn into_storage(self)->G17PUserRenderStorage{self.storage}
+  pub fn into_storage(self)->Box<G17PUserRenderStorage>{self.storage}
   pub fn reclaim_retained_sksm_backing(&mut self,to:&mut Option<G17PRenderSksmBacking>)->Result{
    if self.retained{if to.is_some(){return Err(EIO)}*to=self.storage.backing.take();self.retained=false;}Ok(())
   }
@@ -101,9 +102,9 @@ fn capture(m:&mut Manager,i:u8)->Box<G17PWarmRenderGraph>{
  m.take_warm_render_graph(&mmu::Vm(Arc::new(AtomicUsize::new(0))),G17PRenderQueuePair(i),Arc::new(G17PLogicalQueueContext{live:AtomicBool::new(true)}),Arc::new(G17PWorkStateLease),&g17_uapi::TranslatedRenderCommand::default()).unwrap().unwrap()
 }
 fn build(r:&mut G17PWarmRenderGraph)->Arc<AtomicUsize>{
- let dropped=Arc::new(AtomicUsize::new(0));r.storage_box=Some(Box::new_uninit());
+ let dropped=Arc::new(AtomicUsize::new(0));
  let retained=r.retained_sksm_backing.is_some();
- r.graph=Some(G17PUninstalledRenderGraph{storage:G17PUserRenderStorage{backing:r.retained_sksm_backing.take(),id:r.hardware_buffer_id.unwrap(),dropped:dropped.clone()},retained});dropped
+ r.graph=Some(G17PUninstalledRenderGraph{storage:Box::new(G17PUserRenderStorage{backing:r.retained_sksm_backing.take(),id:r.hardware_buffer_id.unwrap(),dropped:dropped.clone()}),retained});dropped
 }
 fn finish(m:&mut Manager,r:&mut G17PWarmRenderGraph,commit:bool)->Result{m.return_warm_render_graph(&AsahiDevice,r,commit,&regs::Resources,&mut |_|Ok(()))}
 #[test]fn simultaneous_builders_release_runtime_and_commit_in_reverse_order(){

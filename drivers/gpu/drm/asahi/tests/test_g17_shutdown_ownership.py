@@ -82,6 +82,8 @@ host_only.update(('submit_open', 'submit_count', 'dvfs_native_bracket', 'clpc_ef
 # v92e published GPU power budget (a u32) and the v93r drained-pair reclaim
 # poll start (an Instant): plain host values.
 host_only.update(('power_target_mw', 'reclaim_pending_since'))
+# Render publication's dependency-set scratch (a host KBox; no DMA).
+host_only.add('render_dependency_scratch')
 options = 'pdev drm registers manager cpus gfx_state gfx_rtkit gfx1_state gfx1_rtkit queue compute_binding compute_timestamps pending_compute'.split()
 vectors = 'retired_queues quarantined_bindings pending_render pending_render_queued quarantined_render_completions'.split()
 # Completions the firmware has already retired, waiting for their fence to be

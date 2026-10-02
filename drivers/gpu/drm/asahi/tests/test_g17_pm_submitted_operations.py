@@ -200,13 +200,18 @@ assert manager.count("operation.commit();") == 1
 # render publication must not overwrite it with a client VmBind; the already
 # rooted execution context supplies descriptor/MCache identity before storage
 # construction and outer publication.
-render_publish = manager.index(
-    "fn begin_translated_render_with_hardware_buffer")
-render_body = manager[render_publish:]
-storage_at = manager.index(".new_user_render_storage(", render_publish)
-outer_at = manager.index(".publish_partial_opening_pair(", render_publish)
+# The cold no-storage branch is an out-of-line helper (kernel stack depth);
+# splice its body back at the call site so ordering invariants still read in order.
+cold_at = manager.index("    fn install_cold_render_storage(")
+cold_body = manager[cold_at:manager.index("\n    }\n", cold_at) + 6]
+spliced = manager[manager.index("fn begin_translated_render_with_hardware_buffer"):]
+spliced = spliced.replace("self.install_cold_render_storage(", cold_body + "(", 1)
+render_publish = 0
+render_body = spliced
+storage_at = spliced.index(".new_user_render_storage(")
+outer_at = spliced.index(".publish_partial_opening_pair(")
 assert ".bind(vm)" not in render_body[:outer_at - render_publish]
 assert "install_t8140_render_mcache_context_alias" not in render_body[:outer_at - render_publish]
-context_at = manager.index("u8::try_from(execution_context.context_id())", render_publish)
+context_at = spliced.index("u8::try_from(execution_context.context_id())")
 assert context_at < storage_at < outer_at
 print("PM submitted-operation transaction and actual publication ordering PASS")

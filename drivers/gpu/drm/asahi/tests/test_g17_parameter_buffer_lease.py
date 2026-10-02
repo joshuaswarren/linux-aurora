@@ -161,7 +161,10 @@ outer = block(manager, r"^    pub\(crate\) fn begin_translated_render\(")
 reservation = block(manager, r"^    fn reserve_translated_render\(")
 assert ".allocate_with_token()" in reservation
 assert outer.index("self.reserve_translated_render(") < outer.index("self.begin_translated_render_with_hardware_buffer(")
+# The cold no-storage branch is an out-of-line helper (kernel stack depth);
+# splice its body back at the call site so ordering invariants still read in order.
 inner = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\(")
+inner = inner.replace("self.install_cold_render_storage(", block(manager, r"^    fn install_cold_render_storage\(") + "(", 1)
 assert inner.index(".restage_command(") < inner.index(".set_parameter_buffer_lease_token(")
 assert inner.index(".new_user_render_storage(") < inner.index(".set_parameter_buffer_lease_token(")
 assert inner.index(".set_parameter_buffer_lease_token(") < inner.index(".stage_render_groups_with_sksm(")

@@ -139,7 +139,8 @@ assert 'self.aggregate_member.complete(Err(ECANCELED));' in compute
 guard = block("impl Drop for G17POutputFencePublication<'_> {")
 assert 'aggregate.finish_enqueue(if self.succeeded { Ok(()) } else { Err(self.failure) });' in guard
 dispatch = block('    fn submit_guarded(')
-assert dispatch.index('publication.aggregate = Some(aggregate.clone());') < dispatch.index('pending.drain(..)')
+# Commands are published by index in place (kernel stack depth), not drained.
+assert dispatch.index('publication.aggregate = Some(aggregate.clone());') < dispatch.index('for index in 0..command_count {')
 assert dispatch.count('G17PSubmitCompletionMember::new(aggregate.clone())') == 2
 assert 'publication.publish_async(&aggregate.fence());' in dispatch
 assert 'publication.publish_async(&finished);' not in source
