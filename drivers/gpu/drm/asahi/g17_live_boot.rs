@@ -3684,6 +3684,10 @@ pub(crate) struct G17PLiveRuntime {
     /// Cleared at arm/settlement so a compute-only or prior render event can
     /// never retire the current fence.
     render_event_masks: KVec<[u64; 2]>,
+    /// Preallocated heap scratch for a render's explicit dependency set
+    /// (~1 KiB), taken while one publication computes and consumes it, so the
+    /// set is never staged on the publication stack.
+    render_dependency_scratch: Option<KBox<g17_manager::G17PRenderDependencies>>,
     /// Exact completion tokens live in pending_render/queued. This mask makes
     /// the ordinary return path one zero check, with no allocation or scan.
     deferred_render_timeouts: u64,
@@ -7146,7 +7150,9 @@ impl G17PLiveRuntime {
         self.settle_open_recovery_once(settled)?;
         if fine[0] != 0 { fine[1] = crate::g17_e2e::now(); }
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
-        let dependencies = self.render_submission_dependencies(completion, command)?;
+        let mut dependencies = self.take_render_dependency_scratch()?;
+        let taken = (|| {
+        self.render_submission_dependencies(completion, command, &mut dependencies)?;
         if fine[0] != 0 { fine[2] = crate::g17_e2e::now(); }
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         if manager.render_pair_preparing(render_slot) { return Err(EAGAIN); }
@@ -7154,7 +7160,10 @@ impl G17PLiveRuntime {
         manager.handoff_retained_render_vm(render_slot, vm, context.clone())?;
         if fine[0] != 0 { fine[3] = crate::g17_e2e::now(); }
         let pair = manager.render_queue_pair(render_slot)?;
-        let taken = manager.take_render_restage(&drm, vm, pair, context, completion.work_state(), command, dependencies)?;
+        manager.take_render_restage(&drm, vm, pair, context, completion.work_state(), command, &dependencies)
+        })();
+        self.render_dependency_scratch = Some(dependencies);
+        let taken = taken?;
         if fine[0] != 0 {
             crate::g17_e2e::record(crate::g17_e2e::K_FINE_RESERVE, 0, u64::from(render_slot),
                 [fine[0], fine[1], fine[2], fine[3], crate::g17_e2e::now()]);
@@ -7183,13 +7192,25 @@ impl G17PLiveRuntime {
         self.manager.as_mut().ok_or(ENODEV)?.cancel_render_restage(render_slot)
     }
 
+    /// Take the preallocated dependency scratch (reallocated only if a
+    /// previous failure path lost it).
+    fn take_render_dependency_scratch(&mut self) -> Result<KBox<g17_manager::G17PRenderDependencies>> {
+        match self.render_dependency_scratch.take() {
+            Some(scratch) => Ok(scratch),
+            None => Ok(KBox::new(g17_manager::G17PRenderDependencies::empty(), GFP_KERNEL)?),
+        }
+    }
+
+    /// Build this render's explicit dependency set into `out` (heap scratch).
+    /// `out` is valid only when this returns Ok.
     fn render_submission_dependencies(&mut self,
         completion: &crate::g17_drm::G17PRenderCompletion,
         command: &g17_uapi::TranslatedRenderCommand,
-    ) -> Result<g17_manager::G17PRenderDependencies> {
-        let mut render_dependencies = [g17_submission::G17PClBarrierDependency {
-            native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
-        }; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
+        out: &mut g17_manager::G17PRenderDependencies,
+    ) -> Result {
+        out.count = 0;
+        out.entries.fill(g17_manager::G17PRenderDependencies::EMPTY_ENTRY);
+        let render_dependencies = &mut out.entries;
         let mut dependency_sequences = [0; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX];
         let mut dependency_count = 0;
         if command.render_order.wait_through.is_some_and(|limit| limit != 0) {
@@ -7200,7 +7221,7 @@ impl G17PLiveRuntime {
             {
                 if let Some(dependency) = completion.predecessor_dependency(predecessor)? {
                     g17_submission::g17p_insert_prefix_dependency(
-                        &mut render_dependencies, &mut dependency_sequences, &mut dependency_count,
+                        render_dependencies, &mut dependency_sequences, &mut dependency_count,
                         predecessor.render_sequence(), dependency,
                     ).map_err(|_| EOVERFLOW)?;
                 }
@@ -7216,9 +7237,8 @@ impl G17PLiveRuntime {
             *render_dependencies.get_mut(dependency_count).ok_or(EOVERFLOW)? = dependency;
             dependency_count += 1;
         }
-        Ok(g17_manager::G17PRenderDependencies {
-            entries: render_dependencies, count: dependency_count,
-        })
+        out.count = dependency_count;
+        Ok(())
     }
 
     /// A real eligible render job may announce work before CPU preparation.
@@ -7579,16 +7599,27 @@ impl G17PLiveRuntime {
         // satisfy dependencies already encoded in those entries. A failed
         // predecessor poisons the VM checked above. Do not rescan the device's
         // pending queues or retake fence locks for an already prepared entry.
-        let dependencies = if self.manager.as_ref().ok_or(ENODEV)?
-            .render_sksm_prepared(render_slot) { None } else {
-            Some(self.render_submission_dependencies(&completion, command)?)
+        let sksm_prepared = self.manager.as_ref().ok_or(ENODEV)?
+            .render_sksm_prepared(render_slot);
+        // Heap scratch, returned right after begin_translated_render consumes
+        // the slice below.
+        let mut dependency_scratch = self.take_render_dependency_scratch()?;
+        if !sksm_prepared {
+            if let Err(error) = self.render_submission_dependencies(
+                &completion, command, &mut dependency_scratch)
+            {
+                self.render_dependency_scratch = Some(dependency_scratch);
+                return Err(error);
+            }
+        }
+        let render_dependencies = if sksm_prepared { &[][..] } else {
+            &dependency_scratch.entries[..dependency_scratch.count]
         };
-        let render_dependencies = dependencies.as_ref().map_or(&[][..], |d|
-            &d.entries[..d.count]);
         let dependency_count = render_dependencies.len();
         // Diagnostic modes 2/3 construct TA later and do not accept this
         // dependency slice. Refuse an unresolved prefix instead of losing it.
         if dependency_count != 0 && (native_doorbell_mode == 2 || native_doorbell_mode == 3) {
+            self.render_dependency_scratch = Some(dependency_scratch);
             return Err(ENOTSUPP);
         }
         let mut manager = self.manager.take().ok_or(ENODEV)?;
@@ -7613,6 +7644,7 @@ impl G17PLiveRuntime {
             },
             stages,
         );
+        self.render_dependency_scratch = Some(dependency_scratch);
         if let Some(started) = prepare_started {
             stages.prepare_ns = started.elapsed().as_nanos().max(0) as u64;
         }
@@ -10566,6 +10598,10 @@ impl G17PLiveRuntime {
         // partially drop `manager` before `cpus`, violating the same stop-first
         // rule enforced by normal runtime teardown.
         let completion_signal = G17PCompletionSignal::new()?;
+        // Render publication's dependency scratch: a host allocation, so it
+        // also precedes the firmware boot.
+        let render_dependency_scratch =
+            KBox::new(g17_manager::G17PRenderDependencies::empty(), GFP_KERNEL)?;
         // Keep owner-capacity arrays out of the by-value runtime construction
         // and the probe caller's frame. Allocate before either ASC starts.
         let owner_count = g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize;
@@ -10668,6 +10704,7 @@ impl G17PLiveRuntime {
             quarantined_render_completions,
             reclaim_pending_since: None,
             render_event_masks,
+            render_dependency_scratch: Some(render_dependency_scratch),
             deferred_render_timeouts: 0,
             render_fence_state: g17_completion::RenderFenceState::default(),
             trace_service_entry_counter: 0,

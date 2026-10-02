@@ -53,7 +53,10 @@ assert begin.index("self.recycle_desynced_render_storage(pair_slot)?") < begin.i
 assert begin.index(".acquire_reserved_with_token(") < begin.index(".allocate_with_token()"), \
     "the retained path must be tried before a fresh allocation"
 
+# The cold no-storage branch is an out-of-line helper (kernel stack depth);
+# splice its body back at the call site so ordering invariants still read in order.
 inner = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\(")
+inner = inner.replace("self.install_cold_render_storage(", block(manager, r"^    fn install_cold_render_storage\(") + "(", 1)
 # PB_OWNER_REF (g17p_host_path bit18) reserves the ID with its owner reference.
 assert inner.index('"new-user-render-storage"') < inner.index(".reserve_with_owner_ref(id,"), \
     "a fresh storage's ID is not reserved for the storage's lifetime"

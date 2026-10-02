@@ -1603,6 +1603,11 @@ pub(crate) struct G17PManagerConstruction {
     /// until the exact release consumer (or both firmware CPUs stopped).
     render_flist_owners: KVec<Option<G17PBootstrapUmaLifecycle>>,
     render_flist_scan: [u64; 4],
+    /// Heap scratch for the per-publication copy of the translated render
+    /// command (its HardwareBufferID and context generation are overridden).
+    /// Allocated once with the manager; keeps ~1.1 KiB off the publication
+    /// stack. Taken for the duration of `begin_translated_render`.
+    render_command_scratch: Option<KBox<core::mem::MaybeUninit<g17_uapi::TranslatedRenderCommand>>>,
     render_channel_leases: [Option<[crate::g17_channel::Lease; 2]>; 64],
     accepted_firmware_recovery_generation: u64,
     /// Coalesced firmware recovery: host generation, record count, and the
@@ -1754,6 +1759,18 @@ pub(crate) struct G17PRenderDependencies {
 }
 
 #[cfg(not(test))]
+impl G17PRenderDependencies {
+    pub(crate) const EMPTY_ENTRY: g17_submission::G17PClBarrierDependency =
+        g17_submission::G17PClBarrierDependency {
+            native_timestamp: None, event_word: 0, shared_stamp: 0, queue_id: 0,
+        };
+
+    pub(crate) const fn empty() -> Self {
+        Self { entries: [Self::EMPTY_ENTRY; g17_submission::G17P_CL_EXPLICIT_DEPENDENCIES_MAX], count: 0 }
+    }
+}
+
+#[cfg(not(test))]
 #[derive(Clone, Copy)]
 struct G17PRenderPreparedSksm {
     descriptor_contexts: [u32; 2],
@@ -1881,7 +1898,6 @@ impl G17PRenderGrow {
 pub(crate) struct G17PWarmRenderGraph {
     pub(crate) installed: bool,
     graph: Option<g17_resources::G17PUninstalledRenderGraph>,
-    storage_box: Option<KBox<core::mem::MaybeUninit<g17_resources::G17PUserRenderStorage>>>,
     retained_sksm_backing: Option<g17_resources::G17PRenderSksmBacking>,
     parameter_metrics: Option<g17_resources::G17PPmPageMetricsBinding>,
     pub(crate) queue_pair: g17_resources::G17PRenderQueuePair,
@@ -1904,13 +1920,15 @@ impl G17PWarmRenderGraph {
         let root_slot = u8::try_from(self.context.context_id()).map_err(|_| EOVERFLOW)?;
         let word = self.work_state.word();
         if word == u32::MAX { return Err(EINVAL); }
-        self.storage_box = Some(KBox::new_uninit(GFP_KERNEL)?);
-        self.graph = Some(g17_resources::G17PUninstalledRenderGraph::build(
+        // Built in place in this heap-allocated request, its storage in the
+        // box that becomes the slot's storage: no stack copy.
+        let storage_box = KBox::new_uninit(GFP_KERNEL)?;
+        g17_resources::G17PUninstalledRenderGraph::build(
             dev, &self.vm, self.uat.clone(), self.parameter_metrics.take().ok_or(EIO)?,
             self.queue_pair, Some(self.context.clone()), context_id, Some(root_slot),
             &self.command, self.num_clusters, [word; 2], self.ordinal,
-            self.pm_generation, &mut self.retained_sksm_backing,
-        )?);
+            self.pm_generation, &mut self.retained_sksm_backing, storage_box, &mut self.graph,
+        )?;
         Ok(())
     }
 }
@@ -3119,6 +3137,7 @@ impl G17PManagerConstruction {
                 render_slots: G17PRenderSlots::new()?,
                 render_flist_owners: g17p_new_render_flist_owners()?,
                 render_flist_scan: [0; 4],
+                render_command_scratch: Some(KBox::new_uninit(GFP_KERNEL)?),
                 render_channel_leases: [None; 64],
                 accepted_firmware_recovery_generation: 0,
                 pending_primary_recovery: None,
@@ -3907,9 +3926,10 @@ impl G17PManagerConstruction {
         let storage_box = KBox::<g17_resources::G17PUserRenderStorage>::new_uninit(GFP_KERNEL)?;
         let mut no_retained_sksm_backing = None;
         let pm_generation = self.prepare_render_pm_manager_generation()?;
-        self.render_slots.get_mut(pair_slot).storage = Some(storage_box.write(
+        self.render_slots.get_mut(pair_slot).storage = Some(
             self.resources
                 .new_user_render_storage(
+                    storage_box,
                     dev,
                     &vm,
                     g17_resources::G17PRenderQueuePair::for_slot(0).ok_or(EINVAL)?,
@@ -3934,7 +3954,7 @@ impl G17PManagerConstruction {
                         error
                     );
                 })?,
-        ));
+        );
         let storage = self.render_slots.get_mut(pair_slot).storage.as_deref_mut().ok_or(ENODEV)?;
         if let Some(failed) = storage.first_unreachable(self.resources.uat(), &vm) {
             storage.log_reachability(dev, self.resources.uat(), &vm);
@@ -6982,6 +7002,7 @@ impl G17PManagerConstruction {
             .and_then(|queues| queues.backing.take());
         let pm_generation = self.prepare_render_pm_manager_generation()?;
         let storage = self.resources.new_user_render_storage(
+            storage_box,
             dev,
             vm,
             queue_pair,
@@ -6995,7 +7016,7 @@ impl G17PManagerConstruction {
             pm_generation,
             &mut retained_sksm_backing,
         );
-        self.render_slots.get_mut(pair_slot).storage = Some(storage_box.write(match storage {
+        self.render_slots.get_mut(pair_slot).storage = Some(match storage {
             Ok(storage) if retained_sksm_backing.is_none() => storage,
             Ok(_) => return Err(Self::render_stage_fail(
                 "warm-render-sksm-backing-unclaimed", EIO,
@@ -7009,7 +7030,7 @@ impl G17PManagerConstruction {
                 }
                 return Err(Self::render_stage_fail("warm-render-storage", error));
             }
-        }));
+        });
         self.finish_warm_render_pair_storage(dev, vm, queue_pair,
             execution_context, pm_generation, registers, registration_power)
     }
@@ -7210,7 +7231,7 @@ impl G17PManagerConstruction {
         let num_clusters = self.num_clusters;
         let uat = self.resources.owned_uat();
         let mut request = KBox::init(try_init!(G17PWarmRenderGraph {
-            installed: false, graph: None, storage_box: None, retained_sksm_backing: None,
+            installed: false, graph: None, retained_sksm_backing: None,
             parameter_metrics: Some(parameter_metrics), queue_pair: pair, ordinal,
             hardware_buffer_id: None, pm_generation, context, work_state,
             vm: vm.clone(), command: *command, num_clusters, uat,
@@ -7246,8 +7267,7 @@ impl G17PManagerConstruction {
             self.resources.finish_user_render_storage(request.graph.as_mut().ok_or(EIO)?,
                 &mut request.retained_sksm_backing)?;
             let graph = request.graph.take().ok_or(EIO)?;
-            let storage = request.storage_box.take().ok_or(EIO)?.write(graph.into_storage());
-            self.render_slots.get_mut(index).storage = Some(storage);
+            self.render_slots.get_mut(index).storage = Some(graph.into_storage());
             request.installed = true;
             self.finish_warm_render_pair_storage(dev, &request.vm, request.queue_pair,
                 request.context.clone(), request.pm_generation, registers, registration_power)
@@ -7280,7 +7300,7 @@ impl G17PManagerConstruction {
         context: Arc<g17_resources::G17PLogicalQueueContext>,
         work_state: Arc<g17_resources::G17PWorkStateLease>,
         command: &g17_uapi::TranslatedRenderCommand,
-        dependencies: G17PRenderDependencies,
+        dependencies: &G17PRenderDependencies,
     ) -> Result<Option<G17PRenderRestage>> {
         let pair_slot = queue_pair.slot();
         let slot = self.render_slots.allocated(pair_slot)?;
@@ -7303,7 +7323,9 @@ impl G17PManagerConstruction {
         let slot = self.render_slots.get_mut(pair_slot);
         let mut storage = slot.storage.take().ok_or(EIO)?;
         let mut dependency_buffer = storage.take_sksm_dependency_buffer();
-        *dependency_buffer = dependencies;
+        // Heap to heap: the ~1 KiB dependency set never stages on the stack.
+        dependency_buffer.entries = dependencies.entries;
+        dependency_buffer.count = dependencies.count;
         slot.preparing = true;
         Ok(Some(G17PRenderRestage { work_state, storage, reservation, num_clusters: self.num_clusters,
             uat: self.resources.owned_uat(), producers, dependencies: dependency_buffer }))
@@ -7741,16 +7763,24 @@ impl G17PManagerConstruction {
         if ordinal != self.render_slots.get(pair_slot).submission_ordinal {
             return Err(EIO);
         }
-        let mut command = *command;
+        // The command copy lives in the manager's preallocated heap scratch,
+        // not on the publication stack (same bytes, same overrides).
+        let mut scratch = match self.render_command_scratch.take() {
+            Some(scratch) => scratch,
+            None => KBox::new_uninit(GFP_KERNEL)?,
+        };
+        let result = (|| {
+        let command = core::mem::MaybeUninit::write(&mut *scratch, *command);
         command.parameters.ta_hardware_buffer_id = hardware_buffer_id;
         command.parameters.context_generation = execution_context.generation();
+        let command: &g17_uapi::TranslatedRenderCommand = command;
         self.begin_translated_render_with_hardware_buffer(
             dev,
             vm,
             queue_pair,
             execution_context,
             descriptor_context_id,
-            &command,
+            command,
             render_dependencies,
             parameter_buffer_token,
             [command_buffer_state_word; 2],
@@ -7760,6 +7790,9 @@ impl G17PManagerConstruction {
             registration_power,
             stages,
         )
+        })();
+        self.render_command_scratch = Some(scratch);
+        result
         })();
         if result.is_err() && !self.render_slots.get(pair_slot).hardware_buffer_published {
             // acquire() stages a copy of the completed FList owner. Until
@@ -7799,6 +7832,104 @@ impl G17PManagerConstruction {
         self.render_slots.get_mut(pair_slot).hardware_buffer_id = None;
         self.render_slots.get_mut(pair_slot).hardware_buffer_published = false;
         self.render_slots.get_mut(pair_slot).auxiliary_timestamp = 0;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn install_cold_render_storage(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        queue_pair: g17_resources::G17PRenderQueuePair,
+        execution_context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        descriptor_context_id: u16,
+        render_root_slot: u8,
+        command: &g17_uapi::TranslatedRenderCommand,
+        command_buffer_state_words: [u32; 2],
+    ) -> Result {
+        let pair_slot = queue_pair.slot();
+        if self.render_slots.get(pair_slot).bind.is_some() {
+            return Err(EIO);
+        }
+        let storage_box = KBox::<g17_resources::G17PUserRenderStorage>::new_uninit(GFP_KERNEL)?;
+        let mut retained_sksm_backing = self.render_slots.get_mut(pair_slot)
+            .sksm
+            .as_mut()
+            .and_then(|queues| queues.backing.take());
+        let pm_generation = self.prepare_render_pm_manager_generation()?;
+        let storage = self.resources.new_user_render_storage(
+            storage_box,
+            dev,
+            vm,
+            queue_pair,
+            Some(execution_context.clone()),
+            descriptor_context_id,
+            Some(render_root_slot),
+            command,
+            self.num_clusters,
+            command_buffer_state_words,
+            self.render_slots.get(pair_slot).submission_ordinal,
+            pm_generation,
+            &mut retained_sksm_backing,
+        );
+        self.render_slots.get_mut(pair_slot).storage = Some(match storage {
+            Ok(storage) if retained_sksm_backing.is_none() => storage,
+            Ok(_) => return Err(Self::render_stage_fail(
+                "new-user-render-sksm-backing-unclaimed", EIO,
+            )),
+            Err(error) => {
+                if let Some(backing) = retained_sksm_backing.take() {
+                    let queues = self.render_slots.get_mut(pair_slot).sksm.as_mut().ok_or(EIO)?;
+                    if queues.backing.replace(backing).is_some() {
+                        return Err(EIO);
+                    }
+                }
+                return Err(Self::render_stage_fail("new-user-render-storage", error));
+            }
+        });
+        self.commit_render_pm_manager_generation(pair_slot, pm_generation)
+            .map_err(|error| Self::render_stage_fail("commit-pm-manager-generation", error))?;
+        // The fresh graph was encoded against this ID; keep the ID off the
+        // shared free list for as long as the storage lives.
+        if let Some(id) = self.render_slots.get(pair_slot)
+            .storage
+            .as_deref()
+            .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
+        {
+            self.render_hardware_buffer_ids
+                .reserve_with_owner_ref(id, crate::g17_host_path::enabled(crate::g17_host_path::PB_OWNER_REF))
+                .map_err(|_| Self::render_stage_fail("reserve-hardware-buffer-id", EIO))?;
+        }
+        if self.render_slots.get(pair_slot).submission_ordinal != 0 {
+            let parameter_page_list_vas = self.render_slots.get(pair_slot)
+                .storage
+                .as_deref()
+                .ok_or(ENODEV)?
+                .parameter_buffer_page_list_vas()?;
+            let slot = self.render_slots.get_mut(pair_slot);
+            let storage = slot.storage.as_deref_mut().ok_or(ENODEV)?;
+            storage
+                .rebase_empty_queue_cursors(slot.submission_ordinal)
+                .map_err(|error| Self::render_stage_fail("rebase-new-vm-queue", error))?;
+            storage.restage_command(
+                    dev,
+                    vm,
+                    descriptor_context_id,
+                    parameter_page_list_vas,
+                    command,
+                    self.num_clusters,
+                    command_buffer_state_words,
+                    slot.submission_ordinal,
+                    true,
+                )
+                .map_err(|error| Self::render_stage_fail("restage-new-vm-command", error))?;
+        }
+        // `new_user_render_storage` has just stamped the device-global PB
+        // loader from this fresh graph, so record it as the owner without
+        // repeating the write.
+        self.render_parameter_buffer_owner =
+            self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?.render_pool_id();
         Ok(())
     }
 
@@ -7951,86 +8082,11 @@ impl G17PManagerConstruction {
             self.retarget_render_parameter_buffer(pair_slot)
                 .map_err(|error| Self::render_stage_fail("retarget-parameter-buffer", error))?;
         } else {
-            if self.render_slots.get(pair_slot).bind.is_some() {
-                return Err(EIO);
-            }
-            let storage_box = KBox::<g17_resources::G17PUserRenderStorage>::new_uninit(GFP_KERNEL)?;
-            let mut retained_sksm_backing = self.render_slots.get_mut(pair_slot)
-                .sksm
-                .as_mut()
-                .and_then(|queues| queues.backing.take());
-            let pm_generation = self.prepare_render_pm_manager_generation()?;
-            let storage = self.resources.new_user_render_storage(
-                dev,
-                vm,
-                queue_pair,
-                Some(execution_context.clone()),
-                descriptor_context_id,
-                Some(render_root_slot),
-                command,
-                self.num_clusters,
-                command_buffer_state_words,
-                self.render_slots.get(pair_slot).submission_ordinal,
-                pm_generation,
-                &mut retained_sksm_backing,
-            );
-            self.render_slots.get_mut(pair_slot).storage = Some(storage_box.write(match storage {
-                Ok(storage) if retained_sksm_backing.is_none() => storage,
-                Ok(_) => return Err(Self::render_stage_fail(
-                    "new-user-render-sksm-backing-unclaimed", EIO,
-                )),
-                Err(error) => {
-                    if let Some(backing) = retained_sksm_backing.take() {
-                        let queues = self.render_slots.get_mut(pair_slot).sksm.as_mut().ok_or(EIO)?;
-                        if queues.backing.replace(backing).is_some() {
-                            return Err(EIO);
-                        }
-                    }
-                    return Err(Self::render_stage_fail("new-user-render-storage", error));
-                }
-            }));
-            self.commit_render_pm_manager_generation(pair_slot, pm_generation)
-                .map_err(|error| Self::render_stage_fail("commit-pm-manager-generation", error))?;
-            // The fresh graph was encoded against this ID; keep the ID off the
-            // shared free list for as long as the storage lives.
-            if let Some(id) = self.render_slots.get(pair_slot)
-                .storage
-                .as_deref()
-                .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
-            {
-                self.render_hardware_buffer_ids
-                    .reserve_with_owner_ref(id, crate::g17_host_path::enabled(crate::g17_host_path::PB_OWNER_REF))
-                    .map_err(|_| Self::render_stage_fail("reserve-hardware-buffer-id", EIO))?;
-            }
-            if self.render_slots.get(pair_slot).submission_ordinal != 0 {
-                let parameter_page_list_vas = self.render_slots.get(pair_slot)
-                    .storage
-                    .as_deref()
-                    .ok_or(ENODEV)?
-                    .parameter_buffer_page_list_vas()?;
-                let slot = self.render_slots.get_mut(pair_slot);
-                let storage = slot.storage.as_deref_mut().ok_or(ENODEV)?;
-                storage
-                    .rebase_empty_queue_cursors(slot.submission_ordinal)
-                    .map_err(|error| Self::render_stage_fail("rebase-new-vm-queue", error))?;
-                storage.restage_command(
-                        dev,
-                        vm,
-                        descriptor_context_id,
-                        parameter_page_list_vas,
-                        command,
-                        self.num_clusters,
-                        command_buffer_state_words,
-                        slot.submission_ordinal,
-                        true,
-                    )
-                    .map_err(|error| Self::render_stage_fail("restage-new-vm-command", error))?;
-            }
-            // `new_user_render_storage` has just stamped the device-global PB
-            // loader from this fresh graph, so record it as the owner without
-            // repeating the write.
-            self.render_parameter_buffer_owner =
-                self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?.render_pool_id();
+            // Cold path: no storage on this pair at publication. Kept out of
+            // line so its G17PUserRenderStorage temporary (~2.8 KiB) is not
+            // part of the hot publication frame.
+            self.install_cold_render_storage(dev, vm, queue_pair, &execution_context,
+                descriptor_context_id, render_root_slot, command, command_buffer_state_words)?;
         }
         if !restaged {
             self.render_slots.get_mut(pair_slot).storage.as_deref_mut().ok_or(ENODEV)?
@@ -8389,6 +8445,7 @@ impl G17PManagerConstruction {
                     queue_pair.fragment,
                 );
             } else if queue_pair.slot() != 0 && first_install {
+                crate::g17_stackwatch::FIRST_INSTALL_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 // Power guarantee modes (see `g17p_render_registration_power`):
                 // 1 production IdlePowerOff bracket; 0 native shape (no
                 // device-control record, aperture must already read powered);
@@ -8404,6 +8461,7 @@ impl G17PManagerConstruction {
                     };
                     if bracket {
                         bracketed = true;
+                        crate::g17_stackwatch::BRACKET_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         registration_power(self)
                             .map_err(|error| Self::render_stage_fail(
                                 "power-secondary-render-pair", error,

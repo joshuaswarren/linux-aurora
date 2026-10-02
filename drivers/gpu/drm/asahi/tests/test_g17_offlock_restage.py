@@ -62,7 +62,7 @@ impl Manager{
  fn release_active_render_command_buffer_states(&mut self,_:u8)->Result{self.released_states+=1;Ok(())}
 ''' + item(m,'    pub(crate) fn take_render_restage(') + item(m,'    pub(crate) fn return_render_restage(') + item(m,'    pub(crate) fn cancel_render_restage(') + r'''
 }
-fn take(m:&mut Manager,slot:u8)->Result<Option<G17PRenderRestage>>{m.take_render_restage(&AsahiDevice,&mmu::Vm,g17_resources::G17PRenderQueuePair(slot),Arc::new(g17_resources::G17PLogicalQueueContext),Arc::new(g17_resources::G17PWorkStateLease),&g17_uapi::TranslatedRenderCommand,G17PRenderDependencies{entries:[0;31],count:0})}
+fn take(m:&mut Manager,slot:u8)->Result<Option<G17PRenderRestage>>{m.take_render_restage(&AsahiDevice,&mmu::Vm,g17_resources::G17PRenderQueuePair(slot),Arc::new(g17_resources::G17PLogicalQueueContext),Arc::new(g17_resources::G17PWorkStateLease),&g17_uapi::TranslatedRenderCommand,&G17PRenderDependencies{entries:[0;31],count:0})}
 #[test]fn independent_preparers_hold_no_global_mutex_and_return_exact_graphs(){
  let drops=Arc::new(std::sync::atomic::AtomicUsize::new(0));let m=Arc::new(Mutex::new(Manager::new(drops.clone())));let barrier=Arc::new(Barrier::new(3));let mut threads=vec![];
  for slot in 0..2{let m=m.clone();let barrier=barrier.clone();threads.push(std::thread::spawn(move||{

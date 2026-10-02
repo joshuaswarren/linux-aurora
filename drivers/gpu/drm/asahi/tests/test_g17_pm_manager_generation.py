@@ -12,8 +12,11 @@ reserve=item(manager,'    fn prepare_render_pm_manager_generation(')
 commit=item(manager,'    fn commit_render_pm_manager_generation(')
 plan=item(resources,'pub(crate) fn g17p_pm_manager_generation_plan(')
 assert 'put_u64(raw, selected_scene + 0x4c, manager_generation)' in resources
+# The cold no-storage branch is an out-of-line helper (kernel stack depth);
+# splice its body back at the call site so ordering invariants still read in order.
 for name in ['stage_compute_bootstrap_render','warm_render_pair_storage_inner','begin_translated_render_with_hardware_buffer']:
  body=item(manager,'fn '+name+'(')
+ body=body.replace('self.install_cold_render_storage(', item(manager,'    fn install_cold_render_storage(')+'(', 1)
  assert body.index('prepare_render_pm_manager_generation()?') < body.index('.new_user_render_storage(')
  if name == 'warm_render_pair_storage_inner':
   assert body.index('.new_user_render_storage(') < body.index('finish_warm_render_pair_storage(')

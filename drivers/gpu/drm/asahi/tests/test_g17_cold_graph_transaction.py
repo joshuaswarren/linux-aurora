@@ -70,7 +70,7 @@ impl Owner{
 fn prepare()->(G17PUninstalledRenderGraph,Arc<Audit>,mmu::Vm,Owner){
  let audit=Arc::new(Audit::default());let vm=mmu::Vm::default();
  let aliases=|n|KVec((0..n).map(|_|Mapping::new(&audit)).collect());
- let p=G17PUninstalledRenderGraph{driver_aliases:aliases(1),storage:G17PUserRenderStorage{queue_pair:Pair(3),sksm_vm_aliases:aliases(2),persistent:aliases(1),render_tvb:Some(Tvb{block_count:17}),audit:audit.clone()},vm:vm.clone(),had_retained_sksm_backing:true,_uat:Arc::new(Box::new(Uat))};
+ let p=G17PUninstalledRenderGraph{driver_aliases:aliases(1),storage:Box::new(G17PUserRenderStorage{queue_pair:Pair(3),sksm_vm_aliases:aliases(2),persistent:aliases(1),render_tvb:Some(Tvb{block_count:17}),audit:audit.clone()}),vm:vm.clone(),had_retained_sksm_backing:true,_uat:Arc::new(Box::new(Uat))};
  (p,audit,vm,Owner{address_space:AddressSpace{uat:Uat},pbdesc:99})
 }
 #[test]fn uninstalled_graph_pins_uat_after_external_owner_drops(){let(p,a,_v,_o)=prepare();let owner=p._uat.clone();let weak=Arc::downgrade(&owner);drop(owner);assert!(weak.upgrade().is_some());drop(p);assert!(weak.upgrade().is_none());assert_eq!(a.graphs.load(Ordering::SeqCst),1);}

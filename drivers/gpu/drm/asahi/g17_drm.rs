@@ -2247,6 +2247,9 @@ impl G17PRenderQueueBackend {
             completion.fail_unpublished(ECANCELED);
             return Err(ECANCELED);
         }
+        // g17p_stack_watch (diagnostic, default off): stack high-water mark
+        // of the whole publication, including every callee.
+        let stack_watch = crate::g17_stackwatch::begin();
         let mut failure_stage = "render-vm-status";
         let result = (|| -> Result<Fence> {
             if completion.vm_status().get() != 0 { return Err(EIO); }
@@ -2606,6 +2609,7 @@ impl G17PRenderQueueBackend {
             completion.fail_unpublished(*error);
             G17PQueue::stage_fail(submission_id, failure_stage, *error);
         }
+        crate::g17_stackwatch::end(stack_watch, early);
         result
     }
 
@@ -3262,14 +3266,18 @@ impl G17PQueue {
 
     /// Queue a compute command with its required render prefix and an owned
     /// member of the ioctl output aggregate. Input fence scope is unchanged.
+    // Never inlined: keeps this command's frame off the other command
+    // kind's publication path (stack depth, see g17p_stack_watch).
+    #[inline(never)]
     fn submit_compute_async(
-        &mut self, submission_id: u64, mut translated: g17_uapi::TranslatedComputeCommand,
+        &mut self, submission_id: u64, translated: &g17_uapi::TranslatedComputeCommand,
         syncs: &[file::SyncItem], plan: Option<&G17PSyncPlan>, record: bool,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         aggregate_member: G17PSubmitCompletionMember,
         vm_job: mmu::T8140VmJobGuard,
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
+        let mut translated = *translated;
         // v93 FW_DEPS: same-queue input syncs become a render prefix. Earlier
         // compute of this queue is already ordered by the QID's implicit
         // previous-kick parent and the scheduler FIFO, so compute_through
@@ -3372,14 +3380,18 @@ impl G17PQueue {
     /// Queue render behind user completion syncs and its explicit compute
     /// prefix's publication. Independent engines can publish in either order;
     /// the runtime resolves only tokens inside the captured logical prefix.
+    // Never inlined: keeps this command's frame off the other command
+    // kind's publication path (stack depth, see g17p_stack_watch).
+    #[inline(never)]
     fn submit_render_async(
-        &mut self, submission_id: u64, mut translated: g17_uapi::TranslatedRenderCommand,
+        &mut self, submission_id: u64, translated: &g17_uapi::TranslatedRenderCommand,
         syncs: &[file::SyncItem], plan: Option<&G17PSyncPlan>, record: bool,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         aggregate_member: G17PSubmitCompletionMember,
         vm_job: mmu::T8140VmJobGuard,
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
+        let mut translated = *translated;
         // v93 FW_DEPS: same-queue input syncs become render/compute prefixes,
         // resolved exactly like an explicit barrier: render predecessors by
         // native tokens at publication (scheduler FIFO publishes them first),
@@ -3806,103 +3818,16 @@ impl G17PQueue {
         }
     }
 
-    fn submit_guarded(
+    /// Phase one of `submit_guarded`: VM status, mapping pin, parse and
+    /// translate every hardware command, and one VM job guard per command.
+    /// Kept out of line (never inlined) so its large temporaries are not on
+    /// the stack while the commands are published.
+    #[inline(never)]
+    fn translate_submission(
         &mut self,
         submission_id: u64,
-        mut syncs: KVec<file::SyncItem>,
-        in_sync_count: usize,
         cmdbuf_raw: &[u8],
-        objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result {
-        // Keep diagnostic timing entirely out of the production hot path.
-        // The parameter has no runtime permissions, so this branch is stable
-        // for the lifetime of the module.
-        let perf_enabled = *module_parameters::g17p_perf_window.value() != 0;
-        let mut entered = if perf_enabled {
-            Some(Instant::<Monotonic>::now())
-        } else {
-            None
-        };
-        if crate::util::g17p_verbose() {
-            pr_info!(
-                "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
-                submission_id,
-                syncs.len(),
-                in_sync_count,
-                cmdbuf_raw.len()
-            );
-        }
-        self.e2e_fine = [0; 12];
-        self.e2e_fine[0] = crate::g17_e2e::fine();
-        Self::log_cmdbuf_headers(submission_id, cmdbuf_raw);
-        if in_sync_count > syncs.len() {
-            return Err(Self::stage_fail(submission_id, "sync-count", EINVAL));
-        }
-        // Split the output syncobjs off immediately and hand them to a
-        // publication guard, so every failure from here on still publishes a
-        // fence. Arming this only after the queue lease was acquired left the
-        // whole class of "another client owns the render slot" failures
-        // publishing nothing, and a compositor that hit one waited on an
-        // unsignalled syncobj forever instead of losing a frame.
-        let early_output_fence = new_independent_submission_fence(&self.fence_contexts)
-            .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?;
-        let output_count = syncs.len() - in_sync_count;
-        let deferred_outputs: KVec<file::SyncItem> =
-            match KVec::with_capacity(output_count, GFP_KERNEL) {
-                Ok(outputs) => outputs,
-                Err(_) => {
-                    // Output syncobjs are already resolved and userspace may
-                    // wait on them even when this bookkeeping allocation
-                    // fails. Publish the fence directly from the original
-                    // vector before returning the allocation error.
-                    early_output_fence.set_error(ENOMEM);
-                    let fence = Fence::from_fence(&early_output_fence);
-                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
-                    early_output_fence.signal();
-                    return Err(Self::stage_fail(
-                        submission_id, "output-sync-list", ENOMEM,
-                    ));
-                }
-            };
-        let mut publication = G17POutputFencePublication {
-            fence: &early_output_fence,
-            outputs: deferred_outputs,
-            failure: ECANCELED,
-            succeeded: false,
-            aggregate: None,
-        };
-        while syncs.len() > in_sync_count {
-            // Removing the first output keeps timeline points in userspace
-            // order and, unlike a Drain iterator, leaves every later output
-            // reachable if the supposedly infallible capacity invariant is
-            // ever violated.
-            let item = match syncs.remove(in_sync_count) {
-                Ok(item) => item,
-                Err(_) => {
-                    let failure = Self::stage_fail(submission_id, "output-sync-index", EIO);
-                    publication.failed(failure);
-                    let fence = Fence::from_fence(&early_output_fence);
-                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
-                    self.note_submission_failure(submission_id, failure);
-                    return Err(failure);
-                }
-            };
-            if let Err(error) = publication.outputs.push_within_capacity(item) {
-                let failure = Self::stage_fail(submission_id, "output-sync-capacity", EIO);
-                publication.failed(failure);
-                let fence = Fence::from_fence(&early_output_fence);
-                Self::install_output_fences(core::iter::once(error.0), &fence);
-                Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
-                self.note_submission_failure(submission_id, failure);
-                return Err(failure);
-            }
-        }
-        self.e2e_fine[1] = crate::g17_e2e::fine();
-        // Keep the publication guard alive until the exact result is known.
-        // Terminal VM state and outstanding jobs must be settled before an
-        // error fence wakes userspace; wrapping the body also makes every `?`
-        // and explicit return obey that ordering without duplicating cleanup.
-        let result = (|| -> Result {
+    ) -> Result<(KVec<G17PPendingCommand>, KVec<mmu::T8140VmJobGuard>)> {
         // A VM that has already faulted rejects every later submission. That
         // check used to run before any of the above, so a client whose VM died
         // got EIO with no fence published at all and then waited forever on the
@@ -4113,6 +4038,112 @@ impl G17PQueue {
         self.e2e_fine[9] = u64::from(proof_outcome.requests)
             | u64::from(proof_outcome.hit) << 8 | u64::from(proof_outcome.batched) << 9
             | u64::from(proof_outcome.fallback) << 10 | (pending.capacity() as u64) << 16;
+        Ok((pending, vm_jobs))
+    }
+
+    fn submit_guarded(
+        &mut self,
+        submission_id: u64,
+        mut syncs: KVec<file::SyncItem>,
+        in_sync_count: usize,
+        cmdbuf_raw: &[u8],
+        objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
+        // Keep diagnostic timing entirely out of the production hot path.
+        // The parameter has no runtime permissions, so this branch is stable
+        // for the lifetime of the module.
+        let perf_enabled = *module_parameters::g17p_perf_window.value() != 0;
+        let mut entered = if perf_enabled {
+            Some(Instant::<Monotonic>::now())
+        } else {
+            None
+        };
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
+                submission_id,
+                syncs.len(),
+                in_sync_count,
+                cmdbuf_raw.len()
+            );
+        }
+        self.e2e_fine = [0; 12];
+        self.e2e_fine[0] = crate::g17_e2e::fine();
+        Self::log_cmdbuf_headers(submission_id, cmdbuf_raw);
+        if in_sync_count > syncs.len() {
+            return Err(Self::stage_fail(submission_id, "sync-count", EINVAL));
+        }
+        // Split the output syncobjs off immediately and hand them to a
+        // publication guard, so every failure from here on still publishes a
+        // fence. Arming this only after the queue lease was acquired left the
+        // whole class of "another client owns the render slot" failures
+        // publishing nothing, and a compositor that hit one waited on an
+        // unsignalled syncobj forever instead of losing a frame.
+        let early_output_fence = new_independent_submission_fence(&self.fence_contexts)
+            .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?;
+        let output_count = syncs.len() - in_sync_count;
+        let deferred_outputs: KVec<file::SyncItem> =
+            match KVec::with_capacity(output_count, GFP_KERNEL) {
+                Ok(outputs) => outputs,
+                Err(_) => {
+                    // Output syncobjs are already resolved and userspace may
+                    // wait on them even when this bookkeeping allocation
+                    // fails. Publish the fence directly from the original
+                    // vector before returning the allocation error.
+                    early_output_fence.set_error(ENOMEM);
+                    let fence = Fence::from_fence(&early_output_fence);
+                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                    early_output_fence.signal();
+                    return Err(Self::stage_fail(
+                        submission_id, "output-sync-list", ENOMEM,
+                    ));
+                }
+            };
+        let mut publication = G17POutputFencePublication {
+            fence: &early_output_fence,
+            outputs: deferred_outputs,
+            failure: ECANCELED,
+            succeeded: false,
+            aggregate: None,
+        };
+        while syncs.len() > in_sync_count {
+            // Removing the first output keeps timeline points in userspace
+            // order and, unlike a Drain iterator, leaves every later output
+            // reachable if the supposedly infallible capacity invariant is
+            // ever violated.
+            let item = match syncs.remove(in_sync_count) {
+                Ok(item) => item,
+                Err(_) => {
+                    let failure = Self::stage_fail(submission_id, "output-sync-index", EIO);
+                    publication.failed(failure);
+                    let fence = Fence::from_fence(&early_output_fence);
+                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                    self.note_submission_failure(submission_id, failure);
+                    return Err(failure);
+                }
+            };
+            if let Err(error) = publication.outputs.push_within_capacity(item) {
+                let failure = Self::stage_fail(submission_id, "output-sync-capacity", EIO);
+                publication.failed(failure);
+                let fence = Fence::from_fence(&early_output_fence);
+                Self::install_output_fences(core::iter::once(error.0), &fence);
+                Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                self.note_submission_failure(submission_id, failure);
+                return Err(failure);
+            }
+        }
+        self.e2e_fine[1] = crate::g17_e2e::fine();
+        // Keep the publication guard alive until the exact result is known.
+        // Terminal VM state and outstanding jobs must be settled before an
+        // error fence wakes userspace; wrapping the body also makes every `?`
+        // and explicit return obey that ordering without duplicating cleanup.
+        let result = (|| -> Result {
+        // Parse and translate in a separate, never-inlined frame: its parser,
+        // parsed command and translated temporaries (~8 KiB) are released
+        // before publication, which can run the whole render publication
+        // (early path) on this ioctl stack.
+        let (pending, mut vm_jobs) = self.translate_submission(submission_id, cmdbuf_raw)?;
+        let command_count = pending.len();
 
         let aggregate = G17PSubmitCompletion::new(
             new_independent_submission_fence(&self.fence_contexts)?,
@@ -4141,7 +4172,10 @@ impl G17PQueue {
         }
         self.e2e_fine[6] = crate::g17_e2e::fine();
 
-        for (index, command) in pending.drain(..).enumerate() {
+        // Index the commands in place: moving each ~1.1 KiB command out of
+        // the vector staged it (and the iterator's Option) on this frame,
+        // which is the base of the early-publication stack.
+        for index in 0..command_count {
             let last = index + 1 == command_count;
             // Input syncs gate the whole ioctl. Independent commands may now
             // publish in either engine order, so each owns the input fences
@@ -4149,7 +4183,7 @@ impl G17PQueue {
             let vm_job = vm_jobs.remove(0).map_err(|_| EIO)?;
             let command_entered = if last { entered.take() } else { None };
 
-            match command {
+            match pending.get(index).ok_or(EIO)? {
                 G17PPendingCommand::Render(translated) => self.submit_render_async(
                     submission_id,
                     translated,
