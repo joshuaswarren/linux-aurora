@@ -21070,9 +21070,6 @@ impl G17ResourceOwner {
         self.stage_render_uma_owner(&storage.render_flist)
     }
 
-    /// Pair the UMA load with a store at the retired graph boundary. The
-    /// shared FList object is not updated by GPU allocation or async growth;
-    /// reloading it unchanged would reset cursors and forget grown pages.
     /// (counter_a, counter_b, total_pages) of a global UMA descriptor row as
     /// currently in memory; diagnostic only.
     pub(crate) fn uma_row_counters(&mut self, hardware_buffer_id: u32) -> Result<(u32, u32, u32)> {
@@ -21082,6 +21079,9 @@ impl G17ResourceOwner {
         Ok((state.counter_a, state.counter_b, state.total_pages))
     }
 
+    /// Pair the UMA load with a store at the retired graph boundary. The
+    /// shared FList object is not updated by GPU allocation or async growth;
+    /// reloading it unchanged would reset cursors and forget grown pages.
     pub(crate) fn save_user_render_uma(&mut self, storage: &G17PUserRenderStorage) -> Result {
         let owner = &storage.render_flist;
         let state = owner.uma_state()?;
