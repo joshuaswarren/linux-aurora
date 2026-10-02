@@ -1490,6 +1490,7 @@ fn drain_primary_firmware_event_batch(
 fn complete_primary_real_recovery(
     pdev: &platform::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
+    primary_queue: Option<&mut g17_manager::G17PSksmQueue>,
     async_compute_queues: &mut KVec<G17PAsyncComputeQueue>,
     registers: Option<&regs::Resources>,
     state: &G17PRoleRtkitState,
@@ -1756,6 +1757,12 @@ fn complete_primary_real_recovery(
             finish_g17p_render_trace(pdev.as_ref(), manager, slot, crate::g17_trace_capture::Phase::RecoveryBeforeAck);
         }
     }
+    // Native restartWorkQueue sets every work queue's recovery target while
+    // firmware is still halted, before resuming it. After the read-only
+    // captures above, so they keep observing the faulted state.
+    if *module_parameters::g17p_recovery_target_restart.value() != 0 {
+        publish_g17p_recovery_targets(pdev, manager, primary_queue, async_compute_queues, generation);
+    }
     manager.acknowledge_primary_firmware_recovery(1, 2)?;
     let mut post_state = 2;
     for _ in 0..FIRMWARE_RECOVERY_POLLS {
@@ -1839,6 +1846,57 @@ fn complete_primary_real_recovery(
         return Err(EIO);
     }
     Ok(())
+}
+
+/// `AGXAccelerator::restartWorkQueue` ("GPU Hang - Channel Restart") copies
+/// each live work queue's uncached producer to its recovery target before the
+/// restarted firmware replays outstanding work: TA and 3D channels of every
+/// AGX3DWorkQueue and the channel of every AGXCLWorkQueue. Here: every render
+/// pair carrying a graph, the primary CL queue and every async CL queue. See
+/// `g17p_publish_recovery_target` for the firmware consumer.
+///
+/// Native skips the walk for restart reasons 2, 4, 5 and 6 (byte +8 of its
+/// accelerator+0x18dc0 restart record); the firmware source of that byte is
+/// not decoded, so Linux applies it on every serviced type-4 recovery. A
+/// failed copy is reported and leaves that channel's previous target.
+fn publish_g17p_recovery_targets(
+    pdev: &platform::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    primary_queue: Option<&mut g17_manager::G17PSksmQueue>,
+    async_compute_queues: &mut KVec<G17PAsyncComputeQueue>,
+    generation: u64,
+) {
+    let (render, render_failure) = manager.publish_render_recovery_targets();
+    let mut compute = 0u32;
+    let mut compute_failure = None;
+    for queue in Iterator::chain(primary_queue.into_iter(),
+        async_compute_queues.iter_mut().map(|queue| &mut queue.queue))
+    {
+        match queue.publish_recovery_target() {
+            Ok(_) => compute += 1,
+            Err(error) => {
+                if compute_failure.is_none() { compute_failure = Some((queue.queue_id(), error)); }
+            }
+        }
+    }
+    // Native orders the copies before the stamp table and the resume with
+    // `dmb ish`; the acknowledge that follows is the resume.
+    fence(Ordering::SeqCst);
+    dev_info!(
+        pdev.as_ref(),
+        "G17P recovery: generation={} recovery targets set to producers for {} render pair(s) and {} CL queue(s) before resume (native restartWorkQueue)\n",
+        generation,
+        render,
+        compute,
+    );
+    if let Some((slot, error)) = render_failure {
+        dev_warn!(pdev.as_ref(),
+            "G17P recovery: render pair slot {} recovery target not published ({:?})\n", slot, error);
+    }
+    if let Some((qid, error)) = compute_failure {
+        dev_warn!(pdev.as_ref(),
+            "G17P recovery: CL qid {} recovery target not published ({:?})\n", qid, error);
+    }
 }
 
 static INLINE_RECOVERIES_SERVICED: AtomicU32 = AtomicU32::new(0);
@@ -4544,6 +4602,7 @@ impl G17PLiveRuntime {
         // DRAM only -- see `log_compute_recovery_alignment`.
         self.log_recovery_alignment("pre-recovery");
         let registers = self.registers.as_ref();
+        let primary_queue = self.queue.as_mut();
         let async_compute_queues = &mut self.async_compute_queues;
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         let Some((generation, records, blamed_stamp)) = manager.pending_primary_recovery() else {
@@ -4552,6 +4611,7 @@ impl G17PLiveRuntime {
         let result = complete_primary_real_recovery(
             &pdev,
             manager,
+            primary_queue,
             async_compute_queues,
             registers,
             &state,

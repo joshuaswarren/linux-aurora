@@ -2624,6 +2624,12 @@ impl G17PComputeRetirementTicket {
 }
 
 impl G17PSksmQueue {
+    /// Native `restartWorkQueue` recovery target for this CL queue's channel:
+    /// uncached producer (+0x40) copied to +0x50 while firmware is halted.
+    pub(crate) fn publish_recovery_target(&mut self) -> Result<u32> {
+        self.compute.publish_recovery_target()
+    }
+
     pub(crate) fn bind_logical_channel_control(
         &mut self, context: &g17_resources::G17PLogicalQueueContext,
     ) -> Result {
@@ -9389,6 +9395,29 @@ impl G17PManagerConstruction {
         let bit = 1u64 << (qid % 64);
         let set = |pair: usize| masks[pair * 2 + word].as_ref().is_ok_and(|value| value & bit != 0);
         (set(0), set(2))
+    }
+
+    /// Native `AGXAccelerator::restartWorkQueue` for every AGX3DWorkQueue:
+    /// each render pair that carries a graph gets its TA and 3D recovery
+    /// targets set to the current producers. Called with firmware halted at
+    /// recovery state 1, before the host's 1 -> 2 acknowledge. Graphs parked
+    /// in a logical-queue teardown are not on any pair (a successor's graph
+    /// owns the QIDs) and are skipped. Returns (pairs published, first failure).
+    pub(crate) fn publish_render_recovery_targets(&mut self) -> (u32, Option<(u8, Error)>) {
+        let mut published = 0u32;
+        let mut failure = None;
+        for (slot, state) in self.render_slots.iter_mut() {
+            let Some(storage) = state.and_then(|state| state.storage.as_deref_mut()) else {
+                continue;
+            };
+            match storage.publish_recovery_targets() {
+                Ok(_) => published += 1,
+                Err(error) => {
+                    if failure.is_none() { failure = Some((slot, error)); }
+                }
+            }
+        }
+        (published, failure)
     }
 
     pub(crate) fn log_render_recovery_pre_ack(&mut self, label: &'static str) {
