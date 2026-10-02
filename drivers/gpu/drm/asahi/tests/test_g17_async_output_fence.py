@@ -145,7 +145,7 @@ assert "if quarantine" not in render_publish
 assert "quarantine_render_slot(" not in render_publish
 assert render_publish.count("timeout_deferred_render(") == 1
 assert render_publish.index("packet.begin_publication()") < render_publish.index(
-    "self.registry.acquire_lease(self.owner)?"
+    "self.registry.acquire_lease(self.owner, G17PTileRequest::of(&packet))?"
 )
 assert render_publish.index("completion.attach_lease(lease)?") < render_publish.index(
     "runtime.submit_translated_render("

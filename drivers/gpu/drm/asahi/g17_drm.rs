@@ -341,6 +341,10 @@ pub(crate) struct G17PQueueRegistry {
     lease: Mutex<G17PQueueLeaseState>,
     #[pin]
     lease_free: CondVar,
+    /// `g17p_tile_backstop` (A): every render holding a pair lease, with its
+    /// attachment footprint. Taken only nested inside `lease`.
+    #[pin]
+    tile_inflight: Mutex<KVec<G17PTileInflight>>,
     live_queues: AtomicU32,
     compute_readers: AtomicU32,
     compute_faulted: AtomicU32,
@@ -369,6 +373,55 @@ const G17P_RENDER_SLOTS: usize =
 const G17P_ACTIVE_RENDER_SLOTS: usize = G17P_RENDER_SLOTS;
 const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS > 0);
 const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS <= G17P_RENDER_SLOTS);
+
+/// `g17p_tile_backstop` (A): one render holding a physical pair lease, or
+/// (slot `TILE_PENDING`) waiting for an overlapping render with `ticket`.
+struct G17PTileInflight {
+    owner: u64,
+    sequence: u64,
+    slot: u8,
+    ticket: u64,
+    footprint: Arc<crate::g17_tile_backstop::Footprint>,
+}
+
+const TILE_PENDING: u8 = u8::MAX;
+
+/// Removes a waiting render's pending record on every early exit of
+/// `acquire_lease`. Declared after the lease guard it is used under, so it
+/// drops first, with `lease` still held (the `lease` -> `tile_inflight` order).
+struct G17PTilePending<'a> {
+    registry: &'a G17PQueueRegistry,
+    owner: u64,
+    ticket: u64,
+}
+
+impl Drop for G17PTilePending<'_> {
+    fn drop(&mut self) {
+        let mut inflight = self.registry.tile_inflight.lock();
+        if let Some(index) = inflight.iter().position(|entry|
+            entry.slot == TILE_PENDING && entry.owner == self.owner && entry.ticket == self.ticket)
+        {
+            drop(inflight.swap_remove(index));
+        }
+    }
+}
+
+/// `g17p_tile_backstop`: what a render brings to its pair lease.
+#[derive(Copy, Clone)]
+pub(crate) struct G17PTileRequest<'a> {
+    footprint: &'a Arc<crate::g17_tile_backstop::Footprint>,
+    sequence: u64,
+    wait_through: Option<u64>,
+}
+
+impl<'a> G17PTileRequest<'a> {
+    fn of(packet: &'a g17_job::G17PRenderJobPacket) -> Option<Self> {
+        let order = packet.command().render_order;
+        packet.footprint().map(|footprint| Self {
+            footprint, sequence: order.sequence, wait_through: order.wait_through,
+        })
+    }
+}
 
 struct G17PQueueLeaseState {
     render_slots: u64,
@@ -630,12 +683,40 @@ impl G17PQueueLeaseState {
 
 }
 
+// ---- g17p_tile_backstop (B) ------------------------------------------------
+impl G17PQueueLeaseState {
+    /// Take `slot` for `owner` behind the owner's overlapping in-flight render
+    /// there: only a pair the owner holds, not quarantined or held, with depth
+    /// left (the same bound as the stacking path).
+    fn acquire_render_slot_on(&mut self, owner: u64, slot: u8) -> Option<u8> {
+        let index = usize::from(slot);
+        if owner == 0 || index >= G17P_RENDER_SLOTS || self.render_owner[index] != owner {
+            return None;
+        }
+        let bit = 1u64 << slot;
+        if (self.render_quarantined | self.render_kill_hold) & bit != 0 {
+            return None;
+        }
+        if self.render_refs[index] == 0 {
+            return Some(self.take_render_slot(slot, owner));
+        }
+        if u32::from(self.render_refs[index]) >= crate::g17_queue_limits::RENDER_KICKS_PER_PAIR {
+            return None;
+        }
+        self.render_refs[index] += 1;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.render_epoch[index] = self.epoch;
+        Some(slot)
+    }
+}
+
 impl G17PQueueRegistry {
     fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(G17PQueueRegistry {
                 lease <- new_mutex!(G17PQueueLeaseState::default(), "G17PQueueRegistry::lease"),
                 lease_free <- new_condvar!("G17PQueueRegistry::lease_free"),
+                tile_inflight <- new_mutex!(KVec::new(), "G17PQueueRegistry::tile_inflight"),
                 live_queues: AtomicU32::new(0),
                 compute_readers: AtomicU32::new(0),
                 compute_faulted: AtomicU32::new(0),
@@ -832,9 +913,17 @@ impl G17PQueueRegistry {
         self.lease.lock().warmable_sibling_render_slot(owner, publishing)
     }
 
-    fn acquire_lease(self: &Arc<Self>, owner: u64) -> Result<G17PLeaseGuard> {
+    fn acquire_lease(self: &Arc<Self>, owner: u64, tile: Option<G17PTileRequest<'_>>)
+        -> Result<G17PLeaseGuard>
+    {
+        use crate::g17_tile_backstop::{self as backstop, Plan};
         if owner == 0 { return Err(EINVAL); }
         let mut held = self.lease.lock();
+        // g17p_tile_backstop (C): a bounded wait for an overlapping render
+        // of another queue; after it expires the ordinary selection applies.
+        let mut tile_budget = kernel::time::msecs_to_jiffies(backstop::WAIT_CAP_MS);
+        let mut tile_expired = false;
+        let mut tile_pending: Option<G17PTilePending<'_>> = None;
         // Recovery isolation ADMISSION_WAIT: bounded wait for the reclaim of
         // an owner's quarantined pair (boot d324fcdd 05:38:44: spared VM
         // 2559's next render hit EIO here and `fail_unpublished` poisoned it,
@@ -896,24 +985,66 @@ impl G17PQueueRegistry {
                     => return Err(ENOSPC),
                 _ => {},
             }
-            if let Some(slot) = held.acquire_render_slot(owner) {
-                break slot;
+            let ticket = tile_pending.as_ref().map(|pending| pending.ticket);
+            let plan = match tile {
+                Some(tile) if !tile_expired => self.tile_plan(&held, owner, &tile, ticket),
+                _ => Plan::Free,
+            };
+            let picked = match plan {
+                Plan::Free => held.acquire_render_slot(owner),
+                Plan::Stack(slot) => held.acquire_render_slot_on(owner, slot),
+                Plan::Wait => None,
+            };
+            if let Some(slot) = picked {
+                if let Plan::Stack(_) = plan {
+                    G17PQueueRegistry::note_tile("stacked behind its overlapping render", &backstop::STACKED,
+                        owner, slot, tile);
+                }
+                // A waiting render's pending record becomes its in-flight one.
+                drop(tile_pending.take());
+                let recorded = tile.and_then(|tile| self.tile_record(owner, slot, &tile));
+                break (slot, recorded);
+            }
+            if plan != Plan::Free {
+                if tile_pending.is_none() {
+                    G17PQueueRegistry::note_tile("waiting for an overlapping render", &backstop::WAITS,
+                        owner, u8::MAX, tile);
+                    if let Some(tile) = tile {
+                        tile_pending = self.tile_wait(owner, &tile);
+                    }
+                }
+                match self.lease_free.wait_interruptible_timeout(&mut held, tile_budget) {
+                    kernel::sync::CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                    kernel::sync::CondVarTimeoutResult::Timeout => {
+                        tile_budget = 0;
+                        tile_expired = true;
+                        G17PQueueRegistry::note_tile("wait expired; publishing unordered",
+                            &backstop::WAIT_TIMEOUTS, owner, u8::MAX, tile);
+                    }
+                    kernel::sync::CondVarTimeoutResult::Woken { jiffies } => tile_budget = jiffies,
+                }
+                continue;
             }
             if self.lease_free.wait_interruptible(&mut held) {
                 return Err(ERESTARTSYS);
             }
         };
         core::mem::drop(held);
+        let (slot, tile) = slot;
         Ok(G17PLeaseGuard {
             registry: self.clone(),
             slot,
+            tile,
         })
     }
 
     /// v84: `acquire_lease` without waiting. `Ok(None)` when a wait would be
     /// needed or any refusal applies; the caller then takes the scheduler path,
     /// which reproduces the exact refusal (or waits) as before.
-    fn try_acquire_lease(self: &Arc<Self>, owner: u64) -> Result<Option<G17PLeaseGuard>> {
+    fn try_acquire_lease(self: &Arc<Self>, owner: u64, tile: Option<G17PTileRequest<'_>>)
+        -> Result<Option<G17PLeaseGuard>>
+    {
+        use crate::g17_tile_backstop::Plan;
         if owner == 0 { return Ok(None); }
         let mut held = self.lease.lock();
         if self.compute_faulted.load(Ordering::Acquire) != 0 && self.compute_poison_is_device_wide() {
@@ -927,9 +1058,94 @@ impl G17PQueueRegistry {
             None => return Ok(None),
             _ => {}
         }
-        let Some(slot) = held.acquire_render_slot(owner) else { return Ok(None); };
+        // g17p_tile_backstop: never wait here; a conflict takes the
+        // scheduler path, which plans (and may wait) again.
+        let plan = tile.map_or(Plan::Free, |tile| self.tile_plan(&held, owner, &tile, None));
+        let picked = match plan {
+            Plan::Free => held.acquire_render_slot(owner),
+            Plan::Stack(slot) => held.acquire_render_slot_on(owner, slot),
+            Plan::Wait => None,
+        };
+        let Some(slot) = picked else { return Ok(None); };
+        if let Plan::Stack(_) = plan {
+            G17PQueueRegistry::note_tile("stacked behind its overlapping render",
+                &crate::g17_tile_backstop::STACKED, owner, slot, tile);
+        }
+        let recorded = tile.and_then(|tile| self.tile_record(owner, slot, &tile));
         core::mem::drop(held);
-        Ok(Some(G17PLeaseGuard { registry: self.clone(), slot }))
+        Ok(Some(G17PLeaseGuard { registry: self.clone(), slot, tile: recorded }))
+    }
+
+    /// `g17p_tile_backstop`: the plan for a render of `owner` under the lease
+    /// mutex (B, C, D). `tile_inflight` nests inside `lease` only.
+    fn tile_plan(&self, held: &G17PQueueLeaseState, owner: u64, tile: &G17PTileRequest<'_>,
+        ticket: Option<u64>) -> crate::g17_tile_backstop::Plan
+    {
+        use crate::g17_tile_backstop as backstop;
+        let inflight = self.tile_inflight.lock();
+        if inflight.is_empty() { return backstop::Plan::Free; }
+        backstop::plan(backstop::mask(), owner, tile.wait_through, ticket, tile.footprint,
+            inflight.iter().map(|entry| backstop::Inflight {
+                owner: entry.owner,
+                sequence: entry.sequence,
+                slot: entry.slot,
+                footprint: &entry.footprint,
+                quarantined: entry.slot < 64 && held.render_quarantined & (1u64 << entry.slot) != 0,
+                pending: entry.slot == TILE_PENDING,
+                ticket: entry.ticket,
+            }))
+    }
+
+    /// `g17p_tile_backstop` (C): record a render that starts waiting, so a
+    /// newer overlapping render of another queue waits behind it. Called
+    /// with `lease` held; the returned guard removes the record.
+    fn tile_wait<'a>(&'a self, owner: u64, tile: &G17PTileRequest<'_>) -> Option<G17PTilePending<'a>> {
+        let ticket = crate::g17_tile_backstop::next_ticket();
+        let entry = G17PTileInflight {
+            owner, sequence: tile.sequence, slot: TILE_PENDING, ticket, footprint: tile.footprint.clone(),
+        };
+        self.tile_inflight.lock().push(entry, GFP_KERNEL).ok()?;
+        Some(G17PTilePending { registry: self, owner, ticket })
+    }
+
+    /// `g17p_tile_backstop` (A): record a render that now holds `slot`. The
+    /// guard forgets it when the lease drops (completion releases the lease
+    /// before its fence signals). Called with `lease` held.
+    fn tile_record(&self, owner: u64, slot: u8, tile: &G17PTileRequest<'_>) -> Option<(u64, u64)> {
+        let mut inflight = self.tile_inflight.lock();
+        let entry = G17PTileInflight {
+            owner, sequence: tile.sequence, slot, ticket: 0, footprint: tile.footprint.clone(),
+        };
+        match inflight.push(entry, GFP_KERNEL) {
+            Ok(()) => Some((owner, tile.sequence)),
+            Err(_) => {
+                crate::g17_tile_backstop::count(&crate::g17_tile_backstop::UNRECORDED);
+                None
+            }
+        }
+    }
+
+    fn tile_forget(&self, slot: u8, owner: u64, sequence: u64) {
+        let mut inflight = self.tile_inflight.lock();
+        if let Some(index) = inflight.iter().position(|entry|
+            entry.slot == slot && entry.owner == owner && entry.sequence == sequence)
+        {
+            drop(inflight.swap_remove(index));
+        }
+    }
+
+    /// The first few backstop decisions per boot, for hardware verification.
+    #[cold]
+    #[inline(never)]
+    fn note_tile(what: &str, counter: &core::sync::atomic::AtomicU64, owner: u64, slot: u8,
+        tile: Option<G17PTileRequest<'_>>)
+    {
+        let events = crate::g17_tile_backstop::count(counter);
+        if events <= 8 {
+            pr_info!("G17P tile backstop: owner={} sequence={} {} (slot {}; #{}; totals(stacked,waits,timeouts,object,truncated,unrecorded)={:?})\n",
+                owner, tile.map_or(0, |tile| tile.sequence), what, slot, events,
+                crate::g17_tile_backstop::totals());
+        }
     }
 
     /// Retire one render slot whose retained graph can no longer be trusted.
@@ -1033,6 +1249,8 @@ impl Drop for G17PComputeLeaseGuard {
 struct G17PLeaseGuard {
     registry: Arc<G17PQueueRegistry>,
     slot: u8,
+    /// `g17p_tile_backstop`: (owner, render sequence) recorded in flight.
+    tile: Option<(u64, u64)>,
 }
 
 /// iso4 `g17_recovery_isolation::inherited_errno`: a consumer that fails
@@ -1667,6 +1885,9 @@ impl Drop for G17PLeaseGuard {
     fn drop(&mut self) {
         let mut held = self.registry.lease.lock();
         held.release_render_slot(self.slot);
+        if let Some((owner, sequence)) = self.tile {
+            self.registry.tile_forget(self.slot, owner, sequence);
+        }
         drop(held);
         self.registry.lease_free.notify_all();
     }
@@ -2252,7 +2473,7 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
         {
             return false;
         }
-        let lease = match self.registry.try_acquire_lease(self.owner) {
+        let lease = match self.registry.try_acquire_lease(self.owner, G17PTileRequest::of(packet)) {
             Ok(Some(lease)) => lease,
             _ => return false,
         };
@@ -2340,7 +2561,7 @@ impl G17PRenderQueueBackend {
             failure_stage = "render-acquire-physical-lease";
             let lease = match early_lease.take() {
                 Some(lease) => lease,
-                None => self.registry.acquire_lease(self.owner)?,
+                None => self.registry.acquire_lease(self.owner, G17PTileRequest::of(&packet))?,
             };
             if packet.cancel_requested() { return Err(ECANCELED); }
             failure_stage = "render-attach-physical-lease";
@@ -3465,6 +3686,8 @@ impl G17PQueue {
         vm_job: mmu::T8140VmJobGuard,
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
+        // g17p_tile_backstop: from the caller's command, before the local copy.
+        let footprint = self.tile_footprint(&translated.fragment_attachments)?;
         let mut translated = *translated;
         // v93 FW_DEPS: same-queue input syncs become render/compute prefixes,
         // resolved exactly like an explicit barrier: render predecessors by
@@ -3535,6 +3758,7 @@ impl G17PQueue {
         self.e2e_fine[8] = crate::g17_e2e::fine();
         let packet = g17_job::G17PRenderJobPacket::new(
             submission_id, translated, checked_dependencies, firmware_fences, completion,
+            footprint,
         )?;
         self.e2e_fine[10] = crate::g17_e2e::fine();
         // v84: publish from this ioctl only for fully independent work.
@@ -3737,6 +3961,32 @@ impl G17PQueue {
             return Ok((page, Some(self.ts_pool.clone())));
         }
         Ok((self.owned_compute_timestamps()?, Some(self.ts_pool.clone())))
+    }
+
+    /// `g17p_tile_backstop`: the render's attachment footprint -- its
+    /// validated fragment attachment spans in this VM, plus the object ranges
+    /// they reach through shareable-object bindings (D). Out of line: the
+    /// footprint is built in this frame, not the submit path's.
+    #[inline(never)]
+    fn tile_footprint(&self, attachments: &g17_uapi::UapiAttachmentList)
+        -> Result<Option<Arc<crate::g17_tile_backstop::Footprint>>>
+    {
+        use crate::g17_tile_backstop as backstop;
+        if backstop::mask() & backstop::DEFAULT_MASK == 0 || attachments.as_slice().is_empty() {
+            return Ok(None);
+        }
+        let mut footprint = backstop::Footprint::new(self.vm.id());
+        for attachment in attachments.as_slice() {
+            footprint.push_vm_span(attachment.address, attachment.address.saturating_add(attachment.size));
+            self.vm.shared_footprint_spans(attachment.address, attachment.size, &mut footprint);
+        }
+        if footprint.object_spans() != 0 {
+            backstop::count(&backstop::OBJECT_FOOTPRINTS);
+        }
+        if footprint.truncated() {
+            backstop::count(&backstop::TRUNCATED);
+        }
+        Ok(Some(Arc::new(footprint, GFP_KERNEL)?))
     }
 
     fn owned_compute_timestamps(&self) -> Result<mmu::KernelMapping> {
