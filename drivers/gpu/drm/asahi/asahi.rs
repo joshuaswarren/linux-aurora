@@ -203,16 +203,16 @@ kernel::prelude::module! {
             description: "Diagnostic: 1 writes RegionC+0x30 (idle core power-off enable) as 0 at init; 0 keeps the encoded 1",
         },
         g17p_timer_cswitch_mask: u32 {
-            default: 2,
-            description: "RegionC+0x0 TimerCSwitch per-DM resume mask (bit0 TA, bit1 FRG, bit2 CL); 0 disables",
+            default: 0,
+            description: "A/B only: RegionC+0x0 TimerCSwitch per-DM resume mask (bit0 TA, bit1 FRG, bit2 CL); 0 (default) keeps the native encoding",
         },
         g17p_fender_delay: u32 {
             default: 0,
             description: "Diagnostic: RegionC+0x9bc idle-off (fender) delay override; 0 keeps the native 40",
         },
         g17p_cswitch_timer_multiplier: u32 {
-            default: 16,
-            description: "RegionC+0x6a CSwitchTimerMultiplier: 1 ms engine walks per TimerCSwitch resume; 0 keeps the encoded 1",
+            default: 0,
+            description: "A/B only: RegionC+0x6a CSwitchTimerMultiplier, 1 ms engine walks per TimerCSwitch resume; 0 (default) keeps the encoded 1",
         },
         g17p_dump_state: u32 {
             default: 0,

@@ -275,11 +275,19 @@ pub(crate) fn g17p_fw_pool_release_all() {
 /// engine walk (bundle+0xed0), each DM bit in +0 resumes that DM's installed
 /// QIDs through group 3 (`23fc4..24020` -> `a2a8(3)`): a hardware
 /// re-arbitration handshake plus re-add of any QID removed after an A==B park.
-/// Without it a FRG queue parked under multi-client contention is re-added
-/// only when the GPU drains, which Neo measured as 2 s stalls and
-/// DEVICE_LOST. FRG with multiplier 16 passed four-client qualification with
-/// no single-client cost; multiplier 1 cost 23% light-render throughput.
-/// The native runtime TimerCSwitch value is not established.
+/// On an earlier driver line, without it a FRG queue parked under
+/// multi-client contention was re-added only when the GPU drained, which Neo
+/// measured as 2 s stalls and DEVICE_LOST; FRG with multiplier 16 passed
+/// four-client qualification with no single-client cost, and multiplier 1
+/// cost 23% light-render throughput. The native runtime TimerCSwitch value is
+/// not established.
+///
+/// Both parameters now default to 0, which keeps the native encoded values
+/// (+0 = 0, +0x6a = 1) and logs no override. On the iso2 line (2026-10-01)
+/// the native encoding matched mask 2 / multiplier 16: depth-2 medians fell
+/// inside each other's ranges, saturated runs were within noise, and the
+/// original four-client FRG-stall reproducer ran 8 four-client and 2 mixed
+/// windows clean on both. The parameters remain for A/B.
 /// Opt-in diagnostic `g17p_fastdie_target_cc`: lower the GPU firmware
 /// fast-die target (native 11000 = 110.00 C, recorded in the bundle and the
 /// secondary +0xb8 object) before the firmware boots.  0 keeps native.
