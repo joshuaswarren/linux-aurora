@@ -8323,13 +8323,16 @@ impl G17PManagerConstruction {
             // configureHardware transaction.  Do the same: reacquire immediately
             // at the transaction boundary and retry only the still-unpublished
             // four-write registration, without restaging the command.
-            // One log line per publication naming the install/rebind decision,
-            // so the per-session install policy can be verified from dmesg.
+            // Log the install decision for every FIRST install (a few dozen per
+            // boot) and, under g17p_verbose, for rebinds too. A per-publication
+            // printk on the steady-state path costs about 16% at depth 2 on a
+            // console-backed log (measured on boot d5250d86: 132k REBIND lines).
             let routes_configured = self.render_slots.get(pair_slot).sksm.as_ref()
                 .is_some_and(|queues| queues.tiling.hardware_enabled && queues.fragment.hardware_enabled);
             let first_kick_reconfigure =
                 *module_parameters::g17p_render_first_kick_reconfigure.value() != 0;
             let first_install = fragment_install || tiling_install.unwrap_or(false);
+            if first_install || crate::util::g17p_verbose() {
             dev_info!(
                 dev.as_ref(),
                 "G17P render install decision: pair {}/{} slot {} context {} ordinal {}: {} (fragment install={} tiling install={:?}, routes_configured={}, first_kick_reconfigure={})\n",
@@ -8344,6 +8347,7 @@ impl G17PManagerConstruction {
                 routes_configured,
                 first_kick_reconfigure,
             );
+            }
             if queue_pair.slot() != 0 && first_install && routes_configured && !first_kick_reconfigure {
                 // Native count: configureHardware runs once per queue. The
                 // warm-up transaction already enabled both routes; skip the
