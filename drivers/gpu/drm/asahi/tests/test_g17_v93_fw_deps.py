@@ -379,11 +379,18 @@ program_b += '\nstruct G17PQueue; impl G17PQueue {' + block(DRM, '    fn check_f
 # production inheritance rule (EIO with the isolation mask clear).
 program_b += block(DRM, 'pub(crate) fn inherited_dependency_error(').replace('pub(crate) ', '') + '\n'
 program_b += recovery_isolation_mod()
+# Counter-only resolver statistics (g17_dep_stats): no behaviour, stubbed.
+program_b += '''
+mod g17_dep_stats {
+    pub fn note_resolved(_word: u64) {}
+    pub fn note_error(_error: super::g17_submission::SubmissionError, _status: i32, _word: u64) {}
+}
+'''
 program_b += r'''
 struct Render { owner: u64, status: Arc<g17_status::VmStatus>, render_order: g17_submission::G17PRenderOrder,
                 fragment_dependency: AtomicU64, fence: Fence }
 impl Render { fn fence(&self) -> Fence { self.fence.clone() }
-''' + block(DRM, '    pub(crate) fn predecessor_dependency(') + r'''
+''' + block(DRM, '    pub(crate) fn predecessor_dependency(') + block(DRM, '    fn counted_dependency(') + r'''
 }
 fn fence(s: i32) -> Fence { Fence { status: Arc::new(AtomicI32::new(s)) } }
 fn render(vm: &Arc<g17_status::VmStatus>, seq: u64, wait: Option<u64>, qid: u8, stamp: u64, s: i32) -> Render {

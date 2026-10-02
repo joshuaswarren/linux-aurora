@@ -1280,16 +1280,37 @@ impl G17PRenderCompletion {
         }
         // SAFETY: this completion owns the queried hardware fence.
         let status = unsafe { bindings::dma_fence_get_status(self.fence().raw()) };
-        crate::g17_submission::g17p_live_render_dependency(
+        let word = self.fragment_dependency.load(Ordering::Acquire);
+        Self::counted_dependency(crate::g17_submission::g17p_live_render_dependency(
             crate::g17_submission::G17PRenderOrder { sequence: 0, wait_through: Some(sequence) },
-            sequence, status, self.fragment_dependency.load(Ordering::Acquire),
-        ).map_err(|error| if error
-            == crate::g17_submission::SubmissionError::RenderBarrierPredecessorFailed
-        {
-            // iso4: the predecessor failed; that is not this render's own
-            // device loss (see `inherited_dependency_error`).
-            inherited_dependency_error(EIO)
-        } else { EIO })
+            sequence, status, word,
+        ), status, word)
+    }
+
+    /// Count a resolver outcome (`g17p_render_dep_stats`) and map its error.
+    #[inline]
+    fn counted_dependency(
+        resolved: core::result::Result<Option<crate::g17_submission::G17PClBarrierDependency>,
+            crate::g17_submission::SubmissionError>,
+        status: i32, word: u64,
+    ) -> Result<Option<crate::g17_submission::G17PClBarrierDependency>> {
+        match resolved {
+            Ok(Some(dependency)) => {
+                crate::g17_dep_stats::note_resolved(word);
+                Ok(Some(dependency))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                crate::g17_dep_stats::note_error(error, status, word);
+                Err(if error
+                    == crate::g17_submission::SubmissionError::RenderBarrierPredecessorFailed
+                {
+                    // iso4: the predecessor failed; that is not this render's own
+                    // device loss (see `inherited_dependency_error`).
+                    inherited_dependency_error(EIO)
+                } else { EIO })
+            }
+        }
     }
 
     /// Runtime publication and retirement share one mutex. Every preceding
@@ -1308,16 +1329,10 @@ impl G17PRenderCompletion {
         ) { return Ok(None); }
         // SAFETY: predecessor owns its fence throughout this read.
         let status = unsafe { bindings::dma_fence_get_status(predecessor.fence().raw()) };
-        crate::g17_submission::g17p_live_render_dependency(
-            self.render_order, predecessor.render_order.sequence, status,
-            predecessor.fragment_dependency.load(Ordering::Acquire),
-        ).map_err(|error| if error
-            == crate::g17_submission::SubmissionError::RenderBarrierPredecessorFailed
-        {
-            // iso4: the predecessor failed; that is not this render's own
-            // device loss (see `inherited_dependency_error`).
-            inherited_dependency_error(EIO)
-        } else { EIO })
+        let word = predecessor.fragment_dependency.load(Ordering::Acquire);
+        Self::counted_dependency(crate::g17_submission::g17p_live_render_dependency(
+            self.render_order, predecessor.render_order.sequence, status, word,
+        ), status, word)
     }
 
     pub(crate) fn render_sequence(&self) -> u64 {

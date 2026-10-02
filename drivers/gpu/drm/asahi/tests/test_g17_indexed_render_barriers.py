@@ -132,6 +132,18 @@ fn encoded(dependency:G17PClBarrierDependency) -> u64 {
     assert!(encode_kick_word(KICK_TS_MASK+1,11).is_err());
     assert!(encode_kick_word(1,128).is_err());
 }
+#[test] fn high_qid_predecessor_token_resolves_with_all_seven_qid_bits() {
+    // Dead-pair DeviceLost: QID bit 6 is kick-word bit 46, the firmware's
+    // mask-word selector. A predecessor on QID 64..127 must resolve exactly.
+    let order=g17p_render_order(0,1,1).unwrap();
+    for qid in [63u8,64,0x5d,0x7f] {
+        let edge=native(order,1,qid,0x1234).unwrap();
+        assert_eq!(edge.queue_id,qid);
+        assert_eq!(encoded(edge),encode_kick_word(0x1234,qid).unwrap());
+    }
+    // Bits [63:47] stay unmodeled and refused.
+    assert_eq!(g17p_live_render_dependency(order,1,0,1u64<<47),Err(SubmissionError::KickWordUnmodeledBits));
+}
 }''',
 ])
 

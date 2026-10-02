@@ -2931,10 +2931,14 @@ pub(crate) fn g17p_live_render_dependency(
     if native_word == u64::MAX {
         return Err(SubmissionError::RenderBarrierMissingToken);
     }
+    // Bit 46 is QID bit 6: the firmware takes the QID as bits [46:40] (ubfx
+    // x1,x5,#40,#7) and the same bit as its valid-queue mask-word selector
+    // (ubfx x6,x5,#46,#1). A predecessor on QID 64..127 sets it; its token is
+    // fully modeled and the dependency encoder takes all seven QID bits.
+    // decode_kick_word still refuses bits [63:47]. Refusing the selector made
+    // every barrier on a 64..127 fragment QID fail the dependent render with
+    // EIO (the dead-pair DeviceLost).
     let token = decode_kick_word(native_word)?;
-    if token.mask_selector != 0 {
-        return Err(SubmissionError::KickWordUnmodeledBits);
-    }
     let mut dependency = g17p_render_barrier_from_timestamp(token.timestamp, token.queue_id)?;
     dependency.native_timestamp = Some(token.timestamp);
     Ok(Some(dependency))

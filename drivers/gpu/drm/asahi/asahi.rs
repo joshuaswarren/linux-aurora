@@ -27,6 +27,7 @@ mod g17_completion;
 mod g17_config;
 mod g17_compute;
 mod g17_drm;
+mod g17_dep_stats;
 mod g17_dvfs_parity;
 mod g17_gpu_power;
 mod g17_dvfs_policy;
