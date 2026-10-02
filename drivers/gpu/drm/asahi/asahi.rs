@@ -49,6 +49,7 @@ mod g17_host_path;
 mod g17_recovery_path;
 mod g17_recovery_isolation;
 mod g17_exit_kill;
+mod g17_tile_backstop;
 mod g17_mem_path;
 mod g17_store;
 mod g17_power_preflight;
@@ -129,6 +130,10 @@ kernel::prelude::module! {
         g17p_max_recoveries: u32 {
             default: 0,
             description: "Maximum firmware recoveries per session; 0 is unlimited",
+        },
+        g17p_tile_backstop: u32 {
+            default: 3,
+            description: "Tile-hazard backstop for overlapping in-flight renders: bit0 same-queue pair affinity, bit1 cross-queue/process wait; 0 disables",
         },
         g17p_exit_kill: u32 {
             default: 1,

@@ -945,9 +945,14 @@ impl File {
                     vm.track_t8140_native_context_binding(
                         bo.clone(), op.addr, op.range, op.offset,
                     )?;
+                    vm.track_shared_binding(
+                        bo, op.addr, op.range, op.offset,
+                        op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0,
+                    );
                 }
                 PreparedGemBindOp::Unmap { op, .. } => {
                     vm.untrack_t8140_native_context_range(op.addr..op.addr + op.range);
+                    vm.untrack_shared_range(op.addr..op.addr + op.range);
                 }
             }
         }
@@ -970,6 +975,7 @@ impl File {
                     core::mem::drop(file_vm);
                     vm.drop_mappings(bo)?;
                     vm.untrack_t8140_native_context_object(bo);
+                    vm.untrack_shared_object(bo);
                     if idx == usize::MAX {
                         break;
                     }

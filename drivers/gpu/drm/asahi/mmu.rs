@@ -1358,8 +1358,32 @@ pub(crate) struct Vm {
     /// view. This records backing identity only; it never changes context 0
     /// until the VM owns a render submission.
     t8140_native_context_bindings: Option<Arc<Mutex<T8140NativeContextBindings>>>,
+    /// `g17p_tile_backstop` (D): user bindings of shareable GEM objects.
+    shared_bindings: Arc<SharedBindings>,
 }
 no_debug!(Vm);
+
+/// One user binding of a shareable (non VM-private) GEM object: GPU VA range
+/// and the object offset its start maps. The object is named by address only
+/// (identity; never dereferenced). A stale entry can only make the tile
+/// backstop order two renders that did not need it.
+struct SharedBinding {
+    start: u64,
+    end: u64,
+    object: usize,
+    offset: u64,
+}
+
+/// `g17p_tile_backstop` (D): the shareable-object bindings of one VM, so a
+/// render's attachment span can also be named as (object, offset range),
+/// which two processes mapping one dma-buf share. `count` keeps the common
+/// no-shared-binding case to one atomic load per render.
+#[pin_data]
+struct SharedBindings {
+    #[pin]
+    list: Mutex<KVec<SharedBinding>>,
+    count: AtomicU32,
+}
 
 struct T8140VmJobLifetime {
     active: usize,
@@ -2724,6 +2748,10 @@ impl Vm {
             } else {
                 None
             },
+            shared_bindings: Arc::pin_init(pin_init!(SharedBindings {
+                list <- new_mutex!(KVec::new(), "SharedBindings"),
+                count: AtomicU32::new(0),
+            }), GFP_KERNEL)?,
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
                     new_mutex!(
@@ -2828,6 +2856,66 @@ impl Vm {
         }
         if touched {
             bindings.generation = bindings.generation.wrapping_add(1);
+        }
+    }
+
+    /// `g17p_tile_backstop` (D): record a committed user binding. A binding
+    /// replaces whatever it overlaps; only a shareable object's (an external
+    /// GPUVM object, i.e. not VM-private) multi-page binding is kept. An
+    /// allocation failure leaves it unrecorded: the backstop then simply does
+    /// not see it, as before this registry existed.
+    pub(crate) fn track_shared_binding(
+        &self, gem: &gem::Object, address: u64, size: u64, offset: u64, single_page: bool,
+    ) {
+        let Some(end) = address.checked_add(size) else { return };
+        let shareable = !single_page && self.is_extobj(gem);
+        // Common case: a VM-private bind into a VM without shared bindings.
+        if !shareable && self.shared_bindings.count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut list = self.shared_bindings.list.lock();
+        list.retain(|binding| binding.end <= address || end <= binding.start);
+        if shareable {
+            let _ = list.push(SharedBinding {
+                start: address, end, object: gem as *const gem::Object as usize, offset,
+            }, GFP_KERNEL);
+        }
+        self.shared_bindings.count.store(list.len() as u32, Ordering::Relaxed);
+    }
+
+    /// `g17p_tile_backstop` (D): a user unbind of `range`.
+    pub(crate) fn untrack_shared_range(&self, range: Range<u64>) {
+        if self.shared_bindings.count.load(Ordering::Relaxed) == 0 { return; }
+        let mut list = self.shared_bindings.list.lock();
+        list.retain(|binding| binding.end <= range.start || range.end <= binding.start);
+        self.shared_bindings.count.store(list.len() as u32, Ordering::Relaxed);
+    }
+
+    /// `g17p_tile_backstop` (D): GEM close dropped every mapping of `gem`.
+    pub(crate) fn untrack_shared_object(&self, gem: &gem::Object) {
+        if self.shared_bindings.count.load(Ordering::Relaxed) == 0 { return; }
+        let object = gem as *const gem::Object as usize;
+        let mut list = self.shared_bindings.list.lock();
+        list.retain(|binding| binding.object != object);
+        self.shared_bindings.count.store(list.len() as u32, Ordering::Relaxed);
+    }
+
+    /// `g17p_tile_backstop` (D): add to `footprint` the object ranges that the
+    /// VA range `[address, address + size)` reaches through shareable-object
+    /// bindings. One atomic load when the VM has none.
+    pub(crate) fn shared_footprint_spans(
+        &self, address: u64, size: u64, footprint: &mut crate::g17_tile_backstop::Footprint,
+    ) {
+        if self.shared_bindings.count.load(Ordering::Relaxed) == 0 { return; }
+        let Some(end) = address.checked_add(size) else { return };
+        let list = self.shared_bindings.list.lock();
+        for binding in list.iter() {
+            let start = binding.start.max(address);
+            let stop = binding.end.min(end);
+            if start >= stop { continue; }
+            let object_start = binding.offset.saturating_add(start - binding.start);
+            footprint.push_object_span(binding.object, object_start,
+                object_start.saturating_add(stop - start));
         }
     }
 

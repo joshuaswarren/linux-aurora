@@ -540,6 +540,9 @@ pub(crate) struct G17PRenderJobPacket {
     /// As above, distinct from user completion dependencies.
     firmware_fences: KVec<Fence>,
     completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+    /// `g17p_tile_backstop`: the attachment footprint recorded while this
+    /// render holds its pair lease (None: backstop off or no attachments).
+    footprint: Option<Arc<crate::g17_tile_backstop::Footprint>>,
     publication_state: AtomicU32,
     cancel_requested: AtomicU32,
     /// v84 early publication from the submit ioctl: 0 not attempted/declined,
@@ -558,10 +561,11 @@ impl G17PRenderJobPacket {
         input_fences: KVec<Fence>,
         firmware_fences: KVec<Fence>,
         completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+        footprint: Option<Arc<crate::g17_tile_backstop::Footprint>>,
     ) -> Result<Arc<Self>> {
         if submission_id == 0 { return Err(EINVAL); }
         Ok(Arc::new(Self {
-            submission_id, command, input_fences, firmware_fences, completion,
+            submission_id, command, input_fences, firmware_fences, completion, footprint,
             publication_state: AtomicU32::new(0),
             cancel_requested: AtomicU32::new(0),
             early_state: AtomicU32::new(0),
@@ -603,6 +607,9 @@ impl G17PRenderJobPacket {
         &self.completion
     }
     pub(crate) fn fence(&self) -> Fence { self.completion.fence() }
+    pub(crate) fn footprint(&self) -> Option<&Arc<crate::g17_tile_backstop::Footprint>> {
+        self.footprint.as_ref()
+    }
 
     /// Claim the only transition from queued to hardware publication.
     pub(crate) fn begin_publication(&self) -> bool {
