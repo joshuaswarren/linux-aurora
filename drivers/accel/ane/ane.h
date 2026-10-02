@@ -15,6 +15,8 @@
 
 #include <drm/ane_accel.h>
 
+#include "ane_stats.h"
+
 struct ane_device {
 	struct drm_device drm;
 	struct device *dev;
@@ -46,7 +48,12 @@ struct ane_device {
 	int dart_count;
 
 	int irq;
+	/* Protects mm and the iommu_map()/iommu_unmap() calls on domain. */
 	struct mutex iommu_lock;
+	/*
+	 * Serializes engine access (submit, BO mapping, recovery, removal)
+	 * and protects bo_list, preserved_list and removed.
+	 */
 	struct mutex engine_lock;
 	struct list_head bo_list;
 
@@ -98,7 +105,7 @@ struct ane_device {
 	 * run ~2x slower while schedutil parks the idle clusters low.
 	 */
 	struct ane_boost {
-		struct mutex lock;
+		struct mutex lock;	/* protects the fields below */
 		struct delayed_work off;
 		struct freq_qos_request *legs;
 		int nlegs;
@@ -107,6 +114,16 @@ struct ane_device {
 		bool busy;
 		bool on;
 	} boost;
+
+	/*
+	 * Producer-side stats (sysfs ane_stats, debugfs ane_timeline;
+	 * see ane_stats.h). stats=0 or a failed ring allocation leaves
+	 * stats_slots NULL, which is the one hot-path gate: no files,
+	 * no counter updates.
+	 */
+	struct ane_stats_counters stats_ctrs;
+	struct ane_stats_ring stats_ring;
+	struct ane_stats_ring_entry *stats_slots;
 };
 
 struct ane_request {
@@ -115,7 +132,7 @@ struct ane_request {
 	u32 td_size;
 	u32 td_count;
 	u32 btsp_iova;
-	u32 bar[ANE_TILE_COUNT];
+	u32 bar[DRM_ANE_TILE_COUNT];
 };
 
 /*

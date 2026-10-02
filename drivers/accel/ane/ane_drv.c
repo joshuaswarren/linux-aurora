@@ -2,7 +2,9 @@
 /* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/atomic.h>
+#include <linux/device.h>
 #include <linux/iommu.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
@@ -11,6 +13,7 @@
 #include <linux/sysfs.h>
 
 #include <drm/drm_accel.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
@@ -53,6 +56,16 @@ module_param(map_mode, int, 0644);
 MODULE_PARM_DESC(map_mode,
 		 "BO mapping: bit0=IOMMU_CACHE DART descriptors, bit1=cacheable CPU vmas (default 3 = cached; 0 = writecombine + non-cacheable rollback)");
 
+/*
+ * Producer-side stats (ane_stats sysfs, ane_timeline debugfs), read
+ * once at probe. stats=0 keeps the hot path at its single predictable
+ * branch (the NULL stats_slots check) and no files are created.
+ */
+static bool stats = true;
+module_param(stats, bool, 0444);
+MODULE_PARM_DESC(stats,
+		 "Expose ane_stats sysfs and ane_timeline debugfs (default 1; 0 = no files and the hot path skips the counters)");
+
 #define CMD_BUF_BDX 0
 #define KRN_BUF_BDX 1
 
@@ -92,7 +105,7 @@ static int ane_iommu_map_pages(struct ane_device *ane, struct ane_bo *bo)
 	if (bo->mm)
 		return -EBUSY;
 
-	bo->mm = kzalloc(sizeof(*bo->mm), GFP_KERNEL);
+	bo->mm = kzalloc_obj(*bo->mm);
 	if (!bo->mm)
 		return -ENOMEM;
 
@@ -227,7 +240,7 @@ static void ane_preserve_bo(struct ane_device *ane, struct ane_bo *bo)
 {
 	struct ane_preserved *p;
 
-	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	p = kzalloc_obj(*p);
 	if (!p) {
 		/* Fail closed the old way: the node stays inserted and the
 		 * pages leak until reboot - safe, just unreclaimable.
@@ -352,6 +365,22 @@ static const struct drm_gem_object_funcs ane_gem_object_funcs = {
 	.vm_ops = &drm_gem_ane_vm_ops,
 };
 
+static int ane_get_caps(struct drm_device *drm, void *data,
+			struct drm_file *file)
+{
+	struct drm_ane_get_caps *args = data;
+
+	if (args->flags || args->pad)
+		return -EINVAL;
+
+	*args = (struct drm_ane_get_caps) {
+		.size = sizeof(*args),
+		.abi_version = DRM_ANE_ABI_V1,
+		.chip_family = DRM_ANE_CHIP_H13,
+	};
+	return 0;
+}
+
 static int ane_bo_init(struct drm_device *drm, void *data,
 		       struct drm_file *file)
 {
@@ -364,7 +393,7 @@ static int ane_bo_init(struct drm_device *drm, void *data,
 	if (args->pad || !args->size)
 		return -EINVAL;
 
-	bo = kzalloc(sizeof(struct ane_bo), GFP_KERNEL);
+	bo = kzalloc_obj(*bo);
 	if (!bo)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&bo->node);
@@ -460,10 +489,11 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct ane_device *ane = drm->dev_private;
 	struct drm_ane_submit *args = data;
-	struct drm_gem_object *gem[ANE_TILE_COUNT] = { 0 };
+	struct drm_gem_object *gem[DRM_ANE_TILE_COUNT] = { 0 };
 	struct drm_gem_object *btsp = NULL;
 	struct ane_bo *bo;
 	struct ane_request req;
+	u32 stats_idx = 0;
 	int err;
 
 	memset(&req, 0, sizeof(req));
@@ -483,11 +513,11 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	}
 
 	req.qid = 4;
-	req.nid = ANE_FIFO_NID;
+	req.nid = DRM_ANE_FIFO_NID;
 	req.td_size = args->td_size;
 	req.td_count = args->td_count;
 
-	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+	for (int bdx = 0; bdx < DRM_ANE_TILE_COUNT; bdx++) {
 		if (!args->handles[bdx])
 			continue;
 		bo = bo_lookup(file, args->handles[bdx]);
@@ -497,8 +527,8 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 		}
 		gem[bdx] = &bo->base;
 		if (!bo->iova ||
-		    ((bdx == CMD_BUF_BDX) &&
-		     (args->tsk_size >= (bo->npages << ane->shift)))) {
+		    (bdx == CMD_BUF_BDX &&
+		     args->tsk_size >= (bo->npages << ane->shift))) {
 			err = -EINVAL;
 			goto put;
 		}
@@ -510,8 +540,8 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	 * access. Since this isn't page aligned, we represent the two as one
 	 * buffer and calculate the delimiter (where the weights would start).
 	 */
-	req.bar[KRN_BUF_BDX] =
-		req.bar[CMD_BUF_BDX] + round_up(args->tsk_size, ANE_CMD_GRAN);
+	req.bar[KRN_BUF_BDX] = req.bar[CMD_BUF_BDX] +
+			       round_up(args->tsk_size, DRM_ANE_CMD_GRAN);
 
 	bo = bo_lookup(file, args->btsp_handle);
 	if (!bo) {
@@ -545,15 +575,24 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	if (err < 0)
 		goto unlock;
 
+	if (ane->stats_slots)
+		stats_idx = ane_stats_begin(&ane->stats_ring, ktime_get_ns(),
+					    req.td_count);
+
 	ane_boost_begin(ane);
 	err = ane_tm_execute(ane, &req);
 	ane_boost_end(ane);
+
+	if (ane->stats_slots)
+		ane_stats_complete(&ane->stats_ctrs, &ane->stats_ring,
+				   stats_idx, ktime_get_ns(),
+				   err ? (u32)err : 0, ane_last_tmst);
 
 unlock:
 	mutex_unlock(&ane->engine_lock);
 put:
 	drm_gem_object_put(btsp);
-	for (int bdx = 0; bdx < ANE_TILE_COUNT; bdx++) {
+	for (int bdx = 0; bdx < DRM_ANE_TILE_COUNT; bdx++) {
 		if (gem[bdx])
 			drm_gem_object_put(gem[bdx]);
 	}
@@ -561,6 +600,7 @@ put:
 }
 
 static const struct drm_ioctl_desc ane_drm_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(ANE_GET_CAPS, ane_get_caps, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_INIT, ane_bo_init, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_FREE, ane_bo_free, 0),
 	DRM_IOCTL_DEF_DRV(ANE_SUBMIT, ane_submit, 0),
@@ -594,12 +634,47 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(reset);
 
+/*
+ * ane_stats: cumulative busy_ns/jobs for this device (mode 0444, no
+ * root needed). Formatting lives in ane_stats_show.c, shared with
+ * ane_t6021.ko.
+ */
+static ssize_t ane_stats_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct ane_device *ane = dev_get_drvdata(dev);
+
+	return ane_stats_emit(&ane->stats_ctrs, buf);
+}
+static DEVICE_ATTR_RO(ane_stats);
+
 static struct attribute *ane_dev_attrs[] = {
 	&dev_attr_wedged.attr,
 	&dev_attr_reset.attr,
+	&dev_attr_ane_stats.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(ane_dev);
+
+/* ane_stats appears only when stats=1 gave the device a ring. */
+static umode_t ane_dev_attr_is_visible(struct kobject *kobj,
+				       struct attribute *attr, int n)
+{
+	struct ane_device *ane = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (attr == &dev_attr_ane_stats.attr && !ane->stats_slots)
+		return 0;
+	return attr->mode;
+}
+
+static const struct attribute_group ane_dev_group = {
+	.attrs = ane_dev_attrs,
+	.is_visible = ane_dev_attr_is_visible,
+};
+
+static const struct attribute_group *ane_dev_groups[] = {
+	&ane_dev_group,
+	NULL,
+};
 
 static int ane_drm_open(struct drm_device *drm, struct drm_file *file)
 {
@@ -656,9 +731,9 @@ static void ane_drm_postclose(struct drm_device *drm, struct drm_file *file)
 }
 
 /*
- * The driver only owns three ioctls (ANE_BO_INIT, ANE_BO_FREE,
- * ANE_SUBMIT). Anything outside that table would otherwise fall through
- * the standard drm_ioctl path to legacy primary-node handlers that
+ * The driver only owns four ioctls (ANE_GET_CAPS, ANE_BO_INIT,
+ * ANE_BO_FREE, ANE_SUBMIT). The standard drm_ioctl path would otherwise
+ * pass anything outside that table to legacy primary-node handlers that
  * dereference drm_device.unique, which an accel node never sets. Reject
  * such callers explicitly so they fail with -ENOTTY instead of oopsing.
  *
@@ -732,10 +807,10 @@ static int ane_drm_mmap(struct file *file, struct vm_area_struct *vma)
 	 */
 	vm_flags_mod(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP, VM_PFNMAP);
 
-	if (map_mode & 2)
+	if (map_mode & 2) {
 		vma->vm_page_prot =
 			pgprot_decrypted(vm_get_page_prot(vma->vm_flags));
-	else {
+	} else {
 		vma->vm_page_prot =
 			pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
 		vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
@@ -764,7 +839,7 @@ static const struct drm_driver ane_drm_driver = {
 	.ioctls = ane_drm_ioctls,
 	.num_ioctls = ARRAY_SIZE(ane_drm_ioctls),
 	.fops = &ane_drm_fops,
-	.major = ANE_ABI_MAJOR,
+	.major = DRM_ANE_ABI_V1,
 	.name = "ane",
 	.desc = "Apple Neural Engine driver",
 };
@@ -842,8 +917,9 @@ static int ane_attach_genpd(struct ane_device *ane)
 {
 	struct device *dev = ane->dev;
 
-	ane->pd_count = of_count_phandle_with_args(
-		dev->of_node, "power-domains", "#power-domain-cells");
+	ane->pd_count = of_count_phandle_with_args(dev->of_node,
+						   "power-domains",
+						   "#power-domain-cells");
 	if (ane->pd_count < 1)
 		return ane->pd_count < 0 ? ane->pd_count : -EINVAL;
 	if (ane->pd_count == 1)
@@ -880,54 +956,33 @@ static int ane_attach_genpd(struct ane_device *ane)
 }
 
 /*
- * Per-SoC support descriptor, one per Linux `compatible`.
+ * Per-SoC descriptor, one per Linux `compatible`.
  *
  * Everything the probe needs except the SET block is derived from the
  * device tree by design: DART topology from "iommus", power wiring from
- * "power-domains", the engine window from "reg", the IRQ by name. Board
- * facts belong in the overlay, not in compiled constants. The SET block
- * is the one exception: the live overlays carry no range for it, so it
- * is compiled in per SoC — and only from a source that has proven the
+ * "power-domains", the engine window from "reg", the IRQ by name. The SET
+ * block is the one exception: the device tree carries no range for it, so
+ * it is compiled in per SoC, and only from a source that has proven the
  * address on hardware (m1n1 proxyclient ANE.ps_map, then a bound device).
  * A guessed SET base is not a bug but a brick: direct writes to the
  * block external-abort the SoC (T6001 named by netconsole 2026-09-16,
- * PS_SET0 down at 0x28e08c000; T8103 same mechanism at 0x23b70c000),
- * which is why a SoC without proven constants must refuse to bind
- * instead of carrying a guess.
- *
- * Qualification tiers:
- *  ANE_QUALIFIED   — execution proven on this silicon; binds normally.
- *  ANE_RECOGNIZED  — constants present, never run on hardware; binds
- *                    only with ane.allow_unqualified=1, loudly.
- *  ANE_UNSUPPORTED — no proven constants; refuses and names the data
- *                    needed to advance the port.
+ * PS_SET0 down at 0x28e08c000; T8103 same mechanism at 0x23b70c000).
+ * The M2 family (T602x, T8112) runs the ANE firmware and binds to
+ * ane_t6021 instead.
  */
-enum ane_qual {
-	ANE_QUALIFIED,
-	ANE_RECOGNIZED,
-	ANE_UNSUPPORTED,
-};
-
 struct ane_soc {
 	phys_addr_t ps_base;
-	enum ane_qual qual;
 	/* True when the tm/tq register file survives a genpd cycle in
 	 * retention and recovery must drain it (see ane_tm_drain_retained).
 	 */
 	bool tm_retention;
 };
 
-static bool allow_unqualified;
-module_param(allow_unqualified, bool, 0444);
-MODULE_PARM_DESC(allow_unqualified,
-		 "Bind recognized-but-unproven ANE SoCs (unverified SET base: external-abort risk)");
-
 static const struct ane_soc ane_soc_t8103 = {
 	/* M1 (m1-test-host). SET block mapped read-only for the recovery ACTUAL
 	 * log and the powered-on guard. Execution proven in the fleet.
 	 */
 	.ps_base = 0x23b70c000ULL,
-	.qual = ANE_QUALIFIED,
 };
 
 static const struct ane_soc ane_soc_t6000 = {
@@ -935,42 +990,12 @@ static const struct ane_soc ane_soc_t6000 = {
 	 * (proven on T6001/t6001-test-host); M1 Pro and M1 Ultra are untested.
 	 */
 	.ps_base = 0x28e08c000ULL,
-	.qual = ANE_QUALIFIED,
 	.tm_retention = true,
-};
-
-static const struct ane_soc ane_soc_t6020 = {
-	/* M2 Pro (t6020). Community device-tree captures exist, but the
-	 * SET base is unproven and the H14 compiler backend is unqualified:
-	 * no constants may enter here yet.
-	 */
-	.ps_base = 0,
-	.qual = ANE_UNSUPPORTED,
-};
-
-static const struct ane_soc ane_soc_t6021 = {
-	/* M2 Max (T6021, t6021-test-host). SET window 0x8e08c000 = pmgr base
-	 * 0x8e080000 + 0xc000, present in ane0's own reg on macOS captures
-	 * of both 26.6.2 and 27.0 (2026-09-18, 11/11 derivation-input
-	 * checks each, zero delta); the Linux translation reuses the pmgr
-	 * high bits proven on T6000/T6020 rows (low-32 match) ->
-	 * 0x28e08c000. Recognized, not qualified: constants complete, but
-	 * no Linux execution yet, and the t6021 pwrstate word layout
-	 * (which of set0/base/set1..4 sits at which offset — macOS-side
-	 * capture cannot see it) is unverified; the first probe resume
-	 * logs the ACTUAL nibbles through this window as the Linux-side
-	 * probe (receipt 2026-09-18-t6021-driver-entry-prepared.md).
-	 * Promotion to ANE_QUALIFIED needs an exact run on this silicon.
-	 */
-	.ps_base = 0x28e08c000ULL,
-	.qual = ANE_RECOGNIZED,
 };
 
 static const struct of_device_id ane_of_match[] = {
 	{ .compatible = "apple,t8103-ane", .data = &ane_soc_t8103 },
 	{ .compatible = "apple,t6000-ane", .data = &ane_soc_t6000 },
-	{ .compatible = "apple,t6020-ane", .data = &ane_soc_t6020 },
-	{ .compatible = "apple,t6021-ane", .data = &ane_soc_t6021 },
 	{}
 };
 
@@ -979,31 +1004,10 @@ MODULE_DEVICE_TABLE(of, ane_of_match);
 static int ane_platform_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	const struct of_device_id *id = of_match_device(ane_of_match, dev);
-	const struct ane_soc *soc = id->data;
+	const struct ane_soc *soc = of_device_get_match_data(dev);
 	struct ane_device *ane;
 	struct drm_device *drm;
 	int err;
-
-	/* Tier gate before any power-domain, MMIO or IRQ interaction: an
-	 * unqualified SoC must fail cleanly, never half-probe.
-	 */
-	if (soc->qual == ANE_UNSUPPORTED) {
-		dev_err(dev,
-			"%s: unsupported ANE: no proven SET-block base (a guessed base external-aborts the SoC); not binding. To advance this port, run the mlx-omarchy quick collector (scripts/collect_quick.py: captures ANE/DART/PMGR/AIC device-tree data, no driver needed) and submit the capture\n",
-			id->compatible);
-		return -ENODEV;
-	}
-	if (soc->qual == ANE_RECOGNIZED && !allow_unqualified) {
-		dev_err(dev,
-			"%s: recognized but unqualified: constants present, execution never proven on this silicon; not binding. Override with ane.allow_unqualified=1, or prove a run and report it\n",
-			id->compatible);
-		return -ENODEV;
-	}
-	if (soc->qual == ANE_RECOGNIZED)
-		dev_warn(dev,
-			 "%s: UNQUALIFIED bind forced by allow_unqualified: no execution proven on this silicon — SET-block base and board topology unverified\n",
-			 id->compatible);
 
 	ane = devm_drm_dev_alloc(dev, &ane_drm_driver, struct ane_device, drm);
 	if (IS_ERR(ane))
@@ -1017,6 +1021,25 @@ static int ane_platform_probe(struct platform_device *pdev)
 
 	atomic_set(&ane->wedged, 0);
 	ane->tm_retention = soc->tm_retention;
+
+	/* Producer-side stats: preallocate the ring at probe; the files
+	 * and the hot-path branch key off stats_slots.
+	 */
+	if (stats) {
+		ane->stats_slots = devm_kcalloc(dev,
+						1u << ANE_STATS_RING_ORDER_DEFAULT,
+						sizeof(*ane->stats_slots),
+						GFP_KERNEL);
+		if (ane->stats_slots) {
+			ane_stats_counters_init(&ane->stats_ctrs,
+						&ane->stats_ring,
+						ANE_STATS_RING_ORDER_DEFAULT);
+			ane->stats_ring.slots = ane->stats_slots;
+		} else {
+			dev_warn(dev,
+				 "ane_stats ring allocation failed; stats disabled\n");
+		}
+	}
 
 	/* Managed power first: genpd links hold the ANE/DART supplier
 	 * topology awake before any register is touched.
@@ -1093,6 +1116,11 @@ static int ane_platform_probe(struct platform_device *pdev)
 	err = ane_dart_init(ane);
 	if (err < 0)
 		goto put_pm;
+
+	if (ane->stats_slots)
+		drm_debugfs_add_file(drm, "ane_timeline",
+				     ane_stats_timeline_show,
+				     &ane->stats_ring);
 
 	err = drm_dev_register(drm, 0);
 	if (err < 0)
@@ -1172,10 +1200,13 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 		 * SET window reads come first (pmgr class, always safe
 		 * per T6001/T8103 bisect evidence), then the engine. A
 		 * hard reset after the last off-box line names the
-		 * killing access exactly (T6021 console bring-up).
+		 * killing access exactly.
 		 */
-		struct resource *eng = platform_get_resource_byname(
-			to_platform_device(dev), IORESOURCE_MEM, "engine");
+		struct platform_device *pdev = to_platform_device(dev);
+		struct resource *eng;
+
+		eng = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+						   "engine");
 
 		dev_info(dev,
 			 "ANE-resume: genpd raise complete; SET window probe next\n");
@@ -1198,8 +1229,8 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 		/* Linux-side pwrstate probe: ACTUAL nibbles read through
 		 * the SoC descriptor's SET window while the partition is
 		 * raised. 0xffffff means the mapped window is the live
-		 * pmgr SET block with every word on; anything else names
-		 * the t6021 word layout to fix before promotion.
+		 * pmgr SET block with every word on; anything else means
+		 * the window does not match the expected word layout.
 		 */
 		dev_info(dev, "ANERD ps probe act=%#x\n", ane_ps_act(ane));
 	}

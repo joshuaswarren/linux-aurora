@@ -6,9 +6,11 @@ ane-y := \
 	ane_drv.o \
 	ane_tm.o \
 	ane_dart.o \
-	ane_boost.o
+	ane_boost.o \
+	ane_stats_show.o
 
 ane_t6021-y := \
 	ane_t6021_rtclient_main.o \
 	ane_t6021_fwload.o \
-	ane_t6021_boot.o
+	ane_t6021_boot.o \
+	ane_stats_show.o

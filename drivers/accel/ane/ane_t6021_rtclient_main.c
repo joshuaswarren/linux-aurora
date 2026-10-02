@@ -87,6 +87,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_accel.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -95,6 +96,7 @@
 #include <drm/drm_mm.h>
 #include <crypto/sha2.h>
 
+#include "ane_stats.h"
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
 
@@ -177,6 +179,17 @@ module_param(hello_wait_ms, uint, 0444);
 MODULE_PARM_DESC(hello_wait_ms,
 		 "RTKit HELLO wait in legacy mode; 0 (default) skips RTKit and leaves the mailbox stopped. A firmware that speaks RTKit needs 1000.");
 
+/*
+ * Producer-side stats (ane_stats sysfs, ane_timeline debugfs), read
+ * once at probe. stats=0 keeps the hot path at its single predictable
+ * branch (the NULL stats_slots check) and no files are created. Same
+ * name and meaning as ane.ko's parameter.
+ */
+static bool stats = true;
+module_param(stats, bool, 0444);
+MODULE_PARM_DESC(stats,
+		 "Expose ane_stats sysfs and ane_timeline debugfs (default 1; 0 = no files and the hot path skips the counters)");
+
 #define ANE_LEGACY_ALLOCS 8192
 #define ANE_LEGACY_BYTES SZ_512M
 
@@ -222,6 +235,15 @@ struct ane_rtclient {
 	 * which the firmware may reference forever (held until reboot).
 	 */
 	struct ane_legacy_buffer *cmd_buf;
+
+	/*
+	 * Producer-side stats (see ane_stats.h). stats=0 or a failed
+	 * ring allocation leaves stats_slots NULL, which is the one
+	 * hot-path gate: no files, no counter updates.
+	 */
+	struct ane_stats_counters stats_ctrs;
+	struct ane_stats_ring stats_ring;
+	struct ane_stats_ring_entry *stats_slots;
 };
 
 /* Per-open BO ownership (drm_file->driver_priv). Handles live in the
@@ -506,6 +528,9 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 
 		if (pending) {
 			writel(pending, ipi + 0xc000);
+			/* Complete the IPI acknowledgment before the
+			 * next reads of the command and malloc rings.
+			 */
 			mb();
 		}
 		header = READ_ONCE(io[0]);
@@ -617,7 +642,7 @@ MODULE_PARM_DESC(call_settle_us,
  * trace state is protected by ane_t6021_fw_lock.
  */
 #define ANE_TRACE_MAGIC		0x31445441	/* "ATD1" */
-#define ANE_TRACE_RECS		(1U << 18)
+#define ANE_TRACE_RECS		BIT(18)
 #define ANE_PMGR_PS_LAST_OFF	0x30
 
 enum {
@@ -886,6 +911,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						     unsigned int timeout_ms)
 {
 	int ret;
+	u32 stats_idx = 0;
 
 	ane_t6021_tracing = opcode == CSNE_CMD_PROCEDURE_CALL && trace_td &&
 			    ane->soc->trace_td_off;
@@ -893,10 +919,17 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		ane_t6021_trace->calls++;
 		ane_t6021_trace_add(ANE_TR_CALL, 0);
 	}
+	if (ane->stats_slots)
+		stats_idx = ane_stats_begin(&ane->stats_ring, ktime_get_ns(),
+					    1);
 	ret = ane_rtclient_legacy_exchange(ane, command, length, opcode,
 					   channel, timeout_ms);
 	if (ret) {
 		ane_t6021_tracing = false;
+		if (ane->stats_slots)
+			ane_stats_complete(&ane->stats_ctrs,
+					   &ane->stats_ring, stats_idx,
+					   ktime_get_ns(), (u32)ret, 0);
 		dev_info(ane->dev, "EXCH op=%#x failed %d (fw allocs %u, %zu bytes)\n",
 			 opcode, ret, ane->legacy_allocated, ane->legacy_bytes);
 		atomic_set(&ane_t6021_quarantined, 1);
@@ -910,12 +943,20 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		if (!ret && call_settle_us)
 			usleep_range(call_settle_us, call_settle_us + 100);
 		if (ret) {
+			if (ane->stats_slots)
+				ane_stats_complete(&ane->stats_ctrs,
+						   &ane->stats_ring,
+						   stats_idx, ktime_get_ns(),
+						   (u32)ret, 0);
 			dev_info(ane->dev, "call completion wait failed %d\n",
 				 ret);
 			atomic_set(&ane_t6021_quarantined, 1);
 			return ret;
 		}
 	}
+	if (ane->stats_slots)
+		ane_stats_complete(&ane->stats_ctrs, &ane->stats_ring,
+				   stats_idx, ktime_get_ns(), 0, 0);
 	/* The fw talks back on the target-to-host rings (fwlog, perf);
 	 * hand those slots back so the rings never fill (the sequencer
 	 * did this per step; same ack, channels 4 and 6).
@@ -990,9 +1031,10 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	size_t binds_size;
 	int ret, i, j;
 
-	if (user->section_count < 1 ||
+	BUILD_BUG_ON(DRM_ANE_MAX_SECTIONS != ANE_T6021_LOAD_SEC_COUNT);
+	if (user->pad || user->section_count < 1 ||
 	    user->section_count > ANE_T6021_LOAD_SEC_COUNT ||
-	    user->generic_count > ANE_M2_MAX_BINDS || !fd)
+	    user->generic_count > DRM_ANE_MAX_BINDS || !fd)
 		return -EINVAL;
 
 	sections = kmalloc_array(user->section_count, sizeof(*sections),
@@ -1015,6 +1057,12 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 					binds_size)) {
 		ret = -EFAULT;
 		goto out;
+	}
+	for (i = 0; i < user->generic_count; i++) {
+		if (binds[i].pad) {
+			ret = -EINVAL;
+			goto out;
+		}
 	}
 
 	/* Lab contract: the record slot IS the section identity (slot =
@@ -1075,7 +1123,8 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 			sha256_update(&sha, (const u8 *)hdr, sizeof(hdr));
 			left = sections[i].size;
 			while (left) {
-				size_t n = min(left, (size_t)ANE_T6021_BO_HASH_CHUNK);
+				size_t n = min_t(size_t, left,
+						 ANE_T6021_BO_HASH_CHUNK);
 
 				memcpy(scratch, (const u8 *)bo->cpu +
 				       sections[i].offset +
@@ -1248,7 +1297,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	size_t cmd_size;
 	int ret, i;
 
-	if (user->count < 1 || user->count > ANE_M2_MAX_BINDS ||
+	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
 	    user->priority < 2 || user->priority > 7 || !fd)
 		return -EINVAL;
 
@@ -1259,6 +1308,12 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	if (copy_from_user(ios, u64_to_user_ptr(user->io_ptr), ios_size)) {
 		kfree(ios);
 		return -EFAULT;
+	}
+	for (i = 0; i < user->count; i++) {
+		if (ios[i].flags || ios[i].reserved) {
+			kfree(ios);
+			return -EINVAL;
+		}
 	}
 
 	cmd_size = sizeof(struct ane_csne_cmd_procedure_call) +
@@ -1364,7 +1419,8 @@ static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
 	struct ane_t6021_bo *bo;
 	struct ane_rtclient *ane;
 
-	if (args->size == 0 || args->size > ANE_T6021_BO_MAX || !fd)
+	if (args->pad || args->size == 0 || args->size > ANE_T6021_BO_MAX ||
+	    !fd)
 		return -EINVAL;
 	/* A parked io BO is already mapped and counted; its old contents
 	 * belong to another process, so it is zeroed like a new one.
@@ -1385,7 +1441,7 @@ static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
 		return -ENOSPC;
 	}
 	ane = to_ane_t6021_drm(drm)->ane;
-	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	bo = kzalloc_obj(*bo);
 	if (!bo) {
 		atomic64_sub(PAGE_ALIGN(args->size), &ane_t6021_bo_total_bytes);
 		return -ENOMEM;
@@ -1447,6 +1503,8 @@ static int ane_t6021_bo_free_ioctl(struct drm_device *drm, void *data,
 
 	if (!fd)
 		return -ENODEV;
+	if (args->pad)
+		return -EINVAL;
 	mutex_lock(&ane_t6021_bo_lock);
 	list_for_each_entry(b, &fd->bos, node) {
 		if (b->handle == args->handle) {
@@ -1517,7 +1575,7 @@ static int ane_t6021_open(struct drm_device *drm, struct drm_file *file)
 {
 	struct ane_t6021_fd *fd;
 
-	fd = kzalloc(sizeof(*fd), GFP_KERNEL);
+	fd = kzalloc_obj(*fd);
 	if (!fd)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&fd->bos);
@@ -1538,6 +1596,25 @@ static void ane_t6021_postclose(struct drm_device *drm, struct drm_file *file)
 	mutex_unlock(&ane_t6021_bo_lock);
 	kfree(fd);
 	file->driver_priv = NULL;
+}
+
+static int ane_t6021_get_caps_ioctl(struct drm_device *drm, void *data,
+				    struct drm_file *file)
+{
+	struct drm_ane_get_caps *args = data;
+
+	if (args->flags || args->pad)
+		return -EINVAL;
+
+	*args = (struct drm_ane_get_caps) {
+		.size = sizeof(*args),
+		.abi_version = DRM_ANE_ABI_V2,
+		.chip_family = DRM_ANE_CHIP_H14,
+		.section_size = sizeof(struct drm_ane_section),
+		.bind_size = sizeof(struct drm_ane_generic_bind),
+		.exec_io_size = sizeof(struct drm_ane_exec_io),
+	};
+	return 0;
 }
 
 static int ane_t6021_submit_ioctl(struct drm_device *drm, void *data,
@@ -1650,6 +1727,7 @@ static int ane_t6021_exec_ioctl(struct drm_device *drm, void *data,
 }
 
 static const struct drm_ioctl_desc ane_t6021_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(ANE_GET_CAPS, ane_t6021_get_caps_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_INIT, ane_t6021_bo_init_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(ANE_BO_FREE, ane_t6021_bo_free_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(ANE_SUBMIT, ane_t6021_submit_ioctl, 0),
@@ -1685,7 +1763,7 @@ static const struct drm_driver ane_t6021_drm_driver = {
 	.ioctls = ane_t6021_ioctls,
 	.num_ioctls = ARRAY_SIZE(ane_t6021_ioctls),
 	.fops = &ane_t6021_fops,
-	.major = ANE_ABI_M2_MAJOR,
+	.major = DRM_ANE_ABI_V2,
 	.minor = 0,
 	.name = "ane",
 	.desc = "Apple Neural Engine (T6021/M2)",
@@ -1846,7 +1924,7 @@ static int ane_rtclient_attach_genpd(struct ane_rtclient *ane)
 		if (pd->dev == dev)
 			goto found;
 
-	pd = kzalloc(sizeof(*pd), GFP_KERNEL);
+	pd = kzalloc_obj(*pd);
 	if (!pd) {
 		err = -ENOMEM;
 		goto out;
@@ -2199,9 +2277,9 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 					 READ_ONCE(((u32 *)command->cpu)[1]),
 					 READ_ONCE(((u32 *)command->cpu)[2]),
 					 qret);
-				if (qret)
+				if (qret) {
 					cfg_err = qret;
-				else if (!READ_ONCE(((u32 *)command->cpu)[2])) {
+				} else if (!READ_ONCE(((u32 *)command->cpu)[2])) {
 					dev_err(dev,
 						"LEGACY CONFIG_GET reply word +0x08 zero\n");
 					cfg_err = -EPROTO;
@@ -2264,6 +2342,25 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		return -EPROTO;
 	}
 
+	/* Producer-side stats: preallocate the ring at probe; the files
+	 * and the hot-path branch key off stats_slots.
+	 */
+	if (stats) {
+		ane->stats_slots = devm_kcalloc(dev,
+						1u << ANE_STATS_RING_ORDER_DEFAULT,
+						sizeof(*ane->stats_slots),
+						GFP_KERNEL);
+		if (ane->stats_slots) {
+			ane_stats_counters_init(&ane->stats_ctrs,
+						&ane->stats_ring,
+						ANE_STATS_RING_ORDER_DEFAULT);
+			ane->stats_ring.slots = ane->stats_slots;
+		} else {
+			dev_warn(dev,
+				 "ane_stats ring allocation failed; stats disabled\n");
+		}
+	}
+
 	{
 		struct ane_t6021_drm *adrm;
 		int drmret;
@@ -2280,6 +2377,10 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		}
 		adrm->dev = dev;
 		adrm->ane = ane;
+		if (ane->stats_slots)
+			drm_debugfs_add_file(&adrm->drm, "ane_timeline",
+					     ane_stats_timeline_show,
+					     &ane->stats_ring);
 		WRITE_ONCE(ane_t6021_perf_ane, ane);
 		drmret = drm_dev_register(&adrm->drm, 0);
 		if (drmret) {
@@ -2289,7 +2390,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		}
 		dev_info(dev,
 			 "loaded ane_t6021 (DRM major %d minor %d; ABI 2; legacy_only=%u chman_ok=%u booted=%u; state %s; BO cap %u MiB)\n",
-			 ANE_ABI_M2_MAJOR, 0,
+			 DRM_ANE_ABI_V2, 0,
 			 legacy_only, ane->chman_ok,
 			 ane->fw ? ane->fw->booted : 0,
 			 ane->held ? "HELD" : "ready", bo_total_max_mb);
@@ -2298,11 +2399,11 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 	return 0;
 
 err_pm_or_hold:
-	if (ane->held)
+	if (ane->held) {
 		dev_warn(dev,
 			 "probe failed after CPU start (%pe) — binding fenced; power/rings/IRQ HELD until reboot\n",
 			 ERR_PTR(ret));
-	else {
+	} else {
 		pm_runtime_put_sync_suspend(dev);
 		pm_runtime_disable(dev);
 	}
@@ -2332,10 +2433,51 @@ static const struct of_device_id ane_rtclient_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, ane_rtclient_of_match);
 
+/*
+ * ane_stats: cumulative busy_ns/jobs for this device (mode 0444, no
+ * root needed). Formatting lives in ane_stats_show.c, shared with
+ * ane.ko.
+ */
+static ssize_t ane_stats_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct ane_rtclient *ane = dev_get_drvdata(dev);
+
+	return ane_stats_emit(&ane->stats_ctrs, buf);
+}
+static DEVICE_ATTR_RO(ane_stats);
+
+static struct attribute *ane_t6021_stats_attrs[] = {
+	&dev_attr_ane_stats.attr,
+	NULL,
+};
+
+/* ane_stats appears only when stats=1 gave the device a ring. */
+static umode_t ane_t6021_stats_is_visible(struct kobject *kobj,
+					  struct attribute *attr, int n)
+{
+	struct ane_rtclient *ane = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (attr == &dev_attr_ane_stats.attr && !ane->stats_slots)
+		return 0;
+	return attr->mode;
+}
+
+static const struct attribute_group ane_t6021_stats_group = {
+	.attrs = ane_t6021_stats_attrs,
+	.is_visible = ane_t6021_stats_is_visible,
+};
+
+static const struct attribute_group *ane_t6021_stats_groups[] = {
+	&ane_t6021_stats_group,
+	NULL,
+};
+
 static struct platform_driver ane_rtclient_driver = {
 	.driver = {
 		.name = "ane_t6021",
 		.of_match_table = ane_rtclient_of_match,
+		.dev_groups = ane_t6021_stats_groups,
 		.suppress_bind_attrs = true,
 	},
 	.probe = ane_rtclient_probe,
