@@ -4585,23 +4585,56 @@ impl G17PLiveRuntime {
                     batch.recovery_records,
                     batch.blamed_stamp,
                 )?;
-            self.service_primary_recovery()?;
+            self.service_primary_recovery_nested()?;
         }
         self.service_async_render_completions([0; 2])?;
         Ok(batch.notification_count)
     }
 
+    /// Top-level recovery service (the recovery worker's outermost hold):
+    /// may rebuild the session in place when one was requested.
     pub(crate) fn service_primary_recovery(&mut self) -> Result {
-        if !self.primary_recovery_pending() { return Ok(()); }
+        if !self.recovery_service_admitted()? { return Ok(()); }
+        if self.service_requested_session_rebuild()? { return Ok(()); }
+        self.service_primary_recovery_body()
+    }
+
+    /// Recovery service from inline event service, which can run inside a
+    /// publication. Identical except that it never rebuilds the session in
+    /// place: a requested rebuild already queued the recovery worker, which
+    /// performs it at its own top level once this hold ends. The rebuild
+    /// replaces the session, so the pending firmware recovery is not serviced
+    /// here either -- exactly what the top-level path does after rebuilding.
+    /// Keeps the session rebuild (and `boot_session`) off nested stacks
+    /// (tests/audit_g17_publication_stack.py).
+    fn service_primary_recovery_nested(&mut self) -> Result {
+        if !self.recovery_service_admitted()? { return Ok(()); }
+        if self.session_rebuild_requested {
+            if let Some(drm) = self.drm.as_ref() {
+                crate::driver::queue_g17p_recovery_worker(drm.clone());
+            }
+            return Ok(());
+        }
+        self.service_primary_recovery_body()
+    }
+
+    /// Common admission: a pending recovery, the device present, and every
+    /// preparation drained (otherwise the recovery worker joins them first).
+    fn recovery_service_admitted(&mut self) -> Result<bool> {
+        if !self.primary_recovery_pending() { return Ok(false); }
         if self.preparations.is_removed() { return Err(ENODEV); }
         self.preparations.close(false);
         if !self.preparations.is_drained() {
             if let Some(drm) = self.drm.as_ref() {
                 crate::driver::queue_g17p_recovery_worker(drm.clone());
             }
-            return Ok(());
+            return Ok(false);
         }
-        if self.service_requested_session_rebuild()? { return Ok(()); }
+        Ok(true)
+    }
+
+    #[inline(never)]
+    fn service_primary_recovery_body(&mut self) -> Result {
         self.note_service_pass_entry();
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
         let state = self.gfx_state.as_ref().cloned().ok_or(ENODEV)?;
@@ -4708,7 +4741,7 @@ impl G17PLiveRuntime {
         // The scan above re-reads quarantined commands too, but it can fail
         // before reaching them (the warning above). Firmware has just retired
         // whatever the recovery cancelled; observe that independently.
-        self.release_firmware_retired_quarantined_compute("post-recovery");
+        self.release_firmware_retired_quarantined_compute_nested("post-recovery");
         self.log_recovery_alignment("post-recovery");
         // Realign before the next kick. Continuity across a recovery is exactly
         // the assumption the evidence contradicts.
@@ -6169,7 +6202,13 @@ impl G17PLiveRuntime {
                     error,
                 );
             }
-            self.rebuild_session_or_defer()?;
+            // Completions are settled inside event and recovery service,
+            // which can itself run inside a publication: never rebuild the
+            // session that deep (kernel stack). Close admission and hand the
+            // rebuild to the recovery worker -- exactly the outcome
+            // `rebuild_session_or_defer` already gives when preparations are
+            // in flight -- so no submission can reuse this state first.
+            return Err(self.request_session_rebuild(EAGAIN));
         }
         Ok(true)
     }
@@ -8524,6 +8563,13 @@ impl G17PLiveRuntime {
                 return Ok(());
             }
             let _ = self.service_firmware_events_inline();
+            // A requested session rebuild is performed by the recovery worker
+            // at its own top level, never inside a publication (kernel stack;
+            // `service_primary_recovery_nested`). Nothing can be published on
+            // this session before it: refuse now rather than poll out.
+            if self.session_rebuild_requested {
+                return Err(EAGAIN);
+            }
             if !self.preparations.is_drained() && self.primary_recovery_pending() {
                 return Err(EAGAIN);
             }

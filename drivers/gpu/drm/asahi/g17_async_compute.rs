@@ -214,6 +214,44 @@ impl G17PLiveRuntime {
         )
     }
 
+    /// Build (or take the boot graph for) a new queue entry and append it.
+    /// Out of line and cold: the queue entry is several KiB and is staged on
+    /// the stack while it is constructed; keep that off the submit path's
+    /// frame (only queue creation pays it).
+    #[cold]
+    #[inline(never)]
+    fn create_async_compute_queue(&mut self) -> Result<usize> {
+        self.async_compute_queues.reserve(1, GFP_KERNEL)?;
+        // Reuse the unsubmitted boot graph, preserving QID 4 as first queue.
+        let queue = if self.compute_binding.is_none() && self.pending_compute.is_none() {
+            self.queue.take()
+        } else { None };
+        let queue = match queue {
+            Some(queue) => queue,
+            None => self.manager.as_mut().ok_or(ENODEV)?
+                .prepare_g17p_compute_queue(self.drm.as_ref().ok_or(ENODEV)?)?,
+        };
+        self.queue_setup_pending = false;
+        let index = self.async_compute_queues.len();
+        self.async_compute_queues.push(G17PAsyncComputeQueue {
+            owner: None, queue, binding: None, context: None,
+            inflight: G17PAsyncComputeInflight::new(),
+            previous_binding: None,
+            released: false, retirement_ready: false,
+            quarantined: false, retired_by_teardown: false,
+            terminal_fanout: None,
+            retire_pending: false,
+            awaiting_retirement_witness: false,
+            retired_leases: G17PAsyncComputeRetiredLeases::new(),
+            spared_quarantine: false,
+            first_kick_watch: false,
+            spared_deferred: false,
+            exit_kill: None,
+            exit_kill_refused: false,
+        }, GFP_KERNEL)?;
+        Ok(index)
+    }
+
     pub(crate) fn prepare_async_compute_queue(
         &mut self, owner: u64, vm: &mmu::Vm,
         context: Arc<crate::g17_resources::G17PLogicalQueueContext>,
@@ -223,7 +261,7 @@ impl G17PLiveRuntime {
         if let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) {
             return Ok((q.queue.queue_id(), q.context.as_ref().ok_or(EIO)?.clone()));
         }
-        self.release_firmware_retired_quarantined_compute("client-prepare");
+        self.release_firmware_retired_quarantined_compute_nested("client-prepare");
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.stage_compute_flist_state()?;
         let free = self.async_compute_queues.iter().position(|q|
@@ -253,34 +291,7 @@ impl G17PLiveRuntime {
                 )
             });
         let index = if let Some(index) = free { index } else {
-            self.async_compute_queues.reserve(1, GFP_KERNEL)?;
-            // Reuse the unsubmitted boot graph, preserving QID 4 as first queue.
-            let queue = if self.compute_binding.is_none() && self.pending_compute.is_none() {
-                self.queue.take()
-            } else { None };
-            let queue = match queue {
-                Some(queue) => queue,
-                None => manager.prepare_g17p_compute_queue(self.drm.as_ref().ok_or(ENODEV)?)?,
-            };
-            self.queue_setup_pending = false;
-            let index = self.async_compute_queues.len();
-            self.async_compute_queues.push(G17PAsyncComputeQueue {
-                owner: None, queue, binding: None, context: None,
-                inflight: G17PAsyncComputeInflight::new(),
-                previous_binding: None,
-                released: false, retirement_ready: false,
-                quarantined: false, retired_by_teardown: false,
-                terminal_fanout: None,
-                retire_pending: false,
-                awaiting_retirement_witness: false,
-                retired_leases: G17PAsyncComputeRetiredLeases::new(),
-                spared_quarantine: false,
-                first_kick_watch: false,
-                spared_deferred: false,
-                exit_kill: None,
-                exit_kill_refused: false,
-            }, GFP_KERNEL)?;
-            index
+            self.create_async_compute_queue()?
         };
         let q = &mut self.async_compute_queues[index];
         if q.binding.is_some() != q.context.is_some() {
@@ -314,7 +325,7 @@ impl G17PLiveRuntime {
         let reused_installed = !q.queue.requires_first_install();
         // All fallible mapping work precedes the ownership transition. An
         // allocation/validation failure leaves the old queue fully bound.
-        let binding = manager.bind_independent_compute_user_vm(
+        let binding = self.manager.as_mut().ok_or(ENODEV)?.bind_independent_compute_user_vm(
             &mut q.queue, vm, context.clone(),
         )?;
         q.queue.bind_logical_channel_control(&context)?;
@@ -1079,7 +1090,7 @@ impl G17PLiveRuntime {
             self.fail_outstanding_jobs_for_vm_after_compute_observation(&pending.0, pending.1);
         }
         if witness_pending {
-            self.release_firmware_retired_quarantined_compute("event");
+            self.release_firmware_retired_quarantined_compute_nested("event");
         }
         Ok(())
     }
@@ -1108,19 +1119,58 @@ impl G17PLiveRuntime {
     /// the QID remain retained exactly as before, because firmware still has
     /// the QID installed and sweeps it. A command that is still executing
     /// (runaway shader) never satisfies the test and stays pinned.
+    ///
+    /// Top-level form: only from an outermost Runtime hold (the event and
+    /// recovery workers' entries, a client's prepare/submit), because it may
+    /// publish iso4 REPLAY kicks, and publication can itself service firmware
+    /// events and recoveries inline. Event, recovery and release paths that
+    /// can run nested inside a publication use
+    /// `release_firmware_retired_quarantined_compute_nested`.
     fn release_firmware_retired_quarantined_compute(&mut self, reason: &'static str) {
-        if !self.async_compute_queues.iter().any(|q| q.awaiting_retirement_witness) {
-            return;
+        let replays = self.retire_witnessed_quarantined_compute(reason, true);
+        for (owner, kept) in replays.into_iter() {
+            self.replay_spared_compute(owner, kept);
         }
-        let pdev = self.pdev.as_ref();
-        let Some(manager) = self.manager.as_mut() else { return; };
-        match manager.firmware_recovery_handshake_snapshot() {
-            Ok(handshake) if handshake.state == 0 => {}
-            _ => return,
+    }
+
+    /// The witness from a context that may be nested inside a publication
+    /// (event service, recovery, owner release). Identical, except that a
+    /// queue whose witnessed kicks would be replayed is left untouched --
+    /// still quarantined and awaiting its witness, packets, pins and fences
+    /// as they are -- for the next top-level witness, which replays it. This
+    /// keeps publication out of the event/recovery call chain (kernel stack
+    /// depth; see tests/audit_g17_publication_stack.py).
+    fn release_firmware_retired_quarantined_compute_nested(&mut self, reason: &'static str) {
+        let replays = self.retire_witnessed_quarantined_compute(reason, false);
+        // Never collected without `replay`; fail any as the pre-REPLAY path
+        // would rather than drop a packet with its fence unsignalled.
+        for (_, kept) in replays.into_iter() {
+            for replay in kept.into_iter() {
+                if let Ok(completion) = replay.packet.completion() {
+                    completion.complete(Err(ENODATA));
+                }
+            }
         }
+    }
+
+    /// One witness scan. With `replay` false, replay candidates are skipped
+    /// (see `release_firmware_retired_quarantined_compute_nested`).
+    #[inline(never)]
+    fn retire_witnessed_quarantined_compute(
+        &mut self, reason: &'static str, replay: bool,
+    ) -> KVec<(u64, KVec<G17PAsyncComputeReplay>)> {
         // iso4 REPLAY: never-started spared kicks kept across the witness, per
         // owner and in publication order, published again after this scan.
         let mut replays: KVec<(u64, KVec<G17PAsyncComputeReplay>)> = KVec::new();
+        if !self.async_compute_queues.iter().any(|q| q.awaiting_retirement_witness) {
+            return replays;
+        }
+        let pdev = self.pdev.as_ref();
+        let Some(manager) = self.manager.as_mut() else { return replays; };
+        match manager.firmware_recovery_handshake_snapshot() {
+            Ok(handshake) if handshake.state == 0 => {}
+            _ => return replays,
+        }
         for q in self.async_compute_queues.iter_mut() {
             if !q.awaiting_retirement_witness {
                 continue;
@@ -1154,7 +1204,6 @@ impl G17PLiveRuntime {
             ) {
                 Ok(false) => {}
                 Ok(true) => {
-                    q.awaiting_retirement_witness = false;
                     // iso4 REPLAY: a Vulkan client cannot be told that one
                     // command buffer was dropped -- any error is device loss
                     // or silently wrong results. When every kick this queue
@@ -1179,6 +1228,13 @@ impl G17PLiveRuntime {
                         q.inflight.iter().map(|active| active.packet.completion().ok()
                             .and_then(|completion| completion.replay_witness_words())),
                     );
+                    if !replay && decision == crate::g17_recovery_isolation::ComputeReplay::Replay {
+                        // Nested caller: leave this queue for the next
+                        // top-level witness, which replays it. Nothing has
+                        // changed yet; the witness above only read.
+                        continue;
+                    }
+                    q.awaiting_retirement_witness = false;
                     let replay_candidate =
                         decision != crate::g17_recovery_isolation::ComputeReplay::NotCandidate;
                     let mut unstarted = decision == crate::g17_recovery_isolation::ComputeReplay::Replay;
@@ -1341,9 +1397,7 @@ impl G17PLiveRuntime {
                 }
             }
         }
-        for (owner, kept) in replays.into_iter() {
-            self.replay_spared_compute(owner, kept);
-        }
+        replays
     }
 
     /// `g17p_recovery_isolation` REPLAY: publish again, oldest first, the
@@ -1599,7 +1653,7 @@ impl G17PLiveRuntime {
         // A departing client is the usual last event for a recovered queue:
         // its error fence woke it, and its file close has just parked the VM
         // teardown behind the quarantined command's job guard.
-        self.release_firmware_retired_quarantined_compute("owner-release");
+        self.release_firmware_retired_quarantined_compute_nested("owner-release");
         if let Some(index) = self.async_compute_queues.iter().position(|q| q.owner == Some(owner)) {
             let q = &self.async_compute_queues[index];
             if q.inflight.is_none() && !q.quarantined && q.previous_binding.is_none()
@@ -1609,7 +1663,7 @@ impl G17PLiveRuntime {
                 // No firmware-visible publication used this exact lease. Its
                 // private graph and client aliases can be dropped immediately.
                 // Published or ambiguous owners still follow retention below.
-                drop(self.async_compute_queues.remove(index));
+                self.drop_unpublished_compute_queue(index);
                 return;
             }
             let q = &mut self.async_compute_queues[index];
@@ -1650,6 +1704,15 @@ impl G17PLiveRuntime {
                 }
             }
         }
+    }
+
+    /// Remove and drop one never-published queue graph. Out of line: moving
+    /// the whole `G17PAsyncComputeQueue` out of the table stages several KiB
+    /// on the stack, which must not be part of every owner release's frame.
+    #[cold]
+    #[inline(never)]
+    fn drop_unpublished_compute_queue(&mut self, index: usize) {
+        drop(self.async_compute_queues.remove(index));
     }
 
     /// Cancel only the scheduler waiter. A published command must remain in
@@ -2048,6 +2111,13 @@ impl G17PLiveRuntime {
             crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::SETTLED_CANCELLED);
             self.settle_failed_deferred_render(slot, None, None, ECANCELED);
         }
+    }
+
+    /// Top-level witness for the event and recovery workers, called from their
+    /// outermost Runtime hold (`G17PRuntimeRef`) after the pass: replays the
+    /// queues a nested witness left for it.
+    pub(crate) fn service_compute_witness_top(&mut self, reason: &'static str) {
+        self.release_firmware_retired_quarantined_compute(reason);
     }
 
     /// ADMISSION_WAIT for compute submits: observe the retirement witness of

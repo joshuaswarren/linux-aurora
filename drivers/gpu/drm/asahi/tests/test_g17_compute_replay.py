@@ -26,7 +26,10 @@ def item(text, marker):
 
 
 compute = (root / "g17_async_compute.rs").read_text()
-witness = item(compute, "    fn release_firmware_retired_quarantined_compute(")
+scan = item(compute, "    fn retire_witnessed_quarantined_compute(")
+top = item(compute, "    fn release_firmware_retired_quarantined_compute(")
+nested = item(compute, "    fn release_firmware_retired_quarantined_compute_nested(")
+witness = scan + top
 replay = item(compute, "    fn replay_spared_compute(")
 native = item(compute, "    pub(crate) fn async_compute_native_dependency(")
 
@@ -35,6 +38,15 @@ native = item(compute, "    pub(crate) fn async_compute_native_dependency(")
 assert witness.index("return_witnessed_compute_queue(") < witness.index("replays.push_within_capacity(")
 assert "let kept = if returned {" in witness
 assert witness.index("for (owner, kept) in replays.into_iter()") > witness.index("Err(error) => {\n                    q.awaiting_retirement_witness = false;")
+# Only the top-level witness publishes. A nested scan (event/recovery service,
+# possibly inside a publication) skips a replay candidate before changing it,
+# leaving it awaiting the next top-level witness.
+assert "replay_spared_compute" in top and "replay_spared_compute" not in nested
+assert "retire_witnessed_quarantined_compute(reason, true)" in top
+assert "retire_witnessed_quarantined_compute(reason, false)" in nested
+skip = scan.index("if !replay && decision == crate::g17_recovery_isolation::ComputeReplay::Replay {")
+assert skip < scan.index("q.awaiting_retirement_witness = false;\n                    let replay_candidate")
+assert "replay_spared_compute" not in scan
 # The decision sees every kept kick's own words and any native consumer.
 assert "completion.replay_witness_words()" in witness
 assert "completion.has_native_consumer()" in witness

@@ -48,7 +48,8 @@ assert settle.index("self.pending_render.get(index)") < settle.index(
 signal = settle.index("self.defer_render_completion(signal, observed);")
 assert "signal.complete(Ok(" not in settle
 retire = settle.index("retire_render_usc_freelist_at_completion(render_slot)")
-recover = settle.index("rebuild_session_or_defer()")
+# Deferred to the recovery worker with admission closed (stack depth).
+recover = settle.index("self.request_session_rebuild(EAGAIN)")
 assert signal < retire < recover
 
 # Executable state-machine oracle. The manager first commits paired retirement

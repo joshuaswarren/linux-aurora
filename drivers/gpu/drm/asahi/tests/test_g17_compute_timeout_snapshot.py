@@ -24,7 +24,8 @@ def constant(source, name):
     return re.search(r"(?:pub\(crate\) )?const " + name + r": .*?;", source).group()
 
 
-diagnostic = block(manager, "    pub(crate) fn log_async_compute_timeout(")
+# The report half lives in its own cold frame (stack depth).
+diagnostic = block(manager, "    fn log_async_compute_timeout_report(") + block(manager, "    pub(crate) fn log_async_compute_timeout(")
 assert "queue.completion_descriptor" in diagnostic
 assert "registers" not in diagnostic and "fsleep" not in diagnostic
 assert "snapshot_initial_channel_group" not in diagnostic  # fixed slot zero is wrong

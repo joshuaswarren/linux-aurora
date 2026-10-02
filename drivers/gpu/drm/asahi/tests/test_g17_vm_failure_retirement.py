@@ -25,6 +25,8 @@ methods = "\n".join(block(compute, marker) for marker in [
     "    fn fail_outstanding_jobs_for_vm_after_compute_observation(",
     "    pub(crate) fn fail_outstanding_jobs_for_vm(",
     "    fn release_firmware_retired_quarantined_compute(",
+    "    fn release_firmware_retired_quarantined_compute_nested(",
+    "    fn retire_witnessed_quarantined_compute(",
 ])
 completion_methods = "\n".join(block(job, marker) for marker in [
     "    pub(crate) fn fail_while_owned(",

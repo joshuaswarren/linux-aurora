@@ -84,9 +84,15 @@ assert "self.defer_render_completion(signal, observed);" in settle_render, \
 assert settle_render.index("self.defer_render_completion(signal, observed);") \
     < settle_render.index("retire_render_usc_freelist_at_completion(render_slot)"), \
     'fallible retained cleanup can suppress a proven render completion'
+# The rebuild is handed to the recovery worker (stack depth); admission closes
+# first, so the state is still never reused before the processor stop.
 assert settle_render.index("retire_render_usc_freelist_at_completion(render_slot)") \
-    < settle_render.index("rebuild_session_or_defer()"), \
+    < settle_render.index("self.request_session_rebuild(EAGAIN)"), \
     'failed retained cleanup can be reused without a processor-stop boundary'
+request_rebuild = live_block("    fn request_session_rebuild(")
+assert "self.preparations.close(false);" in request_rebuild
+assert "self.accepting_submissions = false;" in request_rebuild
+assert "queue_g17p_recovery_worker" in request_rebuild
 # v92d: the watchdog entry itself returns nothing and hands the exact
 # still-pending owner to one failure sink after its final observation.
 exact_timeout = live_block("    pub(crate) fn timeout_deferred_render(")

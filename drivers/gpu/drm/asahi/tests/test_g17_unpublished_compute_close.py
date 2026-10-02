@@ -49,8 +49,8 @@ struct Queue {owner:Option<u64>,queue:G17PSksmQueue,inflight:Inflight,quarantine
 struct Runtime {async_compute_queues:Vec<Queue>,manager:Option<Manager>}
 impl Runtime {
  // recovery-leak witness (tested in test_g17_async_retirement.py): no queue here is quarantined.
- fn release_firmware_retired_quarantined_compute(&mut self,_reason:&'static str){}
-''' + item('g17_async_compute.rs', 'pub(crate) fn release_async_compute_queue(') + r'''
+ fn release_firmware_retired_quarantined_compute_nested(&mut self,_reason:&'static str){}
+''' + item('g17_async_compute.rs', 'fn drop_unpublished_compute_queue(') + item('g17_async_compute.rs', 'pub(crate) fn release_async_compute_queue(') + r'''
 }
 fn runtime()->Runtime{Runtime{async_compute_queues:vec![],manager:Some(Manager{channel_ids:ChannelTable::new()})}}
 fn add(r:&mut Runtime,id:u64,drops:&Arc<AtomicUsize>)->Lease{

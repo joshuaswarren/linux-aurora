@@ -21,7 +21,10 @@ def function(text: str, marker: str) -> str:
 
 
 drain = function(live, "fn drain_primary_firmware_event_batch(")
-recovery = function(live, "    pub(crate) fn service_primary_recovery(")
+# The service body is shared by the top-level and nested entries (stack depth).
+recovery = function(live, "    fn service_primary_recovery_body(")
+assert "self.service_primary_recovery_body()" in function(live, "    pub(crate) fn service_primary_recovery(")
+assert "self.service_primary_recovery_body()" in function(live, "    fn service_primary_recovery_nested(")
 assert ".firmware_event_notifications\n        .swap(0, Ordering::AcqRel)" in drain
 type4 = drain.index("g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE")
 assert drain.index("break;", type4) > drain.index("batch.recovery_generation = Some", type4)

@@ -81,6 +81,8 @@ impl G17PRuntimeRef {
             if e2e_entry != 0 { e2e_locked = crate::g17_e2e::now(); }
             runtime.begin_deferred_completion_drain();
             let result = runtime.service_primary_firmware_events();
+            // Outermost hold: replay what a nested witness left (iso4).
+            runtime.service_compute_witness_top("event-worker");
             let observable = !skip_enabled || runtime.render_observation_possible();
             (result, runtime.take_deferred_completions(), observable)
         };
@@ -213,6 +215,7 @@ impl G17PRuntimeRef {
             let mut runtime = self.mutex().lock();
             runtime.begin_deferred_completion_drain();
             let result = runtime.service_primary_recovery();
+            runtime.service_compute_witness_top("recovery-worker");
             (result, runtime.take_deferred_completions())
         };
         for completion in completed {
@@ -2913,6 +2916,9 @@ impl G17PQueue {
         })
     }
 
+    // Out of line: queue (re)creation builds a whole compute graph; keep its
+    // frame off submit_compute_async (ioctl stack depth).
+    #[inline(never)]
     fn ensure_async_compute_queue(&mut self) -> Result {
         // Recovery isolation: a spared queue is returned to service by its
         // firmware-retirement witness, normally within the recovery's own
