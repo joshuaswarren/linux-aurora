@@ -12625,14 +12625,36 @@ impl G17PManagerConstruction {
         queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         fence(Ordering::SeqCst);
         submission_phase.store(G17P_SUBMIT_PHASE_ADD_KICKS, Ordering::Release);
-        let entry_signal_record =
-            queue.compute.stage_record_entry_signal(record_slot, &entry_signal)?;
-        let write_index = self.publish_repeat_record(
-            queue,
-            "the tag-16 EntrySignal record",
-            after_kicks,
-            G17PRepeatRecord::Pointer(entry_signal_record),
-        )?;
+        // Native AGXCLCommandDescriptor (kext 0xfffffe0008862208..86227c)
+        // requests a KSMKickQueueEntrySignal only for a command whose barrier
+        // list names another context (or whose per-queue mode changed), and
+        // the CL submit (0x88606f8, 0x8860a1c) then sets that kick's own hold
+        // bit 254 and names the kick itself. An ordinary next kick on the same
+        // queue -- the second CL kick of one submission -- carries no hold bit
+        // and gets no EntrySignal: AddKicks alone admits it. B1's tag-16
+        // handler (0x11828) is a full KSM pause handshake (0x211c8/0x211d0),
+        // an entry RMW and an all-queue rescan (0x210d8/0x210e0 = -1), so
+        // publishing it for every kick adds a global scheduler pause per
+        // compute kick that native never issues. Keep it only where a barrier
+        // crosses to another hardware queue; knob bit 25 restores the old
+        // every-kick publication for same-boot A/B.
+        let cross_queue_barrier = context.barriers.iter()
+            .any(|barrier| barrier.queue_id != queue.queue_id);
+        let publish_entry_signal = cross_queue_barrier
+            || crate::g17_timing_buffer::diag_knob(
+                crate::g17_timing_buffer::DIAG_CL_ENTRY_SIGNAL_EVERY_KICK);
+        let write_index = if publish_entry_signal {
+            let entry_signal_record =
+                queue.compute.stage_record_entry_signal(record_slot, &entry_signal)?;
+            self.publish_repeat_record(
+                queue,
+                "the tag-16 EntrySignal record",
+                after_kicks,
+                G17PRepeatRecord::Pointer(entry_signal_record),
+            )?
+        } else {
+            after_kicks
+        };
         queue.compute.note_record_slot_published(record_slot, write_index);
         submission_phase.store(G17P_SUBMIT_PHASE_TAG16, Ordering::Release);
 

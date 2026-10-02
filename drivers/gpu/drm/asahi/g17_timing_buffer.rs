@@ -773,6 +773,10 @@ pub(crate) const DIAG_MCACHE_SELECTOR_NATIVE: u32 = 1 << 23;
 /// v89 A/B-only bit26: suspend the default native both-role trace/statistics
 /// ring consumers at runtime (the pre-v89 diagnostic-gated behaviour).
 pub(crate) const DIAG_NATIVE_RING_DRAIN_OFF: u32 = 1 << 26;
+/// bit25: A/B only. Publish the compute tag-16 EntrySignal on every repeat CL
+/// kick, as before the native per-command policy. Default clear: only a kick
+/// whose barriers name another hardware queue publishes one.
+pub(crate) const DIAG_CL_ENTRY_SIGNAL_EVERY_KICK: u32 = 1 << 25;
 
 /// v90 bits27..30: allocate render descriptors / TSQ node page / ChannelState
 /// prefix / ConfigUpdate as pooled firmware-cached objects (native bit41).
