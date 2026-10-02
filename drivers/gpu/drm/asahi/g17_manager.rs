@@ -8939,6 +8939,19 @@ impl G17PManagerConstruction {
         if !crate::util::g17p_verbose() {
             return;
         }
+        // Report half in its own cold frame; the per-storage page dumps
+        // (which nest further) run after it has returned.
+        self.log_render_status_pages_report(pair_slot, label);
+        let dev = self.resources.dev();
+        if let Some(storage) = self.render_slots.get_mut(pair_slot).storage.as_deref_mut() {
+            storage.log_status_pages(&dev, label);
+            storage.log_parameter_management(&dev, label);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn log_render_status_pages_report(&mut self, pair_slot: u8, label: &str) {
         if crate::g17_config::DEP_RECORDS != 0 {
             let dev = self.resources.dev();
             {
@@ -9243,8 +9256,6 @@ impl G17PManagerConstruction {
                     error,
                 ),
             }
-            storage.log_status_pages(&dev, label);
-            storage.log_parameter_management(&dev, label);
         }
     }
 
@@ -9751,7 +9762,13 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    fn log_selected_render_recovery_pre_ack(&mut self, pair_slot: u8, label: &'static str, parent_qid: Option<u8>) {
+    /// `log_selected_render_recovery_pre_ack`'s snapshot and report half,
+    /// in its own cold frame; returns the completion-dump targets.
+    #[cold]
+    #[inline(never)]
+    fn log_selected_render_recovery_report(&mut self, pair_slot: u8, label: &'static str, parent_qid: Option<u8>)
+        -> [Option<(u8, u64)>; 2]
+    {
         let progress = self.resources.firmware_gpu_progress_snapshot();
         dev_info!(self.resources.dev().as_ref(),
             "G17P global GPU progress[{}]: (recovery-epoch,counter)={:x?}; not per-job completion\n",
@@ -10071,6 +10088,14 @@ impl G17PManagerConstruction {
                 }
             }
         }
+        core::array::from_fn(|index| render_queues.and_then(|queues|
+            next_entries[index].map(|(stamp, _)| (queues[index].0 as u8, stamp))))
+    }
+
+    fn log_selected_render_recovery_pre_ack(&mut self, pair_slot: u8, label: &'static str, parent_qid: Option<u8>) {
+        // Report half first, in its own frame; the nested page/entry dumps
+        // below then run without its diagnostic locals on the stack.
+        let targets = self.log_selected_render_recovery_report(pair_slot, label, parent_qid);
         self.log_render_status_pages(pair_slot, label);
         self.log_render_sksm_entries(pair_slot, label);
         if g17p_native_fragment_first_mode(
@@ -10078,8 +10103,6 @@ impl G17PManagerConstruction {
         ) {
             self.log_render_outer_channels(label);
         }
-        let targets = core::array::from_fn(|index| render_queues.and_then(|queues|
-            next_entries[index].map(|(stamp, _)| (queues[index].0 as u8, stamp))));
         if let Err(error) = self.dump_completion_records_targets(label, targets) {
             let dev = self.resources.dev();
             dev_warn!(
@@ -13465,7 +13488,11 @@ impl G17PManagerConstruction {
             read(0xffff_fc00_0012_8a68));
     }
 
-    pub(crate) fn log_async_compute_timeout(&mut self, queue: &mut G17PSksmQueue) -> u128 {
+    /// `log_async_compute_timeout`'s snapshot and report half: returns the
+    /// observed QIDs and the incomplete render-parent QIDs.
+    #[cold]
+    #[inline(never)]
+    fn log_async_compute_timeout_report(&mut self, queue: &mut G17PSksmQueue) -> (u128, u128) {
         let progress = self.resources.firmware_gpu_progress_snapshot();
         dev_info!(self.resources.dev().as_ref(),
             "G17P global GPU progress[{}]: (recovery-epoch,counter)={:x?}; not per-job completion\n",
@@ -13746,6 +13773,15 @@ impl G17PManagerConstruction {
                     queue.queue_id, completed, next);
             }
         }
+        (observed_qids, incomplete_render_parents)
+    }
+
+    pub(crate) fn log_async_compute_timeout(&mut self, queue: &mut G17PSksmQueue) -> u128 {
+        // The snapshot/report half runs in its own cold frame (several KiB
+        // of diagnostic locals and format arguments), released before the
+        // render-parent reports below, which nest further logging.
+        let (mut observed_qids, incomplete_render_parents) =
+            self.log_async_compute_timeout_report(queue);
         // Observe only the retained render pairs named by unsatisfied
         // hardware parents. This is fault-only, before VM poison propagates;
         // do not select the unrelated most-recent publisher's graph.

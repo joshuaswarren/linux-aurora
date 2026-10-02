@@ -40,7 +40,7 @@ def item(text: str, marker: str) -> str:
 drain = item(live, "fn drain_primary_firmware_event_batch(")
 settle = item(live, "fn settle_primary_empty_recovery(")
 events = item(live, "    pub(crate) fn service_primary_firmware_events(")
-recovery = item(live, "    pub(crate) fn service_primary_recovery(")
+recovery = item(live, "    fn service_primary_recovery_body(")
 inline = item(live, "    fn service_firmware_events_inline(")
 
 # --- a duplicate restart is coalesced, never refused ----------------------

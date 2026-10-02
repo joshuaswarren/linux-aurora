@@ -20,7 +20,7 @@ def item(source, marker):
 source = (ROOT / 'g17_manager.rs').read_text()
 assert 'default: 0' in item((ROOT / 'asahi.rs').read_text(), 'g17p_mixed_resource_probe: u32')
 submit = item(source, 'pub(crate) fn submit_translated_compute(')
-timeout = item(source, 'pub(crate) fn log_async_compute_timeout(')
+timeout = item(source, 'fn log_async_compute_timeout_report(') + item(source, 'pub(crate) fn log_async_compute_timeout(')
 assert 'self.log_mixed_resource_census(queue, false);' in submit
 assert 'self.log_mixed_resource_census(queue, true);' in timeout
 census = item(source, 'fn log_mixed_resource_census(')

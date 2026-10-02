@@ -47,7 +47,10 @@ methods='\n'.join(item(r,n) for n in [
  '    pub(crate) fn release_async_compute_queue(',
  '    pub(crate) fn cancel_async_compute(',
  '    pub(crate) fn quarantine_async_compute(',
- '    fn release_firmware_retired_quarantined_compute('])
+ '    fn release_firmware_retired_quarantined_compute(',
+ '    fn release_firmware_retired_quarantined_compute_nested(',
+ '    fn retire_witnessed_quarantined_compute(',
+ '    fn drop_unpublished_compute_queue('])
 # Recovery isolation (iso1): spared zero-duration queues fail their fences here.
 spared_helper=item(r,'fn fail_spared_deferred(')
 publish = item(r, '    pub(crate) fn publish_async_compute(')
