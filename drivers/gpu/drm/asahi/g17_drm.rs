@@ -386,6 +386,15 @@ struct G17PQueueLeaseState {
     /// EBUSY and reports VK_ERROR_DEVICE_LOST.
     render_quarantined: u64,
     render_released: u64,
+    /// `g17p_exit_kill`: closed owners' pairs named by a published
+    /// process-exit kill (device control 0x29). Held from just before the
+    /// record is published, so the kill cannot reach a successor's QIDs,
+    /// and kept for the rest of the session: the firmware kill task writes
+    /// per-QID state (fw 0x26ae0..0x26b2c, words at +0x21088/+0x21090 of the
+    /// base at fw 0x178010 -- likely KSMFE registers, not confirmed) whose
+    /// effect on a later rebind (+0x1a=0, no host KSMFE write) is not
+    /// established. Cleared at processor stop, like `render_quarantined`.
+    render_kill_hold: u64,
     epoch: u64,
 }
 
@@ -394,7 +403,7 @@ impl Default for G17PQueueLeaseState {
         Self { render_slots: 0, render_refs: [0; G17P_RENDER_SLOTS],
             render_owner: [0; G17P_RENDER_SLOTS],
             render_epoch: [0; G17P_RENDER_SLOTS], render_quarantined: 0,
-            render_released: 0, epoch: 0 }
+            render_released: 0, render_kill_hold: 0, epoch: 0 }
     }
 }
 
@@ -491,7 +500,8 @@ impl G17PQueueLeaseState {
             return Some(slot as u8);
         }
 
-        let free = (!self.render_slots) & Self::render_mask() & !self.render_quarantined;
+        let free = (!self.render_slots) & Self::render_mask() & !self.render_quarantined
+            & !self.render_kill_hold;
         if free == 0 {
             return None;
         }
@@ -543,7 +553,8 @@ impl G17PQueueLeaseState {
         if owned >= crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE as usize {
             return;
         }
-        let free = (!self.render_slots) & Self::render_mask() & !self.render_quarantined;
+        let free = (!self.render_slots) & Self::render_mask() & !self.render_quarantined
+            & !self.render_kill_hold;
         let usable = |slot: usize| free & (1u64 << slot) != 0;
         let sibling = (0..G17P_RENDER_SLOTS)
             .filter(|slot| {
@@ -580,6 +591,26 @@ impl G17PQueueLeaseState {
                     && self.render_quarantined & (1u64 << slot) == 0
             })
             .map(|slot| slot as u8)
+    }
+
+    /// `g17p_exit_kill`: hold `slots` if every one is still the departed
+    /// `owner`'s: released by it, idle, and taken by nobody since. All or
+    /// nothing.
+    fn hold_for_exit_kill(&mut self, owner: u64, slots: u64) -> bool {
+        if owner == 0 || slots & !Self::render_mask() != 0 { return false; }
+        for slot in 0..G17P_RENDER_SLOTS {
+            let bit = 1u64 << slot;
+            if slots & bit == 0 { continue; }
+            if self.render_owner[slot] != owner
+                || self.render_refs[slot] != 0
+                || self.render_slots & bit != 0
+                || self.render_released & bit == 0
+            {
+                return false;
+            }
+        }
+        self.render_kill_hold |= slots;
+        true
     }
 
     fn release_render_slot(&mut self, slot: u8) {
@@ -742,6 +773,27 @@ impl G17PQueueRegistry {
         }
         held.render_released &= !released;
         held.render_quarantined &= !released;
+        // No firmware kill survives a processor stop.
+        held.render_kill_hold = 0;
+        self.lease_free.notify_all();
+    }
+
+    /// `g17p_exit_kill`: hold `slots` -- render pairs a process-exit kill is
+    /// about to name -- out of reuse until firmware acknowledges the kill.
+    /// Every pair must still belong to the departed `owner` (closed, idle,
+    /// not yet taken by anyone else); otherwise nothing is held and false
+    /// is returned, and the caller does not publish. Runtime -> registry is
+    /// the established nesting (`admission_snapshot`, lease drop).
+    pub(crate) fn hold_render_slots_for_exit_kill(&self, owner: u64, slots: u64) -> bool {
+        self.lease.lock().hold_for_exit_kill(owner, slots)
+    }
+
+    /// Undo a hold whose kill record could not be published.
+    pub(crate) fn release_exit_kill_hold(&self, slots: u64) {
+        if slots == 0 { return; }
+        let mut held = self.lease.lock();
+        held.render_kill_hold &= !slots;
+        drop(held);
         self.lease_free.notify_all();
     }
 
@@ -836,6 +888,7 @@ impl G17PQueueRegistry {
                     && (held.render_released
                         & !held.render_slots
                         & !held.render_quarantined
+                        & !held.render_kill_hold
                         & G17PQueueLeaseState::render_mask()) == 0
                     => return Err(ENOSPC),
                 _ => {},

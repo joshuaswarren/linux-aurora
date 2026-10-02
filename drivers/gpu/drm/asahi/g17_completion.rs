@@ -56,6 +56,10 @@ pub(crate) const G17P_FIRMWARE_EVENT_STAMP_TYPE: u32 = 1;
 pub(crate) const G17P_FIRMWARE_EVENT_RECOVERY_TYPE: u32 = 4;
 pub(crate) const G17P_FIRMWARE_EVENT_TVB_GROW_TYPE: u32 = 6;
 pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
+/// `kAGFIFirmwareEventTypeProcessExitComplete`: the answer to a process-exit
+/// kill (device control 0x29), `{u32 type, u64 cookie at +0x04}` (fw 0x5110
+/// and 0x26c1c build it on the stack and post it with fw 0x21124).
+pub(crate) const G17P_FIRMWARE_EVENT_PROCESS_EXIT_TYPE: u32 = 12;
 pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
 pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
 
@@ -1296,6 +1300,18 @@ pub(crate) fn decode_g17p_firmware_recovery_event(
         generation: get_u64(raw, 0x04),
         stamp_index: get_i32(raw, 0x0c),
     })
+}
+
+/// Firmware event type 12 (`kAGFIFirmwareEventTypeProcessExitComplete`).
+/// Returns the kill cookie the host supplied at `+0x0c` of its 0x29 record.
+pub(crate) fn decode_g17p_process_exit_event(raw: &[u8]) -> Result<u64, CompletionDecodeError> {
+    if raw.len() != G17P_FIRMWARE_EVENT_ENTRY_SIZE {
+        return Err(CompletionDecodeError::RecordSize);
+    }
+    if get_u32(raw, 0x00) != G17P_FIRMWARE_EVENT_PROCESS_EXIT_TYPE {
+        return Err(CompletionDecodeError::FirmwareEventType);
+    }
+    Ok(get_u64(raw, 0x04))
 }
 
 /// Firmware event type 13

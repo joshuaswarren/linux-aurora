@@ -117,6 +117,7 @@ type Inflight=g17_completion::PairFifo<Active,{g17_queue_limits::MAX_COMPUTE_IN_
 type RetiredLeases=g17_completion::PairFifo<Probe,{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
 struct Queue {inflight:Inflight,retired_leases:RetiredLeases,_graph:Probe,_root:Probe}
 struct Registry;impl Registry {fn release_retained_owners_after_processor_stop(&self){}}
+mod g17_exit_kill {pub fn forget_all_acks(){}}
 struct Deferred{completion:Arc<Completion>}
 impl Deferred{fn signal(self){self.completion.complete(Ok(()))}}
 struct Runtime {

@@ -5693,6 +5693,65 @@ impl G17PManagerConstruction {
         Ok(publication)
     }
 
+    /// Nanoseconds since teardown `index` was armed (the client's close).
+    pub(crate) fn logical_queue_teardown_age_ns(&self, index: usize) -> i64 {
+        self.logical_queue_teardowns.get(index)
+            .map_or(0, |teardown| teardown.armed.elapsed().as_nanos())
+    }
+
+    /// `g17p_exit_kill`: which render QIDs belong to `context` and which to
+    /// anyone else. `own` and `own_slots` are the pairs whose graph is bound
+    /// to exactly this context and not being prepared; `foreign` is every
+    /// other bound or preparing pair (the bootstrap pair included). A pair
+    /// with no bound graph is in neither set.
+    pub(crate) fn exit_kill_render_scope(
+        &self,
+        context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
+    ) -> (u128, u128, u64) {
+        let (mut own, mut foreign, mut own_slots) = (0u128, 0u128, 0u64);
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            let Ok(state) = self.render_slots.allocated(slot) else { continue };
+            let Ok(pair) = self.retained_render_queue_pair(slot) else { continue };
+            let qids = u8::try_from(pair.tiling).map_or(0, crate::g17_exit_kill::qid_bit)
+                | u8::try_from(pair.fragment).map_or(0, crate::g17_exit_kill::qid_bit);
+            let mine = !state.preparing && matches!(&state.bind,
+                Some(G17PRenderRootOwner::Job { context: owner }) if Arc::ptr_eq(owner, context));
+            if mine {
+                own |= qids;
+                own_slots |= 1u64 << slot;
+            } else if state.preparing || state.bind.is_some() {
+                foreign |= qids;
+            }
+        }
+        (own, foreign, own_slots)
+    }
+
+    /// The two QIDs of render pair `slot` as a mask (0 if it has none).
+    pub(crate) fn render_slot_qids(&self, slot: u8) -> u128 {
+        self.retained_render_queue_pair(slot).map_or(0, |pair|
+            u8::try_from(pair.tiling).map_or(0, crate::g17_exit_kill::qid_bit)
+                | u8::try_from(pair.fragment).map_or(0, crate::g17_exit_kill::qid_bit))
+    }
+
+    /// Publish the process-exit kill of `context`'s scheduler-state page,
+    /// exactly as `AGXCommandQueue::processExitTimeoutHandler` submits it
+    /// (opcode 0x29, page VA, cookie; submit flags 1: no completion wait).
+    /// The caller announces it (EP 0x21, mode 1). EAGAIN: ring full or a
+    /// mandatory reply is pending; retried on the next teardown turn.
+    pub(crate) fn publish_exit_kill(
+        &mut self,
+        context: &Arc<crate::g17_resources::G17PLogicalQueueContext>,
+        cookie: u64,
+    ) -> Result<g17_resources::G17PDeviceControlPublication> {
+        if self.pending_primary_control.is_some() {
+            return Err(EAGAIN);
+        }
+        let mut record = [0u8; g17_initdata::CONTROL_RECORD_SIZE];
+        g17_initdata::encode_context_kill_record(context.channel_control.gpu_va(), cookie, &mut record)
+            .map_err(|_| EINVAL)?;
+        self.resources.publish_primary_device_control_raw(&record)
+    }
+
     /// Detach every graph on any pair whose current root owner is exactly
     /// `context`. A graph a same-VM successor retargeted in place belongs to
     /// that successor now and is left alone. EBUSY if such a pair is not idle.
