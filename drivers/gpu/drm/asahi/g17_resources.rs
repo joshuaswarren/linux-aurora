@@ -2254,6 +2254,27 @@ fn g17p_live_write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result {
     Ok(())
 }
 
+/// Native `AGXAccelerator::restartWorkQueue` ("GPU Hang - Channel Restart",
+/// AGXG17P kext 25, function +0x2378..+0x2910): for every AGX3DWorkQueue (TA
+/// channel +0x218, 3D channel +0x220) and AGXCLWorkQueue (channel +0x218) in
+/// the accelerator's work-queue collection, copy the uncached channel state's
+/// producer (+0x40) to its recovery target (+0x50). It runs after the restart
+/// report and before the 128-entry last-submitted-stamp publication, which
+/// the stamp-table analysis places before firmware is resumed.
+///
+/// `AGXChannel::resetChannelState` initialises +0x50 to 0xffffffff, as this
+/// driver does; that and this copy are the only native writers found. The
+/// firmware never writes it and reads it only in its recovery replay (B100
+/// FUN_12638 with w4=1, reached from FUN_eb7c mode 1 for the TA/3D/CL kinds).
+/// Statically, a target at or beyond the ring count does not terminate that
+/// replay loop. Linux never refreshed it, so every replay saw the reset value.
+#[inline]
+fn g17p_publish_recovery_target(graph: &mut [u8], pointers: usize) -> Result<u32> {
+    let producer = g17p_live_read_u32(graph, pointers + 0x40)?;
+    g17p_live_write_u32(graph, pointers + 0x50, producer)?;
+    Ok(producer)
+}
+
 #[cfg(test)]
 fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -7632,6 +7653,14 @@ impl G17PComputeDescriptorStorage {
     /// stays 0 across a working submission, that word is not a firmware-owned
     /// consumer and the host is expected to rewind and reuse slots 0..3
     /// instead -- see `g17p_repeat_ring`.
+    /// `AGXAccelerator::restartWorkQueue` for one AGXCLWorkQueue (channel
+    /// +0x218). See `g17p_publish_recovery_target`.
+    pub(crate) fn publish_recovery_target(&mut self) -> Result<u32> {
+        self.queue_graph.with_bytes_mut(|graph| {
+            g17p_publish_recovery_target(graph, g17_compute::COMPUTE_QUEUE_POINTERS)
+        })
+    }
+
     pub(crate) fn read_compute_ring_state(&mut self) -> Result<G17PComputeRingState> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let queue = self.queue_graph.iova();
@@ -14790,6 +14819,19 @@ impl G17PUserRenderStorage {
             Ok([
                 g17p_live_read_u32(raw, Self::TILING_POINTERS + 0x40)?,
                 g17p_live_read_u32(raw, Self::FRAGMENT_POINTERS + 0x40)?,
+            ])
+        })
+    }
+
+    /// `AGXAccelerator::restartWorkQueue` for one AGX3DWorkQueue: the TA
+    /// (channel +0x218) and 3D (channel +0x220) uncached states get their
+    /// producer (+0x40) copied to the recovery target (+0x50). See
+    /// `g17p_publish_recovery_target`. Returns the TA and 3D targets.
+    pub(crate) fn publish_recovery_targets(&mut self) -> Result<[u32; 2]> {
+        self.graph.with_bytes_mut(|raw| {
+            Ok([
+                g17p_publish_recovery_target(raw, Self::TILING_POINTERS)?,
+                g17p_publish_recovery_target(raw, Self::FRAGMENT_POINTERS)?,
             ])
         })
     }

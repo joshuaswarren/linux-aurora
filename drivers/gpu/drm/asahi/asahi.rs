@@ -194,6 +194,10 @@ kernel::prelude::module! {
             default: 0,
             description: "Opt-in mitigation: 1 keeps each render queue on one physical TA/3D pair (no sibling pair). It avoided the hard hang under concurrent render-pair construction and was faster at depth 2, but raised the per-pass 3D-stall hazard and is not native (macOS alternates two pairs); 0 (default) keeps the two-pair policy",
         },
+        g17p_recovery_target_restart: u32 {
+            default: 1,
+            description: "1 (default, native restartWorkQueue): at each firmware recovery, while firmware is halted before the resume acknowledge, copy every render pair's TA/3D and every CL queue's uncached producer (+0x40) to its recovery target (+0x50). 0 = A/B only: leave the reset value 0xffffffff",
+        },
         g17p_frg_hwdsid_clear: u32 {
             default: 0,
             description: "Diagnostic: 1 writes FRG descriptor +0x222d as 0 (native light captures); 0 preserves 1",
