@@ -5009,8 +5009,18 @@ pub(crate) struct G17PRenderFlist {
     grown: AtomicBool,
     /// Set once the pool has been handed to an owner.
     served: AtomicBool,
+    /// Boot-unique identity of this pool object. FList IDs and the pool's
+    /// VAs are recycled as soon as a closed context's pool is dropped, so
+    /// the next context's new pool can present exactly the previous owner's
+    /// (ID, control, run-table, grow-end) tuple. Only this serial tells a
+    /// new pool, which needs its UMA descriptor row loaded, from the
+    /// retained owner, whose row firmware has been advancing.
+    serial: u64,
     _id_lease: G17PRenderFlistId,
 }
+
+#[cfg(not(test))]
+static G17P_RENDER_FLIST_SERIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[cfg(not(test))]
 impl G17PRenderFlist {
@@ -5080,8 +5090,11 @@ impl G17PRenderFlist {
             _control_inner: control_inner,
             grown: AtomicBool::new(true),
             served: AtomicBool::new(false),
+            serial: G17P_RENDER_FLIST_SERIAL.fetch_add(1, Ordering::Relaxed) + 1,
         })
     }
+
+    pub(crate) fn serial(&self) -> u64 { self.serial }
 
     /// Every page-list entry and run slot of the pool's initial image, as
     /// `(byte offset in backing, value)`.
@@ -11511,6 +11524,11 @@ impl G17PUserRenderStorage {
 
     pub(crate) fn render_flist_cookie(&self) -> u64 {
         self.render_flist.grow_end_va()
+    }
+
+    /// Boot-unique serial of this graph's current pool object.
+    pub(crate) fn render_flist_serial(&self) -> u64 {
+        self.render_flist.serial()
     }
 
     pub(crate) fn repopulate_render_flist(&self) -> Result {
@@ -21074,6 +21092,15 @@ impl G17ResourceOwner {
     /// Pair the UMA load with a store at the retired graph boundary. The
     /// shared FList object is not updated by GPU allocation or async growth;
     /// reloading it unchanged would reset cursors and forget grown pages.
+    /// (counter_a, counter_b, total_pages) of a global UMA descriptor row as
+    /// currently in memory; diagnostic only.
+    pub(crate) fn uma_row_counters(&mut self, hardware_buffer_id: u32) -> Result<(u32, u32, u32)> {
+        let id = u8::try_from(hardware_buffer_id).map_err(|_| EINVAL)?;
+        let row = self.snapshot_compute_uma(id)?;
+        let state = g17_submission::decode_g17p_umadesc(row, g17_submission::G17PUmaPagePoolState::default());
+        Ok((state.counter_a, state.counter_b, state.total_pages))
+    }
+
     pub(crate) fn save_user_render_uma(&mut self, storage: &G17PUserRenderStorage) -> Result {
         let owner = &storage.render_flist;
         let state = owner.uma_state()?;

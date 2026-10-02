@@ -618,9 +618,18 @@ struct G17PBootstrapUmaLifecycle {
     /// Reacquisition carries it without emitting opcode 0x20 a second time.
     request_published: bool,
     state: G17PBootstrapUmaRequestState,
+    /// Host-only serial of the pool object this lease registered (0 for the
+    /// bootstrap pool); never sent to firmware. See `G17PRenderFlist::serial`.
+    pool_serial: u64,
 }
 
 impl G17PBootstrapUmaLifecycle {
+    /// The owner registered exactly this pool object, not merely a pool that
+    /// recycled its FList ID and VAs.
+    fn same_pool_object(&self, serial: u64) -> bool {
+        self.pool_serial == serial
+    }
+
     fn matches_owner(
         &self,
         hardware_buffer_id: u32,
@@ -661,6 +670,7 @@ impl G17PBootstrapUmaLifecycle {
             }),
             request_published: false,
             state: G17PBootstrapUmaRequestState::Submitted,
+            pool_serial: 0,
         }
     }
 
@@ -720,6 +730,7 @@ impl G17PBootstrapUmaLifecycle {
             request: None,
             request_published: false,
             state: G17PBootstrapUmaRequestState::Submitted,
+            pool_serial: previous.pool_serial,
         })
     }
 
@@ -758,6 +769,7 @@ impl G17PBootstrapUmaLifecycle {
                 request: needs_grow.then(new_request),
                 request_published: false,
                 state: G17PBootstrapUmaRequestState::Submitted,
+                pool_serial: 0,
             });
         };
         if previous.hardware_buffer_id != hardware_buffer_id
@@ -800,6 +812,7 @@ impl G17PBootstrapUmaLifecycle {
                 else if overlapping && pending_grow { previous.request } else { None },
             request_published: overlapping && pending_grow,
             state: G17PBootstrapUmaRequestState::Submitted,
+            pool_serial: previous.pool_serial,
         })
     }
 
@@ -4286,7 +4299,8 @@ impl G17PManagerConstruction {
             if self.render_flist_owners[slot.flist_index].as_ref().is_some_and(|owner|
                 owner.request.is_some() && matches!(owner.state, G17PBootstrapUmaRequestState::Ready)
                     && owner.matches_owner(storage.render_flist_id(), storage.render_flist_pointer(),
-                        storage.render_flist_operand_table(), storage.render_flist_cookie())) {
+                        storage.render_flist_operand_table(), storage.render_flist_cookie())
+                    && owner.same_pool_object(storage.render_flist_serial())) {
                 storage.mark_render_flist_grown();
             }
             slot.storage = Some(storage);
@@ -4500,7 +4514,8 @@ impl G17PManagerConstruction {
         for state in self.render_slots.slots.iter().flatten() {
             if let Some(storage) = state.storage.as_deref() {
                 if lifecycle.matches_owner(storage.render_flist_id(), storage.render_flist_pointer(),
-                    storage.render_flist_operand_table(), storage.render_flist_cookie()) {
+                    storage.render_flist_operand_table(), storage.render_flist_cookie())
+                    && lifecycle.same_pool_object(storage.render_flist_serial()) {
                     storage.mark_render_flist_grown();
                 }
             }
@@ -7045,13 +7060,18 @@ impl G17PManagerConstruction {
                 && self.render_slots.get(pair_slot).flist_leases.is_some() { return Err(EBUSY); }
             self.render_slots.get_mut(pair_slot).flist_index = id;
             let storage = self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?;
+            // A context's new pool can recycle the previous owner's FList ID
+            // and every VA in the tuple. It is still a new owner: its image
+            // and UMA descriptor row must be staged (native
+            // populateInitialFirmwareState + halLoadUMADesc), never the
+            // retained row whose cursors firmware advanced for the old pool.
             let owner_matches = self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().is_some_and(|owner| {
                 owner.matches_owner(
                     storage.render_flist_id(),
                     storage.render_flist_pointer(),
                     storage.render_flist_operand_table(),
                     storage.render_flist_cookie(),
-                )
+                ) && owner.same_pool_object(storage.render_flist_serial())
             });
             if !owner_matches {
                 if self.render_flist_owners[id].as_ref().is_some_and(|old|
@@ -7074,9 +7094,10 @@ impl G17PManagerConstruction {
                     let outstanding = submitted != completed;
                     if outstanding || crate::g17_recovery_path::log_budget(takeovers, 16, 256) {
                         let note = if outstanding { " OUTSTANDING" } else { "" };
+                        let row = self.resources.uma_row_counters(u32::from(id));
                         dev_info!(self.resources.dev().as_ref(),
-                            "G17P FList takeover #{}: pair={} id={} submitted={} completed={}{}\n",
-                            takeovers, pair_slot, id, submitted, completed, note);
+                            "G17P FList takeover #{}: pair={} id={} submitted={} completed={} previous-uma-row(a,b,total)={:x?}{}\n",
+                            takeovers, pair_slot, id, submitted, completed, row, note);
                     }
                 }
                 storage.repopulate_render_flist()
@@ -7302,7 +7323,8 @@ impl G17PManagerConstruction {
             owner.request.is_some() && matches!(owner.state, G17PBootstrapUmaRequestState::Ready)
                 && owner.matches_owner(storage.render_flist_id(),
                     storage.render_flist_pointer(), storage.render_flist_operand_table(),
-                    storage.render_flist_cookie())) {
+                    storage.render_flist_cookie())
+                && owner.same_pool_object(storage.render_flist_serial())) {
             storage.mark_render_flist_grown();
         }
         slot.storage = Some(storage);
@@ -8032,18 +8054,23 @@ impl G17PManagerConstruction {
                 && self.render_slots.get(pair_slot).flist_leases.is_some() { return Err(EBUSY); }
             self.render_slots.get_mut(pair_slot).flist_index = id;
             let storage = self.render_slots.get(pair_slot).storage.as_deref().ok_or(ENODEV)?;
+            // A context's new pool can recycle the previous owner's FList ID
+            // and every VA in the tuple. It is still a new owner: its image
+            // and UMA descriptor row must be staged (native
+            // populateInitialFirmwareState + halLoadUMADesc), never the
+            // retained row whose cursors firmware advanced for the old pool.
             let owner_matches = self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().is_some_and(|owner| {
                 owner.matches_owner(
                     storage.render_flist_id(),
                     storage.render_flist_pointer(),
                     storage.render_flist_operand_table(),
                     storage.render_flist_cookie(),
-                )
+                ) && owner.same_pool_object(storage.render_flist_serial())
             });
             // Validate the lifecycle before repopulating memory or replacing
             // the global UMA descriptor. A rejected owner/sequence must leave
             // the preceding owner's published image untouched.
-            let prepared = G17PBootstrapUmaLifecycle::acquire_owner(
+            let mut prepared = G17PBootstrapUmaLifecycle::acquire_owner(
                 self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref(),
                 self.render_flist_owners[self.render_slots.get(pair_slot).flist_index].as_ref().map_or(Ok(G17P_BOOTSTRAP_UMA_SEQUENCE), |owner| owner.sequence.checked_add(1).ok_or(EOVERFLOW))?,
                 storage.render_flist_id(),
@@ -8052,6 +8079,7 @@ impl G17PManagerConstruction {
                 storage.render_flist_cookie(),
                 storage.render_flist_needs_grow(),
             ).map_err(|_| EBUSY)?;
+            prepared.pool_serial = storage.render_flist_serial();
             if !owner_matches {
                 if self.render_flist_owners[id].as_ref().is_some_and(|old|
                     old.state != G17PBootstrapUmaRequestState::Completed
@@ -8065,9 +8093,10 @@ impl G17PManagerConstruction {
                     let outstanding = submitted != completed;
                     if outstanding || crate::g17_recovery_path::log_budget(takeovers, 16, 256) {
                         let note = if outstanding { " OUTSTANDING" } else { "" };
+                        let row = self.resources.uma_row_counters(u32::from(id));
                         dev_info!(self.resources.dev().as_ref(),
-                            "G17P FList takeover #{}: pair={} id={} submitted={} completed={}{}\n",
-                            takeovers, pair_slot, id, submitted, completed, note);
+                            "G17P FList takeover #{}: pair={} id={} submitted={} completed={} previous-uma-row(a,b,total)={:x?}{}\n",
+                            takeovers, pair_slot, id, submitted, completed, row, note);
                     }
                 }
                 storage.repopulate_render_flist()

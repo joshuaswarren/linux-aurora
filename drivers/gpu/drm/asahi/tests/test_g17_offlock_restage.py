@@ -35,6 +35,7 @@ mod g17_resources {
  pub fn render_flist_pointer(&self)->u64{1}
  pub fn render_flist_operand_table(&self)->u64{2}
  pub fn render_flist_cookie(&self)->u64{3}
+ pub fn render_flist_serial(&self)->u64{4}
  pub fn ensure_sksm_dependency_buffer(&mut self)->Result{Ok(())}
  pub fn take_sksm_dependency_buffer(&mut self)->Box<G17PRenderDependencies>{Box::new(G17PRenderDependencies{entries:[0;31],count:0})}
  pub fn return_sksm_dependency_buffer(&mut self,_:Box<G17PRenderDependencies>){}
@@ -43,7 +44,7 @@ mod g17_resources {
 }
 enum G17PBootstrapUmaRequestState{Submitted,Ready}
 struct Uma{request:Option<()>,state:G17PBootstrapUmaRequestState,id:u32}
-impl Uma{fn matches_owner(&self,id:u32,_:u64,_:u64,_:u64)->bool{self.id==id}}
+impl Uma{fn matches_owner(&self,id:u32,_:u64,_:u64,_:u64)->bool{self.id==id}fn same_pool_object(&self,_:u64)->bool{true}}
 struct Slot{sksm:Option<Queues>,storage:Option<Box<g17_resources::G17PUserRenderStorage>>,preparing:bool,restaged:Option<G17PRenderReservation>,
  flist_index:usize,submission_ordinal:u64,hardware_buffer_id:Option<u32>,hardware_buffer_published:bool,prepared_render_flist:Option<()>,auxiliary_timestamp:u64}
 struct Slots(Vec<Slot>);

@@ -161,7 +161,7 @@ mod g17_resources {
  pub struct G17PUserRenderStorage{render_tvb:Option<Tvb>,parameter_management:Option<Pm>,queue_pair:Pair,reachability_cache:ReachabilityCache}
  impl G17PUserRenderStorage {
   pub fn render_flist_id(&self)->u32{1}pub fn render_flist_pointer(&self)->u64{2}
-  pub fn render_flist_operand_table(&self)->u64{3}pub fn render_flist_cookie(&self)->u64{4}
+  pub fn render_flist_operand_table(&self)->u64{3}pub fn render_flist_cookie(&self)->u64{4}pub fn render_flist_serial(&self)->u64{5}
   pub fn mark_render_flist_grown(&self){}
 
   fn render_pool_id(&self)->u64{1}
@@ -346,7 +346,7 @@ mod g17_resources {
 }
 enum G17PBootstrapUmaRequestState{Ready}
 struct Uma{request:Option<()>,state:G17PBootstrapUmaRequestState}
-impl Uma{fn matches_owner(&self,_:u32,_:u64,_:u64,_:u64)->bool{true}}
+impl Uma{fn matches_owner(&self,_:u32,_:u64,_:u64,_:u64)->bool{true}fn same_pool_object(&self,_:u64)->bool{true}}
 struct G17PRenderRootOwner{context:u8,vm:mmu::Vm}
 impl G17PRenderRootOwner{fn root_slot(&self)->Result<u8>{Ok(self.context)}fn vm(&self)->&mmu::Vm{&self.vm}}
 struct Tracker{hardware_buffer_id:u32}
