@@ -1282,6 +1282,27 @@ fn append_render_prefix_dependencies(
     Ok(())
 }
 
+/// Same-QID firmware parents cover ordinary execution, but not the host's
+/// post-retirement timestamp copies. Add host waits only for timestamp
+/// publishers inside this command's explicit logical compute prefix.
+fn append_compute_timestamp_dependencies(
+    frontier: &[(u64, g17_job::G17PCommandFences)], prefix: Option<u64>,
+    dependencies: &mut KVec<Fence>, checked_dependencies: &mut KVec<Fence>,
+) -> Result {
+    if prefix.is_none() { return Ok(()); }
+    for (sequence, fence) in frontier {
+        if crate::g17_submission::g17p_render_prefix_contains(prefix, *sequence)
+            && fence.ready.raw() == fence.completed.raw()
+        {
+            // ready aliases completed only for host-published timestamps.
+            // Retain status as well as readiness: an error fence is signalled.
+            checked_dependencies.push(fence.completed.clone(), GFP_KERNEL)?;
+            dependencies.push(fence.ready.clone(), GFP_KERNEL)?;
+        }
+    }
+    Ok(())
+}
+
 /// Callback-driven completion of every hardware command in one ioctl. The
 /// initial member is held by the output-publication guard until enqueue ends.
 pub(crate) struct G17PSubmitCompletion {
@@ -3550,6 +3571,29 @@ impl G17PQueue {
         Ok(plan)
     }
 
+    /// A failed timestamp publisher has no valid query value to expose. Keep
+    /// the earliest failed timestamp fence as a bounded prefix-error witness,
+    /// even for cancellation/recovery-spared errors which do not poison the VM.
+    /// Entries are appended in increasing logical sequence: every prefix that
+    /// covers any later failed publisher also covers this first one. Holding
+    /// one independent fence does not retain the producer's packet or mapping.
+    fn prune_compute_frontier(&mut self) {
+        let mut retained_timestamp_failure = false;
+        self.compute_frontier.retain(|(_, fence)| {
+            // SAFETY: the retained Fence owns this status read. Inspect once:
+            // a pending fence that fails afterward stays for the next pass.
+            let status = unsafe { bindings::dma_fence_get_status(fence.completed.raw()) };
+            if status == 0 { return true; }
+            if status < 0 && fence.ready.raw() == fence.completed.raw()
+                && !retained_timestamp_failure
+            {
+                retained_timestamp_failure = true;
+                return true;
+            }
+            false
+        });
+    }
+
     fn prune_render_frontier(&mut self) {
         // All command failure paths publish sticky VM status before signalling;
         // an errored render may be dropped here without treating it as success.
@@ -3573,18 +3617,15 @@ impl G17PQueue {
         entered: Option<Instant<Monotonic>>,
     ) -> Result {
         let mut translated = *translated;
-        // v93 FW_DEPS: same-queue input syncs become a render prefix. Earlier
-        // compute of this queue is already ordered by the QID's implicit
-        // previous-kick parent and the scheduler FIFO, so compute_through
-        // needs no encoding here; its aggregate is still status-checked.
+        // Native parents retain ordinary same-engine execution order. Explicit
+        // prefixes additionally cover host-published timestamp destinations.
         if let Some(plan) = plan {
             translated.render_wait_through = crate::g17_host_path::fw_dep_raise(
                 translated.render_wait_through, plan.render_through);
+            translated.compute_wait_through = crate::g17_host_path::fw_dep_raise(
+                translated.compute_wait_through, plan.compute_through);
         }
-        self.compute_frontier.retain(|(_, fence)| {
-            // SAFETY: the retained fence owns the pointer during this read.
-            unsafe { bindings::dma_fence_get_status(fence.completed.raw()) == 0 }
-        });
+        self.prune_compute_frontier();
         self.compute_frontier.reserve(1, GFP_KERNEL)?;
         self.ensure_async_compute_queue()?;
         self.runtime.mutex().lock().check_async_compute_submission(self.id)?;
@@ -3604,9 +3645,19 @@ impl G17PQueue {
         let prefix_count = self.render_frontier.iter().filter(|(sequence, _)|
             crate::g17_submission::g17p_render_prefix_contains(translated.render_wait_through, *sequence)
         ).count();
-        let mut dependencies = KVec::with_capacity(syncs.len() + prefix_count, GFP_KERNEL)?;
-        let mut checked_dependencies = KVec::with_capacity(syncs.len(), GFP_KERNEL)?;
+        let timestamp_prefix_count = if translated.compute_wait_through.is_some() {
+            self.compute_frontier.iter().filter(|(sequence, fence)|
+                crate::g17_submission::g17p_render_prefix_contains(translated.compute_wait_through, *sequence)
+                    && fence.ready.raw() == fence.completed.raw()
+            ).count()
+        } else { 0 };
+        let mut dependencies = KVec::with_capacity(syncs.len() + prefix_count + timestamp_prefix_count, GFP_KERNEL)?;
+        let mut checked_dependencies = KVec::with_capacity(syncs.len() + timestamp_prefix_count, GFP_KERNEL)?;
         let mut firmware_fences = KVec::with_capacity(prefix_count, GFP_KERNEL)?;
+        append_compute_timestamp_dependencies(
+            &self.compute_frontier, translated.compute_wait_through,
+            &mut dependencies, &mut checked_dependencies,
+        )?;
         append_render_prefix_dependencies(
             &self.render_frontier, translated.render_wait_through,
             &mut dependencies, &mut firmware_fences,
@@ -4309,10 +4360,11 @@ impl G17PQueue {
                             payload, attachments, window, space,
                         ),
                     ).map_err(|error| Self::reject_uapi(submission_id, "compute", error))?;
-                    translated.compute_sequence = crate::g17_submission::g17p_render_order(
-                        self.compute_sequence, compute_preceding, g17_uapi::UAPI_BARRIER_NONE,
-                    ).map_err(|_| Self::stage_fail(submission_id, "compute-index", EOVERFLOW))?
-                        .sequence;
+                    let compute_order = crate::g17_submission::g17p_render_order(
+                        self.compute_sequence, compute_preceding, header.compute_barrier,
+                    ).map_err(|_| Self::stage_fail(submission_id, "compute-index", EOVERFLOW))?;
+                    translated.compute_sequence = compute_order.sequence;
+                    translated.compute_wait_through = compute_order.wait_through;
                     compute_preceding += 1;
                     translated.render_wait_through = crate::g17_submission::g17p_render_order(
                         self.render_sequence, render_preceding, header.render_barrier,
