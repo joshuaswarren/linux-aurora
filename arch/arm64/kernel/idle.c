@@ -10,6 +10,7 @@
 #include <asm/apple-idle.h>
 #include <asm/cpuidle.h>
 #include <asm/cpufeature.h>
+#include <asm/fpsimd.h>
 #include <asm/sysreg.h>
 
 enum {
@@ -52,6 +53,8 @@ void __cpuidle cpu_do_idle(void)
 
 	if (likely(idle == ARM64_IDLE_WFI)) {
 		if (apple_m5_needs_wait_save()) {
+			/* WFI also loses SIMD state; the last task may still own it. */
+			fpsimd_save_and_flush_cpu_state();
 			apple_m5_cpu_wfi();
 			goto restore_context;
 		}
