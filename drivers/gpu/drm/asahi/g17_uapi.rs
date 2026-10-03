@@ -993,6 +993,8 @@ pub(crate) fn build_render_descriptors(
 pub(crate) struct TranslatedComputeCommand {
     /// Monotonic logical index, independent of the hardware timestamp.
     pub(crate) compute_sequence: u64,
+    /// Explicit same-engine prefix; only host-published timestamps need host waits.
+    pub(crate) compute_wait_through: Option<u64>,
     pub(crate) render_wait_through: Option<u64>,
     pub(crate) render_wait_last: Option<u64>,
     pub(crate) usc_exec_base: u64,
@@ -1073,6 +1075,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     };
     Ok(TranslatedComputeCommand {
         compute_sequence: 0,
+        compute_wait_through: None,
         render_wait_through: None,
         render_wait_last: None,
         usc_exec_base: queue.base,
