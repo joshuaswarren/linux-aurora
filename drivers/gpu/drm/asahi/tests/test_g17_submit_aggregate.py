@@ -28,7 +28,14 @@ type Result<T=()>=std::result::Result<T,Error>;
 const EINVAL:Error=Error(-22);const ENOSPC:Error=Error(-28);const EOVERFLOW:Error=Error(-75);
 const ECANCELED:Error=Error(-125);const EBUSY:Error=Error(-16);const GFP_KERNEL:()=();
 struct Arc<T>(std::sync::Arc<T>);
-impl<T>Arc<T>{fn new(value:T,_flags:())->Result<Self>{Ok(Self(std::sync::Arc::new(value)))}}
+impl<T>Arc<T>{
+ fn new(value:T,_flags:())->Result<Self>{Ok(Self(std::sync::Arc::new(value)))}
+ fn pin_init(value:T,flags:())->Result<Self>{Self::new(value,flags)}
+}
+struct Mutex<T>(std::sync::Mutex<T>);
+impl<T>Mutex<T>{fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}
+macro_rules! new_mutex {($value:expr,$name:expr)=>{Mutex(std::sync::Mutex::new($value))}}
+macro_rules! pin_init {($($value:tt)*)=>{$($value)*}}
 impl<T>Clone for Arc<T>{fn clone(&self)->Self{Self(self.0.clone())}}
 impl<T>std::ops::Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 #[derive(Default)]struct Signals{signals:AtomicU32,error:AtomicI32}
@@ -46,6 +53,10 @@ actual = '\n'.join(block(marker) for marker in [
     'pub(crate) struct G17PSubmitCompletionMember {', 'impl G17PSubmitCompletionMember {',
     'impl Drop for G17PSubmitCompletionMember {',
 ])
+# Kernel pin initialization is compile-checked by the module build. Host tests
+# use std mutex backing while retaining the production completion/lease bodies.
+actual = actual.replace('#[pin]', '').replace(
+    'work_state <- new_mutex!', 'work_state: new_mutex!')
 saved_source = source
 source = (root / 'g17_resources.rs').read_text()
 lease = '\n'.join(block(marker) for marker in [
@@ -76,8 +87,8 @@ fn aggregate()->Arc<G17PSubmitCompletion>{aggregate_with_context(context())}
  let context=context();let a=aggregate_with_context(context.clone());
  let render=G17PSubmitCompletionMember::new(a.clone());let compute=G17PSubmitCompletionMember::new(a.clone());
  let untouched:Vec<_>=(0..63).map(|_|g17_resources::G17PWorkStateLease::new(context.clone()).unwrap()).collect();drop(untouched);
- let key=render.work_state().acquire().unwrap();assert_eq!(compute.work_state().acquire(),Ok(key));
- let runtime_owner=render.work_state();
+ let key=render.work_state().unwrap().acquire().unwrap();assert_eq!(compute.work_state().unwrap().acquire(),Ok(key));
+ let runtime_owner=render.work_state().unwrap();
  a.finish_enqueue(Ok(()));render.complete(Err(Error(-5)));compute.complete(Err(Error(-5)));
  assert_eq!(signals(&a),1);drop(render);drop(compute);drop(a);
  let others:Vec<_>=(0..62).map(|_|g17_resources::G17PWorkStateLease::new(context.clone()).unwrap()).collect();
@@ -121,6 +132,40 @@ fn error(a:&G17PSubmitCompletion)->i32{a.fence.state.error.load(Ordering::Acquir
  a.finish_enqueue(Ok(()));std::thread::scope(|scope|{for (i,m) in members.into_iter().enumerate(){
  scope.spawn(move||m.complete(if i==13{Err(Error(-5))}else{Ok(())}));}});
  assert_eq!(signals(&a),1);assert_eq!(error(&a),-5);
+}
+
+#[test]fn completed_packets_do_not_exhaust_63_native_states(){
+ let context=context();let mut retained=Vec::new();
+ for _ in 0..4096 {
+  let a=aggregate_with_context(context.clone());let m=G17PSubmitCompletionMember::new(a.clone());
+  m.work_state().unwrap().acquire().unwrap();a.finish_enqueue(Ok(()));m.complete(Ok(()));
+  assert_eq!(signals(&a),1);assert_eq!(m.work_state().err(),Some(ECANCELED));
+  // Models deferred scheduler free_job: both packet member and aggregate live.
+  retained.push((a,m));
+ }
+ assert!(context.work_states.has_free());assert_eq!(retained.len(),4096);
+}
+#[test]fn success_keeps_runtime_owner_until_its_exact_retirement(){
+ let context=context();let a=aggregate_with_context(context.clone());
+ let m=G17PSubmitCompletionMember::new(a.clone());let runtime=m.work_state().unwrap();runtime.acquire().unwrap();
+ a.finish_enqueue(Ok(()));m.complete(Ok(()));
+ let others:Vec<_>=(0..62).map(|_|g17_resources::G17PWorkStateLease::new(context.clone()).unwrap()).collect();
+ assert!(!context.work_states.has_free());drop(runtime);assert!(context.work_states.has_free());drop(others);
+}
+#[test]fn enqueue_gate_keeps_successful_state_for_later_members(){
+ let context=context();let a=aggregate_with_context(context.clone());let first=G17PSubmitCompletionMember::new(a.clone());
+ let word=first.work_state().unwrap().acquire().unwrap();first.complete(Ok(()));
+ let last=G17PSubmitCompletionMember::new(a.clone());assert_eq!(last.work_state().unwrap().acquire(),Ok(word));
+ a.finish_enqueue(Ok(()));assert_eq!(signals(&a),0);last.complete(Ok(()));
+ assert_eq!(last.work_state().err(),Some(ECANCELED));assert!(context.work_states.has_free());
+}
+#[test]fn concurrent_success_releases_state_once_with_members_retained(){
+ let context=context();let a=aggregate_with_context(context.clone());
+ let members=(0..32).map(|_|G17PSubmitCompletionMember::new(a.clone())).collect::<Vec<_>>();
+ members[0].work_state().unwrap().acquire().unwrap();a.finish_enqueue(Ok(()));
+ std::thread::scope(|scope|{for member in &members {scope.spawn(move||member.complete(Ok(())));}});
+ assert_eq!(signals(&a),1);assert_eq!(error(&a),0);assert_eq!(members[0].work_state().err(),Some(ECANCELED));
+ assert!(context.work_states.has_free());
 }
 '''
 

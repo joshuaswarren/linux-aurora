@@ -543,7 +543,7 @@ impl G17PLiveRuntime {
         let publication_handshake = self.manager.as_mut().ok_or(ENODEV)?
             .firmware_recovery_handshake_snapshot()?;
         if publication_handshake.state != 0 { return Err(EBUSY); }
-        let work_state = packet.completion()?.work_state();
+        let work_state = packet.completion()?.work_state()?;
         // The backend reserves/initializes this context-owned node before
         // acquiring the runtime. Commit only consumes the installed identity.
         let work_state_word = work_state.word();
@@ -1424,7 +1424,7 @@ impl G17PLiveRuntime {
             // Open question recorded per replay: whether firmware counted the
             // cancelled kick in its work-state TSQ completed count. The replay
             // adds one more submitted kick exactly as any publication does.
-            let tsq = completion.work_state().tsq_counters().ok();
+            let tsq = completion.work_state().and_then(|state| state.tsq_counters()).ok();
             let result = match prepared {
                 Ok(()) => {
                     lease.rearm_admission();

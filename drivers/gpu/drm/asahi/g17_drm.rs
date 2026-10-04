@@ -1305,13 +1305,17 @@ fn append_compute_timestamp_dependencies(
 
 /// Callback-driven completion of every hardware command in one ioctl. The
 /// initial member is held by the output-publication guard until enqueue ends.
+#[pin_data]
 pub(crate) struct G17PSubmitCompletion {
     fence: UserFence<G17PSubmissionFence>,
     /// v81 e2e diagnostic identity (the ioctl submission id).
     e2e_id: u64,
     /// All engines in this ioctl share one native command-buffer state.
-    /// Error fences do not release it: command/runtime owners retain this Arc.
-    work_state: Arc<g17_resources::G17PWorkStateLease>,
+    /// Successful aggregate retirement detaches this bookkeeping owner before
+    /// signaling. Failed/replayable work keeps its original lifetime. Runtime
+    /// preparation and firmware owners retain their independent Arcs.
+    #[pin]
+    work_state: Mutex<Option<Arc<g17_resources::G17PWorkStateLease>>>,
     remaining: AtomicU32,
     error: AtomicI32,
 }
@@ -1319,7 +1323,12 @@ pub(crate) struct G17PSubmitCompletion {
 impl G17PSubmitCompletion {
     fn new(fence: UserFence<G17PSubmissionFence>, context: Arc<g17_resources::G17PLogicalQueueContext>, e2e_id: u64) -> Result<Arc<Self>> {
         let work_state = Arc::new(g17_resources::G17PWorkStateLease::deferred(context), GFP_KERNEL)?;
-        Ok(Arc::new(Self { fence, e2e_id, work_state, remaining: AtomicU32::new(1), error: AtomicI32::new(0) }, GFP_KERNEL)?)
+        Arc::pin_init(pin_init!(Self {
+            fence, e2e_id,
+            work_state <- new_mutex!(Some(work_state), "G17PSubmitCompletion::work_state"),
+            remaining: AtomicU32::new(1),
+            error: AtomicI32::new(0),
+        }), GFP_KERNEL)
     }
 
     fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
@@ -1330,7 +1339,18 @@ impl G17PSubmitCompletion {
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             let error = self.error.load(Ordering::Acquire);
-            if error != 0 { self.fence.set_error(Error::from_errno(error)); }
+            if error != 0 {
+                self.fence.set_error(Error::from_errno(error));
+            } else {
+                // Every command has retired successfully and enqueue is closed.
+                // Scheduler free_job can lag hardware completion or wait behind
+                // run_job on its ordered worker. Do not let those bookkeeping
+                // references retain all native command-buffer state slots.
+                // Error signals are deliberately excluded: quarantine/replay
+                // may still require the exact original allocation.
+                let retired = self.work_state.lock().take();
+                drop(retired);
+            }
             let e2e_before = crate::g17_e2e::stamp();
             self.fence.signal();
             if e2e_before != 0 {
@@ -1356,8 +1376,8 @@ pub(crate) struct G17PSubmitCompletionMember {
 }
 
 impl G17PSubmitCompletionMember {
-    pub(crate) fn work_state(&self) -> Arc<g17_resources::G17PWorkStateLease> {
-        self.aggregate.work_state.clone()
+    pub(crate) fn work_state(&self) -> Result<Arc<g17_resources::G17PWorkStateLease>> {
+        self.aggregate.work_state.lock().as_ref().cloned().ok_or(ECANCELED)
     }
 
     fn new(aggregate: Arc<G17PSubmitCompletion>) -> Self {
@@ -1450,7 +1470,7 @@ impl G17PRenderCompletion {
         (error != 0).then(|| Error::from_errno(error))
     }
 
-    pub(crate) fn work_state(&self) -> Arc<g17_resources::G17PWorkStateLease> {
+    pub(crate) fn work_state(&self) -> Result<Arc<g17_resources::G17PWorkStateLease>> {
         self.aggregate_member.work_state()
     }
 
@@ -2643,7 +2663,7 @@ impl G17PRenderQueueBackend {
                     } else {
                         self.runtime.preparations.enter_wait()?
                     };
-                    match completion.work_state().acquire() {
+                    match completion.work_state().and_then(|state| state.acquire()) {
                         Ok(_) => {}
                         Err(error) if error == EBUSY => {
                             drop(preparation);
@@ -3031,7 +3051,7 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
             loop {
                 if completion.status.get() != 0 { return Err(EIO); }
                 let preparation = self.runtime.preparations.enter_wait()?;
-                completion.work_state().acquire()?;
+                completion.work_state()?.acquire()?;
                 let lease = self.registry.acquire_compute()?;
                 let mut runtime = self.runtime.mutex().lock();
                 if preparation.finish().is_err() {

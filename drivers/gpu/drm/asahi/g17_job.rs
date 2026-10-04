@@ -156,7 +156,7 @@ impl G17PJobCompletion {
         self.recovery_class.load(Ordering::Acquire) == crate::g17_recovery_isolation::CLASS_SPARED
     }
 
-    pub(crate) fn work_state(&self) -> Arc<crate::g17_resources::G17PWorkStateLease> {
+    pub(crate) fn work_state(&self) -> Result<Arc<crate::g17_resources::G17PWorkStateLease>> {
         self.aggregate_member.work_state()
     }
 
