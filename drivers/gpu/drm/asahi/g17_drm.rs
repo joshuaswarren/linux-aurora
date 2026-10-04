@@ -1988,6 +1988,7 @@ impl DrmGpu for G17PDrmGpu {
         !self.registry.compute_poison_is_device_wide()
     }
     fn supports_per_command_input_syncs(&self) -> bool { true }
+    fn supports_exact_prior_barriers(&self) -> bool { true }
     fn independent_queue_limits(&self) -> Option<[u8; 16]> {
         Some(crate::g17_queue_limits::encode_limits())
     }
@@ -4241,6 +4242,10 @@ impl G17PQueue {
             user_end: self.user_range.end,
         };
         let mut parser = g17_uapi::UapiCommandParser::new(cmdbuf_raw);
+        // Freeze logical bases for every historical-prefix check in this
+        // ioctl. Translation completes before the first job is published.
+        let render_base = self.render_sequence;
+        let compute_base = self.compute_sequence;
         let mut render_preceding = 0u64;
         let mut compute_preceding = 0u64;
         // v91 PENDING_EXACT: 64 x ~1.2 KB preallocated is a kmalloc_large
@@ -4352,13 +4357,19 @@ impl G17PQueue {
                     self.e2e_fine[4] = crate::g17_e2e::fine();
                     translated.render_barrier = header.render_barrier;
                     translated.compute_barrier = header.compute_barrier;
-                    translated.compute_wait_through = crate::g17_submission::g17p_render_order(
-                        self.compute_sequence, compute_preceding, header.compute_barrier,
-                    ).map_err(|_| Self::stage_fail(submission_id, "render-compute-index", EOVERFLOW))?
+                    translated.compute_wait_through = crate::g17_submission::g17p_render_order_with_prior(
+                        compute_base, compute_preceding, header.compute_barrier, payload.prior_cdm,
+                    ).map_err(|error| Self::stage_fail(submission_id, "render-compute-index",
+                        if error == crate::g17_submission::SubmissionError::PriorBarrierFuture {
+                            EINVAL
+                        } else { EOVERFLOW }))?
                         .wait_through;
-                    translated.render_order = crate::g17_submission::g17p_render_order(
-                        self.render_sequence, render_preceding, header.render_barrier,
-                    ).map_err(|_| Self::stage_fail(submission_id, "render-index", EOVERFLOW))?;
+                    translated.render_order = crate::g17_submission::g17p_render_order_with_prior(
+                        render_base, render_preceding, header.render_barrier, payload.prior_vdm,
+                    ).map_err(|error| Self::stage_fail(submission_id, "render-index",
+                        if error == crate::g17_submission::SubmissionError::PriorBarrierFuture {
+                            EINVAL
+                        } else { EOVERFLOW }))?;
                     if crate::g17_e2e::armed() {
                         crate::g17_e2e::record(crate::g17_e2e::K_IOCTL_PARSED, 0, submission_id,
                             [render_preceding | compute_preceding << 32,
@@ -4380,15 +4391,21 @@ impl G17PQueue {
                             payload, attachments, window, space,
                         ),
                     ).map_err(|error| Self::reject_uapi(submission_id, "compute", error))?;
-                    let compute_order = crate::g17_submission::g17p_render_order(
-                        self.compute_sequence, compute_preceding, header.compute_barrier,
-                    ).map_err(|_| Self::stage_fail(submission_id, "compute-index", EOVERFLOW))?;
+                    let compute_order = crate::g17_submission::g17p_render_order_with_prior(
+                        compute_base, compute_preceding, header.compute_barrier, payload.prior_cdm,
+                    ).map_err(|error| Self::stage_fail(submission_id, "compute-index",
+                        if error == crate::g17_submission::SubmissionError::PriorBarrierFuture {
+                            EINVAL
+                        } else { EOVERFLOW }))?;
                     translated.compute_sequence = compute_order.sequence;
                     translated.compute_wait_through = compute_order.wait_through;
                     compute_preceding += 1;
-                    translated.render_wait_through = crate::g17_submission::g17p_render_order(
-                        self.render_sequence, render_preceding, header.render_barrier,
-                    ).map_err(|_| Self::stage_fail(submission_id, "compute-render-index", EOVERFLOW))?
+                    translated.render_wait_through = crate::g17_submission::g17p_render_order_with_prior(
+                        render_base, render_preceding, header.render_barrier, payload.prior_vdm,
+                    ).map_err(|error| Self::stage_fail(submission_id, "compute-render-index",
+                        if error == crate::g17_submission::SubmissionError::PriorBarrierFuture {
+                            EINVAL
+                        } else { EOVERFLOW }))?
                         .wait_through;
                     G17PPendingCommand::Compute(translated)
                 },

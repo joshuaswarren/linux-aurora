@@ -458,6 +458,10 @@ impl File {
         if gpu.supports_per_command_input_syncs() {
             params.features |= crate::g17_queue_limits::FEATURE_PER_COMMAND_INPUT_SYNCS;
         }
+        if gpu.supports_exact_prior_barriers() {
+            params.features |=
+                uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS as u64;
+        }
         if gpu.independent_queue_limits().is_some() {
             params.features |= crate::g17_queue_limits::FEATURE_INDEPENDENT_QUEUES;
         }
