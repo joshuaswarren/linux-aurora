@@ -112,6 +112,7 @@ pub(crate) enum PipeType {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionError {
     RenderBarrierFuture,
+    PriorBarrierFuture,
     RenderBarrierSequenceOverflow,
     RenderBarrierMissingToken,
     RenderBarrierPredecessorFailed,
@@ -2911,6 +2912,23 @@ pub(crate) fn g17p_render_order(
             .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?)
     };
     Ok(G17PRenderOrder { sequence, wait_through })
+}
+
+/// Add an exact historical prefix without broadening it to the ioctl base.
+/// The base is frozen for the whole ioctl, before any of its jobs publish;
+/// even an earlier command in this ioctl cannot satisfy a historical ordinal.
+/// Zero is absent, including when the legacy header is NONE.
+pub(crate) fn g17p_render_order_with_prior(
+    ioctl_base: u64, preceding: u64, barrier: u16, prior: u64,
+) -> Result<G17PRenderOrder, SubmissionError> {
+    if prior > ioctl_base {
+        return Err(SubmissionError::PriorBarrierFuture);
+    }
+    let mut order = g17p_render_order(ioctl_base, preceding, barrier)?;
+    if prior != 0 {
+        order.wait_through = Some(order.wait_through.map_or(prior, |p| p.max(prior)));
+    }
+    Ok(order)
 }
 
 /// Resolve a still-owned predecessor. A successful retirement needs no GPU
@@ -8865,5 +8883,94 @@ mod usc_freelist_tests {
         assert_eq!(u32_at(&record, 0x30), 0);
         assert_eq!(u32_at(&record, 0x34), 1);
         assert!(record[0x38..].iter().all(|byte| *byte == 0));
+    }
+}
+
+
+#[cfg(test)]
+mod exact_prior_tests {
+    use super::*;
+
+    #[test]
+    fn absent_prior_preserves_every_legacy_header_form() {
+        for base in [0, 1, 100, u64::MAX - 10] {
+            for preceding in 0..5 {
+                for barrier in [u16::MAX, 0, 1, 3, 5] {
+                    assert_eq!(g17p_render_order_with_prior(base, preceding, barrier, 0),
+                               g17p_render_order(base, preceding, barrier));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_old_prefix_does_not_grow_with_newer_unrelated_commands() {
+        for base in [7, 8, 1000] {
+            for preceding in [0, 1, 17] {
+                let order = g17p_render_order_with_prior(base, preceding, u16::MAX, 7).unwrap();
+                assert_eq!(order.wait_through, Some(7));
+                assert_eq!(order.sequence, base + preceding + 1);
+                assert!(g17p_render_prefix_contains(order.wait_through, 7));
+                assert!(!g17p_render_prefix_contains(order.wait_through, 8));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_max_preserves_zero_and_positive_relative_prefixes() {
+        assert_eq!(g17p_render_order_with_prior(100, 4, 0, 7).unwrap().wait_through, Some(100));
+        assert_eq!(g17p_render_order_with_prior(100, 4, 3, 100).unwrap().wait_through, Some(103));
+        assert_eq!(g17p_render_order_with_prior(100, 4, u16::MAX, 100).unwrap().wait_through, Some(100));
+        assert_eq!(g17p_render_order_with_prior(0, 0, u16::MAX, 0).unwrap().wait_through, None);
+    }
+
+    #[test]
+    fn earlier_current_ioctl_commands_are_not_historical() {
+        for prior in [11, 12, 100, u64::MAX] {
+            assert_eq!(g17p_render_order_with_prior(10, 100, u16::MAX, prior),
+                       Err(SubmissionError::PriorBarrierFuture));
+        }
+        assert_eq!(g17p_render_order_with_prior(0, 1, u16::MAX, 1),
+                   Err(SubmissionError::PriorBarrierFuture));
+    }
+
+    #[test]
+    fn relative_future_and_counter_overflow_still_reject() {
+        assert_eq!(g17p_render_order_with_prior(10, 1, 2, 7),
+                   Err(SubmissionError::RenderBarrierFuture));
+        assert_eq!(g17p_render_order_with_prior(u64::MAX, 0, u16::MAX, 1),
+                   Err(SubmissionError::RenderBarrierSequenceOverflow));
+        assert_eq!(g17p_render_order_with_prior(u64::MAX - 1, 1, 1, 1),
+                   Err(SubmissionError::RenderBarrierSequenceOverflow));
+    }
+
+    #[test]
+    fn split_ioctl_prefix_has_same_members_as_original_relative_prefix() {
+        let original = g17p_render_order_with_prior(20, 6, 3, 0).unwrap();
+        let later_slice = g17p_render_order_with_prior(25, 1, u16::MAX, 23).unwrap();
+        assert_eq!(original, later_slice);
+        for sequence in 0..30 {
+            assert_eq!(g17p_render_prefix_contains(original.wait_through, sequence),
+                       g17p_render_prefix_contains(later_slice.wait_through, sequence));
+        }
+    }
+
+    #[test]
+    fn physical_siblings_remain_independent_prefix_members() {
+        let order = g17p_render_order_with_prior(50, 0, u16::MAX, 12).unwrap();
+        let mut deps = [g17p_render_barrier_from_timestamp(0, 0).unwrap(); 4];
+        let mut seqs = [0; 4];
+        let mut count = 0;
+        for (sequence, qid, timestamp) in [(10, 2, 99), (11, 3, 55), (12, 2, 100)] {
+            assert!(g17p_render_prefix_contains(order.wait_through, sequence));
+            let dep = g17p_render_barrier_from_timestamp(timestamp, qid).unwrap();
+            g17p_insert_prefix_dependency(&mut deps, &mut seqs, &mut count, sequence, dep).unwrap();
+        }
+        assert_eq!(count, 2);
+        assert_eq!(&seqs[..count], &[12, 11]);
+        assert_eq!((deps[0].queue_id, deps[1].queue_id), (2, 3));
+        // Consuming one destination does not change another's exact prefix.
+        assert_eq!(g17p_render_order_with_prior(51, 0, u16::MAX, 12).unwrap().wait_through,
+                   order.wait_through);
     }
 }

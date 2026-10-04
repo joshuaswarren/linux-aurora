@@ -269,6 +269,13 @@ enum drm_asahi_feature {
 	 * replaces the VM_STATUS query. Registration may still be refused.
 	 */
 	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 4,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS: Render and compute payloads
+	 * support exact queue-local historical prefixes in prior_vdm/prior_cdm.
+	 * These fields supplement, rather than replace, the header barriers.
+	 */
+	DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS = (1UL) << 5,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
@@ -1245,6 +1252,24 @@ struct drm_asahi_cmd_render {
 
 	/** @bg_partial_rsrc_spec_hi: High dword of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
+
+	/**
+	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
+	 *
+	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
+	 * commands accepted on this queue since creation, starting at one. A
+	 * nonzero value must not exceed the render count at this ioctl's entry;
+	 * it waits for every render command through that ordinal. The effective
+	 * dependency is the maximum of this prefix and the header's resolved
+	 * vdm_barrier. Header NONE does not suppress this field.
+	 */
+	__u64 prior_vdm;
+
+	/**
+	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
+	 * queue's compute command count and the header's cdm_barrier instead.
+	 */
+	__u64 prior_cdm;
 };
 
 /**
@@ -1297,6 +1322,24 @@ struct drm_asahi_cmd_compute {
 	 * payloads are accepted with this field zero-filled.
 	 */
 	__u64 scs_layout;
+
+	/**
+	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
+	 *
+	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
+	 * commands accepted on this queue since creation, starting at one. A
+	 * nonzero value must not exceed the render count at this ioctl's entry;
+	 * it waits for every render command through that ordinal. The effective
+	 * dependency is the maximum of this prefix and the header's resolved
+	 * vdm_barrier. Header NONE does not suppress this field.
+	 */
+	__u64 prior_vdm;
+
+	/**
+	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
+	 * queue's compute command count and the header's cdm_barrier instead.
+	 */
+	__u64 prior_cdm;
 };
 
 /**

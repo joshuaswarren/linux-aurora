@@ -31,8 +31,8 @@ use g17_submission::{
 };
 
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
-pub(crate) const UAPI_RENDER_SIZE: usize = 256;
-pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;
+pub(crate) const UAPI_RENDER_SIZE: usize = 272;
+pub(crate) const UAPI_COMPUTE_SIZE: usize = 88;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
@@ -353,6 +353,8 @@ pub(crate) struct UapiRenderCommand {
     pub(crate) stencil_clear: u32,
     pub(crate) vertex_timestamps: UapiTimestamps,
     pub(crate) fragment_timestamps: UapiTimestamps,
+    pub(crate) prior_vdm: u64,
+    pub(crate) prior_cdm: u64,
 }
 
 impl UapiRenderCommand {
@@ -391,6 +393,8 @@ impl UapiRenderCommand {
             stencil_clear: get_u32(&raw, 0xcc),
             vertex_timestamps: timestamps(&raw, 0xd0),
             fragment_timestamps: timestamps(&raw, 0xe0),
+            prior_vdm: get_u64(&raw, 0x100),
+            prior_cdm: get_u64(&raw, 0x108),
         })
     }
 }
@@ -405,6 +409,8 @@ pub(crate) struct UapiComputeCommand {
     pub(crate) helper: UapiHelperProgram,
     pub(crate) timestamps: UapiTimestamps,
     pub(crate) scs_layout: u64,
+    pub(crate) prior_vdm: u64,
+    pub(crate) prior_cdm: u64,
 }
 
 impl UapiComputeCommand {
@@ -419,6 +425,8 @@ impl UapiComputeCommand {
             helper: helper(&raw, 0x20),
             timestamps: timestamps(&raw, 0x30),
             scs_layout: get_u64(&raw, 0x40),
+            prior_vdm: get_u64(&raw, 0x48),
+            prior_cdm: get_u64(&raw, 0x50),
         })
     }
 }
@@ -1760,6 +1768,8 @@ mod tests {
                             },
                         },
                         scs_layout: 0,
+                        prior_vdm: 0,
+                        prior_cdm: 0,
                     }
                 );
             }
@@ -1815,5 +1825,53 @@ mod tests {
             ),
             Err(UapiTranslateError::ProgramOffset)
         );
+    }
+}
+
+
+#[cfg(test)]
+mod exact_prior_payload_tests {
+    use super::*;
+
+    #[test]
+    fn historical_wire_offsets_preserve_scs_and_render_high_words() {
+        let mut render = [0u8; 272];
+        render[0xf0..0xf4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        render[256..264].copy_from_slice(&0x123456789abcdef0u64.to_le_bytes());
+        render[264..272].copy_from_slice(&0xfedcba9876543210u64.to_le_bytes());
+        let p = UapiRenderCommand::parse(&render).unwrap();
+        assert_eq!(p.prior_vdm, 0x123456789abcdef0);
+        assert_eq!(p.prior_cdm, 0xfedcba9876543210);
+        let old = UapiRenderCommand::parse(&render[..256]).unwrap();
+        assert_eq!(old.end_of_tile, p.end_of_tile);
+        assert_eq!((old.prior_vdm, old.prior_cdm), (0, 0));
+        let mut compute = [0u8; 88];
+        compute[64..72].copy_from_slice(&0x8877665544332211u64.to_le_bytes());
+        compute[72..80].copy_from_slice(&0x0123456789abcdefu64.to_le_bytes());
+        compute[80..88].copy_from_slice(&0xfedcba9876543210u64.to_le_bytes());
+        let c = UapiComputeCommand::parse(&compute).unwrap();
+        assert_eq!(c.scs_layout, 0x8877665544332211);
+        assert_eq!((c.prior_vdm, c.prior_cdm), (0x0123456789abcdef, 0xfedcba9876543210));
+        let old72 = UapiComputeCommand::parse(&compute[..72]).unwrap();
+        assert_eq!(old72.scs_layout, c.scs_layout);
+        assert_eq!((old72.prior_vdm, old72.prior_cdm), (0, 0));
+        let old64 = UapiComputeCommand::parse(&compute[..64]).unwrap();
+        assert_eq!((old64.scs_layout, old64.prior_vdm, old64.prior_cdm), (0, 0, 0));
+    }
+
+    #[test]
+    fn truncated_extensions_zero_fill_and_unknown_nonzero_tails_reject() {
+        let mut render = [0u8; 280];
+        render[256] = 7;
+        assert_eq!(UapiRenderCommand::parse(&render[..257]).unwrap().prior_vdm, 7);
+        assert!(UapiRenderCommand::parse(&render).is_ok());
+        render[272] = 1;
+        assert_eq!(UapiRenderCommand::parse(&render), Err(UapiTranslateError::PayloadTail));
+        let mut compute = [0u8; 96];
+        compute[80] = 9;
+        assert_eq!(UapiComputeCommand::parse(&compute[..81]).unwrap().prior_cdm, 9);
+        assert!(UapiComputeCommand::parse(&compute).is_ok());
+        compute[88] = 1;
+        assert_eq!(UapiComputeCommand::parse(&compute), Err(UapiTranslateError::PayloadTail));
     }
 }
