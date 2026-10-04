@@ -452,7 +452,8 @@ static int apple_probe_per_dcp(struct device *dev,
 		type = zpos ? DRM_PLANE_TYPE_OVERLAY : DRM_PLANE_TYPE_PRIMARY;
 		planes[zpos] = apple_plane_init(drm, 1U << num,
 						 iomfb_surfaces[zpos],
-						 supports_l10r, type);
+						 supports_l10r,
+						 dcp_fw_compat_is_h17p(dcp), type);
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
 		ret = drm_plane_create_zpos_immutable_property(planes[zpos], zpos);

@@ -467,12 +467,16 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
 				   u32 iomfb_surface,
 				   bool supports_l10r,
+				   bool is_h17p,
 				   enum drm_plane_type type)
 {
 	struct apple_plane *plane;
 	const u32 *fmts;
+	u32 h17p_primary_formats[ARRAY_SIZE(dcp_primary_formats)];
 	u32 num_fmts;
 
+	static_assert(ARRAY_SIZE(dcp_primary_formats_12_x) <=
+		      ARRAY_SIZE(dcp_primary_formats));
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
 		if (supports_l10r) {
@@ -481,6 +485,22 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 		} else {
 			fmts = dcp_primary_formats_12_x;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats_12_x);
+		}
+		/* H17P XR24 direct scanout has a color-dependent horizon band on
+		 * the panel while the captured RGB image is correct. An OSD clears
+		 * it through composition; the existing surface-flag 0/1 control did
+		 * not fix it. Withdraw only opaque 8-bit XRGB from the primary plane
+		 * so these buffers compose instead. This compatibility fallback
+		 * neither guesses a blend flag nor changes the producer's pixels.
+		 */
+		if (is_h17p) {
+			u32 count = 0;
+
+			for (u32 i = 0; i < num_fmts; i++)
+				if (fmts[i] != DRM_FORMAT_XRGB8888)
+					h17p_primary_formats[count++] = fmts[i];
+			fmts = h17p_primary_formats;
+			num_fmts = count;
 		}
 		plane = drmm_universal_plane_alloc(dev, struct apple_plane, base, possible_crtcs,
 				       &apple_plane_funcs, fmts, num_fmts,
