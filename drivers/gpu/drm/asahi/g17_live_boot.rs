@@ -7173,7 +7173,7 @@ impl G17PLiveRuntime {
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         let pair = manager.render_queue_pair(render_slot)?;
-        Ok(manager.take_warm_render_graph(vm, pair, context, completion.work_state(), command)?
+        Ok(manager.take_warm_render_graph(vm, pair, context, completion.work_state()?, command)?
             .map(|request| (drm, request)))
     }
 
@@ -7235,7 +7235,7 @@ impl G17PLiveRuntime {
         manager.handoff_retained_render_vm(render_slot, vm, context.clone())?;
         if fine[0] != 0 { fine[3] = crate::g17_e2e::now(); }
         let pair = manager.render_queue_pair(render_slot)?;
-        manager.take_render_restage(&drm, vm, pair, context, completion.work_state(), command, &dependencies)
+        manager.take_render_restage(&drm, vm, pair, context, completion.work_state()?, command, &dependencies)
         })();
         self.render_dependency_scratch = Some(dependencies);
         let taken = taken?;
@@ -7582,6 +7582,9 @@ impl G17PLiveRuntime {
         completion: Arc<crate::g17_drm::G17PRenderCompletion>,
         stages: &mut crate::g17_perf::RenderStageTimes,
     ) -> Result {
+        // Acquire before taking manager/register/dependency ownership so an
+        // already-completed aggregate cannot bypass their restoration paths.
+        let work_state = completion.work_state()?;
         stages.lap_start();
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
@@ -7707,7 +7710,7 @@ impl G17PLiveRuntime {
             vm,
             queue_pair,
             execution_context,
-            completion.work_state(),
+            work_state,
             command,
             &render_dependencies[..dependency_count],
             &registers,

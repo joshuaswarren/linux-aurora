@@ -122,7 +122,7 @@ assert publish.count("fsleep(") == 2
 guard = publish.index("render_flist_takeover_ready(")
 assert publish.index("fsleep(Delta::from_micros(200))", guard) < publish.index("takeover_polls += 1", guard) + 200
 assert "takeover_polls >= 5000" in publish
-exhausted = publish.index("match completion.work_state().acquire()")
+exhausted = publish.index("match completion.work_state().and_then(|state| state.acquire())")
 # Capacity waits and node initialization finish before taking device exclusion.
 assert exhausted < publish.index("fsleep(", exhausted) < publish.index("self.runtime.mutex().lock()", exhausted)
 assert "Err(error) if error == EBUSY" in publish
