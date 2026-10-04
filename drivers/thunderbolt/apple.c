@@ -1865,6 +1865,12 @@ static const struct dev_pm_ops apple_nhi_pm_ops = {
 
 static const struct of_device_id apple_nhi_match[] = {
 	{
+		.compatible = "apple,t6000-usb4-nhi",
+	},
+	{
+		.compatible = "apple,t6020-usb4-nhi",
+	},
+	{
 		.compatible = "apple,t8103-usb4-nhi",
 	},
 	{},
@@ -2398,6 +2404,12 @@ static void apple_cio_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_acio_match[] = {
+	{
+		.compatible = "apple,t6000-usb4-acio",
+	},
+	{
+		.compatible = "apple,t6020-usb4-acio",
+	},
 	{
 		.compatible = "apple,t8103-usb4-acio",
 	},

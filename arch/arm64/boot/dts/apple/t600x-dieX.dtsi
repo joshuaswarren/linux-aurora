@@ -484,8 +484,9 @@
 	DIE_NODE(usb4_0_acio): cio@701ac0000 {
 		compatible = "apple,t6000-usb4-acio", "apple,t8103-usb4-acio";
 		reg = <0x7 0x01ac0000 0x0 0xc000>,
-			<0x7 0x01080000 0x0 0x20000>;
-		reg-names = "rc", "sram";
+			<0x7 0x01080000 0x0 0x20000>,
+			<0x7 0x01e44000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter";
 
 		mboxes = <&DIE_NODE(usb4_0_mbox)>;
 		resets = <&DIE_NODE(cio_reset) 0>;
@@ -496,6 +497,7 @@
 				<&DIE_NODE(ps_atc0_pcie)>;
 
 		thunderbolt-switch;
+		apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
 
 		pinctrl-0 = <&DIE_NODE(acio0_pins)>;
 		pinctrl-names = "default";
@@ -640,8 +642,9 @@
 	DIE_NODE(usb4_1_acio): cio@b01ac0000 {
 		compatible = "apple,t6000-usb4-acio", "apple,t8103-usb4-acio";
 		reg = <0xb 0x01ac0000 0x0 0xc000>,
-			<0xb 0x01080000 0x0 0x20000>;
-		reg-names = "rc", "sram";
+			<0xb 0x01080000 0x0 0x20000>,
+			<0xb 0x01e44000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter";
 
 		mboxes = <&DIE_NODE(usb4_1_mbox)>;
 		resets = <&DIE_NODE(cio_reset) 1>;
@@ -652,6 +655,7 @@
 				<&DIE_NODE(ps_atc1_pcie)>;
 
 		thunderbolt-switch;
+		apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
 
 		pinctrl-0 = <&DIE_NODE(acio1_pins)>;
 		pinctrl-names = "default";
@@ -796,8 +800,9 @@
 	DIE_NODE(usb4_2_acio): cio@f01ac0000 {
 		compatible = "apple,t6000-usb4-acio", "apple,t8103-usb4-acio";
 		reg = <0xf 0x01ac0000 0x0 0xc000>,
-			<0xf 0x01080000 0x0 0x20000>;
-		reg-names = "rc", "sram";
+			<0xf 0x01080000 0x0 0x20000>,
+			<0xf 0x01e44000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter";
 
 		mboxes = <&DIE_NODE(usb4_2_mbox)>;
 		resets = <&DIE_NODE(cio_reset) 2>;
@@ -808,6 +813,7 @@
 				<&DIE_NODE(ps_atc2_pcie)>;
 
 		thunderbolt-switch;
+		apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
 
 		pinctrl-0 = <&DIE_NODE(acio2_pins)>;
 		pinctrl-names = "default";
@@ -952,8 +958,9 @@
 	DIE_NODE(usb4_3_acio): cio@1301ac0000 {
 		compatible = "apple,t6000-usb4-acio", "apple,t8103-usb4-acio";
 		reg = <0x13 0x01ac0000 0x0 0xc000>,
-			<0x13 0x01080000 0x0 0x20000>;
-		reg-names = "rc", "sram";
+			<0x13 0x01080000 0x0 0x20000>,
+			<0x13 0x01e44000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter";
 
 		mboxes = <&DIE_NODE(usb4_3_mbox)>;
 		resets = <&DIE_NODE(cio_reset) 3>;
@@ -963,6 +970,7 @@
 				<&DIE_NODE(ps_atc3_cio_usb)>;
 
 		thunderbolt-switch;
+		apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
 
 		pinctrl-0 = <&DIE_NODE(acio3_pins)>;
 		pinctrl-names = "default";
