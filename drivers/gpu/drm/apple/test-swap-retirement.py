@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Execute DCP retirement functions across rejection, replay and ID wrap."""
 from pathlib import Path
 import os
