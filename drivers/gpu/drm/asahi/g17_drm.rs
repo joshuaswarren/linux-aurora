@@ -3353,6 +3353,9 @@ impl G17PQueue {
     /// the sync-count check to the manager publish used to fail silently, which
     /// is why a submission could die with a bare EINVAL and no marker at all.
     fn stage_fail(submission_id: u64, stage: &str, error: kernel::error::Error) -> kernel::error::Error {
+        if error == ENOSPC {
+            crate::g17_queue_slots::note_submit_enospc(stage);
+        }
         pr_info!(
             "G17P submit: FAIL submission {} stage={} errno={}\n",
             submission_id,

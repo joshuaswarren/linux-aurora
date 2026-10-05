@@ -202,6 +202,8 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.prepare_logical_queue_context(self.drm.as_ref().ok_or(ENODEV)?, vm)
+            .inspect_err(|error| crate::g17_queue_slots::note_error(
+                crate::g17_queue_slots::Pool::QueueContextQos, *error))
     }
 
     pub(crate) fn prepare_compute_execution_context(

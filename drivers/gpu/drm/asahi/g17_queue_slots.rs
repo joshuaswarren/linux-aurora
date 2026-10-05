@@ -10,9 +10,13 @@
 //! `qids` fields are exact (kept by the table itself); the `compute`,
 //! `teardowns` and `render_quarantined` fields are a snapshot taken on every
 //! teardown turn and on every queue creation.
+//!
+//! Every ENOSPC from one of these pools is counted by pool and named in
+//! dmesg (the first one, then each power of two), so a failed QUEUE_CREATE
+//! or submit says which pool ran out.
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
-use kernel::{bindings, module_param::KernelParam};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use kernel::{bindings, module_param::KernelParam, prelude::*};
 
 use crate::g17_channel::{self, QID_COUNT};
 
@@ -24,6 +28,69 @@ static COMPUTE_EXIT_KILLED: AtomicU32 = AtomicU32::new(0);
 static RETIRED_GRAPHS: AtomicU32 = AtomicU32::new(0);
 static TEARDOWNS: AtomicU32 = AtomicU32::new(0);
 static RENDER_QUARANTINED: AtomicU32 = AtomicU32::new(0);
+
+/// Pools whose exhaustion returns ENOSPC to a client.
+#[derive(Clone, Copy)]
+pub(crate) enum Pool {
+    /// A render slot's first use leases two QIDs (`render-warm-pairs`).
+    QidRenderPair,
+    /// A new compute graph leases one QID (queue creation / first compute).
+    QidCompute,
+    /// A new logical queue context (QUEUE_CREATE): its only 128-wide pool
+    /// is the QoS hardware-buffer IDs, held by logical queues and installed
+    /// graph bindings.
+    QueueContextQos,
+    /// Any other submit-path ENOSPC (TSQ render slots, retained scenes,
+    /// compute item ring), named by its submit stage in the log line.
+    SubmitOther,
+}
+
+const POOL_COUNT: usize = 4;
+const POOL_NAMES: [&str; POOL_COUNT] = ["qid-render-pair", "qid-compute", "queue-context-qos", "submit-other"];
+static POOL_ENOSPC: [AtomicU64; POOL_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Submits that failed with ENOSPC, whichever pool.
+static SUBMIT_ENOSPC: AtomicU64 = AtomicU64::new(0);
+
+fn log_enospc(pool: &str, stage: &str, count: u64) {
+    // First one, then each power of two: a stuck pool cannot flood dmesg.
+    if count.is_power_of_two() {
+        pr_warn!(
+            "G17P ENOSPC pool={} stage={} (#{}): qids leased={}/{} compute={} compute-quarantined={} \
+             reserve-refused={}\n",
+            pool, stage, count, g17_channel::leased_total(), QID_COUNT,
+            g17_channel::LEASED[2].load(Ordering::Relaxed),
+            COMPUTE_QUARANTINED.load(Ordering::Relaxed),
+            g17_channel::RESERVE_REFUSED.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// Count and name one ENOSPC from `pool`, and return it.
+#[cold]
+pub(crate) fn enospc(pool: Pool) -> Error {
+    let count = POOL_ENOSPC[pool as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    log_enospc(POOL_NAMES[pool as usize], "-", count);
+    ENOSPC
+}
+
+/// A submit failed with ENOSPC at `stage`. Pools tagged at their source
+/// were already counted and named; this names the rest by stage.
+#[cold]
+pub(crate) fn note_submit_enospc(stage: &str) {
+    SUBMIT_ENOSPC.fetch_add(1, Ordering::Relaxed);
+    if stage != "render-warm-pairs" {
+        let other = POOL_ENOSPC[Pool::SubmitOther as usize].fetch_add(1, Ordering::Relaxed) + 1;
+        log_enospc(POOL_NAMES[Pool::SubmitOther as usize], stage, other);
+    }
+}
+
+/// [`enospc`] for a call that may fail for other reasons too.
+pub(crate) fn note_error(pool: Pool, error: Error) {
+    if error == ENOSPC {
+        enospc(pool);
+    }
+}
 
 /// Snapshot of the runtime's queue-slot holders.
 pub(crate) struct Snapshot {
@@ -67,17 +134,22 @@ unsafe extern "C" fn slots_get(buf: *mut core::ffi::c_char, _: *const bindings::
     let bytes = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), 1024) };
     let mut out = Output { bytes, used: 0 };
     let r = |c: &AtomicU32| c.load(Ordering::Relaxed);
+    let e = |pool: usize| POOL_ENOSPC[pool].load(Ordering::Relaxed);
     let leased = g17_channel::leased_total();
     let published: u32 = g17_channel::PUBLISHED.iter().map(r).sum();
     let _ = writeln!(out,
         "qids leased={} free={} published={} tiling={} fragment={} compute={} high_water={} exhausted={} \
+         reserve={} reserve_refused={} \
          compute graphs={} owned={} released={} quarantined={} exit_killed={} retired_graphs={} \
-         teardowns={} render_quarantined={}",
+         teardowns={} render_quarantined={} \
+         enospc qid-render-pair={} qid-compute={} queue-context-qos={} submit-other={} submits={}",
         leased, (QID_COUNT as u32).saturating_sub(leased), published,
         r(&g17_channel::LEASED[0]), r(&g17_channel::LEASED[1]), r(&g17_channel::LEASED[2]),
         r(&g17_channel::HIGH_WATER), g17_channel::EXHAUSTED.load(Ordering::Relaxed),
+        g17_channel::COMPUTE_RENDER_RESERVE, g17_channel::RESERVE_REFUSED.load(Ordering::Relaxed),
         r(&COMPUTE_GRAPHS), r(&COMPUTE_OWNED), r(&COMPUTE_RELEASED), r(&COMPUTE_QUARANTINED),
-        r(&COMPUTE_EXIT_KILLED), r(&RETIRED_GRAPHS), r(&TEARDOWNS), r(&RENDER_QUARANTINED));
+        r(&COMPUTE_EXIT_KILLED), r(&RETIRED_GRAPHS), r(&TEARDOWNS), r(&RENDER_QUARANTINED),
+        e(0), e(1), e(2), e(3), SUBMIT_ENOSPC.load(Ordering::Relaxed));
     out.used as core::ffi::c_int
 }
 

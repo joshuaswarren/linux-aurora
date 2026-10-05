@@ -107,11 +107,24 @@ impl Runtime {{
 }}
 #[test] fn partial_render_allocation_returns_the_unpublished_qid() {{
     let mut m=manager();
-    for _ in 0..125 {{m.allocate_compute_queue_id().unwrap();}}
-    assert_eq!(m.render_queue_pair(1),Err(ENOSPC));
-    assert!(m.render_channel_leases[1].is_none());
-    assert!(m.allocate_compute_queue_id().is_ok());
+    for _ in 0..110 {{m.allocate_compute_queue_id().unwrap();}}
+    for slot in 1..8 {{m.render_queue_pair(slot).unwrap();}}
+    m.channel_ids.acquire(g17_channel::ChannelId(1_000_000), g17_channel::Engine::Tiling, None).unwrap();
+    assert_eq!(m.channel_ids.free(), 1);
+    assert_eq!(m.render_queue_pair(8),Err(ENOSPC));
+    assert!(m.render_channel_leases[8].is_none());
+    assert_eq!(m.channel_ids.free(), 1);
+}}
+#[test] fn compute_exhaustion_leaves_render_pairs_servable() {{
+    let mut m=manager();
+    for _ in 0..110 {{m.allocate_compute_queue_id().unwrap();}}
+    let next = m.next_channel_identity;
     assert_eq!(m.allocate_compute_queue_id(),Err(ENOSPC));
+    assert_eq!(m.next_channel_identity, next);
+    assert_eq!(m.channel_ids.free(), g17_channel::COMPUTE_RENDER_RESERVE);
+    for slot in 1..=8 {{m.render_queue_pair(slot).unwrap();}}
+    assert_eq!(m.channel_ids.free(), 0);
+    assert_eq!(m.render_queue_pair(9),Err(ENOSPC));
 }}
 #[test] fn rollback_reuses_qid_but_not_graph_identity() {{
     let mut m = manager();
@@ -139,7 +152,7 @@ impl Runtime {{
 #[test] fn exhaustion_and_identity_overflow_do_not_change_owner() {{
     let mut m = manager();
     let mut seen = [false; 128];
-    for index in 0..126 {{
+    for index in 0..126 - g17_channel::COMPUTE_RENDER_RESERVE {{
         let lease = m.allocate_compute_queue_id().unwrap();
         if index == 0 {{ assert_eq!(lease.qid, 4); }}
         assert!(lease.qid >= 2);
@@ -147,7 +160,7 @@ impl Runtime {{
         seen[lease.qid as usize] = true;
         assert!(m.channel_ids.publish(lease));
     }}
-    assert!(seen[2..].iter().all(|seen| *seen));
+    assert_eq!(seen[2..].iter().filter(|seen| **seen).count(), 126 - g17_channel::COMPUTE_RENDER_RESERVE);
     let next = m.next_channel_identity;
     assert_eq!(m.allocate_compute_queue_id(), Err(ENOSPC));
     assert_eq!(m.next_channel_identity, next);

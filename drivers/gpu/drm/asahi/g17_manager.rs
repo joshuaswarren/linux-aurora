@@ -2528,7 +2528,8 @@ pub(crate) const G17P_COMPUTE_QUEUE_ID_BASE: u8 = 4;
 /// firmware's KSM restore set has 128 slots. IDs 0..3 are the two bounded
 /// render pairs, 4 is the first compute queue, and additional compute graphs
 /// consume 5..127 exactly once. Exhaustion returns ENOSPC rather than
-/// reprogramming a queue still installed in the firmware.
+/// reprogramming a queue still installed in the firmware. New compute graphs
+/// leave `g17_channel::COMPUTE_RENDER_RESERVE` QIDs to render pairs.
 pub(crate) const G17P_COMPUTE_QUEUE_ID_LAST: u8 = 127;
 const _: () = assert!(G17P_COMPUTE_QUEUE_ID_BASE > 1);
 const _: () = assert!(G17P_COMPUTE_QUEUE_ID_LAST <= 127);
@@ -11916,8 +11917,11 @@ impl G17PManagerConstruction {
         use crate::g17_channel::{ChannelId, Engine};
         let identity = self.next_channel_identity;
         let next = identity.checked_add(1).ok_or(EOVERFLOW)?;
-        let lease = self.channel_ids.acquire(ChannelId(identity), Engine::Compute, Some(G17P_COMPUTE_QUEUE_ID_BASE))
-            .ok_or(ENOSPC)?;
+        // Keep render pairs servable when compute faults have used up the rest.
+        let lease = self.channel_ids.acquire_reserving(
+            ChannelId(identity), Engine::Compute, Some(G17P_COMPUTE_QUEUE_ID_BASE),
+            crate::g17_channel::COMPUTE_RENDER_RESERVE,
+        ).ok_or(ENOSPC)?;
         self.next_channel_identity = next;
         Ok(lease)
     }
@@ -11991,7 +11995,9 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
     ) -> Result<G17PSksmQueue> {
-        let channel_lease = self.allocate_compute_queue_id()?;
+        let channel_lease = self.allocate_compute_queue_id()
+            .inspect_err(|error| crate::g17_queue_slots::note_error(
+                crate::g17_queue_slots::Pool::QidCompute, *error))?;
         let queue_id = channel_lease.qid;
         let hardware_buffer_id = 1;
         let result = (|| {
