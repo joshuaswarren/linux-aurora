@@ -928,9 +928,8 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
  * The CRTC-disable commit never reaches dcp_flush(): the driver commits
  * through drm_atomic_helper_commit_tail_rpm(), whose ACTIVE_ONLY plane pass
  * skips the planes and the flush of a CRTC that is going inactive.  That
- * commit calls this from the CRTC's atomic_disable instead.  An entry that
- * is queued twice for the same framebuffer only holds one more reference,
- * which the same release path drops.
+ * commit calls this from the CRTC's atomic_disable instead.  The prepared
+ * entry is consumed once, even if disable and flush both visit the state.
  */
 static void dcp_retain_unbound_fbs(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			    struct drm_atomic_state *state)
@@ -940,22 +939,24 @@ static void dcp_retain_unbound_fbs(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	int i;
 
 	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, i) {
+		struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
 		struct dcp_fb_reference *entry;
 		unsigned long flags;
 
-		if (old_state->crtc != crtc && new_state->crtc != crtc)
-			continue;
-		if (!old_state->fb || new_state->fb == old_state->fb)
-			continue;
-
-		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-		if (!entry)
-			continue;
-		entry->fb = old_state->fb;
-		drm_framebuffer_get(old_state->fb);
-		spin_lock_irqsave(&dcp->swapped_out_lock, flags);
-		list_add_tail(&entry->head, &dcp->swapped_out_fbs);
-		spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
+		if (old_state->crtc == crtc && old_state->fb &&
+		    (new_state->fb != old_state->fb || new_state->crtc != crtc)) {
+			/* prepare_fb reserved this before the state swap. */
+			entry = apple_state->retiring_fb;
+			/* Disable and flush can both visit the same state. */
+			if (!entry)
+				continue;
+			apple_state->retiring_fb = NULL;
+			entry->fb = old_state->fb;
+			drm_framebuffer_get(old_state->fb);
+			spin_lock_irqsave(&dcp->swapped_out_lock, flags);
+			list_add_tail(&entry->head, &dcp->swapped_out_fbs);
+			spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
+		}
 	}
 }
 
@@ -969,6 +970,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	/* Even a skipped swap must keep the firmware's previous surface alive. */
+	dcp_retain_unbound_fbs(dcp, crtc, state);
 
 	/*
 	 * DCP does not complete swaps after a link loss.  A plane-only commit
@@ -984,8 +988,6 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
-	dcp_retain_unbound_fbs(dcp, crtc, state);
-
 	if (dcp_channel_busy(&dcp->ch_cmd))
 	{
 		if (!dcp->ch_cmd.warned_busy) {

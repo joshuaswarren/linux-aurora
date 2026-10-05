@@ -8,7 +8,7 @@ import tempfile
 
 root = Path(__file__).resolve().parent
 plane = (root / 'plane.c').read_text()
-swap = (root / 'iomfb_template.c').read_text()
+swap = (root / 'iomfb.c').read_text()
 
 def block(source, marker):
     start = source.index(marker)
@@ -20,6 +20,7 @@ def block(source, marker):
     return source[start:end]
 
 prepare = block(plane, 'static int apple_plane_prepare_fb(')
+cleanup = block(plane, 'static void apple_plane_cleanup_fb(')
 reset = block(plane, 'static void apple_plane_reset(')
 duplicate = block(plane, 'static struct drm_plane_state *\napple_plane_duplicate_state(')
 destroy = block(plane, 'static void apple_plane_destroy_state(')
@@ -92,11 +93,13 @@ static void list_add_tail(struct list_head *head, struct list_head *list) {
     queued = (struct dcp_fb_reference *)head;
 }
 '''
-code = stub + prepare + '\n' + reset + '\n' + duplicate + '\n' + destroy + r'''
+code = stub + prepare + '\n' + cleanup + '\n' + reset + '\n' + duplicate + '\n' + destroy + r'''
 static void retire(struct dcp *dcp, struct drm_crtc *crtc,
                    struct drm_plane_state *old_state, struct drm_plane_state *new_state) {
     struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
-''' + retire + r'''
+    struct dcp_fb_reference *entry;
+    unsigned long flags;
+''' + retire.replace('continue;', 'return;') + r'''
 }
 int main(void) {
     struct drm_framebuffer a = {1}, b = {1};
@@ -139,6 +142,8 @@ int main(void) {
     retire(&d, &c, old, next);
     assert(queued && queued->fb == &a && a.refs == 2 && !n->retiring_fb);
     assert(!queued->armed && allocs == before);
+    retire(&d, &c, old, next); /* disable plus flush must consume only once */
+    assert(a.refs == 2 && allocs == before);
     apple_plane_destroy_state(&p, next);
     assert(a.refs == 2); /* DCP still owns the reference after atomic cleanup. */
     queued->fb->refs--;
@@ -151,6 +156,28 @@ int main(void) {
     assert(to_apple_plane_state(next)->retiring_fb);
     apple_plane_destroy_state(&p, next); /* rejected/cancelled commit */
     assert(a.refs == 1 && allocs == frees && fence_calls == 6);
+    /* Moving the same framebuffer to another CRTC still retires the old pipe. */
+    next = apple_plane_duplicate_state(&p);
+    next->crtc = &other;
+    fail_alloc = 1;
+    assert(apple_plane_prepare_fb(&p, next) == -ENOMEM);
+    fail_alloc = 0;
+    assert(apple_plane_prepare_fb(&p, next) == 0);
+    retire(&d, &c, old, next);
+    assert(queued && queued->fb == &a && a.refs == 2);
+    apple_plane_destroy_state(&p, next);
+    queued->fb->refs--;
+    kfree(queued);
+    queued = NULL;
+    /* prepare/unprepare can be retried on an atomic state without leaking. */
+    next = apple_plane_duplicate_state(&p);
+    next->fb = NULL;
+    assert(apple_plane_prepare_fb(&p, next) == 0);
+    apple_plane_cleanup_fb(&p, next);
+    assert(!to_apple_plane_state(next)->retiring_fb);
+    assert(apple_plane_prepare_fb(&p, next) == 0);
+    apple_plane_destroy_state(&p, next);
+    assert(a.refs == 1 && allocs == frees);
     return 0;
 }
 '''
@@ -159,6 +186,7 @@ with tempfile.TemporaryDirectory() as tmp:
     binary = Path(tmp) / 'test'
     source.write_text(code)
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                    '-Wno-unused-parameter',
                     *shlex.split(os.environ.get('CFLAGS', '')),
                     str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
