@@ -291,7 +291,9 @@ impl G17PLiveRuntime {
                 )
             });
         let index = if let Some(index) = free { index } else {
-            self.create_async_compute_queue()?
+            let created = self.create_async_compute_queue();
+            self.note_queue_slots();
+            created?
         };
         let q = &mut self.async_compute_queues[index];
         if q.binding.is_some() != q.context.is_some() {

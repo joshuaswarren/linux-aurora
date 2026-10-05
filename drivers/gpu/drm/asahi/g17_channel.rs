@@ -6,7 +6,25 @@
 //! Published Linux channels currently retain their leases until processor stop:
 //! a completed command does not by itself prove scheduler-resource detachment.
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 pub(crate) const QID_COUNT: usize = 128;
+
+/// Device-wide QID gauges for `g17p_queue_slots`, indexed by [`Engine`].
+/// Kept by every table mutation and undone by `Drop`, so replacing the table
+/// at processor stop leaves only the new table's leases counted.
+pub(crate) static LEASED: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+pub(crate) static PUBLISHED: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// Most QIDs leased at once since load.
+pub(crate) static HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+/// `acquire` calls that found no free QID (the ENOSPC of queue creation and
+/// of a new render pair).
+pub(crate) static EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Total QIDs currently leased, all engines.
+pub(crate) fn leased_total() -> u32 {
+    LEASED.iter().map(|count| count.load(Ordering::Relaxed)).sum()
+}
 
 /// Stable host channel identity, distinct from its reusable numerical QID.
 /// Identity zero is invalid; identities must not be recycled within a session.
@@ -18,6 +36,16 @@ pub(crate) enum Engine {
     Tiling,
     Fragment,
     Compute,
+}
+
+impl Engine {
+    const fn gauge(self) -> usize {
+        match self {
+            Engine::Tiling => 0,
+            Engine::Fragment => 1,
+            Engine::Compute => 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,8 +96,14 @@ impl ChannelTable {
         }
         let qid = preferred.filter(|qid| {
             self.entries.get(usize::from(*qid)).is_some_and(Option::is_none)
-        }).map(usize::from).or_else(|| self.entries.iter().position(Option::is_none))?;
+        }).map(usize::from).or_else(|| self.entries.iter().position(Option::is_none));
+        let Some(qid) = qid else {
+            EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         self.entries[qid] = Some(Entry { channel, engine, published: false });
+        LEASED[engine.gauge()].fetch_add(1, Ordering::Relaxed);
+        HIGH_WATER.fetch_max(leased_total(), Ordering::Relaxed);
         Some(Lease { qid: qid as u8, channel, engine })
     }
 
@@ -78,7 +112,11 @@ impl ChannelTable {
     /// return an installed QID to the free pool.
     pub(crate) fn publish(&mut self, lease: Lease) -> bool {
         if !self.matches(lease) { return false; }
-        self.entries[usize::from(lease.qid)].as_mut().unwrap().published = true;
+        let entry = self.entries[usize::from(lease.qid)].as_mut().unwrap();
+        if !entry.published {
+            PUBLISHED[entry.engine.gauge()].fetch_add(1, Ordering::Relaxed);
+        }
+        entry.published = true;
         true
     }
 
@@ -89,7 +127,19 @@ impl ChannelTable {
         let entry = &mut self.entries[usize::from(lease.qid)];
         if entry.is_some_and(|entry| entry.published) { return false; }
         *entry = None;
+        LEASED[lease.engine.gauge()].fetch_sub(1, Ordering::Relaxed);
         true
+    }
+}
+
+impl Drop for ChannelTable {
+    fn drop(&mut self) {
+        for entry in self.entries.iter().flatten() {
+            LEASED[entry.engine.gauge()].fetch_sub(1, Ordering::Relaxed);
+            if entry.published {
+                PUBLISHED[entry.engine.gauge()].fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
