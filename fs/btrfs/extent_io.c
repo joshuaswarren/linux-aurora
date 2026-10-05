@@ -150,6 +150,18 @@ struct btrfs_bio_ctrl {
 	 * inside the same inode.
 	 */
 	u64 last_em_start;
+
+	/*
+	 * The extent map of the compressed extent being read into bbio, with
+	 * a reference held.
+	 *
+	 * The bio is submitted after the extent range is unlocked, and by then
+	 * the extent map shrinker may have removed the map from the inode's
+	 * extent map tree, so btrfs_submit_compressed_read() must not look it
+	 * up again. Released by the caller of btrfs_do_readpage() after the
+	 * last submit_one_bio().
+	 */
+	struct extent_map *compressed_em;
 };
 
 /*
@@ -186,7 +198,7 @@ static void submit_one_bio(struct btrfs_bio_ctrl *bio_ctrl)
 
 	if (btrfs_op(&bbio->bio) == BTRFS_MAP_READ &&
 	    bio_ctrl->compress_type != BTRFS_COMPRESS_NONE)
-		btrfs_submit_compressed_read(bbio);
+		btrfs_submit_compressed_read(bbio, bio_ctrl->compressed_em);
 	else
 		btrfs_submit_bbio(bbio, 0);
 
@@ -1121,17 +1133,17 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 		bio_ctrl->last_em_start = em->start;
 
 		em_gen = em->generation;
-		btrfs_free_extent_map(em);
-		em = NULL;
 
 		/* we've found a hole, just zero and go on */
 		if (block_start == EXTENT_MAP_HOLE) {
+			btrfs_free_extent_map(em);
 			folio_zero_range(folio, pg_offset, blocksize);
 			end_folio_read(vi, folio, true, cur, blocksize);
 			continue;
 		}
 		/* the get_extent function already copied into the folio */
 		if (block_start == EXTENT_MAP_INLINE) {
+			btrfs_free_extent_map(em);
 			end_folio_read(vi, folio, true, cur, blocksize);
 			continue;
 		}
@@ -1143,6 +1155,21 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 
 		if (force_bio_submit)
 			submit_one_bio(bio_ctrl);
+
+		/*
+		 * Any bio built from a different compressed extent has been
+		 * submitted above, so from here on bio_ctrl->bbio only covers
+		 * @em. Keep a reference for btrfs_submit_compressed_read().
+		 */
+		if (compress_type != BTRFS_COMPRESS_NONE &&
+		    bio_ctrl->compressed_em != em) {
+			btrfs_free_extent_map(bio_ctrl->compressed_em);
+			bio_ctrl->compressed_em = em;
+		} else {
+			btrfs_free_extent_map(em);
+		}
+		em = NULL;
+
 		submit_extent_folio(bio_ctrl, disk_bytenr, folio, blocksize,
 				    pg_offset, em_gen);
 	}
@@ -1355,6 +1382,7 @@ int btrfs_read_folio(struct file *file, struct folio *folio)
 	 * bio to do the cleanup.
 	 */
 	submit_one_bio(&bio_ctrl);
+	btrfs_free_extent_map(bio_ctrl.compressed_em);
 	return ret;
 }
 
@@ -2714,6 +2742,7 @@ void btrfs_readahead(struct readahead_control *rac)
 	if (em_cached)
 		btrfs_free_extent_map(em_cached);
 	submit_one_bio(&bio_ctrl);
+	btrfs_free_extent_map(bio_ctrl.compressed_em);
 }
 
 /*
