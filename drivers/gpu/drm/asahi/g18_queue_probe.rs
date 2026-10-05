@@ -304,14 +304,25 @@ impl G18QueueProbe {
 
     pub(crate) fn prepare_application_compute(&mut self, command: G18PreparedComputeCommand,
         pool: G18UmaPoolBinding, generation: u32) -> Result {
+        self.prepare_application_compute_rebind(command, pool, pool, command.context_id, generation)
+    }
+
+    pub(crate) fn prepare_application_compute_rebind(&mut self, command: G18PreparedComputeCommand,
+        pool: G18UmaPoolBinding, previous: G18UmaPoolBinding, previous_context: u32,
+        generation: u32) -> Result {
         use crate::m5_sksm as sksm;
+        if pool.slot != previous.slot || pool.generation == u64::MAX
+            || !(pool.generation == previous.generation && pool.state == previous.state
+                || previous.generation.checked_add(1) == Some(pool.generation)
+                    && pool.state != previous.state)
+            || pool.state < KERNEL_BASE || pool.state & 0x3fff != 0 { return Err(EINVAL); }
         if generation == 0 || generation > 0x00ff_ffff
             || generation != self.compute_generation + 1 { return Err(EINVAL); }
         let before = (3 + (generation - 1) * 3) % 256;
         if self.compute_prepared || self.counters()? != [before; 3]
             || !Self::installed(self.slot())
             || !Self::scheduler_usable(self.scheduler_status()?)
-            || !Self::pool_bound_for_context(self.pool_status(), pool, command.context_id)
+            || !Self::pool_bound_for_context(self.pool_status(), previous, previous_context)
             || !(3..64).contains(&command.context_id) || command.expected_stamp != generation << 8
             || command.firmware_address < KERNEL_BASE
             || command.registers.main_count > 127 || command.registers.secondary_count != 4 {
@@ -351,6 +362,9 @@ impl G18QueueProbe {
             out.copy_within(CONFIG + 0x200..CONFIG + 0x298, CONFIG + 0x300);
             let config = &mut out[CONFIG + 0x300..CONFIG + 0x398];
             put32(config, 0x32, command.context_id);
+            put64(config, 0x36, pool.state);
+            put64(config, 0x3e, pool.generation);
+            put32(config, 0x46, pool.slot);
             put32(config, 0x62, 1); // native descriptor+0x190: update context
             put32(config, 0x66, 1); // retained process owner identity
             out[CONFIG + 0x400..CONFIG + 0x400 + kick.len()].copy_from_slice(&kick);

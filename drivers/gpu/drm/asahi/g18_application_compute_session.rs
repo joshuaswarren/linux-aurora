@@ -46,16 +46,20 @@ impl G18Session {
                 dev_info!(self.device(), "G18_APP_COMPUTE_BIND_PASS phase={}\n", phase);
             }
         }
+        let (previous_pool, bound_context) = self.memory.as_ref().ok_or(EIO)?
+            .application_compute_previous_binding()?;
+        let previous_context = if generation == 1 { command.context_id } else { bound_context };
         let probe = self.queue_probe.as_mut().ok_or(EIO)?;
-        if let Some(what) = probe.compute_unready(pool, command.context_id, generation)? {
+        if let Some(what) = probe.compute_unready(previous_pool, previous_context, generation)? {
             let (counters, slot, scheduler, pool_words) = probe.compute_state()?;
             dev_err!(self.device(),
                 "G18_APP_COMPUTE_UNREADY compute={} unready={} counters={:?} slot={:x?} scheduler={:x?} pool={:x?}\n",
                 generation, what, counters, slot, scheduler, pool_words);
             return Err(EINVAL.into());
         }
+        self.memory.as_mut().ok_or(EIO)?.install_application_compute_pool(&self.dev)?;
         self.queue_probe.as_mut().ok_or(EIO)?
-            .prepare_application_compute(command, pool, generation)?;
+            .prepare_application_compute_rebind(command, pool, previous_pool, previous_context, generation)?;
         self.poll_idle_faults("application compute pre-kick")?;
         let memory = self.memory.as_mut().ok_or(EIO)?;
         let completed = memory.compute().completion_snapshot()?;
@@ -106,21 +110,35 @@ impl G18Session {
             }
             if report {
                 dev_info!(session.device(),
-                    "G18_APP_COMPUTE_WAIT generation={} ms={} recovered={} outer={:?} inner={:?} stamps={:x?} masks={:x?} scheduler={:?}\n",
-                    generation, ms, recovered, outer, inner, completed.stamps, masks, scheduler);
+                    "G18_APP_COMPUTE_WAIT generation={} ms={} recovered={} outer={:?} inner={:?} stamps={:x?} timestamps={:x?} masks={:x?} scheduler={:?} expected_outer={} expected_inner={} expected_stamp={:#x} consumed={} finished={}\n",
+                    generation, ms, recovered, outer, inner, completed.stamps, completed.timestamps,
+                    masks, scheduler, outer_after, inner_after, expected_stamp, consumed, finished);
             }
             Ok(consumed && (finished || recovered))
         })?;
         let recovery = match end {
             JobEnd::Retired => match self.poll_faults("application compute retired")? {
                 None => {
+                    let observed = self.queue_probe.as_ref().ok_or(EIO)?.pool_status();
+                    if !G18QueueProbe::pool_bound_for_context(observed, pool, command.context_id) {
+                        dev_err!(self.device(),
+                            "G18_COMPUTE_POOL_VERIFY_FAILED compute={} binding={:?} observed={:x?}; both owners retained\n",
+                            generation, pool, observed);
+                        return Err(EIO.into());
+                    }
+                    if pool.generation != previous_pool.generation {
+                        dev_info!(self.device(),
+                            "G18_COMPUTE_POOL_VERIFY compute={} generation={} state={:#x} context={} slot={} observed={:x?} verified=1\n",
+                            generation, pool.generation, pool.state, command.context_id, pool.slot, observed);
+                    }
                     if recovery::phases_due(generation) {
                         dev_info!(self.device(),
                             "G18_JOB_PHASES compute={} us={:?} gpu_ticks={} (outer inner submitted completed linked stamp mask)\n",
                             generation, first, gpu_ticks);
                     }
                     self.queue_probe.as_mut().ok_or(EIO)?.retire_application_compute(generation)?;
-                    self.memory.as_mut().ok_or(EIO)?.retire_application_compute(generation)?;
+                    self.memory.as_mut().ok_or(EIO)?
+                        .retire_application_compute(generation, command.context_id)?;
                     dev_info!(self.device(),
                         "G18_APP_FRAME_PASS compute={} stamp={:#x} scheduler={} outer={} inner={}\n",
                         generation, expected_stamp, generation, outer_after, inner_after);

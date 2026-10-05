@@ -109,6 +109,15 @@ pub(crate) const REGIONS: &[Region] = &[
     r("application-compute-preempt", 0x70_5000_0000, PAGE),
     r("application-compute-preempt-driver", APPLICATION_COMPUTE_PREEMPT_DRIVER,
         APPLICATION_COMPUTE_PREEMPT_DRIVER_BYTES + PAGE),
+    // Replacement views have independent sparse directories and block lists.
+    // Each scratch aperture includes every supported 2-MiB block plus guards
+    // at a 3-MiB stride; four-GiB bank spacing also covers the full 2-GiB plan.
+    r("compute-replacement-a-directory", POOL_DIRECTORY + 0x2_4000_0000, 0x2000000),
+    r("compute-replacement-a-list", POOL_BLOCK_LIST + 0x2_4000_0000, PAGE),
+    r("compute-replacement-a-blocks", POOL_BLOCKS + 0x2_4000_0000, 0xc0000000),
+    r("compute-replacement-b-directory", POOL_DIRECTORY + 0x3_4000_0000, 0x2000000),
+    r("compute-replacement-b-list", POOL_BLOCK_LIST + 0x3_4000_0000, PAGE),
+    r("compute-replacement-b-blocks", POOL_BLOCKS + 0x3_4000_0000, 0xc0000000),
     r("pool-block0-guard", POOL_BLOCKS, 0x104000),
     r("pool-block1-guard", POOL_BLOCKS + POOL_BLOCK_STRIDE, 0x104000),
     r("pool-block2-guard", POOL_BLOCKS + 2 * POOL_BLOCK_STRIDE, 0x104000),

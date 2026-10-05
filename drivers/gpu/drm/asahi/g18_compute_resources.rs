@@ -48,6 +48,9 @@ pub(crate) struct G18ComputeMemory {
     layout: G18ComputeChannelLayout,
     pointers: G18ComputeChannelPointers,
     prepared: bool,
+    // Set before attempting publication, so even a partial failure cannot
+    // authorize the unpublished preparation rollback path.
+    context_published: bool,
 }
 
 struct G18ComputeProcess {
@@ -76,9 +79,23 @@ impl G18ComputeMemory {
     fn release_application(&mut self) -> Result {
         self.process = None;
         self.prepared = false;
+        self.context_published = false;
         self.command.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
         self.support.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
         Ok(())
+    }
+
+    /// Drop a process lease acquired by a failed preparation. No prepared
+    /// command or attempted root publication may cross this boundary.
+    pub(crate) fn abort_unpublished_process(&mut self) -> Result {
+        if self.prepared || self.context_published { return Err(EBUSY); }
+        self.command.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+        self.process = None;
+        Ok(())
+    }
+
+    pub(crate) fn unpublished_idle(&self) -> bool {
+        !self.prepared && !self.context_published && self.process.is_none()
     }
 
     pub(crate) fn new(
@@ -154,6 +171,7 @@ impl G18ComputeMemory {
             layout,
             pointers,
             prepared: false,
+            context_published: false,
         })
     }
 
@@ -162,7 +180,7 @@ impl G18ComputeMemory {
     pub(crate) fn bind_process(
         &mut self, dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
     ) -> Result<u32> {
-        if self.prepared || self.process.is_some() { return Err(EBUSY); }
+        if !self.unpublished_idle() { return Err(EBUSY); }
         let context = uat.prepare_t8152_execution_context(vm)?;
         let command = self.command.map_alias_at(vm, self.command.iova(), mmu::PROT_GPU_SHARED_RW)?;
         let channel = self.channel.map_alias_at(vm, self.channel.iova(), mmu::PROT_GPU_SHARED_RW)?;
@@ -242,6 +260,7 @@ impl G18ComputeMemory {
     pub(crate) fn publish_context(&mut self) -> Result<[u64; 2]> {
         if !self.prepared { return Err(EINVAL); }
         let process = self.process.as_mut().ok_or(EINVAL)?;
+        self.context_published = true;
         process.context.publish()?;
         if !process.context.is_current() { return Err(EIO); }
         Ok(process.context.roots())

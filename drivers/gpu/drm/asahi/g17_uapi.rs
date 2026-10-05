@@ -33,6 +33,8 @@ use g17_submission::{
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
 pub(crate) const UAPI_RENDER_SIZE: usize = 256;
 pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;
+pub(crate) const UAPI_G18_COMPUTE_SIZE: usize = 136;
+pub(crate) const COMPUTE_G18_RESOURCES: u32 = 1 << 2;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
@@ -362,11 +364,28 @@ pub(crate) struct UapiComputeCommand {
     pub(crate) helper: UapiHelperProgram,
     pub(crate) timestamps: UapiTimestamps,
     pub(crate) scs_layout: u64,
+    pub(crate) g18_resources: [u32; 16],
 }
 
 impl UapiComputeCommand {
     fn parse(raw: &[u8]) -> Result<Self, UapiTranslateError> {
-        let raw = padded_payload::<UAPI_COMPUTE_SIZE>(raw)?;
+        // Legacy compute payloads are zero-extended as before. A flagged
+        // metadata payload must be complete; padding it could hide truncation
+        // of a valid zero-valued field or reserved word.
+        let has_resources = raw.len() >= 4 && get_u32(raw, 0) & COMPUTE_G18_RESOURCES != 0;
+        if has_resources && raw.len() < UAPI_G18_COMPUTE_SIZE {
+            return Err(UapiTranslateError::PayloadTruncated);
+        }
+        if !has_resources && raw.len() > UAPI_COMPUTE_SIZE
+            && raw[UAPI_COMPUTE_SIZE..].iter().any(|byte| *byte != 0)
+        {
+            return Err(UapiTranslateError::PayloadTail);
+        }
+        let raw = padded_payload::<UAPI_G18_COMPUTE_SIZE>(raw)?;
+        let mut g18_resources = [0; 16];
+        for (i, word) in g18_resources.iter_mut().enumerate() {
+            *word = get_u32(&raw, UAPI_COMPUTE_SIZE + i * 4);
+        }
         Ok(Self {
             flags: get_u32(&raw, 0),
             sampler_count: get_u32(&raw, 4),
@@ -376,6 +395,7 @@ impl UapiComputeCommand {
             helper: helper(&raw, 0x20),
             timestamps: timestamps(&raw, 0x30),
             scs_layout: get_u64(&raw, 0x40),
+            g18_resources,
         })
     }
 }
@@ -913,6 +933,9 @@ pub(crate) struct TranslatedComputeCommand {
     /// one and leaves this false; the G18 adapter admits the bit, strips it
     /// before translation and sets this afterwards.
     pub(crate) g18_texture_state: bool,
+    /// Validated native descriptor inputs; resource/launch integration is
+    /// separate, so this field does not by itself authorize scratch use.
+    pub(crate) g18_resource_descriptor: Option<[u32; 23]>,
 }
 
 pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
@@ -924,6 +947,9 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     queue.validate()?;
     if command.flags & !COMPUTE_G17P_ADD3_PROOF != 0 {
         return Err(UapiTranslateError::Flags);
+    }
+    if command.g18_resources != [0; 16] {
+        return Err(UapiTranslateError::FlagsUnsupported);
     }
     if command.control_stream_base & 3 != 0
         || command.control_stream_end & 3 != 0
@@ -991,6 +1017,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         timestamps: command.timestamps,
         scs_layout: command.scs_layout,
         g18_texture_state: false,
+        g18_resource_descriptor: None,
     })
 }
 
@@ -1639,6 +1666,7 @@ mod tests {
                             },
                         },
                         scs_layout: 0,
+                        g18_resources: [0; 16],
                     }
                 );
             }

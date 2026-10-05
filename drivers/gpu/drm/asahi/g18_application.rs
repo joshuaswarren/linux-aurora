@@ -61,6 +61,7 @@ const ZLS_STENCIL_TRANSFER: u64 = (1 << 14) | (1 << 18);
 const ZLS_STENCIL_COMPRESSION: u64 = (1 << 4) | (1 << 8);
 const ZLS_DEPTH_TRANSFER: u64 = (1 << 15) | (1 << 19);
 const ZLS_DEPTH_FORMAT: u64 = 3 << 25;
+const ZLS_DEPTH_FORMAT_D16: u64 = 2 << 25;
 /// Upper ISP_BGOBJVALS bits every Mesa backend seeds (`agx_pipe.c:1333`).
 const ISP_BGOBJVALS_BASE: u32 = 0x300;
 /// Width of the compact VDM view (`agx_m5_va.h:37`, `g17_render.rs:88`).
@@ -81,7 +82,6 @@ pub(crate) enum G18ApplicationRefusal {
     Utile(u8, u8),
     MultisampleControl(u64),
     Samplers { heap: u64, count: u16 },
-    OcclusionQuery,
     StencilTransfer(u64),
     StencilClear(u32),
     Depth(g17_uapi::UapiTranslateError),
@@ -137,7 +137,7 @@ pub(crate) struct G18DescriptorPointers {
     pub(crate) d04e0: u64,
     /// d04e8 -> 3D +0x1d30: ISP scissor array.
     pub(crate) d04e8: u64,
-    /// d04f0 -> 3D +0x1d40: occlusion query base (refused, so zero).
+    /// d04f0 -> 3D +0x1d40 / register 0x15311: aligned occlusion query heap.
     pub(crate) d04f0: u64,
 }
 
@@ -235,16 +235,40 @@ pub(crate) fn g18_vdm_compact(vdm_base: u64) -> Option<u64> {
 
 /// msaa163: whether `command` is exactly the native 4x render set (see
 /// `g18_render::G18_MSAA4_UTILE`): four samples, 32x16 utiles, sample
-/// positions 0xeaa26e26, eight-byte samples, one layer and no depth or
-/// stencil plane (none is witnessed at 4x). Everything else stays refused.
+/// positions 0xeaa26e26, eight-byte samples and one layer. Native315 adds
+/// D32/S8 attachments to that render geometry. Gallium currently allocates
+/// them uncompressed; compressed multisample metadata remains unadmitted.
 fn is_msaa4_command(command: &g17_uapi::UapiRenderCommand) -> bool {
     command.samples == g18_render::G18_MSAA4_SAMPLES
         && (command.utile_width, command.utile_height) == g18_render::G18_MSAA4_UTILE
         && command.multisample_control == g18_render::G18_MSAA4_MULTISAMPLE_CONTROL
         && command.sample_size == g18_render::G18_MSAA4_SAMPLE_SIZE
         && command.layers == 1
-        && command.depth.base == 0
-        && command.stencil.base == 0
+        && command.depth.compression_base == 0
+        && command.stencil.compression_base == 0
+}
+
+/// Complete single-level D16/D32/S8 storage for the admitted one/four-sample
+/// render. AIL's tile contains 16 KiB: multiplying bytes per pixel by samples
+/// shrinks its logical-pixel dimensions, rather than multiplying the rounded
+/// one-sample allocation (which is wrong across a tile boundary).
+fn uncompressed_plane_bytes(width: u64, height: u64, bytes_per_sample: u64,
+                            samples: u8) -> u64 {
+    let block_bytes = bytes_per_sample * u64::from(samples);
+    let (tile_width, tile_height) = match block_bytes {
+        1 => (128, 128),
+        2 => (128, 64),
+        4 => (64, 64),
+        8 => (64, 32),
+        16 => (32, 32),
+        _ => return 0, // Only admitted D16/D32/S8 at 1x/4x reaches this helper.
+    };
+    if width >= tile_width && height >= tile_height {
+        width.div_ceil(tile_width) * height.div_ceil(tile_height) * 0x4000
+    } else {
+        (width.next_power_of_two() * height.next_power_of_two() * block_bytes)
+            .div_ceil(128) * 128
+    }
 }
 
 /// The envelope checks that need only the raw command. Order matters for
@@ -283,8 +307,8 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
     if command.sampler_heap != 0 || command.sampler_count != 0 {
         return Err(R::Samplers { heap: command.sampler_heap, count: command.sampler_count });
     }
-    if command.occlusion_query_base != 0 {
-        return Err(R::OcclusionQuery);
+    if command.occlusion_query_base & 0xf != 0 {
+        return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressAlignment));
     }
     if command.zls_control & ZLS_STENCIL_TRANSFER != 0
         && (command.stencil.base == 0 || command.stencil.compression_base != 0) {
@@ -327,31 +351,51 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
 ) -> Result<G18ApplicationRender, G18ApplicationRefusal> {
     use G18ApplicationRefusal as R;
     admit_envelope(command, msaa4)?;
-    // Z32F only: validate_m5_reference_depth also admits Z16, which has no
-    // G18 witness (G18 captures are D32F, `g18_render.rs:505-511`).
-    // Retain the existing depth validation while admitting stencil's own
-    // load/store bits. Its full uncompressed S8 range is checked separately.
+    // Native G18 masks the low four base bits. The PPP slot is 15 bits
+    // and addresses an 8-byte result, matching Gallium's 32768-entry heap.
+    // Validate the complete read/modify/write range, not only slot zero:
+    // a mapped first result does not make later indices safe.
+    if command.occlusion_query_base != 0 {
+        const QUERY_HEAP_BYTES: u64 = 32768 * 8;
+        if command.occlusion_query_base.checked_add(QUERY_HEAP_BYTES).is_none()
+            || !address_space.covers(command.occlusion_query_base, QUERY_HEAP_BYTES,
+                                    g17_uapi::GpuAccess::ReadWrite) {
+            return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressRange));
+        }
+    }
+    // Native321 binds D16 write/load/test at 1x/4x to selector 2 and a
+    // UNORM16 integer clear; D32 remains selector zero. Keep compression
+    // and format validation in the common validator. Stencil's own
+    // load/store bits and full uncompressed range are checked separately.
+    let depth_format = command.zls_control & ZLS_DEPTH_FORMAT;
+    if command.depth.base != 0 {
+        if depth_format != 0 && depth_format != ZLS_DEPTH_FORMAT_D16 {
+            return Err(R::DepthFormat(command.zls_control));
+        }
+        if depth_format == ZLS_DEPTH_FORMAT_D16 && command.depth_clear > 0xffff {
+            return Err(R::Depth(g17_uapi::UapiTranslateError::ZlsFields));
+        }
+    }
     let mut depth_command = *command;
     depth_command.zls_control &= !ZLS_STENCIL_TRANSFER;
     g17_uapi::validate_m5_reference_depth(&depth_command, address_space).map_err(R::Depth)?;
+    if command.samples == 4 && command.depth.base != 0 {
+        let bytes = uncompressed_plane_bytes(u64::from(command.width),
+            u64::from(command.height),
+            if depth_format == ZLS_DEPTH_FORMAT_D16 { 2 } else { 4 }, command.samples);
+        if bytes == 0 || command.depth.base.checked_add(bytes).is_none()
+            || !address_space.covers(command.depth.base, bytes, g17_uapi::GpuAccess::ReadWrite) {
+            return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressRange));
+        }
+    }
     if command.stencil.base != 0 && command.stencil.compression_base == 0 {
-        let width = u64::from(command.width);
-        let height = u64::from(command.height);
-        // S8 uses 128x128 tiles of 16 KiB; small levels are power-of-two
-        // miptails rounded to the 128-byte cacheline, as in AIL.
-        let bytes = if width >= 128 && height >= 128 {
-            width.div_ceil(128) * height.div_ceil(128) * 0x4000
-        } else {
-            (width.next_power_of_two() * height.next_power_of_two()).div_ceil(128) * 128
-        };
-        if command.stencil.base & 0x7f != 0
+        let bytes = uncompressed_plane_bytes(u64::from(command.width),
+            u64::from(command.height), 1, command.samples);
+        if bytes == 0 || command.stencil.base & 0x7f != 0
             || command.stencil.base.checked_add(bytes).is_none()
             || !address_space.covers(command.stencil.base, bytes, g17_uapi::GpuAccess::ReadWrite) {
             return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressRange));
         }
-    }
-    if command.depth.base != 0 && command.zls_control & ZLS_DEPTH_FORMAT != 0 {
-        return Err(R::DepthFormat(command.zls_control));
     }
     let translated = g17_uapi::translate_render_command(*command, vertex_attachments,
         fragment_attachments, window, address_space,
