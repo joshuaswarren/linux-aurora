@@ -9,6 +9,8 @@
 # The optional wrapper runs the writer under another ABI (Aurora: the
 # userpages 4k launcher). Exits non-zero if any append fails or verification
 # does not match. Must run as root (systemd-run transient unit).
+# Set APPEND_RECLAIM to a prebuilt append-reclaim binary to skip compiling
+# on the target.
 set -eu
 DIR=${1:?workdir on a compress=zstd btrfs mount}
 SECS=${2:-25}
@@ -18,13 +20,15 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$DIR"
 findmnt -no FSTYPE,OPTIONS -T "$DIR" | /usr/bin/grep -q '^btrfs .*compress' ||
 	echo "warning: $DIR is not on a compressed btrfs mount; the bug needs compressed extents" >&2
-gcc -O2 -Wall -Wextra -Werror -pthread "$HERE/append-reclaim.c" -o "$DIR/append-reclaim"
+BIN=${APPEND_RECLAIM:-$DIR/append-reclaim}
+[ -n "${APPEND_RECLAIM:-}" ] ||
+	gcc -O2 -Wall -Wextra -Werror -pthread "$HERE/append-reclaim.c" -o "$BIN"
 UNIT=bcar-$$
 CG=/sys/fs/cgroup/system.slice/$UNIT.service
 rm -f "$DIR/go"
 systemd-run --unit="$UNIT" --collect -p MemoryMax=256M -p MemoryHigh=224M \
 	-p MemorySwapMax=0 -p RuntimeMaxSec=$((SECS + 45)) -p CPUQuota=100% \
-	"$@" "$DIR/append-reclaim" "$DIR" "$SECS" "$ANON" "$DIR/go"
+	"$@" "$BIN" "$DIR" "$SECS" "$ANON" "$DIR/go"
 for ((i = 0; i < 100; i++)); do [ -s "$CG/cgroup.procs" ] && break; sleep .05; done
 touch "$DIR/go"
 for ((i = 0; i < 10 * (SECS + 50); i++)); do
