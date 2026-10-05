@@ -925,11 +925,10 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
  * dcp_arm_swapped_out_fbs(), and a commit without a swap leaves them held
  * until the next swap does.
  *
- * The CRTC-disable commit never reaches dcp_flush(): the driver commits
- * through drm_atomic_helper_commit_tail_rpm(), whose ACTIVE_ONLY plane pass
- * skips the planes and the flush of a CRTC that is going inactive.  That
- * commit calls this from the CRTC's atomic_disable instead.  The prepared
- * entry is consumed once, even if disable and flush both visit the state.
+ * commit_tail_rpm() skips plane hooks on inactive CRTCs, even when an update
+ * replaces their framebuffer. The driver's commit-tail wrapper retains all
+ * displaced framebuffers before calling that helper. The prepared entry is
+ * consumed once.
  */
 static void dcp_retain_unbound_fbs(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			    struct drm_atomic_state *state)
@@ -970,9 +969,6 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-	/* Even a skipped swap must keep the firmware's previous surface alive. */
-	dcp_retain_unbound_fbs(dcp, crtc, state);
 
 	/*
 	 * DCP does not complete swaps after a link loss.  A plane-only commit
