@@ -253,6 +253,20 @@ static void dcp_arm_swapped_out_fbs(struct apple_dcp *dcp, u32 swap_id)
 	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
 }
 
+/* A rejected replacement did not retire anything the pipe was reading. */
+static void dcp_unarm_swapped_out_fbs(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->swapped_out_lock, flags);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head) {
+		if (entry->armed && entry->swap_id == swap_id)
+			entry->armed = false;
+	}
+	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
+}
+
 /*
  * Drop framebuffers whose unbinding swap has completed.
  *
@@ -1575,6 +1589,7 @@ static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (resp->ret) {
 		dev_err(dcp->dev, "swap_clear failed! status %u\n", resp->ret);
+		dcp_unarm_swapped_out_fbs(dcp, DCP_FW_UNION(dcp->swap).swap.swap_id);
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
@@ -1586,6 +1601,19 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 				   void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
+
+	if (resp->ret) {
+		struct dcp_swap_cookie *info = cookie;
+
+		dev_err(dcp->dev, "swap_clear start failed! status %u\n", resp->ret);
+		if (info) {
+			complete(&info->done);
+			kref_put(&info->refcount, release_swap_cookie);
+		}
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
+
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
 	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
 
@@ -2140,9 +2168,16 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (resp->ret) {
 		dev_err(dcp->dev, "swap failed! status %u\n", resp->ret);
+		dcp_unarm_swapped_out_fbs(dcp, DCP_FW_UNION(dcp->swap).swap.swap_id);
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/* Brightness must replay an accepted surface, never a rejected update. */
+	memcpy(&dcp->h17p_last_swap, &dcp->h17p_pending_swap,
+	       sizeof(dcp->h17p_last_swap));
+	dcp->h17p_have_last_swap = true;
+#endif
 	dcp->swap_start = ktime_get();
 	dcp->swap_submit_timestamp = arch_timer_read_counter();
 	if (dcp_swap_trace)
@@ -2156,6 +2191,12 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
+
+	if (resp->ret) {
+		dev_err(dcp->dev, "swap_start failed! status %u\n", resp->ret);
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
 
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
 	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
@@ -2261,6 +2302,13 @@ static void dcp_bl_swap_started(struct apple_dcp *dcp, void *data,
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 	struct dcp_swap_cookie *info = cookie;
+
+	if (resp->ret) {
+		dev_err(dcp->dev, "brightness swap_start failed! status %u\n", resp->ret);
+		complete(&info->done);
+		kref_put(&info->refcount, release_swap_cookie);
+		return;
+	}
 
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
 	info->swap_id = resp->swap_id;
@@ -2632,12 +2680,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
-	 * Keep what this swap puts on the panel, before the timestamps, the
-	 * backlight block and the wire fix-up go in, so the backlight can
-	 * re-present it while the CRTC is off.
+	 * Stage the surface before the wire fix-up. Publish it for brightness
+	 * replay only when the submit response accepts it.
 	 */
-	memcpy(&dcp->h17p_last_swap, req, sizeof(*req));
-	dcp->h17p_have_last_swap = true;
+	memcpy(&dcp->h17p_pending_swap, req, sizeof(*req));
 #endif
 
 	if (has_surface)

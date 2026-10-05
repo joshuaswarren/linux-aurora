@@ -311,6 +311,7 @@ struct apple_dcp {
 	 * iomfb_present_brightness()).
 	 */
 	struct dcp_swap_submit_req_h17p h17p_last_swap;
+	struct dcp_swap_submit_req_h17p h17p_pending_swap;
 	bool h17p_have_last_swap;
 
 	/* swap id of the last completed swap */
