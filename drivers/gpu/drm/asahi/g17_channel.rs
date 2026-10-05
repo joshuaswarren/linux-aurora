@@ -20,6 +20,19 @@ pub(crate) static HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 /// `acquire` calls that found no free QID (the ENOSPC of queue creation and
 /// of a new render pair).
 pub(crate) static EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+/// New compute graphs refused to keep [`COMPUTE_RENDER_RESERVE`] QIDs free.
+pub(crate) static RESERVE_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// QIDs a new compute graph may never take: kept for render pairs.
+///
+/// A published QID is only returned at processor stop, and a quarantined or
+/// exit-killed compute graph is never reused, so compute faults consume the
+/// table one QID at a time. Without a reserve the last free QID goes to a
+/// compute graph, and from then on every client that needs a new render
+/// pair -- every new desktop client -- fails its first render with ENOSPC.
+/// With it, exhaustion fails the next compute queue creation instead. 16 is
+/// eight render pairs.
+pub(crate) const COMPUTE_RENDER_RESERVE: usize = 16;
 
 /// Total QIDs currently leased, all engines.
 pub(crate) fn leased_total() -> u32 {
@@ -107,6 +120,24 @@ impl ChannelTable {
         Some(Lease { qid: qid as u8, channel, engine })
     }
 
+    /// Free QIDs left in the table.
+    pub(crate) fn free(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_none()).count()
+    }
+
+    /// [`acquire`](Self::acquire), except that a new lease may not take one
+    /// of the last `reserve` free QIDs. An existing channel keeps its QID.
+    pub(crate) fn acquire_reserving(
+        &mut self, channel: ChannelId, engine: Engine, preferred: Option<u8>, reserve: usize,
+    ) -> Option<Lease> {
+        let existing = self.entries.iter().any(|entry| entry.is_some_and(|entry| entry.channel == channel));
+        if !existing && self.free() <= reserve {
+            RESERVE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.acquire(channel, engine, preferred)
+    }
+
     /// Publication is irreversible until a verified detach or processor stop.
     /// In particular, timeout, cancellation and a signalled error fence do not
     /// return an installed QID to the free pool.
@@ -183,6 +214,20 @@ mod tests {
         }
         assert_eq!(table.acquire(ChannelId(129), Engine::Tiling, None), None);
         assert_eq!(table.acquire(ChannelId(128), Engine::Fragment, None).unwrap().qid, 127);
+    }
+
+    #[test]
+    fn reserve_refuses_only_new_leases() {
+        let mut table = ChannelTable::new();
+        for index in 0..QID_COUNT - 4 {
+            assert!(table.acquire(ChannelId(index as u64 + 1), Engine::Tiling, None).is_some());
+        }
+        assert_eq!(table.free(), 4);
+        assert_eq!(table.acquire_reserving(ChannelId(1000), Engine::Compute, None, 4), None);
+        let kept = table.acquire_reserving(ChannelId(1), Engine::Tiling, None, 4).unwrap();
+        assert_eq!(kept.qid, 0);
+        assert!(table.acquire_reserving(ChannelId(1000), Engine::Compute, None, 3).is_some());
+        assert_eq!(table.free(), 3);
     }
 
     #[test]

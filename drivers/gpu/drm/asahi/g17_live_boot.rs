@@ -7189,7 +7189,9 @@ impl G17PLiveRuntime {
         }
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
-        let pair = manager.render_queue_pair(render_slot)?;
+        let pair = manager.render_queue_pair(render_slot)
+            .inspect_err(|error| crate::g17_queue_slots::note_error(
+                crate::g17_queue_slots::Pool::QidRenderPair, *error))?;
         Ok(manager.take_warm_render_graph(vm, pair, context, completion.work_state()?, command)?
             .map(|request| (drm, request)))
     }
@@ -7251,7 +7253,9 @@ impl G17PLiveRuntime {
         manager.ensure_render_slot(render_slot)?;
         manager.handoff_retained_render_vm(render_slot, vm, context.clone())?;
         if fine[0] != 0 { fine[3] = crate::g17_e2e::now(); }
-        let pair = manager.render_queue_pair(render_slot)?;
+        let pair = manager.render_queue_pair(render_slot)
+            .inspect_err(|error| crate::g17_queue_slots::note_error(
+                crate::g17_queue_slots::Pool::QidRenderPair, *error))?;
         manager.take_render_restage(&drm, vm, pair, context, completion.work_state()?, command, &dependencies)
         })();
         self.render_dependency_scratch = Some(dependencies);
