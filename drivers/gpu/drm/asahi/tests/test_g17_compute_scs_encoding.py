@@ -99,6 +99,7 @@ fn command(layout: u64) -> TranslatedComputeCommand {
         },
         scs_layout: layout,
         g18_texture_state: false,
+        g18_resource_descriptor: None,
     }
 }
 

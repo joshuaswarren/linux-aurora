@@ -53,6 +53,11 @@ pub(crate) struct AsahiObject {
     kernel: bool,
 }
 
+impl AsahiObject {
+    /// Guard-tail aliases are restricted to driver-owned shared backing.
+    pub(crate) fn is_kernel_object(&self) -> bool { self.kernel }
+}
+
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
 

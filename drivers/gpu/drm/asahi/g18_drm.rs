@@ -385,6 +385,17 @@ impl G18Queue {
                 if status < 0 { return Err(Error::from_errno(status)); }
             }
         }
+        // An empty command buffer is a synchronization-only submission. Input
+        // fences have completed above; the normal publication guard installs
+        // and signals its output fence, preserving timeline chaining. Never
+        // manufacture a hardware job or relax hardware retirement checks.
+        if cmdbuf_raw.is_empty() {
+            let _serialized = self.submit_lock.lock();
+            if self.vm.status().get() != 0 { return Err(EIO); }
+            if self.runtime.is_crashed() { return Err(ENODEV); }
+            pr_info!("G18_SYNC_ONLY inputs={}\n", inputs.len());
+            return Ok(());
+        }
         let _vm_job = self.vm.retain_t8140_job()?;
         // Parsing and translation frames end here, before the job runs its
         // own register builders on this stack.
@@ -474,19 +485,47 @@ impl G18Queue {
             return Err(ENOTSUPP);
         }
         let stream_bytes = payload.control_stream_end.saturating_sub(payload.control_stream_base);
-        // The only flag G18 admits is its own texture-state bit; every other
-        // bit, ADD3 included, is still refused.
-        if payload.flags & !G18_COMPUTE_TEXTURE_STATE != 0 || payload.sampler_heap != 0
+        let g18_flags = G18_COMPUTE_TEXTURE_STATE | g17_uapi::COMPUTE_G18_RESOURCES;
+        // ADD3 and every flag outside the G18 contract remain refused.
+        if payload.flags & !g18_flags != 0 || payload.sampler_heap != 0
             || payload.sampler_count != 0 || stream_bytes > G18_COMPUTE_STREAM_BYTES {
             pr_err!("G18 compute admission rejected flags={:#x} sampler_heap={:#x} samplers={} stream_bytes={} (profile admits one dispatch, {})\n",
                 payload.flags, payload.sampler_heap, payload.sampler_count, stream_bytes,
                 G18_COMPUTE_STREAM_BYTES);
             return Err(ENOTSUPP);
         }
-        // The shared G17 translator refuses every bit but ADD3, so it sees
-        // the command without the G18 bit, which travels on beside it.
+        let resource_descriptor = if payload.flags & g17_uapi::COMPUTE_G18_RESOURCES != 0 {
+            let metadata = crate::g18_compute_metadata::G18ComputeMetadata::decode(payload.g18_resources)
+                .ok_or_else(|| {
+                    pr_err!("G18 compute admission rejected: invalid resource metadata\n");
+                    EINVAL
+                })?;
+            if crate::g18_compute_plan::G18ComputePlan::from_descriptor(&metadata.descriptor).is_none() {
+                pr_err!("G18 compute admission rejected: resource plan exceeds supported capacity\n");
+                return Err(ENOSPC);
+            }
+            // Main static TPS uses the metadata-derived owned pool and SMA
+            // launch pair. Mesa's G18 compute encoder carries the same aligned
+            // frame in both SPECTPR scratch fields. Constant-program scratch
+            // and SCS still need their separate launch contract.
+            if metadata.demand.constant_scratch_bytes != 0 || payload.scs_layout != 0
+            {
+                pr_err!("G18 compute admission rejected: constant scratch or SCS integration pending\n");
+                return Err(ENOTSUPP);
+            }
+            pr_info!("G18_COMPUTE_METADATA stream={:#x} registers={} scratch_bytes={} spectpr_bytes={} constant_scratch={} local={:?}\n",
+                payload.control_stream_base, payload.g18_resources[2],
+                metadata.demand.scratch_bytes, payload.g18_resources[4],
+                metadata.demand.constant_scratch_bytes, &payload.g18_resources[12..15]);
+            Some(metadata.descriptor)
+        } else {
+            None
+        };
+        // The shared G17 translator refuses G18 flags and nonzero resource
+        // words. Only this adapter may consume and strip a validated suffix.
         let mut untagged = *payload;
-        untagged.flags &= !G18_COMPUTE_TEXTURE_STATE;
+        untagged.flags &= !g18_flags;
+        if resource_descriptor.is_some() { untagged.g18_resources = [0; 16]; }
         let address_space = UserAddressSpace { vm: &self.vm };
         let mut translated = g17_uapi::translate_compute_command(untagged, attachments,
             self.window, &address_space).map_err(|error| {
@@ -495,6 +534,7 @@ impl G18Queue {
                 EINVAL
             })?;
         translated.g18_texture_state = payload.flags & G18_COMPUTE_TEXTURE_STATE != 0;
+        translated.g18_resource_descriptor = resource_descriptor;
         let slots = [
             TimestampSlot::resolve(objects, payload.timestamps.start)?,
             TimestampSlot::resolve(objects, payload.timestamps.end)?,

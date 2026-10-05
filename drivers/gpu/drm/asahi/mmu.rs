@@ -1826,6 +1826,73 @@ impl KernelMapping {
         )
     }
 
+    /// Map this shared GEM subrange into the end of another mapping's guards.
+    /// The caller must keep GPU work quiescent until the complete resource
+    /// update is published. Existing mappings are never removed or relocated.
+    pub(crate) fn map_alias_into_guard(
+        &self, anchor: &mut KernelMapping, prot: Prot,
+    ) -> Result<KernelMapping> {
+        let size = self.size();
+        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
+        if size == 0 || size & UAT_PGMSK != 0 || prot.is_cached_noncoherent()
+            || !gem.is_kernel_object()
+            || self.0.offset.checked_add(size).ok_or(EOVERFLOW)? > gem.size()
+        {
+            return Err(EINVAL);
+        }
+        let available = anchor.0.size().checked_sub(anchor.size() as u64).ok_or(EINVAL)?;
+        if size as u64 > available { return Err(ENOSPC); }
+        let sgt = gem.owned_sg_table()?;
+        let owner_ref = anchor.0.owner.clone();
+        let mut owner = owner_ref.exec_lock(Some(gem), false)?;
+        let vm_bo = owner_ref.obtain_bo(gem)?;
+        {
+            let mut guard = vm_bo.inner().inner.lock();
+            if guard.sgt.is_none() { guard.sgt.replace(sgt); }
+        }
+        let mut vm_bo = Some(ImmediateGpuVmBoRef::new(vm_bo, owner_ref.clone()));
+        // As in map_at_with_guards, the fallible allocator operation must not
+        // own DMA-reservation references whose Drop would reacquire this lock.
+        let node = anchor.0.as_mut().split_tail(size as u64, KernelMappingInner {
+            owner: owner_ref.clone(), uat_inner: owner.uat_inner.clone(), prot,
+            bo: None, _gem: None, offset: self.0.offset, mapped_size: size,
+        });
+        let mut node = match node {
+            Ok(node) => node,
+            Err(error) => { drop(owner); return Err(error); }
+        };
+        {
+            let inner = node.as_mut().inner_mut();
+            inner.bo = vm_bo.take();
+            inner._gem = Some(gem.clone());
+        }
+        let mapped = owner.map_node(&node, prot);
+        if let Err(error) = mapped {
+            // Restore reservation coverage before the temporary mapping is
+            // dropped. Its normal Drop unmaps partial PTEs and invalidates
+            // every live context; the detached node cannot free the guard.
+            let rollback = anchor.0.as_mut().rejoin_tail(node.as_mut());
+            drop(owner);
+            drop(KernelMapping(node));
+            rollback?;
+            return Err(error);
+        }
+        drop(owner);
+        Ok(KernelMapping(node))
+    }
+
+    /// Undo a staged guard-tail alias before publication. Consume tails in
+    /// reverse growth order so each remains adjacent to its original anchor.
+    /// The caller owns the tail and must ensure no GPU work can reference it.
+    pub(crate) fn rollback_guard_tail(&mut self, mut tail: KernelMapping) -> Result {
+        if tail.0.prot.is_cached_noncoherent() { return Err(EINVAL); }
+        self.0.as_mut().rejoin_tail(tail.0.as_mut())?;
+        // KernelMapping::drop removes the PTEs and flushes live contexts. Its
+        // now-invalid MM node leaves the restored guard reservation intact.
+        drop(tail);
+        Ok(())
+    }
+
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
     /// coprocessor cache. This is required to safely unmap cached/private mappings.
     fn remap_uncached_and_flush(&mut self) {

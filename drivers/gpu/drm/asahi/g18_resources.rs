@@ -226,6 +226,11 @@ impl G18FirmwareMemory {
         if !uat.is_t8152_geometry() {
             return Err(ENODEV);
         }
+        match *crate::module_parameters::g18_compute_owner_test.value() {
+            0 => {},
+            1 => G18UmaPoolMemory::verify_shared_compute_owner(dev, &uat)?,
+            _ => return Err(EINVAL),
+        }
         let trace_journal = [
             KVVec::with_capacity(TRACE_JOURNAL_CAPACITY, GFP_KERNEL)?,
             KVVec::with_capacity(TRACE_JOURNAL_CAPACITY, GFP_KERNEL)?,

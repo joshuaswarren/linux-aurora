@@ -195,7 +195,7 @@ fn validate(p: &G17pRenderParameters) -> Result<(), G18RenderError> {
     }
     if p.sampler_count != 0
         || p.sampler_array != 0
-        || p.occlusion_query_base != 0
+        || p.occlusion_query_base & 0xf != 0
         || p.ta_timestamp_start != 0
         || p.ta_timestamp_end != 0
         || p.fragment_timestamp_start != 0

@@ -14,6 +14,10 @@
 
 #[path = "g18_application_pool.rs"]
 mod application;
+#[path = "g18_shared_compute_resources.rs"]
+mod shared_compute;
+#[path = "g18_compute_owner_probe.rs"]
+mod owner_probe;
 
 use super::MappedObject;
 use crate::{driver::AsahiDevice, g18_uma, mmu};
@@ -67,6 +71,8 @@ pub(crate) struct G18UmaPoolMemory {
     scratch_plan: Option<g18_uma::G18ComputeScratchPlan>,
     directory: KVec<MappedObject>,
     directory_growth: KVec<MappedObject>,
+    directory_growth_offsets: KVec<u64>,
+    shared_compute_plan: Option<crate::g18_compute_plan::G18ComputePlan>,
     block_list: MappedObject,
     state: MappedObject,
     // Firmware dereferences state+0x88 during pool retirement. Keep the
@@ -99,7 +105,8 @@ impl G18UmaPoolMemory {
 
     pub(crate) fn compute_application_aliases(&mut self, dev: &AsahiDevice,
         uat: &mmu::Uat, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
-        if self.render || self.low_bias != 0x40000000 || !self.process_aliases.is_empty() {
+        if self.render || ![0x40000000, 0x2_4000_0000, 0x3_4000_0000].contains(&self.low_bias)
+            || !self.process_aliases.is_empty() {
             return Err(EINVAL);
         }
         self.alias_into_process(dev, uat, vm)?;
@@ -109,6 +116,10 @@ impl G18UmaPoolMemory {
     /// The retained backing plan; application compute bounds its SMA pair by it.
     pub(crate) fn scratch_plan(&self) -> Option<g18_uma::G18ComputeScratchPlan> {
         self.scratch_plan
+    }
+
+    pub(crate) fn shared_compute_plan(&self) -> Option<crate::g18_compute_plan::G18ComputePlan> {
+        self.shared_compute_plan
     }
 
     pub(crate) fn new(
@@ -162,6 +173,7 @@ impl G18UmaPoolMemory {
             usize::from(guard));
         let mut directory = KVec::new();
         let mut directory_growth = KVec::new();
+        let mut directory_growth_offsets = KVec::new();
         let mut aliases = KVec::new();
         for index in 0..layout.initial_page_count {
             let offset = layout.page_offset(index).ok_or(EINVAL)?;
@@ -197,6 +209,7 @@ impl G18UmaPoolMemory {
                         != uat.kernel_lower_vm().translate_iova(low + offset)? { return Err(EFAULT); }
                 }
                 directory_growth.push(extent, GFP_KERNEL)?;
+                directory_growth_offsets.push(low - directory_base, GFP_KERNEL)?;
             }
         }
         // Validate every PTE in the aperture, including the intentionally
@@ -266,6 +279,7 @@ impl G18UmaPoolMemory {
             process_aliases: KVec::new(),
             aliases, scratch_aliases: KVec::new(), scratch: KVec::new(), scratch_plan: None,
             directory, directory_growth, block_list, state, preempt_counter, geometry, layout, encoded: false,
+            directory_growth_offsets, shared_compute_plan: None,
             descriptor_loaded: false,
             render: false, low_bias, hardware_slot,
             block_stride: if low_bias == 0 { BLOCK_DATA_STRIDE } else { 0x300000 },
@@ -421,12 +435,20 @@ impl G18UmaPoolMemory {
         let mut ranges = KVec::new();
         for (index, page) in self.directory.iter_mut().enumerate() {
             let gpu = DIRECTORY_BASE + self.low_bias + self.layout.page_offset(index as u32).ok_or(EINVAL)?;
-            aliases.push(page.map_alias_at(vm, gpu, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+            let guards = if let Some(shared) = self.shared_compute_plan {
+                let commitment = crate::g18_compute_plan::G18ComputeDirectory::for_blocks(
+                    shared.ideal.block_count).ok_or(EINVAL)?;
+                if index < 12 {
+                    (self.geometry.directory_bytes_per_usc / self.layout.page_bytes) as usize
+                        - commitment.tail_pages_per_usc as usize - 1
+                } else { 0 }
+            } else { 0 };
+            aliases.push(page.map_alias_at_with_guards(vm, gpu, mmu::PROT_GPU_SHARED_RW, guards)?, GFP_KERNEL)?;
             ranges.push((gpu, mmu::UAT_PGSZ as u64), GFP_KERNEL)?;
         }
         for (index, extent) in self.directory_growth.iter_mut().enumerate() {
-            let gpu = DIRECTORY_BASE + self.low_bias + index as u64 * self.geometry.directory_bytes_per_usc
-                + crate::g18_render_policy::IDEAL_GROWTH_OFFSET;
+            let gpu = DIRECTORY_BASE + self.low_bias
+                + *self.directory_growth_offsets.get(index).ok_or(EINVAL)?;
             aliases.push(extent.map_alias_at(vm, gpu, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
             ranges.push((gpu, extent.logical_size as u64), GFP_KERNEL)?;
         }
@@ -436,7 +458,8 @@ impl G18UmaPoolMemory {
         let block_base = if self.render { crate::g18_render_policy::block_base() } else { BLOCK_DATA_BASE + self.low_bias };
         for (index, block) in self.scratch.iter_mut().enumerate() {
             let gpu = block_base + index as u64 * self.block_stride;
-            aliases.push(block.map_alias_at(vm, gpu, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+            aliases.push(block.map_alias_at_with_guards(vm, gpu, mmu::PROT_GPU_SHARED_RW,
+                usize::from(self.shared_compute_plan.is_some()))?, GFP_KERNEL)?;
             ranges.push((gpu, plan.block_bytes), GFP_KERNEL)?;
         }
         // Every job-context page must reach the same memory as the kernel
@@ -473,7 +496,10 @@ impl G18UmaPoolMemory {
             if value != 0 { return Err(EBUSY); }
             Ok(value)
         })?;
-        let encoded = g18_uma::encode_g18_pool_state(&g18_uma::G18UmaPoolState {
+        let encoded = if let Some(plan) = self.shared_compute_plan {
+            plan.pool_state(1, DIRECTORY_BASE + self.low_bias,
+                BLOCK_LIST_BASE + self.low_bias, counter_address, counter).ok_or(EINVAL)?
+        } else { g18_uma::encode_g18_pool_state(&g18_uma::G18UmaPoolState {
             // Host identities are local to this one fixed-VA pool and boot.
             // The statistics ID and FList generation have different meanings.
             statistics_id: 1,
@@ -494,7 +520,7 @@ impl G18UmaPoolMemory {
             compute: !self.render,
             // Fresh Pool::init clears +0x1f0; prepareBufferResources writes 1.
             policy_value: 1,
-        });
+        }) };
         self.state.with_bytes_mut(|bytes| {
             if bytes.iter().enumerate().any(|(i, &v)| v != if (8..12).contains(&i) { 0xff } else { 0 }) {
                 return Err(EBUSY);
@@ -521,10 +547,44 @@ impl G18UmaPoolMemory {
         binding: G18UmaPoolBinding,
         device_config: [u64; 4],
     ) -> Result<[u64; g18_uma::G18_UMA_DESCRIPTOR_BYTES / 8]> {
+        if binding.generation != 0 { return Err(EINVAL); }
+        self.write_hardware_descriptor(dev, table, binding, device_config, [0; 16], false)
+    }
+
+    /// Requires the caller's retired scheduler and old firmware binding check.
+    /// This only replaces our own still-retained descriptor; it cannot reclaim
+    /// an arbitrary occupied slot or reset an already encoded view in place.
+    pub(crate) fn replace_hardware_descriptor(&mut self, dev: &AsahiDevice,
+        table: &mut MappedObject, binding: G18UmaPoolBinding,
+        previous: &mut Self, old: G18UmaPoolBinding, device_config: [u64; 4])
+        -> Result<[u64; 16]>
+    {
+        if !previous.descriptor_loaded || previous.render || self.render
+            || old.state != previous.state.iova() || old.slot != previous.hardware_slot
+            || binding.slot != old.slot || binding.state == old.state
+            || old.generation.checked_add(1) != Some(binding.generation)
+            || binding.generation == u64::MAX { return Err(EINVAL); }
+        let state = previous.render_state()?;
+        if state[8..12] != old.slot.to_le_bytes() { return Err(EIO); }
+        let packed: [u8; g18_uma::G18_UMA_STATE_BYTES] =
+            state[..g18_uma::G18_UMA_STATE_BYTES].try_into().map_err(|_| EINVAL)?;
+        let expected = g18_uma::pack_g18_uma_descriptor(&packed, device_config);
+        self.write_hardware_descriptor(dev, table, binding, device_config, expected, true)
+    }
+
+    fn write_hardware_descriptor(&mut self, dev: &AsahiDevice, table: &mut MappedObject,
+        binding: G18UmaPoolBinding, device_config: [u64; 4], expected: [u64; 16],
+        retired_view: bool)
+        -> Result<[u64; 16]>
+    {
         const DESCRIPTOR: usize = g18_uma::G18_UMA_DESCRIPTOR_BYTES;
-        if !self.encoded || self.descriptor_loaded { return Err(EBUSY); }
+        if !self.encoded || self.descriptor_loaded {
+            dev_err!(dev.as_ref(), "G18_POOL_DESCRIPTOR_REFUSED owner encoded={} loaded={}\n",
+                self.encoded, self.descriptor_loaded);
+            return Err(EBUSY);
+        }
         if binding.state != self.state.iova() || binding.slot != self.hardware_slot
-            || binding.generation != 0 || device_config == [0; 4] {
+            || binding.generation == u64::MAX || device_config == [0; 4] {
             return Err(EINVAL);
         }
         let slot = binding.slot as usize;
@@ -533,6 +593,7 @@ impl G18UmaPoolMemory {
         self.state.with_bytes_mut(|bytes| {
             // The encoded state must still carry the native unassigned slot.
             if bytes.len() < STATE_BYTES || bytes[8..12] != u32::MAX.to_le_bytes() {
+                dev_err!(dev.as_ref(), "G18_POOL_DESCRIPTOR_REFUSED candidate slot is not unassigned\n");
                 return Err(EBUSY);
             }
             packed.copy_from_slice(&bytes[..g18_uma::G18_UMA_STATE_BYTES]);
@@ -542,9 +603,28 @@ impl G18UmaPoolMemory {
         let words = g18_uma::pack_g18_uma_descriptor(&packed, device_config);
         let offset = slot * DESCRIPTOR;
         table.with_bytes_mut(|out| {
-            if out.len() != UMA_TABLE_SLOTS * DESCRIPTOR
-                || out[offset..offset + DESCRIPTOR].iter().any(|&v| v != 0) {
+            if out.len() != UMA_TABLE_SLOTS * DESCRIPTOR {
                 return Err(EBUSY);
+            }
+            for (index, word) in expected.iter().enumerate() {
+                let at = offset + index * 8;
+                let actual = u64::from_le_bytes(out[at..at + 8].try_into().map_err(|_| EINVAL)?);
+                if actual == *word { continue; }
+                // Native FList prepareBufferResources resets these cursor
+                // fields separately from immutable identity/geometry:
+                // state+0x24..0x43 and +0x5c..0x7b. They may have advanced
+                // in the used descriptor. A retired replacement has its own
+                // fresh cursors; the first-load check still admits only zero.
+                if retired_view && matches!(index, 1 | 2 | 7 | 8 | 12..=15) {
+                    dev_info!(dev.as_ref(),
+                        "G18_POOL_DESCRIPTOR_CURSOR slot={} word={} host={:#x} retired={:#x}\n",
+                        binding.slot, index, word, actual);
+                } else {
+                    dev_err!(dev.as_ref(),
+                        "G18_POOL_DESCRIPTOR_REFUSED slot={} word={} expected={:#x} actual={:#x} retired_view={}\n",
+                        binding.slot, index, word, actual, retired_view);
+                    return Err(EBUSY);
+                }
             }
             Ok(())
         })?;

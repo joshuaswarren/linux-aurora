@@ -45,6 +45,9 @@ mod g17_submission;
 mod g17_trace_capture;
 mod g17_uapi;
 mod g18_compute;
+mod g18_compute_inputs;
+mod g18_compute_metadata;
+mod g18_compute_plan;
 mod g18_compute_memory;
 mod g18_compute_state;
 mod g18_compute_payload;
@@ -115,6 +118,10 @@ kernel::module_platform_driver! {
         g18_compute_variant: u32 {
             default: 0,
             description: "Stage 8 compute diagnostic. 0=captured compute-add. 1=empty stream: captured barrier and terminate replace the launch; all output must remain poisoned. 2=64x64 compute triangle using a separately verified private shader patch; no TA/3D or Mesa. Variants 1 and 2 require g18_initdata_test=8. Other values are refused",
+        },
+        g18_compute_owner_test: u32 {
+            default: 0,
+            description: "J873 allocation-only E2E before firmware publication: 1 verifies shared-compute backing, guarded directory growth, allocator rollback and process aliases. Never submits GPU work. Other nonzero values refused",
         },
         g18_render_variant: u32 {
             default: 0,
