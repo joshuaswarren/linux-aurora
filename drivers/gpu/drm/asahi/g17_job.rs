@@ -442,6 +442,13 @@ fn renew_progress_timeout(previous: &mut Option<(u64, u32)>, renewals: &mut u8,
 
 pub(crate) trait G17PQueueBackend: Send + Sync {
     fn timeout_progress(&self) -> Option<(u64, u32)> { None }
+    /// `g17p_recovery_isolation` bit7: classify an expired timeout before
+    /// `timed_out`. `renewals` periods were already granted to this job.
+    fn victim_timeout(&self, _packet: &G17PComputeJobPacket, _renewals: u8)
+        -> crate::g17_recovery_isolation::VictimTimeout
+    {
+        crate::g17_recovery_isolation::VictimTimeout::Own
+    }
     fn prepare(&self, packet: &G17PComputeJobPacket) -> Option<Fence>;
     fn publish(&self, packet: Arc<G17PComputeJobPacket>) -> Result<Fence>;
     fn timed_out(&self, packet: Arc<G17PComputeJobPacket>) -> sched::Status;
@@ -453,6 +460,7 @@ pub(crate) struct G17PScheduledJob<B: G17PQueueBackend> {
     packet: Arc<G17PComputeJobPacket>,
     timeout_progress: Option<(u64, u32)>,
     timeout_renewals: u8,
+    victim_renewals: u8,
 }
 
 impl<B: G17PQueueBackend> sched::JobImpl for G17PScheduledJob<B> {
@@ -464,6 +472,14 @@ impl<B: G17PQueueBackend> sched::JobImpl for G17PScheduledJob<B> {
             crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::REPLAY_TIMEOUT_RENEWED);
             pr_info!("G17P recovery isolation: replayed compute submission={} timeout renewed once\n",
                 job.packet.submission_id());
+            return true;
+        }
+        // bit7 VICTIM_DEFER: head-of-line blocked behind another VM's older
+        // unfinished kick -- wait (bounded) for it instead of taking the blame.
+        if job.backend.victim_timeout(&job.packet, job.victim_renewals)
+            == crate::g17_recovery_isolation::VictimTimeout::Defer
+        {
+            job.victim_renewals += 1;
             return true;
         }
         if !cfg!(g17p_progress_timeout_probe) { return false; }
@@ -766,6 +782,7 @@ impl<B: G17PQueueBackend> G17PJobScheduler<B> {
         let hardware = packet.completion()?.fence();
         let mut job = self.entity.new_job(1, G17PScheduledJob {
             backend: self.backend.clone(), packet, timeout_progress: None, timeout_renewals: 0,
+            victim_renewals: 0,
         })?;
         for dependency in dependencies { job.add_dependency(dependency)?; }
         let mut job = job.arm();

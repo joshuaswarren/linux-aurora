@@ -11,6 +11,8 @@ struct G17PAsyncComputeActive {
     /// stamp store may still be pending), so retirement must never depend on
     /// finding the record in the ring a second time.
     observed: Option<crate::g17_resources::G17PComputeCompletionCandidate>,
+    /// Global publication order (`g17_recovery_isolation::COMPUTE_PUBLICATION`).
+    published: u64,
 }
 
 /// `g17p_recovery_isolation` REPLAY: one spared kick that the retirement
@@ -555,9 +557,11 @@ impl G17PLiveRuntime {
         // From this point, every error retains the packet, mappings and root.
         // A failed notification does not prove the firmware missed the kick.
         q.retirement_ready = false;
+        let published = crate::g17_recovery_isolation::COMPUTE_PUBLICATION
+            .fetch_add(1, Ordering::Relaxed) + 1;
         q.inflight.push(G17PAsyncComputeActive {
             packet: packet.clone(), _lease: lease, _work_state: work_state.clone(),
-            retirement: None, observed: None,
+            retirement: None, observed: None, published,
         }).map_err(|_| EBUSY)?;
         let mut tsq_reserved = false;
         let result = (|| {
@@ -1754,6 +1758,69 @@ impl G17PLiveRuntime {
                 owner, q.queue.queue_id(), submission);
         }
         true
+    }
+
+    /// `g17p_recovery_isolation` bit7 VICTIM_DEFER: is this compute timeout
+    /// head-of-line blocking behind another VM's older unfinished kick? On
+    /// `Spare` every in-flight kick of the queue is classified spared, so the
+    /// quarantine that follows fails their fences without VM status.
+    pub(crate) fn classify_compute_timeout(&mut self, owner: u64, submission: u64, renewals: u8)
+        -> crate::g17_recovery_isolation::VictimTimeout
+    {
+        use crate::g17_recovery_isolation as iso;
+        if !iso::enabled(iso::VICTIM_DEFER) { return iso::VictimTimeout::Own; }
+        // The same final DRAM-only retirement pass the quarantine takes.
+        let _ = self.service_async_compute_completions();
+        let Some(index) = self.async_compute_queues.iter().position(|q| q.owner == Some(owner)) else {
+            return iso::VictimTimeout::Own;
+        };
+        let q = &self.async_compute_queues[index];
+        if q.quarantined || !q.inflight.iter().any(|active| active.packet.submission_id() == submission) {
+            return iso::VictimTimeout::Own;
+        }
+        // The queue's own oldest kick: if it already finished, nothing blocks it.
+        let Some(front) = q.inflight.front().filter(|front| front.observed.is_none()) else {
+            return iso::VictimTimeout::Own;
+        };
+        let (own_vm, own_published, qid) = (front.packet.context().vm_id(), front.published, q.queue.queue_id());
+        // A queue quarantined without retirement tickets keeps its kicks until
+        // processor stop whatever firmware did with them: it proves nothing
+        // about the pipe now, so it never excuses a timeout.
+        let head = |other: &G17PAsyncComputeQueue| other.inflight.front()
+            .filter(|_| !other.quarantined || other.awaiting_retirement_witness)
+            .map(|head| iso::ComputeHead {
+                vm: head.packet.context().vm_id(), published: head.published, finished: head.observed.is_some(),
+            });
+        let (decision, blocker) = iso::victim_timeout(iso::mask(), own_vm, own_published, renewals,
+            self.async_compute_queues.iter().enumerate()
+                .filter(|(other, _)| *other != index)
+                .filter_map(|(_, other)| head(other)));
+        if decision == iso::VictimTimeout::Own { return decision; }
+        let blocker = self.async_compute_queues.iter()
+            .find(|other| other.inflight.front().is_some_and(|head| Some(head.published) == blocker))
+            .map(|other| (other.queue.queue_id(), other.owner, other.quarantined));
+        if decision == iso::VictimTimeout::Spare {
+            iso::count(&iso::VICTIM_SPARED);
+            for active in self.async_compute_queues[index].inflight.iter() {
+                if let Ok(completion) = active.packet.completion() {
+                    completion.set_recovery_class(iso::CLASS_SPARED);
+                }
+            }
+        } else {
+            iso::count(&iso::VICTIM_DEFERRED);
+        }
+        // One line when the deferral starts and one if it runs out.
+        if renewals == 0 || decision == iso::VictimTimeout::Spare {
+            let verdict = if decision == iso::VictimTimeout::Spare {
+                "still blocked after the renewal budget: failing its kicks spared, VM status untouched"
+            } else { "victim, timeout renewed" };
+            if let Some(pdev) = &self.pdev {
+                dev_warn!(pdev.as_ref(),
+                    "G17P recovery isolation: compute timeout owner={} qid={} vm={} submission={} blocked behind (qid,owner,quarantined)={:?}; {}\n",
+                    owner, qid, own_vm, submission, blocker, verdict);
+            }
+        }
+        decision
     }
 
     pub(crate) fn quarantine_async_compute(&mut self, owner: u64, submission: u64, error: Error) -> bool {

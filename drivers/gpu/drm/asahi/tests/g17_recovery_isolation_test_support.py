@@ -44,7 +44,10 @@ def recovery_isolation_mod():
                    "pub(crate) const fn never_executed(",
                    "pub(crate) fn compute_replay_decision<",
                    "pub(crate) const fn inherited_errno(",
-                   "pub(crate) const fn replay_budget_left("):
+                   "pub(crate) const fn replay_budget_left(",
+                   "pub(crate) struct ComputeHead {",
+                   "pub(crate) enum VictimTimeout {",
+                   "pub(crate) fn victim_timeout<"):
         typed = "struct" in marker or "enum" in marker
         out.append(" #[derive(Copy, Clone, Debug, PartialEq, Eq)]" if typed else "")
         out.append(_block(src, marker).replace("pub(crate)", "pub"))
