@@ -9,6 +9,7 @@ import tempfile
 root = Path(__file__).resolve().parent
 plane = (root / 'plane.c').read_text()
 swap = (root / 'iomfb.c').read_text()
+driver = (root / 'apple_drv.c').read_text()
 
 def block(source, marker):
     start = source.index(marker)
@@ -25,6 +26,7 @@ reset = block(plane, 'static void apple_plane_reset(')
 duplicate = block(plane, 'static struct drm_plane_state *\napple_plane_duplicate_state(')
 destroy = block(plane, 'static void apple_plane_destroy_state(')
 retire = block(swap, 'if (old_state->crtc == crtc && old_state->fb &&')
+tail = block(driver, 'static void apple_atomic_commit_tail(')
 
 stub = r'''
 #include <assert.h>
@@ -101,6 +103,27 @@ static void retire(struct dcp *dcp, struct drm_crtc *crtc,
     unsigned long flags;
 ''' + retire.replace('continue;', 'return;') + r'''
 }
+struct drm_crtc_state { bool active; };
+struct platform_device { struct dcp *d; };
+struct apple_crtc { struct platform_device *dcp; };
+static struct apple_crtc tail_crtc;
+static struct drm_crtc *tail_base;
+static struct drm_crtc_state inactive_state;
+static struct drm_plane_state *tail_plane;
+#define to_apple_crtc(c) ((void)(c), &tail_crtc)
+#define for_each_old_crtc_in_state(s,c,o,i) \
+    for ((void)(s), (i)=0; (i)<1 && ((c)=tail_base, (o)=&inactive_state, true); (i)++)
+static void dcp_retain_unbound_fbs_pdev(struct platform_device *pdev,
+                                      struct drm_crtc *crtc, struct drm_atomic_state *state) {
+    (void)state;
+    retire(pdev->d, crtc, old, tail_plane);
+}
+static void drm_atomic_helper_commit_tail_rpm(struct drm_atomic_state *state) {
+    (void)state;
+    assert(!inactive_state.active); /* ACTIVE_ONLY would skip plane hooks. */
+    assert(queued && queued->fb==old->fb); /* held before standard cleanup */
+}
+''' + tail + r'''
 int main(void) {
     struct drm_framebuffer a = {1}, b = {1};
     struct drm_crtc c, other;
@@ -177,6 +200,21 @@ int main(void) {
     assert(!to_apple_plane_state(next)->retiring_fb);
     assert(apple_plane_prepare_fb(&p, next) == 0);
     apple_plane_destroy_state(&p, next);
+    assert(a.refs == 1 && allocs == frees);
+    /* Execute the real commit-tail wrapper with an already inactive CRTC. */
+    next = apple_plane_duplicate_state(&p);
+    next->fb = NULL;
+    assert(apple_plane_prepare_fb(&p, next) == 0);
+    struct platform_device pdev = {.d = &d};
+    struct drm_atomic_state atomic = {0};
+    tail_crtc.dcp = &pdev;
+    tail_base = &c;
+    tail_plane = next;
+    apple_atomic_commit_tail(&atomic);
+    assert(queued && a.refs == 2);
+    apple_plane_destroy_state(&p, next);
+    queued->fb->refs--;
+    kfree(queued);
     assert(a.refs == 1 && allocs == frees);
     return 0;
 }

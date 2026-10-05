@@ -156,12 +156,6 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 	if (crtc_state->active_changed && !crtc_state->active) {
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 
-		/*
-		 * The ACTIVE_ONLY plane pass of commit_tail_rpm() skips this
-		 * CRTC's planes and flush, so hold its framebuffers here: the
-		 * coprocessor keeps scanning the last one out.
-		 */
-		dcp_retain_unbound_fbs_pdev(apple_crtc->dcp, crtc, state);
 		dcp_poweroff(apple_crtc->dcp);
 	}
 
@@ -266,8 +260,27 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.fb_create		= drm_gem_fb_create,
 };
 
+static void apple_atomic_commit_tail(struct drm_atomic_state *state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
+	int i;
+
+	/*
+	 * H17P soft-off leaves the pipe scanning its last surface. A plane
+	 * update on an already inactive CRTC runs neither atomic_disable nor
+	 * atomic_flush in commit_tail_rpm(), but still releases old plane state.
+	 * Retain displaced framebuffers before every commit, including these
+	 * updates, and delegate the hardware ordering to the standard helper.
+	 */
+	for_each_old_crtc_in_state(state, crtc, old_crtc_state, i)
+		dcp_retain_unbound_fbs_pdev(to_apple_crtc(crtc)->dcp, crtc, state);
+
+	drm_atomic_helper_commit_tail_rpm(state);
+}
+
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
-	.atomic_commit_tail	= drm_atomic_helper_commit_tail_rpm,
+	.atomic_commit_tail	= apple_atomic_commit_tail,
 };
 
 static void appledrm_connector_cleanup(struct drm_connector *connector)
