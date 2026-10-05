@@ -58,7 +58,7 @@ mod g17_recovery_path {
     @SHADOW@
     @PARSE@
 }
-'''.replace("@CORE@", rp_core.replace("static MASK: AtomicU32 = AtomicU32::new(0);", "")
+'''.replace("@CORE@", rp_core.replace("const DEFAULT_MASK: u32 = RECLAIM_DRAINED;\nstatic MASK: AtomicU32 = AtomicU32::new(DEFAULT_MASK);", "")
             .replace("const ALL_BITS: u32 = RECLAIM_DRAINED | CONTROL_TRACE | GROW_REKICK | STALL_WATCH | STALL_REDOORBELL\n    | STALL_FRAGMENT;", "")).replace("@SHADOW@", rp_shadow).replace("@PARSE@", "pub(crate) " + rp_parse)
 
 # ---------------------------------------------------------------------------

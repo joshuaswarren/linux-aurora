@@ -2,7 +2,10 @@
 //! v93r post-recovery controls and control-ring diagnostics (`g17p_recovery_path`).
 //!
 //! Root-only sysfs, runtime-writable bitmask, also settable at load. Default
-//! 0 is exactly v93f.
+//! is RECLAIM_DRAINED; 0 is exactly v93f. Without bit0 a client whose render
+//! was failed by a stamp-blamed recovery keeps its whole VM -- every BO it
+//! ever mapped -- pinned until both firmware processors stop, which in
+//! practice is the next reboot.
 //!   bit0 RECLAIM_DRAINED: after a firmware stamp-blamed recovery the render
 //!        whose group could not be proven retired, and every render queued
 //!        behind it on the same physical pair, are failed with their guards
@@ -66,7 +69,8 @@ pub(crate) const STALL_FRAGMENT: u32 = 1 << 6;
 const ALL_BITS: u32 = RECLAIM_DRAINED | CONTROL_TRACE | GROW_REKICK | STALL_WATCH | STALL_REDOORBELL
     | STALL_FRAGMENT;
 
-static MASK: AtomicU32 = AtomicU32::new(0);
+const DEFAULT_MASK: u32 = RECLAIM_DRAINED;
+static MASK: AtomicU32 = AtomicU32::new(DEFAULT_MASK);
 
 #[inline(always)]
 pub(crate) fn enabled(bit: u32) -> bool { MASK.load(Ordering::Relaxed) & bit != 0 }
