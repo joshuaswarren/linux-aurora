@@ -129,6 +129,36 @@
 //! blamed; slot 4 = Minecraft 3D qid 27 (pass started, DM1 record state 2)
 //! had stalled.
 //!
+//! bit7 VICTIM_DEFER (t-1179, default on): a HOST scheduler timeout is
+//!        not a firmware recovery, so nothing above classifies it. Field case
+//!        (boot of 2026-10-06 06:47:56, census J700-003): a vkd3d-proton test
+//!        (owner 18911, qid 72, vm 25834) stopped retiring compute; its 2 s
+//!        watchdog quarantined it. gnome-shell's compute kick (owner 3, qid 4,
+//!        vm 5) had been published right behind it (submissions 3131223 and
+//!        3131225) and never ran: global GPU progress moved by one in those
+//!        6 s. Its own watchdog fired at 06:48:02, poisoned VM 5 with -110 and
+//!        failed its render slots; firmware retired BOTH queues at 06:48:05,
+//!        three seconds later, but VM 5 refused every later map and the
+//!        compositor aborted. So a compute timeout whose queue's oldest kick
+//!        was published after an unfinished kick of ANOTHER VM's queue is
+//!        treated as head-of-line blocked: its scheduler timeout is renewed,
+//!        at most VICTIM_MAX_RENEWALS times, and nothing else changes (a
+//!        firmware recovery meanwhile classifies its kicks as usual). If the
+//!        blocker is still unretired when the budget runs out, its in-flight
+//!        kicks are classified CLASS_SPARED before the quarantine: their
+//!        fences fail, the VM status is untouched and the queue returns after
+//!        the retirement witness. Without a blocker, or once the blocker
+//!        retired, a timeout is the queue's own and keeps today's behaviour
+//!        (VM poisoned). A queue quarantined without retirement tickets
+//!        never counts as a blocker: its kicks stay listed until processor
+//!        stop, whatever firmware did. Kicks of different QIDs share the
+//!        compute pipe in publication order -- the field case shows that
+//!        blocking on G17P and the same client pair shows it on G13 (a 3 s
+//!        kick delayed another process's tiny kick by 2.998 s), but it is not
+//!        decoded from firmware -- so the renewal is
+//!        bounded, and the oldest unretired kick never has a blocker: a stall
+//!        always charges at least that queue.
+//!
 //! Memory safety is unchanged in every mode: packets, VM-job guards and
 //! quarantined pairs are retained and released only by the existing
 //! witnesses (exact retirement, firmware drain/reclaim, processor stop).
@@ -144,17 +174,23 @@ pub(crate) const GUILTY_GRACE: u32 = 1 << 3;
 pub(crate) const RESUME_DOORBELL: u32 = 1 << 4;
 pub(crate) const ATTRIBUTION: u32 = 1 << 5;
 pub(crate) const REPLAY: u32 = 1 << 6;
+pub(crate) const VICTIM_DEFER: u32 = 1 << 7;
 const ALL_BITS: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | GUILTY_GRACE | RESUME_DOORBELL
-    | ATTRIBUTION | REPLAY;
+    | ATTRIBUTION | REPLAY | VICTIM_DEFER;
 /// Correctness/containment fixes with no hot-path cost are on; the guilty
 /// grace changes the guilty client's semantics and stays opt-in.
-pub(crate) const DEFAULT_MASK: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | ATTRIBUTION | REPLAY;
+pub(crate) const DEFAULT_MASK: u32 = INNOCENT | ADMISSION_WAIT | SETTLE_CANCELLED | ATTRIBUTION | REPLAY
+    | VICTIM_DEFER;
 
 pub(crate) const ADMISSION_WAIT_MS: u32 = 1000;
 /// iso4 REPLAY: publications of one command beyond its first.
 pub(crate) const MAX_REPLAYS: u8 = 3;
 pub(crate) const SUBMIT_WAIT_MS: u32 = 200;
 pub(crate) const GRACE_WINDOW_NS: u64 = 60_000_000_000;
+/// bit7: scheduler periods (2 s each) a head-of-line blocked compute job may
+/// wait for its blocker beyond its own. The field blocker retired 9 s after
+/// its own timeout; 8 extra periods cover that with margin.
+pub(crate) const VICTIM_MAX_RENEWALS: u8 = 8;
 
 static MASK: AtomicU32 = AtomicU32::new(DEFAULT_MASK);
 
@@ -295,6 +331,53 @@ pub(crate) const fn classify(guilty: bool, grace: bool, now_ns: u64, last_grace_
     }
     (CLASS_GUILTY, false)
 }
+
+// ---- head-of-line victim deferral (bit7) ------------------------------------
+
+/// The oldest unretired kick of one OTHER compute queue at a host timeout.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComputeHead {
+    /// VM of that queue's owner.
+    pub(crate) vm: u64,
+    /// Global publication order of the kick (`COMPUTE_PUBLICATION`).
+    pub(crate) published: u64,
+    /// Its completion record was already latched (finished, not retired yet).
+    pub(crate) finished: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VictimTimeout {
+    /// No older unfinished kick of another VM: the timeout is this queue's own.
+    Own,
+    /// Head-of-line blocked: renew the scheduler timeout once more.
+    Defer,
+    /// Still blocked after the renewal budget: quarantine spared.
+    Spare,
+}
+
+/// `own_vm`/`own_published`: the timed-out queue's VM and its oldest
+/// unretired kick's publication order; `renewals`: periods already granted.
+/// Returns the decision and the publication order of the oldest blocker.
+pub(crate) fn victim_timeout<I>(mask: u32, own_vm: u64, own_published: u64, renewals: u8, others: I)
+    -> (VictimTimeout, Option<u64>)
+where I: IntoIterator<Item = ComputeHead> {
+    if mask & VICTIM_DEFER == 0 { return (VictimTimeout::Own, None); }
+    let blocker = others.into_iter()
+        .filter(|head| head.vm != own_vm && !head.finished && head.published < own_published)
+        .map(|head| head.published)
+        .min();
+    match blocker {
+        None => (VictimTimeout::Own, None),
+        Some(_) if renewals < VICTIM_MAX_RENEWALS => (VictimTimeout::Defer, blocker),
+        // Sparing needs the INNOCENT machinery (no-poison fail, witness return).
+        Some(_) if mask & INNOCENT != 0 => (VictimTimeout::Spare, blocker),
+        Some(_) => (VictimTimeout::Own, blocker),
+    }
+}
+
+/// Global publication order of async compute kicks. Written only under the
+/// runtime lock at publication; a plain counter, never reset.
+pub(crate) static COMPUTE_PUBLICATION: AtomicU64 = AtomicU64::new(0);
 
 // ---- fault-source attribution (bit5) ---------------------------------------
 
@@ -464,11 +547,15 @@ pub(crate) static REPLAY_ORDER_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// against a cancelled kick; consumer failures not charged to the VM.
 pub(crate) static REPLAY_REFUSED_CONSUMER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INHERITED_NOT_POISONED: AtomicU64 = AtomicU64::new(0);
+/// bit7: compute timeouts renewed because another VM's older kick was still
+/// unfinished, and queues quarantined spared after the renewal budget.
+pub(crate) static VICTIM_DEFERRED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static VICTIM_SPARED: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn count(counter: &AtomicU64) { counter.fetch_add(1, Ordering::Relaxed); }
 
-static COUNTERS: [(&str, &AtomicU64); 31] = [
+static COUNTERS: [(&str, &AtomicU64); 33] = [
     ("recoveries", &RECOVERIES), ("unresolved", &UNRESOLVED),
     ("spared-renders", &SPARED_RENDERS), ("spared-compute", &SPARED_COMPUTE),
     ("guilty-marked", &GUILTY_MARKED), ("graced", &GRACED),
@@ -486,6 +573,7 @@ static COUNTERS: [(&str, &AtomicU64); 31] = [
     ("replay-order-timeouts", &REPLAY_ORDER_TIMEOUTS),
     ("replay-refused-consumer", &REPLAY_REFUSED_CONSUMER),
     ("inherited-not-poisoned", &INHERITED_NOT_POISONED),
+    ("victim-deferred", &VICTIM_DEFERRED), ("victim-spared", &VICTIM_SPARED),
 ];
 
 // ---- parameter -----------------------------------------------------------------

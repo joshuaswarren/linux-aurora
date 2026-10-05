@@ -3011,6 +3011,12 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
         self.runtime.mutex().lock().timeout_progress_snapshot()
     }
 
+    fn victim_timeout(&self, packet: &g17_job::G17PComputeJobPacket, renewals: u8)
+        -> crate::g17_recovery_isolation::VictimTimeout
+    {
+        self.runtime.mutex().lock().classify_compute_timeout(self.owner, packet.submission_id(), renewals)
+    }
+
     /// No host dependency on the previous compute job. Its CL kick is this
     /// kick's implicit firmware parent, so publication never waits for a
     /// host retirement; scheduler credits bound only host bookkeeping.
