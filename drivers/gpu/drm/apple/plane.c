@@ -14,6 +14,7 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_plane.h>
 
 #define FRAC_16_16(mult, div)    (((mult) << 16) / (div))
@@ -292,13 +293,52 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		new_state->iova = obj->dma_addr + base->fb->offsets[0];
 }
 
+static int apple_plane_prepare_fb(struct drm_plane *plane,
+				  struct drm_plane_state *new_state)
+{
+	struct drm_plane_state *old_state;
+	struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
+	int ret;
+
+	ret = drm_gem_plane_helper_prepare_fb(plane, new_state);
+	if (ret)
+		return ret;
+
+	old_state = drm_atomic_get_old_plane_state(new_state->state, plane);
+	if (!old_state || !old_state->crtc || !old_state->fb ||
+	    (old_state->fb == new_state->fb && old_state->crtc == new_state->crtc) ||
+	    apple_state->retiring_fb)
+		return 0;
+
+	/* The commit tail cannot fail once the DRM state has been swapped. */
+	apple_state->retiring_fb = kzalloc(sizeof(*apple_state->retiring_fb),
+					 GFP_KERNEL);
+	if (!apple_state->retiring_fb)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void apple_plane_cleanup_fb(struct drm_plane *plane,
+				   struct drm_plane_state *state)
+{
+	struct apple_plane_state *apple_state = to_apple_plane_state(state);
+
+	kfree(apple_state->retiring_fb);
+	apple_state->retiring_fb = NULL;
+}
+
 static const struct drm_plane_helper_funcs apple_primary_plane_helper_funcs = {
+	.prepare_fb	= apple_plane_prepare_fb,
+	.cleanup_fb	= apple_plane_cleanup_fb,
 	.atomic_check	= apple_plane_atomic_check,
 	.atomic_update	= apple_plane_atomic_update,
 	.get_scanout_buffer = drm_fb_dma_get_scanout_buffer,
 };
 
 static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
+	.prepare_fb	= apple_plane_prepare_fb,
+	.cleanup_fb	= apple_plane_cleanup_fb,
 	.atomic_check	= apple_plane_atomic_check,
 	.atomic_update	= apple_plane_atomic_update,
 };
@@ -306,9 +346,12 @@ static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
 // Duplicate drm_atomic_helper_plane_reset but allocate struct apple_plane_state
 static void apple_plane_reset(struct drm_plane *plane)
 {
-        struct apple_plane_state *state = to_apple_plane_state(plane->state);
-	if (state)
+	struct apple_plane_state *state = plane->state ?
+		to_apple_plane_state(plane->state) : NULL;
+	if (plane->state) {
+		apple_plane_cleanup_fb(plane, &state->base);
 		__drm_atomic_helper_plane_destroy_state(&state->base);
+	}
 
 	kfree(state);
 	plane->state = NULL;
@@ -333,23 +376,26 @@ apple_plane_duplicate_state(struct drm_plane *plane)
         __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
+	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
+	apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
+	apple_plane_state->iova = old_apple_plane_state->iova;
 
 	return &apple_plane_state->base;
 }
 
-// void apple_plane_destroy_state(struct drm_plane *plane,
-//                                      struct drm_plane_state *state)
-// {
-// 	drm_atomic_helper_plane_destroy_state(plane, state);
-// }
+static void apple_plane_destroy_state(struct drm_plane *plane,
+				      struct drm_plane_state *state)
+{
+	apple_plane_cleanup_fb(plane, state);
+	drm_atomic_helper_plane_destroy_state(plane, state);
+}
 
 static const struct drm_plane_funcs apple_plane_funcs = {
 	.update_plane		= drm_atomic_helper_update_plane,
 	.disable_plane		= drm_atomic_helper_disable_plane,
 	.reset			= apple_plane_reset,
 	.atomic_duplicate_state = apple_plane_duplicate_state,
-	// .atomic_destroy_state	= apple_plane_destroy_state,
-	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
+	.atomic_destroy_state	= apple_plane_destroy_state,
 };
 
 /*

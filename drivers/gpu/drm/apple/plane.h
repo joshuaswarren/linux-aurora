@@ -25,6 +25,8 @@ struct apple_plane_state {
 	struct dcp_rect src_rect;
 	struct dcp_rect dst_rect;
 	u64 iova;
+	/* Prepared before state swap; transferred to DCP on displacement. */
+	struct dcp_fb_reference *retiring_fb;
 };
 
 #define to_apple_plane_state(x) container_of(x, struct apple_plane_state, base)
