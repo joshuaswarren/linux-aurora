@@ -5450,6 +5450,22 @@ impl G17PLiveRuntime {
         })
     }
 
+    /// Refresh the `g17p_queue_slots` snapshot of who holds queue slots.
+    fn note_queue_slots(&self) {
+        let compute = &self.async_compute_queues;
+        crate::g17_queue_slots::note(crate::g17_queue_slots::Snapshot {
+            compute_graphs: compute.len(),
+            compute_owned: compute.iter().filter(|q| q.owner.is_some()).count(),
+            compute_released: compute.iter().filter(|q| q.released && !q.quarantined).count(),
+            compute_quarantined: compute.iter().filter(|q| q.quarantined).count(),
+            compute_exit_killed: compute.iter().filter(|q| q.exit_kill.is_some()).count(),
+            retired_graphs: self.retired_queues.len(),
+            teardowns: self.manager.as_ref()
+                .map_or(0, |manager| manager.logical_queue_teardowns_outstanding()),
+            render_quarantined: self.quarantined_render_completions.len(),
+        });
+    }
+
     /// One teardown turn: publish the scheduler-state release of every closed
     /// queue whose render pairs and compute are quiescent, then hand back the
     /// teardowns whose release the firmware has consumed. The caller drops
@@ -5467,6 +5483,7 @@ impl G17PLiveRuntime {
         // context whose compute packets they release can publish its
         // scheduler-state release in this same turn.
         self.release_exit_killed_compute();
+        self.note_queue_slots();
         let outstanding = self
             .manager
             .as_ref()
