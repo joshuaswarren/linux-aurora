@@ -178,16 +178,16 @@ module_param_named(pipe_crc_idx, dcp_pipe_crc_idx, uint, 0644);
 MODULE_PARM_DESC(pipe_crc_idx, "Notify_Info_Index for pipe_crc_reads");
 
 /*
- * Runtime properties (IOMFB::PropRelay, A200 setBool / A201 setInt; the
- * RuntimeProperty enum is the firmware's name table at 0x44ff980 in the
- * 25G83 dcpf: 0x86 IOMFBBlendDisabledKey, 0x1e enableDither, 0x11
- * brightnessCorrection, 0x10 enableGammaCorrection, 0x2e
- * enablePartialUpdate ...).  rtp="b:<prop>=<val>" or "i:<prop>=<val>" (hex)
- * issues one call after the next completed swap and logs the status.
+ * Runtime properties (the RuntimeProperty enum is the firmware's name table
+ * in the 25G83 dcpf: 0x49 enableGPAlphaDiv, 0x86 IOMFBBlendDisabledKey, 0x1e
+ * enableDither ...).  rtp="<prop>=<val>" (hex) issues one A352
+ * {u32 prop, u32 value} after the next completed swap and logs the status.
+ * The A200/A201 PropRelay stubs this knob used before made the firmware
+ * panic ("rpc_callee_gated: payload size mismatch: 16 != 24").
  */
 char dcp_rtp_request[32];
 module_param_string(rtp, dcp_rtp_request, sizeof(dcp_rtp_request), 0644);
-MODULE_PARM_DESC(rtp, "b:<prop>=<val> / i:<prop>=<val> (hex): set a DCP runtime property after the next completed swap (H17P)");
+MODULE_PARM_DESC(rtp, "<prop>=<val> (hex): set a DCP runtime property (A352) after the next completed swap (H17P)");
 
 char dcp_h17p_swap_poke[128];
 module_param_string(h17p_swap_poke, dcp_h17p_swap_poke, sizeof(dcp_h17p_swap_poke), 0644);

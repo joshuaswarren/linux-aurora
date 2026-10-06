@@ -206,8 +206,6 @@ DCP_THUNK_OUT(dcp_is_main_display, dcpep_is_main_display, u32);
 DCP_THUNK_OUT(dcp_read_blend_crc, dcpep_read_blend_crc, u32);
 DCP_THUNK_INOUT(dcp_enable_disable_dithering, dcpep_enable_disable_dithering, u32, u32);
 DCP_THUNK_INOUT(dcp_read_crc, dcpep_read_crc, struct dcp_read_crc_req, u32);
-DCP_THUNK_INOUT(dcp_rtp_set_bool, dcpep_rtp_set_bool, struct dcp_rtp_set_bool_req, u32);
-DCP_THUNK_INOUT(dcp_rtp_set_int, dcpep_rtp_set_int, struct dcp_rtp_set_int_req, u32);
 #endif
 
 /* DCP callback handlers */
@@ -342,28 +340,20 @@ static void res_rtp(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void dcp_issue_rtp_request(struct apple_dcp *dcp)
 {
-	char kind = dcp_rtp_request[0];
-	const char *c = dcp_rtp_request + 2;
 	char *e;
 	unsigned long prop, val;
+	u64 rq;
 
-	if (!kind || dcp_rtp_request[1] != ':')
-		goto done;
-	prop = simple_strtoul(c, &e, 16);
-	if (*e != '=')
+	prop = simple_strtoul(dcp_rtp_request, &e, 16);
+	if (*e != '=' || prop > U32_MAX)
 		goto done;
 	val = simple_strtoul(e + 1, &e, 16);
-	if (kind == 'b') {
-		struct dcp_rtp_set_bool_req rq = { .prop = prop, .value = !!val };
-
-		dcp_rtp_set_bool(dcp, false, &rq, res_rtp,
-				 (void *)(uintptr_t)((prop << 8) | rq.value));
-	} else if (kind == 'i') {
-		struct dcp_rtp_set_int_req rq = { .prop = prop, .value = val };
-
-		dcp_rtp_set_int(dcp, false, &rq, res_rtp,
-				(void *)(uintptr_t)((prop << 8) | (val & 0xff)));
-	}
+	if (val > U32_MAX)
+		goto done;
+	/* A352 in: {u32 prop, u32 value} */
+	rq = (u64)val << 32 | prop;
+	dcp_pipe_set_352(dcp, false, &rq, res_rtp,
+			 (void *)(uintptr_t)((prop << 8) | (val & 0xff)));
 done:
 	dcp_rtp_request[0] = '\0';
 }
@@ -394,10 +384,8 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
 	 * At most one diagnostic call per completed swap: they are pushed
-	 * without waiting for the reply, and an A200 pushed straight after an
-	 * A106 made the firmware panic ("rpc_callee_gated: payload size
-	 * mismatch: 16 != 24").  One-shot property and dither requests go
-	 * first; CRC reads wait for the following swaps.
+	 * without waiting for the reply.  One-shot property and dither
+	 * requests go first; CRC reads wait for the following swaps.
 	 */
 	if (dcp_rtp_request[0]) {
 		dcp_issue_rtp_request(dcp);
