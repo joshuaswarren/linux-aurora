@@ -205,9 +205,6 @@ enum dcpep_method {
 	dcpep_enable_disable_dithering,
 	/* IOMFB::UPPipeAP_H17P::read_crc(Notify_Info_Index, u32): (0x8, 0x4) */
 	dcpep_read_crc,
-	/* IOMFB::PropRelay::setBool/setInt(RuntimeProperty, v): (0x8, 0x4) */
-	dcpep_rtp_set_bool,
-	dcpep_rtp_set_int,
 	dcpep_num_methods
 };
 
@@ -321,17 +318,6 @@ struct dcp_set_dcpav_prop_chunk_req {
 
 struct dcp_set_dcpav_prop_end_req {
 	char key[0x40];
-} __packed;
-
-struct dcp_rtp_set_bool_req {
-	u32 prop;
-	u8 value;
-	u8 pad[3];
-} __packed;
-
-struct dcp_rtp_set_int_req {
-	u32 prop;
-	u32 value;
 } __packed;
 
 struct dcp_read_crc_req {
