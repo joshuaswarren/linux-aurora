@@ -337,7 +337,7 @@ static void res_rtp(struct apple_dcp *dcp, void *out, void *cookie)
 		 (unsigned long)(uintptr_t)cookie, st);
 }
 
-static void dcp_issue_rtp_request(struct apple_dcp *dcp)
+static void dcp_issue_rtp_request(struct apple_dcp *dcp, dcp_callback_t cb)
 {
 	char *e;
 	unsigned long prop, val;
@@ -351,10 +351,14 @@ static void dcp_issue_rtp_request(struct apple_dcp *dcp)
 		goto done;
 	/* A352 in: {u32 prop, u32 value} */
 	rq = (u64)val << 32 | prop;
-	dcp_pipe_set_352(dcp, false, &rq, res_rtp,
-			 (void *)(uintptr_t)((prop << 8) | (val & 0xff)));
+	dcp->diag_res = res_rtp;
+	dcp->diag_cookie = (void *)(uintptr_t)((prop << 8) | (val & 0xff));
+	dcp_rtp_request[0] = '\0';
+	dcp_pipe_set_352(dcp, false, &rq, cb, NULL);
+	return;
 done:
 	dcp_rtp_request[0] = '\0';
+	cb(dcp, NULL, NULL);
 }
 
 static void res_pipe_crc(struct apple_dcp *dcp, void *out, void *cookie)
@@ -380,32 +384,6 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 
 	dcp_drm_crtc_page_flip(dcp, now);
 	dcp_release_swapped_out_fbs(dcp);
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/*
-	 * At most one diagnostic call per completed swap: they are pushed
-	 * without waiting for the reply.  One-shot property and dither
-	 * requests go first; CRC reads wait for the following swaps.
-	 */
-	if (dcp_rtp_request[0]) {
-		dcp_issue_rtp_request(dcp);
-	} else if (dcp_dither_request >= 0) {
-		u32 v = dcp_dither_request ? 1 : 0;
-
-		dcp_dither_request = -1;
-		dcp_enable_disable_dithering(dcp, false, &v, res_dither,
-					     (void *)(uintptr_t)v);
-	} else if (dcp_blend_crc_reads > 0) {
-		dcp_blend_crc_reads--;
-		dcp_read_blend_crc(dcp, false, res_blend_crc,
-				   (void *)(uintptr_t)resp->swap_id);
-	} else if (dcp_pipe_crc_reads > 0) {
-		struct dcp_read_crc_req rq = { .index = dcp_pipe_crc_idx, .arg = 0 };
-
-		dcp_pipe_crc_reads--;
-		dcp_read_crc(dcp, false, &rq, res_pipe_crc,
-			     (void *)(uintptr_t)resp->swap_id);
-	}
-#endif
 	if (dcp->crc_enabled) {
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
@@ -2174,7 +2152,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 }
 
 /* Helpers to modeset and swap, used to flush */
-static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
+static void do_swap_start(struct apple_dcp *dcp)
 {
 	struct DCP_FW_NAME(dcp_swap_start_req) start_req = { 0 };
 
@@ -2182,6 +2160,69 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
 	else
 		dcp_drm_crtc_vblank(dcp->crtc);
+}
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+static void dcp_diag_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	dcp_callback_t res = dcp->diag_res;
+
+	dcp->diag_res = NULL;
+	if (res)
+		res(dcp, out, dcp->diag_cookie);
+	do_swap_start(dcp);
+}
+
+/*
+ * One pending runtime property or diagnostic call, issued from the flush
+ * path ahead of the swap and chained on its reply.  Calls pushed from the
+ * swap_complete callback raced the next flush: dcp_call_context() then saw
+ * the command channel busy and sent the swap_start (A406) as a nested call,
+ * and the firmware panicked ("rpc_callee_gated: payload size mismatch:
+ * 36 != 16", an A406 record against an in-flight A106).
+ */
+static bool dcp_issue_pre_swap_call(struct apple_dcp *dcp)
+{
+	dcp->diag_res = NULL;
+	if (dcp_rtp_request[0]) {
+		dcp_issue_rtp_request(dcp, dcp_diag_then_swap);
+	} else if (dcp_dither_request >= 0) {
+		u32 v = dcp_dither_request ? 1 : 0;
+
+		dcp_dither_request = -1;
+		dcp->diag_res = res_dither;
+		dcp->diag_cookie = (void *)(uintptr_t)v;
+		dcp_enable_disable_dithering(dcp, false, &v, dcp_diag_then_swap, NULL);
+	} else if (dcp_blend_crc_reads > 0 && dcp->have_swap_complete) {
+		dcp_blend_crc_reads--;
+		dcp->diag_res = res_blend_crc;
+		dcp->diag_cookie = (void *)(uintptr_t)dcp->last_swap_id;
+		dcp_read_blend_crc(dcp, false, dcp_diag_then_swap, NULL);
+	} else if (dcp_pipe_crc_reads > 0 && dcp->have_swap_complete) {
+		struct dcp_read_crc_req rq = { .index = dcp_pipe_crc_idx, .arg = 0 };
+
+		dcp_pipe_crc_reads--;
+		dcp->diag_res = res_pipe_crc;
+		dcp->diag_cookie = (void *)(uintptr_t)dcp->last_swap_id;
+		dcp_read_crc(dcp, false, &rq, dcp_diag_then_swap, NULL);
+	} else {
+		return false;
+	}
+	return true;
+}
+#else
+static bool dcp_issue_pre_swap_call(struct apple_dcp *dcp)
+{
+	return false;
+}
+#endif
+
+static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
+{
+	if (dcp->connector && dcp->connector->connected &&
+	    dcp_issue_pre_swap_call(dcp))
+		return;
+	do_swap_start(dcp);
 }
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)

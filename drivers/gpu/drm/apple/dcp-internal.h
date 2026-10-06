@@ -318,6 +318,9 @@ struct apple_dcp {
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
+	/* result handler and cookie of the call issued ahead of the next swap */
+	dcp_callback_t diag_res;
+	void *diag_cookie;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
