@@ -6,7 +6,9 @@ The reference is the record as laid out by the earlier fix-up, which built
 a 0x58a-byte swap and shifted every surface and the request tail down by two
 bytes before submission.  The current layout must put the same bytes on the
 wire for every surface the driver builds (linear, so is_tiled = 0), and the
-fix-up must be safe to apply twice.
+fix-up must be safe to apply twice.  On H17P the one intended difference
+is that each surface keeps the is_premultiplied value plane.c chose (X
+formats are scanned out premultiplied); other firmware still forces it 0.
 """
 from pathlib import Path
 import os
@@ -48,6 +50,7 @@ def fix_function(template, suffix):
     text = text.replace('struct DCP_FW_NAME(dcp_swap_submit_req)',
                         'struct req_' + suffix)
     text = text.replace('&DCP_FW_UNION(dcp->swap)', '(void *)dcp')
+    text = text.replace('dcp->fw_compat', 'test_fw_compat')
     return text.replace('struct apple_dcp *dcp', 'void *dcp')
 
 
@@ -90,6 +93,8 @@ typedef uint64_t u64; typedef uint64_t __le64;
 #define req_old dcp_swap_submit_req_old
 #define req_new dcp_swap_submit_req_new
 static char dcp_h17p_swap_poke[128];
+enum { DCP_FIRMWARE_OTHER, DCP_FIRMWARE_H17P };
+static int test_fw_compat = DCP_FIRMWARE_OTHER;
 static unsigned long simple_strtoul(const char *c, char **e, int b)
 { return strtoul(c, e, b); }
 '''
@@ -146,7 +151,57 @@ int main(void)
 			return 1;
 		}
 	}
-	puts("h17p swap layout: 2000 records identical, fix-up idempotent");
+	/* H17P: identical except that is_premultiplied passes through. */
+	test_fw_compat = DCP_FIRMWARE_H17P;
+	for (int iter = 0; iter < 2000; iter++) {
+		u8 premul[SWAP_SURFACES];
+
+		for (size_t i = 0; i < sizeof(o); i++)
+			((u8 *)&o)[i] = rnd();
+		o.swap.h17p_tail[0xd8] = o.swap.h17p_tail[0xd9] = 0;
+		for (int s = 0; s < SWAP_SURFACES; s++)
+			o.surf[s].base.is_tiled = 0;
+		o.h17p_pad_ref[0] = o.h17p_pad_ref[1] = 0;
+
+		memset(&n, 0, sizeof(n));
+		memcpy(&n.swap, &o.swap, sizeof(n.swap));
+		memcpy(n.surf, o.surf, sizeof(n.surf));
+		memcpy(&n.surf_iova, &o.surf_iova, tail - 2);
+		for (int s = 0; s < SWAP_SURFACES; s++)
+			premul[s] = n.surf[s].base.is_premultiplied = rnd() & 1;
+
+		if (iter & 1)
+			strcpy(dcp_h17p_swap_poke, "e38=7");
+		else
+			dcp_h17p_swap_poke[0] = 0;
+
+		fix_old(&o);
+		fix_new(&n);
+		for (int s = 0; s < SWAP_SURFACES; s++) {
+			if (n.surf[s].base.is_premultiplied != premul[s]) {
+				printf("iter %d: surface %d is_premultiplied not kept\n", iter, s);
+				return 1;
+			}
+			/* the reference forced it 0; expect the kept value on the wire */
+			((u8 *)&o)[offsetof(struct req_new, surf[s].base.is_premultiplied)] = premul[s];
+		}
+		if (memcmp(&o, &n, sizeof(n))) {
+			printf("iter %d: H17P record differs beyond is_premultiplied\n", iter);
+			return 1;
+		}
+		twice = n;
+		fix_new(&twice);
+		if (memcmp(&twice, &n, sizeof(n))) {
+			printf("iter %d: H17P fix-up is not idempotent\n", iter);
+			return 1;
+		}
+	}
+	if (offsetof(struct req_new, surf[0].base.is_premultiplied) != 0x58a) {
+		puts("surface 0 is_premultiplied is not at 0x58a");
+		return 1;
+	}
+	puts("h17p swap layout: 2000 records identical, fix-up idempotent; "
+	     "H17P keeps is_premultiplied (2000 records)");
 	return 0;
 }
 '''
