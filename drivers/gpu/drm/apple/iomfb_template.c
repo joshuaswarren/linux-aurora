@@ -1481,17 +1481,12 @@ static void release_swap_cookie(struct kref *ref)
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 /*
- * H17P's swap surface has no is_tearing_allowed and no is_premultiplied:
- * plane_cnt sits at +1, plane_cnt2 at +5 and format at +9, two bytes earlier
- * than every other firmware.
- *
- * Proof from the capture: macOS's A408 carries its plane counts at surface+1
- * and +5 and its format at +9, and reading a u32 at +9 out of *our* record
- * gives 00 00 41 52, which the firmware prints MSB-first as "RA" -- exactly
- * the text it rejects us with ("verify_surfaces: No support for format RA").
- *
- * Shift each surface's tail down by two rather than fork the shared struct,
- * which the A472 default-framebuffer path also uses.
+ * Final H17P wire fix-ups, applied to the request in place just before every
+ * A408.  The swap record is 0x588 bytes (see h17p_tail), so the surfaces keep
+ * the common layout: plane_cnt at +3, format at +0xb, and surf_iova[0] at
+ * +0xe38 of the 0xe9c request.  A record built as if the swap were 0x58a
+ * bytes puts surf_iova two bytes late; the firmware then reads the DVA two
+ * bytes early and faults on an address with no L1 entry.
  */
 static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 {
@@ -1514,62 +1509,37 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	req->swap.h17p_pre_swap_id[0x00] = 2;
 	req->swap.h17p_pre_swap_id[0x28] = 3;
 
+	/*
+	 * Premultiplied blending does not give opaque XRGB on this pipe: an
+	 * alpha 0x00 frame still blends to the black background (blend CRC),
+	 * so it cannot stand in for an alpha-less format here.  Keep straight
+	 * alpha for every surface until a mode that ignores the fourth byte
+	 * is proven.
+	 */
 	for (i = 0; i < SWAP_SURFACES; i++) {
-		u8 *p = (u8 *)&req->surf[i];
-		size_t n = sizeof(req->surf[i]);
-
-		memmove(p + 1, p + 3, n - 3);
-		memset(p + n - 2, 0, 2);
+		req->surf[i].base.is_tearing_allowed = false;
+		req->surf[i].base.is_premultiplied = false;
 	}
 
-	/*
-	 * Our trailing null-flag block lands two bytes late.  In the capture
-	 * macOS's flags sit at +0xe94/+0xe95/+0xe99 of the 0xe9c record while
-	 * ours are at +0xe96/+0xe97/+0xe98/+0xe9a/+0xe9b -- so the last of them
-	 * run off the end and the firmware reads the whole block misaligned.
-	 * It then believes layers are present that are not, verifies their
-	 * empty rectangles, and rejects the swap with
-	 * "verify_scaling: error: null rectangle: src:0x0+0,0 dst:0x0+0,0".
-	 */
-	{
+	/* debug pokes, last so they land in the final layout */
+	if (dcp_h17p_swap_poke[0]) {
+		const char *c = dcp_h17p_swap_poke;
 		u8 *r = (u8 *)req;
 		size_t n = sizeof(*req);
-		size_t off = offsetof(typeof(*req), surf_iova);
 
-		/*
-		 * The two bytes are not just in the tail: everything from
-		 * surf_iova onward is late.  macOS's A408 carries
-		 * surf_iova[0] at +0xe38 of the 0xe9c record, ours sat at
-		 * +0xe3a, so the firmware read our DVA 0x100075fc000 two bytes
-		 * early as 0x0100075fc0000000 and faulted on its low 36 bits,
-		 * 0xfc0000000 -- an address with no L1 entry at all.  Shift the
-		 * whole block, which subsumes the null-flag fixup.
-		 */
-		/* Preserve the complete 16K-aligned IOVA, including its low bits. */
-		static_assert(offsetof(typeof(*req), surf_iova) == 0xe3a,
-			      "H17P source IOVA offset");
-		static_assert(sizeof(*req) == 0xe9c, "H17P request size");
-		memmove(r + off - 2, r + off, n - off);
-		memset(r + n - 2, 0, 2);
+		while (*c) {
+			unsigned long o, v;
+			char *e;
 
-		/* debug pokes, last so they land in the final layout */
-		if (dcp_h17p_swap_poke[0]) {
-			const char *c = dcp_h17p_swap_poke;
-
-			while (*c) {
-				unsigned long o, v;
-				char *e;
-
-				o = simple_strtoul(c, &e, 16);
-				if (*e != '=')
-					break;
-				v = simple_strtoul(e + 1, &e, 16);
-				if (o < n)
-					r[o] = v;
-				if (*e != ',')
-					break;
-				c = e + 1;
-			}
+			o = simple_strtoul(c, &e, 16);
+			if (*e != '=')
+				break;
+			v = simple_strtoul(e + 1, &e, 16);
+			if (o < n)
+				r[o] = v;
+			if (*e != ',')
+				break;
+			c = e + 1;
 		}
 	}
 }
