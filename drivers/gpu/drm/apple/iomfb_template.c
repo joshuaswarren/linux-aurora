@@ -391,26 +391,31 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	dcp_drm_crtc_page_flip(dcp, now);
 	dcp_release_swapped_out_fbs(dcp);
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	if (dcp_blend_crc_reads > 0) {
-		dcp_blend_crc_reads--;
-		dcp_read_blend_crc(dcp, false, res_blend_crc,
-				   (void *)(uintptr_t)resp->swap_id);
-	}
-	if (dcp_pipe_crc_reads > 0) {
-		struct dcp_read_crc_req rq = { .index = dcp_pipe_crc_idx, .arg = 0 };
-
-		dcp_pipe_crc_reads--;
-		dcp_read_crc(dcp, false, &rq, res_pipe_crc,
-			     (void *)(uintptr_t)resp->swap_id);
-	}
-	if (dcp_rtp_request[0])
+	/*
+	 * At most one diagnostic call per completed swap: they are pushed
+	 * without waiting for the reply, and an A200 pushed straight after an
+	 * A106 made the firmware panic ("rpc_callee_gated: payload size
+	 * mismatch: 16 != 24").  One-shot property and dither requests go
+	 * first; CRC reads wait for the following swaps.
+	 */
+	if (dcp_rtp_request[0]) {
 		dcp_issue_rtp_request(dcp);
-	if (dcp_dither_request >= 0) {
+	} else if (dcp_dither_request >= 0) {
 		u32 v = dcp_dither_request ? 1 : 0;
 
 		dcp_dither_request = -1;
 		dcp_enable_disable_dithering(dcp, false, &v, res_dither,
 					     (void *)(uintptr_t)v);
+	} else if (dcp_blend_crc_reads > 0) {
+		dcp_blend_crc_reads--;
+		dcp_read_blend_crc(dcp, false, res_blend_crc,
+				   (void *)(uintptr_t)resp->swap_id);
+	} else if (dcp_pipe_crc_reads > 0) {
+		struct dcp_read_crc_req rq = { .index = dcp_pipe_crc_idx, .arg = 0 };
+
+		dcp_pipe_crc_reads--;
+		dcp_read_crc(dcp, false, &rq, res_pipe_crc,
+			     (void *)(uintptr_t)resp->swap_id);
 	}
 #endif
 	if (dcp->crc_enabled) {
