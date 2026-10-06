@@ -35,7 +35,6 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
 				   u32 iomfb_surface,
 				   bool supports_l10r,
-				   bool is_h17p,
 				   enum drm_plane_type type);
 
 #endif /* __APPLE_PLANE_H__ */
