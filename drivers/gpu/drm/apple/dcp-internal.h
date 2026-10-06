@@ -318,6 +318,13 @@ struct apple_dcp {
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
+	/*
+	 * H17P: GP alpha divide (runtime property 0x49) has been turned off
+	 * since the last full power-on; X formats need it off (see
+	 * dcp_h17p_fix_swap_surfaces()).
+	 */
+	bool h17p_alpha_div_off;
+	bool h17p_swapped_since_on;
 	/* result handler and cookie of the call issued ahead of the next swap */
 	dcp_callback_t diag_res;
 	void *diag_cookie;

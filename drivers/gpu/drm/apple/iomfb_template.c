@@ -337,6 +337,16 @@ static void res_rtp(struct apple_dcp *dcp, void *out, void *cookie)
 		 (unsigned long)(uintptr_t)cookie, st);
 }
 
+#define DCP_H17P_RTP_ENABLE_GP_ALPHA_DIV 0x49
+
+static void res_h17p_alpha_div(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	u32 st = out ? *(u32 *)out : 0xffffffff;
+
+	if (st)
+		dev_warn(dcp->dev, "GP alpha divide off: status %#x\n", st);
+}
+
 static void dcp_issue_rtp_request(struct apple_dcp *dcp, dcp_callback_t cb)
 {
 	char *e;
@@ -381,6 +391,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 			 resp->swap_id, ktime_to_us(now));
 	dcp->last_swap_id = resp->swap_id;
 	dcp->have_swap_complete = true;
+	dcp->h17p_swapped_since_on = true;
 
 	dcp_drm_crtc_page_flip(dcp, now);
 	dcp_release_swapped_out_fbs(dcp);
@@ -1481,15 +1492,19 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 	req->swap.h17p_pre_swap_id[0x28] = 3;
 
 	/*
-	 * Premultiplied blending does not give opaque XRGB on this pipe: an
-	 * alpha 0x00 frame still blends to the black background (blend CRC),
-	 * so it cannot stand in for an alpha-less format here.  Keep straight
-	 * alpha for every surface until a mode that ignores the fourth byte
-	 * is proven.
+	 * The H17P format table has no 8-bit RGB layout without alpha, so the
+	 * fourth byte of XRGB/XBGR is always blended.  As on earlier DCPs,
+	 * scan X formats out as premultiplied over the black background: with
+	 * the GP alpha divide off (runtime property 0x49, sent after the first
+	 * completed swap) that leaves the colour untouched for any X value,
+	 * and the blend CRC of X = 00, 80 and ff frames equals the opaque one.
+	 * plane.c sets is_premultiplied for X formats only; straight-alpha
+	 * surfaces do not depend on 0x49.  Other firmware keeps straight alpha.
 	 */
 	for (i = 0; i < SWAP_SURFACES; i++) {
 		req->surf[i].base.is_tearing_allowed = false;
-		req->surf[i].base.is_premultiplied = false;
+		if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+			req->surf[i].base.is_premultiplied = false;
 	}
 
 	/* debug pokes, last so they land in the final layout */
@@ -1622,6 +1637,13 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 		return;
 	}
 #endif
+
+	/*
+	 * A full power-on may reset runtime properties: send 0x49 again, after
+	 * the first swap completes (A352 is not answered during client open).
+	 */
+	dcp->h17p_alpha_div_off = false;
+	dcp->h17p_swapped_since_on = false;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
@@ -2184,7 +2206,14 @@ static void dcp_diag_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
 static bool dcp_issue_pre_swap_call(struct apple_dcp *dcp)
 {
 	dcp->diag_res = NULL;
-	if (dcp_rtp_request[0]) {
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && !dcp->h17p_alpha_div_off &&
+	    dcp->h17p_swapped_since_on) {
+		u64 rq = DCP_H17P_RTP_ENABLE_GP_ALPHA_DIV; /* {prop, value 0} */
+
+		dcp->h17p_alpha_div_off = true;
+		dcp->diag_res = res_h17p_alpha_div;
+		dcp_pipe_set_352(dcp, false, &rq, dcp_diag_then_swap, NULL);
+	} else if (dcp_rtp_request[0]) {
 		dcp_issue_rtp_request(dcp, dcp_diag_then_swap);
 	} else if (dcp_dither_request >= 0) {
 		u32 v = dcp_dither_request ? 1 : 0;
