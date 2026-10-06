@@ -91,11 +91,15 @@ struct DCP_FW_NAME(dcp_swap) {
 #endif
 #endif
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/* Sized from the wire: a captured A408 request is 0xe9c bytes, which with
-	 * dcp_surface_h17p = 0x22c, SWAP_SURFACES = 4 and no surf2 block leaves
-	 * exactly 0x122 here.  0x278 makes dcp_swap 0x6e0 and forces a
-	 * non-integer surface size, so it cannot be right. */
-	u8 h17p_tail[0xda];
+	/*
+	 * The swap record is 0x588 bytes: the first surface starts there with
+	 * the usual is_tiled/is_tearing_allowed/is_premultiplied header, and
+	 * the request carries two trailing pad bytes instead (see
+	 * dcp_swap_submit_req).  Byte 0x58a selects premultiplied blending:
+	 * with it set, an alpha 0x80 frame gives a different blend CRC from
+	 * the straight-alpha one, while alpha 0x00 and 0xff are unchanged.
+	 */
+	u8 h17p_tail[0xd8];
 #endif
 } __packed;
 
@@ -149,6 +153,8 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	u8 padding[1];
+#else
+	u8 h17p_pad[2];
 #endif
 } __packed;
 
