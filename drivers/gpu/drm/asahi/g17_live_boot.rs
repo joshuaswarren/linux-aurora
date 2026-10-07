@@ -4701,7 +4701,7 @@ impl G17PLiveRuntime {
             crate::g17_recovery_isolation::INNOCENT)
         {
             self.classify_recovery_victims(blamed_stamp)
-        } else { blamed_stamp.map_or(0, |qid| 1u128 << (qid & 127)) };
+        } else { (blamed_stamp.map_or(0, |qid| 1u128 << (qid & 127)), 0) };
         // Classification may have re-attributed the firmware's original QID.
         // Never settle that original owner after classifying it as innocent.
         let mut settled_slots = 0u64;

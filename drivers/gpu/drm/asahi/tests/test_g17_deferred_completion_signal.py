@@ -33,10 +33,12 @@ live = (root / 'g17_live_boot.rs').read_text()
 compute = (root / 'g17_async_compute.rs').read_text()
 
 # --- settle sites defer; failure paths still signal in place ---------------
-settle = item(live, '    fn settle_deferred_render_completion(')
-assert 'self.defer_render_completion(signal, observed);' in settle
+wrapper = item(live, '    fn settle_deferred_render_completion(')
+assert 'self.settle_retired_render_completion(render_slot, Ok(observed))' in wrapper
+settle = item(live, '    fn settle_retired_render_completion(')
+assert 'completion: signal, observed,' in settle
 assert '.complete(Ok(' not in settle
-assert settle.index('self.defer_render_completion(signal, observed);') < settle.index(
+assert settle.index('completion: signal, observed,') < settle.index(
     'retire_render_usc_freelist_at_completion(render_slot)')
 retire = item(compute, '    fn service_async_compute_completions_matching(')
 assert 'G17PDeferredCompletion::Compute {' in retire
@@ -46,8 +48,8 @@ assert retire.index('.defer_into(deferred);') < retire.index(
 # The admission lease still drops under the mutex, before the fence wakes.
 assert retire.index('kick_deferred_completion_drain_from(deferred, gfx_state, drain_owned);') < retire.index('drop(active);')
 assert 'completion.fail_while_owned(error)' in retire
-timeout = item(live, '    fn settle_failed_deferred_render(')
-assert 'signal.fail_while_owned(error);' in timeout
+timeout = item(live, '    fn fail_render_after_final_observation(')
+assert 'self.quarantine_failed_render_completion(signal, error);' in timeout
 assert 'signal.complete(Err(EIO));' in timeout
 render_impl = item(drm, 'impl G17PRenderCompletion {')
 fail_owned = item(render_impl, '    pub(crate) fn fail_while_owned(')
@@ -75,7 +77,6 @@ wrappers = '\n'.join(item(drm, f'    pub(crate) fn {n}(&self) -> Result {{')
                      for n in ('service_primary_firmware_events', 'service_primary_recovery'))
 runtime_methods = '\n'.join(item(live, n) for n in (
     '    fn defer_completion(',
-    '    fn defer_render_completion(',
     '    pub(crate) fn begin_deferred_completion_drain(',
     '    pub(crate) fn take_deferred_completions(',
     '    fn signal_deferred_completions_in_place('))
@@ -124,6 +125,7 @@ mod g17_completion { #[derive(Clone, Copy, Default, Debug, PartialEq)] pub struc
 struct G17PRenderCompletion { signals: AtomicUsize, complete_seen: AtomicUsize }
 impl G17PRenderCompletion {
     fn new() -> Arc<Self> { Arc::new(Self { signals: AtomicUsize::new(0), complete_seen: AtomicUsize::new(0) }) }
+    fn release_after_firmware_drain(&self) { assert!(!LOCKED.load(Ordering::SeqCst)); }
     fn complete(&self, result: Result<g17_completion::PairedRenderCompletion>) {
         assert!(!LOCKED.load(Ordering::SeqCst), "render fence signalled under the runtime mutex");
         self.signals.fetch_add(1, Ordering::SeqCst);
@@ -147,6 +149,21 @@ mod driver { pub fn queue_g17p_firmware_event_worker(_dev: super::Dev) { super::
 struct G17PRoleRtkitState { dev: Dev, event_worker_armed: AtomicBool }
 mod g17_drm { pub(crate) use crate::{G17PDeferredCompletion, G17PRenderCompletion}; }
 ''' + enum + '\n' + enum_impl + '\n' + kick + r'''
+mod g17_e2e {
+    pub const K_WORKER:u32=0;
+    pub fn stamp()->u64{0} pub fn now()->u64{0}
+    pub fn record(_:u32,_:u32,_:u64,_:[u64;5]){}
+}
+mod g17_host_path {
+    use std::sync::atomic::AtomicU64;
+    pub const OBS_SKIP:u32=0;
+    pub static OBS_SKIPPED:AtomicU64=AtomicU64::new(0);
+    pub fn enabled(_:u32)->bool{false} pub fn count(_:&AtomicU64){}
+}
+mod g17_timing_buffer {
+    pub fn enabled()->bool{false} pub fn claim_completion_snapshot()->bool{false}
+    pub fn finish_completion_snapshot(_:super::Result){}
+}
 struct G17PLiveRuntime {
     deferred_completions: KVec<crate::g17_drm::G17PDeferredCompletion>,
     deferred_completion_drain_owned: bool,
@@ -160,8 +177,17 @@ impl G17PLiveRuntime {
                gfx_state: Some(Arc::new(G17PRoleRtkitState { dev: Dev, event_worker_armed: AtomicBool::new(armed) })),
                pending: Vec::new(), fail_after_settle: false }
     }
+    // Test-only producer: the enum and its signal/deferral methods below
+    // are extracted verbatim from production, including cancelled results.
+    fn defer_render_completion(&mut self, completion: Arc<G17PRenderCompletion>,
+        observed: g17_completion::PairedRenderCompletion) {
+        self.defer_completion(G17PDeferredCompletion::Render {completion, observed: Ok(observed)});
+    }
     // A service pass: settles everything pending, then possibly fails.
     fn note_render_observation_error(&mut self,_:Error) {}
+    fn service_compute_witness_top(&mut self,_:&str) {}
+    fn render_observation_possible(&self)->bool{true}
+    fn capture_completion_ring_snapshot(&mut self)->Result{Ok(())}
     fn service_primary_firmware_events(&mut self) -> Result {
         assert!(LOCKED.load(Ordering::SeqCst));
         for completion in std::mem::take(&mut self.pending) {
@@ -254,11 +280,27 @@ fn signalled_once(completions: &[Arc<G17PRenderCompletion>]) -> bool {
     assert_eq!(packet.completion().unwrap().signals.load(Ordering::SeqCst), 1);
     assert_eq!(packet.completion().unwrap().timestamps.get(), [7, 9]);
 }
+#[test] fn cancelled_retirement_defers_an_error_and_signals_once_after_unlocking() {
+    let (rt, _) = runtime(true);
+    let completion = G17PRenderCompletion::new();
+    let deferred = {
+        let mut guard = rt.mutex.lock();
+        guard.begin_deferred_completion_drain();
+        guard.defer_completion(G17PDeferredCompletion::Render {
+            completion: completion.clone(), observed: Err(EIO),
+        });
+        assert_eq!(completion.signals.load(Ordering::SeqCst), 0);
+        guard.take_deferred_completions()
+    };
+    for c in deferred { c.signal(); }
+    assert_eq!(completion.signals.load(Ordering::SeqCst), 1);
+    assert_eq!(completion.complete_seen.load(Ordering::SeqCst), 0);
+}
 #[test] fn no_memory_to_defer_signals_exactly_once_in_place() {
     let completion = G17PRenderCompletion::new();
     let mut list = KVec::default();
     NO_MEMORY.store(true, Ordering::SeqCst);
-    G17PDeferredCompletion::Render { completion: completion.clone(), observed: g17_completion::PairedRenderCompletion { complete: true } }.defer_into(&mut list);
+    G17PDeferredCompletion::Render { completion: completion.clone(), observed: Ok(g17_completion::PairedRenderCompletion { complete: true }) }.defer_into(&mut list);
     NO_MEMORY.store(false, Ordering::SeqCst);
     assert!(list.is_empty());
     assert_eq!(completion.signals.load(Ordering::SeqCst), 1);

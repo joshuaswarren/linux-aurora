@@ -36,7 +36,7 @@ mod g17_host_path {pub const AGG_FIRST:u32=1<<14;pub static MASK:std::sync::atom
 mod g17_drm {
  pub struct G17PSubmissionFence;
  #[derive(Default)]pub struct G17PSubmitCompletionMember(pub std::sync::atomic::AtomicU32);
- impl G17PSubmitCompletionMember {pub fn complete(&self,_r:super::Result){self.0.fetch_add(1,std::sync::atomic::Ordering::AcqRel);}pub fn work_state(&self)->std::sync::Arc<crate::g17_resources::G17PWorkStateLease>{std::sync::Arc::new(crate::g17_resources::G17PWorkStateLease)}}
+ impl G17PSubmitCompletionMember {pub fn complete(&self,_r:super::Result){self.0.fetch_add(1,std::sync::atomic::Ordering::AcqRel);}pub fn work_state(&self)->super::Result<std::sync::Arc<crate::g17_resources::G17PWorkStateLease>>{Ok(std::sync::Arc::new(crate::g17_resources::G17PWorkStateLease))}}
 }
 mod mmu {
  pub struct T8140VmJobGuard;
