@@ -28,11 +28,12 @@ jobs lose their context view. Registry removal now follows the actual GEM
 unmap, including deferred drains.
 
 A later submit may still arrive after userspace has removed its context BO.
-A healthy G17P submit checks whether canonical view 0 was previously bound
-and subsequently removed, with the mapping pin held and before publication.
+A healthy G17P submit checks whether canonical view 0 is unbound, with the mapping pin held and before publication.
 Such a request is refused with ENOENT and its output fence reports ENOENT.
-It does not poison the VM or consume a firmware queue. A successful rebind
-clears the removal flag. A fresh VM that never bound view 0, a poisoned VM,
+It does not poison the VM or consume a firmware queue. A successful bind or rebind clears the unbound flag. The alias validator
+also tags an exact missing-view-0 refusal that races this preflight; ioctl
+and error-fence boundaries preserve ENOENT. Initialization refusals and
+teardown refusals share this counter. A poisoned VM, missing views 1..6,
 and ENOENT from any other submit stage retain ordinary failure reporting.
 The refusal says that context teardown occurred; it does not assert that the
 process is exiting rather than intentionally unbinding its context.

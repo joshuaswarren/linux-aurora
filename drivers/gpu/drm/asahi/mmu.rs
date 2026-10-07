@@ -1364,9 +1364,9 @@ pub(crate) struct Vm {
     /// view. This records backing identity only; it never changes context 0
     /// until the VM owns a render submission.
     t8140_native_context_bindings: Option<Arc<Mutex<T8140NativeContextBindings>>>,
-    /// Userspace removed a previously installed canonical context view 0.
-    /// One cheap load on submit; fresh/never-bound VMs remain ordinary errors.
-    t8140_context_view0_removed: Arc<AtomicBool>,
+    /// Canonical context view 0 is unavailable. One cheap submit load;
+    /// the registry lock confirms missing state before refusing publication.
+    t8140_context_view0_unbound: Arc<AtomicBool>,
     /// `g17p_tile_backstop` (D): user bindings of shareable GEM objects.
     shared_bindings: Arc<SharedBindings>,
 }
@@ -1593,6 +1593,16 @@ impl Drop for T8140VmJobGuard {
     }
 }
 
+
+/// Internal submit-path reason for missing canonical context view 0. It is
+/// produced only before publication by the job-context alias validator and
+/// translated back to ENOENT at ioctl and fence boundaries. Keep this reason
+/// distinct from other ENOENT errors, including missing views 1..6.
+pub(crate) const T8140_CONTEXT_UNBOUND: Error = ESHUTDOWN;
+
+pub(crate) fn context_refusal_to_uapi(error: Error) -> Error {
+    if error == T8140_CONTEXT_UNBOUND { ENOENT } else { error }
+}
 
 struct T8140NativeContextBinding {
     gem: ARef<gem::Object>,
@@ -2763,7 +2773,7 @@ impl Vm {
                 list <- new_mutex!(KVec::new(), "SharedBindings"),
                 count: AtomicU32::new(0),
             }), GFP_KERNEL)?,
-            t8140_context_view0_removed: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
+            t8140_context_view0_unbound: Arc::new(AtomicBool::new(true), GFP_KERNEL)?,
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
                     new_mutex!(
@@ -2835,7 +2845,7 @@ impl Vm {
                 view.source_address..view.source_address + view.size as u64;
             if source_range.overlaps(range.clone()) {
                 if index == 0 && bindings.slots[index].is_some() {
-                    self.t8140_context_view0_removed.store(true, Ordering::Release);
+                    self.t8140_context_view0_unbound.store(true, Ordering::Release);
                 }
                 bindings.slots[index] = None;
                 touched = true;
@@ -2846,7 +2856,7 @@ impl Vm {
                     object_offset,
                 });
                 if index == 0 {
-                    self.t8140_context_view0_removed.store(false, Ordering::Release);
+                    self.t8140_context_view0_unbound.store(false, Ordering::Release);
                 }
                 touched = true;
             }
@@ -2869,7 +2879,7 @@ impl Vm {
                 view.source_address..view.source_address + view.size as u64;
             if source_range.overlaps(range.clone()) {
                 if index == 0 && bindings.slots[index].is_some() {
-                    self.t8140_context_view0_removed.store(true, Ordering::Release);
+                    self.t8140_context_view0_unbound.store(true, Ordering::Release);
                 }
                 bindings.slots[index] = None;
                 touched = true;
@@ -2953,7 +2963,7 @@ impl Vm {
                 .is_some_and(|binding| core::ptr::eq(&*binding.gem, gem))
             {
                 if index == 0 {
-                    self.t8140_context_view0_removed.store(true, Ordering::Release);
+                    self.t8140_context_view0_unbound.store(true, Ordering::Release);
                 }
                 *slot = None;
                 touched = true;
@@ -2966,8 +2976,8 @@ impl Vm {
 
     /// Called with a submit's mapping pin held. Confirm the flag under the
     /// registry lock so a concurrent rebind cannot create a stale refusal.
-    pub(crate) fn t8140_job_context_view0_removed(&self) -> bool {
-        if !self.t8140_context_view0_removed.load(Ordering::Acquire) { return false; }
+    pub(crate) fn t8140_job_context_view0_unbound(&self) -> bool {
+        if !self.t8140_context_view0_unbound.load(Ordering::Acquire) { return false; }
         self.t8140_native_context_bindings.as_ref().is_some_and(|bindings|
             bindings.lock().slots[0].is_none())
     }
@@ -4810,7 +4820,7 @@ impl Uat {
                         view.size,
                         view.context_address,
                     );
-                    ENOENT
+                    if index == 0 { T8140_CONTEXT_UNBOUND } else { ENOENT }
                 })?;
                 snapshot.push((binding.gem.clone(), binding.object_offset), GFP_KERNEL)?;
             }
