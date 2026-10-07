@@ -304,6 +304,9 @@ impl G17PJobCompletion {
 
     /// Only for retired work, proven processor stop, or unsubmitted packets.
     pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
+        let context_unbound = result.as_ref().err()
+            .is_some_and(|error| *error == mmu::T8140_CONTEXT_UNBOUND);
+        let result = result.map_err(mmu::context_refusal_to_uapi);
         if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;
         }
@@ -320,7 +323,7 @@ impl G17PJobCompletion {
             // syncobj considers an error fence signaled, so waits query this.
             // An unsubmitted job cancelled during scheduler destruction has
             // no hardware failure to publish to sibling queues in this VM.
-            if error != ECANCELED && !self.recovery_spared() {
+            if error != ECANCELED && !context_unbound && !self.recovery_spared() {
                 self.status.record(error.to_errno());
             }
             self.fence.set_error(error);

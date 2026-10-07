@@ -39,13 +39,15 @@ mod g17_drm {
  impl G17PSubmitCompletionMember {pub fn complete(&self,_r:super::Result){self.0.fetch_add(1,std::sync::atomic::Ordering::AcqRel);}pub fn work_state(&self)->super::Result<std::sync::Arc<crate::g17_resources::G17PWorkStateLease>>{Ok(std::sync::Arc::new(crate::g17_resources::G17PWorkStateLease))}}
 }
 mod mmu {
+ pub const T8140_CONTEXT_UNBOUND:i32=-108;
+ pub fn context_refusal_to_uapi(e:i32)->i32{if e==T8140_CONTEXT_UNBOUND{-2}else{e}}
  pub struct T8140VmJobGuard;
  impl T8140VmJobGuard {pub fn quarantine(&self){}}
  pub struct KernelMapping {pub fail:bool}
  impl KernelMapping {pub fn iova(&self)->u64{0}pub fn with_cpu_bytes<T>(&self,f:impl FnOnce(&mut[u8])->super::Result<T>)->super::Result<T>{if self.fail{return Err(-14)}f(&mut [0;16])}}
 }
 struct UserFence<T>{status:Arc<g17_status::VmStatus>,expected:i32,done:AtomicU32,_tag:std::marker::PhantomData<T>}
-impl<T>UserFence<T>{fn set_error(&self,error:i32){if error!=ECANCELED{assert_eq!(self.status.get(),error)}}fn signal(&self){assert_eq!(self.status.get(),self.expected);self.done.fetch_add(1,Ordering::AcqRel);}}
+impl<T>UserFence<T>{fn set_error(&self,error:i32){if error!=ECANCELED && error!=-2{assert_eq!(self.status.get(),error)}}fn signal(&self){assert_eq!(self.status.get(),self.expected);self.done.fetch_add(1,Ordering::AcqRel);}}
 struct Fence;impl Fence{fn from_fence<T>(_:&UserFence<T>)->Self{Self}}
 mod uapi {pub struct drm_asahi_get_params{pub pointer:u64,pub size:u64,pub pad:u32}}
 #[derive(Copy,Clone)]struct UserPtr(usize);impl UserPtr{fn from_addr(n:usize)->Self{Self(n)}}
@@ -62,6 +64,7 @@ tests=r'''
  use super::*;
  fn file()->DrmFile{DrmFile{vms:Vms(Mutex::new([(7,FileVm{vm:TestVm(Arc::new(g17_status::VmStatus::new()))})].into()))}}
  fn query(f:&DrmFile,vm:u32,error:i32,flags:u32,pad:u32,size:u64)->(Result<u32>,[u8;16]){let mut b=g17_status::encode_response(vm,0);b[4..8].copy_from_slice(&flags.to_ne_bytes());b[12..].copy_from_slice(&pad.to_ne_bytes());let d=uapi::drm_asahi_get_params{pointer:b.as_mut_ptr() as u64,size,pad:0};let result=get_vm_status(&AsahiDevice{gpu:Gpu{supported:true,error}},&d,f);(result,b)}
+ #[test]fn missing_context_refusal_is_signalled_without_vm_error(){let c=completion(0,false);c.complete(Err(mmu::T8140_CONTEXT_UNBOUND));assert_eq!(c.status.get(),0);assert_eq!(c.fence.done.load(Ordering::SeqCst),1);assert_eq!(mmu::context_refusal_to_uapi(mmu::T8140_CONTEXT_UNBOUND),-2);assert_eq!(mmu::context_refusal_to_uapi(-5),-5);}
  #[test]fn first_failure_sticks_and_vms_are_isolated(){let a=g17_status::VmStatus::new();let b=g17_status::VmStatus::new();a.record(-110);a.record(-5);a.record(0);assert_eq!(a.get(),-110);assert_eq!(b.get(),0);}
  #[test]fn query_enforces_file_vm_ownership_and_reserved_fields(){let f=file();assert_eq!(query(&f,7,0,0,0,16).0,Ok(0));assert_eq!(query(&f,8,0,0,0,16).0,Err(ENOENT));assert_eq!(query(&f,7,0,1,0,16).0,Err(EINVAL));assert_eq!(query(&f,7,0,0,1,16).0,Err(EINVAL));assert_eq!(query(&f,7,0,0,0,15).0,Err(EINVAL));assert_eq!(query(&f,7,0,0,0,32).0,Ok(0));}
  #[test]fn query_preserves_domain_failure_after_recovery(){let f=file();assert_eq!(query(&f,7,-5,0,0,16).1,g17_status::encode_response(7,-5));assert_eq!(query(&f,7,0,0,0,16).1,g17_status::encode_response(7,-5));assert_eq!(query(&file(),7,0,0,0,16).1,g17_status::encode_response(7,0));}

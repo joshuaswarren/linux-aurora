@@ -1690,6 +1690,7 @@ impl G17PRenderCompletion {
     /// device-loss filter the rest of the driver already uses; the fence still
     /// reports the exact error to this one client.
     pub(crate) fn fail_unpublished(&self, error: Error) -> bool {
+        let error = mmu::context_refusal_to_uapi(error);
         if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return false;
         }
@@ -2495,11 +2496,11 @@ impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {
         if let Some(outcome) = packet.early_outcome() {
             crate::g17_e2e::record(crate::g17_e2e::K_RUN_JOB, 2, packet.submission_id(),
                 [0, 0, 0, outcome.is_ok() as u64, 0]);
-            return outcome.map(|()| packet.fence());
+            return outcome.map(|()| packet.fence()).map_err(mmu::context_refusal_to_uapi);
         }
         let result = self.publish_with(packet.clone(), None);
         self.release_backlog(&packet);
-        result
+        result.map_err(mmu::context_refusal_to_uapi)
     }
 
     fn try_publish_early(&self, packet: &Arc<g17_job::G17PRenderJobPacket>) -> bool {
@@ -3361,6 +3362,10 @@ impl G17PQueue {
     /// the sync-count check to the manager publish used to fail silently, which
     /// is why a submission could die with a bare EINVAL and no marker at all.
     fn stage_fail(submission_id: u64, stage: &str, error: kernel::error::Error) -> kernel::error::Error {
+        if error == mmu::T8140_CONTEXT_UNBOUND {
+            pr_info!("G17P submit: context-unbound refusal submission {} stage={} errno=-2\n", submission_id, stage);
+            return error;
+        }
         if error == ENOSPC {
             crate::g17_queue_slots::note_submit_enospc(stage);
         }
@@ -4133,7 +4138,7 @@ struct G17POutputFencePublication<'a> {
 impl G17POutputFencePublication<'_> {
     /// Preserve the actual submit error in the fence userspace will wait on.
     fn failed(&mut self, error: Error) {
-        self.failure = error;
+        self.failure = mmu::context_refusal_to_uapi(error);
     }
 
     /// Hand the output syncobjs to an asynchronous completion fence.
@@ -4190,7 +4195,13 @@ impl queue::Queue for G17PQueue {
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         self.context_unbound_refusal = None;
-        self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects)
+        match self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects) {
+            Err(mmu::T8140_CONTEXT_UNBOUND) => {
+                self.context_unbound_refusal = Some(submission_id);
+                Err(ENOENT)
+            }
+            result => result,
+        }
     }
 }
 
@@ -4252,7 +4263,7 @@ impl G17PQueue {
         // GEM-handle close and VM teardown defer their unmaps behind this
         // guard; a successfully published render/compute packet inherits it.
         let parse_guard = self.vm.retain_first_t8140_job()?;
-        if self.vm.t8140_job_context_view0_removed() {
+        if self.vm.t8140_job_context_view0_unbound() {
             self.context_unbound_refusal = Some(submission_id);
             pr_info!("G17P submit: context-unbound refusal submission {} vm={} view=0 errno=-2\n",
                 submission_id, self.vm.id());
