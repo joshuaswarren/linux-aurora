@@ -54,9 +54,9 @@ assert translate.index('retain_first_t8140_job') < translate.index('t8140_job_co
 assert 'context_unbound_refusal = Some(submission_id)' in translate
 assert 'ret == Err(ENOENT) && queue.context_unbound_refusal(id)' in file
 assert 'Err(ENOENT) if context_unbound' in file
-assert 'Err(mmu::T8140_CONTEXT_UNBOUND)' in drm
+assert 'Err(error) if mmu::is_context_unbound(error)' in drm
 aliases = item(mmu, '    pub(crate) fn install_t8140_job_context_aliases(')
-assert 'if index == 0 { T8140_CONTEXT_UNBOUND } else { ENOENT }' in aliases
+assert 'if index == 0 { context_unbound_error() } else { ENOENT }' in aliases
 assert 't8140_context_view0_unbound: Arc::new(AtomicBool::new(true)' in mmu
 
 

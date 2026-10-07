@@ -3362,7 +3362,7 @@ impl G17PQueue {
     /// the sync-count check to the manager publish used to fail silently, which
     /// is why a submission could die with a bare EINVAL and no marker at all.
     fn stage_fail(submission_id: u64, stage: &str, error: kernel::error::Error) -> kernel::error::Error {
-        if error == mmu::T8140_CONTEXT_UNBOUND {
+        if mmu::is_context_unbound(error) {
             pr_info!("G17P submit: context-unbound refusal submission {} stage={} errno=-2\n", submission_id, stage);
             return error;
         }
@@ -4196,7 +4196,7 @@ impl queue::Queue for G17PQueue {
     ) -> Result {
         self.context_unbound_refusal = None;
         match self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects) {
-            Err(mmu::T8140_CONTEXT_UNBOUND) => {
+            Err(error) if mmu::is_context_unbound(error) => {
                 self.context_unbound_refusal = Some(submission_id);
                 Err(ENOENT)
             }
