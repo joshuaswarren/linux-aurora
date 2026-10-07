@@ -1955,7 +1955,7 @@ impl G17PLiveRuntime {
     /// Fail-safe: if the guilty set is empty or any guilty QID has no
     /// in-flight owner the host can name, nothing is marked (today's
     /// behaviour for this recovery).
-    fn classify_recovery_victims(&mut self, blamed_stamp: Option<u8>) -> u128 {
+    fn classify_recovery_victims(&mut self, blamed_stamp: Option<u8>) -> (u128, u128) {
         use crate::g17_recovery_isolation as iso;
         iso::count(&iso::RECOVERIES);
         let mut table = [iso::RecoveryEntry { qid: 0, flags: 0, stamp: 0 }; iso::MAX_ENTRIES];
@@ -2064,7 +2064,7 @@ impl G17PLiveRuntime {
                     "G17P recovery isolation: blamed stamp {:?} guilty-qids={:#x} entries={} -- guilty owner not resolvable; isolation off for this recovery\n",
                     blamed_stamp, guilty_qids, used);
             }
-            return 0;
+            return (firmware_guilty_qids, 0);
         }
 
         // One class per VM for this recovery (the grace is consumed once).
@@ -2161,27 +2161,37 @@ impl G17PLiveRuntime {
                 &spared_ids[..spared_id_count],
                 spared_renders, guilty_renders, spared_compute, guilty_compute);
         }
-        spared_cancelled
+        (guilty_qids & !collateral_qids, spared_cancelled)
     }
 
-    /// SETTLE_CANCELLED: settle, through the same exact-once path the blamed
-    /// slot takes, every spared render slot the firmware listed as cancelled.
-    /// A firmware-retired group completes with an error fence and the slot
-    /// stays usable; an unproven one is failed with its pair quarantined
-    /// (released by the existing reclaim/processor-stop witnesses).
-    fn settle_spared_cancelled_renders(&mut self, cancelled_qids: u128) {
-        let mut done = 0u64;
-        for qid in 0..128u8 {
-            if cancelled_qids & (1u128 << qid) == 0 { continue; }
-            let Some(slot) = self.manager.as_ref().and_then(|manager| manager.render_slot_for_qid(qid)) else { continue; };
-            if done & (1u64 << (slot & 63)) != 0 { continue; }
-            done |= 1u64 << (slot & 63);
-            let spared = self.pending_render.get(usize::from(slot)).and_then(Option::as_ref)
-                .is_some_and(|completion| completion.recovery_spared());
-            if !spared || !self.render_fence_state.pending(slot) { continue; }
-            crate::g17_recovery_isolation::count(&crate::g17_recovery_isolation::SETTLED_CANCELLED);
-            self.settle_failed_deferred_render(slot, None, None, ECANCELED);
+    /// Recovery can retire listed-only work as well as entries marked cancelled.
+    /// Inspect every spared head after recovery and on event/teardown turns.
+    /// Unproven ownership leaves it pending: no fence, quarantine or unmap.
+    pub(crate) fn service_spared_recovery_renders(&mut self) -> Result {
+        use crate::g17_recovery_isolation as iso;
+        if !iso::enabled(iso::SETTLE_CANCELLED) || self.primary_recovery_pending()
+            || self.is_crashed() { return Ok(()); }
+        for slot in 0..self.pending_render.len() {
+            for _ in 0..g17_resources::G17P_RENDER_MAX_IN_FLIGHT {
+                if !self.pending_render[slot].as_ref()
+                    .is_some_and(|completion| completion.recovery_spared()) { break; }
+                let render_slot = slot as u8;
+                // Preserve real successful completions before checking cancellation.
+                if let Some(observed) = self.poll_deferred_render_completion(render_slot)? {
+                    self.settle_deferred_render_completion(render_slot, observed)?;
+                    continue;
+                }
+                if !self.manager.as_mut().ok_or(ENODEV)?
+                    .retire_abandoned_render_if_firmware_retired(render_slot, false)? { break; }
+                iso::count(&iso::SETTLED_CANCELLED);
+                self.settle_retired_render_completion(render_slot, Err(ECANCELED))?;
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_info!(pdev.as_ref(),
+                        "G17P recovery isolation: cancelled render slot {} witnessed retired; slot remains healthy\n", render_slot);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Top-level witness for the event and recovery workers, called from their

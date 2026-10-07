@@ -61,6 +61,10 @@ mod render;
 
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
+    /// Exact submit rejected before publication because userspace removed its
+    /// previously bound context view. Other queues/errors use normal accounting.
+    fn context_unbound_refusal(&self, _submission_id: u64) -> bool { false }
+
     fn submit(
         &mut self,
         id: u64,

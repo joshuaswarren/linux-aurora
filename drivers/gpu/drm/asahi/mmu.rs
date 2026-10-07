@@ -1364,6 +1364,9 @@ pub(crate) struct Vm {
     /// view. This records backing identity only; it never changes context 0
     /// until the VM owns a render submission.
     t8140_native_context_bindings: Option<Arc<Mutex<T8140NativeContextBindings>>>,
+    /// Userspace removed a previously installed canonical context view 0.
+    /// One cheap load on submit; fresh/never-bound VMs remain ordinary errors.
+    t8140_context_view0_removed: Arc<AtomicBool>,
     /// `g17p_tile_backstop` (D): user bindings of shareable GEM objects.
     shared_bindings: Arc<SharedBindings>,
 }
@@ -2760,6 +2763,7 @@ impl Vm {
                 list <- new_mutex!(KVec::new(), "SharedBindings"),
                 count: AtomicU32::new(0),
             }), GFP_KERNEL)?,
+            t8140_context_view0_removed: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
                     new_mutex!(
@@ -2830,6 +2834,9 @@ impl Vm {
             let source_range =
                 view.source_address..view.source_address + view.size as u64;
             if source_range.overlaps(range.clone()) {
+                if index == 0 && bindings.slots[index].is_some() {
+                    self.t8140_context_view0_removed.store(true, Ordering::Release);
+                }
                 bindings.slots[index] = None;
                 touched = true;
             }
@@ -2838,6 +2845,9 @@ impl Vm {
                     gem: gem.clone(),
                     object_offset,
                 });
+                if index == 0 {
+                    self.t8140_context_view0_removed.store(false, Ordering::Release);
+                }
                 touched = true;
             }
         }
@@ -2858,6 +2868,9 @@ impl Vm {
             let source_range =
                 view.source_address..view.source_address + view.size as u64;
             if source_range.overlaps(range.clone()) {
+                if index == 0 && bindings.slots[index].is_some() {
+                    self.t8140_context_view0_removed.store(true, Ordering::Release);
+                }
                 bindings.slots[index] = None;
                 touched = true;
             }
@@ -2934,11 +2947,14 @@ impl Vm {
         };
         let mut bindings = native_bindings.lock();
         let mut touched = false;
-        for slot in bindings.slots.iter_mut() {
+        for (index, slot) in bindings.slots.iter_mut().enumerate() {
             if slot
                 .as_ref()
                 .is_some_and(|binding| core::ptr::eq(&*binding.gem, gem))
             {
+                if index == 0 {
+                    self.t8140_context_view0_removed.store(true, Ordering::Release);
+                }
                 *slot = None;
                 touched = true;
             }
@@ -2946,6 +2962,14 @@ impl Vm {
         if touched {
             bindings.generation = bindings.generation.wrapping_add(1);
         }
+    }
+
+    /// Called with a submit's mapping pin held. Confirm the flag under the
+    /// registry lock so a concurrent rebind cannot create a stale refusal.
+    pub(crate) fn t8140_job_context_view0_removed(&self) -> bool {
+        if !self.t8140_context_view0_removed.load(Ordering::Acquire) { return false; }
+        self.t8140_native_context_bindings.as_ref().is_some_and(|bindings|
+            bindings.lock().slots[0].is_none())
     }
 
     /// A repeated single-page GPUVA is not the same physical layout as any
@@ -4313,8 +4337,13 @@ impl Vm {
             // We need to drop the exec_lock first, then the GpuVmBo since that will take the lock itself.
             core::mem::drop(inner);
             core::mem::drop(bo);
+        } else {
+            core::mem::drop(inner);
         }
 
+        // Match metadata retirement to the actual GPUVM unmap. Handle close
+        // may have deferred it behind accepted jobs and their mapping pins.
+        self.untrack_t8140_native_context_object(gem);
         Ok(())
     }
 

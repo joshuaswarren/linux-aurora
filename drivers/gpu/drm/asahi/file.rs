@@ -987,7 +987,6 @@ impl File {
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
                     vm.drop_mappings(bo)?;
-                    vm.untrack_t8140_native_context_object(bo);
                     vm.untrack_shared_object(bo);
                     if idx == usize::MAX {
                         break;
@@ -1284,9 +1283,12 @@ impl File {
                 [u64::from(data.in_sync_count) | u64::from(data.out_sync_count) << 32,
                  u64::from(data.cmdbuf_size), e2e_pid, e2e_copied, e2e_parsed]);
         }
-        let ret = queue
-            .lock()
-            .submit(id, syncs, data.in_sync_count as usize, &vec, objects);
+        let (ret, context_unbound) = {
+            let mut queue = queue.lock();
+            let ret = queue.submit(id, syncs, data.in_sync_count as usize, &vec, objects);
+            let refused = ret == Err(ENOENT) && queue.context_unbound_refusal(id);
+            (ret, refused)
+        };
         // The queue lock is dropped and only accepted work refreshes this
         // client's short-lived wait hint. Errors cannot extend a boost.
         if ret.is_ok() {
@@ -1302,7 +1304,15 @@ impl File {
 
         match ret {
             Err(ERESTARTSYS) => Err(ERESTARTSYS),
+            Err(ENOENT) if context_unbound => {
+                crate::g17_queue_slots::note_context_unbound_refusal();
+                dev_info!(device.as_ref(),
+                    "[File {} Queue {}]: IOCTL: submit refused: context-unbound (submission ID: {} err: ENOENT)\n",
+                    file.inner().id, data.queue_id, id);
+                Err(ENOENT)
+            }
             Err(e) => {
+                crate::g17_queue_slots::note_submit_failure();
                 dev_info!(
                     device.as_ref(),
                     "[File {} Queue {}]: IOCTL: submit failed! (submission ID: {} err: {:?})\n",
