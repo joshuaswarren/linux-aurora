@@ -274,7 +274,7 @@ impl G17PRuntimeRef {
 pub(crate) enum G17PDeferredCompletion {
     Render {
         completion: Arc<G17PRenderCompletion>,
-        observed: g17_completion::PairedRenderCompletion,
+        observed: Result<g17_completion::PairedRenderCompletion>,
     },
     Compute {
         packet: Arc<g17_job::G17PComputeJobPacket>,
@@ -292,7 +292,7 @@ impl G17PDeferredCompletion {
     /// was failed or cancelled in between is left alone.
     pub(crate) fn signal(self) {
         match self {
-            Self::Render { completion, observed } => completion.complete(Ok(observed)),
+            Self::Render { completion, observed } => completion.complete(observed),
             Self::Compute { packet, timestamps } => {
                 if let Ok(completion) = packet.completion() {
                     completion.complete(Ok(timestamps));
@@ -2361,6 +2361,7 @@ struct G17PQueue {
     /// v91 fine laps (e2e option bit4) of the submission in progress; the
     /// queue mutex serialises its submissions.
     e2e_fine: [u64; 12],
+    context_unbound_refusal: Option<u64>,
     /// v93 FW_DEPS/AGG_FIRST: this queue's most recent fully enqueued ioctls
     /// (aggregate reference, per-command hardware fences, logical command
     /// ranges), ring order. Slots and their vectors are reused.
@@ -3177,6 +3178,7 @@ impl G17PQueue {
             render_frontier: KVec::new(),
             validation_proof: G17PValidationProof::new(),
             e2e_fine: [0; 12],
+            context_unbound_refusal: None,
             recent: [const { G17PRecentSubmission::EMPTY }; crate::g17_host_path::FW_DEP_RECENT],
             recent_next: 0,
             ts_pool: g17_job::G17PTimestampPool::new()?,
@@ -4167,6 +4169,10 @@ impl Drop for G17POutputFencePublication<'_> {
 }
 
 impl queue::Queue for G17PQueue {
+    fn context_unbound_refusal(&self, submission_id: u64) -> bool {
+        self.context_unbound_refusal == Some(submission_id)
+    }
+
     /// Every synchronous submission funnels through here so that no exit path
     /// can leave the client's own outstanding work unaccounted for.
     ///
@@ -4183,6 +4189,7 @@ impl queue::Queue for G17PQueue {
         cmdbuf_raw: &[u8],
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
+        self.context_unbound_refusal = None;
         self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects)
     }
 }
@@ -4245,6 +4252,12 @@ impl G17PQueue {
         // GEM-handle close and VM teardown defer their unmaps behind this
         // guard; a successfully published render/compute packet inherits it.
         let parse_guard = self.vm.retain_first_t8140_job()?;
+        if self.vm.t8140_job_context_view0_removed() {
+            self.context_unbound_refusal = Some(submission_id);
+            pr_info!("G17P submit: context-unbound refusal submission {} vm={} view=0 errno=-2\n",
+                submission_id, self.vm.id());
+            return Err(ENOENT);
+        }
         let window = g17_uapi::QueueUscWindow {
             base: self.usc_exec_base,
             user_start: self.user_range.start,

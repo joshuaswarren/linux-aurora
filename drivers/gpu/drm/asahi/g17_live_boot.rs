@@ -4197,17 +4197,6 @@ impl G17PLiveRuntime {
         );
     }
 
-    fn defer_render_completion(
-        &mut self,
-        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
-        observed: g17_completion::PairedRenderCompletion,
-    ) {
-        self.defer_completion(crate::g17_drm::G17PDeferredCompletion::Render {
-            completion,
-            observed,
-        });
-    }
-
     pub(crate) fn begin_deferred_completion_drain(&mut self) {
         self.deferred_completion_drain_owned = true;
     }
@@ -4708,19 +4697,25 @@ impl G17PLiveRuntime {
         };
         // Recovery isolation: classify every in-flight completion against this
         // recovery's guilty set BEFORE anything below can fail it.
-        let spared_cancelled = if crate::g17_recovery_isolation::enabled(
+        let (guilty_qids, _spared_cancelled) = if crate::g17_recovery_isolation::enabled(
             crate::g17_recovery_isolation::INNOCENT)
         {
             self.classify_recovery_victims(blamed_stamp)
-        } else { 0 };
-        if let Some(stamp) = blamed_stamp {
-            self.settle_render_blamed_by_recovery(stamp, EIO);
+        } else { blamed_stamp.map_or(0, |qid| 1u128 << (qid & 127)) };
+        // Classification may have re-attributed the firmware's original QID.
+        // Never settle that original owner after classifying it as innocent.
+        let mut settled_slots = 0u64;
+        for qid in 0..128u8 {
+            if guilty_qids & (1u128 << qid) == 0 { continue; }
+            let Some(slot) = self.manager.as_ref()
+                .and_then(|manager| manager.render_slot_for_qid(qid)) else { continue; };
+            if settled_slots & (1u64 << slot) != 0 { continue; }
+            settled_slots |= 1u64 << slot;
+            if self.pending_render[usize::from(slot)].as_ref()
+                .is_some_and(|completion| completion.recovery_spared()) { continue; }
+            self.settle_render_blamed_by_recovery(qid, EIO);
         }
-        if spared_cancelled != 0 && crate::g17_recovery_isolation::enabled(
-            crate::g17_recovery_isolation::SETTLE_CANCELLED)
-        {
-            self.settle_spared_cancelled_renders(spared_cancelled);
-        }
+        self.service_spared_recovery_renders()?;
         // The recovery acknowledged its final clear at state 0: the firmware
         // is alive and reset. Release the compute admission poison here;
         // otherwise only a session rebuild (which ends in rtkit-boot ETIME)
@@ -5478,6 +5473,7 @@ impl G17PLiveRuntime {
         }
         // v93r g17p_recovery_path bit0: return drained quarantined pairs
         // first, so a closed queue's teardown gate can open this turn.
+        self.service_spared_recovery_renders()?;
         self.reclaim_drained_quarantined_render_slots();
         // g17p_exit_kill: settle acknowledged process-exit kills first, so a
         // context whose compute packets they release can publish its
@@ -6160,17 +6156,26 @@ impl G17PLiveRuntime {
         render_slot: u8,
         observed: g17_completion::PairedRenderCompletion,
     ) -> Result<bool> {
+        self.settle_retired_render_completion(render_slot, Ok(observed))
+    }
+
+    /// The manager has already proved retirement and committed its tracker.
+    /// Cancelled work reports an error fence; it never fabricates GPU output.
+    fn settle_retired_render_completion(&mut self, render_slot: u8,
+        observed: Result<g17_completion::PairedRenderCompletion>) -> Result<bool> {
         let index = usize::from(render_slot);
         if self.pending_render.get(index).and_then(Option::as_ref).is_none() {
             return Err(EIO);
         }
         let signal = self.pending_render[index].take().ok_or(EIO)?;
         if crate::g17_e2e::armed() {
-            let ingress = self.notification_ingress_counters();
-            crate::g17_e2e::record(crate::g17_e2e::K_OBSERVED, u32::from(render_slot),
-                signal.submission_id(), [ingress[0], ingress[1], self.trace_service_entry_counter,
-                observed.execution.fragment_timestamps[0], observed.execution.fragment_timestamps[1]]);
-            crate::g17_e2e::power_sample(2, render_slot);
+            if let Ok(observed) = observed.as_ref() {
+                let ingress = self.notification_ingress_counters();
+                crate::g17_e2e::record(crate::g17_e2e::K_OBSERVED, u32::from(render_slot),
+                    signal.submission_id(), [ingress[0], ingress[1], self.trace_service_entry_counter,
+                    observed.execution.fragment_timestamps[0], observed.execution.fragment_timestamps[1]]);
+                crate::g17_e2e::power_sample(2, render_slot);
+            }
         }
         if crate::g17_timing_buffer::enabled() {
             signal.note_service_trace(
@@ -6182,7 +6187,9 @@ impl G17PLiveRuntime {
         // Proven retired. The fence is signalled with the runtime mutex
         // released (`defer_completion`), still ahead of the fallible FList
         // cleanup below.
-        self.defer_render_completion(signal, observed);
+        self.defer_completion(crate::g17_drm::G17PDeferredCompletion::Render {
+            completion: signal, observed,
+        });
         if let Some(next) = self.pending_render_queued[index].take() {
             self.pending_render[index] = Some(next);
         } else {

@@ -51,6 +51,16 @@ static POOL_ENOSPC: [AtomicU64; POOL_COUNT] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// Submits that failed with ENOSPC, whichever pool.
 static SUBMIT_ENOSPC: AtomicU64 = AtomicU64::new(0);
+static SUBMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static CONTEXT_UNBOUND_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_submit_failure() {
+    SUBMIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn note_context_unbound_refusal() {
+    CONTEXT_UNBOUND_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
 
 fn log_enospc(pool: &str, stage: &str, count: u64) {
     // First one, then each power of two: a stuck pool cannot flood dmesg.
@@ -150,6 +160,9 @@ unsafe extern "C" fn slots_get(buf: *mut core::ffi::c_char, _: *const bindings::
         r(&COMPUTE_GRAPHS), r(&COMPUTE_OWNED), r(&COMPUTE_RELEASED), r(&COMPUTE_QUARANTINED),
         r(&COMPUTE_EXIT_KILLED), r(&RETIRED_GRAPHS), r(&TEARDOWNS), r(&RENDER_QUARANTINED),
         e(0), e(1), e(2), e(3), SUBMIT_ENOSPC.load(Ordering::Relaxed));
+    let _ = writeln!(out, "submit failures={} context-unbound-refusals={}",
+        SUBMIT_FAILURES.load(Ordering::Relaxed),
+        CONTEXT_UNBOUND_REFUSALS.load(Ordering::Relaxed));
     out.used as core::ffi::c_int
 }
 
