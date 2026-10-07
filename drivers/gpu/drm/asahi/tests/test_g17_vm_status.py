@@ -40,6 +40,7 @@ mod g17_drm {
 }
 mod mmu {
  pub const T8140_CONTEXT_UNBOUND:i32=-108;
+ pub fn is_context_unbound(e:i32)->bool{e==T8140_CONTEXT_UNBOUND}
  pub fn context_refusal_to_uapi(e:i32)->i32{if e==T8140_CONTEXT_UNBOUND{-2}else{e}}
  pub struct T8140VmJobGuard;
  impl T8140VmJobGuard {pub fn quarantine(&self){}}

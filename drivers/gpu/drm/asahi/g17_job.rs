@@ -305,7 +305,7 @@ impl G17PJobCompletion {
     /// Only for retired work, proven processor stop, or unsubmitted packets.
     pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
         let context_unbound = result.as_ref().err()
-            .is_some_and(|error| *error == mmu::T8140_CONTEXT_UNBOUND);
+            .is_some_and(|error| mmu::is_context_unbound(*error));
         let result = result.map_err(mmu::context_refusal_to_uapi);
         if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;

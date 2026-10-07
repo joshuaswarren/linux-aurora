@@ -1598,10 +1598,16 @@ impl Drop for T8140VmJobGuard {
 /// produced only before publication by the job-context alias validator and
 /// translated back to ENOENT at ioctl and fence boundaries. Keep this reason
 /// distinct from other ENOENT errors, including missing views 1..6.
-pub(crate) const T8140_CONTEXT_UNBOUND: Error = ESHUTDOWN;
+pub(crate) fn context_unbound_error() -> Error {
+    Error::from_errno(-(bindings::ESHUTDOWN as i32))
+}
+
+pub(crate) fn is_context_unbound(error: Error) -> bool {
+    error.to_errno() == -(bindings::ESHUTDOWN as i32)
+}
 
 pub(crate) fn context_refusal_to_uapi(error: Error) -> Error {
-    if error == T8140_CONTEXT_UNBOUND { ENOENT } else { error }
+    if is_context_unbound(error) { ENOENT } else { error }
 }
 
 struct T8140NativeContextBinding {
@@ -4820,7 +4826,7 @@ impl Uat {
                         view.size,
                         view.context_address,
                     );
-                    if index == 0 { T8140_CONTEXT_UNBOUND } else { ENOENT }
+                    if index == 0 { context_unbound_error() } else { ENOENT }
                 })?;
                 snapshot.push((binding.gem.clone(), binding.object_offset), GFP_KERNEL)?;
             }
