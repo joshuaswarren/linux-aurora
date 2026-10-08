@@ -1322,6 +1322,41 @@ struct drm_asahi_cmd_compute {
 	 * payloads are accepted with this field zero-filled.
 	 */
 	__u64 scs_layout;
+};
+
+/* G18 per-dispatch metadata. Counts are compiler halfwords or bytes as named;
+ * the kernel converts them to native units. Both versions are exactly 64 bytes.
+ * Version 1 scales local_bytes + variable_shared_bytes by four for legacy
+ * shaders using byte offsets in element-index fields. Version 2 uses actual
+ * byte footprints for shaders with correctly lowered shared element indices.
+ * Flags: bit0 main staging known, bit1 constant program present, bit2 constant
+ * staging known, bit3 local geometry unknown (local_size must then be zero).
+ * All other flag bits and reserved must be zero. */
+struct drm_asahi_g18_compute_resources {
+	__u32 version;
+	__u32 flags;
+	__u32 registers_16;
+	__u32 scratch_bytes;
+	__u32 spectpr_scratch_bytes;
+	__u32 staging_16;
+	__u32 constant_registers_16;
+	__u32 constant_scratch_bytes;
+	__u32 constant_staging_16;
+	__u32 local_bytes;
+	__u32 imageblock_stride;
+	__u32 variable_shared_bytes;
+	__u32 local_size[3];
+	__u32 reserved;
+};
+
+/* Flagged G18-only extension; base includes ScsLayout at offset0x40. */
+struct drm_asahi_cmd_compute_g18 {
+	struct drm_asahi_cmd_compute base;
+	struct drm_asahi_g18_compute_resources resources;
+};
+
+struct drm_asahi_cmd_compute_with_prior {
+	struct drm_asahi_cmd_compute legacy;
 
 	/**
 	 * @prior_vdm: Historical render prefix, or zero for no added dependency.

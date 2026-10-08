@@ -43,12 +43,22 @@ pub(crate) struct G18ComputeShader {
 }
 
 impl G18ComputeDemand {
-    /// Map the current G18 GL compute path. Its AGX3C shared accesses still
-    /// span four times the logical allocation (agx_state.c). Keep this in
-    /// agreement with the launched SPECLM footprint until that lowering is
-    /// changed. Metal per-thread imageblocks are outside this GL adapter.
+    /// Legacy metadata v1 and precompiled G17G kernels use byte offsets in
+    /// element-index fields, requiring a fourfold SPECLM footprint.
     pub(crate) fn from_shader(shader: G18ComputeShader, local: Option<[u32; 3]>,
         variable_shared_bytes: u32) -> Option<Self> {
+        Self::from_shader_scaled(shader, local, variable_shared_bytes, 4)
+    }
+
+    /// Metadata v2 describes shaders with correctly lowered element indices.
+    /// Their static and variable shared storage both count actual bytes.
+    pub(crate) fn from_shader_element_indices(shader: G18ComputeShader,
+        local: Option<[u32; 3]>, variable_shared_bytes: u32) -> Option<Self> {
+        Self::from_shader_scaled(shader, local, variable_shared_bytes, 1)
+    }
+
+    fn from_shader_scaled(shader: G18ComputeShader, local: Option<[u32; 3]>,
+        variable_shared_bytes: u32, shared_scale: u32) -> Option<Self> {
         if shader.registers_16 == 0 || shader.registers_16 > 256
             || !shader.staging_known || shader.staging_16 > 0xffff
             || shader.imageblock_stride != 0
@@ -77,7 +87,7 @@ impl G18ComputeDemand {
         if scratch > 0xffff * 4 || shader.constant_scratch_bytes > 0xffff * 4 {
             return None;
         }
-        let shared = shader.local_bytes.checked_add(variable_shared_bytes)?.checked_mul(4)?;
+        let shared = shader.local_bytes.checked_add(variable_shared_bytes)?.checked_mul(shared_scale)?;
         let shared = if shared == 0 { 0 } else { (shared.checked_add(63)? & !63).max(256) };
         if shared > 32768 { return None; }
         Some(Self {
