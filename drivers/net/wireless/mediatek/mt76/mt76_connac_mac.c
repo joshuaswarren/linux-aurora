@@ -181,10 +181,7 @@ void mt76_connac_write_hw_txp(struct mt76_dev *dev,
 
 	for (i = 0; i < nbuf; i++) {
 		u16 len = tx_info->buf[i + 1].len & MT_TXD_LEN_MASK;
-		dma_addr_t addr = tx_info->buf[i + 1].addr;
-
-		if (is_mt7932(dev))
-			len |= FIELD_PREP(GENMASK(14, 12), addr >> 32);
+		u32 addr = tx_info->buf[i + 1].addr;
 
 		if (i == nbuf - 1)
 			len |= last_mask;
@@ -252,12 +249,6 @@ void mt76_connac_txp_skb_unmap(struct mt76_dev *dev,
 			       struct mt76_txwi_cache *t)
 {
 	struct mt76_connac_txp_common *txp;
-
-	/* J700 MT7932 data buffers live in permanent descriptor-indexed
-	 * coherent storage established before patch completion.
-	 */
-	if (is_mt7932(dev))
-		return;
 
 	txp = mt76_connac_txwi_to_txp(dev, t);
 	if (is_mt76_fw_txp(dev))
@@ -518,7 +509,6 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 	bool inband_disc = !!(changed & (BSS_CHANGED_UNSOL_BCAST_PROBE_RESP |
 					 BSS_CHANGED_FILS_DISCOVERY));
 	bool amsdu_en = wcid->amsdu;
-	bool altq = wcid->tx_info & MT_WCID_TX_INFO_ALTQ;
 
 	if (vif) {
 		struct mt76_vif_link *mvif = (struct mt76_vif_link *)vif->drv_priv;
@@ -537,7 +527,7 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 	} else if (beacon) {
 		p_fmt = MT_TX_TYPE_FW;
 		q_idx = MT_LMAC_BCN0;
-	} else if (qid >= MT_TXQ_PSD || altq) {
+	} else if (qid >= MT_TXQ_PSD) {
 		p_fmt = mt76_is_mmio(dev) ? MT_TX_TYPE_CT : MT_TX_TYPE_SF;
 		q_idx = MT_LMAC_ALTX0;
 	} else {
@@ -587,27 +577,10 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 	txwi[6] = 0;
 	txwi[7] = amsdu_en ? cpu_to_le32(MT_TXD7_HW_AMSDU) : 0;
 
-	if (is_8023) {
+	if (is_8023)
 		mt76_connac2_mac_write_txwi_8023(txwi, skb, wcid);
-		/* AppleSunriseWLAN/MediaTek's fullmac Ethernet path supplies an
-		 * EtherType offset of ten 16-bit words and leaves the 802.11
-		 * type/subtype fields clear for firmware encapsulation.  Generic
-		 * mt76's host-MAC 802.3 defaults produce a different wire TXD.
-		 */
-		if (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC) {
-			txwi[0] |= cpu_to_le32(FIELD_PREP(
-				MT_TXD0_ETH_TYPE_OFFSET, 10));
-			txwi[2] &= ~cpu_to_le32(MT_TXD2_FRAME_TYPE |
-						    MT_TXD2_SUB_TYPE);
-			txwi[7] &= ~cpu_to_le32(MT_TXD7_TYPE |
-						    MT_TXD7_SUB_TYPE);
-			txwi[3] &= ~cpu_to_le32(MT_TXD3_REM_TX_COUNT);
-			txwi[3] |= cpu_to_le32(FIELD_PREP(
-				MT_TXD3_REM_TX_COUNT, 30));
-		}
-	} else {
+	else
 		mt76_connac2_mac_write_txwi_80211(dev, txwi, skb, key);
-	}
 
 	if (txwi[2] & cpu_to_le32(MT_TXD2_FIX_RATE)) {
 		/* Fixed rata is available just for 802.11 txd */
@@ -636,7 +609,6 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
 
 		txwi[7] &= ~cpu_to_le32(MT_TXD7_HW_AMSDU);
 	}
-
 }
 EXPORT_SYMBOL_GPL(mt76_connac2_mac_write_txwi);
 

@@ -55,7 +55,13 @@ properties:
 
   interrupts:
     minItems: 2
-    maxItems: 6
+    items:
+      - description: mailbox 0
+      - description: mailbox 1
+      - description: mailbox 2
+      - description: mailbox 3
+      - description: flag 0
+      - description: flag 1
 
 required:
   - compatible

@@ -15,7 +15,8 @@ import tempfile
 root = Path(__file__).resolve().parent.parent
 slotalloc = (root / "slotalloc.rs").read_text()
 mmu = (root / "mmu.rs").read_text()
-limits = (root / "g17_queue_limits.rs").read_text().replace("//!", "//")
+from g17_queue_limits_test_support import queue_limits_source
+limits = queue_limits_source()
 
 
 def block(source, marker):

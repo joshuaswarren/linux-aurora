@@ -400,6 +400,9 @@ impl File {
         if data.param_group == crate::g17_status::PARAM_GROUP_VM_STATUS {
             return Self::get_vm_status(device, data, file);
         }
+        if data.param_group == crate::g17_status::PARAM_GROUP_VM_STATUS_MIRROR {
+            return Self::register_vm_status_mirror(device, data, file);
+        }
         if data.param_group == crate::g17_queue_limits::PARAM_GROUP_QUEUE_LIMITS {
             if data.pad != 0 || data.size < crate::g17_queue_limits::QUEUE_LIMITS_SIZE as u64 {
                 return Err(EINVAL);
@@ -448,6 +451,16 @@ impl File {
 
         if gpu.supports_vm_status() {
             params.features |= crate::g17_status::FEATURE_VM_STATUS;
+            if gpu.supports_vm_status_mirror() {
+                params.features |= crate::g17_status::FEATURE_VM_STATUS_MIRROR;
+            }
+        }
+        if gpu.supports_per_command_input_syncs() {
+            params.features |= crate::g17_queue_limits::FEATURE_PER_COMMAND_INPUT_SYNCS;
+        }
+        if gpu.supports_exact_prior_barriers() {
+            params.features |=
+                uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS as u64;
         }
         if gpu.independent_queue_limits().is_some() {
             params.features |= crate::g17_queue_limits::FEATURE_INDEPENDENT_QUEUES;
@@ -507,6 +520,50 @@ impl File {
         }
         let bytes = encode_response(vm_id, status.get());
         UserSlice::new(user, VM_STATUS_SIZE).writer().write_slice(&bytes)?;
+        Ok(0)
+    }
+
+    /// v87: register a userspace word mirroring this file's VM status, so a
+    /// successful syncobj wait can be checked with a load instead of a group
+    /// 1 query per wait. Refused (EOPNOTSUPP) unless the mirror is exact and
+    /// `g17p_host_path` bit8 is set; userspace then keeps querying.
+    fn register_vm_status_mirror(device: &AsahiDevice, data: &uapi::drm_asahi_get_params,
+                                 file: &DrmFile) -> Result<u32> {
+        use crate::g17_status::{decode_mirror_request, VM_STATUS_MIRROR_SIZE};
+        if !device.gpu.supports_vm_status() || !device.gpu.supports_vm_status_mirror()
+            || !crate::g17_host_path::enabled(crate::g17_host_path::VM_STATUS_MIRROR)
+        {
+            // EOPNOTSUPP; the kernel crate declares no constant for it.
+            return Err(Error::from_errno(-95));
+        }
+        if data.pad != 0 || data.size < VM_STATUS_MIRROR_SIZE as u64 { return Err(EINVAL); }
+        let mut bytes = [0u8; VM_STATUS_MIRROR_SIZE];
+        UserSlice::new(UserPtr::from_addr(data.pointer as _), VM_STATUS_MIRROR_SIZE)
+            .reader().read_slice(&mut bytes)?;
+        let (vm_id, handle, offset) = decode_mirror_request(&bytes).ok_or(EINVAL)?;
+        let status = {
+            let vms = file.inner().vms();
+            let guard = vms.lock();
+            let vm = guard.get(vm_id as usize).ok_or(ENOENT)?;
+            vm.vm.status().clone()
+        };
+        let mut owner = gem::ObjectRef::new(gem::Object::lookup_handle(file, handle)?);
+        let offset = offset as usize;
+        // The kernel keeps this object vmapped for the status lifetime, so
+        // bound it (userspace needs one word; Mesa passes a 16 KiB object).
+        const MIRROR_MAX_OBJECT: usize = 64 * 1024;
+        if owner.size() > MIRROR_MAX_OBJECT
+            || offset.checked_add(4).is_none_or(|end| end > owner.size())
+        {
+            return Err(EINVAL);
+        }
+        // The owned kernel mapping lives in `owner`, which the status retains;
+        // moving `owner` does not move the mapping.
+        let base = owner.vmap()?.as_mut_ptr();
+        // SAFETY: offset + 4 lies within the object, checked above.
+        let word = unsafe { base.add(offset) }.cast::<i32>();
+        status.attach_mirror(owner, word)?;
+        crate::g17_host_path::count(&crate::g17_host_path::MIRRORS);
         Ok(0)
     }
 
@@ -703,10 +760,13 @@ impl File {
             None
         };
 
+        let create_started = crate::g17_mem_path::stamp();
         let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj)?;
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
+        crate::g17_mem_path::GEM_CREATE.since(create_started);
+        crate::g17_mem_path::count(&crate::g17_mem_path::GEM_BYTES, data.size);
 
         mod_dev_dbg!(
             device,
@@ -759,6 +819,7 @@ impl File {
             cls_pr_debug!(Errors, "vm_bind: Unexpected headers\n");
             return Err(EINVAL);
         }
+        let bind_started = crate::g17_mem_path::stamp();
 
         let vm_id = data.vm_id.try_into()?;
         let count = usize::try_from(data.num_binds)?;
@@ -804,7 +865,10 @@ impl File {
         let mut plans = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut batch = mmu::PreparedUserBindBatch::new(count)?;
         let mut unmap_count = 0usize;
+        let prepare_started = crate::g17_mem_path::stamp();
+        crate::g17_mem_path::count(&crate::g17_mem_path::BIND_OPS, count as u64);
         for op in ops {
+            crate::g17_mem_path::count(&crate::g17_mem_path::BIND_BYTES, op.range);
             if op.range == 0
                 || (op.addr | op.range | op.offset) & mmu::UAT_PGMSK as u64 != 0
             {
@@ -872,8 +936,11 @@ impl File {
             plans.push(PreparedGemBindOp::Map { op, bo }, GFP_KERNEL)?;
         }
 
+        crate::g17_mem_path::BIND_PREPARE.since(prepare_started);
         vm.reserve_deferred_user_unmaps(unmap_count)?;
+        let commit_started = crate::g17_mem_path::stamp();
         vm.commit_prepared_user_bind_batch(&mut batch)?;
+        crate::g17_mem_path::BIND_COMMIT.since(commit_started);
 
         // Replay registry changes only after the page-table batch commits.
         for plan in &plans {
@@ -882,13 +949,19 @@ impl File {
                     vm.track_t8140_native_context_binding(
                         bo.clone(), op.addr, op.range, op.offset,
                     )?;
+                    vm.track_shared_binding(
+                        bo, op.addr, op.range, op.offset,
+                        op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0,
+                    );
                 }
                 PreparedGemBindOp::Unmap { op, .. } => {
                     vm.untrack_t8140_native_context_range(op.addr..op.addr + op.range);
+                    vm.untrack_shared_range(op.addr..op.addr + op.range);
                 }
             }
         }
         vm.bo_deferred_cleanup();
+        crate::g17_mem_path::BIND_CALL.since(bind_started);
         Ok(0)
     }
 
@@ -905,7 +978,7 @@ impl File {
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
                     vm.drop_mappings(bo)?;
-                    vm.untrack_t8140_native_context_object(bo);
+                    vm.untrack_shared_object(bo);
                     if idx == usize::MAX {
                         break;
                     }
@@ -1120,6 +1193,11 @@ impl File {
         data: &mut uapi::drm_asahi_submit,
         file: &DrmFile,
     ) -> Result<u32> {
+        // v81 e2e diagnostic: 0 (no counter read) unless the ring is armed.
+        let e2e_entry = crate::g17_e2e::stamp();
+        // v92 PCORE_NUDGE (diagnostic, default off): one relaxed load unless
+        // enabled and the feed-perf request is applied.
+        crate::g17_host_path::nudge_feeding_thread();
         debug::update_debug_flags();
 
         if data.flags != 0 || data.pad != 0 {
@@ -1184,17 +1262,48 @@ impl File {
             data.queue_id,
             id
         );
+        let e2e_copied = crate::g17_e2e::stamp();
         let syncs =
             SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count)?;
 
         let objects = file.inner().objects();
-        let ret = queue
-            .lock()
-            .submit(id, syncs, data.in_sync_count as usize, &vec, objects);
+        let e2e_parsed = crate::g17_e2e::stamp();
+        if e2e_entry != 0 {
+            let e2e_pid = kernel::current!().group_leader().pid() as u64;
+            crate::g17_e2e::record_at(e2e_entry, crate::g17_e2e::K_IOCTL_ENTER, data.queue_id, id,
+                [u64::from(data.in_sync_count) | u64::from(data.out_sync_count) << 32,
+                 u64::from(data.cmdbuf_size), e2e_pid, e2e_copied, e2e_parsed]);
+        }
+        let (ret, context_unbound) = {
+            let mut queue = queue.lock();
+            let ret = queue.submit(id, syncs, data.in_sync_count as usize, &vec, objects);
+            let refused = ret == Err(ENOENT) && queue.context_unbound_refusal(id);
+            (ret, refused)
+        };
+        // The queue lock is dropped and only accepted work refreshes this
+        // client's short-lived wait hint. Errors cannot extend a boost.
+        if ret.is_ok() {
+            let wait_util_min = crate::g17_host_path::feeder_wait_util_min();
+            if wait_util_min != 0 {
+                file.set_syncobj_wait_hint(wait_util_min, 8);
+            }
+        }
+        if e2e_entry != 0 {
+            crate::g17_e2e::record(crate::g17_e2e::K_IOCTL_EXIT, 0, id,
+                [ret.as_ref().err().map_or(0, |error| error.to_errno() as i64 as u64), 0, 0, 0, 0]);
+        }
 
         match ret {
             Err(ERESTARTSYS) => Err(ERESTARTSYS),
+            Err(ENOENT) if context_unbound => {
+                crate::g17_queue_slots::note_context_unbound_refusal();
+                dev_info!(device.as_ref(),
+                    "[File {} Queue {}]: IOCTL: submit refused: context-unbound (submission ID: {} err: ENOENT)\n",
+                    file.inner().id, data.queue_id, id);
+                Err(ENOENT)
+            }
             Err(e) => {
+                crate::g17_queue_slots::note_submit_failure();
                 dev_info!(
                     device.as_ref(),
                     "[File {} Queue {}]: IOCTL: submit failed! (submission ID: {} err: {:?})\n",

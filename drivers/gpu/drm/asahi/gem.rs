@@ -16,6 +16,7 @@ use kernel::{
         DriverObject, //
     },
     error::Result,
+    iosys_map::IoSysMapRef,
     prelude::*,
     sync::aref::ARef,
     uapi, //
@@ -41,10 +42,12 @@ use crate::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
 
 /// Represents the inner data of a GEM object for this driver.
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct AsahiObject {
     /// ID for debug
     id: u64,
+    /// Object size in bytes, for live-object accounting.
+    size: usize,
     /// Object creation flags.
     flags: u32,
     /// Whether this object can be exported.
@@ -86,11 +89,16 @@ impl ObjectRef {
     }
 
     /// Return the `VMap` for this object, creating it if necessary.
-    pub(crate) fn vmap(&mut self) -> Result<shmem::VMapRef<'_, AsahiObject, u8>> {
+    ///
+    /// The owned mapping lives as long as this reference, so hand out a view
+    /// of it directly. Going back through `gem.vmap()` took and dropped the
+    /// object's reservation lock and vmap refcount on every access, which the
+    /// G17P firmware-memory accessors do hundreds of times per submission.
+    pub(crate) fn vmap(&mut self) -> Result<IoSysMapRef<'_, u8>> {
         if self.vmap.is_none() {
             self.vmap = Some(self.gem.owned_vmap()?);
         }
-        self.gem.vmap()
+        Ok(self.vmap.as_ref().ok_or(EINVAL)?.get())
     }
 
     /// Returns the size of an object in bytes
@@ -170,6 +178,13 @@ impl ObjectRef {
         }
 
         vm.map_at_with_guards(addr, self.gem.size(), self.gem.clone(), prot, guard_pages)
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for AsahiObject {
+    fn drop(self: Pin<&mut Self>) {
+        crate::gem_stats::note_free(self.kernel, self.size);
     }
 }
 
@@ -257,11 +272,17 @@ impl DriverObject for AsahiObject {
         Some(crate::g18_drm::asahi_gem_prime_import);
 
     /// Callback to create the inner data of a GEM object
-    fn new(_dev: &AsahiDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(_dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         let id = GEM_ID.fetch_add(1, Ordering::Relaxed);
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
             id,
+            // Counted inside the initializer, so an object whose allocation fails before
+            // this runs is never counted; once it has run, PinnedDrop balances it.
+            size: {
+                crate::gem_stats::note_new(args.kernel, size);
+                size
+            },
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,

@@ -5,7 +5,7 @@
 //! T8140/G17P compute descriptor construction.
 //!
 //! The descriptor is the one-page selector-3 object executed by the CL path.
-//! Every field here comes from the hardware-tested m1n1 compute builder. The
+//! The layout combines the m1n1 builder with inspected native producers. The
 //! caller supplies queue-owned object addresses and command-owned UAPI values;
 //! this module only validates and encodes them.
 
@@ -74,6 +74,7 @@ pub(crate) enum ComputeBuildError {
     SamplerAlignment,
     ScsRequestOutOfRange,
     RegisterProgramShape,
+    HardwareTimestampOutOfRange,
 }
 
 /// Low and high GPU aliases of one retained SKSM entry backing.
@@ -182,14 +183,72 @@ pub(crate) struct ComputeDescriptorObjects {
     pub(crate) usage_record: u64,
 }
 
+/// Descriptor offset of the completion-stamp value firmware copies to the
+/// support-page stamp word (`*(descriptor + 0x0F40)`) after the kick's
+/// completion cache maintenance (b1 `AGFAcceleratorProcessTimeStampQueue`,
+/// see `G17P_COMPUTE_STAMP_SUPPORT_OFFSET`).
+pub(crate) const COMPUTE_COMPLETION_STAMP_VALUE: usize = 0x0f50;
+/// Initial stamp for bootstrap records. User publication overwrites this with
+/// the physical queue's monotonic kick value, independently of TSQ slot index.
+pub(crate) const COMPUTE_COMPLETION_STAMP_CONSTANT: u32 = 0x100;
+
+/// Native EventMachine increments a stable event index's value by 0x100.
+/// B1 coalesces timestamp records at that index before cache maintenance:
+/// the newest store must cover every earlier completed kick in that prefix.
+pub(crate) const fn completion_stamp_value(kick_timestamp: u64) -> u32 {
+    (kick_timestamp as u32).wrapping_shl(8)
+}
+
+/// Modular prefix comparison, valid while outstanding kicks span less than
+/// half the 24-bit stamp sequence (the queue's admission bound is much lower).
+/// Zero is a valid wrapped store. Counter/ring identity must also pass.
+pub(crate) const fn completion_stamp_covers(stamp_word: u32, kick_timestamp: u64) -> bool {
+    let delta = stamp_word.wrapping_sub(completion_stamp_value(kick_timestamp));
+    delta & 0xff == 0 && delta < 0x8000_0000
+}
+
+/// Bind the native allocation epoch after building any user compute record.
+/// Zero is a valid wrapped epoch; never replace it with a default value.
+pub(crate) fn set_context_generation(raw: &mut [u8], generation: u8) -> Result<(), ComputeBuildError> {
+    if raw.len() <= 0x0fd3 {
+        return Err(ComputeBuildError::BufferTooSmall);
+    }
+    put_u8(raw, 0x0fd3, generation);
+    Ok(())
+}
+
+/// Bind the physical queue's exact publication prefix before exposing a record.
+pub(crate) fn set_completion_stamp_value(raw: &mut [u8], kick_timestamp: u64) -> Result<(), ComputeBuildError> {
+    if raw.len() < COMPUTE_COMPLETION_STAMP_VALUE + 4 {
+        return Err(ComputeBuildError::BufferTooSmall);
+    }
+    put_u32(raw, COMPUTE_COMPLETION_STAMP_VALUE, completion_stamp_value(kick_timestamp));
+    Ok(())
+}
+
+/// CL's native completion scratch payload is zero; its low forty bits are
+/// the same converted hardware timestamp used by the KSM entry. This field
+/// is a u64 at +0xf60, not a u32 ordinal or a QID-packed dependency token.
+pub(crate) fn set_hardware_timestamp(raw: &mut [u8], timestamp: u64) -> Result<(), ComputeBuildError> {
+    if raw.len() < 0x0f68 { return Err(ComputeBuildError::BufferTooSmall); }
+    if timestamp >> 40 != 0 { return Err(ComputeBuildError::HardwareTimestampOutOfRange); }
+    put_u64(raw, 0x0f60, timestamp);
+    Ok(())
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct ComputeDescriptorMetadata {
     pub(crate) submit_sequence: u64,
     pub(crate) context_id: u32,
+    /// Event stamp index (+0xf54), distinct from the TSQ pointer slot.
     pub(crate) grid_index: u32,
     pub(crate) work_ordinal: u32,
     pub(crate) queue_submission: u32,
+    /// Historical name: +0xf58 selects a pointer slot within the TSQ node.
+    /// It is NOT an unbounded submission ordinal. User queues use slot zero.
     pub(crate) queue_ordinal: u32,
+    /// Bootstrap seed for the low word at +0xf60; user publication binds the
+    /// complete forty-bit hardware timestamp with set_hardware_timestamp.
     pub(crate) submission_index: u32,
     pub(crate) support_control: u32,
     pub(crate) support_flags: u32,
@@ -389,7 +448,9 @@ pub(crate) fn build_compute_registers_with_scs(
     p: ComputeRegisterParameters,
     scs: ScsRequestRegisters,
 ) -> Result<ComputeRegisterProgram, ComputeBuildError> {
-    let context_word = ((p.context_id as u64) << 8) | p.work_ordinal as u64;
+    // Native reads CommandBufferState+8 and masks its low six bits here.
+    // The logical compute ordinal at descriptor+0xf70 is a separate identity.
+    let context_word = ((p.context_id as u64) << 8) | u64::from(p.work_ordinal & 63);
 
     let body = [
         ComputeRegister::new(0x1a510, p.preempt_base),
@@ -630,6 +691,59 @@ pub(crate) fn encode_compute_config_update(
     updates: ComputeConfigUpdates,
     context_id: Option<u16>,
 ) -> Result<(), ComputeBuildError> {
+    // AGXChannel::getPid supplies a full u32 at tag15 +0x5a. The queue's
+    // logical-owner bind populates the same PID at record +0x48; reading that
+    // retained identity avoids capturing a workqueue PID during submission.
+    let owner_pid = u32::from_le_bytes(
+        graph.get(0x48..0x4c).ok_or(ComputeBuildError::BufferTooSmall)?
+            .try_into().map_err(|_| ComputeBuildError::BufferTooSmall)?,
+    );
+    let optional_raw = graph
+        .get_mut(COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE)
+        .ok_or(ComputeBuildError::BufferTooSmall)?;
+    encode_compute_config_update_record(
+        optional_raw,
+        owner_pid,
+        sksm_entries,
+        shared_control,
+        channel_control,
+        queue_id,
+        hardware_buffer_id,
+        install_queue,
+        updates,
+        context_id,
+    )
+}
+
+/// Encode one tag-15 `KSMKickQueueConfigUpdate` record into `optional_raw`
+/// (`COMPUTE_OPTIONAL_SIZE` bytes), wherever that record lives.
+///
+/// A queue's FIRST bind encodes it in the queue graph's optional window; every
+/// later publication encodes it in its own per-publication record slot. The
+/// firmware reads a record through the item-ring pointer that names it, which
+/// can be long after the host has published further kicks, so a record must
+/// never be rewritten while a ring entry still names it. Measured on Neo
+/// 2026-09-26 19:41: a repeat encoded into the graph window while the first
+/// bind's ring entry still pointed there rewrote +0x1a (queue-install) to 0;
+/// the firmware then consumed the first bind with the install branch skipped,
+/// left the per-queue slot unpopulated, and its tag-16 handler faulted on the
+/// NULL slot (pc=0x1190c far=0x140 esr=0x96000004), the same fault shape the
+/// +0x1a note below records for sending 0 directly.
+pub(crate) fn encode_compute_config_update_record(
+    optional_raw: &mut [u8],
+    owner_pid: u32,
+    sksm_entries: ComputeSksmEntryAliases,
+    shared_control: u64,
+    channel_control: u64,
+    queue_id: u8,
+    hardware_buffer_id: u8,
+    install_queue: bool,
+    updates: ComputeConfigUpdates,
+    context_id: Option<u16>,
+) -> Result<(), ComputeBuildError> {
+    let optional_raw = optional_raw
+        .get_mut(..COMPUTE_OPTIONAL_SIZE)
+        .ok_or(ComputeBuildError::BufferTooSmall)?;
     // Record +0x32 is the hardware context this queue's work is declared to run
     // in. It has always been the literal 2, from when every compute client ran
     // in the fixed pair `T8140_COMPUTE_CTXS = [2, 3]`.
@@ -658,16 +772,6 @@ pub(crate) fn encode_compute_config_update(
     } else {
         (shared_control, 0x3fu16, crate::g17_config::compute_flist_id(queue_id))
     };
-    // AGXChannel::getPid supplies a full u32 at tag15 +0x5a. The queue's
-    // logical-owner bind populates the same PID at record +0x48; reading that
-    // retained identity avoids capturing a workqueue PID during submission.
-    let owner_pid = u32::from_le_bytes(
-        graph.get(0x48..0x4c).ok_or(ComputeBuildError::BufferTooSmall)?
-            .try_into().map_err(|_| ComputeBuildError::BufferTooSmall)?,
-    );
-    let optional_raw = graph
-        .get_mut(COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE)
-        .ok_or(ComputeBuildError::BufferTooSmall)?;
     optional_raw.fill(0);
     put_u32(optional_raw, 0x00, 0x0f);
     put_u64(optional_raw, 0x08, sksm_entries.low());
@@ -984,7 +1088,9 @@ pub(crate) fn build_compute_descriptor(
     );
     put_u64(raw, 0x0f40, objects.dispatch_a);
     put_u64(raw, 0x0f48, objects.dispatch_b);
-    put_u32(raw, 0x0f50, metadata.queue_submission << 8);
+    // Bootstrap seed only. Every user publication route binds the actual kick
+    // timestamp separately; queue_ordinal is a TSQ slot, not a stamp sequence.
+    put_u32(raw, 0x0f50, COMPUTE_COMPLETION_STAMP_CONSTANT);
     put_u32(raw, 0x0f54, metadata.grid_index);
     put_u32(raw, 0x0f58, metadata.queue_ordinal);
     put_u32(raw, 0x0f60, metadata.submission_index);
@@ -1013,6 +1119,72 @@ pub(crate) fn build_compute_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_work_state_does_not_overwrite_the_context_id() {
+        for word in [0, 62, 64, 0x1234_5678, u32::MAX - 1] {
+            let mut p = register_parameters();
+            p.context_id = 9;
+            p.work_ordinal = word;
+            let program = build_compute_registers(p).unwrap();
+            let expected = (9 << 8) | u64::from(word & 63);
+            assert_eq!(register_value(program.as_slice(), 0x10201, 0), expected);
+            assert_eq!(register_value(program.as_slice(), 0x10428, 0), expected);
+        }
+    }
+
+    #[test]
+    fn hardware_timestamp_keeps_all_forty_bits_and_zero_payload() {
+        for timestamp in [0, 1, 0xffff_ffff, 0x1_0000_0000, 0xff_ffff_ffff] {
+            let mut raw = [0xa5u8; 0x1000];
+            set_hardware_timestamp(&mut raw, timestamp).unwrap();
+            assert_eq!(u64::from_le_bytes(raw[0xf60..0xf68].try_into().unwrap()), timestamp);
+            assert!(raw[..0xf60].iter().all(|&v| v == 0xa5));
+            assert!(raw[0xf68..].iter().all(|&v| v == 0xa5));
+        }
+        let mut raw = [0xa5u8; 0x1000];
+        assert_eq!(set_hardware_timestamp(&mut raw, 1 << 40), Err(ComputeBuildError::HardwareTimestampOutOfRange));
+        assert!(raw.iter().all(|&v| v == 0xa5));
+        assert_eq!(set_hardware_timestamp(&mut [0; 4], 1), Err(ComputeBuildError::BufferTooSmall));
+    }
+
+    #[test]
+    fn allocation_epoch_changes_only_its_byte_and_accepts_wrap() {
+        for epoch in [0, 1, 2, 3, 127, 255] {
+            let mut raw = [0xa5u8; 0x1000];
+            set_context_generation(&mut raw, epoch).unwrap();
+            assert_eq!(raw[0xfd3], epoch);
+            assert!(raw[..0xfd3].iter().all(|&b| b == 0xa5));
+            assert!(raw[0xfd4..].iter().all(|&b| b == 0xa5));
+        }
+        assert_eq!(set_context_generation(&mut [0; 0xfd3], 1), Err(ComputeBuildError::BufferTooSmall));
+    }
+
+    #[test]
+    fn completion_stamp_covers_only_the_flushed_prefix_including_wrap() {
+        for kick in [1u64, 0x100, 0x3628, 0x3629, 0xff_ffff, 0x100_0000, 0x123_4567_89ab] {
+            let stamp = completion_stamp_value(kick);
+            assert!(completion_stamp_covers(stamp, kick));
+            assert!(!completion_stamp_covers(stamp, kick + 1));
+            assert!(completion_stamp_covers(completion_stamp_value(kick + 16), kick));
+            assert!(!completion_stamp_covers(stamp | 1, kick));
+        }
+        assert!(!completion_stamp_covers(0, 1));
+        assert!(completion_stamp_covers(0, 0x100_0000));
+        assert!(completion_stamp_covers(0, 0xff_ffff));
+        assert!(!completion_stamp_covers(0xffff_ff00, 0x100_0000));
+        assert!(!completion_stamp_covers(0x8000_0100, 1));
+        let mut raw = [0u8; COMPUTE_COMPLETION_STAMP_VALUE + 4];
+        set_completion_stamp_value(&mut raw, 0x3629).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(raw[0x0f50..0x0f54].try_into().unwrap()),
+            0x362900,
+        );
+        let mut raw2 = [0u8; COMPUTE_COMPLETION_STAMP_VALUE + 4];
+        set_completion_stamp_value(&mut raw2, 1).unwrap();
+        assert_ne!(raw2, raw);
+        assert_eq!(set_completion_stamp_value(&mut [0; 4], 1), Err(ComputeBuildError::BufferTooSmall));
+    }
 
     fn fnv1a64(raw: &[u8]) -> u64 {
         let mut value = 0xcbf2_9ce4_8422_2325u64;
@@ -1227,13 +1399,16 @@ mod tests {
         )
         .unwrap();
 
-        // Re-pinned with the register-derived B1 resume checkpoints.
-        assert_eq!(fnv1a64(&raw), 0xfc26_4ad8_26d7_270b);
+        // Re-pinned with the register-derived B1 resume checkpoints, and again
+        // with the constant completion stamp at +0x0F50 (COMPUTE_COMPLETION_STAMP_CONSTANT).
+        assert_eq!(fnv1a64(&raw), 0x8a56_8b1c_2a27_0524);
         assert_eq!(u64::from_le_bytes(raw[0x0ee0..0x0ee8].try_into().unwrap()), 0x100_0410_002c);
         assert_eq!(u64::from_le_bytes(raw[COMPUTE_SAMPLER_ARRAY..COMPUTE_SAMPLER_ARRAY + 8].try_into().unwrap()), 0x100_0800_0000);
         assert_eq!(u32::from_le_bytes(raw[COMPUTE_SAMPLER_COUNT..COMPUTE_SAMPLER_COUNT + 4].try_into().unwrap()), 4);
         assert_eq!(u64::from_le_bytes(raw[0x0f8c..0x0f94].try_into().unwrap()), 0x200_0000_4000);
-        assert_eq!(u32::from_le_bytes(raw[0x0f50..0x0f54].try_into().unwrap()), 8 << 8);
+        // The raw builder retains its bootstrap seed. User publication binds
+        // the physical queue's actual completion prefix after this step.
+        assert_eq!(u32::from_le_bytes(raw[0x0f50..0x0f54].try_into().unwrap()), COMPUTE_COMPLETION_STAMP_CONSTANT);
         assert_eq!(
             [
                 u16::from_le_bytes(raw[0x18..0x1a].try_into().unwrap()),

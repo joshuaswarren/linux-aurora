@@ -28,7 +28,7 @@ plan = "\n".join(
         item("fn g17p_pm_growth_plan("),
     ]
 )
-growth = item("    fn grow_render_tvb_inner(")
+growth = item("    fn grow_render_tvb_owned(")
 
 # Production must consume the firmware cursor at shared +8, build the active
 # circular inventory, and publish it into PBState. The old block-zero rebuild

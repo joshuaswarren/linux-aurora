@@ -45,7 +45,7 @@ assert "g17p_render_pair_first_outer_submit(" in inner
 assert "queue_pair.slot()," in inner
 publish = inner[inner.index(".publish_partial_opening_pair("):inner.index("move || {", inner.index(".publish_partial_opening_pair("))]
 assert "first_outer_submit," in publish
-assert inner.index("self.render_hardware_buffer_published = true;") \
+assert inner.index("self.render_slots.get_mut(pair_slot).hardware_buffer_published = true;") \
     < inner.index("self.render_outer_channels_started[usize::from(queue_pair.slot())] = true;")
 stop = block(manager, "release_runtime_objects_after_processor_stop")
 assert "self.render_outer_channels_started = [false; 64];" in stop
@@ -56,10 +56,16 @@ assert "let render_channel_started = !first_submit;" in outer
 assert inner.index("set_parameter_buffer_lease_token(") < inner.index("set_flist_generation(") \
     < inner.index("stage_render_groups_with_sksm("), "the generation must be set before staging"
 assert "lifecycle.sequence" in inner[inner.index("set_flist_generation("):][:600]
+# v92d: both fragment stages build their tag-15 config update through
+# prepare_render_items -> final_config_update, which carries the FList
+# generation and the GART context-update flag.
+final = block(resources, "final_config_update")
+assert "self.optional_addresses(tiling), ordinal, self.flist_generation," in final
+assert "self.context_update_pending" in final
 for name in ["stage_fragment", "stage_fragment_prefix"]:
-    body = block(resources, name)
-    assert "apply_g17p_retained_optional_with_flist_generation_and_context_update(" in body, name
-    assert "let flist_generation = self.flist_generation;" in body, name
+    assert "self.stage_fragment_config_group(" in block(resources, name), name
+assert "self.prepare_render_items(ordinal)?" in block(resources, "stage_fragment_config_group")
+assert "final_config_update(" in block(resources, "prepare_render_items")
 late = block(resources, "prepare_late_tiling_publication_with_stamp")
 assert "self.flist_generation," in late
 restage = block(resources, "restage_command")
@@ -69,12 +75,11 @@ assert "apply_g17p_retained_optional(" not in resources.replace("apply_g17p_reta
 
 # --- GART context update -----------------------------------------------------
 assert "context_update_pending: true," in resources
-for name in ["stage_fragment", "stage_fragment_prefix", "prepare_late_tiling_publication_with_stamp"]:
-    assert "self.context_update_pending" in block(resources, name), name
+assert "self.context_update_pending" in block(resources, "prepare_late_tiling_publication_with_stamp")
 consistency = block(manager, "validate_render_queue_consistency")
 assert "header.context_update != u16::from(context_update)" in consistency
-completion = block(manager, "poll_translated_render_completion")
-assert "complete_render_context_update_retirement(true)?" in completion
+completion = block(manager, "commit_render_observation")
+assert "complete_render_context_update_retirement(pair_slot, true)?" in completion
 context_retirement = block(manager, "complete_render_context_update_retirement")
 assert "complete_context_update()" in context_retirement
 

@@ -7,10 +7,6 @@ dtb-$(CONFIG_ARCH_APPLE) += t8132-j624.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8132-j713.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8132-j715.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8132-j773g.dtb
-dtb-$(CONFIG_ARCH_APPLE) += t6050-j714s.dtb
-dtb-$(CONFIG_ARCH_APPLE) += t6050-j714c.dtb
-dtb-$(CONFIG_ARCH_APPLE) += t6050-j716s.dtb
-dtb-$(CONFIG_ARCH_APPLE) += t6050-j716c.dtb
 dtb-$(CONFIG_ARCH_APPLE) += s5l8960x-j71.dtb
 dtb-$(CONFIG_ARCH_APPLE) += s5l8960x-j73.dtb
 dtb-$(CONFIG_ARCH_APPLE) += s5l8960x-j85m.dtb
@@ -117,3 +113,6 @@ dtb-$(CONFIG_ARCH_APPLE) += t8122-j613.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8122-j615.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8140-j700.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8152-j873.dtb
+
+# J700 media diagnostics require a qualified AVE firmware handoff.
+dtb-$(CONFIG_ARCH_APPLE) += t8140-j700-encoding.dtb

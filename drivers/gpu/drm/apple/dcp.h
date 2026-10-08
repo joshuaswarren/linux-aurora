@@ -42,7 +42,19 @@ void dcp_poweron(struct platform_device *pdev);
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state);
 int dcp_get_connector_type(struct platform_device *pdev);
+bool dcp_has_typec_routes(struct platform_device *pdev);
+
+/*
+ * The Type-C display fabric.  Ports are enumerated in device-tree order, not
+ * DCP probe order, so a given physical port keeps the same DRM connector index
+ * across boots -- userspace keys its per-monitor configuration on that name.
+ */
+unsigned int dcp_typec_nr_ports(void);
+struct device_node *dcp_typec_port_of_node(unsigned int idx);
+bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
+void dcp_typec_port_set_connector(unsigned int idx, struct apple_connector *connector);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
+bool dcp_fw_compat_is_h17p(struct platform_device *pdev);
 const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count);
 void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
 	      struct apple_connector *connector);
@@ -50,6 +62,8 @@ int dcp_start(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state);
 void dcp_flush_shutdown(struct apple_dcp *dcp);
+void dcp_retain_unbound_fbs_pdev(struct platform_device *pdev, struct drm_crtc *crtc,
+				 struct drm_atomic_state *state);
 bool dcp_is_initialized(struct platform_device *pdev);
 void apple_crtc_vblank(struct apple_crtc *apple);
 void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
@@ -75,6 +89,9 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
 
 int systemep_init(struct apple_dcp *dcp);
 int dptxep_init(struct apple_dcp *dcp);
+int dptx_control_init(struct apple_dcp *dcp);
+void dptx_control_kick(struct apple_dcp *dcp);
+int dptxep_wait_ports(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
 int dpavservep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);

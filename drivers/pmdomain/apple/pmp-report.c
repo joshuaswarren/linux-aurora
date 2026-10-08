@@ -7,19 +7,34 @@
 
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/rculist.h>
+#include <linux/soc/apple/pmp-report.h>
 
 #define PMP_REPORT_READY 0x1
 
+/**
+ * struct apple_pmp_report_offsets - per-SoC layout of the report region
+ * @tgt_read: power state request, read side
+ * @tgt_write: power state request, write side
+ * @actual: power state acknowledgment
+ * @status: PMP status; bit 0 is set while the PMP is running
+ * @fast_die: 32-bit word holding the fast die-temperature effort of each
+ *	CPU cluster, one byte per lane; 0 if the SoC has none
+ * @fast_die_lanes: number of lanes at @fast_die, at most 4
+ */
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
 	u32 tgt_write;
 	u32 actual;
 	u32 status;
+	u32 fast_die;
+	u32 fast_die_lanes;
 };
 
 struct apple_pmp_report {
@@ -27,7 +42,65 @@ struct apple_pmp_report {
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
 	spinlock_t lock;
+	struct list_head list;
 };
+
+/*
+ * Bound report regions, for apple_pmp_report_fast_die_effort().  Regions are
+ * added once they are set up and never removed: the driver cannot be unbound.
+ */
+static LIST_HEAD(apple_pmp_reports);
+static DEFINE_MUTEX(apple_pmp_reports_lock);
+
+/**
+ * apple_pmp_report_fast_die_effort() - read the fast die-temperature effort
+ *	of a CPU cluster
+ * @np: device tree node of the report region
+ * @lane: lane of the cluster in the fast die-temperature report
+ * @effort: set to the effort on success
+ *
+ * The PMP of some SoCs runs a control loop on its own die-temperature sensors
+ * and publishes an 8-bit effort for each CPU cluster: 0 requests no limit,
+ * and the effort rises towards 255 as the die exceeds the firmware's target.
+ * The effort is only valid while the PMP reports that it is running; a
+ * stopped PMP reads 0.
+ *
+ * Context: Any context.
+ * Return: 0 on success, -EPROBE_DEFER if the region is not bound (yet),
+ * -EOPNOTSUPP if the SoC's PMP publishes no such effort, -EINVAL if @lane is
+ * out of range, or -EAGAIN if the PMP does not report that it is running.
+ */
+int apple_pmp_report_fast_die_effort(const struct device_node *np,
+				     unsigned int lane, u8 *effort)
+{
+	const struct apple_pmp_report_offsets *offs;
+	const struct apple_pmp_report *rep;
+	int ret = -EPROBE_DEFER;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+
+		offs = rep->offsets;
+		if (!offs->fast_die) {
+			ret = -EOPNOTSUPP;
+		} else if (lane >= offs->fast_die_lanes) {
+			ret = -EINVAL;
+		} else if (!(readl(rep->base + offs->status) & PMP_REPORT_READY)) {
+			ret = -EAGAIN;
+		} else {
+			*effort = readl(rep->base + offs->fast_die) >>
+				  (lane * BITS_PER_BYTE);
+			ret = 0;
+		}
+		break;
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
@@ -40,6 +113,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (!rep)
 		return -ENOMEM;
 
+	spin_lock_init(&rep->lock);
 	rep->dev = dev;
 	rep->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(rep->base))
@@ -49,6 +123,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	ret = of_platform_populate(np, NULL, NULL, dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to create child devices\n");
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
+	mutex_unlock(&apple_pmp_reports_lock);
 
 	return 0;
 }
@@ -74,10 +152,21 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.status = 0x10,
 };
 
+/* The fast die-temperature report is the low two bytes of entry 0x1c1. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
+	.tgt_read = 0x1880,
+	.tgt_write = 0x10c40,
+	.actual = 0x18c0,
+	.status = 0x10,
+	.fast_die = 0x1c10,
+	.fast_die_lanes = 2,
+};
+
 static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
+	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
 	{}
 };
 
@@ -86,6 +175,11 @@ static struct platform_driver apple_pmp_report_driver = {
 	.driver = {
 		.name = "apple-pmp-report",
 		.of_match_table = apple_pmp_report_of_match,
+		/*
+		 * Its child power domains and the region list keep using the
+		 * mapping, and nothing tears them down.
+		 */
+		.suppress_bind_attrs = true,
 	},
 };
 

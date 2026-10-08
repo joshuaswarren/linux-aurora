@@ -1,0 +1,1180 @@
+diff --git a/src/asahi/clc/asahi_clc.c b/src/asahi/clc/asahi_clc.c
+index 8a8721b963d..09382affe24 100644
+--- a/src/asahi/clc/asahi_clc.c
++++ b/src/asahi/clc/asahi_clc.c
+@@ -265,6 +265,8 @@ target_supports_program(const char *target, const nir_function *func)
+           !strcmp(func->name, "libagx_tess_factors_half") ||
+           !strcmp(func->name, "libagx_tess_setup_indirect") ||
+           !strcmp(func->name, "libagx_tess_isoline") ||
++          !strcmp(func->name, "libagx_tess_tri") ||
++          !strcmp(func->name, "libagx_tess_quad") ||
+           !strcmp(func->name, "libagx_prefix_sum_tess");
+ }
+ 
+@@ -430,6 +432,10 @@ main(int argc, char **argv)
+ 
+             struct agx_shader_part compiled;
+             bool is_helper = !strcmp(libfunc->name, "libagx_helper");
++            const bool g17p_tessellator =
++               !strcmp(*target, "g17p") &&
++               (!strcmp(libfunc->name, "libagx_tess_tri") ||
++                !strcmp(libfunc->name, "libagx_tess_quad"));
+             struct agx_shader_key key = {
+                .promote_constants = !is_helper,
+ 
+@@ -442,6 +448,11 @@ main(int argc, char **argv)
+                .reserved_preamble = layout.size_B / 2,
+                .is_helper = is_helper,
+                .no_preamble = !strcmp(*target, "g17p"),
++               /* AGX3 static spills live in the launch-allocated TPS frame.
++                * The triangle and quad tessellators exceed G17P's 192-half
++                * register file; compile their ordinary spill/reload path
++                * instead of omitting the kernels from the shipped table. */
++               .has_scratch = g17p_tessellator,
+             };
+ 
+             key.dev.encoding = !strcmp(*target, "g17p")
+@@ -471,8 +482,8 @@ main(int argc, char **argv)
+             free(compiled.binary);
+             ralloc_free(clone);
+ 
+-            assert(compiled.info.scratch_size == 0 &&
+-                   "internal shaders do not spill");
++            assert((compiled.info.scratch_size == 0 || g17p_tessellator) &&
++                   "only G17P tessellators may spill");
+ 
+             assert(compiled.info.preamble_scratch_size == 0 &&
+                    "internal shader preambles do not spill");
+@@ -575,6 +586,14 @@ main(int argc, char **argv)
+                  "libagx_tess_isoline_0_g17p,\n"
+                  "    [LIBAGX_TESS_ISOLINE_1] = "
+                  "libagx_tess_isoline_1_g17p,\n"
++                 "    [LIBAGX_TESS_TRI_0] = "
++                 "libagx_tess_tri_0_g17p,\n"
++                 "    [LIBAGX_TESS_TRI_1] = "
++                 "libagx_tess_tri_1_g17p,\n"
++                 "    [LIBAGX_TESS_QUAD_0] = "
++                 "libagx_tess_quad_0_g17p,\n"
++                 "    [LIBAGX_TESS_QUAD_1] = "
++                 "libagx_tess_quad_1_g17p,\n"
+                  "    [LIBAGX_SETUP_INDIRECT_DISPATCH] = "
+                  "libagx_setup_indirect_dispatch_0_g17p,\n"
+                  "};\n\n");
+diff --git a/src/asahi/compiler/agx3_pack_binary.c b/src/asahi/compiler/agx3_pack_binary.c
+index 1db3f976f98..2ed006a5f4b 100644
+--- a/src/asahi/compiler/agx3_pack_binary.c
++++ b/src/asahi/compiler/agx3_pack_binary.c
+@@ -9020,7 +9020,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
+             const bool g17p_returned =
+                enc == AGX_ISA_ENCODING_AGX3B && returned;
+             const uint8_t atomic_slot = g17p_returned ? 1 : slot;
+-            if ((g17p_returned && (slot != 6 || ctx->scratch_size_B != 0)) ||
++            const bool atomic_overlaps_spills =
++               ctx->scratch_size_B != 0 && ctx->spill_base_B < 16;
++            if ((g17p_returned && (slot != 6 || atomic_overlaps_spills)) ||
+                 !agx3_translate_device_atomic(I, enc, block->divergent,
+                                               atomic_slot, wait, &d) ||
+                 !agx3_atomic_encode_device(enc, &d, bytes, &len) ||
+diff --git a/src/asahi/compiler/agx_compile.c b/src/asahi/compiler/agx_compile.c
+index 77b9b31521f..6bcbb2d96c1 100644
+--- a/src/asahi/compiler/agx_compile.c
++++ b/src/asahi/compiler/agx_compile.c
+@@ -6542,27 +6542,38 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
+    AGX_PASS(ctx, agx3_bank_scalar_tile_store_inputs);
+    AGX_PASS(ctx, agx3_mark_implicit_tex_coord_staging);
+ 
+-   AGX_PASS(ctx, agx_ra);
+-
+-   /* Apple's G17P compiler publishes a 16-byte scratch footprint for both
+-    * compute and fragment shaders that consume a device atomic's return.
+-    * The otherwise equivalent return-unused shaders publish zero, and the
+-    * returned form immediately reloads the old value from TPS half 0. Keep
+-    * this fixed ABI reservation distinct from allocator-created spill size;
+-    * the packer refuses a mixed returned-atomic/compiler-scratch shader until
+-    * ordinary scratch offsets are rebased around these words. */
++   /* A returned G17P device atomic publishes its value in TPS half 0 before
++    * RLD moves it to the assigned GPR. If this shader also needs compiler
++    * spills, reserve the complete 16-byte native atomic frame before RA lays
++    * out ordinary spill cells. This keeps both mechanisms in one static TPS
++    * frame without adding a memory barrier or serializing the kernel. */
++   bool g17p_returned_atomic = false;
+    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+        (ctx->stage == MESA_SHADER_COMPUTE ||
+         ctx->stage == MESA_SHADER_FRAGMENT)) {
+       agx_foreach_instr_global(ctx, I) {
+          if (I->op == AGX_OPCODE_ATOMIC && I->nr_dests == 1 &&
+              !agx_is_null(I->dest[0])) {
+-            out->agx3_spectpr_scratch_size =
+-               MAX2(out->agx3_spectpr_scratch_size, 16);
++            g17p_returned_atomic = true;
+             break;
+          }
+       }
+    }
++   if (g17p_returned_atomic && ctx->key->has_scratch)
++      ctx->scratch_size_B = MAX2(ctx->scratch_size_B, 16);
++
++   AGX_PASS(ctx, agx_ra);
++
++   /* Apple's G17P compiler publishes a 16-byte scratch footprint for both
++    * compute and fragment shaders that consume a device atomic's return.
++    * The otherwise equivalent return-unused shaders publish zero, and the
++    * returned form immediately reloads the old value from TPS half 0. Keep
++    * this fixed ABI reservation distinct from allocator-created spill size;
++    * the packer refuses a mixed returned-atomic/compiler-scratch shader until
++    * ordinary scratch offsets are rebased around these words. */
++   if (g17p_returned_atomic)
++      out->agx3_spectpr_scratch_size =
++         MAX2(out->agx3_spectpr_scratch_size, 16);
+ 
+    agx_lower_64bit_postra(ctx);
+ 
+diff --git a/src/asahi/compiler/agx_compile.h b/src/asahi/compiler/agx_compile.h
+index 1a849f875d2..291395dc8c0 100644
+--- a/src/asahi/compiler/agx_compile.h
++++ b/src/asahi/compiler/agx_compile.h
+@@ -204,6 +204,8 @@ struct agx_precompiled_kernel_info {
+    uint16_t workgroup_size[3];
+    uint16_t local_size;
+    uint16_t imageblock_stride;
++   uint16_t scratch_size;
++   uint16_t agx3_spectpr_scratch_size;
+    bool uses_txf;
+    bool agx3_staging_known;
+    uint16_t agx3_staging_halfs;
+@@ -228,6 +230,8 @@ agx_compact_kernel_info(struct agx_shader_info *info)
+                          info->workgroup_size[2]},
+       .local_size = info->local_size,
+       .imageblock_stride = info->imageblock_stride,
++      .scratch_size = info->scratch_size,
++      .agx3_spectpr_scratch_size = info->agx3_spectpr_scratch_size,
+       .uses_txf = info->uses_txf,
+       .agx3_staging_known = info->agx3_staging_known,
+       .agx3_staging_halfs = info->agx3_staging_halfs,
+diff --git a/src/asahi/compiler/agx_nir.h b/src/asahi/compiler/agx_nir.h
+index 949ca4ddb78..f888e9a4648 100644
+--- a/src/asahi/compiler/agx_nir.h
++++ b/src/asahi/compiler/agx_nir.h
+@@ -138,6 +138,12 @@ bool agx_nir_lower_g17p_txf(
+ bool agx_nir_lower_g17p_storage_image(
+    struct nir_shader *s, struct agx_g17p_storage_image_binding *binding);
+ 
++/* Lower Gallium's exact write-only scalar-integer image state to native
++ * G17P PBE state 0. The caller publishes the resolved PBE pointer and native
++ * write-control record in the first four 64-bit resource slots. */
++bool agx_nir_lower_g17p_gallium_storage_write(struct nir_shader *s,
++                                               unsigned pbe_state);
++
+ /* Lower the exact compute textureLod(..., 0) -> rgba8 imageStore form emitted
+  * by vkQuake.  The caller publishes the four-slot native resource tuple. */
+ bool agx_nir_lower_g17p_sampled_storage(
+diff --git a/src/asahi/compiler/agx_nir_lower_g17p_combined_sampler.c b/src/asahi/compiler/agx_nir_lower_g17p_combined_sampler.c
+index 5b8cab6ea43..765501ed6a6 100644
+--- a/src/asahi/compiler/agx_nir_lower_g17p_combined_sampler.c
++++ b/src/asahi/compiler/agx_nir_lower_g17p_combined_sampler.c
+@@ -1397,6 +1397,85 @@ agx_nir_lower_g17p_storage_image(
+    return true;
+ }
+ 
++bool
++agx_nir_lower_g17p_gallium_storage_write(nir_shader *shader,
++                                          unsigned pbe_state)
++{
++   if (!shader || shader->info.stage != MESA_SHADER_COMPUTE ||
++       BITSET_LAST_BIT(shader->info.textures_used) != 0 ||
++       BITSET_LAST_BIT(shader->info.images_used) != 1)
++      return false;
++
++   nir_intrinsic_instr *store = NULL;
++   unsigned impl_count = 0;
++   nir_foreach_function_impl(impl, shader) {
++      impl_count++;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_tex)
++               return false;
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            switch (intr->intrinsic) {
++            case nir_intrinsic_image_store: {
++               const enum pipe_format format = nir_intrinsic_format(intr);
++               const unsigned data_components =
++                  nir_src_num_components(intr->src[3]);
++               if (store ||
++                   (format != PIPE_FORMAT_R32_UINT &&
++                    format != PIPE_FORMAT_R32_SINT) ||
++                   nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_2D ||
++                   nir_intrinsic_image_array(intr) ||
++                   !nir_src_is_const(intr->src[0]) ||
++                   nir_src_as_uint(intr->src[0]) != pbe_state ||
++                   nir_src_num_components(intr->src[1]) != 4 ||
++                   nir_src_bit_size(intr->src[1]) != 32 ||
++                   (data_components != 1 && data_components != 4) ||
++                   nir_src_bit_size(intr->src[3]) != 32 ||
++                   !nir_src_is_const(intr->src[2]) ||
++                   nir_src_as_uint(intr->src[2]) != 0 ||
++                   !nir_src_is_const(intr->src[4]) ||
++                   nir_src_as_uint(intr->src[4]) != 0 ||
++                   (nir_intrinsic_access(intr) &
++                    (ACCESS_COHERENT | ACCESS_VOLATILE)))
++                  return false;
++               store = intr;
++               break;
++            }
++            case nir_intrinsic_image_load:
++            case nir_intrinsic_image_sparse_load:
++            case nir_intrinsic_image_atomic:
++            case nir_intrinsic_image_atomic_swap:
++            case nir_intrinsic_image_size:
++            case nir_intrinsic_image_samples:
++            case nir_intrinsic_bindless_image_load:
++            case nir_intrinsic_bindless_image_sparse_load:
++            case nir_intrinsic_bindless_image_store:
++            case nir_intrinsic_bindless_image_atomic:
++            case nir_intrinsic_bindless_image_atomic_swap:
++            case nir_intrinsic_bindless_image_size:
++            case nir_intrinsic_bindless_image_samples:
++               return false;
++            default:
++               break;
++            }
++         }
++      }
++   }
++
++   if (impl_count != 1 || !store)
++      return false;
++
++   nir_builder b = nir_builder_at(nir_before_instr(&store->instr));
++   nir_src_rewrite(&store->src[0], nir_imm_intN_t(&b, 0, 16));
++   nir_progress(true, nir_shader_get_entrypoint(shader),
++                nir_metadata_control_flow);
++   NIR_PASS(_, shader, nir_opt_dce);
++   return true;
++}
++
+ static bool
+ g17p_sampled_storage_store_shape(const nir_intrinsic_instr *intr)
+ {
+diff --git a/src/asahi/compiler/test/test-agx3-graphics-compile.c b/src/asahi/compiler/test/test-agx3-graphics-compile.c
+index f52ef965ff4..d2fed71e21f 100644
+--- a/src/asahi/compiler/test/test-agx3-graphics-compile.c
++++ b/src/asahi/compiler/test/test-agx3-graphics-compile.c
+@@ -4470,6 +4470,83 @@ test_storage_image_lowering(void)
+    return true;
+ }
+ 
++static nir_shader *
++build_gallium_storage_write(enum pipe_format format, unsigned state,
++                            enum gl_access_qualifier access)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_COMPUTE, &agx_nir_options,
++      "AGX3 Gallium write-only scalar storage image");
++   b.shader->info.workgroup_size[0] = 1;
++   b.shader->info.workgroup_size[1] = 1;
++   b.shader->info.workgroup_size[2] = 1;
++   BITSET_SET(b.shader->info.images_used, 0);
++
++   nir_def *zero = nir_imm_int(&b, 0);
++   nir_def *zero16 = nir_imm_intN_t(&b, 0, 16);
++   nir_def *coord = nir_imm_ivec4(&b, 0, 0, 0, 0);
++   nir_image_store(&b, nir_imm_intN_t(&b, state, 16), coord, zero,
++                   nir_imm_ivec4(&b, 9, 0, 0, 0), zero16,
++                   .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
++                   .format = format, .access = access,
++                   .src_type = format == PIPE_FORMAT_R32_SINT
++                                  ? nir_type_int32
++                                  : nir_type_uint32);
++   return b.shader;
++}
++
++static bool
++test_gallium_storage_write_lowering(void)
++{
++   const enum pipe_format formats[] = {
++      PIPE_FORMAT_R32_UINT,
++      PIPE_FORMAT_R32_SINT,
++   };
++
++   for (unsigned i = 0; i < ARRAY_SIZE(formats); ++i) {
++      nir_shader *nir = build_gallium_storage_write(
++         formats[i], 1, ACCESS_RESTRICT);
++      agx_preprocess_nir(nir);
++      bool ok = agx_nir_lower_g17p_gallium_storage_write(nir, 1);
++      unsigned stores = 0;
++      nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic == nir_intrinsic_image_store) {
++               stores++;
++               ok &= nir_src_is_const(intr->src[0]) &&
++                     nir_src_as_uint(intr->src[0]) == 0;
++            }
++         }
++      }
++
++      struct agx_shader_key key = {0};
++      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
++      key.no_preamble = true;
++      key.reserved_preamble = AGX_G17P_STORAGE_ROOT_HALFS;
++      struct agx_shader_part part = {0};
++      ok &= stores == 1 && agx_compile_shader_nir(nir, &key, &part) &&
++            part.binary != NULL && part.info.binary_size > 0;
++      free(part.binary);
++      ralloc_free(nir);
++      if (!ok)
++         return false;
++   }
++
++   nir_shader *coherent = build_gallium_storage_write(
++      PIPE_FORMAT_R32_SINT, 1, ACCESS_RESTRICT | ACCESS_COHERENT);
++   nir_shader *wrong_state = build_gallium_storage_write(
++      PIPE_FORMAT_R32_SINT, 2, ACCESS_RESTRICT);
++   const bool rejected =
++      !agx_nir_lower_g17p_gallium_storage_write(coherent, 1) &&
++      !agx_nir_lower_g17p_gallium_storage_write(wrong_state, 1);
++   ralloc_free(coherent);
++   ralloc_free(wrong_state);
++   return rejected;
++}
++
+ static nir_shader *
+ build_cs_2d_image_access(bool store)
+ {
+@@ -8220,6 +8297,11 @@ main(int argc, char **argv)
+       all_ok = false;
+    }
+ 
++   if (!test_gallium_storage_write_lowering()) {
++      fputs("Gallium scalar storage-write lowering mismatch\n", stderr);
++      all_ok = false;
++   }
++
+    if (!test_sampled_storage_lowering()) {
+       fputs("sampled storage-image lowering mismatch\n", stderr);
+       all_ok = false;
+diff --git a/src/asahi/lib/tests/test-g17p-precompiled-fill.c b/src/asahi/lib/tests/test-g17p-precompiled-fill.c
+index dea15ae7c0b..cd5154282d4 100644
+--- a/src/asahi/lib/tests/test-g17p-precompiled-fill.c
++++ b/src/asahi/lib/tests/test-g17p-precompiled-fill.c
+@@ -42,17 +42,20 @@ main(void)
+     * libagx receives its six arguments in contiguous uniform halves. */
+    static const uint8_t expected[] = {
+       0x0c, 0xa0, 0x10, 0x06, 0x1c, 0xa1, 0x10, 0x26,
+-      0x2b, 0x04, 0x01, 0x08, 0x9f, 0x30, 0x54, 0x00,
++      0x2b, 0x10, 0x01, 0x08, 0x9f, 0x30, 0x54, 0x00,
+       0x02, 0x04, 0x10, 0x00, 0xd0, 0x2f, 0x2a, 0x00,
+-      0x4b, 0x06, 0x01, 0x08, 0x5b, 0x08, 0x01, 0x08,
+-      0x6b, 0x0a, 0x01, 0x08, 0x7b, 0x0c, 0x01, 0x08,
+-      0xe7, 0x00, 0x54, 0x08, 0x00, 0x00, 0x20, 0x00,
++      0x4b, 0x12, 0x01, 0x08, 0x5b, 0x14, 0x01, 0x08,
++      0x6b, 0x16, 0x01, 0x08, 0x7b, 0x18, 0x01, 0x08,
++      0xe7, 0x00, 0x54, 0x08, 0x03, 0x00, 0x20, 0x00,
+       0x17, 0x00, 0x00, 0x10, 0x10, 0x00, 0x0e, 0x00,
+       0x00, 0x00,
+    };
+ 
+    for (unsigned i = 0; i < LIBAGX_NUM_PROGRAMS; ++i) {
+-      if (i == LIBAGX_FILL_UINT4 ||
++      if (i == LIBAGX_FILL ||
++          i == LIBAGX_COPY_UINT4 ||
++          i == LIBAGX_COPY_UCHAR ||
++          i == LIBAGX_FILL_UINT4 ||
+           i == LIBAGX_COPY_IMAGE ||
+           i == LIBAGX_MIPMAP_UNORM8X4 ||
+           i == LIBAGX_MIPMAP_UNORM8X4_ODD ||
+@@ -62,14 +65,30 @@ main(void)
+           i == LIBAGX_DRAW_ROBUST_INDEX_1 ||
+           i == LIBAGX_DRAW_ROBUST_INDEX_2 ||
+           i == LIBAGX_INCREMENT_IA ||
++          i == LIBAGX_INCREMENT_IA_RESTART ||
+           i == LIBAGX_INCREMENT_IA_RESTART_NONNULL ||
++          (i >= LIBAGX_UNROLL_RESTART_0 &&
++           i <= LIBAGX_UNROLL_RESTART_10) ||
++          i == LIBAGX_GS_SETUP_INDIRECT ||
++          i == LIBAGX_PREFIX_SUM_GEOM ||
++          i == LIBAGX_PREFIX_SUM_TESS_0 ||
++          i == LIBAGX_PREFIX_SUM_TESS_1 ||
+           i == LIBAGX_COPY_QUERY ||
++          i == LIBAGX_COPY_QUERY_GL ||
+           i == LIBAGX_INCREMENT_CS_INVOCATIONS ||
++          i == LIBAGX_SETUP_INDIRECT_DISPATCH ||
+           i == LIBAGX_COPY_TIMESTAMP ||
+           i == LIBAGX_PREDICATE_INDIRECT_0 ||
+           i == LIBAGX_PREDICATE_INDIRECT_1 ||
+           i == LIBAGX_CONDITIONAL_RENDER ||
+-          i == LIBAGX_TESS_FACTORS_HALF)
++          i == LIBAGX_TESS_FACTORS_HALF ||
++          i == LIBAGX_TESS_SETUP_INDIRECT ||
++          i == LIBAGX_TESS_ISOLINE_0 ||
++          i == LIBAGX_TESS_ISOLINE_1 ||
++          i == LIBAGX_TESS_TRI_0 ||
++          i == LIBAGX_TESS_TRI_1 ||
++          i == LIBAGX_TESS_QUAD_0 ||
++          i == LIBAGX_TESS_QUAD_1)
+          CHECK(libagx_g17p[i] != NULL);
+       else
+          CHECK(libagx_g17p[i] == NULL);
+@@ -98,7 +117,7 @@ main(void)
+    CHECK(copy_image_info->binary_size == 1670);
+    CHECK(copy_image_info->nr_gprs == 22);
+    CHECK(copy_image_info->nr_preamble_gprs == 0);
+-   CHECK(copy_image_info->push_count == 42);
++   CHECK(copy_image_info->push_count == 54);
+    CHECK(copy_image_info->workgroup_size[0] == 32);
+    CHECK(copy_image_info->workgroup_size[1] == 1);
+    CHECK(copy_image_info->workgroup_size[2] == 1);
+@@ -108,7 +127,7 @@ main(void)
+    CHECK(copy_image_info->agx3_staging_known);
+    CHECK(copy_image_info->agx3_staging_halfs == 0);
+    CHECK(fnv1a64(copy_image_binary, copy_image_info->binary_size) ==
+-         UINT64_C(0xbc86c399457f3a6a));
++         UINT64_C(0x2b548d68d69cb6f8));
+    CHECK(memcmp(copy_image_binary + copy_image_info->binary_size -
+                    sizeof(copy_image_end),
+                 copy_image_end, sizeof(copy_image_end)) == 0);
+@@ -136,7 +155,7 @@ main(void)
+    CHECK(mipmap_info->binary_size == 3234);
+    CHECK(mipmap_info->nr_gprs == 38);
+    CHECK(mipmap_info->nr_preamble_gprs == 0);
+-   CHECK(mipmap_info->push_count == 28);
++   CHECK(mipmap_info->push_count == 40);
+    CHECK(mipmap_info->workgroup_size[0] == 32);
+    CHECK(mipmap_info->workgroup_size[1] == 1);
+    CHECK(mipmap_info->workgroup_size[2] == 1);
+@@ -146,7 +165,7 @@ main(void)
+    CHECK(mipmap_info->agx3_staging_known);
+    CHECK(mipmap_info->agx3_staging_halfs == 0);
+    CHECK(fnv1a64(mipmap_binary, mipmap_info->binary_size) ==
+-         UINT64_C(0xd412eb7d64cc5c54));
++         UINT64_C(0x02eb67699a97a578));
+    CHECK(memcmp(mipmap_binary + mipmap_info->binary_size -
+                    sizeof(copy_image_end),
+                 copy_image_end, sizeof(copy_image_end)) == 0);
+@@ -171,7 +190,7 @@ main(void)
+    CHECK(odd_mipmap_info->binary_size == 3474);
+    CHECK(odd_mipmap_info->nr_gprs == 36);
+    CHECK(odd_mipmap_info->nr_preamble_gprs == 0);
+-   CHECK(odd_mipmap_info->push_count == 28);
++   CHECK(odd_mipmap_info->push_count == 40);
+    CHECK(odd_mipmap_info->workgroup_size[0] == 32);
+    CHECK(odd_mipmap_info->workgroup_size[1] == 1);
+    CHECK(odd_mipmap_info->workgroup_size[2] == 1);
+@@ -181,7 +200,7 @@ main(void)
+    CHECK(odd_mipmap_info->agx3_staging_known);
+    CHECK(odd_mipmap_info->agx3_staging_halfs == 0);
+    CHECK(fnv1a64(odd_mipmap_binary, odd_mipmap_info->binary_size) ==
+-         UINT64_C(0x1256365ce6cd378b));
++         UINT64_C(0x6945f3c63666667b));
+    CHECK(memcmp(odd_mipmap_binary + odd_mipmap_info->binary_size -
+                    sizeof(copy_image_end),
+                 copy_image_end, sizeof(copy_image_end)) == 0);
+@@ -202,7 +221,7 @@ main(void)
+    CHECK(byte_count_info->binary_size == 332);
+    CHECK(byte_count_info->nr_gprs == 16);
+    CHECK(byte_count_info->nr_preamble_gprs == 0);
+-   CHECK(byte_count_info->push_count == 16);
++   CHECK(byte_count_info->push_count == 28);
+    CHECK(byte_count_info->workgroup_size[0] == 1);
+    CHECK(byte_count_info->workgroup_size[1] == 1);
+    CHECK(byte_count_info->workgroup_size[2] == 1);
+@@ -212,7 +231,7 @@ main(void)
+    CHECK(byte_count_info->agx3_staging_known);
+    CHECK(byte_count_info->agx3_staging_halfs == 0);
+    CHECK(fnv1a64(byte_count_binary, byte_count_info->binary_size) ==
+-         UINT64_C(0xa698ddb6b7dcd46c));
++         UINT64_C(0x0981a4715defd3c2));
+    CHECK(memcmp(byte_count_binary + byte_count_info->binary_size -
+                    sizeof(byte_count_end),
+                 byte_count_end, sizeof(byte_count_end)) == 0);
+@@ -226,12 +245,12 @@ main(void)
+       uint32_t size;
+       uint64_t hash;
+    } robust_index[] = {
+-      {LIBAGX_DRAW_ROBUST_INDEX_0, 3282,
+-       UINT64_C(0x0b9b4afcfff889cc)},
+-      {LIBAGX_DRAW_ROBUST_INDEX_1, 3354,
+-       UINT64_C(0xbfe2ca3f22a5575b)},
+-      {LIBAGX_DRAW_ROBUST_INDEX_2, 3352,
+-       UINT64_C(0xc64c99e36e9c9b95)},
++      {LIBAGX_DRAW_ROBUST_INDEX_0, 3470,
++       UINT64_C(0xb05c70fdd6c4f224)},
++      {LIBAGX_DRAW_ROBUST_INDEX_1, 3586,
++       UINT64_C(0x04595c2f8e9e0974)},
++      {LIBAGX_DRAW_ROBUST_INDEX_2, 3510,
++       UINT64_C(0x6203053d03b24f90)},
+    };
+    static const uint8_t robust_end[] = {0x0e, 0x00, 0x00, 0x00};
+    for (unsigned i = 0; i < ARRAY_SIZE(robust_index); ++i) {
+@@ -257,7 +276,7 @@ main(void)
+       CHECK(robust_info->binary_size == robust_index[i].size);
+       CHECK(robust_info->nr_gprs == 56);
+       CHECK(robust_info->nr_preamble_gprs == 0);
+-      CHECK(robust_info->push_count == 32);
++      CHECK(robust_info->push_count == 44);
+       CHECK(robust_info->workgroup_size[0] == 32);
+       CHECK(robust_info->workgroup_size[1] == 1);
+       CHECK(robust_info->workgroup_size[2] == 1);
+@@ -283,7 +302,7 @@ main(void)
+    CHECK(info->binary_size == sizeof(expected));
+    CHECK(info->nr_gprs == 16);
+    CHECK(info->nr_preamble_gprs == 0);
+-   CHECK(info->push_count == 14);
++   CHECK(info->push_count == 26);
+    CHECK(info->workgroup_size[0] == 32);
+    CHECK(info->workgroup_size[1] == 1);
+    CHECK(info->workgroup_size[2] == 1);
+@@ -311,7 +330,7 @@ main(void)
+    CHECK(xfb_info->main_size == 172);
+    CHECK(xfb_info->binary_size == 172);
+    CHECK(xfb_info->nr_gprs == 12);
+-   CHECK(xfb_info->push_count == 4);
++   CHECK(xfb_info->push_count == 16);
+    CHECK(xfb_info->workgroup_size[0] == 4);
+    CHECK(xfb_info->workgroup_size[1] == 1);
+    CHECK(xfb_info->workgroup_size[2] == 1);
+@@ -340,7 +359,7 @@ main(void)
+    CHECK(ia_info->binary_size == 1364);
+    CHECK(ia_info->nr_gprs == 26);
+    CHECK(ia_info->nr_preamble_gprs == 0);
+-   CHECK(ia_info->push_count == 28);
++   CHECK(ia_info->push_count == 40);
+    CHECK(ia_info->workgroup_size[0] == 1);
+    CHECK(ia_info->workgroup_size[1] == 1);
+    CHECK(ia_info->workgroup_size[2] == 1);
+@@ -350,7 +369,7 @@ main(void)
+    CHECK(ia_info->agx3_staging_known);
+    CHECK(ia_info->agx3_staging_halfs == 0);
+    CHECK(fnv1a64(ia_binary, ia_info->binary_size) ==
+-         UINT64_C(0xccb20ed438e45f04));
++         UINT64_C(0x132f65a0df120431));
+    CHECK(memcmp(ia_binary + ia_info->binary_size - sizeof(end), end,
+                 sizeof(end)) == 0);
+ 
+@@ -372,12 +391,12 @@ main(void)
+       /* The top-level loop has the native guard/entry/exit scopes. Native
+        * descriptor scheduling assigns independent slots and uses per-slot
+        * dependent wait carriers while keeping adjacent producers overlapped. */
+-      {LIBAGX_INCREMENT_IA_RESTART_NONNULL, 128, 2884, 3012, 48, 40,
+-       {1024, 1, 1}, 4, UINT64_C(0x7798f979bfc20f26)},
+-      {LIBAGX_COPY_QUERY, 0, 890, 890, 28, 25, {32, 1, 1}, 0,
+-       UINT64_C(0x28b92f478b1714d4)},
+-      {LIBAGX_INCREMENT_CS_INVOCATIONS, 0, 86, 86, 8, 10, {1, 1, 1}, 0,
+-       UINT64_C(0xd292b1db166dd1e9)},
++      {LIBAGX_INCREMENT_IA_RESTART_NONNULL, 128, 2884, 3012, 48, 52,
++       {1024, 1, 1}, 4, UINT64_C(0x63684eef950d336b)},
++      {LIBAGX_COPY_QUERY, 0, 890, 890, 28, 37, {32, 1, 1}, 0,
++       UINT64_C(0x64a1031992df83e1)},
++      {LIBAGX_INCREMENT_CS_INVOCATIONS, 0, 86, 86, 8, 22, {1, 1, 1}, 0,
++       UINT64_C(0x78a446feaf2e4552)},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(statistics); ++i) {
+       const uint32_t *statistics_blob = libagx_g17p[statistics[i].index];
+@@ -426,8 +445,8 @@ main(void)
+       uint32_t size;
+       uint64_t hash;
+    } predicate[] = {
+-      {LIBAGX_PREDICATE_INDIRECT_0, 642, UINT64_C(0xd312d6837034a3df)},
+-      {LIBAGX_PREDICATE_INDIRECT_1, 784, UINT64_C(0xa7af1ba09fd87252)},
++      {LIBAGX_PREDICATE_INDIRECT_0, 642, UINT64_C(0x4d13544f625d66de)},
++      {LIBAGX_PREDICATE_INDIRECT_1, 784, UINT64_C(0xd82b9078051ecbf3)},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(predicate); ++i) {
+       const uint32_t *predicate_blob = libagx_g17p[predicate[i].index];
+@@ -444,7 +463,7 @@ main(void)
+       CHECK(predicate_info->binary_size == predicate[i].size);
+       CHECK(predicate_info->nr_gprs == 24);
+       CHECK(predicate_info->nr_preamble_gprs == 0);
+-      CHECK(predicate_info->push_count == 14);
++      CHECK(predicate_info->push_count == 26);
+       CHECK(predicate_info->workgroup_size[0] == 32);
+       CHECK(predicate_info->workgroup_size[1] == 1);
+       CHECK(predicate_info->workgroup_size[2] == 1);
+@@ -480,7 +499,7 @@ main(void)
+    CHECK(conditional_info->binary_size == 180);
+    CHECK(conditional_info->nr_gprs == 6);
+    CHECK(conditional_info->nr_preamble_gprs == 0);
+-   CHECK(conditional_info->push_count == 16);
++   CHECK(conditional_info->push_count == 28);
+    CHECK(conditional_info->workgroup_size[0] == 1);
+    CHECK(conditional_info->workgroup_size[1] == 1);
+    CHECK(conditional_info->workgroup_size[2] == 1);
+@@ -490,7 +509,7 @@ main(void)
+    CHECK(conditional_info->agx3_staging_known);
+    CHECK(conditional_info->agx3_staging_halfs == 0);
+    CHECK(fnv1a64(conditional_binary, conditional_info->binary_size) ==
+-         UINT64_C(0x89f7e9a45c600e83));
++         UINT64_C(0x10da7969e9a8236a));
+    CHECK(memcmp(conditional_binary + conditional_info->binary_size -
+                    sizeof(end),
+                 end, sizeof(end)) == 0);
+@@ -504,8 +523,8 @@ main(void)
+     * The Mesa ABI form addresses both pointers from its uniforms, leaving
+     * exactly that load, store and end. */
+    static const uint8_t timestamp_expected[] = {
+-      0x67, 0x00, 0x54, 0x00, 0x01, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00,
+-      0x40, 0x02, 0x00, 0xe7, 0x10, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00,
++      0x67, 0x00, 0x54, 0x00, 0x04, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00,
++      0x40, 0x02, 0x00, 0xe7, 0x10, 0x54, 0x00, 0x03, 0x00, 0x00, 0x00,
+       0x19, 0x00, 0x00, 0x90, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00,
+    };
+    const uint32_t *timestamp_blob = libagx_g17p[LIBAGX_COPY_TIMESTAMP];
+@@ -520,7 +539,7 @@ main(void)
+    CHECK(timestamp_info->binary_size == sizeof(timestamp_expected));
+    CHECK(timestamp_info->nr_gprs == 4);
+    CHECK(timestamp_info->nr_preamble_gprs == 0);
+-   CHECK(timestamp_info->push_count == 8);
++   CHECK(timestamp_info->push_count == 20);
+    CHECK(timestamp_info->workgroup_size[0] == 1);
+    CHECK(timestamp_info->workgroup_size[1] == 1);
+    CHECK(timestamp_info->workgroup_size[2] == 1);
+@@ -549,7 +568,7 @@ main(void)
+    CHECK(factors_info->binary_size == 1496);
+    CHECK(factors_info->nr_gprs == 24);
+    CHECK(factors_info->nr_preamble_gprs == 0);
+-   CHECK(factors_info->push_count == 12);
++   CHECK(factors_info->push_count == 24);
+    CHECK(factors_info->workgroup_size[0] == 32);
+    CHECK(factors_info->workgroup_size[1] == 1);
+    CHECK(factors_info->workgroup_size[2] == 1);
+@@ -559,10 +578,62 @@ main(void)
+    CHECK(factors_info->agx3_staging_known);
+    CHECK(factors_info->agx3_staging_halfs == 0);
+    CHECK(fnv1a64(factors_binary, factors_info->binary_size) ==
+-         UINT64_C(0x0d3d3701f282d673));
++         UINT64_C(0x146c784e634c800b));
+    CHECK(memcmp(factors_binary + factors_info->binary_size - sizeof(end),
+                 end, sizeof(end)) == 0);
+ 
++   /* Pin both forms of each triangle and quad tessellator. Variant 0 stays
++    * entirely in registers. Variant 1 consumes a returned heap-allocation
++    * atomic and exceeds G17P's 192-half register file, so its ordinary spills
++    * begin after the native 16-byte atomic TPS reservation. */
++   const struct {
++      enum libagx_program index;
++      uint32_t main_offset;
++      uint32_t main_size;
++      uint32_t binary_size;
++      uint16_t nr_gprs;
++      uint16_t push_count;
++      uint16_t scratch_size;
++      uint16_t spectpr_scratch_size;
++      uint64_t hash;
++   } tessellators[] = {
++      {LIBAGX_TESS_TRI_0, 0, 1832, 1832, 30, 16, 0, 0,
++       UINT64_C(0x97ebaf3fec6aa659)},
++      {LIBAGX_TESS_TRI_1, 128, 44162, 44290, 192, 24, 68, 16,
++       UINT64_C(0x21ae6571b7e8b2c1)},
++      {LIBAGX_TESS_QUAD_0, 0, 2584, 2584, 36, 16, 0, 0,
++       UINT64_C(0xe57b6f263500a379)},
++      {LIBAGX_TESS_QUAD_1, 128, 43192, 43320, 192, 24, 120, 16,
++       UINT64_C(0xb9bcd095d5f78c9c)},
++   };
++   for (unsigned i = 0; i < ARRAY_SIZE(tessellators); ++i) {
++      const uint32_t *blob = libagx_g17p[tessellators[i].index];
++      CHECK(blob != NULL);
++      if (!blob)
++         continue;
++
++      const struct agx_precompiled_kernel_info *info = (const void *)blob;
++      const uint8_t *binary = (const uint8_t *)blob + sizeof(*info);
++      CHECK(info->preamble_offset == 0);
++      CHECK(info->main_offset == tessellators[i].main_offset);
++      CHECK(info->main_size == tessellators[i].main_size);
++      CHECK(info->binary_size == tessellators[i].binary_size);
++      CHECK(info->nr_gprs == tessellators[i].nr_gprs);
++      CHECK(info->nr_preamble_gprs == 0);
++      CHECK(info->push_count == tessellators[i].push_count);
++      CHECK(info->workgroup_size[0] == 64);
++      CHECK(info->workgroup_size[1] == 1);
++      CHECK(info->workgroup_size[2] == 1);
++      CHECK(info->scratch_size == tessellators[i].scratch_size);
++      CHECK(info->agx3_spectpr_scratch_size ==
++            tessellators[i].spectpr_scratch_size);
++      CHECK(info->agx3_staging_known);
++      CHECK(info->agx3_staging_halfs == 0);
++      CHECK(fnv1a64(binary, info->binary_size) == tessellators[i].hash);
++      CHECK(memcmp(binary + info->binary_size - sizeof(end), end,
++                   sizeof(end)) == 0);
++   }
++
+    if (failures) {
+       fprintf(stderr, "g17p-precompiled-fill: %u/%u checks failed\n",
+               failures, checks);
+diff --git a/src/gallium/drivers/asahi/agx_disk_cache.c b/src/gallium/drivers/asahi/agx_disk_cache.c
+index 8522d3a630c..af6cf1f398e 100644
+--- a/src/gallium/drivers/asahi/agx_disk_cache.c
++++ b/src/gallium/drivers/asahi/agx_disk_cache.c
+@@ -65,6 +65,7 @@ write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
+                     sizeof(binary->attrib_components_read));
+    blob_write_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
+    blob_write_uint8(blob, binary->g17p_texture_resources);
++   blob_write_uint8(blob, binary->g17p_storage_write);
+    blob_write_uint8(blob, binary->g17p_custom_border_emulation);
+    blob_write_uint32(blob, binary->push_range_count);
+    blob_write_bytes(blob, binary->push,
+@@ -124,6 +125,7 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
+                    sizeof(binary->attrib_components_read));
+    blob_copy_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
+    binary->g17p_texture_resources = blob_read_uint8(blob);
++   binary->g17p_storage_write = blob_read_uint8(blob);
+    binary->g17p_custom_border_emulation = blob_read_uint8(blob);
+    binary->push_range_count = blob_read_uint32(blob);
+    blob_copy_bytes(blob, binary->push,
+diff --git a/src/gallium/drivers/asahi/agx_state.c b/src/gallium/drivers/asahi/agx_state.c
+index aeb605f5d48..8f1dc0c6546 100644
+--- a/src/gallium/drivers/asahi/agx_state.c
++++ b/src/gallium/drivers/asahi/agx_state.c
+@@ -68,6 +68,13 @@
+ #include "util/u_upload_mgr.h"
+ #include "agx_bg_eot.h"
+ #include "agx_bo.h"
++
++/* EXP-G1b's native access::write argument is a resolved PBE pointer followed
++ * by this 32-byte control record. This is the same captured record used by
++ * Honeykrisp's G17P compute storage path. */
++static const uint8_t agx_g17p_native_write_control[32] = {
++   0x08, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
++};
+ #include "agx_device.h"
+ #include "agx_disk_cache.h"
+ #include "agx_linker.h"
+@@ -1338,7 +1345,8 @@ static bool
+ agx_batch_upload_pbe(struct agx_batch *batch,
+                      struct agx_gallium_pbe_descriptor *out,
+                      struct pipe_image_view *view, bool block_access,
+-                     bool arrays_as_2d, bool force_2d_array, bool emrt)
++                     bool arrays_as_2d, bool force_2d_array, bool emrt,
++                     bool native_storage_write)
+ {
+    struct agx_device *dev = agx_device(batch->ctx->base.screen);
+    const enum agx_descriptor_generation descriptor_generation =
+@@ -1489,15 +1497,15 @@ agx_batch_upload_pbe(struct agx_batch *batch,
+        *
+        * Only libagx_image_texel_address() and libagx_buffer_texel_address()
+        * ever read it, and both agx_unpack() the 24-byte AGX2 packet, so
+-       * neither can read an AGX3 descriptor at all. A block-access image is
+-       * addressed by the hardware and never consults them, so on AGX3 the
+-       * sideband would be bits with no Gen9/Gen10 home. Leave it out there;
+-       * every other AGX3 descriptor that would carry one stays refused by
+-       * agx_gallium_pack_native_pbe(), which is the honest answer until that
+-       * ABI is recovered.
++       * neither can read an AGX3 descriptor at all. Block-access images and
++       * the bounded native write-only storage path are addressed by hardware
++       * and never consult them, so on AGX3 the sideband would be bits with no
++       * Gen9/Gen10 home. Leave it out only for those proven consumers; every
++       * other AGX3 descriptor that would carry one stays refused by
++       * agx_gallium_pack_native_pbe().
+        */
+       const bool sideband_has_no_reader =
+-         block_access &&
++         (block_access || native_storage_write) &&
+          agx_gallium_descriptor_generation_is_agx3(descriptor_generation);
+ 
+       if (!cfg.extended && (tex->layout.writeable_image || emrt) &&
+@@ -1718,7 +1726,8 @@ static struct agx_compiled_shader *
+ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
+                 struct util_debug_callback *debug, mesa_shader_stage stage,
+                 bool internal_kernel, bool terminal, bool secondary,
+-                unsigned cf_base, BITSET_WORD *attrib_components_read)
++                unsigned cf_base, unsigned nr_samples,
++                BITSET_WORD *attrib_components_read)
+ {
+    struct agx_compiled_shader *compiled = CALLOC_STRUCT(agx_compiled_shader);
+    compiled->stage = stage;
+@@ -1727,6 +1736,11 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
+ 
+    struct agx_shader_key key = {
+       .dev = agx_gather_device_key(dev),
++      /* G17P depth/stencil writeout builds a distinct native coverage word at
++       * one versus several rasterization samples.  The NIR lowering already
++       * specializes fragment epilogs to this count; keep the backend key in
++       * lockstep so it emits the matching depthf sequence. */
++      .fs.nr_samples = nr_samples,
+       .has_scratch = !secondary,
+       /* Apple's G17P constant-colour fragment keeps literals in the main
+        * program (the byte-exact fs-flat-colour compiler ratchet covers that
+@@ -1758,6 +1772,9 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
+    if (internal_kernel) {
+       key.reserved_preamble = 8;
+    } else if (!secondary) {
++      compiled->g17p_storage_write =
++         dev->chip == AGX_CHIP_G17P && stage == MESA_SHADER_COMPUTE &&
++         agx_nir_lower_g17p_gallium_storage_write(nir, 1);
+       const enum agx_descriptor_generation descriptor_generation =
+          agx_gallium_descriptor_generation(dev->chip);
+       const unsigned texture_descriptor_size =
+@@ -1773,9 +1790,11 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
+          (BITSET_LAST_BIT(nir->info.textures_used) != 0 ||
+           BITSET_LAST_BIT(nir->info.images_used) != 0);
+       const unsigned uniform_base =
+-         compiled->g17p_texture_resources
+-            ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
+-            : 0;
++         compiled->g17p_storage_write
++            ? AGX_G17P_STORAGE_ROOT_HALFS
++            : compiled->g17p_texture_resources
++                 ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
++                 : 0;
+       NIR_PASS(_, nir, agx_nir_layout_uniforms, compiled,
+                &key.reserved_preamble, uniform_base);
+    }
+@@ -1821,7 +1840,8 @@ static struct agx_compiled_shader *
+ agx_build_meta_shader_internal(struct agx_context *ctx,
+                                meta_shader_builder_t builder, void *data,
+                                size_t data_size, bool prolog, bool epilog,
+-                               unsigned cf_base, bool internal_kernel);
++                               unsigned cf_base, unsigned nr_samples,
++                               bool internal_kernel);
+ 
+ /* Does not take ownership of key. Clones if necessary. */
+ static struct agx_compiled_shader *
+@@ -1987,7 +2007,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+ 
+    struct agx_compiled_shader *compiled = agx_compile_nir(
+       dev, nir, &pctx->debug, so->type, false, so->type != MESA_SHADER_FRAGMENT,
+-      false, 0, attrib_components_read);
++      false, 0, so->type == MESA_SHADER_FRAGMENT ? key_->fs.nr_samples : 0,
++      attrib_components_read);
+    compiled->g17p_custom_border_emulation = custom_borders;
+ 
+    if (so->type == MESA_SHADER_FRAGMENT) {
+@@ -2005,14 +2026,14 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+    /* Compile auxiliary programs */
+    if (gs_count) {
+       compiled->gs_count = agx_compile_nir(
+-         dev, gs_count, &pctx->debug, so->type, false, true, false, 0, NULL);
++         dev, gs_count, &pctx->debug, so->type, false, true, false, 0, 0, NULL);
+       compiled->gs_count->so = so;
+    }
+ 
+    if (pre_gs) {
+       compiled->pre_gs =
+          agx_compile_nir(dev, pre_gs, &pctx->debug, MESA_SHADER_COMPUTE, false,
+-                         true, false, 0, NULL);
++                         true, false, 0, 0, NULL);
+    }
+ 
+    if (gs_copy) {
+@@ -2033,7 +2054,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+ 
+       compiled->gs_copy =
+          agx_compile_nir(dev, gs_copy, &pctx->debug, MESA_SHADER_GEOMETRY,
+-                         false, true, false, 0, NULL);
++                         false, true, false, 0, 0, NULL);
+       compiled->gs_copy->so = so;
+       compiled->gs_copy->stage = so->type;
+       compiled->gs_copy->uvs = uvs;
+@@ -2676,14 +2697,15 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
+    if (so->type == MESA_SHADER_FRAGMENT) {
+       prolog = agx_build_meta_shader_internal(
+          ctx, build_fs_prolog, &key->prolog.fs, sizeof(key->prolog.fs), true,
+-         false, key->prolog.fs.cf_base, false);
++         false, key->prolog.fs.cf_base, 0, false);
+ 
+       epilog = agx_build_meta_shader_internal(
+          ctx,
+          agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P
+             ? build_g17p_fs_epilog
+             : agx_nir_fs_epilog,
+-         &key->epilog.fs, sizeof(key->epilog.fs), false, true, 0, false);
++         &key->epilog.fs, sizeof(key->epilog.fs), false, true, 0,
++         key->epilog.fs.nr_samples, false);
+ 
+    } else if (so->type == MESA_SHADER_TESS_EVAL) {
+       /* No prolog/epilog needed */
+@@ -2697,7 +2719,7 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
+ 
+       prolog = agx_build_meta_shader_internal(
+          ctx, agx_nir_vs_prolog, &key->prolog.vs, sizeof(key->prolog.vs), true,
+-         false, 0, false);
++         false, 0, 0, false);
+    }
+ 
+    /* A refused prolog or epilog is just as fatal as a refused main: the
+@@ -3250,7 +3272,8 @@ static struct agx_compiled_shader *
+ agx_build_meta_shader_internal(struct agx_context *ctx,
+                                meta_shader_builder_t builder, void *data,
+                                size_t data_size, bool prolog, bool epilog,
+-                               unsigned cf_base, bool internal_kernel)
++                               unsigned cf_base, unsigned nr_samples,
++                               bool internal_kernel)
+ {
+    /* Build the meta shader key */
+    size_t total_key_size = sizeof(struct agx_generic_meta_key) + data_size;
+@@ -3286,7 +3309,7 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
+       dev, b.shader, NULL, MESA_SHADER_COMPUTE, internal_kernel,
+       !prolog && !(b.shader->info.stage == MESA_SHADER_FRAGMENT &&
+                    b.shader->info.fs.uses_sample_shading),
+-      prolog || epilog, cf_base, NULL);
++      prolog || epilog, cf_base, nr_samples, NULL);
+ 
+    ralloc_free(b.shader);
+ 
+@@ -3306,7 +3329,7 @@ agx_build_meta_shader(struct agx_context *ctx, meta_shader_builder_t builder,
+                       void *data, size_t data_size)
+ {
+    return agx_build_meta_shader_internal(ctx, builder, data, data_size, false,
+-                                         false, 0, false);
++                                         false, 0, 0, false);
+ }
+ 
+ static unsigned
+@@ -3412,7 +3435,8 @@ agx_upload_spilled_rt_descriptors(void *out, struct agx_batch *batch,
+                             &sampler_view))
+          agx_native_descriptor_rejected(dev, "spilled-RT texture");
+ 
+-      if (!agx_batch_upload_pbe(batch, pbe, &view, false, false, true, true))
++      if (!agx_batch_upload_pbe(batch, pbe, &view, false, false, true, true,
++                                false))
+          agx_native_descriptor_rejected(dev, "spilled-RT PBE");
+    }
+ }
+@@ -3516,7 +3540,9 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
+                             &sampler_view))
+          agx_native_descriptor_rejected(dev, "storage texture");
+ 
+-      if (!agx_batch_upload_pbe(batch, pbe, view, false, false, false, false))
++      const bool native_storage_write = cs->g17p_storage_write && i == 0;
++      if (!agx_batch_upload_pbe(batch, pbe, view, false, false, false, false,
++                                native_storage_write))
+          agx_native_descriptor_rejected(dev, "storage PBE");
+    }
+ 
+@@ -4304,6 +4330,11 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
+          .uniform_ranges = ranges,
+          .uniform_range_count = range_count,
+          .shader_binary_size = cs->info.main_size,
++         /* AGX3 spills are static COPY/RLD accesses to the per-thread TPS
++          * frame announced by SPECTPR. They do not use the legacy helper
++          * allocator carried in drm_asahi_cmd_compute. */
++         .scratch_size = MAX2(cs->info.scratch_size,
++                              cs->info.agx3_spectpr_scratch_size),
+          .nr_gprs = cs->info.nr_gprs,
+          .compiler_d_valid = cs->info.agx3_staging_known,
+          .compiler_d = (uint32_t)cs->info.agx3_staging_halfs * 2,
+@@ -4616,7 +4647,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
+             struct agx_gallium_pbe_descriptor *argument =
+                agx_pbe_descriptor_at(pbe.cpu, descriptor_size, pbe_index++);
+             if (!agx_batch_upload_pbe(batch, argument, &view, true, true,
+-                                      false, no_compress))
++                                      false, no_compress, false))
+                agx_native_descriptor_rejected(dev, "end-of-tile PBE");
+          }
+ 
+@@ -4851,7 +4882,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
+ 
+          bool no_compress = batch->feedback & (PIPE_CLEAR_COLOR0 << rt);
+          if (!agx_batch_upload_pbe(batch, pbe.cpu, &view, true, true, false,
+-                                   no_compress))
++                                   no_compress, false))
+             agx_native_descriptor_rejected(dev, "end-of-tile PBE");
+ 
+          agx_usc_pack(&b, TEXTURE, cfg) {
+@@ -7644,24 +7675,46 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
+       if (resource_pair) {
+          if (!cs->g17p_texture_resources ||
+              !batch->stage_uniforms[stage].texture_base ||
+-             !batch->samplers[stage] ||
+-             batch->ctx->stage[stage].custom_borders)
++             (!cs->g17p_storage_write &&
++              (!batch->samplers[stage] ||
++               batch->ctx->stage[stage].custom_borders)))
+             agx_native_descriptor_rejected(dev,
+                                            "compute texture resources");
+ 
+-         const uint64_t pointers[2] = {
+-            batch->stage_uniforms[stage].texture_base,
+-            batch->samplers[stage],
+-         };
++         uint64_t pointers[4] = {0};
++         unsigned pointer_halfs = AGX_ABI_G17P_TEXTURE_POINTER_HALFS;
++         if (cs->g17p_storage_write) {
++            const unsigned descriptor_size =
++               agx_gallium_texture_descriptor_size(
++                  agx_gallium_descriptor_generation(dev->chip));
++            const uint64_t write_control = agx_pool_upload_aligned(
++               &batch->pool, agx_g17p_native_write_control,
++               sizeof(agx_g17p_native_write_control), 32);
++            if (!descriptor_size || !write_control)
++               agx_native_descriptor_rejected(dev,
++                                              "compute storage resources");
++
++            /* This lowering accepts exactly image unit 0 with no sampled
++             * textures, whose paired PBE is descriptor 1. State 0 therefore
++             * receives that resolved descriptor and the native write control
++             * directly, matching Honeykrisp's write-only ABI. */
++            pointers[0] = batch->stage_uniforms[stage].texture_base +
++                          descriptor_size;
++            pointers[1] = write_control;
++            pointer_halfs = AGX_G17P_STORAGE_ROOT_HALFS;
++         } else {
++            pointers[0] = batch->stage_uniforms[stage].texture_base;
++            pointers[1] = batch->samplers[stage];
++         }
+          const uint64_t pointer_va = agx_pool_upload_aligned(
+-            &batch->pool, pointers, sizeof(pointers), 8);
++            &batch->pool, pointers, pointer_halfs * 2, 8);
+          if (!pointer_va)
+             agx_native_descriptor_rejected(dev,
+                                            "compute texture pointers");
+ 
+          ranges[range_count++] = (struct agx3_ioto_uniform_range){
+             .start_halfs = 0,
+-            .size_halfs = AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
++            .size_halfs = pointer_halfs,
+             .address = pointer_va,
+          };
+       } else if (cs->g17p_texture_resources) {
+@@ -7924,7 +7977,7 @@ agx_decompress_inplace(struct agx_batch *batch, struct pipe_surface *surf,
+                          surf->format, &sampler_view))
+       agx_native_descriptor_rejected(dev, "decompression texture");
+    if (!agx_batch_upload_pbe(batch, &native_pbe, &view, false, true, true,
+-                             true))
++                             true, false))
+       agx_native_descriptor_rejected(dev, "decompression PBE");
+    memcpy(&img->compressed, &native_texture, AGX_TEXTURE_LENGTH);
+    memcpy(&img->uncompressed, &native_pbe, AGX_PBE_LENGTH);
+diff --git a/src/gallium/drivers/asahi/agx_state.h b/src/gallium/drivers/asahi/agx_state.h
+index a77ad18ffff..a9f2cbffbd0 100644
+--- a/src/gallium/drivers/asahi/agx_state.h
++++ b/src/gallium/drivers/asahi/agx_state.h
+@@ -256,6 +256,10 @@ struct agx_compiled_shader {
+     * native texture and sampler table pointers when they access resources. */
+    bool g17p_texture_resources;
+ 
++   /* Exact G17P compute write-only image protocol: PBE pointer and native
++    * write-control record occupy uniform halves 0..15. */
++   bool g17p_storage_write;
++
+    /* The variant contains Honeykrisp-style custom-border emulation. */
+    bool g17p_custom_border_emulation;
+ 
+diff --git a/src/gallium/drivers/asahi/meson.build b/src/gallium/drivers/asahi/meson.build
+index cb4f084bc6f..fcd79e7c12a 100644
+--- a/src/gallium/drivers/asahi/meson.build
++++ b/src/gallium/drivers/asahi/meson.build
+@@ -91,7 +91,8 @@ if with_tests and with_tools.contains('drm-shim')
+     ],
+     link_with : [
+       libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+-      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
++      libasahi_layout, libasahi_decode, libagx3b_disasm, libgallium,
++      libgalliumvl_stub,
+     ],
+     build_by_default : false,
+   )
+diff --git a/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c b/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c
+index 9922ad0ec6c..8d5130cce8d 100644
+--- a/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c
++++ b/src/gallium/drivers/asahi/tests/test-agx-g17p-blit.c
+@@ -48,6 +48,7 @@
+ 
+ #include "asahi/compiler/agx_compile.h"
+ #include "asahi/genxml/agx_pack.h"
++#include "asahi/isa/disasm.h"
+ #include "compiler/nir/nir_builder.h"
+ #include "compiler/nir/nir_xfb_info.h"
+ #include "compiler/glsl_types.h"
+@@ -583,6 +584,85 @@ check_msaa_depth_blit(struct pipe_context *pctx, unsigned samples)
+    return ok;
+ }
+ 
++static unsigned
++count_g17p_depth_writes(const struct agx_linked_shader *linked)
++{
++   if (!linked || !linked->bo || !linked->size)
++      return 0;
++
++   FILE *out = tmpfile();
++   if (!out)
++      return 0;
++
++   uint8_t *code = (uint8_t *)agx_bo_map(linked->bo) + linked->entry_offset;
++   agx3b_disassemble(code, linked->size, out);
++   rewind(out);
++
++   unsigned writes = 0;
++   char line[512];
++   while (fgets(line, sizeof(line), out))
++      writes += strstr(line, "depthf") != NULL;
++
++   fclose(out);
++   return writes;
++}
++
++/* A single-sample depth source is replicated to every destination sample by
++ * one pixel-rate blit draw.  Its fragment epilog therefore needs one native
++ * depthf write per destination sample.  This catches a mismatch between the
++ * sample count used to lower the epilog NIR and the count passed to the AGX3
++ * backend: the resulting program still encodes, but a 1x depthf leaves a
++ * multisample destination untouched on hardware. */
++static bool
++check_depth_replication_blit(struct pipe_context *pctx, unsigned samples)
++{
++   struct pipe_screen *screen = pctx->screen;
++   struct agx_context *ctx = agx_context(pctx);
++   struct pipe_resource templ = {
++      .target = PIPE_TEXTURE_2D,
++      .format = PIPE_FORMAT_Z32_FLOAT,
++      .width0 = 32,
++      .height0 = 32,
++      .depth0 = 1,
++      .array_size = 1,
++      .last_level = 0,
++      .nr_samples = 1,
++      .nr_storage_samples = 1,
++      .usage = PIPE_USAGE_DEFAULT,
++      .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW,
++   };
++   struct pipe_resource *src = screen->resource_create(screen, &templ);
++   templ.nr_samples = templ.nr_storage_samples = samples;
++   struct pipe_resource *dst = screen->resource_create(screen, &templ);
++   if (!src || !dst) {
++      fprintf(stderr, "depth replication: %ux target unsupported\n", samples);
++      pipe_resource_reference(&src, NULL);
++      pipe_resource_reference(&dst, NULL);
++      return true;
++   }
++
++   const struct pipe_blit_info info = {
++      .src = {.resource = src,
++              .format = PIPE_FORMAT_Z32_FLOAT,
++              .box = {.width = 32, .height = 32, .depth = 1}},
++      .dst = {.resource = dst,
++              .format = PIPE_FORMAT_Z32_FLOAT,
++              .box = {.width = 32, .height = 32, .depth = 1}},
++      .mask = PIPE_MASK_Z,
++      .filter = PIPE_TEX_FILTER_NEAREST,
++   };
++
++   pctx->blit(pctx, &info);
++   const unsigned writes = count_g17p_depth_writes(ctx->linked.fs);
++   const bool ok = writes == samples;
++   printf("depth replication: 1x to %ux emitted %u depth writes (%s)\n",
++          samples, writes, ok ? "correct" : "expected one per sample");
++
++   pipe_resource_reference(&src, NULL);
++   pipe_resource_reference(&dst, NULL);
++   return ok;
++}
++
+ /* KHR-GL30.framebuffer_blit.scissor_blit blits into a framebuffer holding a
+  * colour texture and a depth texture, under a scissor that covers exactly one
+  * tile, and the tile comes back zeroed. Build that shape through the shim --
+@@ -1218,6 +1298,10 @@ main(void)
+    if (!check_msaa_depth_blit(pctx, 2) || !check_msaa_depth_blit(pctx, 4))
+       return 1;
+ 
++   if (!check_depth_replication_blit(pctx, 2) ||
++       !check_depth_replication_blit(pctx, 4))
++      return 1;
++
+    if (!check_scissored_blit(pctx))
+       return 1;
+ 

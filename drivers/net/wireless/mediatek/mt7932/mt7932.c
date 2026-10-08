@@ -35,6 +35,19 @@ static int mt_initialize(struct mt7932 *m);
 static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 static void mt_shutdown(struct pci_dev *pdev);
 
+static bool batch_rx = true;
+module_param(batch_rx, bool, 0644);
+MODULE_PARM_DESC(batch_rx, "Batch runtime RX refill doorbells (disable for comparison)");
+static unsigned int rx_batch_limit = 16;
+module_param(rx_batch_limit, uint, 0644);
+MODULE_PARM_DESC(rx_batch_limit, "Runtime RX refill batch size (1..32, default 16)");
+static unsigned int rx_data_ring_entries = 512;
+module_param(rx_data_ring_entries, uint, 0444);
+MODULE_PARM_DESC(rx_data_ring_entries, "RX2/RX7 entries: 256, 512 (default), or 1024");
+static unsigned int tx_data_ring_entries = 512;
+module_param(tx_data_ring_entries, uint, 0444);
+MODULE_PARM_DESC(tx_data_ring_entries, "TX0 entries: 256 or 512 (default)");
+
 static bool legacy_irq_test;
 module_param(legacy_irq_test, bool, 0444);
 MODULE_PARM_DESC(legacy_irq_test, "Explicit diagnostic use of standard PCI INTx instead of MSI");
@@ -151,6 +164,32 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		return;
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
+	/* Private 25G83 arEventTable entry 31: EIDf0 -> nicEventAssertDump.
+	 * Keep the default path unchanged. Never print opaque dump contents.
+	 * An assert is not a DMA fence or a successful command completion.
+	 */
+	if (event.eid == 0xf0 && m->bw_limit > 20) {
+		if (!m->fw_asserted) {
+			mt_bw_latch(m, "firmware-assert-EIDf0");
+			m->fw_asserted = true;
+			m->link_failed = true;
+			m->cal_state.error = -EIO;
+			m->connect_error = -EIO;
+			WRITE_ONCE(m->rf_ready, false);
+			if (m->netdev) {
+				netif_stop_queue(m->netdev);
+				netif_carrier_off(m->netdev);
+			}
+			complete(&m->response);
+			complete(&m->cal_response);
+			complete(&m->assoc_update);
+			complete(&m->assoc_done);
+			complete(&m->discovery_done);
+			dev_err(&m->pdev->dev,
+				"BW_FIRMWARE_ASSERT: EIDf0; 20 MHz latched, DMA retained; crash reset unavailable, reboot with mt7932_fullmac.max_bw_mhz=20\n");
+		}
+		goto unlock;
+	}
 	if (event.eid == 0xee) {
 		mt_link_event(m, &event);
 		goto unlock;
@@ -164,9 +203,14 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		goto unlock;
 	}
 	if (event.eid == 0xd6) {
+		bool terminal = m->bw_cal_active && m->cal_state.active &&
+			m->cal_state.expected == 1 && !m->cal_state.received;
+
 		ret = mt7932_cal_null(&m->cal_state, packet + 36,
 				     event.length >= 36 ? event.length - 36 : 0,
 				     m->smart_version);
+		if (terminal && ret == -EREMOTEIO)
+			m->bw_cal_rejected = true;
 		dev_info(&m->pdev->dev, "CAL_EVENT: seq=%u length=%zu result=%d credits=%u/%u\n",
 			 event.seq, event.length, ret, m->cal_state.received, m->cal_state.expected);
 		if (ret)
@@ -205,7 +249,8 @@ unlock:
 
 static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 {
-	unsigned int budget = q->count;
+	unsigned int budget = q->count, pending = 0, drained = 0;
+	unsigned int limit = clamp_val(READ_ONCE(rx_batch_limit), 1, 32);
 
 	while (budget--) {
 		u32 ctrl = le32_to_cpu(READ_ONCE(q->desc[q->tail].control));
@@ -213,6 +258,8 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 
 		if (!(ctrl & DONE))
 			break;
+		m->rx_descriptors++;
+		drained++;
 		dma_rmb();
 		length = (ctrl >> 16) & 0x3fff;
 		if (length <= MT7932_RX_CAPACITY && (ctrl & BIT(30)))
@@ -235,9 +282,27 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		mt_rx_post(q, m->runtime_epoch ? q->tail : q->head);
 		q->head = (q->head + 1) % q->count;
 		q->tail = (q->tail + 1) % q->count;
+		pending++;
+		/* Keep the download protocol unchanged. Runtime batches are smaller
+		 * than the smallest ring, so a full wrap never hides returned slots.
+		 */
+		if (!m->runtime_epoch || !READ_ONCE(batch_rx) || pending == limit) {
+			dma_wmb();
+			mt_write(m, q->reg + 8, m->runtime_epoch ?
+				 (q->head + q->count - 1) % q->count : q->head);
+			m->rx_doorbells++;
+			pending = 0;
+		}
+	}
+	if (pending) {
 		dma_wmb();
-		mt_write(m, q->reg + 8,
-			 m->runtime_epoch ? (q->head + q->count - 1) % q->count : q->head);
+		mt_write(m, q->reg + 8, (q->head + q->count - 1) % q->count);
+		m->rx_doorbells++;
+	}
+	if (mt_perf_enabled()) {
+		m->perf_rx_drain_max = max(m->perf_rx_drain_max, (u64)drained);
+		if (drained == q->count)
+			m->perf_rx_drain_full++;
 	}
 }
 
@@ -258,6 +323,11 @@ static void mt_service(struct mt7932 *m)
 	u32 causes = mt_read(m, W + 0x200) & m->irq_mask;
 	unsigned int i;
 
+	/* Acknowledge the snapshot before draining. A completion arriving after
+	 * its ring was visited must leave a new cause pending for the next IRQ.
+	 * Clearing the old snapshot after draining can erase that notification.
+	 */
+	mt_write(m, W + 0x200, causes);
 	mt_data_clean(m);
 	for (i = 0; i < ARRAY_SIZE(m->rx); i++)
 		if (m->rx[i].count)
@@ -267,7 +337,6 @@ static void mt_service(struct mt7932 *m)
 
 		mt_write(m, W + 0x1f0, sw);
 	}
-	mt_write(m, W + 0x200, causes);
 	if (READ_ONCE(m->running) && !poll_test)
 		mt_write(m, W + 0x204, m->irq_mask);
 }
@@ -275,9 +344,17 @@ static void mt_service(struct mt7932 *m)
 static irqreturn_t mt_irq_thread(int irq, void *data)
 {
 	struct mt7932 *m = data;
+	u64 start = 0, elapsed;
 
+	if (mt_perf_enabled())
+		start = ktime_get_ns();
 	m->interrupts++;
 	mt_service(m);
+	if (mt_perf_enabled()) {
+		elapsed = ktime_get_ns() - start;
+		m->perf_irq_ns += elapsed;
+		m->perf_irq_max_ns = max(m->perf_irq_max_ns, elapsed);
+	}
 	return IRQ_HANDLED;
 }
 
@@ -327,6 +404,8 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 	unsigned long flags;
 	int ret;
 
+	if (READ_ONCE(m->fw_asserted))
+		return -EIO;
 	if (q->used >= q->slots) {
 		/* Command buffers can wrap only after every published descriptor has
 		 * retired. Never reclaim by elapsed time or by a reply alone.
@@ -364,6 +443,8 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 			ret = -ETIMEDOUT;
 		}
 	}
+	if (READ_ONCE(m->fw_asserted))
+		ret = -EIO;
 	if (ret == -ETIMEDOUT) {
 		/* Diagnostic only: never turn a polled late reply into IRQ success. */
 		unsigned int i;
@@ -453,6 +534,19 @@ static int mt_dma_setup(struct mt7932 *m)
 	unsigned int i, j;
 	int ret;
 	u32 glo;
+	unsigned int rx_data_entries = READ_ONCE(rx_data_ring_entries);
+	unsigned int tx_data_entries = READ_ONCE(tx_data_ring_entries);
+
+	if (rx_data_entries != 256 && rx_data_entries != 512 && rx_data_entries != 1024) {
+		dev_warn(&m->pdev->dev, "invalid RX data ring size %u, using 512\n",
+			 rx_data_entries);
+		rx_data_entries = 512;
+	}
+	if (tx_data_entries != 256 && tx_data_entries != 512) {
+		dev_warn(&m->pdev->dev, "invalid TX data ring size %u, using 512\n",
+			 tx_data_entries);
+		tx_data_entries = 512;
+	}
 
 	mt_write(m, W + 0x204, 0);
 	mt_write(m, 0x10188, poll_test ? 0 : 0xff);
@@ -486,14 +580,17 @@ static int mt_dma_setup(struct mt7932 *m)
 	for (i = 0; i < ARRAY_SIZE(m->tx); i++) {
 		if (i == 15)
 			continue;
-		ret = mt_ring_alloc(m, &m->tx[i], i, false, i < 15 ? 512 : i == 16 ? 256 : i == 17 ? 24 : 16);
+		ret = mt_ring_alloc(m, &m->tx[i], i, false,
+				    i == 0 ? tx_data_entries :
+				    i < 15 ? 512 : i == 16 ? 256 : i == 17 ? 24 : 16);
 		if (ret)
 			return ret;
 	}
 	for (i = 0; i < ARRAY_SIZE(m->rx); i++) {
 		if (!rx_counts[i])
 			continue;
-		ret = mt_ring_alloc(m, &m->rx[i], i, true, rx_counts[i]);
+		ret = mt_ring_alloc(m, &m->rx[i], i, true,
+				    (i == 2 || i == 7) ? rx_data_entries : rx_counts[i]);
 		if (ret)
 			return ret;
 	}
@@ -1065,6 +1162,7 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	init_completion(&m->cal_response);
 	mutex_init(&m->command_mutex);
 	spin_lock_init(&m->response_lock);
+	mt_perf_init(m);
 	ret = mt_ownership(m);
 	if (ret)
 		goto retain;
@@ -1072,10 +1170,12 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = pci_alloc_irq_vectors(pdev, 1, 1, legacy_irq_test ? PCI_IRQ_INTX : PCI_IRQ_ALL_TYPES);
 	if (ret < 0)
 		goto retain;
+	m->irq_vectors_allocated = true;
 	ret = devm_request_threaded_irq(&pdev->dev, pci_irq_vector(pdev, 0),
 					mt_irq, mt_irq_thread, IRQF_ONESHOT | IRQF_SHARED, "mt7932", m);
 	if (ret)
 		goto retain;
+	m->irq_requested = true;
 	{
 		struct irq_data *irq = irq_get_irq_data(pci_irq_vector(pdev, 0));
 		unsigned int cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
@@ -1098,10 +1198,12 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				 irq->chip->name, irq->hwirq);
 	}
 	ret = mt_initialize(m);
+	if (!ret)
+		m->initialized = true;
 retain:
 	if (ret)
-		dev_err(&pdev->dev, "initialization failed: %d; retaining DMA storage until reboot\n", ret);
-	/* Built-in only and no unbind: an uncertain device must not DMA into freed RAM. */
+		dev_err(&pdev->dev, "initialization failed: %d; DMA storage retained while bound\n", ret);
+	/* A failed epoch retains its DMA storage until the device is removed. */
 	return 0;
 }
 
@@ -1115,6 +1217,121 @@ static void mt_shutdown(struct pci_dev *pdev)
 	/* Storage remains allocated through reset, even if the engine is stuck. */
 }
 
+static void mt_remove(struct pci_dev *pdev)
+{
+	struct mt7932 *m = pci_get_drvdata(pdev);
+	bool dma_active;
+	int ret = 0;
+
+	/* Close cfg80211 admission first, while responses and DMA are available
+	 * to retire the connection.  No work may use the netdev or wiphy after
+	 * their storage is released.
+	 */
+	WRITE_ONCE(m->removing, true);
+	WRITE_ONCE(m->interface_registered, false);
+	if (m->wiphy)
+		cancel_work_sync(&m->startup_work);
+	if (m->netdev)
+		unregister_netdev(m->netdev);
+	dma_active = READ_ONCE(m->running);
+	if (m->irq_requested) {
+		WRITE_ONCE(m->running, false);
+		mt_write(m, W + 0x204, 0);
+		synchronize_irq(pci_irq_vector(pdev, 0));
+	}
+	if (m->wiphy)
+		cancel_work_sync(&m->startup_work);
+	if (m->netdev) {
+		cancel_delayed_work_sync(&m->scan_timeout_work);
+		cancel_work_sync(&m->scan_finish_work);
+		cancel_work_sync(&m->cal_work);
+		cancel_work_sync(&m->connect_work);
+		cancel_work_sync(&m->disconnect_work);
+		free_netdev(m->netdev);
+		m->netdev = NULL;
+	}
+	if (m->wiphy) {
+		wiphy_unregister(m->wiphy);
+		wiphy_free(m->wiphy);
+		m->wiphy = NULL;
+	}
+	/* Stop new DMA at the engine, then revoke bus mastering before the
+	 * device-managed ring allocations are released.  Even a failed idle
+	 * poll must never leave the old descriptors PCI-accessible.
+	 */
+	if (dma_active) {
+		mt_rmw(m, W + 0x208, BIT(0) | BIT(2), 0);
+		ret = mt_poll(m, W + 0x208, BIT(1) | BIT(3), 0, 100000);
+		if (!pci_wait_for_pending_transaction(pdev))
+			dev_warn(&pdev->dev, "pending PCI transaction during remove\n");
+	}
+	pci_clear_master(pdev);
+	if (ret)
+		dev_warn(&pdev->dev, "DMA idle timeout during remove: %d; bus mastering disabled\n", ret);
+	if (m->irq_requested)
+		devm_free_irq(&pdev->dev, pci_irq_vector(pdev, 0), m);
+	if (m->irq_vectors_allocated)
+		pci_free_irq_vectors(pdev);
+}
+
+static int __maybe_unused mt_suspend(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mt7932 *m = pci_get_drvdata(pdev);
+	int ret;
+
+	/* The firmware and its DMA rings have no restartable epoch.  Save the
+	 * configuration here so pci_pm_suspend_noirq() leaves this function and
+	 * its upstream bridge in D0 during s2idle.  wiphy_suspend() has already
+	 * retired the association; retain the firmware and ring storage.
+	 */
+	ret = pci_save_state(pdev);
+	if (ret)
+		return ret;
+	if (!m->irq_requested)
+		return 0;
+	m->suspend_running = READ_ONCE(m->running);
+
+	/*
+	 * mt_irq() reads W + 0x200 to decide whether the interrupt is ours.
+	 * That read is fatal once the device has left D0: this platform reports
+	 * it as an asynchronous SError rather than returning all-ones, and an
+	 * SError panics the kernel.  Measured 2026-09-21 -- a devices-level
+	 * pm_test cycle aborted on apple-pmp-v2 returning -EBUSY and then died
+	 * in mt_irq() during the resume rollback with "SError Interrupt on CPU0,
+	 * code 0xbe000000", taking the machine with it.
+	 *
+	 * Silence the source while the device is still in D0, then stop the
+	 * handler entirely; disable_irq() also waits for the threaded half to
+	 * finish, so nothing is left in flight across the transition.
+	 */
+	WRITE_ONCE(m->running, false);
+	mt_write(m, W + 0x204, 0);
+	disable_irq(pci_irq_vector(pdev, 0));
+	dev_info(dev, "SUSPEND_D0: firmware and DMA retained\n");
+	return 0;
+}
+
+static int __maybe_unused mt_resume(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mt7932 *m = pci_get_drvdata(pdev);
+
+	if (!m->irq_requested)
+		return 0;
+	/* Drain completions accumulated while masked before IRQ delivery resumes.
+	 * The PCI core restores the saved configuration on the rollback path too.
+	 */
+	WRITE_ONCE(m->running, m->suspend_running);
+	if (m->initialized && m->suspend_running)
+		mt_service(m);
+	enable_irq(pci_irq_vector(pdev, 0));
+	dev_info(dev, "RESUME_D0: firmware and DMA retained\n");
+	return 0;
+}
+
+static SIMPLE_DEV_PM_OPS(mt_pm_ops, mt_suspend, mt_resume);
+
 static const struct pci_device_id mt_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7932) },
 	{}
@@ -1124,8 +1341,10 @@ static struct pci_driver mt_driver = {
 	.name = "mt7932-fullmac",
 	.id_table = mt_ids,
 	.probe = mt_probe,
+	.remove = mt_remove,
 	.shutdown = mt_shutdown,
 	.driver.suppress_bind_attrs = true,
+	.driver.pm = &mt_pm_ops,
 };
 module_pci_driver(mt_driver);
 MODULE_LICENSE("GPL");

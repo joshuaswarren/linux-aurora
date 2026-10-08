@@ -14,85 +14,79 @@
 #include <linux/pm_runtime.h>
 #include <linux/iommu.h>
 #include <linux/reset.h>
+#include <linux/delay.h>
 
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 
 #include "avd.h"
+#include "avd-inst.h"
 #include "avd-regs.h"
 
-void fill_rvra(struct avd_rvra *rvra, enum avd_image_fmt image_fmt,
-		u32 width, u32 height)
+static void calc_tile_meta(u32 w, u32 h, u32 bpb, u32 tile_dim,
+			   u32 meta_hdr_bytes, u32 *tile, u32 *meta)
 {
-	u32 size0, size1, size2;
-	u32 hs = round_up(height, 32);
+	u32 tiles_width, tiles_height, meta_tile_w, meta_tile_h, tile_bytes;
+	tiles_width = DIV_ROUND_UP(w, tile_dim);
+	tiles_height = DIV_ROUND_UP(h, tile_dim);
+	tile_bytes = tile_dim * tile_dim * DIV_ROUND_UP(bpb, 8);
+	*tile = ALIGN(tiles_width * tiles_height * tile_bytes, 16);
 
-	size0 = (width * hs) + ((width * hs) / 4);
-	size2 = size0;
+	meta_tile_w = roundup_pow_of_two(tiles_width);
+	meta_tile_h = roundup_pow_of_two(tiles_height);
 
-	switch (image_fmt) {
-	case AVD_IMG_FMT_420_8BIT:
-	case AVD_IMG_FMT_420_10BIT:
-		size2 /= 2;
-		break;
-	default:
-		break;
-	}
-
-	size1 = max((roundup_pow_of_two(width) * roundup_pow_of_two(height)) / 32,
-			 0x100u);
-	/* TODO: how big? */
-
-	rvra->size = round_up(size0 + size1 + size2, 0x4000);
-	rvra->size +=
-		(width < 1000 ? 0 : width < 1800 ? 2 : width < 3800 ? 3 : 9) * 0x4000;
-	/* TODO */
-	rvra->size +=
-		(height < 1000 ? 0 : height < 1800 ? 2 : height < 3800 ? 3 : 9) * 0x4000;
-
-	rvra->offsets[1] = 0;
-	rvra->offsets[0] = size0;
-	rvra->offsets[3] = size0 + size1;
-	rvra->offsets[2] = size0 + size1 + size2;
+	*meta = ALIGN(meta_tile_w * meta_tile_h * meta_hdr_bytes, 16);
 }
 
+void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt, u32 width,
+	       u32 height)
+{
+	u32 y_meta, y, uv_meta, uv;
+	int bit_depth;
 
-int alloc_slots(struct avd_dev *avd, struct avd_ctx *ctx, enum avd_codec codec) {
-	u32 free;
-	u32 offset = 0;
-	for (int i = 0; i < codec; i++)
-		offset += avd->variant->vp_slots[i];
-	if (avd->variant->vp_slot_base[codec])
-		offset = avd->variant->vp_slot_base[codec];
-
-	free = find_next_zero_bit(&avd->vp_slots,
-			offset + avd->variant->vp_slots[codec],
-			offset);
-
-	if (free >= offset + avd->variant->vp_slots[codec])
-		return -ENOMEM;
-
-	set_bit(free, &avd->vp_slots);
-	ctx->vp_slot = free;
-
-	ctx->fifo_idx = find_first_zero_bit(&avd->inst_fifo_slots,
-			avd->variant->fifo_slots);
-
-	if (WARN_ON(ctx->fifo_idx >= avd->variant->fifo_slots)) {
-		clear_bit(free, &avd->vp_slots);
-		return -ENOMEM;
+	switch (image_fmt) {
+	case AVD_IMG_FMT_420_10BIT:
+	case AVD_IMG_FMT_422_10BIT:
+		bit_depth = 10;
+		break;
+	default:
+		bit_depth = 8;
+		break;
 	}
-	set_bit(ctx->fifo_idx,  &avd->inst_fifo_slots);
 
-	return 0;
+	/* y has 32x32 tiles and 32 bytes of metadata per tile */
+	calc_tile_meta(width, height, bit_depth, 32, 32, &y, &y_meta);
+	/* uv has 16x16 tiles and 8 bytes of metadata per tile; 4:2:2 chroma is full height */
+	calc_tile_meta(width / 2,
+		       (image_fmt == AVD_IMG_FMT_422_8BIT ||
+			image_fmt == AVD_IMG_FMT_422_10BIT) ? height : height / 2,
+		       bit_depth * 2, 16, 8, &uv, &uv_meta);
+
+	/* output like DCP driver expects */
+	comp->offsets[0] = y;
+	comp->offsets[1] = 0;
+	comp->offsets[2] = y + y_meta + uv;
+	comp->offsets[3] = y + y_meta;
+
+	comp->size = y_meta + y + uv_meta + uv;
 }
 
 int avd_buf_alloc(struct avd_dev *avd, struct avd_buf *buf, size_t size)
 {
+	/* Keep size equal to the payload length used by the H.264 slice path. */
+	avd_buf_free(avd, buf);
+
+	if (size <= 0)
+		return -ENOMEM;
+
 	buf->size = size;
 	buf->cpu =
 		dma_alloc_coherent(avd->dev, buf->size, &buf->addr, GFP_KERNEL);
-	return buf->cpu ? 0 : -ENOMEM;
+	if (!buf->cpu) {
+		memset(buf, 0, sizeof(*buf));
+		return -ENOMEM;
+	}
+	return 0;
 }
 
 void avd_buf_free(struct avd_dev *avd, struct avd_buf *buf)
@@ -120,12 +114,112 @@ avd_get_ref_buf(struct avd_ctx *ctx, struct vb2_v4l2_buffer *dst, u64 timestamp)
 	return vb2_to_avd_decoded_buf(buf);
 }
 
+static int avd_wait_submission_queue(struct avd_ctx *ctx, int vp)
+{
+	struct avd_dev *avd = ctx->dev;
+	u32 max = readl_relaxed(avd->ctrl +
+				avd->variant->submit_queue_max_offset + vp * 4);
+	u32 cur = readl_relaxed(
+		avd->ctrl + avd->variant->submit_queue_status_offset + vp * 4);
+
+	if (cur == max) {
+		dev_err(avd->dev, "instruction que full! %d/%d", cur, max);
+		return 1;
+	}
+
+	if (cur >= max / 2) {
+		/* TODO: to high? low? Has weird side effects??? */
+		usleep_range(100, 150);
+	}
+	return 0;
+}
+
+int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
+{
+	int ret = 0;
+	struct avd_job *job = &ctx->job;
+
+	job->codec = codec;
+	job->num = 0;
+	/* A table that was built but never submitted still belongs to us. */
+	kvfree(job->segments);
+	job->segments = kvcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
+	if (!job->segments)
+		ret = -ENOMEM;
+	return ret;
+}
+
+int avd_submit_job(struct avd_ctx *ctx)
+{
+	struct avd_dev *avd = ctx->dev;
+	struct avd_job *sub = &ctx->job;
+	struct avd_segment *segments, *seg;
+	unsigned long flags;
+	size_t num;
+	int i, idx = 0, vp = 0;
+	void __iomem *reg;
+	u32 exec_mask = sub->codec == AVD_CODEC_VP9 &&
+					avd->variant->revision == 3 ?
+				AVD_OP_EXEC_REV3_VP9_MASK :
+				0;
+	u32 exec_rev_flag =
+		AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
+		AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3);
+
+	ctx->fifo_idx = 0;
+	for (i = 0; i < sub->codec; i++)
+		vp += avd->variant->vp_slots[i];
+	if (avd->variant->vp_slot_base[sub->codec])
+		vp = avd->variant->vp_slot_base[sub->codec];
+
+	/*
+	 * avd_device_run() keeps this job from being finished (and the next one
+	 * from starting) until it returns, and arms the watchdog itself once the
+	 * job belongs to the hardware. Still walk a local copy of the table.
+	 */
+	segments = sub->segments;
+	num = sub->num;
+	if (WARN_ON_ONCE(!segments))
+		return -EINVAL;
+
+	avd->variant->configure_stream(avd, ctx->inst.addr, ctx->fifo_idx, vp);
+	reg = avd->ctrl + avd->variant->vp_slot_offset + vp * 4;
+
+	/* the first segment is always the header (needs special handling) */
+
+	writel(AVD_OP_EXEC | exec_mask | exec_rev_flag |
+		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx),
+	       reg);
+	seg = &segments[idx++];
+	for (i = 0; i < seg->num; i++)
+		writel(seg->instructions[i], reg);
+	for (; idx <= num; idx++) {
+		seg = &segments[idx];
+		for (i = 0; i < seg->num; i++)
+			writel(seg->instructions[i], reg);
+		if (sub->codec == AVD_CODEC_HEVC &&
+		    avd_wait_submission_queue(ctx, vp))
+			break;
+		if (idx == num) {
+			/* A completion from here on belongs to this job. */
+			spin_lock_irqsave(&avd->job_lock, flags);
+			avd->job_end_sent = true;
+			spin_unlock_irqrestore(&avd->job_lock, flags);
+		}
+		writel(AVD_OP_EXEC | exec_mask |
+			       AVD_OP_EXEC_FLAG_END(idx == num),
+		       reg);
+	}
+
+	if (sub->segments == segments)
+		sub->segments = NULL;
+	kvfree(segments);
+	return 0;
+}
 
 static int avd_reset(struct avd_dev *avd)
 {
 	int ret = 0;
-	avd->vp_slots = 0;
-	avd->inst_fifo_slots = 0;
 
 	ret = pm_runtime_resume_and_get(avd->dev);
 	if (ret < 0)
@@ -153,6 +247,8 @@ static void avd_watchdog_func(struct work_struct *work)
 {
 	struct avd_dev *avd;
 	struct avd_ctx *ctx;
+	unsigned long flags;
+	bool claimed;
 	int ret;
 	ctx = container_of(to_delayed_work(work), struct avd_ctx,
 			   watchdog_work);
@@ -161,12 +257,23 @@ static void avd_watchdog_func(struct work_struct *work)
 
 	avd = ctx->dev;
 
-	dev_err(avd->dev, "Frame processing timed out! Vp: %d (%02d)",
-		ctx->vp_slot, ctx->fifo_idx);
-	avd_status(avd, ctx->vp_slot);
+	/*
+	 * Time out only the job this watchdog was armed for, and only while the
+	 * hardware still owns it. Otherwise that job already finished, and
+	 * resetting the hardware would break whichever job is running now.
+	 */
+	spin_lock_irqsave(&avd->job_lock, flags);
+	claimed = avd->job_ctx == ctx && avd->job_seq == ctx->wd_seq &&
+		  avd->job_state == AVD_JOB_SUBMITTED;
+	if (claimed)
+		avd->job_state = AVD_JOB_FINISHING;
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+	dev_dbg(avd->dev, "avd-job: watchdog seq %llu: %s\n", ctx->wd_seq,
+		claimed ? "timeout" : "stale, ignored");
+	if (!claimed)
+		return;
 
-	free_vp_slot(avd, ctx);
-	free_inst_slot(avd, ctx);
+	dev_err(avd->dev, "Frame processing timed out!");
 
 	writel(0, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
 	ret = avd_reset(avd);
@@ -182,6 +289,8 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 	struct avd_ctx *ctx = v4l2_m2m_get_curr_priv(avd->m2m_dev);
 
 	enum vb2_buffer_state state;
+	unsigned long flags;
+	bool finish = false, stale = false;
 	u32 status;
 	if (!ctx)
 		return IRQ_HANDLED;
@@ -199,24 +308,44 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 	if (status & 0x1000) {
 		/* pp is done ! we are done */
 		state = VB2_BUF_STATE_DONE;
-
-		free_inst_slot(avd, ctx);
 	} else if (status & 0x100) {
-		free_vp_slot(avd, ctx);
 		/* a vp is done, kick the pp and hope for the best */
 		if(ctx->coded_fmt_desc->ops->submit)
 			ctx->coded_fmt_desc->ops->submit(ctx);
-
 		goto done;
 	} else {
-		dev_err(avd->dev, "H%d %02d error", status, ctx->fifo_idx);
+		dev_err(avd->dev, "H%d error", status);
 		/* let watchdog handle */
 		goto done;
 	}
 
-	/* if the watchdog_work has run the work has already been submitted */
-	if (cancel_delayed_work(&ctx->watchdog_work))
+	/*
+	 * Finish only a job the hardware owns. While avd_device_run() is still
+	 * setting up or submitting, a completion is left over from an older job
+	 * unless this job's END command already went out; then remember it and
+	 * let avd_device_run() finish the job when it returns.
+	 */
+	spin_lock_irqsave(&avd->job_lock, flags);
+	if (avd->job_ctx != ctx) {
+		stale = true;
+	} else if (avd->job_state == AVD_JOB_SUBMITTED) {
+		avd->job_state = AVD_JOB_FINISHING;
+		finish = true;
+	} else if (avd->job_state == AVD_JOB_RUNNING && avd->job_end_sent) {
+		avd->job_pending = true;
+		avd->job_pending_result = state;
+	} else {
+		stale = true;
+	}
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+	dev_dbg(avd->dev, "avd-job: irq %#x: %s\n", status,
+		finish ? "finish" : stale ? "stale, ignored" : "pending");
+	if (stale)
+		dev_warn_ratelimited(avd->dev, "ignoring stale completion");
+	if (finish) {
+		cancel_delayed_work(&ctx->watchdog_work);
 		avd_job_finish(ctx, state);
+	}
 
 done:
 	return IRQ_HANDLED;
@@ -227,10 +356,22 @@ static void avd_device_run(void *priv)
 	struct avd_ctx *ctx = priv;
 	struct avd_dev *avd = ctx->dev;
 	const struct avd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
+	enum vb2_buffer_state result = VB2_BUF_STATE_ERROR;
+	const char *outcome = "already finished";
+	unsigned long flags;
+	bool finish = false;
+	u64 seq;
 	int ret;
 
 	if (WARN_ON(!desc))
 		return;
+
+	/*
+	 * IRQ completion cannot wait for an already running watchdog. Drain it
+	 * here, before reusing wd_seq, so an old callback cannot time out this
+	 * context's next job. device_run is sleepable; hold no job_lock here.
+	 */
+	cancel_delayed_work_sync(&ctx->watchdog_work);
 
 	ret = pm_runtime_resume_and_get(avd->dev);
 	if (ret < 0) {
@@ -238,9 +379,51 @@ static void avd_device_run(void *priv)
 		return;
 	}
 
+	/*
+	 * While the job is RUNNING neither completion IRQs nor the watchdog may
+	 * finish it: v4l2-mem2mem would start the next job on a kworker while
+	 * this one still builds and submits ctx->job.
+	 */
+	spin_lock_irqsave(&avd->job_lock, flags);
+	seq = ++avd->job_seq;
+	avd->job_ctx = ctx;
+	avd->job_state = AVD_JOB_RUNNING;
+	avd->job_end_sent = false;
+	avd->job_pending = false;
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+	dev_dbg(avd->dev, "avd-job: run seq %llu\n", seq);
+
 	ret = desc->ops->run(ctx);
-	if (ret)
+	if (ret) {
+		dev_dbg(avd->dev, "avd-job: run seq %llu failed: %d\n", seq, ret);
 		avd_job_finish(ctx, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
+	/*
+	 * The run either finished the job itself (held capture buffer) or handed
+	 * it to the hardware: arm the watchdog, or finish right away if the
+	 * completion already arrived.
+	 */
+	spin_lock_irqsave(&avd->job_lock, flags);
+	if (avd->job_seq == seq && avd->job_state == AVD_JOB_RUNNING) {
+		if (avd->job_pending) {
+			avd->job_state = AVD_JOB_FINISHING;
+			result = avd->job_pending_result;
+			finish = true;
+			outcome = "completed during submission";
+		} else {
+			avd->job_state = AVD_JOB_SUBMITTED;
+			ctx->wd_seq = seq;
+			schedule_delayed_work(&ctx->watchdog_work, msecs_to_jiffies(2000));
+			outcome = "submitted";
+		}
+	}
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+	dev_dbg(avd->dev, "avd-job: run seq %llu: %s\n", seq, outcome);
+
+	if (finish)
+		avd_job_finish(ctx, result);
 }
 
 static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
@@ -262,6 +445,7 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	src_vq->lock = &ctx->dev->vdev_lock;
 	src_vq->dev = ctx->dev->v4l2_dev.dev;
 	src_vq->supports_requests = true;
+	src_vq->allow_cache_hints = true;
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)
@@ -269,7 +453,7 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 
 	dst_vq->bidirectional = true;
 	dst_vq->mem_ops = &vb2_dma_contig_memops;
-	dst_vq->dma_attrs = DMA_ATTR_NO_KERNEL_MAPPING;
+	dst_vq->dma_attrs = 0;
 	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->drv_priv = ctx;
@@ -278,6 +462,7 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->dev->vdev_lock;
 	dst_vq->dev = ctx->dev->v4l2_dev.dev;
+	dst_vq->allow_cache_hints = true;
 
 	return vb2_queue_init(dst_vq);
 }
@@ -293,6 +478,10 @@ static int avd_open(struct file *filp)
 		return -ENOMEM;
 
 	ctx->dev = avd;
+
+	ret = avd_buf_alloc(avd, &ctx->inst, fifo_size());
+	if (ret)
+		goto err_free_ctx;
 
 	INIT_DELAYED_WORK(&ctx->watchdog_work, avd_watchdog_func);
 
@@ -319,6 +508,7 @@ err_cleanup_m2m_ctx:
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 
 err_free_ctx:
+	avd_buf_free(avd, &ctx->inst);
 	kfree(ctx);
 	return ret;
 }
@@ -329,8 +519,12 @@ static int avd_release(struct file *filp)
 
 	v4l2_fh_del(&ctx->fh, filp);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+	/* The job has finished; its watchdog must not run on the freed ctx. */
+	cancel_delayed_work_sync(&ctx->watchdog_work);
 	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
 	v4l2_fh_exit(&ctx->fh);
+	avd_buf_free(ctx->dev, &ctx->inst);
+	kvfree(ctx->job.segments);
 	kfree(ctx);
 
 	return 0;
@@ -561,6 +755,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
 static const struct avd_variant avd_t8132_variant = {
@@ -634,6 +829,7 @@ static int avd_probe(struct platform_device *pdev)
 	avd->pdev = pdev;
 
 	mutex_init(&avd->vdev_lock);
+	spin_lock_init(&avd->job_lock);
 
 	match = of_match_node(avd_of_match, pdev->dev.of_node);
 	avd->variant = match->data;
@@ -716,7 +912,7 @@ static void avd_remove(struct platform_device *pdev)
 	pm_runtime_dont_use_autosuspend(avd->dev);
 }
 
-static int avd_runtime_resume(struct device *dev)
+static __maybe_unused int avd_runtime_resume(struct device *dev)
 {
 	int ret;
 	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
@@ -727,7 +923,7 @@ static int avd_runtime_resume(struct device *dev)
 	return ret;
 }
 
-static int avd_runtime_suspend(struct device *dev)
+static __maybe_unused int avd_runtime_suspend(struct device *dev)
 {
 	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile real close/cancel/lease logic; published or ambiguous owners survive."""
 from pathlib import Path
+from g17_compute_inflight_test_support import completion_mod, queue_limits_mock
 import subprocess
 import tempfile
 
@@ -40,19 +41,23 @@ impl Manager {
 ''' + item('g17_manager.rs', 'pub(crate) fn cancel_unpublished_compute_queue(') + r'''
 }
 struct Previous {_context:Arc<Context>,_binding:Option<Binding>,publication:Option<()>}
-struct Queue {owner:Option<u64>,queue:G17PSksmQueue,active:Option<()>,quarantined:bool,
+''' + completion_mod() + queue_limits_mock() + r'''
+type Inflight=g17_completion::PairFifo<(),{g17_queue_limits::MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize}>;
+struct Queue {owner:Option<u64>,queue:G17PSksmQueue,inflight:Inflight,quarantined:bool,
  previous_binding:Option<Previous>,binding:Option<Binding>,context:Option<Arc<Context>>,
  released:bool,retired_by_teardown:bool,retirement_ready:bool}
 struct Runtime {async_compute_queues:Vec<Queue>,manager:Option<Manager>}
 impl Runtime {
-''' + item('g17_async_compute.rs', 'pub(crate) fn release_async_compute_queue(') + r'''
+ // recovery-leak witness (tested in test_g17_async_retirement.py): no queue here is quarantined.
+ fn release_firmware_retired_quarantined_compute_nested(&mut self,_reason:&'static str){}
+''' + item('g17_async_compute.rs', 'fn drop_unpublished_compute_queue(') + item('g17_async_compute.rs', 'pub(crate) fn release_async_compute_queue(') + r'''
 }
 fn runtime()->Runtime{Runtime{async_compute_queues:vec![],manager:Some(Manager{channel_ids:ChannelTable::new()})}}
 fn add(r:&mut Runtime,id:u64,drops:&Arc<AtomicUsize>)->Lease{
  let lease=r.manager.as_mut().unwrap().channel_ids.acquire(ChannelId(id),Engine::Compute,None).unwrap();
  r.async_compute_queues.push(Queue{owner:Some(id),queue:G17PSksmQueue{channel_lease:lease,
   hardware_state:G17PSksmQueueHardwareState::PreparedMemory,submission_ordinal:0},
-  active:None,quarantined:false,previous_binding:None,binding:Some(Binding(drops.clone())),
+  inflight:Inflight::new(),quarantined:false,previous_binding:None,binding:Some(Binding(drops.clone())),
   context:Some(Arc::new(Context)),released:false,retired_by_teardown:false,
   retirement_ready:false});lease
 }
@@ -77,7 +82,7 @@ fn add(r:&mut Runtime,id:u64,drops:&Arc<AtomicUsize>)->Lease{
  for state in 0..5 {
   let mut r=runtime();let drops=Arc::new(AtomicUsize::new(0));let lease=add(&mut r,1,&drops);
   let q=&mut r.async_compute_queues[0];
-  match state {0=>q.active=Some(()),1=>q.quarantined=true,
+  match state {0=>{let _=q.inflight.push(());},1=>q.quarantined=true,
    2=>q.previous_binding=Some(Previous{_context:Arc::new(Context),_binding:None,publication:Some(())}),
    3=>q.queue.hardware_state=G17PSksmQueueHardwareState::HardwareRegistered,
    _=>q.queue.submission_ordinal=1}

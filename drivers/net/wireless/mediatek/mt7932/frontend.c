@@ -306,7 +306,7 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	dev_info(&m->pdev->dev, "SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
 		 request->n_channels, request->n_ssids, request->ie_len, request->flags,
 		 request->duration, request->duration_mandatory);
-	if (!request->n_channels || request->n_channels > 17 || request->ie_len > 600 ||
+	if (!request->n_channels || request->n_channels > MT7932_CHANNELS || request->ie_len > 600 ||
 	    request->duration_mandatory ||
 	    (request->flags & ~(NL80211_SCAN_FLAG_FLUSH | NL80211_SCAN_FLAG_COLOCATED_6GHZ)) || request->n_ssids > 1 ||
 	    (request->n_ssids && request->ssids[0].ssid_len > 32))
@@ -464,6 +464,7 @@ int mt_register_interface(struct mt7932 *m)
 	m->wdev.netdev = netdev;
 	netdev->ieee80211_ptr = &m->wdev;
 	netdev->netdev_ops = &mt_net_ops;
+	netdev->ethtool_ops = &mt_ethtool_ops;
 	netdev->min_mtu = ETH_MIN_MTU;
 	netdev->max_mtu = ETH_DATA_LEN;
 	SET_NETDEV_DEV(netdev, &m->pdev->dev);
@@ -474,7 +475,7 @@ int mt_register_interface(struct mt7932 *m)
 	INIT_WORK(&m->cal_work, mt_cal_work);
 	INIT_WORK(&m->connect_work, mt_connect_work);
 	INIT_WORK(&m->disconnect_work, mt_disconnect_work);
-	init_completion(&m->assoc_start);
+	init_completion(&m->assoc_update);
 	init_completion(&m->assoc_done);
 	init_completion(&m->disconnect_done);
 	init_completion(&m->discovery_done);
@@ -482,8 +483,21 @@ int mt_register_interface(struct mt7932 *m)
 	m->peer_alloc = BIT(0) | BIT(19);
 	INIT_DELAYED_WORK(&m->scan_timeout_work, mt_scan_timeout_work);
 	m->netdev = netdev;
+	if (mt_gro_enabled()) {
+		ret = gro_cells_init(&m->gro_cells, netdev);
+		if (ret) {
+			m->netdev = NULL;
+			free_netdev(netdev);
+			return ret;
+		}
+		m->gro_cells_ready = true;
+	}
 	ret = register_netdev(netdev);
 	if (ret) {
+		if (m->gro_cells_ready) {
+			gro_cells_destroy(&m->gro_cells);
+			m->gro_cells_ready = false;
+		}
 		m->netdev = NULL;
 		free_netdev(netdev);
 		return ret;
@@ -515,9 +529,14 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 	struct cfg80211_bss *bss;
 	struct ieee80211_channel *channel;
 	unsigned int band;
+	int signal;
 	int ret = mt7932_rx_frame(packet, length, &frame);
 
-	if (ret || !READ_ONCE(m->rf_ready))
+	if (ret) {
+		m->rx_parse_errors++;
+		return;
+	}
+	if (!READ_ONCE(m->rf_ready))
 		return;
 	band = mt7932_channel_band(frame.channel);
 	channel = ieee80211_get_channel(m->wiphy, band == 1 ? 2407 + 5 * frame.channel : 5000 + 5 * frame.channel);
@@ -529,9 +548,11 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 	}
 	if (!frame.signal_valid || !mt7932_rx_beacon(&frame))
 		return;
+	signal = mt7932_rx_signal(&frame, m->antenna_mask);
+	mt_signal_update(m, &frame, signal);
 	bss = cfg80211_inform_bss_frame(m->wiphy, channel,
 				      (struct ieee80211_mgmt *)frame.data, frame.length,
-				      mt7932_rx_signal(&frame, m->antenna_mask) * 100, GFP_ATOMIC);
+				      signal * 100, GFP_ATOMIC);
 	if (bss) {
 		m->beacons++;
 		dev_dbg_ratelimited(&m->pdev->dev, "BSS_RECEIVED: channel=%u BSSID=%pM\n", frame.channel, bss->bssid);

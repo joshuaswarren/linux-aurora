@@ -43,6 +43,8 @@ def main():
                         help="Enable a separately SHA-pinned local numerical test")
     parser.add_argument("--resume-overlay", action="store_true",
                         help="Build a separately named overlay module for an already held power node")
+    parser.add_argument("--allow-unqualified-kernel", action="store_true",
+                        help="Build for another prepared kernel; requires new hardware qualification")
     args = parser.parse_args()
     compatible = fdtget(args.base_dtb, "/", "compatible").split()
     if "apple,j700" not in compatible or "apple,t8140" not in compatible:
@@ -57,7 +59,7 @@ def main():
     if fdtget(args.base_dtb, aic, "#interrupt-cells", "u") != "3" or not phandle:
         parser.error("unexpected AIC binding")
     config = (args.kernel_build / ".config").read_bytes()
-    if hashlib.sha256(config).hexdigest() != "5a2435c69452b1b88a33816de58aa843e64ce09c6992b0e0ce08129fb40cad32":
+    if not args.allow_unqualified_kernel and hashlib.sha256(config).hexdigest() != "5a2435c69452b1b88a33816de58aa843e64ce09c6992b0e0ce08129fb40cad32":
         parser.error("not the qualified Linux 7.1.6-aurora-neo-gpu1 kernel configuration")
     args.output.mkdir(parents=True, exist_ok=False)
     driver = args.source_root / "drivers/soc/apple"
@@ -129,9 +131,10 @@ def main():
     subprocess.run(["make", "-C", str(source), f"O={args.kernel_build.resolve()}",
                     "LLVM=1", "ARCH=arm64", "W=1", f"M={args.output.resolve()}",
                     f"MO={args.output.resolve()}", "modules", "-j2"], check=True)
+    expected_release = (args.kernel_build / "include/config/kernel.release").read_text().strip()
     for name in ("apple-ane-bringup.ko", "apple-ane-fw-test.ko", f"{overlay_name}.ko"):
         vermagic = subprocess.check_output(["modinfo", "-F", "vermagic", str(args.output / name)], text=True)
-        if vermagic.split()[0] != "7.1.6-aurora-neo-gpu1":
+        if vermagic.split()[0] != expected_release:
             raise ValueError("test module does not match the target kernel release")
     manifest = {"kernel_config_sha256": hashlib.sha256(config).hexdigest(),
                 "base_dtb_sha256": hashlib.sha256(args.base_dtb.read_bytes()).hexdigest(),

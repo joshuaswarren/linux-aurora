@@ -82,6 +82,10 @@ description: |
   - iPhone 8 Plus
   - iPhone X
 
+  Devices based on the "A18 Pro" SoC:
+
+  - MacBook Neo (A18 Pro, 2026)
+
   Devices based on the "M1" SoC:
 
   - Mac mini (M1, 2020)
@@ -102,10 +106,6 @@ description: |
   - MacBook Air (15-inch, M3, 2024)
   - MacBook Pro (14-inch, M3, 2023)
   - iMac (24-inch, M3, 2023)
-
-  Device based on the "A18 Pro" SoC:
-
-  - MacBook Neo
 
   Devices based on the "M1 Pro", "M1 Max" and "M1 Ultra" SoCs:
 
@@ -295,6 +295,13 @@ properties:
           - const: apple,t8015
           - const: apple,arm-platform
 
+      - description: Apple A18 Pro SoC based platforms
+        items:
+          - enum:
+              - apple,j700  # MacBook Neo (A18 Pro, 2026)
+          - const: apple,t8140
+          - const: apple,arm-platform
+
       - description: Apple M1 SoC based platforms
         items:
           - enum:
@@ -343,12 +350,6 @@ properties:
         items:
           - const: apple,j873g # Mac mini (M6)
           - const: apple,t8152
-          - const: apple,arm-platform
-
-      - description: Apple A18 Pro SoC based platforms
-        items:
-          - const: apple,j700 # MacBook Neo
-          - const: apple,t8140
           - const: apple,arm-platform
 
       - description: Apple M1 Pro SoC based platforms

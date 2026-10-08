@@ -14,10 +14,10 @@
 #ifndef AVD_H_
 #define AVD_H_
 
-#include "linux/bitmap.h"
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
 #include <linux/iommu.h>
+#include <linux/spinlock.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -32,10 +32,20 @@
 /* Shifts addreses right and bytesperline?? */
 #define AVD_QUIRK_LSR	BIT(0)
 #define AVD_QUIRK_NO_PIPE_STATE	 BIT(1)
+/* HEVC DMA configuration and extended scratch-address table. */
+#define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
 
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
 
+/*
+ * AVD needs most addresses to be aligned to 256
+ * the only exception are the compressed buffers, they are aligned to 128
+ * instead
+ */
+#define AVD_ALIGN	256
+/* hevc, with a b slice where all references are active and weights are sent */
+#define AVD_MAX_INST	512
 
 struct avd_ctx;
 struct avd_dev;
@@ -53,6 +63,11 @@ struct avd_run {
 		struct vb2_v4l2_buffer *src; /* OUTPUT coded */
 		struct vb2_v4l2_buffer *dst; /* CAPTURE decoded */
 	} bufs;
+
+	dma_addr_t coded_in;
+	dma_addr_t y_out;
+	dma_addr_t uv_out;
+	dma_addr_t comp_out;
 };
 
 struct avd_ctrl_desc {
@@ -75,9 +90,13 @@ struct avd_av1_decoded_buffer_info {
 	/* Info needed when the decoded frame serves as a reference frame. */
 	unsigned short width;
 	unsigned short height;
+	unsigned short upscaled_width;
 	unsigned int bit_depth : 4;
+	enum v4l2_av1_frame_type frame_type;
 	u32 order_hints[V4L2_AV1_TOTAL_REFS_PER_FRAME];
 	u8 ref_frame_idx[V4L2_AV1_REFS_PER_FRAME];
+	bool intrabc;
+	size_t color_size;
 };
 
 struct avd_hevc_decoded_buffer_info {
@@ -85,25 +104,28 @@ struct avd_hevc_decoded_buffer_info {
 	bool is_intra;
 };
 
-
-struct avd_rvra {
-	u32 offsets[4]; /* sizes or offsets */
+struct avd_comp {
 	u32 size;
+	/* offset to start of compressed data */
+	size_t start_offset;
+	/* relative offsets to start */
+	u32 offsets[4];
 };
 
-/* TODO: change and use this */
 struct avd_decoded_buffer {
 	/* Must be the first field in this struct. */
 	struct v4l2_m2m_buffer base;
 
-	struct avd_rvra rvra;
+	struct avd_comp comp;
+	/* Pending CPU fill, retained with the buffer until dequeue. */
+	size_t grey_chroma_offset;
+	bool grey_chroma_10bit;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
 		struct avd_hevc_decoded_buffer_info hevc;
 		struct avd_av1_decoded_buffer_info av1;
 	};
-
 };
 
 static inline struct avd_decoded_buffer *
@@ -111,6 +133,7 @@ vb2_to_avd_decoded_buf(struct vb2_buffer *buf)
 {
 	return container_of(buf, struct avd_decoded_buffer, base.vb.vb2_buf);
 }
+
 struct avd_decoded_buffer *
 avd_get_ref_buf(struct avd_ctx *ctx, struct vb2_v4l2_buffer *dst, u64 timestamp);
 
@@ -170,6 +193,14 @@ struct avd_variant {
 	unsigned int quirks;
 };
 
+/* Lifecycle of the one m2m job the device runs at a time. */
+enum avd_job_state {
+	AVD_JOB_IDLE,
+	AVD_JOB_RUNNING,	/* inside avd_device_run() */
+	AVD_JOB_SUBMITTED,	/* handed to the hardware, watchdog armed */
+	AVD_JOB_FINISHING,	/* claimed by the IRQ handler or the watchdog */
+};
+
 struct avd_dev {
 	struct device *dev;
 	struct v4l2_device v4l2_dev;
@@ -189,12 +220,35 @@ struct avd_dev {
 
 	struct mutex vdev_lock;
 
+	/* The current job; see avd_device_run(). Protected by job_lock. */
+	spinlock_t job_lock;
+	enum avd_job_state job_state;
+	struct avd_ctx *job_ctx;
+	u64 job_seq;
+	bool job_end_sent;
+	bool job_pending;
+	enum vb2_buffer_state job_pending_result;
+
 	struct reset_control *rstc;
 
-	unsigned long vp_slots;
-	unsigned long inst_fifo_slots;
-
 	const struct avd_variant *variant;
+};
+
+struct avd_segment {
+	size_t num;
+	u32 instructions[AVD_MAX_INST];
+};
+
+struct avd_job {
+	enum avd_codec codec;
+	size_t num;
+	struct avd_segment *segments;
+};
+
+struct avd_buf {
+	void *cpu;
+	dma_addr_t addr;
+	size_t size;
 };
 
 struct avd_ctx {
@@ -207,23 +261,22 @@ struct avd_ctx {
 	const struct avd_coded_fmt_desc *coded_fmt_desc;
 	struct v4l2_ctrl_handler ctrl_hdl;
 	enum avd_image_fmt image_fmt;
+	bool decomp;
 
 	struct delayed_work watchdog_work;
+	/* job_seq of the job watchdog_work was armed for */
+	u64 wd_seq;
 
 	void *priv;
 
-	/* reference VRA (video resolution adaptation) scaler buffer. */
-	struct avd_rvra rvra;
-
-	u8 fifo_idx;
-	u8 vp_slot;
+	struct avd_comp comp;
+	int fifo_idx;
+	struct avd_job job;
+	struct avd_buf inst;
 };
 
-struct avd_buf {
-	void *cpu;
-	dma_addr_t addr;
-	size_t size;
-};
+int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments);
+int avd_submit_job(struct avd_ctx *ctx);
 
 int avd_buf_alloc(struct avd_dev *avd, struct avd_buf *buf, size_t size);
 void avd_buf_free(struct avd_dev *avd, struct avd_buf *buf);
@@ -256,21 +309,8 @@ static inline u32 fmt_width(struct avd_ctx *ctx)
 	return ctx->coded_fmt.fmt.pix_mp.width;
 }
 
-void fill_rvra(struct avd_rvra *rvra, enum avd_image_fmt image_fmt,
+void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt,
 		u32 width, u32 height);
-int alloc_slots(struct avd_dev *avd, struct avd_ctx *ctx, enum avd_codec codec);
-
-static inline void free_vp_slot(struct avd_dev *avd, struct avd_ctx *ctx)
-{
-	clear_bit(ctx->vp_slot, &avd->vp_slots);
-	ctx->vp_slot = VP_SLOT_NONE;
-}
-
-static inline void free_inst_slot(struct avd_dev *avd, struct avd_ctx *ctx)
-{
-	clear_bit(ctx->fifo_idx, &avd->inst_fifo_slots);
-	ctx->fifo_idx = INST_FIFO_SLOT_NONE;
-}
 
 static inline struct avd_ctx *file_to_ctx(struct file *filp)
 {

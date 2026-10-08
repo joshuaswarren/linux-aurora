@@ -137,7 +137,7 @@ impl G18UmaPoolMemory {
                     mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW, true)?;
                 let iova = mapping.iova();
                 MappedObject { mapping: Some(mapping), object, iova, object_offset: 0,
-                    logical_size: old.logical_size, cpu_wc: true }
+                    logical_size: old.logical_size, cpu_wc: true, fw_node: None, fw_pool: 0 }
             } else {
                 MappedObject::new_wc_in_range(dev, uat.kernel_vm(), high.clone(),
                     G18_COMPUTE_BLOCK_BYTES as usize, mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW)?

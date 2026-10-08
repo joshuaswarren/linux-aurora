@@ -21,5 +21,7 @@ static inline bool apple_m5_needs_wait_save(void)
 
 void apple_m5_cpu_wfi(void);
 void apple_m5_cpu_wfit(u64 deadline);
+/* WFI that preserves x18-x30 on cores that lose them (Apple T8140). */
+void apple_cpu_wfi(void);
 
 #endif

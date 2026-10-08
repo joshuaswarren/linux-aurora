@@ -8,19 +8,6 @@
 #include "dma.h"
 #include "mt76_connac.h"
 
-#define MT7932_MCU_BOUNCE_STRIDE	8192
-#define MT7932_DATA_BOUNCE_STRIDE	4096
-/* Apple 25G83's PCIe command ring has 512 entries.  A bounce pool may not be
- * smaller than the published descriptor ring even though the pre-runtime
- * stream currently contains only 77 acknowledged commands.
- */
-/* J700's one-time calibration adds 560 commands after firmware boot. Keep the
- * complete batch distinct until TX17 is drained; the calibrated sender then
- * resets the cursor only after every descriptor reports DMA_DONE. */
-#define MT7932_MCU_WM_BOUNCE_ENTRIES	1024
-/* 25G83 needs 17 patch plus 583 RAM scatter payloads at 2 KiB. */
-#define MT7932_MCU_FWDL_BOUNCE_ENTRIES	640
-
 static struct mt76_txwi_cache *
 mt76_alloc_txwi(struct mt76_dev *dev)
 {
@@ -31,21 +18,12 @@ mt76_alloc_txwi(struct mt76_dev *dev)
 
 	size = L1_CACHE_ALIGN(dev->drv->txwi_size + sizeof(*t));
 	txwi = kzalloc(size, GFP_ATOMIC);
-	if (!txwi) {
-		if (mt76_chip(dev) == 0x7932)
-			dev_err_ratelimited(dev->dev,
-				"J700_MT7932_TXWI_ALLOC_FAIL: stage=kzalloc size=%d\n",
-				size);
+	if (!txwi)
 		return NULL;
-	}
 
 	addr = dma_map_single(dev->dma_dev, txwi, dev->drv->txwi_size,
 			      DMA_TO_DEVICE);
 	if (unlikely(dma_mapping_error(dev->dma_dev, addr))) {
-		if (mt76_chip(dev) == 0x7932)
-			dev_err_ratelimited(dev->dev,
-				"J700_MT7932_TXWI_ALLOC_FAIL: stage=dma-map size=%u direction=to-device\n",
-				dev->drv->txwi_size);
 		kfree(txwi);
 		return NULL;
 	}
@@ -135,26 +113,6 @@ mt76_put_txwi(struct mt76_dev *dev, struct mt76_txwi_cache *t)
 	spin_unlock(&dev->lock);
 }
 EXPORT_SYMBOL_GPL(mt76_put_txwi);
-
-int mt76_dma_prealloc_txwi(struct mt76_dev *dev, int count)
-{
-	struct mt76_txwi_cache *t;
-	int i;
-
-	for (i = 0; i < count; i++) {
-		t = mt76_alloc_txwi(dev);
-		if (!t)
-			return -ENOMEM;
-		mt76_put_txwi(dev, t);
-	}
-
-	dev_info(dev->dev,
-		 "J700_MT7932_TXWI_PREALLOC_PASS: entries=%d bytes=%zu\n",
-		 count, (size_t)count * dev->drv->txwi_size);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(mt76_dma_prealloc_txwi);
 
 void
 mt76_put_rxwi(struct mt76_dev *dev, struct mt76_txwi_cache *t)
@@ -263,22 +221,6 @@ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
 	}
 
 	mt76_dma_queue_magic_cnt_init(dev, q);
-	if (reset_idx && mt76_chip(dev) == 0x7932 &&
-	    !mt76_queue_is_emi(q)) {
-		/* Run 191 publishes every disabled MT7932 WFDMA ring in this exact
-		 * order: descriptor base, producer index, then entry count.  DIDX is
-		 * device-owned and is reset later by WPDMA_RST_DTX_PTR.  Generic mt76
-		 * instead wrote CIDX, DIDX, count and base, which can seed a different
-		 * hidden payload/prefetch q-status image while EXT0[15] backup/restore
-		 * is enabled.
-		 */
-		Q_WRITE(q, desc_base, q->desc_dma);
-		Q_WRITE(q, cpu_idx, 0);
-		Q_WRITE(q, ring_size, q->ndesc);
-		q->head = Q_READ(q, dma_idx);
-		q->tail = q->head;
-		return;
-	}
 	if (reset_idx) {
 		if (mt76_queue_is_emi(q))
 			*q->emi_cpu_idx = 0;
@@ -457,58 +399,29 @@ mt76_dma_tx_cleanup_idx(struct mt76_dev *dev, struct mt76_queue *q, int idx,
 static void
 mt76_dma_kick_queue(struct mt76_dev *dev, struct mt76_queue *q)
 {
-	u32 cidx = q->head;
-
-	/* Apple publishes all MT7932 RX descriptors.  Its producer register is
-	 * therefore the last device-owned slot, not generic mt76's next empty
-	 * slot.  The first post-restart refill must write 0 after the initial
-	 * ndesc-1 publication; writing 1 leaves firmware one response behind.
-	 */
-	if (q->rx_full_ring)
-		cidx = (q->head + q->ndesc - 1) % q->ndesc;
 	wmb();
 	if (mt76_queue_is_emi(q))
-		*q->emi_cpu_idx = cpu_to_le16(cidx);
+		*q->emi_cpu_idx = cpu_to_le16(q->head);
 	else
-		Q_WRITE(q, cpu_idx, cidx);
+		Q_WRITE(q, cpu_idx, q->head);
 }
 
 static void
 mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
 {
 	struct mt76_queue_entry entry;
-	bool mt7932_cmd;
 	int last;
 
 	if (!q || !q->ndesc)
 		return;
 
 	spin_lock_bh(&q->cleanup_lock);
-	/* MT7932's 24-entry TX17 command ring can have DIDX equal the
-	 * software tail after wrapping while the completed prefix is still
-	 * visible through per-descriptor DDONE.  Apple ignores DIDX here and
-	 * halWpdmaProcessCmdDmaDone() walks DDONE until the first live entry.
-	 */
-	mt7932_cmd = !flush && mt76_chip(dev) == 0x7932 &&
-		     q->hw_idx == 17 && q->tx_bounce_buf;
 	if (flush)
 		last = -1;
 	else
 		last = Q_READ(q, dma_idx);
 
-	while (q->queued > 0) {
-		if (mt7932_cmd) {
-			__le32 ctrl = READ_ONCE(q->desc[q->tail].ctrl);
-
-			if (!(ctrl & cpu_to_le32(MT_DMA_CTL_DMA_DONE)))
-				break;
-			dma_rmb();
-			WRITE_ONCE(q->desc[q->tail].ctrl,
-				   ctrl & ~cpu_to_le32(MT_DMA_CTL_DMA_DONE));
-		} else if (q->tail == last) {
-			break;
-		}
-
+	while (q->queued > 0 && q->tail != last) {
 		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
 		mt76_npu_txdesc_cleanup(q, q->tail);
 		mt76_queue_tx_complete(dev, q, &entry);
@@ -518,7 +431,7 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
 				mt76_put_txwi(dev, entry.txwi);
 		}
 
-		if (!flush && !mt7932_cmd && q->tail == last)
+		if (!flush && q->tail == last)
 			last = Q_READ(q, dma_idx);
 	}
 	spin_unlock_bh(&q->cleanup_lock);
@@ -696,101 +609,17 @@ mt76_dma_tx_queue_skb_raw(struct mt76_dev *dev, struct mt76_queue *q,
 {
 	struct mt76_queue_buf buf = {};
 	dma_addr_t addr;
-	void *bounce;
-	u32 bounce_slot;
-	const char *failure = "mcu-reset";
 
 	if (test_bit(MT76_MCU_RESET, &dev->phy.state))
 		goto error;
 
-	if (mt76_chip(dev) == 0x7932 && q->hw_idx == 17) {
-		/* Apple accepts the 24-entry command ring while used + 1 is
-		 * strictly below 24, allowing 23 live descriptors.  Generic mt76
-		 * reserves a second slot and rejects at 22.
-		 */
-		if (q->queued + 1 >= q->ndesc) {
-			failure = "ring-full";
-			goto error;
-		}
-	} else if (q->queued + 1 >= q->ndesc - 1) {
-		failure = "ring-full";
+	if (q->queued + 1 >= q->ndesc - 1)
 		goto error;
-	}
 
-	if (q->tx_stream_active) {
-		if (skb->len > q->tx_stream_stride) {
-			failure = "stream-length";
-			goto error;
-		}
-
-		/* Run 582 shows Apple retaining the earlier TX17 payload mappings
-		 * after their descriptors have completed.  A normal skb mapping has
-		 * the right DART2 read-only attribute, but mt76 cleanup unmaps it and
-		 * frees the skb too early.  Copy each runtime command into a unique,
-		 * stable slot, map it DMA_TO_DEVICE once, and retain that mapping for
-		 * the lifetime of the device.
-		 */
-		bounce_slot = READ_ONCE(q->tx_stream_next);
-		if (bounce_slot >= q->tx_stream_entries ||
-		    q->tx_stream_dma_len[bounce_slot]) {
-			failure = "stream-exhausted";
-			goto error;
-		}
-		bounce = q->tx_stream_buf[bounce_slot];
-		memcpy(bounce, skb->data, skb->len);
-		addr = dma_map_single(dev->dma_dev, bounce, skb->len,
-				      DMA_TO_DEVICE);
-		if (unlikely(dma_mapping_error(dev->dma_dev, addr))) {
-			failure = "stream-map";
-			goto error;
-		}
-		q->tx_stream_dma[bounce_slot] = addr;
-		q->tx_stream_dma_len[bounce_slot] = skb->len;
-		WRITE_ONCE(q->tx_stream_next, bounce_slot + 1);
-		buf.skip_unmap = true;
-		if (!q->tx_stream_logged) {
-			dev_info(dev->dev,
-				 "J700_MT7932_MCU_STREAM_POOL_ACTIVE: hw=%u entries=%u stride=%u first_dma=%pad direction=to-device lifetime=device\n",
-				 q->hw_idx, q->tx_stream_entries,
-				 q->tx_stream_stride, &addr);
-			q->tx_stream_logged = true;
-		}
-	} else if (q->tx_bounce_buf) {
-		if (skb->len > q->tx_bounce_stride) {
-			failure = "bounce-length";
-			goto error;
-		}
-
-		/* Cycle126 assigned each MCU command a fresh coherent slot for the
-		 * entire firmware-download lifetime.  Descriptor cleanup retires the
-		 * ring entry, but does not prove the device has stopped observing the
-		 * payload through its internal pipeline.
-		 */
-		bounce_slot = READ_ONCE(q->tx_bounce_next);
-		if (bounce_slot >= q->tx_bounce_entries) {
-			failure = "bounce-exhausted";
-			goto error;
-		}
-		WRITE_ONCE(q->tx_bounce_next, bounce_slot + 1);
-		bounce = (u8 *)q->tx_bounce_buf +
-			 bounce_slot * q->tx_bounce_stride;
-		memcpy(bounce, skb->data, skb->len);
-		addr = q->tx_bounce_dma + bounce_slot * q->tx_bounce_stride;
-		buf.skip_unmap = true;
-		if (!q->tx_bounce_logged) {
-			dev_info(dev->dev,
-				 "J700_MT7932_MCU_BOUNCE_ACTIVE: hw=%u stride=%u\n",
-				 q->hw_idx, q->tx_bounce_stride);
-			q->tx_bounce_logged = true;
-		}
-	} else {
-		addr = dma_map_single(dev->dma_dev, skb->data, skb->len,
-				      DMA_TO_DEVICE);
-		if (unlikely(dma_mapping_error(dev->dma_dev, addr))) {
-			failure = "dma-map";
-			goto error;
-		}
-	}
+	addr = dma_map_single(dev->dma_dev, skb->data, skb->len,
+			      DMA_TO_DEVICE);
+	if (unlikely(dma_mapping_error(dev->dma_dev, addr)))
+		goto error;
 
 	buf.addr = addr;
 	buf.len = skb->len;
@@ -803,147 +632,9 @@ mt76_dma_tx_queue_skb_raw(struct mt76_dev *dev, struct mt76_queue *q,
 	return 0;
 
 error:
-	if (mt76_chip(dev) == 0x7932)
-		dev_err_ratelimited(dev->dev,
-			"J700_MT7932_RAW_TX_FAIL: stage=%s hw=%u queued=%d head=%u tail=%u bytes=%u bounce=%u/%u stream=%u/%u\n",
-			failure, q->hw_idx, q->queued, q->head, q->tail,
-			skb->len, READ_ONCE(q->tx_bounce_next),
-			q->tx_bounce_entries, READ_ONCE(q->tx_stream_next),
-			q->tx_stream_entries);
 	dev_kfree_skb(skb);
 	return -ENOMEM;
 }
-
-static void
-mt76_dma_free_tx_stream_pool(struct mt76_dev *dev, struct mt76_queue *q)
-{
-	u32 i;
-
-	if (!q || !q->tx_stream_buf)
-		return;
-
-	for (i = 0; i < q->tx_stream_entries; i++) {
-		if (!q->tx_stream_dma_len[i])
-			continue;
-		dma_unmap_single(dev->dma_dev, q->tx_stream_dma[i],
-				 q->tx_stream_dma_len[i], DMA_TO_DEVICE);
-		q->tx_stream_dma_len[i] = 0;
-	}
-
-	q->tx_stream_buf = NULL;
-	q->tx_stream_dma = NULL;
-	q->tx_stream_dma_len = NULL;
-	q->tx_stream_stride = 0;
-	q->tx_stream_entries = 0;
-	q->tx_stream_next = 0;
-	q->tx_stream_active = false;
-	q->tx_stream_logged = false;
-}
-
-static int
-mt76_dma_alloc_tx_stream_pool(struct mt76_dev *dev, struct mt76_queue *q,
-			      u32 entries, u32 stride)
-{
-	u32 i;
-
-	if (q->tx_stream_buf)
-		return 0;
-	if (entries < q->ndesc || !stride)
-		return -EINVAL;
-
-	q->tx_stream_buf = devm_kcalloc(dev->dev, entries,
-					 sizeof(*q->tx_stream_buf), GFP_KERNEL);
-	q->tx_stream_dma = devm_kcalloc(dev->dev, entries,
-					 sizeof(*q->tx_stream_dma), GFP_KERNEL);
-	q->tx_stream_dma_len = devm_kcalloc(dev->dev, entries,
-					     sizeof(*q->tx_stream_dma_len),
-					     GFP_KERNEL);
-	if (!q->tx_stream_buf || !q->tx_stream_dma ||
-	    !q->tx_stream_dma_len)
-		goto error;
-
-	q->tx_stream_stride = stride;
-	q->tx_stream_entries = entries;
-	for (i = 0; i < entries; i++) {
-		q->tx_stream_buf[i] = devm_kzalloc(dev->dev, stride,
-						   GFP_KERNEL);
-		if (!q->tx_stream_buf[i])
-			goto error;
-	}
-
-	dev_info(dev->dev,
-		 "J700_MT7932_MCU_STREAM_POOL_READY: hw=%u ring_entries=%d pool_entries=%u stride=%u mapping=lazy-retained direction=to-device\n",
-		 q->hw_idx, q->ndesc, q->tx_stream_entries,
-		 q->tx_stream_stride);
-
-	return 0;
-
-error:
-	mt76_dma_free_tx_stream_pool(dev, q);
-	return -ENOMEM;
-}
-
-int mt76_dma_alloc_tx_bounce(struct mt76_dev *dev, struct mt76_queue *q,
-			     u32 entries, u32 stride)
-{
-	size_t bounce_size;
-
-	if (q->tx_bounce_buf)
-		return 0;
-	if (entries < q->ndesc || !stride)
-		return -EINVAL;
-
-	q->tx_bounce_stride = stride;
-	q->tx_bounce_entries = entries;
-	bounce_size = q->tx_bounce_entries * q->tx_bounce_stride;
-	q->tx_bounce_buf = dmam_alloc_coherent(dev->dma_dev, bounce_size,
-					       &q->tx_bounce_dma, GFP_KERNEL);
-	if (!q->tx_bounce_buf)
-		return -ENOMEM;
-
-	dev_info(dev->dev,
-		 "J700_MT7932_MCU_BOUNCE_POOL_PASS: hw=%u ring_entries=%d pool_entries=%u stride=%u dma=%pad bytes=%zu\n",
-		 q->hw_idx, q->ndesc, q->tx_bounce_entries,
-		 q->tx_bounce_stride, &q->tx_bounce_dma, bounce_size);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(mt76_dma_alloc_tx_bounce);
-
-void mt76_dma_reset_tx_pools(struct mt76_dev *dev, struct mt76_queue *q)
-{
-	u32 bounce_used, stream_used, unmapped = 0;
-	u32 i;
-
-	if (!q)
-		return;
-
-	bounce_used = READ_ONCE(q->tx_bounce_next);
-	stream_used = READ_ONCE(q->tx_stream_next);
-	if (q->tx_stream_dma_len) {
-		for (i = 0; i < q->tx_stream_entries; i++) {
-			u32 len = q->tx_stream_dma_len[i];
-
-			if (!len)
-				continue;
-			dma_unmap_single(dev->dma_dev, q->tx_stream_dma[i], len,
-					 DMA_TO_DEVICE);
-			q->tx_stream_dma[i] = 0;
-			q->tx_stream_dma_len[i] = 0;
-			unmapped++;
-		}
-	}
-
-	WRITE_ONCE(q->tx_bounce_next, 0);
-	WRITE_ONCE(q->tx_stream_next, 0);
-	q->tx_bounce_logged = false;
-	q->tx_stream_logged = false;
-	if (q->tx_bounce_buf || q->tx_stream_buf)
-		dev_info(dev->dev,
-			 "J700_MT7932_TX_POOL_RESET_PASS: hw=%u bounce_used=%u stream_used=%u stream_unmapped=%u boundary=post-wpdma-reset\n",
-			 q->hw_idx, bounce_used, stream_used, unmapped);
-}
-EXPORT_SYMBOL_GPL(mt76_dma_reset_tx_pools);
 
 static int
 mt76_dma_tx_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
@@ -962,8 +653,6 @@ mt76_dma_tx_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
 	struct mt76_txwi_cache *t;
 	struct sk_buff *iter;
 	dma_addr_t addr;
-	void *bounce;
-	u32 bounce_slot;
 	u8 *txwi;
 
 	if (test_bit(MT76_RESET, &phy->state))
@@ -985,34 +674,15 @@ mt76_dma_tx_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
 	if (dev->drv->drv_flags & MT_DRV_TX_ALIGNED4_SKBS)
 		mt76_insert_hdr_pad(skb);
 
-	if (q->tx_bounce_buf && mt76_chip(dev) == 0x7932) {
-		if (skb_linearize(skb))
-			goto free;
-		len = skb->len;
-		if (len > q->tx_bounce_stride ||
-		    q->queued + 1 >= q->ndesc - 1)
-			goto free;
-		bounce_slot = READ_ONCE(q->head);
-		if (bounce_slot >= q->tx_bounce_entries)
-			goto free;
-		bounce = (u8 *)q->tx_bounce_buf +
-			 bounce_slot * q->tx_bounce_stride;
-		memcpy(bounce, skb->data, len);
-		addr = q->tx_bounce_dma + bounce_slot * q->tx_bounce_stride;
-	} else {
-		len = skb_headlen(skb);
-		addr = dma_map_single(dev->dma_dev, skb->data, len,
-				      DMA_TO_DEVICE);
-		if (unlikely(dma_mapping_error(dev->dma_dev, addr)))
-			goto free;
-	}
+	len = skb_headlen(skb);
+	addr = dma_map_single(dev->dma_dev, skb->data, len, DMA_TO_DEVICE);
+	if (unlikely(dma_mapping_error(dev->dma_dev, addr)))
+		goto free;
 
 	tx_info.buf[n].addr = t->dma_addr;
 	tx_info.buf[n++].len = dev->drv->txwi_size;
 	tx_info.buf[n].addr = addr;
 	tx_info.buf[n++].len = len;
-	if (q->tx_bounce_buf && mt76_chip(dev) == 0x7932)
-		tx_info.buf[n - 1].skip_unmap = true;
 
 	skb_walk_frags(skb, iter) {
 		if (n == ARRAY_SIZE(tx_info.buf))
@@ -1049,9 +719,8 @@ mt76_dma_tx_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
 
 unmap:
 	for (n--; n > 0; n--)
-		if (!tx_info.buf[n].skip_unmap)
-			dma_unmap_single(dev->dma_dev, tx_info.buf[n].addr,
-					 tx_info.buf[n].len, DMA_TO_DEVICE);
+		dma_unmap_single(dev->dma_dev, tx_info.buf[n].addr,
+				 tx_info.buf[n].len, DMA_TO_DEVICE);
 
 free:
 #ifdef CONFIG_NL80211_TESTMODE
@@ -1086,7 +755,7 @@ mt76_dma_rx_fill_buf(struct mt76_dev *dev, struct mt76_queue *q,
 	if (!q->ndesc)
 		return 0;
 
-	while (q->queued < q->ndesc - !q->rx_full_ring) {
+	while (q->queued < q->ndesc - 1) {
 		struct mt76_queue_buf qbuf = {};
 		void *buf = NULL;
 		int offset;
@@ -1164,41 +833,6 @@ mt76_dma_alloc_queue(struct mt76_dev *dev, struct mt76_queue *q,
 	q->entry = devm_kzalloc(dev->dev, size, GFP_KERNEL);
 	if (!q->entry)
 		return -ENOMEM;
-
-	/* Cycle126 installed the coherent MCU payload mapping before publishing
-	 * and resetting either firmware ring.  Preserve that ordering: mapping a
-	 * pool after the ring is visible is not equivalent once ROM firmware has
-	 * cached the device-side translation path.
-	 */
-	if (mt76_chip(dev) == 0x7932 && (idx == 16 || idx == 17)) {
-		u32 entries = idx == 16 ? MT7932_MCU_FWDL_BOUNCE_ENTRIES :
-					 MT7932_MCU_WM_BOUNCE_ENTRIES;
-
-		ret = mt76_dma_alloc_tx_bounce(dev, q, entries,
-					       MT7932_MCU_BOUNCE_STRIDE);
-		if (ret)
-			return ret;
-
-		if (idx == 17) {
-			ret = mt76_dma_alloc_tx_stream_pool(dev, q, entries,
-						      max_t(u32,
-							    MT7932_MCU_BOUNCE_STRIDE,
-							    PAGE_SIZE));
-			if (ret)
-				return ret;
-		}
-	}
-	if (mt76_chip(dev) == 0x7932 && idx == 0 && !bufsize) {
-		/* Apple assigns one permanent, page-contained data buffer to each
-		 * TX0 descriptor.  J700 completion intentionally does not unmap the
-		 * TXP payload, so a normal per-skb dma_map_single() here leaks one
-		 * IOVA per packet until allocation fails with an otherwise empty ring.
-		 */
-		ret = mt76_dma_alloc_tx_bounce(dev, q, q->ndesc,
-					       MT7932_DATA_BOUNCE_STRIDE);
-		if (ret)
-			return ret;
-	}
 
 	ret = mt76_create_page_pool(dev, q);
 	if (ret)
@@ -1308,113 +942,6 @@ mt76_dma_rx_reset(struct mt76_dev *dev, enum mt76_rxq_id qid)
 	else
 		mt76_dma_rx_fill(dev, q, false);
 }
-
-int mt76_dma_rx_rebuild_existing(struct mt76_dev *dev,
-				 enum mt76_rxq_id qid)
-{
-	struct mt76_queue *q = &dev->q_rx[qid];
-	struct mt76_queue_buf qbuf = {};
-	void *buf;
-	int i, missing = -1, offset, ret;
-
-	if (!q->ndesc)
-		return 0;
-	if (mt76_queue_is_wed_rro_ind(q) ||
-	    mt76_queue_is_wed_rro_rxdmad_c(q) || mt76_queue_is_npu(q) ||
-	    mt76_queue_is_wed_tx_free(q) || mt76_queue_is_npu_txfree(q))
-		return -EOPNOTSUPP;
-
-	/* AppleSunriseWLAN halWpdmaAllocRxRing(..., false) runs before
-	 * halWpdmaInitRing disables WFDMA.  It keeps every existing RX DMA mapping,
-	 * rebuilds all descriptors in place and supplies all ring entries.  Generic
-	 * mt76 instead keeps one empty entry, then rx_cleanup unmaps every buffer and
-	 * rx_fill allocates replacements after WFDMA is disabled.
-	 *
-	 * Preserve the existing mapped buffers and allocate only mt76's structural
-	 * empty slot.  No queue MMIO is permitted here; the caller publishes
-	 * BASE/CIDX/COUNT later, after WFDMA disable, exactly like Apple.
-	 */
-	spin_lock_bh(&q->lock);
-	if (q->queued != q->ndesc - 1 || q->head >= q->ndesc) {
-		dev_err(dev->dev,
-			"J700_MT7932_RX_REBUILD_FAIL: stage=geometry qid=%u hw=%u head=%u tail=%u queued=%u ndesc=%u full_ring=%u\n",
-			qid, q->hw_idx, q->head, q->tail, q->queued,
-			q->ndesc, q->rx_full_ring);
-		ret = -EINVAL;
-		goto unlock;
-	}
-	for (i = 0; i < q->ndesc; i++) {
-		if (q->entry[i].buf)
-			continue;
-		if (missing >= 0) {
-			dev_err(dev->dev,
-				"J700_MT7932_RX_REBUILD_FAIL: stage=multiple-missing qid=%u hw=%u first=%d second=%d\n",
-				qid, q->hw_idx, missing, i);
-			ret = -EINVAL;
-			goto unlock;
-		}
-		missing = i;
-	}
-	if (missing < 0 || missing != q->head) {
-		dev_err(dev->dev,
-			"J700_MT7932_RX_REBUILD_FAIL: stage=missing-slot qid=%u hw=%u missing=%d head=%u\n",
-			qid, q->hw_idx, missing, q->head);
-		ret = -EINVAL;
-		goto unlock;
-	}
-
-	buf = mt76_get_page_pool_buf(q, &offset, q->buf_size);
-	if (!buf) {
-		ret = -ENOMEM;
-		goto unlock;
-	}
-	qbuf.addr = page_pool_get_dma_addr(virt_to_head_page(buf)) + offset +
-		    q->buf_offset;
-	qbuf.len = SKB_WITH_OVERHEAD(q->buf_size) - q->buf_offset;
-	if (mt76_dma_add_rx_buf(dev, q, &qbuf, buf) < 0) {
-		mt76_put_page_pool_buf(buf, false);
-		ret = -ENOMEM;
-		goto unlock;
-	}
-
-	for (i = 0; i < q->ndesc; i++) {
-		struct mt76_queue_entry *entry = &q->entry[i];
-		struct mt76_desc *desc = &q->desc[i];
-		u32 ctrl, buf1 = 0;
-
-		if (!entry->buf || !entry->dma_len[0]) {
-			dev_err(dev->dev,
-				"J700_MT7932_RX_REBUILD_FAIL: stage=entry qid=%u hw=%u index=%d has_buf=%u dma_len=%u\n",
-				qid, q->hw_idx, i, !!entry->buf,
-				entry->dma_len[0]);
-			ret = -EINVAL;
-			goto unlock;
-		}
-		ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
-		ctrl &= BIT(30) | GENMASK(15, 0);
-		ctrl |= FIELD_PREP(MT_DMA_CTL_SD_LEN0, entry->dma_len[0]);
-#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
-		buf1 = FIELD_PREP(MT_DMA_CTL_SDP0_H,
-				  entry->dma_addr[0] >> 32);
-#endif
-		WRITE_ONCE(desc->buf0, cpu_to_le32(entry->dma_addr[0]));
-		WRITE_ONCE(desc->ctrl, cpu_to_le32(ctrl));
-		WRITE_ONCE(desc->buf1, cpu_to_le32(buf1));
-		WRITE_ONCE(desc->info, 0);
-	}
-	q->head = 0;
-	q->tail = 0;
-	q->queued = q->ndesc;
-	q->rx_full_ring = true;
-	ret = 0;
-
-unlock:
-	spin_unlock_bh(&q->lock);
-	if (!ret)
-		dma_wmb();
-	return ret;
-}
-EXPORT_SYMBOL_GPL(mt76_dma_rx_rebuild_existing);
 
 static void
 mt76_add_fragment(struct mt76_dev *dev, struct mt76_queue *q, void *data,
@@ -1568,28 +1095,6 @@ int mt76_dma_rx_poll(struct napi_struct *napi, int budget)
 }
 EXPORT_SYMBOL_GPL(mt76_dma_rx_poll);
 
-int mt76_dma_rx_poll_sync(struct mt76_dev *dev, int budget)
-{
-	int qid, total = 0;
-
-	rcu_read_lock();
-	for (qid = 0; qid < ARRAY_SIZE(dev->q_rx); qid++) {
-		struct mt76_queue *q = &dev->q_rx[qid];
-		int done;
-
-		if (!q->ndesc)
-			continue;
-		done = mt76_dma_rx_process(dev, q, budget);
-		if (done)
-			mt76_rx_poll_complete(dev, qid, NULL);
-		total += done;
-	}
-	rcu_read_unlock();
-
-	return total;
-}
-EXPORT_SYMBOL_GPL(mt76_dma_rx_poll_sync);
-
 static void
 mt76_dma_rx_queue_init(struct mt76_dev *dev, enum mt76_rxq_id qid,
 		       int (*poll)(struct napi_struct *napi, int budget))
@@ -1678,10 +1183,8 @@ void mt76_dma_cleanup(struct mt76_dev *dev)
 			mt76_dma_tx_cleanup(dev, phy->q_tx[j], true);
 	}
 
-	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++) {
+	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
 		mt76_dma_tx_cleanup(dev, dev->q_mcu[i], true);
-		mt76_dma_free_tx_stream_pool(dev, dev->q_mcu[i]);
-	}
 
 	mt76_for_each_q_rx(dev, i) {
 		struct mt76_queue *q = &dev->q_rx[i];

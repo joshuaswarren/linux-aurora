@@ -19,9 +19,6 @@ properties:
     const: apple,smc-reboot
 
   nvmem-cells:
-    description:
-      Optional persistent boot-state cells. Newer SoCs can provide the SMC
-      restart commands without exposing the backing NVMEM region to Linux.
     items:
       - description: Flag indicating shutdown (as opposed to reboot)
       - description: Stage at which the boot process stopped (0x30 for normal boot)
@@ -35,11 +32,9 @@ properties:
       - const: boot_error_count
       - const: panic_count
 
-dependencies:
-  nvmem-cells: [nvmem-cell-names]
-  nvmem-cell-names: [nvmem-cells]
-
 required:
   - compatible
+  - nvmem-cells
+  - nvmem-cell-names
 
 additionalProperties: false

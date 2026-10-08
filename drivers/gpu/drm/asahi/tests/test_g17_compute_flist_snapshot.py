@@ -25,7 +25,7 @@ def constant(name):
     return re.search(r"pub\(crate\) const " + name + r": .*?;", submission).group()
 
 
-diagnostic = block(manager, "    pub(crate) fn log_async_compute_timeout(")
+diagnostic = block(manager, "    fn log_async_compute_timeout_report(") + block(manager, "    pub(crate) fn log_async_compute_timeout(")
 assert "let pool_id = queue.storage.flist_id() as u8" in diagnostic
 assert "snapshot_compute_uma(pool_id)" in diagnostic
 assert "queue.storage.snapshot_compute_flist()" in diagnostic

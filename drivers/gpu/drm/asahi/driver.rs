@@ -17,10 +17,13 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
-        Arc, //
+        Arc, Mutex, //
     },
     time::{delay::fsleep, Delta},
-    workqueue::{self, HasWork, impl_has_work, new_work, Work, WorkItem}, //
+    workqueue::{
+        self, DelayedWork, HasDelayedWork, HasWork, impl_has_delayed_work, impl_has_work,
+        new_delayed_work, new_work, Work, WorkItem, //
+    },
 };
 
 use crate::{
@@ -58,6 +61,23 @@ pub(crate) struct AsahiData {
     g17_event_work: Work<AsahiDevice, 1>,
     #[pin]
     g17_recovery_work: Work<AsahiDevice, 2>,
+    #[pin]
+    g17_reclaim_work: Work<AsahiDevice, 3>,
+    #[pin]
+    g17_tvb_grow_work: Work<AsahiDevice, 4>,
+    /// `g17p_dvfs_parity` bit0 idle re-check (clears the effort after the
+    /// hold window). Never queued while the parity mask is zero.
+    #[pin]
+    g17_dvfs_work: DelayedWork<AsahiDevice, 5>,
+    /// v84 GPU-feed CPU performance actuator (`g17_host_path`).
+    #[pin]
+    g17_feed_perf_work: Work<AsahiDevice, 6>,
+    /// v97d `g17p_recovery_path` bit4 3D stall watch. Never queued while the
+    /// bit is clear.
+    #[pin]
+    g17_stall_work: DelayedWork<AsahiDevice, 7>,
+    #[pin]
+    g17_reclaims: Mutex<KVec<KVec<g17_manager::G17PLogicalQueueTeardown>>>,
 }
 
 unsafe impl Send for AsahiData {}
@@ -66,13 +86,21 @@ unsafe impl Sync for AsahiData {}
 impl_has_work! {
     impl HasWork<AsahiDevice, 1> for AsahiData { self.g17_event_work }
     impl HasWork<AsahiDevice, 2> for AsahiData { self.g17_recovery_work }
+    impl HasWork<AsahiDevice, 3> for AsahiData { self.g17_reclaim_work }
+    impl HasWork<AsahiDevice, 4> for AsahiData { self.g17_tvb_grow_work }
+    impl HasWork<AsahiDevice, 6> for AsahiData { self.g17_feed_perf_work }
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<AsahiDevice, 5> for AsahiData { self.g17_dvfs_work }
+    impl HasDelayedWork<AsahiDevice, 7> for AsahiData { self.g17_stall_work }
 }
 
 impl WorkItem<1> for AsahiData {
     type Pointer = ARef<AsahiDevice>;
 
     fn run(dev: ARef<AsahiDevice>) {
-        let Some(runtime) = dev.g17_runtime else {
+        let Some(runtime) = dev.g17_runtime.as_ref() else {
             return;
         };
         if let Err(error) = runtime.service_primary_firmware_events() {
@@ -83,17 +111,159 @@ impl WorkItem<1> for AsahiData {
             );
             return;
         }
+        if crate::g17_host_path::enabled(crate::g17_host_path::WORKER_TAIL) {
+            g17p_event_worker_tail_merged(&dev, runtime);
+            return;
+        }
+        // DVFS parity (v83 bit0): completions are the idle edge of real work.
+        service_g17p_dvfs_parity(dev.clone(), runtime);
+        // Firmware acknowledgements detach complete owner graphs. Reclaim
+        // their mappings/backing on another worker: the event worker must
+        // remain available for completions and firmware grow requests.
+        g17p_hand_off_teardowns(&dev, runtime.service_logical_queue_teardowns());
         if runtime.primary_device_control_backpressured() {
             // Full-ring backpressure is exceptional. Release the runtime
             // mutex before yielding so submissions and firmware progress are
             // never serialized behind this retry.
             fsleep(Delta::from_millis(1));
         }
+        if crate::g17_host_path::take_pending() {
+            let _ = workqueue::system_unbound().enqueue::<ARef<AsahiDevice>, 6>(dev.clone());
+        }
         if runtime.primary_recovery_pending() {
             queue_g17p_recovery_worker(dev);
+        } else if runtime.logical_queue_teardown_polling() {
+            // A young teardown waits for the control-ring consumer; the
+            // firmware does not notify on consumption, so re-check at
+            // millisecond cadence, off the mutex, until it is acknowledged
+            // or ages past the poll budget (then ordinary events re-check).
+            fsleep(Delta::from_millis(1));
+            queue_g17p_firmware_event_worker(dev);
         } else {
             requeue_g17p_firmware_event_worker_if_pending(dev);
         }
+    }
+}
+
+/// The event worker's single hand-off of acknowledged teardowns to the
+/// reclaim worker (shared by the v84 and the v87 WORKER_TAIL sequences).
+fn g17p_hand_off_teardowns(
+    dev: &ARef<AsahiDevice>,
+    settled: Result<KVec<g17_manager::G17PLogicalQueueTeardown>>,
+) {
+    match settled {
+        Ok(settled) => queue_g17p_retired_graphs(dev.clone(), settled),
+        Err(error) => dev_err!(
+            dev.as_ref(),
+            "G17P event worker: teardown service failed ({:?})\n",
+            error
+        ),
+    }
+}
+
+/// Event-worker bookkeeping decisions taken under one Runtime hold.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum G17PWorkerTailNext {
+    /// Control ring back-pressured: sleep 1 ms, then decide as before.
+    Backpressured,
+    /// Queue the recovery worker.
+    Recovery,
+    /// A young teardown polls the control consumer: sleep 1 ms and requeue.
+    TeardownPoll,
+    /// Nothing else; any pending self-requeue was issued under the hold.
+    Done,
+}
+
+/// v87 WORKER_TAIL decision, in the exact order of the separate checks:
+/// back-pressure first, then recovery, then teardown polling, else requeue.
+pub(crate) const fn g17p_worker_tail_next(
+    backpressured: bool, recovery_pending: bool, teardown_polling: bool,
+) -> G17PWorkerTailNext {
+    if backpressured {
+        G17PWorkerTailNext::Backpressured
+    } else if recovery_pending {
+        G17PWorkerTailNext::Recovery
+    } else if teardown_polling {
+        G17PWorkerTailNext::TeardownPoll
+    } else {
+        G17PWorkerTailNext::Done
+    }
+}
+
+/// v87 WORKER_TAIL: the event worker's post-drain bookkeeping with one
+/// Runtime acquisition instead of six. Each step is the same call, in the
+/// same order, as the separate-lock sequence in `WorkItem<1>::run`:
+/// DVFS parity evaluation and its delayed re-check (enqueued under the hold,
+/// as before), teardown service, the back-pressure test, then the recovery /
+/// teardown-poll / self-requeue decision, with the self-requeue issued under
+/// the hold exactly as `requeue_g17p_firmware_event_worker_if_pending` does.
+/// Reclaim hand-off, sleeps and the feed-perf and recovery work items stay
+/// outside Runtime. Back-pressure keeps the original sleep-then-recheck path.
+fn g17p_event_worker_tail_merged(dev: &ARef<AsahiDevice>, runtime: &g17_drm::G17PRuntimeRef) {
+    use core::sync::atomic::Ordering;
+    crate::g17_host_path::count(&crate::g17_host_path::TAIL_MERGED);
+    let (settled, next) = {
+        let mut guard = runtime.mutex().lock();
+        // DVFS parity (v83 bit0): identical to `service_g17p_dvfs_parity`.
+        if (crate::g17_dvfs_parity::enabled(crate::g17_dvfs_policy::PARITY_CE)
+            || crate::g17_dvfs_parity::CE_LIVE.load(Ordering::Relaxed) != 0)
+            && guard.firmware_event_worker_armed()
+        {
+            if let Some(delay) = guard.dvfs_parity_idle_check() {
+                let ms = crate::g17_dvfs_policy::recheck_ms(delay);
+                crate::g17_dvfs_parity::RECHECKS.fetch_add(1, Ordering::Relaxed);
+                let _ = workqueue::system().enqueue_delayed::<ARef<AsahiDevice>, 5>(
+                    dev.clone(), kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
+            }
+        }
+        let settled = guard.service_logical_queue_teardowns();
+        let backpressured = guard.primary_device_control_backpressured();
+        let next = if backpressured {
+            g17p_worker_tail_next(true, false, false)
+        } else {
+            let recovery = guard.primary_recovery_pending();
+            let polling = !recovery && guard.logical_queue_teardown_polling();
+            let next = g17p_worker_tail_next(false, recovery, polling);
+            if next == G17PWorkerTailNext::Done
+                && guard.firmware_event_worker_armed()
+                && guard.primary_firmware_event_pending()
+            {
+                // Same mutex as disarm: unbind either cancels this work or
+                // disarms first and makes this self-requeue impossible.
+                let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 1>(dev.clone());
+            }
+            next
+        };
+        (settled, next)
+    };
+    g17p_hand_off_teardowns(dev, settled);
+    if next == G17PWorkerTailNext::Backpressured {
+        // Full-ring backpressure is exceptional. Release the runtime
+        // mutex before yielding so submissions and firmware progress are
+        // never serialized behind this retry.
+        fsleep(Delta::from_millis(1));
+    }
+    if crate::g17_host_path::take_pending() {
+        let _ = workqueue::system_unbound().enqueue::<ARef<AsahiDevice>, 6>(dev.clone());
+    }
+    match next {
+        G17PWorkerTailNext::Backpressured => {
+            // Unchanged sequence after the sleep.
+            if runtime.primary_recovery_pending() {
+                queue_g17p_recovery_worker(dev.clone());
+            } else if runtime.logical_queue_teardown_polling() {
+                fsleep(Delta::from_millis(1));
+                queue_g17p_firmware_event_worker(dev.clone());
+            } else {
+                requeue_g17p_firmware_event_worker_if_pending(dev.clone());
+            }
+        }
+        G17PWorkerTailNext::Recovery => queue_g17p_recovery_worker(dev.clone()),
+        G17PWorkerTailNext::TeardownPoll => {
+            fsleep(Delta::from_millis(1));
+            queue_g17p_firmware_event_worker(dev.clone());
+        }
+        G17PWorkerTailNext::Done => {}
     }
 }
 
@@ -101,7 +271,7 @@ impl WorkItem<2> for AsahiData {
     type Pointer = ARef<AsahiDevice>;
 
     fn run(dev: ARef<AsahiDevice>) {
-        let Some(runtime) = dev.g17_runtime else {
+        let Some(runtime) = dev.g17_runtime.as_ref() else {
             return;
         };
         if let Err(error) = runtime.service_primary_recovery() {
@@ -120,12 +290,146 @@ impl WorkItem<2> for AsahiData {
     }
 }
 
+/// All entries have their exact firmware release acknowledgement before
+/// entering this queue. No runtime, queue-registry or reclaim-queue mutex is
+/// held while the VM aliases and backing are destroyed.
+fn reclaim_g17p_graphs(retired: KVec<g17_manager::G17PLogicalQueueTeardown>) {
+    for teardown in retired.iter() {
+        teardown.release_retired_vm_mappings();
+    }
+    drop(retired);
+}
+
+fn drain_g17p_reclaims(dev: &AsahiDevice) {
+    let batches = core::mem::take(&mut *dev.g17_reclaims.lock());
+    for batch in batches {
+        reclaim_g17p_graphs(batch);
+    }
+}
+
+impl WorkItem<3> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(dev: ARef<AsahiDevice>) {
+        drain_g17p_reclaims(&dev);
+    }
+}
+
+impl WorkItem<4> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(dev: ARef<AsahiDevice>) {
+        let Some(runtime) = dev.g17_runtime.as_ref() else { return; };
+        if let Err(error) = runtime.service_render_grows() {
+            runtime.mutex().lock().note_render_observation_error(error);
+            queue_g17p_recovery_worker(dev);
+        }
+    }
+}
+
+/// v97d: 3D stall watch poll. Re-arms itself (under the Runtime mutex and
+/// the armed check) while render work is outstanding and bit4 is set.
+impl WorkItem<7> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(dev: ARef<AsahiDevice>) {
+        let Some(runtime) = dev.g17_runtime.clone() else { return; };
+        let mut guard = runtime.mutex().lock();
+        if let Some(ms) = guard.service_render_stall_watch() {
+            if guard.firmware_event_worker_armed() {
+                let _ = workqueue::system_highpri().enqueue_delayed::<ARef<AsahiDevice>, 7>(
+                    dev.clone(), kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
+            }
+        }
+        drop(guard);
+    }
+}
+
+/// Start the stall watch; already pending is fine (that run re-arms).
+pub(crate) fn arm_g17p_render_stall_watch(dev: ARef<AsahiDevice>, ms: u64) {
+    let _ = workqueue::system_highpri().enqueue_delayed::<ARef<AsahiDevice>, 7>(
+        dev, kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
+}
+
+pub(crate) fn queue_g17p_tvb_grow_worker(dev: ARef<AsahiDevice>) {
+    let _ = workqueue::system_unbound().enqueue::<ARef<AsahiDevice>, 4>(dev);
+}
+
+impl WorkItem<5> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(dev: ARef<AsahiDevice>) {
+        let Some(runtime) = dev.g17_runtime.clone() else { return; };
+        service_g17p_dvfs_parity(dev, &runtime);
+    }
+}
+
+/// Evaluate the work-tied effort and arm its idle re-check. The lock is only
+/// taken when the parity effort is enabled or still published. Enqueue happens
+/// under the runtime mutex after the same armed check the event worker's
+/// self-requeue uses; unbind disables this work after disarming.
+fn service_g17p_dvfs_parity(dev: ARef<AsahiDevice>, runtime: &g17_drm::G17PRuntimeRef) {
+    use core::sync::atomic::Ordering;
+    if !crate::g17_dvfs_parity::enabled(crate::g17_dvfs_policy::PARITY_CE)
+        && crate::g17_dvfs_parity::CE_LIVE.load(Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    let mut guard = runtime.mutex().lock();
+    if !guard.firmware_event_worker_armed() {
+        return;
+    }
+    if let Some(delay) = guard.dvfs_parity_idle_check() {
+        let ms = crate::g17_dvfs_policy::recheck_ms(delay);
+        crate::g17_dvfs_parity::RECHECKS.fetch_add(1, Ordering::Relaxed);
+        // Already pending is fine: that run re-evaluates and re-arms.
+        let _ = workqueue::system().enqueue_delayed::<ARef<AsahiDevice>, 5>(
+            dev, kernel::time::msecs_to_jiffies(ms.min(1000) as u32));
+    }
+    drop(guard);
+}
+
+/// v84: the GPU-feed CPU performance actuator. Sleeps while its request is
+/// held (it polls the linger deadline), so it runs on the unbound workqueue.
+impl WorkItem<6> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(_dev: ARef<AsahiDevice>) {
+        crate::g17_host_path::run_actuator();
+    }
+}
+
+/// Only the firmware-event worker produces batches. Unbind joins that
+/// producer before cancelling this worker and draining any cancelled batch.
+fn queue_g17p_retired_graphs(
+    dev: ARef<AsahiDevice>,
+    retired: KVec<g17_manager::G17PLogicalQueueTeardown>,
+) {
+    if retired.is_empty() { return; }
+    let rejected = {
+        let mut pending = dev.g17_reclaims.lock();
+        if pending.reserve(1, GFP_KERNEL).is_err() {
+            Some(retired)
+        } else {
+            pending.push_within_capacity(retired).err().map(|error| error.0)
+        }
+    };
+    if let Some(retired) = rejected {
+        // Memory pressure must neither leak acknowledged owners nor drop
+        // them under the queue mutex. Only this allocation failure falls
+        // back to synchronous cleanup outside every shared driver lock.
+        reclaim_g17p_graphs(retired);
+    } else {
+        let _ = workqueue::system_unbound().enqueue::<ARef<AsahiDevice>, 3>(dev);
+    }
+}
+
 pub(crate) fn queue_g17p_firmware_event_worker(dev: ARef<AsahiDevice>) {
     let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 1>(dev);
 }
 
 fn requeue_g17p_firmware_event_worker_if_pending(dev: ARef<AsahiDevice>) {
-    let Some(runtime) = dev.g17_runtime else {
+    let Some(runtime) = dev.g17_runtime.clone() else {
         return;
     };
     let runtime = runtime.mutex().lock();
@@ -148,34 +452,79 @@ struct G17PDriverUnbind<'a> {
 
 impl g17_lifecycle::DriverUnbindQuiesce for G17PDriverUnbind<'_> {
     fn disarm_ingress(&self) {
-        self.runtime.lock().disarm_firmware_event_worker();
+        let preparations = {
+            let mut runtime = self.runtime.lock();
+            runtime.disarm_firmware_event_worker();
+            runtime.preparation_control()
+        };
+        preparations.wait_for_preparers();
     }
 
     fn cancel_event_work(&self) {
-        cancel_g17p_work::<1>(&self.drm);
+        // Stop the feed-perf actuator's linger loop before joining it.
+        crate::g17_host_path::begin_shutdown();
+        disable_g17p_work::<1>(&self.drm);
+        disable_g17p_work::<4>(&self.drm);
+        // The DVFS re-check is produced by the event worker (joined above)
+        // and by itself; disabling also rejects any later self-requeue.
+        disable_g17p_delayed_work::<5>(&self.drm);
+        disable_g17p_delayed_work::<7>(&self.drm);
+        // The event worker is its only producer; it is disabled above.
+        disable_g17p_work::<6>(&self.drm);
+        crate::g17_host_path::shutdown();
     }
 
     fn cancel_recovery_work(&self) {
-        cancel_g17p_work::<2>(&self.drm);
+        disable_g17p_work::<2>(&self.drm);
+    }
+
+    fn cancel_reclaim_work(&self) {
+        disable_g17p_work::<3>(&self.drm);
+        // disable_work_sync may cancel a queued invocation before it takes
+        // its batch. The sole producer has already been joined above.
+        drain_g17p_reclaims(&self.drm);
     }
 }
 
-fn cancel_g17p_work<const ID: u64>(dev: &AsahiDevice)
+fn disable_g17p_work<const ID: u64>(dev: &AsahiDevice)
 where
     AsahiDevice: HasWork<AsahiDevice, ID>,
 {
     let dev_ptr = (dev as *const AsahiDevice).cast_mut();
     // SAFETY: `dev` remains strongly referenced by the unbind owner for this
     // whole call. The HasWork implementation returns its embedded work item,
-    // and cancel_work_sync waits until no callback owns that item.
+    // and disable_work_sync waits until no callback owns that item.
     let work = unsafe {
         <AsahiDevice as HasWork<AsahiDevice, ID>>::raw_get_work(dev_ptr)
     };
     // SAFETY: `work` is the initialized embedded work item selected by ID.
     let work = unsafe { Work::raw_get(work) };
-    // SAFETY: no callback can be newly queued after ingress was disarmed, and
-    // the strong `drm` reference keeps the containing object alive.
-    unsafe { bindings::cancel_work_sync(work) };
+    // A late RTKit callback may have loaded event_worker_armed before unbind
+    // cleared it, then try to enqueue after this join. Cancellation alone
+    // permits that stale enqueue to run against the released runtime. Disable
+    // the work permanently as well as joining it; removal never rearms it.
+    // SAFETY: the containing device is strongly held throughout this sleepable
+    // unbind call. No driver mutex needed by the worker is held here.
+    unsafe { bindings::disable_work_sync(work) };
+}
+
+fn disable_g17p_delayed_work<const ID: u64>(dev: &AsahiDevice)
+where
+    AsahiDevice: HasDelayedWork<AsahiDevice, ID>,
+{
+    let dev_ptr = (dev as *const AsahiDevice).cast_mut();
+    // SAFETY: as in `disable_g17p_work`; HasDelayedWork guarantees the
+    // returned work_struct is the `work` field of an embedded delayed_work.
+    let work = unsafe {
+        <AsahiDevice as HasWork<AsahiDevice, ID>>::raw_get_work(dev_ptr)
+    };
+    // SAFETY: `work` is the initialized embedded work item selected by ID.
+    let work = unsafe { Work::raw_get(work) };
+    // SAFETY: HasDelayedWork: this work_struct is inside a delayed_work.
+    let dwork = unsafe { kernel::container_of!(work, bindings::delayed_work, work) };
+    // SAFETY: the device is strongly held for this sleepable unbind call; this
+    // cancels a pending timer, waits for a running callback and disables it.
+    unsafe { bindings::disable_delayed_work_sync(dwork) };
 }
 
 #[allow(dead_code)]
@@ -463,6 +812,32 @@ fn probe_t8140_runtime(
     };
     let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
 
+    // v94 boot-only `g17p_gem_huge`: back every GEM object created from here
+    // on with a dedicated huge tmpfs mount (1 = "within_size", 2 = "always"),
+    // as panfrost/panthor/v3d/i915 do. Must precede the first GEM object.
+    let huge = *crate::module_parameters::g17p_gem_huge.value();
+    #[cfg(CONFIG_TRANSPARENT_HUGEPAGE)]
+    if huge != 0 {
+        let value = if huge == 2 { c"always" } else { c"within_size" };
+        // `drm::Device` is `repr(C)` with the `drm_device` as its first field.
+        let raw = (&*drm as *const AsahiDevice).cast_mut().cast::<bindings::drm_device>();
+        // SAFETY: `raw` is this live, unregistered DRM device; no GEM object
+        // exists yet and the mount is released by a drmm action.
+        let ret = unsafe { bindings::drm_gem_huge_mnt_create(raw, value.as_ptr()) };
+        if ret == 0 {
+            crate::g17_mem_path::HUGE_MOUNT.store(huge, core::sync::atomic::Ordering::Relaxed);
+            let mode = if huge == 2 { "always" } else { "within_size" };
+            dev_info!(pdev.as_ref(), "G17P GEM: huge tmpfs mount ({}) for GEM backing\n", mode);
+        } else {
+            dev_warn!(pdev.as_ref(), "G17P GEM: huge tmpfs mount failed ({}); using shm_mnt\n", ret);
+        }
+    }
+
+    #[cfg(not(CONFIG_TRANSPARENT_HUGEPAGE))]
+    if huge != 0 {
+        dev_warn!(pdev.as_ref(), "G17P GEM: huge pages unavailable; using shm_mnt\n");
+    }
+
     let runtime = g17_live_boot::G17PLiveRuntime::start(
         pdev,
         drm.clone(),
@@ -473,29 +848,52 @@ fn probe_t8140_runtime(
         topology,
     )?;
     let runtime = Arc::pin_init(new_mutex!(runtime), GFP_KERNEL)?;
-    let runtime_ref = g17_drm::G17PRuntimeRef::new(&runtime);
-    let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
-        g17_drm::G17PDrmGpu::new(runtime_ref, soc, observed)?,
-        GFP_KERNEL,
-    )?;
-    let data = try_pin_init!(AsahiData {
-        gpu,
-        pdev: pdev.into(),
-        resources: None,
-        g17_runtime: Some(runtime_ref),
-        g17_event_work <- new_work!("AsahiData::g17_event_work"),
-        g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
-    });
-    let ptr: *const AsahiData = &raw const **drm;
-    // SAFETY: `drm` was created with an uninitialized data slot above; this
-    // is its only initialization before registration exposes file operations.
-    unsafe {
-        data.__pinned_init(ptr as *mut AsahiData)?;
+    let mut data_initialized = false;
+    let registration = (|| -> Result {
+        let runtime_ref = g17_drm::G17PRuntimeRef::new(&runtime);
+        let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
+            g17_drm::G17PDrmGpu::new(runtime_ref.clone(), soc, observed)?,
+            GFP_KERNEL,
+        )?;
+        let data = try_pin_init!(AsahiData {
+            gpu,
+            pdev: pdev.into(),
+            resources: None,
+            g17_runtime: Some(runtime_ref),
+            g17_event_work <- new_work!("AsahiData::g17_event_work"),
+            g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
+            g17_reclaim_work <- new_work!("AsahiData::g17_reclaim_work"),
+            g17_tvb_grow_work <- new_work!("AsahiData::g17_tvb_grow_work"),
+            g17_dvfs_work <- new_delayed_work!("AsahiData::g17_dvfs_work"),
+            g17_feed_perf_work <- new_work!("AsahiData::g17_feed_perf_work"),
+            g17_stall_work <- new_delayed_work!("AsahiData::g17_stall_work"),
+            g17_reclaims <- new_mutex!(KVec::new(), "AsahiData::g17_reclaims"),
+        });
+        let ptr: *const AsahiData = &raw const **drm;
+        // SAFETY: `drm` was created with an uninitialized data slot above; this
+        // is its only initialization before registration exposes file operations.
+        unsafe {
+            data.__pinned_init(ptr as *mut AsahiData)?;
+        }
+        data_initialized = true;
+        runtime.lock().arm_primary_firmware_event_worker()?;
+        runtime.lock().mark_firmware_cache_flush_ready()?;
+        (*drm).gpu.init()?;
+        drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
+        Ok(())
+    })();
+    if let Err(error) = registration {
+        // Once data is initialized it owns strong runtime handles, including
+        // from workers armed before registration. Join them before breaking
+        // the device/runtime cycle, even when registration itself failed.
+        if data_initialized {
+            g17_lifecycle::quiesce_driver_unbind(&G17PDriverUnbind {
+                runtime: &runtime, drm: drm.clone(),
+            });
+        }
+        runtime.lock().shutdown();
+        return Err(error);
     }
-    runtime.lock().arm_primary_firmware_event_worker()?;
-    runtime.lock().mark_firmware_cache_flush_ready()?;
-    (*drm).gpu.init()?;
-    drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
     Ok(runtime)
 }
 
@@ -647,6 +1045,12 @@ fn probe_t8152_drm(
         gpu, pdev: pdev.into(), resources: None, g17_runtime: None,
         g17_event_work <- new_work!("AsahiData::g17_event_work"),
         g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
+        g17_reclaim_work <- new_work!("AsahiData::g17_reclaim_work"),
+        g17_tvb_grow_work <- new_work!("AsahiData::g17_tvb_grow_work"),
+        g17_dvfs_work <- new_delayed_work!("AsahiData::g17_dvfs_work"),
+        g17_feed_perf_work <- new_work!("AsahiData::g17_feed_perf_work"),
+        g17_stall_work <- new_delayed_work!("AsahiData::g17_stall_work"),
+        g17_reclaims <- new_mutex!(KVec::new(), "AsahiData::g17_reclaims"),
     });
     let ptr: *const AsahiData = &raw const **drm;
     // SAFETY: prepare_t8152_device leaves this data slot uninitialized. This
@@ -807,6 +1211,12 @@ fn probe_t8142_runtime(pdev: &platform::Device<Core>) -> Result<crate::m5_drm::S
         gpu, pdev: pdev.into(), resources: None, g17_runtime: None,
         g17_event_work <- new_work!("AsahiData::g17_event_work"),
         g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
+        g17_reclaim_work <- new_work!("AsahiData::g17_reclaim_work"),
+        g17_tvb_grow_work <- new_work!("AsahiData::g17_tvb_grow_work"),
+        g17_dvfs_work <- new_delayed_work!("AsahiData::g17_dvfs_work"),
+        g17_feed_perf_work <- new_work!("AsahiData::g17_feed_perf_work"),
+        g17_stall_work <- new_delayed_work!("AsahiData::g17_stall_work"),
+        g17_reclaims <- new_mutex!(KVec::new(), "AsahiData::g17_reclaims"),
     });
     let ptr: *const AsahiData = &raw const **drm;
     // SAFETY: prepare_t8142_device leaves this data slot uninitialized. This
@@ -1438,6 +1848,12 @@ impl platform::Driver for AsahiDriver {
             g17_runtime: None,
             g17_event_work <- new_work!("AsahiData::g17_event_work"),
             g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
+        g17_reclaim_work <- new_work!("AsahiData::g17_reclaim_work"),
+            g17_tvb_grow_work <- new_work!("AsahiData::g17_tvb_grow_work"),
+            g17_dvfs_work <- new_delayed_work!("AsahiData::g17_dvfs_work"),
+            g17_feed_perf_work <- new_work!("AsahiData::g17_feed_perf_work"),
+            g17_stall_work <- new_delayed_work!("AsahiData::g17_stall_work"),
+        g17_reclaims <- new_mutex!(KVec::new(), "AsahiData::g17_reclaims"),
         });
 
         let ptr: *const AsahiData = &raw const **drm;
@@ -1471,5 +1887,8 @@ impl platform::Driver for AsahiDriver {
             Err(_) => return,
         };
         g17_lifecycle::quiesce_driver_unbind(&G17PDriverUnbind { runtime, drm });
+        // Explicit shutdown is required with owned callback handles: waiting
+        // for the final Arc would retain a runtime/DRM reference cycle.
+        runtime.lock().shutdown();
     }
 }

@@ -1,0 +1,26 @@
+{
+  "kernel_sha256": "b1ea68d23c452099da9fbfe06b19634e0175d4b2b1194f7249abac430a9a7a0d",
+  "fileset_entry": "com.apple.AGXG17P",
+  "verified": [
+    {
+      "meaning": "Select sample positions for 1/2/4/8 samples",
+      "va": "0xfffffe00088c4ca8",
+      "bytes": "6c4a40b99f0d0071cc0000549f050071200600549f09007180050054320000149f110071600300549f210071c1050054"
+    },
+    {
+      "meaning": "Store count in render target +0xb8",
+      "va": "0xfffffe00088c4e10",
+      "bytes": "6c2a17297f5a00f99f0d0071cc0000549f050071200600549f09007180050054"
+    },
+    {
+      "meaning": "Copy target count to host +0x8c8",
+      "va": "0xfffffe0008839d78",
+      "bytes": "881240f9686204f98826572968ca08b9885a40f9685e04f969d208b9"
+    },
+    {
+      "meaning": "Copy host count to firmware record +0x50",
+      "va": "0xfffffe0008837af4",
+      "bytes": "095b00b989ca48b98a5e44f9082b04a988d248b909230a29"
+    }
+  ]
+}

@@ -1,0 +1,3371 @@
+[
+ {
+  "name": "ECPU_0",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 1,
+  "device_id": 1
+ },
+ {
+  "name": "ECPU_1",
+  "base": "0x300700000",
+  "offset": 8,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 2,
+  "device_id": 2
+ },
+ {
+  "name": "ECPU_2",
+  "base": "0x300700000",
+  "offset": 16,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 3,
+  "device_id": 3
+ },
+ {
+  "name": "ECPU_3",
+  "base": "0x300700000",
+  "offset": 24,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 4,
+  "device_id": 4
+ },
+ {
+  "name": "PCPU_0",
+  "base": "0x300700000",
+  "offset": 48,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 5,
+  "device_id": 5
+ },
+ {
+  "name": "PCPU_1",
+  "base": "0x300700000",
+  "offset": 56,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 6,
+  "device_id": 6
+ },
+ {
+  "name": "ECPM",
+  "base": "0x300700000",
+  "offset": 80,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 7,
+  "device_id": 7
+ },
+ {
+  "name": "PCPM",
+  "base": "0x300700000",
+  "offset": 88,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 8,
+  "device_id": 8
+ },
+ {
+  "name": "SEP_AON",
+  "base": "0x300700000",
+  "offset": 96,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 9,
+  "device_id": 9
+ },
+ {
+  "name": "SBR",
+  "base": "0x300700000",
+  "offset": 256,
+  "parents": [],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 10,
+  "device_id": 10
+ },
+ {
+  "name": "MSG",
+  "base": "0x300700000",
+  "offset": 264,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 11,
+  "device_id": 11
+ },
+ {
+  "name": "AIC",
+  "base": "0x300700000",
+  "offset": 272,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 12,
+  "device_id": 12
+ },
+ {
+  "name": "DWI",
+  "base": "0x300700000",
+  "offset": 280,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 13,
+  "device_id": 13
+ },
+ {
+  "name": "GPIO",
+  "base": "0x300700000",
+  "offset": 288,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 14,
+  "device_id": 14
+ },
+ {
+  "name": "PMS_BUSIF",
+  "base": "0x300700000",
+  "offset": 296,
+  "parents": [],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 15,
+  "device_id": 15
+ },
+ {
+  "name": "PMS",
+  "base": "0x300700000",
+  "offset": 304,
+  "parents": [],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 16,
+  "device_id": 16
+ },
+ {
+  "name": "PMC",
+  "base": "0x300700000",
+  "offset": 312,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 17,
+  "device_id": 17
+ },
+ {
+  "name": "PMS_FPWM0",
+  "base": "0x300700000",
+  "offset": 320,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 18,
+  "device_id": 18
+ },
+ {
+  "name": "PMS_FPWM1",
+  "base": "0x300700000",
+  "offset": 328,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 19,
+  "device_id": 19
+ },
+ {
+  "name": "PMS_FPWM2",
+  "base": "0x300700000",
+  "offset": 336,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 20,
+  "device_id": 20
+ },
+ {
+  "name": "PMS_FPWM3",
+  "base": "0x300700000",
+  "offset": 344,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 21,
+  "device_id": 21
+ },
+ {
+  "name": "PMS_FPWM4",
+  "base": "0x300700000",
+  "offset": 352,
+  "parents": [],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 22,
+  "device_id": 22
+ },
+ {
+  "name": "PMS_C1PPT",
+  "base": "0x300700000",
+  "offset": 360,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 23,
+  "device_id": 23
+ },
+ {
+  "name": "SOC_RC",
+  "base": "0x300700000",
+  "offset": 368,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 24,
+  "device_id": 24
+ },
+ {
+  "name": "SOC_DPE",
+  "base": "0x300700000",
+  "offset": 376,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 25,
+  "device_id": 25
+ },
+ {
+  "name": "PMGR_SOC_OCLA",
+  "base": "0x300700000",
+  "offset": 384,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 26,
+  "device_id": 26
+ },
+ {
+  "name": "ISPSENS0",
+  "base": "0x300700000",
+  "offset": 392,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 27,
+  "device_id": 27
+ },
+ {
+  "name": "ISPSENS1",
+  "base": "0x300700000",
+  "offset": 400,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 28,
+  "device_id": 28
+ },
+ {
+  "name": "AFIMCCNI0",
+  "base": "0x300700000",
+  "offset": 408,
+  "parents": [],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 29,
+  "device_id": 29
+ },
+ {
+  "name": "AP_TMM",
+  "base": "0x300700000",
+  "offset": 416,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 30,
+  "device_id": 30
+ },
+ {
+  "name": "PIOGW",
+  "base": "0x300700000",
+  "offset": 424,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 31,
+  "device_id": 31
+ },
+ {
+  "name": "AFIAFT",
+  "base": "0x300700000",
+  "offset": 432,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 32,
+  "device_id": 32
+ },
+ {
+  "name": "AFGGFXNI0",
+  "base": "0x300700000",
+  "offset": 440,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 33,
+  "device_id": 33
+ },
+ {
+  "name": "AFCMCCNI0",
+  "base": "0x300700000",
+  "offset": 448,
+  "parents": [],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 34,
+  "device_id": 34
+ },
+ {
+  "name": "AMCC0_P0",
+  "base": "0x300700000",
+  "offset": 456,
+  "parents": [
+   "AFIMCCNI0",
+   "PIOGW"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 35,
+  "device_id": 35
+ },
+ {
+  "name": "AMCC0_P1",
+  "base": "0x300700000",
+  "offset": 464,
+  "parents": [
+   "AFIMCCNI0",
+   "PIOGW"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 36,
+  "device_id": 36
+ },
+ {
+  "name": "AMCC0_P2",
+  "base": "0x300700000",
+  "offset": 472,
+  "parents": [
+   "AFIMCCNI0",
+   "PIOGW"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 37,
+  "device_id": 37
+ },
+ {
+  "name": "AMCC0_P3",
+  "base": "0x300700000",
+  "offset": 480,
+  "parents": [
+   "AFIMCCNI0",
+   "PIOGW"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 38,
+  "device_id": 38
+ },
+ {
+  "name": "AFINS0",
+  "base": "0x300700000",
+  "offset": 488,
+  "parents": [
+   "AFIMCCNI0",
+   "PIOGW"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 39,
+  "device_id": 39
+ },
+ {
+  "name": "GFX",
+  "base": "0x300700000",
+  "offset": 496,
+  "parents": [
+   "AFIMCCNI0",
+   "PIOGW"
+  ],
+  "flags": 130,
+  "virtual": false,
+  "adt_index": 40,
+  "device_id": 40
+ },
+ {
+  "name": "DCS0",
+  "base": "0x300700000",
+  "offset": 504,
+  "parents": [
+   "AMCC0_P0"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 41,
+  "device_id": 41
+ },
+ {
+  "name": "DCS1",
+  "base": "0x300700000",
+  "offset": 512,
+  "parents": [
+   "AMCC0_P1"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 42,
+  "device_id": 42
+ },
+ {
+  "name": "DCS2",
+  "base": "0x300700000",
+  "offset": 520,
+  "parents": [
+   "AMCC0_P2"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 43,
+  "device_id": 43
+ },
+ {
+  "name": "DCS3",
+  "base": "0x300700000",
+  "offset": 528,
+  "parents": [
+   "AMCC0_P3"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 44,
+  "device_id": 44
+ },
+ {
+  "name": "AFISOCNI0",
+  "base": "0x300700000",
+  "offset": 536,
+  "parents": [
+   "AFINS0",
+   "PIOGW"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 45,
+  "device_id": 45
+ },
+ {
+  "name": "AFISOCNI1",
+  "base": "0x300700000",
+  "offset": 544,
+  "parents": [
+   "AFINS0",
+   "PIOGW"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 46,
+  "device_id": 46
+ },
+ {
+  "name": "AFISOCNI2",
+  "base": "0x300700000",
+  "offset": 552,
+  "parents": [
+   "AFINS0",
+   "PIOGW"
+  ],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 47,
+  "device_id": 47
+ },
+ {
+  "name": "JPG",
+  "base": "0x300700000",
+  "offset": 560,
+  "parents": [
+   "AFISOCNI0"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 48,
+  "device_id": 48
+ },
+ {
+  "name": "MSR",
+  "base": "0x300700000",
+  "offset": 568,
+  "parents": [
+   "AFISOCNI0"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 49,
+  "device_id": 49
+ },
+ {
+  "name": "VENC0_SYS",
+  "base": "0x300700000",
+  "offset": 576,
+  "parents": [
+   "AFISOCNI0",
+   "VENC-CLSTR-V"
+  ],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 50,
+  "device_id": 50
+ },
+ {
+  "name": "VENC1_SYS",
+  "base": "0x300700000",
+  "offset": 584,
+  "parents": [
+   "AFISOCNI0",
+   "VENC-CLSTR-V"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 51,
+  "device_id": 51
+ },
+ {
+  "name": "PRORES",
+  "base": "0x300700000",
+  "offset": 592,
+  "parents": [
+   "AFISOCNI0"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 52,
+  "device_id": 52
+ },
+ {
+  "name": "APCIE_GP",
+  "base": "0x300700000",
+  "offset": 600,
+  "parents": [
+   "AFISOCNI1"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 53,
+  "device_id": 53
+ },
+ {
+  "name": "SIO",
+  "base": "0x300700000",
+  "offset": 608,
+  "parents": [
+   "AFISOCNI1"
+  ],
+  "flags": 17,
+  "virtual": true,
+  "adt_index": 54,
+  "device_id": 54
+ },
+ {
+  "name": "ISP_SYS",
+  "base": "0x300700000",
+  "offset": 616,
+  "parents": [
+   "AFISOCNI1"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 55,
+  "device_id": 55
+ },
+ {
+  "name": "AVD_SYS",
+  "base": "0x300700000",
+  "offset": 624,
+  "parents": [
+   "AFISOCNI1"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 56,
+  "device_id": 56
+ },
+ {
+  "name": "ANS",
+  "base": "0x300700000",
+  "offset": 632,
+  "parents": [
+   "AFISOCNI1"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 57,
+  "device_id": 57
+ },
+ {
+  "name": "DISP_SYS",
+  "base": "0x300700000",
+  "offset": 640,
+  "parents": [
+   "AFISOCNI2"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 58,
+  "device_id": 58
+ },
+ {
+  "name": "DISPEXT0_SYS",
+  "base": "0x300700000",
+  "offset": 648,
+  "parents": [
+   "AFISOCNI2"
+  ],
+  "flags": 2,
+  "virtual": false,
+  "adt_index": 59,
+  "device_id": 59
+ },
+ {
+  "name": "ANE_SYS",
+  "base": "0x300700000",
+  "offset": 656,
+  "parents": [
+   "AFISOCNI2"
+  ],
+  "flags": 128,
+  "virtual": false,
+  "adt_index": 60,
+  "device_id": 60
+ },
+ {
+  "name": "MSR_ASE_CORE",
+  "base": "0x300700000",
+  "offset": 664,
+  "parents": [
+   "MSR"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 61,
+  "device_id": 61
+ },
+ {
+  "name": "APCIE_SYS_GP",
+  "base": "0x300700000",
+  "offset": 672,
+  "parents": [
+   "APCIE_GP"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 62,
+  "device_id": 62
+ },
+ {
+  "name": "SIO_CPU",
+  "base": "0x300700000",
+  "offset": 680,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 63,
+  "device_id": 63
+ },
+ {
+  "name": "FPWM0",
+  "base": "0x300700000",
+  "offset": 688,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 64,
+  "device_id": 64
+ },
+ {
+  "name": "FPWM1",
+  "base": "0x300700000",
+  "offset": 696,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 65,
+  "device_id": 65
+ },
+ {
+  "name": "FPWM2",
+  "base": "0x300700000",
+  "offset": 704,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 66,
+  "device_id": 66
+ },
+ {
+  "name": "I2C0",
+  "base": "0x300700000",
+  "offset": 712,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 67,
+  "device_id": 67
+ },
+ {
+  "name": "I2C1",
+  "base": "0x300700000",
+  "offset": 720,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 68,
+  "device_id": 68
+ },
+ {
+  "name": "I2C2",
+  "base": "0x300700000",
+  "offset": 728,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 69,
+  "device_id": 69
+ },
+ {
+  "name": "I2C3",
+  "base": "0x300700000",
+  "offset": 736,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 70,
+  "device_id": 70
+ },
+ {
+  "name": "I2C4",
+  "base": "0x300700000",
+  "offset": 744,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 71,
+  "device_id": 71
+ },
+ {
+  "name": "SPI_P",
+  "base": "0x300700000",
+  "offset": 752,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 72,
+  "device_id": 72
+ },
+ {
+  "name": "UART_P",
+  "base": "0x300700000",
+  "offset": 760,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 73,
+  "device_id": 73
+ },
+ {
+  "name": "DPA_P",
+  "base": "0x300700000",
+  "offset": 768,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 74,
+  "device_id": 74
+ },
+ {
+  "name": "AES",
+  "base": "0x300700000",
+  "offset": 776,
+  "parents": [
+   "SIO"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 75,
+  "device_id": 75
+ },
+ {
+  "name": "APCIE_ST",
+  "base": "0x300700000",
+  "offset": 784,
+  "parents": [
+   "ANS"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 76,
+  "device_id": 76
+ },
+ {
+  "name": "DISP_FE",
+  "base": "0x300700000",
+  "offset": 792,
+  "parents": [
+   "DISP_SYS"
+  ],
+  "flags": 4,
+  "virtual": false,
+  "adt_index": 77,
+  "device_id": 77
+ },
+ {
+  "name": "DISPEXT0_FE",
+  "base": "0x300700000",
+  "offset": 800,
+  "parents": [
+   "DISPEXT0_SYS"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 78,
+  "device_id": 78
+ },
+ {
+  "name": "DISPEXT0_CPU",
+  "base": "0x300700000",
+  "offset": 808,
+  "parents": [
+   "DISPEXT0_FE"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 79,
+  "device_id": 79
+ },
+ {
+  "name": "SPI0",
+  "base": "0x300700000",
+  "offset": 816,
+  "parents": [
+   "SPI_P"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 80,
+  "device_id": 80
+ },
+ {
+  "name": "SPI1",
+  "base": "0x300700000",
+  "offset": 824,
+  "parents": [
+   "SPI_P"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 81,
+  "device_id": 81
+ },
+ {
+  "name": "SPI2",
+  "base": "0x300700000",
+  "offset": 832,
+  "parents": [
+   "SPI_P"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 82,
+  "device_id": 82
+ },
+ {
+  "name": "SPI3",
+  "base": "0x300700000",
+  "offset": 840,
+  "parents": [
+   "SPI_P"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 83,
+  "device_id": 83
+ },
+ {
+  "name": "QSPI",
+  "base": "0x300700000",
+  "offset": 848,
+  "parents": [
+   "SPI_P"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 84,
+  "device_id": 84
+ },
+ {
+  "name": "UART_N",
+  "base": "0x300700000",
+  "offset": 856,
+  "parents": [
+   "UART_P"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 85,
+  "device_id": 85
+ },
+ {
+  "name": "UART0",
+  "base": "0x300700000",
+  "offset": 864,
+  "parents": [
+   "UART_P"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 86,
+  "device_id": 86
+ },
+ {
+  "name": "UART1",
+  "base": "0x300700000",
+  "offset": 872,
+  "parents": [
+   "UART_P"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 87,
+  "device_id": 87
+ },
+ {
+  "name": "UART2",
+  "base": "0x300700000",
+  "offset": 880,
+  "parents": [
+   "UART_P"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 88,
+  "device_id": 88
+ },
+ {
+  "name": "UART3",
+  "base": "0x300700000",
+  "offset": 888,
+  "parents": [
+   "UART_P"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 89,
+  "device_id": 89
+ },
+ {
+  "name": "UART4",
+  "base": "0x300700000",
+  "offset": 896,
+  "parents": [
+   "UART_P"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 90,
+  "device_id": 90
+ },
+ {
+  "name": "UART5",
+  "base": "0x300700000",
+  "offset": 904,
+  "parents": [
+   "UART_P"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 91,
+  "device_id": 91
+ },
+ {
+  "name": "DPA0",
+  "base": "0x300700000",
+  "offset": 912,
+  "parents": [
+   "DPA_P"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 92,
+  "device_id": 92
+ },
+ {
+  "name": "DPA1",
+  "base": "0x300700000",
+  "offset": 920,
+  "parents": [
+   "DPA_P"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 93,
+  "device_id": 93
+ },
+ {
+  "name": "APCIE_SYS_ST",
+  "base": "0x300700000",
+  "offset": 928,
+  "parents": [
+   "ANS",
+   "APCIE_ST"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 94,
+  "device_id": 94
+ },
+ {
+  "name": "DISPEXT0_DBE",
+  "base": "0x300700000",
+  "offset": 936,
+  "parents": [
+   "DISPEXT0_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 95,
+  "device_id": 95
+ },
+ {
+  "name": "DPEXT0",
+  "base": "0x300700000",
+  "offset": 944,
+  "parents": [
+   "DISPEXT0_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 96,
+  "device_id": 96
+ },
+ {
+  "name": "DISPEXT0_GPPP",
+  "base": "0x300700000",
+  "offset": 952,
+  "parents": [
+   "DISPEXT0_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 97,
+  "device_id": 97
+ },
+ {
+  "name": "APCIE_PHY_SW",
+  "base": "0x300700000",
+  "offset": 960,
+  "parents": [
+   "APCIE_SYS_ST",
+   "APCIE_SYS_GP"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 98,
+  "device_id": 98
+ },
+ {
+  "name": "DPTX_PHY",
+  "base": "0x300700000",
+  "offset": 968,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 99,
+  "device_id": 99
+ },
+ {
+  "name": "PMP",
+  "base": "0x300700000",
+  "offset": 976,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 100,
+  "device_id": 100
+ },
+ {
+  "name": "PMS_SRAM",
+  "base": "0x300700000",
+  "offset": 984,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 101,
+  "device_id": 101
+ },
+ {
+  "name": "ATC0_USB_AON",
+  "base": "0x300700000",
+  "offset": 992,
+  "parents": [],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 102,
+  "device_id": 102
+ },
+ {
+  "name": "ATC0_COMMON",
+  "base": "0x300700000",
+  "offset": 1000,
+  "parents": [
+   "AFISOCNI2",
+   "ATC0_USB_AON"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 103,
+  "device_id": 103
+ },
+ {
+  "name": "ATC0_USB",
+  "base": "0x300700000",
+  "offset": 1008,
+  "parents": [
+   "ATC0_COMMON"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 104,
+  "device_id": 104
+ },
+ {
+  "name": "SEP",
+  "base": "0x300700000",
+  "offset": 3072,
+  "parents": [
+   "AFISOCNI0"
+  ],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 105,
+  "device_id": 105
+ },
+ {
+  "name": "ISP_CPU",
+  "base": "0x300700000",
+  "offset": 16384,
+  "parents": [
+   "ISP_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 106,
+  "device_id": 106
+ },
+ {
+  "name": "ISP_CPU_CORE0",
+  "base": "0x300700000",
+  "offset": 16392,
+  "parents": [
+   "ISP_CPU"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 107,
+  "device_id": 107
+ },
+ {
+  "name": "ISP_CPU_CORE1",
+  "base": "0x300700000",
+  "offset": 16400,
+  "parents": [
+   "ISP_CPU"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 108,
+  "device_id": 108
+ },
+ {
+  "name": "ISP_FE",
+  "base": "0x300700000",
+  "offset": 16408,
+  "parents": [
+   "ISP_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 109,
+  "device_id": 109
+ },
+ {
+  "name": "DPRX",
+  "base": "0x300700000",
+  "offset": 16416,
+  "parents": [
+   "ISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 110,
+  "device_id": 110
+ },
+ {
+  "name": "ISP_SECURE",
+  "base": "0x300700000",
+  "offset": 16424,
+  "parents": [
+   "ISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 111,
+  "device_id": 111
+ },
+ {
+  "name": "ISP_STS0",
+  "base": "0x300700000",
+  "offset": 16432,
+  "parents": [
+   "ISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 112,
+  "device_id": 112
+ },
+ {
+  "name": "ISP_STS1",
+  "base": "0x300700000",
+  "offset": 16440,
+  "parents": [
+   "ISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 113,
+  "device_id": 113
+ },
+ {
+  "name": "ISP_PEARL",
+  "base": "0x300700000",
+  "offset": 16448,
+  "parents": [
+   "ISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 114,
+  "device_id": 114
+ },
+ {
+  "name": "ISP_BE",
+  "base": "0x300700000",
+  "offset": 16456,
+  "parents": [
+   "ISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 115,
+  "device_id": 115
+ },
+ {
+  "name": "ISP_CLR",
+  "base": "0x300700000",
+  "offset": 16464,
+  "parents": [
+   "ISP_BE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 116,
+  "device_id": 116
+ },
+ {
+  "name": "ISP_CVD",
+  "base": "0x300700000",
+  "offset": 16472,
+  "parents": [
+   "ISP_BE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 117,
+  "device_id": 117
+ },
+ {
+  "name": "ISP_CVM",
+  "base": "0x300700000",
+  "offset": 16480,
+  "parents": [
+   "ISP_CVD"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 118,
+  "device_id": 118
+ },
+ {
+  "name": "VENC0_DMA",
+  "base": "0x300700000",
+  "offset": 32768,
+  "parents": [
+   "VENC0_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 119,
+  "device_id": 119
+ },
+ {
+  "name": "VENC0_PIPE4",
+  "base": "0x300700000",
+  "offset": 32776,
+  "parents": [
+   "VENC0_DMA"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 120,
+  "device_id": 120
+ },
+ {
+  "name": "VENC0_PIPE5",
+  "base": "0x300700000",
+  "offset": 32784,
+  "parents": [
+   "VENC0_DMA"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 121,
+  "device_id": 121
+ },
+ {
+  "name": "VENC0_ME0",
+  "base": "0x300700000",
+  "offset": 32792,
+  "parents": [
+   "VENC0_DMA"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 122,
+  "device_id": 122
+ },
+ {
+  "name": "VENC0_ME1",
+  "base": "0x300700000",
+  "offset": 32800,
+  "parents": [
+   "VENC0_ME0"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 123,
+  "device_id": 123
+ },
+ {
+  "name": "VENC1_DMA",
+  "base": "0x300700000",
+  "offset": 32808,
+  "parents": [
+   "VENC1_SYS"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 124,
+  "device_id": 124
+ },
+ {
+  "name": "VENC1_PIPE4",
+  "base": "0x300700000",
+  "offset": 32816,
+  "parents": [
+   "VENC1_DMA"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 125,
+  "device_id": 125
+ },
+ {
+  "name": "VENC1_PIPE5",
+  "base": "0x300700000",
+  "offset": 32824,
+  "parents": [
+   "VENC1_DMA"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 126,
+  "device_id": 126
+ },
+ {
+  "name": "VENC1_ME0",
+  "base": "0x300700000",
+  "offset": 32832,
+  "parents": [
+   "VENC1_DMA"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 127,
+  "device_id": 127
+ },
+ {
+  "name": "VENC1_ME1",
+  "base": "0x300700000",
+  "offset": 32840,
+  "parents": [
+   "VENC1_ME0"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 128,
+  "device_id": 128
+ },
+ {
+  "name": "ANE_CPU",
+  "base": "0x300700000",
+  "offset": 49152,
+  "parents": [
+   "ANE_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 129,
+  "device_id": 129
+ },
+ {
+  "name": "DISP_CPU",
+  "base": "0x300700000",
+  "offset": 65536,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 0,
+  "virtual": false,
+  "adt_index": 130,
+  "device_id": 132
+ },
+ {
+  "name": "DISP_GP0",
+  "base": "0x300700000",
+  "offset": 65544,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 131,
+  "device_id": 133
+ },
+ {
+  "name": "DISP_GP1",
+  "base": "0x300700000",
+  "offset": 65552,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 132,
+  "device_id": 134
+ },
+ {
+  "name": "DISP_CMB",
+  "base": "0x300700000",
+  "offset": 65560,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 133,
+  "device_id": 135
+ },
+ {
+  "name": "DISP_PPP",
+  "base": "0x300700000",
+  "offset": 65568,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 134,
+  "device_id": 136
+ },
+ {
+  "name": "DISP_HILO",
+  "base": "0x300700000",
+  "offset": 65576,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 135,
+  "device_id": 137
+ },
+ {
+  "name": "DISP_DBE",
+  "base": "0x300700000",
+  "offset": 65584,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 136,
+  "device_id": 138
+ },
+ {
+  "name": "DP",
+  "base": "0x300700000",
+  "offset": 65592,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 137,
+  "device_id": 139
+ },
+ {
+  "name": "MIPI_DSI",
+  "base": "0x300700000",
+  "offset": 65600,
+  "parents": [
+   "DISP_FE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 138,
+  "device_id": 140
+ },
+ {
+  "name": "DEBUG_GATED",
+  "base": "0x308280000",
+  "offset": 0,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 139,
+  "device_id": 141
+ },
+ {
+  "name": "NUB_SPMI0",
+  "base": "0x308280000",
+  "offset": 88,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 140,
+  "device_id": 142
+ },
+ {
+  "name": "NUB_SPMI1",
+  "base": "0x308280000",
+  "offset": 96,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 141,
+  "device_id": 143
+ },
+ {
+  "name": "NUB_SPMI_A0",
+  "base": "0x308280000",
+  "offset": 104,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 142,
+  "device_id": 144
+ },
+ {
+  "name": "NUB_AON",
+  "base": "0x308280000",
+  "offset": 112,
+  "parents": [],
+  "flags": 25,
+  "virtual": true,
+  "adt_index": 143,
+  "device_id": 145
+ },
+ {
+  "name": "NUB_AON_NOGATE",
+  "base": "0x308280000",
+  "offset": 120,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 144,
+  "device_id": 146
+ },
+ {
+  "name": "NUB_OCLA",
+  "base": "0x308280000",
+  "offset": 128,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 145,
+  "device_id": 147
+ },
+ {
+  "name": "NUB_GPIO",
+  "base": "0x308280000",
+  "offset": 136,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 146,
+  "device_id": 148
+ },
+ {
+  "name": "DSG",
+  "base": "0x308280000",
+  "offset": 144,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 147,
+  "device_id": 149
+ },
+ {
+  "name": "HPD",
+  "base": "0x308280000",
+  "offset": 152,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 148,
+  "device_id": 150
+ },
+ {
+  "name": "NUB_FABRIC",
+  "base": "0x308280000",
+  "offset": 160,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 149,
+  "device_id": 151
+ },
+ {
+  "name": "NUB_SRAM",
+  "base": "0x308280000",
+  "offset": 168,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 150,
+  "device_id": 152
+ },
+ {
+  "name": "DEBUG_SWITCH",
+  "base": "0x308280000",
+  "offset": 176,
+  "parents": [],
+  "flags": 9,
+  "virtual": false,
+  "adt_index": 151,
+  "device_id": 153
+ },
+ {
+  "name": "AOP_FILTER",
+  "base": "0x308280000",
+  "offset": 16384,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 152,
+  "device_id": 154
+ },
+ {
+  "name": "AOP_GPIO",
+  "base": "0x308280000",
+  "offset": 16392,
+  "parents": [
+   "AOP_FILTER"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 153,
+  "device_id": 155
+ },
+ {
+  "name": "AOP_BASE",
+  "base": "0x308280000",
+  "offset": 16400,
+  "parents": [
+   "AOP_FILTER"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 154,
+  "device_id": 156
+ },
+ {
+  "name": "AOP_FR",
+  "base": "0x308280000",
+  "offset": 16408,
+  "parents": [
+   "AOP_FILTER"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 155,
+  "device_id": 157
+ },
+ {
+  "name": "AUDIO_A",
+  "base": "0x308280000",
+  "offset": 16416,
+  "parents": [
+   "AOP_FILTER"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 156,
+  "device_id": 158
+ },
+ {
+  "name": "AOP_SHIM",
+  "base": "0x308280000",
+  "offset": 16424,
+  "parents": [
+   "AOP_BASE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 157,
+  "device_id": 159
+ },
+ {
+  "name": "AOP_PIODMA",
+  "base": "0x308280000",
+  "offset": 16432,
+  "parents": [
+   "AOP_BASE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 158,
+  "device_id": 160
+ },
+ {
+  "name": "AOP2_PIODMA",
+  "base": "0x308280000",
+  "offset": 16440,
+  "parents": [
+   "AOP_BASE"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 159,
+  "device_id": 161
+ },
+ {
+  "name": "AOP_I2CM0",
+  "base": "0x308280000",
+  "offset": 16448,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 160,
+  "device_id": 162
+ },
+ {
+  "name": "AOP_I2CM1",
+  "base": "0x308280000",
+  "offset": 16456,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 161,
+  "device_id": 163
+ },
+ {
+  "name": "AOP_I2CM2",
+  "base": "0x308280000",
+  "offset": 16464,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 162,
+  "device_id": 164
+ },
+ {
+  "name": "AOP_I2CM3",
+  "base": "0x308280000",
+  "offset": 16472,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 163,
+  "device_id": 165
+ },
+ {
+  "name": "AOP_SCM",
+  "base": "0x308280000",
+  "offset": 16480,
+  "parents": [
+   "AOP_BASE",
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 164,
+  "device_id": 166
+ },
+ {
+  "name": "AOP_SPI0",
+  "base": "0x308280000",
+  "offset": 16488,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 165,
+  "device_id": 167
+ },
+ {
+  "name": "AOP_SPI1",
+  "base": "0x308280000",
+  "offset": 16496,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 166,
+  "device_id": 168
+ },
+ {
+  "name": "AOP_SPMI0",
+  "base": "0x308280000",
+  "offset": 16504,
+  "parents": [
+   "AOP_FILTER",
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 167,
+  "device_id": 169
+ },
+ {
+  "name": "AOP_SPMI1",
+  "base": "0x308280000",
+  "offset": 16512,
+  "parents": [
+   "AOP_FILTER",
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 168,
+  "device_id": 170
+ },
+ {
+  "name": "AOP_HE_NRCS0",
+  "base": "0x308280000",
+  "offset": 16520,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 169,
+  "device_id": 171
+ },
+ {
+  "name": "AOP_HE_NRCS1",
+  "base": "0x308280000",
+  "offset": 16528,
+  "parents": [
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 170,
+  "device_id": 172
+ },
+ {
+  "name": "AOP_CPU",
+  "base": "0x308280000",
+  "offset": 16536,
+  "parents": [
+   "AOP_BASE",
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 171,
+  "device_id": 173
+ },
+ {
+  "name": "AOP2_CPU",
+  "base": "0x308280000",
+  "offset": 16544,
+  "parents": [
+   "AOP_BASE",
+   "AOP_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 172,
+  "device_id": 174
+ },
+ {
+  "name": "AUDIO_FR",
+  "base": "0x308280000",
+  "offset": 16552,
+  "parents": [
+   "AUDIO_A"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 173,
+  "device_id": 175
+ },
+ {
+  "name": "AOP_UART0",
+  "base": "0x308280000",
+  "offset": 16560,
+  "parents": [
+   "AOP_SHIM"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 174,
+  "device_id": 176
+ },
+ {
+  "name": "AOP_UART1",
+  "base": "0x308280000",
+  "offset": 16568,
+  "parents": [
+   "AOP_SHIM"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 175,
+  "device_id": 177
+ },
+ {
+  "name": "AOP_UART2",
+  "base": "0x308280000",
+  "offset": 16576,
+  "parents": [
+   "AOP_SHIM"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 176,
+  "device_id": 178
+ },
+ {
+  "name": "AOP_SRAM",
+  "base": "0x308280000",
+  "offset": 16584,
+  "parents": [
+   "AOP_SCM",
+   "AOP_CPU"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 177,
+  "device_id": 179
+ },
+ {
+  "name": "AUDIO_P",
+  "base": "0x308280000",
+  "offset": 16592,
+  "parents": [
+   "AUDIO_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 178,
+  "device_id": 180
+ },
+ {
+  "name": "AUDIO_LEAP_A",
+  "base": "0x308280000",
+  "offset": 16600,
+  "parents": [
+   "AUDIO_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 179,
+  "device_id": 181
+ },
+ {
+  "name": "AUDIO_SENSE_PDMC",
+  "base": "0x308280000",
+  "offset": 16608,
+  "parents": [
+   "AUDIO_FR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 180,
+  "device_id": 182
+ },
+ {
+  "name": "AUDIO_BASE_S_A",
+  "base": "0x308280000",
+  "offset": 16616,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 181,
+  "device_id": 183
+ },
+ {
+  "name": "AUDIO_BASE_NS_A",
+  "base": "0x308280000",
+  "offset": 16624,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 182,
+  "device_id": 184
+ },
+ {
+  "name": "AUDIO_LEAP_MCA",
+  "base": "0x308280000",
+  "offset": 16632,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 183,
+  "device_id": 185
+ },
+ {
+  "name": "AUDIO_MCA0_M",
+  "base": "0x308280000",
+  "offset": 16640,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 184,
+  "device_id": 186
+ },
+ {
+  "name": "AUDIO_MCA1_M",
+  "base": "0x308280000",
+  "offset": 16648,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 185,
+  "device_id": 187
+ },
+ {
+  "name": "AUDIO_MCA2_M",
+  "base": "0x308280000",
+  "offset": 16656,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 186,
+  "device_id": 188
+ },
+ {
+  "name": "AUDIO_MCA3_M",
+  "base": "0x308280000",
+  "offset": 16664,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 187,
+  "device_id": 189
+ },
+ {
+  "name": "AUDIO_MCA4_M",
+  "base": "0x308280000",
+  "offset": 16672,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 188,
+  "device_id": 190
+ },
+ {
+  "name": "AUDIO_MCA5_M",
+  "base": "0x308280000",
+  "offset": 16680,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 189,
+  "device_id": 191
+ },
+ {
+  "name": "AUDIO_LEAP_C",
+  "base": "0x308280000",
+  "offset": 16688,
+  "parents": [
+   "AUDIO_LEAP_A"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 190,
+  "device_id": 192
+ },
+ {
+  "name": "AUDIO_LEAP_S_A",
+  "base": "0x308280000",
+  "offset": 16696,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 191,
+  "device_id": 193
+ },
+ {
+  "name": "AUDIO_LEAP_NS_A",
+  "base": "0x308280000",
+  "offset": 16704,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 192,
+  "device_id": 194
+ },
+ {
+  "name": "AUDIO_LEAP_RX0",
+  "base": "0x308280000",
+  "offset": 16712,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 193,
+  "device_id": 195
+ },
+ {
+  "name": "AUDIO_LEAP_RX1",
+  "base": "0x308280000",
+  "offset": 16720,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 194,
+  "device_id": 196
+ },
+ {
+  "name": "AUDIO_LEAP_RX2",
+  "base": "0x308280000",
+  "offset": 16728,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 195,
+  "device_id": 197
+ },
+ {
+  "name": "AUDIO_LEAP_RX3",
+  "base": "0x308280000",
+  "offset": 16736,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 196,
+  "device_id": 198
+ },
+ {
+  "name": "AUDIO_LEAP_RX4",
+  "base": "0x308280000",
+  "offset": 16744,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 197,
+  "device_id": 199
+ },
+ {
+  "name": "AUDIO_LEAP_TX0",
+  "base": "0x308280000",
+  "offset": 16752,
+  "parents": [
+   "AUDIO_LEAP_C"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 198,
+  "device_id": 200
+ },
+ {
+  "name": "PDM0_AUDIO_REF",
+  "base": "0x308280000",
+  "offset": 16760,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 199,
+  "device_id": 201
+ },
+ {
+  "name": "PDM1_AUDIO_REF",
+  "base": "0x308280000",
+  "offset": 16768,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 200,
+  "device_id": 202
+ },
+ {
+  "name": "SMC_FABRIC",
+  "base": "0x308280000",
+  "offset": 32768,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 201,
+  "device_id": 203
+ },
+ {
+  "name": "SMC_GPIO",
+  "base": "0x308280000",
+  "offset": 32776,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 202,
+  "device_id": 204
+ },
+ {
+  "name": "SMC_AON",
+  "base": "0x308280000",
+  "offset": 32784,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 203,
+  "device_id": 205
+ },
+ {
+  "name": "SMC_UART0",
+  "base": "0x308280000",
+  "offset": 32792,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 204,
+  "device_id": 206
+ },
+ {
+  "name": "SMC_UART1",
+  "base": "0x308280000",
+  "offset": 32800,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 205,
+  "device_id": 207
+ },
+ {
+  "name": "SMC_I2CM0",
+  "base": "0x308280000",
+  "offset": 32808,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 206,
+  "device_id": 208
+ },
+ {
+  "name": "SMC_I2CM1",
+  "base": "0x308280000",
+  "offset": 32816,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 207,
+  "device_id": 209
+ },
+ {
+  "name": "SMC_I2CM2",
+  "base": "0x308280000",
+  "offset": 32824,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 1,
+  "virtual": false,
+  "adt_index": 208,
+  "device_id": 210
+ },
+ {
+  "name": "SMC_FPWM0",
+  "base": "0x308280000",
+  "offset": 32832,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 209,
+  "device_id": 211
+ },
+ {
+  "name": "SMC_FPWM1",
+  "base": "0x308280000",
+  "offset": 32840,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 210,
+  "device_id": 212
+ },
+ {
+  "name": "SMC_FPWM2",
+  "base": "0x308280000",
+  "offset": 32848,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 211,
+  "device_id": 213
+ },
+ {
+  "name": "SMC_FPWM3",
+  "base": "0x308280000",
+  "offset": 32856,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 212,
+  "device_id": 214
+ },
+ {
+  "name": "SMC_PTD",
+  "base": "0x308280000",
+  "offset": 32864,
+  "parents": [
+   "SMC_FABRIC",
+   "NUB_AON"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 213,
+  "device_id": 215
+ },
+ {
+  "name": "SMC_CPU",
+  "base": "0x308280000",
+  "offset": 32872,
+  "parents": [
+   "SMC_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 214,
+  "device_id": 216
+ },
+ {
+  "name": "NUB_HE_NRCS0",
+  "base": "0x308280000",
+  "offset": 32880,
+  "parents": [
+   "SMC_PTD",
+   "NUB_SPMI0"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 215,
+  "device_id": 217
+ },
+ {
+  "name": "NUB_HE_NRCS1",
+  "base": "0x308280000",
+  "offset": 32888,
+  "parents": [
+   "SMC_PTD",
+   "NUB_SPMI1"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 216,
+  "device_id": 218
+ },
+ {
+  "name": "MTP_FABRIC",
+  "base": "0x308280000",
+  "offset": 49152,
+  "parents": [
+   "NUB_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 217,
+  "device_id": 219
+ },
+ {
+  "name": "MTP_GPIO",
+  "base": "0x308280000",
+  "offset": 49160,
+  "parents": [
+   "MTP_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 218,
+  "device_id": 220
+ },
+ {
+  "name": "MTP_BASE",
+  "base": "0x308280000",
+  "offset": 49168,
+  "parents": [
+   "MTP_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 219,
+  "device_id": 221
+ },
+ {
+  "name": "MTP_PERIPH",
+  "base": "0x308280000",
+  "offset": 49176,
+  "parents": [
+   "MTP_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 220,
+  "device_id": 222
+ },
+ {
+  "name": "MTP_UART0",
+  "base": "0x308280000",
+  "offset": 49184,
+  "parents": [
+   "MTP_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 221,
+  "device_id": 223
+ },
+ {
+  "name": "MTP_CPU",
+  "base": "0x308280000",
+  "offset": 49192,
+  "parents": [
+   "MTP_FABRIC"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 222,
+  "device_id": 224
+ },
+ {
+  "name": "MTP_SCM_FABRIC",
+  "base": "0x308280000",
+  "offset": 49200,
+  "parents": [
+   "MTP_PERIPH"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 223,
+  "device_id": 225
+ },
+ {
+  "name": "MTP_SPI0",
+  "base": "0x308280000",
+  "offset": 49208,
+  "parents": [
+   "MTP_PERIPH"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 224,
+  "device_id": 226
+ },
+ {
+  "name": "MTP_I2CM0",
+  "base": "0x308280000",
+  "offset": 49216,
+  "parents": [
+   "MTP_PERIPH"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 225,
+  "device_id": 227
+ },
+ {
+  "name": "MTP_SRAM",
+  "base": "0x308280000",
+  "offset": 49224,
+  "parents": [
+   "MTP_SCM_FABRIC",
+   "MTP_CPU"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 226,
+  "device_id": 228
+ },
+ {
+  "name": "MTP_DMA",
+  "base": "0x308280000",
+  "offset": 49232,
+  "parents": [
+   "MTP_SRAM"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 227,
+  "device_id": 229
+ },
+ {
+  "name": "CPU-BUSY",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 228,
+  "device_id": 230
+ },
+ {
+  "name": "ECPU_NRG",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 229,
+  "device_id": 231
+ },
+ {
+  "name": "PCPU_NRG",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 230,
+  "device_id": 232
+ },
+ {
+  "name": "ECPU_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 231,
+  "device_id": 233
+ },
+ {
+  "name": "PCPU_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 232,
+  "device_id": 234
+ },
+ {
+  "name": "GFX-SGX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "GFX"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 233,
+  "device_id": 235
+ },
+ {
+  "name": "GFX-BUSY",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 234,
+  "device_id": 236
+ },
+ {
+  "name": "GFX-ASC",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "GFX"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 235,
+  "device_id": 237
+ },
+ {
+  "name": "GFX-ASC1",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "GFX"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 236,
+  "device_id": 321
+ },
+ {
+  "name": "ECPU0_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 237,
+  "device_id": 238
+ },
+ {
+  "name": "ECPU1_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 238,
+  "device_id": 239
+ },
+ {
+  "name": "ECPU2_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 239,
+  "device_id": 240
+ },
+ {
+  "name": "ECPU3_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 240,
+  "device_id": 241
+ },
+ {
+  "name": "PCPU0_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 241,
+  "device_id": 242
+ },
+ {
+  "name": "PCPU1_SRAM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 242,
+  "device_id": 243
+ },
+ {
+  "name": "VENC0-AVE-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 243,
+  "device_id": 247
+ },
+ {
+  "name": "VENC0-MEM-FAST",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 244,
+  "device_id": 248
+ },
+ {
+  "name": "VENC0-AVE-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 245,
+  "device_id": 249
+ },
+ {
+  "name": "AVD-SOC-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 246,
+  "device_id": 250
+ },
+ {
+  "name": "AVD-SOC-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 247,
+  "device_id": 251
+ },
+ {
+  "name": "JPG-SOC-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 248,
+  "device_id": 252
+ },
+ {
+  "name": "JPG-SOC-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 249,
+  "device_id": 253
+ },
+ {
+  "name": "ISP-SOC-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 250,
+  "device_id": 254
+ },
+ {
+  "name": "ISP-SOC-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 251,
+  "device_id": 255
+ },
+ {
+  "name": "CLPC-SOC-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 252,
+  "device_id": 256
+ },
+ {
+  "name": "CLPC-SOC-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 253,
+  "device_id": 257
+ },
+ {
+  "name": "CLPC-DCS-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 254,
+  "device_id": 258
+ },
+ {
+  "name": "CLPC-DCS-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 255,
+  "device_id": 259
+ },
+ {
+  "name": "PRORES-SOC-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 256,
+  "device_id": 260
+ },
+ {
+  "name": "PRORES-SOC-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 257,
+  "device_id": 261
+ },
+ {
+  "name": "MSR-SOC-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 258,
+  "device_id": 262
+ },
+ {
+  "name": "MSR-SOC-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 259,
+  "device_id": 263
+ },
+ {
+  "name": "VENC1-AVE-VNOM",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 260,
+  "device_id": 264
+ },
+ {
+  "name": "VENC1-MEM-FAST",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 261,
+  "device_id": 265
+ },
+ {
+  "name": "VENC1-AVE-VMAX",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 262,
+  "device_id": 266
+ },
+ {
+  "name": "SIO-CPU-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "SIO_CPU"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 263,
+  "device_id": 288
+ },
+ {
+  "name": "USB-AUDIO-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 264,
+  "device_id": 289
+ },
+ {
+  "name": "VENC0-SYS-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "VENC0_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 265,
+  "device_id": 306
+ },
+ {
+  "name": "VENC1-SYS-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "VENC1_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 266,
+  "device_id": 307
+ },
+ {
+  "name": "AVD-SYS-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "AVD_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 267,
+  "device_id": 290
+ },
+ {
+  "name": "ANE-SYS-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "ANE_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 268,
+  "device_id": 291
+ },
+ {
+  "name": "JPG0-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "JPG"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 269,
+  "device_id": 292
+ },
+ {
+  "name": "JPG1-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "JPG"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 270,
+  "device_id": 293
+ },
+ {
+  "name": "MSR-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "MSR"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 271,
+  "device_id": 294
+ },
+ {
+  "name": "ISP-SYS-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "ISP_SYS"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 272,
+  "device_id": 295
+ },
+ {
+  "name": "ISP-CORE-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "ISP_CPU_CORE0",
+   "ISP_CPU_CORE1"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 273,
+  "device_id": 309
+ },
+ {
+  "name": "SEP-PEARL-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 274,
+  "device_id": 296
+ },
+ {
+  "name": "AUDIO-P-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "AUDIO_P"
+  ],
+  "flags": 17,
+  "virtual": true,
+  "adt_index": 275,
+  "device_id": 297
+ },
+ {
+  "name": "ATC0-USB-AUD-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "USB-AUDIO-V"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 276,
+  "device_id": 298
+ },
+ {
+  "name": "AUDIO-LLT-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 277,
+  "device_id": 299
+ },
+ {
+  "name": "AUSB0_AONUSB-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "ATC0_USB_AON"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 278,
+  "device_id": 300
+ },
+ {
+  "name": "USB_SLP_DDR-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 279,
+  "device_id": 305
+ },
+ {
+  "name": "DISP-MIE-DPB",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 280,
+  "device_id": 244
+ },
+ {
+  "name": "DISP-FB-ACTIVE",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 281,
+  "device_id": 245
+ },
+ {
+  "name": "DISP-CARVE-OUT",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 282,
+  "device_id": 246
+ },
+ {
+  "name": "DCP0-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "DISP_CPU"
+  ],
+  "flags": 17,
+  "virtual": true,
+  "adt_index": 283,
+  "device_id": 301
+ },
+ {
+  "name": "DCPEXT0-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "DISPEXT0_CPU"
+  ],
+  "flags": 17,
+  "virtual": true,
+  "adt_index": 284,
+  "device_id": 302
+ },
+ {
+  "name": "FR_SCALING-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 285,
+  "device_id": 304
+ },
+ {
+  "name": "APCIE_SYS_ST-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "APCIE_SYS_ST"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 286,
+  "device_id": 308
+ },
+ {
+  "name": "ATC0-USB-DART",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [
+   "ATC0_USB"
+  ],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 287,
+  "device_id": 320
+ },
+ {
+  "name": "VENC-CLSTR-V",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 288,
+  "device_id": 322
+ },
+ {
+  "name": "DISP_INT_M3",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 289,
+  "device_id": 336
+ },
+ {
+  "name": "DISP_EXT0_M3",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 290,
+  "device_id": 337
+ },
+ {
+  "name": "ANE-SYS-V-PMP",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 18,
+  "virtual": true,
+  "adt_index": 291,
+  "device_id": 338
+ },
+ {
+  "name": "ATC0-DCS-F1",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 292,
+  "device_id": 339
+ },
+ {
+  "name": "ATC0-DCS-F2",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 293,
+  "device_id": 340
+ },
+ {
+  "name": "ATC0-DCS-F3",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 294,
+  "device_id": 341
+ },
+ {
+  "name": "ATC0-DCS-F4",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 295,
+  "device_id": 342
+ },
+ {
+  "name": "ATC0-DCS-F5",
+  "base": "0x300700000",
+  "offset": 0,
+  "parents": [],
+  "flags": 16,
+  "virtual": true,
+  "adt_index": 296,
+  "device_id": 343
+ }
+]

@@ -60,7 +60,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD_H17("A033", "A037", dcpep_dfb_query),    /* (0, 0x4) */
 	IOMFB_METHOD("A380", dcpep_dfb_ready_query),          /* (0, 0x4) */
 	IOMFB_METHOD("A353", dcpep_pipe_query_353),           /* (0, 0x8) */
-	IOMFB_METHOD("A352", dcpep_pipe_set_352),             /* (0x8, 0x4) in 0x70 */
+	IOMFB_METHOD("A352", dcpep_pipe_set_352),             /* (0x8, 0x4) {prop, value}: runtime property */
 	IOMFB_METHOD("A415", dcpep_pipe_cfg_415),             /* (0xc, 0xc) zeros */
 	/* H17G 25G76 UPPipeAP_H17GSCD::update_notify_clients_dcp builds
 	 * tag0x41303335 (A035), input0x6c, output0. */
@@ -71,17 +71,19 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A476", dcpep_pipe_set_476),             /* (0x4, 0) in 1 */
 	IOMFB_METHOD("A438", dcpep_pipe_cfg_438),             /* (0x106c, 0x4) */
 	IOMFB_METHOD("A428", dcpep_pipe_set_428),             /* (0x4, 0x4) 0x10000 */
+	IOMFB_METHOD("A106", dcpep_read_blend_crc),          /* (0, 0x4) kernelcache stub: out u32 seeded 0xaaaaaaaa */
+	IOMFB_METHOD("A448", dcpep_enable_disable_dithering), /* (0x4, 0x4) kernelcache stub: in u32 enable, out u32 status */
+	IOMFB_METHOD("A030", dcpep_read_crc),                /* (0x8, 0x4) kernelcache stub: in {u32 index, u32 arg}, out u32 */
 	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings), /* init_1 position, in = u32 0 */
 	IOMFB_METHOD("A457", dcpep_first_client_open), /* init_2, between A450 and A412; (0,0) */
-	/* UNRESOLVED: A466 is never called by macOS.  No capture contains a
-	 * client teardown, so the real tag is unknown (the shift model suggests
-	 * A458/A459).  Left as-is; only reached on teardown. */
+	/*
+	 * No H17P capture contains client teardown, so these two tags remain
+	 * unknown. Power transitions bypass both slots and issue A473 directly.
+	 */
 	IOMFB_METHOD("A466", iomfbep_last_client_close),
 	IOMFB_METHOD("A465", dcpep_set_display_refresh_properties), /* while it is in flight the DCP calls back D561 with displayMinRefreshInterval */
 	IOMFB_METHOD("A468", dcpep_flush_supports_power), /* immediately follows setup_video_limits inside D121, in = 01 */
-	/* UNRESOLVED: A478 is a live (0,0x4) method, so this entry would hand it
-	 * a 0x14-byte record.  The real abort_swaps tag is unknown (probably
-	 * A469); no capture aborts a swap.  Only reached on teardown. */
+	/* A478 is a different live method; this placeholder must not be called. */
 	IOMFB_METHOD("A478", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A473", dcpep_set_power_state), /* the only OOBCMD call in the capture, matching this method's oob=true; out 0x8 */
 	IOMFB_METHOD("A472", dcpep_register_dfb_surface), /* default FB surface, nested in D582 */
@@ -123,6 +125,12 @@ static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 			  dcp->disp_bw_scratch_offset;
 		clock_request = dcp->disp_bw_doorbell_res.start +
 				dcp->disp_bw_doorbell_offset;
+	} else if (of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext")) {
+		scratch = dcp->disp_bw_scratch_res.start +
+			  dcp->disp_bw_scratch_offset;
+		clock_request = dcp->disp_bw_doorbell_res.start;
+		dev_info(dcp->dev, "D003 external BWR %#llx boost %#llx\n",
+			 scratch, clock_request);
 	}
 
 	trace_iomfb_callback(dcp, tag, __func__);
@@ -283,6 +291,51 @@ static bool trampoline_get_data_prop_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+/*
+ * D114 CoreAnalyticsSendEvent.  The firmware's flipbook-metrics timer fires it
+ * 3600 s after INIT with { char event[0x40]; char payload[0x1000]; ... } (a
+ * serialised analytics dictionary) and expects a 0x1004-byte reply whose first
+ * byte is 'd' followed by a dictionary in its own compact serialisation --
+ * u32 entry count, then 's'-tagged keys with their values.  Anything else
+ * makes it panic ("OSDictionary deserialization failed [%p]", an app NMI
+ * with the panel left dead: hb104/105/106/108/110, always at t = INIT +
+ * 3600 s).  Recovered from the 25G83 dcpf: the call site at 0x426866c checks
+ * reply[0] == 0x64, unserialises reply+1 and only then merges the entries.
+ * A zeroed reply, which is what trampoline_zero produced, fails that check.
+ * Answer with an empty dictionary: 'd' and a zero count.
+ */
+struct dcp_h17p_core_analytics_req {
+	char event[0x40];
+	char payload[0x1000];
+	u8 tail[4];
+} __packed;
+static_assert(sizeof(struct dcp_h17p_core_analytics_req) == 0x1044);
+
+struct dcp_h17p_core_analytics_resp {
+	u8 type;		/* 'd' = OSDictionary */
+	__le32 count;		/* entries */
+	u8 rest[0x1004 - 5];
+} __packed;
+static_assert(sizeof(struct dcp_h17p_core_analytics_resp) == 0x1004);
+
+static bool trampoline_core_analytics_send_event_h17p(struct apple_dcp *dcp,
+						      int tag, void *out,
+						      void *in)
+{
+	const struct dcp_h17p_core_analytics_req *req = in;
+	struct dcp_h17p_core_analytics_resp *resp = out;
+
+	dev_info(dcp->dev, "CoreAnalyticsSendEvent %.*s: %.*s\n",
+		 (int)sizeof(req->event), req->event,
+		 (int)min_t(size_t, 96, strnlen(req->payload, sizeof(req->payload))),
+		 req->payload);
+
+	/* dcpep_handle_cb() zeroed the reply; only the type tag is needed */
+	resp->type = 'd';
+	resp->count = 0;
+	return true;
+}
+
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = dcpep_cb_d000_h17p, /* macOS calls A033 inside D000 before acking */
 	[1] = trampoline_true,
@@ -300,7 +353,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[111] = trampoline_true, /* create_iomfb_service */
 	[112] = trampoline_create_backlight_service, /* create_backlight_service */
 	[113] = trampoline_true, /* create_nvram_service */
-	[114] = trampoline_zero, /* CoreAnalyticsSendEvent */
+	[114] = trampoline_core_analytics_send_event_h17p, /* CoreAnalyticsSendEvent: empty dict reply */
 	[117] = trampoline_nop, /* set_idle_caching_state_ap */
 	[118] = trampoline_zero, /* upload_trace_start */
 	[119] = trampoline_zero, /* upload_trace_chunk */

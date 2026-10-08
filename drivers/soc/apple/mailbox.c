@@ -149,6 +149,18 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_SEND0 ==
 static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 	      0x8830);
 
+/*
+ * The T8140 AOP "setup port" (ADT aop-exclave-mailbox): the second mailbox
+ * the J700 AOP firmware boots through.  Layout measured on hardware by the
+ * native m1n1 microphone host (artifacts/j700-native-lpmic-20260906).
+ */
+#define APPLE_T8140_AOP_SETUP_A2I_CONTROL 0x000
+#define APPLE_T8140_AOP_SETUP_I2A_CONTROL 0x004
+#define APPLE_T8140_AOP_SETUP_A2I_SEND0   0x180
+#define APPLE_T8140_AOP_SETUP_A2I_SEND1   0x188
+#define APPLE_T8140_AOP_SETUP_I2A_RECV0   0x1b0
+#define APPLE_T8140_AOP_SETUP_I2A_RECV1   0x1b8
+
 #define APPLE_T8015_MBOX_A2I_CONTROL	0x108
 #define APPLE_T8015_MBOX_I2A_CONTROL	0x10c
 
@@ -345,6 +357,18 @@ static void apple_mbox_ascwrap_v6_stop_cpu_locked(struct apple_mbox *mbox)
 	pm_runtime_put_autosuspend(mbox->dev);
 }
 
+/*
+ * A failed resume leaves the runtime PM error set, and runtime PM then fails
+ * every later resume with -EINVAL without retrying the power domain.  The
+ * provider keeps no state across a failed resume, so mark it suspended again
+ * and let the next start retry the domain.
+ */
+static void apple_mbox_clear_resume_error(struct apple_mbox *mbox)
+{
+	if (mbox->dev->power.runtime_error)
+		pm_runtime_set_suspended(mbox->dev);
+}
+
 int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 {
 	void __iomem *cpu_control;
@@ -383,8 +407,15 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 	}
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
-	if (ret)
+	if (ret) {
+		dev_err(mbox->dev,
+			"ASC CPU start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
+			ret, mbox->active, mbox->dev->power.runtime_status,
+			mbox->dev->power.disable_depth,
+			mbox->dev->power.runtime_error);
+		apple_mbox_clear_resume_error(mbox);
 		goto out_unlock;
+	}
 
 	if (mbox->hw->is_ascwrap_v8) {
 		/* m1n1 asc_cpu_start(): set RUN at reg[0] + 0x44. */
@@ -608,17 +639,26 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
 		reinit_completion(&mbox->tx_empty);
+		if (!mbox->tx_irq_unmasked) {
+			mbox->tx_irq_unmasked = true;
+			enable_irq(mbox->irq_send_empty);
+		}
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
+		if (t <= 0) {
+			/* A late IRQ may already have masked this under tx_lock. */
+			spin_lock_irqsave(&mbox->tx_lock, flags);
+			if (mbox->tx_irq_unmasked) {
+				disable_irq_nosync(mbox->irq_send_empty);
+				mbox->tx_irq_unmasked = false;
+			}
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			return t < 0 ? t : -ETIMEDOUT;
+		}
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
 		if (unlikely(READ_ONCE(mbox->removing))) {
@@ -648,7 +688,10 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
+	if (mbox->tx_irq_unmasked) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = false;
+	}
 	complete(&mbox->tx_empty);
 	spin_unlock(&mbox->tx_lock);
 
@@ -661,6 +704,9 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 	int ret = 0;
 	u32 mbox_ctrl;
 
+	/* A stopped receiver may still have firmware traffic in its FIFO. */
+	if (!mbox->rx)
+		return 0;
 	if (mbox->hw->is_ascwrap_v8) {
 		struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
 		u32 state, ack;
@@ -829,17 +875,20 @@ int apple_mbox_start(struct apple_mbox *mbox)
 		goto out_unlock;
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
-	if (ret)
+	if (ret) {
+		dev_err(mbox->dev,
+			"mailbox start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
+			ret, mbox->active, mbox->dev->power.runtime_status,
+			mbox->dev->power.disable_depth,
+			mbox->dev->power.runtime_error);
+		apple_mbox_clear_resume_error(mbox);
 		goto out_unlock;
+	}
 
 	if (mbox->hw->ap_initializes_mailboxes) {
-		/* AppleA7IOP::startCPUWithOptions() enables the IOP outbox. */
-		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
-		writel_relaxed(control | BIT(0),
-			       mbox->regs + mbox->hw->i2a_control);
-		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
-		dev_info(mbox->dev,
-			 "T8140 IOP outbox enabled control=%#x\n", control);
+		/* The primary T8140 outbox requires its enable bit before use. */
+		control = readl(mbox->regs + mbox->hw->i2a_control);
+		writel(control | BIT(0), mbox->regs + mbox->hw->i2a_control);
 	}
 
 	/*
@@ -941,9 +990,17 @@ static void apple_mbox_quiesce(void *data)
 	if (apple_mbox_has_rx_poller(mbox))
 		cancel_delayed_work_sync(&apple_mbox_to_priv(mbox)->rx_poll_work);
 
-	/* The TX IRQ is normally disabled; force and synchronize that state. */
-	if (!mbox->hw->rx_poll_required)
-		disable_irq(mbox->irq_send_empty);
+	if (!mbox->hw->rx_poll_required) {
+	/* Serialize once-only masking with the IRQ and send-error paths. */
+	spin_lock_irqsave(&mbox->tx_lock, flags);
+	if (mbox->tx_irq_unmasked) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_unmasked = false;
+	}
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	/* The handler takes tx_lock, so drain it after releasing the lock. */
+	synchronize_irq(mbox->irq_send_empty);
+	}
 	complete_all(&mbox->tx_empty);
 	if (!mbox->hw->rx_poll_required)
 		synchronize_irq(mbox->irq_recv_not_empty);
@@ -1425,6 +1482,21 @@ static const struct apple_mbox_hw apple_mbox_t8152_gfx_ascwrap_v8_hw = {
 
 static_assert(0x20 + sizeof(u32) <= APPLE_ASCWRAP_V8_MBOX_SIZE);
 
+static const struct apple_mbox_hw apple_mbox_t8140_aop_setup_hw = {
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_T8140_AOP_SETUP_A2I_CONTROL,
+	.a2i_send0 = APPLE_T8140_AOP_SETUP_A2I_SEND0,
+	.a2i_send1 = APPLE_T8140_AOP_SETUP_A2I_SEND1,
+
+	.i2a_control = APPLE_T8140_AOP_SETUP_I2A_CONTROL,
+	.i2a_recv0 = APPLE_T8140_AOP_SETUP_I2A_RECV0,
+	.i2a_recv1 = APPLE_T8140_AOP_SETUP_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
 static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.control_full = APPLE_M3_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_M3_MBOX_CONTROL_EMPTY,
@@ -1451,6 +1523,7 @@ static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
 	{ .compatible = "apple,t8142-ascwrap-v6", .data = &apple_mbox_t8142_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
+	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },

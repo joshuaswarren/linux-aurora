@@ -21,7 +21,6 @@
 #define DL_MODE_NEED_RSP		BIT(31)
 
 #define FW_START_OVERRIDE		BIT(0)
-#define FW_START_DELAY_CALIBRATION	BIT(1)
 #define FW_START_WORKING_PDA_CR4	BIT(2)
 #define FW_START_WORKING_PDA_DSP	BIT(3)
 
@@ -1101,8 +1100,7 @@ enum {
 	PATCH_NOT_DL_SEM_FAIL,
 	PATCH_IS_DL,
 	PATCH_NOT_DL_SEM_SUCCESS,
-	PATCH_REL_SEM_SUCCESS,
-	PATCH_REL_SEM_SUCCESS_MT7932
+	PATCH_REL_SEM_SUCCESS
 };
 
 enum {
@@ -1186,7 +1184,6 @@ enum {
 #define __MCU_CMD_FIELD_CE			BIT(18)
 #define __MCU_CMD_FIELD_WA			BIT(19)
 #define __MCU_CMD_FIELD_WM			BIT(20)
-#define __MCU_CMD_FIELD_ACK			BIT(21)
 
 #define MCU_CMD(_t)				FIELD_PREP(__MCU_CMD_FIELD_ID,		\
 							   MCU_CMD_##_t)
@@ -1334,9 +1331,7 @@ enum {
 	MCU_CMD_PATCH_START_REQ = 0x05,
 	MCU_CMD_PATCH_FINISH_REQ = 0x07,
 	MCU_CMD_PATCH_SEM_CONTROL = 0x10,
-	MCU_CMD_EFUSE_ACCESS = 0x50,
 	MCU_CMD_WA_PARAM = 0xc4,
-	MCU_CMD_ONE_TIME_CAL = 0xd6,
 	MCU_CMD_EXT_CID = 0xed,
 	MCU_CMD_FW_SCATTER = 0xee,
 	MCU_CMD_RESTART_DL_REQ = 0xef,
@@ -1345,45 +1340,34 @@ enum {
 /* offload mcu commands */
 enum {
 	MCU_CE_CMD_TEST_CTRL = 0x01,
-	MCU_CE_CMD_BASIC_CONFIG = 0x02,
 	MCU_CE_CMD_START_HW_SCAN = 0x03,
 	MCU_CE_CMD_SET_PS_PROFILE = 0x05,
-	MCU_CE_CMD_SET_INFRASTRUCTURE = 0x09,
 	MCU_CE_CMD_SET_RX_FILTER = 0x0a,
 	MCU_CE_CMD_SET_CHAN_DOMAIN = 0x0f,
-	MCU_CE_CMD_BSS_ACTIVATE_CTRL = 0x11,
-	MCU_CE_CMD_SET_BSS_INFO = 0x12,
-	MCU_CE_CMD_UPDATE_STA_RECORD = 0x13,
-	MCU_CE_CMD_REMOVE_STA_RECORD = 0x14,
 	MCU_CE_CMD_SET_BSS_CONNECTED = 0x16,
 	MCU_CE_CMD_SET_BSS_ABORT = 0x17,
 	MCU_CE_CMD_CANCEL_HW_SCAN = 0x1b,
 	MCU_CE_CMD_SET_ROC = 0x1c,
 	MCU_CE_CMD_SET_EDCA_PARMS = 0x1d,
-	MCU_CE_CMD_SET_DBDC_PARMS = 0x28,
 	MCU_CE_CMD_SET_P2P_OPPPS = 0x33,
 	MCU_CE_CMD_SET_CLC = 0x5c,
 	MCU_CE_CMD_SET_RATE_TX_POWER = 0x5d,
 	MCU_CE_CMD_SCHED_SCAN_ENABLE = 0x61,
 	MCU_CE_CMD_SCHED_SCAN_REQ = 0x62,
-	MCU_CE_CMD_GET_SET_CUSTOMER_CFG = 0x70,
 	MCU_CE_CMD_GET_NIC_CAPAB = 0x8a,
 	MCU_CE_CMD_RSSI_MONITOR = 0xa1,
 	MCU_CE_CMD_SET_MU_EDCA_PARMS = 0xb0,
-	MCU_CE_CMD_SET_STA_MAC = 0xb8,
 	MCU_CE_CMD_REG_WRITE = 0xc0,
 	MCU_CE_CMD_REG_READ = 0xc0,
 	MCU_CE_CMD_CHIP_CONFIG = 0xca,
 	MCU_CE_CMD_FWLOG_2_HOST = 0xc5,
 	MCU_CE_CMD_GET_WTBL = 0xcd,
-	MCU_CE_CMD_SET_6G_SCAN = 0xd7,
 	MCU_CE_CMD_GET_TXPWR = 0xd0,
 };
 
 enum {
 	PATCH_SEM_RELEASE,
-	PATCH_SEM_GET,
-	PATCH_SEM_GET_MT7932,
+	PATCH_SEM_GET
 };
 
 enum {
@@ -2011,14 +1995,11 @@ int mt76_connac_mcu_init_download(struct mt76_dev *dev, u32 addr, u32 len,
 int mt76_connac_mcu_start_patch(struct mt76_dev *dev);
 int mt76_connac_mcu_patch_sem_ctrl(struct mt76_dev *dev, bool get);
 int mt76_connac_mcu_start_firmware(struct mt76_dev *dev, u32 addr, u32 option);
-int mt76_connac_mcu_read_otp(struct mt76_dev *dev, u32 addr, u8 *value);
-int mt76_connac_mcu_read_init_reg(struct mt76_dev *dev, u32 addr, u32 *value);
 
 void mt76_connac_mcu_build_rnr_scan_param(struct mt76_dev *mdev,
 					  struct cfg80211_scan_request *sreq);
 int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 			    struct ieee80211_scan_request *scan_req);
-int mt76_connac_mcu_hw_scan_next(struct mt76_phy *phy);
 int mt76_connac_mcu_cancel_hw_scan(struct mt76_phy *phy,
 				   struct ieee80211_vif *vif);
 int mt76_connac_mcu_sched_scan_req(struct mt76_phy *phy,

@@ -29,9 +29,9 @@ messages = {
         "MMU: T8140 job context reused all",
         "MMU: T8140 job context reused {} GPUVM low views",
     ),
-    "g17_live_boot.rs": ("G17P render: client queue",),
+    "g17_live_boot.rs": ("G17P render: client queue {} released descriptor context",),
     "g17_async_compute.rs": ("G17P async compute: prepared installed graph rebind",),
-    "g17_manager.rs": ("G17P render VM handoff: rebound complete cached graph",),
+    "g17_manager.rs": ("G17P render VM handoff: pair {} graph of closed owner",),
 }
 
 for name, needles in messages.items():

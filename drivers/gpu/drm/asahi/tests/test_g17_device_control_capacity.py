@@ -39,6 +39,11 @@ mod g17_initdata {
  pub fn derive_channel_table(_:super::InstanceRole,_:u64,_:u64,_:u64,_:u64)->[Channel;17]{std::array::from_fn(|_|Channel{ring:0x1000})}
 }
 enum InstanceRole{Primary}
+// Diagnostic message log (g17_timing_buffer::msglog) is a no-op here.
+mod g17_timing_buffer { pub const MSG_DEVICE_CONTROL:u64=4; pub fn msglog(_:u64,_:u64,_:u64,_:u64){} }
+// v93r CONTROL_TRACE (g17p_recovery_path bit1, default off): publish-time bookkeeping only.
+mod g17_recovery_path { pub fn note_control_publish(_slot:u32,_opcode:u32,_arg:u32){} }
+''' + item(resources, 'fn g17p_live_word_bounds(') + '\n' + item(resources, 'fn g17p_live_write_u32(') + r'''
 struct Object{raw:UnsafeCell<Vec<u8>>,fail:Cell<bool>,views:Cell<usize>}
 struct View(*mut u8);impl View{fn as_mut_ptr(&self)->*mut u8{self.0}}
 impl Object{

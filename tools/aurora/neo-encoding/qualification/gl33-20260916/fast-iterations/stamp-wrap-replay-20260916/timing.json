@@ -1,0 +1,63 @@
+{
+  "steps": [
+    {
+      "name": "identity",
+      "seconds": 0.30356566701084375,
+      "exit_code": 0
+    },
+    {
+      "name": "upload",
+      "seconds": 0.39329470903612673,
+      "exit_code": 0
+    },
+    {
+      "name": "hardware",
+      "seconds": 182.16783870803192,
+      "exit_code": 0
+    },
+    {
+      "name": "terminal_receipt",
+      "seconds": 0.025352833908982575,
+      "exit_code": 0
+    },
+    {
+      "name": "collect",
+      "seconds": 0.2424931249115616,
+      "exit_code": 0
+    }
+  ],
+  "label": "stamp-wrap-replay-20260916",
+  "terminal": true,
+  "seconds": 183.18469445896335,
+  "hardware": {
+    "boot": "94c3f079-27bc-456d-93a2-5db1e7ed2171",
+    "label": "stamp-wrap-replay-20260916",
+    "mesa_sha256": "362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56",
+    "steps": [
+      {
+        "name": "start-x11-hardware.py",
+        "seconds": 0.8316087979999907,
+        "exit_code": 0
+      },
+      {
+        "name": "run-official-cts.py",
+        "seconds": 180.77976595,
+        "exit_code": 0
+      }
+    ],
+    "rebooted": false,
+    "resident_modified": false,
+    "complete": true,
+    "xorg_reused": false,
+    "xorg_pid": 761,
+    "cts_exit_code": 0,
+    "kernel_fault": false,
+    "cts_seconds": 179.733355523,
+    "next_action": "reuse_healthy_xorg",
+    "seconds": 181.62496845000004,
+    "diagnostic_passed": true,
+    "statuses": {
+      "Pass": 1312
+    }
+  }
+}

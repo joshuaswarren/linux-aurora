@@ -47,19 +47,16 @@ ran = re.search(r"(\d+) passed", completed.stdout)
 assert ran and int(ran.group(1)) >= 6, completed.stdout
 assert "0 failed" in completed.stdout, completed.stdout
 
-# --- the retained staging image is scratch only ----------------------------
+# --- descriptors are encoded straight into the selected generation ---------
+# v91 direct descriptors replace j700's staging image and copy
+# (test_g17_direct_render_descriptors.py covers the encoding). Builders still
+# zero exactly their prefixes, so no byte carries a previous submission.
 restage = block(resources, "    pub(crate) fn restage_command(")
-assert "self.staging_descriptors.take()" in restage
-assert "self.staging_descriptors = Some(next_descriptors);" in restage
-# A reused buffer must be zeroed exactly as a fresh allocation is; otherwise a
-# field the descriptor builders leave untouched would carry the previous
-# submission's bytes.
-reset = restage[restage.index("self.staging_descriptors.take()"):]
-assert "retained.fill(0)" in reset[: reset.index("};")]
-assert "next_descriptors.object" not in restage
-# And its own address must never be published: the only addresses that go into
-# the command come from the retained storage and the freshly mapped state.
-assert "next_descriptors.iova()" not in restage
+assert "staging_descriptors" not in restage
+assert "self.select_render_command_generation(submission_ordinal)?" in restage
+render = (root / "g17_render.rs").read_text()
+assert "raw[..TA_DESCRIPTOR_SIZE].fill(0);" in block(render, "pub(crate) fn build_ta_descriptor(")
+assert "raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);" in block(render, "pub(crate) fn build_fragment_descriptor(")
 assert "render_state_va = self.render_state.iova()" in restage
 
 # --- nothing per-submission logs unconditionally ---------------------------
@@ -82,7 +79,7 @@ assert "default: 0" in perf_param
 # sufficient.
 guarded = block(drm, "    fn submit_guarded(")
 assert "let perf_enabled = *module_parameters::g17p_perf_window.value() != 0;" in guarded
-assert "let entered = if perf_enabled" in guarded
+assert "let mut entered = if perf_enabled" in guarded
 assert "entered: Option<Instant<Monotonic>>" in async_submit
 render_async = block(drm, "    fn submit_render_async(")
 assert "entered: Option<Instant<Monotonic>>" in render_async

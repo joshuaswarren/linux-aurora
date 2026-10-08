@@ -3,138 +3,9 @@
 
 #include <linux/module.h>
 #include <linux/firmware.h>
-#include <linux/pci.h>
-#include <linux/delay.h>
 
 #include "mt792x.h"
 #include "dma.h"
-
-#define MT7932_MCU_SHARE_IPC_SIZE	0x300
-#define MT7932_MCU_SHARE_AUX_SIZE	0x320
-#define MT7932_MCU_MAP_SETTING		0x7c00e254
-#define MT7932_MCU_MAP_SETTING_VALUE	0x18051848
-#define MT7932_MCU_MAP_SETTING_MASK	GENMASK(31, 16)
-#define MT7932_MCU_MAP_SETTING_READY	0x18050000
-#define MT7932_MCU_SHARE_IPC_ADDR	0x7c053a30
-#define MT7932_MCU_SHARE_FLAGS		0x7c053a38
-#define MT7932_MCU_SHARE_SIZE		0x7c053a3c
-#define MT7932_MCU_SHARE_AUX_ADDR	0x7c053a54
-#define MT7932_MCU_SHARE_ENABLE		0x7c053c28
-
-static int mt7932_mcu_share_info_init(struct mt792x_dev *dev)
-{
-	struct device *dma_dev = dev->mt76.dma_dev;
-	u32 map, enable, flags, size, ipc_addr, aux_addr;
-
-	if (!dev->mt7932_ipc_buf) {
-		dev->mt7932_ipc_buf = dmam_alloc_coherent(dma_dev,
-						 MT7932_MCU_SHARE_IPC_SIZE,
-						 &dev->mt7932_ipc_dma,
-						 GFP_KERNEL);
-		if (!dev->mt7932_ipc_buf)
-			return -ENOMEM;
-	}
-	if (!dev->mt7932_aux_buf) {
-		dev->mt7932_aux_buf = dmam_alloc_coherent(dma_dev,
-						 MT7932_MCU_SHARE_AUX_SIZE,
-						 &dev->mt7932_aux_dma,
-						 GFP_KERNEL);
-		if (!dev->mt7932_aux_buf)
-			return -ENOMEM;
-	}
-	if (upper_32_bits(dev->mt7932_ipc_dma) ||
-	    upper_32_bits(dev->mt7932_aux_dma))
-		return -ERANGE;
-
-	memset(dev->mt7932_ipc_buf, 0, MT7932_MCU_SHARE_IPC_SIZE);
-	memset(dev->mt7932_aux_buf, 0, MT7932_MCU_SHARE_AUX_SIZE);
-	dma_wmb();
-
-	/* AppleSunriseWLAN 25G83 calls mt7922_mcu_map_setting before
-	 * halUdpateMCUShareInfo publishes either coherent buffer.  The callback
-	 * selects the MCU aperture, waits 2 us and accepts the setting only when
-	 * the register's upper half reads back as 0x1805.
-	 */
-	mt76_wr(dev, MT7932_MCU_MAP_SETTING, MT7932_MCU_MAP_SETTING_VALUE);
-	udelay(2);
-	map = mt76_rr(dev, MT7932_MCU_MAP_SETTING);
-	if ((map & MT7932_MCU_MAP_SETTING_MASK) !=
-	    MT7932_MCU_MAP_SETTING_READY)
-		return -EIO;
-
-	/* J700's MT7932 bus-info version is 0x20.  Apple therefore takes the
-	 * legacy five-write branch in halUdpateMCUShareInfo: enable, flags, IPC
-	 * size, IPC low address and auxiliary low address.  In the handshake
-	 * table 0x7c053a50 is not the auxiliary address for this branch;
-	 * 0x7c053a54 is.  Do not invent the version >= 0x21 high-word writes.
-	 */
-	mt76_wr(dev, MT7932_MCU_SHARE_ENABLE, 1);
-	mt76_wr(dev, MT7932_MCU_SHARE_FLAGS, 2);
-	mt76_wr(dev, MT7932_MCU_SHARE_SIZE, MT7932_MCU_SHARE_IPC_SIZE);
-	mt76_wr(dev, MT7932_MCU_SHARE_IPC_ADDR,
-		lower_32_bits(dev->mt7932_ipc_dma));
-	mt76_wr(dev, MT7932_MCU_SHARE_AUX_ADDR,
-		lower_32_bits(dev->mt7932_aux_dma));
-
-	enable = mt76_rr(dev, MT7932_MCU_SHARE_ENABLE);
-	flags = mt76_rr(dev, MT7932_MCU_SHARE_FLAGS);
-	size = mt76_rr(dev, MT7932_MCU_SHARE_SIZE);
-	ipc_addr = mt76_rr(dev, MT7932_MCU_SHARE_IPC_ADDR);
-	aux_addr = mt76_rr(dev, MT7932_MCU_SHARE_AUX_ADDR);
-	dev_info(dev->mt76.dev,
-		 "J700_MT7932_MCU_MAP_SHARE_PASS: map=0x%08x enable=0x%08x flags=0x%08x size=0x%08x ipc=0x%08x aux=0x%08x\n",
-		 map, enable, flags, size, ipc_addr, aux_addr);
-
-	return 0;
-}
-
-static void mt7932_mcu_share_buffer_trace(struct mt792x_dev *dev,
-					  const char *phase)
-{
-	const __le32 *buffers[] = {
-		dev->mt7932_ipc_buf,
-		dev->mt7932_aux_buf,
-	};
-	const u32 sizes[] = {
-		MT7932_MCU_SHARE_IPC_SIZE,
-		MT7932_MCU_SHARE_AUX_SIZE,
-	};
-	const char * const names[] = { "ipc", "aux" };
-	unsigned int b;
-
-	/* These allocations are coherent.  Order the CPU observations after the
-	 * device's last opportunity to publish its firmware-start handshake.
-	 */
-	dma_rmb();
-	for (b = 0; b < ARRAY_SIZE(buffers); b++) {
-		u32 first_offset = U32_MAX, first_value = 0;
-		u32 last_offset = U32_MAX, last_value = 0;
-		u32 nonzero = 0, xor = 0, sum = 0;
-		u32 i;
-
-		for (i = 0; i < sizes[b] / sizeof(*buffers[b]); i++) {
-			u32 value = le32_to_cpu(READ_ONCE(buffers[b][i]));
-
-			xor ^= value;
-			sum += value;
-			if (!value)
-				continue;
-			if (first_offset == U32_MAX) {
-				first_offset = i * sizeof(*buffers[b]);
-				first_value = value;
-			}
-			last_offset = i * sizeof(*buffers[b]);
-			last_value = value;
-			nonzero++;
-		}
-
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_MCU_SHARE_BUFFER: phase=%s name=%s bytes=0x%x nonzero=%u first=0x%08x:0x%08x last=0x%08x:0x%08x xor=0x%08x sum=0x%08x\n",
-			 phase, names[b], sizes[b], nonzero, first_offset,
-			 first_value, last_offset, last_value, xor, sum);
-	}
-
-}
 
 static const struct ieee80211_iface_limit if_limits[] = {
 	{
@@ -1051,169 +922,20 @@ int mt792xe_mcu_fw_pmctrl(struct mt792x_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mt792xe_mcu_fw_pmctrl);
 
-/* After FW_START the MT7932 BAR stops answering.  Config space is routed
- * independently of the BAR window, so reading it separates "the endpoint left
- * the link" from "the endpoint is present but its memory decode is gone".
- */
-static void mt7932_fw_start_bus_probe(struct mt792x_dev *dev)
-{
-	struct pci_dev *pdev, *parent;
-	u32 id = 0, cmd = 0, uncor = 0, cor = 0;
-	u16 lnksta = 0, devsta = 0, plnksta = 0;
-	int pos;
-
-	if (!dev_is_pci(dev->mt76.dev)) {
-		dev_err(dev->mt76.dev,
-			"J700_MT7932_FW_START_BUS_PROBE: not a pci device\n");
-		return;
-	}
-
-	pdev = to_pci_dev(dev->mt76.dev);
-
-	pci_read_config_dword(pdev, PCI_VENDOR_ID, &id);
-	pci_read_config_dword(pdev, PCI_COMMAND, &cmd);
-	pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &lnksta);
-	pcie_capability_read_word(pdev, PCI_EXP_DEVSTA, &devsta);
-
-	dev_err(dev->mt76.dev,
-		"J700_MT7932_FW_START_BUS_PROBE: cfg_id=0x%08x cmd=0x%08x lnksta=0x%04x devsta=0x%04x\n",
-		id, cmd, lnksta, devsta);
-
-	if (id == 0xffffffff)
-		dev_err(dev->mt76.dev,
-			"J700_MT7932_FW_START_BUS_PROBE: ENDPOINT_GONE config space unreadable\n");
-	else
-		dev_err(dev->mt76.dev,
-			"J700_MT7932_FW_START_BUS_PROBE: ENDPOINT_PRESENT mem_en=%u bus_master=%u\n",
-			!!(cmd & PCI_COMMAND_MEMORY),
-			!!(cmd & PCI_COMMAND_MASTER));
-
-	/* The root port survives the endpoint and has AER enabled, so it can
-	 * say why the link went down.  A Surprise Down uncorrectable error
-	 * means the endpoint vanished; a completion timeout or receiver error
-	 * points somewhere else entirely.
-	 */
-	parent = pdev->bus->self;
-	if (!parent) {
-		dev_err(dev->mt76.dev,
-			"J700_MT7932_FW_START_ROOT_PROBE: no parent bridge\n");
-		return;
-	}
-
-	pcie_capability_read_word(parent, PCI_EXP_LNKSTA, &plnksta);
-	pos = pci_find_ext_capability(parent, PCI_EXT_CAP_ID_ERR);
-	if (pos) {
-		pci_read_config_dword(parent, pos + PCI_ERR_UNCOR_STATUS,
-				      &uncor);
-		pci_read_config_dword(parent, pos + PCI_ERR_COR_STATUS, &cor);
-	}
-
-	dev_err(dev->mt76.dev,
-		"J700_MT7932_FW_START_ROOT_PROBE: lnksta=0x%04x speed=%u width=%u aer_uncor=0x%08x aer_cor=0x%08x\n",
-		plnksta, plnksta & PCI_EXP_LNKSTA_CLS,
-		(plnksta & PCI_EXP_LNKSTA_NLW) >> PCI_EXP_LNKSTA_NLW_SHIFT,
-		uncor, cor);
-
-	if (uncor & PCI_ERR_UNC_SURPDN)
-		dev_err(dev->mt76.dev,
-			"J700_MT7932_FW_START_ROOT_PROBE: SURPRISE_DOWN endpoint removed itself from the link\n");
-	if (uncor & PCI_ERR_UNC_COMP_TIME)
-		dev_err(dev->mt76.dev,
-			"J700_MT7932_FW_START_ROOT_PROBE: COMPLETION_TIMEOUT\n");
-}
-
 int mt792x_load_firmware(struct mt792x_dev *dev)
 {
 	int ret;
-	bool mt7932 = is_mt7932(&dev->mt76);
-	u32 top_hvr = 0, top_fvr = 0;
-	u8 otp[64] = {};
-	u8 otp_mode = 0, otp_format = 0;
-	int i;
 
-	if (mt7932)
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_MCU_RESTART_SKIP: source=apple-normal-start\n");
-	else
-		mt76_connac_mcu_restart(&dev->mt76);
+	mt76_connac_mcu_restart(&dev->mt76);
 
 	if (!mt76_poll_msec(dev, MT_CONN_ON_MISC, MT_TOP_MISC_FW_STATE,
 			    MT_TOP_MISC2_FW_PWR_ON, 1000))
 		dev_warn(dev->mt76.dev,
 			 "MCU is not ready for firmware download\n");
-	if (mt7932) {
-		ret = mt7932_mcu_share_info_init(dev);
-		if (ret) {
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=mcu-share-info ret=%d\n",
-				ret);
-			return ret;
-		}
 
-		/* AppleSunriseWLAN's wlanSetChipEcoInfo() performs these two
-		 * acknowledged INIT_CMD_ID_ACCESS_REG reads after WFDMA/share-info
-		 * setup and before wlanDownloadFW().  Run 191 records both TX17
-		 * submissions; Linux previously started at the patch semaphore.
-		 */
-		ret = mt76_connac_mcu_read_init_reg(&dev->mt76, 0x70010204,
-						  &top_hvr);
-		if (ret)
-			return ret;
-		ret = mt76_connac_mcu_read_init_reg(&dev->mt76, 0x88000004,
-						  &top_fvr);
-		if (ret)
-			return ret;
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_CHIP_ECO_TRANSCRIPT_PASS: hvr=0x%08x fvr=0x%08x\n",
-			 top_hvr, top_fvr);
-	}
-
-	if (mt7932)
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_PATCH_UPLOAD_BEGIN: file=%s\n",
-			 mt792x_patch_name(dev));
 	ret = mt76_connac2_load_patch(&dev->mt76, mt792x_patch_name(dev));
-	if (ret) {
-		if (mt7932)
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=patch-upload ret=%d\n",
-				ret);
+	if (ret)
 		return ret;
-	}
-	if (mt7932)
-		dev_info(dev->mt76.dev, "J700_MT7932_PATCH_UPLOAD_PASS\n");
-	if (mt7932) {
-		ret = mt76_connac_mcu_read_otp(&dev->mt76, 0x7a, &otp_mode);
-		if (ret)
-			return ret;
-		ret = mt76_connac_mcu_read_otp(&dev->mt76, 0x164, &otp_format);
-		if (ret)
-			return ret;
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_OTP_PREAMBLE_PASS: addr007a=0x%02x addr0164=0x%02x\n",
-			 otp_mode, otp_format);
-		ret = mt76_connac_mcu_read_otp(&dev->mt76, 0x200, &otp[0]);
-		if (ret) {
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=otp-read ret=%d\n",
-				ret);
-			return ret;
-		}
-		if (otp[0] != 0x15)
-			return -EPROTO;
-		for (i = 0; i < ARRAY_SIZE(otp); i++) {
-			ret = mt76_connac_mcu_read_otp(&dev->mt76, 0x200 + i, &otp[i]);
-			if (ret) {
-				dev_err(dev->mt76.dev,
-					"J700_MT7932_FIRMWARE_GATE_FAIL: stage=otp-sweep addr=0x%04x ret=%d\n",
-					0x200 + i, ret);
-				return ret;
-			}
-		}
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_OTP_SWEEP_PASS: start=0x0200 bytes=64 selector=0x%02x last=0x%02x\n",
-			 otp[0], otp[ARRAY_SIZE(otp) - 1]);
-	}
 
 	if (mt76_is_sdio(&dev->mt76)) {
 		/* activate again */
@@ -1222,85 +944,15 @@ int mt792x_load_firmware(struct mt792x_dev *dev)
 			ret = __mt792x_mcu_drv_pmctrl(dev);
 	}
 
-	if (mt7932)
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_RAM_UPLOAD_BEGIN: file=%s\n",
-			 mt792x_ram_name(dev));
 	ret = mt76_connac2_load_ram(&dev->mt76, mt792x_ram_name(dev), NULL);
-	if (ret) {
-		if (mt7932) {
-			/* Apple and MediaTek both poll sw_sync0 for
-			 * WIFI_FUNC_READY_BITS after INIT_CMD_ID_WIFI_START;
-			 * neither requires the start command itself to answer.
-			 * MT_CONN_ON_MISC is the mt76 name for that register
-			 * and its low three bits are the same ready field.
-			 * Read it before concluding the firmware never ran,
-			 * because the existing ready poll below is only
-			 * reached when load_ram succeeds.
-			 */
-			u32 misc = mt76_rr(dev, MT_CONN_ON_MISC);
-
-			/* Cycle 210 measured 0xffffffff here while the same
-			 * register returned real data 2ms earlier, so an
-			 * all-ones read means the endpoint stopped answering
-			 * rather than that the ready bits are set.  Never
-			 * treat it as readiness.
-			 */
-			if (misc == 0xffffffff) {
-				dev_err(dev->mt76.dev,
-					"J700_MT7932_FW_READY_PROBE: MMIO_DEAD misc=0xffffffff (endpoint not answering)\n");
-				mt7932_fw_start_bus_probe(dev);
-			} else {
-				dev_err(dev->mt76.dev,
-					"J700_MT7932_FW_READY_PROBE: at-timeout misc=0x%08x state=0x%lx n9_rdy=%lu\n",
-					misc,
-					(unsigned long)(misc & MT_TOP_MISC_FW_STATE),
-					(unsigned long)(misc & MT_TOP_MISC2_FW_N9_RDY));
-
-				if ((misc & MT_TOP_MISC2_FW_N9_RDY) ==
-				    MT_TOP_MISC2_FW_N9_RDY)
-					dev_err(dev->mt76.dev,
-						"J700_MT7932_FW_READY_PROBE: N9_READY_WITHOUT_START_RESPONSE misc=0x%08x\n",
-						misc);
-			}
-
-			mt7932_mcu_share_buffer_trace(dev, "ram-upload-fail");
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=ram-upload ret=%d\n",
-				ret);
-		}
+	if (ret)
 		return ret;
-	}
-	if (mt7932)
-		dev_info(dev->mt76.dev, "J700_MT7932_RAM_UPLOAD_PASS\n");
 
 	if (!mt76_poll_msec(dev, MT_CONN_ON_MISC, MT_TOP_MISC2_FW_N9_RDY,
-			    MT_TOP_MISC2_FW_N9_RDY, mt7932 ? 5000 : 1500)) {
+			    MT_TOP_MISC2_FW_N9_RDY, 1500)) {
 		dev_err(dev->mt76.dev, "Timeout for initializing firmware\n");
-		if (mt7932)
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=n9-ready ret=%d\n",
-				-EIO);
 
 		return -EIO;
-	}
-	if (mt7932) {
-		u32 misc = mt76_rr(dev, MT_CONN_ON_MISC);
-
-		/* A dead PCIe endpoint returns all ones, which also contains the
-		 * N9-ready mask and therefore satisfies mt76_poll_msec().  Cycle 228
-		 * exposed this false positive after the root port had already reported
-		 * link-down.  Validate the register before publishing readiness.
-		 */
-		if (misc == 0xffffffff) {
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=n9-ready misc=0xffffffff endpoint-not-answering ret=%d\n",
-				-ENODEV);
-			return -ENODEV;
-		}
-
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_N9_READY_PASS: misc=0x%08x\n", misc);
 	}
 
 #ifdef CONFIG_PM

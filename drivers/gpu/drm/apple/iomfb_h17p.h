@@ -11,8 +11,15 @@
 
 #include "iomfb_template.h"
 
-static_assert(sizeof(struct dcp_swap_h17p) == 0x58a);
+static_assert(sizeof(struct dcp_swap_h17p) == 0x588);
+/* The backlight block, at the offsets of the macOS 25G83 capture. */
+static_assert(offsetof(struct dcp_swap_h17p, bl_h17p_update) == 0x354);
+static_assert(offsetof(struct dcp_swap_h17p, bl_h17p_flags) == 0x358);
+static_assert(offsetof(struct dcp_swap_h17p, bl_h17p_d) == 0x35e);
+static_assert(offsetof(struct dcp_swap_h17p, unk_1) == 0x4a8);
 static_assert(sizeof(struct dcp_surface_h17p) == 0x22c);
+static_assert(offsetof(struct dcp_swap_submit_req_h17p, surf) == 0x588);
+static_assert(offsetof(struct dcp_swap_submit_req_h17p, surf_iova) == 0xe38);
 static_assert(sizeof(struct dcp_swap_submit_req_h17p) == 0xe9c);
 static_assert(sizeof(struct dcp_swap_submit_resp_h17p) == 0x0c);
 

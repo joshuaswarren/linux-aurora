@@ -2,6 +2,8 @@
 #ifndef MT7932_CALIBRATION_H
 #define MT7932_CALIBRATION_H
 
+#include "channels.h"
+
 #include "protocol.h"
 
 /* Protected by the RX/procedure lock. One active logical procedure only;
@@ -135,22 +137,17 @@ struct mt7932_cal_piece {
 	u8 metadata[8];
 };
 
-/* NEO_5GHZ_WIFI_CONTRACT: association-only20MHz type1 group0/1.
- * This does not extend the separate genuine D7 type2/3 producer.
+/* Shared type-1 payload planner. Center is packed in bits 24:17; there
+ * is no independent width field here. The genuine D7 producer is separate.
  */
-static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel,
-					struct mt7932_cal_piece pieces[2])
+static inline int mt7932_cal_association_center(const u8 *data, size_t size, u8 center,
+						unsigned int group,
+						struct mt7932_cal_piece pieces[2])
 {
 	struct mt7932_cal_segment segment;
-	unsigned int group, part;
+	unsigned int part;
 	int ret;
 
-	if (channel >= 1 && channel <= 13)
-		group = 0;
-	else if (channel >= 36 && channel <= 48 && !(channel % 4))
-		group = 1;
-	else
-		return -EOPNOTSUPP;
 	ret = mt7932_cal_validate(data, size);
 	if (ret)
 		return ret;
@@ -163,10 +160,40 @@ static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel
 		pieces[part] = (struct mt7932_cal_piece) {
 			.data = segment.data + part * (segment.length / 2),
 			.length = segment.length / 2,
-			.parameter = 0x04000000 | (channel << 17) | group,
+			.parameter = 0x04000000 | (center << 17) | group,
 			.type = 1, .fragment = 0x20 | part,
 		};
 	return 2;
+}
+
+/* Preserve the qualified 20 MHz path, including its original group choice. */
+static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel,
+					 struct mt7932_cal_piece pieces[2])
+{
+	unsigned int band = mt7932_channel_band(channel);
+
+	if (!band)
+		return -EOPNOTSUPP;
+	return mt7932_cal_association_center(data, size, channel, band - 1, pieces);
+}
+
+/* Private/tainted 25G83 AisPreloadCal -> rlmOneTimeCalSet:
+ * CW/SCO determine center; center << 17 and GROUP_FREQ_DEF_ARR determine
+ * type-1 parameter/segment. 5170..5250 MHz -> 1, 5735..5815 MHz -> 7.
+ * Only our two bounded 5 GHz blocks, no DFS, 160 MHz or 6 GHz expansion.
+ */
+static inline int mt7932_cal_association_wide(const u8 *data, size_t size,
+					      u8 center, struct mt7932_cal_piece pieces[2])
+{
+	unsigned int group;
+
+	if (center >= 38 && center <= 46)
+		group = 1;
+	else if (center >= 151 && center <= 159)
+		group = 7;
+	else
+		return -EOPNOTSUPP;
+	return mt7932_cal_association_center(data, size, center, group, pieces);
 }
 
 /* Plan all conditional power-on fragments before the first command is sent. */
@@ -229,7 +256,7 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 	int ret;
 
 	if (upper != 0x1000 || version != 12 || module != 0x89 ||
-	    channel < 36 || channel > 48 || channel % 4)
+	    mt7932_channel_band(channel) != 2)
 		return -EOPNOTSUPP;
 	ret = mt7932_cal_validate(data, size);
 	if (ret)
@@ -243,7 +270,7 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 	for (i = 0; i < segment.length; i++)
 		if (segment.data[i])
 			return -EOPNOTSUPP;
-	selected = channel <= 40 ? 38 : 46;
+	selected = mt7932_channel_cal_centre(channel);
 	params[0] = 0x10000001;
 	params[1] = 0x10001000 | channel;
 	params[2] = 0x10001000 | (channel << 17) | selected;

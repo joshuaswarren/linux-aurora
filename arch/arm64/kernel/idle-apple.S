@@ -4,7 +4,7 @@
 
 	.text
 /*
- * T8142 secondaries can resume from WFI with cleared general registers.
+ * T8140/T8142/T8152 secondaries can resume from WFI with cleared general registers.
  * SP and stack memory survive. Preserve the AAPCS64 callee-saved registers
  * and x18 (which may hold the shadow call stack), including the return PC.
  * This follows the stateless-wait approach used during m1n1 M5 Windows
@@ -49,3 +49,10 @@ SYM_FUNC_START(apple_m5_cpu_wfit)
 	.inst	0xd5031020	/* wfit x0 */
 	apple_m5_wait_restore
 SYM_FUNC_END(apple_m5_cpu_wfit)
+	.pushsection .cpuidle.text, "ax"
+SYM_FUNC_START(apple_cpu_wfi)
+	apple_m5_wait_save
+	wfi
+	apple_m5_wait_restore
+SYM_FUNC_END(apple_cpu_wfi)
+	.popsection

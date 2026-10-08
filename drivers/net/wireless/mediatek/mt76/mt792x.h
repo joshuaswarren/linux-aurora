@@ -45,17 +45,12 @@
 #define MT7920_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7961_1a.bin"
 #define MT7921_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7961_1.bin"
 #define MT7922_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7922_1.bin"
-#define MT7932_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7932_1.bin"
-#define MT7932_WCAL		"mediatek/j700-mt7932-wcal.bin"
-#define MT7932_ONE_TIME_CAL \
-	"mediatek/j700-mt7932-one-time-cal.bin"
 #define MT7925_FIRMWARE_WM	"mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin"
 
 #define MT7902_ROM_PATCH	"mediatek/WIFI_MT7902_patch_mcu_1_1_hdr.bin"
 #define MT7920_ROM_PATCH	"mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin"
 #define MT7921_ROM_PATCH	"mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin"
 #define MT7922_ROM_PATCH	"mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin"
-#define MT7932_ROM_PATCH	"mediatek/WIFI_MT7932_patch_mcu_1_2_hdr.bin"
 #define MT7925_ROM_PATCH	"mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"
 
 #define MT792x_SDIO_HDR_TX_BYTES	GENMASK(15, 0)
@@ -194,7 +189,6 @@ struct mt792x_phy {
 	wait_queue_head_t roc_wait;
 	u8 roc_token_id;
 	bool roc_grant;
-	bool has_single_sku;
 };
 
 struct mt792x_irq_map {
@@ -246,10 +240,6 @@ struct mt792x_dev {
 	bool hif_idle:1;
 	bool hif_resumed:1;
 	bool regd_change:1;
-	/* Select the measured post-download MT7932 WFDMA enable sequence. */
-	bool mt7932_runtime_dma_epoch:1;
-	bool mt7932_6g_scan_policy_enabled:1;
-	bool mt7932_scan_fwlog_enabled:1;
 	wait_queue_head_t wait;
 
 	struct work_struct init_work;
@@ -270,12 +260,6 @@ struct mt792x_dev {
 	enum environment_cap country_ie_env;
 	u32 backup_l1;
 	u32 backup_l2;
-	void *mt7932_ipc_buf;
-	dma_addr_t mt7932_ipc_dma;
-	void *mt7932_aux_buf;
-	dma_addr_t mt7932_aux_dma;
-	/* Run 191 publishes otherwise-idle WFDMA TX1..TX14 before FW_START. */
-	struct mt76_queue *mt7932_idle_tx[14];
 
 	struct ieee80211_chanctx_conf *new_ctx;
 };
@@ -473,8 +457,6 @@ static inline char *mt792x_ram_name(struct mt792x_dev *dev)
 		return MT7920_FIRMWARE_WM;
 	case 0x7922:
 		return MT7922_FIRMWARE_WM;
-	case 0x7932:
-		return MT7932_FIRMWARE_WM;
 	case 0x7925:
 		return MT7925_FIRMWARE_WM;
 	default:
@@ -491,8 +473,6 @@ static inline char *mt792x_patch_name(struct mt792x_dev *dev)
 		return MT7920_ROM_PATCH;
 	case 0x7922:
 		return MT7922_ROM_PATCH;
-	case 0x7932:
-		return MT7932_ROM_PATCH;
 	case 0x7925:
 		return MT7925_ROM_PATCH;
 	default:

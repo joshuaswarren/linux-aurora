@@ -34,21 +34,25 @@ def item(source, needle):
 
 
 # --- where the recovery runs ----------------------------------------------
-begin = item(manager, '    pub(crate) fn begin_translated_render(')
-assert 'self.recycle_desynced_render_storage()' in begin, \
+# v92d: per-pair storage; the reservation (reached from begin_translated_render
+# and the off-lock restage) recycles before anything is allocated.
+begin = item(manager, '    fn reserve_translated_render(')
+assert 'self.recycle_desynced_render_storage(pair_slot)?' in begin, \
     'nothing recycles a desynced graph before a submission is built'
-assert begin.index('self.recycle_desynced_render_storage()') \
+assert begin.index('self.recycle_desynced_render_storage(pair_slot)?') \
     < begin.index('.allocate_with_token()'), \
     'the recycle runs after this submission has already taken a HardwareBufferID'
 
 recycle = item(manager, '    fn recycle_desynced_render_storage(')
 # It may only drop a graph on the same evidence a cross-VM handoff requires.
-assert 'self.require_retired_render_owner().is_err()' in recycle, \
+assert 'self.require_retired_render_owner(pair_slot).is_err()' in recycle, \
     'the recycle is not gated on the retirement predicate'
-assert recycle.index('restage_admission_desynced') < recycle.index('release_client_context'), \
+# The detached graph waits in its queue's deferred teardown.
+assert recycle.index('restage_admission_desynced') < recycle.index('storage.take()') \
+    < recycle.index('logical_queue_teardowns'), \
     'the graph is dropped before the desync is established'
 
-plan = '\n'.join(item(resources, n) for n in [
+plan = '#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n' + '\n'.join(item(resources, n) for n in [
     'struct G17PRenderItemPlan {',
     'impl G17PRenderItemPlan {',
 ])
@@ -57,7 +61,11 @@ ordinals = ordinals[:ordinals.index(';') + 1]
 predicate = '\n'.join(item(resources, n) for n in [
     '    pub(crate) fn restage_admission_desynced(',
     '    pub(crate) fn restage_admission_cursors(',
+    '    fn render_item_bases(',
 ])
+# v91 word stores used by the item plan.
+live_words = '\n'.join(item(resources, n) for n in [
+    'fn g17p_live_word_bounds(', 'fn g17p_live_write_u32(', 'fn g17p_live_write_u64('])
 
 code = r'''
 #![allow(dead_code)]
@@ -84,6 +92,8 @@ mod g17_submission{
  }
 }
 fn g17p_render_tag16_enabled()->bool{false}
+''' + live_words + r'''
+struct RenderPublication{cursors:[u32;2]}
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Default)]
 struct QueueIndices{done:u32,read:u32,write:u32}
@@ -97,9 +107,21 @@ struct G17PUserRenderQueueState{
 }
 ''' + plan + r'''
 
-struct Storage{state:G17PUserRenderQueueState}
+// g17p_host_path PRODUCER_READS (bit17): a per-thread mask so one test can
+// run the same scenarios with the producer-only prefilter enabled.
+mod g17_host_path {
+ pub const PRODUCER_READS:u32=1<<17;
+ thread_local!{pub static MASK:std::cell::Cell<u32>=const{std::cell::Cell::new(0)};}
+ pub fn enabled(bit:u32)->bool{MASK.with(|m|m.get()&bit!=0)}
+}
+
+// Fixed-item plans (variable_render_items false), as with RENDER_SKSM items.
+struct Storage{state:G17PUserRenderQueueState,render_publication:RenderPublication}
 impl Storage{
+ fn variable_render_items(&self)->bool{false}
  fn snapshot(&mut self,_ordinal:u64)->Result<G17PUserRenderQueueState>{Ok(self.state)}
+ // The two producer words the full snapshot also reports.
+ fn render_producer_indices(&mut self)->Result<[u32;2]>{Ok([self.state.tiling.write,self.state.fragment.write])}
 ''' + predicate + r'''
 }
 
@@ -107,7 +129,7 @@ fn storage(tiling:u32,fragment:u32,job_list_empty:bool,busy:bool)->Storage{
  let mut t=QueueIndices::at(tiling);
  let mut f=QueueIndices::at(fragment);
  if busy{t.write=t.write+3;f.write=f.write+3;}
- Storage{state:G17PUserRenderQueueState{tiling:t,fragment:f,job_list_empty}}
+ Storage{state:G17PUserRenderQueueState{tiling:t,fragment:f,job_list_empty},render_publication:RenderPublication{cursors:[0;2]}}
 }
 
 fn base(ordinal:u64)->u32{G17PRenderItemPlan::new(ordinal,false).unwrap().base}
@@ -125,7 +147,7 @@ fn base(ordinal:u64)->u32{G17PRenderItemPlan::new(ordinal,false).unwrap().base}
   let ahead=base(ordinal+1);
   let mut s=storage(ahead,ahead,true,false);
   assert!(s.restage_admission_desynced(ordinal).unwrap(),"ordinal {}",ordinal);
-  assert_eq!(s.restage_admission_cursors(ordinal).unwrap(),(base(ordinal),ahead,ahead));
+  assert_eq!(s.restage_admission_cursors(ordinal).unwrap(),([base(ordinal);2],ahead,ahead));
  }
 }
 
@@ -146,6 +168,14 @@ fn base(ordinal:u64)->u32{G17PRenderItemPlan::new(ordinal,false).unwrap().base}
  // Job list not empty: same.
  let mut s=storage(base(ordinal+1),base(ordinal+1),false,false);
  assert!(!s.restage_admission_desynced(ordinal).unwrap());
+}
+
+#[test]fn producer_read_prefilter_gives_the_same_answers(){
+ g17_host_path::MASK.with(|m|m.set(g17_host_path::PRODUCER_READS));
+ an_aligned_graph_is_not_desynced();
+ a_staged_but_unpublished_group_is_desynced();
+ only_one_queue_needs_to_have_drifted();
+ a_running_group_is_never_reported_as_desync();
 }
 
 #[test]fn an_unusable_ordinal_is_never_a_desync(){

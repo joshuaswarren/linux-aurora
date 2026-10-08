@@ -746,16 +746,6 @@ config HID_MAGICMOUSE
 	Apple Wireless "Magic" Mouse, the Apple Wireless "Magic" Trackpad and
 	force touch Trackpads in Macbooks starting from 2015.
 
-config HID_MAGICMOUSE_KUNIT_TEST
-	tristate "KUnit tests for J700 Magic Trackpad framing" if !KUNIT_ALL_TESTS
-	depends on KUNIT && HID_MAGICMOUSE
-	default KUNIT_ALL_TESTS
-	help
-	  Build hardware-independent tests for the captured J700 C1FE report
-	  framing and its malformed-packet rejection controls.
-	  The tests do not require a connected trackpad.
-	  If in doubt, say N.
-
 config HID_MALTRON
 	tristate "Maltron L90 keyboard"
 	help
@@ -1037,6 +1027,7 @@ config HID_PXRC
 
 config HID_RAPOO
 	tristate "Rapoo non-fully HID-compliant devices"
+	depends on USB_HID
 	help
 	Support for Rapoo devices that are not fully compliant with the
 	HID standard.

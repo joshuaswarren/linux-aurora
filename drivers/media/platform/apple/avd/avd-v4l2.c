@@ -15,6 +15,7 @@
 
 #include <media/v4l2-event.h>
 #include <media/v4l2-mem2mem.h>
+#include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
 
@@ -77,8 +78,10 @@ static void avd_fill_decoded_pixfmt(struct avd_ctx *ctx,
 {
 	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat, pix_mp->width,
 			    pix_mp->height);
-	fill_rvra(&ctx->rvra, ctx->image_fmt, pix_mp->width, pix_mp->height);
-	pix_mp->plane_fmt[0].sizeimage += ctx->rvra.size;
+
+	ctx->comp.start_offset = pix_mp->plane_fmt[0].sizeimage;
+	fill_comp(&ctx->comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
+	pix_mp->plane_fmt[0].sizeimage += ctx->comp.size;
 	if (ctx->coded_fmt_desc->ops->adjust_decoded_fmt)
 		ctx->coded_fmt_desc->ops->adjust_decoded_fmt(ctx, pix_mp);
 }
@@ -259,7 +262,6 @@ static const struct avd_ctrl_desc avd_h264_ctrl_descs[] = {
 		.cfg.min = V4L2_STATELESS_H264_START_CODE_NONE,
 		.cfg.max = V4L2_STATELESS_H264_START_CODE_NONE,
 		.cfg.def = V4L2_STATELESS_H264_START_CODE_NONE,
-		/* annex b is also possibly but a bit more painfull */
 	},
 	{
 		.cfg.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE,
@@ -821,11 +823,44 @@ static int avd_buf_prepare(struct vb2_buffer *vb)
 	 * (for OUTPUT buffers, if userspace passes 0 bytesused, v4l2-core sets
 	 * it to buffer length).
 	 */
-	if (V4L2_TYPE_IS_CAPTURE(vq->type))
+	if (V4L2_TYPE_IS_CAPTURE(vq->type)) {
+		vb2_to_avd_decoded_buf(vb)->grey_chroma_offset = 0;
 		vb2_set_plane_payload(vb, 0,
 				      f->fmt.pix_mp.plane_fmt[0].sizeimage);
+	}
 
 	return 0;
+}
+
+static void avd_buf_finish(struct vb2_buffer *vb)
+{
+	struct avd_decoded_buffer *buf;
+	size_t luma;
+	u8 *y;
+
+	if (!V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type))
+		return;
+
+	buf = vb2_to_avd_decoded_buf(vb);
+	luma = buf->grey_chroma_offset;
+	buf->grey_chroma_offset = 0;
+	if (!luma || vb->state != VB2_BUF_STATE_DONE)
+		return;
+
+	/* VB2 has synchronized the capture buffer for CPU access. */
+	y = vb2_plane_vaddr(vb, 0);
+	if (!y)
+		return;
+
+	if (buf->grey_chroma_10bit) {
+		/* P010: 16-bit little-endian samples, 512 << 6. */
+		for (size_t i = 0; i + 1 < luma / 2; i += 2) {
+			y[luma + i] = 0x00;
+			y[luma + i + 1] = 0x80;
+		}
+	} else {
+		memset(y + luma, 0x80, luma / 2);
+	}
 }
 
 static void avd_buf_queue(struct vb2_buffer *vb)
@@ -855,22 +890,31 @@ static int avd_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct avd_ctx *ctx = vb2_get_drv_priv(q);
 	const struct avd_coded_fmt_desc *desc;
+	struct vb2_v4l2_buffer *vbuf;
 	int ret;
 
 	if (V4L2_TYPE_IS_CAPTURE(q->type))
 		return 0;
 
 	desc = ctx->coded_fmt_desc;
-	if (WARN_ON(!desc))
-		return -EINVAL;
+	if (WARN_ON(!desc)) {
+		ret = -EINVAL;
+		goto err_return_buffers;
+	}
 
 	if (desc->ops->start) {
 		ret = desc->ops->start(ctx);
 		if (ret)
-			return ret;
+			goto err_return_buffers;
 	}
 
 	return 0;
+
+err_return_buffers:
+	/* Keep requests queued for a later STREAMON retry. */
+	while ((vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx)))
+		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_QUEUED);
+	return ret;
 }
 
 static void avd_queue_cleanup(struct vb2_queue *vq, u32 state)
@@ -906,6 +950,10 @@ static void avd_stop_streaming(struct vb2_queue *q)
 
 		if (desc->ops->stop)
 			desc->ops->stop(ctx);
+
+		/* Drop a job table left over from a frame that never finished. */
+		kvfree(ctx->job.segments);
+		ctx->job.segments = NULL;
 	}
 
 	avd_queue_cleanup(q, VB2_BUF_STATE_ERROR);
@@ -914,6 +962,7 @@ static void avd_stop_streaming(struct vb2_queue *q)
 const struct vb2_ops avd_queue_ops = {
 	.queue_setup = avd_queue_setup,
 	.buf_prepare = avd_buf_prepare,
+	.buf_finish = avd_buf_finish,
 	.buf_queue = avd_buf_queue,
 	.buf_out_validate = avd_buf_out_validate,
 	.buf_request_complete = avd_buf_request_complete,
@@ -923,6 +972,17 @@ const struct vb2_ops avd_queue_ops = {
 
 void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result)
 {
+	struct avd_dev *avd = ctx->dev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&avd->job_lock, flags);
+	if (avd->job_ctx == ctx) {
+		avd->job_state = AVD_JOB_IDLE;
+		avd->job_ctx = NULL;
+		avd->job_pending = false;
+	}
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+
 	if (ctx->coded_fmt_desc->ops->done) {
 		struct vb2_v4l2_buffer *src_buf, *dst_buf;
 
@@ -953,8 +1013,18 @@ void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 	run->bufs.src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	run->bufs.dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 
+	run->coded_in =
+		vb2_dma_contig_plane_dma_addr(&run->bufs.src->vb2_buf, 0);
+	run->y_out = vb2_dma_contig_plane_dma_addr(&run->bufs.dst->vb2_buf, 0);
+	run->uv_out = run->y_out +
+		      ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
+			      ctx->decoded_fmt.fmt.pix_mp.height;
+
+	run->comp_out = run->y_out + ctx->comp.start_offset;
+	ctx->decomp = true;
+
 	dst = vb2_to_avd_decoded_buf(&run->bufs.dst->vb2_buf);
-	memcpy(&dst->rvra, &ctx->rvra, sizeof(ctx->rvra));
+	memcpy(&dst->comp, &ctx->comp, sizeof(ctx->comp));
 
 	/* Apply request(s) controls if needed. */
 	src_req = run->bufs.src->vb2_buf.req_obj.req;

@@ -33,7 +33,7 @@ static int mt_stock_config(struct mt7932 *m)
 	if (file->size != 8 + 65 * 68 || memcmp(file->data, "J7CF", 4) ||
 	    get_unaligned_le32(file->data + 4) != 65)
 		goto out;
-	records = kcalloc(72, sizeof(*records), GFP_KERNEL);
+	records = kcalloc(80, sizeof(*records), GFP_KERNEL);
 	if (!records) {
 		ret = -ENOMEM;
 		goto out;
@@ -72,24 +72,38 @@ static int mt_stock_config(struct mt7932 *m)
 			records[j].key_len = strscpy(records[j].key, updates[i].key, 32);
 		}
 		value = updates[i].at == 4 ? min(requested, m->phy_cap[4]) : requested & m->phy_cap[updates[i].at];
+		if (!strcmp(updates[i].key, "StaVHT") || !strcmp(updates[i].key, "Nss"))
+			dev_info(&m->pdev->dev, "PHY_CONFIG: %s=%u requested=%u capability=%u\n",
+				 updates[i].key, value, requested, m->phy_cap[updates[i].at]);
 		memset(records[j].value, 0, 32);
 		records[j].value_len = scnprintf(records[j].value, 32, "0x%x", value);
 	}
 	{
-		/* Intentional host override, not a change to the original artifact:
-		 * Sta5gBw0 caps infrastructure5GHz at20MHz in the native consumer.
-		 * CID0f uses a different enum (1); keep Sta2gBw untouched.
+		static const char * const keys[] = { "StaBw", "Sta5gBw" };
+		u8 value = m->bw_limit == 80 ? '2' :
+			   m->bw_limit == 40 ? '1' : '0';
+
+		/* MAX_BW enum: 20=0, 40=1, 80=2. The station-wide cap
+		 * and the 5 GHz cap both constrain a join. CID0f's 0 is its
+		 * separate 20/40 selector; VHT operation selects 80 MHz.
+		 * Preserve the original package and the legacy 20 MHz policy.
 		 */
-		for (j = 0; j < count; j++)
-			if (!strcmp(records[j].key, "Sta5gBw"))
-				break;
-		if (j == count) {
-			ret = -EINVAL;
-			goto free;
+		for (i = m->bw_limit > 20 ? 0 : 1; i < ARRAY_SIZE(keys); i++) {
+			for (j = 0; j < count; j++)
+				if (!strcmp(records[j].key, keys[i]))
+					break;
+			if (j == count) {
+				count++;
+				records[j].type = 3;
+				strscpy(records[j].key, keys[i], sizeof(records[j].key));
+				records[j].key_len = strlen(keys[i]);
+			}
+			dev_info(&m->pdev->dev, "BW_CONFIG: %s original=%s selected=%c\n",
+				 keys[i], j < 65 ? records[j].value : "(absent)", value);
+			memset(records[j].value, 0, sizeof(records[j].value));
+			records[j].value[0] = value;
+			records[j].value_len = 1;
 		}
-		memset(records[j].value, 0, sizeof(records[j].value));
-		records[j].value[0] = '0';
-		records[j].value_len = 1;
 		for (j = 0; j < count; j++)
 			if (!strcmp(records[j].key, "DisRoaming"))
 				break;
@@ -100,6 +114,20 @@ static int mt_stock_config(struct mt7932 *m)
 		memset(records[j].value, 0, sizeof(records[j].value));
 		records[j].value[0] = '1';
 		records[j].value_len = 1;
+	}
+	if (m->bw_limit > 20) {
+		/* The original package has no Sta2gBw entry. Do not depend on a
+		 * firmware default while enabling wider 5 GHz operation.
+		 */
+		for (j = 0; j < count; j++)
+			if (!strcmp(records[j].key, "Sta2gBw"))
+				break;
+		if (j == count)
+			count++;
+		records[j] = (struct mt_config_record) {
+			.type = 3, .key_len = 7, .value_len = 1,
+			.key = "Sta2gBw", .value = "0",
+		};
 	}
 	for (i = 0; i < count; i += batch) {
 		batch = min(4U, count - i);
@@ -112,11 +140,63 @@ static int mt_stock_config(struct mt7932 *m)
 		if (ret)
 			goto free;
 	}
+	dev_info(&m->pdev->dev,
+		 "PHY_POLICY: requested=%u effective=%u MHz 5GHz; 2GHz=20; private/tainted experiment=%u\n",
+		 mt_bw_requested(), m->bw_limit, m->bw_limit > 20);
 	dev_info(&m->pdev->dev, "STOCK_CONFIG_SUBMITTED: %u original/PHY-derived entries\n", count);
 free:
 	kfree(records);
 out:
 	release_firmware(file);
+	return ret;
+}
+
+/* command_mutex held, old connection ownership has retired. Firmware SETs
+ * are submission receipts, not acknowledgements. Keep the current country's
+ * power tables; only lower its width policy. No reset/epoch flag is cleared.
+ */
+int mt_bw_apply_fallback(struct mt7932 *m)
+{
+	struct mt_config_record records[] = {
+		{ .type = 3, .key_len = 5, .value_len = 1,
+		  .key = "StaBw", .value = "0" },
+		{ .type = 3, .key_len = 7, .value_len = 1,
+		  .key = "Sta5gBw", .value = "0" },
+	};
+	struct mt7932_reg_snapshot reg;
+	unsigned long flags;
+	unsigned int i;
+	u8 body[284] = {};
+	int ret;
+
+	if (!READ_ONCE(m->bw_policy_pending))
+		return 0;
+	if (m->link_failed || m->fw_asserted || m->cal_state.error)
+		return -EIO;
+	spin_lock_irqsave(&m->response_lock, flags);
+	reg = m->reg_desired;
+	reg.domain[4] = 1;
+	reg.domain[5] = 1;
+	for (i = 12; i < reg.length; i += 8)
+		put_unaligned_le32(get_unaligned_le32(reg.domain + i + 4) | 0x1b0,
+				   reg.domain + i + 4);
+	m->reg_desired = reg;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	put_unaligned_le32(1, body + 4);
+	body[8] = ARRAY_SIZE(records);
+	put_unaligned_le16(sizeof(records), body + 10);
+	memcpy(body + 12, records, sizeof(records));
+	ret = mt_request(m, 0x70, true, true, false, body, sizeof(body));
+	if (!ret)
+		ret = mt_request(m, 0x0f, true, true, false, reg.domain, reg.length);
+	if (ret) {
+		WRITE_ONCE(m->policy_failed, true);
+		dev_err(&m->pdev->dev, "BW_FALLBACK_POLICY_FAILED: %d; RF blocked\n", ret);
+	} else {
+		WRITE_ONCE(m->bw_policy_pending, false);
+		dev_info(&m->pdev->dev,
+			 "BW_FALLBACK_APPLIED: 20 MHz for remainder of boot (native SET submission)\n");
+	}
 	return ret;
 }
 
@@ -313,7 +393,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	/* cfg80211 calls after updating channels under RTNL in this kernel.
 	 * Copy, never retain the transient request or take command_mutex here.
 	 */
-	if (!request)
+	if (!request || READ_ONCE(m->removing))
 		return;
 	memcpy(reg.alpha2, request->alpha2, 2);
 	if (!((reg.alpha2[0] >= 'A' && reg.alpha2[0] <= 'Z' &&
@@ -328,9 +408,11 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	 */
 	if (!memcmp(reg.alpha2, "00", 2))
 		memcpy(reg.domain, "XZ", 2);
-	reg.domain[4] = reg.domain[5] = 1; /* native 20 MHz selectors */
-	for (i = 0; i < 17; i++) {
-		struct ieee80211_channel *channel = i < 13 ? &m->channels[i] : &m->channels5[i - 13];
+	reg.domain[4] = 1; /* 2 GHz stays 20 MHz */
+	reg.domain[5] = m->bw_limit == 20 || READ_ONCE(m->bw_fallback) ? 1 : 0;
+	for (i = 0; i < MT7932_CHANNELS; i++) {
+		struct ieee80211_channel *channel = i < MT7932_CHANNELS_2G ?
+			&m->channels[i] : &m->channels5[i - MT7932_CHANNELS_2G];
 		u32 flags = channel->flags;
 
 		reg.power[i] = channel->max_power;
@@ -346,9 +428,10 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		if (channel->max_power < 20)
 			reg.error = -EOPNOTSUPP;
 		put_unaligned_le16(channel->hw_value, reg.domain + 12 + count * 8);
-		put_unaligned_le32(0x1b0 | flags, reg.domain + 16 + count * 8);
+		put_unaligned_le32(mt_bw_channel_flags(m, channel),
+				   reg.domain + 16 + count * 8);
 		count++;
-		reg.domain[i < 13 ? 8 : 9]++;
+		reg.domain[i < MT7932_CHANNELS_2G ? 8 : 9]++;
 	}
 	reg.length = 12 + count * 8;
 	if (!count)
@@ -363,9 +446,14 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	WRITE_ONCE(m->reg_pending, true);
 	if (m->netdev) {
 		netif_stop_queue(m->netdev);
+		if (READ_ONCE(m->data_ready)) {
+			spin_lock(&m->data_lock);
+			mt_data_kick_locked(m);
+			spin_unlock(&m->data_lock);
+		}
 		if (m->connecting) {
 			m->connect_error = -ECANCELED;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 			complete(&m->discovery_done);
 		}
@@ -382,6 +470,9 @@ static const struct cfg80211_ops mt_cfg_ops = {
 	.connect = mt_connect, .disconnect = mt_disconnect,
 	.deauth = mt_deauth,
 	.change_virtual_intf = mt_change_interface,
+	.set_power_mgmt = mt_set_power_mgmt,
+	.get_station = mt_get_station,
+	.set_cqm_rssi_config = mt_set_cqm_rssi_config,
 };
 
 int mt_register_regulatory_gate(struct mt7932 *m)
@@ -391,6 +482,8 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	unsigned int i;
 	int ret;
 
+	m->bw_limit = mt_bw_requested();
+	mt_bw_caps(m);
 	INIT_WORK(&m->startup_work, mt_startup_work);
 	m->reg_pending = true;
 	m->wiphy = wiphy_new(&mt_cfg_ops, sizeof(m));
@@ -419,7 +512,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	 * Global hints from other radios still reach the notifier and are handled.
 	 */
 	m->wiphy->regulatory_flags |= REGULATORY_COUNTRY_IE_IGNORE;
-	for (i = 0; i < 13; i++) {
+	for (i = 0; i < MT7932_CHANNELS_2G; i++) {
 		m->channels[i].band = NL80211_BAND_2GHZ;
 		m->channels[i].center_freq = 2412 + 5 * i;
 		m->channels[i].hw_value = i + 1;
@@ -437,12 +530,17 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy->bands[NL80211_BAND_2GHZ] = &m->band2;
 	{
 		for (i = 0; i < ARRAY_SIZE(m->channels5); i++) {
+			unsigned int hw = i < 4 ? 36 + 4 * i : 149 + 4 * (i - 4);
+
 			m->channels5[i].band = NL80211_BAND_5GHZ;
-			m->channels5[i].center_freq = 5180 + 20 * i;
-			m->channels5[i].hw_value = 36 + 4 * i;
+			m->channels5[i].center_freq = 5000 + 5 * hw;
+			m->channels5[i].hw_value = hw;
 			m->channels5[i].max_power = 20;
-			m->channels5[i].flags = IEEE80211_CHAN_NO_HT40 |
-				IEEE80211_CHAN_NO_80MHZ | IEEE80211_CHAN_NO_160MHZ;
+			m->channels5[i].flags = IEEE80211_CHAN_NO_160MHZ;
+			if (m->bw_limit < 80)
+				m->channels5[i].flags |= IEEE80211_CHAN_NO_80MHZ;
+			if (m->bw_limit == 20 || hw == 165)
+				m->channels5[i].flags |= 0x1b0;
 		}
 		m->band5.channels = m->channels5;
 		m->band5.n_channels = ARRAY_SIZE(m->channels5);

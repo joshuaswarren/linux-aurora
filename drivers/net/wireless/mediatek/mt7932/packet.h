@@ -8,10 +8,10 @@
 struct mt7932_rx_frame {
 	const u8 *data;
 	size_t length;
-	u32 timestamp, rcpi;
+	u32 timestamp, rcpi, rxv;
 	u16 frame_control, sequence_control, qos_control, wtbl;
 	u8 channel, amsdu;
-	bool translated, group4, signal_valid, unicast;
+	bool translated, group4, group3, signal_valid, unicast;
 };
 
 /* NEO_PACKET_RX_GROUPS_AND_DATA_TXP_CONTRACT. Strict non-monitor subset;
@@ -73,6 +73,10 @@ static inline int mt7932_rx_frame(const u8 *packet, size_t size, struct mt7932_r
 		} else if (group == 2) {
 			out->timestamp = get_unaligned_le32(packet + offset);
 		} else if (group == 3 || group == 5) {
+			if (group == 3) {
+				out->rxv = get_unaligned_le32(packet + offset);
+				out->group3 = true;
+			}
 			out->rcpi = get_unaligned_le32(packet + offset + (group == 3 ? 4 : 24));
 			out->signal_valid = true;
 		}

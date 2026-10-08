@@ -365,7 +365,7 @@ pub(crate) struct G17PHaltedGmmuSnapshot {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PHaltedSlot0Snapshot {
+pub(crate) struct G17PHaltedSlotSnapshot {
     pub(crate) gpc_state: u32,
     pub(crate) state_before: u64,
     pub(crate) key: u64,
@@ -1017,6 +1017,20 @@ impl Resources {
     /// valid masks without permitting another queue publication to interleave.
     /// Returning `false` means no write was attempted; callers must withhold
     /// both outer commands.
+    ///
+    /// `disable` carries the two queues' disable-mask pairs when the KSMFE
+    /// already has them enabled: native `AGXKSMKickQueueG16::configureHardware`
+    /// (kext25 0x88b9e78..0x88b9f20) writes `1<<qid` to 0x21080 then 0x21078
+    /// before reprogramming a queue whose `+0xa8` flag is set, then the
+    /// tag/data pair, then the enable mask (0x21070 then 0x21068). The
+    /// production four-write transaction rewrote tag/data and re-enabled
+    /// without the disable.
+    ///
+    /// `fender_bracket` is the opt-in AGXArmFenderChinook bracket
+    /// (`disableDynamicFenderGating` 0x88b737c: GFX 0xd06030 |= 4;
+    /// `enableDynamicFenderGating` 0x88b746c: &= ~6, with a read-back). Native
+    /// takes it only when accelerator flag bits 27/28 are set, which no
+    /// writer in kext25 does on G17P, so it is off by default.
     pub(crate) fn g17p_sksm_configure_powered_render_pair(
         &self,
         fragment: (
@@ -1027,6 +1041,11 @@ impl Resources {
             g17_submission::G17SksmOrderedWritePair,
             g17_submission::G17SksmOrderedWritePair,
         ),
+        disable: Option<(
+            g17_submission::G17SksmOrderedWritePair,
+            g17_submission::G17SksmOrderedWritePair,
+        )>,
+        fender_bracket: bool,
     ) -> Result<bool> {
         for (configure, enable) in [fragment, tiling] {
             if !Self::g17p_sksm_pair_fits(configure)
@@ -1034,6 +1053,13 @@ impl Resources {
                 || enable.word0 | enable.word1 == 0
             {
                 return Err(EINVAL);
+            }
+        }
+        if let Some((fragment_disable, tiling_disable)) = disable {
+            for pair in [fragment_disable, tiling_disable] {
+                if !Self::g17p_sksm_pair_fits(pair) || pair.word0 | pair.word1 == 0 {
+                    return Err(EINVAL);
+                }
             }
         }
         let _guard = self.sksm_fifo.lock();
@@ -1045,10 +1071,36 @@ impl Resources {
             return Ok(false);
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        Self::g17p_sksm_publish_locked(&sgx, fragment.0)?;
-        Self::g17p_sksm_publish_locked(&sgx, fragment.1)?;
-        Self::g17p_sksm_publish_locked(&sgx, tiling.0)?;
-        Self::g17p_sksm_publish_locked(&sgx, tiling.1)?;
+        let mut fender_before = None;
+        if fender_bracket {
+            let res = sgx.relaxed();
+            let before = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+            res.try_write32(before | 0x4, T8140_FENDER_DYNAMIC_GATING)?;
+            let _ = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+            fender_before = Some(before);
+        }
+        let result = (|| -> Result {
+            if let Some((fragment_disable, tiling_disable)) = disable {
+                // Native order per queue is disable -> tag/data -> enable;
+                // both halves are disabled before either is reprogrammed so
+                // the pair is never half-routed while enabled.
+                Self::g17p_sksm_publish_locked(&sgx, fragment_disable)?;
+                Self::g17p_sksm_publish_locked(&sgx, tiling_disable)?;
+            }
+            Self::g17p_sksm_publish_locked(&sgx, fragment.0)?;
+            Self::g17p_sksm_publish_locked(&sgx, fragment.1)?;
+            Self::g17p_sksm_publish_locked(&sgx, tiling.0)?;
+            Self::g17p_sksm_publish_locked(&sgx, tiling.1)?;
+            Ok(())
+        })();
+        if let Some(before) = fender_before {
+            let res = sgx.relaxed();
+            // enableDynamicFenderGating: clear bits 1 and 2, then read back.
+            let now = res.try_read32(T8140_FENDER_DYNAMIC_GATING).unwrap_or(before | 0x4);
+            let _ = res.try_write32(now & !0x6, T8140_FENDER_DYNAMIC_GATING);
+            let _ = res.try_read32(T8140_FENDER_DYNAMIC_GATING);
+        }
+        result?;
         Ok(true)
     }
 
@@ -1268,20 +1320,26 @@ impl Resources {
         let tag = reg | (qid << 43) | tag_flags;
         // The tag store and data load form one ordered transaction. Apple's
         // host uses a device-memory STR/LDR pair; Linux's ordered writeq/readq
-        // provides the corresponding MMIO ordering. Relaxed accesses returned
-        // opaque values for 0x21028 and hid the TA -> 3D dependency frontier.
+        // provides the corresponding MMIO ordering. Even ordered, power-held
+        // reads of 0x21028 returned opaque values on the 2026-09-27 timeout
+        // capture, including queues with proven completed work. Do not treat
+        // this port's 0x21028 value as a validated dependency timestamp yet.
         sgx.try_write64(tag, 0x4090)?;
         sgx.try_read64(0x4098)
     }
 
     /// Caller must own the runtime mutex and have just verified the firmware
-    /// is stopped at the pre-ACK recovery handshake with DM0 or DM1 slot0
+    /// is stopped at the pre-ACK recovery handshake with a valid DM0 or DM1 slot
     /// selected. This is not an admission probe and must never run before
-    /// that halt. `read_dm1_progress` must only be true for a DM1 report.
-    pub(crate) fn g17p_halted_slot0_snapshot(
+    /// that halt. `data_master` selects the native DM0 or DM1 read table.
+    pub(crate) fn g17p_halted_slot_snapshot(
         &self,
-        read_dm1_progress: bool,
-    ) -> Result<Option<G17PHaltedSlot0Snapshot>> {
+        slot: u32,
+        data_master: u32,
+    ) -> Result<Option<G17PHaltedSlotSnapshot>> {
+        // B1 0x8794..0x8828 walks hardware selectors 0..15.
+        if slot >= 16 { return Err(EINVAL); }
+        let reads = crate::g17_completion::g17p_monitor_reads(data_master).ok_or(EINVAL)?;
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let _guard = self.sksm_fifo.lock();
         // The GPC summary is in the always-on range. A halted firmware need
@@ -1291,39 +1349,29 @@ impl Resources {
             return Ok(None);
         }
         // B1 FUN_6a20 uses the bit42 namespace for c020, but not c078.
-        // Index 0 is a hardware SLOT, never the fragment's physical QID.
+        // The firmware-selected index is a SLOT, never a physical QID.
         // The host port at4090 is distinct from B1's seven thread ports
         // (4080,40a0,40b0,40c0,40d0,40e0,40f0; table45c78).
-        let state_before = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
-        let key = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;
+        let state_before = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, u64::from(slot), 1u64 << 42)?;
+        let key = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, u64::from(slot), 0)?;
         let mut progress = [0u64; 8];
         let mut progress_count = 0;
         let mut progress_errno = 0;
-        if read_dm1_progress {
-            if let Some(selector) =
-                crate::g17_completion::g17p_dm1_monitor_selector_index(state_before)
-            {
-                // These are the eight reads B1 FUN_6a20 performs for DM1,
-                // through the selected progress port. Do not write10400/10408
-                // or touch any bank absent from the native sample table.
-                for (index, (register, flags)) in crate::g17_completion::G17P_DM1_MONITOR_READS
-                    .iter().enumerate()
-                {
-                    match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
-                        Ok(value) => {
-                            progress[index] = value;
-                            progress_count += 1;
-                        }
-                        Err(error) => {
-                            progress_errno = error.to_errno();
-                            break;
-                        }
-                    }
+        if let Some(selector) =
+            crate::g17_completion::g17p_dm1_monitor_selector_index(state_before)
+        {
+            // FUN6a20 uses the same selector predicate for both render
+            // engines. Read only that engine's native table, without wakes
+            // or additional writes to the sampled register banks.
+            for (index, (register, flags)) in reads.iter().enumerate() {
+                match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
+                    Ok(value) => { progress[index] = value; progress_count += 1; }
+                    Err(error) => { progress_errno = error.to_errno(); break; }
                 }
             }
         }
-        let state_after = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
-        Ok(Some(G17PHaltedSlot0Snapshot {
+        let state_after = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, u64::from(slot), 1u64 << 42)?;
+        Ok(Some(G17PHaltedSlotSnapshot {
             gpc_state,
             state_before,
             key,
@@ -1354,6 +1402,24 @@ impl Resources {
             *word = registers.try_read32(base + index * 4)?;
         }
         Ok(())
+    }
+
+    /// Explicit bounded diagnostic: native reads completion counts without
+    /// acknowledgement (B1 deb8..df68). Never wakes the GPU or writes ACK.
+    pub(crate) fn g17p_completion_pending_snapshot(&self) -> Result<[u64; 2]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let _guard = self.sksm_fifo.lock();
+        // Final powered witness is UNDER the same lock as both tag/data reads.
+        // The GPC summary is always-on. No power request, polling or retry.
+        if sgx.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf == 0 {
+            return Err(EAGAIN);
+        }
+        Ok([
+            Self::g17p_sksm_port_read_locked(
+                &sgx, T8140_KSM_WORK_CHANNEL_0, 0, 1u64 << 42)?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx, T8140_KSM_WORK_CHANNEL_2, 0, 1u64 << 42)?,
+        ])
     }
 
     pub(crate) fn g17p_render_ksm_admission_snapshot(

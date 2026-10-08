@@ -50,12 +50,12 @@ assert private_map.index("self.page_table.map_pages(") < private_map.index(
     "self.tlbi_live_contexts(node.start(), node.mapped_size as u64)"
 )
 
-new_storage = function(resources, "pub(crate) fn new_user_render_storage(")
+new_storage = function(resources, "pub(crate) fn finish_user_render_storage(")
 assert new_storage.index("vm.install_render_pool_mappings(") < new_storage.index(
     "self.address_space.uat.flush_t8140_vm_contexts(vm)?"
 )
 assert new_storage.index("self.address_space.uat.flush_t8140_vm_contexts(vm)?") < new_storage.index(
-    "self.stage_render_parameter_buffer_page_list(&mut storage)?"
+    "self.stage_render_parameter_buffer_page_list(storage)?"
 )
 
 class ContextTlb:

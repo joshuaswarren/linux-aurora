@@ -1,0 +1,17 @@
+obj-m += neo-rtc-overlay.o
+obj-m += neo-dwi-probe.o
+obj-m += neo-smc-inventory.o
+obj-m += neo-dwi-trial.o
+obj-m += neo-backlight-trial.o
+obj-m += neo-display-sleep.o
+obj-m += neo-smc-power.o
+obj-m += neo-sleep-irqs.o
+obj-m += neo-pmgr-snapshot.o
+obj-m += neo-dcp-retained.o
+obj-m += neo-netconsole-prep.o
+obj-m += neo-pmgr-admission.o
+obj-m += neo-dcp-force-wake.o
+obj-m += neo-media-sleep.o
+obj-m += neo-auto-idle.o
+obj-m += neo-cpu-regs.o
+neo-cpu-regs-y := neo-cpu-regs-main.o neo-cpu-regs-read.o

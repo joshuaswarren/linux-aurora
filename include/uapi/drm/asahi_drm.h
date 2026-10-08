@@ -250,10 +250,52 @@ enum drm_asahi_feature {
 
 	/** @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: QUEUE_LIMITS and reserved independent compute queues. */
 	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS: Every hardware command in
+	 * a submit waits on all of that ioctl's input syncs, including errors.
+	 * Independent commands need no extra dependency on the first command.
+	 * Userspace splitting a batch across ioctls must supply its input syncs
+	 * to every chunk relying on this guarantee.
+	 */
+	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 3,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_VM_STATUS_MIRROR: GET_PARAMS group
+	 * DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR registers a userspace word that
+	 * always holds the VM's sticky status (the value group VM_STATUS would
+	 * return). The kernel stores a failure there before signalling any fence
+	 * of the failed job, so after a successful syncobj wait a load of the word
+	 * replaces the VM_STATUS query. Registration may still be refused.
+	 */
+	DRM_ASAHI_FEATURE_VM_STATUS_MIRROR = (1UL) << 4,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS: Render and compute payloads
+	 * support exact queue-local historical prefixes in prior_vdm/prior_cdm.
+	 * These fields supplement, rather than replace, the header barriers.
+	 */
+	DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS = (1UL) << 5,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
+#define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3
+
+/* GET_PARAMS group VM_STATUS_MIRROR (input only; feature bit 4).
+ * handle names a GEM object (at most 64 KiB) of the calling file; offset is a 4-byte-aligned
+ * byte offset of a __s32 inside it; flags is zero. The kernel keeps its own
+ * reference to the object for the VM status lifetime, zeroes the word, then
+ * keeps it equal to the sticky VM error (0 or a negative errno). One
+ * registration per VM. EOPNOTSUPP means "keep using group VM_STATUS".
+ */
+struct drm_asahi_vm_status_mirror {
+   __u32 vm_id;
+   __u32 handle;
+   __u32 offset;
+   __u32 flags;
+};
+
 
 /* GET_PARAMS group VM_STATUS is an in/out query on the calling file's VM.
  * Set pointer to this structure and size to sizeof(structure).
@@ -303,7 +345,7 @@ struct drm_asahi_queue_limits {
  * struct drm_asahi_get_params - Arguments passed to DRM_IOCTL_ASAHI_GET_PARAMS
  */
 struct drm_asahi_get_params {
-	/** @param_group: 0 global properties, 1 VM status, 2 queue limits. */
+	/** @param_group: 0 global properties, 1 VM status, 2 queue limits, 3 VM status mirror. */
 	__u32 param_group;
 
 	/** @pad: MBZ */
@@ -1210,6 +1252,24 @@ struct drm_asahi_cmd_render {
 
 	/** @bg_partial_rsrc_spec_hi: High dword of @partial_bg.rsrc_spec */
 	__u32 bg_partial_rsrc_spec_hi;
+
+	/**
+	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
+	 *
+	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
+	 * commands accepted on this queue since creation, starting at one. A
+	 * nonzero value must not exceed the render count at this ioctl's entry;
+	 * it waits for every render command through that ordinal. The effective
+	 * dependency is the maximum of this prefix and the header's resolved
+	 * vdm_barrier. Header NONE does not suppress this field.
+	 */
+	__u64 prior_vdm;
+
+	/**
+	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
+	 * queue's compute command count and the header's cdm_barrier instead.
+	 */
+	__u64 prior_cdm;
 };
 
 /**
@@ -1290,6 +1350,28 @@ struct drm_asahi_g18_compute_resources {
 struct drm_asahi_cmd_compute_g18 {
 	struct drm_asahi_cmd_compute base;
 	struct drm_asahi_g18_compute_resources resources;
+};
+
+struct drm_asahi_cmd_compute_with_prior {
+	struct drm_asahi_cmd_compute legacy;
+
+	/**
+	 * @prior_vdm: Historical render prefix, or zero for no added dependency.
+	 *
+	 * Requires DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS. Counts hardware render
+	 * commands accepted on this queue since creation, starting at one. A
+	 * nonzero value must not exceed the render count at this ioctl's entry;
+	 * it waits for every render command through that ordinal. The effective
+	 * dependency is the maximum of this prefix and the header's resolved
+	 * vdm_barrier. Header NONE does not suppress this field.
+	 */
+	__u64 prior_vdm;
+
+	/**
+	 * @prior_cdm: Historical compute prefix; see @prior_vdm, using the
+	 * queue's compute command count and the header's cdm_barrier instead.
+	 */
+	__u64 prior_cdm;
 };
 
 /**

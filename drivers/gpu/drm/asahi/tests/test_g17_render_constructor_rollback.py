@@ -18,7 +18,7 @@ def function(marker):
 
 stage = function("    pub(crate) fn stage_render_parameter_buffer_descriptor(")
 restore = function("    fn restore_render_parameter_buffer_descriptor(")
-constructor = function("    pub(crate) fn new_user_render_storage(")
+constructor = function("    pub(crate) fn finish_user_render_storage(")
 
 assert "Result<Option<(u32, [u32; 4])>>" in stage
 assert stage.index("let mut previous = [0u32; 4]") < stage.index(
@@ -29,7 +29,7 @@ assert "bytes[at..at + 4].copy_from_slice(&value.to_le_bytes())" in restore
 
 install = constructor.index("vm.install_render_pool_mappings")
 publish = constructor.index("staged_descriptor = self.stage_render_parameter_buffer_descriptor")
-append = constructor.index("vm.append_driver_mappings(storage.take_sksm_vm_aliases())")
+append = constructor.index("vm.append_driver_mappings(core::mem::take(&mut prepared.driver_aliases))")
 failure = constructor.index("if let Err(error) = finish")
 undo_descriptor = constructor.index("restore_render_parameter_buffer_descriptor", failure)
 undo_pool = constructor.index("vm.clear_render_pool_mappings", failure)

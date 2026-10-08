@@ -1,9 +1,6 @@
 Linux kernel
 ============
 
-For the Aurora Silicon MacBook Neo branch, start with J700.md for the
-verified desktop checkpoint, source map and bring-up documentation.
-
 The Linux kernel is the core of any Linux operating system. It manages hardware,
 system resources, and provides the fundamental services for all other software.
 

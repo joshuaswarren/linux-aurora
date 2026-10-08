@@ -12,9 +12,24 @@ static void disp_service_init(struct apple_epic_service *service, const char *na
 }
 
 
+/*
+ * The service name follows the pipe, not the endpoint.  The internal DCP
+ * offers "disp0-service" on DISP0_ENDPOINT; the external one offers
+ * "dispext-service" on the same endpoint, and an unmatched service is only
+ * reported as an AFK warning:
+ *
+ *   AFK[ep:23]: unable to match service dispext-service on channel 1
+ *
+ * which is easy to read as noise from an endpoint that should not have been
+ * started.  Both are the same do-nothing handshake, so accept both.
+ */
 static const struct apple_epic_service_ops ibootep_ops[] = {
 	{
 		.name = "disp0-service",
+		.init = disp_service_init,
+	},
+	{
+		.name = "dispext-service",
 		.init = disp_service_init,
 	},
 	{}

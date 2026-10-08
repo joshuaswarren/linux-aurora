@@ -7,6 +7,175 @@ static void mt_peer_release(struct mt7932 *m);
 static int mt_retire_connection(struct mt7932 *m);
 static bool mt_open_request(const struct cfg80211_connect_params *p);
 
+/* The firmware owns BSS parsing for its join. Record the Linux scan copy so
+ * a wide-policy attempt can be compared with the AP's advertised operation.
+ */
+static void mt_bw_log_bss(struct mt7932 *m)
+{
+	const struct cfg80211_bss_ies *ies;
+	const u8 *vht;
+	int width = -1, seg0 = -1, seg1 = -1;
+
+	if (m->bw_limit < 80 || !m->connect_bss)
+		return;
+	rcu_read_lock();
+	ies = rcu_dereference(m->connect_bss->ies);
+	vht = ies ? cfg80211_find_ie(WLAN_EID_VHT_OPERATION,
+					 ies->data, ies->len) : NULL;
+	if (vht && vht[1] >= 5) {
+		width = vht[2];
+		seg0 = vht[3];
+		seg1 = vht[4];
+	}
+	rcu_read_unlock();
+	dev_info(&m->pdev->dev,
+		 "BW_BSS: primary=%u VHT-operation-width=%d seg0=%d seg1=%d\n",
+		 m->connect_bss->channel->hw_value, width, seg0, seg1);
+}
+
+/* command_mutex held.  The native J700 nicConfigPowerSaveProfile sends legacy
+ * CID05, set=1, no response, four bytes: BSS index, profile, two reserved
+ * bytes; CAM=0, MAX PS=1, FAST PS=2 (AppleSunriseWLAN
+ * _wlanoidSet802dot11PowerSaveProfile; the same layout as MediaTek's published
+ * gen3 CMD_ID_POWER_SAVE_MODE).  Station radio policy only: the HIF, DMA and
+ * Ethernet path keep running.  A submission is not a firmware acknowledgement.
+ */
+static int mt_station_ps_submit(struct mt7932 *m, u8 profile)
+{
+	u8 body[4] = {0, profile, 0, 0};
+	int ret;
+
+	lockdep_assert_held(&m->command_mutex);
+	ret = mt_request(m, 0x05, true, true, false, body, sizeof(body));
+	dev_info(&m->pdev->dev, "STATION_PS_SUBMIT: bss=0 profile=%u result=%d\n",
+		 profile, ret);
+	return ret;
+}
+
+/* Reapply the requested policy after each association, before reporting it
+ * to cfg80211: the firmware's own default for a fresh peer is a power-saving
+ * profile, which on the J700 bench showed as 50-150 ms mean and 700 ms peak
+ * gateway RTTs with a few percent loss; CAM (the default here, and what
+ * NetworkManager asks for with powersave=disable) removes that.
+ */
+int mt_station_ps_restore(struct mt7932 *m)
+{
+	return mt_station_ps_submit(m, m->ps_profile);
+}
+
+/*
+ * wpa_supplicant enables connection-quality monitoring so that it only scans
+ * when the link actually degrades.  Without it `bgscan simple` falls back to a
+ * timed sweep of every channel -- on this machine every ~31 s, which shows up
+ * as periodic latency spikes on an otherwise idle link.  The associated AP's
+ * beacons already carry an RSSI, so drive both the threshold events and the
+ * station signal from those rather than polling the firmware.
+ */
+void mt_signal_update(struct mt7932 *m, const struct mt7932_rx_frame *frame, int signal)
+{
+	enum nl80211_cqm_rssi_threshold_event event;
+	s32 thold;
+	u32 hyst;
+	int state;
+
+	/* addr3 of a beacon is the BSSID; mt7932_rx_beacon() checked the length. */
+	if (!READ_ONCE(m->connected) || frame->length < 22 || signal <= -128)
+		return;
+	if (!ether_addr_equal(frame->data + 16, m->connect_bssid))
+		return;
+
+	WRITE_ONCE(m->assoc_signal_dbm, signal);
+	WRITE_ONCE(m->assoc_signal_valid, true);
+
+	thold = READ_ONCE(m->cqm_rssi_thold);
+	if (!thold)
+		return;
+	hyst = READ_ONCE(m->cqm_rssi_hyst);
+	if (signal >= thold + (int)hyst)
+		state = 1;
+	else if (signal <= thold - (int)hyst)
+		state = -1;
+	else
+		return;				/* inside the hysteresis band */
+	if (state == READ_ONCE(m->cqm_rssi_state))
+		return;
+	WRITE_ONCE(m->cqm_rssi_state, state);
+	event = state > 0 ? NL80211_CQM_RSSI_THRESHOLD_EVENT_HIGH :
+			    NL80211_CQM_RSSI_THRESHOLD_EVENT_LOW;
+	cfg80211_cqm_rssi_notify(m->netdev, event, signal, GFP_ATOMIC);
+}
+
+int mt_set_cqm_rssi_config(struct wiphy *wiphy, struct net_device *netdev,
+			   s32 rssi_thold, u32 rssi_hyst)
+{
+	struct mt7932 *m = mt_from_wiphy(wiphy);
+
+	if (netdev != m->netdev || m->wdev.iftype != NL80211_IFTYPE_STATION)
+		return -EINVAL;
+	WRITE_ONCE(m->cqm_rssi_thold, rssi_thold);
+	WRITE_ONCE(m->cqm_rssi_hyst, rssi_hyst);
+	WRITE_ONCE(m->cqm_rssi_state, 0);	/* re-arm: report the next crossing */
+	return 0;
+}
+
+int mt_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
+		   const u8 *mac, struct station_info *sinfo)
+{
+	struct mt7932 *m = mt_from_wiphy(wiphy);
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (wdev != &m->wdev || !m->connected ||
+	    (mac && !ether_addr_equal(mac, m->connect_bssid))) {
+		ret = -ENOENT;
+		goto out;
+	}
+	if (READ_ONCE(m->assoc_signal_valid)) {
+		sinfo->signal = READ_ONCE(m->assoc_signal_dbm);
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+	}
+	if (m->rx_rate_valid && time_before(jiffies, m->rx_rate_updated + 10 * HZ)) {
+		sinfo->rxrate = m->rx_rate;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+	}
+out:
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	return ret;
+}
+
+int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
+		      bool enabled, int timeout)
+{
+	struct mt7932 *m = mt_from_wiphy(wiphy);
+	u8 profile = enabled ? (timeout == -1 ? 2 : 1) : 0;
+	int ret = 0;
+
+	if (netdev != m->netdev || m->wdev.iftype != NL80211_IFTYPE_STATION)
+		return -EINVAL;
+	mutex_lock(&m->command_mutex);
+	if (m->connecting || m->disconnecting || m->scan_request ||
+	    m->retired_scan_seq || m->link_failed) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (m->connected) {
+		if (!mt_rf_allowed(m)) {
+			ret = -EBUSY;
+			goto out;
+		}
+		ret = mt_station_ps_submit(m, profile);
+	}
+	/* cfg80211 can set policy before association. Cache it without sending
+	 * a command to an absent BSS; connect_work applies it after association.
+	 */
+	if (!ret)
+		m->ps_profile = profile;
+out:
+	mutex_unlock(&m->command_mutex);
+	return ret;
+}
+
 /* One owned station, firmware WPA2-PSK handshake; no host key fabrication. */
 static int mt_peer_reserve(struct mt7932 *m)
 {
@@ -59,7 +228,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		}
 		if (m->connecting) {
 			m->connect_error = -ECONNRESET;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 		}
 		return;
@@ -71,10 +240,16 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		if (length >= 20)
 			dev_info(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
 				 get_unaligned_le32(body + 12), body[16], body[17], body[19]);
-		if (length < 20 || get_unaligned_le32(body + 12) != mt7932_channel_band(m->connect_channel) ||
-		    body[16] || body[17] != m->connect_channel || body[19])
-			m->connect_error = -EPROTO;
-		complete(&m->assoc_start);
+		/* Do not overwrite parameters while calibration is pending/in flight. */
+		if (!m->connect_error) {
+			if (m->assoc_pending || completion_done(&m->assoc_done))
+				m->connect_error = -EPROTO;
+			else
+				m->connect_error = mt_bw_assoc_start(m, body, length);
+		}
+		if (!m->connect_error)
+			m->assoc_pending = true;
+		complete(&m->assoc_update);
 		break;
 	case 0x40:
 		if (length >= 52)
@@ -86,7 +261,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		 */
 		if (!mt7932_assoc_resources(body, length, &m->peer_ids, m->connect_channel, m->connect_open)) {
 			m->connect_error = -EPROTO;
-			complete(&m->assoc_start);
+			complete(&m->assoc_update);
 			complete(&m->assoc_done);
 			break;
 		}
@@ -103,6 +278,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		if (length < 2 || get_unaligned_le16(body) || !m->peer_valid)
 			m->connect_error = -ECONNREFUSED;
 		complete(&m->assoc_done);
+		complete(&m->assoc_update);
 		break;
 	}
 }
@@ -111,14 +287,28 @@ static int mt_association_calibration(struct mt7932 *m)
 {
 	const struct firmware *oca;
 	struct mt7932_cal_piece pieces[2];
+	unsigned long flags;
 	int ret;
 
 	ret = request_firmware_direct(&oca, "mediatek/mt7932/oca2.bin", &m->pdev->dev);
 	if (ret)
 		return ret;
-	ret = mt7932_cal_association(oca->data, oca->size, m->connect_channel, pieces);
-	if (ret == 2)
+	if (m->assoc_width || m->assoc_sco)
+		ret = mt7932_cal_association_wide(oca->data, oca->size, m->assoc_center, pieces);
+	else
+		ret = mt7932_cal_association(oca->data, oca->size, m->connect_channel, pieces);
+	if (ret == 2 && (m->assoc_width || m->assoc_sco))
+		dev_info(&m->pdev->dev, "BW_CAL: center=%u parameter=%08x group=%u fragments=2\n",
+			 m->assoc_center, pieces[0].parameter, pieces[0].parameter & 0xff);
+	if (ret == 2) {
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->bw_cal_active = m->assoc_width || m->assoc_sco;
+		spin_unlock_irqrestore(&m->response_lock, flags);
 		ret = mt_cal_procedure(m, pieces, 2, 1, 0);
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->bw_cal_active = false;
+		spin_unlock_irqrestore(&m->response_lock, flags);
+	}
 	release_firmware(oca);
 	return ret;
 }
@@ -154,6 +344,7 @@ static int mt_retire_connection(struct mt7932 *m)
 	netif_tx_disable(m->netdev);
 	/* ndo_start_xmit rechecks the closed admission gate under data_lock. */
 	spin_lock_irqsave(&m->data_lock, flags);
+	mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);
@@ -211,6 +402,18 @@ static int mt_retire_connection(struct mt7932 *m)
 	flush_work(&m->cal_work);
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
+	/* A well-formed negative D6 is terminal for the single logical wide
+	 * association calibration. Only after EE44, TX/token drain and joining
+	 * RX/D7 may that explicit rejection be retired. Timeouts, malformed
+	 * events, D7 errors and asserts retain their original sticky epoch.
+	 */
+	if (!ret && m->bw_cal_rejected && !m->fw_asserted &&
+	    !m->cal_state.active && m->cal_state.error == -EREMOTEIO &&
+	    !m->cal_request_count && !m->waiting) {
+		memset(&m->cal_state, 0, sizeof(m->cal_state));
+		m->bw_cal_rejected = false;
+		dev_info(&m->pdev->dev, "BW_CAL_REJECTION_RETIRED: next attempt may use 20 MHz\n");
+	}
 	if (!ret && (m->cal_state.active || m->cal_state.error || m->cal_request_count || m->waiting))
 		ret = -EPROTO;
 	if (!ret)
@@ -251,8 +454,11 @@ void mt_connect_work(struct work_struct *work)
 	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
 	struct cfg80211_connect_resp_params response = {};
 	u8 *body, mac[8] = {}, queue[32];
-	unsigned long flags;
-	bool submitted = false, peer_owned = false;
+	unsigned long flags, deadline, remaining;
+	bool submitted = false, peer_owned = false, queue_enabled = false;
+	bool pending, done;
+	const char *phase = "prepare";
+	unsigned long started = jiffies;
 	int ret;
 
 	mutex_lock(&m->command_mutex);
@@ -264,8 +470,13 @@ void mt_connect_work(struct work_struct *work)
 		ret = -ECANCELED;
 		goto free;
 	}
+	phase = "bandwidth-policy";
+	ret = mt_bw_apply_fallback(m);
+	if (ret)
+		goto free;
 	if (!m->connect_bss) {
 		dev_info(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
+		phase = "discovery";
 		ret = mt_connect_discover(m);
 		if (ret)
 			goto free;
@@ -275,6 +486,7 @@ void mt_connect_work(struct work_struct *work)
 		ret = -EINVAL;
 		goto free;
 	}
+	mt_bw_log_bss(m);
 	spin_lock_irqsave(&m->response_lock, flags);
 	ret = m->connect_error ?: mt_peer_reserve(m);
 	if (!ret) {
@@ -290,6 +502,11 @@ void mt_connect_work(struct work_struct *work)
 	 * belongs in this field. The recovered framework uses listen interval20.
 	 * Other platform flag policies remain unsupported, not guessed mappings.
 	 */
+	/* Native assocSendConnectCmd supplies band/primary only at 0x338/9.
+	 * 0x33a/b are reserved, not width/center slots. Firmware selects the
+	 * negotiated CW/SCO and returns them in EE4d before calibration.
+	 */
+	phase = "connect-submit";
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
 		m->connect_open ? NULL : m->connect_pmk, m->connect_bssid,
 		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open);
@@ -310,36 +527,74 @@ free:
 	if (ret)
 		goto report;
 	dev_info(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n", m->connect_bssid, m->connect_channel);
-	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
-	mutex_unlock(&m->command_mutex);
-	ret = wait_for_completion_timeout(&m->assoc_start, msecs_to_jiffies(5000)) ? 0 : -ETIMEDOUT;
-	mutex_lock(&m->command_mutex);
-	if (ret) {
-		ret = -ETIMEDOUT;
-		goto report;
+	phase = "assoc-start";
+	deadline = jiffies + msecs_to_jiffies(5000);
+	for (;;) {
+		remaining = jiffies;
+		if (time_after_eq(remaining, deadline)) {
+			ret = -ETIMEDOUT;
+			goto report;
+		}
+		remaining = deadline - remaining;
+		/* Service genuine D7 work while waiting for either link event. */
+		mutex_unlock(&m->command_mutex);
+		ret = wait_for_completion_timeout(&m->assoc_update, remaining) ?
+			0 : -ETIMEDOUT;
+		mutex_lock(&m->command_mutex);
+		spin_lock_irqsave(&m->response_lock, flags);
+		ret = m->connect_error ?: ret;
+		pending = m->assoc_pending;
+		done = completion_done(&m->assoc_done);
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		if (ret)
+			goto report;
+		if (!pending) {
+			if (!done || !queue_enabled)
+				ret = -EPROTO;
+			break;
+		}
+		/* Firmware may restart association within one submitted join. Each
+		 * new start needs calibration; waiting only for CONNECT_REPORT after
+		 * the first start leaves that restart stalled until our timeout.
+		 */
+		phase = "association-calibration";
+		ret = mt_association_calibration(m);
+		spin_lock_irqsave(&m->response_lock, flags);
+		m->assoc_pending = false;
+		ret = ret ?: m->connect_error;
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		if (ret)
+			goto report;
+		dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: channel=%u\n",
+			 m->connect_channel);
+		if (!queue_enabled) {
+			phase = "peer-queue";
+			mt7932_peer_queue(queue, m->peer_ids.station[0], true);
+			ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
+			if (ret)
+				goto report;
+			queue_enabled = true;
+			deadline = jiffies + msecs_to_jiffies(10000);
+		}
+		/* Repeated starts never renew the connection-complete deadline. */
+		phase = "connect-complete";
 	}
-	ret = READ_ONCE(m->connect_error);
-	if (ret)
-		goto report;
-	ret = mt_association_calibration(m);
-	ret = ret ?: READ_ONCE(m->connect_error);
-	if (ret)
-		goto report;
-	dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: channel=%u\n", m->connect_channel);
-	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
-	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
-	if (ret)
-		goto report;
-	mutex_unlock(&m->command_mutex);
-	if (!wait_for_completion_timeout(&m->assoc_done, msecs_to_jiffies(10000)))
-		ret = -ETIMEDOUT;
-	else
-		ret = READ_ONCE(m->connect_error);
-	mutex_lock(&m->command_mutex);
 report:
 	ret = ret ?: READ_ONCE(m->connect_error);
-	if (ret)
+	if (!ret) {
+		phase = "power-save-policy";
+		ret = mt_station_ps_restore(m);
+	}
+	if (ret) {
+		dev_err(&m->pdev->dev,
+			"CONNECT_PHASE_FAILED: phase=%s status=%d elapsed-ms=%u start=%u done=%u peer=%u\n",
+			phase, ret, jiffies_to_msecs(jiffies - started),
+			READ_ONCE(m->assoc_pending), completion_done(&m->assoc_done),
+			READ_ONCE(m->peer_valid));
+		if (submitted && m->connect_channel > 14 && ret != -ECANCELED)
+			mt_bw_latch(m, phase);
 		mt_transport_snapshot(m);
+	}
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
 	if (ret) {
 		spin_lock_irqsave(&m->response_lock, flags);
@@ -347,7 +602,11 @@ report:
 		spin_unlock_irqrestore(&m->response_lock, flags);
 		mutex_unlock(&m->command_mutex);
 		if (submitted) {
-			mt_retire_connection(m);
+			int retired = mt_retire_connection(m);
+
+			if (retired && READ_ONCE(m->bw_fallback))
+				dev_err(&m->pdev->dev,
+					"BW_FALLBACK_BLOCKED: firmware/DMA epoch not retired; reboot with mt7932_fullmac.max_bw_mhz=20 required\n");
 		} else if (peer_owned) {
 			mutex_lock(&m->command_mutex);
 			spin_lock_irqsave(&m->response_lock, flags);
@@ -404,13 +663,36 @@ report:
  * The standard supplicant's Ethernet EAPOL control-port declaration is allowed;
  * nl80211 control-port transport and key/802.1X offloads are not implemented.
  */
+/* iwd (and wpa_supplicant) attach Extended Capabilities and similar
+ * informational elements to every connect, open networks included; only
+ * elements that negotiate security make a request non-open. Measured on a
+ * J700 against an open hotel SSID: "CONNECT_REQUEST: WPA=0 ... IE-bytes=12"
+ * was refused with -EOPNOTSUPP and the network was unusable.
+ */
+static bool mt_open_ies(const u8 *ies, size_t len)
+{
+	const struct element *elem;
+
+	if (!len)
+		return true;
+	for_each_element(elem, ies, len) {
+		if (elem->id == WLAN_EID_RSN || elem->id == WLAN_EID_RSNX)
+			return false;
+		if (elem->id == WLAN_EID_VENDOR_SPECIFIC && elem->datalen >= 4 &&
+		    elem->data[0] == 0x00 && elem->data[1] == 0x50 &&
+		    elem->data[2] == 0xf2 && (elem->data[3] == 1 || elem->data[3] == 4))
+			return false; /* WPA1 or WPS */
+	}
+	return for_each_element_completed(elem, ies, len);
+}
+
 static bool mt_open_request(const struct cfg80211_connect_params *p)
 {
 	return !p->privacy && !p->crypto.wpa_versions &&
 		!p->crypto.n_ciphers_pairwise && !p->crypto.cipher_group &&
 		!p->crypto.n_akm_suites && !p->crypto.psk &&
 		!p->key && !p->key_len && !p->crypto.sae_pwd && !p->crypto.sae_pwd_len &&
-		p->mfp == NL80211_MFP_NO && !p->ie_len && !p->want_1x &&
+		p->mfp == NL80211_MFP_NO && mt_open_ies(p->ie, p->ie_len) && !p->want_1x &&
 		!p->fils_erp_username && !p->fils_erp_username_len &&
 		!p->fils_erp_realm && !p->fils_erp_realm_len &&
 		!p->fils_erp_rrk && !p->fils_erp_rrk_len &&
@@ -418,6 +700,27 @@ static bool mt_open_request(const struct cfg80211_connect_params *p)
 		p->crypto.control_port_ethertype == cpu_to_be16(ETH_P_PAE) &&
 		(p->auth_type == NL80211_AUTHTYPE_OPEN_SYSTEM ||
 		 p->auth_type == NL80211_AUTHTYPE_AUTOMATIC);
+}
+
+/* wpa_supplicant 2.11 lists every AKM the profile allows on a PSK+SAE AP
+ * (PSK and PSK-SHA256 together) so a fullmac driver can choose; the firmware
+ * handshake here is WPA2-PSK, so accept the list when PSK is in it and nothing
+ * outside the PSK family is.
+ */
+static bool mt_psk_akm_list(const struct cfg80211_connect_params *p)
+{
+	bool psk = false;
+	int i;
+
+	if (!p->crypto.n_akm_suites)
+		return false;
+	for (i = 0; i < p->crypto.n_akm_suites; i++) {
+		if (p->crypto.akm_suites[i] == WLAN_AKM_SUITE_PSK)
+			psk = true;
+		else if (p->crypto.akm_suites[i] != WLAN_AKM_SUITE_PSK_SHA256)
+			return false;
+	}
+	return psk;
 }
 
 int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
@@ -438,7 +741,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	if (!open && (params->crypto.wpa_versions != NL80211_WPA_VERSION_2 ||
 	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
 	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.n_akm_suites != 1 || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
+	    !mt_psk_akm_list(params) ||
 	    !params->crypto.psk || params->mfp == NL80211_MFP_REQUIRED ||
 	    !params->ssid_len || params->ssid_len > 32))
 		return -EOPNOTSUPP;
@@ -450,7 +753,13 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		ret = m->link_failed ? -EIO : -EBUSY;
 		goto unlock;
 	}
-	reinit_completion(&m->assoc_start);
+	if (READ_ONCE(m->bw_fallback))
+		mt_bw_narrow_host(m);
+	m->assoc_width = 0;
+	m->assoc_sco = 0;
+	m->assoc_center = 0;
+	reinit_completion(&m->assoc_update);
+	m->assoc_pending = false;
 	m->disconnect_seen = false;
 	m->disconnect_event_received = false;
 	reinit_completion(&m->assoc_done);
@@ -473,6 +782,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_error = 0;
 	m->connect_cancelled = false;
 	m->peer_valid = false;
+	m->rx_rate_valid = false;
+	m->last_rxv = 0;
+	m->rx_rate_updated = 0;
+	WRITE_ONCE(m->assoc_signal_valid, false);
+	WRITE_ONCE(m->cqm_rssi_state, 0);
 	m->connecting = true;
 unlock:
 	spin_unlock_irqrestore(&m->response_lock, flags);
@@ -519,7 +833,7 @@ int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 		m->connect_error = -ECANCELED;
 		m->connect_cancelled = true;
 		m->disconnect_reason = reason;
-		complete(&m->assoc_start);
+		complete(&m->assoc_update);
 		complete(&m->assoc_done);
 		complete(&m->discovery_done);
 	} else if (m->connected) {

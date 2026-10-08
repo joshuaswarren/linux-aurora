@@ -16,6 +16,18 @@ config APPLE_ANE_BRINGUP
 	  unimplemented. No accelerator device or command submission is exposed.
 	  Leave disabled unless testing ANE bring-up on a MacBook Neo.
 
+config APPLE_ANE_FW_TEST
+	tristate "Apple T8140 ANE pinned firmware transport"
+	depends on APPLE_ANE_BRINGUP && IOMMU_API && ARM64_16K_PAGES
+	depends on OF_OVERLAY
+	select FW_LOADER
+	select CRYPTO_LIB_SHA256
+	help
+	  Experimental J700/25G83 firmware transport. Firmware startup requires
+	  an explicit sysfs action and ordered power/DART overlays. After start,
+	  DMA and power remain held until reboot and system sleep is vetoed.
+	  A separately prepared, SHA-pinned model is needed for inference.
+
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -102,24 +114,32 @@ config APPLE_AOP
 	depends on PM
 	depends on RUST
 	select RUST_APPLE_RTKIT
+	select RUST_APPLE_MAILBOX
+	select RUST_FW_LOADER_ABSTRACTIONS
 	help
 	  A co-processor persent on certain Apple SoCs controlling accelerometers,
 	  gyros, ambient light sensors and microphones. Is not actually always on.
 
 	  Say 'y' here if you have an Apple laptop.
 
-config APPLE_SEP
-	tristate "Apple Secure Element Processor"
-	depends on ARCH_APPLE || COMPILE_TEST
-	depends on PM
-	depends on RUST
-	select RUST_APPLE_RTKIT
-	select RUST_APPLE_MAILBOX
-	help
-	  A security co-processor persent on Apple SoCs, controlling transparent
-	  disk encryption, secure boot, HDCP, biometric auth and probably more.
+config APPLE_SEP_FV_INTERFACE
+	bool
 
-	  Say 'y' here if you have an Apple SoC.
+config APPLE_SEP
+	tristate "Apple SEP (Secure Enclave Processor)"
+	depends on ARCH_APPLE
+	depends on PM && RUST && HW_RANDOM && TRUSTED_KEYS && CRYPTO
+	depends on RUST_APPLE_RTKIT && RUST_APPLE_MAILBOX
+	select RUST_FW_LOADER_ABSTRACTIONS
+	select CRYPTO_HMAC
+	select CRYPTO_SHA256
+	select CRYPTO_AES
+	select CRYPTO_GCM
+	select CRYPTO_ECDH
+	select APPLE_SEP_FV_INTERFACE
+	help
+	  This local hybrid driver exposes the retained enclave's RNG, Touch ID
+	  and trusted-key services. It is not part of the clean kernel series.
 
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
@@ -135,5 +155,7 @@ config APPLE_PMP
 	  Say 'y' here if you have an Apple SoC.
 
 endmenu
+
+source "drivers/soc/apple/neo/Kconfig"
 
 endif

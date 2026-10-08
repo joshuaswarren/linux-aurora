@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two native physical render pairs with two exact generations per pair."""
+"""Two native physical render pairs, each with alternating descriptor generations."""
 
 from pathlib import Path
 
@@ -11,7 +11,13 @@ DRM = (ROOT / "g17_drm.rs").read_text()
 LIMITS = (ROOT / "g17_queue_limits.rs").read_text()
 
 assert "MAX_IN_FLIGHT_PER_QUEUE: u32 = 2" in LIMITS
-assert "MAX_COMPUTE_IN_FLIGHT_PER_QUEUE: u32 = 1" in LIMITS
+# Compute publishes without a host-retirement edge: several kicks per queue,
+# ordered by each CL entry's implicit previous-kick parent in firmware.
+assert "MAX_COMPUTE_IN_FLIGHT_PER_QUEUE: u32 = 16" in LIMITS
+assert "COMPUTE_RECORD_SLOTS: usize = 2 * MAX_COMPUTE_IN_FLIGHT_PER_QUEUE as usize" in LIMITS
+_async_prepare = DRM[DRM.index("impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {"):]
+_async_prepare = _async_prepare[:_async_prepare.index("fn publish(")]
+assert "None" in _async_prepare and "async_compute_dependency" not in DRM
 assert "G17P_RENDER_MAX_IN_FLIGHT: usize = 2" in RESOURCES
 assert "owned >= crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE as usize" in DRM
 assert "render_queued_tracker: Option<G17PPartialOpeningRenderTracker>" in MANAGER
@@ -41,7 +47,7 @@ class Queue:
         self.hwpb_refs = 0
 
     def publish(self, ordinal):
-        assert len(self.trackers) < 4
+        assert len(self.trackers) < 2
         slot = ordinal % 2
         generation = (ordinal // 2) % 2
         assert self.generations[slot][generation] is None
@@ -69,8 +75,8 @@ class Queue:
 queue = Queue()
 for ordinal in range(1, 12_289):
     queue.publish(ordinal)
-    if len(queue.trackers) == 4:
-        queue.retire(ordinal - 3)
+    if len(queue.trackers) == 2:
+        queue.retire(ordinal - 1)
 while queue.trackers:
     queue.retire(queue.trackers[0]["ordinal"])
 

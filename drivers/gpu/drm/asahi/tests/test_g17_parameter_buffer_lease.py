@@ -158,9 +158,13 @@ with tempfile.TemporaryDirectory(prefix="g17-pb-lease-") as tmp:
     subprocess.run([str(binary)], check=True)
 
 outer = block(manager, r"^    pub\(crate\) fn begin_translated_render\(")
-assert ".allocate_with_token()" in outer
-assert outer.index(".allocate_with_token()") < outer.index("self.begin_translated_render_with_hardware_buffer(")
+reservation = block(manager, r"^    fn reserve_translated_render\(")
+assert ".allocate_with_token()" in reservation
+assert outer.index("self.reserve_translated_render(") < outer.index("self.begin_translated_render_with_hardware_buffer(")
+# The cold no-storage branch is an out-of-line helper (kernel stack depth);
+# splice its body back at the call site so ordering invariants still read in order.
 inner = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\(")
+inner = inner.replace("self.install_cold_render_storage(", block(manager, r"^    fn install_cold_render_storage\(") + "(", 1)
 assert inner.index(".restage_command(") < inner.index(".set_parameter_buffer_lease_token(")
 assert inner.index(".new_user_render_storage(") < inner.index(".set_parameter_buffer_lease_token(")
 assert inner.index(".set_parameter_buffer_lease_token(") < inner.index(".stage_render_groups_with_sksm(")
@@ -168,5 +172,9 @@ assert inner.index(".set_parameter_buffer_lease_token(") < inner.index(".stage_f
 assert ".stage_render_parameter_buffer_page_list(" not in inner
 assert ".stage_render_parameter_buffer_descriptor(" not in inner
 assert ".selected_scene_index()" in manager
-assert ".selected_parameter_metric(scene)" in manager
+# The diagnostic read names the graph's own leased page-metrics entry, never
+# the device-global entry 0 another graph may be using.
+assert ".selected_parameter_metric(offset, scene)" in manager
+assert "storage.parameter_metrics_offset()" in manager
+assert ".selected_parameter_metric(scene)" not in manager
 print("Production PB token handoff, retained backing preservation, and active Scene metric checks passed")

@@ -69,25 +69,44 @@ timeout_start = live_source.index("    pub(crate) fn timeout_deferred_render(")
 timeout_end = live_source.index("    pub(crate) fn abandon_deferred_render(", timeout_start)
 timeout = live_source[timeout_start:timeout_end]
 settle_render = live_block("    fn settle_deferred_render_completion(")
-assert timeout.index("if !self.render_fence_state.pending(render_slot)") \
+# v92d gates on the exact completion Arc, which install_render_completion
+# records together with render_fence_state.arm() only after preparation.
+install_render = live_block("    fn install_render_completion(")
+assert install_render.index("self.render_fence_state.arm(render_slot)") < install_render.index("*pending = Some(completion);")
+assert timeout.index("if !self.render_completion_pending(render_slot, completion) { return; }") \
     < timeout.index("self.poll_deferred_render_completion(render_slot)"), \
     'pre-publication failures incorrectly enter the hardware watchdog path'
 assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
     < timeout.index("self.settle_deferred_render_completion(render_slot, observed)"), \
     'watchdog consumes the settlement gate before its final completion observation'
-assert "signal.complete(Ok(observed));" in settle_render, \
+assert "self.defer_render_completion(signal, observed);" in settle_render, \
     'watchdog cannot salvage a completion that became visible after the event edge'
-assert settle_render.index("signal.complete(Ok(observed));") \
-    < settle_render.index("retire_render_usc_freelist_at_completion()"), \
+assert settle_render.index("self.defer_render_completion(signal, observed);") \
+    < settle_render.index("retire_render_usc_freelist_at_completion(render_slot)"), \
     'fallible retained cleanup can suppress a proven render completion'
-assert settle_render.index("retire_render_usc_freelist_at_completion()") \
-    < settle_render.index("recover_persistent_runtime(self)"), \
+# The rebuild is handed to the recovery worker (stack depth); admission closes
+# first, so the state is still never reused before the processor stop.
+assert settle_render.index("retire_render_usc_freelist_at_completion(render_slot)") \
+    < settle_render.index("self.request_session_rebuild(EAGAIN)"), \
     'failed retained cleanup can be reused without a processor-stop boundary'
-assert ") -> bool {" not in timeout and "return !retired;" not in timeout, \
+request_rebuild = live_block("    fn request_session_rebuild(")
+assert "self.preparations.close(false);" in request_rebuild
+assert "self.accepting_submissions = false;" in request_rebuild
+assert "queue_g17p_recovery_worker" in request_rebuild
+# v92d: the watchdog entry itself returns nothing and hands the exact
+# still-pending owner to one failure sink after its final observation.
+exact_timeout = live_block("    pub(crate) fn timeout_deferred_render(")
+assert ") -> bool {" not in exact_timeout and "return !retired;" not in exact_timeout, \
     'watchdog still delegates a late registry quarantine to its caller'
-signal_error = timeout.index("signal.fail_while_owned(error);")
-quarantine = timeout.index("quarantined_render_completions", signal_error)
-assert signal_error < quarantine
+assert exact_timeout.index("self.poll_deferred_render_completion(render_slot)") \
+    < exact_timeout.index("self.fail_render_after_final_observation(")
+timeout = live_block("    fn fail_render_after_final_observation(")
+# Stability patch 0006: the failed render and every queued sibling go through
+# one helper that fails the fence while owned, then retains it in quarantine.
+signal_error = timeout.index("self.quarantine_failed_render_completion(signal, error);")
+quarantine_helper = live_block("    fn quarantine_failed_render_completion(")
+assert quarantine_helper.index("completion.fail_while_owned(error)") \
+    < quarantine_helper.index("quarantined_render_completions")
 assert "lease.registry.quarantine_render_slot(lease.slot);" in render_completion, \
     'error fence can wake before its physical slot is quarantined'
 assert "if retired {\n                signal.complete(Err(EIO));\n            } else {" in timeout[:signal_error], \
@@ -110,34 +129,34 @@ assert "&mut self.quarantined_render_completions" in retain_failure
 # before permanently retiring a physical slot. A successful one-frame process
 # can close while its already-completed watch job is still queued.
 watch = block("impl g17_job::G17PRenderQueueBackend for G17PRenderQueueBackend {")
-for marker in ("fn timed_out(", "fn cancel("):
-    body = watch[watch.index(marker):]
+# v92d: the trait methods release the scheduler backlog and delegate to
+# *_inner; publish delegates to publish_with (v84 early lease on the ioctl).
+for trait_fn, inner in (("fn timed_out(", "    fn timed_out_inner("), ("fn cancel(", "    fn cancel_inner(")):
+    body = watch[watch.index(trait_fn):]
     body = body[:body.index("\n    }", body.index("{"))]
-    assert "timeout_deferred_render(" in body, marker
-    assert "quarantine_render_slot(" not in body, marker
-    assert "if quarantine" not in body, marker
+    assert inner.strip()[3:] in body, trait_fn
+    body = block(inner)
+    assert "timeout_deferred_render(" in body, inner
+    assert "quarantine_render_slot(" not in body, inner
+    assert "if quarantine" not in body, inner
 
-render_publish = watch[watch.index("fn publish("):watch.index("fn timed_out(")]
+render_publish = block("    fn publish_with(")
 assert "if quarantine" not in render_publish
 assert "quarantine_render_slot(" not in render_publish
 assert render_publish.count("timeout_deferred_render(") == 1
 assert render_publish.index("packet.begin_publication()") < render_publish.index(
-    "self.registry.acquire_lease(self.owner)?"
+    "self.registry.acquire_lease(self.owner, G17PTileRequest::of(&packet))?"
 )
 assert render_publish.index("completion.attach_lease(lease)?") < render_publish.index(
     "runtime.submit_translated_render("
 )
 
-# The submit path must hand the guard to the asynchronous compute path, and the
-# asynchronous path must publish through it only after the job is enqueued.
+# Counted per-command members feed one ioctl aggregate. The original guard
+# retains the enqueue gate even on partial failure.
 submit = source[source.index('impl queue::Queue for G17PQueue {'):]
-assert 'publication: &mut G17POutputFencePublication' in source, \
-    'submit_compute_async does not receive the output-fence guard'
-assert '&mut publication,' in submit, \
-    'submit() does not hand the guard to the asynchronous compute path'
-enqueue = source.index('.enqueue(packet, dependencies)?;')
-assert enqueue < source.index('publication.publish_async(&finished);', enqueue), \
-    'the completion fence is published before the job is enqueued'
+assert submit.count('G17PSubmitCompletionMember::new(aggregate.clone())') == 2
+assert 'publication.aggregate = Some(aggregate.clone());' in submit
+assert 'publication.publish_async(&aggregate.fence());' in submit
 
 # A queue can contain successors before an earlier asynchronous job fails.
 # DRM considers the predecessor's signalled error fence ready, so the backend
@@ -154,7 +173,7 @@ assert backend.index("completion.complete(Err(EIO));", status_gate) \
 # early fence must exist first, and that allocation failure must publish it
 # directly from the original sync list before returning.
 guarded = block('    fn submit_guarded(')
-fence_create = guarded.index('let early_output_fence:')
+fence_create = guarded.index('let early_output_fence = new_independent_submission_fence(')
 output_alloc = guarded.index('KVec::with_capacity(output_count')
 alloc_failure = guarded.index('Err(_) => {', output_alloc)
 alloc_return = guarded.index('return Err(Self::stage_fail(', alloc_failure)
@@ -186,6 +205,9 @@ use std::sync::{Arc, Mutex};
 struct Error(i32);
 const ECANCELED: Error = Error(125);
 const EIO: Error = Error(5);
+type Result<T=()>=std::result::Result<T,Error>;
+struct G17PSubmitCompletion;
+impl G17PSubmitCompletion { fn finish_enqueue(&self,_result:Result) {} }
 
 /// One dma_fence: unsignalled until whoever owns the work signals it.
 #[derive(Default)]
@@ -281,7 +303,7 @@ fn arm<'a>(
         fence: early,
         outputs,
         failure: ECANCELED,
-        succeeded: false,
+        succeeded: false, aggregate: None,
     }
 }
 '''

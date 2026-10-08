@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from g17_recovery_isolation_test_support import HOST_PATH_V93, recovery_isolation_mod
 
 root = Path(__file__).resolve().parents[1]
 
@@ -24,12 +25,17 @@ live = (root / 'g17_live_boot.rs').read_text()
 compute = (root / 'g17_async_compute.rs').read_text()
 render_impl = item(drm, 'impl G17PRenderCompletion {')
 compute_impl = item(job, 'impl G17PJobCompletion {')
-timeout = item(live, '    fn settle_failed_deferred_render(')
+# v92d: settle_failed_deferred_render delegates the exact failure to this sink.
+assert 'self.fail_render_after_final_observation(' in item(live, '    fn settle_failed_deferred_render(')
+timeout = item(live, '    fn fail_render_after_final_observation(')
 assert 'if retired {\n                signal.complete(Err(EIO));\n            } else {' in timeout
-assert 'signal.fail_while_owned(error);' in timeout
+# Stability patch 0006: the failed render and its queued siblings are failed
+# while owned by one helper, which also retains them in quarantine.
+assert 'self.quarantine_failed_render_completion(signal, error);' in timeout
 assert timeout.index('note_session_recovery_pending(') < timeout.index(
-    'signal.fail_while_owned(error)'
+    'self.quarantine_failed_render_completion(signal, error)'
 )
+assert 'completion.fail_while_owned(error)' in item(live, '    fn quarantine_failed_render_completion(')
 release_quarantine = item(live, '    fn release_quarantined_render_after_processor_stop(')
 assert 'completion.release_after_processor_stop();' in release_quarantine
 for marker in ('    fn release_runtime_objects(', '    fn drop_queue('):
@@ -42,18 +48,38 @@ for marker in ('    fn service_async_compute_completions_matching(',
     body = item(compute, marker)
     assert '.complete(Err(' not in body, marker
     assert '.fail_while_owned(error)' in body, marker
-    assert body.index('note_session_recovery_pending(') < body.index(
-        '.fail_while_owned(error)'
-    ), marker
+    # A VM-scoped fan-out never declares the session crashed (first-submit
+    # hang, 2026-09-26): only the two completion-classification routes still
+    # escalate, and only with QUARANTINE_SCOPE bit 0 clear.
+    if marker != '    fn fail_outstanding_jobs_for_vm_after_compute_observation(':
+        assert body.index('note_session_recovery_pending(') < body.index(
+            '.fail_while_owned(error)'
+        ), marker
+    else:
+        assert 'note_session_recovery_pending(' not in body, marker
 
 source = r'''
 #![allow(dead_code)]
 use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, AtomicI32, Ordering};
-#[derive(Clone,Copy,Debug)] struct Error(i32);
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, AtomicBool, AtomicI32, Ordering};
+macro_rules! pr_info { ($($arg:tt)*) => { let _ = format_args!($($arg)*); }; }
+// v81/v87 instrumentation: e2e ring disarmed, feed-perf detector a no-op here.
+mod g17_e2e { pub const K_COMPLETE:u8=18; pub fn stamp()->u64{0} pub fn record(_:u8,_:u32,_:u64,_:[u64;5]){} }
+mod g17_host_path { pub fn note_render_pass(_:u64,_:u64){}
+'''+HOST_PATH_V93+r'''}
+'''+recovery_isolation_mod()+r'''
+static G17P_RENDER_TIMING_RECORDS: AtomicU32 = AtomicU32::new(0);
+mod g17_timing_buffer {pub const WORDS:usize=24;pub const KIND_RENDER_ADMISSION:u64=1;pub const KIND_RENDER_COMPLETION:u64=2;pub const KIND_RENDER_PUBLISH_STAGES:u64=5;pub const RENDER_COMPLETION_LAYOUT:u64=3;pub fn now()->u64{0} pub fn arch_counter()->u64{0} pub fn record(_words:[u64;24]){}}
+mod module_parameters {
+ pub struct Param(u32); impl Param {pub fn value(&self)->&u32{&self.0}}
+ pub static g17p_trace_depth:Param=Param(0);
+ pub static g17p_completion_trace:Param=Param(0);
+}
+#[derive(Clone,Copy,Debug,PartialEq)] struct Error(i32);
 impl Error {fn to_errno(self)->i32 {self.0}}
-const EIO:Error=Error(-5); const EINVAL:Error=Error(-22);
+const EIO:Error=Error(-5); const EINVAL:Error=Error(-22); const ECANCELED:Error=Error(-125);
 type Result<T=()> = std::result::Result<T,Error>;
+struct Aggregate; impl Aggregate {fn complete(&self,_result:Result){}}
 struct Mutex<T>(StdMutex<T>);
 impl<T> Mutex<T> {fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}
 #[derive(Default)] struct Memory {active:AtomicUsize,closed:AtomicBool,unmapped:AtomicBool,quarantined:AtomicBool}
@@ -74,7 +100,7 @@ impl Registry {
 struct Lease {released:Arc<AtomicUsize>,registry:Registry,slot:u8}
 impl Drop for Lease {fn drop(&mut self){self.released.fetch_add(1,Ordering::SeqCst);}}
 #[derive(Default)] struct Status(AtomicI32);
-impl Status {fn record(&self,e:i32){let _=self.0.compare_exchange(0,e,Ordering::AcqRel,Ordering::Acquire);}}
+impl Status {fn record(&self,e:i32){let _=self.0.compare_exchange(0,e,Ordering::AcqRel,Ordering::Acquire);}fn record_if_device_loss(&self,e:i32){if e != -61 {self.record(e)}}}
 struct Fence {count:AtomicUsize,error:AtomicI32,status:Arc<Status>,status_at_signal:AtomicI32,active_at_signal:AtomicUsize,quarantined_at_signal:AtomicBool,memory:Arc<Memory>}
 impl Fence {
  fn set_error(&self,e:Error){self.error.store(e.0,Ordering::SeqCst);}
@@ -92,10 +118,10 @@ impl Destination {fn write(&self,_timestamp:u64)->Result{Ok(())}}
 '''
 
 for name, impl, extra in [
-    ('Render', render_impl, 'lease:Mutex<Option<Lease>>,timestamps:[Option<Destination>;4],'),
+    ('Render', render_impl, 'lease:Mutex<Option<Lease>>,timestamps:[Option<Destination>;4],created:std::time::Instant,trace_created_ns:u64, trace_attach_ns:AtomicU64, trace_service_counters:[AtomicU64;4], attached_ns:AtomicU64,published_ns:AtomicU64,submission_id:u64,vdm_base:u64,owner:u64,render_slot:AtomicU32,'),
     ('Compute', compute_impl, 'destinations:[Option<Destination>;2],'),
 ]:
-    source += f'''struct {name} {{ fence:Fence,status:Arc<Status>,vm_job:Mutex<Option<VmGuard>>,signalled:AtomicU32,{extra}}}
+    source += f'''struct {name} {{ fence:Fence,status:Arc<Status>,vm_job:Mutex<Option<VmGuard>>,signalled:AtomicU32,aggregate_member:Aggregate,recovery_class:std::sync::atomic::AtomicU8,{extra}}}
 impl {name} {{
 '''
     if '--negative-control' in sys.argv:
@@ -104,14 +130,15 @@ impl {name} {{
     else:
         source += item(impl, '    pub(crate) fn fail_while_owned(')
     source += item(impl, '    pub(crate) fn complete(')
+    source += item(impl, '    pub(crate) fn recovery_spared(')
     source += item(impl, '    pub(crate) fn release_after_processor_stop(')
     source += '\n}\n'
 
 source += r'''
 fn render(m:&Arc<Memory>,released:&Arc<AtomicUsize>)->Arc<Render>{
- let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),timestamps:[None,None,None,None],lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0})))})
+ let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),aggregate_member:Aggregate,recovery_class:Default::default(),timestamps:[None,None,None,None],lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0}))),created:std::time::Instant::now(),trace_created_ns:0,trace_attach_ns:AtomicU64::new(0),trace_service_counters:Default::default(),attached_ns:AtomicU64::new(0),published_ns:AtomicU64::new(0),submission_id:1,vdm_base:0,owner:0,render_slot:AtomicU32::new(0)})
 }
-fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::new(Compute{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),destinations:[None,None]})}
+fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::new(Compute{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),aggregate_member:Aggregate,recovery_class:Default::default(),destinations:[None,None]})}
 #[test] fn render_error_keeps_mapping_and_slot_through_file_and_scheduler_close(){
  let m=Arc::new(Memory::default());let released=Arc::new(AtomicUsize::new(0));
  let runtime=render(&m,&released);let scheduler=runtime.clone();

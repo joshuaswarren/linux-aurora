@@ -1,5 +1,46 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "mt7932.h"
+#include "rate.h"
+
+static bool batch_tx = true;
+module_param(batch_tx, bool, 0644);
+MODULE_PARM_DESC(batch_tx, "Batch TX doorbells with xmit_more (disable for comparison)");
+
+static unsigned int tx_batch_limit = 64;
+
+static int mt_set_tx_batch_limit(const char *val, const struct kernel_param *kp)
+{
+	unsigned int limit;
+	int ret;
+
+	ret = kstrtouint(val, 0, &limit);
+	if (ret)
+		return ret;
+	if (limit < 1 || limit > 64)
+		return -EINVAL;
+	WRITE_ONCE(*(unsigned int *)kp->arg, limit);
+	return 0;
+}
+
+static const struct kernel_param_ops tx_batch_limit_ops = {
+	.set = mt_set_tx_batch_limit,
+	.get = param_get_uint,
+};
+
+module_param_cb(tx_batch_limit, &tx_batch_limit_ops, &tx_batch_limit, 0644);
+MODULE_PARM_DESC(tx_batch_limit, "Maximum data TX descriptors per doorbell (1-64, default 64)");
+
+void mt_data_kick_locked(struct mt7932 *m)
+{
+	if (!m->tx_pending)
+		return;
+	dma_wmb();
+	mt_write(m, m->tx[0].reg + 8, m->tx[0].head);
+	m->tx_pending = false;
+	m->tx_doorbells++;
+	m->tx_kick_max = max(m->tx_kick_max, m->tx_pending_count);
+	m->tx_pending_count = 0;
+}
 
 static bool mt_bss_tx_allowed(struct mt7932 *m);
 static void mt_bss_tx_account(struct mt7932 *m);
@@ -59,10 +100,12 @@ void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event)
 	spin_lock_irqsave(&m->data_lock, flags);
 	m->bss_absent = !!body[1];
 	m->bss_quota = body[2];
-	if (!mt_bss_tx_allowed(m))
+	if (!mt_bss_tx_allowed(m)) {
+		mt_data_kick_locked(m);
 		netif_stop_queue(m->netdev);
-	else if (READ_ONCE(m->data_ready))
+	} else if (READ_ONCE(m->data_ready)) {
 		mt_data_clean_locked(m);
+	}
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	dev_dbg_ratelimited(&m->pdev->dev, "BSS_PRESENCE: absent=%u quota=%u\n",
 			    !!body[1], body[2]);
@@ -82,6 +125,7 @@ void mt_data_complete(struct mt7932 *m, const u8 *packet, size_t length)
 		return;
 	}
 	spin_lock_irqsave(&m->data_lock, flags);
+	m->tx_free_events++;
 	mt_data_clean_locked(m);
 	for (i = 0; i < count; i++) {
 		unsigned int token = tokens[i];
@@ -107,6 +151,7 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	dma_addr_t dma;
 	unsigned long flags;
 	unsigned int slot;
+	u64 copy_start = 0;
 	int ret;
 
 	if (!READ_ONCE(m->connected) || !mt_rf_allowed(m) || !READ_ONCE(m->data_ready) ||
@@ -122,12 +167,23 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	slot = q->head;
 	if (!mt_bss_tx_allowed(m) || m->data_live[slot] || q->queued >= q->count - 1) {
 		netif_stop_queue(netdev);
+		if (mt_perf_enabled())
+			m->perf_tx_queue_stops++;
+		mt_data_kick_locked(m);
+		m->tx_busy++;
 		spin_unlock_irqrestore(&m->data_lock, flags);
 		return NETDEV_TX_BUSY;
 	}
 	payload = m->data_payloads + 4096 * slot;
 	header = m->data_headers + 64 * slot;
+	if (mt_perf_enabled())
+		copy_start = ktime_get_ns();
 	ret = skb_copy_bits(skb, 0, payload, skb->len);
+	if (mt_perf_enabled()) {
+		m->perf_tx_copy_ns += ktime_get_ns() - copy_start;
+		m->perf_tx_frames++;
+		m->perf_tx_bytes += skb->len;
+	}
 	if (!ret)
 		ret = mt7932_data_header(header, payload, skb->len, m->data_payloads_dma + 4096 * slot,
 					 slot, m->peer_wtbl, 0, 0, !m->connect_open);
@@ -146,17 +202,34 @@ netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	desc->control = cpu_to_le32((64 << 16) | BIT(30));
 	q->head = (slot + 1) % q->count;
 	q->queued++;
-	dma_wmb();
-	mt_write(m, q->reg + 8, q->head);
+	if (mt_perf_enabled())
+		m->perf_tx_queued_max = max(m->perf_tx_queued_max, (u64)q->queued);
+	m->tx_pending = true;
+	m->tx_pending_count++;
 	mt_bss_tx_account(m);
 	if (!mt_bss_tx_allowed(m) || m->data_live[q->head] || q->queued >= q->count - 1)
 		netif_stop_queue(netdev);
+	if (mt_perf_enabled() && netif_queue_stopped(netdev))
+		m->perf_tx_queue_stops++;
+	/* Flush before returning a stopped queue: there may be no next skb.
+	 * Bound each qdisc burst to the runtime doorbell limit.
+	 */
+	if (!READ_ONCE(batch_tx) || !netdev_xmit_more() ||
+	    netif_queue_stopped(netdev) ||
+	    !(q->head % clamp_val(READ_ONCE(tx_batch_limit), 1, 64)))
+		mt_data_kick_locked(m);
 	spin_unlock_irqrestore(&m->data_lock, flags);
 	netdev->stats.tx_packets++;
 	netdev->stats.tx_bytes += skb->len;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 drop:
+	/* A rejected last skb must also publish earlier xmit_more packets. */
+	if (READ_ONCE(m->data_ready)) {
+		spin_lock_irqsave(&m->data_lock, flags);
+		mt_data_kick_locked(m);
+		spin_unlock_irqrestore(&m->data_lock, flags);
+	}
 	netdev->stats.tx_dropped++;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
@@ -165,6 +238,8 @@ drop:
 void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 {
 	struct sk_buff *skb;
+	unsigned long flags;
+	u64 copy_start = 0;
 
 	if (!READ_ONCE(m->connected) || !READ_ONCE(m->peer_valid) || !READ_ONCE(m->data_ready))
 		return;
@@ -172,20 +247,50 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 	    (!frame->unicast && frame->wtbl != m->peer_ids.wtbl[0] && frame->wtbl != m->peer_wtbl) ||
 	    mt7932_rx_duplicate(m->duplicates, frame)) {
 		m->netdev->stats.rx_dropped++;
+		m->rx_filtered++;
 		return;
+	}
+	if (frame->amsdu)
+		m->rx_amsdu++;
+	/* Beacons use a basic rate; only this peer's unicast data can provide
+	 * a useful link-rate sample. Never present it as a TX rate or a maximum.
+	 */
+	if (frame->unicast && frame->group3) {
+		spin_lock_irqsave(&m->response_lock, flags);
+		if (m->connected && frame->wtbl == m->peer_wtbl) {
+			m->last_rxv = frame->rxv;
+			m->rx_rate_valid = mt7932_rx_rate(frame->rxv, &m->rx_rate);
+			m->rx_rate_updated = jiffies;
+		}
+		spin_unlock_irqrestore(&m->response_lock, flags);
+	} else if (frame->unicast) {
+		m->rx_rate_missing++;
 	}
 	skb = netdev_alloc_skb_ip_align(m->netdev, frame->length);
 	if (!skb) {
 		m->netdev->stats.rx_dropped++;
 		return;
 	}
+	if (mt_perf_enabled())
+		copy_start = ktime_get_ns();
 	skb_put_data(skb, frame->data, frame->length);
+	if (mt_perf_enabled()) {
+		m->perf_rx_copy_ns += ktime_get_ns() - copy_start;
+		m->perf_rx_frames++;
+		m->perf_rx_bytes += frame->length;
+	}
 	skb->protocol = eth_type_trans(skb, m->netdev);
 	skb->ip_summed = CHECKSUM_NONE;
 	m->netdev->stats.rx_packets++;
 	m->netdev->stats.rx_bytes += frame->length;
 	m->rx_ethernet++;
-	netif_rx(skb);
+	if (m->gro_cells_ready) {
+		if (mt_perf_enabled())
+			m->perf_rx_gro_frames++;
+		gro_cells_receive(&m->gro_cells, skb);
+	} else {
+		netif_rx(skb);
+	}
 	dev_dbg_ratelimited(&m->pdev->dev, "ETHERNET_RX: bytes=%zu peer=%u total=%llu\n",
 		frame->length, frame->wtbl, m->rx_ethernet);
 }
@@ -196,7 +301,7 @@ int mt_data_prepare(struct mt7932 *m)
 	u8 protection[12];
 	int ret;
 
-	if (m->tx[0].count != ARRAY_SIZE(m->data_live))
+	if (!m->tx[0].count || m->tx[0].count > ARRAY_SIZE(m->data_live))
 		return -EINVAL;
 	spin_lock_init(&m->data_lock);
 	m->data_headers = mt_alloc(m, 512 * 64, &m->data_headers_dma);

@@ -1,0 +1,12 @@
+pkgname=vk-gl-cts-j700
+pkgver=20260913
+pkgrel=1
+pkgdesc='Native ARM64 Vulkan OpenGL EGL GLES conformance tests for J700 development'
+arch=('aarch64')
+url='https://github.com/KhronosGroup/VK-GL-CTS'
+license=('Apache-2.0')
+depends=('vulkan-icd-loader' 'libglvnd' 'libx11' 'libxrandr' 'libxrender' 'libpng' 'zlib' 'shaderc')
+options=('!strip' '!debug')
+package() {
+  cp -a /build/cts-installed/. "$pkgdir/"
+}

@@ -25,9 +25,9 @@ handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
 preserve = function(manager, "fn preserve_immediate_retired_render_graph(")
 assert handoff.index("self.require_retired_render_owner()") < handoff.index("G17PRetiredRenderGraph {")
 assert '"handoff-require-retired-owner"' in handoff
-assert "self.render_bind.take().ok_or(EIO)?" in handoff
-assert "self.render_context_aliases.take()" in handoff
-assert "self.render_storage.take().ok_or(ENODEV)?" in handoff
+assert "self.render_slots.active_mut().bind.take().ok_or(EIO)?" in handoff
+assert "self.render_slots.active_mut().context_aliases.take()" in handoff
+assert "self.render_slots.active_mut().storage.take().ok_or(ENODEV)?" in handoff
 assert "release_client_context" not in handoff
 assert ".push_within_capacity(previous)" in preserve
 assert "completion_references_descriptor_range" not in preserve
@@ -55,23 +55,24 @@ assert "snapshot.tiling.idle()" in retired
 assert "snapshot.fragment.idle()" in retired
 assert "partial_opening_outer_counters" not in retired
 
-take = function(manager, "fn take_active_render_slot_state(")
-install = function(manager, "fn install_active_render_slot_state(")
+# Every per-pair owner lives in the slot state; selecting a pair only
+# moves the cursor, allocating a slot on its first selection and never
+# copying state.
+slot_state = function(manager, "struct G17PRenderSlotState {")
 for owner in (
-    "render_storage", "render_tracker", "render_bind", "render_context_aliases",
+    "storage", "tracker", "bind", "context_aliases",
     "retired_handoff_graph",
-    "render_submission_ordinal", "render_auxiliary_timestamp",
-    "render_hardware_buffer_id", "render_hardware_buffer_published", "render_sksm",
+    "submission_ordinal", "auxiliary_timestamp",
+    "hardware_buffer_id", "hardware_buffer_published", "sksm",
 ):
-    assert owner in function(manager, "fn swap_active_render_slot_state(")
+    assert owner in slot_state
 
-select = function(manager, "pub(crate) fn select_render_slot(")
+select = function(manager, "    fn select(&mut self, slot: u8) -> Result {")
 assert "G17PRenderQueuePair::SLOT_COUNT" in select
-assert "self.parked_render_slots[current_slot] = Some(current)" in select
 assert "G17PRenderSlotState::new()?" in select
-assert select.index("G17PRenderSlotState::new()?") < select.index("take_active_render_slot_state()")
-assert "self.swap_active_render_slot_state(&mut state)" in take
-assert "self.render_slot_scratch = Some(state)" in install
+assert select.index("G17PRenderSlotState::new()?") < select.index("self.active_slot = slot")
+assert "core::mem::swap" not in select
+assert function(manager, "pub(crate) fn select_render_slot(").count("self.render_slots.select(slot)") == 1
 
 # The manager contains the active render owner and two complete parked state
 # images. It must be initialized directly in its KBox: building `Self` by

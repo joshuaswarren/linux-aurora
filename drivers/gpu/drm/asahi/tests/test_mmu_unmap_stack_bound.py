@@ -19,8 +19,8 @@ def function(source: str, marker: str) -> str:
 
 
 unmap = function(pgtable, "pub(crate) fn unmap_pages(")
-descriptor_range = function(resources, "fn map_shared_render_descriptor_range(")
-assert "map_shared_render_range(" in descriptor_range
+dual_root = function(resources, "fn map_shared_render_descriptor_range(")
+assert "map_shared_render_range(" in dual_root
 dual_root = function(resources, "fn map_shared_render_range(")
 
 # A failed client-side alias attempt intentionally drops the temporary global

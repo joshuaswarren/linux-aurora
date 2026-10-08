@@ -42,7 +42,9 @@ properties:
 
   "#thermal-sensor-cells":
     const: 1
-    description: Index of the temperature channel in child-node order.
+    description:
+      The cell is the zero-based index of a temperature channel, counting
+      the temperature-* child nodes in order.
 
 patternProperties:
   "^current-[A-Za-z0-9]{4}$":

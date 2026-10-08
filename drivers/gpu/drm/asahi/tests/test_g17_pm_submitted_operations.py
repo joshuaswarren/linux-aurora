@@ -27,6 +27,13 @@ def block(pattern):
 
 body = "\n".join([
     "#![allow(dead_code)]",
+"type LiveResult<T=()> = core::result::Result<T,i32>;", "const EINVAL:i32=22;",
+    block(r"^fn g17p_live_word_bounds\("),
+    block(r"^fn g17p_live_read_u32\("),
+    block(r"^fn g17p_live_read_u64\("),
+    block(r"^fn g17p_live_write_u32\("),
+    block(r"^fn g17p_live_write_u64\("),
+
     "type Result<T = ()> = core::result::Result<T, i32>;",
     "const EOVERFLOW: i32 = 75; const ERANGE: i32 = 34; const EIO: i32 = 5;",
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
@@ -47,23 +54,22 @@ struct TestGem { bytes: UnsafeCell<Vec<u8>>, fail: bool, maps: Cell<usize> }
 impl TestGem {
     fn size(&self) -> usize { unsafe { (&*self.bytes.get()).len() } }
     fn bytes(&self) -> Vec<u8> { unsafe { (&*self.bytes.get()).clone() } }
-    fn vmap(&self) -> Result<kernel::drm::gem::shmem::VMapRef<'_, gem::AsahiObject, u8>> {
+    fn vmap(&self) -> Result<kernel::iosys_map::IoSysMapRef<'_, u8>> {
         self.maps.set(self.maps.get() + 1);
         if self.fail { return Err(EIO); }
-        Ok(kernel::drm::gem::shmem::VMapRef { gem: self, marker: core::marker::PhantomData })
+        Ok(kernel::iosys_map::IoSysMapRef { gem: self, marker: core::marker::PhantomData })
     }
 }
-mod gem { pub struct AsahiObject; }
-mod kernel { pub mod drm { pub mod gem { pub mod shmem {
-    pub struct VMapRef<'a, T, U> {
+mod kernel { pub mod iosys_map {
+    pub struct IoSysMapRef<'a, T> {
         pub gem: &'a crate::TestGem,
-        pub marker: core::marker::PhantomData<(T, U)>,
+        pub marker: core::marker::PhantomData<T>,
     }
-    impl<T> VMapRef<'_, T, u8> {
+    impl IoSysMapRef<'_, u8> {
         pub fn as_ptr(&self) -> *const u8 { unsafe { (&*self.gem.bytes.get()).as_ptr() } }
         pub fn as_mut_ptr(&self) -> *mut u8 { unsafe { (&mut *self.gem.bytes.get()).as_mut_ptr() } }
     }
-}}}}
+}}
 fn pm(size: usize, object_offset: usize, logical_size: usize, counter: usize, value: u32)
     -> G17PParameterManagement
 {
@@ -166,8 +172,8 @@ with tempfile.TemporaryDirectory(prefix="g17-pm-submitted-") as temp:
 # All fallible preconditions (including optional context-alias installation)
 # must finish before the one-shot callback, and neither producer may precede it.
 publish = block(r"^    pub\(crate\) fn publish_partial_opening_pair<F, G>\(")
-assert publish.count("commit_submitted_operation();") == 1
-at = publish.index("commit_submitted_operation();")
+assert publish.count("commit_submitted_operation()?;") == 1
+at = publish.index("commit_submitted_operation()?;")
 for earlier in ["object.vmap()?", "install_t8140_partial_opening_empty_high_roots"]:
     assert publish.index(earlier) < at, earlier
 # The client root binding and its optional MCache alias moved OUT of this
@@ -178,13 +184,13 @@ for earlier in ["object.vmap()?", "install_t8140_partial_opening_empty_high_root
 # manager instead of here, and assert they are gone from here.
 assert "uat.bind(vm)" not in publish
 assert "install_t8140_render_mcache_context_alias" not in publish
-assert "?" not in publish[at:], "fallible operation after committed count"
+assert "?" not in publish[at + len("commit_submitted_operation()?;"): ], "fallible operation after committed count"
 assert "return Err" not in publish[at:]
-for later in ["state[fragment_producer_offset..", "publish_late_tiling_state();",
-              "state[tiling_producer_offset.."]:
+for later in ["g17p_live_write_u32(state, fragment_producer_offset,", "publish_late_tiling_state();",
+              "g17p_live_write_u32(state, tiling_producer_offset,"]:
     assert publish.index(later) > at, later
 assert "G: FnOnce()" in publish
-prepare = manager.index(".prepare_pm_submitted_operation()")
+prepare = manager.index(".prepare_render_submitted_operations(submitted_kicks)")
 publish_at = manager.index(".publish_partial_opening_pair(", prepare)
 commit = manager.index("operation.commit();", publish_at)
 assert prepare < publish_at < commit
@@ -194,13 +200,18 @@ assert manager.count("operation.commit();") == 1
 # render publication must not overwrite it with a client VmBind; the already
 # rooted execution context supplies descriptor/MCache identity before storage
 # construction and outer publication.
-render_publish = manager.index(
-    "fn begin_translated_render_with_hardware_buffer")
-render_body = manager[render_publish:]
-storage_at = manager.index(".new_user_render_storage(", render_publish)
-outer_at = manager.index(".publish_partial_opening_pair(", render_publish)
+# The cold no-storage branch is an out-of-line helper (kernel stack depth);
+# splice its body back at the call site so ordering invariants still read in order.
+cold_at = manager.index("    fn install_cold_render_storage(")
+cold_body = manager[cold_at:manager.index("\n    }\n", cold_at) + 6]
+spliced = manager[manager.index("fn begin_translated_render_with_hardware_buffer"):]
+spliced = spliced.replace("self.install_cold_render_storage(", cold_body + "(", 1)
+render_publish = 0
+render_body = spliced
+storage_at = spliced.index(".new_user_render_storage(")
+outer_at = spliced.index(".publish_partial_opening_pair(")
 assert ".bind(vm)" not in render_body[:outer_at - render_publish]
 assert "install_t8140_render_mcache_context_alias" not in render_body[:outer_at - render_publish]
-context_at = manager.index("u8::try_from(execution_context.context_id())", render_publish)
+context_at = spliced.index("u8::try_from(execution_context.context_id())")
 assert context_at < storage_at < outer_at
 print("PM submitted-operation transaction and actual publication ordering PASS")

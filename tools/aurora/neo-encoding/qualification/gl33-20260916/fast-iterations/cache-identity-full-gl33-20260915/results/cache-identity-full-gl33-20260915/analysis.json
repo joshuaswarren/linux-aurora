@@ -1,0 +1,47 @@
+{
+  "receipt": {
+    "boot": "9f1434bf-725b-4ff1-ae51-babd4df25cb4",
+    "mode": "full",
+    "profile": "gl33",
+    "platform": "x11",
+    "exit_code": 1,
+    "diagnostic_case": null,
+    "diagnostic_session": null,
+    "replay_sessions": null,
+    "command_trace": false,
+    "command_trace_mode": null,
+    "shader_cache_policy": "isolated",
+    "shader_cache_directory": "/home/mcruz/.cache/neo-cts-shaders/362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56/03abec7b984762e6b32a27951652d4c0445e8300e7447a795e5c45dc5291d762",
+    "mesa_sha256": "362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56",
+    "cts_commit": "067e8832315e79817ede1c4863804e440f5d1c80",
+    "asahi_module_sha256": "03abec7b984762e6b32a27951652d4c0445e8300e7447a795e5c45dc5291d762",
+    "asahi_loaded_build_note": "040000001400000003000000474e550081b0fb722ffe014f1a72eb53436c290c7ad52f39",
+    "probe_source_sha256": null,
+    "probe_result": null,
+    "cts_runner_sha256": "80263c0bc5c6fa1cf26b0c6d5ac1306e3b6ded6c50449e46e72eb81561f7de20",
+    "kernel_fault": false,
+    "kernel_stream_overruns": 0,
+    "firmware_dumps": null,
+    "elapsed_seconds": 27344.34186479,
+    "verdict_note": "Interpret the official summary and complete run inventory; process exit alone is not conformance."
+  },
+  "official_summary": {
+    "Type": "gl33",
+    "Conformant": "False"
+  },
+  "expected_test_sessions": 51,
+  "official_inventory_matches": true,
+  "official_conformant": false,
+  "selected_test_executions": 494301,
+  "observed_configuration_cases": 15,
+  "counts": {
+    "Pass": 478338,
+    "NotSupported": 14666,
+    "Fail": 1312
+  },
+  "complete_sessions": 52,
+  "total_sessions": 52,
+  "issues": [],
+  "fully_accounted": true,
+  "acceptance_note": "Preserve unsupported/warnings and inspect applicability. An advertised API, partial run, or process status is not conformance."
+}

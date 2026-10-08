@@ -22,7 +22,7 @@ def block(source, marker):
 
 snapshot = block(resources, "    pub(crate) fn snapshot_compute_submission(")
 arm = block(manager, "    fn arm_compute_completion(")
-timeout = block(manager, "    pub(crate) fn log_async_compute_timeout(")
+timeout = block(manager, "    fn log_async_compute_timeout_report(") + block(manager, "    pub(crate) fn log_async_compute_timeout(")
 completion = block(manager, "    pub(crate) fn poll_staged_independent_compute_completion(")
 first = block(manager, "    fn submit_translated_first_bind_channel(")
 repeat = block(manager, "    fn submit_translated_repeat_channel(")

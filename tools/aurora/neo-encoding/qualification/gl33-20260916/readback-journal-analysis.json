@@ -1,0 +1,666 @@
+{
+  "log_sha256": "20f87539b8412f98d6d9bd0927016a87b47acf4772daca473add75be688c0eb6",
+  "observed_mappings": 6000,
+  "changed_mappings": 21,
+  "pixel_changes": 21,
+  "captured_histories": 6,
+  "verified_histories": 6,
+  "histories": [
+    {
+      "bo": 11,
+      "gpu_va": "0x5ffff34000",
+      "syncobj": 4,
+      "submission_seqid": 1313,
+      "attachment_bytes": 1920,
+      "observed_bytes": 1807,
+      "verified_chain": [
+        {
+          "index": 11808,
+          "kind": "writer-set",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 11809,
+          "kind": "cpu-writer",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 11810,
+          "kind": "attachment",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 412316024832,
+          "size": 1920,
+          "result": 1313
+        },
+        {
+          "index": 11811,
+          "kind": "submit-start",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1313,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 11812,
+          "kind": "submit-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1313,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 11813,
+          "kind": "wait-begin",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 11814,
+          "kind": "wait-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 11815,
+          "kind": "cleanup",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 11816,
+          "kind": "cpu-map",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 4294967295,
+          "sync": 0,
+          "value": 140735509938176,
+          "size": 1807,
+          "result": 1
+        }
+      ]
+    },
+    {
+      "bo": 11,
+      "gpu_va": "0x5ffff34000",
+      "syncobj": 4,
+      "submission_seqid": 1565,
+      "attachment_bytes": 1280,
+      "observed_bytes": 1162,
+      "verified_chain": [
+        {
+          "index": 14076,
+          "kind": "writer-set",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 14077,
+          "kind": "cpu-writer",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 14078,
+          "kind": "attachment",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 412316024832,
+          "size": 1280,
+          "result": 1565
+        },
+        {
+          "index": 14079,
+          "kind": "submit-start",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1565,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 14080,
+          "kind": "submit-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1565,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 14081,
+          "kind": "wait-begin",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 14082,
+          "kind": "wait-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 14083,
+          "kind": "cleanup",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 14084,
+          "kind": "cpu-map",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 4294967295,
+          "sync": 0,
+          "value": 140735509938176,
+          "size": 1162,
+          "result": 1
+        }
+      ]
+    },
+    {
+      "bo": 11,
+      "gpu_va": "0x5ffff34000",
+      "syncobj": 4,
+      "submission_seqid": 1813,
+      "attachment_bytes": 1920,
+      "observed_bytes": 1807,
+      "verified_chain": [
+        {
+          "index": 16308,
+          "kind": "writer-set",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16309,
+          "kind": "cpu-writer",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16310,
+          "kind": "attachment",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 412316024832,
+          "size": 1920,
+          "result": 1813
+        },
+        {
+          "index": 16311,
+          "kind": "submit-start",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1813,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 16312,
+          "kind": "submit-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1813,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 16313,
+          "kind": "wait-begin",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16314,
+          "kind": "wait-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16315,
+          "kind": "cleanup",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16316,
+          "kind": "cpu-map",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 4294967295,
+          "sync": 0,
+          "value": 140735509938176,
+          "size": 1807,
+          "result": 1
+        }
+      ]
+    },
+    {
+      "bo": 11,
+      "gpu_va": "0x5ffff34000",
+      "syncobj": 4,
+      "submission_seqid": 1873,
+      "attachment_bytes": 1280,
+      "observed_bytes": 1162,
+      "verified_chain": [
+        {
+          "index": 16848,
+          "kind": "writer-set",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16849,
+          "kind": "cpu-writer",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16850,
+          "kind": "attachment",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 412316024832,
+          "size": 1280,
+          "result": 1873
+        },
+        {
+          "index": 16851,
+          "kind": "submit-start",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1873,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 16852,
+          "kind": "submit-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 1873,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 16853,
+          "kind": "wait-begin",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16854,
+          "kind": "wait-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16855,
+          "kind": "cleanup",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 16856,
+          "kind": "cpu-map",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 4294967295,
+          "sync": 0,
+          "value": 140735509938176,
+          "size": 1162,
+          "result": 1
+        }
+      ]
+    },
+    {
+      "bo": 11,
+      "gpu_va": "0x5ffff34000",
+      "syncobj": 4,
+      "submission_seqid": 2011,
+      "attachment_bytes": 1920,
+      "observed_bytes": 1807,
+      "verified_chain": [
+        {
+          "index": 18090,
+          "kind": "writer-set",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18091,
+          "kind": "cpu-writer",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18092,
+          "kind": "attachment",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 412316024832,
+          "size": 1920,
+          "result": 2011
+        },
+        {
+          "index": 18093,
+          "kind": "submit-start",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 2011,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 18094,
+          "kind": "submit-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 2011,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 18095,
+          "kind": "wait-begin",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18096,
+          "kind": "wait-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18097,
+          "kind": "cleanup",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18098,
+          "kind": "cpu-map",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 4294967295,
+          "sync": 0,
+          "value": 140735509938176,
+          "size": 1807,
+          "result": 1
+        }
+      ]
+    },
+    {
+      "bo": 11,
+      "gpu_va": "0x5ffff34000",
+      "syncobj": 4,
+      "submission_seqid": 2045,
+      "attachment_bytes": 1280,
+      "observed_bytes": 1162,
+      "verified_chain": [
+        {
+          "index": 18396,
+          "kind": "writer-set",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18397,
+          "kind": "cpu-writer",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18398,
+          "kind": "attachment",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 0,
+          "sync": 4,
+          "value": 412316024832,
+          "size": 1280,
+          "result": 2045
+        },
+        {
+          "index": 18399,
+          "kind": "submit-start",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 2045,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 18400,
+          "kind": "submit-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 2045,
+          "size": 296,
+          "result": 0
+        },
+        {
+          "index": 18401,
+          "kind": "wait-begin",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18402,
+          "kind": "wait-return",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18403,
+          "kind": "cleanup",
+          "bo": 0,
+          "va": 0,
+          "batch": 0,
+          "sync": 4,
+          "value": 0,
+          "size": 0,
+          "result": 0
+        },
+        {
+          "index": 18404,
+          "kind": "cpu-map",
+          "bo": 11,
+          "va": 412316024832,
+          "batch": 4294967295,
+          "sync": 0,
+          "value": 140735509938176,
+          "size": 1162,
+          "result": 1
+        }
+      ]
+    }
+  ],
+  "conformance_passed": false,
+  "conclusion": "Captured histories show the mapped BO as the submitted attachment and a successful wait on its writer syncobj before its pixel bytes changed. This does not prove that the kernel or firmware signalled that fence at the correct time."
+}

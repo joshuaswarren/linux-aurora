@@ -1,0 +1,317 @@
+{
+  "scope": "Existing offline compiler captures, not a runtime or performance result.",
+  "compiler_sha256": "eb941548121e8e962a7bc9acd2f80d613017601ce967ecf1ae27fb14079ec683",
+  "schemas_verified": 4,
+  "captures": [
+    {
+      "directory": "native-preamble-buffers-host27/vertex-buffers-0",
+      "words": null,
+      "workload": "0 separate constant-buffer pointers",
+      "native_sha256": "f13011f59939daace4c32f6b2101c608a47b193f8646c7f801d4f2873dfac867",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 0,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 1,
+          "cprog_uniform_inputs": []
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 64,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 202
+    },
+    {
+      "directory": "native-preamble-buffers-host27/vertex-buffers-1",
+      "words": null,
+      "workload": "1 separate constant-buffer pointers",
+      "native_sha256": "0b0ecd5f7f0defcc2901218a4768265031a80a03d944a0def7d3fbd5b529ae5f",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 2,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 64,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 202
+    },
+    {
+      "directory": "native-preamble-buffers-host27/vertex-buffers-16",
+      "words": null,
+      "workload": "16 separate constant-buffer pointers",
+      "native_sha256": "27bad4cfbf3604f9f3a1cd9abfb011f06996f720afc941ee94fda1bbd0ec01b8",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 144,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 32,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 704,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 842
+    },
+    {
+      "directory": "native-preamble-buffers-host27/vertex-buffers-2",
+      "words": null,
+      "workload": "2 separate constant-buffer pointers",
+      "native_sha256": "2fa464ae14973719b123370aeedde43199669c28455a78722504d29dcfdc3ea0",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 32,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 4,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 128,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 266
+    },
+    {
+      "directory": "native-preamble-buffers-host27/vertex-buffers-3",
+      "words": null,
+      "workload": "3 separate constant-buffer pointers",
+      "native_sha256": "2076e05a7f6ed40d0b7771a0bc497038aa8a4d934ee03c59f745665749ca26dd",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 48,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 6,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 192,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 330
+    },
+    {
+      "directory": "native-preamble-buffers-host27/vertex-buffers-4",
+      "words": null,
+      "workload": "4 separate constant-buffer pointers",
+      "native_sha256": "95e4ef74da28c4880e9b60d01dbb09612a8a18bc6d77927480c8c80f4ea0c198",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 48,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 8,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 192,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 330
+    },
+    {
+      "directory": "native-preamble-buffers-host27/vertex-buffers-8",
+      "words": null,
+      "workload": "8 separate constant-buffer pointers",
+      "native_sha256": "75fe8cd7456895ea8b4b70acb207b95f9c07711397eed2cd8d284159b04be81a",
+      "temporary_register_count": 2,
+      "thread_invariant_spill_buffer_bytes": 80,
+      "thread_invariant_largest_ipr_bytes": 0,
+      "largest_ipr_bytes": 20,
+      "entry_ipr_bytes": 20,
+      "constant_phases": [
+        {
+          "name": "agc.main.constant_program",
+          "execution_rate_raw": 3,
+          "temporary_register_count": 16,
+          "cprog_uniform_inputs": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31
+          ]
+        }
+      ],
+      "text_symbols": {
+        "_agc.main": 384,
+        "_agc.main.constant_program": 0
+      },
+      "text_size_including_constant_program_and_padding": 522
+    }
+  ]
+}

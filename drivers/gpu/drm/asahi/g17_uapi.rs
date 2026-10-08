@@ -31,8 +31,8 @@ use g17_submission::{
 };
 
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
-pub(crate) const UAPI_RENDER_SIZE: usize = 256;
-pub(crate) const UAPI_COMPUTE_SIZE: usize = 72;
+pub(crate) const UAPI_RENDER_SIZE: usize = 272;
+pub(crate) const UAPI_COMPUTE_SIZE: usize = 88;
 pub(crate) const UAPI_G18_COMPUTE_SIZE: usize = 136;
 pub(crate) const COMPUTE_G18_RESOURCES: u32 = 1 << 2;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
@@ -65,7 +65,10 @@ const RENDER_FLAGS: u32 = RENDER_VERTEX_SCRATCH
     | RENDER_PROCESS_EMPTY_TILES
     | RENDER_NO_VERTEX_CLUSTERING
     | RENDER_RSRC_SPEC_HI
-    | RENDER_DBIAS_IS_INT;
+    | RENDER_DBIAS_IS_INT
+    // Private, opt-in matched-workload diagnostic. Ordinary builds reject it.
+    | if cfg!(g17p_aux_fb_small_probe) { 1 << 31 } else { 0 }
+    | if cfg!(g17p_mcache_aperture_probe) { 1 << 30 } else { 0 };
 
 const SAMPLER_SIZE: u64 = 8;
 const MAX_SAMPLERS: u32 = 1024;
@@ -355,6 +358,8 @@ pub(crate) struct UapiRenderCommand {
     pub(crate) stencil_clear: u32,
     pub(crate) vertex_timestamps: UapiTimestamps,
     pub(crate) fragment_timestamps: UapiTimestamps,
+    pub(crate) prior_vdm: u64,
+    pub(crate) prior_cdm: u64,
 }
 
 impl UapiRenderCommand {
@@ -393,6 +398,8 @@ impl UapiRenderCommand {
             stencil_clear: get_u32(&raw, 0xcc),
             vertex_timestamps: timestamps(&raw, 0xd0),
             fragment_timestamps: timestamps(&raw, 0xe0),
+            prior_vdm: get_u64(&raw, 0x100),
+            prior_cdm: get_u64(&raw, 0x108),
         })
     }
 }
@@ -408,6 +415,8 @@ pub(crate) struct UapiComputeCommand {
     pub(crate) timestamps: UapiTimestamps,
     pub(crate) scs_layout: u64,
     pub(crate) g18_resources: [u32; 16],
+    pub(crate) prior_vdm: u64,
+    pub(crate) prior_cdm: u64,
 }
 
 impl UapiComputeCommand {
@@ -426,8 +435,10 @@ impl UapiComputeCommand {
         }
         let raw = padded_payload::<UAPI_G18_COMPUTE_SIZE>(raw)?;
         let mut g18_resources = [0; 16];
-        for (i, word) in g18_resources.iter_mut().enumerate() {
-            *word = get_u32(&raw, UAPI_COMPUTE_SIZE + i * 4);
+        if has_resources {
+            for (i, word) in g18_resources.iter_mut().enumerate() {
+                *word = get_u32(&raw, 72 + i * 4);
+            }
         }
         Ok(Self {
             flags: get_u32(&raw, 0),
@@ -439,6 +450,8 @@ impl UapiComputeCommand {
             timestamps: timestamps(&raw, 0x30),
             scs_layout: get_u64(&raw, 0x40),
             g18_resources,
+            prior_vdm: if has_resources { 0 } else { get_u64(&raw, 0x48) },
+            prior_cdm: if has_resources { 0 } else { get_u64(&raw, 0x50) },
         })
     }
 }
@@ -692,14 +705,15 @@ pub(crate) struct RenderInternalState {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedRenderCommand {
-    /// UAPI VDM barrier carried by this command. With the current one-hardware-
-    /// command limit this is either NONE or zero (the preceding render's
-    /// fragment event). Keep it with the owned scheduler packet so publication
-    /// can encode the dependency in the TA kick rather than blocking the host.
+    /// Exact logical render prefix assigned by the DRM ioctl dispatcher.
+    pub(crate) render_order: g17_submission::G17PRenderOrder,
+    /// Original UAPI render index, retained through admission.
     pub(crate) render_barrier: u16,
-    /// UAPI CDM barrier. Cross-engine ordering is currently enforced by the
-    /// scheduler dependency, but retain the exact request with the packet.
+    /// Original UAPI compute index, retained through admission.
     pub(crate) compute_barrier: u16,
+    /// Exact compute prefix resolved at ioctl admission. Later independent
+    /// compute commands must not become parents of this render.
+    pub(crate) compute_wait_through: Option<u64>,
     pub(crate) flags: u32,
     pub(crate) vdm_base: u64,
     pub(crate) parameters: G17pRenderParameters,
@@ -1086,8 +1100,10 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.partial_store_pipeline = partial_end_of_tile;
 
     Ok(TranslatedRenderCommand {
+        render_order: g17_submission::G17PRenderOrder::default(),
         render_barrier: UAPI_BARRIER_NONE,
         compute_barrier: UAPI_BARRIER_NONE,
+        compute_wait_through: None,
         flags: command.flags,
         vdm_base: command.vdm_base,
         parameters,
@@ -1122,6 +1138,12 @@ pub(crate) fn build_render_descriptors(
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedComputeCommand {
+    /// Monotonic logical index, independent of the hardware timestamp.
+    pub(crate) compute_sequence: u64,
+    /// Explicit same-engine prefix; only host-published timestamps need host waits.
+    pub(crate) compute_wait_through: Option<u64>,
+    pub(crate) render_wait_through: Option<u64>,
+    pub(crate) render_wait_last: Option<u64>,
     pub(crate) usc_exec_base: u64,
     pub(crate) control_stream_base: u64,
     pub(crate) control_stream_end: u64,
@@ -1210,6 +1232,10 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         None
     };
     Ok(TranslatedComputeCommand {
+        compute_sequence: 0,
+        compute_wait_through: None,
+        render_wait_through: None,
+        render_wait_last: None,
         usc_exec_base: queue.base,
         control_stream_base: command.control_stream_base,
         control_stream_end: command.control_stream_end,
@@ -2024,6 +2050,8 @@ mod tests {
                         },
                         scs_layout: 0,
                         g18_resources: [0; 16],
+                        prior_vdm: 0,
+                        prior_cdm: 0,
                     }
                 );
             }
@@ -2079,5 +2107,53 @@ mod tests {
             ),
             Err(UapiTranslateError::ProgramOffset)
         );
+    }
+}
+
+
+#[cfg(test)]
+mod exact_prior_payload_tests {
+    use super::*;
+
+    #[test]
+    fn historical_wire_offsets_preserve_scs_and_render_high_words() {
+        let mut render = [0u8; 272];
+        render[0xf0..0xf4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        render[256..264].copy_from_slice(&0x123456789abcdef0u64.to_le_bytes());
+        render[264..272].copy_from_slice(&0xfedcba9876543210u64.to_le_bytes());
+        let p = UapiRenderCommand::parse(&render).unwrap();
+        assert_eq!(p.prior_vdm, 0x123456789abcdef0);
+        assert_eq!(p.prior_cdm, 0xfedcba9876543210);
+        let old = UapiRenderCommand::parse(&render[..256]).unwrap();
+        assert_eq!(old.end_of_tile, p.end_of_tile);
+        assert_eq!((old.prior_vdm, old.prior_cdm), (0, 0));
+        let mut compute = [0u8; 88];
+        compute[64..72].copy_from_slice(&0x8877665544332211u64.to_le_bytes());
+        compute[72..80].copy_from_slice(&0x0123456789abcdefu64.to_le_bytes());
+        compute[80..88].copy_from_slice(&0xfedcba9876543210u64.to_le_bytes());
+        let c = UapiComputeCommand::parse(&compute).unwrap();
+        assert_eq!(c.scs_layout, 0x8877665544332211);
+        assert_eq!((c.prior_vdm, c.prior_cdm), (0x0123456789abcdef, 0xfedcba9876543210));
+        let old72 = UapiComputeCommand::parse(&compute[..72]).unwrap();
+        assert_eq!(old72.scs_layout, c.scs_layout);
+        assert_eq!((old72.prior_vdm, old72.prior_cdm), (0, 0));
+        let old64 = UapiComputeCommand::parse(&compute[..64]).unwrap();
+        assert_eq!((old64.scs_layout, old64.prior_vdm, old64.prior_cdm), (0, 0, 0));
+    }
+
+    #[test]
+    fn truncated_extensions_zero_fill_and_unknown_nonzero_tails_reject() {
+        let mut render = [0u8; 280];
+        render[256] = 7;
+        assert_eq!(UapiRenderCommand::parse(&render[..257]).unwrap().prior_vdm, 7);
+        assert!(UapiRenderCommand::parse(&render).is_ok());
+        render[272] = 1;
+        assert_eq!(UapiRenderCommand::parse(&render), Err(UapiTranslateError::PayloadTail));
+        let mut compute = [0u8; 96];
+        compute[80] = 9;
+        assert_eq!(UapiComputeCommand::parse(&compute[..81]).unwrap().prior_cdm, 9);
+        assert!(UapiComputeCommand::parse(&compute).is_ok());
+        compute[88] = 1;
+        assert_eq!(UapiComputeCommand::parse(&compute), Err(UapiTranslateError::PayloadTail));
     }
 }

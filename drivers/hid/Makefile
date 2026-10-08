@@ -85,7 +85,6 @@ obj-$(CONFIG_HID_LOGITECH_DJ)	+= hid-logitech-dj.o
 obj-$(CONFIG_HID_LOGITECH_HIDPP)	+= hid-logitech-hidpp.o
 obj-$(CONFIG_HID_MACALLY)	+= hid-macally.o
 obj-$(CONFIG_HID_MAGICMOUSE)	+= hid-magicmouse.o
-obj-$(CONFIG_HID_MAGICMOUSE_KUNIT_TEST) += hid-magicmouse-c1fe-test.o
 obj-$(CONFIG_HID_MALTRON)	+= hid-maltron.o
 obj-$(CONFIG_HID_MCP2200)	+= hid-mcp2200.o
 obj-$(CONFIG_HID_MCP2221)	+= hid-mcp2221.o
@@ -181,8 +180,6 @@ obj-$(CONFIG_AMD_SFH_HID)       += amd-sfh-hid/
 obj-$(CONFIG_HID_DOCKCHANNEL)   += dockchannel-hid/
 
 obj-$(CONFIG_SPI_HID_APPLE_CORE)	+= spi-hid/
-
-obj-$(CONFIG_HID_DOCKCHANNEL)   += dockchannel-hid/
 
 obj-$(CONFIG_SURFACE_HID_CORE)  += surface-hid/
 

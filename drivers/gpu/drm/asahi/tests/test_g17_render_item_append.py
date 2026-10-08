@@ -44,6 +44,14 @@ sizes = "\n".join(
 )
 body = "\n".join([
     "#![allow(dead_code)]",
+"type Result<T=()> = core::result::Result<T,i32>;",
+"type LiveResult<T=()> = core::result::Result<T,i32>;", "const EINVAL:i32=22;",
+    block(r"^fn g17p_live_word_bounds\("),
+    block(r"^fn g17p_live_read_u32\("),
+    block(r"^fn g17p_live_read_u64\("),
+    block(r"^fn g17p_live_write_u32\("),
+    block(r"^fn g17p_live_write_u64\("),
+
     constant,
     constants,
     "mod g17_submission {" + sizes + native_channel_helpers(submission) + "}",
@@ -74,5 +82,5 @@ assert "put_u64_le(out, 0x60, 0x500);" in submission
 manager = (source_dir / "g17_manager.rs").read_text()
 assert "g17p_render_published_prefix()" not in manager
 assert ".stage_fragment_kick(fragment_stamp)" not in manager
-assert source.count("plan.copy_items(raw, Self::FRAGMENT_RING") == 3
+assert source.count("plan.copy_items(raw, Self::FRAGMENT_RING") == 2
 print("actual planner bounds, append copies, firmware cursor preservation and caller checks PASS")

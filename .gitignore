@@ -188,6 +188,3 @@ sphinx_*/
 
 # bc language scripts (not LLVM bitcode)
 !kernel/time/timeconst.bc
-
-# macOS Finder metadata
-.DS_Store

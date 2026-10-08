@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/nvmem-provider.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/spmi.h>
 #include <linux/regmap.h>
 
@@ -18,9 +19,26 @@ static const struct regmap_config apple_spmi_regmap_config = {
 	.max_register	= 0xffff,
 };
 
+static int apple_spmi_nvmem_read(void *priv, unsigned int offset, void *val,
+				 size_t bytes)
+{
+	struct regmap *map = priv;
+
+	return regmap_bulk_read(map, offset, val, bytes);
+}
+
+static int apple_spmi_nvmem_write(void *priv, unsigned int offset, void *val,
+				  size_t bytes)
+{
+	struct regmap *map = priv;
+
+	return regmap_bulk_write(map, offset, val, bytes);
+}
+
 static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
 {
 	struct regmap *regmap;
+	struct nvmem_device *nvmem;
 	struct nvmem_config nvmem_cfg = {
 		.dev = &sdev->dev,
 		.name = "spmi_nvmem",
@@ -28,8 +46,8 @@ static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
 		.word_size = 1,
 		.stride = 1,
 		.size = 0xffff,
-		.reg_read = (void *)regmap_bulk_read,
-		.reg_write = (void *)regmap_bulk_write,
+		.reg_read = apple_spmi_nvmem_read,
+		.reg_write = apple_spmi_nvmem_write,
 	};
 
 	regmap = devm_regmap_init_spmi_ext(sdev, &apple_spmi_regmap_config);
@@ -38,7 +56,14 @@ static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
 
 	nvmem_cfg.priv = regmap;
 
-	return PTR_ERR_OR_ZERO(devm_nvmem_register(&sdev->dev, &nvmem_cfg));
+	nvmem = devm_nvmem_register(&sdev->dev, &nvmem_cfg);
+	if (IS_ERR(nvmem))
+		return PTR_ERR(nvmem);
+
+	/* Optional PMIC functions share this SPMI device and regmap. */
+	if (of_device_is_compatible(sdev->dev.of_node, "apple,baku-pmic"))
+		return devm_of_platform_populate(&sdev->dev);
+	return 0;
 }
 
 static const struct of_device_id apple_spmi_nvmem_id_table[] = {

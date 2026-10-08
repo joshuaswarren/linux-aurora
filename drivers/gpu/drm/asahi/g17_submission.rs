@@ -111,6 +111,11 @@ pub(crate) enum PipeType {
 /// Errors from the submission codec.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionError {
+    RenderBarrierFuture,
+    PriorBarrierFuture,
+    RenderBarrierSequenceOverflow,
+    RenderBarrierMissingToken,
+    RenderBarrierPredecessorFailed,
     /// A doorbell index outside the 3-bit [4:2] field.
     DoorbellIndexOutOfRange,
     /// A doorbell whose type field is not the TX (channel-kick) type.
@@ -1041,9 +1046,15 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
 pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
-pub(crate) const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u8 = 0;
-pub(crate) const G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID: u8 =
-    if G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 { 0 } else { 2 };
+// Default-off build diagnostic: KRUSTFLAGS="--cfg g17p_render_priority_probe".
+// Native ordinary user queues captured priority/subpriority 2/2. This does
+// not establish a Linux UAPI mapping or make the profile a production fix.
+pub(crate) const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u8 =
+    if cfg!(g17p_render_priority_probe) { 2 } else { 0 };
+// HardwareBufferID is independently allocated by AGXHardwareBufferIDManager,
+// not derived from priority (native captures have priority 2 with IDs 5/6).
+// Preserve the existing Linux identity for this diagnostic.
+pub(crate) const G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID: u8 = 0;
 pub(crate) const G17P_NATIVE_RENDER_POLICY: u16 =
     if G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 { 1 } else { 2 };
 /// Mac17P submits 3D first: Fragment(1) | (priority 2 << 2) = 0x09.
@@ -1081,8 +1092,10 @@ pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 =
     g17p_work_channel_table_index(2, PipeType::Compute);
 // The compute index is the validated anchor for the rule above: it must stay 8.
 const _: () = assert!(G17P_COMPUTE_CHANNEL_TABLE_INDEX == 8);
-const _: () = assert!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX == 0);
-const _: () = assert!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX == 1);
+const _: () = assert!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX ==
+    G17P_NATIVE_RENDER_DOORBELL_PRIORITY * 3);
+const _: () = assert!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX ==
+    G17P_NATIVE_RENDER_DOORBELL_PRIORITY * 3 + 1);
 /// Compute work-submission doorbell channel. VALIDATED by 2000 consecutive
 /// passing computes. Decodes under `encode_tx_doorbell` as
 /// `pipe Compute(2) | (priority 2 << 2)` = 0x0a, which is why it is not simply
@@ -2587,15 +2600,15 @@ pub(crate) const fn encode_kick_timestamp(timestamp: KickTimestamp) -> u64 {
     ((timestamp.stamp as u64) << KICK_STAMP_SHIFT) | timestamp.stamp_index as u64
 }
 
-/// Low-byte payload of the current serialized render's 3D channel counter.
+/// Low-byte payload of the retained render channel's next submission.
 ///
-/// `AGX3DChannelSKSM::submitBuffer` increments channel +0x1d4 as a u32
-/// (89d07bc..c4); `getSKSMCompletionScratchRegPayload` reads its low byte
-/// (8a515e4). Both valid cold captures carry payloads 1, 2, 3, not a constant
-/// selector. Our retained path publishes one 3D command per completed pair,
-/// so its ordinal determines that counter while this serialization holds.
-/// This byte wraps independently of the 40-bit SKSM timestamp; it is neither
-/// the queue ID nor an address-space tag.
+/// In the inspected 25G83 kext, FRG submit increments channel +0x204
+/// (8837ae0..e8); getter 88b4ee8 returns its low byte. The counter follows
+/// channel-object lifetime, independently of its physical timestamp base.
+/// Linux retains one ordinal per physical pair across its storage handoffs,
+/// advancing once per publication; outstanding submissions need not retire
+/// before this counter advances. The byte wraps independently of the 40-bit
+/// SKSM timestamp and is neither a QID nor an address-space tag.
 pub(crate) const fn g17p_serialized_render_scratch_payload(submission_ordinal: u64) -> u8 {
     submission_ordinal.wrapping_add(1) as u8
 }
@@ -2616,6 +2629,20 @@ pub(crate) const fn encode_g17p_3d_completion_scratch(
     } else {
         Ok(timestamp | ((payload as u64) << KICK_QID_SHIFT))
     }
+}
+
+/// ConfigUpdate +0x26 gates the u64 completion seed at +0x2a (B1
+/// 11434..11470). Busy channels preserve firmware's evolving scratch value.
+/// Native emits both fields with u32/u64 stores; validate before mutation.
+pub(crate) fn apply_g17p_idle_scratch_seed(
+    out: &mut [u8], seed: Option<u64>,
+) -> Result<(), SubmissionError> {
+    if out.len() < 0x32 {
+        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
+    }
+    put_u32_le(out, 0x26, u32::from(seed.is_some()));
+    put_u64_le(out, 0x2a, seed.unwrap_or(0));
+    Ok(())
 }
 
 /// Prepare the exact entry-slot/doorbell/next-timestamp tuple for one kick.
@@ -2866,6 +2893,9 @@ pub(crate) const G17P_CL_KICK_ENTRY_LAYOUT: G17PClKickEntryLayout = G17PClKickEn
 /// selects the shared-stamp source and has no independent wire field.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PClBarrierDependency {
+    /// Already converted native predecessor stamp. Never reinterpret it using
+    /// the consumer queue's base timestamp or ring geometry.
+    pub(crate) native_timestamp: Option<u64>,
     pub(crate) event_word: u32,
     pub(crate) shared_stamp: u64,
     pub(crate) queue_id: u8,
@@ -2886,10 +2916,121 @@ pub(crate) fn g17p_render_barrier_from_timestamp(
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
     }
     Ok(G17PClBarrierDependency {
+        native_timestamp: None,
         event_word: (timestamp as u32).wrapping_shl(8),
         shared_stamp: timestamp >> 24,
         queue_id,
     })
+}
+
+/// Logical render prefix, resolved at ioctl admission before asynchronous work.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub(crate) struct G17PRenderOrder {
+    pub(crate) sequence: u64,
+    pub(crate) wait_through: Option<u64>,
+}
+
+/// Zero snapshots all preceding ioctls; N adds the first N renders of this
+/// ioctl. NONE remains independent. Sequence zero is reserved for internal work.
+pub(crate) fn g17p_render_order(
+    ioctl_base: u64, preceding: u64, barrier: u16,
+) -> Result<G17PRenderOrder, SubmissionError> {
+    let sequence = ioctl_base.checked_add(preceding)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?;
+    let wait_through = if barrier == u16::MAX {
+        None
+    } else {
+        if u64::from(barrier) > preceding {
+            return Err(SubmissionError::RenderBarrierFuture);
+        }
+        Some(ioctl_base.checked_add(u64::from(barrier))
+            .ok_or(SubmissionError::RenderBarrierSequenceOverflow)?)
+    };
+    Ok(G17PRenderOrder { sequence, wait_through })
+}
+
+/// Add an exact historical prefix without broadening it to the ioctl base.
+/// The base is frozen for the whole ioctl, before any of its jobs publish;
+/// even an earlier command in this ioctl cannot satisfy a historical ordinal.
+/// Zero is absent, including when the legacy header is NONE.
+pub(crate) fn g17p_render_order_with_prior(
+    ioctl_base: u64, preceding: u64, barrier: u16, prior: u64,
+) -> Result<G17PRenderOrder, SubmissionError> {
+    if prior > ioctl_base {
+        return Err(SubmissionError::PriorBarrierFuture);
+    }
+    let mut order = g17p_render_order(ioctl_base, preceding, barrier)?;
+    if prior != 0 {
+        order.wait_through = Some(order.wait_through.map_or(prior, |p| p.max(prior)));
+    }
+    Ok(order)
+}
+
+/// Resolve a still-owned predecessor. A successful retirement needs no GPU
+/// dependency; errors and an unassigned token must never satisfy the prefix.
+/// The caller filters owner identity and supplies every live predecessor in
+/// the prefix under the same runtime lock as publication and retirement.
+pub(crate) fn g17p_live_render_dependency(
+    order: G17PRenderOrder, predecessor_sequence: u64,
+    predecessor_status: i32, native_word: u64,
+) -> Result<Option<G17PClBarrierDependency>, SubmissionError> {
+    if !g17p_render_prefix_contains(order.wait_through, predecessor_sequence) {
+        return Ok(None);
+    }
+    if predecessor_status < 0 {
+        return Err(SubmissionError::RenderBarrierPredecessorFailed);
+    }
+    if predecessor_status > 0 { return Ok(None); }
+    if native_word == u64::MAX {
+        return Err(SubmissionError::RenderBarrierMissingToken);
+    }
+    // Bit 46 is QID bit 6: the firmware takes the QID as bits [46:40] (ubfx
+    // x1,x5,#40,#7) and the same bit as its valid-queue mask-word selector
+    // (ubfx x6,x5,#46,#1). A predecessor on QID 64..127 sets it; its token is
+    // fully modeled and the dependency encoder takes all seven QID bits.
+    // decode_kick_word still refuses bits [63:47]. Refusing the selector made
+    // every barrier on a 64..127 fragment QID fail the dependent render with
+    // EIO (the dead-pair DeviceLost).
+    let token = decode_kick_word(native_word)?;
+    let mut dependency = g17p_render_barrier_from_timestamp(token.timestamp, token.queue_id)?;
+    dependency.native_timestamp = Some(token.timestamp);
+    Ok(Some(dependency))
+}
+
+pub(crate) fn g17p_render_prefix_contains(prefix: Option<u64>, sequence: u64) -> bool {
+    sequence != 0 && prefix.is_some_and(|limit| sequence <= limit)
+}
+
+/// Collapse a validated logical prefix to its newest kick per hardware QID.
+/// Each QID's implicit previous-kick parent supplies the transitive order.
+/// Use logical sequence, not wrapped firmware timestamps or scan order, to
+/// choose the newest. Callers must check every covered predecessor for errors
+/// before inserting it, including predecessors this frontier will subsume.
+pub(crate) fn g17p_insert_prefix_dependency(
+    dependencies: &mut [G17PClBarrierDependency],
+    sequences: &mut [u64], count: &mut usize,
+    sequence: u64, dependency: G17PClBarrierDependency,
+) -> Result<(), SubmissionError> {
+    if *count > dependencies.len() || *count > sequences.len() {
+        return Err(SubmissionError::KickDependencyCountOutOfRange);
+    }
+    if let Some(index) = dependencies[..*count].iter()
+        .position(|prior| prior.queue_id == dependency.queue_id)
+    {
+        if sequence > sequences[index] {
+            dependencies[index] = dependency;
+            sequences[index] = sequence;
+        }
+        return Ok(());
+    }
+    if *count == dependencies.len() || *count == sequences.len() {
+        return Err(SubmissionError::KickDependencyCountOutOfRange);
+    }
+    dependencies[*count] = dependency;
+    sequences[*count] = sequence;
+    *count += 1;
+    Ok(())
 }
 
 /// Optional MCache aperture descriptor copied into entry +0x08.
@@ -3369,6 +3510,10 @@ fn encode_g17p_cl_barrier_dependency(
 ) -> Result<u64, SubmissionError> {
     if barrier.queue_id > KICK_QID_MASK as u8 {
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
+    }
+
+    if let Some(timestamp) = barrier.native_timestamp {
+        return encode_g17p_cl_dependency(timestamp, barrier.queue_id);
     }
 
     let stamp_count = queue.geometry.stamp_count() as u64;
@@ -7406,6 +7551,7 @@ mod tests {
     #[test]
     fn g17p_cl_entry_encodes_every_optional_section() {
         let barriers = [G17PClBarrierDependency {
+            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 3,
@@ -7535,6 +7681,7 @@ mod tests {
         assert_eq!(get_u64_le(&ta.entry, 0x20), 0xffff_0c02_0000_0001);
 
         let fragment_barrier = [G17PClBarrierDependency {
+            native_timestamp: None,
             event_word: 0x100,
             shared_stamp: 0,
             queue_id: 0,
@@ -7678,6 +7825,7 @@ mod tests {
         );
 
         let too_many = [G17PClBarrierDependency {
+            native_timestamp: None,
             event_word: 0,
             shared_stamp: 0,
             queue_id: 0,
@@ -8606,6 +8754,20 @@ pub(crate) const fn g17p_umadesc_offset(hardware_buffer_id: u32) -> Option<usize
     Some(hardware_buffer_id as usize * G17P_UMA_DESC_ENTRY_SIZE)
 }
 
+/// Recover the mutable pool state before its hardware slot changes owners.
+/// The address and allocation unit belong to the retained pool; word three
+/// is firmware-owned and is not part of the load/store handshake.
+pub(crate) const fn decode_g17p_umadesc(
+    descriptor: [u64; 4],
+    mut state: G17PUmaPagePoolState,
+) -> G17PUmaPagePoolState {
+    state.counter_a = ((descriptor[1] >> 5) & 0x0fff_ffff) as u32;
+    state.counter_b = ((descriptor[1] >> 33) & 0x0fff_ffff) as u32;
+    state.empty = (descriptor[1] >> 61) as u32;
+    state.total_pages = descriptor[2] as u32;
+    state
+}
+
 #[cfg(test)]
 mod uma_descriptor_tests {
     use super::*;
@@ -8757,5 +8919,94 @@ mod usc_freelist_tests {
         assert_eq!(u32_at(&record, 0x30), 0);
         assert_eq!(u32_at(&record, 0x34), 1);
         assert!(record[0x38..].iter().all(|byte| *byte == 0));
+    }
+}
+
+
+#[cfg(test)]
+mod exact_prior_tests {
+    use super::*;
+
+    #[test]
+    fn absent_prior_preserves_every_legacy_header_form() {
+        for base in [0, 1, 100, u64::MAX - 10] {
+            for preceding in 0..5 {
+                for barrier in [u16::MAX, 0, 1, 3, 5] {
+                    assert_eq!(g17p_render_order_with_prior(base, preceding, barrier, 0),
+                               g17p_render_order(base, preceding, barrier));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_old_prefix_does_not_grow_with_newer_unrelated_commands() {
+        for base in [7, 8, 1000] {
+            for preceding in [0, 1, 17] {
+                let order = g17p_render_order_with_prior(base, preceding, u16::MAX, 7).unwrap();
+                assert_eq!(order.wait_through, Some(7));
+                assert_eq!(order.sequence, base + preceding + 1);
+                assert!(g17p_render_prefix_contains(order.wait_through, 7));
+                assert!(!g17p_render_prefix_contains(order.wait_through, 8));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_max_preserves_zero_and_positive_relative_prefixes() {
+        assert_eq!(g17p_render_order_with_prior(100, 4, 0, 7).unwrap().wait_through, Some(100));
+        assert_eq!(g17p_render_order_with_prior(100, 4, 3, 100).unwrap().wait_through, Some(103));
+        assert_eq!(g17p_render_order_with_prior(100, 4, u16::MAX, 100).unwrap().wait_through, Some(100));
+        assert_eq!(g17p_render_order_with_prior(0, 0, u16::MAX, 0).unwrap().wait_through, None);
+    }
+
+    #[test]
+    fn earlier_current_ioctl_commands_are_not_historical() {
+        for prior in [11, 12, 100, u64::MAX] {
+            assert_eq!(g17p_render_order_with_prior(10, 100, u16::MAX, prior),
+                       Err(SubmissionError::PriorBarrierFuture));
+        }
+        assert_eq!(g17p_render_order_with_prior(0, 1, u16::MAX, 1),
+                   Err(SubmissionError::PriorBarrierFuture));
+    }
+
+    #[test]
+    fn relative_future_and_counter_overflow_still_reject() {
+        assert_eq!(g17p_render_order_with_prior(10, 1, 2, 7),
+                   Err(SubmissionError::RenderBarrierFuture));
+        assert_eq!(g17p_render_order_with_prior(u64::MAX, 0, u16::MAX, 1),
+                   Err(SubmissionError::RenderBarrierSequenceOverflow));
+        assert_eq!(g17p_render_order_with_prior(u64::MAX - 1, 1, 1, 1),
+                   Err(SubmissionError::RenderBarrierSequenceOverflow));
+    }
+
+    #[test]
+    fn split_ioctl_prefix_has_same_members_as_original_relative_prefix() {
+        let original = g17p_render_order_with_prior(20, 6, 3, 0).unwrap();
+        let later_slice = g17p_render_order_with_prior(25, 1, u16::MAX, 23).unwrap();
+        assert_eq!(original, later_slice);
+        for sequence in 0..30 {
+            assert_eq!(g17p_render_prefix_contains(original.wait_through, sequence),
+                       g17p_render_prefix_contains(later_slice.wait_through, sequence));
+        }
+    }
+
+    #[test]
+    fn physical_siblings_remain_independent_prefix_members() {
+        let order = g17p_render_order_with_prior(50, 0, u16::MAX, 12).unwrap();
+        let mut deps = [g17p_render_barrier_from_timestamp(0, 0).unwrap(); 4];
+        let mut seqs = [0; 4];
+        let mut count = 0;
+        for (sequence, qid, timestamp) in [(10, 2, 99), (11, 3, 55), (12, 2, 100)] {
+            assert!(g17p_render_prefix_contains(order.wait_through, sequence));
+            let dep = g17p_render_barrier_from_timestamp(timestamp, qid).unwrap();
+            g17p_insert_prefix_dependency(&mut deps, &mut seqs, &mut count, sequence, dep).unwrap();
+        }
+        assert_eq!(count, 2);
+        assert_eq!(&seqs[..count], &[12, 11]);
+        assert_eq!((deps[0].queue_id, deps[1].queue_id), (2, 3));
+        // Consuming one destination does not change another's exact prefix.
+        assert_eq!(g17p_render_order_with_prior(51, 0, u16::MAX, 12).unwrap().wait_through,
+                   order.wait_through);
     }
 }

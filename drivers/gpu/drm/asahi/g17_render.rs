@@ -196,6 +196,8 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) context_base: u64,
+    /// Allocation epoch of the trusted execution-context lease, shared by TA/3D.
+    pub(crate) context_generation: u8,
     pub(crate) tilemap: u64,
     /// Per-layer tiler metadata, which native places between the tilemap and
     /// the heap metadata. It is empty, and so equal to `heapmeta`, for a
@@ -203,6 +205,8 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) layermeta: u64,
     pub(crate) heapmeta: u64,
     pub(crate) tpc: u64,
+    /// Geometry size of the owned TPC subregion, before capacity page rounding.
+    pub(crate) tpc_size: u64,
     pub(crate) deflake_1: u64,
     pub(crate) deflake_2: u64,
     pub(crate) deflake_3: u64,
@@ -290,26 +294,10 @@ pub(crate) struct G17pRenderParameters {
     /// legitimately differ. Default zero preserves the userspace mask;
     /// a nonzero value is an explicit diagnostic override only.
     pub(crate) bg_resource_prefix: u64,
-    /// Use the single-capture witnessed values for the two TA descriptor bytes
-    /// `+0x93f` and `+0x94d` instead of the values this driver has always sent.
-    ///
-    /// DIAGNOSTIC, default false. `recs4096-gfx.txt` shows native TA descriptor
-    /// 0 with `+0x93f = 0x87` and `+0x94d = 0x03` where we write `0x91` and
-    /// `0x01`. That is the complete divergence set for literal writes on the TA
-    /// side: 9 literals inside `0x9c0`, 7 matching.
-    ///
-    /// It is NOT sufficient grounds to change the constants, because one
-    /// sighting cannot distinguish "our constant is wrong" from "this offset is
-    /// not a constant". The control is `+0x789`, which reads `0x10` in
-    /// `recs2048-gfx.txt` and `0x08` in `recs4096-gfx.txt`. Testing `0x10` on
-    /// 2026-09-01 produced a hardware result identical to the `0x08` baseline:
-    /// fault-free TA timeout, zero start timestamps, and the same recovery
-    /// entries. No safe derivation is known for this variable field, `0x93f`,
-    /// or `0x94d`. `recs2048`'s TA block stops at `0x800` and
-    /// `recs4096`'s descriptor 1 reaches only `0x640`.
-    ///
-    /// So this flag asks the hardware the answerable question -- do these bytes
-    /// have any effect -- rather than the unanswerable one.
+    /// Historical opt-in diagnostic changing byte 2 of the USC private-memory
+    /// budget qword at TA +0x93d. It must not override +0x94d: that byte is the
+    /// allocation generation of the execution context, not a PM mode flag.
+    /// The captured budget is not yet derived from our pool allocation.
     pub(crate) native_pm_bytes: bool,
     /// Hardware-buffer ID allocated for this TA command. Native allocates it
     /// from the accelerator's 0x7f-entry `AGXHardwareBufferIDManager`, stores
@@ -371,10 +359,12 @@ impl G17pRenderParameters {
             width: 64,
             height: 64,
             context_base: 0x0000_0010_0000_0000,
+            context_generation: 1,
             tilemap: 0x0000_0010_001b_0000,
             layermeta: 0x0000_0010_001b_5000,
             heapmeta: 0x0000_0010_001b_5000,
             tpc: 0x0000_0010_0024_0000,
+            tpc_size: 0x800,
             deflake_1: 0x0000_0010_0006_82a0,
             deflake_2: 0x0000_0010_0006_8020,
             deflake_3: 0x0000_0010_0006_8000,
@@ -990,16 +980,40 @@ fn put_u8(raw: &mut [u8], offset: usize, value: u8) {
     raw[offset] = value;
 }
 
+#[cfg(test)]
 fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
     raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+// v91 WORD_STORES: aligned fields use one store (see g17_store).
+#[cfg(not(test))]
+#[inline(always)]
+fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
+    crate::g17_store::put_u16(raw, offset, value)
+}
+
+#[cfg(test)]
 fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+// v91 WORD_STORES: aligned fields use one store (see g17_store).
+#[cfg(not(test))]
+#[inline(always)]
+fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+    crate::g17_store::put_u32(raw, offset, value)
+}
+
+#[cfg(test)]
 fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+// v91 WORD_STORES: aligned fields use one store (see g17_store).
+#[cfg(not(test))]
+#[inline(always)]
+fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
+    crate::g17_store::put_u64(raw, offset, value)
 }
 
 fn encode_registers(raw: &mut [u8], offset: usize, registers: &[RegisterWrite]) {
@@ -1198,6 +1212,14 @@ pub(crate) fn build_ta_descriptor_base(
         raw,
     );
 
+    // Like the fragment boundaries, these are generated for every native TA
+    // command (25G83 88bdfc4/88be090/88be1a4), not only a queue's first kick.
+    // The final three entries are 01740, 1c880, 1c898; firmware reads +38 and
+    // +3a/+3c to select the corresponding embedded RCE boundaries.
+    put_u16(raw, 0x38, (TA_REGISTER_COUNT - 2) as u16);
+    put_u16(raw, 0x3a, TA_REGISTER_COUNT as u16);
+    put_u16(raw, 0x3c, TA_REGISTER_COUNT as u16);
+
     let deflake = ta_user_offset(parameters.deflake_1)?;
     let sampler_max = if parameters.sampler_count == 0 {
         0
@@ -1210,7 +1232,9 @@ pub(crate) fn build_ta_descriptor_base(
         (((registers.len() * REGISTER_BYTES) as u32) << 16) | registers.len() as u32,
     );
     put_u64(raw, 0x0780, parameters.tpc);
-    put_u8(raw, 0x0789, 0x78);
+    // Native copies RTMemory's geometry-derived TPC size beside its pointer
+    // on every submission (25G83 88fd970..974), independent of queue lifetime.
+    put_u64(raw, 0x0788, parameters.tpc_size);
     put_u32(raw, 0x07d6, deflake as u32);
     put_u32(raw, 0x0876, u32::MAX);
     put_u64(raw, 0x087a, parameters.sampler_array);
@@ -1222,7 +1246,7 @@ pub(crate) fn build_ta_descriptor_base(
     put_u32(raw, 0x0892, 1);
     put_u8(raw, 0x0932, 0x44);
     put_u8(raw, 0x093c, 1);
-    put_u8(raw, 0x094d, if parameters.native_pm_bytes { 3 } else { 1 });
+    put_u8(raw, 0x094d, parameters.context_generation);
     put_u64(raw, 0x08fe, parameters.ta_timestamp_start);
     put_u64(raw, 0x0906, parameters.ta_timestamp_end);
     // +0x090e/+0x0916 are caller-visible timestamp destinations. Firmware
@@ -1238,8 +1262,8 @@ pub(crate) fn build_ta_descriptor_base(
 
 /// Build the TA descriptor used by the proven native cold opening.
 ///
-/// The generic descriptor remains the older 9165484 profile. The first-work
-/// path changes these exact fields immediately before queue publication.
+/// The first-work path applies its pool/lifecycle fields after the common
+/// builder has generated the RCE boundaries required by every command.
 pub(crate) fn build_cold_opening_ta_descriptor(
     parameters: &G17pRenderParameters,
     objects: RenderDescriptorObjects,
@@ -1253,14 +1277,6 @@ pub(crate) fn build_cold_opening_ta_descriptor(
     metadata.command_buffer_state_word = command_buffer_state_word;
     metadata.ta_hardware_buffer_id = ta_hardware_buffer_id;
     build_ta_descriptor(parameters, objects, metadata, raw)?;
-    put_u16(raw, 0x38, 0x47);
-    put_u16(raw, 0x3a, 0x49);
-    put_u16(raw, 0x3c, 0x49);
-    // +0x788 carries the GTP-only RT-buffer size. The valid 32x32 records use
-    // one 0x800-byte buffer and therefore encode qword 0x800 (byte +0x789 =
-    // 0x08). Cold qid0's 0x7800 belongs to a different 15-buffer pool and must
-    // not be copied into this one-buffer Linux pool.
-    put_u8(raw, 0x789, 0x08);
     put_u8(raw, 0x93e, 0xd0);
     put_u8(
         raw,
@@ -1369,6 +1385,18 @@ pub(crate) fn build_fragment_descriptor_base(
     put_u32(raw, 0x6c, parameters.merge_upper_y_bits);
     put_u64(raw, 0x78, geometry.tiles_x * geometry.tiles_y);
 
+    // RCE boundaries belong to every command, including retained queue kicks.
+    // Native emits these from the running register count (25G83 88c0740,
+    // 88c07ac, 88c08c8, 88c0970); firmware consumes +80/+82/+84/+88 when
+    // selecting an entry in this command's embedded program. The fixed recipe
+    // ends with 01731=1, 16020=1, 16020=0, 16068=40000. Boundaries are after
+    // 01731, after the first 16020, that same entry, and the complete program.
+    // Keeping these only in the cold wrapper left ordinary restages at zero.
+    put_u16(raw, 0x80, (register_count - 3) as u16);
+    put_u16(raw, 0x82, (register_count - 2) as u16);
+    put_u16(raw, 0x84, (register_count - 2) as u16);
+    put_u16(raw, 0x88, register_count as u16);
+
     put_u32(
         raw,
         0x07a8,
@@ -1440,10 +1468,10 @@ pub(crate) fn build_fragment_descriptor_base(
     // +0x21a8/+0x21b0: caller-visible destinations, zero as in the TA record.
     put_u8(raw, 0x21cc, 0x53);
     put_u8(raw, 0x21d6, 1);
-    put_u8(raw, 0x21e7, 1);
+    put_u8(raw, 0x21e7, parameters.context_generation);
     put_u8(raw, 0x2208, 1);
     put_u8(raw, 0x220c, 1);
-    put_u8(raw, 0x222d, 1);
+    put_u8(raw, 0x222d, g17p_frg_hwdsid_mode());
     Ok(())
 }
 
@@ -1484,6 +1512,17 @@ fn apply_g17p_fragment_oracle(raw: &mut [u8]) {
     }
 }
 
+/// FRG +0x222d mode byte: Linux has always written 1; all 160 native light
+/// FRG captures hold 0. Diagnostic parameter `g17p_frg_hwdsid_clear`.
+#[cfg(not(test))]
+fn g17p_frg_hwdsid_mode() -> u8 {
+    u8::from(*crate::module_parameters::g17p_frg_hwdsid_clear.value() == 0
+        && !crate::g17_timing_buffer::diag_knob(crate::g17_timing_buffer::DIAG_FRG_222D_CLEAR))
+}
+
+#[cfg(test)]
+fn g17p_frg_hwdsid_mode() -> u8 { 1 }
+
 /// Build the fragment descriptor used by the proven native cold opening.
 pub(crate) fn build_cold_opening_fragment_descriptor(
     parameters: &G17pRenderParameters,
@@ -1496,11 +1535,7 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     metadata.context_id = context_id;
     metadata.command_buffer_state_word = command_buffer_state_word;
     build_fragment_descriptor(parameters, objects, metadata, raw)?;
-    put_u16(raw, 0x80, 0x56);
-    put_u16(raw, 0x82, 0x57);
-    put_u16(raw, 0x84, 0x57);
-    put_u16(raw, 0x88, 0x59);
-    put_u32(raw, 0x90, 1);
+    // +90 is staged with the channel's completion payload at publication.
     // A newly published native 3D queue carries 1 here; retained submissions
     // clear it. This lifecycle is independent of the outer-slot first-submit
     // byte and appears identically on cold QIDs 1 and 8 in both valid traces.
@@ -1596,25 +1631,18 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                     0
                 },
             );
-            // This is a priority-zero channel policy, not a QID identity bit.
-            // Native's priority-zero TA keeps the stamp-info force flag set:
-            // FUN_ab64 ORs it into Pool-A +0x20 and FUN_168d0 publishes the
-            // TA stamp/handoff even while its paired fragment keeps the batch
-            // incomplete. Restricting it to QID 0 let a second independently
-            // allocated priority-zero pair execute TA on QID 2 but never
-            // release the fragment parent on QID 3. Higher-priority native
-            // queues carry their own batching policy and remain unaffected.
-            if crate::g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
-                put_u32(raw, 0x08c2, 1);
-            }
+            // Retain the existing Linux TA drain policy while its visibility
+            // boundaries are audited. Native +0x8c2 is a pending IO-fence
+            // boolean (host descriptor +0x48), not a priority/QID encoding.
+            // Firmware ORs it into TSQ node +0x20 and clears it on a drain;
+            // this TA flag does not guarantee a later fragment drain.
+            // Keep this independent of the opt-in priority diagnostic.
+            put_u32(raw, 0x08c2, 1);
             // Native's host +0x1288 source is a u32 at +0x8d6 (8a990b8),
             // immediately after the qword lifecycle field beginning +0x8ce.
             put_u32(raw, 0x08d6, submission_ordinal as u32);
             put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
-                // Retain the one-buffer GTP size installed by the cold
-                // descriptor builder.
-                put_u8(raw, 0x0789, 0x08);
                 put_u8(raw, 0x093e, 0xd0);
                 put_u8(raw, 0x093f, if native_pm_bytes { 0x87 } else { 0x91 });
             }
@@ -1642,10 +1670,11 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // 1/3/8 for qids 1/3/8, respectively. The old literal only happened
             // to match the first captured qid.
             put_u32(raw, 0x2154, u32::from(queue_id));
-            // Valid cold QIDs 1 and 8 both carry 1; every later submission on
-            // the retained physical queue carries 0. The prior IO-fence guard
-            // was an unsupported semantic guess which inverted this native
-            // lifecycle exactly where first-work setup needs it.
+            // Preserve the existing first-submission policy pending a
+            // visibility-boundary audit. The captured cold/later values do
+            // not establish ordinal semantics: native derives this flag
+            // from pending IO-fences at host descriptor +0x48 (8837268..74,
+            // 8837eb0). See NATIVE-TSQ-OWNERSHIP.md for the decoded producer.
             put_u32(raw, 0x215c, u32::from(submission_ordinal == 0));
             // +0x2160 is the packed 3D-channel SKSM completion scratch value:
             // the physical queue timestamp in bits [39:0] and the channel's
@@ -1653,9 +1682,11 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // from the retained fragment producer immediately before publish.
             put_u32(raw, 0x2170, submission_ordinal as u32);
             put_u64(raw, 0x21ce, runtime_control);
-            // +0x222c is the four-qword AGXCommandHWDSIDData mask tail.
-            // Initial priority-0 3D_0 commands retain the generic 0x100 mask
-            // at this lane; zero belongs to the separate 3D_2/qid8 profile.
+            // Native HWDSID mask occupies +0x220d..+0x222c inclusive;
+            // +0x222d is a separate mode flag. An unaligned u64 at +0x222c
+            // reads 0x100 from that following flag, not from HWDSID bit 8.
+            // Preserve the template's zero mask; aperture IDs alone do not
+            // supply the explicit MDSID-list and accounting contract.
         }
     }
     Ok(())
@@ -2365,7 +2396,7 @@ mod tests {
         assert_eq!(get_u32(&fragment, 0x50), 1);
         assert_eq!(&fragment[0x80..0x86], &[0x56, 0, 0x57, 0, 0x57, 0]);
         assert_eq!(&fragment[0x88..0x8a], &[0x59, 0]);
-        assert_eq!(get_u32(&fragment, 0x90), 1);
+        assert_eq!(get_u32(&fragment, 0x90), 0); // final channel payload is staged later
         assert_eq!(get_u32(&fragment, 0x2154), 1);
         assert_eq!(get_u32(&fragment, 0x215c), 1);
         assert_eq!(fragment[0x2100], 0);
@@ -2462,6 +2493,111 @@ mod tests {
         }
         assert_eq!(get_u32(&tiling, 0x0c), 9);
         assert_eq!(get_u32(&fragment, 0x0c), 9);
+    }
+
+    #[test]
+    fn tpc_extent_survives_cold_and_retained_descriptor_construction() {
+        for size in [0x800, 0x2000, 0x20000, 0x1000000] {
+            let mut p = G17pRenderParameters::source_rsrc8();
+            p.tpc_size = size;
+            let mut ta = [0xa5; TA_DESCRIPTOR_SIZE];
+            build_cold_opening_ta_descriptor(&p, objects(), 7, 0, 0, &mut ta).unwrap();
+            for cold in [true, false] {
+                if !cold {
+                    build_ta_descriptor(&p, objects(),
+                        RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling), &mut ta).unwrap();
+                }
+                apply_g17p_retained_descriptor_fields(RenderDescriptorKind::Tiling,
+                    0x7000090000, 0xfffffc20c0828000, 11, 12, 32,
+                    cold, true, &mut ta).unwrap();
+                assert_eq!(get_u64(&ta, 0x780), p.tpc);
+                assert_eq!(get_u64(&ta, 0x788), size);
+            }
+        }
+    }
+
+    #[test]
+    fn rce_boundaries_survive_retained_descriptor_rebuilds() {
+        let u16_at = |raw: &[u8], at: usize| u16::from_le_bytes([raw[at], raw[at + 1]]);
+        for dimension in [32, 512, 1024] {
+            let mut p = G17pRenderParameters::source_rsrc8();
+            p.width = dimension;
+            p.height = dimension;
+            let mut raw = [0xa5; FRAGMENT_DESCRIPTOR_SIZE];
+            let mut ta = [0xa5; TA_DESCRIPTOR_SIZE];
+            for ordinal in [0, 1, 31, 32, 97, 232, 513] {
+                if ordinal == 0 {
+                    build_cold_opening_fragment_descriptor(&p, objects(), 7, 1, &mut raw).unwrap();
+                    build_cold_opening_ta_descriptor(&p, objects(), 7, 0, 0, &mut ta).unwrap();
+                } else {
+                    build_fragment_descriptor(&p, objects(), RenderDescriptorMetadata {
+                        context_id: 7, submission_ordinal: ordinal,
+                        ..RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment)
+                    }, &mut raw).unwrap();
+                    build_ta_descriptor(&p, objects(), RenderDescriptorMetadata {
+                        context_id: 7, submission_ordinal: ordinal,
+                        ..RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling)
+                    }, &mut ta).unwrap();
+                }
+                apply_g17p_retained_descriptor_fields(RenderDescriptorKind::Fragment,
+                    0x7000098000, 0xfffffc20c0828000, 12, 12, ordinal,
+                    ordinal == 0, true, &mut raw).unwrap();
+                apply_g17p_retained_descriptor_fields(RenderDescriptorKind::Tiling,
+                    0x7000090000, 0xfffffc20c0828000, 11, 12, ordinal,
+                    ordinal == 0, true, &mut ta).unwrap();
+                assert_eq!([u16_at(&ta, 0x38), u16_at(&ta, 0x3a),
+                    u16_at(&ta, 0x3c)], [71, 73, 73]);
+                assert_eq!(get_u32(&ta, 0x768) & 0xffff, 73);
+                for (index, register) in [(70, 0x01740), (71, 0x1c880), (72, 0x1c898)] {
+                    assert_eq!(get_u32(&ta, 0x60 + index * 12), register);
+                }
+                // Independent native publication oracle: all 160 full FRG
+                // images carry these boundaries, including pending overlap.
+                assert_eq!([u16_at(&raw, 0x80), u16_at(&raw, 0x82),
+                    u16_at(&raw, 0x84), u16_at(&raw, 0x88)], [86, 87, 87, 89]);
+                assert_eq!(get_u32(&raw, 0x7a8) & 0xffff, 89);
+                // Check which actual encoded instructions bracket the indices,
+                // so a changed recipe cannot silently retain stale boundaries.
+                for (index, register, value) in [(85, 0x01731, 1),
+                    (86, 0x16020, 1), (87, 0x16020, 0), (88, 0x16068, 0x40000)] {
+                    let at = 0xa0 + index * 12;
+                    assert_eq!(get_u32(&raw, at), register);
+                    assert_eq!(get_u64(&raw, at + 4), value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_epoch_survives_cold_and_retained_encoders_and_wrap() {
+        for epoch in [0, 1, 2, 3, 127, 255] {
+            for diagnostic in [false, true] {
+                let mut parameters = G17pRenderParameters::source_rsrc8();
+                parameters.context_generation = epoch;
+                parameters.native_pm_bytes = diagnostic;
+                for cold in [false, true] {
+                    let mut ta = [0u8; TA_DESCRIPTOR_SIZE];
+                    let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+                    if cold {
+                        build_cold_opening_ta_descriptor(&parameters, objects(), 7, 0, 0, &mut ta).unwrap();
+                        build_cold_opening_fragment_descriptor(&parameters, objects(), 7, 1, &mut fragment).unwrap();
+                    } else {
+                        build_ta_descriptor(&parameters, objects(), RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling), &mut ta).unwrap();
+                        build_fragment_descriptor(&parameters, objects(), RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment), &mut fragment).unwrap();
+                    }
+                    assert_eq!(ta[0x94d], epoch);
+                    assert_eq!(fragment[0x21e7], epoch);
+                    // Retained record restaging changes submission identity,
+                    // but must preserve the immutable execution-context epoch.
+                    apply_g17p_retained_descriptor_fields(RenderDescriptorKind::Tiling,
+                        0x7000098000, 0xfffffc20c0828000, 0, 1, 513, false, true, &mut ta).unwrap();
+                    apply_g17p_retained_descriptor_fields(RenderDescriptorKind::Fragment,
+                        0x7000098000, 0xfffffc20c0828000, 1, 1, 513, false, true, &mut fragment).unwrap();
+                    assert_eq!(ta[0x94d], epoch);
+                    assert_eq!(fragment[0x21e7], epoch);
+                }
+            }
+        }
     }
 
     #[test]

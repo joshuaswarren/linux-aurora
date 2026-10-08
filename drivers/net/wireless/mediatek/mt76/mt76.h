@@ -70,14 +70,6 @@ struct mt76_reg_pair {
 	u32 value;
 };
 
-#define MT76_J700_REG_WRITE_MAX	4096
-
-struct mt76_j700_reg_write {
-	u64 delta_ns;
-	u32 reg;
-	u32 val;
-};
-
 enum mt76_bus_type {
 	MT76_BUS_MMIO,
 	MT76_BUS_USB,
@@ -248,17 +240,6 @@ struct mt76_queue {
 	struct mt76_queue_entry *entry;
 	struct mt76_rro_desc *rro_desc;
 	struct mt76_desc *desc;
-	void *tx_bounce_buf;
-	dma_addr_t tx_bounce_dma;
-	u32 tx_bounce_stride;
-	u32 tx_bounce_entries;
-	u32 tx_bounce_next;
-	void **tx_stream_buf;
-	dma_addr_t *tx_stream_dma;
-	u32 *tx_stream_dma_len;
-	u32 tx_stream_stride;
-	u32 tx_stream_entries;
-	u32 tx_stream_next;
 
 	u16 first;
 	u16 head;
@@ -269,10 +250,6 @@ struct mt76_queue {
 	int queued;
 	int buf_size;
 	bool stopped;
-	bool tx_bounce_logged;
-	bool tx_stream_active;
-	bool tx_stream_logged;
-	bool rx_full_ring;
 	bool blocked;
 
 	u8 buf_offset;
@@ -397,8 +374,6 @@ DECLARE_EWMA(signal, 10, 8);
 #define MT_WCID_TX_INFO_RATE		GENMASK(15, 0)
 #define MT_WCID_TX_INFO_NSS		GENMASK(17, 16)
 #define MT_WCID_TX_INFO_TXPWR_ADJ	GENMASK(25, 18)
-#define MT_WCID_TX_INFO_J700_FULLMAC	BIT(29)
-#define MT_WCID_TX_INFO_ALTQ		BIT(30)
 #define MT_WCID_TX_INFO_SET		BIT(31)
 
 struct mt76_wcid {
@@ -674,10 +649,6 @@ struct mt76_mcu {
 	struct mutex mutex;
 	u32 msg_seq;
 	int timeout;
-	bool mt7932_ram_download_active;
-	bool mt7932_skip_prestart_settle;
-	u8 mt7932_ram_download_responses;
-	u8 mt7932_ram_download_first_seq;
 
 	struct sk_buff_head res_q;
 	wait_queue_head_t wait;
@@ -771,7 +742,6 @@ struct mt76_rx_status {
 
 	u8 phy_idx:2;
 	u8 aggr:1;
-	u8 retry:1;
 	u8 qos_ctl;
 	u16 seqno;
 
@@ -930,12 +900,6 @@ struct mt76_phy {
 
 	struct delayed_work mac_work;
 	u8 mac_work_count;
-	/* Pending bounded firmware scan requests.  MT7932's Apple firmware
-	 * completes measured 2.4/5 GHz batches separately instead of accepting
-	 * one combined 39-channel request.
-	 */
-	struct sk_buff_head scan_pending;
-	u8 scan_active_seq;
 
 	struct {
 		struct sk_buff *head;
@@ -977,12 +941,6 @@ struct mt76_dev {
 	const struct mt76_mcu_ops *mcu_ops;
 	struct device *dev;
 	struct device *dma_dev;
-	spinlock_t j700_reg_write_lock;
-	struct mt76_j700_reg_write *j700_reg_writes;
-	u64 j700_reg_write_start_ns;
-	u32 j700_reg_write_count;
-	bool j700_reg_write_active;
-	bool j700_reg_write_overflow;
 
 	struct mt76_mcu mcu;
 
@@ -1040,7 +998,6 @@ struct mt76_dev {
 	struct debugfs_blob_wrapper otp;
 
 	char alpha2[3];
-	const struct ieee80211_regdomain *custom_regd;
 	enum nl80211_dfs_regions region;
 
 	struct mt76_scan_rnr_param rnr;
@@ -1266,12 +1223,6 @@ bool ____mt76_poll_msec(struct mt76_dev *dev, u32 offset, u32 mask, u32 val,
 #define mt76_poll_msec_tick(dev, ...) ____mt76_poll_msec(&((dev)->mt76), __VA_ARGS__)
 
 void mt76_mmio_init(struct mt76_dev *dev, void __iomem *regs);
-int mt76_mmio_j700_reg_write_arm(struct mt76_dev *dev);
-void mt76_mmio_j700_reg_write(struct mt76_dev *dev, u32 reg, u32 val);
-void mt76_mmio_j700_reg_write_stop_dump(struct mt76_dev *dev,
-					const char *reason);
-void mt76_mmio_j700_reg_write_disarm(struct mt76_dev *dev,
-				     const char *reason);
 void mt76_pci_disable_aspm(struct pci_dev *pdev);
 bool mt76_pci_aspm_supported(struct pci_dev *pdev);
 

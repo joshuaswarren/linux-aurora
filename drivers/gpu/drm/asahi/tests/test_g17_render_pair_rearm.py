@@ -18,7 +18,9 @@ def function(source: str, marker: str) -> str:
     return source[start:pos]
 
 
-submit = function(runtime, "pub(crate) fn submit_translated_render(")
+# v92d: the published body lives in submit_translated_render_inner.
+assert "submit_translated_render_inner(" in function(runtime, "pub(crate) fn submit_translated_render(")
+submit = function(runtime, "fn submit_translated_render_inner(")
 ensure = function(runtime, "fn ensure_g17p_render_registration_power(")
 release = function(runtime, "fn release_g17p_render_registration_power(")
 construct = function(manager, "fn begin_translated_render_with_hardware_buffer(")
@@ -44,13 +46,13 @@ assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_ENABLE_IDLE" in release
 # registration precondition fails. The old ordering moved this owner only
 # after outer publication, leaving storage-without-root and poisoning the next
 # attempt with EBUSY.
-bind_install = construct.index("self.render_bind = Some(G17PRenderRootOwner::Job")
+bind_install = construct.index("self.render_slots.get_mut(pair_slot).bind = Some(G17PRenderRootOwner::Job")
 direct = construct.index("self.configure_fresh_nonbootstrap_render_pair(")
 outer = construct.index(".publish_partial_opening_pair(")
 assert bind_install < direct < outer
 power = construct.index("registration_power(self)")
 assert bind_install < power < direct < outer
-assert "Err(error) if error == EAGAIN => continue" in construct
+assert "Err(error) if error == EAGAIN => {" in construct
 assert "execution_context.clone()" in construct[bind_install - 300 : bind_install + 300]
 
 

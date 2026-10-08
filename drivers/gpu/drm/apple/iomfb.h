@@ -91,6 +91,7 @@ enum iomfb_property_id {
 /* Structures used in v12.0 firmware */
 
 #define SWAP_SURFACES 4
+
 struct dcp_iouserclient {
 	/* Handle for the IOUserClient. macOS sets this to a kernel VA. */
 	u64 handle;
@@ -198,6 +199,12 @@ enum dcpep_method {
 	dcpep_pipe_set_476,
 	dcpep_pipe_cfg_438,
 	dcpep_pipe_set_428,
+	/* IOMFB::UPPipe2::read_blend_crc() const: (0, 0x4), the blend-output CRC */
+	dcpep_read_blend_crc,
+	/* IOMobileFramebufferAP::enable_disable_dithering(u32): (0x4, 0x4) */
+	dcpep_enable_disable_dithering,
+	/* IOMFB::UPPipeAP_H17P::read_crc(Notify_Info_Index, u32): (0x8, 0x4) */
+	dcpep_read_crc,
 	dcpep_num_methods
 };
 
@@ -316,6 +323,11 @@ struct dcp_set_dcpav_prop_chunk_req {
 
 struct dcp_set_dcpav_prop_end_req {
 	char key[0x40];
+} __packed;
+
+struct dcp_read_crc_req {
+	u32 index;
+	u32 arg;
 } __packed;
 
 struct dcp_set_parameter_dcp {

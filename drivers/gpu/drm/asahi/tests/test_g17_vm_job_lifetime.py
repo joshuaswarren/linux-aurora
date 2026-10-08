@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from g17_recovery_isolation_test_support import recovery_isolation_mod
 
 s = (Path(__file__).resolve().parents[1] / "mmu.rs").read_text()
 
@@ -47,6 +48,7 @@ defer_batch = item("    fn defer_blocked_user_bind_batch(")
 commit_batch = item("    pub(crate) fn commit_prepared_user_bind_batch(")
 enter_commit = item("    fn enter_user_mapping_commit(")
 drop_object = item("    pub(crate) fn drop_mappings(")
+release_idle = item("    fn release_idle_closed_objects(")
 
 assert "self.vm.unmap_user_ranges_now" in guard
 assert "self.vm.drop_mappings_now" in guard
@@ -89,6 +91,23 @@ const EOVERFLOW:i32=75;
 const GFP_KERNEL:u32=0;
 macro_rules! pr_err{($($t:tt)*)=>{()}}
 macro_rules! pr_info{($($t:tt)*)=>{()}}
+// This harness covers the production default-off policy; async scheduling
+// itself needs a dedicated workqueue test before that opt-in is qualified.
+mod g17_mem_path {
+    pub struct Stat; impl Stat { pub fn since(&self, _:u64) {} }
+    pub const ASYNC_CLOSED_DRAIN:u32=1;
+    pub static DRAIN_INLINE:Stat=Stat;
+    pub static DRAIN_OBJECTS:()=(); pub static PARKED:()=();
+    pub static RETAIN_WAIT:Stat=Stat; pub static ADMISSION_WAIT:Stat=Stat;
+    pub fn enabled(_:u32)->bool {false}
+    pub fn stamp()->u64 {0} pub fn count(_: &(), _:u64) {}
+}
+struct T8140ClosedObjectDrain;
+impl T8140ClosedObjectDrain {
+    fn queue(_:Vm, _:KVec<ARef<gem::Object>>)->std::result::Result<(),KVec<ARef<gem::Object>>> {
+        panic!("async drain must remain disabled in default policy tests")
+    }
+}
 struct KVec<T>(Vec<T>);
 impl<T>KVec<T>{fn new()->Self{Self(vec![])} fn push(&mut self,v:T,_f:u32)->Result{self.0.push(v);Ok(())}}
 impl<T>Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
@@ -110,6 +129,20 @@ impl CondVar {
         self.1.load(Ordering::SeqCst)
     }
     fn notify_all(&self) { self.0.notify_all(); }
+    // Recovery isolation ADMISSION_WAIT: bounded interruptible wait.
+    fn wait_interruptible_timeout<T>(&self,guard:&mut Guard<'_,T>,jiffies:u64)->kernel::sync::CondVarTimeoutResult {
+        use kernel::sync::CondVarTimeoutResult as R;
+        if self.1.load(Ordering::SeqCst) { return R::Signal{jiffies}; }
+        let held=guard.0.take().unwrap();
+        let (held,result)=self.0.wait_timeout(held,std::time::Duration::from_millis(jiffies)).unwrap();
+        guard.0=Some(held);
+        if self.1.load(Ordering::SeqCst) { R::Signal{jiffies:0} }
+        else if result.timed_out() { R::Timeout } else { R::Woken{jiffies:jiffies.saturating_sub(1)} }
+    }
+}
+mod kernel {
+    pub mod time { pub type Jiffies=u64; pub fn msecs_to_jiffies(ms:u32)->u64{ms as u64} }
+    pub mod sync { pub enum CondVarTimeoutResult { Signal{jiffies:u64}, Timeout, Woken{jiffies:u64} } }
 }
 mod gem{#[derive(Clone)]pub struct Object(pub u64);}
 struct PreparedUserUnmap{iova:u64,size:u64}
@@ -129,7 +162,7 @@ struct Vm {
     block_cleanup:Arc<AtomicBool>,
     cleanup_gate:Arc<(std::sync::Mutex<(bool,bool)>,StdCondvar)>,
 }
-''' + state + "\n" + gate_state + "\n" + gate_type + "\n" + guard + "\nimpl Vm {\n" + retain + "\n" + admit_map + "\n" + unmap_users + "\n" + drop_object + r'''
+''' + state + "\n" + gate_state + "\n" + gate_type + "\n" + guard + "\nimpl Vm {\n" + retain + "\n" + admit_map + "\n" + unmap_users + "\n" + drop_object + "\n" + release_idle + r'''
     fn unmap_user_ranges_now(&self,_user:Range<u64>,_kernel:Range<u64>)->Result {
         self.unmaps.fetch_add(1,Ordering::SeqCst);
         self.maybe_block_cleanup();
@@ -378,7 +411,7 @@ fn import_rechecks_failure_after_retirement_wakeup() {
 
 with tempfile.TemporaryDirectory() as d:
     f = Path(d) / "test.rs"
-    f.write_text(source)
+    f.write_text(source + recovery_isolation_mod())
     exe = Path(d) / "test"
     subprocess.run(["rustc", "--edition=2021", "--test", str(f), "-o", str(exe)], check=True)
     subprocess.run([str(exe), "--test-threads=1", *sys.argv[1:]], check=True)

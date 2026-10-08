@@ -45,9 +45,10 @@ assert "compute_channel_control" in prepare
 logical_prepare = block(manager, "    pub(crate) fn prepare_logical_queue_context(")
 assert "G17PClChannelControl::new" in logical_prepare
 assert "logical_channel_controls" not in logical_prepare
-retain = block(manager, "    pub(crate) fn retain_logical_channel_control(")
-assert "self.logical_channel_controls.push(control.clone(), GFP_KERNEL)?" in retain
-assert retain.index(".push(control.clone()") < retain.index("control.set_session_retained(true)")
+# v92d bounds channel-control pages by their graph owners instead of j700's
+# session-wide list: each render slot state holds its page Arc.
+assert "channel_control: Option<Arc<g17_resources::G17PClChannelControl>>" in block(manager, "struct G17PRenderSlotState {")
+assert "logical_channel_controls" not in manager
 assert "bootstrap_control" in publish
 assert "queue.channel_control_gpu_va" not in publish
 assert "channel_control_gpu_va," in prepare

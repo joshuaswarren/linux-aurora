@@ -341,6 +341,22 @@ pub(crate) const CONTROL_OPENING_PRIMARY_REGISTER_OPCODE: u32 = 0x20;
 pub(crate) const CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE: u32 = 0x22;
 /// Hardware-buffer release emitted after the opening UMA grow request retires.
 pub(crate) const CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE: u32 = 0x2e;
+/// Scheduler-state (channel control) release.
+///
+/// Decoded from AGXG17P 353.14 (25G83) `AGXArmFirmware::submitReleaseResource`
+/// at `0xfffffe00088a722c`: the record's first word is `0x14` on this image
+/// (the G17X image audited in `G17_NATIVE_DETACH_IMPLEMENTATION_PLAN.md`
+/// carries `0x13`; the G17P opcode route table at `0xfffffe0007136180` sends
+/// `0x14` to ring 0, the same primary control ring as `0x2e`, and `0x13` to
+/// ring 1). `AGXCommandQueue::freeReclaimableResources` (`0xfffffe0008865354`)
+/// submits it with the four identity bytes read back from the live scheduler
+/// state page and then waits for the ring consumer to pass the record before
+/// it frees the work queues and their parameter management.
+pub(crate) const CONTROL_SCHEDULER_STATE_RELEASE_OPCODE: u32 = 0x14;
+/// `AGXCommandQueue::processExitTimeoutHandler` (@fffffe000886a494): kill
+/// the work of one scheduler-state page; acknowledged by firmware event 12
+/// (`kAGFIFirmwareEventTypeProcessExitComplete`) carrying the cookie.
+pub(crate) const CONTROL_CONTEXT_KILL_OPCODE: u32 = 0x29;
 /// Device-control ring capacity. FW_PROVEN (b1
 /// `AGFAcceleratorDrainDeviceControlRing` @ `0xfffffc0000003a74`): the drain
 /// walks `ring + index * 0x40` and advances its consumer with
@@ -690,6 +706,51 @@ pub(crate) fn encode_bootstrap_uma_release_record(
     put_u32(out, 0, CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE);
     put_u64(out, 0x04, sequence);
     put_u32(out, 0x0c, hardware_buffer_id);
+    Ok(())
+}
+
+/// Encode the scheduler-state release record exactly as
+/// `AGXArmFirmware::submitReleaseResource(va, a, b, c, d)` writes it into its
+/// 64-byte device-control entry: opcode at `+0`, zero at `+4`, byte `d` at
+/// `+8`, `a` at `+9`, `b` at `+0xa`, `c` at `+0xb`, and the resource's
+/// firmware VA as an unaligned u64 at `+0xc`. `identity` is `[a, b, c, d]`,
+/// i.e. bytes `[0]`, `[1]`, `[4]` and `[0x26]` of the live scheduler-state
+/// page, as `freeReclaimableResources` loads them at `0xfffffe0008865398`.
+pub(crate) fn encode_scheduler_state_release_record(
+    resource_va: u64,
+    identity: [u8; 4],
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, CONTROL_SCHEDULER_STATE_RELEASE_OPCODE);
+    out[0x08] = identity[3];
+    out[0x09] = identity[0];
+    out[0x0a] = identity[1];
+    out[0x0b] = identity[2];
+    put_u64(out, 0x0c, resource_va);
+    Ok(())
+}
+
+/// 64-byte process-exit kill record exactly as `processExitTimeoutHandler`
+/// builds it on its stack (record base sp+8): opcode at `+0`, the
+/// scheduler-state page VA (queue+0x8b8) as an unaligned u64 at `+4`, and
+/// the cookie as an unaligned u64 at `+0xc`; everything else zero. Firmware
+/// 0x29 (fw 0x49cc) reads exactly `[x24,#4]` and `[x24,#0xc]`.
+pub(crate) fn encode_context_kill_record(
+    scheduler_state_va: u64,
+    cookie: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, CONTROL_CONTEXT_KILL_OPCODE);
+    put_u64(out, 0x04, scheduler_state_va);
+    put_u64(out, 0x0c, cookie);
     Ok(())
 }
 
@@ -1177,6 +1238,25 @@ pub(crate) fn encode_render_control_shared(out: &mut [u8]) -> Result<(), Initdat
     Ok(())
 }
 
+/// Encode a per-pair render FList whose whole pool is populated up front.
+///
+/// Same object as `encode_render_control_shared`, but the page counts at
+/// +0x24/+0x2c and the run cursor at +0x48 cover every block, as
+/// AGXUSCPrivMemFList::populateInitialFirmwareState writes them for Apple's
+/// 3D pool (0x1600 pages, cursor 0xb0 for 22 blocks). Nothing is left for a
+/// first opcode-0x20 grow to append.
+pub(crate) fn encode_presized_render_control_shared(
+    out: &mut [u8],
+    blocks: u32,
+) -> Result<(), InitdataError> {
+    let pages = blocks.checked_mul(0x100).ok_or(InitdataError::BufferSize)?;
+    encode_render_control_shared(out)?;
+    put_u64(out, 0x20, u64::from(pages) << 32);
+    put_u64(out, 0x28, u64::from(pages) << 32);
+    put_u32(out, CONTROL_SHARED_CURSOR_OFFSET, blocks * 8);
+    Ok(())
+}
+
 /// Encode the hardware-proven compute form of the compact class-2 object.
 ///
 /// This is deliberately separate from the render UMA form above. Compute's
@@ -1643,8 +1723,9 @@ impl ChannelEntry {
     };
 }
 
-/// The primary's global region views at main `+0x2d0`: a high-only blank
-/// sentinel, then the high halves of two low/high alias pairs (the low halves
+/// The primary's global region views at main `+0x2d0`: a globally retained,
+/// initially zero HWDSID accounting table (256 pairs of u32), followed by
+/// the high halves of two low/high alias pairs (the low halves
 /// are the fixed context-0 addresses in
 /// [`REGION_VIEW_LOW_ADDRS`]). Each pair must map one physical page from both
 /// address spaces — an invariant of the UAT mapping layer that cannot be
@@ -3089,6 +3170,127 @@ pub(crate) fn encode_secondary_root_extra_1_for_profile(
     if matches!(profile, RootProfile::J813G17G25G76 | RootProfile::J873G18G26A428) {
         put_u32(out, 0x10, 2);
     }
+    Ok(())
+}
+
+// --- GPU firmware fast-die controller (GFX1) --------------------------------
+//
+// KEXT_PROVEN (25G83 AGXG17P):
+// - AGXAcceleratorG17P::populateFastDieDeviceConfigData (0x88c7af0) sets target
+//   110.0 C and sensor mask 0xaa0 when accel[0x4a0] == 0x1f, else 0x82a.  It
+//   zeroes the per-sensor array for each mask bit.  It panics ("Not all MTR
+//   Sensors required for FastDie are enabled") only when the host MTR-enable word
+//   accel[0xe978] is non-zero and lacks a required bit.
+// - The base populate (0x883d41c) takes optional ADT gpu-fast-die0-sensor-mask64/
+//   -sensor-mask/-target (default 101.0 C, overridden above).  setupConfig reads
+//   the optional gpu-fast-die0-release-temp/-prop-tgt-delta/-proportional-gain/
+//   -integral-gain and gpu-fastdie-mrc-period.  The J700 ADT carries none of
+//   them.
+// - initPowerAndPerformanceData copies the staged values into
+//   - the GFX1 power object: `[[fw+0x2d8]+0x6678]`; GFX1 reaches it through
+//     secondary main +0x471 = bundle view 2 + 0xe40;
+//   - the 0x6a8-byte secondary-root +0xb8 object (`fw+0xcd8`), which Linux
+//     places at primary status B + 0xe440.
+// FW_PROVEN (fw1 25G83 b100, 0x174d0):
+// - When the +0xb8 object's +0xc4 flag is set, GFX1 copies its +0xc8..+0xe4
+//   fields into the power object.  Native updateLifetimeServoTempTarget and
+//   updateFastDieController set that flag after writing the fields.
+// - GFX1 takes the lower of that target and an external target, then programs
+//   each masked MTR sensor's threshold registers (stride 0x200, +0x1000/+0x1004/
+//   +0x1014) at (target - delta) / 100 C.
+// The recorded Linux runs already carry every non-zero value native publishes
+// here (see the test `fast_die_config_matches_native`).
+
+/// Offset of the GFX1 power object inside the hardware-data bundle.
+pub(crate) const FASTDIE_OBJECT_BUNDLE_OFFSET: usize =
+    BUNDLE_VIEW_OFFSETS[SECONDARY_EXTRA_VIEW_INDEX] + SECONDARY_EXTRA_VIEW_OFFSET;
+pub(crate) const FASTDIE_OBJ_MASK: usize = 0x2310;
+pub(crate) const FASTDIE_OBJ_RELEASE_CC: usize = 0x2318;
+pub(crate) const FASTDIE_OBJ_KI_DT: usize = 0x233c;
+pub(crate) const FASTDIE_OBJ_KP: usize = 0x234c;
+pub(crate) const FASTDIE_OBJ_DELTA_CC: usize = 0x2364;
+pub(crate) const FASTDIE_OBJ_TARGET_CC: usize = 0x236c;
+pub(crate) const FASTDIE_OBJ_STATE: usize = 0x25bc;
+/// Offsets inside the secondary-root +0xb8 object (status B + 0xe440 here).
+pub(crate) const FASTDIE_LIVE_UPDATE: usize = 0xc4;
+pub(crate) const FASTDIE_LIVE_TARGET_CC: usize = 0xc8;
+pub(crate) const FASTDIE_LIVE_RELEASE_CC: usize = 0xcc;
+pub(crate) const FASTDIE_LIVE_KP: usize = 0xd8;
+pub(crate) const FASTDIE_LIVE_KI_DT: usize = 0xdc;
+/// Native G17P target, 0.01 C.
+pub(crate) const FASTDIE_NATIVE_TARGET_CC: u32 = 11_000;
+/// Diagnostic overrides may only lower the target, never below this, so the
+/// recorded 80.00 C release stays below it.
+pub(crate) const FASTDIE_MIN_TARGET_CC: u32 = 8_500;
+
+/// Effective fast-die configuration as encoded (raw words; floats as bits).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct FastDieConfig {
+    pub(crate) mask: u64,
+    pub(crate) target_cc: u32,
+    pub(crate) release_cc: u32,
+    pub(crate) delta_cc: u32,
+    pub(crate) kp_bits: u32,
+    pub(crate) ki_dt_bits: u32,
+    pub(crate) state: u32,
+    pub(crate) live_target_cc: u32,
+    pub(crate) live_release_cc: u32,
+    pub(crate) live_kp_bits: u32,
+    pub(crate) live_ki_dt_bits: u32,
+    pub(crate) live_update: u32,
+}
+
+/// Read the fast-die fields from an encoded bundle and status-B object.
+pub(crate) fn fast_die_config(bundle: &[u8], status_b: &[u8]) -> Result<FastDieConfig, InitdataError> {
+    let o = FASTDIE_OBJECT_BUNDLE_OFFSET;
+    let l = PRIMARY_STATUS_B_CONFIG_OFFSET;
+    if bundle.len() < o + FASTDIE_OBJ_STATE + 4 || status_b.len() < l + FASTDIE_LIVE_KI_DT + 4 {
+        return Err(InitdataError::BufferSize);
+    }
+    Ok(FastDieConfig {
+        mask: get_u64(bundle, o + FASTDIE_OBJ_MASK),
+        target_cc: get_u32(bundle, o + FASTDIE_OBJ_TARGET_CC),
+        release_cc: get_u32(bundle, o + FASTDIE_OBJ_RELEASE_CC),
+        delta_cc: get_u32(bundle, o + FASTDIE_OBJ_DELTA_CC),
+        kp_bits: get_u32(bundle, o + FASTDIE_OBJ_KP),
+        ki_dt_bits: get_u32(bundle, o + FASTDIE_OBJ_KI_DT),
+        state: get_u32(bundle, o + FASTDIE_OBJ_STATE),
+        live_target_cc: get_u32(status_b, l + FASTDIE_LIVE_TARGET_CC),
+        live_release_cc: get_u32(status_b, l + FASTDIE_LIVE_RELEASE_CC),
+        live_kp_bits: get_u32(status_b, l + FASTDIE_LIVE_KP),
+        live_ki_dt_bits: get_u32(status_b, l + FASTDIE_LIVE_KI_DT),
+        live_update: get_u32(status_b, l + FASTDIE_LIVE_UPDATE),
+    })
+}
+
+/// Validate a diagnostic target: 0 keeps native; otherwise lower-only within
+/// [`FASTDIE_MIN_TARGET_CC`]..=[`FASTDIE_NATIVE_TARGET_CC`].
+pub(crate) fn fast_die_target_override(requested_cc: u32) -> Result<Option<u32>, InitdataError> {
+    match requested_cc {
+        0 => Ok(None),
+        t if (FASTDIE_MIN_TARGET_CC..=FASTDIE_NATIVE_TARGET_CC).contains(&t) => Ok(Some(t)),
+        _ => Err(InitdataError::BufferSize),
+    }
+}
+
+/// Apply a validated target to the power object copy (pre-boot encode only).
+pub(crate) fn apply_fast_die_target_bundle(bundle: &mut [u8], target_cc: u32) -> Result<(), InitdataError> {
+    let at = FASTDIE_OBJECT_BUNDLE_OFFSET + FASTDIE_OBJ_TARGET_CC;
+    if bundle.len() < at + 4 {
+        return Err(InitdataError::BufferSize);
+    }
+    put_u32(bundle, at, target_cc);
+    Ok(())
+}
+
+/// Apply a validated target to the +0xb8 live object copy (pre-boot encode
+/// only; no update flag: firmware starts from these words).
+pub(crate) fn apply_fast_die_target_status_b(status_b: &mut [u8], target_cc: u32) -> Result<(), InitdataError> {
+    let at = PRIMARY_STATUS_B_CONFIG_OFFSET + FASTDIE_LIVE_TARGET_CC;
+    if status_b.len() < at + 4 {
+        return Err(InitdataError::BufferSize);
+    }
+    put_u32(status_b, at, target_cc);
     Ok(())
 }
 
@@ -4960,6 +5162,51 @@ mod tests {
 
     const KERN: u64 = 0xffff_fc20_0000_0000;
 
+    fn encoded_fast_die() -> FastDieConfig {
+        let mut bundle = vec![0u8; HW_DATA_BUNDLE_MIN_ALLOC];
+        encode_bundle_static(KERN + 0x1000, &mut bundle).unwrap();
+        let mut status_b = vec![0u8; PRIMARY_STATUS_B_OBJECT_SIZE];
+        encode_primary_status_b(KERN + 0x2000, KERN + 0x2040, &mut status_b).unwrap();
+        fast_die_config(&bundle, &status_b).unwrap()
+    }
+
+    #[test]
+    fn fast_die_config_matches_native() {
+        let c = encoded_fast_die();
+        assert_eq!(FASTDIE_OBJECT_BUNDLE_OFFSET, 0x5240);
+        assert_eq!(c.mask, 0x82a); // G17P mask for accel[0x4a0] != 0x1f
+        assert_eq!(c.target_cc, FASTDIE_NATIVE_TARGET_CC); // 110.00 C
+        assert_eq!(c.release_cc, 8000);
+        assert_eq!(c.delta_cc, 0);
+        assert_eq!(c.kp_bits, 0x41a2_b852);
+        assert_eq!(c.ki_dt_bits, 0x4116_0419);
+        assert_eq!(c.state, 0x4200_0006); // fw1 0x174fc constant
+        assert_eq!(c.live_target_cc, c.target_cc);
+        assert_eq!(c.live_release_cc, c.release_cc);
+        assert_eq!(c.live_kp_bits, c.kp_bits);
+        assert_eq!(c.live_ki_dt_bits, c.ki_dt_bits);
+        assert_eq!(c.live_update, 0);
+        // Same object g17_dvfs_policy::GFX1_STATS_OFFSET (primary state + 0xe780) reads.
+        assert_eq!(PRIMARY_STATUS_B_STATE_GRID_OFFSET + PRIMARY_STATUS_B_CONFIG_OFFSET, 0xe780);
+    }
+
+    #[test]
+    fn fast_die_target_override_is_lower_only() {
+        assert_eq!(fast_die_target_override(0).unwrap(), None);
+        assert_eq!(fast_die_target_override(10_000).unwrap(), Some(10_000));
+        assert_eq!(fast_die_target_override(8_500).unwrap(), Some(8_500));
+        assert!(fast_die_target_override(11_001).is_err());
+        assert!(fast_die_target_override(8_499).is_err());
+        let mut bundle = vec![0u8; HW_DATA_BUNDLE_MIN_ALLOC];
+        encode_bundle_static(KERN + 0x1000, &mut bundle).unwrap();
+        let mut status_b = vec![0u8; PRIMARY_STATUS_B_OBJECT_SIZE];
+        encode_primary_status_b(KERN + 0x2000, KERN + 0x2040, &mut status_b).unwrap();
+        apply_fast_die_target_bundle(&mut bundle, 10_000).unwrap();
+        apply_fast_die_target_status_b(&mut status_b, 10_000).unwrap();
+        let c = fast_die_config(&bundle, &status_b).unwrap();
+        assert_eq!((c.target_cc, c.live_target_cc, c.release_cc, c.mask), (10_000, 10_000, 8000, 0x82a));
+    }
+
 
     fn native_compute_bytes(bytes: &[u8]) -> Vec<u8> {
         let mut native = bytes.to_vec();
@@ -5389,6 +5636,26 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_state_release_record_is_exact() {
+        let mut record = [0xa5; CONTROL_RECORD_SIZE];
+        encode_scheduler_state_release_record(
+            0xffff_fc20_0123_4000,
+            [0x11, 0x22, 0x33, 0x44],
+            &mut record,
+        )
+        .unwrap();
+        assert_eq!(get_u32(&record, 0), 0x14);
+        assert_eq!(get_u32(&record, 4), 0);
+        assert_eq!(record[0x08], 0x44);
+        assert_eq!(record[0x09], 0x11);
+        assert_eq!(record[0x0a], 0x22);
+        assert_eq!(record[0x0b], 0x33);
+        assert_eq!(get_u64(&record, 0x0c), 0xffff_fc20_0123_4000);
+        assert!(record[0x14..].iter().all(|byte| *byte == 0));
+        assert!(device_control_asserts_gpu_power(0x14) == Some(true));
+    }
+
+    #[test]
     fn bootstrap_uma_release_record_is_exact() {
         let mut record = [0xa5; CONTROL_RECORD_SIZE];
         encode_bootstrap_uma_release_record(0, 0, &mut record).unwrap();
@@ -5728,6 +5995,20 @@ mod tests {
         assert_eq!(get_u64(&shared, 0x10), 2);
         assert_eq!(get_u64(&shared, 0x14), 0x70_0000_0000);
         assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x60), 3);
+    }
+
+    #[test]
+    fn presized_render_control_shared_matches_apple_initial_3d_pool() {
+        let mut shared = [0u8; CONTROL_SHARED_OBJECT_SIZE];
+        encode_presized_render_control_shared(&mut shared, 22).unwrap();
+        // 25G83 populateInitialFirmwareState for the 3D pool: 0x1600 pages
+        // at +0x24 and +0x2c, run cursor 0xb0.
+        assert_eq!(get_u64(&shared, 0x20), 0x0000_1600_0000_0000);
+        assert_eq!(get_u64(&shared, 0x28), 0x0000_1600_0000_0000);
+        assert_eq!(get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET), 0xb0);
+        assert_eq!(get_u64(&shared, 0x00), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u64(&shared, 0x60), 3);
     }

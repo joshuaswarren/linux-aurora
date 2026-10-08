@@ -1,0 +1,403 @@
+{
+  "run": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/fast-iterations/cache-identity-full-gl33-20260915/results/cache-identity-full-gl33-20260915",
+  "main_configurations": 50,
+  "counts": {
+    "Pass": 478322,
+    "NotSupported": 14666,
+    "Fail": 1312
+  },
+  "official_summary": {
+    "Type": "gl33",
+    "Conformant": "False"
+  },
+  "runner_exit_code": 1,
+  "original_receipt_kernel_fault": false,
+  "kernel_fault_audit": {
+    "fault_detected": true,
+    "evidence_complete": true,
+    "observed_logs": [
+      "kernel-before.log",
+      "kernel-stream.log",
+      "kernel-after.log"
+    ],
+    "missing_logs": [],
+    "matching_lines": 12412,
+    "samples": [
+      {
+        "log": "kernel-stream.log",
+        "line": 2692242,
+        "message": "3,964203,31796584042,-;asahi 482600000.gpu: G17PMARK session-crashed reason=pause-submissions-for-rebuild -- from here is_crashed() is true, the event worker stops reporting completions, timeouts and recoveries, and the next client open triggers a session rebuild"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692314,
+        "message": "6,964227,31797608705,-;asahi 482600000.gpu: G17PMARK rtkit-boot role=gfx restart_mode=0 ok=false took=1016790us -- ~1000000us means the wait timed out on the IOP HELLO/EPMAP, i.e. the restarted ASC never re-ran its RTKit handshake"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692321,
+        "message": "6,964230,31797608779,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203735 err: ETIME)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692328,
+        "message": "6,964233,31797614938,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203736 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692335,
+        "message": "6,964236,31797615273,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203737 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692342,
+        "message": "6,964239,31797617474,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203738 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692349,
+        "message": "6,964242,31797617785,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203739 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692356,
+        "message": "6,964245,31797620063,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203740 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692363,
+        "message": "6,964248,31797625941,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203741 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692370,
+        "message": "6,964251,31797629483,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203742 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692377,
+        "message": "6,964254,31797630172,-;asahi 482600000.gpu: [File 5 Queue 1]: IOCTL: submit failed! (submission ID: 18203743 err: ENOTSUPP)"
+      },
+      {
+        "log": "kernel-stream.log",
+        "line": 2692384,
+        "message": "6,964257,31797640538,-;asahi 482600000.gpu: [File 328 Queue 1]: IOCTL: submit failed! (submission ID: 18203744 err: ENOTSUPP)"
+      }
+    ],
+    "receipt_disagrees": true,
+    "detector_sha256": "1a18f7c032738ba95d229468fc1994a79c73df97a9c673a25e6d6f4a9422b2ed"
+  },
+  "failed_configurations": [
+    {
+      "log": "config-gl33-main-cfg-64-run-17-width-113-height-47-seed-2-egl.qpa",
+      "count": 1312,
+      "first_case": "KHR-GL33.texture_swizzle.smoke_access_idx_5_channel_idx_2",
+      "counts": {
+        "Pass": 8285,
+        "NotSupported": 289,
+        "Fail": 1312
+      },
+      "other_configurations": [
+        {
+          "log": "config-gl33-main-cfg-1-run-32-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-1-run-33-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-1-run-34-width-64-height--1-seed-3-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-1-run-35-width--1-height-64-seed-3-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-13-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-13-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-14-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-14-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-15-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-15-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-16-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-16-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-2-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-2-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-25-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-25-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-26-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-26-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-27-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-27-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-28-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-28-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-3-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-3-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-37-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-37-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-38-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-38-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-39-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-39-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-4-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-4-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-40-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-40-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-49-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-49-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-50-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-50-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-51-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-51-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-52-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-52-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-61-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-61-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-62-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-62-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-63-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-63-run-17-width-113-height-47-seed-2-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        },
+        {
+          "log": "config-gl33-main-cfg-64-run-16-width-64-height-64-seed-1-egl.qpa",
+          "counts": {
+            "Pass": 1312
+          }
+        }
+      ]
+    }
+  ],
+  "unsupported_distribution": {
+    "307": 12,
+    "289": 38
+  },
+  "scope": "Same-driver configuration comparison, not a prior-version regression test. Strict completion and skip applicability require their separate audits."
+}

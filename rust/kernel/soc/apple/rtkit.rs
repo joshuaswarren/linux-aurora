@@ -23,7 +23,6 @@ use crate::{
 };
 
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
 use core::ptr;
 use macros::vtable;
 
@@ -99,30 +98,13 @@ pub trait Operations {
 pub struct RtKit<T: Operations> {
     rtk: *mut bindings::apple_rtkit,
     data: *mut core::ffi::c_void,
+    retain_shared_buffers: bool,
     _p: PhantomData<T>,
 }
 
-/// Exact result from a discovery-only HELLO/EPMAP exchange.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct EpmapSnapshot {
-    /// Unmodified endpoint-zero HELLO message received from firmware.
-    pub raw_hello: u64,
-    /// HELLO minimum protocol version.
-    pub hello_min_version: u16,
-    /// HELLO maximum protocol version.
-    pub hello_max_version: u16,
-    /// Raw 256-bit endpoint bitmap, little-endian by endpoint number.
-    pub endpoints: [u64; 4],
-}
-
-impl EpmapSnapshot {
-    /// Return whether firmware advertised an endpoint in its EPMAP.
-    pub fn has_endpoint(&self, endpoint: u8) -> bool {
-        let word = endpoint as usize / 64;
-        let bit = endpoint as usize % 64;
-        self.endpoints[word] & (1u64 << bit) != 0
-    }
-}
+// The wrapper owns opaque pointers. Neither the C allocation nor the foreign
+// callback context points back to this Rust wrapper, so moving it is safe.
+impl<T: Operations> Unpin for RtKit<T> {}
 
 unsafe extern "C" fn crashed_callback<T: Operations>(
     cookie: *mut core::ffi::c_void,
@@ -182,6 +164,10 @@ unsafe extern "C" fn shmem_setup_callback<T: Operations>(
         let iova = buf.iova()?;
         let iosys_map = buf.buf()?;
 
+        // The C transport accesses this pointer as normal system memory.
+        if iosys_map.is_iomem() {
+            return Err(EINVAL);
+        }
         if iosys_map.size() < bfr_mut.size {
             return Err(ENOMEM);
         }
@@ -236,30 +222,17 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, false, false)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, false)
     }
 
-    /// Creates a G17P RTKit client with firmware-owned crash-DVA handling.
+    /// Creates a G17P client whose crash DVA belongs to the GPU UAT.
     pub fn new_g17p(
         dev: &device::Device,
         mbox_name: Option<&'static CStr>,
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, false, true)
-    }
-
-    /// Create a passive management client that answers only HELLO/EPMAP.
-    ///
-    /// This mode never starts crashlog or another endpoint and never performs
-    /// an AP/IOP power-state transition.
-    pub fn new_epmap_only(
-        dev: &device::Device,
-        mbox_name: Option<&'static CStr>,
-        mbox_idx: usize,
-        data: T::Data,
-    ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, true, false)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, true)
     }
 
     fn new_inner(
@@ -267,54 +240,28 @@ impl<T: Operations> RtKit<T> {
         mbox_name: Option<&'static CStr>,
         mbox_idx: usize,
         data: T::Data,
-        epmap_only: bool,
-        g17p: bool,
+        firmware_owned_crashlog: bool,
     ) -> Result<Self> {
         let ptr: *mut crate::ffi::c_void = data.into_foreign().cast();
         let guard = ScopeGuard::new(|| {
             // SAFETY: `ptr` came from a previous call to `into_foreign`.
             unsafe { T::Data::from_foreign(ptr.cast()) };
         });
-        // SAFETY: `dev` is valid by its type invarants and otherwise his just
-        //          calls the C init function.
-        let raw_name = match mbox_name {
+        let name = match mbox_name {
             Some(s) => s.as_char_ptr(),
             None => ptr::null(),
         };
-        let raw_index = mbox_idx.try_into()?;
-        let rtk = if epmap_only {
-            // SAFETY: arguments follow the C API contract and `ptr` remains
-            // owned by this wrapper until construction fails or Drop runs.
-            unsafe {
-                from_err_ptr(bindings::apple_rtkit_init_epmap_only(
-                    dev.as_raw(),
-                    ptr,
-                    raw_name,
-                    raw_index,
-                    &Self::VTABLE,
-                ))
-            }
-        } else if g17p {
-            // SAFETY: arguments follow the C API contract. This constructor
-            // changes only the crashlog handshake used by G17P firmware.
-            unsafe {
+        let index = mbox_idx.try_into()?;
+        // SAFETY: `dev` is valid by its type invariant and both C initializers
+        // take the same borrowed pointers. The guard owns `ptr` on failure.
+        let rtk = unsafe {
+            if firmware_owned_crashlog {
                 from_err_ptr(bindings::apple_rtkit_init_g17p(
-                    dev.as_raw(),
-                    ptr,
-                    raw_name,
-                    raw_index,
-                    &Self::VTABLE,
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
                 ))
-            }
-        } else {
-            // SAFETY: same invariants as the discovery-only constructor.
-            unsafe {
+            } else {
                 from_err_ptr(bindings::apple_rtkit_init(
-                    dev.as_raw(),
-                    ptr,
-                    raw_name,
-                    raw_index,
-                    &Self::VTABLE,
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
                 ))
             }
         }?;
@@ -324,8 +271,27 @@ impl<T: Operations> RtKit<T> {
         Ok(Self {
             rtk,
             data: ptr,
+            retain_shared_buffers: false,
             _p: PhantomData,
         })
+    }
+
+    /// Requests acknowledged RTKit shutdown using the C core's bounded waits.
+    ///
+    /// The caller must not hold a lock needed by its receive callbacks: the
+    /// shutdown path also drains the RTKit workqueue.
+    pub fn shutdown(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid and the mutable borrow excludes other callers.
+        to_result(unsafe { bindings::apple_rtkit_shutdown(self.rtk) })
+    }
+
+    /// Retains firmware-visible buffers when a shutdown cannot be confirmed.
+    ///
+    /// Drop will still close callbacks and drain the private RTKit queue, but
+    /// shared mappings/allocation contexts remain retained until reboot. The
+    /// owner must retain its own DMA buffers too. This does not permit reprobe.
+    pub fn retain_shared_buffers_on_drop(&mut self) {
+        self.retain_shared_buffers = true;
     }
 
     /// Boots (wakes up) the RTKit coprocessor.
@@ -338,26 +304,6 @@ impl<T: Operations> RtKit<T> {
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
-    }
-
-    /// Wait for a passive HELLO/EPMAP exchange and return its exact snapshot.
-    pub fn discover_epmap(self: Pin<&mut Self>) -> Result<EpmapSnapshot> {
-        // SAFETY: `rtk` is valid per the type invariant and was constructed in
-        // discovery-only mode; the C API rejects any other mode.
-        to_result(unsafe { bindings::apple_rtkit_discover_epmap(self.rtk) })?;
-
-        let mut raw = MaybeUninit::<bindings::apple_rtkit_epmap_snapshot>::uninit();
-        // SAFETY: a successful discovery initialized the C snapshot.
-        to_result(unsafe { bindings::apple_rtkit_get_epmap_snapshot(self.rtk, raw.as_mut_ptr()) })?;
-        // SAFETY: the successful getter initialized every field.
-        let raw = unsafe { raw.assume_init() };
-
-        Ok(EpmapSnapshot {
-            raw_hello: raw.raw_hello,
-            hello_min_version: raw.hello_min_version,
-            hello_max_version: raw.hello_max_version,
-            endpoints: raw.endpoints,
-        })
     }
 
     /// Starts a non-system endpoint.
@@ -389,7 +335,13 @@ unsafe impl<T: Operations> Send for RtKit<T> {}
 impl<T: Operations> Drop for RtKit<T> {
     fn drop(&mut self) {
         // SAFETY: The pointer is valid by the type invariant.
-        unsafe { bindings::apple_rtkit_free(self.rtk) };
+        unsafe {
+            if self.retain_shared_buffers {
+                bindings::apple_rtkit_free_retaining_buffers(self.rtk);
+            } else {
+                bindings::apple_rtkit_free(self.rtk);
+            }
+        }
 
         // Free context data.
         //
