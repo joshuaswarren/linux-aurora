@@ -24,6 +24,9 @@
 //!   G18 captures (`g18_render.rs:489`, tile_config 0xc10280), dropped by the
 //!   partial helper (`g18_render.rs:396`). The UAPI cannot express them.
 //! - Single-layer ZLS array strides are zeroed, as on M5 (`m5_drm.rs:238-241`).
+//! - Uncompressed Z16 uses the shared range-checked ZLS format and preserves
+//!   ISP bit 18. AGXMetalG18G selects that bit for Depth16Unorm at
+//!   0x2196383e8..0x219638400 (`G18-INDIRECT-DBIAS-PBE.md` section 2).
 //! - msaa163, only with `g18_admit_msaa4=1`: the native 4x render set
 //!   (`is_msaa4_command`) is admitted with the native sample control
 //!   0x40000; every other multisampled command keeps its refusal.
@@ -54,14 +57,15 @@ pub(crate) const G18_MULTISAMPLE_CONTROL: u64 = 0x88;
 // drm_asahi_render_flags (include/uapi/drm/asahi_drm.h:859-895).
 const RENDER_PROCESS_EMPTY_TILES: u32 = 1 << 1;
 const RENDER_RSRC_SPEC_HI: u32 = 1 << 4;
-const G18_RENDER_FLAGS: u32 = RENDER_PROCESS_EMPTY_TILES | RENDER_RSRC_SPEC_HI;
+const RENDER_DBIAS_IS_INT: u32 = 1 << 18;
+const G18_RENDER_FLAGS: u32 =
+    RENDER_PROCESS_EMPTY_TILES | RENDER_RSRC_SPEC_HI | RENDER_DBIAS_IS_INT;
 // ZLS control: stencil load (14) / store (18), stencil compression (4, 8),
 // depth load (15) / store (19), depth format (25-26: 0 = Z32F, 2 = Z16).
 const ZLS_STENCIL_TRANSFER: u64 = (1 << 14) | (1 << 18);
 const ZLS_STENCIL_COMPRESSION: u64 = (1 << 4) | (1 << 8);
 const ZLS_DEPTH_TRANSFER: u64 = (1 << 15) | (1 << 19);
 const ZLS_DEPTH_FORMAT: u64 = 3 << 25;
-const ZLS_DEPTH_FORMAT_D16: u64 = 2 << 25;
 /// Upper ISP_BGOBJVALS bits every Mesa backend seeds (`agx_pipe.c:1333`).
 const ISP_BGOBJVALS_BASE: u32 = 0x300;
 /// Width of the compact VDM view (`agx_m5_va.h:37`, `g17_render.rs:88`).
@@ -235,14 +239,21 @@ pub(crate) fn g18_vdm_compact(vdm_base: u64) -> Option<u64> {
 
 /// msaa163: whether `command` is exactly the native 4x render set (see
 /// `g18_render::G18_MSAA4_UTILE`): four samples, 32x16 utiles, sample
-/// positions 0xeaa26e26, eight-byte samples and one layer. Native315 adds
+/// positions 0xeaa26e26 and one layer. Native331 adds sixteen-byte samples
+/// to the eight-byte profile, retaining its geometry. Native315 adds
 /// D32/S8 attachments to that render geometry. Gallium currently allocates
 /// them uncompressed; compressed multisample metadata remains unadmitted.
-fn is_msaa4_command(command: &g17_uapi::UapiRenderCommand) -> bool {
-    command.samples == g18_render::G18_MSAA4_SAMPLES
-        && (command.utile_width, command.utile_height) == g18_render::G18_MSAA4_UTILE
-        && command.multisample_control == g18_render::G18_MSAA4_MULTISAMPLE_CONTROL
-        && command.sample_size == g18_render::G18_MSAA4_SAMPLE_SIZE
+fn is_multisample_command(command: &g17_uapi::UapiRenderCommand) -> bool {
+    let (utile, positions) = match command.samples {
+        2 => (g18_render::G18_MSAA2_UTILE, g18_render::G18_MSAA2_MULTISAMPLE_CONTROL),
+        4 => (g18_render::G18_MSAA4_UTILE, g18_render::G18_MSAA4_MULTISAMPLE_CONTROL),
+        _ => return false,
+    };
+    (command.utile_width, command.utile_height) == utile
+        && command.multisample_control == positions
+        && matches!(command.sample_size,
+            g18_render::G18_MSAA4_SAMPLE_SIZE | g18_render::G18_MSAA_WIDE_SAMPLE_SIZE
+                | g18_render::G18_MSAA_MRT_SAMPLE_SIZE)
         && command.layers == 1
         && command.depth.compression_base == 0
         && command.stencil.compression_base == 0
@@ -290,10 +301,16 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
     {
         return Err(R::Dimensions { width: command.width, height: command.height });
     }
-    if command.layers != 1 {
+    // Native598 proves layered colour target allocation and all five
+    // register lists. Array ZLS strides and layered MSAA stay outside that
+    // contract; the target plan also checks every backing extent.
+    if !(1..=2048).contains(&command.layers)
+        || (command.layers > 1 && (command.samples != 1
+            || command.depth.base != 0 || command.depth.compression_base != 0
+            || command.stencil.base != 0 || command.stencil.compression_base != 0)) {
         return Err(R::Layers(command.layers));
     }
-    if !(msaa4 && is_msaa4_command(command)) {
+    if !(msaa4 && is_multisample_command(command)) {
         if command.samples != 1 {
             return Err(R::Samples(command.samples));
         }
@@ -363,26 +380,21 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
             return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressRange));
         }
     }
-    // Native321 binds D16 write/load/test at 1x/4x to selector 2 and a
-    // UNORM16 integer clear; D32 remains selector zero. Keep compression
-    // and format validation in the common validator. Stencil's own
-    // load/store bits and full uncompressed range are checked separately.
-    let depth_format = command.zls_control & ZLS_DEPTH_FORMAT;
-    if command.depth.base != 0 {
-        if depth_format != 0 && depth_format != ZLS_DEPTH_FORMAT_D16 {
-            return Err(R::DepthFormat(command.zls_control));
-        }
-        if depth_format == ZLS_DEPTH_FORMAT_D16 && command.depth_clear > 0xffff {
-            return Err(R::Depth(g17_uapi::UapiTranslateError::ZlsFields));
-        }
+    // Validate Z32F and uncompressed Z16, including the complete format-sized
+    // backing. The shared validator refuses compressed Z16 metadata.
+    // Retain the existing depth validation while admitting stencil's own
+    // load/store bits. Its full uncompressed S8 range is checked separately.
+    // Native321 confirms D16's UNORM16 integer clear at 1x and 4x.
+    let depth16 = command.zls_control & ZLS_DEPTH_FORMAT == 0x0400_0000;
+    if command.depth.base != 0 && depth16 && command.depth_clear > 0xffff {
+        return Err(R::Depth(g17_uapi::UapiTranslateError::ZlsFields));
     }
     let mut depth_command = *command;
     depth_command.zls_control &= !ZLS_STENCIL_TRANSFER;
     g17_uapi::validate_m5_reference_depth(&depth_command, address_space).map_err(R::Depth)?;
-    if command.samples == 4 && command.depth.base != 0 {
+    if command.samples > 1 && command.depth.base != 0 {
         let bytes = uncompressed_plane_bytes(u64::from(command.width),
-            u64::from(command.height),
-            if depth_format == ZLS_DEPTH_FORMAT_D16 { 2 } else { 4 }, command.samples);
+            u64::from(command.height), if depth16 { 2 } else { 4 }, command.samples);
         if bytes == 0 || command.depth.base.checked_add(bytes).is_none()
             || !address_space.covers(command.depth.base, bytes, g17_uapi::GpuAccess::ReadWrite) {
             return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressRange));
@@ -397,7 +409,11 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
             return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressRange));
         }
     }
-    let translated = g17_uapi::translate_render_command(*command, vertex_attachments,
+    if command.depth.base != 0
+        && !matches!(command.zls_control & ZLS_DEPTH_FORMAT, 0 | 0x0400_0000) {
+        return Err(R::DepthFormat(command.zls_control));
+    }
+    let translated = g17_uapi::translate_g18_render_command(*command, vertex_attachments,
         fragment_attachments, window, address_space,
         g17_uapi::RenderInternalState { parameters: g18_application_base() })
         .map_err(R::Invalid)?;
@@ -427,7 +443,9 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
     }
     // ISP_BGOBJVALS: retain the S8 clear value and normalize the fixed bits.
     p.stencil_clear_value = command.stencil_clear & 0xff;
-    p.aux_fb_flags = G18_AUX_FB_FLAGS;
+    // Native G18 passes the integer-depth selector to ISP register 0x15021.
+    // Do not erase it while replacing the shared translator's base flags.
+    p.aux_fb_flags = G18_AUX_FB_FLAGS | u64::from(command.flags & RENDER_DBIAS_IS_INT);
     p.tile_config |= G18_MAIN_TILE_FLAGS;
 
     // The job plans every target inside its fixed target window; refuse here
@@ -443,9 +461,17 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
     // independent +4d0 metadata. msaa163: the admitted 4x render (utile
     // 32x16, utile_config 0x6002 and positions from the UAPI; p.samples
     // stays 1, see g18_render::G18_MSAA4_UTILE) takes the native 0x40000.
-    let msaa4_render = msaa4 && is_msaa4_command(command) && g18_render::g18_msaa4(&p);
+    let multisample_render =
+        msaa4 && is_multisample_command(command) && g18_render::g18_multisample(&p);
+    // Native464's 48-byte samples occupy two 32-byte partitions; native331's
+    // 16-byte samples and the original eight-byte profile occupy one.
+    let partitions = if command.sample_size == g18_render::G18_MSAA_MRT_SAMPLE_SIZE {
+        2
+    } else {
+        1
+    };
     controls.fragment_sample_control =
-        if msaa4_render { g18_render::G18_MSAA4_SAMPLE_CONTROL } else { 0 };
+        if multisample_render { (u64::from(command.samples) * partitions) << 16 } else { 0 };
     Ok(G18ApplicationRender {
         parameters: p,
         controls,
@@ -454,7 +480,7 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
             height: p.height,
             layers: p.layers,
             utile: (p.utile_width, p.utile_height),
-            samples: if msaa4_render { g18_render::G18_MSAA4_SAMPLES } else { p.samples },
+            samples: if multisample_render { command.samples } else { p.samples },
         },
         vdm_base: command.vdm_base,
         vertex_attachments: translated.vertex_attachments,

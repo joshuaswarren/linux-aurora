@@ -849,7 +849,8 @@ static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
 					mask |= BIT(bit);
 			}
 		}
-		writel(mask, dart->regs + dart->hw->enable_streams + 4 * word);
+		apple_dart_writel(dart, mask,
+				   dart->hw->enable_streams + 4 * word);
 	}
 }
 
@@ -912,7 +913,6 @@ static void apple_dart_hw_apply_remaps(struct apple_dart *dart)
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
-	int i;
 
 	/* Other SBR streams remain owned by iBoot and live coprocessors. */
 	if (dart->pmp_sid6_only)
@@ -926,10 +926,7 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 	apple_dart_hw_apply_remaps(dart);
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, U32_MAX,
-				   dart->hw->enable_streams + 4 * i);
+	apple_dart_hw_enable_global_streams(dart);
 
 	/* Newer revisions expose per-stream exception records. */
 	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
@@ -1097,10 +1094,7 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, U32_MAX,
-				   dart->hw->enable_streams + 4 * i);
+	apple_dart_hw_enable_global_streams(dart);
 
 	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i) {
 		u64 ttbr = virt_to_phys(pgtbl_cfg->apple_dart_cfg.ttbr[i]);
@@ -2477,7 +2471,8 @@ params_done:
 	if (ret)
 		goto err_sysfs_remove;
 
-	pm_runtime_put(dev);
+	if (!dart->force_available)
+		pm_runtime_put(dev);
 
 	dev_dbg(
 		&pdev->dev,
@@ -2510,6 +2505,8 @@ static void apple_dart_remove(struct platform_device *pdev)
 
 	iommu_device_unregister(&dart->iommu);
 	iommu_device_sysfs_remove(&dart->iommu);
+	if (dart->force_available)
+		pm_runtime_put_noidle(dart->dev);
 
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 }

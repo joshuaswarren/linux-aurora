@@ -895,6 +895,34 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     address_space: &A,
     internal: RenderInternalState,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
+    translate_render_command_with_capacity(command, vertex_attachments,
+        fragment_attachments, queue, address_space, internal, 32_768)
+}
+
+/// G18 has a separately admitted native 96-KiB resident multisample profile.
+/// Its caller validates sample count, utile geometry, stride and layer count.
+pub(crate) fn translate_g18_render_command<A: GpuAddressSpace>(
+    command: UapiRenderCommand,
+    vertex_attachments: UapiAttachmentList,
+    fragment_attachments: UapiAttachmentList,
+    queue: QueueUscWindow,
+    address_space: &A,
+    internal: RenderInternalState,
+) -> Result<TranslatedRenderCommand, UapiTranslateError> {
+    let capacity = if matches!(command.samples, 2 | 4) { 98_304 } else { 32_768 };
+    translate_render_command_with_capacity(command, vertex_attachments,
+        fragment_attachments, queue, address_space, internal, capacity)
+}
+
+fn translate_render_command_with_capacity<A: GpuAddressSpace>(
+    command: UapiRenderCommand,
+    vertex_attachments: UapiAttachmentList,
+    fragment_attachments: UapiAttachmentList,
+    queue: QueueUscWindow,
+    address_space: &A,
+    internal: RenderInternalState,
+    tile_capacity: u64,
+) -> Result<TranslatedRenderCommand, UapiTranslateError> {
     if command.flags & !RENDER_FLAGS != 0 {
         return Err(UapiTranslateError::FlagsUnknownBits);
     }
@@ -950,7 +978,7 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
         * command.utile_width as u64
         * command.utile_height as u64
         * command.samples as u64;
-    if utile_bytes > 32_768 {
+    if utile_bytes > tile_capacity {
         return Err(UapiTranslateError::TilebufferSize);
     }
     let blocks_per_utile = utile_bytes.div_ceil(2048);
