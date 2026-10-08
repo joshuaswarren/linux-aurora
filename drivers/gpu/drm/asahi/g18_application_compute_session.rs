@@ -81,12 +81,16 @@ impl G18Session {
             generation, command.context_id, roots, command.expected_stamp);
         let expected_stamp = command.expected_stamp;
         // Phases: outer, inner, scheduler submitted, completed, linked, stamp,
-        // completion mask.
+        // completion mask, pool binding visibility.
         let kicked = Instant::<Monotonic>::now();
-        let mut first = [0i64; 7];
+        let mut first = [0i64; 8];
         let mut gpu_ticks = 0u64;
+        let mut pool_pending_reported = false;
         let end = self.wait_job("application compute completion", |session, ms, recovered, report| {
             let inner = session.queue_probe.as_mut().ok_or(EIO)?.counters()?;
+            let pool_words = session.queue_probe.as_ref().ok_or(EIO)?.pool_status();
+            let pool_bound = G18QueueProbe::pool_bound_for_context(
+                pool_words, pool, command.context_id);
             let memory = session.memory.as_mut().ok_or(EIO)?;
             let outer = memory.compute_outer_counters()?;
             let completed = memory.compute().completion_snapshot()?;
@@ -104,17 +108,26 @@ impl G18Session {
                 && masks[0] & (1 << QUEUE_ID) != 0;
             recovery::note_phases(&mut first, &kicked, &[outer == [outer_after; 3], inner == [inner_after; 3],
                 scheduler.submitted == generation, scheduler.completed == generation, scheduler.linked == 0,
-                completed.stamps[0] == expected_stamp, masks[0] & (1 << QUEUE_ID) != 0]);
+                completed.stamps[0] == expected_stamp, masks[0] & (1 << QUEUE_ID) != 0, pool_bound]);
             if finished {
                 gpu_ticks = completed.timestamps[1] - completed.timestamps[0];
             }
+            // Queue/stamp completion can precede an observable pool-table
+            // update. Keep both owners until the full binding is visible,
+            // within the same bounded wait as command retirement.
+            if consumed && finished && !pool_bound && !pool_pending_reported {
+                dev_info!(session.device(),
+                    "G18_APP_COMPUTE_POOL_PENDING generation={} binding={:?} observed={:x?}; owners retained\n",
+                    generation, pool, pool_words);
+                pool_pending_reported = true;
+            }
             if report {
                 dev_info!(session.device(),
-                    "G18_APP_COMPUTE_WAIT generation={} ms={} recovered={} outer={:?} inner={:?} stamps={:x?} timestamps={:x?} masks={:x?} scheduler={:?} expected_outer={} expected_inner={} expected_stamp={:#x} consumed={} finished={}\n",
+                    "G18_APP_COMPUTE_WAIT generation={} ms={} recovered={} outer={:?} inner={:?} stamps={:x?} timestamps={:x?} masks={:x?} scheduler={:?} expected_outer={} expected_inner={} expected_stamp={:#x} consumed={} finished={} pool_bound={} pool={:x?}\n",
                     generation, ms, recovered, outer, inner, completed.stamps, completed.timestamps,
-                    masks, scheduler, outer_after, inner_after, expected_stamp, consumed, finished);
+                    masks, scheduler, outer_after, inner_after, expected_stamp, consumed, finished, pool_bound, pool_words);
             }
-            Ok(consumed && (finished || recovered))
+            Ok(consumed && ((finished && pool_bound) || recovered))
         })?;
         let recovery = match end {
             JobEnd::Retired => match self.poll_faults("application compute retired")? {
@@ -133,7 +146,7 @@ impl G18Session {
                     }
                     if recovery::phases_due(generation) {
                         dev_info!(self.device(),
-                            "G18_JOB_PHASES compute={} us={:?} gpu_ticks={} (outer inner submitted completed linked stamp mask)\n",
+                            "G18_JOB_PHASES compute={} us={:?} gpu_ticks={} (outer inner submitted completed linked stamp mask pool)\n",
                             generation, first, gpu_ticks);
                     }
                     self.queue_probe.as_mut().ok_or(EIO)?.retire_application_compute(generation)?;
