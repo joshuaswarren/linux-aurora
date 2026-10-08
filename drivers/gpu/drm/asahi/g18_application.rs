@@ -256,7 +256,8 @@ fn is_multisample_command(command: &g17_uapi::UapiRenderCommand) -> bool {
                 | g18_render::G18_MSAA_MRT_SAMPLE_SIZE)
         && (command.layers == 1 ||
             ((2..=2048).contains(&command.layers) && command.samples == 4
-                && command.sample_size == g18_render::G18_MSAA4_SAMPLE_SIZE
+                && matches!(command.sample_size,
+                    g18_render::G18_MSAA4_SAMPLE_SIZE | g18_render::G18_MSAA_WIDE_SAMPLE_SIZE)
                 && command.depth.base == 0 && command.stencil.base == 0))
         && command.depth.compression_base == 0
         && command.stencil.compression_base == 0
@@ -305,8 +306,8 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
         return Err(R::Dimensions { width: command.width, height: command.height });
     }
     // Native598 proves layered colour target allocation and all five
-    // register lists. Native618 adds layered four-sample colour at eight
-    // bytes per sample. Array ZLS strides remain outside that contract;
+    // register lists. Native618/639 add layered four-sample colour through
+    // sixteen bytes per sample. Array ZLS strides remain outside that contract;
     // the target plan also checks every backing extent.
     if !(1..=2048).contains(&command.layers)
         || (command.layers > 1 && ((command.samples != 1
