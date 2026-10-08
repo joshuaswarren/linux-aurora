@@ -15,7 +15,7 @@ impl G18ComputeMetadata {
     /// not accidentally become a one-thread group in the native accumulator.
     pub(crate) fn decode(words: [u32; 16]) -> Option<Self> {
         let flags = words[1];
-        if words[0] != 1 || flags & !0xf != 0 || words[15] != 0 {
+        if !matches!(words[0], 1 | 2) || flags & !0xf != 0 || words[15] != 0 {
             return None;
         }
         let local = if flags & 8 != 0 {
@@ -38,7 +38,11 @@ impl G18ComputeMetadata {
             local_bytes: words[9],
             imageblock_stride: words[10],
         };
-        let demand = G18ComputeDemand::from_shader(shader, local, words[11])?;
+        let demand = if words[0] == 2 {
+            G18ComputeDemand::from_shader_element_indices(shader, local, words[11])?
+        } else {
+            G18ComputeDemand::from_shader(shader, local, words[11])?
+        };
         let mut inputs = G18ComputeInputs::new();
         inputs.merge(demand, G18_TGMEM_POLICY)?;
         inputs.finish()?;
