@@ -143,10 +143,32 @@ pub(crate) const G18_MSAA4_UTILE_CONFIG: u64 = 0x6002;
 pub(crate) const G18_MSAA4_MULTISAMPLE_CONTROL: u64 = 0xeaa2_6e26;
 pub(crate) const G18_MSAA4_SAMPLES: u8 = 4;
 pub(crate) const G18_MSAA4_SAMPLE_SIZE: u8 = 8;
+/// Native331 RGBA32 two/four-sample renders use 16-byte samples, with the
+/// same geometry and sample control.
+pub(crate) const G18_MSAA_WIDE_SAMPLE_SIZE: u8 = 16;
+/// Native464 retains three RGBA32 targets: 48-byte samples in a 96-KiB tile.
+pub(crate) const G18_MSAA_MRT_SAMPLE_SIZE: u8 = 48;
 /// Register 0x10051 / 3D +0x1f38: samples << 16 (native 0x40000 at 4x).
 pub(crate) const G18_MSAA4_SAMPLE_CONTROL: u64 = (G18_MSAA4_SAMPLES as u64) << 16;
 /// Partial-load list 0x10039 bit 16: native 0x200280 at 1x, 0x210280 at 4x.
 pub(crate) const G18_MSAA4_LOAD_TILE_FLAG: u64 = 0x1_0000;
+
+/// Native326: two samples retain a 32x32 utile and use diagonal positions.
+pub(crate) const G18_MSAA2_UTILE: (u8, u8) = (32, 32);
+pub(crate) const G18_MSAA2_UTILE_CONFIG: u64 = 0xa001;
+pub(crate) const G18_MSAA2_MULTISAMPLE_CONTROL: u64 = 0x44cc;
+
+pub(crate) fn g18_msaa2(p: &G17pRenderParameters) -> bool {
+    (p.utile_width, p.utile_height) == G18_MSAA2_UTILE
+        && p.utile_config == G18_MSAA2_UTILE_CONFIG
+        && p.multisample_control == G18_MSAA2_MULTISAMPLE_CONTROL
+        && p.samples == 1
+        && p.layers == 1
+}
+
+pub(crate) fn g18_multisample(p: &G17pRenderParameters) -> bool {
+    g18_msaa2(p) || g18_msaa4(p)
+}
 
 /// Whether `p` is the admitted 4x render (see [`G18_MSAA4_UTILE`]).
 pub(crate) fn g18_msaa4(p: &G17pRenderParameters) -> bool {
@@ -160,7 +182,13 @@ pub(crate) fn g18_msaa4(p: &G17pRenderParameters) -> bool {
 /// Rasterization samples (3D +0x50): 4 for the admitted 4x render, else the
 /// existing `p.samples`.
 pub(crate) fn g18_sample_count(p: &G17pRenderParameters) -> u32 {
-    if g18_msaa4(p) { u32::from(G18_MSAA4_SAMPLES) } else { u32::from(p.samples) }
+    if g18_msaa4(p) {
+        u32::from(G18_MSAA4_SAMPLES)
+    } else if g18_msaa2(p) {
+        2
+    } else {
+        u32::from(p.samples)
+    }
 }
 
 /// 3D +0x54 macro size in utiles, (x << 16) | y: the register builders'
@@ -184,9 +212,9 @@ pub(crate) fn g18_macro_size(p: &G17pRenderParameters) -> u32 {
 fn validate(p: &G17pRenderParameters) -> Result<(), G18RenderError> {
     if !(1..=16384).contains(&p.width)
         || !(1..=16384).contains(&p.height)
-        || p.layers != 1
+        || !(1..=2048).contains(&p.layers)
         || p.samples != 1
-        || (!g18_msaa4(p)
+        || (!g18_multisample(p)
             && ((p.utile_width, p.utile_height) != (32, 32)
                 || p.utile_config != 0xa000
                 || p.multisample_control != 0x88))
@@ -472,7 +500,8 @@ fn fragment_partials(
     // msaa163: native 4x keeps tile_config bit 16 in the partial-load list
     // (0x10039 = 0x210280 against 0x200280 at 1x, MSAA notes s2.1; the M5
     // 4x load word +0x161c moves the same way). Store/resume do not move.
-    if g18_msaa4(p) {
+    if g18_multisample(p) {
+        // Native326 retains the same partial-load flag at two samples.
         for register in &mut programs.load.registers {
             if register.number == 0x10039 {
                 register.value |= G18_MSAA4_LOAD_TILE_FLAG;
@@ -640,7 +669,19 @@ pub(crate) struct G18NativeTargetLayout {
 /// unchanged.
 pub(crate) fn g18_native_target_layout(w: u32, h: u32, kind: u32, utile: (u8, u8))
     -> Option<G18NativeTargetLayout> {
-    if !(1..=16384).contains(&w) || !(1..=16384).contains(&h) || !(1..=2).contains(&kind) {
+    g18_native_target_layout_layers(w, h, 1, kind, utile)
+}
+
+/// Original G18 target preparation also allocates a tilemap and TPC for each
+/// layer. Layer metadata is one separate 0x100-byte region, not one per layer.
+/// Native598 executes the original parser and preparation through 2048 layers,
+/// including the 32x16 four-sample kind-1 geometry. Submission admission remains
+/// separate: allocation arithmetic alone does not qualify layered rendering.
+pub(crate) fn g18_native_target_layout_layers(
+    w: u32, h: u32, layers: u16, kind: u32, utile: (u8, u8),
+) -> Option<G18NativeTargetLayout> {
+    if !(1..=16384).contains(&w) || !(1..=16384).contains(&h)
+        || !(1..=2048).contains(&layers) || !(1..=2).contains(&kind) {
         return None;
     }
     let utiles = match utile {
@@ -651,14 +692,17 @@ pub(crate) fn g18_native_target_layout(w: u32, h: u32, kind: u32, utile: (u8, u8
     };
     let mx = ((((w as usize + 31) / 32 + 3) / 4) + 3) & !3;
     let my = ((((h as usize + 31) / 32 + 3) / 4) + 3) & !3;
-    let tilemap = 5 * 16 * mx * my * utiles;
+    let layers = usize::from(layers);
+    let tilemap = (5usize * 16 * mx * my * utiles).checked_mul(layers)?;
+    let layermeta_bytes = if layers > 1 { 0x100usize } else { 0 };
     // Explicit experiment policy, not inferred live macOS configuration:
     // segment mode 4 (native table gives 64), range differences zero, 8 PB
     // blocks of 512 KiB. The original generators receive these same inputs.
     let mut slice_sizes = [0; 8];
-    slice_sizes[0] = 2 * 128 * mx * my * utiles;
+    slice_sizes[0] = (2usize * 128 * mx * my * utiles).checked_mul(layers)?;
     if kind == 2 {
-        slice_sizes[1] = tilemap * 64;
+        slice_sizes[1] = tilemap.checked_mul(64)?;
+        slice_sizes[2] = layermeta_bytes * 64;
         slice_sizes[4] = 0x680 + 2 * 0x300;
         slice_sizes[5] = 2 * 0x5c0;
         slice_sizes[6] = (((0x400000usize / 0x8000 + 0x17ff) / 0x1800) + 1) * 8 * 64;
@@ -674,11 +718,13 @@ pub(crate) fn g18_native_target_layout(w: u32, h: u32, kind: u32, utile: (u8, u8
         slice_offsets[n] = bytes;
         bytes = bytes.checked_add(slice_sizes[n])?;
     }
-    let tilemap_bytes = (tilemap + 0xfff) & !0xfff;
+    let tilemap_bytes = tilemap.checked_add(0xfff)? & !0xfff;
+    let heapmeta_offset = tilemap_bytes.checked_add(layermeta_bytes)?;
+    let target_bytes = heapmeta_offset.checked_add(0x200 + 0x3fff)? & !0x3fff;
     Some(G18NativeTargetLayout {
-        layout: G18RenderTargetLayout { tilemap_bytes, heapmeta_offset: tilemap_bytes,
-            heapmeta_bytes: 0x200, target_bytes: (tilemap_bytes + 0x200 + 0x3fff) & !0x3fff,
-            tpc_bytes: (bytes + 0x3fff) & !0x3fff, deflake_bytes: 0xc000, aux_bytes: 0x10000 },
+        layout: G18RenderTargetLayout { tilemap_bytes, heapmeta_offset,
+            heapmeta_bytes: 0x200, target_bytes,
+            tpc_bytes: bytes.checked_add(0x3fff)? & !0x3fff, deflake_bytes: 0xc000, aux_bytes: 0x10000 },
         slice_sizes, slice_offsets,
         cluster_control: if kind == 1 { [1, 0, 0x80] } else { [0x40, 4, 0x80] },
     })

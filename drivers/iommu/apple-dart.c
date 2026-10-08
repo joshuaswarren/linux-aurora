@@ -946,6 +946,29 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 			 drained);
 }
 
+static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
+{
+	if (dart->pmp_sid6_only)
+		return;
+
+	for (int word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
+		u32 mask = U32_MAX;
+
+		if (dart->has_static_enabled) {
+			mask = 0;
+			for (int bit = 0; bit < 32; bit++) {
+				int stream = word * 32 + bit;
+
+				if (stream < dart->num_streams &&
+				    test_bit(stream, dart->static_enabled))
+					mask |= BIT(bit);
+			}
+		}
+		apple_dart_writel(dart, mask,
+				   dart->hw->enable_streams + 4 * word);
+	}
+}
+
 static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map = { .dart = dart };
@@ -1005,7 +1028,6 @@ static void apple_dart_hw_apply_remaps(struct apple_dart *dart)
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
-	int ret;
 
 	/* The MTP firmware is still using this inherited identity mapping. */
 	if (dart->retained_bypass)
@@ -1018,10 +1040,7 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 	apple_dart_hw_apply_remaps(dart);
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, U32_MAX,
-				   dart->hw->enable_streams + 4 * i);
+	apple_dart_hw_enable_global_streams(dart);
 
 	/* Newer revisions expose per-stream exception records. */
 	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
@@ -1190,10 +1209,7 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, U32_MAX,
-				   dart->hw->enable_streams + 4 * i);
+	apple_dart_hw_enable_global_streams(dart);
 
 	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i) {
 		u64 ttbr = virt_to_phys(pgtbl_cfg->apple_dart_cfg.ttbr[i]);
@@ -2641,9 +2657,7 @@ params_done:
 	if (ret)
 		goto err_sysfs_remove;
 
-	if (dart->force_available)
-		dev_info(dev, "forcing DART available for its lifetime\n");
-	else
+	if (!dart->force_available)
 		pm_runtime_put(dev);
 
 	dev_dbg(
