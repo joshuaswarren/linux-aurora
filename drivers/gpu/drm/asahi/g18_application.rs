@@ -239,7 +239,7 @@ pub(crate) fn g18_vdm_compact(vdm_base: u64) -> Option<u64> {
 
 /// msaa163: whether `command` is exactly the native 4x render set (see
 /// `g18_render::G18_MSAA4_UTILE`): four samples, 32x16 utiles, sample
-/// positions 0xeaa26e26 and one layer. Native331 adds sixteen-byte samples
+/// positions 0xeaa26e26. Native331 adds sixteen-byte samples
 /// to the eight-byte profile, retaining its geometry. Native315 adds
 /// D32/S8 attachments to that render geometry. Gallium currently allocates
 /// them uncompressed; compressed multisample metadata remains unadmitted.
@@ -254,7 +254,10 @@ fn is_multisample_command(command: &g17_uapi::UapiRenderCommand) -> bool {
         && matches!(command.sample_size,
             g18_render::G18_MSAA4_SAMPLE_SIZE | g18_render::G18_MSAA_WIDE_SAMPLE_SIZE
                 | g18_render::G18_MSAA_MRT_SAMPLE_SIZE)
-        && command.layers == 1
+        && (command.layers == 1 ||
+            ((2..=2048).contains(&command.layers) && command.samples == 4
+                && command.sample_size == g18_render::G18_MSAA4_SAMPLE_SIZE
+                && command.depth.base == 0 && command.stencil.base == 0))
         && command.depth.compression_base == 0
         && command.stencil.compression_base == 0
 }
@@ -302,10 +305,12 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
         return Err(R::Dimensions { width: command.width, height: command.height });
     }
     // Native598 proves layered colour target allocation and all five
-    // register lists. Array ZLS strides and layered MSAA stay outside that
-    // contract; the target plan also checks every backing extent.
+    // register lists. Native618 adds layered four-sample colour at eight
+    // bytes per sample. Array ZLS strides remain outside that contract;
+    // the target plan also checks every backing extent.
     if !(1..=2048).contains(&command.layers)
-        || (command.layers > 1 && (command.samples != 1
+        || (command.layers > 1 && ((command.samples != 1
+            && !(msaa4 && is_multisample_command(command)))
             || command.depth.base != 0 || command.depth.compression_base != 0
             || command.stencil.base != 0 || command.stencil.compression_base != 0)) {
         return Err(R::Layers(command.layers));
