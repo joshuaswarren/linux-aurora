@@ -176,7 +176,9 @@ pub(crate) fn g18_msaa4(p: &G17pRenderParameters) -> bool {
         && p.utile_config == G18_MSAA4_UTILE_CONFIG
         && p.multisample_control == G18_MSAA4_MULTISAMPLE_CONTROL
         && p.samples == 1
-        && p.layers == 1
+        // Native618 compares layered 32x16 targets and all five register
+        // lists with the same four-sample positions and partial-load mode.
+        && (1..=2048).contains(&p.layers)
 }
 
 /// Rasterization samples (3D +0x50): 4 for the admitted 4x render, else the
