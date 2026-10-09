@@ -702,6 +702,7 @@ fn validate_zls<A: GpuAddressSpace>(
     address_space: &A,
     value: UapiZlsBuffer,
     layers: u16,
+    g18_subpage: bool,
 ) -> Result<(), UapiTranslateError> {
     if value.base == 0
         && (value.compression_base != 0 || value.stride != 0 || value.compression_stride != 0)
@@ -711,17 +712,21 @@ fn validate_zls<A: GpuAddressSpace>(
     if value.compression_base == 0 && value.compression_stride != 0 {
         return Err(UapiTranslateError::ZlsFields);
     }
-    if layers > 1 && value.base != 0 && value.stride == 0 {
+    if !g18_subpage && layers > 1 && value.base != 0 && value.stride == 0 {
         return Err(UapiTranslateError::ZlsFields);
     }
-    if value.stride != 0 && value.stride & 0x3fff != 1 {
+    if value.stride != 0 && value.stride & 0x3fff != 1
+        && !(g18_subpage && value.stride & 0x3fff == 0) {
         return Err(UapiTranslateError::ZlsFields);
     }
     if value.compression_stride & 0x3fff != 0 {
         return Err(UapiTranslateError::ZlsFields);
     }
     if value.base != 0 {
-        let layer_stride = if value.stride == 0 {
+        let layer_stride = if g18_subpage && layers > 1 {
+            let unit = if value.stride & 1 != 0 { PAGE_SIZE } else { 0x80 };
+            ((value.stride as u64 >> 14) + 1) * unit
+        } else if value.stride == 0 {
             0
         } else {
             ((value.stride as u64 >> 14) + 1) * PAGE_SIZE
@@ -757,7 +762,7 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     internal: RenderInternalState,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
     translate_render_command_with_capacity(command, vertex_attachments,
-        fragment_attachments, queue, address_space, internal, 32_768)
+        fragment_attachments, queue, address_space, internal, 32_768, false)
 }
 
 /// G18 has a separately admitted native 96-KiB resident multisample profile.
@@ -772,7 +777,7 @@ pub(crate) fn translate_g18_render_command<A: GpuAddressSpace>(
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
     let capacity = if matches!(command.samples, 2 | 4) { 98_304 } else { 32_768 };
     translate_render_command_with_capacity(command, vertex_attachments,
-        fragment_attachments, queue, address_space, internal, capacity)
+        fragment_attachments, queue, address_space, internal, capacity, true)
 }
 
 fn translate_render_command_with_capacity<A: GpuAddressSpace>(
@@ -783,6 +788,7 @@ fn translate_render_command_with_capacity<A: GpuAddressSpace>(
     address_space: &A,
     internal: RenderInternalState,
     tile_capacity: u64,
+    g18_subpage: bool,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
     if command.flags & !RENDER_FLAGS != 0 {
         return Err(UapiTranslateError::FlagsUnknownBits);
@@ -870,8 +876,8 @@ fn translate_render_command_with_capacity<A: GpuAddressSpace>(
             GpuAccess::Write,
         )?;
     }
-    validate_zls(address_space, command.depth, command.layers)?;
-    validate_zls(address_space, command.stencil, command.layers)?;
+    validate_zls(address_space, command.depth, command.layers, g18_subpage)?;
+    validate_zls(address_space, command.stencil, command.layers, g18_subpage)?;
     validate_sampler(
         address_space,
         command.sampler_heap,

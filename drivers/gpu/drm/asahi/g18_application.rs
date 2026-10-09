@@ -30,8 +30,9 @@
 //! - msaa163, only with `g18_admit_msaa4=1`: the native 4x render set
 //!   (`is_msaa4_command`) is admitted with the native sample control
 //!   0x40000; every other multisampled command keeps its refusal.
-//! - Uncompressed S8 stencil planes retain their validated full backing.
-//!   Inert compressed stencil is stripped until its transfer path is ready.
+//! - Native682 layered Z32/S8 uses cacheline or page array strides and
+//!   independently ranged metadata. Single-layer compressed stencil retains
+//!   its previous inert behavior.
 //!   `isp_bgobjvals` 0x300 is re-asserted by the register builder; its low
 //!   byte carries the application's stencil clear value.
 //!
@@ -286,6 +287,55 @@ fn uncompressed_plane_bytes(width: u64, height: u64, bytes_per_sample: u64,
     }
 }
 
+/// Native682: bit0 selects 16-KiB units; zero selects 128-byte units.
+/// Zero therefore represents a real 128-byte layer, not an absent stride.
+/// Validate the complete final layer, not just its first mapped byte.
+fn validate_layered_zls_plane<A: g17_uapi::GpuAddressSpace>(
+    plane: g17_uapi::UapiZlsBuffer, width: u64, height: u64,
+    bytes_per_sample: u64, layers: u16, address_space: &A,
+) -> Result<(), g17_uapi::UapiTranslateError> {
+    use g17_uapi::{GpuAccess, UapiTranslateError as E};
+    if plane.base == 0 {
+        return if plane.compression_base == 0 && plane.stride == 0
+            && plane.compression_stride == 0 { Ok(()) } else { Err(E::ZlsFields) };
+    }
+    if !matches!(plane.stride & 0x3fff, 0 | 1) || plane.base & 0x7f != 0 {
+        return Err(E::ZlsFields);
+    }
+    let unit = if plane.stride & 1 != 0 { 0x4000 } else { 0x80 };
+    let stride = ((u64::from(plane.stride) >> 14) + 1) * unit;
+    let data_bytes = uncompressed_plane_bytes(width, height, bytes_per_sample, 1);
+    if data_bytes == 0 || stride < data_bytes {
+        return Err(E::ZlsFields);
+    }
+    let extent = stride.checked_mul(u64::from(layers - 1))
+        .and_then(|n| n.checked_add(data_bytes)).ok_or(E::AddressRange)?;
+    if plane.base.checked_add(extent).is_none()
+        || !address_space.covers(plane.base, extent, GpuAccess::ReadWrite) {
+        return Err(E::AddressRange);
+    }
+    if plane.compression_base != 0 {
+        if plane.compression_base & 0x7f != 0 || plane.compression_stride & 0x3fff != 0 {
+            return Err(E::ZlsFields);
+        }
+        let stride = ((u64::from(plane.compression_stride) >> 14) + 1) * 0x80;
+        let metadata_bytes = (width.next_power_of_two().div_ceil(16)
+            * height.next_power_of_two().div_ceil(16) * 8).div_ceil(128) * 128;
+        if stride < metadata_bytes {
+            return Err(E::ZlsFields);
+        }
+        let extent = stride.checked_mul(u64::from(layers - 1))
+            .and_then(|n| n.checked_add(metadata_bytes)).ok_or(E::AddressRange)?;
+        if plane.compression_base.checked_add(extent).is_none()
+            || !address_space.covers(plane.compression_base, extent, GpuAccess::ReadWrite) {
+            return Err(E::AddressRange);
+        }
+    } else if plane.compression_stride != 0 {
+        return Err(E::ZlsFields);
+    }
+    Ok(())
+}
+
 /// The envelope checks that need only the raw command. Order matters for
 /// diagnostics only; every check is independent. `msaa4` admits exactly the
 /// native 4x set (module parameter `g18_admit_msaa4`); refusal classes are
@@ -307,13 +357,13 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
     }
     // Native598 proves layered colour target allocation and all five
     // register lists. Native618/639 add layered four-sample colour through
-    // sixteen bytes per sample. Array ZLS strides remain outside that contract;
-    // the target plan also checks every backing extent.
+    // sixteen bytes per sample. Native682 adds one-sample layered Z32/S8;
+    // each plane and its metadata receive complete array range checks below.
     if !(1..=2048).contains(&command.layers)
         || (command.layers > 1 && ((command.samples != 1
             && !(msaa4 && is_multisample_command(command)))
-            || command.depth.base != 0 || command.depth.compression_base != 0
-            || command.stencil.base != 0 || command.stencil.compression_base != 0)) {
+            || ((command.depth.base != 0 || command.stencil.base != 0)
+                && (command.samples != 1 || command.zls_control & ZLS_DEPTH_FORMAT != 0)))) {
         return Err(R::Layers(command.layers));
     }
     if !(msaa4 && is_multisample_command(command)) {
@@ -334,7 +384,8 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
         return Err(R::Invalid(g17_uapi::UapiTranslateError::AddressAlignment));
     }
     if command.zls_control & ZLS_STENCIL_TRANSFER != 0
-        && (command.stencil.base == 0 || command.stencil.compression_base != 0) {
+        && (command.stencil.base == 0
+            || (command.stencil.compression_base != 0 && command.layers == 1)) {
         return Err(R::StencilTransfer(command.zls_control));
     }
     if command.stencil_clear & !(ISP_BGOBJVALS_BASE | 0xff) != 0 {
@@ -397,7 +448,17 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
     }
     let mut depth_command = *command;
     depth_command.zls_control &= !ZLS_STENCIL_TRANSFER;
+    // Retain the shared single-plane format/control validation. The G18
+    // checks below independently validate every layer's data and metadata.
+    depth_command.layers = 1;
     g17_uapi::validate_m5_reference_depth(&depth_command, address_space).map_err(R::Depth)?;
+    if command.layers > 1 {
+        for (plane, bytes_per_sample) in [(command.depth, 4), (command.stencil, 1)] {
+            validate_layered_zls_plane(plane, u64::from(command.width),
+                u64::from(command.height), bytes_per_sample, command.layers,
+                address_space).map_err(R::Depth)?;
+        }
+    }
     if command.samples > 1 && command.depth.base != 0 {
         let bytes = uncompressed_plane_bytes(u64::from(command.width),
             u64::from(command.height), if depth16 { 2 } else { 4 }, command.samples);
@@ -426,13 +487,15 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
     let mut p = translated.parameters;
 
     p.encoder = g18_vdm_compact(command.vdm_base).ok_or(R::VdmCompact(command.vdm_base))?;
-    // Native single-layer ZLS does not encode an array stride; the full
-    // data/metadata ranges were validated above (m5_drm.rs:238-241).
-    p.depth_stride = 0;
-    p.depth_aux_stride = 0;
-    p.stencil_stride = 0;
-    p.stencil_aux_stride = 0;
-    let stencil_stripped = p.stencil_aux_buffer != 0;
+    // Native single-layer ZLS does not encode an array stride. Layered
+    // Native682 retains all four already-validated data/metadata strides.
+    if command.layers == 1 {
+        p.depth_stride = 0;
+        p.depth_aux_stride = 0;
+        p.stencil_stride = 0;
+        p.stencil_aux_stride = 0;
+    }
+    let stencil_stripped = p.stencil_aux_buffer != 0 && command.layers == 1;
     if stencil_stripped {
         p.stencil_buffer = 0;
         p.stencil_aux_buffer = 0;
