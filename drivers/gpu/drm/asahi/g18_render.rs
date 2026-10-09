@@ -163,7 +163,9 @@ pub(crate) fn g18_msaa2(p: &G17pRenderParameters) -> bool {
         && p.utile_config == G18_MSAA2_UTILE_CONFIG
         && p.multisample_control == G18_MSAA2_MULTISAMPLE_CONTROL
         && p.samples == 1
-        && p.layers == 1
+        // Native673 combines the two-sample positions and 32x32 utiles with
+        // layered target metadata and all five complete register lists.
+        && (1..=2048).contains(&p.layers)
 }
 
 pub(crate) fn g18_multisample(p: &G17pRenderParameters) -> bool {

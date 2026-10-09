@@ -9,6 +9,11 @@ use crate::{g17_render::G17pRenderParameters, g18_address_map as va,
 pub(crate) const TA_OFFSET: usize = 0;
 pub(crate) const FRAGMENT_OFFSET: usize = 0x4000;
 pub(crate) const TARGET_OFFSETS: [u64; 6] = [0, 0x20000, 0x40000, 0x50000, 0x60000, 0x80000];
+// Fixed virtual reservations, not eager allocations. Native tilemap/TPC sizes
+// scale with layers: even a 32x32x64 target needs a 0x40000-byte TPC. Keep
+// addresses stable when an application grows an already-owned target.
+const NATIVE_TARGET_OFFSETS: [u64; 6] =
+    [0, 0x400000, 0xc00000, 0xc10000, 0xc20000, 0xc30000];
 pub(crate) const TARGET_NAMES: [&str; 6] = ["tilemap-heapmeta", "tpc", "deflake", "ta-status", "3d-status", "auxiliary"];
 pub(crate) const DIGEST_NAMES: [&str; 7] = ["ta-command", "3d-command", "ta-registers",
     "3d-main", "3d-store", "3d-resume", "3d-load"];
@@ -45,8 +50,11 @@ pub(crate) fn target_plan_for_kind(p: &G17pRenderParameters, kind: u32) -> Optio
     };
     // Stable VAs across application resizes. The extra slices share the TPC
     // allocation; reserve 4 MiB for it, covering 1280x720 without overlap.
-    let offsets = if kind == 2 { [0, 0x100000, 0x500000, 0x510000, 0x520000, 0x600000] }
-        else { TARGET_OFFSETS };
+    let offsets = match kind {
+        1 => NATIVE_TARGET_OFFSETS,
+        2 => [0, 0x100000, 0x500000, 0x510000, 0x520000, 0x600000],
+        _ => TARGET_OFFSETS,
+    };
     let sizes = [layout.target_bytes, layout.tpc_bytes, layout.deflake_bytes,
         0x4000, 0x4000, layout.aux_bytes];
     for (i, size) in sizes.iter().enumerate() {
