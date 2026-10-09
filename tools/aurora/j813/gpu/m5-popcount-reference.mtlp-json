@@ -1,0 +1,1 @@
+{"pipelines":{"compute_pipelines":[{"compute_function":"m5_popcount_u32"},{"compute_function":"m5_popcount_u16"},{"compute_function":"m5_popcount_live"}]}}

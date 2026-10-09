@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Native offscreen GPU tests with CPU thermal protection and N1 transport. */
+#include "t8142-j813-wifi.dts"
+#include "t8142-j813-thermal.dtsi"
+#include "t8142-j813-thermal-zones.dtsi"
+#include "../gpu/t8142-gpu.dtsi"
+
+&gfx_asc { status = "okay"; };
+&gfx1_asc { status = "okay"; };

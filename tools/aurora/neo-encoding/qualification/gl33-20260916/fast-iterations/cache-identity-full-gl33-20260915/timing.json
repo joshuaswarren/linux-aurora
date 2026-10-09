@@ -1,0 +1,65 @@
+{
+  "steps": [
+    {
+      "name": "identity",
+      "seconds": 0.29723062505945563,
+      "exit_code": 0
+    },
+    {
+      "name": "upload",
+      "seconds": 0.33274779201019555,
+      "exit_code": 0
+    },
+    {
+      "name": "hardware",
+      "seconds": 27348.118191165966,
+      "exit_code": 0
+    },
+    {
+      "name": "terminal_receipt",
+      "seconds": 0.25658695900347084,
+      "exit_code": 0
+    },
+    {
+      "name": "collect",
+      "seconds": 12.3864592500031,
+      "exit_code": 0
+    },
+    {
+      "name": "analyze",
+      "seconds": 15.434907792019658,
+      "exit_code": 0
+    }
+  ],
+  "label": "cache-identity-full-gl33-20260915",
+  "terminal": true,
+  "seconds": 27377.271158042015,
+  "hardware": {
+    "boot": "9f1434bf-725b-4ff1-ae51-babd4df25cb4",
+    "label": "cache-identity-full-gl33-20260915",
+    "mesa_sha256": "362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56",
+    "steps": [
+      {
+        "name": "run-official-cts.py",
+        "seconds": 27347.778977417,
+        "exit_code": 1
+      }
+    ],
+    "rebooted": false,
+    "resident_modified": false,
+    "complete": true,
+    "xorg_reused": true,
+    "xorg_pid": 717,
+    "cts_exit_code": 1,
+    "kernel_fault": false,
+    "cts_seconds": 27344.34186479,
+    "next_action": "reuse_healthy_xorg",
+    "seconds": 27347.792863387003,
+    "fully_accounted": true,
+    "statuses": {
+      "Pass": 478338,
+      "NotSupported": 14666,
+      "Fail": 1312
+    }
+  }
+}

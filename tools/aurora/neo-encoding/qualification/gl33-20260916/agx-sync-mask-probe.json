@@ -1,0 +1,8 @@
+{
+  "source_sha256": "381b710c431d6922bc5809f32b40beb3cb7e1605a9d72958b6d97dc086a870f0",
+  "source": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/probes/agx-sync-mask-dump.c",
+  "build": "/home/mcruz.guest/neo/build/mesa-j700-agx-sync-20260916",
+  "hardware_execution": false,
+  "exit_code": 1,
+  "log": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/agx-sync-mask-probe.log"
+}

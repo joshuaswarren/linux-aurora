@@ -1,0 +1,18 @@
+btrfs compressed-append reclaim reproducer
+==========================================
+
+Sixteen files are appended with 17/511/4093 byte records through stdio. Every
+64 records each file is fdatasync()ed and its page cache dropped with
+POSIX_FADV_DONTNEED, so the next append into a partial block has to read that
+block back (prepare_uptodate_folio() -> btrfs_read_folio()). The data is
+highly compressible, so on a compress=zstd mount these are compressed reads.
+A pressure thread and an anonymous buffer keep the 256M memory cgroup in
+reclaim, which runs the btrfs extent map shrinker.
+
+Before "btrfs: don't look up the extent map again when submitting a
+compressed read", btrfs_submit_compressed_read() failed the read with -EIO
+when the shrinker had dropped the extent map after btrfs_do_readpage(), and
+the append returned EIO. On the J700 (compress=zstd:1 root) this reproduced
+with "run.sh <dir> 25 208" at record 330 (aurora-ctl h-6198).
+
+Pass: RESULT ... eio=0 other=0 and VERIFY bytes equal to the bytes written.

@@ -1,0 +1,22 @@
+{
+  "boot": "94c3f079-27bc-456d-93a2-5db1e7ed2171",
+  "label": "stamp-wrap-failures-only-20260916",
+  "mesa_sha256": "362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56",
+  "steps": [
+    {
+      "name": "run-official-cts.py",
+      "seconds": 185.05101804700007,
+      "exit_code": 0
+    }
+  ],
+  "rebooted": false,
+  "resident_modified": false,
+  "complete": true,
+  "xorg_reused": true,
+  "xorg_pid": 761,
+  "cts_exit_code": 0,
+  "kernel_fault": false,
+  "cts_seconds": 180.22059763300058,
+  "next_action": "reuse_healthy_xorg",
+  "seconds": 185.0648144450006
+}

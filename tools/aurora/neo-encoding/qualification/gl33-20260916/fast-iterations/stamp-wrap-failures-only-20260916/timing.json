@@ -1,0 +1,58 @@
+{
+  "steps": [
+    {
+      "name": "identity",
+      "seconds": 0.2986630410887301,
+      "exit_code": 0
+    },
+    {
+      "name": "upload",
+      "seconds": 0.4233577500563115,
+      "exit_code": 0
+    },
+    {
+      "name": "hardware",
+      "seconds": 185.49583949998487,
+      "exit_code": 0
+    },
+    {
+      "name": "terminal_receipt",
+      "seconds": 0.02621487493161112,
+      "exit_code": 0
+    },
+    {
+      "name": "collect",
+      "seconds": 0.40576704195700586,
+      "exit_code": 0
+    }
+  ],
+  "label": "stamp-wrap-failures-only-20260916",
+  "terminal": true,
+  "seconds": 186.71544720896054,
+  "hardware": {
+    "boot": "94c3f079-27bc-456d-93a2-5db1e7ed2171",
+    "label": "stamp-wrap-failures-only-20260916",
+    "mesa_sha256": "362a359bb06f3a1432720bab738f60dd2095f6188cced7d27bcfd8a2f2c0cc56",
+    "steps": [
+      {
+        "name": "run-official-cts.py",
+        "seconds": 185.05101804700007,
+        "exit_code": 0
+      }
+    ],
+    "rebooted": false,
+    "resident_modified": false,
+    "complete": true,
+    "xorg_reused": true,
+    "xorg_pid": 761,
+    "cts_exit_code": 0,
+    "kernel_fault": false,
+    "cts_seconds": 180.22059763300058,
+    "next_action": "reuse_healthy_xorg",
+    "seconds": 185.0648144450006,
+    "diagnostic_passed": true,
+    "statuses": {
+      "Pass": 1312
+    }
+  }
+}

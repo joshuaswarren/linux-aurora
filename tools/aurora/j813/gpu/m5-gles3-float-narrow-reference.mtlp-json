@@ -1,0 +1,1 @@
+{"pipelines":{"compute_pipelines":[{"compute_function":"m5_float_narrow"},{"compute_function":"m5_float_mul_narrow"},{"compute_function":"m5_float_narrow_modifiers"},{"compute_function":"m5_float_narrow_saturate"}]}}

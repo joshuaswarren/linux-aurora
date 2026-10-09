@@ -1,0 +1,75 @@
+{
+  "member": "Firmware/agx/armfw_g17p.im4p",
+  "im4p_sha256": "9b2afdfbf6c3d4b2892a1e4b98766d57a322c95a2a3a535403c50b2dbfa2955b",
+  "image_sha256": {
+    "a000": "d21dd88ca01e07170125616dd5d6aa569f25eeb8f5cbae5da29f196869f610a6",
+    "b100": "c1d35018d1226f8b7db374b0cc4332c6e43479ad7a0d001c5a7d0ecda1354412"
+  },
+  "verified_witnesses": 9,
+  "witnesses": [
+    {
+      "image": "a000",
+      "address": "0x1171c",
+      "bytes": "750a4079",
+      "instruction": "ldrh w21, [x19, #4]",
+      "meaning": "AddKicks physical QID is u16 at +4"
+    },
+    {
+      "image": "a000",
+      "address": "0x11720",
+      "bytes": "740e4079",
+      "instruction": "ldrh w20, [x19, #6]",
+      "meaning": "AddKicks kick count is u16 at +6"
+    },
+    {
+      "image": "a000",
+      "address": "0x11730",
+      "bytes": "639240f8",
+      "instruction": "ldur x3, [x19, #9]",
+      "meaning": "AddKicks full timestamp load for trace at unaligned +9"
+    },
+    {
+      "image": "a000",
+      "address": "0xfd18",
+      "bytes": "a09c4092",
+      "instruction": "and x0, x5, #0xffffffffff",
+      "meaning": "scheduler timestamp occupies bits 0 through 39"
+    },
+    {
+      "image": "a000",
+      "address": "0xfd1c",
+      "bytes": "a1b868d3",
+      "instruction": "ubfx x1, x5, #0x28, #7",
+      "meaning": "scheduler QID follows timestamp at bit 40"
+    },
+    {
+      "image": "a000",
+      "address": "0xef90",
+      "bytes": "4c050091",
+      "instruction": "add x12, x10, #1",
+      "meaning": "advance scheduler timestamp"
+    },
+    {
+      "image": "a000",
+      "address": "0xef94",
+      "bytes": "8d9d4092",
+      "instruction": "and x13, x12, #0xffffffffff",
+      "meaning": "wrap scheduler timestamp at 40 bits"
+    },
+    {
+      "image": "b100",
+      "address": "0x16e70",
+      "bytes": "165c4229",
+      "instruction": "ldp w22, w23, [x0, #0x10]",
+      "meaning": "load u32 completion value and QID"
+    },
+    {
+      "image": "b100",
+      "address": "0x16ea0",
+      "bytes": "360300b9",
+      "instruction": "str w22, [x25]",
+      "meaning": "publish u32 host completion value after cache maintenance"
+    }
+  ],
+  "scope": "Static firmware evidence. Does not prove runtime queue lifetime."
+}

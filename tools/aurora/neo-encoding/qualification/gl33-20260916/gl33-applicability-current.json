@@ -1,0 +1,121 @@
+{
+  "cts_commit": "067e8832315e79817ede1c4863804e440f5d1c80",
+  "files_reviewed": 2,
+  "counts": {
+    "Pass": 19176,
+    "NotSupported": 596
+  },
+  "unsupported_groups": {
+    "gl41_test_metadata": 2,
+    "gl43_stencil_test_metadata": 4,
+    "configuration_has_no_depth": 18,
+    "glsl450_core_prototype_metadata": 2,
+    "gl40_test_metadata": 2,
+    "cull_fetch_nonpoint_combination": 32,
+    "swizzle_projective_array_access": 48,
+    "swizzle_fixed_texel_fetch_target": 240,
+    "swizzle_format_version_metadata": 198,
+    "swizzle_excluded_shared_exponent_msaa": 4,
+    "swizzle_excluded_depth_target": 36,
+    "unadvertised_optional_texture_filter_minmax": 10
+  },
+  "no_applicability_issues": true,
+  "scope": "Only supplied files. Does not establish full campaign completion, official conformance, or GL4.6 coverage.",
+  "files": [
+    {
+      "path": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/unsupported-audit-cfg1-window.qpa",
+      "sha256": "af14d018afc20b9034961af211378a0dee7b4a57756a6fecde4f7de5726cf9d5",
+      "counts": {
+        "Pass": 9579,
+        "NotSupported": 307
+      },
+      "unsupported_groups": {
+        "gl41_test_metadata": 1,
+        "gl43_stencil_test_metadata": 2,
+        "configuration_has_no_depth": 18,
+        "glsl450_core_prototype_metadata": 1,
+        "gl40_test_metadata": 1,
+        "cull_fetch_nonpoint_combination": 16,
+        "swizzle_projective_array_access": 24,
+        "swizzle_fixed_texel_fetch_target": 120,
+        "swizzle_format_version_metadata": 99,
+        "swizzle_excluded_shared_exponent_msaa": 2,
+        "swizzle_excluded_depth_target": 18,
+        "unadvertised_optional_texture_filter_minmax": 5
+      },
+      "depth_bits": 0,
+      "depth_results": {
+        "NotSupported": 18
+      },
+      "integer_mix_results": {
+        "Pass": 6,
+        "NotSupported": 1
+      },
+      "cull_distance_results": {
+        "Pass": 202,
+        "NotSupported": 16
+      },
+      "swizzle_predicate_cases_checked": 695,
+      "renderer": [
+        "Apple A18 Pro GPU"
+      ],
+      "reported_version": [
+        "4.6 (Core Profile) Mesa 26.1.4"
+      ],
+      "optional_extensions": {
+        "GL_EXT_shader_integer_mix": true,
+        "GL_ARB_stencil_texturing": true,
+        "GL_ARB_texture_filter_minmax": false
+      },
+      "unknown_unsupported": [],
+      "issues": []
+    },
+    {
+      "path": "/Users/mcruz/Developer/aurora-silicon/neo-linux/artifacts/j700-gl30-cts-20260913/unsupported-audit-cfg1-pbuffer.qpa",
+      "sha256": "a08bf12bd048eb5dbd71db5cdc5721de10e0f8eea41dd29bf3af9b58bb402c99",
+      "counts": {
+        "Pass": 9597,
+        "NotSupported": 289
+      },
+      "unsupported_groups": {
+        "gl41_test_metadata": 1,
+        "gl43_stencil_test_metadata": 2,
+        "glsl450_core_prototype_metadata": 1,
+        "gl40_test_metadata": 1,
+        "cull_fetch_nonpoint_combination": 16,
+        "swizzle_projective_array_access": 24,
+        "swizzle_fixed_texel_fetch_target": 120,
+        "swizzle_format_version_metadata": 99,
+        "swizzle_excluded_shared_exponent_msaa": 2,
+        "swizzle_excluded_depth_target": 18,
+        "unadvertised_optional_texture_filter_minmax": 5
+      },
+      "depth_bits": 24,
+      "depth_results": {
+        "Pass": 18
+      },
+      "integer_mix_results": {
+        "Pass": 6,
+        "NotSupported": 1
+      },
+      "cull_distance_results": {
+        "Pass": 202,
+        "NotSupported": 16
+      },
+      "swizzle_predicate_cases_checked": 695,
+      "renderer": [
+        "Apple A18 Pro GPU"
+      ],
+      "reported_version": [
+        "4.6 (Core Profile) Mesa 26.1.4"
+      ],
+      "optional_extensions": {
+        "GL_EXT_shader_integer_mix": true,
+        "GL_ARB_stencil_texturing": true,
+        "GL_ARB_texture_filter_minmax": false
+      },
+      "unknown_unsupported": [],
+      "issues": []
+    }
+  ]
+}

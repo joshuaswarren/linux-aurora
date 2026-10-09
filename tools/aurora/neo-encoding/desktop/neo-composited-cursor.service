@@ -1,0 +1,13 @@
+[Unit]
+Description=Composited cursor for the Neo X11 desktop
+After=plasma-kwin_x11.service
+PartOf=graphical-session.target
+ConditionEnvironment=XDG_SESSION_TYPE=x11
+
+[Service]
+ExecStart=/usr/local/bin/neo-composited-cursor --plasma
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

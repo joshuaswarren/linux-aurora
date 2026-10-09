@@ -1,0 +1,8 @@
+{
+  "boot": "9507522a-6422-4095-b1d9-069c35b4e181",
+  "kernel": "Linux neo-omarchy 7.1.6-aurora-neo-gpu1 #12 SMP PREEMPT 2026-09-13 00:00:00 -0400 aarch64 GNU/Linux",
+  "mesa_sha256": "468edaf312ce469e189f29b66cfe80fa4336e4988c83e80925603bc51d05cc68",
+  "asahi_module_sha256": "aa5b21014671517849cfa12c7415cd5b39f565283c7140f3b3ebaa367e96fb4b",
+  "asahi_build_note": "040000001400000003000000474e5500a947f573e40321482d8e76da54c1663561075deb",
+  "cts_commit": "067e8832315e79817ede1c4863804e440f5d1c80"
+}

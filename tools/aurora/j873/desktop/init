@@ -1,0 +1,57 @@
+#!/bin/sh
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=1777 tmpfs /tmp
+mount -t tmpfs tmpfs /run
+mkdir -p /dev/pts /dev/shm /run/dbus /run/user/0
+mount -t devpts -o gid=5,mode=620 devpts /dev/pts
+mount -t tmpfs -o mode=1777,size=512M tmpfs /dev/shm
+chmod 700 /run/user/0
+export HOME=/root XDG_RUNTIME_DIR=/run/user/0
+hostname j873-linux
+echo AURORA_J873_LINUX_INITRAMFS_READY
+uname -a
+cat /proc/cmdline
+
+thermal_start() {
+    tr '\000' '\n' < /proc/device-tree/compatible | grep -qx apple,j873 || return 1
+    modprobe apple-soc-cpufreq || return 1
+    modprobe macsmc || return 1
+    modprobe macsmc-hwmon || return 1
+    for n in 0 1; do
+        if [ "$n" = 1 ]; then
+            cat /sys/devices/system/cpu/cpu0/hotplug/state > /sys/devices/system/cpu/cpu1/hotplug/target || return 1
+        fi
+        p=/sys/devices/system/cpu/cpufreq/policy$n
+        cat "$p/cpuinfo_min_freq" > "$p/scaling_max_freq" || return 1
+        echo powersave > "$p/scaling_governor" || return 1
+    done
+    /opt/j873/thermal-status.sh || return 1
+    for n in 2 3 4 5 6 7 8 9 10 11; do
+        cat /sys/devices/system/cpu/cpu0/hotplug/state > /sys/devices/system/cpu/cpu$n/hotplug/target || return 1
+    done
+    /opt/j873/thermal-status.sh
+}
+
+if thermal_start; then
+    echo J873_DESKTOP_THERMAL_GATE_PASSED | tee /dev/tty1
+    ip link set lo up
+    /usr/lib/systemd/systemd-udevd --daemon
+    udevadm trigger --action=add
+    udevadm settle --timeout=10
+    dbus-uuidgen --ensure
+    dbus-daemon --system --fork
+    touch /root/.Xauthority
+    xauth -f /root/.Xauthority add :0 . "$(mcookie)"
+    setsid xinit /opt/j873/start-session.sh -- /usr/lib/xorg/Xorg :0 vt1 \
+        -nolisten tcp -auth /root/.Xauthority -config /etc/X11/xorg.conf \
+        > /var/log/j873-desktop.log 2>&1 &
+else
+    echo J873_DESKTOP_THERMAL_GATE_FAILED | tee /dev/tty1
+fi
+echo 'J873 desktop diagnostic shell on DockChannel.'
+while :; do
+    /bin/busybox setsid /bin/busybox cttyhack /bin/sh
+done

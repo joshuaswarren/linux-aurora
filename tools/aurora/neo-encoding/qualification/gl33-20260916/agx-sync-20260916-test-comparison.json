@@ -1,0 +1,36 @@
+{
+  "hardware_execution": false,
+  "candidate_counts": {
+    "OK": 277,
+    "FAIL": 18,
+    "EXPECTEDFAIL": 2
+  },
+  "upstream_counts": {
+    "OK": 274,
+    "FAIL": 21,
+    "EXPECTEDFAIL": 2
+  },
+  "candidate_only": [],
+  "upstream_only": [],
+  "status_changes": [
+    {
+      "test": "asahi - mesa:agx3_alu_core",
+      "candidate": "OK",
+      "upstream": "FAIL"
+    },
+    {
+      "test": "asahi - mesa:agx3_event_wait",
+      "candidate": "OK",
+      "upstream": "FAIL"
+    },
+    {
+      "test": "asahi - mesa:asahi-g17p-early-demote-epilog",
+      "candidate": "OK",
+      "upstream": "FAIL"
+    }
+  ],
+  "common_failure_diagnostic_differences": [
+    "asahi - mesa:asahi-g17p-precompiled-fill",
+    "asahi+g17p-sequential-dispatch - mesa:hk_g17p_sequential_dispatch"
+  ]
+}
