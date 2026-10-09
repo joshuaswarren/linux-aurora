@@ -255,7 +255,7 @@ fn is_multisample_command(command: &g17_uapi::UapiRenderCommand) -> bool {
             g18_render::G18_MSAA4_SAMPLE_SIZE | g18_render::G18_MSAA_WIDE_SAMPLE_SIZE
                 | g18_render::G18_MSAA_MRT_SAMPLE_SIZE)
         && (command.layers == 1 ||
-            ((2..=2048).contains(&command.layers) && command.samples == 4
+            ((2..=2048).contains(&command.layers)
                 && matches!(command.sample_size,
                     g18_render::G18_MSAA4_SAMPLE_SIZE | g18_render::G18_MSAA_WIDE_SAMPLE_SIZE)
                 && command.depth.base == 0 && command.stencil.base == 0))

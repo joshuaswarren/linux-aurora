@@ -45,6 +45,13 @@ impl ApplicationJob {
         if !self.retired {return Err(EBUSY);}
         let frame=Frame::new(self.generation.checked_add(1).ok_or(EOVERFLOW)?).ok_or(EOVERFLOW)?;
         let plan=assembly::target_plan(&render.parameters).ok_or(EINVAL)?;
+        // Growth retains each object's original IOVA. Reject a changed target
+        // policy before touching mappings rather than encode unowned addresses.
+        if self.job.targets.len()!=plan.offsets.len()
+            || self.job.targets.iter().zip(plan.offsets)
+                .any(|(target,offset)|target.iova()!=va::GRAPHICS_TARGET_OFFSET+offset) {
+            return Err(EINVAL);
+        }
         let guard=vm.retain_t8140_job()?;
         let new_client=!self.job.program.matches_vm(vm);
         let remap=self.generation==0 || new_client
