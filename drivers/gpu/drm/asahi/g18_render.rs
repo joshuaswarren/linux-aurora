@@ -235,9 +235,8 @@ fn validate(p: &G17pRenderParameters) -> Result<(), G18RenderError> {
         || p.absolute_pointers
         || p.native_ta_registers != 0
         || p.bg_resource_prefix != 0
-        || p.stencil_aux_buffer != 0
-        || p.stencil_stride != 0
-        || p.stencil_aux_stride != 0
+        || (p.layers == 1 && (p.stencil_aux_buffer != 0
+            || p.stencil_stride != 0 || p.stencil_aux_stride != 0))
         || p.stencil_clear_value > 0xff
     {
         return Err(G18RenderError::UnsupportedFeature);
