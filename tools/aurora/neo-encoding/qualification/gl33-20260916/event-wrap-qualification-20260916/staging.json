@@ -1,0 +1,10 @@
+{
+  "staged": true,
+  "old_boot": "9f1434bf-725b-4ff1-ae51-babd4df25cb4",
+  "old_module": "03abec7b984762e6b32a27951652d4c0445e8300e7447a795e5c45dc5291d762",
+  "next_boot_module": "fc3c7367555041557df6b593e5f3ed98bcbd309c09aaa5472cab9f9b32279d51",
+  "loaded_module_changed": false,
+  "backup": "/home/mcruz/gl30-cts-20260913/asahi-backup-03abec7b984762e6b32a27951652d4c0445e8300e7447a795e5c45dc5291d762.ko",
+  "cts_conformance": false,
+  "blocked_owned_xorg": []
+}

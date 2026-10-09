@@ -1,0 +1,106 @@
+diff --git a/drivers/gpu/drm/asahi/g17_render.rs b/drivers/gpu/drm/asahi/g17_render.rs
+index c840f50ec58d..b4c71deeaf43 100644
+--- a/drivers/gpu/drm/asahi/g17_render.rs
++++ b/drivers/gpu/drm/asahi/g17_render.rs
+@@ -1049,6 +1049,23 @@ const fn render_work_key(context_id: u32, command_buffer_state_word: u32) -> u64
+     ((context_id as u64) << 8) | ((command_buffer_state_word & 0x3f) as u64)
+ }
+ 
++/// The completion record must name the same generation as the rendered writes.
++/// Native nextCommandBufferState stores the allocated word at EventControl +8;
++/// generate3DRegisterList uses its low six bits in 0x10211/0x10420. B1 uses those
++/// same bits in the cache-maintenance request before publishing the stamp.
++/// Keep the full word here: physical slot ordinals and ring indices are not
++/// substitutes for the command-buffer allocator's generation.
++pub(crate) fn set_render_event_control_generation(
++    event_control: &mut [u8],
++    command_buffer_state_word: u32,
++) -> Result<(), RenderBuildError> {
++    let generation = event_control
++        .get_mut(8..12)
++        .ok_or(RenderBuildError::BufferTooSmall)?;
++    generation.copy_from_slice(&command_buffer_state_word.to_le_bytes());
++    Ok(())
++}
++
+ fn descriptor_work_ordinal(ordinal: u32) -> u32 {
+     ordinal + ordinal / 2
+ }
+@@ -2286,6 +2303,44 @@ fn descriptor_context_and_state_word_drive_every_native_work_key() {
+         assert_eq!(get_u32(&fragment, 0x0c), 9);
+     }
+ 
++    #[test]
++    fn completion_generation_matches_render_tags_across_reuse_and_wrap() {
++        let parameters = G17pRenderParameters::source_rsrc8();
++        // Include a second client's cold submission and generations beyond the
++        // six-bit hardware tag wrap. The slot ordinal is intentionally unrelated.
++        for generation in [0, 1, 2, 62, 64, 65, 128, 0x12345678, u32::MAX - 1] {
++            for context_id in [1, 7] {
++                let metadata = RenderDescriptorMetadata {
++                    context_id,
++                    submission_ordinal: 2,
++                    command_buffer_state_word: generation,
++                    ..RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment)
++                };
++                let mut ta = [0u8; TA_DESCRIPTOR_SIZE];
++                let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
++                let mut event_control = [0xa5; 0x100];
++                build_ta_descriptor(&parameters, objects(), metadata, &mut ta).unwrap();
++                build_fragment_descriptor(&parameters, objects(), metadata, &mut fragment)
++                    .unwrap();
++                set_render_event_control_generation(&mut event_control, generation).unwrap();
++                assert_eq!(get_u32(&event_control, 8), generation);
++                assert_eq!(&event_control[..8], &[0xa5; 8]);
++                assert!(event_control[12..].iter().all(|&v| v == 0xa5));
++                let maintenance_key = ((context_id as u64) << 8)
++                    | (get_u32(&event_control, 8) & 63) as u64;
++                for (raw, offset) in [(&ta[..], 0x36c), (&ta[..], 0x378),
++                                      (&ta[..], 0x384), (&fragment[..], 0x46c),
++                                      (&fragment[..], 0x478)] {
++                    assert_eq!(get_u64(raw, offset + 4), maintenance_key);
++                }
++            }
++        }
++        assert_eq!(
++            set_render_event_control_generation(&mut [0; 11], 0),
++            Err(RenderBuildError::BufferTooSmall)
++        );
++    }
++
+     #[test]
+     fn fragment_parameter_buffer_owner_is_independent_of_perf_map_and_tail() {
+         let mut parameters = G17pRenderParameters::source_rsrc8();
+diff --git a/drivers/gpu/drm/asahi/g17_resources.rs b/drivers/gpu/drm/asahi/g17_resources.rs
+index c67b26481ee5..098fec883149 100644
+--- a/drivers/gpu/drm/asahi/g17_resources.rs
++++ b/drivers/gpu/drm/asahi/g17_resources.rs
+@@ -7390,6 +7390,11 @@ macro_rules! bootstrap_stage {
+                     ..G17P_RENDER_POOL_A + g17_submission::G17P_COLD_OPENING_RECORD_POOL_A_SIZE],
+             )
+             .map_err(|_| render_build_fail(11))?;
++            g17_render::set_render_event_control_generation(
++                &mut raw[G17P_RENDER_POOL_A + pool_a_record_index * 0x100..],
++                command_buffer_state_words[0],
++            )
++            .map_err(|_| render_build_fail(11))?;
+             g17_submission::apply_g17p_cold_opening_record_pool_b(
+                 graph_addresses,
+                 &mut raw[G17P_RENDER_POOL_B
+@@ -8814,11 +8819,11 @@ macro_rules! restage_step {
+                     &source[0x4000..0x4000 + g17_render::FRAGMENT_DESCRIPTOR_SIZE],
+                 );
+             let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
+-            put_u32(
+-                support,
+-                record_a + 0x08,
+-                submission_ordinal + submission_ordinal / 2,
+-            );
++            g17_render::set_render_event_control_generation(
++                &mut support[record_a..],
++                command_buffer_state_words[0],
++            )
++            .map_err(|_| EINVAL)?;
+             put_u32(support, record_a + 0x10, 0x50);
+             pool_a_kick.apply(support);
+             put_u32(

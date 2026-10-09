@@ -1,0 +1,56 @@
+{
+  "target": "MacBook Neo J700/T8140",
+  "evidence_date": "2026-09-09",
+  "payloads_stored_locally_and_gitignored": true,
+  "note": "Index of qualification manifests; each archive contains its exact scope, evidence and dependency hashes.",
+  "archives": [
+    {
+      "path": "artifacts/ave-video-qualified-20260908",
+      "manifest_sha256": "8078ee1f72930370187920efef89a9d5ec86a1853043ae54515e12d1c36a5e4e",
+      "file_count": 1922,
+      "total_file_bytes": 566901325
+    },
+    {
+      "path": "artifacts/other-codecs-reference-qualified-20260909",
+      "manifest_sha256": "83c85763114e67e03ff777db9efbe66c41c979e989fca41a469694c9ea9e05a2",
+      "file_count": 75,
+      "total_file_bytes": 5139839
+    },
+    {
+      "path": "artifacts/prores-all-profiles-qualified-20260909",
+      "manifest_sha256": "551fc0137d8d0a708e312176c6f31c45d7d05c1abf929c92ffaa97ffa7756077",
+      "file_count": 1744,
+      "total_file_bytes": 354039456
+    },
+    {
+      "path": "artifacts/jpeg-mjpeg-qualified-20260909",
+      "manifest_sha256": "6efca6c33f935345429b9ba46a6e2d4e2eb6f65931e37dedcd45164c82ad4fd0",
+      "file_count": 442,
+      "total_file_bytes": 57737531
+    },
+    {
+      "path": "artifacts/hevc-precision-qualified-20260909",
+      "manifest_sha256": "0f326f9465ca9ea4293c9a179a46478ebd4ad16d18e0896168603f5ca08e274f",
+      "file_count": 2039,
+      "total_file_bytes": 709366255
+    },
+    {
+      "path": "artifacts/prores-alpha-precision-qualified-20260909",
+      "manifest_sha256": "4cc7901d21cce8fa8a745f89ce303232b35939ac6cec29c59334b194bd06b2a2",
+      "file_count": 744,
+      "total_file_bytes": 450691496
+    },
+    {
+      "path": "artifacts/ave-pool-qualified-20260909",
+      "manifest_sha256": "3ef326d2612f5a01ac0c1d88a79e458f62de961a99464a0216c5a5eb20bb84d2",
+      "file_count": 239,
+      "total_file_bytes": 580983829
+    },
+    {
+      "path": "artifacts/hevc-auxiliary-qualified-20260909",
+      "manifest_sha256": "ded9501a81f3f3e35aa155c51c9fdaa653c85866bbcaab4313250693f3874af8",
+      "file_count": 3101,
+      "total_file_bytes": 1560040608
+    }
+  ]
+}

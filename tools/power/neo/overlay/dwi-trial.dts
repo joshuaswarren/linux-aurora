@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc/power-management@300700000";
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			neo_dwi_power: power-controller@118 {
+				phandle = <0x10000>;
+				compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x118 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "dwi";
+			};
+		};
+	};
+	fragment@1 {
+		target-path = "/soc";
+		__overlay__ {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			backlight@300200000 {
+				compatible = "apple,j700-dwi-trial";
+				reg = <3 0x00200000 0 0x100>;
+				power-domains = <&neo_dwi_power>;
+			};
+		};
+	};
+};

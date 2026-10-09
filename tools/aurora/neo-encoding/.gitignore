@@ -1,0 +1,13 @@
+/artifacts/
+/logs/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.o
+*.ko
+*.dSYM/
+.env
+.env.*
+*.key
+*.pem
+*.sock

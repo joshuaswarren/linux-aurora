@@ -1,0 +1,16 @@
+[Unit]
+Description=One-shot J700 render completion wrap hardware diagnostic
+After=network.target
+RequiresMountsFor=/home/mcruz/gl30-cts-20260913
+ConditionPathExists=/home/mcruz/gl30-cts-20260913/event-wrap-qualification-20260916/pending-boot
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=12min
+ExecStart=/usr/bin/python3 /home/mcruz/gl30-cts-20260913/probes/qualify-event-wrap.py
+StandardOutput=append:/home/mcruz/gl30-cts-20260913/event-wrap-qualification-20260916/service.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

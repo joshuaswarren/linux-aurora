@@ -1,0 +1,22 @@
+#!/bin/sh
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/opt/neo/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+mkdir -p /dev/pts /sys/kernel/debug
+mount -t devpts devpts /dev/pts
+mount -t debugfs debugfs /sys/kernel/debug
+export HOME=/root TERM=vt100
+export VK_DRIVER_FILES=/opt/neo-mesa/share/vulkan/icd.d/asahi_icd.aarch64.json
+export LD_LIBRARY_PATH=/opt/neo-mesa/lib
+export MESA_SHADER_CACHE_DISABLE=true
+echo
+echo AURORA_NEO_LINUX_INITRAMFS_READY
+uname -a
+printf 'Model: '; tr -d '\000' < /proc/device-tree/model; echo
+printf 'CPUs: '; cat /sys/devices/system/cpu/online
+head -n 5 /proc/meminfo
+echo 'Neo RAM bring-up shell. Load AGX explicitly with: modprobe asahi'
+exec setsid cttyhack /bin/sh

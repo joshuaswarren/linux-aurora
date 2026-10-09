@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include "t8142-j813-input.dts"
+#include "../video/linux-ave/t8142-ave.dtsi"
+#include "t8142-gpu.dtsi"

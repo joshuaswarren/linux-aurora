@@ -1,0 +1,20 @@
+#!/bin/sh
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /tmp
+mkdir -p /run /sys/kernel/debug
+mount -t tmpfs tmpfs /run
+mount -t debugfs debugfs /sys/kernel/debug
+echo AURORA_J813_LINUX_INITRAMFS_READY
+uname -a
+cat /proc/cmdline
+if ! /opt/j813/enable-cooling.sh; then
+    echo M5_THERMAL_STARTUP_FAILED
+else
+    /opt/j813/thermal-status.sh
+fi
+echo 'Thermal RAM image: no disks mounted or graphics workload started.'
+while :; do
+    setsid cttyhack /bin/sh
+done

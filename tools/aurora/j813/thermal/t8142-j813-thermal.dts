@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include "t8142-j813.dts"
+#include "t8142-j813-thermal.dtsi"
+#include "t8142-j813-thermal-zones.dtsi"

@@ -1,0 +1,2064 @@
+{
+  "native_sha256": "666816a37045b6dcd351b63ad56a1f5ce284f3acb2157262226e090ade9cfca2",
+  "script_sha256": "b0cacfbc15c08d4d56b62277ac185fad60cac08a61cbc70ec2c482336fd7c24d",
+  "base_oracle_sha256": "ea3744685b094d061093196cbbe81a48b327b7f23e0f6656405442f69379aced",
+  "decoder_sha256": "cf2b5fd4dc0c1bc11fc16acb1bd6ba3fa4e20ea8a11914e8da241f04774a8204",
+  "functions": [
+    "0x216b61fd8",
+    "0x216b630d4",
+    "0x216b6299c",
+    "0x216b62634",
+    "0x216b61e24",
+    "0x216b59054"
+  ],
+  "modeled_external_operation": "byte-vector insertion only",
+  "hardware_execution": false,
+  "cases": [
+    {
+      "destination_raw": 0,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738376,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f00224000140000",
+          "kind": "store",
+          "tps_half": 8,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 0,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738376,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 8,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 0,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705672,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "4b0b0f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "4b0b0f00224000140000",
+          "kind": "store",
+          "tps_half": 8,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 2,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738377,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f00264000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f00264000140000",
+          "kind": "store",
+          "tps_half": 9,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 2,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738377,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f002e4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f002e4000140000",
+          "kind": "store",
+          "tps_half": 9,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 2,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          34359738377,
+          5,
+          8589934602,
+          4294967297
+        ],
+        [
+          34359738378,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f00264000140000",
+        "530a0f002a4000140000"
+      ],
+      "steps": 1733,
+      "decoded": [
+        {
+          "hex": "430a0f00264000140000",
+          "kind": "store",
+          "tps_half": 9,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        },
+        {
+          "hex": "530a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 10,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 4,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738378,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "530a0f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "530a0f00224000140000",
+          "kind": "store",
+          "tps_half": 10,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 4,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738378,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "530a0f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "530a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 10,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 4,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705674,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "5b0b0f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "5b0b0f00224000140000",
+          "kind": "store",
+          "tps_half": 10,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 8,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738380,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "630a0f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "630a0f00224000140000",
+          "kind": "store",
+          "tps_half": 12,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 8,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738380,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "630a0f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "630a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 12,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 8,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705676,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "6b0b0f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "6b0b0f00224000140000",
+          "kind": "store",
+          "tps_half": 12,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 16,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738384,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "830a0f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "830a0f00224000140000",
+          "kind": "store",
+          "tps_half": 16,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 16,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738384,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "830a0f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "830a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 16,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 16,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705680,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "8b0b0f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "8b0b0f00224000140000",
+          "kind": "store",
+          "tps_half": 16,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 32,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738392,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "c30a0f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "c30a0f00224000140000",
+          "kind": "store",
+          "tps_half": 24,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 32,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738392,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "c30a0f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "c30a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 24,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 32,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705688,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "cb0b0f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "cb0b0f00224000140000",
+          "kind": "store",
+          "tps_half": 24,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 148,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738450,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "930a8f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "930a8f00224000140000",
+          "kind": "store",
+          "tps_half": 82,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 148,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738450,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "930a8f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "930a8f002a4000140000",
+          "kind": "store",
+          "tps_half": 82,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 148,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705746,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "9b0b8f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "9b0b8f00224000140000",
+          "kind": "store",
+          "tps_half": 82,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 150,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738451,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "930a8f00264000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "930a8f00264000140000",
+          "kind": "store",
+          "tps_half": 83,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 150,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738451,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "930a8f002e4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "930a8f002e4000140000",
+          "kind": "store",
+          "tps_half": 83,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 150,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          34359738451,
+          5,
+          8589934602,
+          4294967297
+        ],
+        [
+          34359738452,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "930a8f00264000140000",
+        "a30a8f002a4000140000"
+      ],
+      "steps": 1733,
+      "decoded": [
+        {
+          "hex": "930a8f00264000140000",
+          "kind": "store",
+          "tps_half": 83,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        },
+        {
+          "hex": "a30a8f002a4000140000",
+          "kind": "store",
+          "tps_half": 84,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 152,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738452,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "a30a8f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "a30a8f00224000140000",
+          "kind": "store",
+          "tps_half": 84,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 152,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738452,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "a30a8f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "a30a8f002a4000140000",
+          "kind": "store",
+          "tps_half": 84,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 152,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705748,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "ab0b8f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "ab0b8f00224000140000",
+          "kind": "store",
+          "tps_half": 84,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 156,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738454,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "b30a8f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "b30a8f00224000140000",
+          "kind": "store",
+          "tps_half": 86,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 156,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738454,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "b30a8f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "b30a8f002a4000140000",
+          "kind": "store",
+          "tps_half": 86,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 156,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705750,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "bb0b8f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "bb0b8f00224000140000",
+          "kind": "store",
+          "tps_half": 86,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 256,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738504,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f00225000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f00225000140000",
+          "kind": "store",
+          "tps_half": 136,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 256,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738504,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f002a5000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f002a5000140000",
+          "kind": "store",
+          "tps_half": 136,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 256,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": false,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705800,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "4b0b0f00225000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "4b0b0f00225000140000",
+          "kind": "store",
+          "tps_half": 136,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 0,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934612,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "a30a0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "a30a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 0,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934612,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "a30b0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "a30b0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 0,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          12884901908,
+          8,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "ab0a0940"
+      ],
+      "steps": 524,
+      "decoded": [
+        {
+          "hex": "ab0a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 2,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934613,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "a30a0941"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "a30a0941",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 2,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934613,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "a30b0941"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "a30b0941",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 2,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          8589934613,
+          8,
+          8589934602,
+          4294967297
+        ],
+        [
+          8589934614,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "a30a0941",
+        "b30b0940"
+      ],
+      "steps": 977,
+      "decoded": [
+        {
+          "hex": "a30a0941",
+          "kind": "outside_decoder_subset"
+        },
+        {
+          "hex": "b30b0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 4,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934614,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "b30a0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "b30a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 4,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934614,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "b30b0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "b30b0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 4,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          12884901910,
+          8,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "bb0a0940"
+      ],
+      "steps": 524,
+      "decoded": [
+        {
+          "hex": "bb0a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 8,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934616,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "c30a0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "c30a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 8,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934616,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "c30b0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "c30b0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 8,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          12884901912,
+          8,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "cb0a0940"
+      ],
+      "steps": 524,
+      "decoded": [
+        {
+          "hex": "cb0a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 16,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934620,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "e30a0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "e30a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 16,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934620,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "e30b0940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "e30b0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 16,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          12884901916,
+          8,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "eb0a0940"
+      ],
+      "steps": 524,
+      "decoded": [
+        {
+          "hex": "eb0a0940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 32,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934628,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "230a4940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "230a4940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 32,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934628,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "230b4940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "230b4940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 32,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          12884901924,
+          8,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "2b0a4940"
+      ],
+      "steps": 524,
+      "decoded": [
+        {
+          "hex": "2b0a4940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 148,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934686,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "f30a8940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "f30a8940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 148,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934686,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "f30b8940"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "f30b8940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 148,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          12884901982,
+          8,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "fb0a8940"
+      ],
+      "steps": 524,
+      "decoded": [
+        {
+          "hex": "fb0a8940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 150,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934687,
+          8,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "f30a8941"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "f30a8941",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 150,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          8589934687,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "f30b8941"
+      ],
+      "steps": 536,
+      "decoded": [
+        {
+          "hex": "f30b8941",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 150,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          8589934687,
+          8,
+          8589934602,
+          4294967297
+        ],
+        [
+          8589934688,
+          8,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "f30a8941",
+        "030bc940"
+      ],
+      "steps": 977,
+      "decoded": [
+        {
+          "hex": "f30a8941",
+          "kind": "outside_decoder_subset"
+        },
+        {
+          "hex": "030bc940",
+          "kind": "outside_decoder_subset"
+        }
+      ]
+    },
+    {
+      "destination_raw": 152,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738376,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f00224000140000",
+          "kind": "store",
+          "tps_half": 8,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 152,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738376,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "430a0f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "430a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 8,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 152,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705672,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "4b0b0f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "4b0b0f00224000140000",
+          "kind": "store",
+          "tps_half": 8,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 156,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738378,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "530a0f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "530a0f00224000140000",
+          "kind": "store",
+          "tps_half": 10,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 156,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738378,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "530a0f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "530a0f002a4000140000",
+          "kind": "store",
+          "tps_half": 10,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 156,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705674,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "5b0b0f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "5b0b0f00224000140000",
+          "kind": "store",
+          "tps_half": 10,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 256,
+      "mask": 1,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738428,
+          5,
+          8589934602,
+          4294967297
+        ]
+      ],
+      "records": [
+        "e30a4f00224000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "e30a4f00224000140000",
+          "kind": "store",
+          "tps_half": 60,
+          "src": 10,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 256,
+      "mask": 2,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 2,
+      "constructors": [
+        [
+          34359738428,
+          5,
+          8589934603,
+          4294967297
+        ]
+      ],
+      "records": [
+        "e30a4f002a4000140000"
+      ],
+      "steps": 914,
+      "decoded": [
+        {
+          "hex": "e30a4f002a4000140000",
+          "kind": "store",
+          "tps_half": 60,
+          "src": 11,
+          "width": 1,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    },
+    {
+      "destination_raw": 256,
+      "mask": 3,
+      "source_half": 10,
+      "encoder_fast_flag": true,
+      "returned": 4,
+      "constructors": [
+        [
+          38654705724,
+          5,
+          12884901898,
+          4294967297
+        ]
+      ],
+      "records": [
+        "eb0b4f00224000140000"
+      ],
+      "steps": 902,
+      "decoded": [
+        {
+          "hex": "eb0b4f00224000140000",
+          "kind": "store",
+          "tps_half": 60,
+          "src": 10,
+          "width": 2,
+          "src_kill": 1,
+          "slot": 6,
+          "wait_mask": 2,
+          "structural_flag": 0,
+          "replay_equal": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+/dts-v1/;
+/plugin/;
+/ {
+    fragment@0 {
+        target-path = "/soc";
+        __overlay__ {
+            #address-cells = <2>;
+            #size-cells = <2>;
+            neo_dcp_mbox: mailbox@412e08000 {
+                compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+                reg = <4 0x12e08000 0 0x4000>;
+                interrupt-parent = <@AIC@>;
+                interrupts = <0 679 4>, <0 680 4>, <0 681 4>, <0 682 4>;
+                interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+                #mbox-cells = <0>;
+            };
+            neo-dcp-retained@412e00000 {
+                compatible = "apple,j700-dcp-retained-trial";
+                reg = <4 0x12e00000 0 0x4c>;
+                mboxes = <&neo_dcp_mbox>;
+            };
+        };
+    };
+};

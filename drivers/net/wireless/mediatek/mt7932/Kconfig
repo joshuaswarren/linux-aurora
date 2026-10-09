@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MT7932_FULLMAC
+	bool "Experimental J700 MT7932 fullmac wireless support"
+	depends on PCI && OF && ARM64 && IOMMU_DMA
+	select FW_LOADER
+	select CFG80211
+	help
+	  Native support for the built-in J700 Wi-Fi endpoint: managed
+	  WPA2-CCMP station operation on 2.4 GHz and non-DFS 5 GHz at 20 MHz.
+	  The private max_bw_mhz=40/80 experiment enables wider 5 GHz channels.
+	  Its native ABI research is tainted and its RF behavior is unqualified.
+	  Requires original firmware, own calibration and original-derived
+	  country policy packages in addition to the cfg80211 regulatory database.
+	  Requires a trained retained PCI link and a translated SID1 DMA domain.
+	  Firmware, runtime DMA and calibration negotiation start automatically;
+	  cfg80211 and userspace select the country and network. No test boot
+	  parameters are required for ordinary station operation.
+	  No automatic recovery or unbind is provided while DMA teardown is
+	  unqualified. Other MediaTek devices and other machines are not matched.
+
+config MT7932_RATE_KUNIT_TEST
+	tristate "MT7932 RX rate decoder tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Test rate decoding and RX descriptor bounds without radio hardware.
+	  Covers legacy, HT, VHT and HE SU rates, invalid vectors and missing
+	  or truncated descriptor groups. This does not validate the firmware's
+	  live RX vector layout or replace an AP-side rate comparison.
+
+config MT7932_BW_KUNIT_TEST
+	bool "MT7932 experimental bandwidth tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Test native width encodings, regulatory constituent-channel gating,
+	  fallback capabilities and synthetic calibration plans without hardware.
+
+config MT7932_LINK_KUNIT_TEST
+	bool "MT7932 association event tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Test repeated association starts, calibration ownership and completion
+	  wakeups using synthetic firmware events, without radio hardware.
+	  Covers terminal failures and rejects overlapping calibration requests.
+	  These tests do not replace cold-boot association qualification.
