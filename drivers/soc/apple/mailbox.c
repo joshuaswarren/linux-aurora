@@ -117,6 +117,7 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 struct apple_mbox_hw {
 	unsigned int reg_offset;
 	bool is_ascwrap_v6;
+	u64 ascwrap_v6_base_delta;
 	bool ap_initializes_mailboxes;
 
 	unsigned int control_full;
@@ -668,15 +669,17 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		if (!strcmp(firmware_role, "GFX")) {
 			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
 			if (res->start != APPLE_T8140_GFX_WRAPPER_BASE ||
-			    iop_vbar_res->start != APPLE_T8140_GFX_IOP_VBAR_BASE)
+			    iop_vbar_res->start != APPLE_T8140_GFX_IOP_VBAR_BASE +
+					 mbox->hw->ascwrap_v6_base_delta)
 				return dev_err_probe(dev, -EINVAL,
-						     "GFX ASCWrap v6 resources do not match T8140\n");
+						     "GFX ASCWrap v6 resources do not match provider profile\n");
 		} else if (!strcmp(firmware_role, "GFX1")) {
 			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1;
 			if (res->start != APPLE_T8140_GFX1_WRAPPER_BASE ||
-			    iop_vbar_res->start != APPLE_T8140_GFX1_IOP_VBAR_BASE)
+			    iop_vbar_res->start != APPLE_T8140_GFX1_IOP_VBAR_BASE +
+					 mbox->hw->ascwrap_v6_base_delta)
 				return dev_err_probe(dev, -EINVAL,
-						     "GFX1 ASCWrap v6 resources do not match T8140\n");
+						     "GFX1 ASCWrap v6 resources do not match provider profile\n");
 		} else {
 			return dev_err_probe(dev, -EINVAL,
 					     "invalid ASCWrap v6 firmware role\n");
@@ -876,7 +879,24 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.irq_bit_send_empty = APPLE_M3_MBOX_IRQ_A2I_EMPTY,
 };
 
+static const struct apple_mbox_hw apple_mbox_t6050_apif_ascwrap_v6_hw = {
+	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
+	.is_ascwrap_v6 = true,
+	.ascwrap_v6_base_delta = 0x380000000ULL,
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
+	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
+	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
+	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+	.has_irq_controls = false,
+};
+
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t6050-apif-ascwrap-v6", .data = &apple_mbox_t6050_apif_ascwrap_v6_hw },
+	{ .compatible = "apple,t6050-x1n1-ascwrap-v6", .data = &apple_mbox_t6050_apif_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
 	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },

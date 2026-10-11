@@ -4,6 +4,13 @@ if ARCH_APPLE || COMPILE_TEST
 
 menu "Apple SoC drivers"
 
+config AURORA_APIF_GPU
+	tristate "Aurora APIF compatibility GPU transport"
+	depends on ARM64 && OF
+	help
+	  Synchronous, revocable access to the monitor's compatibility GPU
+	  operation page. Native APIF version 2 remains a separate provider.
+
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST

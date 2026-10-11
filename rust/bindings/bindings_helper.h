@@ -100,6 +100,7 @@
 #include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/mailbox.h>
+#include <linux/soc/apple/apif-gpu.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>

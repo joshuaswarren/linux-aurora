@@ -37,3 +37,5 @@ apple-mcc-y := mcc.o
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o
+
+obj-$(CONFIG_AURORA_APIF_GPU) += apif-gpu.o
