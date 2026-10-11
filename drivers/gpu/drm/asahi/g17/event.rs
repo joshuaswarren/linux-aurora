@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Event service ordering under the device mutex. A restart ends its role's batch; a worker
 //! joins preparation leases and services it on a separate turn before continuing the rings.
@@ -61,6 +61,9 @@ fn batch<H: Host>(host: &mut H, role: Role, masks: &mut [u64; 2]) -> Result {
                 }
             }
             Event::TvbGrow(request) => {
+                if crate::g17::m5_render_submission::enabled() {
+                    pr_info!("M5 parameter-buffer growth request: {:?}\n", request);
+                }
                 if request.halt_count == host.recovery().generation() {
                     host.queue_tvb_grow(request)?;
                 }

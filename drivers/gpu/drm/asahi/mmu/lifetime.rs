@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Keeps user mappings alive until accepted work has relinquished firmware ownership.
 //!
@@ -18,6 +18,7 @@ const ADMISSION_WAIT_MS: u32 = 1000;
 pub(super) struct DriverMappings {
     mappings: KVec<KernelMapping>,
     reserved: KVec<Range<u64>>,
+    metrics: Option<(u64, KernelMapping)>,
     compute: Option<PoolMappings>,
     render: [Option<PoolMappings>; crate::hw::t8140::queues::RENDER_SLOTS],
 }
@@ -32,7 +33,7 @@ impl DriverMappings {
     fn ranges(&self) -> impl Iterator<Item = Range<u64>> + '_ {
         Iterator::chain(
             Iterator::chain(
-                self.mappings.iter(),
+                Iterator::chain(self.mappings.iter(), self.metrics.iter().map(|(_, mapping)| mapping)),
                 Iterator::chain(
                     self.compute.iter().flat_map(|pool| pool.mappings.iter()),
                     self.render
@@ -142,10 +143,45 @@ impl Vm {
         *driver = Some(DriverMappings {
             mappings,
             reserved,
+            metrics: None,
             compute: None,
             render: core::array::from_fn(|_| None),
         });
         Ok(())
+    }
+
+    /// Cache a single metrics backing per VM. Mapping allocation runs outside
+    /// the driver lock; a racing equivalent installation reuses the winner.
+    pub(crate) fn metrics_alias(
+        &self,
+        key: u64,
+        make: impl FnOnce() -> Result<KernelMapping>,
+    ) -> Result<u64> {
+        let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
+        {
+            let driver = lifetime.driver.lock();
+            if let Some((id, mapping)) = driver.as_ref().and_then(|d| d.metrics.as_ref()) {
+                return if *id == key { Ok(mapping.iova()) } else { Err(EINVAL) };
+            }
+        }
+        let mapping = make()?;
+        let mut driver = lifetime.driver.lock();
+        if let Some((id, existing)) = driver.as_ref().and_then(|d| d.metrics.as_ref()) {
+            let result = if *id == key { Ok(existing.iova()) } else { Err(EINVAL) };
+            drop(driver);
+            drop(mapping);
+            return result;
+        }
+        let driver = driver.get_or_insert_with(|| DriverMappings {
+            mappings: KVec::new(),
+            reserved: KVec::new(),
+            metrics: None,
+            compute: None,
+            render: core::array::from_fn(|_| None),
+        });
+        let address = mapping.iova();
+        driver.metrics = Some((key, mapping));
+        Ok(address)
     }
 
     /// Reserves the complete append before moving aliases into VM ownership.

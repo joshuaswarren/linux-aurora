@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Exact identities and visibility witnesses for a physical compute queue.
 //! A shared work-state counter can include other engines and cannot prove this queue retired.
@@ -152,6 +152,7 @@ struct Request {
 pub(crate) struct Batch {
     requests: KVVec<Request>,
     slots: [(usize, usize); QIDS],
+    kick_bounds: [[u64; 2]; QIDS],
     open: Option<u8>,
 }
 
@@ -160,12 +161,14 @@ impl Batch {
         Ok(Self {
             requests: KVVec::with_capacity(QIDS * IN_FLIGHT, GFP_KERNEL)?,
             slots: [(0, 0); QIDS],
+            kick_bounds: [[0; 2]; QIDS],
             open: None,
         })
     }
     pub(crate) fn clear(&mut self) {
         self.requests.clear();
         self.slots.fill((0, 0));
+        self.kick_bounds.fill([0; 2]);
         self.open = None;
     }
     pub(crate) fn request(&mut self, ticket: &Ticket) -> Result {
@@ -191,6 +194,9 @@ impl Batch {
                 observed: None,
             })
             .map_err(|_| ENOSPC)?;
+        let bounds = &mut self.kick_bounds[ticket.qid as usize];
+        if slot.1 == 0 { *bounds = [ticket.kick, ticket.kick]; }
+        else { bounds[0] = bounds[0].min(ticket.kick); bounds[1] = bounds[1].max(ticket.kick); }
         *slot = (start, slot.1 + 1);
         self.open = Some(ticket.qid);
         Ok(())
@@ -204,12 +210,22 @@ impl Batch {
         if count == 0 {
             return Ok(());
         }
+        let kick = (((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
+        // Numeric extrema are conservative even when the 40-bit counter wraps.
+        let bounds = self.kick_bounds[qid];
+        if kick < bounds[0] || kick > bounds[1] { return Ok(()); }
+        let requests = self.requests.get_mut(start..start + count).ok_or(EIO)?;
+        // Most retained records belong to older kicks of this same physical
+        // queue. Reject them using the already captured control word before
+        // touching their uncached payload. Still scan every slot and retain
+        // the newest exact identity below, including replayed publications.
+        if !requests.iter().any(|request| request.kick == kick) {
+            return Ok(());
+        }
         let descriptor = record.read(6)? & !1;
         if descriptor == 0 || record.read(7)? == 0 {
             return Ok(());
         }
-        let kick = (((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
-        let requests = self.requests.get_mut(start..start + count).ok_or(EIO)?;
         let Some(request) = requests
             .iter_mut()
             .find(|r| r.descriptor == descriptor && r.kick == kick)

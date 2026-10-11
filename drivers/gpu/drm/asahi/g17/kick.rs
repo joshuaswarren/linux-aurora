@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Physical kick-ring backing, queue identities and entry publication.
 //!
@@ -160,6 +160,7 @@ pub(crate) struct Queue {
     id: Id,
     timestamp: KickTimestamp,
     previous: Option<KickTimestamp>,
+    sptm_lower: Option<mmu::Vm>,
 }
 
 /// A checked entry and destination held without changing the shared ring.
@@ -173,8 +174,8 @@ pub(crate) struct PreparedKick<'a> {
 
 impl PreparedKick<'_> {
     /// Publish translation updates after the queue configuration pointer and before its entry.
-    pub(crate) fn prepare_compute_install(&self) -> Result {
-        self.queue.prepare_compute_install()
+    pub(crate) fn prepare_install(&self) -> Result {
+        self.queue.prepare_install()
     }
 
     /// Writes and fences the complete entry, then advances host state. The
@@ -203,8 +204,7 @@ impl Queue {
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let mut range = alloc.uat.geometry().kernel_range();
-        range.start += t8140::dynamic::KERNEL_OFFSET;
+        let range = alloc.uat.kernel_dynamic_range();
         let high = low.alias_in(
             alloc.uat.kernel_vm(),
             range,
@@ -214,6 +214,7 @@ impl Queue {
         fence(Ordering::SeqCst);
         Ok(Self {
             backing: Backing::Compute { high, low },
+            sptm_lower: alloc.uat.is_sptm().then(|| alloc.uat.kernel_lower_vm().clone()),
             id,
             timestamp: KickTimestamp::FIRST,
             previous: None,
@@ -258,6 +259,7 @@ impl Queue {
         Ok((
             Self {
                 backing: Backing::Render { low, high },
+                sptm_lower: alloc.uat.is_sptm().then(|| alloc.uat.kernel_lower_vm().clone()),
                 id,
                 timestamp: KickTimestamp::FIRST,
                 previous: None,
@@ -304,7 +306,12 @@ impl Queue {
 
     /// Both aliases are owned mappings of the same full ring. Publish their
     /// page-table updates to each live translation regime before installation.
-    pub(crate) fn prepare_compute_install(&self) -> Result {
+    pub(crate) fn prepare_install(&self) -> Result {
+        fence(Ordering::SeqCst);
+        // SPTM owns translations for all engines; the direct fallback is
+        // still restricted to the compute-ring layout it was written for.
+        #[cfg(CONFIG_ARM64)]
+        if let Some(vm) = &self.sptm_lower { return vm.sync_sptm_context(); }
         if self.id.engine != DataMaster::Compute {
             return Err(EINVAL);
         }
@@ -332,6 +339,11 @@ impl Queue {
             _ => self.timestamp.prev(),
         })
     }
+    /// Snapshot a retained kick slot for explicit bring-up qualification.
+    pub(crate) fn read_entry_words(&mut self, timestamp:KickTimestamp)->Result<[u32;128]> {
+        self.object().read_words(timestamp.entry_offset())
+    }
+
     pub(crate) fn prepare_entry(&mut self, args: &KickArgs<'_>) -> Result<PreparedKick<'_>> {
         if args.qid != self.id.qid
             || args.timestamp != self.timestamp

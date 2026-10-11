@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Retained USC private-memory pools and their submission counters.
 //!
@@ -30,12 +30,13 @@ impl RenderIds {
         }
     }
 }
-struct RenderId {
+pub(super) struct RenderId {
     slot: u16,
     allocator: Arc<RenderIds>,
 }
 impl RenderId {
-    fn new(allocator: &Arc<RenderIds>) -> Result<Self> {
+    pub(super) fn slot(&self) -> u16 { self.slot }
+    pub(super) fn new(allocator: &Arc<RenderIds>) -> Result<Self> {
         for (bank, used) in allocator.used.iter().enumerate() {
             let mut value = used.load(Ordering::Acquire);
             loop {
@@ -69,13 +70,25 @@ impl Drop for RenderId {
     }
 }
 
+/// Profile-specific descriptor data for a fresh physical pool. The runtime
+/// installs this only before publication, or after an acknowledged release.
+pub(crate) enum PoolDescriptor {
+    Neo { slot: u16, page_list: u64 },
+    M5 { slot: u16, words: [u64; 8] },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageLayout {
+    Neo { blocks: usize, runs: RunLayout },
+    M5(super::fw::m5::pool::PoolGeometry),
+}
+
 pub(crate) struct Pages {
     backing: KernelObject,
-    blocks: usize,
-    layout: RunLayout,
+    layout: PageLayout,
 }
 impl Pages {
-    fn new(alloc: &Allocator<'_>, blocks: usize, layout: RunLayout) -> Result<Self> {
+    fn new(alloc: &Allocator<'_>, blocks: usize, runs: RunLayout) -> Result<Self> {
         let mut backing = alloc.lower(
             TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -83,36 +96,75 @@ impl Pages {
             CpuMap::WriteCombined,
         )?;
         let base = backing.gpu_va();
-        backing.initialize::<PoolTables>(0, |tables| tables.init(base, blocks, layout))?;
-        Ok(Self {
-            backing,
-            blocks,
-            layout,
-        })
+        backing.initialize::<PoolTables>(0, |tables| tables.init(base, blocks, runs))?;
+        Ok(Self { backing, layout: PageLayout::Neo { blocks, runs } })
     }
-    /// Fresh zeroed compute backing, built without the device mutex.
-    pub(crate) fn compute(alloc: &Allocator<'_>) -> Result<Self> {
-        Self::new(alloc, COMPUTE_BLOCKS, RunLayout::Compute)
+    /// Fresh zeroed compute backing, built without the device mutex. M5 keeps
+    /// its directory, block list and initial 32 MiB in one retained allocation.
+    pub(crate) fn compute(alloc: &Allocator<'_>, m5: bool, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result<Self> {
+        if !m5 { return Self::new(alloc, COMPUTE_BLOCKS, RunLayout::Compute); }
+        use super::fw::m5::pool;
+        let geometry = match required { Some(geometry) => geometry,
+            None => pool::PoolGeometry::g17s(8).map_err(|_| EINVAL)?, };
+        Self::m5(alloc, geometry)
     }
-    fn page_list_va(&self) -> u64 {
-        self.backing.gpu_va()
+    fn m5(alloc: &Allocator<'_>, geometry: super::fw::m5::pool::PoolGeometry) -> Result<Self> {
+        use super::fw::m5::pool;
+        let tables = geometry.directory_bytes.checked_add(geometry.freelist_bytes).ok_or(EOVERFLOW)?;
+        let size = geometry.blocks.checked_mul(geometry.block_bytes())
+            .and_then(|n| n.checked_add(tables)).ok_or(EOVERFLOW)?;
+        let mut backing = alloc.lower(size, mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RW, CpuMap::WriteCombined)?;
+        let base = backing.gpu_va();
+        let mut blocks = KVec::with_capacity(geometry.blocks, GFP_KERNEL)?;
+        for index in 0..geometry.blocks {
+            blocks.push(base + (tables + index * geometry.block_bytes()) as u64, GFP_KERNEL)?;
+        }
+        pool::encode_directory(geometry, &blocks,
+            &mut backing.bytes_mut()[..geometry.directory_bytes]).map_err(|_| EINVAL)?;
+        pool::encode_freelist(geometry, &blocks,
+            &mut backing.bytes_mut()[geometry.directory_bytes..tables]).map_err(|_| EINVAL)?;
+        Ok(Self { backing, layout: PageLayout::M5(geometry) })
     }
+    pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        self.backing.map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
+    }
+    fn fits(&self, required: Option<super::fw::m5::pool::PoolGeometry>) -> bool {
+        match (self.layout, required) {
+            (PageLayout::M5(current), Some(required)) =>
+                current.block_bytes() == required.block_bytes() && current.blocks >= required.blocks,
+            (_, None) => true,
+            _ => false,
+        }
+    }
+    fn is_m5(&self) -> bool { matches!(self.layout, PageLayout::M5(_)) }
+    fn page_list_va(&self) -> u64 { self.backing.gpu_va() }
     fn run_list_va(&self) -> u64 {
-        self.page_list_va() + PAGE_LIST_SIZE as u64
+        self.page_list_va() + match self.layout {
+            PageLayout::Neo { .. } => PAGE_LIST_SIZE,
+            PageLayout::M5(g) => g.directory_bytes,
+        } as u64
+    }
+    fn m5_layout(&self, slot: u16) -> Result<super::fw::m5::pool::PoolLayout> {
+        let PageLayout::M5(geometry) = self.layout else { return Err(EINVAL); };
+        Ok(super::fw::m5::pool::PoolLayout { geometry, directory: self.page_list_va(),
+            freelist: self.run_list_va(), hardware_id: u32::from(slot) })
+    }
+    fn descriptor(&self, slot: u16) -> Result<PoolDescriptor> {
+        if self.is_m5() {
+            let words = super::fw::m5::pool::initial_uma_descriptor(self.m5_layout(slot)?)
+                .map_err(|_| EINVAL)?;
+            Ok(PoolDescriptor::M5 { slot, words })
+        } else { Ok(PoolDescriptor::Neo { slot, page_list: self.page_list_va() }) }
     }
     fn repopulate(&self) -> Result {
+        let PageLayout::Neo { blocks, runs } = self.layout else { return Err(EINVAL); };
         let table = self.backing.pointer(0, TABLE_SIZE)?.cast::<u64>();
-        PoolTables::for_each_word(
-            self.page_list_va(),
-            self.blocks,
-            self.layout,
-            |index, value| {
-                // SAFETY: The page-aligned backing was validated for the complete
-                // tables. The enumerator bounds every index inside those tables;
-                // the owner has proven firmware release before this update.
-                unsafe { table.add(index).write_volatile(value) };
-            },
-        )
+        PoolTables::for_each_word(self.page_list_va(), blocks, runs, |index, value| {
+            // SAFETY: Every index is bounded by the checked tables; the caller
+            // has observed release before reusing their firmware-owned words.
+            unsafe { table.add(index).write_volatile(value) };
+        })
     }
 }
 
@@ -123,7 +175,7 @@ static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 /// both aliases before the backing.
 pub(crate) struct RenderBacking {
     _client: mmu::KernelMapping,
-    _global: mmu::KernelMapping,
+    _global: Option<mmu::KernelMapping>,
     pages: Pages,
 }
 
@@ -134,11 +186,18 @@ impl RenderBacking {
         render_global: &mmu::Vm,
         client: &mmu::Vm,
     ) -> Result<Self> {
-        let pages = Pages::new(alloc, RENDER_BLOCKS, RunLayout::Render)?;
+        Self::with_layout(alloc, Some(render_global), client,
+            PageLayout::Neo { blocks: RENDER_BLOCKS, runs: RunLayout::Render })
+    }
+    fn with_layout(alloc: &Allocator<'_>, render_global: Option<&mmu::Vm>,
+        client: &mmu::Vm, layout: PageLayout) -> Result<Self> {
+        let pages = match layout {
+            PageLayout::Neo { blocks, runs } => Pages::new(alloc, blocks, runs)?,
+            PageLayout::M5(geometry) => Pages::m5(alloc, geometry)?,
+        };
         let address = pages.page_list_va();
-        let global = pages
-            .backing
-            .map_alias(render_global, address, mmu::PROT_GPU_SHARED_RW)?;
+        let global = render_global.map(|vm|
+            pages.backing.map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)).transpose()?;
         let client = pages
             .backing
             .map_alias(client, address, mmu::PROT_GPU_SHARED_RW)?;
@@ -168,6 +227,7 @@ pub(crate) struct RenderPool {
     served: AtomicBool,
     serial: u64,
     id: RenderId,
+    layout: PageLayout,
 }
 
 impl RenderPool {
@@ -179,6 +239,21 @@ impl RenderPool {
     ) -> Result<Self> {
         let id = RenderId::new(ids)?;
         let backing = RenderBacking::new(alloc, render_global, client)?;
+        Self::with_backing(alloc, id, client, backing)
+    }
+
+    /// Explicit initial geometry; allocation policy remains with the caller.
+    /// M5 firmware uses the canonical and client mappings of these pages.
+    pub(super) fn m5(alloc: &Allocator<'_>, id: RenderId, client: &mmu::Vm,
+        geometry: super::fw::m5::pool::PoolGeometry) -> Result<Self> {
+        if !alloc.uat.is_sptm() { return Err(EINVAL); }
+        let backing = RenderBacking::with_layout(alloc, None, client, PageLayout::M5(geometry))?;
+        Self::with_backing(alloc, id, client, backing)
+    }
+
+    fn with_backing(alloc: &Allocator<'_>, id: RenderId, client: &mmu::Vm,
+        backing: RenderBacking) -> Result<Self> {
+        let layout = backing.pages.layout;
         let address = backing.pages.page_list_va();
         let run_list_va = backing.pages.run_list_va();
         let state = alloc.kernel(
@@ -193,7 +268,10 @@ impl RenderPool {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        control.write(
+        if let PageLayout::M5(_) = layout {
+            super::fw::m5::pool::encode_g17s_render_state(backing.pages.m5_layout(id.slot)?,
+                state.gpu_va(), control.bytes_mut()).map_err(|_| EINVAL)?;
+        } else { control.write(
             0,
             FreeListControl::render(
                 &FreeListArgs {
@@ -206,7 +284,7 @@ impl RenderPool {
                 },
                 0,
             ),
-        )?;
+        )?; }
         fence(Ordering::SeqCst);
         let serial = RENDER_POOL_SERIAL
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
@@ -225,6 +303,7 @@ impl RenderPool {
             served: AtomicBool::new(false),
             serial,
             id,
+            layout,
         })
     }
 
@@ -251,6 +330,9 @@ impl RenderPool {
     /// The next staging rewrites the control header and descriptor row for it
     /// (its run-list address changes the free-list owner identity).
     pub(crate) fn rearm(&self, fresh: RenderBacking) -> Result {
+        if fresh.pages.layout != self.layout {
+            return Err(EINVAL);
+        }
         let mut backing = self.backing.lock();
         if backing.is_some() {
             return Ok(());
@@ -273,7 +355,8 @@ impl RenderPool {
         if !self.vacant() {
             return Ok(());
         }
-        self.rearm(RenderBacking::new(alloc, render_global, client)?)
+        let global = if matches!(self.layout, PageLayout::M5(_)) { None } else { Some(render_global) };
+        self.rearm(RenderBacking::with_layout(alloc, global, client, self.layout)?)
     }
 
     pub(crate) fn serial(&self) -> u64 {
@@ -293,11 +376,16 @@ impl RenderPool {
         self.page_list.load(Ordering::Acquire)
     }
     pub(crate) fn run_list_va(&self) -> u64 {
-        self.page_list_va() + PAGE_LIST_SIZE as u64
+        self.page_list_va() + match self.layout {
+            PageLayout::Neo { .. } => PAGE_LIST_SIZE,
+            PageLayout::M5(g) => g.directory_bytes,
+        } as u64
     }
     pub(crate) fn end_va(&self) -> u64 {
-        self.run_list_va()
-            + (RENDER_BLOCKS * size_of::<super::fw::initdata::FreeListRunSlot>()) as u64
+        self.run_list_va() + match self.layout {
+            PageLayout::Neo { blocks, .. } => blocks * size_of::<super::fw::initdata::FreeListRunSlot>(),
+            PageLayout::M5(g) => g.blocks * 8,
+        } as u64
     }
 
     /// Fresh pools are already populated. Reuse requires the previous release
@@ -307,6 +395,24 @@ impl RenderPool {
             return Ok(());
         }
         let submitted = self.state.dword(0)?.load(Ordering::Relaxed);
+        if let PageLayout::M5(_) = self.layout {
+            let backing = self.backing.lock();
+            let pages = &backing.as_ref().ok_or(EAGAIN)?.pages;
+            if pages.page_list_va() != self.page_list_va() { return Err(EIO); }
+            let mut bytes = [0; super::fw::m5::pool::STATE_BYTES];
+            super::fw::m5::pool::encode_g17s_render_state(pages.m5_layout(self.id())?,
+                self.state.gpu_va(), &mut bytes).map_err(|_| EINVAL)?;
+            bytes[super::fw::m5::pool::COMPLETED..super::fw::m5::pool::COMPLETED + 8]
+                .copy_from_slice(&submitted.to_le_bytes());
+            let raw = self.control.pointer(0, bytes.len())?;
+            for (index, byte) in bytes.into_iter().enumerate() {
+                // SAFETY: The whole retained range was checked and the caller
+                // observed final release before installing fresh pool backing.
+                unsafe { raw.add(index).write_volatile(byte) };
+            }
+            fence(Ordering::SeqCst);
+            return Ok(());
+        }
         let header = FreeListControl::render(
             &FreeListArgs {
                 buffer_slot: u32::from(self.id()),
@@ -347,7 +453,9 @@ impl RenderPool {
     /// counter, so retain the byte accesses required by that interface.
     pub(crate) fn counters(&self) -> Result<[u64; 2]> {
         let submitted = self.state.dword(0)?.load(Ordering::Relaxed);
-        let completed = self.control.pointer(FreeListControl::COMPLETED, 8)?;
+        let offset = if self.is_m5() { super::fw::m5::pool::COMPLETED }
+            else { FreeListControl::COMPLETED };
+        let completed = self.control.pointer(offset, 8)?;
         let mut bytes = [0; 8];
         for (index, byte) in bytes.iter_mut().enumerate() {
             // SAFETY: The checked eight-byte range stays mapped; byte accesses
@@ -356,6 +464,49 @@ impl RenderPool {
         }
         Ok([submitted, u64::from_le_bytes(bytes)])
     }
+
+    pub(crate) fn fits(&self, geometry: Option<super::fw::m5::pool::PoolGeometry>) -> bool {
+        match (self.layout, geometry) {
+            (PageLayout::M5(current), Some(required)) =>
+                current.block_bytes() == required.block_bytes() && current.blocks >= required.blocks,
+            (PageLayout::Neo { .. }, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_m5(&self) -> bool { matches!(self.layout, PageLayout::M5(_)) }
+
+    fn m5_state(&self) -> Result<super::fw::m5::pool::PoolState> {
+        if !self.is_m5() { return Err(EINVAL); }
+        let mut state = super::fw::m5::pool::PoolState([0; super::fw::m5::pool::STATE_BYTES]);
+        let raw = self.control.pointer(0, state.0.len())?;
+        fence(Ordering::Acquire);
+        for (index, byte) in state.0.iter_mut().enumerate() {
+            // SAFETY: The entire retained header range was checked above.
+            *byte = unsafe { raw.add(index).read_volatile() };
+        }
+        Ok(state)
+    }
+
+    pub(crate) fn m5_descriptor(&self) -> Result<[u64; 8]> { Ok(self.m5_state()?.descriptor()) }
+
+    pub(crate) fn store_m5_descriptor(&self, words: [u64; 8]) -> Result {
+        let mut state = self.m5_state()?;
+        if !state.matches(&words) { return Err(EIO); }
+        state.restore(words);
+        for offset in super::fw::m5::pool::SAVED_FIELDS {
+            let raw = self.control.pointer(offset, 4)?;
+            for index in 0..4 {
+                // SAFETY: Each mutable field was checked; the caller owns the
+                // retired descriptor, and immutable header bytes stay intact.
+                unsafe { raw.add(index).write_volatile(state.0[offset + index]) };
+            }
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(super) fn control_object(&self) -> &KernelObject { &self.control }
 
     /// Snapshot the unaligned shared fields before loading their descriptor.
     pub(crate) fn page_pool_state(&self) -> Result<PagePoolState> {
@@ -435,14 +586,15 @@ pub(crate) struct ComputePool {
     control: KernelObject,
     state: KernelObject,
     id: u16,
+    m5: bool,
 }
 impl ComputePool {
-    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8) -> Result<Self> {
+    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8, m5: bool, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result<Self> {
         if qid > super::fw::kick::QID_MAX {
             return Err(EINVAL);
         }
         let id = u16::from(qid) + 1;
-        let pages = Pages::new(alloc, COMPUTE_BLOCKS, RunLayout::Compute)?;
+        let pages = Pages::compute(alloc, m5, required)?;
         let mut control = alloc.kernel(
             CONTROL_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -455,24 +607,44 @@ impl ComputePool {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        control.write(
-            0,
-            FreeListControl::compute(&FreeListArgs {
-                buffer_slot: u32::from(id),
-                class: FreeListClass::One,
-                page_list_va: pages.page_list_va(),
-                run_list_va: pages.run_list_va(),
-                blocks: COMPUTE_BLOCKS as u32,
-                state_va: state.gpu_va(),
-            }),
-        )?;
+        Self::initialize_control(&mut control, &pages, id, state.gpu_va(), [0; 8])?;
         fence(Ordering::SeqCst);
-        Ok(Self {
-            pages: Some(pages),
-            control,
-            state,
-            id,
-        })
+        Ok(Self { pages: Some(pages), control, state, id, m5 })
+    }
+    fn initialize_control(control: &mut KernelObject, pages: &Pages, id: u16,
+        submitted: u64, completed: [u8; 8]) -> Result {
+        if pages.is_m5() {
+            use super::fw::m5::pool;
+            pool::encode_g17s_compute_state(pages.m5_layout(id)?, submitted,
+                &mut control.bytes_mut()[..pool::STATE_BYTES]).map_err(|_| EINVAL)?;
+            control.bytes_mut()[pool::COMPLETED..pool::COMPLETED + 8].copy_from_slice(&completed);
+            Ok(())
+        } else {
+            let mut header = FreeListControl::compute(&FreeListArgs {
+                buffer_slot: u32::from(id), class: FreeListClass::One,
+                page_list_va: pages.page_list_va(), run_list_va: pages.run_list_va(),
+                blocks: COMPUTE_BLOCKS as u32, state_va: submitted,
+            });
+            header.unk_54[..8].copy_from_slice(&completed);
+            control.write(0, header)
+        }
+    }
+    pub(crate) fn descriptor(&self) -> Result<PoolDescriptor> {
+        self.pages.as_ref().ok_or(EAGAIN)?.descriptor(self.id)
+    }
+    pub(crate) fn completed_submissions(&self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.completed_bytes()?))
+    }
+    fn completed_bytes(&self) -> Result<[u8; 8]> {
+        let offset = if self.m5 { super::fw::m5::pool::COMPLETED } else { FreeListControl::COMPLETED };
+        let pointer = self.control.pointer(offset, 8)?;
+        let mut bytes = [0; 8];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            // SAFETY: The checked packed counter remains mapped. Firmware may
+            // update it; callers use it only with the queue's completion proof.
+            *byte = unsafe { pointer.add(index).read_volatile() };
+        }
+        Ok(bytes)
     }
     pub(crate) fn id(&self) -> u16 {
         self.id
@@ -483,6 +655,9 @@ impl ComputePool {
     }
     pub(crate) fn control_va(&self) -> u64 {
         self.control.gpu_va()
+    }
+    pub(crate) fn fits(&self, required: Option<super::fw::m5::pool::PoolGeometry>) -> bool {
+        self.pages.as_ref().is_some_and(|pages| pages.fits(required))
     }
     pub(crate) fn populated(&self) -> bool {
         self.pages.is_some()
@@ -505,23 +680,9 @@ impl ComputePool {
         if self.pages.is_some() {
             return Err(EBUSY);
         }
-        let completed = self.control.pointer(FreeListControl::COMPLETED, 8)?;
-        let mut bytes = [0; 8];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            // SAFETY: The checked eight-byte range stays mapped; byte accesses
-            // match the unaligned packed counter the firmware writes.
-            *byte = unsafe { completed.add(index).read_volatile() };
-        }
-        let mut header = FreeListControl::compute(&FreeListArgs {
-            buffer_slot: u32::from(self.id),
-            class: FreeListClass::One,
-            page_list_va: pages.page_list_va(),
-            run_list_va: pages.run_list_va(),
-            blocks: COMPUTE_BLOCKS as u32,
-            state_va: self.state.gpu_va(),
-        });
-        header.unk_54[..8].copy_from_slice(&bytes);
-        self.control.write(0, header)?;
+        if pages.is_m5() != self.m5 { return Err(EINVAL); }
+        let completed = self.completed_bytes()?;
+        Self::initialize_control(&mut self.control, &pages, self.id, self.state.gpu_va(), completed)?;
         fence(Ordering::SeqCst);
         self.pages = Some(pages);
         Ok(())

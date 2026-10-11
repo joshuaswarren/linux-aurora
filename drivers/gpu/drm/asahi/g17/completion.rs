@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Per-command fences, timestamp destinations and VM pins retained through retirement.
 //!
@@ -166,6 +166,31 @@ impl ComputeTimestamps {
     }
 }
 
+/// M5 timestamp pairs share a retained page of the physical compute queue.
+/// A completion keeps its backing alive through quarantine and replay.
+struct M5ComputeTimestamps {
+    object: Arc<KernelObject>,
+    offset: usize,
+}
+
+impl M5ComputeTimestamps {
+    fn clear(&self) -> Result {
+        let start = self.object.dword(self.offset)?;
+        let end = self.object.dword(self.offset + 8)?;
+        start.store(0, Ordering::Relaxed);
+        end.store(0, Ordering::Relaxed);
+        barrier(Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn words(&self) -> Result<[u64; 2]> {
+        let words = [self.object.dword(self.offset)?.load(Ordering::Relaxed),
+            self.object.dword(self.offset + 8)?.load(Ordering::Relaxed)];
+        barrier(Ordering::Acquire);
+        Ok(words)
+    }
+}
+
 #[pin_data]
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
@@ -174,6 +199,8 @@ pub(crate) struct Completion {
     // predecessor's host writes. DRM credits must follow the terminal result.
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<ComputeTimestamps>,
+    #[pin]
+    m5_compute: Mutex<Option<M5ComputeTimestamps>>,
     feed: Option<Arc<super::feed::Feed>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
@@ -215,7 +242,7 @@ impl Completion {
         } else {
             HostOutput::Immediate(output)
         };
-        let compute = if compute {
+        let compute = if compute && !context.is_sptm() {
             Some(ComputeTimestamps::new(dev, context.vm())?)
         } else {
             None
@@ -226,6 +253,7 @@ impl Completion {
                 output,
                 terminal,
                 compute,
+                m5_compute <- new_mutex!(None, "M5 queue timestamps"),
                 feed,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
@@ -278,14 +306,33 @@ impl Completion {
     }
 
     pub(crate) fn compute_timestamp_va(&self) -> Result<u64> {
-        Ok(self.compute.as_ref().ok_or(EINVAL)?.mapping.iova())
+        if let Some(compute) = &self.compute { return Ok(compute.mapping.iova()); }
+        let compute = self.m5_compute.lock();
+        let compute = compute.as_ref().ok_or(EINVAL)?;
+        Ok(compute.object.gpu_va() + compute.offset as u64)
+    }
+
+    /// The queue checked its record-slot retirement before calling this.
+    /// Clearing and binding precede descriptor publication under the device lock.
+    pub(crate) fn bind_m5_compute_timestamps(&self, object: &Arc<KernelObject>, offset: usize) -> Result<u64> {
+        if self.compute.is_some() || self.signalled.load(Ordering::Acquire) {
+            return Err(EINVAL);
+        }
+        let timestamps = M5ComputeTimestamps { object: object.clone(), offset };
+        timestamps.clear()?;
+        let address = timestamps.object.gpu_va() + offset as u64;
+        *self.m5_compute.lock() = Some(timestamps);
+        Ok(address)
     }
 
     /// The caller has proved that firmware retired this command, or has
     /// received its scheduler kill acknowledgement with recovery closed.
     /// These are the command's public timestamp words, not queue-private state.
     pub(crate) fn compute_words(&self) -> Result<[u64; 2]> {
-        let object = &self.compute.as_ref().ok_or(EINVAL)?.object;
+        let Some(compute) = self.compute.as_ref() else {
+            return self.m5_compute.lock().as_ref().ok_or(EINVAL)?.words();
+        };
+        let object = &compute.object;
         let words = [
             object.dword(0)?.load(Ordering::Relaxed),
             object.dword(8)?.load(Ordering::Relaxed),
@@ -335,7 +382,10 @@ impl Completion {
         if self.signalled.load(Ordering::Acquire) {
             return Err(ECANCELED);
         }
-        let object = &self.compute.as_ref().ok_or(EINVAL)?.object;
+        let Some(compute) = self.compute.as_ref() else {
+            return self.m5_compute.lock().as_ref().ok_or(EINVAL)?.clear();
+        };
+        let object = &compute.object;
         let start = object.dword(0)?;
         let end = object.dword(8)?;
         start.store(0, Ordering::Relaxed);

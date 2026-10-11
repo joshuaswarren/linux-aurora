@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! G17 firmware structures.
 //!
@@ -18,6 +18,7 @@ pub(crate) mod context;
 pub(crate) mod freelist;
 pub(crate) mod initdata;
 pub(crate) mod kick;
+pub(crate) mod m5;
 pub(crate) mod queue;
 pub(crate) mod render;
 pub(crate) mod qos;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Off-lock render graph construction and command preparation. Every borrowed
 //! installed pair returns to its device owner before its preparation lease ends.
@@ -25,22 +25,39 @@ struct BuildResources {
 }
 impl BuildResources {
     fn new(firmware: &crate::g17::Firmware) -> Result<Self> {
+        let metrics = firmware._pm_metrics.as_ref().ok_or(ENOTSUPP)?.clone();
+        let client = if firmware.uat.is_sptm() { metrics.gpu_va() } else {
+            crate::hw::t8140::CONFIG.pm_metrics.as_ref().ok_or(ENOTSUPP)?.va
+        };
         Ok(Self {
             uat: firmware.uat.clone(),
             objects: firmware.pool.clone(),
             ids: firmware.render_ids.clone(),
             global: firmware._render_global.clone(),
-            metrics: firmware._pm_metrics.clone(),
+            metrics,
             metrics_ids: firmware.queues.metrics.clone(),
             metrics_bases: crate::g17::fw::buffer::MetricsAddresses {
                 firmware: firmware.init.metrics_fw_va()?,
-                client: crate::hw::t8140::CONFIG.pm_metrics.va,
+                client,
             },
             config: firmware.queues.render.config,
         })
     }
+    fn pool_plan(&self, packet: &Packet) -> Result<Option<crate::g17::render_resources::Plan>> {
+        let crate::g17::command::Validated::Render { plan, .. } = &packet.command
+            else { return Err(EINVAL); };
+        if self.uat.is_sptm() != plan.is_some() { return Err(EINVAL); }
+        Ok(*plan)
+    }
     fn metrics(&self) -> Result<MetricsLease> {
         MetricsLease::new(&self.metrics_ids, &self.metrics, self.metrics_bases)
+    }
+    /// Called during off-lock preparation, after userspace bindings exist.
+    fn bind_metrics(&self, context: &crate::g17::context::Context, metrics: &mut MetricsLease) -> Result {
+        if self.uat.is_sptm() {
+            metrics.set_client_base(context.metrics_client(&self.metrics)?)?;
+        }
+        Ok(())
     }
 }
 
@@ -119,18 +136,16 @@ impl super::super::Backend {
                     } else {
                         let pair = entry.pair.as_ref().ok_or(EBUSY)?;
                         if pair.matches(self.owner, &self.context)? {
-                            if !pair.pool().vacant() {
-                                return Ok(());
+                            let plan = resources.pool_plan(first)?;
+                            if pair.pool().fits(plan.map(|p| p.geometry)) {
+                                if !pair.pool().vacant() { return Ok(()); }
+                                let pool = pair.pool().clone();
+                                drop(state);
+                                let alloc = Allocator { dev: &dev, uat: &resources.uat };
+                                return pool.ensure_backing(&alloc, &resources.global, self.context.vm());
                             }
-                            let pool = pair.pool().clone();
-                            drop(state);
-                            let alloc = Allocator {
-                                dev: &dev,
-                                uat: &resources.uat,
-                            };
-                            return pool.ensure_backing(&alloc, &resources.global, self.context.vm());
                         }
-                        if !pair.reusable()? {
+                        if !pair.bindable(self.owner, &self.context)? {
                             return Err(EBUSY);
                         }
                         let foreign = !Arc::ptr_eq(pair.context().status(), self.context.status());
@@ -226,7 +241,7 @@ impl super::super::Backend {
         ctx: &BuildContext<'_>,
         reservation: Reservation,
         pm_generation: u64,
-        metrics: MetricsLease,
+        mut metrics: MetricsLease,
     ) -> Result {
         let BuildContext {
             lease,
@@ -236,9 +251,10 @@ impl super::super::Backend {
             first,
         } = *ctx;
         let built = (|| -> Result<KBox<Pair>> {
+            resources.bind_metrics(&self.context, &mut metrics)?;
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)?;
             Pair::new(
                 &alloc,
                 &resources.objects,
@@ -304,7 +320,7 @@ impl super::super::Backend {
         mut parked: crate::g17::queue::render::parked::ParkedPair,
         buffer: (u8, u64),
         pm_generation: u64,
-        metrics: MetricsLease,
+        mut metrics: MetricsLease,
     ) -> Result {
         let BuildContext {
             lease,
@@ -314,9 +330,10 @@ impl super::super::Backend {
             first,
         } = *ctx;
         let built = (|| -> Result<_> {
+            resources.bind_metrics(&self.context, &mut metrics)?;
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)?;
             let prepared = parked.prepare(
                 &alloc,
                 &resources.objects,
@@ -417,7 +434,7 @@ impl super::super::Backend {
         mut pair: KBox<Pair>,
         buffer: Option<(u8, u64)>,
         pm_generation: Option<u64>,
-        metrics: Option<MetricsLease>,
+        mut metrics: Option<MetricsLease>,
     ) -> Result {
         let BuildContext {
             lease,
@@ -427,9 +444,12 @@ impl super::super::Backend {
             first,
         } = *ctx;
         let prepared = (|| {
+            if let Some(metrics) = metrics.as_mut() {
+                resources.bind_metrics(&self.context, metrics)?;
+            }
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global)?;
+                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)?;
             pair.prepare_bind(
                 &alloc,
                 &resources.objects,
@@ -468,11 +488,11 @@ impl super::super::Backend {
                 {
                     return Err(ENOSPC);
                 }
-                firmware.queues.teardown.displace(
-                    pair.context(),
-                    true,
-                    super::super::now_ns(),
-                )?;
+                if !pair.matches(self.owner, &self.context)? {
+                    firmware.queues.teardown.displace(
+                        pair.context(), true, super::super::now_ns(),
+                    )?;
+                }
                 pair.bind_owner(
                     prepared.as_mut().ok_or(EIO)?,
                     &alloc,
@@ -497,6 +517,7 @@ impl super::super::Backend {
             entry.preparing = None;
             entry.pending_owner = None;
             entry.pending_owner_closed = false;
+            if entry.closed { pair.release_owner(); }
             entry.pair = Some(pair);
             entry.borrowed_dependencies = None;
             (result, firmware.render_grow_ready())

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Kernel objects shared with the G17 firmware.
 //!
@@ -81,6 +81,27 @@ impl KernelObject {
             Placement::In(range, align) => this.obj.map_into_range(vm, range, align, prot, true)?,
         };
         this.mapping = Some(mapping);
+        Ok(this)
+    }
+
+    /// Creates a cached firmware view at its fixed unpublished graph address.
+    ///
+    /// # Safety
+    /// Once published, retain the mapping until both firmware processors stop.
+    pub(crate) unsafe fn new_cached_firmware_at(
+        dev: &AsahiDevice, vm: &mmu::Vm, address: u64, size: usize,
+        prot: mmu::Prot, cpu: CpuMap,
+    ) -> Result<Self> {
+        // GEM backs even a sub-page ABI object with complete UAT pages.
+        // Reserve and cache that same rounded extent, retaining the logical size.
+        let mapped_size = size.checked_add(mmu::UAT_PGMSK).ok_or(EOVERFLOW)?
+            & !mmu::UAT_PGMSK;
+        let end = address.checked_add(mapped_size as u64).ok_or(EOVERFLOW)?;
+        let mut this = Self::backing(dev, size, cpu)?;
+        // SAFETY: The caller owns graph storage through firmware stop. The
+        // exact-sized reservation preserves the ABI's fixed address and extent.
+        this.mapping = Some(unsafe { this.obj.map_into_range_with_cached_prefix(
+            vm, address..end, mmu::UAT_PGSZ as u64, prot, false, mapped_size)? });
         Ok(this)
     }
 
@@ -281,6 +302,25 @@ impl KernelObject {
         Ok(unsafe { AtomicU64::from_ptr(self.aligned(offset)?) })
     }
 
+    /// A checked range of live atomic words. Validate the complete extent and
+    /// alignment once; subsequent indexed loads still observe firmware writes.
+    pub(crate) fn atomic_dwords(&self, offset: usize, count: usize) -> Result<&[AtomicU64]> {
+        let bytes = count.checked_mul(core::mem::size_of::<AtomicU64>()).ok_or(EINVAL)?;
+        if bytes > isize::MAX as usize {
+            return Err(EINVAL);
+        }
+        let ptr = self.pointer(offset, bytes)?.cast::<AtomicU64>();
+        if ptr as usize % core::mem::align_of::<AtomicU64>() != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: pointer() checked the entire extent against this object's
+        // retained mapping; alignment and the slice size limit are checked
+        // above. AtomicU64 accepts every bit pattern. The shared borrow ties
+        // the view to the object, and all CPU accesses remain atomic, as in
+        // dword(). Firmware retains ownership of the live word contents.
+        Ok(unsafe { core::slice::from_raw_parts(ptr, count) })
+    }
+
     /// Copies `N` 32-bit words that start at `offset` out of the object, one volatile access each.
     ///
     /// Used for records another agent has published, which it no longer modifies.
@@ -303,6 +343,20 @@ pub(crate) struct Allocator<'a> {
 }
 
 impl Allocator<'_> {
+    /// Creates attributes before publishing a firmware object's address.
+    ///
+    /// # Safety
+    /// The returned object must remain mapped until firmware stops after publication.
+    unsafe fn kernel_cached_prefix(&self, size: usize, align: u64, prefix: usize,
+        prot: mmu::Prot, cpu: CpuMap, late: Range<usize>) -> Result<KernelObject> {
+        let mut object = KernelObject::backing(self.dev, size, cpu)?;
+        // SAFETY: The caller retains this object through firmware stop.
+        let mapping = unsafe { object.obj.map_into_range_with_cached_regions(
+            self.uat.kernel_vm(), self.uat.kernel_dynamic_range(), align, prot, true, prefix, late)? };
+        object.mapping = Some(mapping);
+        Ok(object)
+    }
+
     /// Allocates in the dynamic part of the firmware's upper address space.
     pub(crate) fn kernel(
         &self,
@@ -311,8 +365,7 @@ impl Allocator<'_> {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<KernelObject> {
-        let mut range = self.uat.geometry().kernel_range();
-        range.start += crate::hw::t8140::dynamic::KERNEL_OFFSET;
+        let range = self.uat.kernel_dynamic_range();
         KernelObject::new(
             self.dev,
             self.uat.kernel_vm(),
@@ -332,14 +385,18 @@ impl Allocator<'_> {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<KernelObject> {
+        let range = self.uat.kernel_lower_dynamic_range();
         KernelObject::new(
             self.dev,
             self.uat.kernel_lower_vm(),
-            Placement::In(crate::hw::t8140::dynamic::LOWER, align),
+            Placement::In(range.clone(), align),
             size,
             prot,
             cpu,
-        )
+        ).inspect_err(|error| {
+            dev_err!(self.dev.as_ref(), "Canonical GPU allocation {} bytes in {:#x}..{:#x}: {:?}\n",
+                size, range.start, range.end, error);
+        })
     }
 }
 
@@ -351,9 +408,10 @@ pub(crate) enum Family {
     WorkState = 1,
     QueueState = 2,
     QueueConfig = 3,
+    Scheduler = 4,
 }
 
-const POOL_FAMILIES: usize = 4;
+const POOL_FAMILIES: usize = 5;
 const POOL_SLOTS: usize = 64;
 const POOL_BYTES: usize = 128 * 1024 * 1024;
 
@@ -477,7 +535,6 @@ impl Pool {
                 lease: Some(lease()),
             });
         }
-        let object = alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, cpu)?;
         let reserved = {
             let mut inner = self.inner.lock();
             if inner.stopped {
@@ -496,11 +553,41 @@ impl Pool {
                 true
             }
         };
+        // A new SPTM mapping can select its attributes at creation, without
+        // changing a live firmware translation. Reserve recycling capacity
+        // first: cached objects must stay mapped until firmware stops.
+        let sptm_cached = reserved && prefix != 0 && prefix <= size
+            && prefix & mmu::UAT_PGMSK == 0 && alloc.uat.is_sptm()
+            && *crate::module_parameters::m5_cached_objects.value() == 1;
+        let allocation = if sptm_cached {
+            // SAFETY: reserved capacity is transferred to the returned CacheLease;
+            // cached mappings stay installed until the pool's firmware-stop witness.
+            unsafe { alloc.kernel_cached_prefix(size, mmu::UAT_PGSZ as u64, prefix, prot, cpu,
+                if family == Family::QueueState && size == 0x1c000 && prefix == 0x8000 {
+                    0xc000..0x14000
+                } else { 0..0 }) }
+        } else { alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, cpu) };
+        let object = match allocation {
+            Ok(object) => object,
+            Err(error) => {
+                if reserved {
+                    let mut inner = self.inner.lock();
+                    inner.reserved[family_index] -= 1;
+                    inner.bytes -= size;
+                }
+                return Err(error);
+            }
+        };
         let mut result = PooledObject {
             object: core::mem::ManuallyDrop::new(object),
             lease: reserved.then(lease),
         };
         if !reserved {
+            return Ok(result);
+        }
+        if sptm_cached {
+            // The synchronous mapping provider verifies the native leaves.
+            // No direct-PTE conversion or synthetic readback is needed.
             return Ok(result);
         }
         let (proof, mutated) = match result.mapping.as_ref() {

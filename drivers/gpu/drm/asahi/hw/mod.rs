@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Per-SoC hardware configuration structures
 //!
@@ -16,6 +16,7 @@ pub(crate) mod t602x;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
 pub(crate) mod t8140;
+pub(crate) mod t6050;
 
 /// GPU generation enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]

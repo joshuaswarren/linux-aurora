@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Asahi driver GEM object implementation
 //!
@@ -168,6 +168,29 @@ impl ObjectRef {
             return Err(EINVAL);
         }
         vm.map_in_range(&self.gem, 0..self.gem.size(), alignment, range, prot, guard)
+    }
+
+    /// Creates an initial firmware-cached prefix in a kernel object mapping.
+    ///
+    /// # Safety
+    /// The owner must retain the mapping until firmware stops after publication.
+    pub(crate) unsafe fn map_into_range_with_cached_prefix(
+        &mut self, vm: &crate::mmu::Vm, range: Range<u64>, alignment: u64,
+        prot: mmu::Prot, guard: bool, prefix: usize,
+    ) -> Result<crate::mmu::KernelMapping> {
+        if !self.gem.kernel { return Err(EINVAL); }
+        // SAFETY: The caller supplies the mapping-retention guarantee.
+        unsafe { vm.map_in_range_with_cached_prefix(&self.gem, alignment, range,
+            prot, guard, prefix) }
+    }
+
+    pub(crate) unsafe fn map_into_range_with_cached_regions(
+        &mut self, vm: &crate::mmu::Vm, range: Range<u64>, alignment: u64,
+        prot: mmu::Prot, guard: bool, prefix: usize, late: Range<usize>,
+    ) -> Result<crate::mmu::KernelMapping> {
+        if !self.gem.kernel { return Err(EINVAL); }
+        unsafe { vm.map_in_range_with_cached_regions(&self.gem, alignment, range,
+            prot, guard, prefix, late) }
     }
 
     /// Maps a range within an object into a given `Vm` at any free address within a given range.
@@ -347,6 +370,10 @@ impl Drop for KernelMappingPin {
 }
 
 impl AsahiObject {
+    pub(crate) fn is_kernel(&self) -> bool {
+        self.kernel
+    }
+
     pub(crate) fn idle_reclaim_candidate(&self) -> bool {
         !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
     }

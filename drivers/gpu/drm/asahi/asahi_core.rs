@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 #![recursion_limit = "2048"]
 
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
@@ -62,8 +62,48 @@ module! {
     type: DriverModule,
     name: "asahi",
     description: "AGX GPU driver for Apple silicon SoCs",
-    license: "Dual MIT/GPL",
+    license: "GPL",
     params: {
+        m5_platform_enable: u32 {
+            default: 0,
+            description: "Enable native M5 SLC allocation and static PMC voters at initialization",
+        },
+        m5_platform_max: u32 {
+            default: 0,
+            description: "Request M5 ADT maximum DCS and SOC floors once at GPU startup",
+        },
+        m5_cached_objects: u32 {
+            default: 1,
+            description: "Use retained native cached M5 command mappings; 0 disables for diagnostics",
+        },
+        m5_render_submit_test: u32 {
+            default: 0,
+            description: "Enable bounded single-group M5 render submission qualification",
+        },
+        m5_drm_test: u32 {
+            default: 0,
+            description: "M5 DRM qualification: 1=memory/queues, 2=non-scratch compute submission",
+        },
+        m5_render_test: u32 {
+            default: 0,
+            description: "M5 render qualification: 1=queues, 2=draw input, 3=draw after pool growth",
+        },
+        m5_render_iterations: u32 {
+            default: 1,
+            description: "Number of exact draws in explicit M5 render qualification",
+        },
+        m5_compute_test: u32 {
+            default: 0,
+            description: "Run explicit M5 arithmetic qualification after firmware startup",
+        },
+        m5_firmware_test: u32 {
+            default: 0,
+            description: "Start M5 firmware through the shared G17 runtime; reboot to repeat",
+        },
+        m5_sptm_selftest: u32 {
+            default: 0,
+            description: "Test M5 SPTM VM/context lifetime without starting GPU firmware",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,

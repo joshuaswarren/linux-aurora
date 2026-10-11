@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Exact logical ownership gates for scheduler release and physical-pair parking.
 
@@ -60,7 +60,10 @@ impl RenderState {
         }
         let mut index = 0;
         while index < self.retired.len() {
-            if self.retired[index].buffer_id().is_some() {
+            let pool = self.retired[index].pool();
+            if self.retired[index].buffer_id().is_some()
+                || (self.retired[index].wait_for_pool_release()
+                    && !self.pools.released(u32::from(pool.id()), pool.control_va())) {
                 index += 1;
                 continue;
             }

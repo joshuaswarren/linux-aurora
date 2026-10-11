@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Firmware restart handshake and per-VM failure classification.
 //!
@@ -164,6 +164,7 @@ pub(super) fn service<H: Host>(
     crashed: impl Fn() -> bool,
 ) -> Result<ServiceResult> {
     let request = host.recovery().pending.ok_or(EINVAL)?;
+    pr_err!("AGX firmware recovery requested: generation={} blamed={:?}\n", request.generation, request.blamed);
     if request.generation != host.recovery().accepted || host.host_recovery()? != 0 {
         return Err(EIO);
     }
@@ -196,6 +197,7 @@ pub(super) fn service<H: Host>(
         host.clear_timestamps()?;
     }
     let mut sources = host.fault_sources()?;
+    pr_err!("AGX firmware recovery fault sources: {:?}\n", sources);
     let target_error = host.publish_recovery_targets();
     host.transition(1, 2)?;
     let mut recovered = false;

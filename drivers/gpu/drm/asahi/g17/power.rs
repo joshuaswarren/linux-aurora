@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Work-based firmware performance effort. Idle power gating is managed separately by the
 //! device-control ring; this input never keeps an otherwise idle GPU powered.
@@ -94,6 +94,8 @@ fn wait<C: Control>(control: &C, target: u32, require_powered: bool) -> kernel::
         }
         control.wait_tick();
     }
+    pr_warn!("G17 power control timed out: target {} counters {:?} retired {} require_powered {} powered {}\n",
+        target, control.counters(), retired, require_powered, control.powered());
     Err(ETIMEDOUT)
 }
 

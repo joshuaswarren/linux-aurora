@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Submission admission, preparation and the firmware visibility boundary.
 
@@ -77,6 +77,10 @@ impl Backend {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
                     if state_polls == 1000 {
+                        if crate::g17::m5_render_submission::enabled() {
+                            dev_warn!(self.shared.dev.as_ref(), "M5 render admission timeout: work={} takeover={} recovery={} published={}\n",
+                                state_polls, takeover_polls, recovery_polls, packet.is_published());
+                        }
                         return Err(ETIMEDOUT);
                     }
                     state_polls += 1;
@@ -92,6 +96,10 @@ impl Backend {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
                     if takeover_polls == 5000 {
+                        if crate::g17::m5_render_submission::enabled() {
+                            dev_warn!(self.shared.dev.as_ref(), "M5 render admission timeout: work={} takeover={} recovery={} published={}\n",
+                                state_polls, takeover_polls, recovery_polls, packet.is_published());
+                        }
                         return Err(ETIMEDOUT);
                     }
                     takeover_polls += 1;
@@ -110,14 +118,22 @@ impl Backend {
                     };
                     if recovering {
                         if recovery_polls == super::super::RECOVERY_SETTLE_POLLS {
-                            return Err(ETIMEDOUT);
+                            if crate::g17::m5_render_submission::enabled() {
+                            dev_warn!(self.shared.dev.as_ref(), "M5 render admission timeout: work={} takeover={} recovery={} published={}\n",
+                                state_polls, takeover_polls, recovery_polls, packet.is_published());
+                        }
+                        return Err(ETIMEDOUT);
                         }
                         recovery_polls += 1;
                         self.shared.queue_events();
                         fsleep(Delta::from_millis(1));
                     } else if error == EBUSY {
                         if takeover_polls == 5000 {
-                            return Err(ETIMEDOUT);
+                            if crate::g17::m5_render_submission::enabled() {
+                            dev_warn!(self.shared.dev.as_ref(), "M5 render admission timeout: work={} takeover={} recovery={} published={}\n",
+                                state_polls, takeover_polls, recovery_polls, packet.is_published());
+                        }
+                        return Err(ETIMEDOUT);
                         }
                         takeover_polls += 1;
                         fsleep(Delta::from_micros(200));

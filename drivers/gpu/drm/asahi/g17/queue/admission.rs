@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Logical queue and physical render-pair admission. A retained pair belongs
 //! to one logical owner even while idle. Closing that owner makes it reusable
@@ -12,7 +12,7 @@ use crate::g17::{
     hazard::{self, Footprint, Plan},
     job::Packet,
 };
-use crate::{hw::t8140::queues as cfg, mmu::MAX_EXECUTION_CONTEXTS};
+use crate::hw::t8140::queues as cfg;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::{
     new_condvar, new_mutex,
@@ -295,10 +295,10 @@ impl Pool {
             GFP_KERNEL,
         )
     }
-    pub(crate) fn reserve_queue(self: &Arc<Self>) -> Result<QueueSlot> {
+    pub(crate) fn reserve_queue(self: &Arc<Self>, limit: u32) -> Result<QueueSlot> {
         let mut count = self.queues.load(Ordering::Acquire);
         loop {
-            if count >= MAX_EXECUTION_CONTEXTS {
+            if count >= limit {
                 return Err(ENOSPC);
             }
             match self.queues.compare_exchange(

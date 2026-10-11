@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Context-local work-state identities. The low six bits address a node;
 //! the complete sequence distinguishes its owner until exact retirement.
@@ -9,12 +9,12 @@ pub(super) const FREE: u32 = u32::MAX;
 pub(super) const STATE_COUNT: usize = 63;
 pub(super) const NODE_STRIDE: usize = 0x100;
 
-pub(super) struct WorkStates {
+pub(crate) struct WorkStates {
     next: AtomicU32,
     live: [AtomicU32; 64],
 }
 impl WorkStates {
-    pub(super) const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             next: AtomicU32::new(0),
             live: [const { AtomicU32::new(FREE) }; 64],
@@ -49,7 +49,7 @@ pub(super) struct RenderSlots {
     origins: [Option<u64>; 2],
 }
 impl RenderSlots {
-    pub(super) const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             pairs: [None; 2],
             origins: [None; 2],

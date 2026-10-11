@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Userspace submission queues: validate whole ioctls, retain mappings, and enqueue
 //! independent engines behind user fences and explicit logical prefixes.
@@ -127,9 +127,12 @@ impl<B: Backend> Queue<B> {
         })
     }
 
-    fn ensure_compute(&mut self) -> Result {
-        // Admission is checked even when this queue already owns a scheduler.
-        self.backend.ensure_compute()?;
+    fn ensure_compute(&mut self, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result {
+        // M5 binds a physical queue at worker publication. A logical queue
+        // can be enqueued while all physical QIDs are busy with other owners.
+        if !self.context.is_sptm() {
+            self.backend.ensure_compute(required)?;
+        }
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
                 &self.dev,
@@ -174,7 +177,10 @@ impl<B: Backend> Queue<B> {
         self.prune_frontier(index);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
-            self.ensure_compute()?;
+            let required = match &command { Validated::Compute { plan, .. } => plan.map(|p| p.geometry), _ => None };
+            self.ensure_compute(required).map_err(|error| {
+                dev_info!(self.dev.as_ref(), "G17 compute graph preparation failed: {:?}\n", error); error
+            })?;
         }
         // Only earlier render ordinals covered by the explicit logical prefix
         // can delay host publication. These links never become GPU dependencies.
@@ -195,7 +201,9 @@ impl<B: Backend> Queue<B> {
             engine == Engine::Compute,
             host_predecessors.clone().next().is_some(),
             if engine == Engine::Render { self.backend.feed() } else { None },
-        )?;
+        ).map_err(|error| {
+            dev_info!(self.dev.as_ref(), "G17 completion allocation failed: {:?}\n", error); error
+        })?;
         let publication = completion.publication()
             .map(|target| PreparedPublication::new(target, host_predecessors))
             .transpose()?;
@@ -311,16 +319,19 @@ impl<B: Backend> Queue<B> {
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
         while let Some(command) = parser.next()? {
-            let payload = self.proof.validate(
+            let mut payload = self.proof.validate(
                 self.context.vm(),
                 self.range.clone(),
                 &self.window,
                 &command.payload,
+                self.backend.max_tile_buffer_bytes(),
             )?;
             let engine = match &payload {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
+            if !self.backend.supports_engine(engine) { return Err(ENOTSUPP); }
+            self.backend.prepare_command(&mut payload)?;
             let order = Order::new(
                 base,
                 preceding,
@@ -368,10 +379,15 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             &self.allocation_failure,
         )?;
         let result = (|| {
+            if !self.backend.supports_submission() {
+                return Err(ENOTSUPP);
+            }
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (pending, guards) = self.prepare_submission(bytes, objects)?;
+            let (pending, guards) = self.prepare_submission(bytes, objects).map_err(|error| {
+                dev_info!(self.dev.as_ref(), "G17 submission validation failed: {:?}\n", error); error
+            })?;
             let mut guards = guards.into_iter();
             let aggregate = outputs.publish(self.context.clone())?;
             for (command, order, destinations) in pending {

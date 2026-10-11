@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! GPU MMIO register abstraction
 //!
@@ -292,6 +292,30 @@ impl Resources {
         Ok(true)
     }
 
+    /// Publishes through the M5 host command port, including the kick that
+    /// makes an idle queue runnable. Core activity is not a prerequisite.
+    pub(crate) fn submit_m5_work(
+        &self, submission:&crate::g17::fw::m5::queue::HardwareSubmission,
+    )->Result {
+        let sgx=self.sgx.try_access().ok_or(ENODEV)?;
+        for &(offset,value) in submission.writes() {sgx.try_write64(value,offset)?;}
+        Ok(())
+    }
+
+    /// Sample only the two owned queue configuration words through the
+    /// host tag/data port. The caller holds the device mutex and power hold.
+    pub(crate) fn m5_queue_configurations(&self,qids:[u8;2])->Result<[u64;2]> {
+        let sgx=self.sgx.try_access().ok_or(ENODEV)?;
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY)&G17_HOST_POWERED==0 {return Err(EAGAIN);}
+        let mut values=[0;2];
+        for (value,qid) in values.iter_mut().zip(qids) {
+            let tag=crate::g17::fw::m5::queue::HardwareSubmission::configuration_tag(qid)?;
+            sgx.try_write64(tag,0x4090)?;
+            *value=sgx.try_read64(0x4098)?;
+        }
+        Ok(values)
+    }
+
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
         if let Some(sgx) = self.sgx.try_access() {
             sgx.relaxed().read32(OFF)
@@ -456,6 +480,43 @@ impl Resources {
             core_masks,
             core_masks_packed,
         })
+    }
+
+    /// Power AFR before GFX without changing the GPX domain.
+    pub(crate) fn power_m5(&self) -> Result {
+        for offset in [0xe80100, 0xe80110] {
+            {
+                let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+                let value = sgx.try_read32(offset)?;
+                sgx.try_write32((value & !(0xf | 0x300 | (1 << 28))) | 0xf, offset)?;
+            }
+            let mut ready = false;
+            for _ in 0..1000 {
+                let value = self.sgx.try_access().ok_or(ENODEV)?.try_read32(offset)?;
+                if (value >> 4) & 0xf == 0xf {
+                    ready = true;
+                    break;
+                }
+                kernel::time::delay::fsleep(kernel::time::Delta::from_micros(100));
+            }
+            if !ready { return Err(ETIMEDOUT); }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_m5_firmware(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let value = sgx.try_read32(0xe90000)?;
+        if value != 0x30000 && value != 0x30001 { return Err(EIO); }
+        sgx.try_write32(value | 1, 0xe90000)?;
+        self.enable_g17_gating()
+    }
+
+    /// Raw M5 fault-window witness; the selector is observed, never changed.
+    pub(crate) fn m5_fault_registers(&self)->Result<[u64;3]> {
+        let sgx=self.sgx.try_access().ok_or(ENODEV)?;
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY)&G17_HOST_POWERED==0 {return Err(EAGAIN);}
+        Ok([sgx.try_read64(0xd800)?,sgx.try_read64(0xd8c0)?,sgx.try_read64(0xd8c8)?])
     }
 
     /// Get the identification of a G17 GPU from its registers.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Device-control records and work-ring slots.
 //!
@@ -245,7 +245,9 @@ impl ControlRecord {
         match self {
             Self::TvbGrow(_) => DeviceControlOp::TvbGrowReply,
             Self::IdlePowerOff(_) => DeviceControlOp::IdlePowerOff,
-            Self::SchedulerStateRelease(_) => DeviceControlOp::SchedulerStateRelease,
+            Self::SchedulerStateRelease(record) => if record.opcode == DeviceControlOp::M5SchedulerStateRelease as u32 {
+                DeviceControlOp::M5SchedulerStateRelease
+            } else { DeviceControlOp::SchedulerStateRelease },
             Self::FreeListRelease(_) => DeviceControlOp::FreeListRelease,
             Self::ContextKill(_) => DeviceControlOp::ContextKill,
         }
@@ -277,6 +279,8 @@ pub(crate) enum DeviceControlOp {
     IdlePowerOff = 0x0a,
     /// Release a logical queue's scheduler state ([`SchedulerStateRelease`]).
     SchedulerStateRelease = 0x14,
+    /// M5 encoding of the same scheduler-state release.
+    M5SchedulerStateRelease = 0x13,
     /// Release a free list's buffer slot ([`FreeListRelease`]).
     FreeListRelease = 0x2e,
     /// Stop the queues named by a closed logical scheduler.
@@ -459,7 +463,7 @@ pub(crate) const fn work_ring_index(priority: u8, data_master: DataMaster) -> Op
 
 /// One work-ring slot: a request to run a queue's newly published commands.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkSlot {
     pub(crate) unk_00: u64,
     /// GPU address of the queue record.

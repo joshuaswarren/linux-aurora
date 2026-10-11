@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Exact packet timeout and paired firmware-drain settlement. Every fence and
 //! admission release is collected under the device lock and finished outside it.
@@ -7,10 +7,15 @@ use crate::g17::{
     job::Packet,
     runtime::{Backend, DeferredBatch},
 };
+use crate::g17::queue::render::Host as _;
 use kernel::{dma_fence::RawDmaFence, prelude::*, sync::Arc};
 
 impl Backend {
     pub(in crate::g17) fn timeout_render(&self, packet: &Arc<Packet>) -> Result {
+        if crate::g17::m5_render_submission::enabled() {
+            dev_warn!(self.shared.dev.as_ref(), "M5 render scheduler timeout: published={} slot={:?}\n",
+                packet.is_published(), packet.completion.render_slot());
+        }
         let mut deferred = DeferredBatch::worker()?;
         let result = {
             let mut state = self.shared.state.lock();
@@ -19,6 +24,15 @@ impl Backend {
             };
             if firmware.queues.defer_render_timeout(packet, ETIMEDOUT) {
                 return Ok(());
+            }
+            if let Some(slot) = packet.completion.render_slot() {
+                let dev = firmware.primary.state.shared.drm()?;
+                firmware.with_render(usize::from(slot), |pair, host| {
+                    pair.diagnose_m5(&dev);
+                    let qids = pair.qids();
+                    dev_warn!(dev.as_ref(), "M5 render completion stamps: {:?}\n", host.stamps(qids));
+                    Ok(())
+                })?;
             }
             firmware.fail_render_packet(packet, ETIMEDOUT, &mut deferred)
         };

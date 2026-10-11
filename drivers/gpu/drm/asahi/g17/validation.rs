@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Reuse address-coverage proofs only while the VM's page tables are unchanged.
 
@@ -91,9 +91,12 @@ impl Proof {
         range: Range<u64>,
         window: &UscWindow,
         payload: &Payload,
+        max_tile_buffer: u64,
     ) -> Result<Validated> {
         let requests = RefCell::new(Requests::new());
-        let optimistic = payload.validate(window, &Space::Record(&range, &requests));
+        let optimistic = payload.validate(
+            window, &Space::Record(&range, &requests), max_tile_buffer,
+        );
         let requests = requests.into_inner();
         if optimistic.is_ok() && !requests.overflow {
             if self.covers(vm.mapping_validation_epoch(), &requests) {
@@ -107,7 +110,7 @@ impl Proof {
             self.epoch = None;
         }
         // Preserve per-range validation's failure and concurrent-mutation behavior.
-        payload.validate(window, &Space::Checked(&range, vm))
+        payload.validate(window, &Space::Checked(&range, vm), max_tile_buffer)
     }
 }
 

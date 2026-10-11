@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Pressure-only backing residency for idle G17 user VMs.
 //!
@@ -393,10 +393,11 @@ impl Vm {
             return 0;
         };
         let uat = inner.uat_inner.clone();
-        let Some(shared) = uat.shared.try_lock() else {
+        let Ok(shared) = uat.try_lock_direct() else {
             return 0;
         };
-        let contexts = shared.contexts_naming_root(inner.ttb());
+        let contexts = inner.page_table.direct_root()
+            .zip(shared.as_ref()).map_or(0, |(root, shared)| shared.contexts_naming_root(root));
         let mut purged = 0usize;
         // SAFETY: The private reservation excludes binding edits and restoration.
         // Callbacks change PTEs/flags only; all aliases stay linked.
@@ -480,10 +481,11 @@ impl Vm {
             return purged;
         };
         let uat = inner.uat_inner.clone();
-        let Some(shared) = uat.shared.try_lock() else {
+        let Ok(shared) = uat.try_lock_direct() else {
             return purged;
         };
-        let contexts = shared.contexts_naming_root(inner.ttb());
+        let contexts = inner.page_table.direct_root()
+            .zip(shared.as_ref()).map_or(0, |(root, shared)| shared.contexts_naming_root(root));
         let mut unpinned = 0usize;
         // SAFETY: Exclusive residency and the private reservation exclude jobs,
         // binding edits and retirement. Callbacks change PTEs/flags only; all
@@ -568,7 +570,7 @@ impl Vm {
                 if needs_sgt {
                     // Preserve review1's reservation/BO lock order: the getter
                     // may acquire the object reservation; never hold BO here.
-                    let sgt = crate::gem::held_sg_table(&map.object)?;
+                    let sgt = Arc::new(crate::gem::held_sg_table(&map.object)?, GFP_KERNEL)?;
                     let mut bo = bo_owner.inner().inner.lock();
                     if bo.sgt.is_none() { bo.sgt = Some(sgt); }
                     drop(bo);
@@ -608,6 +610,7 @@ impl Vm {
                         physical as PhysicalAddr,
                         prot,
                         repeat,
+                        Some(sgt),
                     )?;
                     restored += bytes as u64;
                     left -= bytes;

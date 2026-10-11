@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Resolve ambiguous recovery blame using slot identity and render execution evidence.
 
@@ -6,7 +6,7 @@ pub(super) const SLOTS: usize = 16;
 const STAMP_MASK: u64 = (1 << 40) - 1;
 const PAGE_FAULT: u32 = 3;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Source {
     slot: u8,
     qid: Option<u8>,
@@ -20,6 +20,16 @@ pub(crate) struct Sources {
     mask: u32,
     records: [Source; SLOTS],
     count: usize,
+}
+
+impl core::fmt::Debug for Sources {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Sources")
+            .field("reason", &self.reason)
+            .field("mask", &self.mask)
+            .field("records", &&self.records[..self.count])
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

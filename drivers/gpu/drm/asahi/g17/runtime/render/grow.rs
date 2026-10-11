@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Deferred parameter-buffer growth. Event ingress retains the entire request;
 //! allocation borrows one pair under a preparation lease and runs off-lock.
@@ -249,7 +249,7 @@ impl crate::g17::Shared {
                         manager.prepare_growth(
                             &dev,
                             &vm,
-                            crate::g17::buffer::firmware_growth_target(before),
+                            manager.firmware_target(),
                             None,
                         )
                     }

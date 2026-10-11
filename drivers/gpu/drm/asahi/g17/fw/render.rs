@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Render work descriptors.
 //!
@@ -162,7 +162,7 @@ pub(crate) struct RenderPass {
     pub(crate) utile_width: u8,
     /// Utile height: 16 or 32, at most the width.
     pub(crate) utile_height: u8,
-    /// Samples per pixel, as a power of two: 0 to 2.
+    /// Samples per pixel, as a power of two: 0 to 3 (profile admission applies).
     pub(crate) samples_log2: u8,
     /// Bytes of tile buffer per sample.
     pub(crate) sample_size: u8,
@@ -230,7 +230,7 @@ pub(crate) struct RenderResources {
     /// UAT context the pass runs in.
     pub(crate) context_id: u16,
     /// Allocation generation of that context.
-    pub(crate) context_generation: u8,
+    pub(crate) context_generation: u64,
     /// Buffer slot of the parameter buffer.
     pub(crate) pb_slot: u32,
     /// Buffer slot of the USC private-memory free list.
@@ -399,7 +399,11 @@ struct PassWords {
 
 impl PassWords {
     fn new(pass: &RenderPass) -> Result<Self> {
-        if pass.samples_log2 > SAMPLES_LOG2_MAX {
+        Self::with_sample_limit(pass, SAMPLES_LOG2_MAX)
+    }
+
+    fn with_sample_limit(pass: &RenderPass, max_samples_log2: u8) -> Result<Self> {
+        if pass.samples_log2 > max_samples_log2 {
             return Err(EINVAL);
         }
         let samples = 1u64 << pass.samples_log2;
@@ -936,7 +940,7 @@ impl TaDescriptor {
             self.unk_93e = Self::UNK_93E_FIRST_KICK;
         }
         self.status_va = resources.ta_status_va;
-        self.context_generation = resources.context_generation;
+        self.context_generation = resources.context_generation as u8;
         Ok(())
     }
 
@@ -1271,7 +1275,7 @@ impl FragmentSlot {
         desc.unk_21d6 = Self::UNK_21D6;
         desc.status_va = resources.fragment_status_va;
         desc.status_fw_va = resources.fragment_status_fw_va;
-        desc.context_generation = resources.context_generation;
+        desc.context_generation = resources.context_generation as u8;
         desc.unk_2208 = Self::UNK_2208;
         desc.unk_220c = Self::UNK_220C;
         desc.unk_222d = Self::UNK_222D;
@@ -1325,5 +1329,58 @@ impl FragmentSlot {
             *range = McacheRange::new(attachment, McacheClass::Attachment, context)?;
         }
         Ok(Some(table))
+    }
+}
+
+/// Common render register storage, shared by firmware profiles.
+/// Keep this in the caller's heap workspace when constructing descriptors.
+pub(crate) struct RegisterPrograms {
+    pub(crate) ta: [RegisterWrite; TA_REGISTERS],
+    pub(crate) fragment: [RegisterWrite; FRAGMENT_REGISTERS],
+    pub(crate) store: [RegisterWrite; PARTIAL_STORE_REGISTERS],
+    pub(crate) resume: [RegisterWrite; PARTIAL_RESUME_REGISTERS],
+    pub(crate) load: [RegisterWrite; PARTIAL_LOAD_REGISTERS],
+}
+// SAFETY: All members contain only integer register writes.
+unsafe impl Zeroable for RegisterPrograms {}
+impl RegisterPrograms {
+    pub(crate) fn write(&mut self, args: &RenderArgs<'_>) -> Result {
+        self.write_with_sample_limit(args, SAMPLES_LOG2_MAX)
+    }
+
+    fn write_with_sample_limit(&mut self, args: &RenderArgs<'_>, max_samples_log2: u8) -> Result {
+        let g = Geometry::new(args.pass)?;
+        let w = PassWords::with_sample_limit(args.pass, max_samples_log2)?;
+        self.ta = ta_registers(args, &g, &w)?;
+        self.fragment = fragment_registers(args, &g, &w);
+        self.store = partial_store_registers(args.pass, &w);
+        self.resume = partial_resume_registers(args.pass, &w);
+        self.load = partial_load_registers(args.pass, &w);
+        Ok(())
+    }
+
+    /// M5 partial phases add only their own depth/stencil direction while
+    /// preserving the pass's existing operations and surface layout bits.
+    pub(crate) fn write_m5(&mut self, args: &RenderArgs<'_>) -> Result {
+        self.write_with_sample_limit(args, 3)?;
+        const LOAD: u64 = (1 << 14) | (1 << 15);
+        const STORE: u64 = (1 << 18) | (1 << 19);
+        for register in &mut self.store {
+            if register.reg == 0x15319 {
+                register.value = (register.value & !LOAD) | (args.pass.zls_control & LOAD);
+            } else if register.reg == 0x10039
+                && (args.pass.depth.va != 0 || args.pass.stencil.va != 0)
+            {
+                // The native partial-store encoder forces empty tiles when
+                // either stored ZLS address (descriptor 0x6a8/0x6b8) exists.
+                register.value |= TILE_CONFIG_PROCESS_EMPTY_TILES;
+            }
+        }
+        for register in &mut self.load {
+            if register.reg == 0x15319 {
+                register.value = (register.value & !STORE) | (args.pass.zls_control & STORE);
+            }
+        }
+        Ok(())
     }
 }

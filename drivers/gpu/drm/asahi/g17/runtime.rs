@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Device ownership of physical queues and off-lock construction reservations.
 //!
@@ -71,6 +71,7 @@ impl Registry {
     pub(super) fn new(
         clusters: u32,
         descriptor_flags: [u32; 2],
+        metrics: Arc<MetricsIds>,
     ) -> impl Init<Self, Error> {
         kernel::try_init!(Self {
             qids <- kick::QueueIds::new().chain(|qids| {
@@ -80,7 +81,7 @@ impl Registry {
             }),
             buffers <- BufferIds::new(),
             accounting: qos::Accounting::new(),
-            metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
+            metrics,
             qos_ids: QosIds::new()?,
             admission: admission::Pool::new()?,
             render: render::RenderState::new(clusters, descriptor_flags)?,
@@ -121,10 +122,10 @@ impl Registry {
     /// replacement context must succeed before its old binding is displaced.
     /// A vacant queue (USC backing given back) is offered for re-arming only
     /// when no populated idle queue exists.
-    pub(super) fn rebind_compute(&mut self, owner: u64, context: &Arc<Context>) -> Result<Rebind> {
+    pub(super) fn rebind_compute(&mut self, owner: u64, context: &Arc<Context>, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result<Rebind> {
         if let Some(queue) = self.compute(owner) {
             return Ok(if queue.matches(owner, queue.qid(), context)? {
-                Rebind::Done
+                if queue.pool_fits(required) { Rebind::Done } else { Rebind::Grow }
             } else {
                 Rebind::Fresh
             });
@@ -141,10 +142,34 @@ impl Registry {
                 vacant.get_or_insert(queue.qid());
                 continue;
             }
+            if !queue.pool_fits(required) { continue; }
             queue.bind_owner(owner, context.clone())?;
             return Ok(Rebind::Done);
         }
         Ok(vacant.map_or(Rebind::Fresh, Rebind::Rearm))
+    }
+
+    /// Free an idle M5 physical binding only after the QID allocator is full.
+    /// A size mismatch takes the existing witnessed pool-release/rearm path.
+    /// Some(true) means the caller must notify firmware of that release.
+    fn evict_compute_for_pressure(&mut self, init: &super::initdata::InitData,
+        required: Option<super::fw::m5::pool::PoolGeometry>) -> Result<Option<bool>>
+    {
+        let qid = self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|q| q.eviction_age().map(|age| (age, q.qid())))
+            .min().map(|(_, qid)| qid);
+        let Some(qid) = qid else { return Ok(None); };
+        let queue = self.compute.iter_mut().flatten()
+            .filter_map(|entry| entry.queue.as_deref_mut())
+            .find(|q| q.qid() == qid).ok_or(EIO)?;
+        queue.release_owner()?;
+        if !queue.reusable() { return Err(EIO); }
+        if !queue.pool_fits(required) {
+            queue.vacate(init)?;
+            Ok(Some(true))
+        } else {
+            Ok(Some(false))
+        }
     }
 
     /// Installs fresh USC backing into the vacant queue `qid`; the caller writes
@@ -154,7 +179,7 @@ impl Registry {
         qid: u8,
         pages: crate::g17::freelist::Pages,
         ring: compute::DescriptorRing,
-    ) -> Result<(u16, u64)> {
+    ) -> Result<crate::g17::freelist::PoolDescriptor> {
         let queue = self
             .compute
             .iter_mut()
@@ -274,6 +299,11 @@ impl Registry {
         Ok(freed)
     }
 
+    /// The diagnostics and runtime share one non-recycling channel namespace.
+    pub(super) fn reserve_channel_ids(&mut self, count: u64) -> Result<core::ops::Range<u64>> {
+        self.identities.reserve(count)
+    }
+
     pub(super) fn reserve_compute(&mut self, owner: u64) -> Result<ComputeReservation> {
         if owner == 0
             || self.compute.iter().flatten().any(|entry| {
@@ -365,6 +395,8 @@ impl Registry {
 pub(super) enum Rebind {
     /// The owner now holds an installed, populated queue.
     Done,
+    /// The current owner needs additional private-memory backing.
+    Grow,
     /// Only a vacant queue is available; re-arm `qid` with fresh backing.
     Rearm(u8),
     /// No retained queue suits the owner: reserve a fresh QID.
@@ -387,6 +419,8 @@ impl Backend {
         owner: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
+        let started = now_ns();
+        loop {
         let lease = shared.preparations.enter(true)?;
         let dev = shared.drm()?;
         let (uat, pool, qos, execution, slot) = {
@@ -395,7 +429,15 @@ impl Backend {
             if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
             }
-            let slot = firmware.queues.admission.reserve_queue()?;
+            // SPTM queues in one VM share an address-space binding. The
+            // device-wide queue count is bounded by the existing QoS-ID pool,
+            // not by the number of independently bindable address spaces.
+            let limit = if firmware.uat.is_sptm() {
+                QosIds::CAPACITY
+            } else {
+                crate::mmu::MAX_EXECUTION_CONTEXTS
+            };
+            let slot = firmware.queues.admission.reserve_queue(limit)?;
             let execution = firmware.uat.new_execution_context(vm)?;
             (
                 firmware.uat.clone(),
@@ -411,16 +453,27 @@ impl Backend {
         };
         let owner_pid =
             u32::try_from(kernel::current!().group_leader().pid()).map_err(|_| EOVERFLOW)?;
-        let context = Arc::new(
-            Context::new(&alloc, &pool, &qos, execution, owner_pid, policy)?,
-            GFP_KERNEL,
-        )?;
+        let context = match Context::new(&alloc, &pool, &qos, execution, owner_pid, policy) {
+            Err(error) if error == EAGAIN => {
+                // Firmware retirement needs event processing and may need a
+                // recovery epoch. Hold neither the device lock nor its builder
+                // lease while waiting for a closed context's identity.
+                drop(slot);
+                drop(lease);
+                let remaining = WORK_RING_WAIT_NS.saturating_sub(now_ns().saturating_sub(started));
+                if remaining == 0 { return Err(ENOSPC); }
+                shared.queue_events();
+                qos.wait_available((remaining / 1_000_000).max(1) as u32)?;
+                continue;
+            }
+            result => Arc::new(result?, GFP_KERNEL)?,
+        };
         let state = shared.state.lock();
         if !lease.is_current() || state.is_none() {
             return Err(EAGAIN);
         }
         drop(state);
-        Ok((
+        return Ok((
             Arc::new(
                 Self {
                     shared: shared.clone(),
@@ -431,12 +484,14 @@ impl Backend {
                 GFP_KERNEL,
             )?,
             slot,
-        ))
+        ));
+        }
     }
 
     /// The shared aperture has exactly one builder. Other queues sleep without
     /// holding the device mutex; recovery joins its lease before closing roots.
     fn shared_compute(&self) -> Result {
+        if matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm) { return Ok(()); }
         loop {
             let lease = self.shared.preparations.enter(false)?;
             let dev = self.shared.drm()?;
@@ -549,7 +604,45 @@ impl Backend {
         result
     }
 
-    fn build_compute(&self) -> Result {
+    fn grow_compute(&self, required: super::fw::m5::pool::PoolGeometry) -> Result {
+        use kernel::time::{delay::fsleep, Delta};
+        let lease = self.shared.preparations.enter(false)?;
+        let dev = self.shared.drm()?;
+        let uat = self.shared.state.lock().as_ref().ok_or(ENODEV)?.uat.clone();
+        let alloc = super::object::Allocator { dev: &dev, uat: &uat };
+        let mut pages = Some(super::freelist::Pages::compute(&alloc, true, Some(required))?);
+        let mut alias = Some(pages.as_ref().ok_or(EIO)?.map_client(self.context.vm())?);
+        let mut deferred = DeferredBatch::publication()?;
+        let started = now_ns();
+        loop {
+            let result = (|| {
+                let mut state = self.shared.state.lock();
+                let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+                if !lease.is_current() { return Err(EAGAIN); }
+                if self.shared.crashed.load(Ordering::Acquire) { return Err(EIO); }
+                firmware.scan_compute(None, &mut deferred)?;
+                let queue = firmware.queues.compute_mut(self.owner).ok_or(EIO)?;
+                if queue.pool_fits(Some(required)) { return Ok(None); }
+                if queue.begin_growth(&firmware.init)? {
+                    fence(Ordering::SeqCst);
+                    firmware.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+                }
+                queue.finish_growth(&firmware.init, &mut pages, &mut alias).map(Some)
+            })();
+            deferred.finish();
+            match result {
+                Ok(old) => { drop(old); return Ok(()); }
+                Err(error) if error == EAGAIN && lease.is_current()
+                    && now_ns().saturating_sub(started) < WORK_RING_WAIT_NS => {
+                        self.shared.queue_events();
+                        fsleep(Delta::from_millis(1));
+                    }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn build_compute(&self, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result {
         loop {
             match self.shared_compute() {
                 Err(error) if error == EAGAIN => continue,
@@ -559,10 +652,11 @@ impl Backend {
                 }
             }
         }
+        let mut capacity_wait = None;
         loop {
             let lease = self.shared.preparations.enter(false)?;
             let dev = self.shared.drm()?;
-            let (uat, reservation) = {
+            let (uat, objects, reservation) = {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                 if self
@@ -572,12 +666,38 @@ impl Backend {
                 {
                     return Err(EIO);
                 }
-                match firmware.queues.rebind_compute(self.owner, &self.context)? {
+                match firmware.queues.rebind_compute(self.owner, &self.context, required)? {
                     Rebind::Done => return Ok(()),
-                    Rebind::Rearm(qid) => (firmware.uat.clone(), Err(qid)),
+                    Rebind::Grow => {
+                        drop(state);
+                        return self.grow_compute(required.ok_or(EINVAL)?);
+                    }
+                    Rebind::Rearm(qid) => (firmware.uat.clone(), firmware.pool.clone(), Err(qid)),
                     Rebind::Fresh => {
-                        let reservation = firmware.queues.reserve_compute(self.owner)?;
-                        (firmware.uat.clone(), Ok(reservation))
+                        let reservation = match firmware.queues.reserve_compute(self.owner) {
+                            Err(error) if error == ENOSPC
+                                && matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm) => {
+                                let evicted = firmware.queues.evict_compute_for_pressure(
+                                    &firmware.init, required)?;
+                                if evicted == Some(true) {
+                                    firmware.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+                                }
+                                let now = now_ns();
+                                let since = *capacity_wait.get_or_insert(now);
+                                if now.saturating_sub(since) >= WORK_RING_WAIT_NS {
+                                    return Err(EBUSY);
+                                }
+                                drop(state);
+                                drop(lease);
+                                self.shared.queue_events();
+                                if evicted != Some(false) {
+                                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                                }
+                                continue;
+                            }
+                            result => result?,
+                        };
+                        (firmware.uat.clone(), firmware.pool.clone(), Ok(reservation))
                     }
                 }
             };
@@ -590,26 +710,29 @@ impl Backend {
                 Err(qid) => {
                     // Fresh zeroed backing is built without the device mutex; the
                     // queue may have been taken or re-armed by another owner since.
-                    let pages = crate::g17::freelist::Pages::compute(&alloc)?;
-                    let ring = compute::DescriptorRing::new(&alloc)?;
+                    let pages = crate::g17::freelist::Pages::compute(&alloc,
+                        matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm), required)?;
+                    let ring = compute::DescriptorRing::new(&alloc, &objects,
+                        matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm))?;
                     let mut state = self.shared.state.lock();
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                     if !lease.is_current() {
                         continue;
                     }
-                    let (slot, page_list) = match firmware.queues.rearm_compute(qid, pages, ring) {
+                    let descriptor = match firmware.queues.rearm_compute(qid, pages, ring) {
                         Err(error) if error == EAGAIN => continue,
                         result => result?,
                     };
                     // The firmware consumed this slot's release before the backing
                     // was dropped; the row is rewritten before the queue is kicked.
-                    firmware.init.initialize_compute_pool(slot, page_list)?;
+                    firmware.init.install_compute_pool(descriptor)?;
                     firmware.queues.bind_rearmed(qid, self.owner, &self.context)?;
                     return Ok(());
                 }
             };
             let built = (|| {
-                let pool = compute::PoolBacking::new(&alloc, reservation.id)?;
+                let pool = compute::PoolBacking::new(&alloc, reservation.id,
+                    matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm), required)?;
                 {
                     let mut state = self.shared.state.lock();
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -617,14 +740,17 @@ impl Backend {
                         return Err(EAGAIN);
                     }
                     firmware.queues.reserved(reservation)?;
-                    let (slot, page_list) = pool.pool_descriptor()?;
-                    firmware.init.initialize_compute_pool(slot, page_list)?;
+                    let descriptor = pool.pool_descriptor()?;
+                    firmware.init.install_compute_pool(descriptor)?;
                 }
                 let backing = compute::Backing::new(&alloc, pool)?;
                 // The global scheduler is created after pool/kick backing and
                 // retained even if this queue's later descriptor graph fails.
-                self.compute_scheduler(&alloc, &lease)?;
-                let queue = compute::Queue::new(&alloc, backing, self.owner, self.context.clone())?;
+                if !matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm) {
+                    self.compute_scheduler(&alloc, &lease)?;
+                }
+                let queue = compute::Queue::new(&alloc, &objects, backing, self.owner, self.context.clone(),
+                    matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm))?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
             let (mut built, build_error) = match built {
@@ -790,6 +916,8 @@ impl DeferredBatch {
 }
 
 struct ComputeHost<'a> {
+    regs: &'a crate::regs::Resources,
+    m5: bool,
     init: &'a super::initdata::InitData,
     primary: &'a mut super::Coprocessor,
     effort: &'a mut super::power::Effort,
@@ -808,7 +936,7 @@ impl compute::Host for ComputeHost<'_> {
         ))
     }
     fn prepare_compute_shared(&mut self) -> Result {
-        self.init.activate_compute()
+        if self.m5 { Ok(()) } else { self.init.activate_compute() }
     }
     fn qos_publish(
         &mut self,
@@ -835,11 +963,19 @@ impl compute::Host for ComputeHost<'_> {
         self.init.publish_work(priority, slot).map(|_| ())
     }
     fn notify(&mut self, message: u64) -> Result {
+        if self.m5 && message >> 48 == 0x83 && message & 3 == 2 {
+            if let Err(error) = self.init.note_m5_submission_history() {
+                pr_warn!("M5 submit-history skipped: {:?}\n", error);
+            }
+        }
         self.primary.notify(message)
     }
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
         super::Firmware::apply_shared_effort(self.init, self.effort, super::power::FULL_EFFORT)
+    }
+    fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
+        self.regs.submit_m5_work(submission)
     }
 }
 
@@ -871,6 +1007,8 @@ impl super::Firmware {
             .find(|queue| queue.owner() == Some(owner))
             .ok_or(EIO)?;
         let mut host = ComputeHost {
+            regs: &self.bridge.regs,
+            m5: matches!(self.primary.state.shared.firmware_profile, super::FirmwareProfile::M5Sptm),
             init: &self.init,
             primary: &mut self.primary,
             effort: &mut self.effort,
@@ -1005,23 +1143,43 @@ impl super::Firmware {
 }
 
 impl Backend {
-    fn ensure_compute(&self) -> Result {
+    fn ensure_compute(&self, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result {
         use kernel::time::{delay::fsleep, Delta};
         const SPARED_WAIT_MS: usize = 200;
         let mut deferred = DeferredBatch::publication()?;
         for _ in 0..SPARED_WAIT_MS {
-            let pending = (|| {
+            // This lease preserves the builder's recovery exclusion while
+            // checking an already-bound M5 queue under the witness lock.
+            // Enter before the device lock: recovery joins with it dropped.
+            let lease = if matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm)
+            {
+                Some(self.shared.preparations.enter(false)?)
+            } else { None };
+            let decision = (|| {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                 firmware.replay_compute(&mut deferred)?;
-                firmware
-                    .queues
-                    .release_compute_witness(&firmware.init, self.owner, &mut deferred)
+                let pending = firmware.queues.release_compute_witness(
+                    &firmware.init, self.owner, &mut deferred)?;
+                let ready = if !pending
+                    && lease.as_ref().is_some_and(|lease| lease.is_current())
+                    && !self.shared.crashed.load(Ordering::Acquire)
+                {
+                    // Match rebind_compute's existing-owner branch exactly.
+                    // Missing, growing or mismatched queues retain the builder.
+                    if let Some(queue) = firmware.queues.compute(self.owner) {
+                        queue.matches(self.owner, queue.qid(), &self.context)?
+                            && queue.pool_fits(required)
+                    } else { false }
+                } else { false };
+                Ok::<_, Error>((pending, ready))
             })();
+            drop(lease);
             deferred.finish();
-            let pending = pending?;
+            let (pending, ready) = decision?;
+            if ready { return Ok(()); }
             if !pending {
-                return self.build_compute();
+                return self.build_compute(required);
             }
             // Other owners continue submitting while this owner gives its
             // queue-local drain witness time to arrive.
@@ -1040,6 +1198,11 @@ impl Backend {
         deferred: &mut DeferredBatch,
     ) -> Result {
         packet.check_dependencies()?;
+        let m5 = matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm);
+        let required = match &packet.command {
+            super::command::Validated::Compute { plan, .. } => plan.map(|p| p.geometry),
+            _ => None,
+        };
         let mut recovery_polls = 0;
         let mut outer_wait = None;
         loop {
@@ -1077,6 +1240,16 @@ impl Backend {
                 continue;
             }
             firmware.replay_compute(deferred)?;
+            // Physical ownership is a cache: a fully retired binding may have
+            // been evicted after ioctl preparation. Build/rebind outside this
+            // lock, then check again under the same lock used by publication.
+            if m5 && firmware.queues.compute(self.owner)
+                .is_none_or(|queue| !queue.pool_fits(required)) {
+                drop(state);
+                drop(lease);
+                self.ensure_compute(required)?;
+                continue;
+            }
             let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
             let result = firmware.publish_compute(
                 self.owner,
@@ -1168,6 +1341,11 @@ impl super::Shared {
             state.take()
         };
         if let Some(mut firmware) = firmware {
+            if self.firmware_test {
+                // This diagnostic has no engine-retirement witness yet.
+                core::mem::forget(firmware);
+                return;
+            }
             firmware.finish_stopped_queues();
             // RTKit destruction still dereferences the mailbox provider.
             drop(firmware);
@@ -1225,4 +1403,3 @@ impl super::Firmware {
         Ok(next)
     }
 }
-

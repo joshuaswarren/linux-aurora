@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Decode a submission and validate its user resources before publishing any work.
 
@@ -9,7 +9,8 @@ use super::fw::{
 };
 use crate::util::{AnyBitPattern, Reader};
 use core::ops::Range;
-use kernel::{prelude::*, uapi};
+use kernel::{prelude::*, sync::Arc, uapi};
+use super::render_resources::{ComputePrograms, Programs};
 
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
@@ -19,7 +20,9 @@ const PAGE_SIZE: u64 = 0x4000;
 const ZLS_METADATA_STRIDE: u64 = 0x80;
 const MAX_DIMENSION: u16 = 16384;
 const MAX_LAYERS: u16 = 2048;
-const MAX_TILE_BUFFER: u64 = 32768;
+pub(crate) const MAX_TILE_BUFFER: u64 = 32768;
+// Native M5 eight-RGBA8 MRT capture allocates 64 bytes across a 32x32 tile.
+pub(crate) const M5_MAX_TILE_BUFFER: u64 = 65536;
 const PROCESS_EMPTY: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
@@ -77,8 +80,8 @@ impl Attachments {
 // Commands stay inline in the submission plan, avoiding an allocation per render pass.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
-    Render(uapi::drm_asahi_cmd_render, [Attachments; 2]),
-    Compute(uapi::drm_asahi_cmd_compute, Attachments),
+    Render(uapi::drm_asahi_cmd_render, [Attachments; 2], Option<Arc<Programs>>),
+    Compute(uapi::drm_asahi_cmd_compute, Attachments, Option<Arc<ComputePrograms>>),
 }
 
 pub(crate) struct Command {
@@ -93,6 +96,8 @@ pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     counts: [u16; 2],
     attachments: [Attachments; 3],
+    render_resources: Option<Arc<Programs>>,
+    compute_resources: Option<Arc<ComputePrograms>>,
 }
 
 impl<'a> Parser<'a> {
@@ -101,6 +106,8 @@ impl<'a> Parser<'a> {
             bytes,
             counts: [0; 2],
             attachments: [Attachments::EMPTY; 3],
+            render_resources: None,
+            compute_resources: None,
         }
     }
 
@@ -127,10 +134,11 @@ impl<'a> Parser<'a> {
                         == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                     {
                         self.counts[0] += 1;
-                        Payload::Render(payload(bytes)?, [self.attachments[0], self.attachments[1]])
+                        Payload::Render(payload(bytes)?, [self.attachments[0], self.attachments[1]],
+                            self.render_resources.clone())
                     } else {
                         self.counts[1] += 1;
-                        Payload::Compute(payload(bytes)?, self.attachments[2])
+                        Payload::Compute(payload(bytes)?, self.attachments[2], self.compute_resources.clone())
                     };
                     return Ok(Some(Command { barriers, payload }));
                 }
@@ -143,6 +151,20 @@ impl<'a> Parser<'a> {
                     let slot = header.cmd_type as usize
                         - uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS as usize;
                     self.attachments[slot] = Attachments::parse(bytes)?;
+                }
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES => {
+                    if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] {
+                        return Err(EINVAL);
+                    }
+                    self.render_resources = if bytes.is_empty() { None }
+                        else { Some(Arc::new(Programs::parse(bytes)?, GFP_KERNEL)?) };
+                }
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES => {
+                    if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] {
+                        return Err(EINVAL);
+                    }
+                    self.compute_resources = if bytes.is_empty() { None }
+                        else { Some(Arc::new(ComputePrograms::parse(bytes)?, GFP_KERNEL)?) };
                 }
                 _ => return Err(EINVAL),
             }
@@ -279,10 +301,14 @@ fn surface(
 pub(crate) enum Validated {
     Render {
         pass: RenderPass,
+        resources: Option<Arc<Programs>>,
+        plan: Option<super::render_resources::Plan>,
         attachments: [Attachments; 2],
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
     Compute {
+        resources: Option<Arc<ComputePrograms>>,
+        plan: Option<super::render_resources::Plan>,
         scratch: ScratchRequest,
         usc_base: u64,
         cdm_va: u64,
@@ -296,8 +322,8 @@ pub(crate) enum Validated {
 impl Payload {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
-            Self::Render(cmd, _) => [cmd.prior_vdm, cmd.prior_cdm],
-            Self::Compute(cmd, _) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Render(cmd, ..) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Compute(cmd, ..) => [cmd.prior_vdm, cmd.prior_cdm],
         }
     }
 
@@ -305,9 +331,10 @@ impl Payload {
         &self,
         window: &UscWindow,
         space: &impl AddressSpace,
+        max_tile_buffer: u64,
     ) -> Result<Validated> {
         match self {
-            Self::Render(cmd, attachments) => {
+            Self::Render(cmd, attachments, resources) => {
                 if cmd.flags & !RENDER_FLAGS != 0
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -323,13 +350,14 @@ impl Payload {
                     1 => 0,
                     2 => 1,
                     4 => 2,
+                    8 => 3,
                     _ => return Err(EINVAL),
                 };
                 if u64::from(cmd.sample_size_B)
                     * u64::from(cmd.utile_width_px)
                     * u64::from(cmd.utile_height_px)
                     * u64::from(cmd.samples)
-                    > MAX_TILE_BUFFER
+                    > max_tile_buffer
                     || cmd.vdm_ctrl_stream_base == 0
                     || cmd.vdm_ctrl_stream_base & 3 != 0
                     || cmd.isp_scissor_base == 0
@@ -411,11 +439,13 @@ impl Payload {
                 };
                 Ok(Validated::Render {
                     pass,
+                    resources: resources.clone(),
+                    plan: None,
                     attachments: *attachments,
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })
             }
-            Self::Compute(cmd, attachments) => {
+            Self::Compute(cmd, attachments, resources) => {
                 if cmd.flags != 0
                     || cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
@@ -433,6 +463,7 @@ impl Payload {
                 sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
                 attachments.validate(space)?;
                 Ok(Validated::Compute {
+                    resources: resources.clone(), plan: None,
                     scratch: ScratchRequest::new(cmd.scs_layout)?,
                     usc_base: window.base,
                     cdm_va: cmd.cdm_ctrl_stream_base,

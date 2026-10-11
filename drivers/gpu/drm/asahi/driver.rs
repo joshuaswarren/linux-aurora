@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Top-level GPU driver implementation.
 
@@ -122,6 +122,7 @@ impl drm::driver::Driver for AsahiDriver {
 pub(crate) enum ProbeConfig {
     Legacy(&'static hw::HwConfig),
     G17(&'static g17::Config),
+    M5Sptm,
 }
 
 // OF Device ID table.
@@ -130,6 +131,14 @@ kernel::of_device_table!(
     MODULE_OF_TABLE,
     <AsahiDriver as platform::Driver>::IdInfo,
     [
+        (
+            of::DeviceId::new(c_str!("gpu,t6050")),
+            ProbeConfig::M5Sptm
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6050")),
+            ProbeConfig::M5Sptm
+        ),
         (
             of::DeviceId::new(c_str!("apple,agx-t8140")),
             ProbeConfig::G17(&hw::t8140::CONFIG)
@@ -193,6 +202,7 @@ impl platform::Driver for AsahiDriver {
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Legacy(cfg) => *cfg,
             ProbeConfig::G17(cfg) => return Self::probe_g17(pdev, cfg),
+            ProbeConfig::M5Sptm => return Self::probe_m5_sptm(pdev),
         };
 
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
@@ -271,6 +281,24 @@ impl platform::Driver for AsahiDriver {
 }
 
 impl AsahiDriver {
+    fn probe_m5_sptm(pdev: &platform::Device<Core>) -> Result<Self> {
+        #[cfg(CONFIG_ARM64)]
+        if *crate::module_parameters::m5_sptm_selftest.value() == 1 {
+            // The platform provider validates the physical backing of every map.
+            unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
+            // SAFETY: This bounded pre-firmware test uses GEM/GPUVM only and
+            // never publishes DRM registration or accesses AsahiData.
+            let drm: ARef<AsahiDevice> = unsafe { drm::device::Device::new_uninit(pdev.as_ref())? };
+            crate::mmu::Uat::sptm_selftest(&drm, pdev)
+                .inspect_err(|error| dev_err!(pdev.as_ref(), "M5 SPTM runtime selftest failed: {:?}\n", error))?;
+            dev_info!(pdev.as_ref(), "M5 SPTM runtime selftest PASS; GPU firmware was not started\n");
+        }
+        if *crate::module_parameters::m5_firmware_test.value() == 1 {
+            return Self::probe_g17(pdev, &hw::t6050::CONFIG);
+        }
+        Err(ENODEV)
+    }
+
     fn probe_g17(pdev: &platform::Device<Core>, cfg: &'static g17::Config) -> Result<Self> {
         // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
@@ -289,6 +317,11 @@ impl AsahiDriver {
         if let Err(error) = unsafe { drm.init_data(data) } {
             gpu.shutdown();
             return Err(error);
+        }
+        if matches!(cfg.firmware, g17::FirmwareProfile::M5Sptm)
+            && !matches!(*crate::module_parameters::m5_drm_test.value(), 1 | 2) {
+            return Ok(Self { drm, raw_dev: pdev.as_ref().as_raw(),
+                raw_stats: core::ptr::null_mut(), stats: None });
         }
         if let Err(error) = drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0) {
             gpu.shutdown();

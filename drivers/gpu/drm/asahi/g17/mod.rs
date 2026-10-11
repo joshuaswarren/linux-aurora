@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! G17 GPU support.
 //!
@@ -20,6 +20,7 @@
 mod buffer;
 mod channel;
 mod command;
+mod render_resources;
 pub(crate) use command::Attachments;
 mod completion;
 pub(crate) mod context;
@@ -45,6 +46,11 @@ pub(crate) mod status;
 mod teardown;
 mod timeout;
 mod validation;
+mod m5_test;
+mod m5_render_test;
+mod m5_render_resources;
+mod m5_render_input;
+mod m5_test_program;
 
 use core::any::Any;
 use core::ops::Range;
@@ -133,6 +139,13 @@ pub(crate) struct FixedBuffer {
     pub(crate) size: usize,
 }
 
+/// Firmware boot and translation ownership.
+#[derive(Copy, Clone)]
+pub(crate) enum FirmwareProfile {
+    PublishedRoots { secondary_root_offset: u64 },
+    M5Sptm,
+}
+
 /// Static configuration of a SoC with a G17 GPU.
 pub(crate) struct Config {
     /// SoC identifier.
@@ -144,11 +157,11 @@ pub(crate) struct Config {
     /// Output (physical) address bits of the UAT.
     pub(crate) uat_oas: u32,
     /// Offset of the secondary coprocessor's kernel root in the `pagetables` region.
-    pub(crate) secondary_root_offset: u64,
+    pub(crate) firmware: FirmwareProfile,
     /// Crash log buffer of each [`Role`].
-    pub(crate) crash_buffers: [FixedBuffer; 2],
+    pub(crate) crash_buffers: Option<[FixedBuffer; 2]>,
     /// Parameter buffer page metrics shared with the firmware.
-    pub(crate) pm_metrics: FixedBuffer,
+    pub(crate) pm_metrics: Option<FixedBuffer>,
 }
 
 /// A firmware coprocessor instance.
@@ -219,8 +232,8 @@ impl rtkit::Buffer for CrashLog {
 struct RoleState {
     role: Role,
     shared: Arc<Shared>,
-    crash_log: FixedBuffer,
-    crash_map: shmem::VMap<AsahiObject, u8>,
+    crash_log: Option<FixedBuffer>,
+    crash_map: Option<shmem::VMap<AsahiObject, u8>>,
     crashed: AtomicBool,
     #[pin]
     ack: Opaque<kernel::bindings::completion>,
@@ -299,13 +312,14 @@ impl rtkit::Operations for RoleOps {
         iova: usize,
         size: usize,
     ) -> Result<CrashLog> {
-        if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != data.crash_log.va || size > data.crash_log.size
+        let buffer = data.crash_log.as_ref().ok_or(ENOTSUPP)?;
+        if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != buffer.va || size > buffer.size
         {
             return Err(EINVAL);
         }
         Ok(CrashLog {
             iova,
-            map: data.crash_map.clone(),
+            map: data.crash_map.as_ref().ok_or(ENOTSUPP)?.clone(),
         })
     }
 }
@@ -318,7 +332,7 @@ struct Coprocessor {
     running: bool,
     rtkit: rtkit::RtKit<RoleOps>,
     state: Arc<RoleState>,
-    _crash_buffer: KernelObject,
+    _crash_buffer: Option<KernelObject>,
 }
 
 impl Coprocessor {
@@ -332,26 +346,20 @@ impl Coprocessor {
         role: Role,
     ) -> Result<Coprocessor> {
         let index = role as usize;
-        let buffer = &cfg.crash_buffers[index];
-        let mut crash_buffer = KernelObject::new(
-            dev,
-            uat.kernel_lower_vm(),
-            Placement::At(buffer.va),
-            buffer.size,
-            mmu::PROT_FW_SHARED_RW,
-            CpuMap::WriteCombined,
-        )?;
-        crash_buffer.bytes_mut().fill(CRASH_BUFFER_FILL[index]);
-
-        let crash_map = crash_buffer.kernel_map()?;
+        let (crash_buffer, crash_map, crash_log) = if let Some(buffers) = &cfg.crash_buffers {
+            let buffer = &buffers[index];
+            let mut object = KernelObject::new(dev, uat.kernel_lower_vm(),
+                Placement::At(buffer.va), buffer.size, mmu::PROT_FW_SHARED_RW,
+                CpuMap::WriteCombined)?;
+            object.bytes_mut().fill(CRASH_BUFFER_FILL[index]);
+            let map = object.kernel_map()?;
+            (Some(object), Some(map), Some(FixedBuffer { va: buffer.va, size: buffer.size }))
+        } else { (None, None, None) };
         let state = Arc::pin_init(
             pin_init!(RoleState {
                 role,
                 shared: shared.clone(),
-                crash_log: FixedBuffer {
-                    va: buffer.va,
-                    size: buffer.size,
-                },
+                crash_log,
                 crash_map,
                 crashed: AtomicBool::new(false),
                 ack <- Opaque::ffi_init(|ptr| {
@@ -478,7 +486,9 @@ struct Firmware {
     render_ids: Arc<freelist::RenderIds>,
     init: initdata::InitData,
     _render_global: mmu::Vm,
-    _pm_metrics: Arc<KernelObject>,
+    _pm_metrics: Option<Arc<KernelObject>>,
+    m5_compute: Option<KBox<m5_test::Compute>>,
+    m5_render: Option<KBox<m5_render_test::Pair>>,
     uat: Arc<mmu::Uat>,
 }
 
@@ -516,6 +526,51 @@ impl Firmware {
         power::release(self)
     }
 
+    /// Retry a temporarily unavailable transaction once under a registration
+    /// power hold. Other access errors propagate to the retained owner.
+    fn submit_m5_work(&mut self, submission: &fw::m5::queue::HardwareSubmission) -> Result {
+        match self.bridge.regs.submit_m5_work(submission) {
+            Err(error) if error == EAGAIN => {
+                self.acquire_registration_power()?;
+                self.bridge.regs.submit_m5_work(submission)
+            }
+            result => result,
+        }
+    }
+
+    /// Both outer slots and their capacity are checked before any host-port
+    /// write. An EAGAIN retry drops the old views and revalidates them under a
+    /// power hold. After a successful transaction, publication is infallible.
+    fn submit_m5_render_pair(
+        &mut self,
+        priority: u8,
+        records: &[fw::channels::WorkSlot; 2],
+        submission: &fw::m5::queue::HardwareSubmission,
+        commit_accounting: impl FnOnce() -> Result,
+        publish_inner: impl FnOnce(),
+        deferred: bool,
+    ) -> Result<[u32; 2]> {
+        let mut commit_accounting = Some(commit_accounting);
+        let mut publish_inner = Some(publish_inner);
+        for attempt in 0..2 {
+            let pair = self.init.m5_work_pair(priority, &records[0], &records[1])?;
+            pair.prepare();
+            if let Some(commit) = commit_accounting.take() { commit()?; }
+            match self.bridge.regs.submit_m5_work(submission) {
+                Err(error) if error == EAGAIN && attempt == 0 => {
+                    drop(pair);
+                    self.acquire_registration_power()?;
+                }
+                Err(error) => return Err(error),
+                Ok(()) => {
+                    if let Some(publish) = publish_inner.take() { publish(); }
+                    return Ok(if deferred { pair.next() } else { pair.publish() });
+                }
+            }
+        }
+        Err(EAGAIN)
+    }
+
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
@@ -531,6 +586,7 @@ impl Firmware {
         state: &mut power::Effort,
         effort: u32,
     ) -> Result {
+        let effort = init.submission_effort(effort);
         if state.applied() == effort && init.effort()? == effort {
             return Ok(());
         }
@@ -602,8 +658,12 @@ struct Shared {
     /// Shutdown removes this owning backedge after joining device work.
     #[pin]
     drm: Mutex<Option<AsahiDevRef>>,
+    firmware_test: bool,
+    submission_enabled: bool,
+    firmware_profile: FirmwareProfile,
     clusters: u32,
     descriptor_flags: [u32; 2],
+    render_policy: Option<render_resources::M5Policy>,
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
     #[pin]
@@ -722,6 +782,7 @@ impl Shared {
 
     /// Queues the event worker. Callable from any context.
     fn queue_events(self: &Arc<Self>) {
+        if !self.submission_enabled { return; }
         // Already queued if this fails, which is just as good.
         let _ = workqueue::system_highpri().enqueue::<Arc<Shared>, EVENT_WORK>(self.clone());
     }
@@ -857,6 +918,8 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::Resources,
     ) -> Result<Arc<Gpu>> {
+        let m5 = matches!(cfg.firmware, FirmwareProfile::M5Sptm);
+        if m5 { regs.power_m5()?; }
         let id = regs.get_g17_id()?;
         if id.family != cfg.identity.family
             || id.variant != cfg.identity.variant
@@ -876,7 +939,9 @@ impl Gpu {
             ias: cfg.uat_ias,
             oas: cfg.uat_oas,
         };
-        let max_frequency_khz = Self::max_frequency_khz(dev)?;
+        let max_frequency_khz = if m5 { fw::m5::initdata::J714_GPU_PERF_STATES[13].0 * 1000 }
+            else { Self::max_frequency_khz(dev)? };
+        let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         let preparations = preparation::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
@@ -884,8 +949,12 @@ impl Gpu {
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
                 dev: dev.as_ref().into(),
+                firmware_test: m5,
+                submission_enabled: !m5 || *crate::module_parameters::m5_drm_test.value() == 2,
+                firmware_profile: cfg.firmware,
                 clusters: id.num_clusters,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
+                render_policy,
                 crashed: AtomicBool::new(false),
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
@@ -914,7 +983,7 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
-        let firmware = Self::boot(pdev, dev, cfg, regs, geometry, &gpu.shared)?;
+        let firmware = Self::boot(pdev, dev, cfg, regs, geometry, &gpu.id, &gpu.shared)?;
         *gpu.shared.state.lock() = Some(firmware);
         gpu.shared.queue_events();
         Ok(gpu)
@@ -941,15 +1010,22 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::Resources,
         geometry: mmu::UatGeometry,
+        id: &regs::G17Id,
         shared: &Arc<Shared>,
     ) -> Result<KBox<Firmware>> {
+        if matches!(cfg.firmware, FirmwareProfile::M5Sptm) {
+            return Self::boot_m5(pdev, dev, cfg, regs, geometry, id, shared);
+        }
+        let FirmwareProfile::PublishedRoots { secondary_root_offset } = cfg.firmware else {
+            return Err(EINVAL);
+        };
         let uat = Arc::new(
             mmu::Uat::new(
                 dev,
                 geometry,
                 true,
                 mmu::UatFirmware::PublishedRoots {
-                    secondary_root_offset: cfg.secondary_root_offset,
+                    secondary_root_offset,
                 },
             )?,
             GFP_KERNEL,
@@ -957,11 +1033,12 @@ impl Gpu {
 
         // The firmware only samples the kernel lower root's top-level entries when it starts, so
         // everything it uses there must be mapped first.
+        let metrics = cfg.pm_metrics.as_ref().ok_or(EINVAL)?;
         let pm_metrics = KernelObject::new(
             dev,
             uat.kernel_lower_vm(),
-            Placement::At(cfg.pm_metrics.va),
-            cfg.pm_metrics.size,
+            Placement::At(metrics.va),
+            metrics.size,
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
@@ -984,12 +1061,14 @@ impl Gpu {
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 registration_power_release_pending: false,
-                queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags),
+                queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags,
+                    Arc::new(buffer::MetricsIds::new(), GFP_KERNEL)?),
                 pool: object::Pool::new()?,
                 render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
                 init: initdata::InitData::new(),
                 _render_global: render_global,
-                _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
+                _pm_metrics: Some(Arc::new(pm_metrics, GFP_KERNEL)?),
+                m5_compute: None, m5_render: None,
                 uat,
             }),
             GFP_KERNEL,
@@ -1003,7 +1082,7 @@ impl Gpu {
             cfg,
             &session.uat,
             &session._render_global,
-            &session._pm_metrics,
+            session._pm_metrics.as_ref().ok_or(EINVAL)?,
         )?;
         session.uat.confirm_firmware_root_entries(root_entries)?;
         session.uat.mirror_secondary_root()?;
@@ -1019,6 +1098,67 @@ impl Gpu {
             .uat
             .activate_render_context(&session._render_global)?;
         Ok(firmware)
+    }
+
+    fn boot_m5(
+        pdev: &platform::Device<Core>, dev: &AsahiDevice, cfg: &'static Config,
+        regs: regs::Resources, geometry: mmu::UatGeometry, id: &regs::G17Id, shared: &Arc<Shared>,
+    ) -> Result<KBox<Firmware>> {
+        let uat = Arc::new(mmu::Uat::new_sptm(dev, pdev, geometry)?, GFP_KERNEL)?;
+        let mut init = initdata::InitData::new();
+        init.build_m5(dev, &uat, id)?;
+        let render_global = uat.new_vm(0, geometry.user_range())?;
+        let metrics_ids = Arc::new(buffer::MetricsIds::with_stride(64)?, GFP_KERNEL)?;
+        let metrics = Arc::new(KernelObject::new(dev, &render_global,
+            Placement::In(buffer::BlockGeometry::M5_COMPACT, mmu::UAT_PGSZ as u64),
+            metrics_ids.storage_bytes()?, mmu::PROT_GPU_FW_SHARED_RW,
+            CpuMap::WriteCombined)?, GFP_KERNEL)?;
+        init.bind_m5_metrics(&uat, &metrics)?;
+        let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)?;
+        let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)?;
+        let firmware = KBox::try_init(kernel::try_init!(Firmware {
+            secondary, primary, bridge: Bridge { regs, enabled: false },
+            rings: channel::Rings::new(), recovery: recovery::State::new(),
+            effort: power::Effort::new(), registration_power_release_pending: false,
+            queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags, metrics_ids),
+            pool: object::Pool::new()?,
+            render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
+            init, _render_global: render_global, _pm_metrics: Some(metrics), m5_compute: None, m5_render: None, uat,
+        }), GFP_KERNEL)?;
+        // Keep the complete ownership graph if startup fails after context
+        // publication. A stopped CPU is not proof of engine DMA retirement.
+        let mut retained = core::mem::ManuallyDrop::new(firmware);
+        let session = &mut **retained;
+        // SAFETY: The firmware diagnostic is single-use until reboot; callbacks
+        // and uncertain DMA mappings must remain backed by this module.
+        unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
+        session.uat.bind_sptm_kernel_context()?;
+        session.secondary.boot()?;
+        dev_info!(dev.as_ref(), "M5 secondary RTKit booted\n");
+        session.primary.boot()?;
+        dev_info!(dev.as_ref(), "M5 primary RTKit booted\n");
+        session.bridge.regs.prepare_m5_firmware()?;
+        session.primary.init(session.init.root_va(Role::Primary)?)?;
+        dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+        session.secondary.init(session.init.root_va(Role::Secondary)?)?;
+        dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+        session.primary.notify(MSG_POWER_ON_DONE)?;
+        session.secondary.notify(MSG_POWER_ON_DONE)?;
+        Self::wait_for_opening(dev, &session.init, &session.primary, &session.secondary)?;
+        dev_info!(dev.as_ref(), "M5 firmware opening records retired\n");
+        if *crate::module_parameters::m5_compute_test.value() == 1 {
+            let mut test = m5_test::Compute::new(dev, session)?;
+            let result = test.run(dev, session);
+            session.m5_compute = Some(test);
+            result?;
+        }
+        if matches!(*crate::module_parameters::m5_render_test.value(), 1 | 2 | 3) {
+            let mut test = m5_render_test::Pair::new(dev, session, shared.clusters)?;
+            let result = test.install(dev, session).and_then(|()| test.draw(dev, session));
+            session.m5_render = Some(test);
+            result?;
+        }
+        Ok(core::mem::ManuallyDrop::into_inner(retained))
     }
 
     /// Waits for both coprocessors to retire their opening device-control records.
@@ -1100,6 +1240,10 @@ impl gpu::Gpu for Gpu {
                 | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS as u64
                 | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES as u64
                 | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS as u64;
+        if matches!(self.shared.firmware_profile, FirmwareProfile::M5Sptm) {
+            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES as u64
+                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES as u64;
+        }
         params.gpu_generation = hw::GpuGen::G17 as u32;
         params.gpu_variant = self.cfg.identity.gpu_variant as u32;
         params.gpu_revision = self.id.gpu_rev as u32;
@@ -1149,9 +1293,12 @@ impl gpu::Gpu for Gpu {
             .uat
             .new_vm(self.ids.vm.next(), kernel_range)?
             .with_status()?;
-        let mappings = firmware.init.user_aliases(&vm, &firmware._pm_metrics)?;
+        if matches!(self.cfg.firmware, FirmwareProfile::M5Sptm) {
+            return Ok(vm);
+        }
+        let mappings = firmware.init.user_aliases(&vm, firmware._pm_metrics.as_ref().ok_or(ENOTSUPP)?)?;
         let ranges =
-            hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.va).ok_or(EINVAL)?;
+            hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.as_ref().ok_or(ENOTSUPP)?.va).ok_or(EINVAL)?;
         let mut reserved = KVec::with_capacity(ranges.len(), GFP_KERNEL)?;
         for range in ranges {
             reserved.push(range, GFP_KERNEL)?;
@@ -1172,7 +1319,9 @@ impl gpu::Gpu for Gpu {
         let owner = self.ids.queue.next();
         let frontend =
             queue::Frontend::new(priority, usc_exec_base, self.geometry.user_usable_range())?;
-        let policy = scheduling_policy(priority)?;
+        let policy = if matches!(self.cfg.firmware, FirmwareProfile::M5Sptm) {
+            fw::m5::queue::scheduling_policy(priority)?
+        } else { scheduling_policy(priority)? };
         let (backend, slot) = loop {
             match runtime::Backend::new(&self.shared, &vm, owner, policy) {
                 Err(error) if error == EAGAIN => continue,
@@ -1202,8 +1351,7 @@ impl gpu::Gpu for Gpu {
     ) -> Result<mmu::KernelMapping> {
         let state = self.shared.state.lock();
         let firmware = (*state).as_ref().ok_or(ENODEV)?;
-        let mut addresses = firmware.uat.geometry().kernel_range();
-        addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
+        let addresses = firmware.uat.kernel_dynamic_range();
         bo.map_range_into_range(
             firmware.uat.kernel_vm(),
             range,
@@ -1216,8 +1364,8 @@ impl gpu::Gpu for Gpu {
 }
 
 /// Scheduling profile of a new logical queue. `file.rs` passes
-/// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses HIGH and REALTIME, so
-/// MEDIUM arrives as 2 and LOW as 3.
+/// `DRM_ASAHI_PRIORITY_REALTIME - priority`: MEDIUM arrives as 2 and LOW as 3.
+/// This older firmware profile still admits only the qualified classes.
 fn scheduling_policy(priority: u32) -> Result<fw::queue::Policy> {
     match priority {
         2 => Ok(hw::t8140::scheduling::MEDIUM),
@@ -1231,3 +1379,5 @@ impl Drop for Gpu {
         self.shutdown();
     }
 }
+
+pub(crate) mod m5_render_submission;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Prepared userspace mapping transactions. Host callback resources are reserved for the
 //! complete ioctl before its first visible mapping changes; leaf commits retain their
@@ -81,7 +81,7 @@ impl Vm {
             if needs_sgt {
                 // Pin without the BO mutex: alias construction can hold the GEM
                 // reservation while acquiring this mutex.
-                let sgt = crate::gem::held_sg_table(&gem)?;
+                let sgt = Arc::new(crate::gem::held_sg_table(&gem)?, GFP_KERNEL)?;
                 let mut bo = vm_bo.inner().inner.lock();
                 if bo.sgt.is_none() {
                     if bo.sg_vec.is_none() {

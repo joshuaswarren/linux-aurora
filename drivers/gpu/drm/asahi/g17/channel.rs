@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Firmware-produced rings and the device-control producer.
 //!
@@ -23,19 +23,19 @@ enum ReportRing {
 }
 
 impl ReportRing {
-    fn geometry(self) -> (usize, usize, u32, u32) {
+    fn geometry(self) -> (usize, usize, u32, u64) {
         match self {
             Self::Trace => (
                 status::TRACE_STATE as usize,
                 status::TRACE_RING as usize,
                 TRACE_SLOTS,
-                TRACE_TYPES,
+                u64::from(TRACE_TYPES),
             ),
             Self::Statistics => (
                 status::STATS_STATE as usize,
                 status::STATS_RING as usize,
                 STATISTICS_SLOTS,
-                STATISTICS_TYPES,
+                u64::from(STATISTICS_TYPES),
             ),
         }
     }
@@ -82,6 +82,9 @@ impl Rings {
 
     fn consume_report(init: &InitData, role: Role, ring: ReportRing) -> Result {
         let (state, entries, capacity, allowed_types) = ring.geometry();
+        let allowed_types = if matches!(ring, ReportRing::Statistics) {
+            init.statistics_types()
+        } else { allowed_types };
         let consumer_word = init.status_word(role, state)?;
         let producer_word = init.status_word(role, state + RX_PRODUCER_OFFSET)?;
         fence(Ordering::Acquire);
@@ -99,7 +102,10 @@ impl Rings {
                 ReportRing::Trace => init.status_read_words::<EVENT_WORDS>(role, offset)?[0],
                 ReportRing::Statistics => init.status_read_words::<1>(role, offset)?[0],
             };
-            if tag >= u32::BITS || allowed_types & (1 << tag) == 0 {
+            if tag >= u64::BITS || allowed_types & (1u64 << tag) == 0 {
+                pr_warn!("G17 {:?} {:?} unsupported record at {} producer {}: {:x?}\n",
+                    role, ring, consumer, producer,
+                    init.status_read_words::<EVENT_WORDS>(role, offset)?);
                 return Err(EIO);
             }
             consumer = (consumer + 1) & (capacity - 1);
@@ -135,7 +141,7 @@ impl Rings {
         init.publish_control(
             producer,
             record.bytes(),
-            record.opcode().asserts_gpu_power(),
+            init.control_asserts_gpu_power(record.opcode()),
             next,
         )?;
         Ok(next)

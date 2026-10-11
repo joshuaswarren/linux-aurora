@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Paired render retirement evidence and bounded ownership of in-flight work.
 //! Queue progress and execution timestamps precede the completion stamps which
@@ -39,7 +39,7 @@ pub(crate) struct Window {
 
 impl Window {
     pub(crate) fn new(base: u32, count: u32, capacity: u32) -> Result<Self> {
-        if base >= capacity || !(2..=MAX_GROUP_ITEMS).contains(&count) || count >= capacity {
+        if base >= capacity || !(1..=MAX_GROUP_ITEMS).contains(&count) || count >= capacity {
             return Err(EINVAL);
         }
         Ok(Self {
@@ -165,6 +165,10 @@ pub(crate) trait Memory {
     fn snapshot(&mut self, ordinal: u64) -> Result<Snapshot>;
     fn stamps(&mut self) -> Result<[u32; 2]>;
     fn pass(&mut self, ordinal: u64) -> Result<[u64; 2]>;
+    fn stage_timestamps(&mut self, ordinal: u64) -> Result<[u64; 4]> {
+        let [start, end] = self.pass(ordinal)?;
+        Ok([start, start, start, end])
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,8 +224,7 @@ fn complete_poll(
         // Refresh this generation's pass after observing the post-maintenance
         // stamps. The pre-stamp snapshot alone cannot authorize export.
         fence(Ordering::Acquire);
-        let [start, end] = memory.pass(ticket.ordinal)?;
-        return Ok(Poll::Complete([start, start, start, end]));
+        return Ok(Poll::Complete(memory.stage_timestamps(ticket.ordinal)?));
     }
     ticket.previous = snapshot.cursors;
     Ok(Poll::Pending)

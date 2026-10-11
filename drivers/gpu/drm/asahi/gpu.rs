@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Top-level GPU manager
 //!
@@ -951,7 +951,7 @@ impl GpuManager::ver {
         Ok(KBox::new(
             hw::DynConfig {
                 pwr: pwr_cfg,
-                uat_ttb_base: uat.ttb_base(),
+                uat_ttb_base: uat.ttb_base()?,
                 id: gpu_id,
                 firmware_version: fwnode
                     .property_read_array_vec(c_str!("apple,firmware-version"), 3)?

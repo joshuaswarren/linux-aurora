@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 #![allow(clippy::unusual_byte_groupings)]
 
 //! File implementation, which represents a single DRM client.
@@ -1138,10 +1138,12 @@ impl File {
             return Err(EINVAL);
         }
 
-        // TODO: Allow with CAP_SYS_NICE
-        if data.priority >= uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH {
-            cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
-            return Err(EINVAL);
+        // Elevating a GPU queue must not bypass the system scheduling policy.
+        // SAFETY: capable checks the calling task's credentials and LSM policy.
+        if data.priority >= uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
+            && !unsafe { bindings::capable(bindings::CAP_SYS_NICE as i32) }
+        {
+            return Err(EPERM);
         }
 
         let queues_xa = file.inner().queues();

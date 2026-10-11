@@ -298,6 +298,12 @@ enum drm_asahi_feature {
 	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
 	 */
 	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 7,
+
+	/** @DRM_ASAHI_FEATURE_COMPUTE_RESOURCES: Per-dispatch storage declarations. */
+	DRM_ASAHI_FEATURE_COMPUTE_RESOURCES = (1UL) << 8,
+
+	/** @DRM_ASAHI_FEATURE_RENDER_RESOURCES: Per-program render storage declarations. */
+	DRM_ASAHI_FEATURE_RENDER_RESOURCES = (1UL) << 9,
 };
 
 /**
@@ -754,6 +760,72 @@ enum drm_asahi_cmd_type {
 	 * Followed by (possibly multiple) @drm_asahi_attachment payloads.
 	 */
 	DRM_ASAHI_SET_COMPUTE_ATTACHMENTS = 4,
+
+	/**
+	 * @DRM_ASAHI_SET_RENDER_RESOURCES: Replace linked render program storage.
+	 * Followed by zero or more drm_asahi_render_program entries. This software
+	 * command has no barriers and does not advance either command index.
+	 */
+	DRM_ASAHI_SET_RENDER_RESOURCES = 5,
+
+	/** @DRM_ASAHI_SET_COMPUTE_RESOURCES: Replace compute storage declarations. */
+	DRM_ASAHI_SET_COMPUTE_RESOURCES = 6,
+};
+
+
+/**
+ * struct drm_asahi_compute_program - Storage of one linked compute dispatch.
+ *
+ * SET_COMPUTE_RESOURCES replaces the list for subsequent compute commands.
+ * Include each distinct dispatch profile in the command stream. The kernel
+ * combines their requirements before publishing work. All sizes are bytes.
+ */
+struct drm_asahi_compute_program {
+	/** @primary_bytes: Per-thread primary storage. */
+	__u32 primary_bytes;
+	/** @secondary_bytes: Per-thread secondary storage. */
+	__u32 secondary_bytes;
+	/** @linked_bytes: Additional primary storage after linking. */
+	__u32 linked_bytes;
+	/** @minimum_primary_bytes: Minimum primary storage across variants. */
+	__u32 minimum_primary_bytes;
+	/** @threadgroup_bytes: Storage shared by a workgroup. */
+	__u32 threadgroup_bytes;
+	/** @threads: Number of invocations in a workgroup. */
+	__u32 threads;
+	/** @flags: Reserved; must be zero. */
+	__u32 flags;
+};
+
+/**
+ * struct drm_asahi_render_program - Storage of one linked render program.
+ *
+ * SET_RENDER_RESOURCES replaces the list for subsequent renders in this submit.
+ * Include every vertex and fragment program, including background and end-of-tile
+ * programs. Sizes describe the final linked program, in bytes. Each entry is
+ * evaluated separately before taking the maximum demand across the pass.
+ */
+struct drm_asahi_render_program {
+	/** @stage: 0 for vertex, 1 for fragment (including background/end-of-tile). */
+	__u32 stage;
+	/** @primary_bytes: Primary per-thread storage after linking. */
+	__u32 primary_bytes;
+	/** @secondary_bytes: Secondary per-thread storage after linking. */
+	__u32 secondary_bytes;
+	/** @linked_bytes: Additional primary storage from linked programs. */
+	__u32 linked_bytes;
+	/** @minimum_primary_bytes: Minimum primary storage across linked variants. */
+	__u32 minimum_primary_bytes;
+	/** @auxiliary_count: Fragment auxiliary entries; zero for vertex programs. */
+	__u32 auxiliary_count;
+	/** @threadgroup_bytes: Fragment threadgroup storage; zero for vertex. */
+	__u32 threadgroup_bytes;
+	/** @imageblock_bytes: Fragment imageblock storage; zero for vertex. */
+	__u32 imageblock_bytes;
+	/** @multisample_bytes: Fragment multisample storage; zero for vertex. */
+	__u32 multisample_bytes;
+	/** @flags: MBZ. */
+	__u32 flags;
 };
 
 /**

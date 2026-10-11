@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Immutable submissions and the DRM scheduler boundary for independent engines.
 
@@ -97,6 +97,7 @@ pub(crate) struct Packet {
     firmware: KVec<Fence>,
     publication: AtomicU8,
     cancelled: AtomicBool,
+    preparation: AtomicBool,
     early: AtomicI32,
     backlog: AtomicBool,
 }
@@ -129,6 +130,7 @@ impl Packet {
                 firmware,
                 publication: AtomicU8::new(0),
                 cancelled: AtomicBool::new(false),
+                preparation: AtomicBool::new(false),
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
             },
@@ -185,6 +187,12 @@ impl Packet {
     pub(crate) fn is_published(&self) -> bool {
         self.publication.load(Ordering::Acquire) == 2
     }
+    pub(crate) fn claim_preparation(&self) -> bool {
+        !self.preparation.swap(true, Ordering::AcqRel)
+    }
+    pub(crate) fn take_preparation(&self) -> bool {
+        self.preparation.swap(false, Ordering::AcqRel)
+    }
     pub(crate) fn cancel_requested(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
@@ -232,13 +240,21 @@ fn check_status(fence: &Fence) -> Result {
 /// The backend retains visible packets through exact retirement or processor stop.
 /// It performs all completion signalling after releasing the device mutex.
 pub(crate) trait Backend: Send + Sync {
+    /// The device's ordinary command profile is available to this frontend.
+    fn supports_submission(&self) -> bool { true }
+    fn supports_engine(&self, _engine: Engine) -> bool { true }
+    /// Hardware allocation budget, checked even when address proofs are reused.
+    fn max_tile_buffer_bytes(&self) -> u64 { super::command::MAX_TILE_BUFFER }
+    /// Complete architecture-specific validation before accepting any command
+    /// from this ioctl. No device mutex or firmware publication is involved.
+    fn prepare_command(&self, _command: &mut Validated) -> Result { Ok(()) }
     /// Device detector retained by render completions after queue teardown.
     fn feed(&self) -> Option<Arc<super::feed::Feed>> {
         None
     }
 
     /// Lazily create or rebind this logical queue's physical compute graph.
-    fn ensure_compute(&self) -> Result;
+    fn ensure_compute(&self, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result;
     /// Settle outstanding work of a terminal VM before an ioctl error is published.
     fn fail_vm(&self, error: Error);
     /// Called after both scheduler entities have cancelled their queued jobs.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Scheduler cancellation and final retirement checks for retained compute work.
 
@@ -50,6 +50,8 @@ impl Backend {
     /// The caller owns cancellation of a packet that never claimed publication.
     /// A missing retained packet may already have a healthy callback waiting off-lock.
     pub(super) fn timeout_compute(&self, packet: &Arc<Packet>) -> Result {
+        dev_warn!(self.shared.dev.as_ref(), "Compute scheduler timeout: owner={} pid={}\n",
+            self.owner, packet.context.owner_pid());
         let mut deferred = DeferredBatch::worker()?;
         let result = (|| {
             let mut state = self.shared.state.lock();

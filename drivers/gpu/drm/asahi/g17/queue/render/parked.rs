@@ -1,12 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Installed kick storage retained after a logical scheduler release is acknowledged.
 
-use super::{install_memory, memory, target, Pair, RetiredBinding, Tracker};
+use super::{install_memory, memory, Pair, RetiredBinding, Tracker};
 use crate::g17::{
     buffer,
     command::Validated,
-    context::Context,
+    context::{Context, SchedulerStorage},
     freelist::RenderPool,
     job::Packet,
     kick,
@@ -20,7 +20,7 @@ use kernel::{prelude::*, sync::Arc};
 /// context awaiting an executed replacement keeps its separate retirement owner.
 pub(crate) struct ParkedPair {
     kicks: Option<[kick::Queue; 2]>,
-    _scheduler: Arc<KernelObject>,
+    _scheduler: Arc<SchedulerStorage>,
     ids: [kick::Id; 2],
     slot: u8,
     ordinal: u64,
@@ -90,6 +90,7 @@ impl Pair {
             buffer_id,
             publication: None,
             ready: true,
+            wait_for_pool_release: false,
         };
         (parked, retired)
     }
@@ -117,7 +118,7 @@ impl ParkedPair {
             return Err(EINVAL);
         }
         let kicks = self.kicks.as_ref().ok_or(EBUSY)?;
-        let Validated::Render { pass, .. } = &first.command else {
+        let Validated::Render { .. } = &first.command else {
             return Err(EINVAL);
         };
         let word = first.completion.work_state()?.word();
@@ -125,7 +126,7 @@ impl ParkedPair {
             return Err(EINVAL);
         }
         alloc.uat.vm_context_mask(context.vm())?;
-        let layout = target::Layout::new(pass, self.clusters)?;
+        let layout = crate::g17::m5_render_submission::layout(&first.command, self.clusters)?;
         let aliases = [
             kicks[0].prepare_client_alias(context.vm())?,
             kicks[1].prepare_client_alias(context.vm())?,

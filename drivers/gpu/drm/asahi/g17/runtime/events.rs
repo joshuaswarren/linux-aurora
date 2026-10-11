@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Event and restart callbacks borrow the complete firmware owner. The reusable
 //! completion collector belongs to the worker and is drained outside its mutex.
@@ -119,6 +119,10 @@ impl recovery::Memory for Service<'_> {
         self.firmware.init.host_recovery()
     }
     fn fault_sources(&self) -> Result<recovery::Sources> {
+        if crate::g17::m5_render_submission::enabled() {
+            pr_err!("AGX recovery fault registers: {:x?}\n", self.firmware.bridge.regs.m5_fault_registers());
+            self.firmware.init.dump_m5_recovery(&self.firmware.primary.state.shared.dev)?;
+        }
         self.firmware.init.fault_sources()
     }
 

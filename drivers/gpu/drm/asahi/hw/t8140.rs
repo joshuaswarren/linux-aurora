@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Hardware configuration for t8140 platforms (A18 Pro).
 
@@ -23,10 +23,10 @@ pub(crate) const CONFIG: Config = Config {
     uat_ias: 42,
     uat_oas: 42,
     // The secondary coprocessor's kernel root follows the primary one's 256 KiB of page tables.
-    secondary_root_offset: 0x40000,
+    firmware: crate::g17::FirmwareProfile::PublishedRoots { secondary_root_offset: 0x40000 },
     // The coprocessors request their crash log buffers at these addresses, in this order, and
     // expect them to be mapped before they start.
-    crash_buffers: [
+    crash_buffers: Some([
         FixedBuffer {
             va: 0x01e1_c000,
             size: 0x8000,
@@ -35,13 +35,13 @@ pub(crate) const CONFIG: Config = Config {
             va: 0x01f5_0000,
             size: 0x8000,
         },
-    ],
+    ]),
     // Read by the firmware through the kernel lower root, whose top-level entries it only
     // samples when it starts.
-    pm_metrics: FixedBuffer {
+    pm_metrics: Some(FixedBuffer {
         va: 0x10_0008_0000,
         size: 0x8000,
-    },
+    }),
 };
 
 use crate::g17::fw::initdata::{PerfConfig, RegisterWindow, PERF_STATES};

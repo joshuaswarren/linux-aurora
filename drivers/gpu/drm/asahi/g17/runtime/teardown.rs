@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only AND MIT
 
 //! Scheduler release and off-lock destruction of acknowledged logical queue resources.
 
@@ -127,7 +127,7 @@ impl Host for Service<'_> {
     fn publish(&mut self, record: &SchedulerStateRelease) -> Result<u32> {
         Rings::publish_control(
             self.init,
-            &ControlRecord::SchedulerStateRelease(SchedulerStateRelease::new(
+            &ControlRecord::SchedulerStateRelease(self.init.scheduler_release(
                 record.page_va,
                 record.id,
             )),
