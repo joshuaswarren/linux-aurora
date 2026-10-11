@@ -4,6 +4,7 @@
 from pathlib import Path
 import re
 import shutil
+import os
 import subprocess
 import tempfile
 
@@ -48,7 +49,10 @@ int main(void) {
         subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", str(source), "-o", str(binary)],
                        check=True)
-        subprocess.run([str(binary)], check=True)
+        # stdbuf injects LD_PRELOAD into the runner, ahead of the ASan runtime.
+        # Only this isolated sanitizer child needs a clean loader environment.
+        env = {**os.environ, "LD_PRELOAD": ""}
+        subprocess.run([str(binary)], env=env, check=True)
     print("ok 1 - GPIO IRQ banks and apertures")
     return 0
 
