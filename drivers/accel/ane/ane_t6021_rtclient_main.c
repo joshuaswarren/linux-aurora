@@ -556,16 +556,18 @@ MODULE_PARM_DESC(call_settle_us,
 /*
  * The finish-event wait polls the coherent IO_T2H ring, so the poll cadence is
  * the whole detection lag: a uniform 50..100 us sleep adds 0..100 us of pure
- * wait to every CALL. call_poll_us is how long the head of the wait polls at a
- * 1 us cadence before it falls back to the 50..100 us sleep, which keeps long
- * programs (the Parakeet encoder, about 254 ms) from spending the wait on
- * hrtimer wakeups. 0 restores the uniform 50..100 us cadence. Writable at run
- * time (0644), so both cadences can be compared in one boot.
+ * wait to every CALL. call_poll_us is how long the head of the wait sleeps
+ * only 1..2 us between looks (the real period is the hrtimer wake latency)
+ * before it falls back to the 50..100 us sleep, which keeps long programs (the
+ * Parakeet encoder, about 254 ms) from spending the wait on hrtimer wakeups.
+ * 0 restores the uniform 50..100 us cadence. A very large value makes the
+ * whole wait 1..2 us sleeps. Writable at run time (0644), so both cadences can
+ * be compared in one boot.
  */
 static unsigned int call_poll_us = 1000;
 module_param(call_poll_us, uint, 0644);
 MODULE_PARM_DESC(call_poll_us,
-		 "Microseconds of 1 us polling at the head of the CALL finish-event wait, then 50..100 us (default 1000; 0 = uniform 50..100 us)");
+		 "Microseconds at the head of the CALL finish-event wait that sleep only 1..2 us between looks, then 50..100 us (default 1000; 0 = uniform 50..100 us; a very large value makes the whole wait 1..2 us sleeps)");
 
 /*
  * Read-only per-CALL TD timeline, disabled by default. When enabled,
@@ -827,8 +829,9 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 				  unsigned int timeout_ms)
 {
 	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	unsigned int poll_us = READ_ONCE(call_poll_us);
 	ktime_t tight_end = ktime_add_ns(ktime_get(),
-					 (u64)call_poll_us * NSEC_PER_USEC);
+					 (u64)poll_us * NSEC_PER_USEC);
 
 	if (ane_t6021_tracing)
 		return ane_rtclient_call_wait_traced(ane, deadline);
@@ -836,7 +839,7 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 	do {
 		if (ane_rtclient_drain_t2h(ane, 6))
 			return 0;
-		if (call_poll_us && ktime_before(ktime_get(), tight_end))
+		if (poll_us && ktime_before(ktime_get(), tight_end))
 			usleep_range(1, 2);
 		else
 			usleep_range(50, 100);
