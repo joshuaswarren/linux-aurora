@@ -1036,6 +1036,8 @@ fn probe_t8152_drm(
     let config = crate::g18_drm::G18DrmConfig {
         admit_compute: *crate::module_parameters::g18_admit_compute.value() != 0,
         admit_msaa4: *crate::module_parameters::g18_admit_msaa4.value() != 0,
+        admit_graphics_scratch:
+            *crate::module_parameters::g18_admit_graphics_scratch.value() != 0,
     };
     let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
         crate::g18_drm::G18DrmGpu::new(runtime, observed.as_ref(), config)?,

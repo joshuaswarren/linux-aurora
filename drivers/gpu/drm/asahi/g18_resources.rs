@@ -870,7 +870,7 @@ impl G18FirmwareMemory {
                         }
                     }
                     if channel == 0 {
-                        dev_info!(dev.as_ref(), "G18_EVENT role={} ordinal={} type={} payload={:x?}\n",
+                        crate::g18_event_info!(role == 0 && word(0) == 1, dev.as_ref(), "G18_EVENT role={} ordinal={} type={} payload={:x?}\n",
                             role, count, word(0), [qword(4), qword(12), qword(20), qword(28), qword(36)]);
                         recovery |= word(0) == EVENT_TYPE_RECOVERY;
                         if role == 0 && word(0) == 1 {

@@ -66,7 +66,7 @@ impl G18Session {
         if completed.stamps != [0; 2] || completed.timestamps != [0; 2]
             || memory.completion_masks() != [0; 2] { return Err(EBUSY.into()); }
         // The exact knob snapshot this command was built from (g18_app_*).
-        dev_info!(self.device(), "G18_APP_COMPUTE_KNOBS compute={} {}\n", generation, knobs);
+        crate::g18_kick_info!(self.device(), "G18_APP_COMPUTE_KNOBS compute={} {}\n", generation, knobs);
         let memory = self.memory.as_mut().ok_or(EIO)?;
         let roots = memory.compute().publish_context()?;
         if memory.scheduler().publish_kick(0)? != generation { return Err(EIO.into()); }
@@ -76,7 +76,7 @@ impl G18Session {
             .publish_application_compute_outer(inner_after)?;
         Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
             .send_message(EP_GFX_INTERRUPTS, 0x0083_0000_0000_000a)?;
-        dev_info!(self.device(),
+        crate::g18_kick_info!(self.device(),
             "G18_APP_KICK compute={} context={} roots={:x?} stamp={:#x}\n",
             generation, command.context_id, roots, command.expected_stamp);
         let expected_stamp = command.expected_stamp;
@@ -140,7 +140,7 @@ impl G18Session {
                         return Err(EIO.into());
                     }
                     if pool.generation != previous_pool.generation {
-                        dev_info!(self.device(),
+                        crate::g18_kick_info!(self.device(),
                             "G18_COMPUTE_POOL_VERIFY compute={} generation={} state={:#x} context={} slot={} observed={:x?} verified=1\n",
                             generation, pool.generation, pool.state, command.context_id, pool.slot, observed);
                     }
@@ -152,7 +152,7 @@ impl G18Session {
                     self.queue_probe.as_mut().ok_or(EIO)?.retire_application_compute(generation)?;
                     self.memory.as_mut().ok_or(EIO)?
                         .retire_application_compute(generation, command.context_id)?;
-                    dev_info!(self.device(),
+                    crate::g18_kick_info!(self.device(),
                         "G18_APP_FRAME_PASS compute={} stamp={:#x} scheduler={} outer={} inner={}\n",
                         generation, expected_stamp, generation, outer_after, inner_after);
                     return Ok(());
