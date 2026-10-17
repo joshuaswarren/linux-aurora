@@ -505,10 +505,14 @@ impl G18FirmwareMemory {
         // b000 refresh 0x352c/0x3688 copies region-C+0x9ac into
         // global 0x109488. Its compute nibble (bits8..11) selects native
         // progress sampling: mode3 only checks busy; mode2 takes the
-        // detailed sampler. Graphics diagnosis also selects mode2 for TA;
-        // b000 0x890c then enters the original sampler at 0x8924 instead
-        // of the busy-bit-only path. Keep 3D and all timeout bounds.
-        let progress_policy = if graphics_stall_trace { 0x232 } else { 0x233 };
+        // detailed sampler. TA (nibble 0) also takes mode2: b000 0x890c
+        // then enters the original sampler at 0x8924 instead of the
+        // busy-bit-only path. The busy-only path recovers any TA busy for
+        // region-C+0x9a0 (=0xa) one-tick scans, ~12.8 ms after the kick,
+        // which legitimate single-invocation vertex/geometry work reaches
+        // (image-op-rootcause-1113). Mode2 still recovered a real TA hang
+        // (linux-workloads-123, ~32 ms). Keep 3D and all timeout bounds.
+        let progress_policy = 0x232;
         self.region_c.write_u32(progress, progress_policy)?;
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(),
