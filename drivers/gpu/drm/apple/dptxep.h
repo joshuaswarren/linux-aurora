@@ -3,6 +3,7 @@
 
 #include <linux/phy/phy.h>
 #include <linux/mux/consumer.h>
+#include "dcp-peer-v27.h"
 
 enum dptx_apcall {
 	DPTX_APCALL_ACTIVATE = 0,
@@ -48,6 +49,7 @@ enum dptx_link_rate {
 struct apple_epic_service;
 
 struct dptx_port {
+	struct dcp_dptx_caps caps;
 	bool enabled, connected;
 	struct completion enable_completion;
 	struct completion linkcfg_completion;

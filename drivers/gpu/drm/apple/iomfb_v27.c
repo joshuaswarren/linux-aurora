@@ -141,6 +141,22 @@ static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 {
 	const struct dcp_h17p_hotplug_request *request = in;
 
+	/* The opt-in peer allocator needs the native tiling metadata to verify
+	 * the VFTG relationship before implementing its framebuffer lifecycle.
+	 * Keep both halves: the endpoint IDs are at the end of this payload.
+	 */
+	if (dcp->peer_reserved || dcp->peer_owner) {
+		dev_info(dcp->dev, "peer HPD connected=%llu null=%u head=%*ph\n",
+			 le64_to_cpu(request->connected), request->tiled_display_null,
+			 40, request->tiled_display);
+		dev_info(dcp->dev, "peer HPD tail=%*ph\n", 36,
+			 request->tiled_display + 40);
+	}
+	if (!(request->tiled_display_null & 1) && request->connected &&
+	    !(get_unaligned_le32(request->tiled_display + 0xc) & BIT(3)))
+		dcp_peer_display_ids_v27(dcp,
+			get_unaligned_le32(request->tiled_display + 0x3b),
+			get_unaligned_le32(request->tiled_display + 0x47));
 	if (!(request->tiled_display_null & 1))
 		memcpy(out, request->tiled_display,
 		       sizeof(request->tiled_display));
@@ -299,11 +315,29 @@ static bool trampoline_tiling_state_v27(struct apple_dcp *dcp, int tag,
 
 	resp->value = req->value;
 	resp->ret = 0;
+	if (!(req->value_null & 1) &&
+	    dcp_peer_tiling_state_v27(dcp, false, req->event, req->param,
+				      &resp->value)) {
+		resp->ret = 1;
+		return true;
+	}
 	if (!req->value_null && (req->param == 1 || req->param == 11) &&
 	    dcp->connector && !dcp->connector->base.has_tile) {
 		resp->value = 0;
 		resp->ret = 1;
 	}
+	return true;
+}
+
+/* Native D115: same16-byte input as D114, boolean/padded4 output. */
+static bool trampoline_set_tiling_state_v27(struct apple_dcp *dcp, int tag,
+					   void *out, void *in)
+{
+	const struct dcpep_get_tiling_state_req *req = in;
+	u32 value = req->value;
+
+	*(__le32 *)out = cpu_to_le32(!(req->value_null & 1) &&
+		dcp_peer_tiling_state_v27(dcp, true, req->event, req->param, &value));
 	return true;
 }
 
@@ -334,6 +368,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[118] = trampoline_zero,
 	[119] = trampoline_zero,
 	[114] = trampoline_tiling_state_v27,
+	[115] = trampoline_set_tiling_state_v27,
 	[120] = dcpep_cb_boot_1,
 	[121] = trampoline_false,
 	[122] = trampoline_false,
@@ -420,6 +455,7 @@ static const struct {
 	[118] = { 0x3e88, 0x4 },
 	[119] = { 0x4, 0x4 },
 	[114] = { 0x10, 0x8 },
+	[115] = { 0x10, 0x4 },
 	[120] = { 0x0, 0x4 },
 	[121] = { 0x0, 0x4 },
 	[122] = { 0x0, 0x4 },

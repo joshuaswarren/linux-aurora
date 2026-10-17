@@ -70,3 +70,30 @@ Validation
 Native arm64 display-driver builds and host tests cover the present wire
 layout and framebuffer sizing/bounds. These checks do not establish boot,
 physical hotplug, brightness or suspend behavior on hardware.
+
+Paired firmware-27 scanout
+-------------------------
+
+The T6050 peer allocator consumes reported endpoint capacity and explicit
+firmware tiling metadata. It may reserve only an idle, otherwise unrouted
+peer on the same DRM device and display die. Physical Type-C routes remain
+owned by their normal allocator. The current qualification gates are
+``appledrm.peer_allocation_probe=1`` and ``appledrm.peer_scanout=1``; they
+match the private baseline's explicit configuration and remain off until
+the cleaned combination is qualified. ``appledrm.show_notch=1`` is independent.
+
+Both wire records are serialized from the primary's logical atomic input
+without mutating it. Cross-endpoint start replies, errors and combined
+completion watermarks are copied to a bounded callback queue on the owning
+IOMFB worker. They never take another endpoint's IOMFB lock from a receive
+callback. Normal command/transaction ordering and retained-framebuffer
+ownership remain in the common IOMFB implementation. One physical engine's
+completion cannot retire the pair. A failed peer submission may follow
+acceptance by the primary, so it retains the active transaction and scanout
+references as a crashed session rather than treating the error as retirement.
+
+The background-only paired probe also uses one tracked transaction per
+endpoint and cannot run while the paired production completion owner is active.
+Host checks cover copied callback dispatch, stop/cancellation, paired completion
+coverage and split-wire serialization. Build/host evidence does not replace
+physical display, hotplug, DPMS, sleep or paired-frame qualification.

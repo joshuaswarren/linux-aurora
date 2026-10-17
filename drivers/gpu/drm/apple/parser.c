@@ -13,6 +13,7 @@
 #endif
 
 #include "parser.h"
+#include "dcp-peer-v27.h"
 #include "trace.h"
 
 #define DCP_PARSE_HEADER 0xd3
@@ -726,6 +727,50 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 	*width_mm = 10 * width_cm;
 	*height_mm = 10 * height_cm;
 
+	return 0;
+}
+
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps)
+{
+	struct iterator it;
+	struct dcp_dptx_caps parsed = {};
+	int ret = 0;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		u32 *field = NULL;
+		char *key = parse_string(it.handle);
+		s64 value;
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "MaxPixelWidth"))
+			field = &parsed.width;
+		else if (!strcmp(key, "MaxTotalPixelRate"))
+			field = &parsed.total_rate;
+		else if (!strcmp(key, "MaxActivePixelRate"))
+			field = &parsed.active_rate;
+		kfree(key);
+		if (!field) {
+			ret = skip(it.handle);
+			if (ret)
+				return ret;
+			if (it.handle->pos > it.handle->len)
+				return -EINVAL;
+			continue;
+		}
+		if (*field)
+			return -EINVAL;
+		ret = parse_int_bound(it.handle, &value, 1, U32_MAX);
+		if (ret)
+			return ret;
+		*field = value;
+	}
+	if (!parsed.width || !parsed.total_rate || !parsed.active_rate)
+		return -ENOENT;
+	*caps = parsed;
 	return 0;
 }
 

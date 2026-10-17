@@ -782,6 +782,9 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		memcpy(reply, data, min(reply_size, data_size));
 		return 0;
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dcp_peer_hints_v27(service->ep->dcp, dptx, data,
+						  data_size, reply, reply_size);
 		memcpy(reply, data, min(reply_size, data_size));
 		return dptxport_call_set_tiled_display_hint(reply, reply_size);
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
@@ -836,6 +839,21 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	}
 }
 
+static void dptxport_init_props(struct apple_epic_service *service, s64 unit,
+			       const void *props, size_t size)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct dcp_parse_ctx ctx;
+	struct dcp_dptx_caps caps;
+
+	if (unit < 0 || unit >= ARRAY_SIZE(dcp->dptxport) ||
+	    parse(props, size, &ctx) || parse_dptx_caps(&ctx, &caps))
+		return;
+	dcp->dptxport[unit].caps = caps;
+	dev_info(dcp->dev, "DPTX%lld caps: width=%u total=%u active=%u\n",
+		 unit, caps.width, caps.total_rate, caps.active_rate);
+}
+
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
@@ -871,6 +889,7 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
 		.init = dptxport_init,
+		.init_props = dptxport_init_props,
 		.call = dptxport_call,
 	},
 	{}

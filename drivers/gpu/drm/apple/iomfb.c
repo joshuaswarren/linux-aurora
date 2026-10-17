@@ -246,7 +246,8 @@ static void iomfb_queue_advance(struct apple_dcp *dcp)
 		/* The active operation may still be visible to firmware. */
 		return;
 	}
-	if (!iomfb_channels_idle(dcp) || dcp->present_state_h17p.pending)
+	if (!iomfb_channels_idle(dcp) || dcp->present_state_h17p.pending ||
+	    READ_ONCE(dcp->iomfb.callback_count))
 		return;
 
 	if (transaction) {
@@ -292,7 +293,8 @@ static void iomfb_queue_work(struct work_struct *work)
 		goto unlock;
 	}
 	if (dcp->iomfb.active || !iomfb_channels_idle(dcp) ||
-	    dcp->present_state_h17p.pending || list_empty(&dcp->iomfb.pending))
+	    dcp->present_state_h17p.pending || READ_ONCE(dcp->iomfb.callback_count) ||
+	    list_empty(&dcp->iomfb.pending))
 		goto unlock;
 
 	transaction = list_first_entry(&dcp->iomfb.pending,
@@ -373,11 +375,91 @@ static void iomfb_backlight_retry(struct work_struct *work)
 		schedule_work(&dcp->bl_update_wq);
 }
 
+/* A peer endpoint may finish a dependency while this endpoint has an active
+ * transaction. Continue on its serialized owner, not by taking another
+ * endpoint's IOMFB mutex from a receive callback. */
+struct iomfb_callback {
+	struct list_head link;
+	dcp_callback_t callback;
+	void *cookie;
+	u8 data[];
+};
+
+int iomfb_queue_callback(struct apple_dcp *dcp, dcp_callback_t callback,
+			 const void *data, size_t size, void *cookie)
+{
+	struct iomfb_callback *item;
+	unsigned long flags;
+	int ret = 0;
+
+	/* This queue carries control replies and completion watermarks only. */
+	if (!callback || size > 64 || (size && !data))
+		return -EINVAL;
+	item = kzalloc(struct_size(item, data, size), GFP_KERNEL);
+	if (!item)
+		return -ENOMEM;
+	item->callback = callback;
+	item->cookie = cookie;
+	if (size)
+		memcpy(item->data, data, size);
+	spin_lock_irqsave(&dcp->iomfb.callback_lock, flags);
+	if (READ_ONCE(dcp->iomfb.stopped) || READ_ONCE(dcp->crashed)) {
+		ret = -ESHUTDOWN;
+	} else if (dcp->iomfb.callback_count >= 64) {
+		ret = -EBUSY;
+	} else {
+		list_add_tail(&item->link, &dcp->iomfb.callbacks);
+		dcp->iomfb.callback_count++;
+		/* Stop takes this lock before cancelling work, closing enqueue/stop. */
+		schedule_work(&dcp->iomfb.callback_work);
+	}
+	spin_unlock_irqrestore(&dcp->iomfb.callback_lock, flags);
+	if (ret)
+		kfree(item);
+	return ret;
+}
+
+static struct iomfb_callback *iomfb_pop_callback(struct apple_dcp *dcp)
+{
+	struct iomfb_callback *item = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->iomfb.callback_lock, flags);
+	if (!list_empty(&dcp->iomfb.callbacks)) {
+		item = list_first_entry(&dcp->iomfb.callbacks, struct iomfb_callback, link);
+		list_del(&item->link);
+		dcp->iomfb.callback_count--;
+	}
+	spin_unlock_irqrestore(&dcp->iomfb.callback_lock, flags);
+	return item;
+}
+
+static void iomfb_callback_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, iomfb.callback_work);
+	struct iomfb_callback *item;
+
+	mutex_lock(&dcp->iomfb.lock);
+	while ((item = iomfb_pop_callback(dcp))) {
+		if (!dcp->iomfb.stopped && !READ_ONCE(dcp->crashed)) {
+			WRITE_ONCE(dcp->iomfb.owner, current);
+			item->callback(dcp, item->data, item->cookie);
+			WRITE_ONCE(dcp->iomfb.owner, NULL);
+		}
+		kfree(item);
+	}
+	iomfb_queue_advance(dcp);
+	mutex_unlock(&dcp->iomfb.lock);
+}
+
 void iomfb_queue_init(struct apple_dcp *dcp)
 {
 	mutex_init(&dcp->iomfb.lock);
 	INIT_LIST_HEAD(&dcp->iomfb.pending);
 	INIT_WORK(&dcp->iomfb.work, iomfb_queue_work);
+	spin_lock_init(&dcp->iomfb.callback_lock);
+	INIT_LIST_HEAD(&dcp->iomfb.callbacks);
+	INIT_WORK(&dcp->iomfb.callback_work, iomfb_callback_work);
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
 	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
@@ -385,14 +467,22 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 
 void iomfb_queue_stop(struct apple_dcp *dcp)
 {
+	struct iomfb_callback *item;
+	unsigned long flags;
+
 	if (!iomfb_uses_queue(dcp))
 		return;
 
 	mutex_lock(&dcp->iomfb.lock);
-	dcp->iomfb.stopped = true;
+	spin_lock_irqsave(&dcp->iomfb.callback_lock, flags);
+	WRITE_ONCE(dcp->iomfb.stopped, true);
+	spin_unlock_irqrestore(&dcp->iomfb.callback_lock, flags);
 	iomfb_discard_pending(dcp);
 	mutex_unlock(&dcp->iomfb.lock);
 	cancel_work_sync(&dcp->iomfb.work);
+	cancel_work_sync(&dcp->iomfb.callback_work);
+	while ((item = iomfb_pop_callback(dcp)))
+		kfree(item);
 	cancel_delayed_work_sync(&dcp->iomfb.timeout);
 	cancel_delayed_work_sync(&dcp->iomfb.backlight_retry);
 }
@@ -413,7 +503,7 @@ bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout)
 		mutex_lock(&dcp->iomfb.lock);
 		idle = READ_ONCE(dcp->crashed) || dcp->iomfb.stopped ||
 		       (!dcp->iomfb.active && list_empty(&dcp->iomfb.pending) &&
-			!dcp->present_state_h17p.pending);
+			!dcp->present_state_h17p.pending && !READ_ONCE(dcp->iomfb.callback_count));
 		mutex_unlock(&dcp->iomfb.lock);
 		if (idle)
 			return true;

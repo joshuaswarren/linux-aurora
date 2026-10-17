@@ -55,6 +55,14 @@ struct drm_atomic_state;
     program += without_includes((DRIVER / "iomfb_template.h").read_text())
     program += without_includes((DRIVER / "iomfb_v27.h").read_text())
     program += without_includes((DRIVER / "iomfb-dfb.h").read_text())
+    program += "\ntypedef int32_t s32; typedef uint32_t __le32;\n"
+    program += "#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))\n"
+    program += "#define max_t(t,a,b) ((t)(a)>(t)(b)?(t)(a):(t)(b))\n#define min_t(t,a,b) ((t)(a)<(t)(b)?(t)(a):(t)(b))\n"
+    program += "#define div_u64(a,b) ((uint64_t)(a)/(b))\n"
+    program += "static u32 get_unaligned_le32(const void*p){u32 v;memcpy(&v,p,4);return v;}\n"
+    program += "static void put_unaligned_le32(u32 v,void*p){memcpy(p,&v,4); }\n"
+    program += without_includes((DRIVER / "iomfb-peer-v27.h").read_text())
+    program += without_includes((DRIVER / "dcp-peer-frames-v27.h").read_text())
     program += block((DRIVER / "iomfb_v27.c").read_text(),
                      r"^void iomfb_serialize_present_v27\(")
     driver = (DRIVER / "iomfb_v27.c").read_text()
@@ -62,7 +70,7 @@ struct drm_atomic_state;
     callback_sizes = block(driver, r"^static const struct \{\n\tu16 input, output;")
     names = sorted(set(re.findall(r"= (\w+),", handlers)))
     program += "\n#define IOMFB_MAX_CB 1000\n"
-    program += "#define ARRAY_SIZE(v) (sizeof(v) / sizeof((v)[0]))\n"
+
     program += "typedef bool (*iomfb_cb_handler)(void);\n"
     for name in names:
         program += f"static bool {name}(void) {{ return true; }}\n"
@@ -93,6 +101,26 @@ int main(void) {
  assert(wire.swap.event_signal_on_glass == 0 && wire.swap.event_signal[3] == 0);
  assert(wire.swap.brightness_update == 0 && wire.swap.brightness_nits == 0);
  assert(wire.padding[0] == 0 && wire.padding[1] == 0);
+ struct dcp_swap_submit_req_h17p unchanged = input;
+ struct dcp_swap_submit_req_v27 right;
+ memset(wire.surf_null,1,sizeof(wire.surf_null));
+ wire.surf_null[0]=0;
+ wire.swap.src_rect[0]=(struct dcp_rect){.x=0,.y=0,.w=3840,.h=2160};
+ wire.swap.dst_rect[0]=wire.swap.src_rect[0];
+ dcp_peer_split_swap_v27(&wire,&right,1920);
+ assert(wire.swap.src_rect[0].w==1920 && right.swap.src_rect[0].x==1920);
+ assert(right.swap.src_rect[0].w==1920 && right.swap.dst_rect[0].x==0);
+ assert(wire.surf_iova[0]==right.surf_iova[0]);
+ assert(!memcmp(&input,&unchanged,sizeof(input)));
+ struct dcp_peer_frames_v27 frames={.active=true}; u32 watermark=0;
+ dcp_peer_frame_submit_v27(&frames,17);
+ assert(!dcp_peer_frame_complete_v27(&frames,0,17,&watermark));
+ assert(!dcp_peer_frame_complete_v27(&frames,1,16,&watermark));
+ assert(!dcp_peer_frame_complete_v27(&frames,1,18,&watermark));
+ assert(dcp_peer_frame_complete_v27(&frames,1,17,&watermark)&&watermark==17);
+ assert(!dcp_peer_frame_complete_v27(&frames,0,17,&watermark));
+ dcp_peer_frame_submit_v27(&frames,18); frames.failed=true;
+ assert(!dcp_peer_frame_complete_v27(&frames,0,18,&watermark));
  u32 format, allocation;
  assert(!apple_dcp_dfb_allocation(1920,1080,0x42475241,0,1ULL<<32,
                                   &format,&allocation));

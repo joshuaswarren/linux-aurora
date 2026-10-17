@@ -13,6 +13,7 @@
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dp-tunnel.h>
@@ -45,6 +46,7 @@
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
+#include "iomfb_internal.h"
 #include "parser.h"
 #include "trace.h"
 
@@ -175,6 +177,9 @@ struct apple_dcp_typec_port {
 
 static DEFINE_MUTEX(dcp_typec_fabric_lock);
 static LIST_HEAD(dcp_typec_ports);
+
+#include "dcp-peer-v27.inc"
+#include "dcp-peer-probe-v27.inc"
 
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port);
 static void disconnected_hpd_event(struct apple_connector *connector);
@@ -1130,12 +1135,17 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 {
 	typeof(&apple_dp_phy_link_config) get_config;
 	typeof(&apple_dpxbar_link_configure) configure;
+	struct mux_control *xbar;
 	unsigned int pclk;
 	bool uhbr;
 	int ret;
 
 	guard(mutex)(&dcp->tb_lock);
-	if (dcp->dptx_tunnel || !dcp->phy || !dcp->xbar)
+	/* A borrowed Type-C route has its own mux; xbar remains the fixed
+	 * output's mux (or NULL on a Type-C-only pipeline). */
+	xbar = dcp->active_typec_route ?
+		dcp->active_typec_route->active_xbar : dcp->xbar;
+	if (dcp->dptx_tunnel || !dcp->phy || !xbar)
 		return 0;
 	get_config = symbol_get(apple_dp_phy_link_config);
 	if (!get_config)
@@ -1149,13 +1159,13 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	if (ret)
 		return ret;
 	if (!up)
-		return dcp_dpxbar_link(dcp->xbar, false);
+		return dcp_dpxbar_link(xbar, false);
 	configure = symbol_get(apple_dpxbar_link_configure);
 	if (!configure)
 		return -ENODEV;
-	ret = configure(dcp->xbar, pclk, uhbr);
+	ret = configure(xbar, pclk, uhbr);
 	symbol_put(apple_dpxbar_link_configure);
-	return ret ? ret : dcp_dpxbar_link(dcp->xbar, true);
+	return ret ? ret : dcp_dpxbar_link(xbar, true);
 }
 
 /* DP IN adapter handshake through the thunderbolt glue; tb_lock held */
@@ -2007,6 +2017,7 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 		return;
 
 	dcp->crashed = true;
+	dcp_peer_forget(dcp);
 	dev_err(dcp->dev, "DCP has crashed\n");
 	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
@@ -2202,6 +2213,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 		goto out_unlock;
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
+	reinit_completion(&dcp->typec_display_ready);
 	dcp->dptxport[port].atcphy = dcp->phy;
 	ret = dptxport_validate_connection(dcp->dptxport[port].service,
 					   dcp->dptx_dfp_port,
@@ -2262,6 +2274,16 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
 		jiffies_to_msecs(timeout - ret));
+
+	/* Lane configuration precedes IOMFB display publication on firmware27.
+	 * A resume modeset before the positive hotplug callback is rejected
+	 * with 0x80000104, even though the physical link is already trained. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp_is_typec_output(dcp) &&
+	    !wait_for_completion_timeout(&dcp->typec_display_ready, DPTX_CONNECT_TIMEOUT)) {
+		dev_err(dcp->dev, "DPTX link trained but Type-C display publication timed out\n");
+		ret = -ETIMEDOUT;
+		goto out_disconnect;
+	}
 
 	usleep_range(5, 10);
 
@@ -2551,6 +2573,7 @@ int dcp_start(struct platform_device *pdev)
 		return -ENODEV;
 
 	init_completion(&dcp->start_done);
+	init_completion(&dcp->typec_display_ready);
 
 	/*
 	 * The coprocessor start can fail (or be recovered from) without tearing
@@ -3613,6 +3636,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (!dcp)
 		return;
+	dcp_peer_forget(dcp);
 
 	if (dcp->retain_dma) {
 		/* No firmware stop is acknowledged: detach host users, never DMA. */
@@ -4117,6 +4141,7 @@ static struct platform_driver apple_platform_driver = {
 	.shutdown	= dcp_platform_shutdown,
 	.driver	= {
 		.name = "apple-dcp",
+		.dev_groups = dcp_peer_probe_groups,
 		.of_match_table	= of_match,
 		.pm = pm_sleep_ptr(&dcp_platform_pm_ops),
 	},

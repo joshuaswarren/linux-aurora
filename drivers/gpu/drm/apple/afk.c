@@ -380,6 +380,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		goto free;
 	}
 	ep->num_channels = max(ep->num_channels, ch_idx + 1);
+	if (ops->init_props)
+		ops->init_props(service, epic_unit, props, props_size);
 	ops->init(service, epic_name, epic_class, epic_unit);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
 		 ep->endpoint, service_name, channel);

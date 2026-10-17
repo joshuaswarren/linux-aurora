@@ -24,6 +24,7 @@
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
+#include "dcp-peer-frames-v27.h"
 #include "epic/dpavservep.h"
 
 #define DCP_MAX_PLANES 4
@@ -211,6 +212,13 @@ struct apple_dcp {
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
+	/* Protected by dcp_peer_lock; never take the physical route lock in
+	 * an AFK callback (a route operation may be waiting for that reply).
+	 */
+	struct apple_dcp *peer_owner, *peer_reserved;
+	bool peer_unbinding;
+	struct dcp_peer_tiling_v27 peer_tiling;
+	struct dcp_peer_frames_v27 peer_frames;
 
 	struct apple_dcp_hw_data hw;
 
@@ -243,6 +251,8 @@ struct apple_dcp {
 	u32 iomfb_boolean_property_count;
 	u32 external_pipes_v27, external_displays_v27, external_suppression_v27;
 	struct dcp_swap_submit_req_v27 present_v27;
+	/* Both paired wire records belong to the primary endpoint lock. */
+	struct dcp_swap_submit_req_v27 peer_present_v27;
 
 	/* DCP shared memory */
 	void *shmem;
@@ -302,6 +312,8 @@ struct apple_dcp {
 
 	/* completion for active turning true */
 	struct completion start_done;
+	/* IOMFB has published fresh modes and acknowledged a Type-C display. */
+	struct completion typec_display_ready;
 
 	/* Is the DCP booted? */
 	bool active;
@@ -446,6 +458,10 @@ struct apple_dcp {
 		struct iomfb_transaction *active;
 		struct task_struct *owner;
 		struct work_struct work;
+		spinlock_t callback_lock;
+		struct list_head callbacks;
+		struct work_struct callback_work;
+		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
 		unsigned long deadline;
@@ -472,6 +488,8 @@ void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp);
 int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 				   bool inherited_valid, u32 inherited,
 				   bool default_valid, u32 default_nits);
+int iomfb_queue_callback(struct apple_dcp *dcp, dcp_callback_t callback,
+			 const void *data, size_t size, void *cookie);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
