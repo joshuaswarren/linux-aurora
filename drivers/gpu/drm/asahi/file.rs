@@ -465,6 +465,11 @@ impl File {
         if gpu.independent_queue_limits().is_some() {
             params.features |= crate::g17_queue_limits::FEATURE_INDEPENDENT_QUEUES;
         }
+        if gpu.supports_g18_graphics_scratch() {
+            // DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH, spelled as its value:
+            // the incremental module build reuses pinned bindgen output.
+            params.features |= 1u64 << 8;
+        }
         if *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }

@@ -15,6 +15,8 @@ pub(crate) struct ApplicationJob {
     retired: bool,
     /// Frames of the current client VM, counting this one.
     client_frames: u32,
+    /// The current render's adapter-derived private-memory selection.
+    scratch: Option<crate::g18_graphics_scratch::G18RenderScratchSelection>,
 }
 
 impl ApplicationJob {
@@ -25,7 +27,7 @@ impl ApplicationJob {
         // payload and PB backing stay retained but no capture bytes execute.
         job.aliases.clear();
         Ok(KBox::new(Self {job,storage,user_aliases:KVec::new(),pool_aliases:KVec::new(),
-            guard:None,scene,generation:0,retired:true,client_frames:0},GFP_KERNEL)?)
+            guard:None,scene,generation:0,retired:true,client_frames:0,scratch:None},GFP_KERNEL)?)
     }
     pub(crate) fn frame(&self) -> Frame {Frame::new(self.generation).expect("admitted frame")}
     /// The last frame kicked to both graphics queues (0 before the first).
@@ -99,6 +101,7 @@ impl ApplicationJob {
             }
         }
         self.job.parameters=render.parameters;self.job.controls=render.controls;
+        self.scratch=render.scratch;
         assembly::apply_target_plan(&mut self.job.parameters,&plan);
         self.job.parameter_buffer.application_scene(Some(&self.scene))?;
         self.job.parameters.cycle=self.job.parameter_buffer.scene_cycle();
@@ -127,8 +130,17 @@ impl ApplicationJob {
     #[inline(never)]
     fn application_policy(&mut self, frame: Frame) -> Result<KBox<cmd::G18RenderCommandInputs>> {
         let context=u32::from(self.job.context_id());
+        let scratch=self.scratch;
         let job=&mut *self.job;
         let mut inputs=KBox::new(g18_application_runtime::inputs(&mut job.parameters,&mut job.controls,context,frame),GFP_KERNEL)?;
+        // A render whose programs carry a thread-private frame takes both
+        // launch pairs from its own plan; the TA/3D pool stays the owned one.
+        // The adapter admitted it only at one sample, so no 4x override exists.
+        if let Some(selection)=scratch {
+            if job.controls.fragment_sample_control!=0 {return Err(EINVAL);}
+            job.controls.ta.resource_word=selection.stages[0].resource_word();
+            job.controls.fragment.resource_word=selection.stages[1].resource_word();
+        }
         let pb=self.job.parameter_buffer.command_fields();
         inputs.ta.pb_slot=pb.pb_slot;inputs.ta.pm_1d4=pb.pm_1d4;
         inputs.ta.pb_state=pb.pb_state;inputs.fragment.pm_state=pb.pb_state;

@@ -194,7 +194,7 @@ impl G18ComputeMemory {
             }
         }
         let id = u32::from(context.context_id());
-        dev_info!(dev.as_ref(),
+        crate::g18_kick_info!(dev.as_ref(),
             "G18 compute context: id={} roots={:x?}; command/channel aliases retained, unpublished\n",
             id, context.roots());
         self.process = Some(G18ComputeProcess { context, aliases: [command, channel] });

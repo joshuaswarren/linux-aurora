@@ -38,6 +38,14 @@ pub(crate) fn ta_barrier_flag() -> u32 {
     #[cfg(not(CONFIG_RUST))] { 0 }
 }
 pub(crate) fn uma_blocks() -> u32 { if ideal_enabled() { 40 } else { UMA_BLOCKS } }
+/// Block size of the owned render pool (prepare_render_backing).
+pub(crate) const RENDER_POOL_BLOCK_BYTES: u64 = 0x10_0000;
+/// Capacity of the owned render pool as published in its state: backing
+/// bytes and the per-USC chunk counter. Graphics scratch selections must fit
+/// both; they never resize the pool (g18_graphics_scratch.rs).
+pub(crate) fn owned_scratch_capacity() -> (u64, u32) {
+    (u64::from(uma_blocks()) * RENDER_POOL_BLOCK_BYTES, uma_chunks()[1])
+}
 pub(crate) fn uma_chunks() -> [u32; 2] { if ideal_enabled() { [0, 708 + 2305] } else { UMA_CHUNKS } }
 pub(crate) fn block_base() -> u64 { if ideal_enabled() { va::GRAPHICS_IDEAL_BLOCKS } else { va::POOL_BLOCKS } }
 pub(crate) fn usc_required() -> [u64; 2] { if ideal_enabled() { [9 * 0x100000, 28 * 0x100000] } else { USC_REQUIRED } }

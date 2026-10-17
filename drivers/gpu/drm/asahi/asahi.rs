@@ -66,6 +66,7 @@ mod g18_compute;
 mod g18_compute_inputs;
 mod g18_compute_metadata;
 mod g18_compute_plan;
+mod g18_graphics_scratch;
 mod g18_compute_memory;
 mod g18_compute_state;
 mod g18_compute_payload;
@@ -176,6 +177,10 @@ kernel::prelude::module! {
             default: 0,
             description: "G18 DRM adapter (g18_initdata_test=10 only): 1 admits exactly the native 4x MSAA render (4 samples, 32x16 utiles, sample positions 0xeaa26e26, 8-byte samples, one layer, no depth/stencil) with its native 4x command fields; Mesa needs AGX_G18_MSAA4=1 to submit it. 0 refuses every multisampled render (default)",
         },
+        g18_admit_graphics_scratch: u32 {
+            default: 0,
+            description: "G18 DRM adapter: 1 advertises DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH and admits single-sample renders carrying the G18 render resource suffix; the kernel derives both TA/3D private-memory launch pairs and selects the native ideal or minimum result that fits the owned render pool. 0 refuses the suffix (default)",
+        },
         g18_usc_statistics: u32 {
             default: 0,
             description: "Stage 9 colour fixture only: 1 enables owned TA/3D SMAPP statistics pages. Raw memory statistics, not shader invocation counts. Default 0",
@@ -187,6 +192,10 @@ kernel::prelude::module! {
         g18_graphics_stall_trace: u32 {
             default: 0,
             description: "Stage9/profile4 or stage10/profile1, variant0: 1 enables firmware category9 diagnostics and the native TA mode2 progress sampler. No timeout changes. Default 0",
+        },
+        g18_kick_log: u32 {
+            default: 0,
+            description: "Stage10 application DRM log volume: 0 (default) omits the per-kick, frame-pass and per-job resource lines (G18_APP_KICK, G18_APP_FRAME_PASS, G18_APP_COMPUTE_KNOBS, G18_COMPUTE_*, G18_SHARED_COMPUTE_*, G18 UMA/compute-context lines, G18_POOL_DESCRIPTOR_CURSOR, role-0 type-1 G18_EVENT) once G18_DRM_READY is logged; 1 prints them as before. Startup, fault, recovery, refusal, wait, stall, admission and sampled summary lines are always printed",
         },
         g18_vdm_high_alias: u32 {
             default: 0,

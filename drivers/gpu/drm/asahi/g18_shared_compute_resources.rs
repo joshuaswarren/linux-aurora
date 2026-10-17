@@ -215,12 +215,12 @@ impl G18UmaPoolMemory {
         });
         self.shared_compute_plan = Some(plan);
         fence(Ordering::SeqCst);
-        dev_info!(dev.as_ref(),
+        crate::g18_kick_info!(dev.as_ref(),
             "G18_SHARED_COMPUTE_OWNER bytes={} blocks={} directory_pages={} previous_blocks={} pair={:?} counters={:?} unpublished=1\n",
             new.bytes, new.block_count, directory.committed_pages(), previous,
             new.register_pair, new.chunk_counters);
         if let Some(old) = retained {
-            dev_info!(dev.as_ref(),
+            crate::g18_kick_info!(dev.as_ref(),
                 "G18_SHARED_COMPUTE_REPLACEMENT old_bias={:#x} new_bias={:#x} retained_blocks={} blocks={} unpublished=1\n",
                 old.low_bias, self.low_bias, old.scratch.len().min(new.block_count as usize), new.block_count);
         }

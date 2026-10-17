@@ -159,6 +159,7 @@ pub(crate) fn start_drm(pdev:&platform::Device<Core>,probe:T8152Probe)
         Failure::Job(_) => EIO,
     })?;
     dev_info!(pdev.as_ref(),"G18_DRM_READY firmware=live graphics=on-first-submit timestamps=K8\n");
+    crate::debug::g18_mark_drm_live();
     Ok((owner.clone(),owner))
 }
 
@@ -224,7 +225,7 @@ impl G18Session {
         // each client's first frames are logged. Other frames stay sparse;
         // explicit stall tracing records each job.
         if traced {
-            dev_info!(self.device(),"G18_APP_KICK frame={} context={} roots={:x?} order=3D,TA stamp={:#x}\n",frame.generation,pass.context_id,roots,frame.stamp());
+            crate::g18_kick_info!(self.device(),"G18_APP_KICK frame={} context={} roots={:x?} order=3D,TA stamp={:#x}\n",frame.generation,pass.context_id,roots,frame.stamp());
         }
         // Phases: outer, inner, scheduler submitted, completed, linked, list,
         // stamps, completion masks.
@@ -265,7 +266,7 @@ impl G18Session {
                     }
                     self.application_job.as_mut().ok_or(EIO)?.retired();
                     if traced || frame.generation%256==0 {
-                        dev_info!(self.device(),"G18_APP_FRAME_PASS frame={} stamp={:#x} scheduler={} outer={} inner={}\n",
+                        crate::g18_kick_info!(self.device(),"G18_APP_FRAME_PASS frame={} stamp={:#x} scheduler={} outer={} inner={}\n",
                             frame.generation,frame.stamp(),frame.submitted(),outer_after,frame.inner_after());
                     }
                     return Ok(());

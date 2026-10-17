@@ -46,6 +46,8 @@ pub(crate) trait DrmGpu: Send + Sync {
     fn supports_per_command_input_syncs(&self) -> bool { false }
     /// Exact queue-local historical command prefixes in extensible payloads.
     fn supports_exact_prior_barriers(&self) -> bool { false }
+    /// G18 render payloads may carry `DRM_ASAHI_RENDER_G18_RESOURCES`.
+    fn supports_g18_graphics_scratch(&self) -> bool { false }
     fn independent_queue_limits(&self) -> Option<[u8; 16]> { None }
     /// Permanent submission-domain failure; querying must not reset firmware.
     fn submission_error(&self) -> i32 { 0 }
