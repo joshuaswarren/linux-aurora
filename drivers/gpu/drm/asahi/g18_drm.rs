@@ -164,6 +164,7 @@ impl DrmGpu for G18DrmGpu {
     fn is_crashed(&self) -> bool { self.runtime.is_crashed() }
     fn supports_vm_status(&self) -> bool { true }
     fn supports_g18_graphics_scratch(&self) -> bool { self.config.admit_graphics_scratch }
+    fn supports_g18_native_tile_samples(&self) -> bool { true }
     fn submission_error(&self) -> i32 { if self.is_crashed() { EIO.to_errno() } else { 0 } }
     fn update_globals(&self) {}
     fn params(&self) -> Result<DrmGpuParams> {
