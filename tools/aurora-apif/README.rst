@@ -62,3 +62,12 @@ unless both nodes carry the producer-supplied shared power-domain dependency.
 It preserves that dependency on the renamed APIF IOMMU node; platform PM
 attachment therefore precedes IOMMU probe and native access. This does not
 replace physical hotplug/DMA qualification.
+
+The T6050 GPU keeps its separate compatibility-operation page at
+``0x61f3c000`` with register name ``x1n1-uat``. The generic APIF v2 page
+does not replace that GPU ABI. Migration preserves the GPU apertures,
+CPU release offsets, guest-device mask and QSPI/NVRAM description.
+It accepts the legacy ANS ``nvmmu`` resource only to remove that mediated
+window after validating the stopped handoff. The explicitly selected
+T6050 PCIe layout normalizes its historical ``config,port,phy,intr2axi,perst``
+resource order to ``ecam,port,phy,perst,intr2axi`` without changing extents.

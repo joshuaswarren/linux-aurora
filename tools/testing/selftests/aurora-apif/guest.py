@@ -62,6 +62,13 @@ def main():
         iommus=<&usb_dart 0>; power-domains=<&usb_power>;
     };
     gpu {compatible="example,opaque-gpu"; unchanged=[de ad be ef];};
+    gpu@800000000 {compatible="gpu,t6050";
+        reg=<8 0 0 0x3fdc000>,<0 0x61f3c000 0 0x4000>;
+        reg-names="sgx","x1n1-uat";};
+    chosen {x1n1,guest-devices=<0x7ff>;};
+    cpus {#address-cells=<1>; #size-cells=<0>;
+        cpu@1 {reg=<1>; cpu-release-addr=<0 0x4fffc008>;};};
+    spi@62630000 {reg=<0 0x62630000 0 0x4000>; status="okay";};
 };'''
     with tempfile.TemporaryDirectory(prefix="apif-guest-") as directory:
         path = Path(directory)
@@ -82,6 +89,35 @@ def main():
         assert len(module.cells(after, "/nvme@60400000", "reg")) == 8
         assert module.cells(after, "/apif@61ff0000", "reg") == [0, module.APIF_IPA, 0, module.PAGE_SIZE]
         assert module.property_bytes(after, "/iommu-10", "power-domains") == module.property_bytes(before, "/usb@8a000000", "power-domains")
+        for path, properties in [("/gpu@800000000", ["reg", "reg-names", "compatible"]),
+                                 ("/chosen", ["x1n1,guest-devices"]),
+                                 ("/cpus/cpu@1", ["cpu-release-addr"]),
+                                 ("/spi@62630000", ["reg", "status"])]:
+            for prop in properties:
+                assert module.property_bytes(after, path, prop) == module.property_bytes(before, path, prop)
+        four = libfdt.Fdt(bytearray(blob)); four.resize(len(blob)+2048)
+        reg = module.cells(four, "/nvme@60400000", "reg")
+        module.put_cells(four, "/nvme@60400000", "reg", reg[:8]+[0,0x60300000,0,0x30000]+reg[8:])
+        module.put_strings(four, "/nvme@60400000", "reg-names", ["nvme","ans","nvmmu","sptm"])
+        four.pack()
+        converted = libfdt.Fdt(bytearray(module.migrate(bytes(four.as_bytearray()))))
+        assert module.cells(converted, "/nvme@60400000", "reg") == reg[:8]
+        pci = libfdt.Fdt(bytearray(blob)); pci.resize(len(blob)+4096)
+        pci.add_subnode(0, "pcie@62000000")
+        path = "/pcie@62000000"
+        module.put_strings(pci,path,"compatible",["apple,x1n1-pcie"])
+        module.put(pci,path,"apple,preinitialized",b"")
+        module.put_cells(pci,path,"max-link-speed",[3]); module.put_cells(pci,path,"num-lanes",[1])
+        module.put_cells(pci,path,"apple,rid-to-sid",[1,0x100,1])
+        original=[]
+        for address,size in [(0x62000000,0x200000),(0x62800000,0x8000),(0x62808000,0x4000),(0x6280c000,0x4000),(0x62810140,4)]:
+            original += [0,address,0,size]
+        module.put_cells(pci,path,"reg",original)
+        module.put_strings(pci,path,"reg-names",["config","port","phy","intr2axi","perst"])
+        pci.pack()
+        converted=libfdt.Fdt(bytearray(module.migrate(bytes(pci.as_bytearray()),"t6050-gen3-x1")))
+        assert module.strings(converted,path,"reg-names")==["ecam","port","phy","perst","intr2axi"]
+        assert module.cells(converted,path,"reg")==original[:12]+original[16:20]+original[12:16]
         for mutation in ["live", "duplicate", "collision", "unpowered-usb-dart"]:
             bad = libfdt.Fdt(bytearray(blob)); bad.resize(len(blob)+2048)
             if mutation == "live":

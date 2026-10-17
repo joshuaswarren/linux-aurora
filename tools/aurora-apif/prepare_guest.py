@@ -123,6 +123,16 @@ def pci_layout(tree, path, layout):
         raise ValueError(f"{path}: stopped preinitialized producer handoff required")
     if layout != "t6050-gen3-x1":
         raise ValueError(f"{path}: explicitly select the producer's PCIe layout")
+    names = strings(tree, path, "reg-names")
+    if names == ["config", "port", "phy", "intr2axi", "perst"]:
+        parent = path.rsplit("/", 1)[0] or "/"
+        width = number(tree, parent, "#address-cells") + number(tree, parent, "#size-cells")
+        registers = cells(tree, path, "reg")
+        if len(registers) != 5 * width:
+            raise ValueError(f"{path}: incomplete legacy PCIe register extents")
+        put_cells(tree, path, "reg", sum([registers[i*width:(i+1)*width]
+                                          for i in [0, 1, 2, 4, 3]], []))
+        put_strings(tree, path, "reg-names", ["ecam", "port", "phy", "perst", "intr2axi"])
     if strings(tree, path, "reg-names") != ["ecam", "port", "phy", "perst", "intr2axi"]:
         raise ValueError(f"{path}: matched PCIe register resources required")
     if number(tree, path, "max-link-speed") != 3 or number(tree, path, "num-lanes") != 1:
@@ -230,7 +240,7 @@ def migrate(blob, pcie_layout=None, enable_pmp=False):
             reg = cells(tree, path, "reg")
             parent = path.rsplit("/", 1)[0] or "/"
             width = number(tree, parent, "#address-cells") + number(tree, parent, "#size-cells")
-            if names != ["nvme", "ans", "sptm"] or len(reg) != 3 * width:
+            if names not in (["nvme", "ans", "sptm"], ["nvme", "ans", "nvmmu", "sptm"]) or len(reg) != len(names) * width:
                 raise ValueError(f"{path}: expected version-1 NVMe resources")
             put_cells(tree, path, "reg", reg[:2 * width])
             put_strings(tree, path, "reg-names", ["nvme", "ans"])
