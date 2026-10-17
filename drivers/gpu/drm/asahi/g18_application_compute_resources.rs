@@ -339,7 +339,7 @@ impl G18FirmwareMemory {
                 || knobs.sma_units != expected.sma_units || !knobs.metadata_plan {
                 return Err(EIO);
             }
-            dev_info!(dev.as_ref(),
+            crate::g18_kick_info!(dev.as_ref(),
                 "G18_COMPUTE_RESOURCE_PLAN bytes={} blocks={} pair={:?} counters={:?} sma_units={} replacement={}\n",
                 expected.ideal.bytes, expected.ideal.block_count, pair,
                 expected.ideal.chunk_counters, expected.sma_units, u8::from(replacement.is_some()));
@@ -481,7 +481,7 @@ impl G18FirmwareMemory {
             }
             job.pool.replace_hardware_descriptor(dev, &mut self.uma, job.binding,
                 previous, old, j873_sma_device_words(2, 6)?)?;
-            dev_info!(dev.as_ref(),
+            crate::g18_kick_info!(dev.as_ref(),
                 "G18_COMPUTE_POOL_SWITCH compute={} old_state={:#x} new_state={:#x} old_generation={} new_generation={} slot={} old_retained=1\n",
                 job.generation, old.state, job.binding.state, old.generation,
                 job.binding.generation, job.binding.slot);

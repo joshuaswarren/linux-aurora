@@ -276,6 +276,15 @@ enum drm_asahi_feature {
 	 * These fields supplement, rather than replace, the header barriers.
 	 */
 	DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS = (1UL) << 5,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH: G18 render payloads may carry
+	 * the DRM_ASAHI_RENDER_G18_RESOURCES suffix. The kernel sizes the shared
+	 * TA/3D private-memory pool from it and programs both launch pairs;
+	 * userspace emits nonzero SPECTPR scratch frames only for such renders.
+	 * Bits 6 and 7 are reserved for features defined by other clients.
+	 */
+	DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH = (1UL) << 8,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
@@ -935,6 +944,15 @@ enum drm_asahi_render_flags {
 	 * so we match that here for efficiency.
 	 */
 	DRM_ASAHI_RENDER_DBIAS_IS_INT = (1U << 18),
+
+	/**
+	 * @DRM_ASAHI_RENDER_G18_RESOURCES: G18 only, requires
+	 * DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH. The payload is a
+	 * drm_asahi_cmd_render_g18: the complete render payload followed by a
+	 * drm_asahi_g18_render_resources suffix. Bits 19 and 20 are reserved
+	 * for flags defined by other clients.
+	 */
+	DRM_ASAHI_RENDER_G18_RESOURCES = (1U << 21),
 };
 
 /**
@@ -1270,6 +1288,39 @@ struct drm_asahi_cmd_render {
 	 * queue's compute command count and the header's cdm_barrier instead.
 	 */
 	__u64 prior_cdm;
+};
+
+/**
+ * struct drm_asahi_g18_render_resources - G18 per-render program metadata.
+ *
+ * Effective (linked) program demand in compiler units, maximized over every
+ * draw of the render: 16-bit registers, static thread-private (TPS) frame
+ * bytes as programmed in SPECTPR (a multiple of 16) and IPR/staging
+ * halfwords. Tile programs are background, end-of-tile, partial background
+ * and partial end-of-tile; a zero register count marks an absent program.
+ * Tile programs must not use scratch. At least one of the vertex and
+ * fragment frames must be nonzero. Tile storage is taken from the render
+ * command itself. @flags must be 3 (vertex and fragment present); @reserved
+ * must be zero.
+ */
+struct drm_asahi_g18_render_resources {
+	__u32 version;
+	__u32 flags;
+	__u32 vertex_registers_16;
+	__u32 vertex_scratch_bytes;
+	__u32 vertex_staging_16;
+	__u32 fragment_registers_16;
+	__u32 fragment_scratch_bytes;
+	__u32 fragment_staging_16;
+	__u32 tile_registers_16[4];
+	__u32 tile_staging_16[4];
+	__u32 reserved[4];
+};
+
+/* Payload layout when DRM_ASAHI_RENDER_G18_RESOURCES is set. */
+struct drm_asahi_cmd_render_g18 {
+	struct drm_asahi_cmd_render base;
+	struct drm_asahi_g18_render_resources resources;
 };
 
 /**

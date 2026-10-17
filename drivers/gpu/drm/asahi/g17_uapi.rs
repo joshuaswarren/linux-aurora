@@ -35,6 +35,11 @@ pub(crate) const UAPI_RENDER_SIZE: usize = 272;
 pub(crate) const UAPI_COMPUTE_SIZE: usize = 88;
 pub(crate) const UAPI_G18_COMPUTE_SIZE: usize = 136;
 pub(crate) const COMPUTE_G18_RESOURCES: u32 = 1 << 2;
+/// `drm_asahi_cmd_render_g18`: the render payload plus its 80-byte suffix.
+pub(crate) const UAPI_G18_RENDER_SIZE: usize = UAPI_RENDER_SIZE + 80;
+/// `DRM_ASAHI_RENDER_G18_RESOURCES`. Only the G18 adapter may consume and
+/// strip it; the shared translator's RENDER_FLAGS keeps refusing it.
+pub(crate) const RENDER_G18_RESOURCES: u32 = 1 << 21;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
@@ -360,11 +365,30 @@ pub(crate) struct UapiRenderCommand {
     pub(crate) fragment_timestamps: UapiTimestamps,
     pub(crate) prior_vdm: u64,
     pub(crate) prior_cdm: u64,
+    /// `drm_asahi_g18_render_resources` words; zero unless flagged.
+    pub(crate) g18_resources: [u32; 20],
 }
 
 impl UapiRenderCommand {
     fn parse(raw: &[u8]) -> Result<Self, UapiTranslateError> {
-        let raw = padded_payload::<UAPI_RENDER_SIZE>(raw)?;
+        // Legacy payloads are zero-extended exactly as before. A flagged G18
+        // suffix must be complete; padding could hide a truncated field.
+        let has_resources = raw.len() >= 4 && get_u32(raw, 0) & RENDER_G18_RESOURCES != 0;
+        if has_resources && raw.len() < UAPI_G18_RENDER_SIZE {
+            return Err(UapiTranslateError::PayloadTruncated);
+        }
+        if !has_resources && raw.len() > UAPI_RENDER_SIZE
+            && raw[UAPI_RENDER_SIZE..].iter().any(|byte| *byte != 0)
+        {
+            return Err(UapiTranslateError::PayloadTail);
+        }
+        let raw = padded_payload::<UAPI_G18_RENDER_SIZE>(raw)?;
+        let mut g18_resources = [0; 20];
+        if has_resources {
+            for (i, word) in g18_resources.iter_mut().enumerate() {
+                *word = get_u32(&raw, UAPI_RENDER_SIZE + i * 4);
+            }
+        }
         Ok(Self {
             flags: get_u32(&raw, 0x00),
             depth_dimensions: get_u32(&raw, 0x04),
@@ -400,6 +424,7 @@ impl UapiRenderCommand {
             fragment_timestamps: timestamps(&raw, 0xe0),
             prior_vdm: get_u64(&raw, 0x100),
             prior_cdm: get_u64(&raw, 0x108),
+            g18_resources,
         })
     }
 }
@@ -914,7 +939,15 @@ pub(crate) fn translate_g18_render_command<A: GpuAddressSpace>(
     address_space: &A,
     internal: RenderInternalState,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
-    let capacity = if matches!(command.samples, 2 | 4) { 98_304 } else { 32_768 };
+    // Native1044's 1x RGBA32 MRT footprint reaches128 bytes per sample at
+    // 32x32 (128KiB). Keep layered, other geometry and MSAA limits separate.
+    let wide_single = command.samples == 1 && command.layers == 1
+        && (command.utile_width, command.utile_height) == (32, 32)
+        && (48..=128).contains(&command.sample_size)
+        && command.sample_size & 15 == 0;
+    let capacity = if wide_single { 131_072 }
+        else if matches!(command.samples, 2 | 4) { 98_304 }
+        else { 32_768 };
     translate_render_command_with_capacity(command, vertex_attachments,
         fragment_attachments, queue, address_space, internal, capacity, true)
 }

@@ -116,6 +116,11 @@ pub(crate) struct G18DrmConfig {
     /// `g18_admit_msaa4`, default 0; msaa163). Off refuses every
     /// multisampled render as before.
     pub(crate) admit_msaa4: bool,
+    /// Admit renders carrying `DRM_ASAHI_RENDER_G18_RESOURCES` (module
+    /// parameter `g18_admit_graphics_scratch`, default 0). Off leaves the
+    /// feature unadvertised and refuses the flag, so Mesa keeps refusing
+    /// draws whose programs need a thread-private frame.
+    pub(crate) admit_graphics_scratch: bool,
 }
 
 pub(crate) struct G18DrmGpu {
@@ -158,6 +163,7 @@ impl DrmGpu for G18DrmGpu {
     fn ids(&self) -> &gpu::SequenceIDs { &self.ids }
     fn is_crashed(&self) -> bool { self.runtime.is_crashed() }
     fn supports_vm_status(&self) -> bool { true }
+    fn supports_g18_graphics_scratch(&self) -> bool { self.config.admit_graphics_scratch }
     fn submission_error(&self) -> i32 { if self.is_crashed() { EIO.to_errno() } else { 0 } }
     fn update_globals(&self) {}
     fn params(&self) -> Result<DrmGpuParams> {
@@ -458,10 +464,21 @@ impl G18Queue {
         fragment_attachments: g17_uapi::UapiAttachmentList,
         objects: Pin<&xarray::XArray<KBox<file::Object>>>) -> Result<Admitted> {
         let address_space = UserAddressSpace { vm: &self.vm };
-        let render = g18_application::translate_g18_render_admitting(payload,
+        let scratch = if payload.flags & g17_uapi::RENDER_G18_RESOURCES != 0 {
+            Some(self.admit_render_scratch(payload)?)
+        } else {
+            None
+        };
+        // The shared translator refuses the G18 flag and never sees the
+        // suffix. Only this adapter consumes and strips a validated suffix.
+        let mut untagged = *payload;
+        untagged.flags &= !g17_uapi::RENDER_G18_RESOURCES;
+        untagged.g18_resources = [0; 20];
+        let mut render = g18_application::translate_g18_render_admitting(&untagged,
             vertex_attachments, fragment_attachments, self.window, &address_space,
             self.config.admit_msaa4)
             .map_err(|refusal| refuse_render(payload, refusal))?;
+        render.scratch = scratch;
         let render = KBox::new(render, GFP_KERNEL)?;
         if !g18_application::job_owned_fields_clear(&render.parameters, &render.controls) {
             pr_err!("G18 render admission rejected: job-owned fields set\n");
@@ -474,6 +491,48 @@ impl G18Queue {
             TimestampSlot::resolve(objects, payload.fragment_timestamps.end)?,
         ];
         Ok(Admitted::Render(render, slots))
+    }
+
+    /// Derive the TA/3D private-memory selection for a flagged render. Only
+    /// single-sample, single-layer renders with one-page tile storage are in
+    /// the evidenced envelope (g18_graphics_scratch.rs). The selection never
+    /// resizes the owned pool: ideal when both kicks fit it, else the
+    /// native minimum result, else ENOSPC. Nothing is published on refusal.
+    #[inline(never)]
+    fn admit_render_scratch(&self, payload: &g17_uapi::UapiRenderCommand)
+        -> Result<crate::g18_graphics_scratch::G18RenderScratchSelection> {
+        use crate::{g18_graphics_scratch::G18RenderMetadata, g18_render_policy as policy};
+        if !self.config.admit_graphics_scratch {
+            pr_err!("G18 render admission rejected: graphics scratch is disabled (g18_admit_graphics_scratch=0)\n");
+            return Err(ENOTSUPP);
+        }
+        if payload.samples != 1 || payload.layers != 1
+            || (payload.utile_width, payload.utile_height) != (32, 32) {
+            pr_err!("G18 render admission rejected: graphics scratch outside single-sample 32x32 envelope samples={} layers={} utiles={}x{}\n",
+                payload.samples, payload.layers, payload.utile_width, payload.utile_height);
+            return Err(ENOTSUPP);
+        }
+        let tile_bytes = 32 * 32 * u32::from(payload.sample_size);
+        let metadata = G18RenderMetadata::decode(&payload.g18_resources, tile_bytes)
+            .ok_or_else(|| {
+                pr_err!("G18 render admission rejected: invalid graphics scratch metadata words={:x?} tile_bytes={}\n",
+                    payload.g18_resources, tile_bytes);
+                EINVAL
+            })?;
+        let plan = metadata.plan(policy::RENDER_POOL_BLOCK_BYTES).ok_or_else(|| {
+            pr_err!("G18 render admission rejected: graphics scratch exceeds the native pool capacity\n");
+            ENOSPC
+        })?;
+        let (owned_bytes, owned_chunks) = policy::owned_scratch_capacity();
+        let selected = plan.select(owned_bytes, owned_chunks).ok_or_else(|| {
+            pr_err!("G18 render admission rejected: graphics scratch needs {:?} beyond owned pool {} bytes / {} chunks\n",
+                plan.minimum, owned_bytes, owned_chunks);
+            ENOSPC
+        })?;
+        pr_info!("G18_RENDER_SCRATCH vertex={:?} fragment={:?} tiles={:?} tile_bytes={} mode={:?} ta={:?} d3={:?}\n",
+            metadata.vertex, metadata.fragment, metadata.tiles, tile_bytes, selected.mode,
+            selected.stages[0], selected.stages[1]);
+        Ok(selected)
     }
 
     #[inline(never)]
@@ -513,7 +572,7 @@ impl G18Queue {
                 pr_err!("G18 compute admission rejected: constant scratch or SCS integration pending\n");
                 return Err(ENOTSUPP);
             }
-            pr_info!("G18_COMPUTE_METADATA stream={:#x} registers={} scratch_bytes={} spectpr_bytes={} constant_scratch={} local={:?}\n",
+            crate::g18_kick_pr_info!("G18_COMPUTE_METADATA stream={:#x} registers={} scratch_bytes={} spectpr_bytes={} constant_scratch={} local={:?}\n",
                 payload.control_stream_base, payload.g18_resources[2],
                 metadata.demand.scratch_bytes, payload.g18_resources[4],
                 metadata.demand.constant_scratch_bytes, &payload.g18_resources[12..15]);

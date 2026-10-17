@@ -129,6 +129,10 @@ pub(crate) struct G18ApplicationRender {
     pub(crate) stencil_stripped: bool,
     /// UAPI render flags: only PROCESS_EMPTY_TILES and RSRC_SPEC_HI remain.
     pub(crate) flags: u32,
+    /// TA/3D private-memory selection derived from the render's
+    /// `drm_asahi_g18_render_resources` suffix by the adapter; `None` keeps
+    /// the fixed first-use policy (`g18_render_policy::resource_pairs`).
+    pub(crate) scratch: Option<crate::g18_graphics_scratch::G18RenderScratchSelection>,
 }
 
 /// User pointers the G18 3D command carries as native descriptor copies
@@ -359,11 +363,14 @@ fn admit_envelope(command: &g17_uapi::UapiRenderCommand, msaa4: bool)
     // register lists. Native618/639 add layered four-sample colour through
     // sixteen bytes per sample. Native682 adds one-sample layered Z32/S8;
     // each plane and its metadata receive complete array range checks below.
+    // Native1060 also verifies uncompressed D16 arrays, including48 layers.
+    // Shared format validation below continues to reject compressed D16.
     if !(1..=2048).contains(&command.layers)
         || (command.layers > 1 && ((command.samples != 1
             && !(msaa4 && is_multisample_command(command)))
             || ((command.depth.base != 0 || command.stencil.base != 0)
-                && (command.samples != 1 || command.zls_control & ZLS_DEPTH_FORMAT != 0)))) {
+                && (command.samples != 1
+                    || !matches!(command.zls_control & ZLS_DEPTH_FORMAT, 0 | 0x0400_0000))))) {
         return Err(R::Layers(command.layers));
     }
     if !(msaa4 && is_multisample_command(command)) {
@@ -453,7 +460,10 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
     depth_command.layers = 1;
     g17_uapi::validate_m5_reference_depth(&depth_command, address_space).map_err(R::Depth)?;
     if command.layers > 1 {
-        for (plane, bytes_per_sample) in [(command.depth, 4), (command.stencil, 1)] {
+        // D16 uses two bytes per sample; Z32 uses four. Applying the Z32
+        // extent to D16 rejects its native128-byte8x8 layer stride.
+        let depth_bytes = if depth16 { 2 } else { 4 };
+        for (plane, bytes_per_sample) in [(command.depth, depth_bytes), (command.stencil, 1)] {
             validate_layered_zls_plane(plane, u64::from(command.width),
                 u64::from(command.height), bytes_per_sample, command.layers,
                 address_space).map_err(R::Depth)?;
@@ -556,6 +566,7 @@ pub(crate) fn translate_g18_render_admitting<A: g17_uapi::GpuAddressSpace>(
         fragment_attachments: translated.fragment_attachments,
         stencil_stripped,
         flags: command.flags,
+        scratch: None,
     })
 }
 

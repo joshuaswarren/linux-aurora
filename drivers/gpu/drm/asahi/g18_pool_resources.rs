@@ -269,10 +269,10 @@ impl G18UmaPoolMemory {
             Ok(())
         })?;
         uat.kernel_vm().translate_iova(preempt_counter.iova())?;
-        dev_info!(dev.as_ref(),
+        crate::g18_kick_info!(dev.as_ref(),
             "G18 UMA retirement counter: owned FW address={:#x} initial=0; unpublished\n",
             preempt_counter.iova());
-        dev_info!(dev.as_ref(),
+        crate::g18_kick_info!(dev.as_ref(),
             "G18 UMA sparse owner: reserved={:#x} backing_pages={} holes={} bias={:#x} aliases=verified guards=verified unpublished\n",
             layout.reservation_bytes, layout.initial_page_count, holes, layout.gpu_base_offset);
         Ok(Self {
@@ -476,7 +476,7 @@ impl G18UmaPoolMemory {
         }
         fence(Ordering::SeqCst);
         self.process_aliases = aliases;
-        dev_info!(dev.as_ref(),
+        crate::g18_kick_info!(dev.as_ref(),
             "G18 UMA pool aliased into the job VM: {} mappings, {} pages verified (directory {:#x}, block list {:#x}, blocks {:#x}+{}x{:#x})\n",
             ranges.len(), pages, DIRECTORY_BASE + self.low_bias, BLOCK_LIST_BASE + self.low_bias, block_base,
             self.scratch.len(), self.block_stride);
@@ -616,7 +616,7 @@ impl G18UmaPoolMemory {
                 // in the used descriptor. A retired replacement has its own
                 // fresh cursors; the first-load check still admits only zero.
                 if retired_view && matches!(index, 1 | 2 | 7 | 8 | 12..=15) {
-                    dev_info!(dev.as_ref(),
+                    crate::g18_kick_info!(dev.as_ref(),
                         "G18_POOL_DESCRIPTOR_CURSOR slot={} word={} host={:#x} retired={:#x}\n",
                         binding.slot, index, word, actual);
                 } else {
@@ -643,7 +643,7 @@ impl G18UmaPoolMemory {
         })?;
         fence(Ordering::SeqCst);
         self.descriptor_loaded = true;
-        dev_info!(dev.as_ref(),
+        crate::g18_kick_info!(dev.as_ref(),
             "G18 UMA descriptor loaded: slot={} entry={:#x} state={:#x} state+0x08={} sma={:x?} words={:x?}; tag15 unpublished\n",
             binding.slot, table.iova() + offset as u64, binding.state, binding.slot,
             device_config, words);
