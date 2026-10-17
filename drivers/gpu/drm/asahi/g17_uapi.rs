@@ -939,12 +939,12 @@ pub(crate) fn translate_g18_render_command<A: GpuAddressSpace>(
     address_space: &A,
     internal: RenderInternalState,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
-    // Native1044's 1x RGBA32 MRT footprint reaches128 bytes per sample at
-    // 32x32 (128KiB). Keep layered, other geometry and MSAA limits separate.
+    // Native1044's 1x RGBA32 MRT footprint reaches128 bytes per sample at 32x32
+    // (128KiB); native1121 adds 40/56/72. Layered, geometry and MSAA stay separate.
     let wide_single = command.samples == 1 && command.layers == 1
         && (command.utile_width, command.utile_height) == (32, 32)
-        && (48..=128).contains(&command.sample_size)
-        && command.sample_size & 15 == 0;
+        && (((48..=128).contains(&command.sample_size) && command.sample_size & 15 == 0)
+            || matches!(command.sample_size, 40 | 56 | 72));
     let capacity = if wide_single { 131_072 }
         else if matches!(command.samples, 2 | 4) { 98_304 }
         else { 32_768 };

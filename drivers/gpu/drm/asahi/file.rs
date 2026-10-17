@@ -470,6 +470,10 @@ impl File {
             // the incremental module build reuses pinned bindgen output.
             params.features |= 1u64 << 8;
         }
+        if gpu.supports_g18_native_tile_samples() {
+            // DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES, spelled as its value.
+            params.features |= 1u64 << 9;
+        }
         if *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
