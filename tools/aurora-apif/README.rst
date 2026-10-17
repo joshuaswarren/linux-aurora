@@ -71,3 +71,22 @@ It accepts the legacy ANS ``nvmmu`` resource only to remove that mediated
 window after validating the stopped handoff. The explicitly selected
 T6050 PCIe layout normalizes its historical ``config,port,phy,intr2axi,perst``
 resource order to ``ecam,port,phy,perst,intr2axi`` without changing extents.
+
+Kernel configuration check
+--------------------------
+
+T6050 boot NOR uses ``CONFIG_SPI_APPLE_QSPI``, not ``CONFIG_SPI_APPLE``.
+The APIF fragment explicitly enables QSPIMC, SPI memory, MTD, SPI-NOR and
+fixed-partition support. Apply it before ``olddefconfig``, then check the
+resolved configuration against the enabled producer nodes::
+
+    tools/aurora-apif/check_guest_config.py native-apif.dtb build/.config
+
+The checker covers the known M5 guest peripherals and their required build
+options. It follows disabled parent nodes, accepts built-in or modular
+drivers by default, and reports unmatched compatibles as unaudited rather
+than unsupported. ``--built-in`` requires every matched option to be ``y``;
+otherwise the corresponding modules must be supplied by the deployment.
+This checks configuration coverage, not hardware behavior or module contents.
+Migration can also take ``--kernel-config build/.config``; missing known
+driver options then reject the migration before writing its output.

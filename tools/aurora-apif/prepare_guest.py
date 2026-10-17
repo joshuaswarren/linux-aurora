@@ -301,11 +301,16 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--pcie-layout", choices=["t6050-gen3-x1"])
     parser.add_argument("--enable-pmp", action="store_true")
+    parser.add_argument("--kernel-config", type=Path,
+                        help="check enabled guest peripheral drivers before writing output")
     args = parser.parse_args()
     if args.input.resolve() == args.output.resolve() or args.output.exists():
         parser.error("output must be a new file; preserve the producer's original DTB")
     try:
         output = migrate(args.input.read_bytes(), args.pcie_layout, args.enable_pmp)
+        if args.kernel_config:
+            from check_guest_config import validate
+            validate(output, args.kernel_config.read_text())
     except (ValueError, libfdt.FdtException) as error:
         parser.error(str(error))
     with args.output.open("xb") as stream:
