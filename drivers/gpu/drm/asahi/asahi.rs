@@ -150,7 +150,7 @@ kernel::prelude::module! {
             description: "M5 fresh RAM boot: 1=initdata ACKs, 2=openings, 3=queue, 4=scheduler, 5=context, 6=one compute, 7=setup without kick, 8=request stop after admission, 9=live status, 10=live firmware monitors, 11=compute triangle, 12=TA/fragment triangle; 1..12 request stop; 13=retained session, 14=experimental DRM first-job adapter",
         },
         g18_initdata_test: u32 {
-            default: 0,
+            default: 10,
             description: "T8152/J873 G18G bring-up stage. 0 refuses before MMIO/DMA. 1=read-only powered-resource probe. 2=RTKit. 3=initdata ACKs. 4=openings, idle policy, 60 s observation. 5=empty queue. 6=queue plus scheduler binding. 7=owned empty UMA pool binding. 8=compute diagnostic. 9=H1 render replay. 10=firmware plus application DRM render node. Stages 5/6/7 then observe without GPU jobs. Firmware stages require prior power, loader receipt and apple_mailbox.ascwrap_v8_cpu_control=1; all owners remain retained until reboot. 90=SGX power-on; 92=GFX1 power-on; 91=GFX power-on; 93=idle requests. Power stages are never implied. Mutating stages require user-authorized bring-up. Other values refused",
         },
         g18_compute_variant: u32 {
@@ -167,27 +167,27 @@ kernel::prelude::module! {
         },
         g18_render_profile: u32 {
             default: 1,
-            description: "Stage 9 G18GFX01 v2 profile: 1=colour-a, 2=colour-b, 4=fragment-witness (colour only). Gears profile3 is offline only and refused by H1. Stage0 remains the default",
+            description: "Stage 9 G18GFX01 v2 profile: 1=colour-a, 2=colour-b, 4=fragment-witness (colour only). Gears profile3 is offline only and refused by H1. Every other stage, including the default stage10, requires 1",
         },
         g18_admit_compute: u32 {
-            default: 0,
+            default: 1,
             description: "G18 DRM adapter: 1 admits single-dispatch compute commands (K1). 0 refuses them",
         },
         g18_admit_msaa4: u32 {
-            default: 0,
-            description: "G18 DRM adapter (g18_initdata_test=10 only): 1 admits exactly the native 4x MSAA render (4 samples, 32x16 utiles, sample positions 0xeaa26e26, 8-byte samples, one layer, no depth/stencil) with its native 4x command fields; Mesa needs AGX_G18_MSAA4=1 to submit it. 0 refuses every multisampled render (default)",
+            default: 1,
+            description: "G18 DRM adapter (g18_initdata_test=10 only): 1 (default) admits exactly the native 4x MSAA render (4 samples, 32x16 utiles, sample positions 0xeaa26e26, 8-byte samples, one layer, no depth/stencil) with its native 4x command fields; Mesa needs AGX_G18_MSAA4=1 to submit it. 0 refuses every multisampled render",
         },
         g18_admit_graphics_scratch: u32 {
-            default: 0,
-            description: "G18 DRM adapter: 1 advertises DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH and admits single-sample renders carrying the G18 render resource suffix; the kernel derives both TA/3D private-memory launch pairs and selects the native ideal or minimum result that fits the owned render pool. 0 refuses the suffix (default)",
+            default: 1,
+            description: "G18 DRM adapter: 1 (default) advertises DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH and admits single-sample renders carrying the G18 render resource suffix; the kernel derives both TA/3D private-memory launch pairs and selects the native ideal or minimum result that fits the owned render pool. 0 refuses the suffix",
         },
         g18_usc_statistics: u32 {
             default: 0,
             description: "Stage 9 colour fixture only: 1 enables owned TA/3D SMAPP statistics pages. Raw memory statistics, not shader invocation counts. Default 0",
         },
         g18_sma_minimum: u32 {
-            default: 0,
-            description: "Stage9/profile4 or stage10/profile1, variant0: 1 probes fixed native minimum TA/fragment resource words with unchanged owned backing. Default 0",
+            default: 1,
+            description: "Stage9/profile4 or stage10/profile1, variant0: 1 probes fixed native minimum TA/fragment resource words with unchanged owned backing. Default 1",
         },
         g18_graphics_stall_trace: u32 {
             default: 0,
