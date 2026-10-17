@@ -61,7 +61,7 @@ fn shared_space_does_not_create_private_roots() {
 }
 #[test]
 fn failed_bind_retains_claim_and_refuses_reuse() {
-    let mut state=PrivateState::new(1).unwrap();
+    let mut state=PrivateState::new(1,false).unwrap();
     assert_eq!(state.bind(2, |_|Err(7)),Err(TransitionError::Provider(7)));
     assert_eq!(state.state(),ContextState::Uncertain(Some(2)));
     assert!(state.space().is_err());
@@ -70,11 +70,11 @@ fn failed_bind_retains_claim_and_refuses_reuse() {
 }
 #[test]
 fn uncertain_unbind_and_destroy_never_release_identity() {
-    let mut state=PrivateState::new(1).unwrap();
+    let mut state=PrivateState::new(1,false).unwrap();
     state.bind(63, |_|Ok::<_,i32>(())).unwrap();
     assert_eq!(state.unbind(|_|Err(8)),Err(TransitionError::Provider(8)));
     assert_eq!(state.state(),ContextState::Uncertain(Some(63)));
-    let mut state=PrivateState::new(2).unwrap();
+    let mut state=PrivateState::new(2,false).unwrap();
     assert_eq!(state.destroy(|_|Err(9)),Err(TransitionError::Provider(9)));
     assert_eq!(state.state(),ContextState::Uncertain(None));
 }
@@ -84,6 +84,48 @@ fn failed_batch_receipt_keeps_possible_published_backing() {
     assert!(!may_have_mapped(&[table,map],0));
     assert!(may_have_mapped(&[table,map],1));
     assert!(may_have_mapped(&[table],2));
+}
+#[test] fn legacy_handle_bounds_stay_reserved() {
+ assert!(PrivateState::new(254,false).is_ok());
+ for h in [255,256,4095,4096,u64::MAX] { assert!(PrivateState::new(h,false).is_err()); }
+}
+#[test] fn wide_handles_preserve_global_sentinel() {
+ for h in [0,254,256,4095] { assert_eq!(PrivateState::new(h,true).unwrap().handle() as u64,h); }
+ for h in [255,4096,u64::MAX] { assert!(PrivateState::new(h,true).is_err()); }
+}
+#[test] fn wide_handle_survives_every_lifecycle_command() {
+ let mut state=PrivateState::new(4095,true).unwrap();
+ state.bind(63,|op| {assert_eq!(op.args[0],4095);assert_eq!(op.opcode,5);Ok::<(),()>(())}).unwrap();
+ state.unbind(|op| {assert_eq!(op.args[0],4095);assert_eq!(op.opcode,6);Ok::<(),()>(())}).unwrap();
+ assert_eq!(state.destroy(|op| {assert_eq!(op.args[0],4095);assert_eq!(op.opcode,7);op.result=2;Ok::<(),()>(())}),Ok(2));
+ assert_eq!(state.state(),ContextState::Destroyed);assert!(state.space().is_err());
+}
+#[test] fn failed_destroy_never_authorizes_identity_reuse() {
+ let mut state=PrivateState::new(256,true).unwrap();
+ assert_eq!(state.destroy(|_| Err::<(),_>(9)),Err(TransitionError::Provider(9)));
+ assert!(state.space().is_err());assert_eq!(state.state(),ContextState::Uncertain(None));
+ assert_eq!(state.destroy(|_| panic!("uncertain identity submitted again")),Err::<u64,TransitionError<()>>(TransitionError::Invalid));
+}
+#[test] fn bound_space_cannot_destroy_donors() {
+ let mut state=PrivateState::new(256,true).unwrap();state.bind(2,|_|Ok::<(),()>(())).unwrap();
+ assert_eq!(state.destroy(|_|panic!("bound destroy submitted")),Err::<u64,TransitionError<()>>(TransitionError::Invalid));
+}
+#[test] fn donated_tables_require_private_aligned_frames_and_correct_levels() {
+ for (space,va,level,frame) in [(Space::Global,0,1,PAGE),(Space::Private(255),0,1,PAGE),(Space::Private(256),0,0,PAGE),(Space::Private(256),0,3,PAGE),(Space::Private(256),0,1,0),(Space::Private(256),0,1,PAGE+1),(Space::Private(256),PAGE,1,PAGE),(Space::Private(256),1<<42,2,PAGE)] {
+  assert!(donated_table(space,va,level,frame).is_err());
+ }
+ for (va,level) in [(0,1),(1<<36,1),(1<<25,2)] {
+  let op=donated_table(Space::Private(4095),va,level,PAGE).unwrap();assert_eq!(op.args,[4095,va,level,PAGE,0,0]);
+ }
+}
+#[test] fn donation_leaf_plan_emits_no_heap_tables_and_keeps_batching() {
+ let ops:Vec<_>=MapPlan::without_tables(Space::Private(4095),0,MapPages::Contiguous{physical:PAGE,count:129},Protection::GpuReadWrite).unwrap().collect();
+ assert_eq!(ops.len(),3);assert!(ops.iter().all(|o|o.opcode==3&&o.args[0]==4095));
+ assert_eq!(ops.iter().map(|o|o.args[3]).collect::<Vec<_>>(),[64,64,1]);
+}
+#[test] fn legacy_plan_keeps_heap_table_operations() {
+ let ops:Vec<_>=MapPlan::new(Space::Private(254),0,MapPages::Contiguous{physical:PAGE,count:1},Protection::GpuReadOnly).unwrap().collect();
+ assert_eq!(ops.iter().map(|o|o.opcode).collect::<Vec<_>>(),[2,2,3]);
 }
 ''')
     subprocess.run([compiler,"--edition=2021","--test",str(temp / "test.rs"),"-o",str(temp / "tests")],check=True)
