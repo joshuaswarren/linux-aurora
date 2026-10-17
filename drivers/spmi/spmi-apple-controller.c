@@ -350,7 +350,8 @@ static struct irq_chip apple_spmi_irq_chip = {
 	.irq_unmask = apple_spmi_irq_unmask,
 	.irq_ack = apple_spmi_irq_ack,
 	.irq_set_type = apple_spmi_irq_set_type,
-	.flags = IRQCHIP_ONESHOT_SAFE,
+	/* The chained parent stays enabled; children need no separate wake op. */
+	.flags = IRQCHIP_ONESHOT_SAFE | IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int apple_spmi_irq_domain_map(struct irq_domain *irqd,
@@ -421,6 +422,15 @@ static const struct irq_domain_ops apple_spmi_irq_domain_ops = {
 	.free		= apple_spmi_irq_domain_free,
 };
 
+static u64 apple_spmi_irq_status(struct apple_spmi *spmi, unsigned long offset)
+{
+	/* Generation 4 exposes 32-bit IRQ banks, including in the guest grant. */
+	if (spmi->hw->gen4)
+		return readl(spmi->regs + spmi->hw->irq_ack + offset) |
+		       ((u64)readl(spmi->regs + spmi->hw->irq_ack + offset + 4) << 32);
+	return readq(spmi->regs + spmi->hw->irq_ack + offset);
+}
+
 static void apple_spmi_irq_handler(struct irq_desc *desc)
 {
 	struct apple_spmi *spmi = irq_desc_get_handler_data(desc);
@@ -437,7 +447,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	}
 
 	for (offset = 0; offset < SPMI_NUM_PERIPHERAL_IRQS / 8; offset += sizeof(val)) {
-		val = readq(spmi->regs + spmi->hw->irq_ack + offset);
+		val = apple_spmi_irq_status(spmi, offset);
 		/**
 		 * because of other masters in the bus, we're going to get a multitude of
 		 * interrupts we're not interested in. irq_resolve_mapping isn't very

@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from pmp import block
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -22,23 +23,26 @@ def main():
 #include <stdbool.h>
 #include <stdint.h>
 #include <errno.h>
-typedef uint32_t u32;
+typedef uint32_t u32; typedef uint64_t u64;
 #define BIT(n) (1U << (n))
 #define SPMI_ACT_FIFO_FLUSH 1
 #define SPMI_ACT_REG 0xa4
 #define SPMI_IRQ_NOTIFY 256
-struct hw { bool gen4; u32 status, reply, rx_empty; };
+struct hw { bool gen4; u32 status, reply, rx_empty, irq_ack; };
 struct apple_spmi { unsigned char *regs; const struct hw *hw; };
 static unsigned char regs[0x800];
 static u32 status, enabled, reset;
-static int reads, acks, poll_result;
+static int reads, acks, poll_result, irq_reads, wide_reads;
 static u32 readl(void *p) {
     unsigned long off = (unsigned char *)p - regs;
     if (off == 0) return enabled;
     if (off == 0x200) return status;
     if (off == 0x220) reads++;
+    if (off == 0x600) {irq_reads++;return 1;}
+    if (off == 0x604) {irq_reads++;return 2;}
     return 0;
 }
+static u64 readq(void*p){wide_reads++;return 0x300000004ULL;}
 static void writel(u32 v, void *p) {
     unsigned long off = (unsigned char *)p - regs;
     if (off == 0) enabled = v;
@@ -51,10 +55,17 @@ static int poll(u32 *v) {
 }
 #define readl_poll_timeout(addr, val, cond, delay, timeout) poll(&(val))
 static void apple_spmi_irq_ack_raw(struct apple_spmi *s, u32 irq) { acks++; }
-''' + source[start:end] + r'''
+''' + source[start:end] + block(source, r"^static u64 apple_spmi_irq_status\(") + r'''
 int main(void) {
     struct hw hw = {true, 0x200, 0x220, BIT(30)};
     struct apple_spmi s = {regs, &hw};
+    hw.irq_ack=0x600;
+    assert(apple_spmi_irq_status(&s,0)==0x200000001ULL);
+    assert(irq_reads==2 && wide_reads==0);
+    hw.gen4=false;
+    assert(apple_spmi_irq_status(&s,0)==0x300000004ULL);
+    assert(irq_reads==2 && wide_reads==1);
+    hw.gen4=true;
     enabled = 7; status = BIT(14) | BIT(30);
     assert(apple_spmi_recover(&s) == 0);
     assert(enabled == 7 && reset == 0 && acks == 1);
