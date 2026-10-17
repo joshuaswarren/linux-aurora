@@ -13,6 +13,7 @@ fn utile_config(p: &RenderPass) -> u64 {
 }
 #[derive(Copy, Clone)]
 pub(crate) struct M5RenderStageControls {
+    pub(crate) scs: crate::g17::render_resources::StageScratch,
 
     pub(crate) resource_flags: u64,
 
@@ -150,7 +151,20 @@ pub(crate) fn build_ta_registers_into(
                 }
                 register.value |= controls.ta_dispatch_control;
             }
-            0x10799 => out.push(0x1a149, 0)?,
+            0x101c9 => register.value = controls.ta.scs.scratch.size_word(),
+            0xd471 => register.value = u64::from(controls.ta.scs.auxiliary_allocation),
+            0x1a0f1 => register.value = controls.ta.scs.scratch.stack_word(),
+            0x1a099 => register.value = controls.ta.scs.intersection.words()[0],
+            0x1a0a1 => register.value = controls.ta.scs.intersection.words()[1],
+            0x1a069 => register.value = controls.ta.scs.intersection.words()[2],
+            0x1a071 => register.value = controls.ta.scs.intersection.words()[3],
+            0x1a0c9 => register.value = controls.ta.scs.intersection.words()[4],
+            0x1a0d1 => register.value = controls.ta.scs.intersection.words()[5],
+            0x10799 => {
+                register.value = controls.ta.scs.scratch.window_word()
+                    | (register.value & (1 << 25));
+                out.push(0x1a149, controls.ta.scs.scratch.driver_word())?;
+            },
             0x10209 => {
                 out.push(0x0a739, 0)?;
                 register.value = controls.ta.work_key;
@@ -184,7 +198,23 @@ pub(crate) fn build_fragment_registers_into(
             0x100b1 => register.reg = 0x16469,
             0x100d9 => register.reg = 0x16471,
             0x100b8 => register.reg = 0x16138,
-            0x10791 => register.value = controls.fragment_raster_control,
+            0x10791 => {
+                let scratch = controls.fragment.scs.scratch;
+                register.value = if scratch.enabled() {
+                    (controls.fragment_raster_control | (1 << 24)) & 0x200001000204
+                        | (scratch.window_word() & 0xff0000)
+                        | (controls.fragment_raster_control & (1 << 25))
+                } else { controls.fragment_raster_control };
+            },
+            0x101c1 => register.value = controls.fragment.scs.scratch.size_word(),
+            0xd469 => register.value = u64::from(controls.fragment.scs.auxiliary_allocation),
+            0x1a0f9 => register.value = controls.fragment.scs.scratch.stack_word(),
+            0x1a0a9 => register.value = controls.fragment.scs.intersection.words()[0],
+            0x1a0b1 => register.value = controls.fragment.scs.intersection.words()[1],
+            0x1a079 => register.value = controls.fragment.scs.intersection.words()[2],
+            0x1a081 => register.value = controls.fragment.scs.intersection.words()[3],
+            0x1a0d9 => register.value = controls.fragment.scs.intersection.words()[4],
+            0x1a0e1 => register.value = controls.fragment.scs.intersection.words()[5],
             0x15321 => {
                 out.push(0x0d491, controls.fragment.resource_flags)?;
                 out.push(0x0d429, controls.fragment.resource_control)?;
@@ -205,7 +235,7 @@ pub(crate) fn build_fragment_registers_into(
                     continue;
                 }
             }
-            0x160e0 => out.push(0x1a151, 0)?,
+            0x160e0 => out.push(0x1a151, controls.fragment.scs.scratch.driver_word())?,
             0x10211 => {
                 out.push(0x0a741, controls.fragment_event_control)?;
                 register.value = controls.fragment.work_key;
@@ -260,13 +290,13 @@ pub(crate) struct TaExtra {
 }
 
 pub(crate) struct TaProgram {
-    registers: [RegisterWrite; 96],
+    registers: [RegisterWrite; 97],
     length: usize,
 }
 
 impl TaProgram {
     pub(crate) const fn empty() -> Self {
-        Self { registers: [RegisterWrite {reg: 0, value: 0}; 96], length: 0 }
+        Self { registers: [RegisterWrite {reg: 0, value: 0}; 97], length: 0 }
     }
     pub(crate) fn registers(&self) -> &[RegisterWrite] { &self.registers[..self.length] }
     pub(crate) fn set_lifecycle(&mut self, value: u64) {
@@ -284,7 +314,8 @@ impl TaProgram {
     }
 }
 
-pub(crate) fn tiling_with_scratch_into(common: &[RegisterWrite], e: TaExtra, out: &mut TaProgram) -> Result {
+pub(crate) fn tiling_with_scratch_into(common: &[RegisterWrite], e: TaExtra,
+    mesh_storage: u64, out: &mut TaProgram) -> Result {
     out.length = 0;
     if e.d1590 & 1 != 0 { out.push(0x17e1, 1)?; }
     if e.d1591 & 1 != 0 { out.push(0x17f1, 1)?; }
@@ -297,7 +328,11 @@ pub(crate) fn tiling_with_scratch_into(common: &[RegisterWrite], e: TaExtra, out
             continue;
         }
         out.push(r.reg, r.value)?;
-        match r.reg {
+        let register = r.reg;
+        match register {
+            // Native726 mesh-object TA program: the mesh rendering buffer
+            // register follows 0x10799 and precedes 0x1c830.
+            0x10799 if mesh_storage != 0 => out.push(0x1ca48, mesh_storage)?,
             0x1c9c8 => { out.push(0x1c041, e.d11c8)?; out.push(0x1c9d0, e.d11c8)?; }
             0x1c880 if !deflake => {
                 deflake = true;
@@ -312,14 +347,15 @@ pub(crate) fn tiling_with_scratch_into(common: &[RegisterWrite], e: TaExtra, out
             _ => {}
         }
     }
-    if out.length != 92 + usize::from(e.d1590 & 1) * 2 + usize::from(e.d1591 & 1) * 2 {
+    if out.length != 92 + usize::from(e.d1590 & 1) * 2 + usize::from(e.d1591 & 1) * 2
+        + usize::from(mesh_storage != 0) {
         return Err(EINVAL);
     }
     Ok(())
 }
 
 pub(crate) fn fragment_main_with_scratch_into(p: &RenderPass, common: &[RegisterWrite],
-    dispatch: FragmentDispatch, descriptor_flag: u8, out: &mut [RegisterWrite; 92]) -> Result {
+    dispatch: FragmentDispatch, descriptor_flag: u8, scs: bool, out: &mut [RegisterWrite]) -> Result {
 
     let mut n = 0;
     let mut tile = 0;
@@ -338,6 +374,12 @@ pub(crate) fn fragment_main_with_scratch_into(p: &RenderPass, common: &[Register
         let slot = out.get_mut(n).ok_or(EINVAL)?;
         *slot = r;
         n += 1;
+        // Native 3D SCS controls bracket its main list after entry and exit.
+        if scs && matches!(r.reg, 0x1739 | 0x1731) {
+            *out.get_mut(n).ok_or(EINVAL)? = RegisterWrite {
+                reg: if r.reg == 0x1739 { 0x17e1 } else { 0x17d9 }, value: 1 };
+            n += 1;
+        }
     }
     if n != out.len() || tile != 2 { return Err(EINVAL); }
     Ok(())
@@ -374,7 +416,8 @@ pub(crate) struct Workspace {
     common: RegisterPrograms,
     base: [RegisterWrite; 90],
     pub(crate) ta: TaProgram,
-    pub(crate) fragment: [RegisterWrite; 92],
+    pub(crate) fragment: [RegisterWrite; 94],
+    pub(crate) fragment_count: usize,
     pub(crate) store: [RegisterWrite; 17],
     pub(crate) resume: [RegisterWrite; 24],
     pub(crate) load: [RegisterWrite; 12],
@@ -397,7 +440,8 @@ impl Workspace {
         let base = r.deflake_va.checked_sub(0x10_0000_0000).ok_or(EINVAL)?;
         let mut vdm_seen = false;
         for reg in &mut self.common.ta {
-            reg.value = match reg.reg {
+            let register = reg.reg;
+            reg.value = match register {
                 0x1c880 if vdm_seen => base.checked_add(DEFLAKE_STATE_OFFSET).ok_or(EINVAL)?,
                 0x10111 | 0x1c9b0 => base.checked_add(DEFLAKE_STATE_OFFSET).ok_or(EINVAL)?,
                 0x10119 | 0x1c9b8 => base.checked_add(DEFLAKE_AUX_OFFSET).ok_or(EINVAL)?,
@@ -407,7 +451,8 @@ impl Workspace {
             if reg.reg == 0x1c880 { vdm_seen = true; }
         }
         for reg in &mut self.common.fragment {
-            reg.value = match reg.reg {
+            let register = reg.reg;
+            reg.value = match register {
                 0x16060 if p.layers == 1 => r.heapmeta_va,
                 0x15021 => controls.aux_fb_flags,
                 0x15049 => controls.aux_fb_control,
@@ -422,9 +467,9 @@ impl Workspace {
                     reg.value
                         | (u64::from(skip_empty && inputs.fragment.d08c5_flags[3] & 1 == 0) << 17)
                         | (u64::from(p.depth.va != 0
-                            && (skip_empty || p.zls_control & (1 << 19) == 0)) << 18)
+                            && (p.zls_control & (1 << 15) != 0 || p.zls_control & (1 << 19) == 0)) << 18)
                         | (u64::from(p.stencil.va != 0
-                            && (skip_empty || p.zls_control & (1 << 18) == 0)) << 19)
+                            && (p.zls_control & (1 << 14) != 0 || p.zls_control & (1 << 18) == 0)) << 19)
                 }
                 _ => reg.value,
             };
@@ -434,12 +479,16 @@ impl Workspace {
         c.fragment.work_key = super::super::work_key(r.context_id, args.fragment.state_word);
         let ta: &mut [RegisterWrite;82] = (&mut self.base[..82]).try_into().map_err(|_| EINVAL)?;
         build_ta_registers_into(p, &c, r.free_list_slot, ta, &self.common.ta)?;
-        tiling_with_scratch_into(ta, extra, &mut self.ta)?;
+        let mut extra = extra;
+        extra.d1590 |= u8::from(c.ta.scs.scratch.enabled());
+        tiling_with_scratch_into(ta, extra, r.mesh_storage, &mut self.ta)?;
         self.ta.set_lifecycle((u64::from(inputs.ta.d08a4) << 32) | u64::from(inputs.ta.completion.key as u32));
         c.fragment_tile_flags = (c.fragment_tile_flags & !0x7ffff) | 0x36011
             | (u64::from(inputs.fragment.d08c5_flags[3] & 1) << 18);
         build_fragment_registers_into(p, &c, r.free_list_slot, &mut self.base, &self.common.fragment)?;
-        fragment_main_with_scratch_into(p, &self.base, dispatch, inputs.fragment.d08c5_flags[3], &mut self.fragment)?;
+        self.fragment_count = 92 + usize::from(c.fragment.scs.scratch.enabled()) * 2;
+        fragment_main_with_scratch_into(p, &self.base, dispatch, inputs.fragment.d08c5_flags[3],
+            c.fragment.scs.scratch.enabled(), &mut self.fragment[..self.fragment_count])?;
         for reg in &mut self.fragment {
             if matches!(reg.reg, 0x160e0 | 0x1499 | 0xa341) {
                 reg.value = (u64::from(inputs.fragment.d08a4) << 32) | u64::from(inputs.fragment.completion.key as u32);

@@ -104,7 +104,7 @@ mod sptm_runtime;
 mod table;
 pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 pub(crate) use bind::PreparedUserBindBatch;
-pub(crate) use lifetime::VmJobGuard;
+pub(crate) use lifetime::{RenderPoolMappings, VmJobGuard};
 
 /// PPL magic number for the handoff region
 const PPL_MAGIC: u64 = 0x4b1d000000000002;
@@ -115,8 +115,6 @@ const UAT_NUM_CTX: usize = 64;
 /// Application contexts owned by independent logical queues. Contexts 0..4
 /// and 63 remain reserved for the firmware and device-global resources.
 const EXECUTION_CONTEXT_MASK: u64 = ((1u64 << 63) - 1) & !((1u64 << 5) - 1);
-/// Maximum simultaneously retained logical queue contexts.
-pub(crate) const MAX_EXECUTION_CONTEXTS: u32 = EXECUTION_CONTEXT_MASK.count_ones();
 /// First context available for users
 const UAT_USER_CTX_START: usize = 1;
 /// Number of available user contexts
@@ -307,7 +305,15 @@ struct VmInner {
     uat_inner: Arc<UatInner>,
     binding: Arc<Mutex<VmBinding>>,
     id: u64,
+    /// Per-VM sparse tile pools (DRM_ASAHI_BIND_SPARSE_TILE): [read-only zero,
+    /// writable sink], allocated on first use and grown so that no tile
+    /// frame is mapped more than SPARSE_TILE_FRAME_MAPS times.
+    #[cfg(CONFIG_ARM64)]
+    sparse_tiles: [KVec<Arc<sptm_pgtable::SparseTile>>; 2],
 }
+
+/// GPUVA filled from a kernel sparse tile instead of its GEM's first page.
+pub(crate) const GPUVA_SPARSE_TILE: gpuvm::GpuVaFlags = gpuvm::GpuVaFlags::user_flag(0);
 
 /// Slot binding-related inner data for a Vm instance.
 struct VmBinding {
@@ -377,6 +383,18 @@ impl gpuvm::DriverGpuVm for VmInner {
         let mut left = op.range() as usize;
         let mut offset = op.offset() as usize;
 
+        if op.flags().contains(GPUVA_SPARSE_TILE) {
+            // Kernel tile fill: the GEM only anchors the GPUVA.
+            let result = if op.flags().contains(gpuvm::GpuVaFlags::REPEAT) {
+                self.map_sparse_tile(iova..iova + left as u64, ctx.prot)
+            } else {
+                Err(EINVAL)
+            };
+            if let Err(error) = result {
+                self.rollback_failed_map(op.addr(), op.range());
+                return Err(error);
+            }
+        } else {
         let bo = ctx.vm_bo.as_ref().expect("step_map with no BO");
 
         let one_page = op.flags().contains(gpuvm::GpuVaFlags::REPEAT);
@@ -462,6 +480,8 @@ impl gpuvm::DriverGpuVm for VmInner {
                     break;
                 }
             }
+        }
+
         }
 
         let mut gpuva = ctx.new_va.take().expect("Multiple step_map calls");
@@ -593,6 +613,56 @@ impl gpuvm::DriverGpuVm for VmInner {
 }
 
 impl VmInner {
+    /// Fill `range` from the kernel sparse tile for `prot`: the global zero
+    /// tile for read-only fills, this VM's own sink for writable ones (never
+    /// shared, so discarded writes cannot be read by another VM). The caller
+    /// holds the mapping mutation guard.
+    #[cfg(CONFIG_ARM64)]
+    fn map_sparse_tile(&mut self, range: Range<u64>, prot: Prot) -> Result {
+        /// Bound per-frame mapping counts in the provider: every frame of a
+        /// tile is mapped at most this many times (16 GiB of VA per tile).
+        const SPARSE_TILE_FRAME_MAPS: u32 = 16384;
+        let kind = usize::from(prot != PROT_GPU_SHARED_RO);
+        // Pages a tile can still take with every frame staying within the
+        // bound: a run of n pages adds at most ceil(n / 64) to any frame.
+        let room = |tile: &sptm_pgtable::SparseTile| {
+            u64::from(SPARSE_TILE_FRAME_MAPS.saturating_sub(tile.max_frame_maps()))
+                * tile.pages()
+        };
+        let mut at = range.start;
+        while at < range.end {
+            let pages = (range.end - at) / sptm::PAGE;
+            let pool = &self.sparse_tiles[kind];
+            let tile = match pool.iter().find(|tile| room(tile) != 0) {
+                Some(tile) => tile.clone(),
+                None => {
+                    let tile = sptm_pgtable::SparseTile::new()?;
+                    self.sparse_tiles[kind].push(tile.clone(), GFP_KERNEL)?;
+                    static ALLOCATED: core::sync::atomic::AtomicU64 =
+                        core::sync::atomic::AtomicU64::new(0);
+                    let n = ALLOCATED.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 || (n + 1).is_power_of_two() {
+                        let name = if kind == 0 { "zero" } else { "sink" };
+                        pr_info!("asahi: sparse tile {} vm={} pool={} tables={} (tile {})\n",
+                            name, self.id, self.sparse_tiles[kind].len(),
+                            sptm_pgtable::private_tables(), n + 1);
+                    }
+                    tile
+                }
+            };
+            let chunk = pages.min(room(&tile));
+            let end = at + chunk * sptm::PAGE;
+            self.page_table.map_tiled(at..end, &tile, prot)?;
+            at = end;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(CONFIG_ARM64))]
+    fn map_sparse_tile(&mut self, _range: Range<u64>, _prot: Prot) -> Result {
+        Err(ENOTSUPP)
+    }
+
     /// Remove hardware leaves for one complete user GPUVA without allocating.
     fn unmap_gpuva(&mut self, va: &gpuvm::GpuVa<Self>) -> Result {
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
@@ -624,7 +694,7 @@ impl VmInner {
 
     /// A failed map has no GPUVA owner to retain its backing or remove its leaves.
     /// GPUVM has already split or removed overlaps throughout this operation's range.
-    fn rollback_failed_map(&mut self, addr: u64, size: u64) {
+    fn rollback_failed_map(&mut self, addr: u64, size: u64) -> bool {
         // Include the current segment: map_pages can fail after writing some of its leaves.
         // The checked GPUVM operation supplies an aligned range without overflow.
         let result = self.page_table.discard_partial_map(addr..addr + size);
@@ -643,6 +713,7 @@ impl VmInner {
                 error
             );
         }
+        result.is_ok()
     }
 
     fn mapping_mutation(&mut self) -> MappingMutation {
@@ -734,24 +805,26 @@ impl VmInner {
     }
 
     /// Map an `mm::Node` representing an mapping in VA space.
-    fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
+    fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> MappingOutcome {
         self.map_node_with_cached_prefix(node, prot, 0, 0..0)
     }
 
     /// Select initial attributes while the newly reserved node is unpublished.
     fn map_node_with_cached_prefix(&mut self, node: &mm::Node<(), KernelMappingInner>,
-        prot: Prot, cached_prefix: usize, cached_late: Range<usize>) -> Result {
-        let end = node
-            .start()
-            .checked_add(node.mapped_size as u64)
-            .ok_or(EOVERFLOW)?;
+        prot: Prot, cached_prefix: usize, cached_late: Range<usize>) -> MappingOutcome {
+        let Some(end) = node.start().checked_add(node.mapped_size as u64) else {
+            return MappingOutcome::Unpublished(EOVERFLOW);
+        };
         let _mutation = self.mapping_mutation();
-        self.page_table.prepare_map(node.start()..end)?;
-        let result = self.map_node_prepared(node, prot, cached_prefix, cached_late);
-        if result.is_err() {
-            self.rollback_failed_map(node.start(), node.mapped_size as u64);
+        if let Err(error) = self.page_table.prepare_map(node.start()..end) {
+            // No leaf belonging to this new node has been submitted. In
+            // particular, a pre-existing shadow must not be unmapped here.
+            return MappingOutcome::Unpublished(error);
         }
-        result
+        let result = self.map_node_prepared(node, prot, cached_prefix, cached_late);
+        MappingOutcome::after_map(result, || {
+            self.rollback_failed_map(node.start(), node.mapped_size as u64)
+        })
     }
 
     /// Install only into the empty range reserved by `map_node`.
@@ -762,6 +835,9 @@ impl VmInner {
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
         let mut offset = node.offset;
         let mut left = node.mapped_size;
+        // Gather every physically contiguous chunk first: SPTM tables publish
+        // the whole mapping as one batched plan with a single ASID sync.
+        let mut chunks: KVVec<(Range<u64>, PhysicalAddr, Prot)> = KVVec::new();
 
         for range in sgt.iter() {
             if left == 0 {
@@ -816,17 +892,27 @@ impl VmInner {
                     (false, usize::MAX)
                 };
                 let chunk = len.min(boundary - relative);
-                self.page_table.map_pages(
-                    iova..(iova + chunk as u64),
-                    addr as PhysicalAddr,
-                    if cached { PROT_FW_PRIV_RW } else { prot },
-                    false,
-                    Some(sgt),
-                )?;
+                chunks.push((iova..(iova + chunk as u64), addr as PhysicalAddr,
+                    if cached { PROT_FW_PRIV_RW } else { prot }), GFP_KERNEL)?;
                 iova += chunk as u64;
                 addr += chunk;
                 left -= chunk;
                 len -= chunk;
+            }
+        }
+
+        if !chunks.is_empty() {
+            let stats = *module_parameters::m5_map_stats.value() != 0;
+            // SAFETY: ktime_get has no preconditions.
+            let start = if stats { unsafe { kernel::bindings::ktime_get() } } else { 0 };
+            let batch = self.page_table.map_chunks(&chunks, sgt)?;
+            if let (true, Some(batch)) = (stats, batch) {
+                // SAFETY: As above.
+                let elapsed = unsafe { kernel::bindings::ktime_get() }.saturating_sub(start);
+                if batch.pages >= 64 {
+                    pr_info!("asahi: SPTM map batch: chunks={} pages={} ops={} ns={}\n",
+                        batch.chunks, batch.pages, batch.operations, elapsed);
+                }
             }
         }
 
@@ -862,6 +948,14 @@ pub(crate) struct ExecutionContext {
     vm: Vm,
 }
 
+/// One published command's claim on its context's hardware identity, held
+/// until the command retires exactly (as the native context ID manager counts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContextPin {
+    pub(crate) id: u8,
+    pub(crate) generation: u64,
+}
+
 struct DirectExecutionRoot {
     released: AtomicBool,
     inner: Arc<UatInner>,
@@ -887,25 +981,57 @@ impl ExecutionContext {
         }
     }
 
+    pub(crate) fn availability(&self) -> Option<&Arc<crate::g17::availability::Availability>> {
+        match &self.root {
+            ExecutionRoot::Direct(_) => None,
+            #[cfg(CONFIG_ARM64)]
+            ExecutionRoot::Sptm(root) => Some(root.availability()),
+        }
+    }
+
+    /// The hardware identity commands name now. SPTM identities are bound
+    /// per publication ([`Self::pin`]); an unbound context reports
+    /// `u32::MAX`, which every descriptor encoder rejects. While a command is
+    /// pinned the value cannot change.
     pub(crate) fn id(&self) -> u32 {
         match &self.root {
             ExecutionRoot::Direct(root) => root.id.into(),
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.id.into(),
+            ExecutionRoot::Sptm(root) => root.bound().map_or(u32::MAX, |(id, _)| id.into()),
         }
     }
     pub(crate) fn generation(&self) -> u8 {
         match &self.root {
             ExecutionRoot::Direct(root) => root.generation,
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.generation as u8,
+            ExecutionRoot::Sptm(root) => root.bound().map_or(0, |(_, generation)| generation as u8),
         }
     }
+    /// Zero (rejected by the render token encoder) while unbound.
     pub(crate) fn native_generation(&self) -> u64 {
         match &self.root {
             ExecutionRoot::Direct(root) => u64::from(root.generation),
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.generation,
+            ExecutionRoot::Sptm(root) => root.bound().map_or(0, |(_, generation)| generation),
+        }
+    }
+
+    /// Claim the context's hardware identity for one published command until
+    /// it retires exactly; binds or steals one first if needed. EBUSY: every
+    /// identity names unretired work.
+    pub(crate) fn pin(&self) -> Result<ContextPin> {
+        match &self.root {
+            ExecutionRoot::Direct(root) => Ok(ContextPin { id: root.id, generation: root.generation.into() }),
+            #[cfg(CONFIG_ARM64)]
+            ExecutionRoot::Sptm(root) => root.pin(&self.vm),
+        }
+    }
+
+    pub(crate) fn unpin(&self, pin: ContextPin) {
+        match &self.root {
+            ExecutionRoot::Direct(_) => {}
+            #[cfg(CONFIG_ARM64)]
+            ExecutionRoot::Sptm(root) => root.unpin(pin),
         }
     }
     pub(crate) fn vm(&self) -> &Vm { &self.vm }
@@ -914,7 +1040,7 @@ impl ExecutionContext {
     pub(crate) fn work_states(&self) -> Result<Arc<crate::g17::context::identity::WorkStates>> {
         match &self.root {
             ExecutionRoot::Direct(_) => Ok(Arc::new(
-                crate::g17::context::identity::WorkStates::new(), GFP_KERNEL)?),
+                crate::g17::context::identity::WorkStates::new()?, GFP_KERNEL)?),
             #[cfg(CONFIG_ARM64)]
             ExecutionRoot::Sptm(root) => Ok(root.states.clone()),
         }
@@ -927,6 +1053,12 @@ impl ExecutionContext {
             #[cfg(CONFIG_ARM64)]
             ExecutionRoot::Sptm(root) => root.release(&self.vm),
         }
+    }
+
+    /// Commands present on physical queues keep an identity unavailable.
+    pub(crate) fn note_activity(&self, entered: bool) {
+        #[cfg(CONFIG_ARM64)]
+        if let ExecutionRoot::Sptm(root) = &self.root { root.note_activity(entered); }
     }
 
     pub(crate) fn is_current(&self) -> bool {
@@ -1111,6 +1243,34 @@ impl TimestampMapping {
                 &*map.as_mut_ptr().add(self.offset + index).cast::<AtomicU8>()
             };
             destination.store(byte, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Ownership receipt for construction of a fresh kernel mapping. A successful
+/// rollback is already an unmap witness; replaying a strict unmap on that empty
+/// range would fail EFAULT and incorrectly retain its VA, GEM pin and VM.
+enum MappingOutcome {
+    Mapped,
+    Unpublished(Error),
+    Retained(Error),
+}
+impl MappingOutcome {
+    fn after_map(result: Result, rollback: impl FnOnce() -> bool) -> Self {
+        match result {
+            Ok(()) => Self::Mapped,
+            Err(error) if rollback() => Self::Unpublished(error),
+            Err(error) => Self::Retained(error),
+        }
+    }
+
+    /// Called only after dropping the VM execution/reservation lock. Unknown
+    /// provider state retains the entire node; confirmed rollback frees it.
+    fn finish<T>(self, node: T) -> Result<T> {
+        match self {
+            Self::Mapped => Ok(node),
+            Self::Unpublished(error) => { drop(node); Err(error) }
+            Self::Retained(error) => { core::mem::forget(node); Err(error) }
         }
     }
 }
@@ -1670,6 +1830,11 @@ impl HandoffFlush {
 }
 
 impl Vm {
+    /// Driver VM identity, for diagnostics.
+    pub(crate) fn id(&self) -> u64 { self.id }
+}
+
+impl Vm {
     /// Create a new virtual memory address space
     fn new(
         dev: &driver::AsahiDevice,
@@ -1769,6 +1934,8 @@ impl Vm {
                     uat_inner,
                     binding: binding_clone,
                     id,
+                    #[cfg(CONFIG_ARM64)]
+                    sparse_tiles: [KVec::new(), KVec::new()],
                 }),
             )?,
             binding,
@@ -1958,7 +2125,7 @@ impl Vm {
         }
         let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        let sgt = Arc::new(crate::gem::held_sg_table(&gem)?, GFP_KERNEL)?;
+        let sgt = Arc::new(gem.owned_sg_table()?, GFP_KERNEL)?;
         let mut inner = self.inner.exec_lock(Some(gem), false)?;
         if (cached_prefix != 0 || cached_late.start != cached_late.end) && (!inner.is_kernel
             || inner.uat_inner.firmware != UatFirmware::Sptm || !gem.is_kernel()) {
@@ -2012,11 +2179,9 @@ impl Vm {
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
         core::mem::drop(inner);
-        // Install the cleanup owner even on partial-map failure. Its Drop
-        // removes any published leaves before returning the VA and backing.
-        let mapping = KernelMapping::new(node);
-        ret?;
-        Ok(mapping)
+        // The receipt distinguishes confirmed rollback from uncertain
+        // provider state. Do not strictly unmap an already rolled-back range.
+        ret.finish(node).map(KernelMapping::new)
     }
 
     /// Map a GEM object into this Vm at a specific address.
@@ -2033,7 +2198,7 @@ impl Vm {
             .checked_add(if guard { UAT_PGSZ } else { 0 })
             .ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
-        let sgt = Arc::new(crate::gem::held_sg_table(&gem)?, GFP_KERNEL)?;
+        let sgt = Arc::new(gem.owned_sg_table()?, GFP_KERNEL)?;
         let mut inner = self.inner.exec_lock(Some(&gem), false)?;
 
         let vm_bo = self.inner.obtain_bo(&gem)?;
@@ -2079,11 +2244,9 @@ impl Vm {
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
         core::mem::drop(inner);
-        // Install the cleanup owner even on partial-map failure. Its Drop
-        // removes any published leaves before returning the VA and backing.
-        let mapping = KernelMapping::new(node);
-        ret?;
-        Ok(mapping)
+        // The receipt distinguishes confirmed rollback from uncertain
+        // provider state. Do not strictly unmap an already rolled-back range.
+        ret.finish(node).map(KernelMapping::new)
     }
 
     /// Map a range of a GEM object into this Vm using GPUVM.
@@ -2115,7 +2278,7 @@ impl Vm {
             if needs_sgt {
                 // Pin without the BO mutex: alias construction can hold the GEM
                 // reservation while acquiring this mutex.
-                let sgt = Arc::new(crate::gem::held_sg_table(&gem)?, GFP_KERNEL)?;
+                let sgt = Arc::new(gem.owned_sg_table()?, GFP_KERNEL)?;
                 let mut vm_bo_guard = vm_bo.inner().inner.lock();
                 if vm_bo_guard.sgt.is_none() {
                     if vm_bo_guard.sg_vec.is_none() {
@@ -2218,27 +2381,23 @@ impl Vm {
         )?;
 
         let end = iova.checked_add(size as u64).ok_or(EOVERFLOW)?;
-        inner.page_table.prepare_map(iova..end)?;
         let mutation = inner.mapping_mutation();
-        let ret = inner.page_table.map_pages(
-            iova..end,
-            phys as PhysicalAddr,
-            prot,
-            false,
-            None,
-        );
-        if ret.is_err() {
-            inner.rollback_failed_map(iova, size as u64);
-        }
+        let ret = match inner.page_table.prepare_map(iova..end) {
+            Err(error) => MappingOutcome::Unpublished(error),
+            Ok(()) => {
+                let result = inner.page_table.map_pages(
+                    iova..end, phys as PhysicalAddr, prot, false, None,
+                );
+                MappingOutcome::after_map(result, || inner.rollback_failed_map(iova, size as u64))
+            }
+        };
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
         drop(mutation);
         core::mem::drop(inner);
-        // Install the cleanup owner even on partial-map failure. Its Drop
-        // removes any published leaves before returning the VA and backing.
-        let mapping = KernelMapping::new(node);
-        ret?;
-        Ok(mapping)
+        // The receipt distinguishes confirmed rollback from uncertain
+        // provider state. Do not strictly unmap an already rolled-back range.
+        ret.finish(node).map(KernelMapping::new)
     }
 
     /// Unmap everything in an address range.
@@ -2360,6 +2519,10 @@ impl Vm {
 
 impl Drop for VmInner {
     fn drop(&mut self) {
+        #[cfg(CONFIG_ARM64)]
+        if let table::PageTable::Sptm(table) = &self.page_table {
+            sptm_transport::note_private("vm-drop", table.private_handle(), self.id);
+        }
         let mut binding = self.binding.lock();
         assert_eq!(binding.active_users, 0);
 
@@ -2495,7 +2658,12 @@ impl Uat {
                 return Err(EINVAL);
             }
             let table::PageTable::Sptm(table) = &mut owner.page_table else { return Err(EINVAL); };
-            return table.sync_context();
+            // An identity is bound only while the VM publishes work; an
+            // unbound VM has nothing cached, and its next bind synchronizes.
+            return match table.sync_context() {
+                Err(error) if error == ENOENT => Ok(0),
+                result => result,
+            };
         }
         let contexts = self.vm_context_mask(vm)?;
         if contexts == 0 {

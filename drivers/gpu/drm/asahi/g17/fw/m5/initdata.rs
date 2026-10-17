@@ -845,8 +845,8 @@ pub(crate) fn encode_main_config_for_profile(
             put_u64(out, MAIN_REGION_VIEWS + 0x10, views.alias_high[0]);
             put_u64(out, MAIN_REGION_VIEWS + 0x18, REGION_VIEW_LOW_ADDRS[1]);
             put_u64(out, MAIN_REGION_VIEWS + 0x20, views.alias_high[1]);
-            // Both primary words are present during captured J714 native
-            // workloads; they are not exclusive to the older J700 ABI.
+            // Both primary sentinels are present in all fresh J714 native
+            // captures; they are not exclusive to the older J700 ABI.
             if matches!(profile, RootProfile::J700G17P | RootProfile::J714G17S26A428) {
                 put_u32(out, MAIN_PRIMARY_SCALAR_32C, 1);
                 put_u32(out, MAIN_PRIMARY_SCALAR_344, 0xabcd_abcd);
@@ -1927,7 +1927,7 @@ pub(crate) fn encode_m5_hw_data(
     put_u32(out, 0x272c, 1);
     // J714 native26A428 HW+0x26b0 is 0x00200000. Firmware init
     // copies it to 0x10a3a0; the tiling allocator shifts it by19.
-    // The shifted value is four in native rather than three.
+    // The inherited J813 word selected three groups instead of four.
     put_u32(out, 0x26b0, 0x0020_0000);
     Ok(())
 }

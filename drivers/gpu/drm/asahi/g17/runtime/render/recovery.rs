@@ -6,6 +6,12 @@ use crate::g17::runtime::Registry;
 use kernel::prelude::*;
 
 impl Registry {
+    pub(in crate::g17::runtime) fn dump_m5_failure(&self, dev: &kernel::device::Device) {
+        for pair in self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+            pair.dump_m5_failure(dev);
+        }
+    }
+
     pub(in crate::g17::runtime) fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.render.entries.iter().flatten()
             .filter_map(|entry| entry.pair.as_ref())

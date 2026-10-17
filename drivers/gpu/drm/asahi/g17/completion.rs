@@ -348,6 +348,11 @@ impl Completion {
         self.compute_words().ok()
     }
 
+    /// The command's fence was already signalled; it can no longer be replayed.
+    pub(crate) fn signalled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
     pub(crate) fn begin_replay(&self) -> bool {
         let accepted = self
             .replays
@@ -434,6 +439,11 @@ impl Completion {
         self.class.load(Ordering::Acquire) == 1
     }
 
+    /// Recovery classified this command's VM as owning guilty work.
+    pub(crate) fn guilty(&self) -> bool {
+        self.class.load(Ordering::Acquire) == 2
+    }
+
     /// Installed before the first firmware-visible prefix. Cancellation takes
     /// the same lock after claiming the signal, so it cannot miss a late lease.
     pub(crate) fn attach_render_lease(
@@ -449,6 +459,12 @@ impl Completion {
         }
         *render = Some(lease);
         Ok(())
+    }
+
+    /// Returns the lease of an unpublished packet whose pair could not be
+    /// built, so it can be admitted again on a built pair.
+    pub(crate) fn take_render_lease(&self) -> Option<super::queue::admission::RenderLease> {
+        self.render.lock().take()
     }
 
     pub(crate) fn render_slot(&self) -> Option<u8> {
@@ -491,6 +507,8 @@ impl Completion {
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
             feed.note_render_pass(ticks[2], ticks[3]);
         }
+        // Exact retirement: forward progress for capacity waits (vmfix6d).
+        super::progress::note_retirement();
         if let Err(error) = result {
             if self.spared() {
                 self.status.report_failure(error);

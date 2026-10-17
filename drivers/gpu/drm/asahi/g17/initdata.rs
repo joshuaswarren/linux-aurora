@@ -13,11 +13,13 @@ use super::{
 use crate::{driver::AsahiDevice, hw::t8140, mmu};
 use core::ops::Range;
 use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
-use kernel::{c_str, prelude::*};
+use kernel::{c_str, prelude::*, sync::Arc};
 use t8140::{kernel_window as high, low};
 
 mod m5;
 mod work_pair;
+pub(crate) mod outer_credit;
+pub(crate) use outer_credit::{OuterClaim, OuterScope};
 
 const EVENT_RING_RECHECK: u32 = 256;
 
@@ -26,6 +28,7 @@ const CONTEXT_SIZE: usize = 0x20000;
 const REGION_A_SIZE: usize = core::mem::size_of::<abi::RegionA>();
 const REGION_C_SIZE: usize = 0x1000;
 
+const COMPUTE_BLOCKS_ALLOCATED: usize = 23;
 const COMPUTE_BLOCKS_MAPPED: usize = 22;
 const COMPUTE_BLOCKS_POPULATED: usize = 21;
 const COMPUTE_CONTROL_BLOCKS: u32 = 25;
@@ -60,8 +63,8 @@ impl ComputeShared {
             KernelObject::backing(alloc.dev, low::RENDER_PAGE_LIST_SIZE, CpuMap::WriteCombined)?;
         let runs =
             KernelObject::backing(alloc.dev, low::RENDER_RUN_LIST_SIZE, CpuMap::WriteCombined)?;
-        let mut blocks = KVec::with_capacity(COMPUTE_BLOCKS_MAPPED, GFP_KERNEL)?;
-        for _ in 0..COMPUTE_BLOCKS_MAPPED {
+        let mut blocks = KVec::with_capacity(COMPUTE_BLOCKS_ALLOCATED, GFP_KERNEL)?;
+        for _ in 0..COMPUTE_BLOCKS_ALLOCATED {
             blocks.push(
                 KernelObject::backing(alloc.dev, abi::FREE_LIST_BLOCK_SIZE, CpuMap::WriteCombined)?,
                 GFP_KERNEL,
@@ -105,6 +108,7 @@ impl ComputeScheduler {
 /// Checked views used only within one publication call. Every fallible operation completes
 /// before either member of a paired render publication is copied into shared memory.
 struct WorkPublication<'a> {
+    published: Option<&'a AtomicU64>,
     record: &'a super::fw::channels::WorkSlot,
     destination: *mut u8,
     producer: &'a AtomicU32,
@@ -128,6 +132,7 @@ impl WorkPublication<'_> {
         self.copy_record();
         fence(Ordering::SeqCst);
         self.producer.store(self.next, Ordering::Relaxed);
+        if let Some(published) = self.published { published.fetch_add(1, Ordering::Release); }
         fence(Ordering::SeqCst);
         self.next
     }
@@ -136,6 +141,7 @@ impl WorkPublication<'_> {
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     m5: bool,
+    outer_credits: Option<Arc<outer_credit::Credits>>,
     // Live publication uses interior writes under the device mutex. This owner is Send but not
     // Sync, so safe host code cannot issue those writes concurrently through shared references.
     _single_publisher: core::marker::PhantomData<core::cell::Cell<()>>,
@@ -219,6 +225,7 @@ impl InitData {
     pub(super) fn new() -> Self {
         Self {
             m5: false,
+            outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
             objects: KVec::new(),
@@ -483,23 +490,68 @@ impl InitData {
         Ok(())
     }
 
-    /// The sole host publisher holds the device mutex through the following
-    /// inner and outer publication. Firmware consumers can only free capacity;
-    /// neither this check nor waiting for room reserves or limits other queues.
-    /// `priority` selects the engine's ring of that priority class.
+    /// Resource-specific wait domain; register only after dropping the device
+    /// mutex. A successful claim allocates no waiter fence.
+    pub(crate) fn outer_available(&mut self) -> Result<Arc<super::availability::Availability>> {
+        if self.outer_credits.is_none() {
+            self.outer_credits = Some(outer_credit::Credits::new()?);
+        }
+        Ok(self.outer_credits.as_ref().ok_or(EIO)?.available())
+    }
+
+    /// M5 TA, fragment and compute share the compute outer ring per priority.
+    /// The physical queue claim prevents reassignment while this credit lives.
+    pub(crate) fn reserve_outer(&mut self, priority: u8, count: u32) -> Result<OuterClaim> {
+        if !self.m5 { return Err(EINVAL); }
+        self.outer_available()?;
+        let cursors = self.work_cursors(priority, super::fw::queue::DataMaster::Compute)?;
+        self.outer_credits.as_ref().ok_or(EIO)?.reserve(priority, count, cursors)
+    }
+
+    /// Hold the device mutex for this scope, including its Drop. The result
+    /// borrows only the claim, allowing the caller to publish through Firmware.
+    pub(crate) fn outer_scope<'a>(&self, claim: &'a mut OuterClaim) -> Result<OuterScope<'a>> {
+        self.outer_credits.as_ref().ok_or(EINVAL)?.scope(claim)
+    }
+
+    pub(crate) fn outer_waiting(&self) -> bool {
+        self.outer_credits.as_ref().is_some_and(|credits| credits.waiting())
+    }
+
+    /// Return a notification for off-lock dispatch only on consumer progress.
+    /// Call while actual outer waiters exist; firmware may consume a config
+    /// without generating a GPU completion IRQ, so those waiters need polling.
+    pub(crate) fn poll_outer_progress(&self) -> Result<Option<Arc<super::availability::Availability>>> {
+        let Some(credits) = self.outer_credits.as_ref().filter(|credits| credits.waiting()) else {
+            return Ok(None);
+        };
+        let mut progressed = false;
+        for priority in 0..4 {
+            progressed |= credits.progressed(priority,
+                self.work_cursors(priority, super::fw::queue::DataMaster::Compute)?)?;
+        }
+        Ok(progressed.then(|| credits.available()))
+    }
+
+    fn outer_capacity(&self, priority: u8, cursors: [u32; 3]) -> Result<u32> {
+        match &self.outer_credits {
+            Some(credits) => credits.capacity(priority, cursors),
+            None => outer_credit::free(cursors),
+        }
+    }
+
+    /// Unclaimed publications cannot consume another preparation's credit.
+    /// A claimed publication temporarily lends its own credits via outer_scope.
     pub(super) fn work_ready(
         &self,
         priority: u8,
         engine: super::fw::queue::DataMaster,
     ) -> Result<bool> {
-        if self.m5 && engine != super::fw::queue::DataMaster::Compute {
-            return match work_pair::Window::new(self.work_cursors(
-                priority, super::fw::queue::DataMaster::Compute,
-            )?) {
-                Ok(_) => Ok(true),
-                Err(error) if error == EBUSY => Ok(false),
-                Err(error) => Err(error),
-            };
+        use super::fw::queue::DataMaster;
+        if self.m5 {
+            let needed = if engine == DataMaster::Compute { 1 } else { 2 };
+            return Ok(self.outer_capacity(priority,
+                self.work_cursors(priority, DataMaster::Compute)?)? >= needed);
         }
         let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
         let next = (producer + 1) % super::fw::channels::WORK_RING_SLOTS;
@@ -520,6 +572,10 @@ impl InitData {
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
         let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
+        if self.m5 && engine == DataMaster::Compute
+            && self.outer_capacity(priority, [consumer, consumer_b, producer])? < 1 {
+            return Err(EBUSY);
+        }
         let next = (producer + 1) % channels::WORK_RING_SLOTS;
         if next == consumer || next == consumer_b {
             return Err(EINVAL);
@@ -533,7 +589,11 @@ impl InitData {
                 + abi::work_state_offset(channel)
                 + abi::ChannelState::PRODUCER,
         )?;
+        let published = if self.m5 && engine == DataMaster::Compute {
+            self.outer_credits.as_ref().map(|credits| credits.counter(priority)).transpose()?
+        } else { None };
         Ok(WorkPublication {
+            published,
             record,
             destination,
             producer,
@@ -593,7 +653,9 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let window = work_pair::Window::new(self.work_cursors(priority, DataMaster::Compute)?)?;
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        if self.outer_capacity(priority, cursors)? < 2 { return Err(EBUSY); }
+        let window = work_pair::Window::new(cursors)?;
         let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
         let bundle = self.object(self.bundle)?;
         let destinations = [window.start, window.next[0]].map(|index| {
@@ -610,7 +672,8 @@ impl InitData {
         let records = [copy(fragment)?, copy(tiling)?];
         // SAFETY: Complete, distinct slots were checked in the retained bundle;
         // the device's single publisher holds its mutex across this borrow.
-        Ok(unsafe { work_pair::Publication::new(records, destinations, producer, window) })
+        let published = self.outer_credits.as_ref().map(|credits| credits.counter(priority)).transpose()?;
+        Ok(unsafe { work_pair::Publication::new(records, destinations, producer, window, published) })
     }
 
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
@@ -684,6 +747,7 @@ impl InitData {
             core::mem::size_of_val(record),
         )?;
         Ok(WorkPublication {
+            published: None,
             record,
             destination,
             producer,
@@ -941,6 +1005,9 @@ impl InitData {
         let compute_state = self.add(KernelObject::backing(env.dev, mmu::UAT_PGSZ, WB)?)?;
         self.object_mut(compute_state)?
             .write(0, abi::FreeListState::COMPUTE)?;
+        for _ in &low::COMPUTE_ZERO_BLOCKS {
+            self.add(KernelObject::backing(env.dev, abi::FREE_LIST_BLOCK_SIZE, WB)?)?;
+        }
         let compute_runs = self.add(KernelObject::new(
             env.dev,
             env.lower,
@@ -1584,6 +1651,32 @@ impl super::recovery::Memory for InitData {
 
     fn wait_tick(&self) {
         kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+    }
+
+    /// M5 only: the status words the native firmware driver reads around a restart (recovery
+    /// reason/stamp words +0x4a9c..+0x4ab8, state +0x4ae0, host +0x4af0, and the
+    /// progress counter +0x4b00 that checkGPUProgress compares), so the log shows
+    /// whether firmware is still progressing while the host waits for state 1.
+    fn describe_recovery_wait(&self, polls: usize) {
+        if !self.m5 {
+            return;
+        }
+        let base = super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b;
+        let Ok(cluster) = self.object(self.cluster) else {
+            return;
+        };
+        fence(Ordering::Acquire);
+        let mut words = [0u32; 10];
+        for (slot, offset) in [0x4a9c, 0x4aa8, 0x4aac, 0x4ab0, 0x4ab4, 0x4ab8, 0x4ae0, 0x4af0, 0x4b00, 0x4b04]
+            .into_iter()
+            .enumerate()
+        {
+            words[slot] = cluster.word(base + offset).map_or(u32::MAX, |w| w.load(Ordering::Relaxed));
+        }
+        pr_info!(
+            "AGX recovery wait {} ms: 4a9c {:#x} 4aa8 {:#x} 4aac {:#x} 4ab0 {:#x}{:08x} 4ab8 {:#x} state {} host {} progress {:#x} 4b04 {:#x}\n",
+            polls, words[0], words[1], words[2], words[4], words[3], words[5], words[6], words[7], words[8], words[9]
+        );
     }
 }
 

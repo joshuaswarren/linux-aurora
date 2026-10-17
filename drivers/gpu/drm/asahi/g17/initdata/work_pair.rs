@@ -4,7 +4,7 @@
 //! are checked before the host-port transaction can make either queue runnable.
 
 use crate::g17::fw::channels::{WorkSlot, WORK_RING_SLOTS};
-use core::sync::atomic::{fence, AtomicU32, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use kernel::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +27,7 @@ impl Window {
 }
 
 pub(in crate::g17) struct Publication<'a> {
+    published: Option<&'a AtomicU64>,
     records: [WorkSlot; 2],
     destinations: [*mut u8; 2],
     producer: &'a AtomicU32,
@@ -42,8 +43,9 @@ impl<'a> Publication<'a> {
         destinations: [*mut u8; 2],
         producer: &'a AtomicU32,
         window: Window,
+        published: Option<&'a AtomicU64>,
     ) -> Self {
-        Self { records, destinations, producer, window }
+        Self { records, destinations, producer, window, published }
     }
 
     pub(in crate::g17) fn next(&self) -> [u32; 2] { self.window.next }
@@ -66,6 +68,7 @@ impl<'a> Publication<'a> {
         self.prepare();
         fence(Ordering::SeqCst);
         self.producer.store(self.window.next[1], Ordering::Relaxed);
+        if let Some(published) = self.published { published.fetch_add(2, Ordering::Release); }
         fence(Ordering::SeqCst);
         self.window.next
     }

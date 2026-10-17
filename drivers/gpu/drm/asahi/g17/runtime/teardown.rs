@@ -167,6 +167,7 @@ impl Firmware {
     /// pending controls. Recovery blocks new releases, never an observed ack.
     pub(in crate::g17) fn service_teardown(&mut self, reclaim: &mut ReclaimBatch) -> Result {
         self.queues.render.collect_reclaimable(reclaim)?;
+        self.collect_retained_eagerly(reclaim)?;
         if self.queues.teardown.is_empty() {
             return Ok(());
         }

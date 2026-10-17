@@ -7,10 +7,156 @@
 //! even when the GPUVA transaction cannot install its normal owner. Successful
 //! unmap releases those references before GPUVM attempts idle page reclaim.
 
-use super::{sptm::{ContextState, MapPages, Protection, PAGE}, sptm_transport::{AddressSpace, Transport}, MappingBacking};
+use super::{sptm::{self, ContextState, MapPages, MapPlan, Protection, TablePlan, PAGE}, sptm_transport::{AddressSpace, Transport}, table::BatchStats, MappingBacking};
 use crate::{g17::status::VmStatus, pgtable::{prot, Prot}};
 use core::ops::Range;
 use kernel::{addr::PhysicalAddr, prelude::*, rbtree::{RBTree, RBTreeNode, RBTreeNodeReservation}, sync::Arc};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Legacy providers only: private-space L2/L3 table frames x1n1 allocates
+/// from its own heap (sptm_hv_uat_alloc_frame -> memalign). x1n1 never returns
+/// them to the heap: DESTROY pools them for later spaces, so its heap holds the
+/// boot's peak of live private tables, and an x1n1 heap allocation failure is a
+/// hypervisor panic (dlmalloc MALLOC_FAILURE_ACTION). Keeping live tables under
+/// this budget bounds that peak. 2048 frames (32 MiB): a 4 x 64 GiB concurrent
+/// fill reset the machine at >= 7930 live frames, far below the heap's 1 GiB VA
+/// cap, so the real headroom is unknown; keep a wide margin.
+///
+/// A provider with donated tables takes each frame from Linux memory instead,
+/// as native XNU does (pmap_alloc_iommu_page), and returns it on destroy, so
+/// table memory has no budget beyond the kernel's own allocator.
+const PRIVATE_TABLE_BUDGET: u64 = 2048;
+static PRIVATE_TABLES: AtomicU64 = AtomicU64::new(0);
+static PRIVATE_TABLES_PEAK: AtomicU64 = AtomicU64::new(0);
+static DONATED_QUARANTINED: AtomicU64 = AtomicU64::new(0);
+
+/// Record donated frames becoming live and log each new 128-frame peak.
+fn note_donated(added: u64) {
+    let live = PRIVATE_TABLES.fetch_add(added, Ordering::AcqRel) + added;
+    let peak = PRIVATE_TABLES_PEAK.fetch_max(live, Ordering::AcqRel);
+    if live > peak && live / 128 != peak / 128 {
+        pr_info!("asahi: SPTM donated table frames: live {} peak {} ({} KiB of guest memory)\n",
+            live, live, live * (PAGE >> 10));
+    }
+}
+
+/// A guest page the provider holds as a UAT table frame. Freed only after the
+/// provider confirms it returned the page; otherwise deliberately leaked.
+struct DonorFrame(*mut kernel::bindings::page);
+
+// SAFETY: An exclusively owned page reference; only its physical address is
+// shared, with the provider.
+unsafe impl Send for DonorFrame {}
+// SAFETY: See Send. No interior mutability.
+unsafe impl Sync for DonorFrame {}
+
+impl DonorFrame {
+    fn physical(&self) -> u64 {
+        // SAFETY: The page is a live allocation owned by this frame.
+        unsafe { kernel::bindings::page_to_phys(self.0) as u64 }
+    }
+
+    /// Free a page the provider never took or has returned.
+    fn free(self) {
+        // SAFETY: The page is mapped for the guest again and owned only here.
+        unsafe { kernel::bindings::__free_pages(self.0, 0) };
+    }
+}
+
+const L3_SPAN: u64 = 1 << 25;
+const L3_PER_L2: u64 = 1 << 11;
+
+/// Live private table frames, for diagnostics.
+pub(super) fn private_tables() -> u64 { PRIVATE_TABLES.load(Ordering::Relaxed) }
+
+fn refuse_tables(needed: u64) -> Error {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || (n + 1).is_power_of_two() {
+        pr_warn!("asahi: SPTM table budget refusal: need {} live {} budget {} (occurrence {})\n",
+            needed, private_tables(), PRIVATE_TABLE_BUDGET, n + 1);
+    }
+    ENOMEM
+}
+
+/// Kernel-owned, physically contiguous scratch for sparse fills: one provider
+/// MAP operation covers up to SPTM_UAT_SEG_LIMIT (64) consecutive pages, so a
+/// 64-page tile repeated across a range needs 64 times fewer operations than
+/// one repeated page. Zeroed at allocation.
+pub(super) struct SparseTile {
+    page: *mut kernel::bindings::page,
+    physical: u64,
+    /// Current provider mappings of each frame. A VA-aligned fill maps frame
+    /// `(va / PAGE) % 64`, so short runs can concentrate on a few frames;
+    /// per-frame counts keep the bound exact.
+    frames: [core::sync::atomic::AtomicU32; 64],
+}
+
+// SAFETY: The pages are exclusively owned until Drop; only their physical
+// address is shared, and it is immutable.
+unsafe impl Send for SparseTile {}
+// SAFETY: See Send. No interior mutability.
+unsafe impl Sync for SparseTile {}
+
+impl SparseTile {
+    /// 64 pages: the provider's per-operation segment limit.
+    pub(super) const ORDER: u32 = 6;
+
+    pub(super) fn new() -> Result<Arc<Self>> {
+        // SAFETY: A plain zeroed higher-order page allocation.
+        let page = unsafe { kernel::bindings::alloc_pages(
+            kernel::bindings::GFP_KERNEL | kernel::bindings::__GFP_ZERO, Self::ORDER) };
+        if page.is_null() { return Err(ENOMEM); }
+        // SAFETY: page is a live allocation returned above.
+        let physical = unsafe { kernel::bindings::page_to_phys(page) } as u64;
+        let tile = Arc::new(Self { page, physical,
+            frames: [const { core::sync::atomic::AtomicU32::new(0) }; 64] }, GFP_KERNEL);
+        if tile.is_err() {
+            // SAFETY: The allocation above was not published anywhere.
+            unsafe { kernel::bindings::__free_pages(page, Self::ORDER) };
+        }
+        Ok(tile?)
+    }
+
+    pub(super) fn physical(&self) -> u64 { self.physical }
+
+    pub(super) fn pages(&self) -> u64 { 1 << Self::ORDER }
+
+    /// Highest current mapping count of any frame.
+    pub(super) fn max_frame_maps(&self) -> u32 {
+        self.frames.iter().map(|count| count.load(Ordering::Relaxed)).max().unwrap_or(0)
+    }
+
+    /// Add or remove the mappings of `pages` pages starting at VA page `first`.
+    fn account(&self, first: u64, pages: u64, add: bool) {
+        let period = self.pages();
+        let base = (pages / period) as u32;
+        let extra = pages % period;
+        for frame in 0..period {
+            let offset = (frame + period - first % period) % period;
+            let count = base + u32::from(offset < extra);
+            if count == 0 { continue; }
+            let slot = &self.frames[frame as usize];
+            if add { slot.fetch_add(count, Ordering::Relaxed); }
+            else { slot.fetch_sub(count, Ordering::Relaxed); }
+        }
+    }
+}
+
+impl Drop for SparseTile {
+    fn drop(&mut self) {
+        // SAFETY: Runs hold an Arc for as long as the provider may map these
+        // pages; an uncertain address space leaks its runs (and so the tile).
+        unsafe { kernel::bindings::__free_pages(self.page, Self::ORDER) };
+    }
+}
+
+#[derive(Clone)]
+enum RunBacking {
+    // Field kept only to retain the counted SG lease.
+    Gem(#[allow(dead_code)] MappingBacking),
+    Tile(Arc<SparseTile>),
+}
 
 #[derive(Clone)]
 struct Run {
@@ -18,11 +164,17 @@ struct Run {
     physical: u64,
     prot: Prot,
     repeat: bool,
-    _backing: Option<MappingBacking>,
+    /// Nonzero for a tiled run: `physical` is the tile base and the page at
+    /// VA `a` is tile page `(a / PAGE) % period`, independent of the run start.
+    period: u64,
+    _backing: Option<RunBacking>,
 }
 
 impl Run {
     fn physical_at(&self, start: u64, address: u64) -> u64 {
+        if self.period != 0 {
+            return self.physical + (address / PAGE) % self.period * PAGE;
+        }
         self.physical + if self.repeat { 0 } else { address - start }
     }
 }
@@ -44,16 +196,26 @@ pub(super) struct PageTable {
     space: AddressSpace,
     runs: RBTree<u64, Run>,
     status: Arc<VmStatus>,
+    /// Private spaces: L3 tables known to exist, one bitmap per L2 span (word
+    /// 32 bit 0 = the L2 table itself), and their count in PRIVATE_TABLES.
+    tables: RBTree<u64, KBox<[u64; 33]>>,
+    table_count: u64,
+    /// Donated table frames the provider holds for this space.
+    donors: KVec<DonorFrame>,
 }
 
 impl PageTable {
     pub(super) fn new(transport: &Arc<Transport>, status: Arc<VmStatus>) -> Result<Self> {
-        Ok(Self { space: AddressSpace::private(transport)?, runs: RBTree::new(), status })
+        Ok(Self { space: AddressSpace::private(transport)?, runs: RBTree::new(), status,
+            tables: RBTree::new(), table_count: 0, donors: KVec::new() })
     }
 
     pub(super) fn new_global(transport: &Arc<Transport>, status: Arc<VmStatus>) -> Self {
-        Self { space: AddressSpace::global(transport), runs: RBTree::new(), status }
+        Self { space: AddressSpace::global(transport), runs: RBTree::new(), status,
+            tables: RBTree::new(), table_count: 0, donors: KVec::new() }
     }
+
+    pub(super) fn private_handle(&self) -> Option<u16> { self.space.private_handle() }
 
     pub(super) fn ensure_certain(&self) -> Result {
         match self.space.state() {
@@ -93,6 +255,202 @@ impl PageTable {
         Ok(())
     }
 
+    fn l3_spans(range: &Range<u64>) -> impl Iterator<Item = (u64, usize)> {
+        let first = range.start / L3_SPAN;
+        let last = (range.end - 1) / L3_SPAN;
+        (first..=last).map(|span| (span / L3_PER_L2, (span % L3_PER_L2) as usize))
+    }
+
+    /// Bitmap storage for every L2 span of `range`, allocated before publication.
+    fn table_bitmaps(&mut self, range: &Range<u64>) -> Result {
+        let mut last_l2 = None;
+        for (l2, _) in Self::l3_spans(range) {
+            if last_l2 == Some(l2) { continue; }
+            last_l2 = Some(l2);
+            if self.tables.get(&l2).is_none() {
+                let bits = KBox::new([0u64; 33], GFP_KERNEL)?;
+                self.tables.insert(RBTreeNode::new(l2, bits, GFP_KERNEL)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_table(&mut self, l2: u64, l3: Option<usize>) {
+        if let Some(bits) = self.tables.get_mut(&l2) {
+            match l3 {
+                None => bits[32] |= 1,
+                Some(l3) => bits[l3 / 64] |= 1 << (l3 % 64),
+            }
+        }
+    }
+
+    /// Donated tables: give the provider one zeroed Linux page for every
+    /// missing L2/L3 of `range` before any leaf is published (native
+    /// pmap_alloc_iommu_page). Each table's receipt is exact: 0 took the
+    /// page, 1 found the table present, a refusal or an unexecuted operation
+    /// left the page with Linux. Only taken pages stay allocated.
+    fn install_donated_tables(&mut self, range: &Range<u64>) -> Result {
+        let mut wanted = KVec::new();
+        let mut last_l2 = None;
+        for (l2, l3) in Self::l3_spans(range) {
+            let bits = self.tables.get(&l2);
+            if last_l2 != Some(l2) {
+                last_l2 = Some(l2);
+                if !bits.is_some_and(|bits| bits[32] & 1 != 0) {
+                    wanted.push((l2, None), GFP_KERNEL)?;
+                }
+            }
+            if !bits.is_some_and(|bits| bits[l3 / 64] & (1 << (l3 % 64)) != 0) {
+                wanted.push((l2, Some(l3)), GFP_KERNEL)?;
+            }
+        }
+        if wanted.is_empty() { return Ok(()); }
+        self.table_bitmaps(range)?;
+        self.donors.reserve(wanted.len(), GFP_KERNEL)?;
+        let space = self.space.plan_space()?;
+        let mut frames: KVec<DonorFrame> = KVec::with_capacity(wanted.len(), GFP_KERNEL)?;
+        let mut operations = KVec::with_capacity(wanted.len(), GFP_KERNEL)?;
+        let release = |frames: KVec<DonorFrame>| for frame in frames { frame.free() };
+        for (l2, l3) in wanted.iter() {
+            // SAFETY: A plain zeroed order-0 page allocation.
+            let page = unsafe { kernel::bindings::alloc_pages(
+                kernel::bindings::GFP_KERNEL | kernel::bindings::__GFP_ZERO, 0) };
+            if page.is_null() {
+                release(frames);
+                return Err(ENOMEM);
+            }
+            let frame = DonorFrame(page);
+            let (va, level) = match l3 {
+                None => (l2 * L3_SPAN * L3_PER_L2, 1),
+                Some(l3) => ((l2 * L3_PER_L2 + *l3 as u64) * L3_SPAN, 2),
+            };
+            let operation = sptm::donated_table(space, va, level, frame.physical());
+            frames.push_within_capacity(frame).map_err(|_| ENOMEM).ok();
+            match operation {
+                Ok(operation) => operations.push_within_capacity(operation).map_err(|_| ENOMEM).ok(),
+                Err(_) => {
+                    release(frames);
+                    return Err(EINVAL);
+                }
+            };
+        }
+        let Some(private) = self.space.donating() else {
+            release(frames);
+            return Err(EINVAL);
+        };
+        let (completed, result) = private.map_tables(&mut operations);
+        let mut taken = 0u64;
+        for (index, frame) in frames.into_iter().enumerate() {
+            let (l2, l3) = wanted[index];
+            let receipt = (index < completed).then(|| operations[index].result);
+            match receipt {
+                Some(0) => {
+                    self.mark_table(l2, l3);
+                    self.donors.push_within_capacity(frame).ok();
+                    taken += 1;
+                }
+                Some(1) => {
+                    self.mark_table(l2, l3);
+                    frame.free();
+                }
+                // An undefined receipt: keep the page until destroy asks the
+                // provider where it is. The table is not assumed to exist.
+                Some(_) => { self.donors.push_within_capacity(frame).ok(); }
+                None => frame.free(),
+            }
+        }
+        if taken != 0 {
+            self.table_count += taken;
+            note_donated(taken);
+        }
+        result
+    }
+
+    /// Return the donated frames after a confirmed destroy. A receipt of 0
+    /// means the provider returned every frame; otherwise ask about each one
+    /// and leak any it still holds.
+    fn release_donors(&mut self, receipt: u64) {
+        let donors = core::mem::replace(&mut self.donors, KVec::new());
+        let transport = match &self.space {
+            AddressSpace::Private(space) => Some(space.transport()),
+            AddressSpace::Global { .. } => None,
+        };
+        let mut retained = 0u64;
+        for frame in donors {
+            let returned = receipt == 0
+                || transport.is_some_and(|transport|
+                    matches!(transport.donation_state(frame.physical()), Ok(0)));
+            if returned { frame.free(); } else { retained += 1; }
+        }
+        if retained != 0 {
+            DONATED_QUARANTINED.fetch_add(retained, Ordering::Relaxed);
+            pr_err!("asahi: SPTM destroy kept {} donated table frames (receipt {}); total {}\n",
+                retained, receipt, DONATED_QUARANTINED.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Reserve budget for every private table frame `range` may create
+    /// before any provider operation. Returns the count to commit or release.
+    /// Donated tables are installed here instead, with nothing to settle.
+    fn reserve_tables(&mut self, range: &Range<u64>) -> Result<u64> {
+        if !matches!(self.space, AddressSpace::Private(_)) { return Ok(0); }
+        if self.space.donating().is_some() {
+            self.install_donated_tables(range)?;
+            return Ok(0);
+        }
+        let mut needed = 0u64;
+        let mut last_l2 = None;
+        for (l2, l3) in Self::l3_spans(range) {
+            let bits = self.tables.get(&l2);
+            if last_l2 != Some(l2) {
+                last_l2 = Some(l2);
+                if !bits.is_some_and(|bits| bits[32] & 1 != 0) { needed += 1; }
+            }
+            if !bits.is_some_and(|bits| bits[l3 / 64] & (1 << (l3 % 64)) != 0) { needed += 1; }
+        }
+        if needed == 0 { return Ok(0); }
+        let live = PRIVATE_TABLES.fetch_add(needed, Ordering::AcqRel) + needed;
+        if live > PRIVATE_TABLE_BUDGET {
+            PRIVATE_TABLES.fetch_sub(needed, Ordering::AcqRel);
+            return Err(refuse_tables(needed));
+        }
+        // Bitmap storage is allocated before publication; marking cannot fail.
+        let mut last_l2 = None;
+        for (l2, _) in Self::l3_spans(range) {
+            if last_l2 == Some(l2) { continue; }
+            last_l2 = Some(l2);
+            if self.tables.get(&l2).is_none() {
+                let node = KBox::new([0u64; 33], GFP_KERNEL).map_err(Error::from)
+                    .and_then(|bits| RBTreeNode::new(l2, bits, GFP_KERNEL).map_err(Error::from));
+                match node {
+                    Ok(node) => { self.tables.insert(node); }
+                    Err(error) => {
+                        PRIVATE_TABLES.fetch_sub(needed, Ordering::AcqRel);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(needed)
+    }
+
+    /// A submitted plan may have created any table of its range: count them
+    /// all until the space is destroyed. An unsubmitted plan created none.
+    fn settle_tables(&mut self, range: &Range<u64>, reserved: u64, submitted: bool) {
+        if reserved == 0 { return; }
+        if !submitted {
+            PRIVATE_TABLES.fetch_sub(reserved, Ordering::AcqRel);
+            return;
+        }
+        for (l2, l3) in Self::l3_spans(range) {
+            if let Some(bits) = self.tables.get_mut(&l2) {
+                bits[32] |= 1;
+                bits[l3 / 64] |= 1 << (l3 % 64);
+            }
+        }
+        self.table_count += reserved;
+    }
+
     pub(super) fn map_pages(&mut self, range: Range<u64>, physical: PhysicalAddr,
         prot: Prot, repeat: bool, backing: Option<&MappingBacking>) -> Result
     {
@@ -114,12 +472,119 @@ impl PageTable {
         let map_pages = if repeat { MapPages::Repeated { physical, count } }
             else { MapPages::Contiguous { physical, count } };
         let node = RBTreeNode::new(range.start, Run {
-            end: range.end, physical, prot, repeat, _backing: backing.cloned(),
+            end: range.end, physical, prot, repeat, period: 0,
+            _backing: backing.cloned().map(RunBacking::Gem),
         }, GFP_KERNEL)?;
+        let reserved = self.reserve_tables(&range)?;
         match self.space.map(range.start, map_pages, protection) {
-            Ok(()) => { self.runs.insert(node); Ok(()) }
+            Ok(()) => {
+                self.settle_tables(&range, reserved, true);
+                self.runs.insert(node);
+                Ok(())
+            }
             Err(failure) => {
+                self.settle_tables(&range, reserved, failure.submitted);
                 if failure.may_have_mapped { self.runs.insert(node); }
+                self.report_uncertain();
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Map the physically contiguous chunks of one GPU mapping, which together
+    /// cover `chunks[0].start..chunks.last().end` without gaps, as one provider
+    /// plan: the range's table operations once, then every chunk's leaf
+    /// operations, in native-sized batches and (private spaces) one ASID sync.
+    ///
+    /// Shadow bookkeeping matches mapping the chunks one by one: every run
+    /// node and table reservation exists before the first operation; success
+    /// records every run. On failure that may have published any page, every
+    /// run is retained, so no backing page can be released while it might
+    /// still be mapped (the space is poisoned exactly as for a single run).
+    pub(super) fn map_chunks(&mut self, chunks: &[(Range<u64>, PhysicalAddr, Prot)],
+        backing: &MappingBacking) -> Result<BatchStats>
+    {
+        let (Some(first), Some(last)) = (chunks.first(), chunks.last()) else { return Err(EINVAL); };
+        let union = first.0.start..last.0.end;
+        let space = self.space.plan_space()?;
+        let mut at = union.start;
+        let mut nodes = KVVec::with_capacity(chunks.len(), GFP_KERNEL)?;
+        let mut plans = KVVec::with_capacity(chunks.len(), GFP_KERNEL)?;
+        let mut pages = 0u64;
+        for (range, physical, chunk_prot) in chunks {
+            if range.start != at || range.end <= range.start { return Err(EINVAL); }
+            at = range.end;
+            if *chunk_prot == prot::PROT_FW_MMIO_RW || *chunk_prot == prot::PROT_FW_MMIO_RO {
+                return Err(EINVAL);
+            }
+            self.prepare_map(range.clone())?;
+            let count = (range.end - range.start) / PAGE;
+            if *physical & (PAGE - 1) != 0 { return Err(EINVAL); }
+            physical.checked_add(range.end - range.start).ok_or(EOVERFLOW)?;
+            let plan = MapPlan::without_tables(space, range.start,
+                MapPages::Contiguous { physical: *physical, count }, protection(*chunk_prot)?)
+                .map_err(|_| EINVAL)?;
+            plans.push(plan, GFP_KERNEL)?;
+            nodes.push(RBTreeNode::new(range.start, Run {
+                end: range.end, physical: *physical, prot: *chunk_prot, repeat: false, period: 0,
+                _backing: Some(RunBacking::Gem(backing.clone())),
+            }, GFP_KERNEL)?, GFP_KERNEL)?;
+            pages += count;
+        }
+        // Donated tables are installed by reserve_tables before any leaf.
+        let tables = if self.space.donating().is_some() { None }
+            else { Some(TablePlan::new(space, &union).map_err(|_| EINVAL)?) };
+        let plan = Iterator::chain(tables.into_iter().flatten(), plans.iter().cloned().flatten());
+        let operations = plan.clone().count() as u64;
+        let reserved = self.reserve_tables(&union)?;
+        let result = self.space.map_batch(plan);
+        let submitted = match &result { Ok(()) => true, Err(failure) => failure.submitted };
+        self.settle_tables(&union, reserved, submitted);
+        let keep = match &result { Ok(()) => true, Err(failure) => failure.may_have_mapped };
+        if keep {
+            for node in nodes { self.runs.insert(node); }
+        }
+        if let Err(failure) = result {
+            self.report_uncertain();
+            return Err(failure.error);
+        }
+        Ok(BatchStats { chunks: chunks.len() as u64, pages, operations })
+    }
+
+    /// Fill `range` with `tile` repeated at its own period, VA-aligned so that
+    /// any later split keeps the same page-to-tile correspondence.
+    pub(super) fn map_tiled(&mut self, range: Range<u64>, tile: &Arc<SparseTile>, prot: Prot)
+        -> Result
+    {
+        self.prepare_map(range.clone())?;
+        if prot == prot::PROT_FW_MMIO_RW || prot == prot::PROT_FW_MMIO_RO
+            || !matches!(self.space, AddressSpace::Private(_)) {
+            return Err(EINVAL);
+        }
+        let protection = protection(prot)?;
+        let count = (range.end - range.start) / PAGE;
+        let period = tile.pages();
+        let pages = MapPages::Tiled {
+            base: tile.physical(), period, first: range.start / PAGE % period, count,
+        };
+        let node = RBTreeNode::new(range.start, Run {
+            end: range.end, physical: tile.physical(), prot, repeat: false, period,
+            _backing: Some(RunBacking::Tile(tile.clone())),
+        }, GFP_KERNEL)?;
+        let reserved = self.reserve_tables(&range)?;
+        match self.space.map(range.start, pages, protection) {
+            Ok(()) => {
+                self.settle_tables(&range, reserved, true);
+                tile.account(range.start / PAGE, count, true);
+                self.runs.insert(node);
+                Ok(())
+            }
+            Err(failure) => {
+                self.settle_tables(&range, reserved, failure.submitted);
+                if failure.may_have_mapped {
+                    tile.account(range.start / PAGE, count, true);
+                    self.runs.insert(node);
+                }
                 self.report_uncertain();
                 Err(failure.error)
             }
@@ -154,13 +619,18 @@ impl PageTable {
             return Err(error);
         }
         for (start, run) in touched {
+            if let Some(RunBacking::Tile(tile)) = &run._backing {
+                let from = start.max(range.start);
+                tile.account(from / PAGE, (run.end.min(range.end) - from) / PAGE, false);
+            }
             self.runs.remove(&start);
             if start < range.start {
                 let left = Run { end: range.start, ..run.clone() };
                 self.runs.insert(spare.pop().expect("reserved left fragment").into_node(start, left));
             }
             if run.end > range.end {
-                let right = Run { physical: run.physical_at(start, range.end), ..run };
+                let physical = if run.period != 0 { run.physical } else { run.physical_at(start, range.end) };
+                let right = Run { physical, ..run };
                 self.runs.insert(spare.pop().expect("reserved right fragment").into_node(range.end, right));
             }
         }
@@ -224,8 +694,14 @@ impl Drop for PageTable {
             loop {
                 let next = self.runs.iter().next().map(|(start, run)| (*start, run.end));
                 let Some((start, end)) = next else {
-                    if self.space.destroy().is_err() {
-                        pr_err!("SPTM: empty address space could not be released\n");
+                    match self.space.destroy() {
+                        Err(_) => pr_err!("SPTM: empty address space could not be released\n"),
+                        Ok(receipt) => {
+                            // Legacy x1n1 pools heap frames for later spaces;
+                            // donated frames return to Linux. Neither is live.
+                            PRIVATE_TABLES.fetch_sub(self.table_count, Ordering::AcqRel);
+                            self.release_donors(receipt);
+                        }
                     }
                     return;
                 };
@@ -237,6 +713,15 @@ impl Drop for PageTable {
         }
         self.status.record(EIO);
         core::mem::forget(core::mem::replace(&mut self.runs, RBTree::new()));
+        if let Some(handle) = self.space.private_handle() {
+            let state = match self.space.state() {
+                ContextState::Unbound => 0,
+                ContextState::Bound(id) => 0x100 | u64::from(id),
+                ContextState::Uncertain(id) => 0x200 | id.map_or(0xff, u64::from),
+                ContextState::Destroyed => 0x300,
+            };
+            super::sptm_transport::note_private_retained(Some(handle), state);
+        }
         pr_err!("SPTM: address space retained without confirmed retirement\n");
     }
 }

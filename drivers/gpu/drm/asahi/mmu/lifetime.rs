@@ -29,6 +29,10 @@ struct PoolMappings {
     mappings: KVec<KernelMapping>,
 }
 
+/// vmfix6f: a graph's pool mappings moved out of a VM slot (see
+/// Vm::take_render_pool_mappings). Dropping it unmaps them.
+pub(crate) struct RenderPoolMappings(PoolMappings);
+
 impl DriverMappings {
     fn ranges(&self) -> impl Iterator<Item = Range<u64>> + '_ {
         Iterator::chain(
@@ -194,6 +198,51 @@ impl Vm {
             driver.mappings.push(mapping, GFP_KERNEL)?;
         }
         Ok(())
+    }
+
+    /// vmfix6f: move a drained graph's pool mappings for `slot` out of this VM
+    /// (so another graph of the same VM can install there); `put` returns them
+    /// if that install fails. Only the exact owner identity is taken.
+    pub(crate) fn take_render_pool_mappings(&self, slot: u8, id: u64) -> Option<RenderPoolMappings> {
+        if id == 0 {
+            return None;
+        }
+        let lifetime = self.lifetime.as_ref()?;
+        let mut driver = lifetime.driver.lock();
+        Option::as_mut(&mut *driver)?
+            .render
+            .get_mut(usize::from(slot))?
+            .take_if(|pool| pool.id == id)
+            .map(RenderPoolMappings)
+    }
+    pub(crate) fn put_render_pool_mappings(&self, slot: u8, mappings: RenderPoolMappings) -> Result {
+        let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
+        let mut driver = lifetime.driver.lock();
+        let driver = Option::as_mut(&mut *driver).ok_or(EINVAL)?;
+        let pool = driver.render.get_mut(usize::from(slot)).ok_or(EINVAL)?;
+        if pool.is_some() {
+            return Err(EBUSY);
+        }
+        *pool = Some(mappings.0);
+        Ok(())
+    }
+
+    /// vmfix6d A: the graph identity whose pool mappings occupy `slot` in this
+    /// VM (0 when free). A second graph cannot install there until it leaves.
+    pub(crate) fn render_pool_owner(&self, slot: u8) -> u64 {
+        self.lifetime
+            .as_ref()
+            .and_then(|lifetime| {
+                lifetime
+                    .driver
+                    .lock()
+                    .as_ref()?
+                    .render
+                    .get(usize::from(slot))?
+                    .as_ref()
+                    .map(|pool| pool.id)
+            })
+            .unwrap_or(0)
     }
 
     pub(crate) fn render_pool_tvb_blocks(&self, slot: u8, id: u64) -> Option<usize> {

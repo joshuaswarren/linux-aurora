@@ -210,9 +210,10 @@ impl Events {
                     if !self.unknown_reported {
                         dev_warn!(
                             dev.as_ref(),
-                            "G17 {:?} unknown firmware event {}\n",
+                            "G17 {:?} unknown firmware event {}: {:08x?}\n",
                             role,
-                            tag
+                            tag,
+                            record.raw_words()
                         );
                         self.unknown_reported = true;
                     }

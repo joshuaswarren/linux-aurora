@@ -49,7 +49,7 @@ impl Resources {
             scene_end_va:memory.manager.trailer_va(),
             pm_scratch:scratch,pm_metric:metric,tilemap_va:target_addresses.tilemap,
             layermeta_va:target_addresses.layer,heapmeta_va:target_addresses.heap,
-            tpc_va:memory.target.tpc_va(),tpc_size:layout.tpc_size as u64,deflake_va:deflake,ta_status_va:ta_status,
+            tpc_va:memory.target.tpc_va(),tpc_size:layout.tpc_size as u64,deflake_va:deflake,ta_status_va:ta_status,mesh_storage:0,mesh_class:0,
             fragment_status_va:fragment_status,fragment_status_fw_va:fragment_status_fw,aux_fb_va:auxiliary,timestamp_va:0,
             ta_ids:fw::ObjectIds{predecessor:0,current:0},fragment_ids:fw::ObjectIds{predecessor:0,current:0},unk_2104:0,unk_210c:0};
         Ok(Self{aliases,memory,layout,pass:*pass,pool:private_pool,scenes_seen:0,view,extra,uma_row,pb_row})

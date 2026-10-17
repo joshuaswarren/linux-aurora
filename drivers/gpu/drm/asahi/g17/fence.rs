@@ -63,7 +63,7 @@ pub(crate) struct Submission {
 
 impl Submission {
     fn new(fence: UserFence<CompletionFence>, context: Arc<Context>) -> Result<Arc<Self>> {
-        let work_state = Arc::new(WorkStateLease::deferred(context), GFP_KERNEL)?;
+        let work_state = Arc::pin_init(WorkStateLease::deferred(context), GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self {
                 fence,
@@ -100,6 +100,14 @@ impl Submission {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             let error = self.error.load(Ordering::Acquire);
             if error != 0 {
+                // Failure-path diagnostic: the ioctl's out-syncobj fence
+                // signals with this error (first 8, then powers of two).
+                static ERRORS: AtomicU32 = AtomicU32::new(0);
+                let n = ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    pr_info!("asahi: submission fence signalled with error {} (error fence {})\n",
+                        error, n);
+                }
                 self.fence.set_error(Error::from_errno(error));
             } else {
                 // Scheduler cleanup can wait behind submission on the same worker.

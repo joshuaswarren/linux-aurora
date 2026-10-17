@@ -372,10 +372,21 @@ pub(crate) struct KickArgs<'a> {
     pub(crate) event_mask: [u64; 4],
     /// Register arrays bound to the kick.
     pub(crate) register_arrays: [Option<RegisterArrayBinding>; 4],
-    /// The compute register program includes a shader-context scratch request.
+    /// The stage's register program includes a shader-context scratch (SCS)
+    /// bracket (header bit 61; compute, TA and 3D alike).
     pub(crate) compute_scratch: bool,
+    /// The stage's register program includes a matrix bracket (bit 63).
+    pub(crate) compute_matrix: bool,
     /// Priority class of the queue.
     pub(crate) priority: u8,
+}
+
+/// Per-stage (TA, 3D) kick header flags of a render, derived from the same
+/// state that emits the SCS and matrix register brackets.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StageKickFlags {
+    pub(crate) scratch: [bool; 2],
+    pub(crate) matrix: [bool; 2],
 }
 
 /// One kick ring entry.
@@ -386,7 +397,8 @@ pub(crate) struct KickArgs<'a> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct KickEntry {
     /// Timestamp in bits 41:2, QID in bits 48:42, MCache table present in bit
-    /// 58, queue priority in bits 60:59 and compute scratch enabled in bit 61.
+    /// 58, queue priority in bits 60:59, SCS bracket in the stage's register
+    /// program in bit 61 and matrix bracket in bit 63.
     pub(crate) header: u64,
     /// MCache table: address >> 5 in bits 43:6, count - 1 in bits 59:54.
     pub(crate) mcache: u64,
@@ -431,6 +443,7 @@ impl KickEntry {
     const MCACHE_PRESENT: u64 = 1 << 58;
     const PRIORITY_SHIFT: u32 = 59;
     const COMPUTE_SCRATCH: u64 = 1 << 61;
+    const COMPUTE_MATRIX: u64 = 1 << 63;
     const QOS_SLOT_SHIFT: u32 = 32;
     const QOS_CLASS_SHIFT: u32 = 40;
     const QOS_CLASS_MAX: u8 = 0x1f;
@@ -455,6 +468,9 @@ impl KickEntry {
             | (args.priority as u64) << Self::PRIORITY_SHIFT;
         if args.compute_scratch {
             header |= Self::COMPUTE_SCRATCH;
+        }
+        if args.compute_matrix {
+            header |= Self::COMPUTE_MATRIX;
         }
         let mcache = match args.mcache {
             Some(table) => {

@@ -17,8 +17,11 @@ use crate::{hw::t8140, mem, mmu};
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
-/// QIDs kept free for render pairs when compute queues fill the table.
+/// Minimum QIDs each engine family can always reach: render pairs (tiling +
+/// fragment) and compute. Published identities are never recycled and each
+/// family reuses only its own, so neither may take the other's last share.
 const COMPUTE_RENDER_RESERVE: usize = 16;
+const RENDER_COMPUTE_RESERVE: usize = 16;
 
 /// Stable physical-channel identity. The owner must not be reused within a
 /// device lifetime, including after an unpublished allocation is cancelled.
@@ -45,10 +48,21 @@ struct Identity {
 }
 
 /// One shared namespace for tiling, fragment and compute queues.
+///
+/// Recycling (vmfix6, native-like): macOS keeps one kick ring per QID for the
+/// device lifetime and hands the QID to any engine and owner after the previous
+/// owner's scheduler release; the per-QID stamp sequence continues (v70
+/// captures). A recycled QID's ring is kept here as a spare channel; the next
+/// queue reserving that QID adopts it, continuing its 40-bit timestamp.
 pub(crate) struct QueueIds {
     entries: [Option<Identity>; QID_COUNT],
     compute_publication: u64,
     leased: usize,
+    channels: KVec<Option<Queue>>,
+    /// QIDs whose spare channel was handed to a constructor. A constructor that
+    /// loses it (dropped ring) poisons the QID instead of re-ringing it.
+    taken: u128,
+    recycles: u64,
 }
 
 impl QueueIds {
@@ -57,7 +71,90 @@ impl QueueIds {
             entries <- pin_init::init_array_from_fn(|_| None),
             compute_publication: 0,
             leased: 0,
+            channels: {
+                let mut channels = KVec::with_capacity(QID_COUNT, GFP_KERNEL)?;
+                for _ in 0..QID_COUNT {
+                    channels.push(None, GFP_KERNEL)?;
+                }
+                channels
+            },
+            taken: 0,
+            recycles: 0,
         })
+    }
+
+    /// Returns a published QID to the free table, keeping its ring (and the
+    /// timestamp sequence the firmware stamps for it) as a spare channel. The
+    /// caller proved the owner's scheduler release consumed, the graph drained
+    /// and the QID's stamp at the ring's high-water mark.
+    pub(crate) fn recycle(&mut self, queue: Queue, from: &str) -> core::result::Result<(), Queue> {
+        let id = queue.id;
+        let qid = usize::from(id.qid);
+        match self.entries.get(qid) {
+            Some(Some(entry)) if entry.id == id && entry.published
+                && self.channels.get(qid).is_some_and(Option::is_none) => {}
+            _ => return Err(queue),
+        }
+        self.entries[qid] = None;
+        self.leased -= 1;
+        self.taken &= !(1u128 << qid);
+        self.recycles += 1;
+        pr_info!("asahi: qid {} recycled: {:?} ({}) -> spare, stamp hwm {:#x} (recycle {})\n",
+            qid, id.engine, from, queue.timestamp.prev().get(), self.recycles);
+        self.channels[qid] = Some(queue);
+        Ok(())
+    }
+
+    /// Hands the spare channel of a just-reserved QID to its constructor,
+    /// re-identified for the new owner and engine; its timestamp continues.
+    pub(crate) fn take_channel(&mut self, id: Id) -> Option<Queue> {
+        let qid = usize::from(id.qid);
+        if !matches!(self.entries.get(qid), Some(Some(entry)) if entry.id == id) {
+            return None;
+        }
+        let mut queue = self.channels.get_mut(qid)?.take()?;
+        let old = queue.id.engine;
+        queue.id = id;
+        self.taken |= 1u128 << qid;
+        pr_info!("asahi: qid {} reused: {:?} -> {:?}, continuing after stamp {:#x}\n",
+            qid, old, id.engine, queue.timestamp.prev().get());
+        Some(queue)
+    }
+
+    /// A constructor returns an unused adopted channel.
+    pub(crate) fn return_channel(&mut self, queue: Queue) {
+        let qid = usize::from(queue.id.qid);
+        if let Some(slot) = self.channels.get_mut(qid) {
+            if slot.is_none() {
+                *slot = Some(queue);
+                self.taken &= !(1u128 << qid);
+                return;
+            }
+        }
+        pr_warn!("asahi: qid {} spare channel returned twice; keeping the first\n", qid);
+    }
+
+    /// The adopted channel of `id` was dropped before installation: its ring
+    /// is gone, so the QID must never take a different ring. Keep it leased.
+    pub(crate) fn poison(&mut self, id: Id) {
+        let qid = usize::from(id.qid);
+        if self.taken & (1u128 << qid) == 0 {
+            return;
+        }
+        self.taken &= !(1u128 << qid);
+        if let Some(Some(entry)) = self.entries.get_mut(qid) {
+            entry.published = true;
+            entry.id.owner = u64::MAX;
+        }
+        pr_warn!("asahi: qid {} poisoned: adopted ring lost before installation\n", qid);
+    }
+
+    pub(crate) fn has_spare(&self, qid: u8) -> bool {
+        self.channels.get(usize::from(qid)).is_some_and(Option::is_some)
+    }
+
+    pub(crate) fn adopted(&self, id: Id) -> bool {
+        self.taken & (1u128 << id.qid) != 0
     }
 
     /// Reuses only an exact owner/engine match. Preferred placement is for
@@ -84,15 +181,34 @@ impl QueueIds {
             };
         }
         // Healthy existing channels keep their QID. Never recycle a published
-        // identity to recover capacity after a fault; leave eight render pairs.
-        if engine == DataMaster::Compute && QID_COUNT - self.leased <= COMPUTE_RENDER_RESERVE {
-            return Err(ENOSPC);
+        // identity to recover capacity after a fault. Keep enough free entries
+        // for the other family to reach its minimum share.
+        let compute = engine == DataMaster::Compute;
+        let other = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| (entry.id.engine == DataMaster::Compute) != compute)
+            .count();
+        let other_min = if compute { COMPUTE_RENDER_RESERVE } else { RENDER_COMPUTE_RESERVE };
+        let free_after = (QID_COUNT - self.leased).saturating_sub(1);
+        if free_after < other_min.saturating_sub(other) {
+            return Err(if compute {
+                enospc_site!("kick.rs compute QID reserve guard (render share)")
+            } else {
+                enospc_site!("kick.rs render QID reserve guard (compute share)")
+            });
         }
+        let free = |index: usize| self.entries.get(index).is_some_and(Option::is_none);
+        let spare = |index: usize| self.channels.get(index).is_some_and(Option::is_some);
+        // Never-ringed QIDs first; a recycled QID's spare ring is adopted only
+        // when none is left (render pairs need spare rings in matched pairs).
         let index = preferred
             .map(usize::from)
-            .filter(|index| self.entries.get(*index).is_some_and(Option::is_none))
-            .or_else(|| self.entries.iter().position(Option::is_none))
-            .ok_or(ENOSPC)?;
+            .filter(|index| free(*index) && !spare(*index))
+            .or_else(|| (0..QID_COUNT).find(|index| free(*index) && !spare(*index)))
+            .or_else(|| (0..QID_COUNT).find(|index| free(*index)))
+            .ok_or_else(|| enospc_site!("kick.rs:95 QID table full"))?;
         let id = Id {
             qid: index as u8,
             owner,
@@ -104,6 +220,69 @@ impl QueueIds {
         });
         self.leased += 1;
         Ok(id)
+    }
+
+    /// Two QIDs for a render pair (tiling, fragment). A pair's two kick rings
+    /// advance together and the pair ordinal equals their last timestamp, so
+    /// recycled rings are adopted only as two spares with equal timestamps
+    /// (the two lanes of one recycled pair); otherwise two never-ringed QIDs.
+    pub(crate) fn reserve_render_pair(&mut self, identity: u64) -> Result<[Id; 2]> {
+        if identity == 0 {
+            return Err(EINVAL);
+        }
+        if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.id.owner == identity || entry.id.owner == identity + 1)
+        {
+            return Err(EINVAL);
+        }
+        let compute_held = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.id.engine == DataMaster::Compute)
+            .count();
+        let free_after = (QID_COUNT - self.leased).saturating_sub(2);
+        if free_after < RENDER_COMPUTE_RESERVE.saturating_sub(compute_held) {
+            return Err(enospc_site!("kick.rs render QID reserve guard (compute share)"));
+        }
+        let free = |index: usize| self.entries.get(index).is_some_and(Option::is_none);
+        // Only rings built with the render layout (GPU+FW high mapping) can
+        // serve a render pair; compute-built rings map their high alias FW-only.
+        let stamp = |index: usize| {
+            self.channels
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|queue| (queue.timestamp.get(), matches!(queue.backing, Backing::Render { .. })))
+        };
+        let mut chosen = None;
+        'search: for a in 0..QID_COUNT {
+            let Some((ts, true)) = stamp(a).filter(|_| free(a)) else { continue };
+            for b in (a + 1)..QID_COUNT {
+                if free(b) && stamp(b) == Some((ts, true)) {
+                    chosen = Some([a, b]);
+                    break 'search;
+                }
+            }
+        }
+        if chosen.is_none() {
+            let mut fresh = (0..QID_COUNT).filter(|index| free(*index) && stamp(*index).is_none());
+            if let (Some(a), Some(b)) = (fresh.next(), fresh.next()) {
+                chosen = Some([a, b]);
+            }
+        }
+        let chosen = chosen.ok_or_else(|| enospc_site!("kick.rs render pair: no matched QIDs"))?;
+        let ids = [
+            Id { qid: chosen[0] as u8, owner: identity, engine: DataMaster::Tiling },
+            Id { qid: chosen[1] as u8, owner: identity + 1, engine: DataMaster::Fragment },
+        ];
+        for id in ids {
+            self.entries[usize::from(id.qid)] = Some(Identity { id, published: false });
+        }
+        self.leased += 2;
+        Ok(ids)
     }
 
     /// Ordered under the device mutex; no atomic operation on the submission path.
@@ -127,7 +306,18 @@ impl QueueIds {
         Ok(())
     }
 
+    /// The adopting graph is installed in the registry: the ring is owned again.
+    pub(crate) fn adopted_installed(&mut self, id: Id) {
+        self.taken &= !(1u128 << id.qid);
+    }
+
     pub(crate) fn cancel_unpublished(&mut self, id: Id) -> Result {
+        if self.adopted(id) {
+            // The constructor that adopted this QID's ring failed; the ring
+            // may be gone, so the QID is kept rather than freed.
+            self.poison(id);
+            return Ok(());
+        }
         let slot = self.entries.get_mut(usize::from(id.qid)).ok_or(EINVAL)?;
         match slot {
             Some(entry) if entry.id == id && !entry.published => {
@@ -315,7 +505,6 @@ impl Queue {
         if self.id.engine != DataMaster::Compute {
             return Err(EINVAL);
         }
-        mem::sync();
         for asid in 0..4 {
             mem::tlbi_range_or_asid(asid, self.low_va() as usize, KICK_RING_SIZE);
             mem::tlbi_range_or_asid(asid, self.firmware_va() as usize, KICK_RING_SIZE);
@@ -330,6 +519,16 @@ impl Queue {
         self.previous = None;
     }
 
+    /// The last committed timestamp (ZERO if the ring never carried a kick).
+    pub(crate) fn high_water(&self) -> KickTimestamp {
+        self.timestamp.prev()
+    }
+
+    /// Client alias for a constructor adopting this ring for another owner.
+    pub(crate) fn adopt_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        self.map_client(vm)
+    }
+
     pub(crate) fn timestamp(&self) -> KickTimestamp {
         self.timestamp
     }
@@ -340,6 +539,14 @@ impl Queue {
         })
     }
     /// Snapshot a retained kick slot for explicit bring-up qualification.
+    pub(crate) fn dump_m5_entry(&self, dev: &kernel::device::Device, label: &str,
+        timestamp: KickTimestamp) -> Result {
+        let object = match &self.backing {
+            Backing::Compute { low, .. } => low,
+            Backing::Render { high, .. } => high,
+        };
+        crate::g17::m5_render_test::dump_device(dev, label, object, timestamp.entry_offset(), 0x200)
+    }
     pub(crate) fn read_entry_words(&mut self, timestamp:KickTimestamp)->Result<[u32;128]> {
         self.object().read_words(timestamp.entry_offset())
     }

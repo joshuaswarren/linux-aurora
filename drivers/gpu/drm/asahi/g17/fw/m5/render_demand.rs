@@ -209,6 +209,21 @@ impl RenderDemand {
             count(shared_large)?, 0, 0], minimum, ideal, pressure, clusters)
     }
 
+    /// Mesh/object execute on the tiling engine. Reuse compute's occupancy
+    /// arithmetic with the tiling-limited core topology, never compute's full
+    /// enabled core count. Resident/shared limits are explicit device policy.
+    pub(crate) fn include_mesh(&mut self, storage: ComputeStorage,
+        resident_warps: u32, shared_budget: u32) -> Result<()> {
+        let maximum = self.maximum;
+        let total = self.total;
+        self.maximum = self.limited_maximum;
+        self.total = self.limited_total;
+        let result = self.include_compute(storage, resident_warps, shared_budget);
+        self.maximum = maximum;
+        self.total = total;
+        result
+    }
+
     fn merge(&mut self, parts: [u32; 5], minimum: u64, ideal: u64, pressure: u64,
         clusters: u64) -> Result<()> {
         // Stored page counts are signed before conversion to byte counts.

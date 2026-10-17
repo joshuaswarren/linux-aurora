@@ -63,6 +63,17 @@ pub(super) enum Class {
 pub(super) trait Queues {
     fn render_scheduler_active(&self) -> bool;
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool>;
+    /// The compute queue's front command never executed (zero-duration record).
+    fn compute_unexecuted(&self, qid: u8) -> Option<bool>;
+    /// The compute queue's front command was already republished once.
+    fn compute_front_replayed(&self, qid: u8) -> bool;
+    /// Latch the compute queue's front completion record from the shared ring;
+    /// whether it is present, None without a ticketed compute front.
+    fn observe_compute_front(&mut self, qid: u8) -> Option<bool>;
+    /// Describe every compute queue's in-flight front after the restart closed.
+    fn describe_compute_fronts(&self);
+    /// QIDs of render pairs whose front group started tiling and never finished.
+    fn started_unfinished_renders(&self) -> u128;
     /// Copy every retained queue's live producer to its recovery target, then
     /// issue a full barrier. A failed graph must not skip subsequent queues.
     fn publish_recovery_targets(&self) -> Option<Error>;
@@ -87,6 +98,13 @@ pub(super) trait Memory {
     fn entries(&self) -> Result<Entries>;
     /// One millisecond wait; this is polled because the firmware sends no state-3 notification.
     fn wait_tick(&self);
+    /// Recovery diagnostic while waiting for state 1 (`polls` 1 ms ticks so far):
+    /// firmware status words that show whether firmware is still progressing.
+    fn describe_recovery_wait(&self, _polls: usize) {}
+    /// A 100 us wait for a cancellation record firmware stores after resuming.
+    fn wait_short(&self) {
+        kernel::time::delay::fsleep(kernel::time::Delta::from_micros(100));
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -99,7 +117,17 @@ struct Request {
 pub(super) struct State {
     accepted: u64,
     pending: Option<Request>,
+    /// Host time of the last recovery that withdrew firmware blame from a
+    /// compute command that never executed.
+    withdrawn_at: Option<u64>,
 }
+
+/// Polls (100 us apart) for the blamed compute command's completion record.
+/// Firmware stores its cancellation record after the host closes the restart.
+const BLAMED_RECORD_POLLS: usize = 50;
+/// A recovery within this interval of a withdrawn blame keeps the firmware's
+/// blame, so work that repeatedly stalls the GPU cannot avoid it indefinitely.
+const WITHDRAW_INTERVAL_NS: u64 = 2_000_000_000;
 
 /// Non-fatal post-recovery failures. The firmware handshake has already closed successfully.
 pub(super) struct ServiceResult {
@@ -112,6 +140,7 @@ impl State {
         Self {
             accepted: 0,
             pending: None,
+            withdrawn_at: None,
         }
     }
     pub(super) fn generation(&self) -> u64 {
@@ -172,16 +201,24 @@ pub(super) fn service<H: Host>(
     // Its ring cursor is already consumed; wait only for that readiness word,
     // without advancing the host generation or acknowledging an early event.
     let mut ready = false;
-    for _ in 0..RECOVERY_POLLS {
+    for poll in 0..RECOVERY_POLLS {
         if crashed() {
             return Err(EIO);
         }
         match host.recovery_state()? {
             1 => {
                 ready = true;
+                if poll != 0 {
+                    host.describe_recovery_wait(poll);
+                }
                 break;
             }
-            0 => host.wait_tick(),
+            0 => {
+                if poll % 25 == 0 {
+                    host.describe_recovery_wait(poll);
+                }
+                host.wait_tick()
+            }
             _ => return Err(EIO),
         }
     }
@@ -216,13 +253,26 @@ pub(super) fn service<H: Host>(
     }
     // A failed table read leaves only the explicit blamed QID as evidence of guilt.
     let entries = host.entries().unwrap_or_default();
+    pr_info!("AGX firmware recovery table: guilty={:#x} cancelled={:#x}\n", entries.guilty, entries.cancelled);
     host.transition(3, 0)?;
     if host.recovery_state()? != 0 {
         return Err(EIO);
     }
     host.recovery_mut().pending = None;
 
-    let cancelled = classify(host, entries, request.blamed, &mut sources);
+    if let Some(qid) = request.blamed {
+        observe_blamed_compute(host, qid);
+    }
+    host.describe_compute_fronts();
+    let now = super::now_ns();
+    let may_withdraw = host
+        .recovery()
+        .withdrawn_at
+        .is_none_or(|at| now.saturating_sub(at) >= WITHDRAW_INTERVAL_NS);
+    let (cancelled, withdrawn) = classify(host, entries, request.blamed, may_withdraw, &mut sources);
+    if withdrawn {
+        host.recovery_mut().withdrawn_at = Some(now);
+    }
     if let Some(qid) = request.blamed {
         host.settle_blamed_render(qid, EIO);
     }
@@ -234,21 +284,76 @@ pub(super) fn service<H: Host>(
     Ok(ServiceResult { scan_error, target_error })
 }
 
+/// Firmware stores a blamed compute command's cancellation record after the
+/// restart closes. Wait briefly for it so classification sees the exact
+/// record; this runs only on the recovery path.
+fn observe_blamed_compute<H: Host>(host: &mut H, qid: u8) {
+    for poll in 0..BLAMED_RECORD_POLLS {
+        match host.observe_compute_front(qid) {
+            None => return,
+            Some(true) => {
+                if poll != 0 {
+                    pr_info!("AGX recovery: blamed compute qid {} record latched after {} polls\n", qid, poll);
+                }
+                return;
+            }
+            Some(false) => host.wait_short(),
+        }
+    }
+    pr_info!("AGX recovery: blamed compute qid {} has no completion record after {} polls\n", qid, BLAMED_RECORD_POLLS);
+}
+
 /// Resolves guilty QIDs before changing any completion's classification. Unknown ownership or
 /// too many distinct guilty VMs leaves all prior classifications intact. The oldest spared work
 /// of a QID makes later blame collateral to its previous recovery, rather than new VM guilt.
-fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sources: &mut Sources) -> u128 {
+/// Also returns whether the firmware's blame of a never-executed compute command was withdrawn.
+fn classify<Q: Queues>(
+    queues: &mut Q,
+    entries: Entries,
+    blamed: Option<u8>,
+    may_withdraw: bool,
+    sources: &mut Sources,
+) -> (u128, bool) {
     let mut guilty_qids = entries.guilty | blamed.map_or(0, |qid| 1u128 << qid);
+    let mut withdrawn = false;
+    // A blamed compute command whose record proves it never executed cannot
+    // have made the stall; it is the work that could not be switched in. No
+    // VM is guilty then, as attribute() decides for a blamed render that never
+    // started when firmware names no other culprit: the command is spared and
+    // replayed. Renders whose tiler started and never finished are not blamed
+    // instead: without firmware fault sources that is no evidence of guilt
+    // (R336v4: such renders of an innocent loop and of the CTS were replayed
+    // and completed). A command blamed again after its replay, or a recovery
+    // shortly after a withdrawn blame, keeps the firmware's blame.
+    if let Some(qid) = blamed {
+        if queues.compute_unexecuted(qid) == Some(true) {
+            let bit = 1u128 << qid;
+            let started = queues.started_unfinished_renders() & !bit;
+            pr_info!("AGX recovery: blamed compute qid {} never executed; started unfinished renders {:#x}\n", qid, started);
+            if queues.compute_front_replayed(qid) {
+                pr_info!("AGX recovery: blamed compute qid {} was already replayed; firmware blame stands\n", qid);
+            } else if !may_withdraw {
+                pr_info!("AGX recovery: blamed compute qid {} within the withdrawn-blame interval; firmware blame stands\n", qid);
+            } else {
+                guilty_qids = entries.guilty & !bit;
+                withdrawn = true;
+                pr_info!("AGX recovery: blamed compute qid {} blame withdrawn; remaining guilty {:#x}\n", qid, guilty_qids);
+            }
+        }
+    }
     let cancelled = entries.cancelled;
     let attribution = sources.attribute(blamed, |qid, stamp| queues.render_pass_started(qid, stamp));
     match attribution {
         Attribution::Firmware => {}
-        Attribution::Queues(qids) => guilty_qids = qids,
+        Attribution::Queues(qids) => {
+            guilty_qids = qids;
+            withdrawn = false;
+        }
         Attribution::NoCulprit => guilty_qids = 0,
     }
-    let no_culprit = attribution == Attribution::NoCulprit;
+    let no_culprit = attribution == Attribution::NoCulprit || (withdrawn && guilty_qids == 0);
     if guilty_qids == 0 && !no_culprit {
-        return 0;
+        return (0, withdrawn);
     }
     let mut guilty: [Option<Arc<VmStatus>>; MAX_GUILTY_VMS] = Default::default();
     let mut count = 0;
@@ -284,7 +389,7 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sou
         }
     }
     if unresolved || (count == 0 && collateral == 0 && !no_culprit) {
-        return 0;
+        return (0, false);
     }
     let spared = queues.classify_work(&|status| {
         guilty[..count]
@@ -297,5 +402,5 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sou
             })
             .unwrap_or(Class::Spared)
     });
-    cancelled & !(guilty_qids & !collateral) & spared
+    (cancelled & !(guilty_qids & !collateral) & spared, withdrawn)
 }

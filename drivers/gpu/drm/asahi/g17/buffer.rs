@@ -81,7 +81,7 @@ impl BufferIds {
             self.entries
                 .iter()
                 .position(|entry| entry.free())
-                .ok_or(ENOSPC)? as u8
+                .ok_or_else(|| enospc_site!("buffer.rs:84 buffer id"))? as u8
         };
         if !self.entries[usize::from(id)].free() {
             return Err(EIO);
@@ -114,7 +114,7 @@ impl BufferIds {
         if !entry.owner {
             return Err(EINVAL);
         }
-        entry.references = entry.references.checked_add(1).ok_or(ENOSPC)?;
+        entry.references = entry.references.checked_add(1).ok_or_else(|| enospc_site!("buffer.rs:117 buffer refs"))?;
         Ok((id, entry.token))
     }
     /// Preflight shared completion bookkeeping before any of its counters change.
@@ -132,6 +132,31 @@ impl BufferIds {
             self.return_id(id);
         }
         Ok(())
+    }
+    /// vmfix6d A: [free, graph-owned, referenced (refs > 0), total refs].
+    pub(crate) fn census(&self) -> [u32; 4] {
+        let mut out = [0u32; 4];
+        for entry in &self.entries {
+            if entry.free() {
+                out[0] += 1;
+            }
+            if entry.owner {
+                out[1] += 1;
+            }
+            if entry.references != 0 {
+                out[2] += 1;
+            }
+            out[3] += u32::from(entry.references);
+        }
+        out
+    }
+    /// The current token of a graph-owned identity (vmfix6d restore).
+    pub(crate) fn owner_token(&self, id: u8) -> Result<u64> {
+        let entry = self.entries.get(usize::from(id)).ok_or(EINVAL)?;
+        if !entry.owner {
+            return Err(EINVAL);
+        }
+        Ok(entry.token)
     }
     pub(crate) fn unreserve_owner(&mut self, id: u8) -> Result {
         let entry = self.entries.get_mut(usize::from(id)).ok_or(EINVAL)?;
@@ -177,7 +202,7 @@ impl Scenes {
         (0..fw::SCENES)
             .map(|offset| (self.next + offset) % fw::SCENES)
             .find(|scene| self.owners[scene % self.scratch_slots].is_none())
-            .ok_or(ENOSPC)
+            .ok_or_else(|| enospc_site!("buffer.rs:180"))
     }
     pub(crate) fn commit(&mut self, ordinal: u64, scene: usize) -> Result {
         if self.select(ordinal)? != scene {
@@ -256,7 +281,7 @@ impl Growth {
         }
         let retained = (before.total as usize + capacity - before.read as usize) % capacity;
         if retained.checked_add(added).ok_or(EOVERFLOW)? >= capacity {
-            return Err(ENOSPC);
+            return Err(enospc_site!("buffer.rs:259"));
         }
         let target = (before.total as usize + added) % capacity;
         Ok(Self {
@@ -339,7 +364,7 @@ pub(crate) fn compact_alias(
             Err(error) => return Err(error),
         }
     }
-    Err(ENOSPC)
+    Err(enospc_site!("buffer.rs:342"))
 }
 
 /// Allocated aliases remain private until the owner installs them in its VM
@@ -544,7 +569,7 @@ impl MetricsLease {
                 break;
             }
         }
-        let slot = selected.ok_or(ENOSPC)?;
+        let slot = selected.ok_or_else(|| enospc_site!("buffer.rs:528 slot"))?;
         // Construct the lease before any fallible address/view validation so
         // every constructor failure returns the selected bit.
         let mut lease = Self {

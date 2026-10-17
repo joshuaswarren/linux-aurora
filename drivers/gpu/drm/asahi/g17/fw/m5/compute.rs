@@ -2,7 +2,7 @@
 
 //! M5 compute register programs. The operand and preemption layouts differ
 //! from the other G17 profile; sharing a register count does not imply a shared
-//! register program. These builders encode the non-scratch program only.
+//! register program. M5 scratch has its own layout and two control writes.
 
 use kernel::prelude::*;
 use super::super::{kick::RegisterWrite, offset_va, work_key};
@@ -13,8 +13,125 @@ pub(crate) const PREEMPT_BYTES: usize = 0x4000;
 pub(crate) const OPERAND_BYTES: usize = 0x40000;
 pub(crate) const CHECKPOINTS: [u16; 4] = [37, 39, 39, 40];
 
+/// Native ScsLayoutGen2 allocation. Pages are 4 KiB USC pool pages, independent
+/// of the host's CPU page size. Layout sections and control registers are
+/// specific to M5; the other G17 profile uses a different fixed region.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScratchRequest {
+    layout: u64,
+    driver_end: u32,
+    pages: u16,
+}
+
+impl ScratchRequest {
+    pub(crate) const NONE: Self = Self { layout: 0, driver_end: 0, pages: 0 };
+
+    pub(crate) fn new(layout: u64) -> Result<Self> {
+        let cliques = (layout >> 24) & 0xff;
+        if cliques == 0 { return Ok(Self::NONE); }
+        let depth = layout & 0xffff;
+        let levels = (layout >> 16) & 0xff;
+        let user = (layout >> 32) & 0xffff;
+        let driver = layout >> 48;
+        let threads = cliques * 32;
+        // Four fixed sections followed by per-thread stacks, driver/user
+        // payloads and per-level state. All inputs are bounded bitfields.
+        let driver_end = 0x68000 + threads * (depth * 8 + driver);
+        // Register 0x1a141 has a 24-bit byte offset for the end of the
+        // driver section. Reject truncation even if the total page count fits.
+        if driver_end > 0xffffff { return Err(EINVAL); }
+        let bytes = driver_end + threads * user
+            + cliques * 256 * (levels + u64::from(levels > 1));
+        let pages = (bytes + 0x1fff) >> 12;
+        Ok(Self { layout, driver_end: driver_end as u32,
+            pages: u16::try_from(pages).map_err(|_| EINVAL)? })
+    }
+
+    pub(crate) fn enabled(self) -> bool { self.pages != 0 }
+    pub(crate) fn pages(self) -> u16 { self.pages }
+    pub(crate) fn size_word(self) -> u64 {
+        let pages = u64::from(self.pages);
+        pages | (pages.div_ceil(256) << 16)
+    }
+    pub(crate) fn window_word(self) -> u64 {
+        if self.enabled() { (1 << 24) | (((self.layout >> 24) & 0xff) << 16) }
+        else { 0xff0000 }
+    }
+    pub(crate) fn stack_word(self) -> u64 {
+        if self.enabled() { self.layout & 0xfff8 } else { 8 }
+    }
+    pub(crate) fn driver_word(self) -> u64 {
+        if !self.enabled() { return 0; }
+        let levels = (self.layout >> 16) & 0xff;
+        u64::from(self.driver_end) | ((levels + u64::from(levels > 1)) << 24)
+    }
+    fn checkpoints(self) -> [u16; 4] {
+        CHECKPOINTS.map(|count| count + if self.enabled() { 2 } else { 0 })
+    }
+}
+
+/// Per-command native intersection table bindings. The pool contains 128-byte
+/// blocks of eight 16-byte program entries. Addresses are UAT user addresses;
+/// ownership and readable ranges are checked by command validation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntersectionTables {
+    pub(crate) pool: u64,
+    pub(crate) pool_bytes: u64,
+    first: u32,
+    count: u32,
+    pub(crate) default_program: u64,
+    default_control: u64,
+}
+
+impl IntersectionTables {
+    pub(crate) const NONE: Self = Self {
+        pool: 0, pool_bytes: 0, first: 0, count: 0,
+        default_program: 0, default_control: 0,
+    };
+
+    pub(crate) fn new(pool: u64, pool_bytes: u64, first: u32, count: u32,
+                      default_program: u64, default_control: u64) -> Result<Self> {
+        if pool == 0 {
+            if pool_bytes != 0 || first != 0 || count != 0
+                || default_program != 0 || default_control != 0 {
+                return Err(EINVAL);
+            }
+            return Ok(Self::NONE);
+        }
+        // Native resource sizes are encoded in 16 KiB pages. Table lengths
+        // have 18 block-count bits; truncating either field changes addressing.
+        let end = pool.checked_add(pool_bytes).ok_or(EINVAL)?;
+        let blocks_end = u64::from(first) + u64::from(count);
+        let code = default_program & 0x0000_ffff_ffff_ffff;
+        if pool & 0x3fff != 0 || pool_bytes == 0 || pool_bytes & 0x3fff != 0
+            || end > (1u64 << 48) || (pool_bytes >> 14) >= (1u64 << 25)
+            || count == 0 || count >= (1 << 18) || blocks_end * 128 > pool_bytes
+            || code & 63 != 0
+            || default_control & !0x0000_7fff_0000_3fff != 0
+            || (code == 0 && (default_program != 0 || default_control != 0))
+            || (code != 0 && default_control & (1u64 << 40) == 0) {
+            return Err(EINVAL);
+        }
+        Ok(Self { pool, pool_bytes, first, count, default_program, default_control })
+    }
+
+    pub(crate) fn enabled(self) -> bool { self.pool != 0 }
+
+    pub(crate) fn words(self) -> [u64; 6] {
+        if !self.enabled() { return [0; 6]; }
+        [self.pool + u64::from(self.first) * 128 | (1u64 << 51),
+         0xc0000000 | (u64::from(self.count) << 7), self.pool,
+         self.pool_bytes >> 14, self.default_program, self.default_control]
+    }
+}
+
 /// Addresses and policy owned by a queued compute command.
 pub(crate) struct RegisterArgs {
+    pub(crate) matrix_ops: bool,
+    pub(crate) scratch: ScratchRequest,
+    pub(crate) intersection: IntersectionTables,
+    /// Opaque native allocation word, independent of the SCS layout.
+    pub(crate) auxiliary_allocation: u32,
     pub(crate) preempt_va: u64,
     pub(crate) cdm_va: u64,
     pub(crate) operand_va: u64,
@@ -63,6 +180,7 @@ pub(crate) fn main(args: &RegisterArgs) -> Result<[RegisterWrite; MAIN_COUNT]> {
     let preempt = args.preempt_va;
     let operand = args.operand_va;
     let ids = args.object_ids;
+    let intersection = args.intersection.words();
     let state = u64::from(args.preempt_state_offset);
     let region = u64::from(args.operand_region_bytes);
     let key = work_key(args.context_id, args.work_state);
@@ -79,17 +197,17 @@ pub(crate) fn main(args: &RegisterArgs) -> Result<[RegisterWrite; MAIN_COUNT]> {
         RegisterWrite::new(0x0a599, args.resource_policy),
         RegisterWrite::new(0x1a458, args.dispatch_control),
         RegisterWrite::new(0x101d9, 0x1c),
-        RegisterWrite::new(0x1a089, 0),
-        RegisterWrite::new(0x1a091, 0),
-        RegisterWrite::new(0x1a059, 0),
-        RegisterWrite::new(0x1a061, 0),
-        RegisterWrite::new(0x1a0b9, 0),
-        RegisterWrite::new(0x1a0c1, 0),
-        RegisterWrite::new(0x101d1, 0),
-        RegisterWrite::new(0x0d479, 0),
-        RegisterWrite::new(0x1a0e9, 8),
-        RegisterWrite::new(0x1a141, 0),
-        RegisterWrite::new(0x107a1, 0xff0000),
+        RegisterWrite::new(0x1a089, intersection[0]),
+        RegisterWrite::new(0x1a091, intersection[1]),
+        RegisterWrite::new(0x1a059, intersection[2]),
+        RegisterWrite::new(0x1a061, intersection[3]),
+        RegisterWrite::new(0x1a0b9, intersection[4]),
+        RegisterWrite::new(0x1a0c1, intersection[5]),
+        RegisterWrite::new(0x101d1, args.scratch.size_word()),
+        RegisterWrite::new(0x0d479, u64::from(args.auxiliary_allocation)),
+        RegisterWrite::new(0x1a0e9, args.scratch.stack_word()),
+        RegisterWrite::new(0x1a141, args.scratch.driver_word()),
+        RegisterWrite::new(0x107a1, args.scratch.window_word() | (u64::from(args.matrix_ops) << 25)),
         RegisterWrite::new(0x1a540, ids),
         RegisterWrite::new(0x014a9, ids),
         RegisterWrite::new(0x0a351, ids),
@@ -107,7 +225,36 @@ pub(crate) fn main(args: &RegisterArgs) -> Result<[RegisterWrite; MAIN_COUNT]> {
         RegisterWrite::new(0x0a731, 0),
         RegisterWrite::new(0x1a440, 0x154024209),
         RegisterWrite::new(0x0a599, 0x6000400020),
-    ])
+])
+}
+
+fn program(args: &RegisterArgs) -> Result<([RegisterWrite; MAIN_COUNT + 4], usize)> {
+    let main = main(args)?;
+    let mut writes = [RegisterWrite::new(0, 0); MAIN_COUNT + 4];
+    let mut count = 0;
+    if args.scratch.enabled() {
+        writes[count] = RegisterWrite::new(0x17e1, 1);
+        count += 1;
+    }
+    if args.matrix_ops {
+        writes[count] = RegisterWrite::new(0x17f1, 1);
+        count += 1;
+    }
+    for (index, register) in main.iter().enumerate() {
+        if index == 33 {
+            if args.scratch.enabled() {
+                writes[count] = RegisterWrite::new(0x17d9, 1);
+                count += 1;
+            }
+            if args.matrix_ops {
+                writes[count] = RegisterWrite::new(0x17e9, 1);
+                count += 1;
+            }
+        }
+        writes[count] = *register;
+        count += 1;
+    }
+    Ok((writes, count))
 }
 
 /// Operand-state exchange used by the alternate program.
@@ -125,12 +272,12 @@ pub(crate) fn alternate(args: &RegisterArgs) -> Result<[RegisterWrite; ALTERNATE
 
 /// Register-array bindings in a compute kick. The first checkpoint follows
 /// the initial 0x0a5c9 write, before the second 0x0a731 write.
-pub(crate) fn bindings(descriptor_va: u64)
+pub(crate) fn bindings(descriptor_va: u64, scratch: ScratchRequest, matrix_ops: bool)
     -> Result<[Option<super::super::kick::RegisterArrayBinding>; 4]>
 {
     use super::super::kick::RegisterArrayBinding;
     Ok([
-        Some(RegisterArrayBinding::new(offset_va(descriptor_va, 0x40)?, CHECKPOINTS[0] as u8)?),
+        Some(RegisterArrayBinding::new(offset_va(descriptor_va, 0x40)?, (scratch.checkpoints()[0] + if matrix_ops { 2 } else { 0 }) as u8)?),
         Some(RegisterArrayBinding::new(offset_va(descriptor_va, 0x760)?, ALTERNATE_COUNT as u8)?),
         None,
         None,
@@ -223,19 +370,19 @@ impl Descriptor {
         if args.cdm_end_va < args.registers.cdm_va || args.qid >= 128 {
             return Err(EINVAL);
         }
-        let main = main(&args.registers)?;
+        let (main, count) = program(&args.registers)?;
         let alternate = alternate(&args.registers)?;
         let main_va = offset_va(args.descriptor_va, 0x40)?;
         let alternate_va = offset_va(args.descriptor_va, 0x760)?;
         // Also validate the kick's encodable addresses before mutating storage.
-        bindings(args.descriptor_va)?;
+        bindings(args.descriptor_va, args.registers.scratch, args.registers.matrix_ops)?;
         super::super::clear(self);
         self.tag = 3;
         self.submit_sequence = args.submit_sequence;
         self.context_id = args.registers.context_id.into();
         self.work_state_va = args.work_state_va;
-        self.checkpoints = CHECKPOINTS;
-        super::set_register_array(&mut self.registers, main_va, &main)?;
+        self.checkpoints = args.registers.scratch.checkpoints().map(|n| n + if args.registers.matrix_ops { 2 } else { 0 });
+        super::set_register_array(&mut self.registers, main_va, &main[..count])?;
         super::set_register_array(&mut self.alternate, alternate_va, &alternate)?;
         self.preempt_va = args.registers.preempt_va;
         self.cdm_end_va = args.cdm_end_va;

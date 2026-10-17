@@ -52,6 +52,23 @@ use kernel::{
     xarray, //
 };
 
+/// UAPI DRM_ASAHI_BIND_SPARSE_TILE (bit 4): with SINGLE_PAGE, fill the range
+/// from kernel sparse tiles (read-only: global zero tile; writable: per-VM
+/// sink) instead of the GEM's first page. The GEM only anchors the GPUVA.
+pub(crate) const DRM_ASAHI_BIND_SPARSE_TILE: u32 = 1 << 4;
+/// UAPI DRM_ASAHI_FEATURE_SPARSE_TILES (bit 11): BIND_SPARSE_TILE accepted.
+pub(crate) const DRM_ASAHI_FEATURE_SPARSE_TILES: u64 = 1 << 11;
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_MATRIX: u64 = 1 << 12;
+/// UAPI DRM_ASAHI_FEATURE_TASK_MESH_STORAGE (bit 13): render programs accept
+/// DRM_ASAHI_RENDER_PROGRAM_TASK and such task (object-stage) kicks get the
+/// TA mesh rendering buffer (register 0x1ca48), which backs the native
+/// object payload address. Reported only while m5_mesh_storage_chunks != 0.
+pub(crate) const DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: u64 = 1 << 13;
+/// UAPI DRM_ASAHI_RENDER_PROGRAM_TASK (bit 3), only with
+/// DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object program is an API task stage.
+pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = 1 << 3;
+pub(crate) const DRM_ASAHI_COMPUTE_USES_MATRIX: u32 = 1 << 1;
+
 const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
 pub(crate) const MAX_COMMANDS_PER_SUBMISSION: u32 = 64;
@@ -747,11 +764,13 @@ impl File {
             if op.flags
                 & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
                     | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
-                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE)
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE
+                    | DRM_ASAHI_BIND_SPARSE_TILE)
                 != 0
             {
                 return Err(EINVAL);
             }
+            let sparse_tile = op.flags & DRM_ASAHI_BIND_SPARSE_TILE != 0;
             let read = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0;
             let write = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0;
             let prot = match (read, write) {
@@ -778,6 +797,7 @@ impl File {
                 op.offset,
                 prot,
                 single_page,
+                sparse_tile,
             )?)?;
         }
         vm.reserve_deferred_user_unmaps(unmaps)?;

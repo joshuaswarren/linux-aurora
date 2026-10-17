@@ -24,6 +24,8 @@ struct Entry {
     phase: Phase,
     armed: u64,
     announce_pending: bool,
+    /// Diagnostic (sptm_space_trace): a draining entry blocked for 2 s was logged.
+    stuck_logged: bool,
 }
 
 /// Publication and announcement errors retain the entry; no timeout frees
@@ -89,6 +91,7 @@ impl Pending {
             phase,
             armed: now,
             announce_pending: false,
+            stuck_logged: false,
         };
         self.entries.push(entry, GFP_KERNEL)?;
         Ok(())
@@ -151,6 +154,16 @@ impl Pending {
                     || !host.flists_released(&entry.context)
                     || !host.compute_idle(&entry.context)
                 {
+                    if entry.phase == Phase::Draining && !entry.stuck_logged
+                        && now.saturating_sub(entry.armed) > POLL_NS
+                        && *crate::module_parameters::sptm_space_trace.value() != 0
+                    {
+                        entry.stuck_logged = true;
+                        let render = host.render_idle(&entry.context);
+                        pr_info!("G17 teardown stuck: context={} vm={} render_idle={:?} flists_released={} compute_idle={}\n",
+                            entry.context.id(), entry.context.vm().id(), render,
+                            host.flists_released(&entry.context), host.compute_idle(&entry.context));
+                    }
                     continue;
                 }
                 if host.control_backpressured() {

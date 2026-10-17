@@ -28,8 +28,16 @@ pub(crate) fn validate(pass: &RenderPass) -> Result {
             * u32::from(pass.utile_height) <= 65536
         && (pass.sample_size != 0 || pass.layers == 1);
     // Native ZLS addresses/actions and page strides are sample-independent.
-    // Retain the checked plain layout; compression is not admitted here.
-    let multisample = (pass.layers == 1 || pass.zls_control == 0)
+    // Retain the checked plain layout; compression is not admitted here,
+    // except in the layered form native emits (native-window item 1,
+    // render-layers-2-depth-msaa4-store / -stencil-store 3D commands: ZLS
+    // control 0x80044 / 0xc0154, every enabled Z/S load or store compressed,
+    // a compression address per compressed plane, depth stride word 0x1 and
+    // stencil stride 0x7c000 as supplied by userspace).
+    let plain_zls = pass.zls_control == 0
+        || (pass.zls_control & 0x154 == 0
+            && pass.depth.compression_va == 0 && pass.stencil.compression_va == 0);
+    let multisample = (plain_zls || layered_compressed_zls(pass))
         && matches!(pass.samples_log2, 1..=3)
         && matches!((pass.utile_width, pass.utile_height),
                     (32, 32) | (32, 16) | (16, 16))
@@ -37,15 +45,46 @@ pub(crate) fn validate(pass: &RenderPass) -> Result {
         && (u32::from(pass.utile_width) * u32::from(pass.utile_height)
             << pass.samples_log2) <= 2048
         && (u32::from(pass.sample_size) * u32::from(pass.utile_width)
-            * u32::from(pass.utile_height) << pass.samples_log2) <= 65536
-        && (pass.zls_control == 0
-            || (pass.zls_control & 0x154 == 0
-                && pass.depth.compression_va == 0 && pass.stencil.compression_va == 0));
+            * u32::from(pass.utile_height) << pass.samples_log2) <= 65536;
     if !enabled() || !(single_sample || multisample)
         || (pass.zls_control != 0 && pass.depth.va == 0 && pass.stencil.va == 0) {
         return Err(ENOTSUPP);
     }
     Ok(())
+}
+
+/// Layered multisample depth/stencil in native's form: each enabled load or
+/// store of a plane is compressed (ZLS bits: Z load 15 / compress 2, S load 14
+/// / compress 4, Z store 19 / compress 6, S store 18 / compress 8; the depth
+/// format bits 25:26 are allowed), a plane
+/// with any compression has a compression address, and no other ZLS bits.
+fn layered_compressed_zls(pass: &RenderPass) -> bool {
+    const Z_LOAD: u64 = 1 << 15;
+    const S_LOAD: u64 = 1 << 14;
+    const Z_STORE: u64 = 1 << 19;
+    const S_STORE: u64 = 1 << 18;
+    const Z_LOAD_COMPRESS: u64 = 1 << 2;
+    const S_LOAD_COMPRESS: u64 = 1 << 4;
+    const Z_STORE_COMPRESS: u64 = 1 << 6;
+    const S_STORE_COMPRESS: u64 = 1 << 8;
+    /// Depth format (bits 25:26) is a property of the plane, not of layering.
+    const Z_FORMAT: u64 = 3 << 25;
+    const KNOWN: u64 = Z_LOAD | S_LOAD | Z_STORE | S_STORE | Z_LOAD_COMPRESS | S_LOAD_COMPRESS
+        | Z_STORE_COMPRESS | S_STORE_COMPRESS | Z_FORMAT;
+    let control = pass.zls_control;
+    let z_compressed = control & (Z_LOAD_COMPRESS | Z_STORE_COMPRESS) != 0;
+    let s_compressed = control & (S_LOAD_COMPRESS | S_STORE_COMPRESS) != 0;
+    pass.layers > 1
+        && control != 0
+        && control & !KNOWN == 0
+        && (control & Z_LOAD == 0 || control & Z_LOAD_COMPRESS != 0)
+        && (control & S_LOAD == 0 || control & S_LOAD_COMPRESS != 0)
+        && (control & Z_STORE == 0 || control & Z_STORE_COMPRESS != 0)
+        && (control & S_STORE == 0 || control & S_STORE_COMPRESS != 0)
+        && (!z_compressed || (pass.depth.va != 0 && pass.depth.compression_va != 0))
+        && (!s_compressed || (pass.stencil.va != 0 && pass.stencil.compression_va != 0))
+        && (z_compressed || pass.depth.compression_va == 0)
+        && (s_compressed || pass.stencil.compression_va == 0)
 }
 
 pub(crate) fn parameter_geometry(blocks: usize) -> Result<super::buffer::BlockGeometry> {
@@ -77,12 +116,17 @@ pub(crate) fn layout(command: &Validated, clusters: u32) -> Result<target::Layou
 pub(crate) fn controls(pass: &RenderPass) -> Result<regs::M5RenderControls> {
     validate(pass)?;
     let stage = |resource_flags| regs::M5RenderStageControls {
+        scs: super::render_resources::StageScratch::NONE,
         resource_flags, resource_control: 0x200000001, ptc_max: 96, work_key: 0,
     };
     Ok(regs::M5RenderControls {
         fragment_event_control: regs::fragment_event_control(true, 1),
         ta: stage(0x4054b), fragment: stage(0x104054b),
-        ta_tile_control: 0x10c08860, ta_dispatch_control: 0x700,
+        // Native code chooses this word from descriptor+12a4.
+        // Mode 2 is a private command-policy discriminator, not a default.
+        ta_tile_control: if *crate::module_parameters::m5_ta_policy_test.value() == 2 {
+            0x14c08a60
+        } else { 0x10c08860 }, ta_dispatch_control: 0x700,
         fragment_raster_control: 0x200000ff0200, fragment_tile_flags: 0x200003717f,
         store_pipeline_2_bind: pass.eot_rsrc_spec << 32,
         store_pipeline_2: pass.usc_base + u64::from(pass.eot_offset & !7),
@@ -105,6 +149,9 @@ pub(crate) fn inputs(args: &RenderArgs<'_>, usage: [u64; 2]) -> Result<cmd::M5Re
     fields.ta.resolved_tail_value = usage[0];
     fields.fragment.resolved_tail_value = Some(usage[1]);
     fields.scheduler_record = r.kick_record_va;
+    // Native725 image-copy TA+0x89a copies descriptor+0x1177 bit0.
+    // Its full policy is not decoded; keep this explicit diagnostic off by default.
+    fields.ta.d1177 = u8::from(*crate::module_parameters::m5_ta_policy_test.value() == 1);
     fields.ta.sequence = args.ordinal.checked_mul(2).and_then(|n| n.checked_add(1)).ok_or(EOVERFLOW)?;
     fields.fragment.sequence = args.ordinal.checked_mul(2).ok_or(EOVERFLOW)?;
     fields.fragment.pass = 1;

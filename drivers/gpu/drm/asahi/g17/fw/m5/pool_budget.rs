@@ -72,6 +72,42 @@ impl RenderBudget {
         Ok(Self { active_cores, constant_pages, active_kicks })
     }
 
+    /// Compute SCS storage is private to each enabled USC. The eight-page
+    /// tail belongs to the compute allocator, in addition to its small/large
+    /// SCS page inventories and the execution-state spill reservation.
+    pub(crate) fn compute_scs_requirements(&self, mut request: Requirements,
+        pages: u16) -> Result<Requirements, PoolError>
+    {
+        if pages != 0 {
+            let small = u64::from(pages);
+            let per_core = add(add(small, small.div_ceil(256))?, 8)?;
+            let bytes = mul(mul(per_core, u64::from(self.active_cores))?, 4096)?;
+            request.minimum_bytes = add(request.minimum_bytes, bytes)?;
+            request.ideal_bytes = add(request.ideal_bytes, bytes)?;
+            request.has_spill = true;
+        }
+        Ok(request)
+    }
+
+    /// Render's allocator publishes the already rounded auxiliary page count
+    /// at descriptor +0x38, including its eight-page tail. This is separate
+    /// from the layout-derived small/large SCS inventories. Native
+    /// USC spill-buffer allocation multiplies their sum by cores.
+    pub(crate) fn render_scs_requirements(&self, mut request: Requirements,
+        pages: u16, auxiliary_pages: u32) -> Result<Requirements, PoolError>
+    {
+        if pages != 0 {
+            let small = u64::from(pages);
+            let per_core = add(add(small, small.div_ceil(256))?,
+                u64::from(auxiliary_pages))?;
+            let bytes = mul(mul(per_core, u64::from(self.active_cores))?, 4096)?;
+            request.minimum_bytes = add(request.minimum_bytes, bytes)?;
+            request.ideal_bytes = add(request.ideal_bytes, bytes)?;
+            request.has_spill = true;
+        }
+        Ok(request)
+    }
+
     pub(crate) fn sizes(&self, request: Requirements, history: History)
         -> Result<Sizes, PoolError>
     {

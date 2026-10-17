@@ -130,6 +130,16 @@ impl Generation {
         }
     }
 
+    pub(super) fn dump_m5_failure(&self, dev: &kernel::device::Device) -> Result {
+        if !matches!(self.views, Views::M5 { .. }) { return Err(EINVAL); }
+        for (label, offset) in [("ta-deflake-head", 0usize),
+            ("ta-deflake-state", 0x980), ("ta-engine-status", 0x4000),
+            ("ta-aux-state", 0x8000)] {
+            crate::g17::m5_render_test::dump_device(dev, label, &self.state, offset, 0x40)?;
+        }
+        Ok(())
+    }
+
     pub(in crate::g17) fn retire(&mut self, ordinal: u64) -> Result {
         if self.ordinal != Some(ordinal) { return Err(EIO); }
         self.ordinal = None;

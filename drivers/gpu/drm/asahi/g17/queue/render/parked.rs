@@ -2,7 +2,7 @@
 
 //! Installed kick storage retained after a logical scheduler release is acknowledged.
 
-use super::{install_memory, memory, Pair, RetiredBinding, Tracker};
+use super::{install_memory, memory, target, Pair, RetiredBinding, Tracker};
 use crate::g17::{
     buffer,
     command::Validated,
@@ -66,6 +66,7 @@ impl Pair {
     /// Consumes the pair only after can_park and all collector capacity checks succeeded
     /// under the same device mutex. Moving these owners performs no firmware operation.
     pub(crate) fn park(self) -> (ParkedPair, RetiredBinding) {
+        let qids = self.qids();
         let context = self.memory.context.clone();
         let scheduler = context.scheduler_owner();
         let buffer_id = self.buffer_id();
@@ -91,6 +92,8 @@ impl Pair {
             publication: None,
             ready: true,
             wait_for_pool_release: false,
+            qids,
+            displaced_at: None,
         };
         (parked, retired)
     }
@@ -99,6 +102,25 @@ impl Pair {
 impl ParkedPair {
     pub(crate) fn qids(&self) -> [u8; 2] {
         self.ids.map(kick::Id::qid)
+    }
+
+    /// Both rings are present and no prior owner awaits an executed replacement.
+    pub(crate) fn recyclable(&self) -> bool {
+        self.kicks.is_some() && self.previous.is_none()
+    }
+
+    /// The rings' last committed timestamps, by lane.
+    pub(crate) fn high_water(&self) -> Option<[(u8, u64); 2]> {
+        let kicks = self.kicks.as_ref()?;
+        Some([0, 1].map(|lane| (kicks[lane].id().qid(), kicks[lane].high_water().get())))
+    }
+
+    /// Dismantles the parked pair for QID recycling (vmfix6): the rings go back
+    /// to the QID table; the last scheduler page stays retained by the caller
+    /// until the next owner of each QID installs its own.
+    pub(crate) fn into_recycled(mut self) -> Option<([kick::Queue; 2], Arc<SchedulerStorage>)> {
+        let kicks = self.kicks.take()?;
+        Some((kicks, self._scheduler))
     }
 
     #[inline(never)]
@@ -118,7 +140,7 @@ impl ParkedPair {
             return Err(EINVAL);
         }
         let kicks = self.kicks.as_ref().ok_or(EBUSY)?;
-        let Validated::Render { .. } = &first.command else {
+        let Validated::Render { pass, .. } = &first.command else {
             return Err(EINVAL);
         };
         let word = first.completion.work_state()?.word();
@@ -190,6 +212,7 @@ impl ParkedPair {
             self.kicks = Some(kicks);
             return Err(EIO);
         };
+        let first_owner = next.owner as u32;
         storage.write_init(kernel::try_init!(Pair {
             kick_aliases: None,
             memory,
@@ -211,11 +234,108 @@ impl ParkedPair {
             registered: self.registered,
             outer_started: self.outer_started,
             quarantined: false,
+            drain_logged: false,
             terminal: None,
             previous: self.previous.take(),
             displaced: None,
             context_update: true,
+            identity_update: true,
+            configuration: None,
+            configured_context: None,
+            configured_qos: None,
+            history: [(1, self.ordinal, first_owner); 4],
+            last_pass: None,
+            replay: None,
+            replay_since: 0,
+            executed_generation: None,
         }))
+    }
+}
+
+impl ParkedPair {
+    /// vmfix6d eager restore into a parked pair: whether `binding` (a graph
+    /// retained after it was displaced from this pair) can be reinstalled.
+    /// Parking proves the successor drained and was released; the stamps must
+    /// still cover its last publication. Returns the graph's write cursors.
+    pub(crate) fn restorable(&self, binding: &RetiredBinding, stamps: [u32; 2]) -> Result<Option<[u32; 2]>> {
+        if self.kicks.is_none()
+            || binding.qids != self.qids()
+            || self.previous.as_ref().is_some_and(|p| p.memory.is_some())
+        {
+            return Ok(None);
+        }
+        if self.ordinal != 0
+            && !stamps
+                .into_iter()
+                .all(|stamp| super::retirement::stamp_covers(stamp, self.ordinal))
+        {
+            return Ok(None);
+        }
+        super::restorable_graph(binding)
+    }
+
+    /// Rebuild the installed pair around the retained graph (checked by
+    /// restorable() under the same device mutex). The rings, registration and
+    /// ordinal continue; channel configurations are reset as for a foreign
+    /// bind, so the first publication carries the restored graph's PB binding
+    /// and a completion seed. The emptied parked owner (with its last
+    /// scheduler page) stays with the caller, who drops it off-lock. On
+    /// failure the binding is returned untouched.
+    pub(crate) fn restore(
+        &mut self,
+        mut binding: RetiredBinding,
+        cursors: [u32; 2],
+        storage: KBox<core::mem::MaybeUninit<Pair>>,
+    ) -> core::result::Result<KBox<Pair>, RetiredBinding> {
+        if self.kicks.is_none() || binding.memory.is_none() || binding.qids != self.qids() {
+            return Err(binding);
+        }
+        let (Some(kicks), Some(mut memory)) = (self.kicks.take(), binding.memory.take()) else {
+            return Err(binding);
+        };
+        memory.clear_stale_claims();
+        let pool = binding.pool.clone();
+        let result = storage.write_init(kernel::try_init!(Pair {
+            kick_aliases: None,
+            memory,
+            kicks,
+            free_list: pool,
+            pending_aliases: None,
+            prepared: None,
+            active: Tracker::new(),
+            slot: self.slot,
+            owner: None,
+            ordinal: self.ordinal,
+            initial_packet: 0,
+            clusters: self.clusters,
+            descriptor_flags: self.descriptor_flags,
+            installed: self.installed,
+            configs: [None; 2],
+            cursors,
+            recovery_generation: self.recovery_generation,
+            registered: self.registered,
+            outer_started: self.outer_started,
+            quarantined: false,
+            drain_logged: false,
+            terminal: None,
+            previous: self.previous.take(),
+            displaced: None,
+            context_update: true,
+            identity_update: true,
+            configuration: None,
+            configured_context: None,
+            configured_qos: None,
+            history: [(5, self.ordinal, 0); 4],
+            last_pass: None,
+            replay: None,
+            replay_since: 0,
+            executed_generation: None,
+        }));
+        match result {
+            Ok(pair) => Ok(pair),
+            // try_init! of plain moves cannot fail; keep the graph if it did.
+            Err(_) => Err(binding),
+        }
     }
 }
 

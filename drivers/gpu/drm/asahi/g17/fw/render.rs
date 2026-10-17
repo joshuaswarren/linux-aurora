@@ -264,6 +264,13 @@ pub(crate) struct RenderResources {
     pub(crate) deflake_va: u64,
     /// GPU address of the tiling status word.
     pub(crate) ta_status_va: u64,
+    /// Native TA register 0x1ca48 value for mesh/object kicks: the context VA
+    /// of the queue's mesh rendering buffer in the low 48 bits and its
+    /// 64 KiB chunk count above (native726 mesh-object: 0x0200_0100_0036_8000).
+    /// Zero leaves the register out, as native does for kicks without it.
+    pub(crate) mesh_storage: u64,
+    /// 0 ordinary, 1 mesh, 2 object→mesh (V2 program usage flags).
+    pub(crate) mesh_class: u8,
     /// GPU address of the fragment status word, as seen by the pass's VM.
     pub(crate) fragment_status_va: u64,
     /// Firmware alias of the fragment status word.

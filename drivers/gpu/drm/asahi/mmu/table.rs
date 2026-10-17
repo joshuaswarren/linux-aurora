@@ -6,6 +6,14 @@ use super::{MappingBacking, Prot, UatPageTable};
 use core::ops::Range;
 use kernel::{addr::PhysicalAddr, prelude::*};
 
+/// Diagnostic size of one batched mapping.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct BatchStats {
+    pub(crate) chunks: u64,
+    pub(crate) pages: u64,
+    pub(crate) operations: u64,
+}
+
 pub(super) enum PageTable {
     Direct(UatPageTable),
     #[cfg(CONFIG_ARM64)]
@@ -28,6 +36,33 @@ impl PageTable {
             Self::Direct(table) => table.map_pages(range, physical, prot, repeat),
             #[cfg(CONFIG_ARM64)]
             Self::Sptm(table) => table.map_pages(range, physical, prot, repeat, backing),
+        }
+    }
+
+    /// Map VA-contiguous chunks of one mapping. SPTM tables submit them as one
+    /// batched plan; direct tables keep their per-chunk path.
+    pub(super) fn map_chunks(&mut self, chunks: &[(Range<u64>, PhysicalAddr, Prot)],
+        backing: &MappingBacking) -> Result<Option<BatchStats>>
+    {
+        match self {
+            Self::Direct(table) => {
+                for (range, physical, prot) in chunks {
+                    table.map_pages(range.clone(), *physical, *prot, false)?;
+                }
+                Ok(None)
+            }
+            #[cfg(CONFIG_ARM64)]
+            Self::Sptm(table) => table.map_chunks(chunks, backing).map(Some),
+        }
+    }
+
+    #[cfg(CONFIG_ARM64)]
+    pub(super) fn map_tiled(&mut self, range: Range<u64>,
+        tile: &kernel::sync::Arc<super::sptm_pgtable::SparseTile>, prot: Prot) -> Result
+    {
+        match self {
+            Self::Direct(_) => Err(ENOTSUPP),
+            Self::Sptm(table) => table.map_tiled(range, tile, prot),
         }
     }
 

@@ -13,7 +13,7 @@ use crate::g17::{
 };
 use kernel::{prelude::*, sync::Arc};
 
-/// Wake interval while a tiler heap may still shrink: the native check period.
+/// Wake interval while a tiler heap may still shrink.
 const SHRINK_WAKE_NS: u64 = 1_000_000_000;
 
 struct Service<'a> {
@@ -121,6 +121,17 @@ impl recovery::Memory for Service<'_> {
     fn fault_sources(&self) -> Result<recovery::Sources> {
         if crate::g17::m5_render_submission::enabled() {
             pr_err!("AGX recovery fault registers: {:x?}\n", self.firmware.bridge.regs.m5_fault_registers());
+            for queue in self
+                .firmware
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+            {
+                queue.describe_recovery_entry();
+            }
+            self.firmware.queues.dump_m5_failure(&self.firmware.primary.state.shared.dev);
             self.firmware.init.dump_m5_recovery(&self.firmware.primary.state.shared.dev)?;
         }
         self.firmware.init.fault_sources()
@@ -138,11 +149,59 @@ impl recovery::Memory for Service<'_> {
     fn wait_tick(&self) {
         self.firmware.init.wait_tick();
     }
+    fn describe_recovery_wait(&self, polls: usize) {
+        self.firmware.init.describe_recovery_wait(polls);
+    }
 }
 
 impl recovery::Queues for Service<'_> {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.firmware.queues.render_pass_started(qid, stamp)
+    }
+    fn compute_unexecuted(&self, qid: u8) -> Option<bool> {
+        self.firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .find(|queue| queue.qid() == qid)
+            .and_then(|queue| queue.front_unexecuted())
+    }
+    fn compute_front_replayed(&self, qid: u8) -> bool {
+        self.firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .find(|queue| queue.qid() == qid)
+            .is_some_and(|queue| queue.front_replayed())
+    }
+    fn observe_compute_front(&mut self, qid: u8) -> Option<bool> {
+        match self.firmware.observe_compute_front(qid) {
+            Ok(observed) => observed,
+            Err(error) => {
+                pr_info!("AGX recovery: compute qid {} front observation failed: {:?}\n", qid, error);
+                None
+            }
+        }
+    }
+    fn describe_compute_fronts(&self) {
+        for queue in self
+            .firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+        {
+            queue.describe_front();
+        }
+    }
+
+    fn started_unfinished_renders(&self) -> u128 {
+        self.firmware.queues.render.started_unfinished()
     }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
@@ -372,6 +431,7 @@ impl crate::g17::Shared {
         // Replay only at this outer boundary, after recovery has settled.
         // Publication may service events but must never recurse into replay.
         firmware.replay_compute(deferred)?;
+        firmware.replay_render(deferred)?;
         drop(state);
         self.observe_renders(masks, deferred)?;
         let mut state = self.state.lock();
@@ -399,9 +459,7 @@ impl crate::g17::Shared {
             firmware
                 .queues
                 .vacate_evicted_render_pools(&firmware.init, deferred)?;
-            shrinking = firmware
-                .queues
-                .shrink_render_heaps(&firmware.init, now, deferred);
+            shrinking = firmware.queues.shrink_render_heaps(&firmware.init, now, deferred);
         }
         {
             let mut reclaim = self.reclaim.lock();
@@ -410,9 +468,16 @@ impl crate::g17::Shared {
                 self.queue_reclaims();
             }
         }
+        if let Some(domain) = firmware.init.poll_outer_progress()? {
+            deferred.notify_outer(&domain);
+        }
         let backpressured = firmware.render_control_backpressured();
         let polling = backpressured
+            || firmware.init.outer_waiting()
+            || firmware.compute_growth_pending()
             || firmware.queues.replay_outer_wait.is_some()
+            || firmware.queues.replay_consumer_wait.is_some()
+            || firmware.queues.render.replay_polling()
             || firmware.queues.teardown.polling(now)
             || firmware.compute_exit_polling(now)
             || firmware

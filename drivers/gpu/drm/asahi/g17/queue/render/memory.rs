@@ -277,7 +277,16 @@ impl Graph {
         self.owners[ordinal as usize % RECORDS] = None;
         Ok(())
     }
+    /// vmfix6d: the ordinal holding the descriptor record `ordinal` would use.
+    pub(in crate::g17) fn record_owner(&self, ordinal: u64) -> Option<u64> {
+        self.owners[ordinal as usize % RECORDS]
+    }
 }
+
+/// Native mesh per-workgroup storage granule: the fragment reconstructs
+/// record addresses as (plane << 16) | (offset << 2), so chunk bases are
+/// 64 KiB aligned and the 0x1ca48 control counts 64 KiB chunks.
+const MESH_STORAGE_CHUNK: usize = 0x10000;
 
 struct Compact {
     mapping: Option<mmu::KernelMapping>,
@@ -285,6 +294,15 @@ struct Compact {
     _backing: KernelObject,
 }
 impl Compact {
+    /// M5 shared-RW object in the compact window with an explicit VA alignment.
+    fn new_aligned(alloc: &Allocator<'_>, vm: &mmu::Vm, size: usize, align: u64) -> Result<Self> {
+        let size = size.checked_add(mmu::UAT_PGSZ - 1).ok_or(EOVERFLOW)? & !(mmu::UAT_PGSZ - 1);
+        let backing = KernelObject::backing(alloc.dev, size, CpuMap::WriteCombined)?;
+        let mapping = backing.map_range(vm, 0..size, buffer::BlockGeometry::M5_COMPACT,
+            align, mmu::PROT_GPU_SHARED_RW, mmu::UAT_PGSZ)?;
+        if mapping.iova() % align != 0 { return Err(EINVAL); }
+        Ok(Self { address: mapping.iova(), mapping: Some(mapping), _backing: backing })
+    }
     fn new(alloc: &Allocator<'_>, vm: &mmu::Vm, size: usize, m5: bool) -> Result<Self> {
         let size = size.checked_add(mmu::UAT_PGSZ - 1).ok_or(EOVERFLOW)? & !(mmu::UAT_PGSZ - 1);
         let backing = KernelObject::backing(alloc.dev, size, CpuMap::WriteCombined)?;
@@ -311,6 +329,12 @@ pub(in crate::g17) struct Memory {
     pub(in crate::g17) graph: Graph,
     scratch: Compact,
     discard: Compact,
+    /// M5 mesh rendering buffer: the per-queue analogue of the native per-TA-
+    /// channel kernel resource (TA channel init → descriptor +0x15e0/+0x15e8
+    /// → TA register 0x1ca48). Shaders read its per-workgroup 64 KiB chunk base
+    /// through SR64/SR65, so it is mapped in the context VM with full VA.
+    mesh_storage: Option<Compact>,
+    mesh_storage_chunks: u32,
     pub(in crate::g17) target: KBox<target::Target>,
     generations: [Option<KBox<Generation>>; DEPTH],
     generation_count: usize,
@@ -433,6 +457,8 @@ impl Memory {
                 graph,
                 scratch,
                 discard: discard,
+                mesh_storage: None,
+                mesh_storage_chunks: 0,
                 target,
                 generations,
                 generation_count: count,
@@ -448,11 +474,59 @@ impl Memory {
             mappings,
         ))
     }
+    /// Register 0x1ca48 value for a mesh/object kick. The buffer is allocated
+    /// lazily on the queue's first such kick and kept for the queue lifetime,
+    /// so ordinary (non-mesh) contexts pay nothing. A failed allocation leaves
+    /// no partial state: the kick fails with the allocation error. A zero
+    /// chunk parameter disables the binding.
+    pub(in crate::g17) fn mesh_storage_register(&mut self, alloc: &Allocator<'_>) -> Result<u64> {
+        if self.mesh_storage.is_none() {
+            let chunks = *crate::module_parameters::m5_mesh_storage_chunks.value();
+            if chunks == 0 { return Ok(0); }
+            if chunks > 0xffff { return Err(EINVAL); }
+            let bytes = (chunks as usize).checked_mul(MESH_STORAGE_CHUNK).ok_or(EOVERFLOW)?;
+            let storage = Compact::new_aligned(alloc, self.context.vm(), bytes, MESH_STORAGE_CHUNK as u64)?;
+            // One-shot per queue: confirms the lazy binding path and the
+            // register value that reaches the TA program (diagnostic only).
+            dev_info!(alloc.dev.as_ref(),
+                "M5 mesh storage bound: context={} va={:#x} chunks={:#x} register 0x1ca48={:#x}\n",
+                self.context.id(), storage.address, chunks,
+                (storage.address & 0xffff_ffff_ffff) | (u64::from(chunks) << 48));
+            self.mesh_storage = Some(storage);
+            self.mesh_storage_chunks = chunks;
+        }
+        let storage = self.mesh_storage.as_ref().ok_or(ENOMEM)?;
+        Ok((storage.address & 0xffff_ffff_ffff) | (u64::from(self.mesh_storage_chunks) << 48))
+    }
     pub(in crate::g17) fn generation(&mut self, ordinal: u64) -> Result<&mut Generation> {
         self.generations[ordinal as usize % self.generation_count]
             .as_deref_mut()
             .ok_or(EIO)
     }
+    pub(super) fn dump_m5_failure(&self, dev: &kernel::device::Device, ordinal: u64) -> Result {
+        if !self.owns(ordinal) { return Err(EIO); }
+        // Firmware is halted; retain the exact linked command and channel records.
+        // This does not log or delay any healthy submission.
+        use crate::g17::m5_render_test::dump_device;
+        dev_info!(dev, "M5 fault command ordinal={} canonical={:#x} client={:#x} queues={:#x} config={:#x}\n",
+            ordinal, self.graph.descriptors.gpu_va(), self.graph.descriptor_client(0, ordinal),
+            self.graph.queues.gpu_va(), self.graph.config.gpu_va());
+        dump_device(dev, "fault-command-ta", &self.graph.descriptors,
+            self.graph.offset(0, ordinal), fw::m5::render::M5_TA_COMMAND_BYTES)?;
+        dump_device(dev, "fault-command-fragment", &self.graph.descriptors,
+            self.graph.offset(1, ordinal), fw::m5::render::M5_3D_COMMAND_BYTES)?;
+        dump_device(dev, "fault-queues", &self.graph.queues, 0, 0x4000)?;
+        dump_device(dev, "fault-pointers", &self.graph.queues, POINTERS[0], 0x100)?;
+        dump_device(dev, "fault-items-ta", &self.graph.queues, ITEMS[0], 0x100)?;
+        dump_device(dev, "fault-items-fragment", &self.graph.queues, ITEMS[1], 0x100)?;
+        dump_device(dev, "fault-config-ta", &self.graph.config,
+            CONFIG[0] + (ordinal as usize % RECORDS) * CONFIG_STRIDE, CONFIG_STRIDE)?;
+        dump_device(dev, "fault-config-fragment", &self.graph.config,
+            CONFIG[1] + (ordinal as usize % RECORDS) * CONFIG_STRIDE, CONFIG_STRIDE)?;
+        self.generations[ordinal as usize % self.generation_count]
+            .as_deref().ok_or(EIO)?.dump_m5_failure(dev)
+    }
+
     pub(super) fn owns(&self, ordinal: u64) -> bool {
         self.graph.owns(ordinal)
             && self.generations[ordinal as usize % self.generation_count]
@@ -495,6 +569,81 @@ impl Memory {
             self.timestamps.dword(offset + 24)?.load(Ordering::Relaxed),
         ])
     }
+    /// vmfix6d eager collection gate, on driver-visible state only: no
+    /// generation owns an ordinal, both pointer blocks are drained, the
+    /// graph's private job list is empty and the context's shared job list
+    /// (which can link other pairs) neither starts nor ends in this graph's
+    /// queue storage. Firmware-internal caches are not observable here.
+    pub(in crate::g17) fn collectable(&self) -> Result<bool> {
+        if self.owners().iter().any(Option::is_some) {
+            return Ok(false);
+        }
+        core::sync::atomic::fence(Ordering::Acquire);
+        if self.graph.cursors()?.iter().any(|c| c.done != c.read || c.read != c.write) {
+            return Ok(false);
+        }
+        let base = self.graph.queues.gpu_va();
+        let private = [
+            self.graph.queues.dword(JOB_LIST)?.load(Ordering::Relaxed),
+            self.graph.queues.dword(JOB_LIST + 8)?.load(Ordering::Relaxed),
+        ];
+        if private != [0, base + JOB_LIST as u64] {
+            return Ok(false);
+        }
+        let shared = self.context.work_head()?;
+        let end = base + GRAPH_SIZE as u64;
+        Ok(!shared.iter().any(|va| *va >= base && *va < end))
+    }
+
+    /// The VM still holds this graph's pool mappings (restorable in place).
+    pub(in crate::g17) fn has_pool_mappings(&self) -> bool {
+        self.installed_pool.is_some()
+    }
+    /// vmfix6f: move this drained graph's pool mappings out of its VM slot so
+    /// a new graph of the same VM can install on the pair (see bind_owner).
+    pub(in crate::g17) fn take_pool_mappings(&mut self) -> Option<(u8, mmu::RenderPoolMappings)> {
+        let slot = self.installed_pool?;
+        let id = u64::from(self.lifecycle[0].predecessor);
+        let mappings = self.context.vm().take_render_pool_mappings(slot, id)?;
+        self.installed_pool = None;
+        Some((slot, mappings))
+    }
+    pub(in crate::g17) fn put_pool_mappings(&mut self, slot: u8, mappings: mmu::RenderPoolMappings) -> Result {
+        self.context.vm().put_render_pool_mappings(slot, mappings)?;
+        self.installed_pool = Some(slot);
+        Ok(())
+    }
+
+    /// vmfix6e poison diagnostic: remove the client pool mappings now and
+    /// fill the firmware-visible graph storage with a pattern whose pointers
+    /// are not canonical, so a late firmware read faults instead of reading
+    /// a reused object. The caller keeps this memory out of reuse.
+    pub(in crate::g17) fn poison(&mut self) {
+        const POISON: u8 = 0xde;
+        if let Some(slot) = self.installed_pool.take() {
+            self.context.vm().clear_render_pool_mappings_if_owner(
+                slot,
+                u64::from(self.lifecycle[0].predecessor),
+            );
+        }
+        self.graph.descriptors.bytes_mut().fill(POISON);
+        self.graph.queues.bytes_mut().fill(POISON);
+        self.graph.config.bytes_mut().fill(POISON);
+        self.graph.support.bytes_mut().fill(POISON);
+        self.timestamps.bytes_mut().fill(POISON);
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    /// vmfix6d restore: drop per-ordinal claims of a drained graph whose
+    /// generations own no ordinal (checked by the caller under the device
+    /// mutex). Returns the number of stale claims cleared.
+    pub(super) fn clear_stale_claims(&mut self) -> u32 {
+        let mut cleared = self.target.cancel_all();
+        for owner in self.graph.owners.iter_mut() {
+            cleared += u32::from(owner.take().is_some());
+        }
+        cleared
+    }
     pub(super) fn owners(&self) -> [Option<u64>; DEPTH] {
         core::array::from_fn(|index| self.generations[index].as_ref().and_then(|g| g.ordinal))
     }
@@ -525,12 +674,15 @@ impl Memory {
         context: u8,
         layout: &target::Layout,
         plan: Option<crate::g17::render_resources::Plan>,
-    ) -> Result<(Option<fw::kick::McacheTable>, [[Option<fw::kick::RegisterArrayBinding>; 4]; 2])> {
+    ) -> Result<(Option<fw::kick::McacheTable>, [[Option<fw::kick::RegisterArrayBinding>; 4]; 2],
+        fw::kick::StageKickFlags)> {
         if self.graph.m5 {
             use fw::m5::{render_assembly, render_registers};
             use crate::g17::m5_render_submission as render_submission;
             let mut controls = render_submission::controls(args.pass)?;
             if let Some(stages) = plan.and_then(|p| p.stages) {
+                controls.ta.scs = stages[0].scs;
+                controls.fragment.scs = stages[1].scs;
                 controls.ta.resource_flags = stages[0].resource_flags;
                 controls.ta.ptc_max = stages[0].ptc_max;
                 controls.fragment.resource_flags = stages[1].resource_flags;
@@ -538,6 +690,7 @@ impl Memory {
             }
             let usage = self.graph.m5_usage(args.ordinal)?;
             let mut inputs = render_submission::inputs(args, usage)?;
+            inputs.ta.d0938 = fw::m5::render::ta_word_938(args.resources.mesh_class);
             render_registers::apply_pass(args, &controls, &mut inputs)?;
             let extra = self.target.m5_extra(layout)?;
             let low = self.graph.descriptor_client(0, args.ordinal);
@@ -554,7 +707,7 @@ impl Memory {
                     args.resources.context_id, args.ordinal, args.ta.qid, args.fragment.qid,
                     args.resources.pb_slot, args.resources.free_list_slot);
             }
-            return Ok((None, encoded.rce));
+            return Ok((None, encoded.rce, encoded.kick_flags));
         }
         let tiling = self
             .graph
@@ -610,7 +763,7 @@ impl Memory {
             Ok((mcache, [
                 abi::TaDescriptor::register_bindings(args.ta.descriptor_va)?,
                 abi::FragmentDescriptor::register_bindings(args.fragment.descriptor_va)?,
-            ]))
+            ], fw::kick::StageKickFlags::default()))
         }
     }
 }
@@ -664,10 +817,16 @@ impl Memory {
         {
             return Err(EIO);
         }
+        if self.mesh_storage.as_ref().is_some_and(|m| m.mapping.is_none()) {
+            return Err(EIO);
+        }
         let mut aliases = KVec::new();
-        aliases.reserve(tvb.len().checked_add(3).ok_or(EOVERFLOW)?, GFP_KERNEL)?;
+        aliases.reserve(tvb.len().checked_add(4).ok_or(EOVERFLOW)?, GFP_KERNEL)?;
         aliases.push(self.scratch.mapping.take().ok_or(EIO)?, GFP_KERNEL)?;
         aliases.push(self.discard.mapping.take().ok_or(EIO)?, GFP_KERNEL)?;
+        if let Some(storage) = &mut self.mesh_storage {
+            aliases.push(storage.mapping.take().ok_or(EIO)?, GFP_KERNEL)?;
+        }
         if let Some(registers) = &mut self.registers {
             aliases.push(registers.take_mapping()?, GFP_KERNEL)?;
         }
@@ -720,7 +879,10 @@ impl Memory {
     /// Retargets both retired queue records to `context`. A context of another
     /// scheduling profile also replaces the priority and policy words, after
     /// the owner fields; the same profile leaves them untouched.
-    pub(super) fn set_owner(&self, qids: [u8; 2], context: &Context) -> Result {
+    /// `rewrite`: store the records even when their host-owned words already
+    /// name `context` (vmfix6f: M5 skips that no-op read-modify-write, which
+    /// also stored back firmware-owned words of a possibly running queue).
+    pub(super) fn set_owner(&self, qids: [u8; 2], context: &Context, rewrite: bool) -> Result {
         if self.graph.m5 {
             let records = qids.map(|qid| self.graph.queues.pointer(self.graph.queue_offset(qid),
                 size_of::<fw::m5::queue::QueueRecord>()));
@@ -730,6 +892,16 @@ impl Memory {
             // retired queues exclusively; build both updates before storing.
             unsafe {
                 let mut values = pointers.map(|p| p.read_unaligned());
+                if !rewrite {
+                    let mut named = true;
+                    for value in &values {
+                        named &= value.names_owner(context.work_head_va(), context.scheduler_va(),
+                            context.owner_pid(), context.policy())?;
+                    }
+                    if named {
+                        return Ok(());
+                    }
+                }
                 for value in &mut values {
                     value.set_compute_owner(context.work_head_va(), context.scheduler_va(),
                         context.owner_pid(), context.policy())?;

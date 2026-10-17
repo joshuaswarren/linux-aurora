@@ -335,6 +335,20 @@ impl Target {
         }
         Ok(())
     }
+    /// vmfix6d: the ordinal holding the record slot `ordinal` would use.
+    pub(crate) fn slot_owner(&self, ordinal: u64) -> Option<u64> {
+        self.slots[ordinal as usize % DEPTH]
+    }
+    /// vmfix6d restore: a retained graph with no live generation has no
+    /// record in flight; any slot claim left is stale (Memory::new claims its
+    /// first ordinal at construction, before that ordinal is published).
+    pub(crate) fn cancel_all(&mut self) -> u32 {
+        let mut cleared = 0;
+        for slot in self.slots.iter_mut() {
+            cleared += u32::from(slot.take().is_some());
+        }
+        cleared
+    }
     /// Cancels only an unpublished record; older referenced backing remains
     /// owned until normal paired retirement or the firmware-stop boundary.
     pub(crate) fn cancel(&mut self, ordinal: u64) {

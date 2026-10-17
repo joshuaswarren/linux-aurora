@@ -4,7 +4,7 @@ use kernel::prelude::*;
 use super::super::queue::{Policy,QueueConfig,QueueConfigArgs,QueueConfigTarget};
 
 /// Native setChannelPriority profiles, including the independent QoS weight
-/// used for queue registration. A single owner has a full share.
+/// selected at native queue registration. A single owner has a full share.
 pub(crate) fn scheduling_policy(priority: u32) -> Result<Policy> {
     match priority {
         0 => Ok(Policy::new(0, 1, 15, 8192)),
@@ -59,11 +59,23 @@ impl QueueRecord {
             reserved_78: [0; 8],
         })
     }
+    /// Every host-owned identity word already holds what set_compute_owner
+    /// would store (so that update would not change the record).
+    pub(crate) fn names_owner(&self, work_head: u64, scheduler: u64,
+        owner_pid: u32, policy: super::super::queue::Policy) -> Result<bool> {
+        let (reserved_30, sentinel, reserved_38) = Self::scheduling_words(policy)?;
+        let (job_list, scheduler_va, pid, priority) =
+            (self.job_list_va, self.scheduler_va, self.owner_pid, self.priority);
+        let (r30, s36, r38, current) = (self.reserved_30, self.sentinel_36, self.reserved_38, self.policy);
+        Ok(job_list == work_head && scheduler_va == scheduler && pid == owner_pid
+            && priority == [u32::from(policy.priority()); 2] && r30 == reserved_30
+            && s36 == sentinel && r38 == reserved_38 && current == u32::from(policy.policy()))
+    }
     /// Replace only host-owned identity fields after the old owner retires.
     pub(crate) fn set_compute_owner(&mut self, work_head: u64, scheduler: u64,
         owner_pid: u32, policy: super::super::queue::Policy) -> Result {
         let (reserved_30, sentinel, reserved_38) = Self::scheduling_words(policy)?;
-        // Changing queue priority invalidates this word when its hardware
+        // The native channel priority setter invalidates this word when its hardware
         // class changes. Retained physical queues can change class on reuse.
         if self.priority[0] != u32::from(policy.priority()) {
             self.sentinel_40 = u32::MAX;

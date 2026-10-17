@@ -174,6 +174,9 @@ pub(crate) struct M5TaCommandFields {
     pub timestamp_counts: [u32; 2],
 
     pub d1400: u64,
+    /// Native TA command +0x938 (native726: 0xc0c0 tess, 0x10ac0 mesh,
+    /// 0x12b40 object→mesh). Zero reproduces the loaded module.
+    pub d0938: u64,
 
     pub uma_state: u64,
 
@@ -390,6 +393,28 @@ fn place_program(out: &mut [u8], low_alias: u64, p: &M5ProgramRef<'_>) -> Result
     Ok(address)
 }
 
+/// TA command +0x938. Native sets it on every TA command: low bits 0xc0c0 for
+/// ordinary vertex-stage passes (all 75 single-pass v70 render captures and
+/// native726 tess), 0x9d00 for clear-only passes, 0x10ac0 for mesh with the
+/// passthrough object and 0x12b40 for a user object (task) stage (native726),
+/// with bits 63:62 rotating with the pass number on multi-pass streams. The
+/// Linux encoder previously left it zero for every non-mesh TA command.
+/// Mesh class 1 covers native mesh kicks, including the mesh-only
+/// passthrough object stage (0x10ac0); class 2 is an API task (object) →
+/// mesh kick, which native encodes as 0x12b40.
+/// Module parameter: 1 (default) = native class values, 0 = legacy zero
+/// (diagnostic A/B only), other = that raw value for every TA command.
+pub(crate) fn ta_word_938(mesh_class: u8) -> u64 {
+    let mode = *crate::module_parameters::m5_mesh_ta_word_938.value();
+    match (mode, mesh_class) {
+        (0, _) => 0,
+        (1, 0) => 0xc0c0,
+        (1, 1) => 0x10ac0,
+        (1, _) => 0x12b40,
+        (raw, _) => u64::from(raw),
+    }
+}
+
 pub(crate) fn encode_m5_ta_command(
     out: &mut [u8; M5_TA_COMMAND_BYTES],
     low_alias: u64,
@@ -447,6 +472,7 @@ pub(crate) fn encode_m5_ta_command(
     put64(out, 0x926, t.d1400);
     put64(out, 0x92e, t.uma_state);
     put8(out, 0x936, t.d1444 & 1);
+    put64(out, 0x938, t.d0938);
     put64(out, 0x8fe, t.d08b0);
     put64(out, 0x906, t.diagnostic_ta_timestamp_upper);
     put32(out, 0x892, u32::from(t.d1174 & 1));

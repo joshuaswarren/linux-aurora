@@ -159,6 +159,11 @@ impl<'a> Parser<'a> {
                     self.render_resources = if bytes.is_empty() { None }
                         else { Some(Arc::new(Programs::parse(bytes)?, GFP_KERNEL)?) };
                 }
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2 => {
+                    if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] { return Err(EINVAL); }
+                    self.render_resources = if bytes.is_empty() { None }
+                        else { Some(Arc::new(Programs::parse_v2(bytes)?, GFP_KERNEL)?) };
+                }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES => {
                     if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] {
                         return Err(EINVAL);
@@ -307,9 +312,12 @@ pub(crate) enum Validated {
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
     Compute {
+        matrix_ops: bool,
         resources: Option<Arc<ComputePrograms>>,
         plan: Option<super::render_resources::Plan>,
         scratch: ScratchRequest,
+        cdm_auxiliary_allocation: u32,
+        intersection: super::fw::m5::compute::IntersectionTables,
         usc_base: u64,
         cdm_va: u64,
         cdm_end_va: u64,
@@ -437,6 +445,16 @@ impl Payload {
                         | (u64::from(cmd.bg_eot_partial_rsrc_spec_hi) << 32),
                     rsrc_spec_hi: cmd.flags & RSRC_SPEC_HI != 0,
                 };
+                if let Some(programs) = resources {
+                    for stage in programs.stage_scs()? {
+                        let intersection = stage.intersection;
+                        if intersection.enabled() {
+                            require_range(space, intersection.pool, intersection.pool_bytes, Access::Read)?;
+                            let code = intersection.default_program & 0x0000_ffff_ffff_ffff;
+                            if code != 0 { require_range(space, code, 64, Access::Read)?; }
+                        }
+                    }
+                }
                 Ok(Validated::Render {
                     pass,
                     resources: resources.clone(),
@@ -446,7 +464,7 @@ impl Payload {
                 })
             }
             Self::Compute(cmd, attachments, resources) => {
-                if cmd.flags != 0
+                if cmd.flags & !crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX != 0 || cmd.reserved != 0
                     || cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
@@ -462,9 +480,21 @@ impl Payload {
                 )?;
                 sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
                 attachments.validate(space)?;
+                let intersection = super::fw::m5::compute::IntersectionTables::new(
+                    cmd.intersection_pool, cmd.intersection_pool_bytes,
+                    cmd.intersection_first, cmd.intersection_count,
+                    cmd.intersection_default_program, cmd.intersection_default_control)?;
+                if intersection.enabled() {
+                    require_range(space, intersection.pool, intersection.pool_bytes, Access::Read)?;
+                    let code = intersection.default_program & 0x0000_ffff_ffff_ffff;
+                    if code != 0 { require_range(space, code, 64, Access::Read)?; }
+                }
                 Ok(Validated::Compute {
+                    matrix_ops: cmd.flags & crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX != 0,
                     resources: resources.clone(), plan: None,
                     scratch: ScratchRequest::new(cmd.scs_layout)?,
+                    cdm_auxiliary_allocation: cmd.cdm_auxiliary_allocation,
+                    intersection,
                     usc_base: window.base,
                     cdm_va: cmd.cdm_ctrl_stream_base,
                     cdm_end_va: cmd.cdm_ctrl_stream_end - 4,

@@ -40,6 +40,7 @@ impl Pair {
         let execution=uat.new_execution_context(&vm)?;
         let context=Arc::new(Context::new(&alloc,&firmware.pool,
             &firmware.queues.qos_ids,execution,0,POLICY)?,GFP_KERNEL)?;
+        firmware.m5_test_pins.acquire(&context)?;
         let input=if matches!(*crate::module_parameters::m5_render_test.value(), 2 | 3) {
             Some(super::m5_render_input::Input::load(dev,&vm,uat.geometry().user_range())?)
         } else {None};
@@ -176,7 +177,7 @@ impl Pair {
         input.reset_result()?;
         self.resources.memory.graph.queues.bytes_mut()[0x14000..0x14120].fill(0);
         if self.current_work.is_some(){return Err(EBUSY);}
-        let work_state=Arc::new(WorkStateLease::deferred(self.context.clone()),GFP_KERNEL)?;
+        let work_state=Arc::pin_init(WorkStateLease::deferred(self.context.clone()),GFP_KERNEL)?;
         let work_word=work_state.acquire()?;
         let record=work_state.node_va()?;
         work_state.add_submitted_kicks(2)?;
@@ -198,7 +199,7 @@ impl Pair {
         let args=RenderArgs{pass:&input.pass,resources:&view,ordinal:0,ta:stage(0),fragment:stage(1)};
         let eot=input.pass.usc_base+u64::from(input.pass.eot_offset&!7);
         let peot=input.pass.usc_base+u64::from(input.pass.partial_eot_offset&!7);
-        let stage_controls=|flags|regs::M5RenderStageControls{resource_flags:flags,
+        let stage_controls=|flags|regs::M5RenderStageControls{scs: super::render_resources::StageScratch::NONE, resource_flags:flags,
             resource_control:0x200000001,ptc_max:0,work_key:0};
         let controls=regs::M5RenderControls{fragment_event_control:regs::fragment_event_control(true,1),ta:stage_controls(0x4054b),fragment:stage_controls(0x104054b),
             ta_tile_control:0x10c08860,ta_dispatch_control:0x700,fragment_raster_control:0x200000ff0200,
@@ -261,7 +262,7 @@ impl Pair {
                 parent:self.kicks[n].parent(),barriers,dependency_types:Some(types),
                 descriptor_va:command_base+(n*0x4000)as u64,queue_va:self.resources.memory.graph.queue_va(self.ids[n].qid()),
                 qos:fw::kick::KickQos{slot:self.context.qos_id(),class:if n==0{12}else{24}},mcache:None,event_mask:[0;4],
-                register_arrays:encoded.rce[n],compute_scratch:false,priority:POLICY.priority()};
+                register_arrays:encoded.rce[n],compute_matrix:false,compute_scratch:false,priority:POLICY.priority()};
             let prepared=self.kicks[n].prepare_entry(&entry)?;
             prepared.prepare_install()?;
             let submitted_stamp=prepared.commit();

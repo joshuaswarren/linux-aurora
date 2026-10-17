@@ -41,6 +41,7 @@ impl Compute {
         let execution = uat.new_execution_context(&vm)?;
         let context = Arc::new(Context::new(&alloc, &firmware.pool,
             &firmware.queues.qos_ids, execution, 0, POLICY)?, GFP_KERNEL)?;
+        firmware.m5_test_pins.acquire(&context)?;
         let owner = firmware.queues.reserve_channel_ids(1)?.start;
         let id = firmware.queues.qids.reserve(owner, DataMaster::Compute, Some(11))?;
         let mut kick = kick::Queue::compute(&alloc, id)?;
@@ -50,7 +51,7 @@ impl Compute {
         let cpu = CpuMap::WriteCombined;
         let mut graph = alloc.kernel(0x10000, PAGE as u64, prot, cpu)?;
         super::queue::compute::initialize_graph(&mut graph, &context, true)?;
-        let descriptor = alloc.kernel(0x10000, PAGE as u64, prot, cpu)?;
+        let mut descriptor = alloc.kernel(0x10000, PAGE as u64, prot, cpu)?;
         let low = descriptor.alias_in(uat.kernel_lower_vm(), crate::hw::t8140::dynamic::LOWER,
             PAGE as u64, mmu::PROT_GPU_SHARED_RW)?;
         let descriptor_low = low.iova();
@@ -77,7 +78,7 @@ impl Compute {
         let mut pool = super::freelist::ComputePool::new(&alloc, id.qid(), true, None)?;
         aliases.push(pool.map_client(&vm)?, GFP_KERNEL)?;
         firmware.init.install_compute_pool(pool.descriptor()?)?;
-        let operand = alloc.lower(compute::OPERAND_BYTES, PAGE as u64,
+        let mut operand = alloc.lower(compute::OPERAND_BYTES, PAGE as u64,
             mmu::PROT_GPU_SHARED_RW, cpu)?;
         let operand_va = operand.gpu_va();
         aliases.push(operand.map_alias(&vm, operand_va, mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
@@ -166,7 +167,7 @@ impl Compute {
                 .store(program::SENTINEL, Ordering::Relaxed);
         }
         if self.current_work.is_some() { return Err(EBUSY); }
-        let work = Arc::new(WorkStateLease::deferred(self.context.clone()), GFP_KERNEL)?;
+        let work = Arc::pin_init(WorkStateLease::deferred(self.context.clone()), GFP_KERNEL)?;
         let work_word = work.acquire()?;
         let work_node = work.node_va()?;
         work.add_submitted_kicks(1)?;
@@ -175,6 +176,9 @@ impl Compute {
         if pool_target != u64::from(generation) { return Err(EIO); }
         let args = compute::DescriptorArgs {
             registers: compute::RegisterArgs {
+                matrix_ops: false,
+                scratch: compute::ScratchRequest::NONE, auxiliary_allocation: 0,
+                intersection: compute::IntersectionTables::NONE,
                 preempt_va: program::PREEMPT_PAGE, cdm_va: program::STREAM_PAGE,
                 operand_va: self.operand, usage_va: program::ROBUSTNESS_PAGE,
                 free_list_slot: u32::from(self.pool.id()), context_id: self.context.id().try_into()?, work_state: work_word,
@@ -205,8 +209,8 @@ impl Compute {
             qid: self.id.qid(), timestamp, parent: self.kick.parent(), barriers: &[],
             dependency_types: Some(&[2]), descriptor_va: high, queue_va: self.graph.gpu_va(),
             qos: fw::kick::KickQos {slot: self.context.qos_id(), class: 8}, mcache: None,
-            event_mask: [0,0,8,0], register_arrays: compute::bindings(self.descriptor_low)?,
-            compute_scratch: false, priority: POLICY.priority(),
+            event_mask: [0,0,8,0], register_arrays: compute::bindings(self.descriptor_low, compute::ScratchRequest::NONE, false)?,
+            compute_matrix: false, compute_scratch: false, priority: POLICY.priority(),
         };
         let prepared = self.kick.prepare_entry(&kick_args)?;
         prepared.prepare_install()?;

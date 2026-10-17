@@ -85,7 +85,18 @@ impl Publication {
                 return;
             }
             state.result = Some(result);
-            state.claim()
+            let ready = state.claim();
+            if ready.is_none() && result.is_err() {
+                // Failure-path diagnostic: a failed command's fence waits for
+                // its host predecessors before it can signal.
+                static HELD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                let n = HELD.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    pr_info!("asahi: failed ordered publication waits for {} predecessor(s) (held {})\n",
+                        state.remaining, n);
+                }
+            }
+            ready
         };
         if let Some(result) = ready {
             Self::drain(self.publish(result));

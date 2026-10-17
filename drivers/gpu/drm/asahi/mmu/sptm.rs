@@ -23,7 +23,7 @@ pub(super) const GLOBAL_RANGE: Range<u64> = 0xffff_fc20_0000_0000..0xffff_fc30_0
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Space {
     Global,
-    Private(u8),
+    Private(u16),
 }
 
 impl Space {
@@ -101,13 +101,17 @@ pub(super) enum MapPages<'a> {
     Slice(&'a [u64]),
     Contiguous { physical: u64, count: u64 },
     Repeated { physical: u64, count: u64 },
+    /// A contiguous tile of `period` pages repeated across the range; page
+    /// `i` maps tile page `(first + i) % period`.
+    Tiled { base: u64, period: u64, first: u64, count: u64 },
 }
 
 impl MapPages<'_> {
     fn len(self) -> u64 {
         match self {
             Self::Slice(pages) => pages.len() as u64,
-            Self::Contiguous { count, .. } | Self::Repeated { count, .. } => count,
+            Self::Contiguous { count, .. } | Self::Repeated { count, .. }
+                | Self::Tiled { count, .. } => count,
         }
     }
 
@@ -119,6 +123,10 @@ impl MapPages<'_> {
                 if valid(physical) && count.checked_mul(PAGE)
                     .and_then(|size| physical.checked_add(size)).is_some() => Ok(()),
             Self::Repeated { physical, .. } if valid(physical) => Ok(()),
+            Self::Tiled { base, period, first, .. }
+                if valid(base) && period != 0 && first < period
+                    && period.checked_mul(PAGE).and_then(|size| base.checked_add(size)).is_some()
+                => Ok(()),
             _ => Err(InvalidRequest),
         }
     }
@@ -128,6 +136,7 @@ impl MapPages<'_> {
             Self::Slice(pages) => pages[page as usize],
             Self::Contiguous { physical, .. } => physical + page * PAGE,
             Self::Repeated { physical, .. } => physical,
+            Self::Tiled { base, period, first, .. } => base + (first + page) % period * PAGE,
         }
     }
 
@@ -136,6 +145,8 @@ impl MapPages<'_> {
             // The provider ABI maps physically consecutive pages. A repeated
             // physical address must still be published in separate operations.
             Self::Repeated { .. } => 1,
+            // A tile is physically contiguous up to its wrap point.
+            Self::Tiled { period, first, .. } => limit.min(period - (first + start) % period),
             Self::Contiguous { .. } => limit,
             Self::Slice(pages) => {
                 let start = start as usize;
@@ -194,6 +205,78 @@ impl<'a> MapPlan<'a> {
             l3: va & !(L3_SPAN - 1), pages, next_page: 0, options: protection.options(),
             opcode: if io { 9 } else { 3 },
         })
+    }
+}
+
+impl<'a> MapPlan<'a> {
+    /// The leaf MAP operations of one run whose tables a preceding
+    /// [`TablePlan`] for an enclosing range already requested.
+    pub(super) fn without_tables(space: Space, va: u64, pages: MapPages<'a>, protection: Protection)
+        -> Result<Self, InvalidRequest>
+    {
+        let mut plan = Self::new(space, va, pages, protection)?;
+        plan.l2 = plan.end;
+        plan.l3 = plan.end;
+        Ok(plan)
+    }
+}
+
+/// One MAP_TABLE whose frame is the guest page at `frame` (donated tables).
+/// Level 1 installs an L2, level 2 an L3. Receipt 0: the page became the
+/// table; 1: the table already existed and the page was not used.
+pub(super) fn donated_table(space: Space, va: u64, level: u64, frame: u64)
+    -> Result<Operation, InvalidRequest>
+{
+    let Space::Private(_) = space else { return Err(InvalidRequest); };
+    let handle = space.handle()?;
+    if !(1..=2).contains(&level) || frame == 0 || frame & (PAGE - 1) != 0 || va >= PRIVATE_END
+        || va & (if level == 1 { L2_SPAN } else { L3_SPAN } - 1) != 0 {
+        return Err(InvalidRequest);
+    }
+    Ok(Operation::new(2, [handle, va, level, frame, 0]))
+}
+
+/// The table operations a [`MapPlan`] would emit for `range`, issued once for a
+/// batch of runs that together cover exactly that range. Private spaces get
+/// their L2 tables then every L3; the shared space owns its L2s, so only L3s.
+#[derive(Clone)]
+pub(super) struct TablePlan {
+    handle: u64,
+    end: u64,
+    l2: u64,
+    l3: u64,
+}
+
+impl TablePlan {
+    pub(super) fn new(space: Space, range: &Range<u64>) -> Result<Self, InvalidRequest> {
+        let handle = space.handle()?;
+        if range.start >= range.end || (range.start | range.end) & (PAGE - 1) != 0
+            || !space.contains(range) {
+            return Err(InvalidRequest);
+        }
+        Ok(Self {
+            handle, end: range.end,
+            l2: if space == Space::Global { range.end } else { range.start & !(L2_SPAN - 1) },
+            l3: range.start & !(L3_SPAN - 1),
+        })
+    }
+}
+
+impl Iterator for TablePlan {
+    type Item = Operation;
+
+    fn next(&mut self) -> Option<Operation> {
+        if self.l2 < self.end {
+            let va = self.l2;
+            self.l2 += L2_SPAN;
+            return Some(Operation::new(2, [self.handle, va, 1, 0, 0]));
+        }
+        if self.l3 < self.end {
+            let va = self.l3;
+            self.l3 += L3_SPAN;
+            return Some(Operation::new(2, [self.handle, va, 2, 0, 0]));
+        }
+        None
     }
 }
 
@@ -261,9 +344,13 @@ pub(super) enum ContextState {
     Destroyed,
 }
 
+/// Handles a client that negotiated wide handles may receive; 0xff always
+/// names the global object.
+pub(super) const WIDE_HANDLE_LIMIT: u64 = 4096;
+
 /// Provider object identity; this is deliberately not a physical root address.
 pub(super) struct PrivateState {
-    handle: u8,
+    handle: u16,
     state: ContextState,
 }
 
@@ -274,12 +361,17 @@ pub(super) enum TransitionError<E> {
 }
 
 impl PrivateState {
-    pub(super) fn new(handle: u64) -> Result<Self, InvalidRequest> {
-        if handle >= 0xff { return Err(InvalidRequest); }
-        Ok(Self { handle: handle as u8, state: ContextState::Unbound })
+    pub(super) fn new(handle: u64, wide: bool) -> Result<Self, InvalidRequest> {
+        if handle == 0xff || handle >= if wide { WIDE_HANDLE_LIMIT } else { 0xff } {
+            return Err(InvalidRequest);
+        }
+        Ok(Self { handle: handle as u16, state: ContextState::Unbound })
     }
 
     pub(super) fn state(&self) -> ContextState { self.state }
+
+    /// Provider object identity, for diagnostics only.
+    pub(super) fn handle(&self) -> u16 { self.handle }
 
     pub(super) fn space(&self) -> Result<Space, InvalidRequest> {
         match self.state {
@@ -325,14 +417,16 @@ impl PrivateState {
 
     /// The caller must confirm unmap of all backing before returning the object.
     /// Failed destruction retains its identity; it never makes it reusable.
+    /// Returns the provider's receipt: 0, or 2 when some donated table frames
+    /// could not be returned (query each).
     pub(super) fn destroy<E>(&mut self,
-        submit: impl FnOnce(&mut Operation) -> Result<(), E>) -> Result<(), TransitionError<E>>
+        submit: impl FnOnce(&mut Operation) -> Result<(), E>) -> Result<u64, TransitionError<E>>
     {
         if self.state != ContextState::Unbound { return Err(TransitionError::Invalid); }
         self.state = ContextState::Uncertain(None);
-        submit(&mut Operation::new(7, [self.handle as u64, 0, 0, 0, 0]))
-            .map_err(TransitionError::Provider)?;
+        let mut operation = Operation::new(7, [self.handle as u64, 0, 0, 0, 0]);
+        submit(&mut operation).map_err(TransitionError::Provider)?;
         self.state = ContextState::Destroyed;
-        Ok(())
+        Ok(operation.result)
     }
 }

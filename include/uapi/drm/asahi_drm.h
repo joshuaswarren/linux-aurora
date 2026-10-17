@@ -253,8 +253,8 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_VM_STATUS = (1UL) << 1,
 
 	/**
-	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: Each queue reserves its own
-	 * hardware execution state when it is created, and GET_PARAMS
+	 * @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: Queues have independent execution
+	 * and completion ordering, and GET_PARAMS
 	 * supports DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS.
 	 */
 	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
@@ -304,6 +304,15 @@ enum drm_asahi_feature {
 
 	/** @DRM_ASAHI_FEATURE_RENDER_RESOURCES: Per-program render storage declarations. */
 	DRM_ASAHI_FEATURE_RENDER_RESOURCES = (1UL) << 9,
+	/** @DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2: Versioned SCS and mesh storage. */
+	DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 = (1UL) << 10,
+	/** @DRM_ASAHI_FEATURE_SPARSE_TILES: DRM_ASAHI_BIND_SPARSE_TILE accepted. */
+	DRM_ASAHI_FEATURE_SPARSE_TILES = (1UL) << 11,
+	/** @DRM_ASAHI_FEATURE_COMPUTE_MATRIX: Native compute matrix instructions. */
+	DRM_ASAHI_FEATURE_COMPUTE_MATRIX = (1UL) << 12,
+	/** @DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: Task object payload storage. */
+	DRM_ASAHI_FEATURE_TASK_MESH_STORAGE = (1UL) << 13,
+
 };
 
 /**
@@ -370,9 +379,9 @@ struct drm_asahi_vm_status {
 struct drm_asahi_queue_limits {
 	/**
 	 * @max_queues: Maximum number of queues on the device, shared by all
-	 * files and VMs. This is a hardware bound, not a promise that as many
-	 * are currently available: QUEUE_CREATE reserves a queue's hardware
-	 * state and fails once it runs out.
+	 * files and VMs. This bounds logical queues, not simultaneous hardware
+	 * residency. QUEUE_CREATE reserves a logical queue; physical execution
+	 * identities are admitted when work is prepared.
 	 */
 	__u32 max_queues;
 
@@ -599,6 +608,15 @@ enum drm_asahi_bind_flags {
 	 * It is intended as a mechanism to accelerate sparse.
 	 */
 	DRM_ASAHI_BIND_SINGLE_PAGE = (1L << 3),
+
+	/**
+	 * @DRM_ASAHI_BIND_SPARSE_TILE: With DRM_ASAHI_BIND_SINGLE_PAGE, fill
+	 * the range from kernel-owned, physically contiguous tiles instead of
+	 * repeating the BO's first page: read-only binds read zeroes, writable
+	 * binds target a sink; both tile pools are private to the VM. The BO
+	 * only anchors the mapping. Requires DRM_ASAHI_FEATURE_SPARSE_TILES.
+	 */
+	DRM_ASAHI_BIND_SPARSE_TILE = (1L << 4),
 };
 
 /**
@@ -770,6 +788,8 @@ enum drm_asahi_cmd_type {
 
 	/** @DRM_ASAHI_SET_COMPUTE_RESOURCES: Replace compute storage declarations. */
 	DRM_ASAHI_SET_COMPUTE_RESOURCES = 6,
+	/** @DRM_ASAHI_SET_RENDER_RESOURCES_V2: Version 2 render storage declarations. */
+	DRM_ASAHI_SET_RENDER_RESOURCES_V2 = 7,
 };
 
 
@@ -826,6 +846,34 @@ struct drm_asahi_render_program {
 	__u32 multisample_bytes;
 	/** @flags: MBZ. */
 	__u32 flags;
+};
+
+/** Version 2 linked render storage. Version 1 remains exactly 40 bytes. */
+#define DRM_ASAHI_RENDER_PROGRAM_SCS (1U << 0)
+#define DRM_ASAHI_RENDER_PROGRAM_MESH (1U << 1)
+#define DRM_ASAHI_RENDER_PROGRAM_OBJECT (1U << 2)
+/* With OBJECT: the object program is an API task stage. The kernel binds the
+ * TA mesh rendering buffer (native register 0x1ca48, the backing of the
+ * object payload address) to such kicks only. Requires
+ * DRM_ASAHI_FEATURE_TASK_MESH_STORAGE. */
+#define DRM_ASAHI_RENDER_PROGRAM_TASK (1U << 3)
+struct drm_asahi_render_program_v2 {
+	struct drm_asahi_render_program legacy;
+	/** @threads: Mesh/object workgroup invocation count; zero otherwise. */
+	__u32 threads;
+	/** @usage_flags: DRM_ASAHI_RENDER_PROGRAM_* bits. */
+	__u32 usage_flags;
+	/** @scs_layout: Packed depth/levels/cliques/user/driver SCS layout. */
+	__u64 scs_layout;
+	/** @auxiliary_allocation: Stage native auxiliary allocation word. */
+	__u32 auxiliary_allocation;
+	__u32 reserved;
+	__u64 intersection_pool;
+	__u64 intersection_pool_bytes;
+	__u32 intersection_first;
+	__u32 intersection_count;
+	__u64 intersection_default_program;
+	__u64 intersection_default_control;
 };
 
 /**
@@ -1497,7 +1545,7 @@ struct drm_asahi_cmd_render {
  * single compute command, although timestamps are at command granularity.
  */
 struct drm_asahi_cmd_compute {
-	/** @flags: MBZ */
+	/** @flags: Combination of drm_asahi_compute_flags. */
 	__u32 flags;
 
 	/** @sampler_count: Number of samplers in the sampler heap. */
@@ -1525,7 +1573,7 @@ struct drm_asahi_cmd_compute {
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
 
-	/** @scs_layout: Reserved; must be zero. */
+	/** @scs_layout: Packed depth/levels/cliques/user/driver shader-context scratch layout. */
 	__u64 scs_layout;
 
 	/**
@@ -1545,6 +1593,37 @@ struct drm_asahi_cmd_compute {
 	 * queue's compute command count and the header's cdm_barrier instead.
 	 */
 	__u64 prior_cdm;
+	/* Native M5 compute allocation word, independent of scs_layout.
+	 * Zero preserves the legacy path. Older kernels reject a nonzero tail. */
+	__u32 cdm_auxiliary_allocation;
+	__u32 reserved;
+	/** @intersection_pool: M5 intersection-table pool, 16 KiB aligned. */
+	__u64 intersection_pool;
+	/** @intersection_pool_bytes: Mapped size, a multiple of 16 KiB. */
+	__u64 intersection_pool_bytes;
+	/** @intersection_first: First 128-byte driver table block. */
+	__u32 intersection_first;
+	/** @intersection_count: Number of driver table blocks (1..262143). */
+	__u32 intersection_count;
+	/**
+	 * @intersection_default_program: Native default program descriptor.
+	 * Low 48 bits are the 64-byte aligned program address; upper 16 bits
+	 * contain the low resource-specification bits.
+	 */
+	__u64 intersection_default_program;
+	/**
+	 * @intersection_default_control: Native default program control word.
+	 * Bits 13:0 and 46:32 are defined by the M5 program descriptor. All
+	 * other bits must be zero. A nonzero default program requires bit 40.
+	 * An all-zero intersection extension preserves the ordinary compute path.
+	 */
+	__u64 intersection_default_control;
+};
+
+/** enum drm_asahi_compute_flags - Compute command flags */
+enum drm_asahi_compute_flags {
+	/** @DRM_ASAHI_COMPUTE_USES_MATRIX: Dispatch uses native matrix instructions. */
+	DRM_ASAHI_COMPUTE_USES_MATRIX = (1U << 1),
 };
 
 /**

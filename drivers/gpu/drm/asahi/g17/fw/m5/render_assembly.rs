@@ -11,6 +11,7 @@ pub(crate) const COMMAND_STORAGE_BYTES: usize = 0x8000;
 pub(crate) struct EncodedRender {
     pub(crate) rce: [[Option<RegisterArrayBinding>; 4]; 2],
     pub(crate) register_counts: [u16; 5],
+    pub(crate) kick_flags: super::super::kick::StageKickFlags,
 }
 
 fn commands(storage: &mut [u8]) -> Result<(
@@ -57,7 +58,9 @@ pub(crate) fn encode_into(storage: &mut [u8], low: u64,
     let view = |registers, rce_count, command_offset| cmd::M5ProgramRef {
         registers, rce_count, command_offset };
     let fragment_programs = cmd::M5FragmentProgramRefs {
-        main: view(&workspace.fragment, 88, 0xa0), main_mid_count: 90,
+        main: view(&workspace.fragment[..workspace.fragment_count],
+            workspace.fragment_count as u16 - 4, 0xa0),
+        main_mid_count: workspace.fragment_count as u16 - 2,
         store: view(store, partial_counts[0], 0x7c0),
         resume: view(resume, partial_counts[1], 0xee0),
         load: view(load, partial_counts[2], 0x1600),
@@ -70,6 +73,17 @@ pub(crate) fn encode_into(storage: &mut [u8], low: u64,
     let (ta_storage, fragment_storage) = storage.split_at_mut(FRAGMENT_OFFSET);
     ta_storage[..cmd::M5_TA_COMMAND_BYTES].copy_from_slice(ta);
     fragment_storage[..cmd::M5_3D_COMMAND_BYTES].copy_from_slice(fragment);
+    // Native kicks set header bit 61 for a stage whose register program has
+    // the SCS bracket and bit 63 for its matrix bracket (encodeTAKickEntry:
+    // descriptor +0x1590/+0x1591; encode3DKickEntry: +0xb80/+0x838), the
+    // same flags that gate those brackets. The 3D matrix bracket is never
+    // emitted here.
+    let kick_flags = super::super::kick::StageKickFlags {
+        scratch: [extra.d1590 & 1 != 0 || controls.ta.scs.scratch.enabled(),
+            controls.fragment.scs.scratch.enabled()],
+        matrix: [extra.d1591 & 1 != 0, false],
+    };
     Ok(EncodedRender { rce: [ta_rce, fragment_rce],
-        register_counts: [count, 92, partial_counts[0], partial_counts[1], partial_counts[2]] })
+        register_counts: [count, workspace.fragment_count as u16, partial_counts[0], partial_counts[1], partial_counts[2]],
+        kick_flags })
 }

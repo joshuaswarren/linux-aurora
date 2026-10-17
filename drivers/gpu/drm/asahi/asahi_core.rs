@@ -64,6 +64,10 @@ module! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "GPL",
     params: {
+        m5_matrix_submit_test: u32 {
+            default: 0,
+            description: "Diagnostic native M5 matrix submission controls; default0 unchanged,1 enabled",
+        },
         m5_platform_enable: u32 {
             default: 0,
             description: "Enable native M5 SLC allocation and static PMC voters at initialization",
@@ -72,9 +76,53 @@ module! {
             default: 0,
             description: "Request M5 ADT maximum DCS and SOC floors once at GPU startup",
         },
+        m5_platform_probe: u32 {
+            default: 0,
+            description: "Read M5 cache and PMC state once during GPU initialization",
+        },
         m5_cached_objects: u32 {
             default: 1,
             description: "Use retained native cached M5 command mappings; 0 disables for diagnostics",
+        },
+        m5_map_stats: u32 {
+            default: 0,
+            description: "Diagnostic only: log batched SPTM kernel mappings of at least 64 pages (chunks, pages, provider operations, ns); default off",
+        },
+        sptm_trace: u32 {
+            default: 0,
+            description: "Diagnostic SPTM batch counts and duration; disabled by default",
+        },
+        sptm_space_trace: u32 {
+            default: 0,
+            description: "Diagnostic: log SPTM private address-space create/destroy/retention with live counts; disabled by default",
+        },
+        m5_ta_policy_test: u32 {
+            default: 0,
+            description: "Diagnostic only: force native image-copy TA field0x89a; default off",
+        },
+        m5_mesh_ta_word_938: u32 {
+            default: 1,
+            description: "TA command word +0x938: 1 (default) = native class values (0xc0c0 vertex, 0x10ac0 mesh, 0x12b40 task->mesh); 0 = legacy zero (diagnostic only); other = raw value for every TA command",
+        },
+        m5_mesh_storage_chunks: u32 {
+            default: 0x200,
+            description: "M5 mesh rendering buffer bound to API task (object-stage) render kicks only, in 64 KiB chunks (native TA register 0x1ca48 control 0x200); 0 disables the binding and the task feature",
+        },
+        m5_render_lend_test: u32 {
+            default: 0,
+            description: "Diagnostic only (vmfix6b qualification): lend idle live owners' render pairs before fresh or released pairs, even when fresh pairs can be built; default off",
+        },
+        m5_regionc_native: u32 {
+            default: 0,
+            description: "Diagnostic only (long-VS investigation): set the M5 region C words that differ from native M5 macOS (94 identical captures, native-window 2026-10-12; all other words already match). Bit 0: 0x990 = 0x06000840, 0x994 = 2, 0x998 = 0x30d40 (ours 0). Bit 1: 0xa0 = 0x3200000d, 0xa4 = 0x31000002 (ours 0). Default off",
+        },
+        m5_render_rebind_legacy: u32 {
+            default: 0,
+            description: "Diagnostic only (vmfix6f attribution): restore one pre-6f render rebind behaviour. Bit 0: a same-context pool rebind sets the queue configuration's context/QoS update bits (native: clear on same-owner free-list/PB switches). Bit 1: it rewrites both queue records (read-modify-write including firmware-owned words) although their host words are unchanged. Bit 2: another logical context of the same VM retargets the graph's queue records in place instead of getting its own graph. Bit 3: after any rebind every publication repeats the update bits until the first one retires (native: only a new owner's first configuration). Default 0",
+        },
+        m5_render_collect_poison: u32 {
+            default: 0,
+            description: "Diagnostic only (vmfix6e qualification): keep eagerly collected render graphs out of reuse, filled with a poison pattern, their client pool mappings removed and their PB descriptor pointed at an unmapped address, so a late firmware reference faults; default off",
         },
         m5_render_submit_test: u32 {
             default: 0,

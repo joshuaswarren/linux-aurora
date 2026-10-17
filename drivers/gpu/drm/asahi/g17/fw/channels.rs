@@ -154,6 +154,12 @@ impl EventRecord {
         Self { words }
     }
 
+    /// Preserve an unrecognized firmware event before returning its ring slot.
+    pub(crate) fn raw_words(&self) -> [u32; EVENT_WORDS] {
+        // SAFETY: from_words initializes the complete integer array.
+        unsafe { self.words }
+    }
+
     pub(crate) fn tag(&self) -> u32 {
         // SAFETY: All constructors initialize the entire union. Every bit
         // pattern is valid for its u32 words, and word zero is the tag.

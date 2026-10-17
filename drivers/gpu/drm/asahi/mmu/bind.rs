@@ -13,6 +13,7 @@ pub(crate) struct PreparedUserMap {
     size: u64,
     offset: u64,
     single_page: bool,
+    sparse_tile: bool,
     context: context::PreparedBinding,
     _residency: Option<residency::Lease>,
 }
@@ -64,7 +65,11 @@ impl Vm {
         offset: u64,
         prot: Prot,
         single_page: bool,
+        sparse_tile: bool,
     ) -> Result<PreparedUserMap> {
+        if sparse_tile && !single_page {
+            return Err(EINVAL);
+        }
         gem::validate_vm_binding(gem, self)?;
         let residency = self.enter_residency_metadata()?;
         let context = self.prepare_context_binding(addr, size, offset)?;
@@ -114,6 +119,7 @@ impl Vm {
             size,
             offset,
             single_page,
+            sparse_tile,
             context,
         })
     }
@@ -151,7 +157,10 @@ impl Vm {
                     let mut inner = self.inner.exec_lock(Some(&map.gem), true)?;
                     match self.mapping_commit() {
                         Ok(commit) => {
-                            let (flags, repeat) = if map.single_page {
+                            let (flags, repeat) = if map.sparse_tile {
+                                (gpuvm::GpuVaFlags::REPEAT | super::GPUVA_SPARSE_TILE,
+                                 UAT_PGSZ as u32)
+                            } else if map.single_page {
                                 (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
                             } else {
                                 (gpuvm::GpuVaFlags::NONE, 0)

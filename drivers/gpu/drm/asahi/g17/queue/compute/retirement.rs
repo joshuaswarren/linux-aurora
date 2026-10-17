@@ -87,6 +87,18 @@ pub(crate) fn note_stampless(qid: u8, kick: u64) {
     }
 }
 
+/// Firmware retires the compute commands in flight at a restart without executing them and
+/// stores a record whose end is at most this many timer ticks after its start (0 or 1 tick
+/// observed). The shortest executed command record seen is 18 ticks.
+pub(crate) const CANCELLED_TICKS: u64 = 1;
+
+/// The record shows the command never executed: zero duration, or, for a command that was in
+/// flight across a recovery (`crossed`), the restart's cancellation record.
+pub(crate) fn unexecuted(record: Observation, crossed: bool) -> bool {
+    let [start, end] = record.timestamps;
+    start == end || (crossed && start != 0 && end >= start && end - start <= CANCELLED_TICKS)
+}
+
 /// A zero-duration record fails before visibility polling. It proves execution did not occur;
 /// ownership still requires a separate retirement witness before mappings can be released.
 /// The command is complete when its stamp covers it, or when its exact completion record has
@@ -101,7 +113,10 @@ pub(crate) fn poll(
     next_end: Option<u64>,
     record_aged: bool,
 ) -> Result<Option<[u64; 2]>> {
-    if observed.is_some_and(|record| record.timestamps[0] == record.timestamps[1]) {
+    let crossed = matches!(recordless, Recordless::CrossedRecovery);
+    if observed.is_some_and(|record| unexecuted(record, crossed)) {
+        pr_warn!("G17 zero-duration compute completion: ticket={:?} record={:?} cursors={:?} stamp={:#x}\n",
+                 ticket, observed, cursors, stamp);
         return Err(ENODATA);
     }
     let completed = stamp_covers(stamp, ticket.kick) || (observed.is_some() && record_aged);
@@ -180,7 +195,7 @@ impl Batch {
             return Err(EBUSY);
         }
         if slot.1 >= IN_FLIGHT {
-            return Err(ENOSPC);
+            return Err(enospc_site!("compute/retirement.rs:185"));
         }
         let start = if slot.1 == 0 {
             self.requests.len()
@@ -193,7 +208,7 @@ impl Batch {
                 kick: ticket.kick,
                 observed: None,
             })
-            .map_err(|_| ENOSPC)?;
+            .map_err(|_| enospc_site!("compute/retirement.rs:198"))?;
         let bounds = &mut self.kick_bounds[ticket.qid as usize];
         if slot.1 == 0 { *bounds = [ticket.kick, ticket.kick]; }
         else { bounds[0] = bounds[0].min(ticket.kick); bounds[1] = bounds[1].max(ticket.kick); }

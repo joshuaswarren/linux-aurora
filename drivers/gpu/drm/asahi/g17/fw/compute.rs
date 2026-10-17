@@ -30,6 +30,7 @@ const COMPUTE_REGISTERS_MAX: usize = COMPUTE_REGISTERS + 1;
 #[derive(Clone, Copy)]
 pub(crate) struct ScratchRequest {
     pages: u16,
+    layout: u64,
 }
 
 impl ScratchRequest {
@@ -49,7 +50,7 @@ impl ScratchRequest {
         let user = (layout >> 32) & u16::MAX as u64;
         let driver = (layout >> 48) & u16::MAX as u64;
         if user == 0 && driver == 0 {
-            return Ok(Self { pages: 0 });
+            return Ok(Self { pages: 0, layout });
         }
         let threads = cliques.checked_mul(Self::THREADS_PER_CLIQUE).ok_or(EINVAL)?;
         let per_thread = depth.checked_mul(Self::BYTES_PER_STACK_ENTRY)
@@ -60,8 +61,10 @@ impl ScratchRequest {
             .and_then(|bytes| bytes.checked_add(2 * Self::PAGE_SIZE - 1))
             .ok_or(EINVAL)?;
         let pages = bytes >> Self::PAGE_SHIFT;
-        Ok(Self { pages: u16::try_from(pages).map_err(|_| EINVAL)? })
+        Ok(Self { pages: u16::try_from(pages).map_err(|_| EINVAL)?, layout })
     }
+
+    pub(crate) fn layout(self) -> u64 { self.layout }
 
     pub(crate) fn enabled(self) -> bool {
         self.pages != 0

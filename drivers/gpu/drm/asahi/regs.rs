@@ -513,10 +513,10 @@ impl Resources {
     }
 
     /// Raw M5 fault-window witness; the selector is observed, never changed.
-    pub(crate) fn m5_fault_registers(&self)->Result<[u64;3]> {
+    pub(crate) fn m5_fault_registers(&self)->Result<[u64;6]> {
         let sgx=self.sgx.try_access().ok_or(ENODEV)?;
         if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY)&G17_HOST_POWERED==0 {return Err(EAGAIN);}
-        Ok([sgx.try_read64(0xd800)?,sgx.try_read64(0xd8c0)?,sgx.try_read64(0xd8c8)?])
+        Ok([sgx.try_read64(0xd800)?,sgx.try_read64(0xd8c0)?,sgx.try_read64(0xd8c8)?,sgx.try_read64(0xc078)?,sgx.try_read64(0xc008)?,sgx.try_read64(0xc028)?])
     }
 
     /// Get the identification of a G17 GPU from its registers.

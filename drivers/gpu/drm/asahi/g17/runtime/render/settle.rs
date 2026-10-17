@@ -26,13 +26,29 @@ impl Backend {
                 return Ok(());
             }
             if let Some(slot) = packet.completion.render_slot() {
+                // A pair checked out by its publisher, constructor or grower is
+                // still owned by that path: it observes the deferred timeout
+                // when it returns the pair. Never escalate that to a runtime
+                // stop. Diagnostics are best effort.
+                let checked_out = firmware.queues.render.entries.get(usize::from(slot))
+                    .and_then(Option::as_ref)
+                    .is_some_and(|entry| entry.pair.is_none());
+                if checked_out {
+                    packet.completion.defer_timeout(ETIMEDOUT);
+                    if let Ok(entry) = firmware.queues.render.entry_mut(slot) {
+                        entry.pending_timeout = true;
+                    }
+                    dev_warn!(self.shared.dev.as_ref(),
+                        "M5 render timeout deferred: slot {} is checked out\n", slot);
+                    return Ok(());
+                }
                 let dev = firmware.primary.state.shared.drm()?;
-                firmware.with_render(usize::from(slot), |pair, host| {
+                let _ = firmware.with_render(usize::from(slot), |pair, host| {
                     pair.diagnose_m5(&dev);
                     let qids = pair.qids();
                     dev_warn!(dev.as_ref(), "M5 render completion stamps: {:?}\n", host.stamps(qids));
                     Ok(())
-                })?;
+                });
             }
             firmware.fail_render_packet(packet, ETIMEDOUT, &mut deferred)
         };
@@ -84,7 +100,7 @@ impl crate::g17::Firmware {
                 .and_then(Option::as_ref)
                 .and_then(|entry| entry.pair.as_ref())
                 .ok_or(EIO)?;
-            if !pair.contains_packet(packet) {
+            if pair.replay_contains(packet) || !pair.contains_packet(packet) {
                 return Ok(());
             }
             let generation = self.recovery.generation();
@@ -101,6 +117,14 @@ impl crate::g17::Firmware {
                 Err(error) if error == EAGAIN => {}
                 result => result?,
             }
+        }
+        if error == ETIMEDOUT
+            && self.with_render(slot, |pair, host| pair.defer_abandoned_timeout(packet, host))?
+        {
+            if crate::g17::m5_render_submission::enabled() {
+                pr_info!("render slot {} timeout deferred: retired without execution, proving for replay\n", slot);
+            }
+            return Ok(());
         }
         self.with_render(slot, |pair, host| {
             pair.fail_after_observation(packet, error, host, &mut |event| deferred.push(event))
@@ -157,6 +181,12 @@ impl crate::g17::Firmware {
                 })
                 .and_then(|pair| pair.oldest_packet());
             if let Some(packet) = packet {
+                if self.with_render(slot, |pair, host| pair.defer_abandoned_cancel(&packet, host))? {
+                    if crate::g17::m5_render_submission::enabled() {
+                        pr_info!("render slot {} cancelled by recovery: retired without execution, proving for replay\n", slot);
+                    }
+                    continue;
+                }
                 self.fail_render_packet(&packet, ECANCELED, deferred)?;
             }
         }

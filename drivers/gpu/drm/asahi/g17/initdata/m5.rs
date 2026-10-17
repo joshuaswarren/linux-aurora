@@ -62,6 +62,29 @@ impl InitData {
         let report = m::M5_BUNDLE_VIEW_OFFSETS[abi::recovery::REPORT_VIEW];
         super::super::m5_render_test::dump_device(dev, "recovery-report",
             self.object(self.bundle)?, report, 0x100)?;
+        for (label, view, start) in [
+            ("ta", 0usize, 0x614usize),
+            ("fragment", 1usize, 0xa40usize),
+            ("compute", 2usize, 0x808usize),
+        ] {
+            for slot in 0..64 {
+                match self.recovery_view_words::<6>(view, start + slot * 24) {
+                    Ok(words) if words != [0; 6] => {
+                        dev_info!(dev, "M5 progress-record {} slot={} words={:08x?}\n",
+                            label, slot, words);
+                    }
+                    Ok(_) => {},
+                    Err(error) => {
+                        dev_warn!(dev, "M5 progress-record {} read failed: {:?}\n", label, error);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Err(error) = super::super::m5_render_test::dump_device(dev, "progress-hw-config",
+            self.object(self.bundle)?, 0x27f0, 0x60) {
+            dev_warn!(dev, "M5 progress config read failed: {:?}\n", error);
+        }
         let offset = m::M5_PRIVATE_LAYOUT.status_b;
         super::super::m5_render_test::dump_device(dev, "status-b-recovery",
             self.object(self.cluster)?, offset + 0x4000, 0xc00)?;
@@ -150,6 +173,27 @@ impl InitData {
         m::encode_common26_aon_ptd(&mut self.object_mut(aon)?.bytes_mut()[..m::M5_AON_PTD_SIZE])
             .map_err(|_| EINVAL)?;
         m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
+        let native = *crate::module_parameters::m5_regionc_native.value();
+        if native != 0 {
+            // Long-VS diagnostic: the only static words in which our region C
+            // differs from native M5 (semantics not decoded; 0x998 = 200000).
+            let bytes = self.object_mut(self.region_c)?.bytes_mut();
+            let mut put = |at: usize, value: u32| {
+                if let Some(word) = bytes.get_mut(at..at + 4) {
+                    word.copy_from_slice(&value.to_le_bytes());
+                }
+            };
+            if native & 1 != 0 {
+                put(0x990, 0x0600_0840);
+                put(0x994, 0x2);
+                put(0x998, 0x0003_0d40);
+            }
+            if native & 2 != 0 {
+                put(0xa0, 0x3200_000d);
+                put(0xa4, 0x3100_0002);
+            }
+            pr_warn!("asahi: M5 region C native words applied (mask {:#x}, diagnostic)\n", native);
+        }
         m::encode_m5_private_cluster(PRIVATE, FWCTL,
             &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
         let windows = m::j714_register_windows();

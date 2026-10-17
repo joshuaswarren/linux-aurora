@@ -4,7 +4,7 @@
 #[derive(Clone, Copy)]
 pub(crate) enum RenderStage { Tiling, Fragment }
 
-/// The context tag packs a six-bit execution identity above its reuse
+/// The native context ID manager packs a six-bit execution identity above its reuse
 /// generation. All 314 native M5 render records agree with their header ID.
 pub(crate) fn context_token(context: u32, generation: u64) -> Option<u64> {
     if context >= 64 || generation == 0 || generation >= (1u64 << 58) {
