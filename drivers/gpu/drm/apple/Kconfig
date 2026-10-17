@@ -20,9 +20,9 @@ config DRM_APPLE_AUDIO
 	bool "DisplayPort/HDMI Audio support"
 	default y
 	depends on DRM_APPLE
-	depends on SND
-	select SND_PCM
-	select SND_DMAENGINE_PCM
+	depends on SND && (SND=y || DRM_APPLE=m)
+	select SND_PCM if DRM_APPLE
+	select SND_DMAENGINE_PCM if DRM_APPLE
 
 config DRM_APPLE_DEBUG
 	bool "Enable additional driver debugging"
