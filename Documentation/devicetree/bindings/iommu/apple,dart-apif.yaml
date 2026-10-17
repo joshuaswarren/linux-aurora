@@ -24,6 +24,12 @@ properties:
   aurora,apif:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: APIF version-2 transport provider.
+  power-domains:
+    maxItems: 1
+    description: |
+      Native register-clock dependency needed before the first APIF DART call.
+      The provider must be powered independently of consumer probe ordering.
+      For T6050 ATC2 USB DART this is the ATC2_USB domain shared with DWC3.
   apple,apif-dart-id:
     $ref: /schemas/types.yaml#/definitions/uint32
     maximum: 255

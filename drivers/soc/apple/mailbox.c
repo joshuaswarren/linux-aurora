@@ -52,6 +52,7 @@
 #define APPLE_ASCWRAP_V6_WRAPPER_SIZE 0x88000
 #define APPLE_ASCWRAP_V6_IOP_VBAR_SIZE 0x8
 #define APPLE_ASCWRAP_V6_CPU_CONTROL 0x44
+#define APPLE_ASCWRAP_V6_CPU_STATUS 0x48
 #define APPLE_ASCWRAP_V6_CPU_RUN BIT(4)
 #define APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR BIT(5)
 
@@ -59,6 +60,7 @@
 #define APPLE_T8140_GFX_IOP_VBAR_BASE 0x482050000ULL
 #define APPLE_T8140_GFX1_WRAPPER_BASE 0x482e00000ULL
 #define APPLE_T8140_GFX1_IOP_VBAR_BASE 0x482850000ULL
+#define APPLE_T6050_ASCWRAP_BASE_DELTA 0x380000000ULL
 
 static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_CONTROL ==
 	      0x8110);
@@ -118,6 +120,7 @@ struct apple_mbox_hw {
 	unsigned int reg_offset;
 	bool is_ascwrap_v6;
 	u64 ascwrap_v6_base_delta;
+	u64 ascwrap_v6_wrapper_delta;
 	bool ap_initializes_mailboxes;
 
 	unsigned int control_full;
@@ -271,6 +274,27 @@ out_unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_stop_cpu);
+
+int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
+				     u32 *control, u32 *status)
+{
+	int ret = 0;
+
+	if (!mbox || !control || !status || !mbox->hw->is_ascwrap_v6 ||
+	    !mbox->wrapper_regs)
+		return -EOPNOTSUPP;
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing) {
+		ret = -ENODEV;
+	} else {
+		*control = readl(mbox->wrapper_regs + APPLE_ASCWRAP_V6_CPU_CONTROL);
+		*status = readl(mbox->wrapper_regs + APPLE_ASCWRAP_V6_CPU_STATUS);
+	}
+	mutex_unlock(&mbox->lifecycle_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_get_cpu_state);
+
 
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)
@@ -648,7 +672,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	if (mbox->hw->is_ascwrap_v6) {
 		/*
 		 * Validate the entire provider identity before mapping either
-		 * resource.  These are fixed T8140 CPU-physical windows and role
+		 * resource.  These are fixed provider CPU windows and role
 		 * assignments, not generic consumer-provided aliases.
 		 */
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wrapper");
@@ -668,18 +692,20 @@ static int apple_mbox_probe(struct platform_device *pdev)
 
 		if (!strcmp(firmware_role, "GFX")) {
 			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
-			if (res->start != APPLE_T8140_GFX_WRAPPER_BASE ||
+			if (res->start != APPLE_T8140_GFX_WRAPPER_BASE +
+					mbox->hw->ascwrap_v6_wrapper_delta ||
 			    iop_vbar_res->start != APPLE_T8140_GFX_IOP_VBAR_BASE +
-					 mbox->hw->ascwrap_v6_base_delta)
+					mbox->hw->ascwrap_v6_base_delta)
 				return dev_err_probe(dev, -EINVAL,
-						     "GFX ASCWrap v6 resources do not match provider profile\n");
+						     "GFX ASCWrap v6 resources do not match the SoC profile\n");
 		} else if (!strcmp(firmware_role, "GFX1")) {
 			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1;
-			if (res->start != APPLE_T8140_GFX1_WRAPPER_BASE ||
+			if (res->start != APPLE_T8140_GFX1_WRAPPER_BASE +
+					mbox->hw->ascwrap_v6_wrapper_delta ||
 			    iop_vbar_res->start != APPLE_T8140_GFX1_IOP_VBAR_BASE +
-					 mbox->hw->ascwrap_v6_base_delta)
+					mbox->hw->ascwrap_v6_base_delta)
 				return dev_err_probe(dev, -EINVAL,
-						     "GFX1 ASCWrap v6 resources do not match provider profile\n");
+						     "GFX1 ASCWrap v6 resources do not match the SoC profile\n");
 		} else {
 			return dev_err_probe(dev, -EINVAL,
 					     "invalid ASCWrap v6 firmware role\n");
@@ -879,10 +905,30 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.irq_bit_send_empty = APPLE_M3_MBOX_IRQ_A2I_EMPTY,
 };
 
+
+/* T6050's native ASCWrap v6 uses the same RUN/stop sequence. Aura grants
+ * these complete wrapper/VBAR windows in the retained GPU aperture. */
+static const struct apple_mbox_hw apple_mbox_t6050_ascwrap_v6_hw = {
+	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
+	.is_ascwrap_v6 = true,
+	.ascwrap_v6_base_delta = APPLE_T6050_ASCWRAP_BASE_DELTA,
+	.ascwrap_v6_wrapper_delta = APPLE_T6050_ASCWRAP_BASE_DELTA,
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
+	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
+	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
+	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+	.has_irq_controls = false,
+};
+
+/* Retained compatibility profile: unshifted wrapper aliases, native VBAR. */
 static const struct apple_mbox_hw apple_mbox_t6050_apif_ascwrap_v6_hw = {
 	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
 	.is_ascwrap_v6 = true,
-	.ascwrap_v6_base_delta = 0x380000000ULL,
+	.ascwrap_v6_base_delta = APPLE_T6050_ASCWRAP_BASE_DELTA,
 	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
 	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
@@ -896,8 +942,9 @@ static const struct apple_mbox_hw apple_mbox_t6050_apif_ascwrap_v6_hw = {
 
 static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t6050-apif-ascwrap-v6", .data = &apple_mbox_t6050_apif_ascwrap_v6_hw },
-	{ .compatible = "apple,t6050-x1n1-ascwrap-v6", .data = &apple_mbox_t6050_apif_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
+	{ .compatible = "apple,t6050-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
+	{ .compatible = "apple,t6050-x1n1-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
 	{ .compatible = "apple,t8140-aop-setup-mailbox", .data = &apple_mbox_t8140_aop_setup_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },

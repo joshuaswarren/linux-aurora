@@ -51,6 +51,16 @@ def main():
         apple,sart=<&sart>;
     };
     pmp@300500000 {compatible="apple,t6050-pmp-v2"; iommus=<&dart 0>; status="disabled";};
+    usb_power: power-domain {#power-domain-cells=<0>;};
+    usb_dart: iommu@61f38000 {
+        compatible="apple,dart-x1n1"; reg=<0 0x61f38000 0 0x4000>;
+        #iommu-cells=<1>; apple,x1n1-dart-id=<16>;
+        power-domains=<&usb_power>;
+    };
+    usb@8a000000 {
+        compatible="apple,t6050-dwc3"; reg=<0 0x8a000000 0 0x10000>;
+        iommus=<&usb_dart 0>; power-domains=<&usb_power>;
+    };
     gpu {compatible="example,opaque-gpu"; unchanged=[de ad be ef];};
 };'''
     with tempfile.TemporaryDirectory(prefix="apif-guest-") as directory:
@@ -71,7 +81,8 @@ def main():
         assert module.property_bytes(after, "/gpu", "unchanged") == module.property_bytes(before, "/gpu", "unchanged")
         assert len(module.cells(after, "/nvme@60400000", "reg")) == 8
         assert module.cells(after, "/apif@61ff0000", "reg") == [0, module.APIF_IPA, 0, module.PAGE_SIZE]
-        for mutation in ["live", "duplicate", "collision"]:
+        assert module.property_bytes(after, "/iommu-10", "power-domains") == module.property_bytes(before, "/usb@8a000000", "power-domains")
+        for mutation in ["live", "duplicate", "collision", "unpowered-usb-dart"]:
             bad = libfdt.Fdt(bytearray(blob)); bad.resize(len(blob)+2048)
             if mutation == "live":
                 module.delete(bad, "/nvme@60400000", "asahi,rtkit-quiesced")
@@ -79,6 +90,8 @@ def main():
                 handles = module.cells(bad, "/nvme@60400000", "memory-region")
                 handles[1] = handles[0]
                 module.put_cells(bad, "/nvme@60400000", "memory-region", handles)
+            elif mutation == "unpowered-usb-dart":
+                module.delete(bad, "/iommu@61f38000", "power-domains")
             else:
                 bad.add_subnode(0, "device@61ff0000")
                 module.put_cells(bad, "/device@61ff0000", "reg", [0, module.APIF_IPA, 0, 4])

@@ -98,6 +98,26 @@ def nvme_handoff(tree, path):
         raise ValueError(f"{path}: queue reservations must be distinct")
 
 
+def usb_dart_power(tree, compatible):
+    """Require the producer's known T6050 USB-DART register-clock dependency."""
+    for path, matches in compatible.items():
+        if "apple,t6050-dwc3" not in matches or strings(tree, path, "status") == ["disabled"]:
+            continue
+        iommu = cells(tree, path, "iommus")
+        if len(iommu) != 2:
+            raise ValueError(f"{path}: one USB DART stream required")
+        provider = tree.get_path(tree.node_offset_by_phandle(iommu[0]))
+        if LEGACY_DART not in strings(tree, provider, "compatible"):
+            continue
+        # T6050's right USB DART gate has no local power state: its native
+        # OPEN touches registers clocked by the controller's ATC2_USB parent.
+        if number(tree, provider, "apple,x1n1-dart-id") != 16:
+            continue
+        domains = property_bytes(tree, provider, "power-domains")
+        if domains is None or domains != property_bytes(tree, path, "power-domains"):
+            raise ValueError(f"{provider}: T6050 USB DART requires the producer's ATC2_USB power-domain dependency before OPEN")
+
+
 def pci_layout(tree, path, layout):
     if property_bytes(tree, path, "apple,preinitialized") is None:
         raise ValueError(f"{path}: stopped preinitialized producer handoff required")
@@ -118,6 +138,10 @@ def migrate(blob, pcie_layout=None, enable_pmp=False):
     tree.resize(len(blob) * 2 + 16384)
     inventory = list(paths(tree))
     compatible = {p: strings(tree, p, "compatible") for p in inventory}
+    usb_dart_power(tree, compatible)
+    for path, matches in compatible.items():
+        if "apple,t6050-x1n1-ascwrap-v6" in matches:
+            put_strings(tree, path, "compatible", ["apple,t6050-ascwrap-v6"])
     targets = [p for p, c in compatible.items() if any(v in c for v in
                [LEGACY_DART, LEGACY_SART, LEGACY_NVME, LEGACY_PCIE])]
     # Reject direct CPU-space collisions; buses without ranges are not CPU

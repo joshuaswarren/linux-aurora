@@ -15,6 +15,41 @@ description:
 
 allOf:
   - $ref: snps,dwc3-common.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-dwc3
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 5
+        reg-names:
+          items:
+            - const: dwc3-core
+            - const: dwc3-apple
+            - const: drd-cfg
+            - const: drd-bulk
+            - const: drd-ausbc
+      required:
+        - apple,tunable-bulk-default
+        - apple,tunable-gbl-default
+        - apple,tunable-gbl-host
+        - apple,tunable-cio-default
+        - apple,tunable-debug-default
+        - apple,tunable-cfg-host
+        - apple,tunable-link-default
+        - apple,tunable-ausbc-default
+    else:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+        reg-names:
+          items:
+            - const: dwc3-core
+            - const: dwc3-apple
 
 properties:
   compatible:
@@ -27,17 +62,16 @@ properties:
               - apple,t8140-dwc3
               - apple,t8142-dwc3
           - const: apple,t8103-dwc3
+      - const: apple,t6050-dwc3
       - const: apple,t8103-dwc3
 
   reg:
-    items:
-      - description: Core DWC3 region
-      - description: Apple-specific DWC3 region
+    minItems: 2
+    maxItems: 5
 
   reg-names:
-    items:
-      - const: dwc3-core
-      - const: dwc3-apple
+    minItems: 2
+    maxItems: 5
 
   interrupts:
     maxItems: 1
@@ -50,6 +84,38 @@ properties:
 
   power-domains:
     maxItems: 1
+
+  apple,tunable-bulk-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-gbl-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-gbl-host:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-cio-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-debug-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-cfg-host:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-link-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-ausbc-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Producer-supplied offset, mask and value register tuples
 
 required:
   - compatible

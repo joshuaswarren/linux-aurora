@@ -53,3 +53,12 @@ qualify boot, storage durability, MSI, USB DMA, PMP and teardown separately.
 The matched T6050 Abbey RTC is migrated to ``apple,abbey-pmu-rtc`` only
 when its five named cells describe the counter, offset, alarm, control
 and interrupt mask. This leaves the separate Baku RTC binding unchanged.
+
+T6050 right-port USB DART must name its ATC2_USB power domain independently
+of the DWC3 consumer. Its DART gate has no local power-state register and
+requires the shared controller parent before native OPEN reads DART registers.
+The migration rejects an enabled T6050 USB controller using native DART16
+unless both nodes carry the producer-supplied shared power-domain dependency.
+It preserves that dependency on the renamed APIF IOMMU node; platform PM
+attachment therefore precedes IOMMU probe and native access. This does not
+replace physical hotplug/DMA qualification.

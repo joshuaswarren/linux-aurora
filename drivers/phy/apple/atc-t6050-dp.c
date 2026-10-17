@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* T6050 fixed four-lane DisplayPort PHY (HDMI bridge path). */
+/* T6050 DisplayPort PHY for fixed bridges and Type-C DP alternate mode. */
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/io.h>
@@ -9,12 +9,22 @@
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/reset-controller.h>
+#include <dt-bindings/phy/phy.h>
+#include "usb-t6050/apple_t6050_usb_phy.h"
+#include "usb-t6050/apple_t6050_usb3_pipe.h"
+#include "usb-t6050/apple_t6050_usb2_reset.h"
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/usb/typec.h>
+#include <linux/usb/typec_mux.h>
+#include <linux/usb/typec_dp.h>
+#include <linux/usb/typec_altmode.h>
 
-enum atc_operation { ATC_MASK, ATC_TUNABLE, ATC_DELAY, ATC_POLL, ATC_POWER };
+enum atc_operation { ATC_MASK, ATC_TUNABLE, ATC_DELAY, ATC_POLL, ATC_POWER, ATC_FIRMWARE };
 struct atc_op {
 	u8 op, bank;
 	u16 offset;
@@ -26,6 +36,7 @@ struct atc_rate_op {
 	u32 values[4];
 };
 #include "atc-t6050-dp-data.h"
+#include "atc-t6050-typec-data.h"
 
 static const struct { u8 bank; u32 offset; } core_banks[] = {
 	{2, 0}, {3, 0x400}, {4, 0x800}, {5, 0xa00}, {6, 0x1000},
@@ -33,11 +44,12 @@ static const struct { u8 bank; u32 offset; } core_banks[] = {
 	{14, 0x7000}, {16, 0x9000}, {18, 0xb000}, {19, 0xc000},
 	{20, 0xd000}, {21, 0xe000}, {22, 0xf000}, {25, 0x19000},
 	{27, 0x1b000}, {28, 0x1c000}, {29, 0x1d000}, {30, 0x1e000},
-	{31, 0x1f000}, {33, 0x28000}, {34, 0x28400},
+	{31, 0x1f000}, {33, 0x28000}, {34, 0x28400}, {35, 0x29000},
 };
 static const struct { u8 bank; const char *name; } extra_banks[] = {
 	{39, "reset"}, {40, "fabric"}, {41, "axi2af"},
 	{42, "lioa"}, {43, "common-cfg"},
+	{38, "usb-control"},
 };
 static const struct { u8 bank; const char *name; } tunable_names[] = {
 	{41, "apple,tunable-axi2af"}, {40, "apple,tunable-fabric"},
@@ -45,6 +57,7 @@ static const struct { u8 bank; const char *name; } tunable_names[] = {
 	{20, "apple,tunable-lane0-rx-clock"}, {29, "apple,tunable-lane1-rx-clock"},
 	{18, "apple,tunable-lane0-rx-eq"}, {27, "apple,tunable-lane1-rx-eq"},
 	{8, "apple,tunable-auspll"},
+	{5, "apple,tunable-aus40cmn-shm"}, {10, "apple,tunable-cio4pll"},
 };
 static const unsigned int link_rates[] = {1620, 2700, 5400, 8100};
 static const char * const training_names[] = {
@@ -55,17 +68,30 @@ struct atc_domain {
 	struct device *dev;
 	bool active;
 };
+enum combo_mode { COMBO_SAFE, COMBO_USB, COMBO_DP4, COMBO_DP2 };
 struct t6050_dp {
+	bool combo, usb_prepared, usb2_active, pipe_active, controller_active;
+	enum combo_mode combo_mode;
+	enum typec_orientation orientation;
+	struct phy *combo_phy[3];
+	struct reset_controller_dev reset;
+	struct apple_t6050_usb_io usb_io;
+	struct apple_t6050_usb_platform usb_platform;
+	struct apple_tunable *usb2_default, *usb2_host, *pipe_default;
 	struct device *dev;
 	struct mutex lock;
-	void __iomem *banks[44];
-	struct resource resources[44];
+	void __iomem *banks[45];
+	struct resource resources[45];
 	struct apple_tunable *tunables[ARRAY_SIZE(tunable_names)];
 	struct atc_domain domain[3]; /* USB AON, common, wrapper: native order. */
 	u32 training[4][16];
 	u32 voltage[4], pre[4];
 	int rate;
 	bool enabled, faulted;
+	bool typec, reverse, multifunction;
+	struct apple_rtkit *rtkit;
+	void __iomem *fw_data;
+	bool fw_running;
 };
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
@@ -99,12 +125,87 @@ static void atc_domain_release(void *data)
 	dev_pm_domain_detach(pd->dev, true);
 }
 
+/* The bootloader preloads CIO80 firmware into local SRAM. The firmware's
+ * data segment is 0x10000000..0x10010000, not guest system RAM. */
+static int atc_fw_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
+{
+	struct t6050_dp *dp = cookie;
+
+	if (bfr->iova < 0x10000000 ||
+	    bfr->size > 0x10000 || bfr->iova - 0x10000000 > 0x10000 - bfr->size) {
+		dev_err(dp->dev, "unsupported PHY firmware buffer %llx size %zx\n",
+			(unsigned long long)bfr->iova, bfr->size);
+		return -EINVAL;
+	}
+	bfr->iomem = dp->fw_data + (bfr->iova - 0x10000000);
+	bfr->is_mapped = true;
+	return 0;
+}
+
+static void atc_fw_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
+{
+	/* SRAM is owned by the PHY and mapped for the device lifetime. */
+}
+
+static void atc_fw_message(void *cookie, u8 endpoint, u64 message)
+{
+	struct t6050_dp *dp = cookie;
+
+	dev_dbg(dp->dev, "PHY firmware ep%x: %016llx\n", endpoint, message);
+}
+
+static void atc_fw_crashed(void *cookie, const void *log, size_t size)
+{
+	struct t6050_dp *dp = cookie;
+
+	WRITE_ONCE(dp->faulted, true);
+	dev_err(dp->dev, "PHY firmware crashed\n");
+}
+
+static const struct apple_rtkit_ops atc_fw_ops = {
+	.shmem_setup = atc_fw_shmem_setup,
+	.shmem_destroy = atc_fw_shmem_destroy,
+	.recv_message = atc_fw_message,
+	.crashed = atc_fw_crashed,
+};
+
+static int atc_firmware(struct t6050_dp *dp, bool start)
+{
+	int ret;
+
+	if (!dp->rtkit)
+		return -ENODEV;
+	if (dp->fw_running == start)
+		return 0;
+	if (start) {
+		/* Native coprocessor run, after its +0x40 firmware enable. */
+		writel(BIT(4), dp->banks[38] + 0x28);
+		ret = apple_rtkit_wake(dp->rtkit);
+		if (!ret)
+			ret = apple_rtkit_start_ep(dp->rtkit, 0x20);
+	} else {
+		/* CIO80PhyMBI::sendPowerDown, then the RTBuddy power transition. */
+		ret = apple_rtkit_send_message(dp->rtkit, 0x20, BIT_ULL(56), NULL, false);
+		if (!ret)
+			ret = apple_rtkit_shutdown(dp->rtkit);
+		if (!ret)
+			writel((u32)~BIT(4), dp->banks[38] + 0x28);
+	}
+	if (ret)
+		dev_err(dp->dev, "PHY firmware %s failed: %d\n", start ? "start" : "stop", ret);
+	else
+		dp->fw_running = start;
+	return ret;
+}
+
 static int atc_validate_step(struct t6050_dp *dp, const struct atc_op *s)
 {
 	if (s->op == ATC_DELAY)
-		return s->value <= 1000 ? 0 : -EINVAL;
+		return s->value <= 10000 ? 0 : -EINVAL;
 	if (s->op == ATC_POWER)
 		return s->value <= 1 ? 0 : -EINVAL;
+	if (s->op == ATC_FIRMWARE)
+		return dp->typec && s->value <= 1 ? 0 : -EINVAL;
 	if (s->bank >= ARRAY_SIZE(dp->banks) || !dp->banks[s->bank] ||
 	    s->offset % 4 || s->offset + 4 > resource_size(&dp->resources[s->bank]))
 		return -EINVAL;
@@ -120,12 +221,16 @@ static int atc_step(struct t6050_dp *dp, const struct atc_op *s)
 {
 	void __iomem *reg;
 	u32 value;
-	int ret;
+	int ret = atc_validate_step(dp, s);
 
+	if (ret)
+		return ret;
 	if (s->op == ATC_DELAY) {
 		udelay(s->value);
 		return 0;
 	}
+	if (s->op == ATC_FIRMWARE)
+		return atc_firmware(dp, s->value);
 	if (s->op == ATC_POWER)
 		return atc_domain_set(&dp->domain[2], s->value);
 	if (s->bank >= ARRAY_SIZE(dp->banks) || !dp->banks[s->bank] ||
@@ -170,24 +275,34 @@ static int atc_sequence(struct t6050_dp *dp, const struct atc_op *s, size_t coun
 
 static int atc_link_rate(struct t6050_dp *dp, int rate)
 {
+	const struct atc_rate_op *on = dp_link_on;
+	size_t nr_on = ARRAY_SIZE(dp_link_on);
 	int ret;
 
+	if (dp->multifunction) {
+		on = dp->reverse ? dp_group0_on : dp_group1_on;
+		nr_on = dp->reverse ? ARRAY_SIZE(dp_group0_on) : ARRAY_SIZE(dp_group1_on);
+	}
 	if (dp->rate == rate)
 		return 0;
 	if (dp->rate >= 0) {
-		ret = ATC_SEQUENCE(dp, dp_link_off);
+		if (dp->multifunction)
+			ret = dp->reverse ? ATC_SEQUENCE(dp, dp_group0_off) :
+					    ATC_SEQUENCE(dp, dp_group1_off);
+		else
+			ret = ATC_SEQUENCE(dp, dp_link_off);
 		if (ret)
 			return ret;
 		dp->rate = -1;
 	}
 	if (rate < 0)
 		return 0;
-	for (size_t i = 0; i < ARRAY_SIZE(dp_link_on); i++) {
-		struct atc_op op = dp_link_on[i].op;
+	for (size_t i = 0; i < nr_on; i++) {
+		struct atc_op op = on[i].op;
 
-		if (!(dp_link_on[i].rates & BIT(rate)))
+		if (!(on[i].rates & BIT(rate)))
 			continue;
-		op.value = dp_link_on[i].values[rate];
+		op.value = on[i].values[rate];
 		ret = atc_step(dp, &op);
 		if (ret) {
 			dp->faulted = true;
@@ -216,7 +331,12 @@ static int atc_start(struct t6050_dp *dp)
 		atc_domain_set(&dp->domain[0], false);
 		return ret;
 	}
-	ret = ATC_SEQUENCE(dp, dp_init);
+	if (dp->multifunction)
+		ret = dp->reverse ? ATC_SEQUENCE(dp, mf_reverse_init) :
+				    ATC_SEQUENCE(dp, mf_normal_init);
+	else
+		ret = dp->reverse ? ATC_SEQUENCE(dp, dp_reverse_init) :
+				    ATC_SEQUENCE(dp, dp_init);
 	if (!ret)
 		ret = ATC_SEQUENCE(dp, aux_on);
 	if (ret)
@@ -237,10 +357,14 @@ static int atc_stop(struct t6050_dp *dp)
 	if (!ret)
 		ret = ATC_SEQUENCE(dp, aux_off);
 	if (!ret)
-		ret = ATC_SEQUENCE(dp, dp_poweroff);
+		ret = dp->multifunction ? ATC_SEQUENCE(dp, mf_poweroff) :
+					 ATC_SEQUENCE(dp, dp_poweroff);
 	if (ret)
 		return ret;
 	dp->enabled = false;
+	/* Combo owns domain shutdown after USB2 and PIPE have also quiesced. */
+	if (dp->combo)
+		return 0;
 	ret = atc_domain_set(&dp->domain[1], false);
 	if (!ret)
 		ret = atc_domain_set(&dp->domain[0], false);
@@ -254,8 +378,8 @@ static void atc_mask(void __iomem *reg, u32 mask, u32 value)
 
 static void atc_drive(struct t6050_dp *dp, unsigned int lane, u32 preset)
 {
-	/* Fixed normal DP orientation: group1 RX/TX, then group0 RX/TX. */
-	unsigned int group = lane < 2 ? 1 : 0;
+	/* Native DP lane order is RX/TX in each orientation-selected group. */
+	unsigned int group = (lane < 2 ? 1 : 0) ^ dp->reverse;
 	bool tx = lane & 1;
 	void __iomem *base = dp->banks[(tx ? 21 : 20) + 9 * group];
 	u32 ctrl = ((preset >> 2) & 0xf) | ((preset & 3) << 14);
@@ -268,25 +392,30 @@ static void atc_drive(struct t6050_dp *dp, unsigned int lane, u32 preset)
 	atc_mask(base + (tx ? 0x100 : 0xa8), 0x7ffff, eq);
 }
 
+#include "atc-t6050-combo.h"
+
 static int t6050_dp_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct t6050_dp *dp = phy_get_drvdata(phy);
 
 	guard(mutex)(&dp->lock);
 	if (mode == PHY_MODE_DP)
-		return atc_start(dp);
+		return dp->typec ? (dp->enabled ? 0 : -ENOLINK) : atc_start(dp);
 	if (mode == PHY_MODE_INVALID)
-		return atc_stop(dp);
+		return dp->combo ? atc_link_rate(dp, -1) : atc_stop(dp);
 	return -EINVAL;
 }
 
 static int t6050_dp_validate(struct phy *phy, enum phy_mode mode, int submode,
 			    union phy_configure_opts *opts)
 {
+	struct t6050_dp *dp = phy_get_drvdata(phy);
+
+	guard(mutex)(&dp->lock);
 	if (mode != PHY_MODE_DP)
 		return -EINVAL;
 	memset(opts, 0, sizeof(*opts));
-	opts->dp.lanes = 4;
+	opts->dp.lanes = dp->multifunction ? 2 : 4;
 	opts->dp.link_rate = 8100;
 	opts->dp.ssc = 0;
 	return 0;
@@ -321,12 +450,14 @@ static int t6050_dp_configure(struct phy *phy, union phy_configure_opts *opts)
 		return -EIO;
 	if (!dp->enabled)
 		return -EPIPE;
+	if ((cfg->set_lanes || cfg->set_voltages) && dp->multifunction && cfg->lanes > 2)
+		return -EINVAL;
 	if (cfg->set_rate) {
 		ret = atc_link_rate(dp, rate);
 		if (ret)
 			return ret;
 	}
-	/* The display controller owns the active lane count. */
+	/* Native setActiveLaneCount is a no-op; DCP controls the active count. */
 	if (cfg->set_voltages) {
 		if (dp->rate < 0)
 			return -EPIPE;
@@ -348,7 +479,7 @@ static const struct phy_ops t6050_dp_ops = {
 	.owner = THIS_MODULE,
 };
 
-int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr)
+int apple_t6050_dp_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr)
 {
 	struct t6050_dp *dp;
 
@@ -366,7 +497,111 @@ int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr)
 	*uhbr = false;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(apple_dp_phy_link_config);
+EXPORT_SYMBOL_GPL(apple_t6050_dp_link_config);
+
+/* The connector sets orientation before changing the alternate-mode mux. */
+static int t6050_set_orientation(struct t6050_dp *dp,
+				enum typec_orientation orientation)
+{
+	bool reverse = orientation == TYPEC_ORIENTATION_REVERSE;
+	int ret;
+
+	if (dp->combo)
+		return combo_orientation(dp, orientation);
+	guard(mutex)(&dp->lock);
+	if (orientation == TYPEC_ORIENTATION_NONE)
+		return atc_stop(dp);
+	if (dp->reverse == reverse)
+		return 0;
+	ret = atc_stop(dp);
+	if (!ret)
+		dp->reverse = reverse;
+	return ret;
+}
+
+static int t6050_set_typec_mode(struct t6050_dp *dp, struct typec_mux_state *state)
+{
+	bool multifunction;
+	int ret;
+
+	if (dp->combo)
+		return combo_mux(dp, state);
+	guard(mutex)(&dp->lock);
+	if (state->mode == TYPEC_STATE_SAFE)
+		return atc_stop(dp);
+	/* USB-only and USB4 require their controller's separate PHY interface. */
+	if (!state->alt || state->alt->svid != USB_TYPEC_DP_SID)
+		return -EOPNOTSUPP;
+	switch (state->mode) {
+	case TYPEC_DP_STATE_C:
+	case TYPEC_DP_STATE_E:
+		multifunction = false;
+		break;
+	case TYPEC_DP_STATE_D:
+		multifunction = true;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	if (dp->enabled && dp->multifunction == multifunction)
+		return 0;
+	ret = atc_stop(dp);
+	if (ret)
+		return ret;
+	dp->multifunction = multifunction;
+	ret = atc_start(dp);
+	if (!ret)
+		dev_info(dp->dev, "Type-C DP: %u lanes, %s orientation\n",
+			 multifunction ? 2 : 4, dp->reverse ? "reverse" : "normal");
+	return ret;
+}
+
+static int t6050_typec_orientation(struct typec_switch_dev *sw,
+				 enum typec_orientation orientation)
+{
+	return t6050_set_orientation(typec_switch_get_drvdata(sw), orientation);
+}
+
+static int t6050_typec_mode(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+	return t6050_set_typec_mode(typec_mux_get_drvdata(mux), state);
+}
+
+static void t6050_typec_switch_release(void *data)
+{
+	typec_switch_unregister(data);
+}
+
+static void t6050_typec_mux_release(void *data)
+{
+	typec_mux_unregister(data);
+}
+
+static int t6050_typec_register(struct t6050_dp *dp)
+{
+	struct typec_switch_desc sw_desc = {
+		.fwnode = dev_fwnode(dp->dev), .drvdata = dp,
+		.set = t6050_typec_orientation,
+	};
+	struct typec_mux_desc mux_desc = {
+		.fwnode = dev_fwnode(dp->dev), .drvdata = dp,
+		.set = t6050_typec_mode,
+	};
+	struct typec_switch_dev *sw;
+	struct typec_mux_dev *mux;
+	int ret;
+
+	sw = typec_switch_register(dp->dev, &sw_desc);
+	if (IS_ERR(sw))
+		return PTR_ERR(sw);
+	ret = devm_add_action_or_reset(dp->dev, t6050_typec_switch_release, sw);
+	if (ret)
+		return ret;
+	mux = typec_mux_register(dp->dev, &mux_desc);
+	if (IS_ERR(mux))
+		return PTR_ERR(mux);
+	return devm_add_action_or_reset(dp->dev, t6050_typec_mux_release, mux);
+}
 
 static int t6050_dp_probe(struct platform_device *pdev)
 {
@@ -383,11 +618,21 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	if (!dp)
 		return -ENOMEM;
 	dp->dev = dev;
+	dp->combo = of_device_is_compatible(dev->of_node, "apple,t6050-combo-phy");
+	if (dp->combo) {
+		u32 port;
+		if (of_property_read_u32(dev->of_node, "apple,port-index", &port) ||
+		    (port != 1 && port != 2) ||
+		    !of_property_present(dev->of_node, "apple,guest-port-reserved") ||
+		    !of_property_present(dev->of_node, "mode-switch"))
+			return -EINVAL;
+	}
+	dp->typec = of_property_present(dev->of_node, "mode-switch");
 	dp->rate = -1;
 	mutex_init(&dp->lock);
 	platform_set_drvdata(pdev, dp);
 	core = platform_get_resource_byname(pdev, IORESOURCE_MEM, "core");
-	if (!core || resource_size(core) < 0x2c400)
+	if (!core || resource_size(core) < (dp->combo ? 0x2c000 : 0x2c400))
 		return -EINVAL;
 	base = devm_ioremap_resource(dev, core);
 	if (IS_ERR(base))
@@ -398,13 +643,15 @@ static int t6050_dp_probe(struct platform_device *pdev)
 		dp->banks[bank] = base + core_banks[i].offset;
 		dp->resources[bank] = *core;
 		dp->resources[bank].start += core_banks[i].offset;
-		dp->resources[bank].end = dp->resources[bank].start + 0x4000 - 1;
+		dp->resources[bank].end = core->end;
 	}
 	for (unsigned int i = 0; i < ARRAY_SIZE(extra_banks); i++) {
 		u8 bank = extra_banks[i].bank;
 		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
 								   extra_banks[i].name);
 
+		if (bank == 38 && !dp->typec)
+			continue;
 		if (!res || resource_size(res) < 4)
 			return -EINVAL;
 		dp->banks[bank] = devm_ioremap_resource(dev, res);
@@ -440,7 +687,39 @@ static int t6050_dp_probe(struct platform_device *pdev)
 					return ret;
 			}
 	}
+	if (dp->typec) {
+		static const struct { const struct atc_op *ops; size_t count; } sequences[] = {
+			{ dp_reverse_init, ARRAY_SIZE(dp_reverse_init) },
+			{ mf_normal_init, ARRAY_SIZE(mf_normal_init) },
+			{ mf_reverse_init, ARRAY_SIZE(mf_reverse_init) },
+			{ mf_poweroff, ARRAY_SIZE(mf_poweroff) },
+			{ dp_group0_off, ARRAY_SIZE(dp_group0_off) },
+			{ dp_group1_off, ARRAY_SIZE(dp_group1_off) },
+		};
+		const struct atc_rate_op *rates[] = { dp_group0_on, dp_group1_on };
+		const size_t counts[] = { ARRAY_SIZE(dp_group0_on), ARRAY_SIZE(dp_group1_on) };
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(sequences); i++)
+			for (size_t j = 0; j < sequences[i].count; j++) {
+				ret = atc_validate_step(dp, &sequences[i].ops[j]);
+				if (ret)
+					return ret;
+			}
+		for (unsigned int group = 0; group < ARRAY_SIZE(rates); group++)
+			for (size_t i = 0; i < counts[group]; i++)
+				for (unsigned int rate = 0; rate < ARRAY_SIZE(link_rates); rate++) {
+					struct atc_op op = rates[group][i].op;
+					if (!(rates[group][i].rates & BIT(rate)))
+						continue;
+					op.value = rates[group][i].values[rate];
+					ret = atc_validate_step(dp, &op);
+					if (ret)
+						return ret;
+				}
+	}
 	for (unsigned int i = 0; i < ARRAY_SIZE(tunable_names); i++) {
+		if (i >= 9 && !dp->typec)
+			continue;
 		dp->tunables[i] = devm_apple_tunable_parse(dev, dev->of_node,
 				 tunable_names[i].name, &dp->resources[tunable_names[i].bank]);
 		if (IS_ERR(dp->tunables[i]))
@@ -474,12 +753,28 @@ static int t6050_dp_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
+	if (dp->typec) {
+		dp->fw_data = devm_platform_ioremap_resource_byname(pdev, "firmware-data");
+		if (IS_ERR(dp->fw_data))
+			return PTR_ERR(dp->fw_data);
+		dp->rtkit = devm_apple_rtkit_init(dev, dp, NULL, 0, &atc_fw_ops);
+		if (IS_ERR(dp->rtkit))
+			return dev_err_probe(dev, PTR_ERR(dp->rtkit), "cannot initialize PHY firmware IPC\n");
+	}
+	if (dp->combo) {
+		ret = combo_setup(pdev, dp);
+		if (ret)
+			return ret;
+	}
 	phy = devm_phy_create(dev, NULL, &t6050_dp_ops);
 	if (IS_ERR(phy))
 		return PTR_ERR(phy);
 	phy_set_drvdata(phy, dp);
-	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
-	return PTR_ERR_OR_ZERO(provider);
+	dp->combo_phy[2] = phy;
+	provider = devm_of_phy_provider_register(dev, dp->combo ? combo_xlate : of_phy_simple_xlate);
+	if (IS_ERR(provider))
+		return PTR_ERR(provider);
+	return dp->typec ? t6050_typec_register(dp) : 0;
 }
 
 static void t6050_dp_shutdown(struct platform_device *pdev)
@@ -487,12 +782,13 @@ static void t6050_dp_shutdown(struct platform_device *pdev)
 	struct t6050_dp *dp = platform_get_drvdata(pdev);
 
 	guard(mutex)(&dp->lock);
-	if (atc_stop(dp))
+	if (dp->combo ? combo_stop(dp) : atc_stop(dp))
 		dev_warn(dp->dev, "PHY shutdown incomplete after an earlier error\n");
 }
 
 static const struct of_device_id t6050_dp_match[] = {
 	{ .compatible = "apple,t6050-dp-phy" },
+	{ .compatible = "apple,t6050-combo-phy" },
 	{},
 };
 MODULE_DEVICE_TABLE(of, t6050_dp_match);
@@ -507,4 +803,4 @@ static struct platform_driver t6050_dp_driver = {
 };
 module_platform_driver(t6050_dp_driver);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Apple T6050 fixed DisplayPort PHY");
+MODULE_DESCRIPTION("Apple T6050 DisplayPort and Type-C USB combo PHY");
