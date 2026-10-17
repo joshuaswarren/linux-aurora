@@ -435,8 +435,9 @@ impl PrivateSpace {
     }
 
     /// Install tables backed by donated guest pages ([`sptm::donated_table`]).
-    /// A refused table operation leaves its page with the guest and creates
-    /// no table, so no outcome here is uncertain.
+    /// Preflight refusals leave pages with the guest. A failed native transition
+    /// may quarantine the first incomplete operation's page; the page-table
+    /// owner queries that page before releasing it.
     pub(super) fn map_tables(&mut self, operations: &mut [Operation]) -> (usize, Result) {
         if self.state.space().is_err() { return (0, Err(EIO)); }
         self.transport.submit_receipts(operations)

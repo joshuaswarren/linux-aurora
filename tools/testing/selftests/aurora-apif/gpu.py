@@ -130,3 +130,60 @@ fn failed_batch_receipt_keeps_possible_published_backing() {
 ''')
     subprocess.run([compiler,"--edition=2021","--test",str(temp / "test.rs"),"-o",str(temp / "tests")],check=True)
     subprocess.run([str(temp / "tests")],check=True)
+
+# Compile the production donation-ownership decisions with a counted release
+# stand-in. In particular, destroy success covers installed tables only.
+page_source = (root / "drivers/gpu/drm/asahi/mmu/sptm_pgtable.rs").read_text()
+start = page_source.index("#[derive(Debug, PartialEq, Eq)]\nenum DonatedPage")
+end = page_source.index("// SAFETY: An exclusively owned page", start)
+with tempfile.TemporaryDirectory(prefix="apif-gpu-ownership-") as directory:
+    temp = Path(directory)
+    (temp / "test.rs").write_text(
+        "type Result<T> = core::result::Result<T, i32>;\n" + page_source[start:end] + r'''
+#[test] fn completed_receipts_keep_their_exact_meaning() {
+    assert_eq!(donated_page_receipt(Some(0), Err(5)), DonatedPage::Taken);
+    assert_eq!(donated_page_receipt(Some(1), Err(5)), DonatedPage::Unused);
+}
+#[test] fn failed_transition_only_frees_a_confirmed_guest_page() {
+    assert_eq!(donated_page_receipt(None, Ok(0)), DonatedPage::Unused);
+    for state in [Ok(1), Ok(2), Ok(99), Err(5)] {
+        assert_eq!(donated_page_receipt(None, state), DonatedPage::Uncertain);
+    }
+}
+#[test] fn undefined_positive_receipt_never_proves_installation() {
+    for receipt in [2, 3, u64::MAX] {
+        assert_eq!(donated_page_receipt(Some(receipt), Ok(0)), DonatedPage::Uncertain);
+    }
+}
+#[test] fn successful_destroy_of_a_known_table_keeps_the_fast_path() {
+    assert!(donated_page_returned(0, false, || panic!("unnecessary provider query")));
+}
+#[test] fn zero_destroy_receipt_cannot_free_a_quarantined_failed_installation() {
+    for state in [Ok(1), Ok(2), Ok(99), Err(5)] {
+        assert!(!donated_page_returned(0, true, || state));
+    }
+    assert!(donated_page_returned(0, true, || Ok(0)));
+}
+#[test] fn partial_destroy_queries_each_page_and_keeps_unknown_ownership() {
+    assert!(donated_page_returned(2, false, || Ok(0)));
+    for state in [Ok(1), Ok(2), Err(5)] {
+        assert!(!donated_page_returned(2, false, || state));
+    }
+}
+#[test] fn mixed_failure_prefix_never_releases_the_quarantined_page() {
+    let dispositions = [donated_page_receipt(Some(0),Ok(0)),
+        donated_page_receipt(None,Ok(2)), donated_page_receipt(None,Ok(0))];
+    let mut freed = Vec::new();
+    let mut retained = Vec::new();
+    for (index, disposition) in dispositions.into_iter().enumerate() {
+        match disposition {
+            DonatedPage::Unused => freed.push(index),
+            DonatedPage::Taken => if donated_page_returned(0,false,||panic!()) {freed.push(index)},
+            DonatedPage::Uncertain => if donated_page_returned(0,true,||Ok(2)) {freed.push(index)} else {retained.push(index)},
+        }
+    }
+    assert_eq!(freed,[0,2]); assert_eq!(retained,[1]);
+}
+''')
+    subprocess.run([compiler,"--edition=2021","--test",str(temp / "test.rs"),"-o",str(temp / "tests")],check=True)
+    subprocess.run([str(temp / "tests")],check=True)

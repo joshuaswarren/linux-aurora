@@ -42,7 +42,33 @@ fn note_donated(added: u64) {
 
 /// A guest page the provider holds as a UAT table frame. Freed only after the
 /// provider confirms it returned the page; otherwise deliberately leaked.
-struct DonorFrame(*mut kernel::bindings::page);
+struct DonorFrame {
+    page: *mut kernel::bindings::page,
+    /// A failed/undefined installation receipt was not part of a confirmed
+    /// native table. Even destroy receipt 0 cannot release this page.
+    query_on_destroy: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DonatedPage { Taken, Unused, Uncertain }
+
+/// A completed MAP_TABLE returns 0 (taken) or 1 (unused). The first failed
+/// operation may have quarantined its page; later operations never ran.
+fn donated_page_receipt(receipt: Option<u64>, ownership: Result<u64>) -> DonatedPage {
+    match receipt {
+        Some(0) => DonatedPage::Taken,
+        Some(1) => DonatedPage::Unused,
+        Some(_) => DonatedPage::Uncertain,
+        None if matches!(ownership, Ok(0)) => DonatedPage::Unused,
+        None => DonatedPage::Uncertain,
+    }
+}
+
+fn donated_page_returned(receipt: u64, uncertain: bool,
+    query: impl FnOnce() -> Result<u64>) -> bool
+{
+    (!uncertain && receipt == 0) || matches!(query(), Ok(0))
+}
 
 // SAFETY: An exclusively owned page reference; only its physical address is
 // shared, with the provider.
@@ -53,13 +79,13 @@ unsafe impl Sync for DonorFrame {}
 impl DonorFrame {
     fn physical(&self) -> u64 {
         // SAFETY: The page is a live allocation owned by this frame.
-        unsafe { kernel::bindings::page_to_phys(self.0) as u64 }
+        unsafe { kernel::bindings::page_to_phys(self.page) as u64 }
     }
 
     /// Free a page the provider never took or has returned.
     fn free(self) {
         // SAFETY: The page is mapped for the guest again and owned only here.
-        unsafe { kernel::bindings::__free_pages(self.0, 0) };
+        unsafe { kernel::bindings::__free_pages(self.page, 0) };
     }
 }
 
@@ -287,8 +313,9 @@ impl PageTable {
     /// Donated tables: give the provider one zeroed Linux page for every
     /// missing L2/L3 of `range` before any leaf is published (native
     /// pmap_alloc_iommu_page). Each table's receipt is exact: 0 took the
-    /// page, 1 found the table present, a refusal or an unexecuted operation
-    /// left the page with Linux. Only taken pages stay allocated.
+    /// page, 1 found the table present. A failed operation's page is queried
+    /// before release; unexecuted tail pages stay with Linux. Taken or uncertain
+    /// pages remain allocated until their ownership is confirmed.
     fn install_donated_tables(&mut self, range: &Range<u64>) -> Result {
         let mut wanted = KVec::new();
         let mut last_l2 = None;
@@ -319,7 +346,7 @@ impl PageTable {
                 release(frames);
                 return Err(ENOMEM);
             }
-            let frame = DonorFrame(page);
+            let frame = DonorFrame { page, query_on_destroy: false };
             let (va, level) = match l3 {
                 None => (l2 * L3_SPAN * L3_PER_L2, 1),
                 Some(l3) => ((l2 * L3_PER_L2 + *l3 as u64) * L3_SPAN, 2),
@@ -339,36 +366,46 @@ impl PageTable {
             return Err(EINVAL);
         };
         let (completed, result) = private.map_tables(&mut operations);
+        // Only the first incomplete operation could have run. A failed
+        // native retype whose aliases could not be restored stays quarantined
+        // even though its operation did not complete. Query before freeing.
+        let failed_owner = if completed < frames.len() {
+            private.transport().donation_state(frames[completed].physical())
+        } else { Ok(0) };
         let mut taken = 0u64;
-        for (index, frame) in frames.into_iter().enumerate() {
+        let mut uncertain = false;
+        for (index, mut frame) in frames.into_iter().enumerate() {
             let (l2, l3) = wanted[index];
             let receipt = (index < completed).then(|| operations[index].result);
-            match receipt {
-                Some(0) => {
+            let ownership = if index == completed { failed_owner } else { Ok(0) };
+            match donated_page_receipt(receipt, ownership) {
+                DonatedPage::Taken => {
                     self.mark_table(l2, l3);
                     self.donors.push_within_capacity(frame).ok();
                     taken += 1;
                 }
-                Some(1) => {
-                    self.mark_table(l2, l3);
+                DonatedPage::Unused => {
+                    if receipt == Some(1) { self.mark_table(l2, l3); }
                     frame.free();
                 }
-                // An undefined receipt: keep the page until destroy asks the
-                // provider where it is. The table is not assumed to exist.
-                Some(_) => { self.donors.push_within_capacity(frame).ok(); }
-                None => frame.free(),
+                DonatedPage::Uncertain => {
+                    frame.query_on_destroy = true;
+                    self.donors.push_within_capacity(frame).ok();
+                    uncertain = true;
+                }
             }
         }
         if taken != 0 {
             self.table_count += taken;
             note_donated(taken);
         }
-        result
+        if uncertain { result.and(Err(EIO)) } else { result }
     }
 
     /// Return the donated frames after a confirmed destroy. A receipt of 0
-    /// means the provider returned every frame; otherwise ask about each one
-    /// and leak any it still holds.
+    /// means the provider returned every installed table. Failed installations
+    /// always need their own ownership query, as does every page for a partial
+    /// destroy. Retain any page whose return is not confirmed.
     fn release_donors(&mut self, receipt: u64) {
         let donors = core::mem::replace(&mut self.donors, KVec::new());
         let transport = match &self.space {
@@ -377,9 +414,9 @@ impl PageTable {
         };
         let mut retained = 0u64;
         for frame in donors {
-            let returned = receipt == 0
-                || transport.is_some_and(|transport|
-                    matches!(transport.donation_state(frame.physical()), Ok(0)));
+            let returned = donated_page_returned(receipt, frame.query_on_destroy, || {
+                transport.ok_or(EIO)?.donation_state(frame.physical())
+            });
             if returned { frame.free(); } else { retained += 1; }
         }
         if retained != 0 {
