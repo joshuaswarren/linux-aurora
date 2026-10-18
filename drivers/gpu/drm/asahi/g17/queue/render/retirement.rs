@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Paired render retirement evidence and bounded ownership of in-flight work.
 //! Queue progress and execution timestamps precede the completion stamps which

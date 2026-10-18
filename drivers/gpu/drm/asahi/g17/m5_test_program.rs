@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Fixed arithmetic shader for explicit hardware qualification.
 pub(crate) const PAGE_BYTES: usize = 0x4000;
 pub(crate) const ELEMENTS: usize = 1024;

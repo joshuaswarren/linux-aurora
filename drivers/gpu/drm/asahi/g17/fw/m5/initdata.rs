@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! M5 firmware initialization encodings and allocation layout.
 //! Opaque initialized words have no inferred meaning. Runtime ownership is

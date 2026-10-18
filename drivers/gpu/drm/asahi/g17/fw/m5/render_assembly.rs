@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Assemble an M5 render pair from shared render resources.
 use kernel::prelude::*;
 use super::{render_registers as regs, render as cmd};

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! USC free-list page addresses and block run tables.
 

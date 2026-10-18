@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Command planning for SPTM-owned GPU address spaces.
 //!
@@ -23,7 +23,7 @@ pub(super) const GLOBAL_RANGE: Range<u64> = 0xffff_fc20_0000_0000..0xffff_fc30_0
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Space {
     Global,
-    Private(u16),
+    Private(u8),
 }
 
 impl Space {
@@ -221,21 +221,6 @@ impl<'a> MapPlan<'a> {
     }
 }
 
-/// One MAP_TABLE whose frame is the guest page at `frame` (donated tables).
-/// Level 1 installs an L2, level 2 an L3. Receipt 0: the page became the
-/// table; 1: the table already existed and the page was not used.
-pub(super) fn donated_table(space: Space, va: u64, level: u64, frame: u64)
-    -> Result<Operation, InvalidRequest>
-{
-    let Space::Private(_) = space else { return Err(InvalidRequest); };
-    let handle = space.handle()?;
-    if !(1..=2).contains(&level) || frame == 0 || frame & (PAGE - 1) != 0 || va >= PRIVATE_END
-        || va & (if level == 1 { L2_SPAN } else { L3_SPAN } - 1) != 0 {
-        return Err(InvalidRequest);
-    }
-    Ok(Operation::new(2, [handle, va, level, frame, 0]))
-}
-
 /// The table operations a [`MapPlan`] would emit for `range`, issued once for a
 /// batch of runs that together cover exactly that range. Private spaces get
 /// their L2 tables then every L3; the shared space owns its L2s, so only L3s.
@@ -344,13 +329,9 @@ pub(super) enum ContextState {
     Destroyed,
 }
 
-/// Handles a client that negotiated wide handles may receive; 0xff always
-/// names the global object.
-pub(super) const WIDE_HANDLE_LIMIT: u64 = 4096;
-
 /// Provider object identity; this is deliberately not a physical root address.
 pub(super) struct PrivateState {
-    handle: u16,
+    handle: u8,
     state: ContextState,
 }
 
@@ -361,17 +342,15 @@ pub(super) enum TransitionError<E> {
 }
 
 impl PrivateState {
-    pub(super) fn new(handle: u64, wide: bool) -> Result<Self, InvalidRequest> {
-        if handle == 0xff || handle >= if wide { WIDE_HANDLE_LIMIT } else { 0xff } {
-            return Err(InvalidRequest);
-        }
-        Ok(Self { handle: handle as u16, state: ContextState::Unbound })
+    pub(super) fn new(handle: u64) -> Result<Self, InvalidRequest> {
+        if handle >= 0xff { return Err(InvalidRequest); }
+        Ok(Self { handle: handle as u8, state: ContextState::Unbound })
     }
 
     pub(super) fn state(&self) -> ContextState { self.state }
 
     /// Provider object identity, for diagnostics only.
-    pub(super) fn handle(&self) -> u16 { self.handle }
+    pub(super) fn handle(&self) -> u8 { self.handle }
 
     pub(super) fn space(&self) -> Result<Space, InvalidRequest> {
         match self.state {
@@ -417,16 +396,14 @@ impl PrivateState {
 
     /// The caller must confirm unmap of all backing before returning the object.
     /// Failed destruction retains its identity; it never makes it reusable.
-    /// Returns the provider's receipt: 0, or 2 when some donated table frames
-    /// could not be returned (query each).
     pub(super) fn destroy<E>(&mut self,
-        submit: impl FnOnce(&mut Operation) -> Result<(), E>) -> Result<u64, TransitionError<E>>
+        submit: impl FnOnce(&mut Operation) -> Result<(), E>) -> Result<(), TransitionError<E>>
     {
         if self.state != ContextState::Unbound { return Err(TransitionError::Invalid); }
         self.state = ContextState::Uncertain(None);
-        let mut operation = Operation::new(7, [self.handle as u64, 0, 0, 0, 0]);
-        submit(&mut operation).map_err(TransitionError::Provider)?;
+        submit(&mut Operation::new(7, [self.handle as u64, 0, 0, 0, 0]))
+            .map_err(TransitionError::Provider)?;
         self.state = ContextState::Destroyed;
-        Ok(operation.result)
+        Ok(())
     }
 }

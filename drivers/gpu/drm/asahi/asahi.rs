@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 #![recursion_limit = "2048"]
 
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
@@ -28,8 +28,6 @@ mod pgtable;
 mod queue;
 mod regs;
 mod slotalloc;
-mod stats;
-mod sysfs_exports;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
@@ -62,7 +60,7 @@ module! {
     type: DriverModule,
     name: "asahi",
     description: "AGX GPU driver for Apple silicon SoCs",
-    license: "GPL",
+    license: "Dual MIT/GPL",
     params: {
         m5_matrix_submit_test: u32 {
             default: 0,
@@ -171,11 +169,6 @@ module! {
             default: 0,
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
-        },
-        stats_export: u8 {
-            default: 1,
-            // permissions: 0,
-            description: "Export AGX firmware stats to sysfs (1 = on, 0 = off)",
         },
     },
 }

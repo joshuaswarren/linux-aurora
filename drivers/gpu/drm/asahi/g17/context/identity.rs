@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Context-local work-state identities. The low six bits address a node;
 //! the complete sequence distinguishes its owner until exact retirement.
@@ -10,17 +10,15 @@ pub(super) const STATE_COUNT: usize = 63;
 pub(super) const NODE_STRIDE: usize = 0x100;
 
 pub(crate) struct WorkStates {
-    pub(crate) available: kernel::sync::Arc<crate::g17::availability::Availability>,
     next: AtomicU32,
     live: [AtomicU32; 64],
 }
 impl WorkStates {
-    pub(crate) fn new() -> kernel::error::Result<Self> {
-        Ok(Self {
-            available: crate::g17::availability::Availability::new()?,
+    pub(crate) const fn new() -> Self {
+        Self {
             next: AtomicU32::new(0),
             live: [const { AtomicU32::new(FREE) }; 64],
-        })
+        }
     }
     pub(super) fn allocate(&self) -> Option<u32> {
         for _ in 0..64 {
@@ -38,12 +36,10 @@ impl WorkStates {
     }
     pub(super) fn release(&self, word: u32) -> bool {
         let index = (word & 63) as usize;
-        let released = index != STATE_COUNT
+        index != STATE_COUNT
             && self.live[index]
                 .compare_exchange(word, FREE, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok();
-        if released { self.available.notify(); }
-        released
+                .is_ok()
     }
 }
 

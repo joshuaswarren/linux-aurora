@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Resolve ambiguous recovery blame using slot identity and render execution evidence.
 

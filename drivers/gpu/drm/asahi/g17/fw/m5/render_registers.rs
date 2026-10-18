@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! M5 register adaptation over the shared render-pass/resource lowering.
 #![allow(dead_code)]
 use kernel::prelude::*;

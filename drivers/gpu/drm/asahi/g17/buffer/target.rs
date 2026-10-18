@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Rotating tile-map/heap metadata and the retained tail-pointer cache.
 //! Larger targets replace only the objects that need more capacity. Every old

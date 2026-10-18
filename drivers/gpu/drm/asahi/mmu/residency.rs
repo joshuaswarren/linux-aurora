@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Pressure-only backing residency for idle G17 user VMs.
 //!
@@ -441,7 +441,6 @@ impl Vm {
                 bo_inner.sgt = None;
             }
             if object.purge_locked().is_ok() {
-                crate::gem::set_mapping_held(object, false);
                 purged = purged.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             } else {
                 gate.note_evicted();
@@ -522,7 +521,6 @@ impl Vm {
             // tables above. Kernel mappings and other SG owners are excluded;
             // the C/Rust backing helper rechecks exclusion before release.
             if object.release_idle_pages_locked().is_ok() {
-                crate::gem::set_mapping_held(object, false);
                 unpinned = unpinned.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             }
             Ok(unpinned < target)
@@ -570,7 +568,7 @@ impl Vm {
                 if needs_sgt {
                     // Preserve review1's reservation/BO lock order: the getter
                     // may acquire the object reservation; never hold BO here.
-                    let sgt = Arc::new(crate::gem::held_sg_table(&map.object)?, GFP_KERNEL)?;
+                    let sgt = Arc::new(map.object.owned_sg_table()?, GFP_KERNEL)?;
                     let mut bo = bo_owner.inner().inner.lock();
                     if bo.sgt.is_none() { bo.sgt = Some(sgt); }
                     drop(bo);

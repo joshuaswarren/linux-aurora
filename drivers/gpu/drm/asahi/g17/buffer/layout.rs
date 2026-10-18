@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Wire geometry for the shared parameter-buffer owner and growth machinery.
 

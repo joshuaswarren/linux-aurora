@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Submission admission, preparation and the firmware visibility boundary.
 
@@ -17,8 +17,7 @@ use kernel::{
 };
 
 /// Each relocation consumes one unbuildable slot; their number is finite.
-/// Under render-slot pressure an unbuildable slot can recur; each move is bounded inside.
-const MAX_RENDER_RELOCATIONS: u32 = 64;
+const MAX_RENDER_RELOCATIONS: u32 = 8;
 /// vmfix6d B: a wait first keeps the previous 200 us poll latency for this
 /// many polls (short waits behave as before), then sleeps on the device
 /// change condition in one-jiffy slices.
@@ -108,31 +107,18 @@ impl Backend {
             return Err(EIO);
         }
         let interruptible = early.is_none();
-        // Move the credit token before taking the device mutex. The packet
-        // mutex orders prepare/cancel; it is never acquired by a publisher
-        // while holding the device mutex.
-        let mut outer = packet.preparation.lock().outer.take();
-        let prepared = packet.completion.render_slot();
-        let mut slot = if let Some(slot) = prepared {
-            // Preparation already reserved this pair and its depth. Keep that
-            // exact lease through publication and eventual retirement.
-            if early.is_some() { return Err(EINVAL); }
-            slot
-        } else {
-            let admission = match early {
-                Some(lease) => lease,
-                None => {
-                    let pool = {
-                        let state = self.shared.state.lock();
-                        (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
-                    };
-                    pool.acquire_render(self.owner, Request::of(packet))?
-                }
-            };
-            let slot = admission.slot();
-            packet.completion.attach_render_lease(admission)?;
-            slot
+        let admission = match early {
+            Some(lease) => lease,
+            None => {
+                let pool = {
+                    let state = self.shared.state.lock();
+                    (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
+                };
+                pool.acquire_render(self.owner, Request::of(packet))?
+            }
         };
+        let mut slot = admission.slot();
+        packet.completion.attach_render_lease(admission)?;
         self.busy_site.store(Site::None as u32, Ordering::Relaxed);
         let mut relocations = 0u32;
         let mut recovery_polls = 0;
@@ -155,13 +141,7 @@ impl Backend {
             let generation = progress::changes();
             let work_state = {
                 let preparation = self.shared.preparations.enter(interruptible)?;
-                let result = if prepared.is_some() {
-                    // The reversible aggregate claim belongs to Preparation;
-                    // publication commits it only after firmware visibility.
-                    packet.completion.work_state().and_then(|state| state.node_va()).map(|_| ())
-                } else {
-                    packet.completion.work_state().and_then(|state| state.acquire()).map(|_| ())
-                };
+                let result = packet.completion.work_state().and_then(|state| state.acquire());
                 if preparation.is_current() {
                     result
                 } else {
@@ -180,7 +160,7 @@ impl Backend {
                 }
                 result => {
                     result?;
-                    match self.ensure_render(packet, slot, false, None) {
+                    match self.ensure_render(packet, slot) {
                         Err(error) if error == EAGAIN => continue,
                         Err(error) if error == super::LEND_PENDING => Wait::Lend,
                         Err(error) if error == ENOSPC && !packet.is_published() && {
@@ -218,7 +198,7 @@ impl Backend {
                         Err(error) if error == EBUSY => Wait::Build,
                         result => {
                             result?;
-                            match self.prepare_render(slot, packet, deferred, outer.as_mut()) {
+                            match self.prepare_render(slot, packet, deferred) {
                                 Err(error)
                                     if !packet.is_published()
                                         && error == crate::g17::context::RENDER_CHANNEL_PENDING =>
@@ -414,12 +394,7 @@ impl Backend {
                 _ => return false,
             }
         };
-        // The scheduler path waits for an identity; this fast path does not.
-        if packet.ensure_pinned().is_err() {
-            return false;
-        }
         if !packet.begin_publication() {
-            packet.unpin_retired();
             packet.completion.fail_unpublished(ECANCELED);
             packet.set_early_result(Err(ECANCELED));
             return true;
@@ -430,7 +405,6 @@ impl Backend {
                 if packet.completion.status().get() != 0 {
                     <Self as crate::g17::job::Backend>::fail_vm(self, error);
                 }
-                packet.unpin_retired();
                 packet.completion.fail_unpublished(error);
                 packet.set_early_result(Err(error));
                 return true;

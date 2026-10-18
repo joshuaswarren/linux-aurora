@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Storage of one render pair and its per-command generations. Client aliases
 //! precede their backing owners so teardown cannot leave a dangling GPU view.

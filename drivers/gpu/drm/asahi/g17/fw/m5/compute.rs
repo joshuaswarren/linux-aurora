@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! M5 compute register programs. The operand and preemption layouts differ
 //! from the other G17 profile; sharing a register count does not imply a shared

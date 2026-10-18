@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! M5 qualification over the normal render-memory owner.
 use super::{buffer::target, context::Context, fw::{self, m5::{pool,
     render::M5RenderCommandInputs, render_registers::TaExtra},

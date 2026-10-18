@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Userspace submission queues: validate whole ioctls, retain mappings, and enqueue
 //! independent engines behind user fences and explicit logical prefixes.
@@ -127,10 +127,9 @@ impl<B: Backend> Queue<B> {
         })
     }
 
-    fn ensure_compute_scheduler(&mut self) -> Result {
-        // A waiting software job must not materialize a physical compute
-        // queue before its dependencies are ready. The publication path
-        // reserves/rebinds the physical queue using this packet's geometry.
+    fn ensure_compute(&mut self, required: Option<super::fw::m5::pool::PoolGeometry>) -> Result {
+        // Admission is checked even when this queue already owns a scheduler.
+        self.backend.ensure_compute(required)?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
                 &self.dev,
@@ -175,7 +174,10 @@ impl<B: Backend> Queue<B> {
         self.prune_frontier(index);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
-            self.ensure_compute_scheduler()?;
+            let required = match &command { Validated::Compute { plan, .. } => plan.map(|p| p.geometry), _ => None };
+            self.ensure_compute(required).map_err(|error| {
+                dev_info!(self.dev.as_ref(), "G17 compute graph preparation failed: {:?}\n", error); error
+            })?;
         }
         // Only earlier render ordinals covered by the explicit logical prefix
         // can delay host publication. These links never become GPU dependencies.

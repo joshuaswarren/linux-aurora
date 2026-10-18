@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Per-command tiling, fragment-status and auxiliary storage. Mappings precede
 //! their backing owners; a generation is reusable only after paired retirement.

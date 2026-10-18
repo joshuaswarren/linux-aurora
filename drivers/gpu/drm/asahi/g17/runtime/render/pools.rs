@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Device-wide references to render free lists. Two physical pairs bound to
 //! one logical context share one registration and one final release witness.

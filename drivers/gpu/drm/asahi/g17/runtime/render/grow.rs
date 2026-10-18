@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Deferred parameter-buffer growth. Event ingress retains the entire request;
 //! allocation borrows one pair under a preparation lease and runs off-lock.

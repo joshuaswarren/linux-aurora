@@ -1,10 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Retained physical compute queues. Logical ownership and command retirement never free an
 //! installed graph; the device retains it until both firmware processors have stopped.
 
 pub(crate) mod exit;
-mod configuration;
 pub(crate) mod retirement;
 
 use crate::g17::{
@@ -464,8 +463,6 @@ impl<T> Fifo<T> {
 
 struct Active {
     packet: Arc<Packet>,
-    /// The command is on this physical queue: its identity and QoS slot stay.
-    activity: crate::g17::context::ActivityMark,
     published: u64,
     work: Arc<WorkStateLease>,
     ticket: Option<Ticket>,
@@ -576,7 +573,6 @@ pub(crate) struct Queue {
     replay_prepared: bool,
     exit: Option<exit::Transaction>,
     installed: bool,
-    configuration: Option<configuration::Configuration>,
     m5_install: Option<u32>,
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
@@ -642,7 +638,6 @@ impl Queue {
             replay_prepared: false,
             exit: None,
             installed: false,
-            configuration: None,
             m5_install: None,
             outer_started: 0,
             published_config: None,
@@ -677,23 +672,13 @@ impl Queue {
     /// Quarantined commands still retain the scheduler until their retirement witness.
     pub(crate) fn idle_for_context(&self, context: &Arc<Context>) -> bool {
         !self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
-            || (self.active.len == 0 && self.replays.len == 0 && self.configuration.is_none())
+            || (self.active.len == 0 && self.replays.len == 0)
     }
     pub(crate) fn in_flight(&self) -> bool {
-        (self.active.len != 0 || self.configuration.is_some()) && !self.quarantined
+        self.active.len != 0 && !self.quarantined
     }
     pub(crate) fn room(&self) -> bool {
         !self.quarantined && !self.released && self.replays.len == 0 && self.active.len < IN_FLIGHT
-    }
-    /// Cold M5 installation publishes one configuration before the first kick.
-    /// A prepared claim prevents reassignment while these credits are owned.
-    pub(crate) fn outer_slots(&self) -> u32 {
-        if self.graph.m5 && self.m5_install.is_none() { 2 } else { 1 }
-    }
-    /// Publication slots not occupied by retained commands. Registry subtracts
-    /// unpublished packet claims under the device mutex before reserving one.
-    pub(crate) fn preparation_slots(&self) -> usize {
-        if self.room() && self.configuration.is_none() { IN_FLIGHT - self.active.len } else { 0 }
     }
     /// Quarantines without a pending witness no longer describe live pipe order.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
@@ -744,7 +729,7 @@ impl Queue {
     /// A completion hint can require a second visibility/recordless pass even
     /// when firmware has no more events to send. Do not poll idle or failed queues.
     pub(crate) fn retirement_polling(&self) -> bool {
-        self.configuration.is_some() || (!self.quarantined && self.retire_pending)
+        !self.quarantined && self.retire_pending
     }
     /// One diagnostic line describing the in-flight front after a recovery.
     pub(crate) fn describe_front(&self) {
@@ -898,7 +883,6 @@ impl Queue {
         mut complete_qos: impl FnMut(qos::Owner) -> Result,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        if recovery_state == 0 { self.retire_configuration(epoch)?; }
         if self.quarantined || !self.selected(masks) {
             return Ok(());
         }
@@ -986,11 +970,7 @@ impl Queue {
                     ))?;
                     self.retire_pending = false;
                     self.submitted = submitted;
-                    let mut active = self.active.pop().ok_or(EIO)?;
-                    // Exact retirement: the identity may move once nothing pins
-                    // it and no command of its VM remains on a physical queue.
-                    active.activity.end();
-                    active.packet.unpin_retired();
+                    let active = self.active.pop().ok_or(EIO)?;
                     if active.observed.is_some() {
                         self.last_end = self.last_end.max(timestamps[1]);
                     }
@@ -1121,11 +1101,7 @@ impl Queue {
             } else {
                 defer(Deferred::Release(completion))?;
             }
-            let mut active = self.active.pop().ok_or(EIO)?;
-            active.activity.end();
-            if !self.replay_retirement {
-                active.packet.unpin_retired();
-            }
+            drop(self.active.pop());
         }
         self.awaiting_witness = false;
         self.retirement_proved = false;
@@ -1220,20 +1196,16 @@ impl Queue {
 
     /// Caller already stopped both processors. No firmware owner can access retained mappings.
     pub(crate) fn stopped(&mut self, defer: &mut impl FnMut(Deferred) -> Result) -> Result {
-        if let Some(configuration) = self.configuration.take() { configuration.release(); }
         while let Some(packet) = self.replays.front() {
             defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
-            let packet = self.replays.pop().ok_or(EIO)?;
-            packet.unpin_retired();
+            drop(self.replays.pop());
         }
         while let Some(active) = self.active.front() {
             defer(Deferred::Retired(
                 active.packet.completion.clone(),
                 Err(EIO),
             ))?;
-            let mut active = self.active.pop().ok_or(EIO)?;
-            active.activity.end();
-            active.packet.unpin_retired();
+            drop(self.active.pop());
         }
         Ok(())
     }
@@ -1259,7 +1231,6 @@ impl Queue {
     }
     pub(crate) fn reusable(&self) -> bool {
         self.installed
-            && self.configuration.is_none()
             // A pool release in flight must be witnessed before any successor.
             && !matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
             // A recycled killed queue is offered only once its backing is vacant (re-arm path).
@@ -1331,7 +1302,7 @@ impl Queue {
             return Ok(true);
         }
         self.released = true;
-        if self.active.len == 0 && !self.quarantined && self.configuration.is_none() {
+        if self.active.len == 0 && !self.quarantined {
             if let Some(previous) = self.previous.as_ref().filter(|p| p.publication.is_none()) {
                 if let Err(error) = self.graph.set_owner(&previous.context) {
                     self.quarantined = true;
@@ -1396,7 +1367,7 @@ impl Queue {
     /// ring is reset to empty at the firmware's consumer cursor; the USC pool and
     /// descriptor ring are vacated and re-armed fresh before the next owner binds.
     pub(crate) fn recycle_killed(&mut self) -> Result<bool> {
-        if self.configuration.is_some() || !self.installed
+        if !self.installed
             || !self.exit.as_ref().is_some_and(|exit| exit.released())
             || self.active.len != 0
             || self.replays.len != 0
@@ -1425,7 +1396,7 @@ impl Queue {
     /// item ring restarts at the firmware consumer and the USC pool/ring are
     /// vacated and re-armed before any successor binds.
     pub(crate) fn recycle_failed(&mut self, recovery_state: u32) -> Result<bool> {
-        if self.configuration.is_some() || recovery_state != 0
+        if recovery_state != 0
             || !self.installed
             || !self.quarantined
             || self.spared_quarantine
@@ -1483,7 +1454,6 @@ impl Queue {
     /// closed (release_owner + the normal bind_owner rebinding).
     pub(crate) fn idle_owned(&self) -> bool {
         self.installed
-            && self.configuration.is_none()
             && self.owner.is_some()
             && !self.released
             && self.retirement_ready
@@ -1564,8 +1534,6 @@ impl Queue {
     pub(crate) fn pool_fits(&self, required: Option<crate::g17::fw::m5::pool::PoolGeometry>) -> bool {
         !self.growing && self.pool_phase == PoolPhase::Populated && self.pool.fits(required)
     }
-
-    pub(crate) fn growth_started(&self) -> bool { self.growing }
 
     /// Only a capacity increase waits for this queue's previously published work.
     /// Other queues and ordinary submissions keep their existing concurrency.
@@ -2043,7 +2011,6 @@ impl Queue {
         let published = host.next_compute_publication()?;
         self.active
             .push(Active {
-                activity: crate::g17::context::ActivityMark::begin(&packet.context),
                 packet: packet.clone(),
                 published,
                 work: work.clone(),
@@ -2113,8 +2080,6 @@ impl Queue {
                         Err(error)
                     })?;
                 visible = true;
-                // This Active and its Packet pins now own all visible records.
-                if let Some(configuration) = self.configuration.take() { configuration.release(); }
             } else if first {
                 producer = self.graph.first_descriptor(descriptor_high)?;
                 host.prepare_compute_shared()?;
@@ -2270,20 +2235,7 @@ impl Queue {
     /// The firmware consumes an empty channel installation before host-port
     /// configuration. EAGAIN leaves the packet unpublished and is retried by
     /// the common runtime with the device mutex released.
-    fn retire_configuration(&mut self, epoch: u64) -> Result {
-        let Some(configuration) = self.configuration.as_ref() else { return Ok(()); };
-        if !configuration.consumed(self.graph.cursors()?, epoch) { return Ok(()); }
-        self.configuration.take().ok_or(EIO)?.release();
-        if self.ordinal == 0 && self.active.len == 0 && self.replays.len == 0 {
-            self.retirement_ready = true;
-            if self.released { self.owner = None; }
-        }
-        Ok(())
-    }
-
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
-        let (epoch, state) = host.epoch()?;
-        if state == 0 { self.retire_configuration(epoch)?; }
         if let Some(end) = self.m5_install {
             return if self.graph.cursors()?.consumer == end || self.ordinal != 0 { Ok(()) }
                 else { Err(EAGAIN) };
@@ -2298,25 +2250,16 @@ impl Queue {
             scheduler_va: context.scheduler_va(), policy, qos_slot: context.qos_id(),
             qos_update: true, owner_pid: context.owner_pid(), context_update: false,
         })?;
-        if self.configuration.is_some() { return Err(EBUSY); }
-        self.configuration = Some(configuration::Configuration::new(context, 1, epoch)?);
-        let result = (|| {
-            let va = self.graph.record(None, CONFIG, 0xc0, config)?;
-            let configuration = self.configuration.as_mut().ok_or(EIO)?;
-            let producer = self.graph.append(0, va, || configuration.mark_visible())?;
-            self.m5_install = Some(producer);
-            self.installed = true;
-            host.publish_qid(self.kick.id())?;
-            host.publish_outer(policy.priority(), &crate::g17::fw::channels::WorkSlot::new(DataMaster::Compute,
-                self.graph.graph.gpu_va(), self.qid(), producer.try_into()?, true)?)?;
-            self.outer_started |= 1 << policy.priority();
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
-            Err(EAGAIN)
-        })();
-        if result.is_err() && self.configuration.as_ref().is_some_and(|owner| !owner.visible()) {
-            self.configuration.take().ok_or(EIO)?.release();
-        }
-        result
+        let va = self.graph.record(None, CONFIG, 0xc0, config)?;
+        let producer = self.graph.append(0, va, || {})?;
+        self.m5_install = Some(producer);
+        self.installed = true;
+        host.publish_qid(self.kick.id())?;
+        host.publish_outer(policy.priority(), &crate::g17::fw::channels::WorkSlot::new(DataMaster::Compute,
+            self.graph.graph.gpu_va(), self.qid(), producer.try_into()?, true)?)?;
+        self.outer_started |= 1 << policy.priority();
+        host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+        Err(EAGAIN)
     }
 
     /// Everything that must hold before a publication changes any state: a healthy device

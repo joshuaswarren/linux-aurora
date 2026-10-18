@@ -22,7 +22,6 @@ const EPOCH: u64 = CLOSED << 3;
 
 #[pin_data]
 pub(super) struct Gate {
-    available: Arc<super::availability::Availability>,
     state: AtomicU64,
     #[pin]
     wait: Mutex<()>,
@@ -31,10 +30,9 @@ pub(super) struct Gate {
 }
 
 impl Gate {
-    pub(super) fn new(available: Arc<super::availability::Availability>) -> Result<Arc<Self>> {
+    pub(super) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
-                available,
                 state: AtomicU64::new(EPOCH),
                 wait <- new_mutex!((), "g17::Gate::wait"),
                 changed <- new_condvar!("g17::Gate::changed"),
@@ -123,16 +121,12 @@ impl Gate {
         self.invalidate(REMOVED);
         let _wait = self.wait.lock();
         self.changed.notify_all();
-        drop(_wait);
-        self.available.notify();
     }
 
     pub(super) fn fail(&self) {
         self.invalidate(FAILED);
         let _wait = self.wait.lock();
         self.changed.notify_all();
-        drop(_wait);
-        self.available.notify();
     }
 
     /// Join builders with no device, queue or mapping lock held.
@@ -159,8 +153,6 @@ impl Gate {
             ) {
                 Ok(_) => {
                     self.changed.notify_all();
-                    drop(_wait);
-                    self.available.notify();
                     return true;
                 }
                 Err(current) => previous = current,

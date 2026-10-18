@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Program and tile storage pressure for shared render pools. Program sizes
 //! are byte counts after linking; they are independent of register allocation.

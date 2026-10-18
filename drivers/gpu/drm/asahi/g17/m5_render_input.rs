@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Explicit render qualification input: application buffers plus a UAPI command.
 //! Kernel queues, pool state and page tables are always constructed by the driver.
 use super::{command::{self,Access,AddressSpace},fw::render::RenderPass,

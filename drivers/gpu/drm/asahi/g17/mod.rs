@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! G17 GPU support.
 //!
@@ -37,7 +37,6 @@ mod render_resources;
 pub(crate) use command::Attachments;
 mod completion;
 pub(crate) mod context;
-pub(crate) mod availability;
 mod dependency;
 mod event;
 mod feed;
@@ -63,7 +62,6 @@ mod timeout;
 mod validation;
 mod m5_test;
 mod m5_render_test;
-mod m5_test_pin;
 mod m5_render_resources;
 mod m5_render_input;
 mod m5_test_program;
@@ -503,7 +501,6 @@ struct Firmware {
     init: initdata::InitData,
     _render_global: mmu::Vm,
     _pm_metrics: Option<Arc<KernelObject>>,
-    m5_test_pins: m5_test_pin::Pins,
     m5_compute: Option<KBox<m5_test::Compute>>,
     m5_render: Option<KBox<m5_render_test::Pair>>,
     uat: Arc<mmu::Uat>,
@@ -517,7 +514,6 @@ impl Drop for Firmware {
         // RTKit destruction releases the mailbox power references. Clear the bridge while
         // those references still keep the register block powered.
         self.bridge.disable();
-        self.m5_test_pins.release_after_stop();
     }
 }
 
@@ -683,8 +679,6 @@ struct Shared {
     descriptor_flags: [u32; 2],
     render_policy: Option<render_resources::M5Policy>,
     crashed: AtomicBool,
-    admission_stop: Arc<availability::Availability>,
-    physical_available: Arc<availability::Availability>,
     feed: Arc<feed::Feed>,
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
@@ -795,7 +789,6 @@ impl Shared {
     pub(super) fn notify_changed(&self) {
         progress::note_change();
         self.changed.notify_all();
-        self.physical_available.notify();
     }
 }
 
@@ -833,7 +826,6 @@ impl Shared {
                 break;
             };
             next.finish();
-            self.physical_available.notify();
         }
     }
 
@@ -883,7 +875,6 @@ impl Shared {
         if !self.crashed.swap(true, Ordering::AcqRel) {
             dev_err!(self.dev.as_ref(), "GPU runtime stopped, device lost\n");
         }
-        self.admission_stop.notify();
         self.queue_events();
     }
 
@@ -893,7 +884,6 @@ impl Shared {
     fn lose_device(self: &Arc<Self>, role: Role, crashlog: Option<&[u8]>) {
         self.preparations.fail();
         self.crashed.store(true, Ordering::Release);
-        self.admission_stop.notify();
         dev_err!(
             self.dev.as_ref(),
             "GPU firmware ({:?}) crashed, device lost\n",
@@ -976,9 +966,7 @@ impl Gpu {
         let max_frequency_khz = if m5 { fw::m5::initdata::J714_GPU_PERF_STATES[13].0 * 1000 }
             else { Self::max_frequency_khz(dev)? };
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
-        let physical_available = availability::Availability::new()?;
-        let preparations = preparation::Gate::new(physical_available.clone())?;
-        let admission_stop = availability::Availability::new()?;
+        let preparations = preparation::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let shared = Arc::pin_init(
@@ -992,8 +980,6 @@ impl Gpu {
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 render_policy,
                 crashed: AtomicBool::new(false),
-                admission_stop,
-                physical_available,
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
@@ -1106,7 +1092,7 @@ impl Gpu {
                 init: initdata::InitData::new(),
                 _render_global: render_global,
                 _pm_metrics: Some(Arc::new(pm_metrics, GFP_KERNEL)?),
-                m5_test_pins: m5_test_pin::Pins::new(), m5_compute: None, m5_render: None,
+                m5_compute: None, m5_render: None,
                 uat,
             }),
             GFP_KERNEL,
@@ -1161,7 +1147,7 @@ impl Gpu {
             queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags, metrics_ids),
             pool: object::Pool::new()?,
             render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
-            init, _render_global: render_global, _pm_metrics: Some(metrics), m5_test_pins: m5_test_pin::Pins::new(), m5_compute: None, m5_render: None, uat,
+            init, _render_global: render_global, _pm_metrics: Some(metrics), m5_compute: None, m5_render: None, uat,
         }), GFP_KERNEL)?;
         // Keep the complete ownership graph if startup fails after context
         // publication. A stopped CPU is not proof of engine DMA retirement.
@@ -1319,7 +1305,7 @@ impl gpu::Gpu for Gpu {
 
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         Some(uapi::drm_asahi_queue_limits {
-            max_queues: context::MAX_QUEUES,
+            max_queues: mmu::MAX_EXECUTION_CONTEXTS,
             max_in_flight_per_queue: hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u32,
             ..Default::default()
         })

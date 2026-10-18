@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Logical queue ownership of scheduler, QoS and work-state identities.
 //!
@@ -14,7 +14,7 @@ use super::{
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
-use core::sync::atomic::{fence, AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 use identity::{RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 
 /// No render channel of the context can move to a new pair yet: one of its
@@ -26,199 +26,44 @@ use kernel::{
     sync::{Arc, Mutex},
 };
 
-/// QoS slots belong to one device; the two lowest values are reserved.
-const QOS_SLOTS: usize = 128;
-const QOS_MASK: u128 = !3u128;
-/// No slot: every encoder rejects it (rows and owners index below 128).
-const QOS_NONE: u16 = 0xff;
-
-
-/// Logical queues are no longer bounded by their QoS slot (bound per
-/// publication); this bounds host bookkeeping only.
-pub(crate) const MAX_QUEUES: u32 = u32::MAX;
-
-struct QosState {
-    used: u128,
-    /// Published commands naming each slot that have not retired exactly.
-    pins: [u32; QOS_SLOTS],
-    /// The owning context's slot cell; the allocator never holds a context.
-    owners: [Option<Arc<AtomicU16>>; QOS_SLOTS],
-    /// That context's commands present on physical queues ([`QosLease`]).
-    activity: [Option<Arc<AtomicU32>>; QOS_SLOTS],
-    /// Steal candidates with no pin whose context still had commands on
-    /// physical queues. Nonzero means a command ran without its pin.
-    unpinned_active: u64,
-    steals: u64,
-    peak: u32,
-}
-
-/// Native AGXQOSManager registers a queue's QoS slot in prepare() and
-/// unregisters it in complete() once the queue is idle; a full table makes
-/// prepare() wait. Slots here are bound per published command the same way:
-/// an idle context keeps its slot until another needs one.
+/// QoS IDs belong to one device; the two lowest values are reserved.
 #[pin_data]
 pub(crate) struct QosIds {
-    available: Arc<super::availability::Availability>,
     #[pin]
-    state: Mutex<QosState>,
+    used: Mutex<u128>,
 }
 impl QosIds {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
-            try_pin_init!(Self {
-                available: super::availability::Availability::new()?,
-                state <- new_mutex!(QosState {
-                    used: 3, pins: [0; QOS_SLOTS], owners: [const { None }; QOS_SLOTS],
-                    activity: [const { None }; QOS_SLOTS], unpinned_active: 0,
-                    steals: 0, peak: 0,
-                }, "G17 QoS slots"),
-            }),
+            pin_init!(Self { used <- new_mutex!(3, "G17 QoS IDs") }),
             GFP_KERNEL,
         )
     }
-    /// A queue's lease; it names no slot until its first publication.
     pub(super) fn acquire(self: &Arc<Self>) -> Result<QosLease> {
+        let mut used = self.used.lock();
+        let id = used.trailing_ones();
+        if id == 128 {
+            return Err(enospc_site!("context.rs:42"));
+        }
+        *used |= 1u128 << id;
         Ok(QosLease {
             ids: self.clone(),
-            cell: Arc::new(AtomicU16::new(QOS_NONE), GFP_KERNEL)?,
-            activity: Arc::new(AtomicU32::new(0), GFP_KERNEL)?,
+            id: id as u8,
         })
     }
-    fn pin(&self, cell: &Arc<AtomicU16>, activity: &Arc<AtomicU32>) -> Result<u8> {
-        let mut state = self.state.lock();
-        let current = cell.load(Ordering::Acquire);
-        if current != QOS_NONE {
-            let slot = usize::from(current);
-            if state.owners[slot].as_ref().is_some_and(|owner| Arc::ptr_eq(owner, cell)) {
-                state.pins[slot] = state.pins[slot].checked_add(1).ok_or(EOVERFLOW)?;
-                return Ok(slot as u8);
-            }
-            cell.store(QOS_NONE, Ordering::Release);
-        }
-        let free = !state.used & QOS_MASK;
-        let slot = if free != 0 {
-            free.trailing_zeros() as usize
-        } else {
-            // Steal the lowest slot whose context has no unretired command:
-            // no pin and no command on any physical queue.
-            let mut unpinned_active = None;
-            let candidate = (2..QOS_SLOTS).find(|&slot| {
-                if state.pins[slot] != 0 || state.owners[slot].is_none() {
-                    return false;
-                }
-                let active = state.activity[slot].as_ref()
-                    .map_or(0, |activity| activity.load(Ordering::Acquire));
-                if active != 0 {
-                    unpinned_active.get_or_insert((slot, active));
-                }
-                active == 0
-            });
-            if let Some((slot, active)) = unpinned_active {
-                state.unpinned_active += 1;
-                let n = state.unpinned_active;
-                if n <= 8 || n.is_power_of_two() {
-                    pr_warn!("asahi: QoS slot {} has no pin but {} command(s) on physical queues; not taken (occurrence {})\n",
-                        slot, active, n);
-                }
-            }
-            let Some(slot) = candidate else { return Err(EBUSY); };
-            if let Some(victim) = state.owners[slot].take() {
-                victim.store(QOS_NONE, Ordering::Release);
-            }
-            drop(state.activity[slot].take());
-            state.steals += 1;
-            let steals = state.steals;
-            if steals <= 8 || steals.is_power_of_two() {
-                pr_info!("asahi: QoS slot {} taken from an idle queue (steal {})\n", slot, steals);
-            }
-            slot
-        };
-        let bit = 1u128 << slot;
-        state.used |= bit;
-        state.pins[slot] = 1;
-        state.owners[slot] = Some(cell.clone());
-        state.activity[slot] = Some(activity.clone());
-        cell.store(slot as u16, Ordering::Release);
-        let in_use = state.used.count_ones() - 2;
-        if in_use > state.peak {
-            state.peak = in_use;
-            if in_use % 16 == 0 {
-                pr_info!("asahi: QoS slots in use: peak {}\n", in_use);
-            }
-        }
-        Ok(slot as u8)
-    }
-    fn unpin(&self, cell: &Arc<AtomicU16>, slot: u8) {
-        let mut state = self.state.lock();
-        let index = usize::from(slot);
-        if index < QOS_SLOTS && state.owners[index].as_ref().is_some_and(|owner| Arc::ptr_eq(owner, cell))
-            && state.pins[index] != 0 {
-            state.pins[index] -= 1;
-            let available = state.pins[index] == 0;
-            drop(state);
-            if available { self.available.notify(); }
-        }
-    }
-    fn release(&self, cell: &Arc<AtomicU16>) {
-        let mut state = self.state.lock();
-        let current = cell.load(Ordering::Acquire);
-        if current == QOS_NONE { return; }
-        let slot = usize::from(current);
-        if state.owners[slot].as_ref().is_some_and(|owner| Arc::ptr_eq(owner, cell)) {
-            let active = state.activity[slot].as_ref()
-                .map_or(0, |activity| activity.load(Ordering::Acquire));
-            if state.pins[slot] != 0 || active != 0 {
-                pr_warn!("asahi: retaining closed QoS slot {}: pins={} active={}\n",
-                    slot, state.pins[slot], active);
-                return;
-            }
-            let owner = state.owners[slot].take();
-            let activity = state.activity[slot].take();
-            state.used &= !(1u128 << slot);
-            state.pins[slot] = 0;
-            cell.store(QOS_NONE, Ordering::Release);
-            drop(state);
-            drop(owner);
-            drop(activity);
-            self.available.notify();
-        }
-    }
-
 }
-/// Logical contexts alive, including closed ones still in teardown (their
-/// scheduler release and installed-graph detach), for capacity diagnostics.
-static LIVE_CONTEXTS: AtomicU32 = AtomicU32::new(0);
-static LIVE_CONTEXTS_PEAK: AtomicU32 = AtomicU32::new(0);
-
-fn note_live_context(added: i32) {
-    if added < 0 {
-        LIVE_CONTEXTS.fetch_sub(1, Ordering::AcqRel);
-        return;
-    }
-    let live = LIVE_CONTEXTS.fetch_add(1, Ordering::AcqRel) + 1;
-    let peak = LIVE_CONTEXTS_PEAK.fetch_max(live, Ordering::AcqRel);
-    if live > peak && live % 32 == 0 {
-        pr_info!("asahi: logical contexts alive: peak {}\n", live);
-    }
-}
-
 pub(super) struct QosLease {
     ids: Arc<QosIds>,
-    cell: Arc<AtomicU16>,
-    /// This context's commands present on physical queues: its slot is never
-    /// taken while nonzero, pinned or not.
-    activity: Arc<AtomicU32>,
+    id: u8,
 }
 impl QosLease {
-    /// The slot published commands name now; QOS_NONE (rejected by every
-    /// encoder) while unbound. Stable while a command is pinned.
     pub(super) fn id(&self) -> u8 {
-        self.cell.load(Ordering::Acquire) as u8
+        self.id
     }
 }
 impl Drop for QosLease {
     fn drop(&mut self) {
-        self.ids.release(&self.cell);
+        *self.ids.used.lock() &= !(1u128 << self.id);
     }
 }
 
@@ -364,7 +209,6 @@ impl Context {
         )?;
         let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
         let states = execution.work_states()?;
-        note_live_context(1);
         Ok(Self {
             execution,
             status,
@@ -407,23 +251,8 @@ impl Context {
     pub(crate) fn is_current(&self) -> bool {
         self.execution.is_current()
     }
-    pub(crate) fn pin(&self) -> Result<mmu::ContextPin> {
-        self.execution.pin()
-    }
-    pub(crate) fn unpin(&self, pin: mmu::ContextPin) {
-        self.execution.unpin(pin)
-    }
     pub(crate) fn is_sptm(&self) -> bool {
         self.execution.is_sptm()
-    }
-    pub(crate) fn execution_availability(&self) -> Option<&Arc<super::availability::Availability>> {
-        self.execution.availability()
-    }
-    pub(crate) fn qos_availability(&self) -> &Arc<super::availability::Availability> {
-        &self.qos.ids.available
-    }
-    pub(crate) fn work_state_availability(&self) -> &Arc<super::availability::Availability> {
-        &self.states.available
     }
     pub(crate) fn owner_pid(&self) -> u32 {
         self.owner_pid
@@ -432,26 +261,7 @@ impl Context {
         self.policy
     }
     pub(crate) fn qos_id(&self) -> u8 {
-        self.qos.id()
-    }
-    /// Claim the queue's QoS slot for one published command (see [`QosIds`]).
-    pub(crate) fn pin_qos(&self) -> Result<u8> {
-        self.qos.ids.pin(&self.qos.cell, &self.qos.activity)
-    }
-    /// A command of this context entered (`true`) or left a physical queue.
-    /// Neither its hardware identity nor its QoS slot moves while it is there.
-    pub(crate) fn note_activity(&self, entered: bool) {
-        if entered {
-            self.qos.activity.fetch_add(1, Ordering::AcqRel);
-        } else {
-            if self.qos.activity.fetch_sub(1, Ordering::AcqRel) == 1 {
-                self.qos.ids.available.notify();
-            }
-        }
-        self.execution.note_activity(entered);
-    }
-    pub(crate) fn unpin_qos(&self, slot: u8) {
-        self.qos.ids.unpin(&self.qos.cell, slot)
+        self.qos.id
     }
     pub(crate) fn scheduler_va(&self) -> u64 {
         self.scheduler.gpu_va()
@@ -564,68 +374,43 @@ impl Context {
 }
 
 /// Shared by all engines of one ioctl. Queued work initially consumes no node.
-struct WorkClaims {
-    preparing: u32,
-    retained: bool,
-}
-
-#[pin_data(PinnedDrop)]
 pub(crate) struct WorkStateLease {
     context: Arc<Context>,
     word: AtomicU32,
-    #[pin]
-    claims: Mutex<WorkClaims>,
 }
 impl WorkStateLease {
-    pub(crate) fn deferred(context: Arc<Context>) -> impl PinInit<Self, Error> {
-        try_pin_init!(Self {
+    pub(crate) fn deferred(context: Arc<Context>) -> Self {
+        Self {
             context,
             word: AtomicU32::new(FREE),
-            claims <- new_mutex!(WorkClaims { preparing: 0, retained: false }, "G17 work-state claims"),
-        })
+        }
     }
-
-    /// Existing publication/replay callers retain the aggregate node. A retry
-    /// must never return a sibling's node while that sibling can still use it.
     pub(crate) fn acquire(&self) -> Result<u32> {
-        let (result, unused) = {
-            let mut claims = self.claims.lock();
-            let result = self.acquire_inner();
-            if result.0.is_ok() { claims.retained = true; }
-            result
-        };
-        if let Some(word) = unused { self.context.states.release(word); }
-        result
-    }
-
-    /// A preparation owns one reversible claim. Only the last failed claim
-    /// may return a node, and only if no member has committed it for execution.
-    pub(crate) fn claim(self: &Arc<Self>) -> Result<WorkStateClaim> {
-        let (result, unused) = {
-            let mut claims = self.claims.lock();
-            let next = claims.preparing.checked_add(1).ok_or(EOVERFLOW)?;
-            let result = self.acquire_inner();
-            if result.0.is_ok() { claims.preparing = next; }
-            result
-        };
-        if let Some(word) = unused { self.context.states.release(word); }
-        result.map(|_| WorkStateClaim { lease: self.clone() })
-    }
-
-    /// Return an unused allocation separately so its availability notification
-    /// always runs after the aggregate claim mutex has been dropped.
-    fn acquire_inner(&self) -> (Result<u32>, Option<u32>) {
         let current = self.word();
-        if current != FREE { return (Ok(current), None); }
+        if current != FREE {
+            return Ok(current);
+        }
         let Some(candidate) = self.context.states.allocate() else {
-            return (Err(EBUSY), None);
+            let current = self.word();
+            return if current != FREE {
+                Ok(current)
+            } else {
+                Err(EBUSY)
+            };
         };
         if let Err(error) = self.context.work.lock().initialize(candidate) {
-            return (Err(error), Some(candidate));
+            self.context.states.release(candidate);
+            return Err(error);
         }
-        match self.word.compare_exchange(FREE, candidate, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => (Ok(candidate), None),
-            Err(installed) => (Ok(installed), Some(candidate)),
+        match self
+            .word
+            .compare_exchange(FREE, candidate, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(candidate),
+            Err(installed) => {
+                self.context.states.release(candidate);
+                Ok(installed)
+            }
         }
     }
     pub(crate) fn word(&self) -> u32 {
@@ -713,61 +498,11 @@ impl WorkStateLease {
             .ok_or(EINVAL)
     }
 }
-pub(crate) struct WorkStateClaim {
-    lease: Arc<WorkStateLease>,
-}
-impl WorkStateClaim {
-    pub(crate) fn commit(&self) { self.lease.claims.lock().retained = true; }
-}
-impl Drop for WorkStateClaim {
+impl Drop for WorkStateLease {
     fn drop(&mut self) {
-        let word = {
-            let mut claims = self.lease.claims.lock();
-            claims.preparing -= 1;
-            if claims.preparing == 0 && !claims.retained {
-                self.lease.word.swap(FREE, Ordering::AcqRel)
-            } else {
-                FREE
-            }
-        };
-        if word != FREE { self.lease.context.states.release(word); }
-    }
-}
-
-#[pinned_drop]
-impl PinnedDrop for WorkStateLease {
-    fn drop(self: core::pin::Pin<&mut Self>) {
         let word = self.word();
         if word != FREE {
             self.context.states.release(word);
         }
-    }
-}
-
-impl Drop for Context {
-    fn drop(&mut self) {
-        note_live_context(-1);
-    }
-}
-
-/// A command's presence on a physical queue (see [`Context::note_activity`]):
-/// begun when the queue takes the command at publication, ended when exact
-/// retirement removes it (before its pins are returned) or when the queue
-/// drops it on any other path.
-pub(crate) struct ActivityMark(Option<Arc<Context>>);
-impl ActivityMark {
-    pub(crate) fn begin(context: &Arc<Context>) -> Self {
-        context.note_activity(true);
-        Self(Some(context.clone()))
-    }
-    pub(crate) fn end(&mut self) {
-        if let Some(context) = self.0.take() {
-            context.note_activity(false);
-        }
-    }
-}
-impl Drop for ActivityMark {
-    fn drop(&mut self) {
-        self.end();
     }
 }

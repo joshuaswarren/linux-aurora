@@ -1,9 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Top-level GPU driver implementation.
 
-use crate::module_parameters;
-use kernel::bindings;
 use kernel::{
     c_str,
     device::Core,
@@ -48,12 +46,6 @@ unsafe impl Sync for AsahiData {}
 
 pub(crate) struct AsahiDriver {
     drm: ARef<drm::Device<Self>>,
-    /// Raw `struct device *` of the platform device. Stored once at probe
-    /// time so the `Drop` impl can find the sysfs file on unregister.
-    raw_dev: *mut bindings::device,
-    raw_stats: *mut core::ffi::c_void,
-    // Keep the allocation alive until sysfs readers have drained.
-    stats: Option<Arc<crate::stats::StatsSnapshot>>,
 }
 
 unsafe impl Send for AsahiDriver {}
@@ -265,18 +257,7 @@ impl platform::Driver for AsahiDriver {
 
         drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
 
-        // Register the sysfs file on the platform device. Must happen after
-        // the DRM device is registered so the device is fully bound.
-        let raw_dev = pdev.as_ref().as_raw();
-        let stats = (*drm).gpu.stats_snapshot();
-        let snapshot = stats.as_ref().map_or(core::ptr::null(), Arc::as_ptr);
-        let raw_stats = crate::sysfs_exports::register(
-            raw_dev,
-            snapshot,
-            stats.is_some() && *module_parameters::stats_export.value() != 0,
-        )?;
-
-        Ok(Self { drm, raw_dev, raw_stats, stats })
+        Ok(Self { drm })
     }
 }
 
@@ -320,32 +301,18 @@ impl AsahiDriver {
         }
         if matches!(cfg.firmware, g17::FirmwareProfile::M5Sptm)
             && !matches!(*crate::module_parameters::m5_drm_test.value(), 1 | 2) {
-            return Ok(Self { drm, raw_dev: pdev.as_ref().as_raw(),
-                raw_stats: core::ptr::null_mut(), stats: None });
+            return Ok(Self { drm });
         }
         if let Err(error) = drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0) {
             gpu.shutdown();
             return Err(error);
         }
-        // G17's firmware channel format has no supported stats decoder yet.
-        let raw_dev = pdev.as_ref().as_raw();
-        let raw_stats = match crate::sysfs_exports::register(
-            raw_dev, core::ptr::null(), false,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                gpu.shutdown();
-                return Err(error);
-            }
-        };
-        Ok(Self { drm, raw_dev, raw_stats, stats: None })
+        Ok(Self { drm })
     }
 }
 
 impl Drop for AsahiDriver {
     fn drop(&mut self) {
-        crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);
-        drop(self.stats.take());
         if let Some(gpu) = (*self.drm).gpu.as_any().downcast_ref::<g17::Gpu>() {
             // Also covers failure to allocate platform driver data after the probe body returned.
             gpu.shutdown();

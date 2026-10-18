@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Preflighted item-ring publications. Each lane retains an independent cursor
 //! and omits its configuration record only when its durable identity matches.

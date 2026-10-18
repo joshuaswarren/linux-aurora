@@ -64,7 +64,6 @@ impl State {
 enum Phase {
     Published,
     Acknowledged,
-    Witnessed,
     Unproven,
     Released,
 }
@@ -157,50 +156,32 @@ impl Queue {
         complete_qos: &mut impl FnMut(crate::g17::qos::Owner) -> Result,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        if !self.exit.as_ref().is_some_and(|exit| matches!(exit.phase, Phase::Acknowledged | Phase::Witnessed)) {
+        if !self.exit.as_ref().is_some_and(|exit| exit.phase == Phase::Acknowledged) {
             return Ok(());
         }
         if self.active.len != 0 {
             if !recovery_closed {
                 return Ok(());
             }
-            if self.exit.as_ref().ok_or(EIO)?.phase == Phase::Acknowledged {
-                let Some(context) = self.context() else {
-                    return Ok(());
-                };
-                let state = match State::read(context) {
-                    Ok(state) => state,
-                    Err(_) => return Ok(()),
-                };
-                if state.killed != 1 {
-                    self.exit.as_mut().ok_or(EIO)?.phase = Phase::Unproven;
-                    return Ok(());
-                }
-                // A kill ACK and killed flag identify the control transaction,
-                // not completion of firmware reads. M5 public timestamp words may
-                // stay zero even for executed work. Keep the precise Active/token
-                // owners until the ordinary exact retirement witness (or stop).
-                for active in self.active.iter() {
-                    let Some(ticket) = active.ticket.as_ref() else {
-                        return Ok(());
-                    };
-                    if self.valid_ticket(active, ticket).is_err() {
-                        return Ok(());
-                    }
-                }
-                let newest = self.active.back().and_then(|active| active.ticket).ok_or(EIO)?;
-                if !super::retirement::quarantined_retired(
-                    &newest,
-                    self.graph.cursors()?,
-                    self.graph.stamp()?,
-                    self.active.len as u32,
-                    self.submitted,
-                )? {
-                    return Ok(());
-                }
-                // Cache the full-queue witness across collector failures:
-                // submitted still counts entries already drained on a retry.
-                self.exit.as_mut().ok_or(EIO)?.phase = Phase::Witnessed;
+            let Some(context) = self.context() else {
+                return Ok(());
+            };
+            let state = match State::read(context) {
+                Ok(state) => state,
+                Err(_) => return Ok(()),
+            };
+            if state.killed != 1 {
+                self.exit.as_mut().ok_or(EIO)?.phase = Phase::Unproven;
+                return Ok(());
+            }
+            if !self.active.iter().all(|active| {
+                active
+                    .packet
+                    .completion
+                    .compute_words()
+                    .is_ok_and(|words| words == [0, 0] || words[1] != 0)
+            }) {
+                return Ok(());
             }
         }
         while let Some(active) = self.active.front() {
@@ -217,9 +198,7 @@ impl Queue {
                     ECANCELED
                 }),
             ))?;
-            let mut active = self.active.pop().ok_or(EIO)?;
-            active.activity.end();
-            active.packet.unpin_retired();
+            drop(self.active.pop());
         }
         self.exit.as_mut().ok_or(EIO)?.phase = Phase::Released;
         self.quarantined = true;

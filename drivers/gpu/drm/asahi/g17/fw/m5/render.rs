@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! M5 tiling and fragment command encoders, with shared kick bindings.
 
 #![allow(dead_code)]

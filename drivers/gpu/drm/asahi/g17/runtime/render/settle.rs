@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Exact packet timeout and paired firmware-drain settlement. Every fence and
 //! admission release is collected under the device lock and finished outside it.

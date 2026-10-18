@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Hardware configuration for t8140 platforms (A18 Pro).
 
@@ -196,9 +196,8 @@ pub(crate) mod low {
     pub(crate) const RENDER_BLOCKS: u64 = 0x70_0022_0000;
     /// Distance between consecutive blocks.
     pub(crate) const BLOCK_STRIDE: u64 = 0x10_8000;
-    /// Render blocks allocated at boot: the mapped blocks and the block that
-    /// holds the compute page list.
-    pub(crate) const RENDER_BLOCKS_ALLOCATED: usize = COMPUTE_PAGE_LIST_BLOCK + 1;
+    /// Render blocks allocated at boot.
+    pub(crate) const RENDER_BLOCKS_ALLOCATED: usize = 28;
     /// Render blocks mapped at boot.
     pub(crate) const RENDER_BLOCKS_MAPPED: usize = 22;
     /// Render blocks in the free list at boot.

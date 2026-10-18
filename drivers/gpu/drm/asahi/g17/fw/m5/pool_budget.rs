@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! G17S shared render private-memory demand. Counts describe hardware and
 //! simultaneous work; byte requirements come from the submitted programs.
 

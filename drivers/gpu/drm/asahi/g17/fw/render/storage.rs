@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Auxiliary render records and their initial images. Live event counters
 //! are accessed individually by the queue owner after publication.

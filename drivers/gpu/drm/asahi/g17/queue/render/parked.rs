@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Installed kick storage retained after a logical scheduler release is acknowledged.
 
@@ -240,9 +240,6 @@ impl ParkedPair {
             displaced: None,
             context_update: true,
             identity_update: true,
-            configuration: None,
-            configured_context: None,
-            configured_qos: None,
             history: [(1, self.ordinal, first_owner); 4],
             last_pass: None,
             replay: None,
@@ -322,9 +319,6 @@ impl ParkedPair {
             displaced: None,
             context_update: true,
             identity_update: true,
-            configuration: None,
-            configured_context: None,
-            configured_qos: None,
             history: [(5, self.ordinal, 0); 4],
             last_pass: None,
             replay: None,

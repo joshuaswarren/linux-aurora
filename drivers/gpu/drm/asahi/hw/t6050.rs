@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! M5 Pro GPU firmware and address-space configuration.
 use crate::g17::{Config, FirmwareProfile, Identity};
 use crate::hw::GpuVariant;

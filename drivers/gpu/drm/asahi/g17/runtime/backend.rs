@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Scheduler callbacks and the off-lock fence boundary of a logical queue.
 
@@ -38,10 +38,6 @@ impl Backend {
             }
             deferred.finish();
             if !packet.is_published() {
-                // Return the unpublished physical lease before its identity
-                // and aggregate work-state claims can become reusable.
-                drop(packet.completion.take_render_lease());
-                packet.unpin_retired();
                 packet.completion.fail_unpublished(error);
             }
             Err(error)
@@ -49,13 +45,6 @@ impl Backend {
             deferred.finish();
             Ok(packet.completion.scheduler_fence())
         }
-    }
-
-    /// Scheduler preparation already reserves these identities. The early
-    /// path is a nonblocking try; no hardware-capacity wait runs under the
-    /// scheduler's execution watchdog.
-    pub(super) fn pin_packet(&self, packet: &Arc<Packet>) -> Result {
-        packet.ensure_pinned()
     }
 
     fn release_queue(&self) -> Result {
@@ -69,14 +58,12 @@ impl Backend {
             .queues
             .teardown
             .close(&self.context, super::now_ns())?;
-        let growth = firmware.queues.release_compute(self.owner)?;
-        let result = firmware.queues.release_render(self.owner);
-        if result.is_ok() { firmware.queues.admission.release_owner(self.owner); }
+        firmware.queues.release_compute(self.owner)?;
+        firmware.queues.release_render(self.owner)?;
+        firmware.queues.admission.release_owner(self.owner);
         drop(state);
-        drop(growth);
-        self.shared.notify_changed();
         self.shared.queue_events();
-        result
+        Ok(())
     }
 }
 
@@ -167,70 +154,8 @@ impl job::Backend for Backend {
 
     /// Firmware kick parents order the same engine. Explicit cross-engine and
     /// input dependencies were already attached to the DRM scheduled job.
-    fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence> {
-        let mut preparation = packet.preparation.lock();
-        let stop_observed = self.shared.admission_stop.observe();
-        // The scheduler has consumed dependencies before this callback. Early
-        // publication and replay already own their original reservations.
-        if packet.early_result().is_some() || preparation.ready { return None; }
-        drop(preparation.wait.take());
-        let had_pin = packet.has_pin();
-        let had_compute = preparation.compute.is_some();
-        let had_outer = preparation.outer.is_some();
-        let had_render = packet.completion.render_slot().is_some();
-        let result = (|| -> Result<Option<crate::g17::availability::Wait>> {
-            if packet.cancel_requested() { return Err(ECANCELED); }
-            if packet.completion.status().get() != 0
-                || self.shared.crashed.load(Ordering::Acquire) { return Err(EIO); }
-            packet.check_dependencies()?;
-            if let Some(wait) = packet.prepare_pins()? { return Ok(Some(wait)); }
-            loop {
-                let domain = packet.context.work_state_availability();
-                let observed = domain.observe();
-                match packet.completion.work_state()?.claim() {
-                    Ok(claim) => {
-                        preparation.work_state = Some(claim);
-                        break;
-                    }
-                    Err(error) if error == EBUSY => {
-                        if let Some(wait) = domain.wait(observed)? { return Ok(Some(wait)); }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            self.prepare_physical(packet, &mut preparation)
-        })().and_then(|wait| {
-            if let Some(mut wait) = wait {
-                wait.also_wake(&self.shared.admission_stop, stop_observed)?;
-                Ok(Some(wait))
-            } else { Ok(None) }
-        });
-        match result {
-            Ok(None) => { preparation.ready = true; None }
-            Ok(Some(wait)) => {
-                // These claims never reached firmware. An aggregate node with
-                // a committed or still-preparing sibling remains retained.
-                if !had_outer { drop(preparation.outer.take()); }
-                if !had_render { drop(packet.completion.take_render_lease()); }
-                if !had_compute { drop(preparation.compute.take()); }
-                drop(preparation.work_state.take());
-                if !had_pin { packet.unpin_retired(); }
-                let fence = wait.fence();
-                preparation.wait = Some(wait);
-                Some(fence)
-            }
-            Err(error) => {
-                if !had_outer { drop(preparation.outer.take()); }
-                if !had_render { drop(packet.completion.take_render_lease()); }
-                if !had_compute { drop(preparation.compute.take()); }
-                drop(preparation.work_state.take());
-                if !had_pin { packet.unpin_retired(); }
-                packet.set_early_result(Err(error));
-                self.release_backlog(packet);
-                packet.completion.fail_unpublished(error);
-                None
-            }
-        }
+    fn prepare(&self, _packet: &Packet) -> Option<Fence> {
+        None
     }
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {
@@ -240,15 +165,6 @@ impl job::Backend for Backend {
         let mut deferred = match DeferredBatch::publication() {
             Ok(batch) => batch,
             Err(error) => {
-                {
-                    let mut preparation = packet.preparation.lock();
-                    drop(preparation.outer.take());
-                    drop(packet.completion.take_render_lease());
-                    drop(preparation.compute.take());
-                    drop(preparation.work_state.take());
-                    drop(preparation.wait.take());
-                    packet.unpin_retired();
-                }
                 self.release_backlog(&packet);
                 if packet.completion.status().get() != 0 {
                     <Self as job::Backend>::fail_vm(self, error);
@@ -257,35 +173,16 @@ impl job::Backend for Backend {
                 return Err(error);
             }
         };
-        let began = {
-            let mut preparation = packet.preparation.lock();
-            let began = packet.begin_publication();
-            drop(preparation.wait.take());
-            began
-        };
-        let result = if !began {
+        let result = if !packet.begin_publication() {
             Err(ECANCELED)
         } else if packet.completion.status().get() != 0 {
             Err(EIO)
-        } else if let Err(error) = self.pin_packet(&packet) {
-            Err(error)
         } else {
             match packet.engine() {
                 Engine::Compute => self.compute_packet(&packet, &mut deferred),
                 Engine::Render => self.render_packet(&packet, &mut deferred),
             }
         };
-        // Physical prepare claims protect the checked queue until publication
-        // has either installed its Active owner or failed without visibility.
-        {
-            let mut preparation = packet.preparation.lock();
-            drop(preparation.outer.take());
-            if result.is_err() && !packet.is_published() { drop(packet.completion.take_render_lease()); }
-            if let Some(claim) = preparation.work_state.take() {
-                if result.is_ok() || packet.is_published() { claim.commit(); }
-            }
-            drop(preparation.compute.take());
-        }
         self.release_backlog(&packet);
         self.finish_publication(&packet, result, &mut deferred)
     }
@@ -304,20 +201,7 @@ impl job::Backend for Backend {
 
     fn cancel(&self, packet: Arc<Packet>) {
         self.release_backlog(&packet);
-        let cancelled = {
-            let mut preparation = packet.preparation.lock();
-            let cancelled = packet.request_cancel();
-            if cancelled {
-                drop(preparation.outer.take());
-                drop(packet.completion.take_render_lease());
-                drop(preparation.compute.take());
-                drop(preparation.work_state.take());
-                packet.unpin_retired();
-            }
-            drop(preparation.wait.take());
-            cancelled
-        };
-        if cancelled {
+        if packet.request_cancel() {
             Deferred::Unpublished(packet.completion.clone(), ECANCELED).finish();
             return;
         }

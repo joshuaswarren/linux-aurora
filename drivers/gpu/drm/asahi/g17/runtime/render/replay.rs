@@ -81,7 +81,7 @@ impl Firmware {
         for slot in 0..self.queues.render.entries.len() {
             let recheck = self.queues.render.entries[slot].as_ref().is_some_and(|entry| {
                 !(entry.preparing.is_some() || entry.growing || entry.constructing)
-                    && entry.pair.as_ref().is_some_and(|pair| pair.abandonment_pending() || pair.configuration_pending())
+                    && entry.pair.as_ref().is_some_and(|pair| pair.abandonment_pending())
             });
             if recheck {
                 let progressed = self.with_render(slot, |pair, host| {
@@ -191,7 +191,7 @@ impl Firmware {
                     if !packet.is_published() {
                         self.with_render(slot, |pair, _| pair.discard_prepared(&packet))?;
                     }
-                    if packet.is_published() || (error != EBUSY && error != EAGAIN) {
+                    if error != EBUSY && error != EAGAIN {
                         self.with_render(slot, |pair, _| {
                             pair.fail_replay(error, &mut |event| deferred.push(event))
                         })?;

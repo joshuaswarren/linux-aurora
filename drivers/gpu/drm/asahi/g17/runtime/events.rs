@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Event and restart callbacks borrow the complete firmware owner. The reusable
 //! completion collector belongs to the worker and is drained outside its mutex.
@@ -12,9 +12,6 @@ use crate::g17::{
     Firmware, Role,
 };
 use kernel::{prelude::*, sync::Arc};
-
-/// Wake interval while a tiler heap may still shrink.
-const SHRINK_WAKE_NS: u64 = 1_000_000_000;
 
 struct Service<'a> {
     firmware: &'a mut Firmware,
@@ -453,13 +450,11 @@ impl crate::g17::Shared {
         let idle = firmware.idle_check(now, in_flight)?;
         firmware.reclaim_drained_renders(deferred)?;
         firmware.service_compute_exit(deferred)?;
-        let pools = firmware.service_compute_pools(deferred, now)?;
-        let mut shrinking = false;
+        firmware.service_compute_pools(deferred)?;
         if !firmware.recovery.pending() {
             firmware
                 .queues
                 .vacate_evicted_render_pools(&firmware.init, deferred)?;
-            shrinking = firmware.queues.shrink_render_heaps(&firmware.init, now, deferred);
         }
         {
             let mut reclaim = self.reclaim.lock();
@@ -468,13 +463,8 @@ impl crate::g17::Shared {
                 self.queue_reclaims();
             }
         }
-        if let Some(domain) = firmware.init.poll_outer_progress()? {
-            deferred.notify_outer(&domain);
-        }
         let backpressured = firmware.render_control_backpressured();
         let polling = backpressured
-            || firmware.init.outer_waiting()
-            || firmware.compute_growth_pending()
             || firmware.queues.replay_outer_wait.is_some()
             || firmware.queues.replay_consumer_wait.is_some()
             || firmware.queues.render.replay_polling()
@@ -490,18 +480,6 @@ impl crate::g17::Shared {
         if polling {
             self.queue_poll();
         }
-        // A heap with growth to give back is re-evaluated at least once per
-        // shrink period, also while the device is otherwise idle.
-        let idle = if shrinking {
-            Some(idle.map_or(SHRINK_WAKE_NS, |delay| delay.min(SHRINK_WAKE_NS)))
-        } else {
-            idle
-        };
-        // A retained compute pool gives its backing back when it expires.
-        let idle = match (idle, pools) {
-            (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
-            (delay, expiry) => delay.or(expiry),
-        };
         if let Some(delay) = idle {
             self.queue_idle(delay);
         }

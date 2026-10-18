@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Exact identities and visibility witnesses for a physical compute queue.
 //! A shared work-state counter can include other engines and cannot prove this queue retired.

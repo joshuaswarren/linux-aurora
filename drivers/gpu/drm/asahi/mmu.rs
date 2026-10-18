@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! GPU UAT (MMU) management
 //!
@@ -115,6 +115,8 @@ const UAT_NUM_CTX: usize = 64;
 /// Application contexts owned by independent logical queues. Contexts 0..4
 /// and 63 remain reserved for the firmware and device-global resources.
 const EXECUTION_CONTEXT_MASK: u64 = ((1u64 << 63) - 1) & !((1u64 << 5) - 1);
+/// Maximum simultaneously retained logical queue contexts.
+pub(crate) const MAX_EXECUTION_CONTEXTS: u32 = EXECUTION_CONTEXT_MASK.count_ones();
 /// First context available for users
 const UAT_USER_CTX_START: usize = 1;
 /// Number of available user contexts
@@ -566,7 +568,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         }
 
         if let Some(asid) = self.slot() {
-            mem::sync();
+            fence(Ordering::SeqCst);
             self.tlbi_range(asid as u8, unmap_start, unmap_range as usize);
             mod_dev_dbg!(
                 self.dev,
@@ -675,7 +677,7 @@ impl VmInner {
         }
 
         if let Some(asid) = self.slot() {
-            mem::sync();
+            fence(Ordering::SeqCst);
             self.tlbi_range(asid as u8, va.addr(), va.range() as usize);
             mod_dev_dbg!(
                 self.dev,
@@ -694,13 +696,13 @@ impl VmInner {
 
     /// A failed map has no GPUVA owner to retain its backing or remove its leaves.
     /// GPUVM has already split or removed overlaps throughout this operation's range.
-    fn rollback_failed_map(&mut self, addr: u64, size: u64) -> bool {
+    fn rollback_failed_map(&mut self, addr: u64, size: u64) {
         // Include the current segment: map_pages can fail after writing some of its leaves.
         // The checked GPUVM operation supplies an aligned range without overflow.
         let result = self.page_table.discard_partial_map(addr..addr + size);
         if self.uat_inner.firmware == UatFirmware::Handoff {
             if let Some(asid) = self.slot() {
-                mem::sync();
+                fence(Ordering::SeqCst);
                 self.tlbi_range(asid as u8, addr, size as usize);
                 mem::sync();
             }
@@ -713,7 +715,6 @@ impl VmInner {
                 error
             );
         }
-        result.is_ok()
     }
 
     fn mapping_mutation(&mut self) -> MappingMutation {
@@ -776,7 +777,6 @@ impl VmInner {
     /// already invalidate.
     fn tlbi_contexts_naming_root(&self, iova: u64, size: usize) {
         if self.uat_inner.firmware == UatFirmware::Handoff {
-            mem::sync();
             return;
         }
 
@@ -788,14 +788,11 @@ impl VmInner {
     }
 
     fn tlbi_context_mask(&self, iova: u64, size: usize, contexts: u64) {
-        // Complete new leaves even if no context currently names this root:
-        // a later context can publish it without repeating the map operation.
-        // DMB orders accesses but does not complete stores before TLBI; the
-        // GPU uses outer-shareable invalidation and the barrier covers it.
-        mem::sync();
         if contexts == 0 {
             return;
         }
+
+        fence(Ordering::SeqCst);
         for ctx in 0..UAT_NUM_CTX {
             if contexts & (1 << ctx) != 0 {
                 mem::tlbi_range_or_asid(ctx as u8, iova as usize, size);
@@ -805,26 +802,24 @@ impl VmInner {
     }
 
     /// Map an `mm::Node` representing an mapping in VA space.
-    fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> MappingOutcome {
+    fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
         self.map_node_with_cached_prefix(node, prot, 0, 0..0)
     }
 
     /// Select initial attributes while the newly reserved node is unpublished.
     fn map_node_with_cached_prefix(&mut self, node: &mm::Node<(), KernelMappingInner>,
-        prot: Prot, cached_prefix: usize, cached_late: Range<usize>) -> MappingOutcome {
-        let Some(end) = node.start().checked_add(node.mapped_size as u64) else {
-            return MappingOutcome::Unpublished(EOVERFLOW);
-        };
+        prot: Prot, cached_prefix: usize, cached_late: Range<usize>) -> Result {
+        let end = node
+            .start()
+            .checked_add(node.mapped_size as u64)
+            .ok_or(EOVERFLOW)?;
         let _mutation = self.mapping_mutation();
-        if let Err(error) = self.page_table.prepare_map(node.start()..end) {
-            // No leaf belonging to this new node has been submitted. In
-            // particular, a pre-existing shadow must not be unmapped here.
-            return MappingOutcome::Unpublished(error);
-        }
+        self.page_table.prepare_map(node.start()..end)?;
         let result = self.map_node_prepared(node, prot, cached_prefix, cached_late);
-        MappingOutcome::after_map(result, || {
-            self.rollback_failed_map(node.start(), node.mapped_size as u64)
-        })
+        if result.is_err() {
+            self.rollback_failed_map(node.start(), node.mapped_size as u64);
+        }
+        result
     }
 
     /// Install only into the empty range reserved by `map_node`.
@@ -948,14 +943,6 @@ pub(crate) struct ExecutionContext {
     vm: Vm,
 }
 
-/// One published command's claim on its context's hardware identity, held
-/// until the command retires exactly (as the native context ID manager counts).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ContextPin {
-    pub(crate) id: u8,
-    pub(crate) generation: u64,
-}
-
 struct DirectExecutionRoot {
     released: AtomicBool,
     inner: Arc<UatInner>,
@@ -981,57 +968,25 @@ impl ExecutionContext {
         }
     }
 
-    pub(crate) fn availability(&self) -> Option<&Arc<crate::g17::availability::Availability>> {
-        match &self.root {
-            ExecutionRoot::Direct(_) => None,
-            #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => Some(root.availability()),
-        }
-    }
-
-    /// The hardware identity commands name now. SPTM identities are bound
-    /// per publication ([`Self::pin`]); an unbound context reports
-    /// `u32::MAX`, which every descriptor encoder rejects. While a command is
-    /// pinned the value cannot change.
     pub(crate) fn id(&self) -> u32 {
         match &self.root {
             ExecutionRoot::Direct(root) => root.id.into(),
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.bound().map_or(u32::MAX, |(id, _)| id.into()),
+            ExecutionRoot::Sptm(root) => root.id.into(),
         }
     }
     pub(crate) fn generation(&self) -> u8 {
         match &self.root {
             ExecutionRoot::Direct(root) => root.generation,
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.bound().map_or(0, |(_, generation)| generation as u8),
+            ExecutionRoot::Sptm(root) => root.generation as u8,
         }
     }
-    /// Zero (rejected by the render token encoder) while unbound.
     pub(crate) fn native_generation(&self) -> u64 {
         match &self.root {
             ExecutionRoot::Direct(root) => u64::from(root.generation),
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.bound().map_or(0, |(_, generation)| generation),
-        }
-    }
-
-    /// Claim the context's hardware identity for one published command until
-    /// it retires exactly; binds or steals one first if needed. EBUSY: every
-    /// identity names unretired work.
-    pub(crate) fn pin(&self) -> Result<ContextPin> {
-        match &self.root {
-            ExecutionRoot::Direct(root) => Ok(ContextPin { id: root.id, generation: root.generation.into() }),
-            #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.pin(&self.vm),
-        }
-    }
-
-    pub(crate) fn unpin(&self, pin: ContextPin) {
-        match &self.root {
-            ExecutionRoot::Direct(_) => {}
-            #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.unpin(pin),
+            ExecutionRoot::Sptm(root) => root.generation,
         }
     }
     pub(crate) fn vm(&self) -> &Vm { &self.vm }
@@ -1040,7 +995,7 @@ impl ExecutionContext {
     pub(crate) fn work_states(&self) -> Result<Arc<crate::g17::context::identity::WorkStates>> {
         match &self.root {
             ExecutionRoot::Direct(_) => Ok(Arc::new(
-                crate::g17::context::identity::WorkStates::new()?, GFP_KERNEL)?),
+                crate::g17::context::identity::WorkStates::new(), GFP_KERNEL)?),
             #[cfg(CONFIG_ARM64)]
             ExecutionRoot::Sptm(root) => Ok(root.states.clone()),
         }
@@ -1053,12 +1008,6 @@ impl ExecutionContext {
             #[cfg(CONFIG_ARM64)]
             ExecutionRoot::Sptm(root) => root.release(&self.vm),
         }
-    }
-
-    /// Commands present on physical queues keep an identity unavailable.
-    pub(crate) fn note_activity(&self, entered: bool) {
-        #[cfg(CONFIG_ARM64)]
-        if let ExecutionRoot::Sptm(root) = &self.root { root.note_activity(entered); }
     }
 
     pub(crate) fn is_current(&self) -> bool {
@@ -1101,7 +1050,7 @@ impl DirectExecutionRoot {
             owned || (low == 0 && high == 0)
         };
         if release {
-            mem::sync();
+            fence(Ordering::SeqCst);
             mem::tlbi_asid(self.id);
             mem::sync();
             if let Ok(mut inner) = self.inner.lock() {
@@ -1247,34 +1196,6 @@ impl TimestampMapping {
     }
 }
 
-/// Ownership receipt for construction of a fresh kernel mapping. A successful
-/// rollback is already an unmap witness; replaying a strict unmap on that empty
-/// range would fail EFAULT and incorrectly retain its VA, GEM pin and VM.
-enum MappingOutcome {
-    Mapped,
-    Unpublished(Error),
-    Retained(Error),
-}
-impl MappingOutcome {
-    fn after_map(result: Result, rollback: impl FnOnce() -> bool) -> Self {
-        match result {
-            Ok(()) => Self::Mapped,
-            Err(error) if rollback() => Self::Unpublished(error),
-            Err(error) => Self::Retained(error),
-        }
-    }
-
-    /// Called only after dropping the VM execution/reservation lock. Unknown
-    /// provider state retains the entire node; confirmed rollback frees it.
-    fn finish<T>(self, node: T) -> Result<T> {
-        match self {
-            Self::Mapped => Ok(node),
-            Self::Unpublished(error) => { drop(node); Err(error) }
-            Self::Retained(error) => { core::mem::forget(node); Err(error) }
-        }
-    }
-}
-
 /// An object mapping into a [`Vm`], which reserves the address range from use by other mappings.
 pub(crate) struct KernelMapping(ManuallyDrop<mm::Node<(), KernelMappingInner>>);
 
@@ -1372,7 +1293,7 @@ impl KernelMapping {
                 self.iova()..self.iova() + prefix as u64,
                 PROT_GPU_FW_PRIV_RW,
             )?;
-            mem::sync();
+            fence(Ordering::SeqCst);
             mem::tlbi_all();
             mem::sync();
             let mut after = [0; MAX_PAGES];
@@ -1422,7 +1343,7 @@ impl KernelMapping {
                 self.size()
             );
         }
-        mem::sync();
+        fence(Ordering::SeqCst);
 
         // If we don't have (and have never had) a VM slot, just return
         let slot = match owner.slot() {
@@ -1585,7 +1506,7 @@ impl Drop for KernelMapping {
         }
 
         if let Some(asid) = owner.slot() {
-            mem::sync();
+            fence(Ordering::SeqCst);
             owner.tlbi_range(asid as u8, self.iova(), self.size());
             mod_dev_dbg!(
                 owner.dev,
@@ -2179,9 +2100,11 @@ impl Vm {
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
         core::mem::drop(inner);
-        // The receipt distinguishes confirmed rollback from uncertain
-        // provider state. Do not strictly unmap an already rolled-back range.
-        ret.finish(node).map(KernelMapping::new)
+        // Install the cleanup owner even on partial-map failure. Its Drop
+        // removes any published leaves before returning the VA and backing.
+        let mapping = KernelMapping::new(node);
+        ret?;
+        Ok(mapping)
     }
 
     /// Map a GEM object into this Vm at a specific address.
@@ -2244,9 +2167,11 @@ impl Vm {
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
         core::mem::drop(inner);
-        // The receipt distinguishes confirmed rollback from uncertain
-        // provider state. Do not strictly unmap an already rolled-back range.
-        ret.finish(node).map(KernelMapping::new)
+        // Install the cleanup owner even on partial-map failure. Its Drop
+        // removes any published leaves before returning the VA and backing.
+        let mapping = KernelMapping::new(node);
+        ret?;
+        Ok(mapping)
     }
 
     /// Map a range of a GEM object into this Vm using GPUVM.
@@ -2381,23 +2306,27 @@ impl Vm {
         )?;
 
         let end = iova.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        inner.page_table.prepare_map(iova..end)?;
         let mutation = inner.mapping_mutation();
-        let ret = match inner.page_table.prepare_map(iova..end) {
-            Err(error) => MappingOutcome::Unpublished(error),
-            Ok(()) => {
-                let result = inner.page_table.map_pages(
-                    iova..end, phys as PhysicalAddr, prot, false, None,
-                );
-                MappingOutcome::after_map(result, || inner.rollback_failed_map(iova, size as u64))
-            }
-        };
+        let ret = inner.page_table.map_pages(
+            iova..end,
+            phys as PhysicalAddr,
+            prot,
+            false,
+            None,
+        );
+        if ret.is_err() {
+            inner.rollback_failed_map(iova, size as u64);
+        }
         // Drop the exec_lock first, so that if map_node failed the
         // KernelMappingInner destructur does not deadlock.
         drop(mutation);
         core::mem::drop(inner);
-        // The receipt distinguishes confirmed rollback from uncertain
-        // provider state. Do not strictly unmap an already rolled-back range.
-        ret.finish(node).map(KernelMapping::new)
+        // Install the cleanup owner even on partial-map failure. Its Drop
+        // removes any published leaves before returning the VA and backing.
+        let mapping = KernelMapping::new(node);
+        ret?;
+        Ok(mapping)
     }
 
     /// Unmap everything in an address range.
@@ -2564,7 +2493,6 @@ impl Drop for VmInner {
                     self.id,
                     idx
                 );
-                mem::sync();
                 mem::tlbi_asid(idx as u8);
                 mem::sync();
             }
@@ -2658,18 +2586,13 @@ impl Uat {
                 return Err(EINVAL);
             }
             let table::PageTable::Sptm(table) = &mut owner.page_table else { return Err(EINVAL); };
-            // An identity is bound only while the VM publishes work; an
-            // unbound VM has nothing cached, and its next bind synchronizes.
-            return match table.sync_context() {
-                Err(error) if error == ENOENT => Ok(0),
-                result => result,
-            };
+            return table.sync_context();
         }
         let contexts = self.vm_context_mask(vm)?;
         if contexts == 0 {
             return Err(ENOENT);
         }
-        mem::sync();
+        fence(Ordering::SeqCst);
         for context in 0..UAT_NUM_CTX {
             if contexts & (1u64 << context) != 0 {
                 mem::tlbi_asid(context as u8);
@@ -2736,7 +2659,6 @@ impl Uat {
                 core::mem::drop(uat_inner);
 
                 // Make sure all TLB entries from the previous owner of this ASID are gone
-                mem::sync();
                 mem::tlbi_asid(idx as u8);
                 mem::sync();
             }
@@ -2810,7 +2732,7 @@ impl Uat {
             roots.ttb0.store(low, Ordering::Release);
             roots.ttb1.store(high, Ordering::Release);
         }
-        mem::sync();
+        fence(Ordering::SeqCst);
         mem::tlbi_asid(id as u8);
         mem::sync();
         Ok(context)
@@ -2880,7 +2802,7 @@ impl Uat {
             })
         }?;
 
-        mem::sync();
+        fence(Ordering::SeqCst);
         mem::tlbi_all();
         mem::sync();
         Ok(snapshot)
@@ -2925,7 +2847,7 @@ impl Uat {
             })
         }??;
 
-        mem::sync();
+        fence(Ordering::SeqCst);
         mem::tlbi_all();
         mem::sync();
         Ok(())
@@ -2953,7 +2875,7 @@ impl Uat {
             .store(tagged_root(render_root, KERNEL_ALIAS_CTX), Ordering::Release);
         inner.handoff().unlock();
         core::mem::drop(inner);
-        mem::sync();
+        fence(Ordering::SeqCst);
         mem::tlbi_asid(KERNEL_ALIAS_CTX as u8);
         mem::sync();
         Ok(())
@@ -3105,7 +3027,7 @@ impl Drop for Uat {
     fn drop(&mut self) {
         if self.inner.firmware == UatFirmware::Sptm { return; }
         // Make sure we flush the TLBs
-        mem::sync();
+        fence(Ordering::SeqCst);
         mem::tlbi_all();
         mem::sync();
     }

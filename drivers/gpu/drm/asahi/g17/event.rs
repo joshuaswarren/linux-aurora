@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only AND MIT
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Event service ordering under the device mutex. A restart ends its role's batch; a worker
 //! joins preparation leases and services it on a separate turn before continuing the rings.
