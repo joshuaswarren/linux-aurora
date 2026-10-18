@@ -90,6 +90,18 @@ module! {
             default: 0,
             description: "Diagnostic SPTM batch counts and duration; disabled by default",
         },
+        coverage_cache: u32 {
+            default: 1,
+            description: "Use revocation-tracked submission coverage proofs; 0 is a diagnostic full-walk control",
+        },
+        coverage_check: u32 {
+            default: 0,
+            description: "Diagnostic only: recheck one cached proof per N requests against the page table; 0 disables",
+        },
+        coverage_stats: u32 {
+            default: 0,
+            description: "Diagnostic only: log submission coverage hit, walk and mismatch counts; default off",
+        },
         sptm_space_trace: u32 {
             default: 0,
             description: "Diagnostic: log SPTM private address-space create/destroy/retention with live counts; disabled by default",

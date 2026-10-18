@@ -444,7 +444,7 @@ impl Vm {
     ) -> Result<Self> {
         let status = Arc::pin_init(crate::g17::status::VmStatus::new(), GFP_KERNEL)?;
         let table = if global {
-            sptm_pgtable::PageTable::new_global(&state.transport, status.clone())
+            sptm_pgtable::PageTable::new_global(&state.transport, status.clone())?
         } else {
             sptm_pgtable::PageTable::new(&state.transport, status.clone())?
         };

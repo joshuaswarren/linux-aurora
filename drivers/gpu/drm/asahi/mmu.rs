@@ -90,6 +90,7 @@ use pin_init;
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
 mod bind;
+pub(crate) mod coverage;
 mod context;
 mod shared;
 mod lifetime;
@@ -920,6 +921,7 @@ impl VmInner {
 pub(crate) struct Vm {
     id: u64,
     mapping_epoch: Option<Arc<MappingEpoch>>,
+    removals: Option<Arc<coverage::RemovalLog>>,
     lifetime: Option<Arc<lifetime::VmLifetime>>,
     residency: Option<Arc<residency::Gate>>,
     context_bindings: Option<Arc<context::ContextBindings>>,
@@ -1871,9 +1873,11 @@ impl Vm {
             None
         };
         let binding_clone = binding.clone();
+        let removals = page_table.removal_log();
         Ok(Vm {
             id,
             mapping_epoch: mapping_epoch.clone(),
+            removals,
             lifetime: None,
             residency: None,
             context_bindings: None,
@@ -2005,6 +2009,8 @@ impl Vm {
     pub(crate) fn mapping_validation_epoch(&self) -> Option<u64> {
         self.mapping_epoch.as_ref()?.snapshot()
     }
+
+    pub(crate) fn has_removal_log(&self) -> bool { self.removals.is_some() }
 
     /// Get the translation table base for this Vm
     fn ttb(&self) -> Result<u64> {

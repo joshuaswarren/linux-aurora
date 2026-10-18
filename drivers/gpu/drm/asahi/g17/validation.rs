@@ -48,13 +48,17 @@ impl Requests {
 pub(crate) struct Proof {
     epoch: Option<u64>,
     requests: Requests,
+    coverage: mmu::coverage::CoverageCache,
+    commands: u64,
 }
 
 impl Proof {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             epoch: None,
             requests: Requests::new(),
+            coverage: mmu::coverage::CoverageCache::new(),
+            commands: 0,
         }
     }
 
@@ -98,6 +102,25 @@ impl Proof {
             window, &Space::Record(&range, &requests), max_tile_buffer,
         );
         let requests = requests.into_inner();
+        if optimistic.is_ok() && vm.has_removal_log()
+            && *crate::module_parameters::coverage_cache.value() != 0 {
+            self.commands = self.commands.wrapping_add(1);
+            if *crate::module_parameters::coverage_stats.value() != 0 && self.commands % 4096 == 0 {
+                let stats = self.coverage.stats;
+                pr_info!("asahi: coverage cache: {} commands, {} requests, {} hits, {} walks, {} visited runs, {} checks, {} mismatches\n",
+                    self.commands, stats.requests, stats.hits, stats.walks, stats.runs_visited, stats.checks, stats.mismatches);
+            }
+            if !requests.overflow {
+                match self.coverage.covers(vm, requests.as_slice()) {
+                    Some(true) => return optimistic,
+                    Some(false) => return payload.validate(window, &Space::Checked(&range, vm), max_tile_buffer),
+                    None => {}
+                }
+            } else if vm.has_removal_log() {
+                let coverage = RefCell::new(&mut self.coverage);
+                return payload.validate(window, &Space::Cached(&range, vm, &coverage), max_tile_buffer);
+            }
+        }
         if optimistic.is_ok() && !requests.overflow {
             if self.covers(vm.mapping_validation_epoch(), &requests) {
                 return optimistic;
@@ -117,12 +140,13 @@ impl Proof {
 enum Space<'a> {
     Record(&'a Range<u64>, &'a RefCell<Requests>),
     Checked(&'a Range<u64>, &'a mmu::Vm),
+    Cached(&'a Range<u64>, &'a mmu::Vm, &'a RefCell<&'a mut mmu::coverage::CoverageCache>),
 }
 
 impl AddressSpace for Space<'_> {
     fn covers(&self, address: u64, size: u64, access: Access) -> bool {
         let range = match self {
-            Self::Record(range, _) | Self::Checked(range, _) => range,
+            Self::Record(range, _) | Self::Checked(range, _) | Self::Cached(range, _, _) => range,
         };
         let Some(end) = address.checked_add(size) else {
             return false;
@@ -143,6 +167,9 @@ impl AddressSpace for Space<'_> {
             Self::Checked(_, vm) => {
                 vm.covers_range(address, size, permissions & 1 != 0, permissions & 2 != 0)
             }
+            Self::Cached(_, vm, coverage) => coverage.borrow_mut()
+                .covers(vm, &[(address, size, permissions)])
+                .unwrap_or_else(|| vm.covers_range(address, size, permissions & 1 != 0, permissions & 2 != 0)),
         }
     }
 }

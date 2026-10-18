@@ -21,6 +21,21 @@ pub(super) enum PageTable {
 }
 
 impl PageTable {
+    pub(super) fn removal_log(&self) -> Option<kernel::sync::Arc<super::coverage::RemovalLog>> {
+        match self {
+            Self::Direct(_) => None,
+            #[cfg(CONFIG_ARM64)]
+            Self::Sptm(table) => Some(table.removal_log()),
+        }
+    }
+
+    pub(super) fn visit_runs(&self, range: Range<u64>, visit: impl FnMut(u64, u64, u8) -> Result) -> Result<bool> {
+        match self {
+            Self::Direct(_) => { let _ = (range, visit); Err(ENOTSUPP) }
+            #[cfg(CONFIG_ARM64)]
+            Self::Sptm(table) => table.visit_runs(range, visit),
+        }
+    }
     pub(super) fn direct_root(&self) -> Option<u64> {
         match self {
             Self::Direct(table) => Some(table.ttb()),

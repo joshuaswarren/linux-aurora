@@ -228,17 +228,37 @@ pub(super) struct PageTable {
     table_count: u64,
     /// Donated table frames the provider holds for this space.
     donors: KVec<DonorFrame>,
+    removals: Arc<super::coverage::RemovalLog>,
 }
 
 impl PageTable {
     pub(super) fn new(transport: &Arc<Transport>, status: Arc<VmStatus>) -> Result<Self> {
+        // Finish fallible host allocation before acquiring a provider handle.
+        let removals = super::coverage::RemovalLog::new()?;
         Ok(Self { space: AddressSpace::private(transport)?, runs: RBTree::new(), status,
-            tables: RBTree::new(), table_count: 0, donors: KVec::new() })
+            tables: RBTree::new(), table_count: 0, donors: KVec::new(), removals })
     }
 
-    pub(super) fn new_global(transport: &Arc<Transport>, status: Arc<VmStatus>) -> Self {
-        Self { space: AddressSpace::global(transport), runs: RBTree::new(), status,
-            tables: RBTree::new(), table_count: 0, donors: KVec::new() }
+    pub(super) fn new_global(transport: &Arc<Transport>, status: Arc<VmStatus>) -> Result<Self> {
+        let removals = super::coverage::RemovalLog::new()?;
+        Ok(Self { space: AddressSpace::global(transport), runs: RBTree::new(), status,
+            tables: RBTree::new(), table_count: 0, donors: KVec::new(), removals })
+    }
+
+    pub(super) fn removal_log(&self) -> Arc<super::coverage::RemovalLog> { self.removals.clone() }
+
+    pub(super) fn visit_runs(&self, range: Range<u64>, mut visit: impl FnMut(u64, u64, u8) -> Result) -> Result<bool> {
+        self.ensure_certain()?;
+        if self.validate_range(range.clone()).is_err() { return Ok(false); }
+        let mut at = range.start;
+        while at < range.end {
+            let Some((start, run)) = self.run_at(at) else { return Ok(false); };
+            let access = u8::from(run.prot.allows_gpu(true, false))
+                | (u8::from(run.prot.allows_gpu(false, true)) << 1);
+            visit(start, run.end, access)?;
+            at = run.end;
+        }
+        Ok(true)
     }
 
     pub(super) fn private_handle(&self) -> Option<u16> { self.space.private_handle() }
@@ -253,6 +273,7 @@ impl PageTable {
     fn report_uncertain(&self) {
         if matches!(self.space.state(), ContextState::Uncertain(_)) {
             self.status.record(EIO);
+            self.removals.record_all();
         }
     }
 
@@ -648,6 +669,8 @@ impl PageTable {
             at = end;
         }
         if touched.is_empty() { return Ok(()); }
+        // Publish invalidation before any provider or shadow-table removal.
+        self.removals.record(range.start, range.end);
         let mut spare = KVec::with_capacity(2, GFP_KERNEL)?;
         // Only the first and last runs can have surviving fragments.
         for _ in 0..2 { spare.push(RBTreeNodeReservation::<u64, Run>::new(GFP_KERNEL)?, GFP_KERNEL)?; }
