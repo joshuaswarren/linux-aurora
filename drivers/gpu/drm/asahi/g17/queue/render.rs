@@ -73,6 +73,8 @@ pub(crate) struct RenderAddresses {
 pub(crate) struct PublicationLease {
     pub(crate) free_list_generation: u64,
     pub(crate) buffer_token: u64,
+    /// Hardware context for which the M5 token was selected.
+    pub(crate) buffer_context: Option<u32>,
 }
 
 /// Host services borrow the device-locked firmware state. Resource construction
@@ -428,6 +430,9 @@ impl Pair {
     }
     pub(crate) fn buffer_id(&self) -> u8 {
         self.memory.manager.buffer_id()
+    }
+    pub(crate) fn m5_pb_state_va(&self) -> Option<u64> {
+        self.memory.graph.is_m5().then(|| self.memory.manager.state_va())
     }
     pub(crate) fn manager(&mut self) -> &mut buffer::Manager {
         &mut self.memory.manager
@@ -838,6 +843,11 @@ impl Pair {
             self.identity_update = true;
         }
         let m5 = self.memory.graph.is_m5();
+        if lease.buffer_context.is_some_and(|bound| bound != context_id) {
+            pr_warn!("asahi: M5 render qids {:?}: PB token chosen for context {:?}, publishing context {}\n",
+                self.qids(), lease.buffer_context, context_id);
+            return Err(EBUSY);
+        }
         let ordinal = self.ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let qids = self.qids();

@@ -22,6 +22,8 @@ struct BufferId {
     references: u8,
     owner: bool,
     token: u64,
+    /// Hardware context and PB state named by this token's M5 binding.
+    bound: Option<(u32, u64)>,
 }
 impl BufferId {
     fn free(self) -> bool {
@@ -43,6 +45,7 @@ impl BufferIds {
                 references: 0,
                 owner: false,
                 token: 0,
+                bound: None,
             }),
             returned <- pin_init::init_array_from_fn(|index| (BUFFER_IDS - index - 1) as u8),
             returned_count: BUFFER_IDS,
@@ -91,6 +94,7 @@ impl BufferIds {
             references: 1,
             owner: false,
             token,
+            bound: None,
         };
         Ok((id, token))
     }
@@ -104,6 +108,7 @@ impl BufferIds {
         if entry.free() {
             let token = self.fresh_token();
             self.entries[usize::from(id)].token = token;
+            self.entries[usize::from(id)].bound = None;
         }
         self.entries[usize::from(id)].owner = true;
         self.remove_returned(id);
@@ -116,6 +121,36 @@ impl BufferIds {
         }
         entry.references = entry.references.checked_add(1).ok_or_else(|| enospc_site!("buffer.rs:117 buffer refs"))?;
         Ok((id, entry.token))
+    }
+    /// A repeated token must name the same M5 PB state and hardware context.
+    /// Renew it if an idle VM moved; other firmware profiles keep acquire_owner.
+    pub(crate) fn acquire_owner_bound(&mut self, id: u8, context: u32, pb_va: u64)
+        -> Result<(u8, u64)> {
+        let entry = self.entries.get(usize::from(id)).ok_or(EINVAL)?;
+        if !entry.owner {
+            return Err(EINVAL);
+        }
+        let references = entry.references.checked_add(1)
+            .ok_or_else(|| enospc_site!("buffer.rs:117 buffer refs"))?;
+        let previous = entry.bound;
+        let old_token = entry.token;
+        let token = if previous.is_some_and(|bound| bound != (context, pb_va)) {
+            self.fresh_token()
+        } else {
+            old_token
+        };
+        let entry = &mut self.entries[usize::from(id)];
+        entry.references = references;
+        entry.token = token;
+        entry.bound = Some((context, pb_va));
+        if token != old_token {
+            static REBINDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            if let Some(n) = crate::g17::progress::sampled(&REBINDS) {
+                pr_info!("asahi: M5 PB slot {} rebinds from {:?} to ({}, {:#x}): token {} -> {} (rebind {})\n",
+                    id, previous, context, pb_va, old_token, token, n);
+            }
+        }
+        Ok((id, token))
     }
     /// Preflight shared completion bookkeeping before any of its counters change.
     pub(crate) fn can_release(&self, id: u8) -> Result {

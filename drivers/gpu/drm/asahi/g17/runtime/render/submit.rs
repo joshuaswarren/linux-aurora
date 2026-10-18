@@ -572,7 +572,13 @@ impl crate::g17::Firmware {
         let pair = self.queues.render.entry(slot)?.pair.as_ref().ok_or(EIO)?;
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();
-        let (buffer_id, buffer_token) = self.queues.buffers.acquire_owner(buffer_id)?;
+        let pb_state = pair.m5_pb_state_va();
+        let buffer_context = pb_state.map(|_| packet.context.id());
+        let (buffer_id, buffer_token) = match (pb_state, buffer_context) {
+            (Some(pb_va), Some(context)) =>
+                self.queues.buffers.acquire_owner_bound(buffer_id, context, pb_va)?,
+            _ => self.queues.buffers.acquire_owner(buffer_id)?,
+        };
         let preparation = match self.queues.render.pools.prepare(&self.init, &pool) {
             Ok(preparation) => preparation,
             Err(error) => {
@@ -583,6 +589,7 @@ impl crate::g17::Firmware {
         let lease = PublicationLease {
             free_list_generation: preparation.generation,
             buffer_token,
+            buffer_context,
         };
         let result = self.with_render(usize::from(slot), |pair, host| {
             pair.publish(
