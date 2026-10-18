@@ -4,6 +4,7 @@
 //! installed graph; the device retains it until both firmware processors have stopped.
 
 pub(crate) mod exit;
+mod activation;
 mod configuration;
 pub(crate) mod retirement;
 
@@ -1985,8 +1986,10 @@ impl Queue {
         };
         self.free_list_generation = u64::from(packet.context.scheduler_generation());
         let policy = packet.context.policy();
-        let ring = 1u8 << policy.priority();
-        let config = self.queue_config(&identity, first, args.context_id, policy, &packet)?;
+        let activation = activation::Publication::new(
+            self.outer_started, policy.priority(), self.graph.m5);
+        let config = self.queue_config(&identity, first, activation.refresh,
+            args.context_id, policy, &packet)?;
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
@@ -2203,11 +2206,11 @@ impl Queue {
                     self.graph.graph.gpu_va(),
                     qid,
                     producer.try_into()?,
-                    self.outer_started & ring == 0,
+                    activation.first,
                 )?,
             )?;
-            let notify_activation = self.outer_started & ring == 0;
-            self.outer_started |= ring;
+            let notify_activation = activation.first;
+            self.outer_started = activation.next_started;
             self.installed = true;
             self.published_config = Some(identity);
             self.ordinal = ordinal;
@@ -2243,7 +2246,8 @@ impl Queue {
                 // The firmware work notification must precede a deferred host
                 // doorbell: an idle-policy hold alone does not wake gated cores.
                 host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
-                    qid, self.kick.low_va(), policy.priority(), first)?)?;
+                    qid, self.kick.low_va(), policy.priority(),
+                    first || notify_activation)?)?;
             }
             fence(Ordering::SeqCst);
             if !self.graph.m5 { host.notify((0x83 << 48) | 0x10)?; }
@@ -2309,7 +2313,7 @@ impl Queue {
             host.publish_qid(self.kick.id())?;
             host.publish_outer(policy.priority(), &crate::g17::fw::channels::WorkSlot::new(DataMaster::Compute,
                 self.graph.graph.gpu_va(), self.qid(), producer.try_into()?, true)?)?;
-            self.outer_started |= 1 << policy.priority();
+            self.outer_started = 1 << policy.priority();
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             Err(EAGAIN)
         })();
@@ -2370,6 +2374,7 @@ impl Queue {
         &self,
         identity: &ConfigIdentity,
         first: bool,
+        priority_refresh: bool,
         context_id: u16,
         policy: crate::g17::fw::queue::Policy,
         packet: &Arc<Packet>,
@@ -2379,7 +2384,11 @@ impl Queue {
             kick_ring_va: self.kick.low_va(),
             kick_ring_fw_va: self.kick.firmware_va(),
             qid: self.qid(),
-            install: first && !self.graph.m5,
+            // An existing M5 queue needs the firmware install/update path to
+            // replace its private scheduling state when its class changes.
+            // The ordinary binding fields below are still processed afterward;
+            // no completion seed is supplied for a retained queue.
+            install: (first && !self.graph.m5) || priority_refresh,
             completion_seed: (first && self.graph.m5).then_some(0),
             context_id,
             free_list: FreeListBinding {
