@@ -115,8 +115,6 @@ const UAT_NUM_CTX: usize = 64;
 /// Application contexts owned by independent logical queues. Contexts 0..4
 /// and 63 remain reserved for the firmware and device-global resources.
 const EXECUTION_CONTEXT_MASK: u64 = ((1u64 << 63) - 1) & !((1u64 << 5) - 1);
-/// Maximum simultaneously retained logical queue contexts.
-pub(crate) const MAX_EXECUTION_CONTEXTS: u32 = EXECUTION_CONTEXT_MASK.count_ones();
 /// First context available for users
 const UAT_USER_CTX_START: usize = 1;
 /// Number of available user contexts
@@ -943,6 +941,14 @@ pub(crate) struct ExecutionContext {
     vm: Vm,
 }
 
+/// One published command's claim on its context's hardware identity, held
+/// until the command retires exactly (as the native context ID manager counts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContextPin {
+    pub(crate) id: u8,
+    pub(crate) generation: u64,
+}
+
 struct DirectExecutionRoot {
     released: AtomicBool,
     inner: Arc<UatInner>,
@@ -968,25 +974,57 @@ impl ExecutionContext {
         }
     }
 
+    pub(crate) fn availability(&self) -> Option<&Arc<crate::g17::availability::Availability>> {
+        match &self.root {
+            ExecutionRoot::Direct(_) => None,
+            #[cfg(CONFIG_ARM64)]
+            ExecutionRoot::Sptm(root) => Some(root.availability()),
+        }
+    }
+
+    /// The hardware identity commands name now. SPTM identities are bound
+    /// per publication ([`Self::pin`]); an unbound context reports
+    /// `u32::MAX`, which every descriptor encoder rejects. While a command is
+    /// pinned the value cannot change.
     pub(crate) fn id(&self) -> u32 {
         match &self.root {
             ExecutionRoot::Direct(root) => root.id.into(),
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.id.into(),
+            ExecutionRoot::Sptm(root) => root.bound().map_or(u32::MAX, |(id, _)| id.into()),
         }
     }
     pub(crate) fn generation(&self) -> u8 {
         match &self.root {
             ExecutionRoot::Direct(root) => root.generation,
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.generation as u8,
+            ExecutionRoot::Sptm(root) => root.bound().map_or(0, |(_, generation)| generation as u8),
         }
     }
+    /// Zero (rejected by the render token encoder) while unbound.
     pub(crate) fn native_generation(&self) -> u64 {
         match &self.root {
             ExecutionRoot::Direct(root) => u64::from(root.generation),
             #[cfg(CONFIG_ARM64)]
-            ExecutionRoot::Sptm(root) => root.generation,
+            ExecutionRoot::Sptm(root) => root.bound().map_or(0, |(_, generation)| generation),
+        }
+    }
+
+    /// Claim the context's hardware identity for one published command until
+    /// it retires exactly; binds or steals one first if needed. EBUSY: every
+    /// identity names unretired work.
+    pub(crate) fn pin(&self) -> Result<ContextPin> {
+        match &self.root {
+            ExecutionRoot::Direct(root) => Ok(ContextPin { id: root.id, generation: root.generation.into() }),
+            #[cfg(CONFIG_ARM64)]
+            ExecutionRoot::Sptm(root) => root.pin(&self.vm),
+        }
+    }
+
+    pub(crate) fn unpin(&self, pin: ContextPin) {
+        match &self.root {
+            ExecutionRoot::Direct(_) => {}
+            #[cfg(CONFIG_ARM64)]
+            ExecutionRoot::Sptm(root) => root.unpin(pin),
         }
     }
     pub(crate) fn vm(&self) -> &Vm { &self.vm }
@@ -995,7 +1033,7 @@ impl ExecutionContext {
     pub(crate) fn work_states(&self) -> Result<Arc<crate::g17::context::identity::WorkStates>> {
         match &self.root {
             ExecutionRoot::Direct(_) => Ok(Arc::new(
-                crate::g17::context::identity::WorkStates::new(), GFP_KERNEL)?),
+                crate::g17::context::identity::WorkStates::new()?, GFP_KERNEL)?),
             #[cfg(CONFIG_ARM64)]
             ExecutionRoot::Sptm(root) => Ok(root.states.clone()),
         }
@@ -1008,6 +1046,12 @@ impl ExecutionContext {
             #[cfg(CONFIG_ARM64)]
             ExecutionRoot::Sptm(root) => root.release(&self.vm),
         }
+    }
+
+    /// Commands present on physical queues keep an identity unavailable.
+    pub(crate) fn note_activity(&self, entered: bool) {
+        #[cfg(CONFIG_ARM64)]
+        if let ExecutionRoot::Sptm(root) = &self.root { root.note_activity(entered); }
     }
 
     pub(crate) fn is_current(&self) -> bool {
@@ -2586,7 +2630,12 @@ impl Uat {
                 return Err(EINVAL);
             }
             let table::PageTable::Sptm(table) = &mut owner.page_table else { return Err(EINVAL); };
-            return table.sync_context();
+            // An identity is bound only while the VM publishes work; an
+            // unbound VM has nothing cached, and its next bind synchronizes.
+            return match table.sync_context() {
+                Err(error) if error == ENOENT => Ok(0),
+                result => result,
+            };
         }
         let contexts = self.vm_context_mask(vm)?;
         if contexts == 0 {

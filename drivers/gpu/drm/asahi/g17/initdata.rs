@@ -13,11 +13,13 @@ use super::{
 use crate::{driver::AsahiDevice, hw::t8140, mmu};
 use core::ops::Range;
 use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
-use kernel::{c_str, prelude::*};
+use kernel::{c_str, prelude::*, sync::Arc};
 use t8140::{kernel_window as high, low};
 
 mod m5;
 mod work_pair;
+pub(crate) mod outer_credit;
+pub(crate) use outer_credit::{OuterClaim, OuterScope};
 
 const EVENT_RING_RECHECK: u32 = 256;
 
@@ -106,6 +108,7 @@ impl ComputeScheduler {
 /// Checked views used only within one publication call. Every fallible operation completes
 /// before either member of a paired render publication is copied into shared memory.
 struct WorkPublication<'a> {
+    published: Option<&'a AtomicU64>,
     record: &'a super::fw::channels::WorkSlot,
     destination: *mut u8,
     producer: &'a AtomicU32,
@@ -129,6 +132,7 @@ impl WorkPublication<'_> {
         self.copy_record();
         fence(Ordering::SeqCst);
         self.producer.store(self.next, Ordering::Relaxed);
+        if let Some(published) = self.published { published.fetch_add(1, Ordering::Release); }
         fence(Ordering::SeqCst);
         self.next
     }
@@ -137,6 +141,7 @@ impl WorkPublication<'_> {
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     m5: bool,
+    outer_credits: Option<Arc<outer_credit::Credits>>,
     // Live publication uses interior writes under the device mutex. This owner is Send but not
     // Sync, so safe host code cannot issue those writes concurrently through shared references.
     _single_publisher: core::marker::PhantomData<core::cell::Cell<()>>,
@@ -220,6 +225,7 @@ impl InitData {
     pub(super) fn new() -> Self {
         Self {
             m5: false,
+            outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
             objects: KVec::new(),
@@ -484,23 +490,68 @@ impl InitData {
         Ok(())
     }
 
-    /// The sole host publisher holds the device mutex through the following
-    /// inner and outer publication. Firmware consumers can only free capacity;
-    /// neither this check nor waiting for room reserves or limits other queues.
-    /// `priority` selects the engine's ring of that priority class.
+    /// Resource-specific wait domain; register only after dropping the device
+    /// mutex. A successful claim allocates no waiter fence.
+    pub(crate) fn outer_available(&mut self) -> Result<Arc<super::availability::Availability>> {
+        if self.outer_credits.is_none() {
+            self.outer_credits = Some(outer_credit::Credits::new()?);
+        }
+        Ok(self.outer_credits.as_ref().ok_or(EIO)?.available())
+    }
+
+    /// M5 TA, fragment and compute share the compute outer ring per priority.
+    /// The physical queue claim prevents reassignment while this credit lives.
+    pub(crate) fn reserve_outer(&mut self, priority: u8, count: u32) -> Result<OuterClaim> {
+        if !self.m5 { return Err(EINVAL); }
+        self.outer_available()?;
+        let cursors = self.work_cursors(priority, super::fw::queue::DataMaster::Compute)?;
+        self.outer_credits.as_ref().ok_or(EIO)?.reserve(priority, count, cursors)
+    }
+
+    /// Hold the device mutex for this scope, including its Drop. The result
+    /// borrows only the claim, allowing the caller to publish through Firmware.
+    pub(crate) fn outer_scope<'a>(&self, claim: &'a mut OuterClaim) -> Result<OuterScope<'a>> {
+        self.outer_credits.as_ref().ok_or(EINVAL)?.scope(claim)
+    }
+
+    pub(crate) fn outer_waiting(&self) -> bool {
+        self.outer_credits.as_ref().is_some_and(|credits| credits.waiting())
+    }
+
+    /// Return a notification for off-lock dispatch only on consumer progress.
+    /// Call while actual outer waiters exist; firmware may consume a config
+    /// without generating a GPU completion IRQ, so those waiters need polling.
+    pub(crate) fn poll_outer_progress(&self) -> Result<Option<Arc<super::availability::Availability>>> {
+        let Some(credits) = self.outer_credits.as_ref().filter(|credits| credits.waiting()) else {
+            return Ok(None);
+        };
+        let mut progressed = false;
+        for priority in 0..4 {
+            progressed |= credits.progressed(priority,
+                self.work_cursors(priority, super::fw::queue::DataMaster::Compute)?)?;
+        }
+        Ok(progressed.then(|| credits.available()))
+    }
+
+    fn outer_capacity(&self, priority: u8, cursors: [u32; 3]) -> Result<u32> {
+        match &self.outer_credits {
+            Some(credits) => credits.capacity(priority, cursors),
+            None => outer_credit::free(cursors),
+        }
+    }
+
+    /// Unclaimed publications cannot consume another preparation's credit.
+    /// A claimed publication temporarily lends its own credits via outer_scope.
     pub(super) fn work_ready(
         &self,
         priority: u8,
         engine: super::fw::queue::DataMaster,
     ) -> Result<bool> {
-        if self.m5 && engine != super::fw::queue::DataMaster::Compute {
-            return match work_pair::Window::new(self.work_cursors(
-                priority, super::fw::queue::DataMaster::Compute,
-            )?) {
-                Ok(_) => Ok(true),
-                Err(error) if error == EBUSY => Ok(false),
-                Err(error) => Err(error),
-            };
+        use super::fw::queue::DataMaster;
+        if self.m5 {
+            let needed = if engine == DataMaster::Compute { 1 } else { 2 };
+            return Ok(self.outer_capacity(priority,
+                self.work_cursors(priority, DataMaster::Compute)?)? >= needed);
         }
         let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
         let next = (producer + 1) % super::fw::channels::WORK_RING_SLOTS;
@@ -521,6 +572,10 @@ impl InitData {
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
         let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
+        if self.m5 && engine == DataMaster::Compute
+            && self.outer_capacity(priority, [consumer, consumer_b, producer])? < 1 {
+            return Err(EBUSY);
+        }
         let next = (producer + 1) % channels::WORK_RING_SLOTS;
         if next == consumer || next == consumer_b {
             return Err(EINVAL);
@@ -534,7 +589,11 @@ impl InitData {
                 + abi::work_state_offset(channel)
                 + abi::ChannelState::PRODUCER,
         )?;
+        let published = if self.m5 && engine == DataMaster::Compute {
+            self.outer_credits.as_ref().map(|credits| credits.counter(priority)).transpose()?
+        } else { None };
         Ok(WorkPublication {
+            published,
             record,
             destination,
             producer,
@@ -594,7 +653,9 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let window = work_pair::Window::new(self.work_cursors(priority, DataMaster::Compute)?)?;
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        if self.outer_capacity(priority, cursors)? < 2 { return Err(EBUSY); }
+        let window = work_pair::Window::new(cursors)?;
         let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
         let bundle = self.object(self.bundle)?;
         let destinations = [window.start, window.next[0]].map(|index| {
@@ -611,7 +672,8 @@ impl InitData {
         let records = [copy(fragment)?, copy(tiling)?];
         // SAFETY: Complete, distinct slots were checked in the retained bundle;
         // the device's single publisher holds its mutex across this borrow.
-        Ok(unsafe { work_pair::Publication::new(records, destinations, producer, window) })
+        let published = self.outer_credits.as_ref().map(|credits| credits.counter(priority)).transpose()?;
+        Ok(unsafe { work_pair::Publication::new(records, destinations, producer, window, published) })
     }
 
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
@@ -685,6 +747,7 @@ impl InitData {
             core::mem::size_of_val(record),
         )?;
         Ok(WorkPublication {
+            published: None,
             record,
             destination,
             producer,

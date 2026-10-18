@@ -91,8 +91,22 @@ struct BuildContext<'a> {
 }
 
 impl super::super::Backend {
-    fn build_render_pair(&self, slot: u8, first: &Arc<Packet>, optional: bool) -> Result {
-        let lease = self.shared.preparations.enter(false)?;
+    /// Restoring a borrowed graph wakes other publishers. A preparation
+    /// attempt must not mistake its own restoration for returned capacity;
+    /// preserve any independently observed progress when advancing its sample.
+    fn notify_render_attempt(&self, observed: Option<&mut u64>) {
+        if let Some(observed) = observed {
+            crate::g17::progress::note_change();
+            self.shared.changed.notify_all();
+            self.shared.physical_available.notify_own(observed);
+        } else {
+            self.shared.notify_changed();
+        }
+    }
+
+    fn build_render_pair(&self, slot: u8, first: &Arc<Packet>, optional: bool,
+        nonblocking: bool, mut observed: Option<&mut u64>) -> Result {
+        let lease = if nonblocking { self.shared.preparations.try_enter()? } else { self.shared.preparations.enter(false)? };
         let dev = self.shared.drm()?;
         let (resources, build) = loop {
             let mut state = self.shared.state.lock();
@@ -126,7 +140,7 @@ impl super::super::Backend {
                 // vmfix6d: reinstall this VM's retained graph first, in its own
                 // frame (off this deep build path), then build as usual.
                 drop(state);
-                self.restore_retained(slot, &lease)?;
+                self.restore_retained(slot, &lease, observed.as_deref_mut())?;
                 continue;
             }
             let resources = BuildResources::new(firmware)?;
@@ -175,6 +189,13 @@ impl super::super::Backend {
                                 let alloc = Allocator { dev: &dev, uat: &resources.uat };
                                 return pool.ensure_backing(&alloc, &resources.global, self.context.vm());
                             }
+                        }
+                        // Every rebind, including same-context pool growth,
+                        // needs a retired-binding slot. Refuse before borrowing
+                        // the pair so restoration cannot wake our own capacity
+                        // wait without any resource becoming available.
+                        if firmware.queues.render.retired.len() == firmware.queues.render.retired.capacity() {
+                            return Err(self.capacity(Site::CapacityRetired, ENOSPC));
                         }
                         if !pair.bindable(self.owner, &self.context)? {
                             return Err(self.busy(Site::BuildBindable));
@@ -265,14 +286,14 @@ impl super::super::Backend {
                 pm_generation,
                 metrics,
             } => self
-                .install_parked_pair(&ctx, parked, buffer, pm_generation, metrics)
+                .install_parked_pair(&ctx, parked, buffer, pm_generation, metrics, observed.as_deref_mut())
                 .map_err(|error| self.tag(Site::ParkedInstall, error))?,
             Build::Rebind {
                 pair,
                 buffer,
                 pm_generation,
                 metrics,
-            } => self.rebind_pair(&ctx, pair, buffer, pm_generation, metrics)?,
+            } => self.rebind_pair(&ctx, pair, buffer, pm_generation, metrics, observed.as_deref_mut())?,
         }
         self.finish_render_build(&lease, slot, fresh_graph)
             .map_err(|error| self.tag(Site::BuildFinish, error))
@@ -283,7 +304,7 @@ impl super::super::Backend {
     /// allocated off-lock only when needed; an emptied parked owner (with its
     /// last scheduler page) is dropped after the device mutex is released.
     #[inline(never)]
-    fn restore_retained(&self, slot: u8, lease: &Lease) -> Result {
+    fn restore_retained(&self, slot: u8, lease: &Lease, observed: Option<&mut u64>) -> Result {
         let mut storage: Option<KBox<core::mem::MaybeUninit<Pair>>> = None;
         loop {
             let emptied = {
@@ -304,7 +325,7 @@ impl super::super::Backend {
                 }
             };
             drop(emptied);
-            self.shared.notify_changed();
+            self.notify_render_attempt(observed);
             return Ok(());
         }
     }
@@ -332,7 +353,8 @@ impl super::super::Backend {
             resources.bind_metrics(&self.context, &mut metrics)?;
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)?;
+                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
+                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?;
             Pair::new(
                 &alloc,
                 &resources.objects,
@@ -427,6 +449,7 @@ impl super::super::Backend {
         buffer: (u8, u64),
         pm_generation: u64,
         mut metrics: MetricsLease,
+        observed: Option<&mut u64>,
     ) -> Result {
         let BuildContext {
             lease,
@@ -439,7 +462,8 @@ impl super::super::Backend {
             resources.bind_metrics(&self.context, &mut metrics)?;
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)?;
+                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
+                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?;
             let prepared = parked.prepare(
                 &alloc,
                 &resources.objects,
@@ -522,7 +546,7 @@ impl super::super::Backend {
             entry.pending_owner_closed = false;
             firmware.render_grow_ready()
         };
-        self.shared.notify_changed();
+        self.notify_render_attempt(observed);
         if grow_ready {
             self.shared.queue_grow();
         }
@@ -541,6 +565,7 @@ impl super::super::Backend {
         buffer: Option<(u8, u64)>,
         pm_generation: Option<u64>,
         mut metrics: Option<MetricsLease>,
+        observed: Option<&mut u64>,
     ) -> Result {
         let BuildContext {
             lease,
@@ -555,7 +580,8 @@ impl super::super::Backend {
             }
             let free_list =
                 self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)?;
+                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
+                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?;
             pair.prepare_bind(
                 &alloc,
                 &resources.objects,
@@ -647,7 +673,7 @@ impl super::super::Backend {
                     .release(id)?;
             }
         }
-        self.shared.notify_changed();
+        self.notify_render_attempt(observed);
         if grow_ready {
             self.shared.queue_grow();
         }
@@ -690,8 +716,9 @@ impl super::super::Backend {
         firmware.queues.render.pools.warm(&firmware.init, &pool)
     }
 
-    pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8) -> Result {
-        self.build_render_pair(slot, packet, false)?;
+    pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8, nonblocking: bool,
+        mut observed: Option<&mut u64>) -> Result {
+        self.build_render_pair(slot, packet, false, nonblocking, observed.as_deref_mut())?;
         let sibling = {
             let state = self.shared.state.lock();
             (*state)
@@ -699,12 +726,12 @@ impl super::super::Backend {
                 .ok_or(ENODEV)?
                 .queues
                 .admission
-                .warmable_sibling(self.owner, slot)
+                .reserve_warmable_sibling(self.owner, slot)
         };
         if let Some(sibling) = sibling {
             // An optional sibling may be borrowed or waiting for recovery.
             // The selected pair is revalidated by prepare_render before publication.
-            match self.build_render_pair(sibling, packet, true) {
+            match self.build_render_pair(sibling.slot(), packet, true, nonblocking, observed.as_deref_mut()) {
                 Err(error)
                     if error == EBUSY
                         || error == EAGAIN
@@ -721,6 +748,7 @@ impl super::super::Backend {
         slot: u8,
         packet: &Arc<Packet>,
         deferred: &mut super::super::DeferredBatch,
+        outer: Option<&mut crate::g17::initdata::outer_credit::OuterClaim>,
     ) -> Result {
         let lease = self.shared.preparations.enter(false)?;
         let dev = self.shared.drm()?;
@@ -836,6 +864,10 @@ impl super::super::Backend {
             if packet.cancel_requested() || firmware.queues.render.entry(slot)?.closed {
                 return Err(ECANCELED);
             }
+            // Lend this packet's reserved credits only while the device
+            // mutex excludes every other producer. Scope drop charges actual
+            // producer movement and restores the remaining reservation.
+            let _scope = outer.map(|claim| firmware.init.outer_scope(claim)).transpose()?;
             firmware
                 .publish_render(self.owner, slot, packet, deferred)
                 .map_err(|error| self.tag(Site::Publish, error))

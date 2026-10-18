@@ -41,6 +41,7 @@ impl Compute {
         let execution = uat.new_execution_context(&vm)?;
         let context = Arc::new(Context::new(&alloc, &firmware.pool,
             &firmware.queues.qos_ids, execution, 0, POLICY)?, GFP_KERNEL)?;
+        firmware.m5_test_pins.acquire(&context)?;
         let owner = firmware.queues.reserve_channel_ids(1)?.start;
         let id = firmware.queues.qids.reserve(owner, DataMaster::Compute, Some(11))?;
         let mut kick = kick::Queue::compute(&alloc, id)?;
@@ -166,7 +167,7 @@ impl Compute {
                 .store(program::SENTINEL, Ordering::Relaxed);
         }
         if self.current_work.is_some() { return Err(EBUSY); }
-        let work = Arc::new(WorkStateLease::deferred(self.context.clone()), GFP_KERNEL)?;
+        let work = Arc::pin_init(WorkStateLease::deferred(self.context.clone()), GFP_KERNEL)?;
         let work_word = work.acquire()?;
         let work_node = work.node_va()?;
         work.add_submitted_kicks(1)?;

@@ -4,6 +4,7 @@
 
 pub(in crate::g17) mod generation;
 mod observation;
+mod configuration;
 pub(crate) use observation::Observed;
 mod dependencies;
 pub(in crate::g17) mod memory;
@@ -126,6 +127,8 @@ struct Prepared {
     kick_flags: crate::g17::fw::kick::StageKickFlags,
 }
 struct Active {
+    /// The command is on this physical pair: its identity and QoS slot stay.
+    activity: crate::g17::context::ActivityMark,
     qos_completed: bool,
     flist_completed: bool,
     outer_published: bool,
@@ -272,6 +275,13 @@ pub(crate) struct Pair {
     /// live render queues carry them clear, with a completion seed. Cleared
     /// once a publication carried it.
     identity_update: bool,
+    /// Hardware identity named by the configurations firmware last took.
+    /// A VM's identity can move while its pairs are idle (no command pinned
+    /// it); the next publication then carries the update bits.
+    configuration: Option<configuration::Configuration>,
+    configured_context: Option<u32>,
+    /// QoS slot named by those configurations (bound per publication too).
+    configured_qos: Option<u8>,
     /// vmfix6e attribution: the last binding changes (kind, pair ordinal,
     /// logical owner); kinds 1 new, 2 same-VM rebind, 3 foreign rebind,
     /// 4 restore, 5 parked restore. Printed when a published packet times out.
@@ -388,6 +398,9 @@ impl Pair {
             displaced: None,
             context_update: true,
             identity_update: true,
+            configuration: None,
+            configured_context: None,
+            configured_qos: None,
             history: [(1, start_ordinal, first_owner); 4],
             last_pass: None,
             replay: None,
@@ -420,11 +433,18 @@ impl Pair {
         &mut self.memory.manager
     }
     pub(crate) fn in_flight(&self) -> bool {
-        self.active.len() != 0 || self.replay.is_some()
+        self.active.len() != 0 || self.replay.is_some() || self.configuration.is_some()
     }
-    /// A replay or an abandonment grace period needs the worker to poll.
+    /// Cold M5 installation publishes two configuration items before its pair
+    /// of kick items. A warm pair needs only the two kick items.
+    pub(crate) fn outer_slots(&self) -> u32 {
+        if self.memory.graph.is_m5() && self.registered.is_none() && self.installed != [true; 2] { 4 } else { 2 }
+    }
+    pub(crate) fn configuration_pending(&self) -> bool { self.configuration.is_some() }
+    /// Configuration consumption, replay or abandonment needs worker polling.
     pub(crate) fn replay_polling(&self) -> bool {
-        self.replay.is_some() || self.active.iter().any(|a| a.abandoned_since.is_some())
+        self.configuration.is_some() || self.replay.is_some()
+            || self.active.iter().any(|a| a.abandoned_since.is_some())
     }
     pub(crate) fn replay_front(&self) -> Option<Arc<Packet>> {
         self.replay.clone()
@@ -811,6 +831,12 @@ impl Pair {
         };
         use core::sync::atomic::{fence, Ordering};
         let (epoch, mcache, policy) = self.publication_preflight(&packet, host)?;
+        let context_id = packet.context.id();
+        let qos_slot = packet.context.qos_id();
+        if self.configured_context.is_some_and(|configured| configured != context_id)
+            || self.configured_qos.is_some_and(|configured| configured != qos_slot) {
+            self.identity_update = true;
+        }
         let m5 = self.memory.graph.is_m5();
         let ordinal = self.ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
@@ -922,11 +948,24 @@ impl Pair {
                 let [fragment, tiling] = [slots[1], slots[0]];
                 let (fragment, tiling) = (fragment?, tiling?);
                 for kick in &self.kicks { host.publish_qid(kick.id())?; }
-                host.publish_configuration_pair(policy.priority(), &fragment, &tiling, || {
+                if self.configuration.is_some() { return Err(EBUSY); }
+                self.configuration = Some(configuration::Configuration::new(&packet.context, ends, host.generation())?);
+                let configuration = self.configuration.as_mut().ok_or(EIO)?;
+                let configured = host.publish_configuration_pair(policy.priority(), &fragment, &tiling, || {
+                    // Ownership exists before either item producer can become visible.
+                    configuration.mark_visible();
                     for lane in &lanes { lane.publish_prefix(); }
-                })?;
+                });
+                if let Err(error) = configured {
+                    if self.configuration.as_ref().is_some_and(|owner| !owner.visible()) {
+                        self.configuration.take().ok_or(EIO)?.release();
+                    }
+                    return Err(error);
+                }
                 self.cursors = ends;
                 self.installed = [true; 2];
+                self.configured_context = Some(context_id);
+                self.configured_qos = Some(qos_slot);
                 self.configs = [Some(configs[0]), Some(configs[1])];
                 self.context_update = false;
                 self.identity_update = false;
@@ -1070,6 +1109,7 @@ impl Pair {
         let pm_submission = memory.manager.prepare_submission()?;
         self.active
             .push(Active {
+                activity: crate::g17::context::ActivityMark::begin(&packet.context),
                 qos_completed: false,
                 flist_completed: false,
                 outer_published: false,
@@ -1098,6 +1138,9 @@ impl Pair {
             .map_err(|_| EBUSY)?;
         self.prepared = None;
         packet.mark_published();
+        // The Active now retains this Packet and its original identity/QoS
+        // pins; it replaces the configuration-only identity owner.
+        if let Some(configuration) = self.configuration.take() { configuration.release(); }
         work.channel_published(self.slot, qids, next_ordinal);
         if m5 {
             for lane in &lanes { lane.prepare(); }
@@ -1169,6 +1212,8 @@ impl Pair {
         }
         self.recovery_generation = epoch;
         self.installed = [true; 2];
+        self.configured_context = Some(packet.context.id());
+        self.configured_qos = Some(packet.context.qos_id());
         // vmfix6f: both configurations of this publication carried the update
         // bits (publication::required), so firmware applies them before this
         // kick. Native sets them only on a new owner's first configuration;
@@ -1533,6 +1578,13 @@ impl Pair {
         self.retire_front(None, state, Some(observed), host, defer)
     }
 
+    fn retire_configuration(&mut self, host: &impl Host) -> Result<bool> {
+        let Some(configuration) = self.configuration.as_ref() else { return Ok(false); };
+        if !configuration.consumed(self.memory.graph.cursors()?, host.generation()) { return Ok(false); }
+        self.configuration.take().ok_or(EIO)?.release();
+        Ok(true)
+    }
+
     fn retire_front(
         &mut self,
         masks: Option<[u64; 2]>,
@@ -1541,8 +1593,9 @@ impl Pair {
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result<bool> {
+        let configuration_retired = state == 0 && self.retire_configuration(host)?;
         if self.quarantined || state != 0 || !self.selected(masks) {
-            return Ok(false);
+            return Ok(configuration_retired);
         }
         let qids = self.qids();
         let qos = self.qos_owners();
@@ -1550,10 +1603,10 @@ impl Pair {
         let buffer = self.buffer_id();
         loop {
             let Some(front) = self.active.front_mut() else {
-                return Ok(false);
+                return Ok(configuration_retired);
             };
             if !front.outer_published {
-                return Ok(false);
+                return Ok(configuration_retired);
             }
             if !Arc::ptr_eq(&front.packet.context, &self.memory.context)
                 || !self.memory.owns(front.ticket.ordinal)
@@ -1576,14 +1629,14 @@ impl Pair {
             let timestamps = match result {
                 Ok(retirement::Poll::Complete(timestamps)) => timestamps,
                 Ok(retirement::Poll::Pending) => return self.replay_abandoned(host, defer),
-                Ok(retirement::Poll::Retry) => return Ok(false),
+                Ok(retirement::Poll::Retry) => return Ok(configuration_retired),
                 Err(error) => {
                     if crate::g17::m5_render_submission::enabled() {
                         pr_warn!("M5 render retirement rejected: queues={:?} ticket={:?} snapshot={:?} error={:?}\n",
                             qids, front.ticket, retirement::Memory::snapshot(&mut observer, front.ticket.ordinal), error);
                     }
                     self.quarantine(error, defer)?;
-                    return Ok(false);
+                    return Ok(configuration_retired);
                 }
             };
             let ordinal = front.ticket.ordinal;
@@ -1605,7 +1658,11 @@ impl Pair {
                 Ok(timestamps),
             ))?;
             self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
+            // Exact retirement: the identity may move once nothing pins it
+            // and no command of its VM remains on a physical queue.
+            let mut retired = self.active.pop().ok_or(EIO)?;
+            retired.activity.end();
+            retired.packet.unpin_retired();
             let generation = host.generation();
             if generation != 0 && self.executed_generation.is_some_and(|g| g < generation) {
                 // First executed retirement of this pair after a recovery.
@@ -1713,7 +1770,9 @@ impl Pair {
             }
             defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
             self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
+            let mut active = self.active.pop().ok_or(EIO)?;
+            active.activity.end();
+            active.packet.unpin_retired();
             return Ok(true);
         }
         self.memory.retire(ordinal)?;
@@ -1732,10 +1791,30 @@ impl Pair {
         error: Error,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        let Some(packet) = self.replay.take() else {
+        let Some(packet) = self.replay.as_ref().cloned() else {
             return Ok(());
         };
-        defer(Deferred::Retired(packet.completion.clone(), Err(error)))
+        if self.active.iter().any(|active| Arc::ptr_eq(&active.packet, &packet)) {
+            // Publication may have failed after firmware gained visibility.
+            // Keep the active owner and its pins until retirement or stop;
+            // only the redundant replay reference can be removed here.
+            // Even a refused collector leaves Active as the precise owner.
+            // Do not leave a duplicate replay available after Active retires.
+            self.replay = None;
+            return self.quarantine(error, defer);
+        } else {
+            // replay_abandoned reset publication only after the exact old
+            // retirement witness. A new publication without its active owner
+            // is ambiguous: retain this last packet/token owner for stop.
+            if packet.is_published() {
+                return Err(EIO);
+            }
+            self.discard_prepared(&packet)?;
+            defer(Deferred::Retired(packet.completion.clone(), Err(error)))?;
+            packet.unpin_retired();
+        }
+        self.replay = None;
+        Ok(())
     }
 
     /// A closed preparation epoch invalidates only this unpublished descriptor.
@@ -1849,7 +1928,9 @@ impl Pair {
             defer(Deferred::Drained(active.packet.completion.clone(), result))?;
             let ordinal = active.ticket.ordinal;
             self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
+            let mut active = self.active.pop().ok_or(EIO)?;
+            active.activity.end();
+            active.packet.unpin_retired();
         }
         self.quarantined = false;
         self.resync();
@@ -1909,7 +1990,9 @@ impl Pair {
                 ))?;
                 let ordinal = active.ticket.ordinal;
                 self.memory.retire(ordinal)?;
-                self.active.pop().ok_or(EIO)?;
+                let mut active = self.active.pop().ok_or(EIO)?;
+                active.activity.end();
+                active.packet.unpin_retired();
                 return Ok(true);
             }
         }
@@ -1920,13 +2003,15 @@ impl Pair {
     /// Both processors have stopped before the caller reaches this method.
     /// VM ownership settles before quarantined admission is rehabilitated.
     pub(crate) fn stopped(&mut self, defer: &mut impl FnMut(Deferred) -> Result) -> Result {
+        if let Some(configuration) = self.configuration.take() { configuration.release(); }
         if let Some(prepared) = self.prepared.as_ref() {
             defer(Deferred::Unpublished(
                 prepared.packet.completion.clone(),
                 EIO,
             ))?;
             self.memory.retire(prepared.ordinal)?;
-            self.prepared = None;
+            let prepared = self.prepared.take().ok_or(EIO)?;
+            prepared.packet.unpin_retired();
         }
         while let Some(active) = self.active.front() {
             defer(Deferred::Drained(
@@ -1935,10 +2020,14 @@ impl Pair {
             ))?;
             let ordinal = active.ticket.ordinal;
             self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
+            let mut active = self.active.pop().ok_or(EIO)?;
+            active.activity.end();
+            active.packet.unpin_retired();
         }
-        if let Some(packet) = self.replay.take() {
+        if let Some(packet) = self.replay.as_ref() {
             defer(Deferred::Drained(packet.completion.clone(), Err(EIO)))?;
+            let packet = self.replay.take().ok_or(EIO)?;
+            packet.unpin_retired();
         }
         if let Some(previous) = self.previous.as_mut() {
             previous.ready = true;

@@ -40,6 +40,7 @@ impl Pair {
         let execution=uat.new_execution_context(&vm)?;
         let context=Arc::new(Context::new(&alloc,&firmware.pool,
             &firmware.queues.qos_ids,execution,0,POLICY)?,GFP_KERNEL)?;
+        firmware.m5_test_pins.acquire(&context)?;
         let input=if matches!(*crate::module_parameters::m5_render_test.value(), 2 | 3) {
             Some(super::m5_render_input::Input::load(dev,&vm,uat.geometry().user_range())?)
         } else {None};
@@ -176,7 +177,7 @@ impl Pair {
         input.reset_result()?;
         self.resources.memory.graph.queues.bytes_mut()[0x14000..0x14120].fill(0);
         if self.current_work.is_some(){return Err(EBUSY);}
-        let work_state=Arc::new(WorkStateLease::deferred(self.context.clone()),GFP_KERNEL)?;
+        let work_state=Arc::pin_init(WorkStateLease::deferred(self.context.clone()),GFP_KERNEL)?;
         let work_word=work_state.acquire()?;
         let record=work_state.node_va()?;
         work_state.add_submitted_kicks(2)?;

@@ -463,8 +463,13 @@ impl crate::g17::Shared {
                 self.queue_reclaims();
             }
         }
+        if let Some(domain) = firmware.init.poll_outer_progress()? {
+            deferred.notify_outer(&domain);
+        }
         let backpressured = firmware.render_control_backpressured();
         let polling = backpressured
+            || firmware.init.outer_waiting()
+            || firmware.compute_growth_pending()
             || firmware.queues.replay_outer_wait.is_some()
             || firmware.queues.replay_consumer_wait.is_some()
             || firmware.queues.render.replay_polling()

@@ -63,7 +63,7 @@ pub(crate) struct Submission {
 
 impl Submission {
     fn new(fence: UserFence<CompletionFence>, context: Arc<Context>) -> Result<Arc<Self>> {
-        let work_state = Arc::new(WorkStateLease::deferred(context), GFP_KERNEL)?;
+        let work_state = Arc::pin_init(WorkStateLease::deferred(context), GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self {
                 fence,

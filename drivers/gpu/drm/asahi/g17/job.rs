@@ -4,13 +4,14 @@
 
 use super::{command::Validated, completion::Completion, context::Context};
 use crate::driver::AsahiDevice;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use kernel::{
     bindings, c_str,
     dma_fence::{Fence, RawDmaFence},
     drm::sched,
     prelude::*,
-    sync::Arc,
+    new_mutex,
+    sync::{Arc, Mutex},
 };
 
 pub(super) const TIMEOUT_MS: kernel::time::Msecs = 2000;
@@ -86,7 +87,18 @@ impl Order {
     }
 }
 
+pub(crate) struct Preparation {
+    pub(crate) outer: Option<super::initdata::OuterClaim>,
+    pub(crate) compute: Option<super::runtime::ComputeClaim>,
+    pub(crate) wait: Option<super::availability::Wait>,
+    pub(crate) work_state: Option<super::context::WorkStateClaim>,
+    pub(crate) ready: bool,
+}
+
+#[pin_data]
 pub(crate) struct Packet {
+    #[pin]
+    pub(crate) preparation: Mutex<Preparation>,
     pub(crate) id: u64,
     pub(crate) context: Arc<Context>,
     pub(crate) command: Validated,
@@ -99,6 +111,11 @@ pub(crate) struct Packet {
     cancelled: AtomicBool,
     early: AtomicI32,
     backlog: AtomicBool,
+    /// The context identity this command names (`pinned` publishes it).
+    pin_id: AtomicU8,
+    pin_generation: AtomicU64,
+    pin_qos: AtomicU8,
+    pinned: AtomicBool,
 }
 
 impl Packet {
@@ -117,8 +134,9 @@ impl Packet {
             }
             Validated::Compute { .. } => None,
         };
-        Ok(Arc::new(
-            Self {
+        Ok(Arc::pin_init(
+            pin_init!(Self {
+                preparation <- new_mutex!(Preparation { outer: None, compute: None, wait: None, work_state: None, ready: false }, "G17 packet preparation"),
                 id,
                 context,
                 command,
@@ -131,9 +149,90 @@ impl Packet {
                 cancelled: AtomicBool::new(false),
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
-            },
+                pin_id: AtomicU8::new(0),
+                pin_generation: AtomicU64::new(0),
+                pin_qos: AtomicU8::new(0),
+                pinned: AtomicBool::new(false),
+            }),
             GFP_KERNEL,
         )?)
+    }
+
+    /// Claim the context's hardware identity before anything of this command
+    /// names it; a replay keeps the original claim. EBUSY: no identity is
+    /// free or idle yet.
+    pub(crate) fn ensure_pinned(&self) -> Result {
+        if self.pinned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let pin = self.context.pin()?;
+        let qos = match self.context.pin_qos() {
+            Ok(qos) => qos,
+            Err(error) => {
+                self.context.unpin(pin);
+                return Err(error);
+            }
+        };
+        self.pin_id.store(pin.id, Ordering::Relaxed);
+        self.pin_generation.store(pin.generation, Ordering::Relaxed);
+        self.pin_qos.store(qos, Ordering::Relaxed);
+        self.pinned.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Called under the packet preparation mutex, before scheduler run_job.
+    /// Snapshot only the resource whose failed try will cause this wait.
+    pub(crate) fn prepare_pins(&self) -> Result<Option<super::availability::Wait>> {
+        if self.pinned.load(Ordering::Acquire) { return Ok(None); }
+        loop {
+            let execution = self.context.execution_availability();
+            let observed = execution.map(|domain| domain.observe());
+            let pin = match self.context.pin() {
+                Ok(pin) => pin,
+                Err(error) if error == EBUSY => {
+                    let domain = execution.ok_or(error)?;
+                    if let Some(wait) = domain.wait(observed.ok_or(error)?)? {
+                        return Ok(Some(wait));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let qos_domain = self.context.qos_availability();
+            let qos_observed = qos_domain.observe();
+            let qos = match self.context.pin_qos() {
+                Ok(qos) => qos,
+                Err(error) => {
+                    self.context.unpin(pin);
+                    if error != EBUSY { return Err(error); }
+                    if let Some(wait) = qos_domain.wait(qos_observed)? {
+                        return Ok(Some(wait));
+                    }
+                    continue;
+                }
+            };
+            self.pin_id.store(pin.id, Ordering::Relaxed);
+            self.pin_generation.store(pin.generation, Ordering::Relaxed);
+            self.pin_qos.store(qos, Ordering::Relaxed);
+            self.pinned.store(true, Ordering::Release);
+            return Ok(None);
+        }
+    }
+
+    pub(crate) fn has_pin(&self) -> bool { self.pinned.load(Ordering::Acquire) }
+
+    /// Exact retirement: firmware finished this command and it will not be
+    /// replayed. Other endings keep the claim until the VM's last queue is
+    /// released after its scheduler release, so an identity never moves while
+    /// a command of its VM may still run.
+    pub(crate) fn unpin_retired(&self) {
+        if self.pinned.swap(false, Ordering::AcqRel) {
+            self.context.unpin_qos(self.pin_qos.load(Ordering::Relaxed));
+            self.context.unpin(crate::mmu::ContextPin {
+                id: self.pin_id.load(Ordering::Relaxed),
+                generation: self.pin_generation.load(Ordering::Relaxed),
+            });
+        }
     }
 
     pub(crate) fn engine(&self) -> Engine {
@@ -256,7 +355,7 @@ pub(crate) trait Backend: Send + Sync {
     fn fail_vm(&self, error: Error);
     /// Called after both scheduler entities have cancelled their queued jobs.
     fn release_owner(&self);
-    fn prepare(&self, packet: &Packet) -> Option<Fence>;
+    fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence>;
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence>;
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status;
     fn cancel(&self, packet: Arc<Packet>);

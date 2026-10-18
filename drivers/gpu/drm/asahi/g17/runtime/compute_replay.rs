@@ -156,6 +156,10 @@ impl Firmware {
                     if !queue.owns_packet(&packet) {
                         deferred
                             .push(Deferred::Retired(packet.completion.clone(), Err(ENODATA)))?;
+                        // The old publication crossed its exact retirement
+                        // witness before entering the replay FIFO, and this
+                        // failed attempt acquired no new active ownership.
+                        packet.unpin_retired();
                     }
                 } else {
                     pr_info!(

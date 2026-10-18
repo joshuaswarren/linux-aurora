@@ -9,11 +9,12 @@
 //! a graph or waiting for GPU work. Capacity waiters sleep on the release event.
 
 use crate::g17::{
+    availability::Availability,
     hazard::{self, Footprint, Plan},
     job::Packet,
     progress::{self, Step, Watch},
 };
-use crate::{hw::t8140::queues as cfg, mmu::MAX_EXECUTION_CONTEXTS};
+use crate::{g17::context::MAX_QUEUES, hw::t8140::queues as cfg};
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::{
     new_condvar, new_mutex,
@@ -553,14 +554,17 @@ pub(crate) struct Pool {
     #[pin]
     released: CondVar,
     queues: AtomicU32,
+    available: Arc<Availability>,
 }
 impl Pool {
     pub(crate) fn new() -> Result<Arc<Self>> {
+        let available = Availability::new()?;
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(State::new(), "G17 render admission"),
                 released <- new_condvar!("G17 render pair release"),
                 queues: AtomicU32::new(0),
+                available,
             }),
             GFP_KERNEL,
         )
@@ -568,8 +572,10 @@ impl Pool {
     pub(crate) fn reserve_queue(self: &Arc<Self>) -> Result<QueueSlot> {
         let mut count = self.queues.load(Ordering::Acquire);
         loop {
-            if count >= MAX_EXECUTION_CONTEXTS {
-                return Err(enospc_site!("admission.rs:302 logical queue limit"));
+            // Hardware identities and QoS slots are bound per publication;
+            // this bounds host bookkeeping only.
+            if count == MAX_QUEUES {
+                return Err(EOVERFLOW);
             }
             match self.queues.compare_exchange(
                 count,
@@ -757,8 +763,50 @@ impl Pool {
             record,
         }))
     }
-    pub(crate) fn warmable_sibling(&self, owner: u64, publishing: u8) -> Option<u8> {
-        self.state.lock().warmable_sibling(owner, publishing)
+    pub(crate) fn availability(&self) -> &Arc<Availability> {
+        &self.available
+    }
+
+    /// Dependency-ready admission reserves depth for the packet, including new
+    /// logical owners. A lease counts both prepared and published work, so an
+    /// idle pair cannot be lent between preparation and publication.
+    pub(crate) fn prepare_render(
+        self: &Arc<Self>,
+        owner: u64,
+        request: Option<Request<'_>>,
+    ) -> Result<Option<RenderLease>> {
+        if owner == 0 { return Err(EINVAL); }
+        let mut state = self.state.lock();
+        match state.refusal(owner) {
+            Err(error) if error == ENOSPC => return Ok(None),
+            result => result?,
+        }
+        let plan = state.plan(owner, request, None);
+        let Some(slot) = state.pick(owner, plan) else { return Ok(None); };
+        let record = match request {
+            Some(request) => match state.record(owner, Some(slot), 0, request) {
+                Some(record) => Some(record),
+                None => {
+                    state.release(slot);
+                    drop(state);
+                    self.available.notify();
+                    return Err(ENOMEM);
+                }
+            },
+            None => None,
+        };
+        Ok(Some(RenderLease { pool: self.clone(), slot, record }))
+    }
+
+    /// Reserve the idle sibling while its graph is built off-lock. Otherwise
+    /// admission could lend that zero-ref slot to a different logical owner.
+    pub(crate) fn reserve_warmable_sibling(
+        self: &Arc<Self>, owner: u64, publishing: u8,
+    ) -> Option<RenderLease> {
+        let mut state = self.state.lock();
+        let slot = state.warmable_sibling(owner, publishing)?;
+        state.take_idle(usize::from(slot), owner);
+        Some(RenderLease { pool: self.clone(), slot, record: None })
     }
 
     /// The pair for `slot` cannot be built: no QID or identity is left. Never
@@ -783,6 +831,7 @@ impl Pool {
             }
         }
         self.released.notify_all();
+        self.available.notify();
     }
 
     /// QID recycling (vmfix6) dismantles `slot`'s parked pair: make the slot
@@ -813,6 +862,7 @@ impl Pool {
         state.fresh_blocked = false;
         drop(state);
         self.released.notify_all();
+        self.available.notify();
         true
     }
 
@@ -907,6 +957,7 @@ impl Pool {
         }
         drop(state);
         self.released.notify_all();
+        self.available.notify();
     }
     /// Active leases survive this transition. Their later drop is still the
     /// event which releases capacity, so a stopped owner is never double-freed.
@@ -926,6 +977,7 @@ impl Pool {
         state.kill_hold = 0;
         drop(state);
         self.released.notify_all();
+        self.available.notify();
     }
 }
 
@@ -951,6 +1003,7 @@ impl RenderLease {
     pub(crate) fn quarantine(&self) {
         self.pool.state.lock().quarantined |= 1u64 << self.slot;
         self.pool.released.notify_all();
+        self.pool.available.notify();
     }
     /// The VM pin must be retired first. Keep this lease until after clearing
     /// quarantine; its drop is what permits waiting publications to proceed.
@@ -975,6 +1028,7 @@ impl Drop for RenderLease {
         state.release(self.slot);
         drop(state);
         self.pool.released.notify_all();
+        self.pool.available.notify();
     }
 }
 
@@ -1014,5 +1068,6 @@ impl Pool {
         }
         self.state.lock().kill_hold &= !slots;
         self.released.notify_all();
+        self.available.notify();
     }
 }

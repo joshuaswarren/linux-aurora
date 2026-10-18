@@ -11,7 +11,7 @@ use super::fw::freelist::*;
 use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_SIZE};
 use super::object::{Allocator, CpuMap, KernelObject};
 use crate::mmu;
-use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel::{
     new_mutex,
     prelude::*,
@@ -51,6 +51,12 @@ impl RenderId {
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
+                        static PEAK: AtomicU32 = AtomicU32::new(0);
+                        let used = allocator.used.iter()
+                            .map(|bank| bank.load(Ordering::Relaxed).count_ones()).sum::<u32>() - 1;
+                        if used > PEAK.fetch_max(used, Ordering::AcqRel) && used % 16 == 0 {
+                            pr_info!("asahi: render pool identities in use: peak {}\n", used);
+                        }
                         return Ok(Self {
                             slot: 129 + bank as u16 * 64 + bit as u16,
                             allocator: allocator.clone(),

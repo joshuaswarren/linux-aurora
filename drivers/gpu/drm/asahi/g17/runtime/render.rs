@@ -9,6 +9,7 @@ mod dependencies;
 mod grow;
 mod observe;
 mod pools;
+mod physical;
 mod prepare;
 mod recovery;
 mod replay;
@@ -74,15 +75,18 @@ pub(super) enum Site {
     CapacityRetired,
     /// Capacity: graph construction refused for want of QIDs/identities.
     CapacityReserve,
+    /// Capacity: no free render pool (USC free-list) identity (127); pools of
+    /// closed queues return theirs after their teardown completes.
+    CapacityRenderPool,
 }
 impl Site {
     pub(super) fn name(value: u32) -> &'static str {
-        const NAMES: [&str; 21] = [
+        const NAMES: [&str; 22] = [
             "none", "build-pending", "build-busy", "build-reserve", "build-bindable",
             "rebind-prepare", "rebind-bind", "fresh-install", "parked-install", "build-finish",
             "prepare-no-pair", "prepare-take", "prepare-growth", "prepare-pending",
             "prepare-pair", "publish", "restore", "capacity-buffer-id", "capacity-metrics",
-            "capacity-retired-list", "capacity-reserve",
+            "capacity-retired-list", "capacity-reserve", "capacity-render-pool",
         ];
         NAMES.get(value as usize).copied().unwrap_or("?")
     }
@@ -734,7 +738,11 @@ impl crate::g17::queue::render::Host for Host<'_> {
             queues.accounting.complete(&view, &owners)?;
         }
         queues.render.pools.commit_completed(pool_id, next);
-        queues.buffers.release(buffer_id)
+        queues.buffers.release(buffer_id)?;
+        // Actual retirement returns buffer/pool capacity. Lease rollback uses
+        // a separate admission domain and cannot manufacture this progress.
+        self.firmware.primary.state.shared.physical_available.notify();
+        Ok(())
     }
 }
 
@@ -833,6 +841,8 @@ impl crate::g17::Firmware {
                     .map_err(|_| ENOMEM)?;
             }
             pr_info!("asahi: render slot {} recycled (qids {}/{})\n", slot, high_water[0].0, high_water[1].0);
+            self.primary.state.shared.physical_available.notify();
+            self.queues.compute_available.notify();
             return Ok(true);
         }
         Ok(false)
@@ -1444,6 +1454,7 @@ impl crate::g17::Firmware {
                 *reclaim.binding_slot()? = Some(binding);
             }
             self.queues.buffers.unreserve_owner(id)?;
+            self.primary.state.shared.physical_available.notify();
             static COLLECTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
             if let Some(n) = crate::g17::progress::sampled(&COLLECTS) {
                 let (ids, graphs) = self.queues.render_census();
