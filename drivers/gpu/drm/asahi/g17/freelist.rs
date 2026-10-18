@@ -11,31 +11,210 @@ use super::fw::freelist::*;
 use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_SIZE};
 use super::object::{Allocator, CpuMap, KernelObject};
 use crate::mmu;
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use kernel::{
     new_mutex,
     prelude::*,
     sync::{Arc, Mutex},
 };
 
-/// Render pools occupy 129..255; compute uses its QID plus one, in 1..128.
-/// First-free allocation keeps the shared firmware namespace deterministic.
-pub(crate) struct RenderIds {
-    used: [AtomicU64; 2],
+mod render_ids;
+
+const NO_RENDER_ID: u16 = u16::MAX;
+static NEXT_RENDER_OWNER: AtomicU64 = AtomicU64::new(1);
+
+struct RenderIdCell {
+    owner: u64,
+    slot: AtomicU16,
+    generation: AtomicU64,
+    closed: AtomicBool,
+    storage: Arc<RenderStorage>,
 }
-impl RenderIds {
-    pub(crate) const fn new() -> Self {
-        Self {
-            used: [AtomicU64::new(0), AtomicU64::new(1 << 63)],
-        }
+impl RenderIdCell {
+    fn has_storage(&self) -> bool {
+        self.storage.backing.lock().is_some() || self.storage.spare.lock().is_some()
     }
 }
+
+/// Detached after the device's final free-list release. Drop outside the
+/// device and identity locks because mappings may take memory-management locks.
+#[must_use]
+pub(crate) struct ReclaimedRenderId {
+    _backing: Option<RenderBacking>,
+    spare: Option<Pages>,
+}
+impl ReclaimedRenderId {
+    /// Caller is outside the device lock. Remove the previous client's alias
+    /// before handing physical storage to another logical pool.
+    fn into_pages(self) -> Option<Pages> {
+        self._backing.map(RenderBacking::into_pages).or(self.spare)
+    }
+}
+
+struct RenderIdState {
+    leases: render_ids::State,
+    cells: [Option<Arc<RenderIdCell>>; render_ids::COUNT],
+}
+
+/// Render pools occupy 129..255; compute uses its QID plus one, in 1..128.
+/// First-free allocation keeps the shared firmware namespace deterministic.
+#[pin_data]
+pub(crate) struct RenderIds {
+    used: [AtomicU64; 2],
+    available: Arc<super::availability::Availability>,
+    #[pin]
+    state: Mutex<RenderIdState>,
+}
+impl RenderIds {
+    #[inline(never)]
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(try_pin_init!(Self {
+            used: [AtomicU64::new(0), AtomicU64::new(1 << 63)],
+            available: super::availability::Availability::new()?,
+            state <- new_mutex!(RenderIdState {
+                leases: render_ids::State::new(),
+                cells: [const { None }; render_ids::COUNT],
+            }, "G17 render identities"),
+        }), GFP_KERNEL)
+    }
+
+    pub(crate) fn availability(&self) -> &Arc<super::availability::Availability> {
+        &self.available
+    }
+
+    fn pin(self: &Arc<Self>, cell: &Arc<RenderIdCell>, assigned: impl FnOnce()) -> Result<RenderIdPin> {
+        let mut state = self.state.lock();
+        let slot = cell.slot.load(Ordering::Acquire);
+        if slot != NO_RENDER_ID {
+            let lease = render_ids::Lease {
+                slot, owner: cell.owner, generation: cell.generation.load(Ordering::Acquire),
+            };
+            match state.leases.pin(lease) {
+                Ok(_) => return Ok(RenderIdPin { allocator: self.clone(), cell: cell.clone(), lease }),
+                Err(render_ids::Error::Overflow) => return Err(EOVERFLOW),
+                Err(_) => {}
+            }
+        }
+        let claim = state.leases.claim(cell.owner, |_| false).map_err(|error| match error {
+            render_ids::Error::Busy | render_ids::Error::PendingRelease => ENOSPC,
+            render_ids::Error::Overflow => EOVERFLOW,
+            _ => EIO,
+        })?;
+        let index = usize::from(claim.lease.slot - render_ids::FIRST);
+        state.cells[index] = Some(cell.clone());
+        assigned();
+        cell.generation.store(claim.lease.generation, Ordering::Relaxed);
+        cell.slot.store(claim.lease.slot, Ordering::Release);
+        Ok(RenderIdPin { allocator: self.clone(), cell: cell.clone(), lease: claim.lease })
+    }
+
+    fn close(&self, cell: &Arc<RenderIdCell>) {
+        cell.closed.store(true, Ordering::Release);
+        let mut state = self.state.lock();
+        let slot = cell.slot.load(Ordering::Acquire);
+        if slot == NO_RENDER_ID { return; }
+        let index = usize::from(slot - render_ids::FIRST);
+        if state.cells[index].as_ref().is_some_and(|owner| Arc::ptr_eq(owner, cell))
+            && state.leases.remove(cell.owner, |_| true).is_ok() {
+            let old = state.cells[index].take();
+            cell.slot.store(NO_RENDER_ID, Ordering::Release);
+            drop(state);
+            drop(old);
+            self.available.notify();
+        }
+    }
+
+    /// Caller holds the device mutex and supplies the exact final release proof.
+    pub(crate) fn reclaim_one(&self, released: impl FnMut(u16) -> bool) -> Option<ReclaimedRenderId> {
+        self.reclaim(false, released)
+    }
+    /// Reuse backing for a pool that already has an ID, without evicting an
+    /// empty metadata-only owner. Caller supplies the same release proof.
+    pub(crate) fn reclaim_backing(&self, released: impl FnMut(u16) -> bool) -> Option<ReclaimedRenderId> {
+        self.reclaim(true, released)
+    }
+    fn reclaim(&self, only_storage: bool, mut released: impl FnMut(u16) -> bool) -> Option<ReclaimedRenderId> {
+        let mut state = self.state.lock();
+        let RenderIdState { leases, cells } = &mut *state;
+        let mut select = |require_storage: bool| leases.reclaim_one(|lease| {
+            cells[usize::from(lease.slot - render_ids::FIRST)].as_ref().is_some_and(|cell|
+                cell.owner == lease.owner
+                    && cell.slot.load(Ordering::Acquire) == lease.slot
+                    && cell.generation.load(Ordering::Acquire) == lease.generation
+                    && (!require_storage || cell.has_storage()))
+                && released(lease.slot)
+        });
+        let lease = select(true).or_else(|| if only_storage { None } else { select(false) })?;
+        let old = state.cells[usize::from(lease.slot - render_ids::FIRST)].take();
+        let (backing, spare) = if let Some(cell) = old.as_ref() {
+            let backing = cell.storage.backing.lock().take();
+            let spare = cell.storage.spare.lock().take();
+            cell.storage.page_list.store(0, Ordering::Release);
+            cell.slot.store(NO_RENDER_ID, Ordering::Release);
+            (backing, spare)
+        } else { (None, None) };
+        drop(state);
+        drop(old);
+        static RECLAIMS: AtomicU64 = AtomicU64::new(0);
+        if let Some(count) = super::progress::sampled(&RECLAIMS) {
+            pr_info!("asahi: idle render pool identity {} returned after firmware release (reclaim {})\n",
+                lease.slot, count);
+        }
+        self.available.notify();
+        Some(ReclaimedRenderId { _backing: backing, spare })
+    }
+}
+
+pub(super) struct RenderIdPin {
+    allocator: Arc<RenderIds>,
+    cell: Arc<RenderIdCell>,
+    lease: render_ids::Lease,
+}
+impl Drop for RenderIdPin {
+    fn drop(&mut self) {
+        let available = self.allocator.state.lock().leases.unpin(self.lease).unwrap_or(false);
+        if self.cell.closed.load(Ordering::Acquire) { self.allocator.close(&self.cell); }
+        if available { self.allocator.available.notify(); }
+    }
+}
+
+enum RenderIdKind {
+    Fixed(u16),
+    Rebindable(Arc<RenderIdCell>),
+}
 pub(super) struct RenderId {
-    slot: u16,
+    kind: RenderIdKind,
     allocator: Arc<RenderIds>,
 }
 impl RenderId {
-    pub(super) fn slot(&self) -> u16 { self.slot }
+    pub(super) fn slot(&self) -> u16 {
+        match &self.kind {
+            RenderIdKind::Fixed(slot) => *slot,
+            RenderIdKind::Rebindable(cell) => cell.slot.load(Ordering::Acquire),
+        }
+    }
+    pub(super) fn logical(allocator: &Arc<RenderIds>) -> Result<Self> {
+        let owner = NEXT_RENDER_OWNER.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |next| next.checked_add(1)).map_err(|_| EOVERFLOW)?;
+        let storage = RenderStorage::new(None)?;
+        Ok(Self { kind: RenderIdKind::Rebindable(Arc::new(RenderIdCell {
+            owner, slot: AtomicU16::new(NO_RENDER_ID), generation: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            storage,
+        }, GFP_KERNEL)?), allocator: allocator.clone() })
+    }
+    fn storage(&self) -> Option<Arc<RenderStorage>> {
+        match &self.kind {
+            RenderIdKind::Rebindable(cell) => Some(cell.storage.clone()),
+            RenderIdKind::Fixed(_) => None,
+        }
+    }
+    fn pin(&self, assigned: impl FnOnce()) -> Result<Option<RenderIdPin>> {
+        match &self.kind {
+            RenderIdKind::Fixed(_) => Ok(None),
+            RenderIdKind::Rebindable(cell) => self.allocator.pin(cell, assigned).map(Some),
+        }
+    }
     pub(super) fn new(allocator: &Arc<RenderIds>) -> Result<Self> {
         for (bank, used) in allocator.used.iter().enumerate() {
             let mut value = used.load(Ordering::Acquire);
@@ -58,7 +237,7 @@ impl RenderId {
                             pr_info!("asahi: render pool identities in use: peak {}\n", used);
                         }
                         return Ok(Self {
-                            slot: 129 + bank as u16 * 64 + bit as u16,
+                            kind: RenderIdKind::Fixed(129 + bank as u16 * 64 + bit as u16),
                             allocator: allocator.clone(),
                         })
                     }
@@ -71,8 +250,13 @@ impl RenderId {
 }
 impl Drop for RenderId {
     fn drop(&mut self) {
-        let bit = self.slot as usize - 129;
-        self.allocator.used[bit / 64].fetch_and(!(1u64 << (bit % 64)), Ordering::Release);
+        match &self.kind {
+            RenderIdKind::Fixed(slot) => {
+                let bit = *slot as usize - 129;
+                self.allocator.used[bit / 64].fetch_and(!(1u64 << (bit % 64)), Ordering::Release);
+            }
+            RenderIdKind::Rebindable(cell) => self.allocator.close(cell),
+        }
     }
 }
 
@@ -92,6 +276,20 @@ enum PageLayout {
 pub(crate) struct Pages {
     backing: KernelObject,
     layout: PageLayout,
+    render_accounting: Option<RenderAccounting>,
+}
+static RENDER_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static RENDER_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+struct RenderAccounting(u64);
+impl RenderAccounting {
+    fn new(bytes: u64) -> Self {
+        let live = RENDER_LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        RENDER_PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+        Self(bytes)
+    }
+}
+impl Drop for RenderAccounting {
+    fn drop(&mut self) { RENDER_LIVE_BYTES.fetch_sub(self.0, Ordering::Relaxed); }
 }
 impl Pages {
     fn new(alloc: &Allocator<'_>, blocks: usize, runs: RunLayout) -> Result<Self> {
@@ -103,7 +301,7 @@ impl Pages {
         )?;
         let base = backing.gpu_va();
         backing.initialize::<PoolTables>(0, |tables| tables.init(base, blocks, runs))?;
-        Ok(Self { backing, layout: PageLayout::Neo { blocks, runs } })
+        Ok(Self { backing, layout: PageLayout::Neo { blocks, runs }, render_accounting: None })
     }
     /// Fresh zeroed compute backing, built without the device mutex. M5 keeps
     /// its directory, block list and initial 32 MiB in one retained allocation.
@@ -115,22 +313,37 @@ impl Pages {
         Self::m5(alloc, geometry)
     }
     fn m5(alloc: &Allocator<'_>, geometry: super::fw::m5::pool::PoolGeometry) -> Result<Self> {
-        use super::fw::m5::pool;
         let tables = geometry.directory_bytes.checked_add(geometry.freelist_bytes).ok_or(EOVERFLOW)?;
         let size = geometry.blocks.checked_mul(geometry.block_bytes())
             .and_then(|n| n.checked_add(tables)).ok_or(EOVERFLOW)?;
-        let mut backing = alloc.lower(size, mmu::UAT_PGSZ as u64,
+        let backing = alloc.lower(size, mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RW, CpuMap::WriteCombined)?;
-        let base = backing.gpu_va();
+        let mut pages = Self { backing, layout: PageLayout::M5(geometry), render_accounting: None };
+        pages.populate_m5()?;
+        Ok(pages)
+    }
+    fn populate_m5(&mut self) -> Result {
+        use super::fw::m5::pool;
+        let PageLayout::M5(geometry) = self.layout else { return Err(EINVAL); };
+        let tables = geometry.directory_bytes.checked_add(geometry.freelist_bytes).ok_or(EOVERFLOW)?;
+        let base = self.backing.gpu_va();
         let mut blocks = KVec::with_capacity(geometry.blocks, GFP_KERNEL)?;
         for index in 0..geometry.blocks {
             blocks.push(base + (tables + index * geometry.block_bytes()) as u64, GFP_KERNEL)?;
         }
         pool::encode_directory(geometry, &blocks,
-            &mut backing.bytes_mut()[..geometry.directory_bytes]).map_err(|_| EINVAL)?;
+            &mut self.backing.bytes_mut()[..geometry.directory_bytes]).map_err(|_| EINVAL)?;
         pool::encode_freelist(geometry, &blocks,
-            &mut backing.bytes_mut()[geometry.directory_bytes..tables]).map_err(|_| EINVAL)?;
-        Ok(Self { backing, layout: PageLayout::M5(geometry) })
+            &mut self.backing.bytes_mut()[geometry.directory_bytes..tables]).map_err(|_| EINVAL)?;
+        Ok(())
+    }
+    fn reset_for_client(&mut self) -> Result {
+        // Released storage may contain the previous client's private data.
+        // Clear it before exposing an alias in a different client VM.
+        self.backing.bytes_mut().fill(0);
+        self.populate_m5()?;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
     pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
         self.backing.map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
@@ -186,6 +399,12 @@ pub(crate) struct RenderBacking {
 }
 
 impl RenderBacking {
+    fn into_pages(self) -> Pages {
+        let Self { _client, _global, pages } = self;
+        drop(_client);
+        drop(_global);
+        pages
+    }
     /// Fresh populated backing, built without the device mutex.
     pub(crate) fn new(
         alloc: &Allocator<'_>,
@@ -197,10 +416,11 @@ impl RenderBacking {
     }
     fn with_layout(alloc: &Allocator<'_>, render_global: Option<&mmu::Vm>,
         client: &mmu::Vm, layout: PageLayout) -> Result<Self> {
-        let pages = match layout {
+        let mut pages = match layout {
             PageLayout::Neo { blocks, runs } => Pages::new(alloc, blocks, runs)?,
             PageLayout::M5(geometry) => Pages::m5(alloc, geometry)?,
         };
+        pages.render_accounting = Some(RenderAccounting::new(pages.backing.bytes_mut().len() as u64));
         let address = pages.page_list_va();
         let global = render_global.map(|vm|
             pages.backing.map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)).transpose()?;
@@ -215,14 +435,31 @@ impl RenderBacking {
     }
 }
 
+#[pin_data]
+struct RenderStorage {
+    #[pin]
+    backing: Mutex<Option<RenderBacking>>,
+    #[pin]
+    spare: Mutex<Option<Pages>>,
+    page_list: AtomicU64,
+}
+impl RenderStorage {
+    fn new(backing: Option<RenderBacking>) -> Result<Arc<Self>> {
+        let address = backing.as_ref().map_or(0, |backing| backing.pages.page_list_va());
+        Arc::pin_init(try_pin_init!(Self {
+            backing <- new_mutex!(backing, "G17 render pool backing"),
+            spare <- new_mutex!(None, "G17 render pool spare"),
+            page_list: AtomicU64::new(address),
+        }), GFP_KERNEL)
+    }
+}
+
 /// A render pool retained by a logical context and every graph referencing it.
 /// Its backing can be given back while the pool's free-list release has been
 /// consumed and the client VM is evicted; a fresh backing is installed before
 /// the pool is staged again.
 pub(crate) struct RenderPool {
-    backing: Arc<Mutex<Option<RenderBacking>>>,
-    /// Page-list VA of the installed backing; zero while vacant.
-    page_list: AtomicU64,
+    storage: Arc<RenderStorage>,
     /// Counts installed backings, so a re-armed backing is a new free-list
     /// owner even if its addresses repeat.
     epoch: AtomicU64,
@@ -236,7 +473,26 @@ pub(crate) struct RenderPool {
     layout: PageLayout,
 }
 
+/// Keeps both a physical identity and its logical pool alive during use.
+/// Drop the identity pin before releasing the retained pool reference.
+pub(crate) struct PoolPin {
+    _identity: RenderIdPin,
+    _pool: Arc<RenderPool>,
+}
+
 impl RenderPool {
+    pub(crate) fn backing_bytes() -> (u64, u64) {
+        (RENDER_LIVE_BYTES.load(Ordering::Relaxed), RENDER_PEAK_BYTES.load(Ordering::Relaxed))
+    }
+    /// The caller retains this guard across construction and all firmware use.
+    pub(crate) fn pin_id(self: &Arc<Self>) -> Result<Option<PoolPin>> {
+        let pin = self.id.pin(|| {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+            self.served.store(true, Ordering::Release);
+        })?;
+        Ok(pin.map(|pin| PoolPin { _identity: pin, _pool: self.clone() }))
+    }
+
     pub(crate) fn new(
         alloc: &Allocator<'_>,
         ids: &Arc<RenderIds>,
@@ -253,8 +509,18 @@ impl RenderPool {
     pub(super) fn m5(alloc: &Allocator<'_>, id: RenderId, client: &mmu::Vm,
         geometry: super::fw::m5::pool::PoolGeometry) -> Result<Self> {
         if !alloc.uat.is_sptm() { return Err(EINVAL); }
-        let backing = RenderBacking::with_layout(alloc, None, client, PageLayout::M5(geometry))?;
-        Self::with_backing(alloc, id, client, backing)
+        // Logical metadata is cheap; physical backing is installed only once
+        // preparation owns both an identity pin and admission capacity.
+        let storage = id.storage().ok_or(EINVAL)?;
+        let state = alloc.kernel(CONTROL_SIZE, mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW, CpuMap::WriteCombined)?;
+        let control = alloc.kernel(CONTROL_SIZE, mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW, CpuMap::WriteCombined)?;
+        let serial = RENDER_POOL_SERIAL.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |value| value.checked_add(1)).map_err(|_| EOVERFLOW)? + 1;
+        Ok(Self { storage, epoch: AtomicU64::new(0), client_residency: client.residency_gate(),
+            control, state, served: AtomicBool::new(true), serial, id,
+            layout: PageLayout::M5(geometry) })
     }
 
     fn with_backing(alloc: &Allocator<'_>, id: RenderId, client: &mmu::Vm,
@@ -275,13 +541,13 @@ impl RenderPool {
             CpuMap::WriteCombined,
         )?;
         if let PageLayout::M5(_) = layout {
-            super::fw::m5::pool::encode_g17s_render_state(backing.pages.m5_layout(id.slot)?,
+            super::fw::m5::pool::encode_g17s_render_state(backing.pages.m5_layout(id.slot())?,
                 state.gpu_va(), control.bytes_mut()).map_err(|_| EINVAL)?;
         } else { control.write(
             0,
             FreeListControl::render(
                 &FreeListArgs {
-                    buffer_slot: u32::from(id.slot),
+                    buffer_slot: u32::from(id.slot()),
                     class: FreeListClass::Two,
                     page_list_va: address,
                     run_list_va,
@@ -295,13 +561,16 @@ impl RenderPool {
         let serial = RENDER_POOL_SERIAL
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
             .map_err(|_| EOVERFLOW)? + 1;
-        let backing = Arc::pin_init(
-            new_mutex!(Some(backing), "G17 render pool backing"),
-            GFP_KERNEL,
-        )?;
+        if serial <= 8 || serial.is_power_of_two() {
+            let bytes = match layout {
+                PageLayout::M5(geometry) => geometry.blocks * geometry.block_bytes(),
+                PageLayout::Neo { blocks, .. } => blocks * FREE_LIST_BLOCK_SIZE,
+            };
+            pr_info!("asahi: render pool allocation {}: {} backing bytes, identity {}\n", serial, bytes, id.slot());
+        }
+        let storage = RenderStorage::new(Some(backing))?;
         Ok(Self {
-            backing,
-            page_list: AtomicU64::new(address),
+            storage,
             epoch: AtomicU64::new(0),
             client_residency: client.residency_gate(),
             control,
@@ -315,7 +584,11 @@ impl RenderPool {
 
     /// No backing is installed: the pool must be re-armed before staging.
     pub(crate) fn vacant(&self) -> bool {
-        self.page_list.load(Ordering::Acquire) == 0
+        self.storage.page_list.load(Ordering::Acquire) == 0
+    }
+    pub(crate) fn has_id(&self) -> bool { self.id() != NO_RENDER_ID }
+    pub(crate) fn needs_storage(&self) -> bool {
+        self.vacant() && self.storage.spare.lock().is_none()
     }
     /// Pressure reclaim evicted the client VM, which is idle.
     pub(crate) fn client_evicted(&self) -> bool {
@@ -326,29 +599,26 @@ impl RenderPool {
     /// next staging requires a re-armed backing. The caller drops the result
     /// after releasing the device mutex.
     pub(crate) fn vacate(&self) -> Option<RenderBacking> {
-        let backing = self.backing.lock().take();
+        let backing = self.storage.backing.lock().take();
         if backing.is_some() {
-            self.page_list.store(0, Ordering::Release);
+            self.storage.page_list.store(0, Ordering::Release);
         }
         backing
     }
-    /// Installs fresh backing into a vacant pool, unless another caller did.
-    /// The next staging rewrites the control header and descriptor row for it
-    /// (its run-list address changes the free-list owner identity).
-    pub(crate) fn rearm(&self, fresh: RenderBacking) -> Result {
-        if fresh.pages.layout != self.layout {
-            return Err(EINVAL);
+    /// Keep released physical storage for the incoming owner, without keeping
+    /// the old VM alias or assigning backing to every logical context.
+    pub(crate) fn cache_reclaimed(&self, reclaimed: ReclaimedRenderId) {
+        let pages = reclaimed.into_pages();
+        let backing = self.storage.backing.lock();
+        let mut spare = self.storage.spare.lock();
+        let mut pages = pages;
+        if backing.is_none() && spare.is_none()
+            && pages.as_ref().is_some_and(|pages| pages.layout == self.layout) {
+            *spare = pages.take();
         }
-        let mut backing = self.backing.lock();
-        if backing.is_some() {
-            return Ok(());
-        }
-        let address = fresh.pages.page_list_va();
-        *backing = Some(fresh);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.served.store(true, Ordering::Release);
-        self.page_list.store(address, Ordering::Release);
-        Ok(())
+        drop(spare);
+        drop(backing);
+        drop(pages);
     }
     /// Re-arms a vacant pool with fresh backing built here, without the device
     /// mutex. `client` is the VM of the context that owns this pool.
@@ -358,11 +628,23 @@ impl RenderPool {
         render_global: &mmu::Vm,
         client: &mmu::Vm,
     ) -> Result {
-        if !self.vacant() {
-            return Ok(());
-        }
+        let mut backing = self.storage.backing.lock();
+        if backing.is_some() { return Ok(()); }
         let global = if matches!(self.layout, PageLayout::M5(_)) { None } else { Some(render_global) };
-        self.rearm(RenderBacking::with_layout(alloc, global, client, self.layout)?)
+        let spare = self.storage.spare.lock().take();
+        let fresh = if let Some(mut pages) = spare {
+            pages.reset_for_client()?;
+            let alias = pages.map_client(client)?;
+            RenderBacking { _client: alias, _global: None, pages }
+        } else {
+            RenderBacking::with_layout(alloc, global, client, self.layout)?
+        };
+        let address = fresh.pages.page_list_va();
+        *backing = Some(fresh);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.served.store(true, Ordering::Release);
+        self.storage.page_list.store(address, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn serial(&self) -> u64 {
@@ -372,14 +654,14 @@ impl RenderPool {
         self.epoch.load(Ordering::Acquire)
     }
     pub(crate) fn id(&self) -> u16 {
-        self.id.slot
+        self.id.slot()
     }
     pub(crate) fn control_va(&self) -> u64 {
         self.control.gpu_va()
     }
     /// Zero while vacant.
     pub(crate) fn page_list_va(&self) -> u64 {
-        self.page_list.load(Ordering::Acquire)
+        self.storage.page_list.load(Ordering::Acquire)
     }
     pub(crate) fn run_list_va(&self) -> u64 {
         self.page_list_va() + match self.layout {
@@ -402,7 +684,7 @@ impl RenderPool {
         }
         let submitted = self.state.dword(0)?.load(Ordering::Relaxed);
         if let PageLayout::M5(_) = self.layout {
-            let backing = self.backing.lock();
+            let backing = self.storage.backing.lock();
             let pages = &backing.as_ref().ok_or(EAGAIN)?.pages;
             if pages.page_list_va() != self.page_list_va() { return Err(EIO); }
             let mut bytes = [0; super::fw::m5::pool::STATE_BYTES];
@@ -440,7 +722,7 @@ impl RenderPool {
                 .write_unaligned(header)
         };
         let control = self.control.pointer(0, CONTROL_SIZE)?.cast::<u64>();
-        let backing = self.backing.lock();
+        let backing = self.storage.backing.lock();
         let pages = &backing.as_ref().ok_or(EAGAIN)?.pages;
         if pages.page_list_va() != self.page_list_va() {
             return Err(EIO);

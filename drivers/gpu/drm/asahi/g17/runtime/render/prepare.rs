@@ -88,9 +88,108 @@ struct BuildContext<'a> {
     resources: &'a BuildResources,
     slot: u8,
     first: &'a Arc<Packet>,
+    private_pool: Option<&'a Arc<crate::g17::freelist::RenderPool>>,
 }
 
 impl super::super::Backend {
+    /// Reserve scarce pool capacity before transferring a physical render pair.
+    /// Reclaim only a cached identity whose exact firmware release is consumed.
+    pub(in crate::g17::runtime) fn claim_render_pool(&self, first: &Arc<Packet>)
+        -> Result<(Arc<crate::g17::freelist::RenderPool>, Option<crate::g17::freelist::PoolPin>)>
+    {
+        let lease = self.shared.preparations.try_enter()?;
+        let dev = self.shared.drm()?;
+        let (resources, existing_pool) = {
+            let state = self.shared.state.lock();
+            let firmware = (*state).as_deref().ok_or(ENODEV)?;
+            let resources = BuildResources::new(firmware)?;
+            let geometry = resources.pool_plan(first)?.map(|plan| plan.geometry);
+            let mut existing = None;
+            for entry in firmware.queues.render.entries.iter().flatten() {
+                let Some(pair) = entry.pair.as_ref() else { continue; };
+                if pair.matches(self.owner, &self.context)? && pair.pool().fits(geometry)
+                    && !pair.pool().vacant() {
+                    existing = Some(pair.pool().clone());
+                    break;
+                }
+            }
+            (resources, existing)
+        };
+        let alloc = Allocator { dev: &dev, uat: &resources.uat };
+        let pool = match existing_pool {
+            Some(pool) => pool,
+            None => self.context.render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)?,
+        };
+        let pin = self.pin_render_pool(&pool, &resources, &lease)?;
+        Ok((pool, pin))
+    }
+
+    /// Recycle a released cache entry before assigning another physical pool.
+    /// Logical contexts keep metadata, not an unbounded private-memory cache.
+    /// The detached backing is always dropped after the device lock.
+    fn pin_render_pool(&self, pool: &Arc<crate::g17::freelist::RenderPool>,
+        resources: &BuildResources, lease: &Lease)
+        -> Result<Option<crate::g17::freelist::PoolPin>>
+    {
+        let mut reclaimed_pages = None;
+        loop {
+            if !lease.is_current() { return Err(EAGAIN); }
+            match pool.pin_id() {
+                Ok(pin) => {
+                    if let Some(reclaimed) = reclaimed_pages.take() {
+                        pool.cache_reclaimed(reclaimed);
+                    }
+                    return Ok(pin);
+                }
+                Err(error) if error == ENOSPC && resources.uat.is_sptm() => {
+                    // Repeat the release observation once after a failed claim;
+                    // a concurrent pin may have consumed the reclaimed slot.
+                    let reclaimed = {
+                        let mut state = self.shared.state.lock();
+                        let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+                        if !lease.is_current() { return Err(EAGAIN); }
+                        if firmware.recovery.pending()
+                            || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0 {
+                            return Err(EAGAIN);
+                        }
+                        firmware.queues.render.pools.observe(&firmware.init)?;
+                        resources.ids.reclaim_one(|id|
+                            firmware.queues.render.pools.released(u32::from(id), 0))
+                    };
+                    if reclaimed.is_some() { reclaimed_pages = reclaimed; continue; }
+                    self.shared.queue_events();
+                    return Err(self.capacity(Site::CapacityRenderPool, error));
+                }
+                Err(error) => return Err(self.capacity(Site::CapacityRenderPool, error)),
+            }
+        }
+    }
+
+    /// Caller owns physical admission and holds this pool's ID pin. Do not
+    /// evict a warm backing for a logical contender still awaiting admission.
+    fn prepare_pool_backing(&self, pool: &Arc<crate::g17::freelist::RenderPool>,
+        resources: &BuildResources, lease: &Lease, client: &crate::mmu::Vm) -> Result
+    {
+        if resources.uat.is_sptm() && pool.needs_storage() {
+            let reclaimed = {
+                let mut state = self.shared.state.lock();
+                let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+                if !lease.is_current() { return Err(EAGAIN); }
+                if firmware.recovery.pending()
+                    || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0 {
+                    return Err(EAGAIN);
+                }
+                firmware.queues.render.pools.observe(&firmware.init)?;
+                resources.ids.reclaim_backing(|id|
+                    firmware.queues.render.pools.released(u32::from(id), 0))
+            };
+            if let Some(reclaimed) = reclaimed { pool.cache_reclaimed(reclaimed); }
+        }
+        let dev = self.shared.drm()?;
+        let alloc = Allocator { dev: &dev, uat: &resources.uat };
+        pool.ensure_backing(&alloc, &resources.global, client)
+    }
+
     /// Restoring a borrowed graph wakes other publishers. A preparation
     /// attempt must not mistake its own restoration for returned capacity;
     /// preserve any independently observed progress when advancing its sample.
@@ -108,6 +207,9 @@ impl super::super::Backend {
         nonblocking: bool, mut observed: Option<&mut u64>) -> Result {
         let lease = if nonblocking { self.shared.preparations.try_enter()? } else { self.shared.preparations.enter(false)? };
         let dev = self.shared.drm()?;
+        let pool_claim = if matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm) {
+            Some(self.claim_render_pool(first)?)
+        } else { None };
         let (resources, build) = loop {
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -186,8 +288,7 @@ impl super::super::Backend {
                                 if !pair.pool().vacant() { return Ok(()); }
                                 let pool = pair.pool().clone();
                                 drop(state);
-                                let alloc = Allocator { dev: &dev, uat: &resources.uat };
-                                return pool.ensure_backing(&alloc, &resources.global, self.context.vm());
+                                return self.prepare_pool_backing(&pool, &resources, &lease, self.context.vm());
                             }
                         }
                         // Every rebind, including same-context pool growth,
@@ -275,6 +376,7 @@ impl super::super::Backend {
             resources: &resources,
             slot,
             first,
+            private_pool: pool_claim.as_ref().map(|(pool, _)| pool),
         };
         match build {
             Build::Fresh(reservation, pm_generation, metrics, channels) => self
@@ -305,6 +407,15 @@ impl super::super::Backend {
     /// last scheduler page) is dropped after the device mutex is released.
     #[inline(never)]
     fn restore_retained(&self, slot: u8, lease: &Lease, observed: Option<&mut u64>) -> Result {
+        let (resources, pool, context) = {
+            let state = self.shared.state.lock();
+            let firmware = (*state).as_deref().ok_or(ENODEV)?;
+            let Some(index) = firmware.retained_index(slot, &self.context) else { return Ok(()); };
+            let binding = &firmware.queues.render.retired[index];
+            (BuildResources::new(firmware)?, binding.pool().clone(), binding.context().clone())
+        };
+        let mut pool_pin = self.pin_render_pool(&pool, &resources, lease)?;
+        self.prepare_pool_backing(&pool, &resources, lease, context.vm())?;
         let mut storage: Option<KBox<core::mem::MaybeUninit<Pair>>> = None;
         loop {
             let emptied = {
@@ -313,7 +424,8 @@ impl super::super::Backend {
                 if !lease.is_current() {
                     return Err(EAGAIN);
                 }
-                match firmware.restore_render_binding(slot, &self.context, &mut storage) {
+                match firmware.restore_render_binding(slot, &self.context, &mut storage,
+                    &pool, &mut pool_pin) {
                     Ok(Restore::None) => return Ok(()),
                     Ok(Restore::Done(parked)) => parked,
                     Ok(Restore::NeedStorage) => {
@@ -348,13 +460,16 @@ impl super::super::Backend {
             resources,
             slot,
             first,
+            private_pool,
         } = *ctx;
         let built = (|| -> Result<KBox<Pair>> {
             resources.bind_metrics(&self.context, &mut metrics)?;
-            let free_list =
-                self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
-                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?;
+            let free_list = match private_pool {
+                Some(pool) => pool.clone(),
+                None => self.context.render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
+                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?,
+            };
+            self.prepare_pool_backing(&free_list, resources, lease, self.context.vm())?;
             Pair::new(
                 &alloc,
                 &resources.objects,
@@ -457,13 +572,16 @@ impl super::super::Backend {
             resources,
             slot,
             first,
+            private_pool,
         } = *ctx;
         let built = (|| -> Result<_> {
             resources.bind_metrics(&self.context, &mut metrics)?;
-            let free_list =
-                self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
-                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?;
+            let free_list = match private_pool {
+                Some(pool) => pool.clone(),
+                None => self.context.render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
+                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?,
+            };
+            self.prepare_pool_backing(&free_list, resources, lease, self.context.vm())?;
             let prepared = parked.prepare(
                 &alloc,
                 &resources.objects,
@@ -573,15 +691,18 @@ impl super::super::Backend {
             resources,
             slot,
             first,
+            private_pool,
         } = *ctx;
         let prepared = (|| {
             if let Some(metrics) = metrics.as_mut() {
                 resources.bind_metrics(&self.context, metrics)?;
             }
-            let free_list =
-                self.context
-                    .render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
-                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?;
+            let free_list = match private_pool {
+                Some(pool) => pool.clone(),
+                None => self.context.render_pool(&alloc, &resources.ids, &resources.global, resources.pool_plan(first)?)
+                    .map_err(|error| self.capacity(Site::CapacityRenderPool, error))?,
+            };
+            self.prepare_pool_backing(&free_list, resources, lease, self.context.vm())?;
             pair.prepare_bind(
                 &alloc,
                 &resources.objects,

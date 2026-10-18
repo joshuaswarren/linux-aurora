@@ -1102,7 +1102,7 @@ impl Gpu {
                 queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags,
                     Arc::new(buffer::MetricsIds::new(), GFP_KERNEL)?),
                 pool: object::Pool::new()?,
-                render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
+                render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
                 _render_global: render_global,
                 _pm_metrics: Some(Arc::new(pm_metrics, GFP_KERNEL)?),
@@ -1160,7 +1160,7 @@ impl Gpu {
             effort: power::Effort::new(), registration_power_release_pending: false,
             queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags, metrics_ids),
             pool: object::Pool::new()?,
-            render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
+            render_ids: freelist::RenderIds::new()?,
             init, _render_global: render_global, _pm_metrics: Some(metrics), m5_test_pins: m5_test_pin::Pins::new(), m5_compute: None, m5_render: None, uat,
         }), GFP_KERNEL)?;
         // Keep the complete ownership graph if startup fails after context

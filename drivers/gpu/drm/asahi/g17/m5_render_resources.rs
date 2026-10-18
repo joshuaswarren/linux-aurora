@@ -12,6 +12,7 @@ const SCENE_TABLE:usize=0x400;
 const SCENE:usize=SCENE_TABLE+pool::SCENE_STRIDE;
 
 pub(super) struct Resources {
+    _pool_pin: Option<super::freelist::PoolPin>,
     aliases:KVec<mmu::KernelMapping>,
     pub(super) memory:KBox<Memory>,
     layout:target::Layout,
@@ -28,6 +29,9 @@ impl Resources {
         qids:[u8;2],pass:&RenderPass,clusters:u32,pb_slot:u8,
         private_pool:Arc<super::freelist::RenderPool>,metrics:super::buffer::MetricsLease)->Result<Self> {
         if !alloc.uat.is_sptm() {return Err(EINVAL);}
+        let pool_pin = private_pool.pin_id()?;
+        private_pool.ensure_backing(alloc, context.vm(), context.vm())?;
+        private_pool.repopulate()?;
         // Explicit single-group qualification policy. Physical cluster count
         // still sizes TPC storage. Normal rendering selects its own policy.
         let active_groups=1;
@@ -52,7 +56,7 @@ impl Resources {
             tpc_va:memory.target.tpc_va(),tpc_size:layout.tpc_size as u64,deflake_va:deflake,ta_status_va:ta_status,mesh_storage:0,mesh_class:0,
             fragment_status_va:fragment_status,fragment_status_fw_va:fragment_status_fw,aux_fb_va:auxiliary,timestamp_va:0,
             ta_ids:fw::ObjectIds{predecessor:0,current:0},fragment_ids:fw::ObjectIds{predecessor:0,current:0},unk_2104:0,unk_210c:0};
-        Ok(Self{aliases,memory,layout,pass:*pass,pool:private_pool,scenes_seen:0,view,extra,uma_row,pb_row})
+        Ok(Self{_pool_pin:pool_pin,aliases,memory,layout,pass:*pass,pool:private_pool,scenes_seen:0,view,extra,uma_row,pb_row})
     }
     pub(super) fn prepare_scene(&mut self,ordinal:u64)->Result {
         let target=self.memory.target.prepare(ordinal,&self.layout)?;
@@ -129,7 +133,11 @@ pub(super) fn qualify_pool_growth(alloc: &Allocator<'_>, context: &Arc<Context>,
     let initial = plan(0)?;
     let required = plan(1040)?;
     let old = context.render_pool(alloc, ids, global, Some(initial))?;
+    let _old_pin = old.pin_id()?;
+    old.ensure_backing(alloc, global, context.vm())?;
     let next = context.render_pool(alloc, ids, global, Some(required))?;
+    let _next_pin = next.pin_id()?;
+    next.ensure_backing(alloc, global, context.vm())?;
     if Arc::ptr_eq(&old, &next) || old.fits(Some(required.geometry))
         || !next.fits(Some(required.geometry)) || old.counters()? != [0; 2] {
         return Err(EIO);

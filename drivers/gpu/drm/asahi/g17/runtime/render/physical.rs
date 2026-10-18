@@ -22,6 +22,26 @@ impl super::super::Backend {
             if packet.cancel_requested() { return Err(ECANCELED); }
             if self.shared.crashed.load(Ordering::Acquire)
                 || packet.completion.status().get() != 0 { return Err(EIO); }
+            // Reserve a pool ID before admission can transfer a physical pair.
+            // Dropping this temporary pin after success is safe: the pair owns
+            // its own pin by then. A capacity miss has changed no pair owner.
+            let _pool_claim = if matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm) {
+                let ids = self.shared.state.lock().as_ref().ok_or(ENODEV)?.render_ids.clone();
+                let ids_observed = ids.availability().observe();
+                let physical_observed = self.shared.physical_available.observe();
+                match self.claim_render_pool(packet) {
+                    Ok(claim) => Some(claim),
+                    Err(error) if error == super::RENDER_CAPACITY_PENDING => {
+                        if let Some(mut wait) = ids.availability().wait(ids_observed)? {
+                            wait.also_wake(&self.shared.physical_available, physical_observed)?;
+                            self.shared.queue_events();
+                            return Ok(Some(wait));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else { None };
             let available = pool.availability();
             let observed = available.observe();
             let Some(lease) = pool.prepare_render(self.owner, Request::of(packet))? else {

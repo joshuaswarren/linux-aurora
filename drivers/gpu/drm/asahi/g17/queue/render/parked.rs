@@ -35,6 +35,7 @@ pub(crate) struct ParkedPair {
 
 /// All new graph ownership stays separate from the installed kick storage until commit.
 pub(crate) struct Prepared {
+    pool_pin: Option<crate::g17::freelist::PoolPin>,
     memory: Option<KBox<memory::Memory>>,
     pool: Arc<RenderPool>,
     aliases: Option<KVec<mmu::KernelMapping>>,
@@ -136,6 +137,10 @@ impl ParkedPair {
         pm_generation: u64,
         first: &Arc<Packet>,
     ) -> Result<Prepared> {
+        let pool_pin = free_list.pin_id()?;
+        if alloc.uat.is_sptm() {
+            free_list.ensure_backing(alloc, context.vm(), context.vm())?;
+        }
         if owner == 0 || !Arc::ptr_eq(&context, &first.context) || !context.is_current() {
             return Err(EINVAL);
         }
@@ -166,6 +171,7 @@ impl ParkedPair {
             word,
         )?;
         Ok(Prepared {
+            pool_pin,
             memory: Some(memory),
             pool: free_list,
             aliases: Some(persistent),
@@ -214,6 +220,7 @@ impl ParkedPair {
         };
         let first_owner = next.owner as u32;
         storage.write_init(kernel::try_init!(Pair {
+            pool_pin: next.pool_pin.take(),
             kick_aliases: None,
             memory,
             kicks,
@@ -286,6 +293,7 @@ impl ParkedPair {
         mut binding: RetiredBinding,
         cursors: [u32; 2],
         storage: KBox<core::mem::MaybeUninit<Pair>>,
+        pool_pin: Option<crate::g17::freelist::PoolPin>,
     ) -> core::result::Result<KBox<Pair>, RetiredBinding> {
         if self.kicks.is_none() || binding.memory.is_none() || binding.qids != self.qids() {
             return Err(binding);
@@ -296,6 +304,7 @@ impl ParkedPair {
         memory.clear_stale_claims();
         let pool = binding.pool.clone();
         let result = storage.write_init(kernel::try_init!(Pair {
+            pool_pin,
             kick_aliases: None,
             memory,
             kicks,

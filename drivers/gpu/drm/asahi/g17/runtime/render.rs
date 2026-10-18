@@ -330,8 +330,9 @@ impl Registry {
         }
         LAST.store(now.max(1), core::sync::atomic::Ordering::Relaxed);
         let (ids, graphs) = self.render_census();
-        pr_info!("asahi: render census ({}): ids free={} owned={} referenced={} refs={} graphs installed={} parked={} retired={} retired_pb={} retired_live={}\n",
-            why, ids[0], ids[1], ids[2], ids[3], graphs[0], graphs[1], graphs[2], graphs[3], graphs[4]);
+        let (backing, peak) = crate::g17::freelist::RenderPool::backing_bytes();
+        pr_info!("asahi: render census ({}): ids free={} owned={} referenced={} refs={} graphs installed={} parked={} retired={} retired_pb={} retired_live={} backing_bytes={} peak_backing_bytes={}\n",
+            why, ids[0], ids[1], ids[2], ids[3], graphs[0], graphs[1], graphs[2], graphs[3], graphs[4], backing, peak);
     }
 
     fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
@@ -1284,6 +1285,8 @@ impl crate::g17::Firmware {
         slot: u8,
         context: &Arc<Context>,
         storage: &mut Option<KBox<core::mem::MaybeUninit<Pair>>>,
+        pool: &Arc<crate::g17::freelist::RenderPool>,
+        pool_pin: &mut Option<crate::g17::freelist::PoolPin>,
     ) -> Result<Restore> {
         let Some(index) = self.retained_index(slot, context) else {
             return Ok(Restore::None);
@@ -1308,6 +1311,9 @@ impl crate::g17::Firmware {
         ];
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let binding = &self.queues.render.retired[index];
+        if !Arc::ptr_eq(binding.pool(), pool) || pool.vacant() {
+            return Err(EAGAIN);
+        }
         let installed = entry.pair.is_some();
         let cursors = match (entry.pair.as_ref(), entry.parked.as_ref()) {
             (Some(pair), _) => pair.restorable(binding, stamps)?,
@@ -1338,7 +1344,7 @@ impl crate::g17::Firmware {
         let entry = render.entries[usize::from(slot)].as_mut().ok_or(EIO)?;
         let parked = if installed {
             let pair = entry.pair.as_mut().ok_or(EIO)?;
-            let successor = pair.restore(binding, cursors);
+            let successor = pair.restore(binding, cursors, pool_pin.take());
             if render.retired.push_within_capacity(successor).is_err() {
                 // Capacity was freed by the removal above.
                 return Err(EIO);
@@ -1346,7 +1352,7 @@ impl crate::g17::Firmware {
             None
         } else {
             let mut parked = entry.parked.take().ok_or(EIO)?;
-            match parked.restore(binding, cursors, storage.take().ok_or(EIO)?) {
+            match parked.restore(binding, cursors, storage.take().ok_or(EIO)?, pool_pin.take()) {
                 Ok(pair) => entry.pair = Some(pair),
                 Err(binding) => {
                     entry.parked = Some(parked);

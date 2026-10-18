@@ -400,22 +400,32 @@ impl Backend {
         if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
+        let m5 = matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm);
+        let had_pin = packet.has_pin();
+        let _pool_claim = if m5 {
+            if packet.ensure_pinned().is_err() { return false; }
+            match self.claim_render_pool(packet) {
+                Ok(claim) => Some(claim),
+                Err(_) => {
+                    if !had_pin { packet.unpin_retired(); }
+                    return false;
+                }
+            }
+        } else { None };
         let admission = {
             let state = self.shared.state.lock();
-            let Some(firmware) = (*state).as_deref() else {
-                return false;
-            };
-            match firmware
+            (*state).as_deref().and_then(|firmware| firmware
                 .queues
                 .admission
                 .try_acquire_render(self.owner, Request::of(packet))
-            {
-                Ok(Some(lease)) => lease,
-                _ => return false,
-            }
+                .ok().flatten())
+        };
+        let Some(admission) = admission else {
+            if m5 && !had_pin { packet.unpin_retired(); }
+            return false;
         };
         // The scheduler path waits for an identity; this fast path does not.
-        if packet.ensure_pinned().is_err() {
+        if !m5 && packet.ensure_pinned().is_err() {
             return false;
         }
         if !packet.begin_publication() {

@@ -67,7 +67,7 @@ impl Pair {
                 firmware.primary.state.shared.render_policy.as_ref().ok_or(EINVAL)?)?
         } else {
             Arc::new(super::freelist::RenderPool::m5(&alloc,
-                super::freelist::RenderId::new(&firmware.render_ids)?, context.vm(),
+                super::freelist::RenderId::logical(&firmware.render_ids)?, context.vm(),
                 fw::m5::pool::PoolGeometry::g17s(7).map_err(|_| EINVAL)?)?, GFP_KERNEL)?
         };
         let mut resources=heap_owner(||super::m5_render_resources::Resources::new(

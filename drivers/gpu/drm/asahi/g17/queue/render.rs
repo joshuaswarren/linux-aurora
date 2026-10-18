@@ -238,6 +238,7 @@ impl PairDiag {
 /// Installed kick backing remains owned even when this pair has no logical
 /// owner. Commands retain their exact descriptor and allocation generations.
 pub(crate) struct Pair {
+    pool_pin: Option<crate::g17::freelist::PoolPin>,
     kick_aliases: Option<[Option<mmu::KernelMapping>; 2]>,
     memory: KBox<memory::Memory>,
     kicks: [kick::Queue; 2],
@@ -320,6 +321,10 @@ impl Pair {
         descriptor_flags: [u32; 2],
         channels: &mut Option<KBox<[Option<kick::Queue>; 2]>>,
     ) -> Result<KBox<Self>> {
+        let pool_pin = free_list.pin_id()?;
+        if alloc.uat.is_sptm() {
+            free_list.ensure_backing(alloc, context.vm(), context.vm())?;
+        }
         if slot == 0
             || usize::from(slot) >= queues::RENDER_SLOTS
             || owner == 0
@@ -374,6 +379,7 @@ impl Pair {
             adopt_render_kicks(alloc, ids, &client_vm, channels)?;
         let first_owner = owner as u32;
         storage.write_init(kernel::try_init!(Self {
+            pool_pin,
             kick_aliases: Some([Some(ta_alias), Some(fragment_alias)]),
             memory,
             kicks: [tiling, fragment],
@@ -2149,6 +2155,7 @@ fn install_memory(
 /// A binding prepared while the registry exclusively lends the idle pair.
 /// Its frontier prevents a stale off-lock result from replacing another owner.
 pub(crate) struct PreparedBinding {
+    pool_pin: Option<crate::g17::freelist::PoolPin>,
     previous_context: Arc<Context>,
     previous_owner: Option<u64>,
     ordinal: u64,
@@ -2399,7 +2406,8 @@ impl Pair {
     /// with the restored graph's PB state, slot and token, the free list and
     /// the scheduler page) and a completion seed (context_update). The pair is
     /// left without a logical owner; the normal same-VM rebind then binds it.
-    pub(crate) fn restore(&mut self, mut binding: RetiredBinding, cursors: [u32; 2]) -> RetiredBinding {
+    pub(crate) fn restore(&mut self, mut binding: RetiredBinding, cursors: [u32; 2],
+        pool_pin: Option<crate::g17::freelist::PoolPin>) -> RetiredBinding {
         let qids = self.qids();
         let successor = RetiredBinding {
             memory: None,
@@ -2414,6 +2422,7 @@ impl Pair {
         };
         let mut successor = successor;
         if let Some(mut memory) = binding.memory.take() {
+            self.pool_pin = pool_pin;
             memory.clear_stale_claims();
             successor.memory = Some(core::mem::replace(&mut self.memory, memory));
             successor.pool = core::mem::replace(&mut self.free_list, binding.pool.clone());
@@ -2474,6 +2483,10 @@ impl Pair {
         pm_generation: Option<u64>,
         first: &Arc<Packet>,
     ) -> Result<PreparedBinding> {
+        let pool_pin = free_list.pin_id()?;
+        if alloc.uat.is_sptm() {
+            free_list.ensure_backing(alloc, context.vm(), context.vm())?;
+        }
         if !self.bindable(owner, &context)?
             || owner == 0
             || !Arc::ptr_eq(&context, &first.context)
@@ -2522,6 +2535,7 @@ impl Pair {
             (Some(memory), Some(persistent), Some(aliases))
         };
         Ok(PreparedBinding {
+            pool_pin,
             previous_context: self.context().clone(),
             previous_owner: self.owner,
             ordinal: self.ordinal,
@@ -2589,6 +2603,7 @@ impl Pair {
             && !Arc::ptr_eq(&self.free_list, &binding.pool);
         let old_context = self.context().clone();
         let old_buffer = self.buffer_id();
+        self.pool_pin = binding.pool_pin.take();
         let old_pool = core::mem::replace(&mut self.free_list, binding.pool.clone());
         let old_memory = binding
             .memory

@@ -525,7 +525,9 @@ impl Context {
         if let Some(pool) = &*render {
             if pool.fits(plan.as_ref().map(|p| p.geometry)) {
                 // A pool vacated under memory pressure is re-armed before reuse.
-                pool.ensure_backing(alloc, render_global, self.vm())?;
+                if !alloc.uat.is_sptm() {
+                    pool.ensure_backing(alloc, render_global, self.vm())?;
+                }
                 return Ok(pool.clone());
             }
             // Existing pairs retain the old pool through replacement and its
@@ -533,7 +535,7 @@ impl Context {
         }
         let pool = Arc::new(
             match plan {
-                Some(plan) => RenderPool::m5(alloc, super::freelist::RenderId::new(ids)?,
+                Some(plan) => RenderPool::m5(alloc, super::freelist::RenderId::logical(ids)?,
                     self.vm(), plan.geometry)?,
                 None => RenderPool::new(alloc, ids, render_global, self.vm())?,
             },
