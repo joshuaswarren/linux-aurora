@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! SPTM address spaces and their confirmed mapping shadow.
 //!
@@ -7,22 +7,87 @@
 //! even when the GPUVA transaction cannot install its normal owner. Successful
 //! unmap releases those references before GPUVM attempts idle page reclaim.
 
-use super::{sptm::{ContextState, MapPages, MapPlan, Protection, TablePlan, PAGE}, sptm_transport::{AddressSpace, Transport}, table::BatchStats, MappingBacking};
+use super::{sptm::{self, ContextState, MapPages, MapPlan, Protection, TablePlan, PAGE}, sptm_transport::{AddressSpace, Transport}, table::BatchStats, MappingBacking};
 use crate::{g17::status::VmStatus, pgtable::{prot, Prot}};
 use core::ops::Range;
 use kernel::{addr::PhysicalAddr, prelude::*, rbtree::{RBTree, RBTreeNode, RBTreeNodeReservation}, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Private-space L2/L3 table frames x1n1 allocates from its own heap
-/// (sptm_hv_uat_alloc_frame -> memalign). x1n1 never returns them to the heap:
-/// DESTROY pools them for later spaces, so its heap holds the boot's peak of
-/// live private tables, and an x1n1 heap allocation failure is a hypervisor
-/// panic (dlmalloc MALLOC_FAILURE_ACTION). Keeping live tables under this
-/// budget bounds that peak. 2048 frames (32 MiB): a 4 x 64 GiB concurrent fill
-/// reset the machine at >= 7930 live frames, far below the heap's 1 GiB VA cap,
-/// so the real headroom is unknown; keep a wide margin until x1n1 reports it.
+/// Legacy providers only: private-space L2/L3 table frames x1n1 allocates
+/// from its own heap (sptm_hv_uat_alloc_frame -> memalign). x1n1 never returns
+/// them to the heap: DESTROY pools them for later spaces, so its heap holds the
+/// boot's peak of live private tables, and an x1n1 heap allocation failure is a
+/// hypervisor panic (dlmalloc MALLOC_FAILURE_ACTION). Keeping live tables under
+/// this budget bounds that peak. 2048 frames (32 MiB): a 4 x 64 GiB concurrent
+/// fill reset the machine at >= 7930 live frames, far below the heap's 1 GiB VA
+/// cap, so the real headroom is unknown; keep a wide margin.
+///
+/// A provider with donated tables takes each frame from Linux memory instead,
+/// as native XNU does (pmap_alloc_iommu_page), and returns it on destroy, so
+/// table memory has no budget beyond the kernel's own allocator.
 const PRIVATE_TABLE_BUDGET: u64 = 2048;
 static PRIVATE_TABLES: AtomicU64 = AtomicU64::new(0);
+static PRIVATE_TABLES_PEAK: AtomicU64 = AtomicU64::new(0);
+static DONATED_QUARANTINED: AtomicU64 = AtomicU64::new(0);
+
+/// Record donated frames becoming live and log each new 128-frame peak.
+fn note_donated(added: u64) {
+    let live = PRIVATE_TABLES.fetch_add(added, Ordering::AcqRel) + added;
+    let peak = PRIVATE_TABLES_PEAK.fetch_max(live, Ordering::AcqRel);
+    if live > peak && live / 128 != peak / 128 {
+        pr_info!("asahi: SPTM donated table frames: live {} peak {} ({} KiB of guest memory)\n",
+            live, live, live * (PAGE >> 10));
+    }
+}
+
+/// A guest page the provider holds as a UAT table frame. Freed only after the
+/// provider confirms it returned the page; otherwise deliberately leaked.
+struct DonorFrame {
+    page: *mut kernel::bindings::page,
+    /// A failed/undefined installation receipt was not part of a confirmed
+    /// native table. Even destroy receipt 0 cannot release this page.
+    query_on_destroy: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DonatedPage { Taken, Unused, Uncertain }
+
+/// A completed MAP_TABLE returns 0 (taken) or 1 (unused). The first failed
+/// operation may have quarantined its page; later operations never ran.
+fn donated_page_receipt(receipt: Option<u64>, ownership: Result<u64>) -> DonatedPage {
+    match receipt {
+        Some(0) => DonatedPage::Taken,
+        Some(1) => DonatedPage::Unused,
+        Some(_) => DonatedPage::Uncertain,
+        None if matches!(ownership, Ok(0)) => DonatedPage::Unused,
+        None => DonatedPage::Uncertain,
+    }
+}
+
+fn donated_page_returned(receipt: u64, uncertain: bool,
+    query: impl FnOnce() -> Result<u64>) -> bool
+{
+    (!uncertain && receipt == 0) || matches!(query(), Ok(0))
+}
+
+// SAFETY: An exclusively owned page reference; only its physical address is
+// shared, with the provider.
+unsafe impl Send for DonorFrame {}
+// SAFETY: See Send. No interior mutability.
+unsafe impl Sync for DonorFrame {}
+
+impl DonorFrame {
+    fn physical(&self) -> u64 {
+        // SAFETY: The page is a live allocation owned by this frame.
+        unsafe { kernel::bindings::page_to_phys(self.page) as u64 }
+    }
+
+    /// Free a page the provider never took or has returned.
+    fn free(self) {
+        // SAFETY: The page is mapped for the guest again and owned only here.
+        unsafe { kernel::bindings::__free_pages(self.page, 0) };
+    }
+}
 
 const L3_SPAN: u64 = 1 << 25;
 const L3_PER_L2: u64 = 1 << 11;
@@ -161,20 +226,22 @@ pub(super) struct PageTable {
     /// 32 bit 0 = the L2 table itself), and their count in PRIVATE_TABLES.
     tables: RBTree<u64, KBox<[u64; 33]>>,
     table_count: u64,
+    /// Donated table frames the provider holds for this space.
+    donors: KVec<DonorFrame>,
 }
 
 impl PageTable {
     pub(super) fn new(transport: &Arc<Transport>, status: Arc<VmStatus>) -> Result<Self> {
         Ok(Self { space: AddressSpace::private(transport)?, runs: RBTree::new(), status,
-            tables: RBTree::new(), table_count: 0 })
+            tables: RBTree::new(), table_count: 0, donors: KVec::new() })
     }
 
     pub(super) fn new_global(transport: &Arc<Transport>, status: Arc<VmStatus>) -> Self {
         Self { space: AddressSpace::global(transport), runs: RBTree::new(), status,
-            tables: RBTree::new(), table_count: 0 }
+            tables: RBTree::new(), table_count: 0, donors: KVec::new() }
     }
 
-    pub(super) fn private_handle(&self) -> Option<u8> { self.space.private_handle() }
+    pub(super) fn private_handle(&self) -> Option<u16> { self.space.private_handle() }
 
     pub(super) fn ensure_certain(&self) -> Result {
         match self.space.state() {
@@ -220,10 +287,154 @@ impl PageTable {
         (first..=last).map(|span| (span / L3_PER_L2, (span % L3_PER_L2) as usize))
     }
 
+    /// Bitmap storage for every L2 span of `range`, allocated before publication.
+    fn table_bitmaps(&mut self, range: &Range<u64>) -> Result {
+        let mut last_l2 = None;
+        for (l2, _) in Self::l3_spans(range) {
+            if last_l2 == Some(l2) { continue; }
+            last_l2 = Some(l2);
+            if self.tables.get(&l2).is_none() {
+                let bits = KBox::new([0u64; 33], GFP_KERNEL)?;
+                self.tables.insert(RBTreeNode::new(l2, bits, GFP_KERNEL)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_table(&mut self, l2: u64, l3: Option<usize>) {
+        if let Some(bits) = self.tables.get_mut(&l2) {
+            match l3 {
+                None => bits[32] |= 1,
+                Some(l3) => bits[l3 / 64] |= 1 << (l3 % 64),
+            }
+        }
+    }
+
+    /// Donated tables: give the provider one zeroed Linux page for every
+    /// missing L2/L3 of `range` before any leaf is published (native
+    /// pmap_alloc_iommu_page). Each table's receipt is exact: 0 took the
+    /// page, 1 found the table present. A failed operation's page is queried
+    /// before release; unexecuted tail pages stay with Linux. Taken or uncertain
+    /// pages remain allocated until their ownership is confirmed.
+    fn install_donated_tables(&mut self, range: &Range<u64>) -> Result {
+        let mut wanted = KVec::new();
+        let mut last_l2 = None;
+        for (l2, l3) in Self::l3_spans(range) {
+            let bits = self.tables.get(&l2);
+            if last_l2 != Some(l2) {
+                last_l2 = Some(l2);
+                if !bits.is_some_and(|bits| bits[32] & 1 != 0) {
+                    wanted.push((l2, None), GFP_KERNEL)?;
+                }
+            }
+            if !bits.is_some_and(|bits| bits[l3 / 64] & (1 << (l3 % 64)) != 0) {
+                wanted.push((l2, Some(l3)), GFP_KERNEL)?;
+            }
+        }
+        if wanted.is_empty() { return Ok(()); }
+        self.table_bitmaps(range)?;
+        self.donors.reserve(wanted.len(), GFP_KERNEL)?;
+        let space = self.space.plan_space()?;
+        let mut frames: KVec<DonorFrame> = KVec::with_capacity(wanted.len(), GFP_KERNEL)?;
+        let mut operations = KVec::with_capacity(wanted.len(), GFP_KERNEL)?;
+        let release = |frames: KVec<DonorFrame>| for frame in frames { frame.free() };
+        for (l2, l3) in wanted.iter() {
+            // SAFETY: A plain zeroed order-0 page allocation.
+            let page = unsafe { kernel::bindings::alloc_pages(
+                kernel::bindings::GFP_KERNEL | kernel::bindings::__GFP_ZERO, 0) };
+            if page.is_null() {
+                release(frames);
+                return Err(ENOMEM);
+            }
+            let frame = DonorFrame { page, query_on_destroy: false };
+            let (va, level) = match l3 {
+                None => (l2 * L3_SPAN * L3_PER_L2, 1),
+                Some(l3) => ((l2 * L3_PER_L2 + *l3 as u64) * L3_SPAN, 2),
+            };
+            let operation = sptm::donated_table(space, va, level, frame.physical());
+            frames.push_within_capacity(frame).map_err(|_| ENOMEM).ok();
+            match operation {
+                Ok(operation) => operations.push_within_capacity(operation).map_err(|_| ENOMEM).ok(),
+                Err(_) => {
+                    release(frames);
+                    return Err(EINVAL);
+                }
+            };
+        }
+        let Some(private) = self.space.donating() else {
+            release(frames);
+            return Err(EINVAL);
+        };
+        let (completed, result) = private.map_tables(&mut operations);
+        // Only the first incomplete operation could have run. A failed
+        // native retype whose aliases could not be restored stays quarantined
+        // even though its operation did not complete. Query before freeing.
+        let failed_owner = if completed < frames.len() {
+            private.transport().donation_state(frames[completed].physical())
+        } else { Ok(0) };
+        let mut taken = 0u64;
+        let mut uncertain = false;
+        for (index, mut frame) in frames.into_iter().enumerate() {
+            let (l2, l3) = wanted[index];
+            let receipt = (index < completed).then(|| operations[index].result);
+            let ownership = if index == completed { failed_owner } else { Ok(0) };
+            match donated_page_receipt(receipt, ownership) {
+                DonatedPage::Taken => {
+                    self.mark_table(l2, l3);
+                    self.donors.push_within_capacity(frame).ok();
+                    taken += 1;
+                }
+                DonatedPage::Unused => {
+                    if receipt == Some(1) { self.mark_table(l2, l3); }
+                    frame.free();
+                }
+                DonatedPage::Uncertain => {
+                    frame.query_on_destroy = true;
+                    self.donors.push_within_capacity(frame).ok();
+                    uncertain = true;
+                }
+            }
+        }
+        if taken != 0 {
+            self.table_count += taken;
+            note_donated(taken);
+        }
+        if uncertain { result.and(Err(EIO)) } else { result }
+    }
+
+    /// Return the donated frames after a confirmed destroy. A receipt of 0
+    /// means the provider returned every installed table. Failed installations
+    /// always need their own ownership query, as does every page for a partial
+    /// destroy. Retain any page whose return is not confirmed.
+    fn release_donors(&mut self, receipt: u64) {
+        let donors = core::mem::replace(&mut self.donors, KVec::new());
+        let transport = match &self.space {
+            AddressSpace::Private(space) => Some(space.transport()),
+            AddressSpace::Global { .. } => None,
+        };
+        let mut retained = 0u64;
+        for frame in donors {
+            let returned = donated_page_returned(receipt, frame.query_on_destroy, || {
+                transport.ok_or(EIO)?.donation_state(frame.physical())
+            });
+            if returned { frame.free(); } else { retained += 1; }
+        }
+        if retained != 0 {
+            DONATED_QUARANTINED.fetch_add(retained, Ordering::Relaxed);
+            pr_err!("asahi: SPTM destroy kept {} donated table frames (receipt {}); total {}\n",
+                retained, receipt, DONATED_QUARANTINED.load(Ordering::Relaxed));
+        }
+    }
+
     /// Reserve budget for every private table frame `range` may create
     /// before any provider operation. Returns the count to commit or release.
+    /// Donated tables are installed here instead, with nothing to settle.
     fn reserve_tables(&mut self, range: &Range<u64>) -> Result<u64> {
         if !matches!(self.space, AddressSpace::Private(_)) { return Ok(0); }
+        if self.space.donating().is_some() {
+            self.install_donated_tables(range)?;
+            return Ok(0);
+        }
         let mut needed = 0u64;
         let mut last_l2 = None;
         for (l2, l3) in Self::l3_spans(range) {
@@ -357,8 +568,10 @@ impl PageTable {
             }, GFP_KERNEL)?, GFP_KERNEL)?;
             pages += count;
         }
-        let tables = TablePlan::new(space, &union).map_err(|_| EINVAL)?;
-        let plan = Iterator::chain(tables, plans.iter().cloned().flatten());
+        // Donated tables are installed by reserve_tables before any leaf.
+        let tables = if self.space.donating().is_some() { None }
+            else { Some(TablePlan::new(space, &union).map_err(|_| EINVAL)?) };
+        let plan = Iterator::chain(tables.into_iter().flatten(), plans.iter().cloned().flatten());
         let operations = plan.clone().count() as u64;
         let reserved = self.reserve_tables(&union)?;
         let result = self.space.map_batch(plan);
@@ -518,11 +731,14 @@ impl Drop for PageTable {
             loop {
                 let next = self.runs.iter().next().map(|(start, run)| (*start, run.end));
                 let Some((start, end)) = next else {
-                    if self.space.destroy().is_err() {
-                        pr_err!("SPTM: empty address space could not be released\n");
-                    } else {
-                        // x1n1 pools the frames for later spaces: no longer live.
-                        PRIVATE_TABLES.fetch_sub(self.table_count, Ordering::AcqRel);
+                    match self.space.destroy() {
+                        Err(_) => pr_err!("SPTM: empty address space could not be released\n"),
+                        Ok(receipt) => {
+                            // Legacy x1n1 pools heap frames for later spaces;
+                            // donated frames return to Linux. Neither is live.
+                            PRIVATE_TABLES.fetch_sub(self.table_count, Ordering::AcqRel);
+                            self.release_donors(receipt);
+                        }
                     }
                     return;
                 };

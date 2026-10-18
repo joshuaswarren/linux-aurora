@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Synchronous submission to the platform's SPTM service.
 //!
@@ -24,7 +24,7 @@ pub(super) fn space_trace() -> bool {
     *crate::module_parameters::sptm_space_trace.value() != 0
 }
 
-pub(super) fn note_private(event: &str, handle: Option<u8>, detail: u64) {
+pub(super) fn note_private(event: &str, handle: Option<u16>, detail: u64) {
     if !space_trace() { return; }
     let created = PRIVATE_CREATED.load(Ordering::Relaxed);
     let destroyed = PRIVATE_DESTROYED.load(Ordering::Relaxed);
@@ -33,7 +33,7 @@ pub(super) fn note_private(event: &str, handle: Option<u8>, detail: u64) {
         created.saturating_sub(destroyed));
 }
 
-pub(super) fn note_private_retained(handle: Option<u8>, detail: u64) {
+pub(super) fn note_private_retained(handle: Option<u16>, detail: u64) {
     PRIVATE_RETAINED.fetch_add(1, Ordering::Relaxed);
     note_private("retained", handle, detail);
 }
@@ -133,11 +133,19 @@ unsafe extern "C" fn platform_reboot(block: *mut bindings::notifier_block,
     0
 }
 
+/// Provider features (op 18). Without negotiation the provider keeps its
+/// legacy ABI: 255 handles and table frames from its own heap.
+const FEATURES: u32 = 18;
+const DONATION_QUERY: u32 = 19;
+const FEATURE_DONATED_TABLES: u64 = 1;
+const FEATURE_WIDE_HANDLES: u64 = 2;
+
 pub(super) struct Transport {
     raw: *mut bindings::aurora_apif_gpu,
     reboot: Option<KBox<PlatformReboot>>,
+    features: u64,
     // Mapping plans share one native-sized batch for this transport's lifetime.
-    // The mutex covers the complete plan, including its failure prefix.
+    // The mutex covers one native batch; failure counts cover the whole plan.
     operations: Pin<KBox<Mutex<KVec<Operation>>>>,
 }
 
@@ -172,7 +180,7 @@ impl Transport {
                 bindings::AURORA_APIF_GPU_UAT_DOORBELL,
             ))
         }?;
-        let mut transport = Self { raw, operations, reboot: None };
+        let mut transport = Self { raw, operations, reboot: None, features: 0 };
         if *crate::module_parameters::m5_platform_enable.value() != 0 {
             let mut reboot = KBox::new(PlatformReboot {
                 notifier: bindings::notifier_block {
@@ -209,6 +217,20 @@ impl Transport {
                 result.as_ref().map_err(|failure| failure.error), operation.args, operation.result);
             result.map_err(|failure| failure.error)?;
         }
+        // Native XNU allocates UAT table pages from ordinary kernel memory and
+        // has no fixed address-space count. A provider without op 18 rejects
+        // it; the legacy ABI then applies.
+        let mut operation = Operation::new(FEATURES,
+            [FEATURE_DONATED_TABLES | FEATURE_WIDE_HANDLES, 0, 0, 0, 0]);
+        match transport.submit(core::slice::from_mut(&mut operation)) {
+            Ok(()) => {
+                transport.features = operation.result & (FEATURE_DONATED_TABLES | FEATURE_WIDE_HANDLES);
+                pr_info!("SPTM UAT features {:#x}: handle limit {} heap headroom {} MiB donated live {} quarantined {} peak {}\n",
+                    transport.features, operation.args[1], operation.args[2] >> 20, operation.args[3],
+                    operation.args[4], operation.args[5]);
+            }
+            Err(_) => pr_info!("SPTM UAT features: legacy provider (status {:#x})\n", operation.result),
+        }
         if *crate::module_parameters::m5_platform_probe.value() != 0 {
             for (kind, count) in [(0, 16), (1, 9), (2, 4), (3, 1), (4, 5), (6, 4)] {
                 for index in 0..count {
@@ -222,6 +244,28 @@ impl Transport {
             }
         }
         Ok(transport)
+    }
+
+    /// Table frames are guest pages (native pmap_alloc_iommu_page model).
+    pub(super) fn donated_tables(&self) -> bool { self.features & FEATURE_DONATED_TABLES != 0 }
+
+    fn wide_handles(&self) -> bool { self.features & FEATURE_WIDE_HANDLES != 0 }
+
+    /// Where a donated page is now: 0 guest, 1 provider table, 2 quarantined.
+    pub(super) fn donation_state(&self, physical: u64) -> Result<u64> {
+        let mut operation = Operation::new(DONATION_QUERY, [physical, 0, 0, 0, 0]);
+        self.submit(core::slice::from_mut(&mut operation)).map_err(|failure| failure.error)?;
+        Ok(operation.result)
+    }
+
+    /// Submit independent operations and report how many completed. Every
+    /// completed operation's receipt is in `result`; the operation at index
+    /// `completed` (if any) failed or never ran, and later ones never ran.
+    pub(super) fn submit_receipts(&self, operations: &mut [Operation]) -> (usize, Result) {
+        match self.submit(operations) {
+            Ok(()) => (operations.len(), Ok(())),
+            Err(failure) => (failure.completed.min(operations.len()), Err(failure.error)),
+        }
     }
 
     fn submit(&self, operations: &mut [Operation]) -> core::result::Result<(), Failure> {
@@ -256,7 +300,7 @@ impl Transport {
         })
     }
 
-    /// Borrow the retained native-sized batch for the complete mapping plan.
+    /// Borrow retained command storage separately for each native batch.
     /// No command-storage allocation occurs during mapping or unmapping.
     fn submit_plan(&self, plan: impl Iterator<Item = Operation> + Clone)
         -> core::result::Result<(), Failure>
@@ -340,7 +384,7 @@ impl Transport {
             note_private("create-failed", None, operations[0].result);
             return Err(failure.error);
         }
-        let state = sptm::PrivateState::new(operations[0].result).map_err(|_| {
+        let state = sptm::PrivateState::new(operations[0].result, transport.wide_handles()).map_err(|_| {
             note_private("create-invalid", None, operations[0].result);
             EIO
         })?;
@@ -371,14 +415,17 @@ impl PrivateSpace {
             .map_err(Self::transition_error)
     }
 
-    pub(super) fn handle(&self) -> u8 { self.state.handle() }
+    pub(super) fn handle(&self) -> u16 { self.state.handle() }
 
-    pub(super) fn destroy(&mut self) -> Result {
+    pub(super) fn transport(&self) -> &Transport { &self.transport }
+
+    /// Returns the provider receipt (see [`sptm::PrivateState::destroy`]).
+    pub(super) fn destroy(&mut self) -> Result<u64> {
         let handle = self.state.handle();
         let result = self.state.destroy(|op| self.transport.submit(core::slice::from_mut(op)))
             .map_err(Self::transition_error);
         match &result {
-            Ok(()) => {
+            Ok(_) => {
                 PRIVATE_DESTROYED.fetch_add(1, Ordering::Relaxed);
                 note_private("destroy", Some(handle), 0);
             }
@@ -387,11 +434,25 @@ impl PrivateSpace {
         result
     }
 
+    /// Install tables backed by donated guest pages ([`sptm::donated_table`]).
+    /// Preflight refusals leave pages with the guest. A failed native transition
+    /// may quarantine the first incomplete operation's page; the page-table
+    /// owner queries that page before releasing it.
+    pub(super) fn map_tables(&mut self, operations: &mut [Operation]) -> (usize, Result) {
+        if self.state.space().is_err() { return (0, Err(EIO)); }
+        self.transport.submit_receipts(operations)
+    }
+
     pub(super) fn map(&mut self, address: u64, pages: MapPages<'_>, protection: sptm::Protection)
         -> core::result::Result<(), Failure>
     {
         let space = self.state.space().map_err(|_| Failure::from(EIO))?;
-        let plan = MapPlan::new(space, address, pages, protection).map_err(|_| Failure::from(EINVAL))?;
+        // Donated tables are installed by the page table before the leaves.
+        let plan = if self.transport.donated_tables() {
+            MapPlan::without_tables(space, address, pages, protection)
+        } else {
+            MapPlan::new(space, address, pages, protection)
+        }.map_err(|_| Failure::from(EINVAL))?;
         let result = self.transport.map(plan).and_then(|()| {
             self.sync_context().map_err(|error| Failure {
                 error, completed: 0, submitted: true, may_have_mapped: true,
@@ -484,7 +545,7 @@ impl AddressSpace {
     }
 
     /// Diagnostic identity of a private provider object.
-    pub(super) fn private_handle(&self) -> Option<u8> {
+    pub(super) fn private_handle(&self) -> Option<u16> {
         match self { Self::Private(space) => Some(space.handle()), Self::Global { .. } => None }
     }
     pub(super) fn private(transport: &kernel::sync::Arc<Transport>) -> Result<Self> {
@@ -518,11 +579,20 @@ impl AddressSpace {
         match self { Self::Private(space) => space.unbind(), Self::Global { .. } => Err(EINVAL) }
     }
 
-    pub(super) fn destroy(&mut self) -> Result {
+    /// Returns the provider receipt (0 for the global space).
+    pub(super) fn destroy(&mut self) -> Result<u64> {
         match self {
             Self::Private(space) => space.destroy(),
-            Self::Global { uncertain: false, .. } => Ok(()),
+            Self::Global { uncertain: false, .. } => Ok(0),
             Self::Global { uncertain: true, .. } => Err(EIO),
+        }
+    }
+
+    /// The private space when its tables are guest-donated frames.
+    pub(super) fn donating(&mut self) -> Option<&mut PrivateSpace> {
+        match self {
+            Self::Private(space) if space.transport.donated_tables() => Some(space),
+            _ => None,
         }
     }
 
