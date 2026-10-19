@@ -12,13 +12,19 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/string.h>
 
 #define APPLE_ASC_CPU_CONTROL		0x44
 #define APPLE_ASC_CPU_CONTROL_RUN	BIT(4)
 
+/* A running T8140 MTP session described by the boot stage that started it. */
+#define APPLE_RTKIT_HELPER_HANDOFF	"mtp-live-v1"
+
 struct apple_rtkit_helper {
 	struct device *dev;
 	struct apple_rtkit *rtk;
+	/* Inherited from the boot stage; it cannot be restarted. */
+	bool adopted;
 
 	void __iomem *asc_base;
 
@@ -73,6 +79,39 @@ static const struct apple_rtkit_ops apple_rtkit_helper_ops = {
 	.shmem_destroy = apple_rtkit_helper_shmem_destroy,
 };
 
+static void apple_rtkit_helper_release(void *rtk)
+{
+	apple_rtkit_free_retaining_buffers(rtk);
+}
+
+/*
+ * T8140 MTP firmware cannot be restarted once it has been taken to QUIESCED
+ * or SLEEP, so a boot stage that used it hands the session over running. It
+ * reserves the buffers the firmware holds and maps them 1:1 through the
+ * DART. Only adopt a session it described whose CPU still runs.
+ */
+static bool apple_rtkit_helper_live(struct apple_rtkit_helper *helper)
+{
+	const char *handoff;
+
+	if (of_property_read_string(helper->dev->of_node, "apple,rtkit-handoff",
+				    &handoff))
+		return false;
+
+	if (strcmp(handoff, APPLE_RTKIT_HELPER_HANDOFF)) {
+		dev_warn(helper->dev, "unknown RTKit handoff \"%s\"\n", handoff);
+		return false;
+	}
+
+	if (!(readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
+	      APPLE_ASC_CPU_CONTROL_RUN)) {
+		dev_warn(helper->dev, "RTKit handoff without a running CPU\n");
+		return false;
+	}
+
+	return true;
+}
+
 static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -103,6 +142,23 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 					"Failed to map SRAM region");
 	}
 
+	if (apple_rtkit_helper_live(helper)) {
+		helper->rtk = apple_rtkit_init_adopted(dev, helper, NULL, 0,
+						       &apple_rtkit_helper_ops);
+		if (IS_ERR(helper->rtk))
+			return dev_err_probe(dev, PTR_ERR(helper->rtk),
+					     "Failed to adopt RTKit");
+
+		ret = devm_add_action_or_reset(dev, apple_rtkit_helper_release,
+					       helper->rtk);
+		if (ret)
+			return ret;
+
+		helper->adopted = true;
+		dev_info(dev, "adopted the running RTKit session\n");
+		return 0;
+	}
+
 	helper->rtk =
 		devm_apple_rtkit_init(dev, helper, NULL, 0, &apple_rtkit_helper_ops);
 	if (IS_ERR(helper->rtk))
@@ -126,6 +182,10 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 static void apple_rtkit_helper_remove(struct platform_device *pdev)
 {
 	struct apple_rtkit_helper *helper = platform_get_drvdata(pdev);
+
+	/* An inherited session would not come back from QUIESCED. */
+	if (helper->adopted)
+		return;
 
 	if (apple_rtkit_is_running(helper->rtk))
 		apple_rtkit_quiesce(helper->rtk);
