@@ -107,9 +107,14 @@ apple_t6050_usb3_pipe_stop(const struct apple_t6050_usb_io *io,
     apple_t6050_usb_mask(io, 44, 0x00, 1, 1);
     apple_t6050_usb_mask(io, 44, 0x00, 4, 4);
     apple_t6050_usb_mask(io, 44, 0x10, 1, 1);
-    /* Native mode0-from2 allows 150 ms for shutdown lock acquisition. */
-    if (io->poll(io->context, 44, 0x14, 1, 1, 150000))
-        goto out;
+    /* Native mode0-from2 waits 150 ms, logs a missing lock ACK, and
+     * continues teardown, as the saved native driver does.
+     * The caller has already stopped the controller's DMA/PIPE consumer;
+     * this is not the active-producer handoff used by pipe_switch().
+     * The nonselected override, final mux readback and unlock checks below
+     * remain mandatory, as does successful PHY quiescence.
+     */
+    io->poll(io->context, 44, 0x14, 1, 1, 150000);
     if (quiesce(context))
         goto out;
     apple_t6050_usb_mask(io, 44, 0x20, 0x100f, 0x1002);
