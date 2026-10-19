@@ -23,6 +23,11 @@ const MAX_RENDER_RELOCATIONS: u32 = 64;
 /// many polls (short waits behave as before), then sleeps on the device
 /// change condition in one-jiffy slices.
 const FAST_POLLS: u32 = 8;
+/// A publisher refused because its pair is on the event worker's observation loan retries as
+/// soon as the loan ends, up to this many times per packet, instead of sleeping a poll period.
+const LOAN_RETRIES_MAX: u32 = 32;
+/// Safety bound of one wait for an observation loan (a loan lasts microseconds).
+const LOAN_WAIT_NS: u64 = 2_000_000;
 /// Work-state nodes are freed off-lock by completion: bounded short retries
 /// before the progress watch takes over (unchanged first-attempt latency).
 const STATE_FAST_DELAY_US: i64 = 1000;
@@ -137,6 +142,7 @@ impl Backend {
         let mut relocations = 0u32;
         let mut recovery_polls = 0;
         let mut state_delay = 20i64;
+        let mut loan_retries = 0u32;
         // vmfix6d B: one progress watch for all of this packet's waits.
         let mut watch: Option<Watch> = None;
         loop {
@@ -153,6 +159,7 @@ impl Backend {
             // Sampled before the attempt: a change notified after this point
             // never lets the wait below sleep through it.
             let generation = progress::changes();
+            self.busy_site.store(Site::None as u32, Ordering::Relaxed);
             let work_state = {
                 let preparation = self.shared.preparations.enter(interruptible)?;
                 let result = if prepared.is_some() {
@@ -264,8 +271,40 @@ impl Backend {
                     }
                 }
             };
+            // The pair was on the event worker's observation loan (it retires completed renders
+            // off the device mutex): wait for that loan to end and retry, instead of sleeping a
+            // fixed poll period (fsleep(200 us), about 275 us, in render_wait()).
+            let site = self.busy_site.load(Ordering::Relaxed);
+            if (site == Site::BuildBusy as u32 || site == Site::PrepareNoPair as u32)
+                && loan_retries < LOAN_RETRIES_MAX
+            {
+                loan_retries += 1;
+                self.wait_observation_loan(slot, interruptible);
+                continue;
+            }
             self.render_wait(&mut watch, blocked, slot, packet, interruptible, generation)?;
         }
+    }
+
+    /// Wait, bounded by LOAN_WAIT_NS, while `slot`'s pair is on an observation loan. The loan's
+    /// return clears RenderState::observing() and notifies Shared::changed with the device mutex
+    /// held, and this checks the flag and sleeps on that condition variable with the same mutex
+    /// held, so the return cannot be missed. Returns at once when the loan already ended.
+    fn wait_observation_loan(&self, slot: u8, interruptible: bool) {
+        let start = crate::g17::now_ns();
+        let mut state = self.shared.state.lock();
+        loop {
+            let on_loan = (*state).as_deref().is_some_and(|firmware| firmware.queues.render.observing(slot));
+            if !on_loan || crate::g17::now_ns().saturating_sub(start) >= LOAN_WAIT_NS {
+                break;
+            }
+            let _ = if interruptible {
+                self.shared.changed.wait_interruptible_timeout(&mut state, 1)
+            } else {
+                self.shared.changed.wait_timeout(&mut state, 1)
+            };
+        }
+        drop(state);
     }
 
     /// vmfix6d B: one poll of a progress-bounded render wait. Called with no
