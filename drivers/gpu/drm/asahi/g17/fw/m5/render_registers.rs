@@ -73,7 +73,7 @@ fn value(registers: &[RegisterWrite], number: u32) -> Result<u64> {
         .ok_or(EINVAL)
 }
 
-// AGX3DChannelSKSM::generateRegisterListFor3D, 8bb3b70..8bb3bdc.
+// As the native 3D channel's register-list generation encodes it.
 pub(crate) const fn fragment_event_control(enabled: bool, kind: u32) -> u64 {
     if !enabled { 0 } else if kind == 1 { 3 } else { 1 }
 }
