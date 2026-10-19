@@ -13,6 +13,19 @@ pub(crate) fn context_token(context: u32, generation: u64) -> Option<u64> {
     Some((u64::from(context) << 58) | generation)
 }
 
+/// Merge the legacy shifted hint into the native TA descriptor value.
+///
+/// The native value occupies bytes 0x937..0x93f. Its first byte belongs to
+/// the descriptor; the shifted hint fits only the following seven bytes.
+/// Byte 0x93f starts the independent resolved usage pointer, so accepting an
+/// eighth hint byte would overwrite that pointer.
+pub(crate) fn tiling_descriptor_value(descriptor: u64, shifted_hint: u64) -> Option<u64> {
+    if shifted_hint > (u64::MAX >> 8) {
+        return None;
+    }
+    Some((descriptor & 0xff) | (shifted_hint << 8))
+}
+
 pub(crate) struct RenderTail {
 
     pub(crate) descriptor_value: u64,

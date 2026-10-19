@@ -32,6 +32,7 @@ pub(crate) enum M5RenderCommandError {
     MissingDispatchMirror,
     AddressOverflow,
     InvalidCompletionState,
+    InvalidUsageHint,
     Kick,
     Sksm,
 }
@@ -174,8 +175,8 @@ pub(crate) struct M5TaCommandFields {
     pub timestamp_counts: [u32; 2],
 
     pub d1400: u64,
-    /// Native TA command +0x938 (native726: 0xc0c0 tess, 0x10ac0 mesh,
-    /// 0x12b40 object→mesh). Zero reproduces the loaded module.
+    /// Legacy seven-byte shifted hint within the native value at 0x937.
+    /// The following byte at 0x93f belongs to the resolved usage pointer.
     pub d0938: u64,
 
     pub uma_state: u64,
@@ -393,17 +394,13 @@ fn place_program(out: &mut [u8], low_alias: u64, p: &M5ProgramRef<'_>) -> Result
     Ok(address)
 }
 
-/// TA command +0x938. Native sets it on every TA command: low bits 0xc0c0 for
-/// ordinary vertex-stage passes (all 75 single-pass v70 render captures and
-/// native726 tess), 0x9d00 for clear-only passes, 0x10ac0 for mesh with the
-/// passthrough object and 0x12b40 for a user object (task) stage (native726),
-/// with bits 63:62 rotating with the pass number on multi-pass streams. The
-/// Linux encoder previously left it zero for every non-mesh TA command.
-/// Mesh class 1 covers native mesh kicks, including the mesh-only
-/// passthrough object stage (0x10ac0); class 2 is an API task (object) →
-/// mesh kick, which native encodes as 0x12b40.
-/// Module parameter: 1 (default) = native class values, 0 = legacy zero
-/// (diagnostic A/B only), other = that raw value for every TA command.
+/// Retain the existing shifted-hint values without treating the neighboring
+/// usage-pointer byte as part of the hint. Native's apparent high-bit
+/// "pass rotation" in an unaligned u64 read at 0x938 comes from that pointer
+/// at 0x93f; it is not a separate field. The full native descriptor value is
+/// encoded at 0x937, and other ordinary vertex programs have different hints.
+/// Module parameter: 1 retains the existing values by programmed mesh class,
+/// 0 retains the legacy zero diagnostic, other values remain raw diagnostics.
 pub(crate) fn ta_word_938(mesh_class: u8) -> u64 {
     let mode = *crate::module_parameters::m5_mesh_ta_word_938.value();
     match (mode, mesh_class) {
@@ -431,11 +428,13 @@ pub(crate) fn encode_m5_ta_command(
     low_alias.checked_add(u64::from(ta.command_offset))
         .ok_or(M5RenderCommandError::AddressOverflow)?;
     let t = &i.ta;
+    let descriptor_value = tail::tiling_descriptor_value(t.d1448, t.d0938)
+        .ok_or(M5RenderCommandError::InvalidUsageHint)?;
     put32(out, 0, M5_TA_SELECTOR);
     put64(out, 4, t.sequence);
     put32(out, 0xc, i.context_id);
     tail::encode(out, RenderStage::Tiling, &RenderTail {
-        descriptor_value: t.d1448, resolved_value: Some(t.resolved_tail_value),
+        descriptor_value, resolved_value: Some(t.resolved_tail_value),
         trailing_value: t.d1298,
     }).expect("fixed TA command extent");
     put32(out, 0x8d6, t.d1290);
@@ -472,7 +471,6 @@ pub(crate) fn encode_m5_ta_command(
     put64(out, 0x926, t.d1400);
     put64(out, 0x92e, t.uma_state);
     put8(out, 0x936, t.d1444 & 1);
-    put64(out, 0x938, t.d0938);
     put64(out, 0x8fe, t.d08b0);
     put64(out, 0x906, t.diagnostic_ta_timestamp_upper);
     put32(out, 0x892, u32::from(t.d1174 & 1));
