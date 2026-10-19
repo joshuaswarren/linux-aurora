@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-TEST_PROGS := gpu.py gpio.py dcp.py afk.py apif_mmio.py pmp.py guest.py spmi.py rtc.py display.py centauri.py wifi.py bluetooth.py typec.py dcp_callbacks.py config.py audio_config.py
+TEST_PROGS := gpu.py dart_retained.py gpio.py pmgr.py dcp.py smc_metadata.py smc_charge_policy.py afk.py apif_mmio.py pmp.py guest.py spmi.py rtc.py display.py centauri.py wifi.py bluetooth.py typec.py dcp_callbacks.py config.py audio_config.py
 TEST_PROGS += compute_activation.py
 TEST_PROGS += render_ids.py render_backing.py
 TEST_PROGS += coverage.py coverage_constructor.py
