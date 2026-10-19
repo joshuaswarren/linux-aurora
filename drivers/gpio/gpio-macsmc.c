@@ -307,7 +307,8 @@ static int macsmc_pcio_set(struct gpio_chip *gc, unsigned int offset, int value)
 
 	put_unaligned_le64(smcgp->output_commands[offset] | !!value, command);
 	ret = apple_smc_write(smcgp->smc, SMC_KEY(pcIO), command, sizeof(command));
-	return ret < 0 ? ret : ret == sizeof(command) ? 0 : -EIO;
+	/* SMC writes return status, not a byte count. */
+	return ret < 0 ? ret : 0;
 }
 
 static int macsmc_pcio_get(struct gpio_chip *gc, unsigned int offset)
