@@ -188,6 +188,26 @@ impl RenderState {
         })
     }
 
+    /// Plain host metadata under the existing device mutex; no pair/fence callbacks.
+    pub(super) fn timeout_snapshot(&self, out: &mut crate::g17::timeout_trace::Snapshot) {
+        for (slot, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry.as_ref() else { continue; };
+            let i = out.render_count as usize;
+            if i == out.renders.len() { out.reason = crate::g17::timeout_trace::OVERFLOW; break; }
+            let flags = u64::from(entry.closed) | (u64::from(entry.constructing) << 1)
+                | (u64::from(entry.growing) << 2) | (u64::from(entry.published) << 3)
+                | (u64::from(entry.pending_timeout) << 4) | (u64::from(entry.borrowed_active) << 5)
+                | (u64::from(entry.pending_owner_closed) << 6) | (u64::from(entry.lent_live) << 7);
+            out.renders[i] = [slot as u64, entry.reservation.owner,
+                u64::from(entry.reservation.ids[0].qid()), u64::from(entry.reservation.ids[1].qid()),
+                flags, u64::from(entry.pair.is_some()), u64::from(entry.parked.is_some()),
+                entry.preparing.as_ref().map_or(0, |p| Arc::as_ptr(p) as usize as u64),
+                entry.pending_owner.unwrap_or(0), u64::from(entry.pending_owner.is_some()),
+                u64::from(entry.pending_error.is_some()), entry.context.as_ref().map_or(0, |c| u64::from(c.id()))];
+            out.render_count += 1;
+        }
+    }
+
     fn reserve_pm_generation(&mut self) -> Result<u64> {
         let generation = self.next_pm_generation;
         self.next_pm_generation = generation.checked_add(1).ok_or(EOVERFLOW)?;

@@ -272,6 +272,16 @@ impl Packet {
     pub(crate) fn has_dependencies(&self) -> bool {
         !self.inputs.is_empty() || !self.firmware.is_empty()
     }
+    /// Raw immutable/atomic identity only; no preparation/fence locks or callbacks.
+    pub(crate) fn timeout_trace_words(&self) -> [u64; 14] {
+        [self as *const Self as usize as u64, self.id, self.order.sequence,
+         self.order.wait_through[0].unwrap_or(0), self.order.wait_through[1].unwrap_or(0),
+         u64::from(self.order.wait_through[0].is_some()) | (u64::from(self.order.wait_through[1].is_some()) << 1),
+         u64::from(self.publication.load(Ordering::Acquire)), u64::from(self.cancelled.load(Ordering::Acquire)),
+         u64::from(self.pin_id.load(Ordering::Acquire)), self.pin_generation.load(Ordering::Acquire),
+         u64::from(self.pin_qos.load(Ordering::Acquire)), u64::from(self.pinned.load(Ordering::Acquire)),
+         self.inputs.len() as u64, self.firmware.len() as u64]
+    }
 
     pub(crate) fn begin_publication(&self) -> bool {
         self.publication

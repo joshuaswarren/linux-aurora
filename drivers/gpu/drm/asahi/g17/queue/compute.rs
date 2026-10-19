@@ -715,6 +715,92 @@ impl Queue {
         !self.quarantined && self.owns_packet(packet)
     }
 
+    /// Device mutex held; read existing CPU mappings only. Never take context,
+    /// preparation, lifetime or fence locks, nor release any retained resource.
+    pub(crate) fn timeout_snapshot(&mut self, packet: &Arc<Packet>, out: &mut crate::g17::timeout_trace::Snapshot) {
+        out.victim_index = u32::MAX;
+        out.owner = self.owner.unwrap_or(0);
+        out.pid = packet.context.owner_pid();
+        out.context = u64::from(packet.context.id());
+        out.packet = packet.timeout_trace_words();
+        out.queue = [u64::from(self.qid()), u64::from(self.ordinal), u64::from(self.submitted),
+            self.last_end, self.kick.timestamp().get(), self.kick.high_water().get(), self.kick.parent().get(),
+            u64::from(self.quarantined), u64::from(self.awaiting_witness), u64::from(self.retire_pending),
+            u64::from(self.retirement_proved), u64::from(self.released), u64::from(self.growing),
+            u64::from(self.configuration.is_some()), u64::from(self.m5_install.is_some()),
+            match self.pool_phase { PoolPhase::Populated=>0, PoolPhase::ReleaseSent(c)=>1|(u64::from(c)<<32), PoolPhase::Vacant=>2 }];
+        match self.graph.cursors() {
+            Ok(c) => out.cursors = [c.producer,c.consumer,c.count],
+            Err(e) => out.cursor_error=e.to_errno(),
+        }
+        match self.graph.stamp() { Ok(s)=>out.stamp=s, Err(e)=>out.stamp_error=e.to_errno() }
+        match self.pool.completed_submissions() { Ok(n)=>out.pool_completed=n, Err(e)=>out.pool_error=e.to_errno() }
+        let mut victim = None;
+        for (i,active) in self.active.iter().enumerate() {
+            if i >= crate::g17::timeout_trace::ACTIVE { out.reason=crate::g17::timeout_trace::OVERFLOW;break; }
+            out.active_count=i as u32+1;
+            let row=&mut out.items[i];
+            row[0]=Arc::as_ptr(&active.packet) as usize as u64;
+            row[1]=active.packet.id;row[2]=active.packet.order.sequence;row[3]=active.published;
+            row[4]=u64::from(active.ticket.is_some()) | (u64::from(active.observed.is_some())<<1)
+                | (u64::from(active.qos_pending)<<2) | (u64::from(active.failure_deferred)<<3);
+            if let Some(t)=active.ticket {
+                row[5]=t.kick;row[6]=t.owner;row[7]=t.submission;row[8]=u64::from(t.context_id);
+                row[9]=t.descriptor;row[10]=t.work_node;row[11]=u64::from(t.ordinal);
+                row[12]=u64::from(t.item_producer);row[13]=u64::from(t.item_count);row[14]=t.epoch;
+            }
+            if let Some(o)=active.observed { row[15]=o.timestamps[0];row[16]=o.timestamps[1]; }
+            row[17]=active.observed_at.unwrap_or(0);
+            if Arc::ptr_eq(&active.packet,packet) { out.victim_index=i as u32;victim=active.ticket; }
+        }
+        if out.victim_index==u32::MAX {
+            if out.reason == 0 { out.reason=crate::g17::timeout_trace::NOT_OWNED; }
+            return;
+        }
+        out.kick_error=-61;out.descriptor_error=-61; // ENODATA until a ticket/map is validated.
+        if let Some(t)=victim {
+            if let Some(active) = self.active.iter().nth(out.victim_index as usize) {
+                active.work.timeout_work_snapshot(t.work_node, &mut out.work);
+            }
+            out.raw_identity[0]=t.descriptor;
+            if let Some(k)=crate::g17::fw::kick::KickTimestamp::new(t.kick) {
+                match self.kick.timeout_words(k,&mut out.kick_words) {
+                    Ok(())=>{
+                        let word=|i| u64::from(out.kick_words[i])|(u64::from(out.kick_words[i+1])<<32);
+                        let header=word(0);out.raw_identity[1]=word(4);
+                        out.kick_error=if ((header>>2)&0xff_ffff_ffff)==t.kick
+                            && ((header>>42)&0x7f)==u64::from(t.qid) && word(4)==t.descriptor {0} else {-(kernel::bindings::EUCLEAN as i32)};
+                    },
+                    Err(e)=>out.kick_error=e.to_errno(),
+                }
+                if let Some(ring)=self.graph.ring.as_ref() {
+                    let slot=k.slot()%DESCRIPTORS;let offset=slot*COMPUTE_DESCRIPTOR_SIZE;
+                    out.raw_identity[2]=ring.firmware_va()+offset as u64;
+                    out.raw_identity[3]=ring.gpu_va()+offset as u64;
+                    if out.raw_identity[2]!=t.descriptor { out.descriptor_error=-(kernel::bindings::EUCLEAN as i32); }
+                    else {
+                        out.descriptor_error=0;
+                        for (i,word) in out.descriptor_words.iter_mut().enumerate() {
+                            match ring.object.word(offset+i*4) { Ok(v)=>*word=v.load(Ordering::Relaxed), Err(e)=>{out.descriptor_error=e.to_errno();break;} }
+                        }
+                    }
+                }
+            } else { out.kick_error=EINVAL.to_errno(); }
+        }
+        out.valid=1;
+    }
+
+    /// Compact queue status for a dependency QID, with no nested ownership locks.
+    pub(crate) fn timeout_peer(&self) -> [u64; 12] {
+        let c=self.graph.cursors();let stamp=self.graph.stamp();let front=self.active.front();
+        [self.owner.unwrap_or(0),u64::from(self.qid()),self.active.len as u64,u64::from(self.ordinal),
+         stamp.map_or(u64::MAX,u64::from),c.as_ref().map_or(u64::MAX,|v|u64::from(v.producer)),
+         c.as_ref().map_or(u64::MAX,|v|u64::from(v.consumer)),c.as_ref().map_or(u64::MAX,|v|u64::from(v.count)),
+         front.and_then(|f|f.ticket).map_or(0,|t|t.kick),front.map_or(0,|f|f.published),
+         u64::from(self.quarantined)|(u64::from(self.awaiting_witness)<<1)|(u64::from(self.growing)<<2),
+         match self.pool_phase {PoolPhase::Populated=>0,PoolPhase::ReleaseSent(n)=>1|(u64::from(n)<<32),PoolPhase::Vacant=>2}]
+    }
+
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
         self.active
             .front()

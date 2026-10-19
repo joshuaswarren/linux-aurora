@@ -94,6 +94,8 @@ pub(crate) mod coverage;
 mod context;
 mod shared;
 mod lifetime;
+mod drain_trace;
+use drain_trace::{DrainTrace, WaitTrace, Snapshot, Phase};
 mod residency;
 mod sptm;
 #[cfg(CONFIG_ARM64)]
@@ -2387,7 +2389,7 @@ impl Vm {
         self.unmap_range_commit(iova, size, true)
     }
 
-    fn unmap_prepared_cleanup(&self, unmap: &mut bind::PreparedUserUnmap) -> Result {
+    fn unmap_prepared_cleanup(&self, unmap: &mut bind::PreparedUserUnmap, mut trace: Option<&mut DrainTrace>) -> Result {
         let mut inner = self.inner.lock_inner();
         // SAFETY: step_unmap/step_remap modify this VM's translations and
         // immediate GPUVA metadata only, using the retained split nodes. They
@@ -2397,7 +2399,9 @@ impl Vm {
             self.untrack_shared_range(unmap.iova, unmap.size);
         }
         drop(inner);
+        let start = DrainTrace::ref_stamp(&trace);
         self.bo_deferred_cleanup();
+        DrainTrace::ref_add(&mut trace, Phase::Eager, start);
         result
     }
 
@@ -2434,18 +2438,27 @@ impl Vm {
     }
 
     fn drop_mappings_now(&self, gem: &gem::Object) -> Result {
+        self.drop_mappings_now_traced(gem, None)
+    }
+
+    fn drop_mappings_now_traced(&self, gem: &gem::Object, mut trace: Option<&mut DrainTrace>) -> Result {
         let _residency = self.enter_retirement_residency();
         // Removing whole mappings only does unmaps, so no preallocated VAs
         let mut ctx = Default::default();
 
-        let inner = match self.inner.exec_lock(Some(gem), false) {
-            Err(error) if error == ENOMEM => return self.drop_mappings_low_memory(gem),
+        let start = DrainTrace::ref_stamp(&trace);
+        let locked = self.inner.exec_lock(Some(gem), false);
+        DrainTrace::ref_add(&mut trace, Phase::Exec, start);
+        let inner = match locked {
+            Err(error) if error == ENOMEM => return self.drop_mappings_low_memory(gem, trace),
             result => result?,
         };
 
         if let Some(bo) = self.inner.find_bo(gem) {
             mod_dev_dbg!(inner.dev, "MMU: bo_unmap\n");
+            let start = DrainTrace::ref_stamp(&trace);
             let result = self.inner.bo_unmap(&mut ctx, &bo);
+            DrainTrace::ref_add(&mut trace, Phase::Unmap, start);
             if result.is_ok() {
                 // The close callback or deferred object list retains this GEM,
                 // so clearing its candidate cannot release its final reference.
@@ -2456,9 +2469,11 @@ impl Vm {
             // BO release can drain unrelated deferred GEMs, including on an
             // unmap error. Always release reservations before dropping it.
             core::mem::drop(inner);
+            let start = DrainTrace::ref_stamp(&trace);
             core::mem::drop(bo);
+            DrainTrace::ref_add(&mut trace, Phase::BoPut, start);
             if result == Err(ENOMEM) {
-                return self.drop_mappings_low_memory(gem);
+                return self.drop_mappings_low_memory(gem, trace);
             }
             result?;
         }
@@ -2468,7 +2483,7 @@ impl Vm {
 
     /// Preserve the indexed fast path normally; memory pressure must not lose
     /// accepted object cleanup just because an exec or operation list failed.
-    fn drop_mappings_low_memory(&self, gem: &gem::Object) -> Result {
+    fn drop_mappings_low_memory(&self, gem: &gem::Object, mut trace: Option<&mut DrainTrace>) -> Result {
         let mut inner = self.inner.lock_inner();
         let result = inner.unmap_object(gem, VmInner::unmap_gpuva);
         if result.is_ok() {
@@ -2476,7 +2491,9 @@ impl Vm {
             self.untrack_shared_object(gem);
         }
         drop(inner);
+        let start = DrainTrace::ref_stamp(&trace);
         self.bo_deferred_cleanup();
+        DrainTrace::ref_add(&mut trace, Phase::Eager, start);
         result
     }
 

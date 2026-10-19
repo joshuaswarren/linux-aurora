@@ -60,9 +60,28 @@ struct State {
     draining: bool,
     closed: bool,
     cleanup_failed: bool,
+    trace_seq: u64,
     close_ranges: Option<(Range<u64>, Range<u64>)>,
     unmaps: KVec<super::bind::PreparedUserUnmap>,
     objects: KVec<ARef<gem::Object>>,
+}
+
+impl State {
+    fn trace_begin(&mut self, vm: &Vm, origin: u8) -> Option<DrainTrace> {
+        if !DrainTrace::enabled() { return None; }
+        let trace = DrainTrace::begin(vm.id, origin, Snapshot {
+            flags: (self.blocked as u8) | ((self.quarantined as u8) << 1)
+                | ((self.draining as u8) << 2) | ((self.closed as u8) << 3)
+                | ((self.cleanup_failed as u8) << 4),
+            active: self.active, commits: self.commits,
+            status: vm.status.as_ref().map_or(i32::MIN, |s| s.get()),
+            reported: vm.status.as_ref().map_or(i32::MIN, |s| s.reported_error()),
+            close: self.close_ranges.is_some() as usize,
+            unmaps: self.unmaps.len(), objects: self.objects.len(),
+        });
+        self.trace_seq = trace.seq;
+        Some(trace)
+    }
 }
 
 #[pin_data]
@@ -88,7 +107,7 @@ impl VmLifetime {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(State { active:0, commits:0, blocked:false,
-                    quarantined:false, draining:false, closed:false, cleanup_failed:false, close_ranges:None,
+                    quarantined:false, draining:false, closed:false, cleanup_failed:false, trace_seq:0, close_ranges:None,
                     unmaps:KVec::new(), objects:KVec::new() }, "VM job lifetime"),
                 changed <- new_condvar!("VM mapping admission"),
                 driver <- new_mutex!(None, "VM driver mappings"),
@@ -402,6 +421,7 @@ impl Vm {
         let Some(lifetime) = self.lifetime.as_ref() else {
             return Ok(());
         };
+        let mut trace = WaitTrace::new(self.id);
         let mut state = lifetime.state.lock();
         let mut remaining = msecs_to_jiffies(ADMISSION_WAIT_MS);
         loop {
@@ -430,7 +450,10 @@ impl Vm {
             if !state.draining {
                 return Ok(());
             }
-            if lifetime.changed.wait_interruptible(&mut state) {
+            let start = trace.before_wait(state.trace_seq);
+            let signaled = lifetime.changed.wait_interruptible(&mut state);
+            trace.after_wait(start, state.trace_seq, signaled);
+            if signaled {
                 return Err(ERESTARTSYS);
             }
         }
@@ -604,9 +627,10 @@ impl Vm {
             self.untrack_context_object(gem);
             return Ok(());
         }
+        let trace = state.trace_begin(self, 2); // Object close, before publication.
         state.draining = true;
         drop(state);
-        self.drain_mappings(lifetime);
+        self.drain_mappings(lifetime, trace);
         Ok(())
     }
 
@@ -627,7 +651,11 @@ impl Vm {
         self.unmap_user_ranges_now(user, kernel)
     }
 
-    fn unmap_user_ranges_now(&self, user: Range<u64>, _kernel: Range<u64>) -> Result {
+    fn unmap_user_ranges_now(&self, user: Range<u64>, kernel: Range<u64>) -> Result {
+        self.unmap_user_ranges_now_traced(user, kernel, None)
+    }
+
+    fn unmap_user_ranges_now_traced(&self, user: Range<u64>, _kernel: Range<u64>, mut trace: Option<&mut DrainTrace>) -> Result {
         let _residency = self.enter_retirement_residency();
         // User mappings alone have GPUVA nodes. Kernel and driver aliases use
         // mm::Node and are untouched; GPUVM's embedded kernel cutout is skipped.
@@ -639,7 +667,9 @@ impl Vm {
         }
         drop(inner);
         // Final GEM/SG-table destruction may acquire reservations itself.
+        let start = DrainTrace::ref_stamp(&trace);
         self.bo_deferred_cleanup();
+        DrainTrace::ref_add(&mut trace, Phase::Eager, start);
         result
     }
 }
@@ -677,42 +707,53 @@ impl Drop for VmJobGuard {
             self.vm.bo_deferred_cleanup();
             return;
         }
+        let trace = state.trace_begin(&self.vm, 1); // Last job, before publication.
         state.draining = true;
         drop(state);
-        self.vm.drain_mappings(lifetime);
+        self.vm.drain_mappings(lifetime, trace);
     }
 }
 
 impl Vm {
     /// Admission stays closed to new jobs while the exec lock is acquired for cleanup.
     /// Recheck queued cleanup and reopen under the same lock used to append it.
-    fn drain_mappings(&self, lifetime: &VmLifetime) {
+    fn drain_mappings(&self, lifetime: &VmLifetime, mut trace: Option<DrainTrace>) {
         let _residency = self.enter_retirement_residency();
         let mut state = lifetime.state.lock();
         let mut failure = None;
         loop {
+            DrainTrace::batch(&mut trace, state.close_ranges.is_some() as usize, state.unmaps.len(), state.objects.len());
             let close = state.close_ranges.take();
             let unmaps = core::mem::replace(&mut state.unmaps, KVec::new());
             let objects = core::mem::replace(&mut state.objects, KVec::new());
             drop(state);
             if let Some((user, kernel)) = close {
-                if let Err(error) = self.unmap_user_ranges_now(user, kernel) {
+                let start = DrainTrace::stamp(&trace);
+                if let Err(error) = self.unmap_user_ranges_now_traced(user, kernel, trace.as_mut()) {
                     failure.get_or_insert(error);
                     pr_err!("MMU: deferred VM close failed\n");
                 }
+                DrainTrace::add(&mut trace, Phase::Close, start);
             } else {
                 for mut unmap in unmaps {
-                    if let Err(error) = self.unmap_prepared_cleanup(&mut unmap) {
+                    let start = DrainTrace::stamp(&trace);
+                    if let Err(error) = self.unmap_prepared_cleanup(&mut unmap, trace.as_mut()) {
                         failure.get_or_insert(error);
                         pr_err!("MMU: deferred user unmap failed\n");
                     }
+                    DrainTrace::add(&mut trace, Phase::Prepared, start);
                 }
             }
             for object in objects {
-                if let Err(error) = self.drop_mappings_now(&object) {
+                let start = DrainTrace::stamp(&trace);
+                if let Err(error) = self.drop_mappings_now_traced(&object, trace.as_mut()) {
                     failure.get_or_insert(error);
                     pr_err!("MMU: deferred object unmap failed\n");
                 }
+                DrainTrace::add(&mut trace, Phase::Object, start);
+                let start = DrainTrace::stamp(&trace);
+                drop(object); // Same iteration-end owner drop, now timed.
+                DrainTrace::add(&mut trace, Phase::OwnerPut, start);
             }
             state = lifetime.state.lock();
             if state.close_ranges.is_some() || !state.unmaps.is_empty() || !state.objects.is_empty()
@@ -733,10 +774,15 @@ impl Vm {
             } else if !state.closed && !state.cleanup_failed {
                 state.blocked = false;
             }
+            DrainTrace::closed(&mut trace, state.blocked, state.closed, state.cleanup_failed, failure.map_or(0, |e| e.to_errno()));
             drop(state);
             lifetime.changed.notify_all();
+            DrainTrace::notified(&mut trace);
             break;
         }
+        let start = DrainTrace::stamp(&trace);
         self.bo_deferred_cleanup();
+        DrainTrace::add(&mut trace, Phase::Tail, start);
+        DrainTrace::finish(trace);
     }
 }

@@ -167,6 +167,33 @@ impl Registry {
             .find(|queue| queue.owner() == Some(owner))
     }
 
+    /// Existing device mutex excludes registry mutation. No nested locks or callbacks.
+    fn timeout_snapshot(&mut self, owner: u64, packet: &Arc<super::job::Packet>,
+        out: &mut super::timeout_trace::Snapshot)
+    {
+        let Some(slot) = self.compute.iter().position(|entry| entry.as_ref()
+            .and_then(|entry| entry.queue.as_deref()).is_some_and(|q| q.owner() == Some(owner))) else {
+            out.reason = super::timeout_trace::NO_QUEUE;
+            return;
+        };
+        let entry = self.compute[slot].as_mut().unwrap();
+        out.reservation = [slot as u64, u64::from(entry.reservation.id.qid()),
+            entry.reservation.owner, self.compute_prepared[slot].load(Ordering::Acquire) as u64,
+            u64::from(entry.growth.is_some()), u64::from(self.compute_building)
+                | (u64::from(self.compute_scheduler_building) << 1)];
+        entry.queue.as_deref_mut().unwrap().timeout_snapshot(packet, out);
+        // All resident compute queues, including vacant/quarantined ones. These rows
+        // support cross-QID dependency lookup without decoding a possibly stale kick.
+        for entry in self.compute.iter().flatten() {
+            if let Some(queue) = entry.queue.as_deref() {
+                let i = out.peer_count as usize;
+                if i == out.peers.len() { out.reason = super::timeout_trace::OVERFLOW; break; }
+                out.peers[i] = queue.timeout_peer(); out.peer_count += 1;
+            }
+        }
+        self.render.timeout_snapshot(out);
+    }
+
     fn claim_compute(&self, owner: u64, context: &Arc<Context>,
         existing: &Option<ComputeClaim>) -> Result<Option<ComputeClaim>>
     {

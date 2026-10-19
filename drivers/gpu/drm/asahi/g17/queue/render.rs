@@ -1504,12 +1504,27 @@ impl Pair {
     }
 
     /// Firmware is halted and all graph borrowers have joined before this copy.
-    pub(crate) fn dump_m5_failure(&self, dev: &kernel::device::Device) {
+    pub(crate) fn dump_m5_failure(&self, dev: &kernel::device::Device,
+        init: &crate::g17::initdata::InitData) {
         for active in self.active.iter().take(4) {
             let ordinal = active.ticket.ordinal;
             dev_info!(dev, "M5 render failure context={} qids={:?} ordinal={} pass={:?}\n",
                 self.memory.context.id(), self.qids(), ordinal,
                 observation::snapshot(&self.memory, ordinal).map(|s| s.pass));
+            // Recovery has halted firmware and joined every graph borrower.
+            // Preserve intermediate stage progress, not just TA start/3D end,
+            // and tie this retained command to the userspace repro process.
+            // No extra reads or logging are added to healthy submissions.
+            dev_info!(dev, "M5 render failure detail pid={} pool={} pool_epoch={} lease_generation={} context_update={} stages={:?}\n",
+                active.packet.context.owner_pid(), self.pool().id(), self.pool().epoch(),
+                active.generation, active.context_update,
+                self.memory.stage_timestamps(ordinal));
+            let stamps: Result<[u32; 2]> = (|| Ok([
+                init.stamp(self.qids()[0])?.load(core::sync::atomic::Ordering::Acquire),
+                init.stamp(self.qids()[1])?.load(core::sync::atomic::Ordering::Acquire),
+            ]))();
+            dev_info!(dev, "M5 render failure completion stamps={:?} expected={:#x} kicks={:?}\n",
+                stamps, ordinal.wrapping_add(1).wrapping_shl(8), active.kicks);
             for stage in 0..2 {
                 if let Err(error) = self.kicks[stage].dump_m5_entry(dev,
                     if stage == 0 { "fault-kick-ta" } else { "fault-kick-fragment" }, active.kicks[stage]) {

@@ -52,14 +52,34 @@ impl Backend {
     pub(super) fn timeout_compute(&self, packet: &Arc<Packet>) -> Result {
         dev_warn!(self.shared.dev.as_ref(), "Compute scheduler timeout: owner={} pid={}\n",
             self.owner, packet.context.owner_pid());
-        let mut deferred = DeferredBatch::worker()?;
+        let mut trace = crate::g17::timeout_trace::Attempt::begin();
+        let mut deferred = match DeferredBatch::worker() {
+            Ok(deferred) => deferred,
+            Err(error) => {
+                if let Some(mut trace) = trace { trace.skip(crate::g17::timeout_trace::DEFERRED_ALLOCATION_FAILED); trace.finish(); }
+                return Err(error);
+            }
+        };
         let result = (|| {
             let mut state = self.shared.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
                 // Teardown owns the detached queues and will settle their callbacks.
                 return Ok(None);
             };
-            firmware.scan_compute(None, &mut deferred)?;
+            if let Err(error) = firmware.scan_compute(None, &mut deferred) {
+                if let Some(trace) = trace.as_mut() { trace.skip(crate::g17::timeout_trace::SCAN_FAILED); }
+                return Err(error);
+            }
+            if let Some(out) = trace.as_mut().and_then(|trace| trace.storage()) {
+                crate::g17::timeout_trace::Attempt::started(out);
+                out.epoch = firmware.recovery.generation();
+                match crate::g17::recovery::Memory::recovery_state(&firmware.init) {
+                    Ok(state) => out.recovery = state,
+                    Err(error) => out.recovery_error = error.to_errno(),
+                }
+                firmware.queues.timeout_snapshot(self.owner, packet, out);
+                crate::g17::timeout_trace::Attempt::ended(out);
+            }
             let Some(queue) = firmware.queues.compute_mut(self.owner) else {
                 return Ok(None);
             };
@@ -73,6 +93,9 @@ impl Backend {
             // owns the same logical VM as the retained packet matched under the mutex.
             <Self as job::Backend>::fail_vm(self, ETIMEDOUT);
         }
+        // Preserve VM failure/peer settlement before potentially long diagnostic logs.
+        // The copied snapshot predates timeout; no live queue references remain.
+        if let Some(trace) = trace { trace.finish(); }
         deferred.finish();
         result.map(|_| ())
     }

@@ -57,6 +57,7 @@ mod qos;
 mod queue;
 mod recovery;
 mod runtime;
+mod timeout_trace;
 pub(crate) mod status;
 mod teardown;
 mod timeout;

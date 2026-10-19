@@ -6,9 +6,10 @@ use crate::g17::runtime::Registry;
 use kernel::prelude::*;
 
 impl Registry {
-    pub(in crate::g17::runtime) fn dump_m5_failure(&self, dev: &kernel::device::Device) {
+    pub(in crate::g17::runtime) fn dump_m5_failure(&self, dev: &kernel::device::Device,
+        init: &crate::g17::initdata::InitData) {
         for pair in self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
-            pair.dump_m5_failure(dev);
+            pair.dump_m5_failure(dev, init);
         }
     }
 

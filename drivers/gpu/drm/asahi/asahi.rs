@@ -82,6 +82,14 @@ module! {
             default: 1,
             description: "Use retained native cached M5 command mappings; 0 disables for diagnostics",
         },
+        m5_vm_drain_trace: u32 {
+            default: 0,
+            description: "Diagnostic only: bounded slow VM cleanup/admission timing; default off",
+        },
+        m5_compute_timeout_trace: u32 {
+            default: 0,
+            description: "Diagnostic only: one exact compute timeout snapshot; default off",
+        },
         m5_map_stats: u32 {
             default: 0,
             description: "Diagnostic only: log batched SPTM kernel mappings of at least 64 pages (chunks, pages, provider operations, ns); default off",

@@ -647,6 +647,62 @@ impl WorkStateLease {
             Ok(object.word(offset + 0xc)?.load(Ordering::Acquire))
         })
     }
+    /// Opt-in timeout-only read into fresh zeroed scratch. The Active retains
+    /// this exact lease; a failed trylock never waits behind preparation.
+    /// Host identity serialization does not freeze concurrent firmware writes.
+    pub(crate) fn timeout_work_snapshot(&self, expected: u64,
+        out: &mut crate::g17::timeout_trace::WorkSnapshot) {
+        out.addresses[0] = expected;
+        let Some(storage) = self.context.work.try_lock() else {
+            out.status = 2;
+            return;
+        };
+        let word = self.word();
+        out.identity[0] = word;
+        out.identity[1] = u32::MAX;
+        if word == FREE { out.status = 3; return; }
+        let slot = (word & 63) as usize;
+        out.identity[2] = slot as u32;
+        if slot >= STATE_COUNT { out.status = 4; return; }
+        if let Some(stored) = storage.words[slot] { out.identity[1] = stored; }
+        if storage.words[slot] != Some(word) { out.status = 5; return; }
+        out.identity[3] = storage.counts[slot];
+        let node = slot * NODE_STRIDE;
+        let head = UAT_PGSZ + 0x400;
+        let counter = UAT_PGSZ + slot * 4;
+        let object = &storage.object;
+        out.addresses[1] = object.gpu_va() + node as u64;
+        out.addresses[2] = object.gpu_va() + head as u64;
+        out.addresses[3] = object.gpu_va() + counter as u64;
+        if out.addresses[1] != expected { out.status = 6; return; }
+        for (offset, bytes) in [(node, 0xc8), (head, 0x18), (counter, 4)] {
+            if let Err(error) = object.pointer(offset, bytes) {
+                out.status = 7; out.error = error.to_errno(); return;
+            }
+        }
+        for (i, value) in out.node.iter_mut().enumerate() {
+            match object.word(node + i * 4) {
+                Ok(source) => { *value = source.load(Ordering::Relaxed); out.valid[0] += 1; }
+                Err(error) => { out.status = 8; out.error = error.to_errno(); return; }
+            }
+        }
+        for (i, value) in out.head.iter_mut().enumerate() {
+            match object.word(head + i * 4) {
+                Ok(source) => { *value = source.load(Ordering::Relaxed); out.valid[1] += 1; }
+                Err(error) => { out.status = 8; out.error = error.to_errno(); return; }
+            }
+        }
+        match object.word(counter) {
+            Ok(source) => { out.counter = source.load(Ordering::Relaxed); out.valid[2] = 1; }
+            Err(error) => { out.status = 8; out.error = error.to_errno(); return; }
+        }
+        // Treat firmware pointers as data. Read only our validated mapped
+        // counter above, even when the captured pointer names something else.
+        let pointer = u64::from(out.node[0]) | (u64::from(out.node[1]) << 32);
+        if pointer != out.addresses[3] { out.mismatch |= 1; }
+        if out.counter != out.identity[3] { out.mismatch |= 2; }
+        out.status = 1;
+    }
     /// Inspect a live node while retaining its storage and exact lease identity.
     /// The callback cannot replace the node or release its backing.
     pub(crate) fn with_node<T>(&self,

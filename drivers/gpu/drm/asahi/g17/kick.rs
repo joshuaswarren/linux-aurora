@@ -550,6 +550,17 @@ impl Queue {
     pub(crate) fn read_entry_words(&mut self, timestamp:KickTimestamp)->Result<[u32;128]> {
         self.object().read_words(timestamp.entry_offset())
     }
+    /// Copy into caller-owned heap storage without temporary array or new lock.
+    pub(crate) fn timeout_words(&mut self, timestamp: KickTimestamp, out: &mut [u32; 128]) -> Result {
+        let offset = timestamp.entry_offset();
+        let object = self.object();
+        // Check the complete extent before copying; all reads are existing CPU mappings.
+        object.pointer(offset, 512)?;
+        for (i, word) in out.iter_mut().enumerate() {
+            *word = object.word(offset + i * 4)?.load(Ordering::Relaxed);
+        }
+        Ok(())
+    }
 
     pub(crate) fn prepare_entry(&mut self, args: &KickArgs<'_>) -> Result<PreparedKick<'_>> {
         if args.qid != self.id.qid

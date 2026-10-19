@@ -128,7 +128,8 @@ impl recovery::Memory for Service<'_> {
             {
                 queue.describe_recovery_entry();
             }
-            self.firmware.queues.dump_m5_failure(&self.firmware.primary.state.shared.dev);
+            self.firmware.queues.dump_m5_failure(&self.firmware.primary.state.shared.dev,
+                &self.firmware.init);
             self.firmware.init.dump_m5_recovery(&self.firmware.primary.state.shared.dev)?;
         }
         self.firmware.init.fault_sources()
