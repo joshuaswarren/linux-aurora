@@ -89,6 +89,7 @@ def main():
         assert len(module.cells(after, "/nvme@60400000", "reg")) == 8
         assert module.cells(after, "/apif@61ff0000", "reg") == [0, module.APIF_IPA, 0, module.PAGE_SIZE]
         assert module.property_bytes(after, "/iommu-10", "power-domains") == module.property_bytes(before, "/usb@8a000000", "power-domains")
+        assert module.property_bytes(after, "/iommu-10", "apple,apif-reserve-last-page") == b""
         for path, properties in [("/gpu@800000000", ["reg", "reg-names", "compatible"]),
                                  ("/chosen", ["x1n1,guest-devices"]),
                                  ("/cpus/cpu@1", ["cpu-release-addr"]),

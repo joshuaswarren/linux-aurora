@@ -99,7 +99,8 @@ def nvme_handoff(tree, path):
 
 
 def usb_dart_power(tree, compatible):
-    """Require the producer's known T6050 USB-DART register-clock dependency."""
+    """Identify USB DARTs after checking their register-clock dependency."""
+    providers = set()
     for path, matches in compatible.items():
         if "apple,t6050-dwc3" not in matches or strings(tree, path, "status") == ["disabled"]:
             continue
@@ -116,6 +117,8 @@ def usb_dart_power(tree, compatible):
         domains = property_bytes(tree, provider, "power-domains")
         if domains is None or domains != property_bytes(tree, path, "power-domains"):
             raise ValueError(f"{provider}: T6050 USB DART requires the producer's ATC2_USB power-domain dependency before OPEN")
+        providers.add(provider)
+    return providers
 
 
 def pci_layout(tree, path, layout):
@@ -148,7 +151,7 @@ def migrate(blob, pcie_layout=None, enable_pmp=False):
     tree.resize(len(blob) * 2 + 16384)
     inventory = list(paths(tree))
     compatible = {p: strings(tree, p, "compatible") for p in inventory}
-    usb_dart_power(tree, compatible)
+    usb_darts = usb_dart_power(tree, compatible)
     for path, matches in compatible.items():
         if "apple,t6050-x1n1-ascwrap-v6" in matches:
             put_strings(tree, path, "compatible", ["apple,t6050-ascwrap-v6"])
@@ -226,6 +229,10 @@ def migrate(blob, pcie_layout=None, enable_pmp=False):
             retained = cells(tree, path, "apple,apif-retained-sids") if property_bytes(tree, path, "apple,apif-retained-sids") else []
             if len(retained) != len(set(retained)) or any(sid >= count for sid in retained):
                 raise ValueError(f"{path}: invalid retained streams")
+            # Native MAP requires both start and exclusive end strictly
+            # inside this USB stream's aperture. Preserve its final granule.
+            if path in usb_darts:
+                put(tree, path, "apple,apif-reserve-last-page", b"")
             renamed[path] = path.rsplit("/", 1)[0] + f"/iommu-{unit:x}"
             delete(tree, path, "reg")
         elif LEGACY_SART in c:
