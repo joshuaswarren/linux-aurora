@@ -201,6 +201,13 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_MGMT:
 			break;
 
+		case APPLE_RTKIT_EP_PMP_AUX:
+			if (rtk->pmp_registry_v2)
+				apple_rtkit_start_ep(rtk, ep);
+			else
+				dev_warn(rtk->dev, "RTKit: unqualified endpoint 7\n");
+			break;
+
 		/* without starting these RTKit refuses to boot */
 		case APPLE_RTKIT_EP_SYSLOG:
 		case APPLE_RTKIT_EP_CRASHLOG:
@@ -367,8 +374,9 @@ reply:
 	return 0;
 
 error:
-	dev_err(rtk->dev, "RTKit: failed buffer request for 0x%zx bytes (%d)\n",
-		request.size, err);
+	dev_err(rtk->dev,
+		"RTKit: failed buffer request ep=%#x for 0x%zx bytes at %pad msg=%#llx (%d)\n",
+		ep, request.size, &request.iova, msg, err);
 	return err;
 }
 
