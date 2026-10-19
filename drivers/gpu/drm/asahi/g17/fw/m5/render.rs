@@ -394,6 +394,13 @@ fn place_program(out: &mut [u8], low_alias: u64, p: &M5ProgramRef<'_>) -> Result
     Ok(address)
 }
 
+/// Per-command tested native external-write metadata and the existing diagnostic.
+pub(crate) const fn shader_write_class(declared: bool, diagnostic: u32) -> u8 {
+    // Native forwards the tested compiler write class to d1177/command89a.
+    // Preserve the existing explicit force-on diagnostic; do not infer policy89e.
+    (declared || diagnostic == 1) as u8
+}
+
 /// Retain the existing shifted-hint values without treating the neighboring
 /// usage-pointer byte as part of the hint. Native's apparent high-bit
 /// "pass rotation" in an unaligned u64 read at 0x938 comes from that pointer

@@ -149,9 +149,11 @@ pub(crate) fn inputs(args: &RenderArgs<'_>, usage: [u64; 2]) -> Result<cmd::M5Re
     fields.ta.resolved_tail_value = usage[0];
     fields.fragment.resolved_tail_value = Some(usage[1]);
     fields.scheduler_record = r.kick_record_va;
-    // Native725 image-copy TA+0x89a copies descriptor+0x1177 bit0.
-    // Its full policy is not decoded; keep this explicit diagnostic off by default.
-    fields.ta.d1177 = u8::from(*crate::module_parameters::m5_ta_policy_test.value() == 1);
+    // Native accumulates tested external-write compiler metadata across graphics
+    // programs, then forwards its bit0 through descriptor1177 to command89a.
+    // This correspondence does not establish a monitor/preemption mechanism.
+    fields.ta.d1177 = cmd::shader_write_class(args.pass.shader_writes_memory,
+        *crate::module_parameters::m5_ta_policy_test.value());
     fields.ta.sequence = args.ordinal.checked_mul(2).and_then(|n| n.checked_add(1)).ok_or(EOVERFLOW)?;
     fields.fragment.sequence = args.ordinal.checked_mul(2).ok_or(EOVERFLOW)?;
     fields.fragment.pass = 1;

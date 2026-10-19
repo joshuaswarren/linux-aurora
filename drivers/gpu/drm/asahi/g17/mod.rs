@@ -1283,7 +1283,8 @@ impl gpu::Gpu for Gpu {
                 | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES as u64
                 | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 as u64
                 | crate::file::DRM_ASAHI_FEATURE_SPARSE_TILES
-                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_MATRIX;
+                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_MATRIX
+                | crate::file::DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES;
             if *crate::module_parameters::m5_mesh_storage_chunks.value() != 0 {
                 params.features |= crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
             }

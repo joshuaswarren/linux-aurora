@@ -64,6 +64,11 @@ pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_MATRIX: u64 = 1 << 12;
 /// TA mesh rendering buffer (register 0x1ca48), which backs the native
 /// object payload address. Reported only while m5_mesh_storage_chunks != 0.
 pub(crate) const DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: u64 = 1 << 13;
+/// New named UAPI bits are kept driver-local like the neighboring features:
+/// retain the running kernel's Rust UAPI crate and its exact link metadata.
+/// Host fixtures compare these values with both public headers.
+pub(crate) const DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: u64 = 1 << 14;
+pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 = 1 << 21;
 /// UAPI DRM_ASAHI_RENDER_PROGRAM_TASK (bit 3), only with
 /// DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object program is an API task stage.
 pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = 1 << 3;

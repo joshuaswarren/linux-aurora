@@ -313,6 +313,9 @@ enum drm_asahi_feature {
 	/** @DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: Task object payload storage. */
 	DRM_ASAHI_FEATURE_TASK_MESH_STORAGE = (1UL) << 13,
 
+	/** @DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: Per-render external shader writes. */
+	DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES = (1UL) << 14,
+
 };
 
 /**
@@ -1200,6 +1203,18 @@ enum drm_asahi_render_flags {
 	 * may depend on it. Requires DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS.
 	 */
 	DRM_ASAHI_RENDER_FRAGMENT_BARRIERS = (1U << 20),
+
+	/**
+	 * @DRM_ASAHI_RENDER_SHADER_WRITES: A graphics program in this command
+	 * writes external memory, including buffer/image stores or atomic RMW.
+	 * Ordinary raster outputs and compiler-private transport do not count.
+	 * The native M5 producer accumulates the tested compiler write metadata
+	 * across its graphics programs and forwards it to TA command byte0x89a.
+	 * Its firmware/hardware effect is not established by that correspondence.
+	 * Requires DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES. Omission retains the
+	 * existing encoding, allowing older userspace to submit unchanged.
+	 */
+	DRM_ASAHI_RENDER_SHADER_WRITES = (1U << 21),
 };
 
 /**

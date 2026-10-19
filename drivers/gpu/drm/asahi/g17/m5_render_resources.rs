@@ -110,7 +110,7 @@ pub(super) fn qualification_pass() -> RenderPass {
     RenderPass{width:256,height:256,layers:1,utile_width:32,utile_height:32,samples_log2:0,
         sample_size:16,process_empty_tiles:true,msaa_control:0x88,ppp_control:0x202,
         vdm_va:0,scissor_va:0,depth_bias_va:0,depth_bias_is_int:false,few_primitives:true,
-        fragment_barriers:false,occlusion_query_va:0,sampler_heap_va:0,sampler_count:0,
+        fragment_barriers:false,shader_writes_memory:false,occlusion_query_va:0,sampler_heap_va:0,sampler_count:0,
         zls_control:0,depth_dimensions:0,depth:surface,stencil:surface,depth_clear:0x3f800000,
         stencil_clear:0,merge_upper_x:0x3bddb3d9,merge_upper_y:0x3bddb3d9,usc_base:0,
         bg:program,partial_bg:program,eot_offset:0,eot_rsrc_spec:0,partial_eot_offset:0,
