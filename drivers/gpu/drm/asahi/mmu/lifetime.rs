@@ -654,6 +654,29 @@ impl Drop for VmJobGuard {
         if state.active != 0 {
             return;
         }
+        // Healthy last-job release need not close mapping/job admission when
+        // there is no accepted cleanup to drain. Keep every recovery, close,
+        // in-progress commit and failed-cleanup path on the existing drain.
+        if !state.blocked
+            && !state.quarantined
+            && !state.draining
+            && !state.closed
+            && !state.cleanup_failed
+            && state.commits == 0
+            && state.close_ranges.is_none()
+            && state.unmaps.is_empty()
+            && state.objects.is_empty()
+            && self.vm.status.as_ref().is_some_and(|status| {
+                status.get() == 0 && status.reported_error() == 0
+            })
+        {
+            drop(state);
+            // The C deferred list is independent of the queues above. Its
+            // GEM puts may sleep/reenter; run after unlocking, while this
+            // job guard still retains the VM and its residency lease.
+            self.vm.bo_deferred_cleanup();
+            return;
+        }
         state.draining = true;
         drop(state);
         self.vm.drain_mappings(lifetime);
