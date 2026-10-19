@@ -90,6 +90,7 @@ struct apple_dart_apif {
 	u64 dma_min, dma_max;
 	bool reserve_last_page;
 	bool inited;
+	bool boot_mappings; /* U-Boot retained the running MTP's DMA tables. */
 	bool ownership_uncertain; /* A table operation needs a fresh boot after lost completion. */
 	struct apif_retained_sid *retained[DART_APIF_MAX_STREAMS];
 	struct mutex init_lock; /* serialises one-time init */
@@ -304,6 +305,30 @@ static int apif_prepare_table(struct apple_dart_apif *dart, u64 sid, u64 dva,
 static int apif_boot_query(struct apple_dart_apif *dart,
 			   struct apif_op *request)
 {
+	struct apif_retained_sid *r = request->arg[0] < dart->num_streams ?
+		dart->retained[request->arg[0]] : NULL;
+
+	if (dart->boot_mappings && r) {
+		if (request->op == APIF_DART_RETAINED_INFO) {
+			request->arg[1] = r->root_level;
+			request->arg[2] = r->count;
+			request->arg[3] = dart->dma_min;
+			request->arg[4] = dart->dma_max - dart->dma_min + 1;
+			request->arg[5] = 1;
+		} else {
+			const struct apif_retained_run *run;
+
+			if (request->arg[1] >= r->count)
+				return -EINVAL;
+			run = &r->runs[request->arg[1]];
+			request->arg[2] = run->dva;
+			request->arg[3] = run->ipa;
+			request->arg[4] = run->size;
+			request->arg[5] = 0;
+		}
+		return 0;
+	}
+
 	struct aurora_apif_boot_iommu *info = dart->boot_info;
 	struct aurora_apif_op op = {
 		.selector = AURORA_APIF_SELECTOR(AURORA_APIF_SERVICE,
@@ -412,6 +437,8 @@ static int apif_ring(struct apple_dart_apif *dart)
 		op->ret = 0;
 		switch (op->op) {
 		case APIF_DART_INIT: {
+			if (dart->boot_mappings)
+				break;
 			struct aurora_apif_op query = {
 				.selector = AURORA_APIF_SELECTOR(
 					AURORA_APIF_SERVICE,
@@ -473,6 +500,15 @@ static int apif_ring(struct apple_dart_apif *dart)
 			break;
 		case APIF_DART_ENABLE:
 		case APIF_DART_DISABLE:
+			if (a[0] >= dart->num_streams) {
+				ret = -EINVAL;
+				goto out;
+			}
+			/* Live firmware retains stream state across Linux domain
+			 * attachment and teardown, just as for power transitions.
+			 */
+			if (dart->retained[a[0]])
+				break;
 			call.selector = AURORA_APIF_SELECTOR(
 				3, op->op == APIF_DART_ENABLE ? 8 : 7);
 			native[n++] = call;
@@ -510,6 +546,52 @@ out:
 /* Setup-only host queries. Firmware-owned mappings are reserved, never replayed
  * through MAP, and never inserted in the Linux-owned mappings xarray.
  */
+static int apif_load_boot_mappings(struct apple_dart_apif *dart)
+{
+	struct device_node *np = dart->dev->of_node;
+	struct apif_retained_sid *r;
+	u64 cells[32], sid, previous = 0;
+	int count, ret;
+
+	if (!of_find_property(np, "apple,apif-boot-mappings", NULL))
+		return 0;
+	count = of_property_count_u64_elems(np, "apple,apif-boot-mappings");
+	if (count < 4 || count > ARRAY_SIZE(cells) || count % 4 || dart->iova_force)
+		return -EINVAL;
+	ret = of_property_read_u64_array(np, "apple,apif-boot-mappings", cells, count);
+	if (ret)
+		return ret;
+	sid = cells[0];
+	if (sid >= dart->num_streams || dart->retained[sid])
+		return -EINVAL;
+	r = devm_kzalloc(dart->dev, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	r->root_level = 1;
+	r->count = count / 4;
+	r->runs = devm_kcalloc(dart->dev, r->count, sizeof(*r->runs), GFP_KERNEL);
+	if (!r->runs)
+		return -ENOMEM;
+	for (unsigned int i = 0; i < r->count; i++) {
+		struct apif_retained_run *run = &r->runs[i];
+
+		run->dva = cells[i * 4 + 1];
+		run->ipa = cells[i * 4 + 2];
+		run->size = cells[i * 4 + 3];
+		if (cells[i * 4] != sid || !run->size ||
+		    (run->dva | run->ipa | run->size) & (DART_APIF_PAGE_SIZE - 1) ||
+		    run->dva < dart->dma_min || run->dva > dart->dma_max ||
+		    run->size - 1 > dart->dma_max - run->dva ||
+		    run->size > U64_MAX - run->ipa || (i && run->dva < previous))
+			return -EINVAL;
+		previous = run->dva + run->size;
+	}
+	dart->retained[sid] = r;
+	dart->boot_mappings = true;
+	dev_info(dart->dev, "retaining %u boot DMA mappings on stream %llu\n", r->count, sid);
+	return 0;
+}
+
 static int apif_load_retained(struct apple_dart_apif *dart)
 {
 	struct device_node *np = dart->dev->of_node;
@@ -1880,6 +1962,9 @@ static int apple_dart_apif_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "retained DART discovery failed\n");
+	ret = apif_load_boot_mappings(dart);
+	if (ret)
+		return dev_err_probe(dev, ret, "invalid boot DMA mappings\n");
 
 	ret = devm_add_action_or_reset(dev, apif_free_page_lists, dart);
 	if (ret)
