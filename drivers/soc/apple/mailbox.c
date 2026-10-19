@@ -349,13 +349,26 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
 		if (t <= 0) {
+			u32 a2i = 0, i2a = 0;
+			bool removing;
+
 			/* A late IRQ may already have masked this under tx_lock. */
 			spin_lock_irqsave(&mbox->tx_lock, flags);
+			removing = READ_ONCE(mbox->removing);
+			if (!removing) {
+				a2i = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
+				i2a = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+			}
 			if (mbox->tx_irq_unmasked) {
 				disable_irq_nosync(mbox->irq_send_empty);
 				mbox->tx_irq_unmasked = false;
 			}
 			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			dev_err(mbox->dev,
+				"TX wait failed ret=%ld a2i=%#x i2a=%#x full=%#x send_irq=%d recv_irq=%d removing=%d msg=%#llx/%#x\n",
+				t, a2i, i2a, mbox->hw->control_full,
+				mbox->irq_send_empty, mbox->irq_recv_not_empty,
+				removing, msg.msg0, msg.msg1);
 			return t < 0 ? t : -ETIMEDOUT;
 		}
 
