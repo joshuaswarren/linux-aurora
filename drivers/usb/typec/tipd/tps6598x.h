@@ -6,6 +6,7 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
+#include <linux/soc/apple/display-event-log.h>
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/bitfield.h>
@@ -340,6 +341,8 @@ struct tps6598x {
 	const struct tipd_data *data;
 
 	struct tipd_debugfs *debugfs;
+	/* Diagnostic tail: preserve all pre-existing transport field offsets. */
+	struct apple_display_event_log *event_log;
 };
 
 /* TPS_REG_USB4_STATUS */
@@ -448,4 +451,17 @@ static inline void tipd_debugfs_unregister(struct tps6598x *tps) { }
 static inline void tipd_debugfs_exit(void) { }
 #endif
 
+/* Guard flag before evaluating payload expressions or accessing owner fields. */
+extern bool tipd_event_trace;
+#define TIPD_EVENT(tps, type, result, flags, ...) do { \
+	if (unlikely(READ_ONCE(tipd_event_trace))) \
+		APPLE_DISPLAY_EVENT_RECORD((tps)->event_log, type, result, flags, __VA_ARGS__); \
+} while (0)
+enum tipd_event_type {
+	TIPD_EVENT_IRQ = 1, TIPD_EVENT_IRQ_EXIT, TIPD_EVENT_DATA,
+	TIPD_EVENT_QUEUE, TIPD_EVENT_CONSUME, TIPD_EVENT_APPLY,
+	TIPD_EVENT_MUX, TIPD_EVENT_MUX_DUPLICATE, TIPD_EVENT_OOB, TIPD_EVENT_RETRY,
+};
+
 #endif /* __TPS6598X_H__ */
+
