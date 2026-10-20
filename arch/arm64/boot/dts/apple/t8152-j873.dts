@@ -230,3 +230,4 @@
 #include "t8152-j873-thermal-sensors.dtsi"
 #include "t8152-j873-gpu.dtsi"
 #include "t8152-j873-pmp.dtsi"
+#include "t8152-j873-ans.dtsi"
