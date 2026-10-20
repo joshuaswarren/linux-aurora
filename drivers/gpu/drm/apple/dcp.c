@@ -2496,7 +2496,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 		INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
 		mutex_init(&dcp->bl_register_mutex);
-		INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
+		INIT_DELAYED_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
@@ -2720,7 +2720,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	}
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
-	cancel_work_sync(&dcp->vblank_wq);
+	cancel_delayed_work_sync(&dcp->vblank_wq);
 
 	/* The component framework releases the bind's devres group after
 	 * unbind, including optional clocks whose managed value can be NULL.
@@ -3022,6 +3022,20 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 };
 
 /*
+ * The M6 (T8152) speaks the H17G transport with firmware 26.4 (26A428). The
+ * dptx-phy description and the HDMI connector come from the device tree. m1n1
+ * either quiesces the DCP before chainload (apple,dcp-rtkit-quiesced) or hands
+ * it over running; both are handled, so adopt_live_session stays off until the
+ * endpoint-map recovery that t8140 waits for lands.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8152 = {
+	.num_dptx_ports = 1,
+	.adopt_running_coprocessor = true,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
+};
+
+/*
  * The J700's two DCPs share one compatible, so they shared one hw_data and
  * with it num_dptx_ports = 0 -- which silently disabled DisplayPort on the
  * external pipe.  dptxep_init()'s port loop runs num_dptx_ports times, so at
@@ -3054,6 +3068,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_ext, },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
+	{ .compatible = "apple,t8152-dcp", .data = &apple_dcp_hw_t8152,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}
