@@ -1,47 +1,50 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J873/T8152 ANS2 NVMe storage. All addresses, IRQs and properties come from
- * the live M6 ADT (m6-experiment-adt-20261019.bin):
- *   /arm-io/ans: reg[0] 0x121600000+0x74000 (ascwrap coproc), reg[1]
- *   0x121050000+0x4000 (msgbox bank), reg[3] 0x125cc0000+0x60000 (nvme window);
- *   interrupts [302, 262, 222, 1349] with nvme-interrupt-idx = 3;
- *   msgbox-mailbox-num = 3, msgbox-using-postoffice = true;
- *   nvme-queue-entries = 64.
- *   /arm-io/sart-ans: compatible "sart,coastguard", reg 0x125c50000+0xc000.
- * The v8 mailbox takes the final mailbox aperture address in reg, like the
- * t8152 SMC node: mailbox 3 with postoffice gives (2*3+0)*0x80 = 0x300 inside
- * the msgbox bank. If the first probe fails, the alias-bank alternative is
- * 0x121060300 (+0x10000) - one bounded iteration.
- * The nvmmu reg repeats the nvme window: the T8152 NVMMU registers are
- * aliased inside it (measured, ANS-v8), and the in-tree apple_nvme_t8152_hw
- * expects a separate "nvmmu" reg - the same window satisfies both layouts.
- * No power-domains or resets: the bring-up DT has no PMGR, and the driver
- * skips them when absent (pd_count <= 1; empty reset array is a no-op).
+ * J873/T8152 ANS2 NVMe storage. Source: live M6 ADT (m6-experiment-adt-20261019.bin).
+ * ADT bus addresses translate to CPU physical by /arm-io ranges: child 0x0 ->
+ * parent 0x200000000, i.e. bus 0x1xxxxxxxx = DT 0x3xxxxxxxx (same rule as the
+ * aic 0x101000000 -> 0x301000000 and smc 0x10c600000 -> 0x30c600000 nodes).
+ *
+ * /arm-io/ans reg (bus -> phys, size):
+ *   [0] 0x121600000 -> 0x321600000 +0x74000  ASC coproc ("ans": CPU_CONTROL at +0x44)
+ *   [1] 0x121050000 -> 0x321050000 +0x4000   not used by the driver
+ *   [2] 0x116000000 -> 0x316000000 +0x1c000  msgbox bank (asc.c reads reg[2] for ASCWrap-v8)
+ *   [3] 0x125cc0000 -> 0x325cc0000 +0x60000  NVMe + NVMMU aperture ("nvme"/"nvmmu")
+ *   [4] 0x123000000 -> 0x323000000 +0x1000000 16 MiB, unidentified, not used
+ * interrupts [302, 262, 222, 1349], nvme-interrupt-idx = 3 -> NVMe IRQ 1349.
+ * msgbox-mailbox-num = 3, msgbox-using-postoffice = true, no using-alias:
+ * mailbox aperture = reg[2] + (2*3 + 0)*0x80 + 0x10000 = 0x316010300 (the same
+ * formula yields the working SMC node's 0x30c710080 from its ADT).
+ * /arm-io/sart-ans reg[0] 0x125c50000 -> 0x325c50000 +0xc000.
+ * The NVMMU registers live inside the shared nvme aperture (ANS-v8 native
+ * analysis), so "nvmmu" repeats the nvme window to satisfy has_separate_nvmmu.
+ * No power-domains/resets: PMGR DT arrives separately.
  */
 
 / {
 	soc {
-		ans_mbox: mailbox@121050300 {
+		ans_mbox: mailbox@316010300 {
 			compatible = "apple,t8152-ascwrap-v8-mailbox";
-			reg = <0x1 0x21050300 0x0 0x80>;
+			reg = <0x3 0x16010300 0x0 0x80>;
 			interrupt-parent = <&aic>;
-			/* ADT order [recv, send, ...]: 302 = recv-not-empty, 262 = send-empty. */
-			interrupts = <AIC_IRQ 262 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>;
+			/* Unmeasured role split: SMC lists [send-empty, recv-not-empty];
+			 * ANS lists three IRQs [302, 262, 222]. First two used. */
+			interrupts = <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 262 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "send-empty", "recv-not-empty";
 			#mbox-cells = <0>;
 		};
 
-		sart: sart@125c50000 {
-			compatible = "sart,coastguard";
-			reg = <0x1 0x25c50000 0x0 0xc000>;
+		sart: sart@325c50000 {
+			compatible = "apple,t8152-sart", "sart,coastguard";
+			reg = <0x3 0x25c50000 0x0 0xc000>;
 		};
 
-		nvme: nvme@125cc0000 {
+		nvme: nvme@325cc0000 {
 			compatible = "apple,t8152-nvme-ans2";
-			reg = <0x1 0x25cc0000 0x0 0x60000>,
-			      <0x1 0x21600000 0x0 0x74000>,
-			      <0x1 0x25cc0000 0x0 0x60000>;
+			reg = <0x3 0x25cc0000 0x0 0x60000>,
+			      <0x3 0x21600000 0x0 0x74000>,
+			      <0x3 0x25cc0000 0x0 0x60000>;
 			reg-names = "nvme", "ans", "nvmmu";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1349 IRQ_TYPE_LEVEL_HIGH>;
