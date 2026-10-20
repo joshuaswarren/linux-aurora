@@ -12,6 +12,8 @@
 			interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
 			power-domains = <&ps_atc2_usb>;
+			apple,static-topology;
+			apple,num-streams = <16>;
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			apple,tunable = <0x20c 0x80000121 0x80000121>,
 					<0x220 0x00000f0f 0x00000f0f>,
@@ -28,6 +30,8 @@
 			interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
 			power-domains = <&ps_atc2_usb>;
+			apple,static-topology;
+			apple,num-streams = <16>;
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			apple,tunable = <0x20c 0x80000121 0x80000121>,
 					<0x220 0x00000f0f 0x00000f0f>,
