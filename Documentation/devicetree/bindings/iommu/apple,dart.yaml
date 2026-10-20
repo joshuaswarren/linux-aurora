@@ -28,6 +28,7 @@ properties:
           - apple,t8103-usb4-dart
           - apple,t8110-dart
           - apple,t6000-dart
+          - apple,t8152-dart
       - items:
           - enum:
               - apple,t6000-dart
@@ -41,7 +42,8 @@ properties:
           - const: apple,t8110-dart
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   interrupts:
     maxItems: 1
