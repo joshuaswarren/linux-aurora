@@ -33,7 +33,7 @@
 		};
 
 		dcp_dart: iommu@286340000 {
-			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			compatible = "apple,t8152-dart";
 			reg = <0x2 0x86340000 0x0 0x20000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 884 IRQ_TYPE_LEVEL_HIGH>;
@@ -42,7 +42,7 @@
 		};
 
 		disp0_dart: iommu@286300000 {
-			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			compatible = "apple,t8152-dart";
 			reg = <0x2 0x86300000 0x0 0xc000>,
 			      <0x2 0x86314000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
