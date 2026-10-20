@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Opt-in J873 DT: APCIe for the Apple N1 radio (port 0) and the Ethernet function (port 2).
+ * The ordinary t8152-j873.dtb deliberately has no PCIe node. UNPROVEN on hardware; see tools/aurora/j873/radio/README.md.
+ */
+#include "t8152-j873.dts"
+#include "t8152-j873-pcie.dtsi"

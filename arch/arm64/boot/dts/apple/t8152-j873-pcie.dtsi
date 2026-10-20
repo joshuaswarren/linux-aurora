@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873 (Mac mini M6, T8152) APCIe: port 0 = Apple N1 "Centauri" Wi-Fi/Bluetooth, port 2 = Ethernet (lan0).
+ *
+ * Every address, interrupt, GPIO and stream number below is read from the live J873 ADT (m6-experiment-adt-20261019,
+ * firmware 26A428/26A434 generation) and cross-checked against the T8140 pattern in t8140-j700-hybrid-additions.dtsi.
+ * Nothing in this file has run on a J873. UNPROVEN items are marked "UNPROVEN" and listed in
+ * tools/aurora/j873/radio/README.md. Opt-in: only t8152-j873-radio.dts includes it.
+ *
+ * ADT facts (apcie = apcie,t8152, 3 ports declared, #ports = 3, ports 0 and 2 present):
+ *   regs   [0] ECAM 0x1cb0000000, [1] RC 0x18c000000, [10] port0 0x188028000, [16] port1 0x189028000, [22] port2 0x18a028000
+ *          (28 entries = 10 shared + 3 ports x 6; the T8140 has 7 shared)
+ *   irqs   apcie 1571 1579 1587 (ports 0,1,2) and 1566 (not used by the driver); dart-apcie0 1572, dart-apcie2 1588;
+ *          apcie0-piodma 1573, apcie2-piodma 1589; msi-vector-offset 1879, 96 vectors (ports share one window)
+ *   dart   dart-apcie0 0x188000000 (control/alpha/beta/piodma streams, sid-count 19), dart-apcie2 0x18a000000
+ *   gpio   gpio0 0x11a000000 (gpio,t8101, 224 pins, 7 interrupt groups 433..439); port0 PERST 3, CLKREQ 0;
+ *          port2 PERST 5, CLKREQ 2; port0 reset/reg_on = pKW8("pcIO", 0x800000, 0x130000) on the SMC
+ *   power  power-gates/clock-gates/service-gates are all None: the ADT has no PMGR power domain for the APCIe, so none is attached
+ */
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	aliases {
+		wifi0 = &wifi0;
+		bluetooth0 = &bluetooth0;
+		ethernet0 = &ethernet0;
+	};
+
+	soc {
+		pinctrl_ap: pinctrl@11a000000 {
+			compatible = "apple,t8152-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x1 0x1a000000 0x0 0x100000>;
+
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_ap 0 0 224>;
+			apple,npins = <224>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 433 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 434 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 435 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 436 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 437 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 438 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 439 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* Port 0 stream owner: control, alpha and beta use SIDs 1, 2 and 3 (slot == SID), the PIODMA stream is 17. */
+		pcie0_dart: iommu@188000000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x1 0x88000000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1572 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* Port 2 (Ethernet) stream owner. */
+		pcie2_dart: iommu@18a000000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x1 0x8a000000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1588 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/*
+		 * Port 0 PIODMA. The window values are the ECAM and the two bus ranges of the ADT; they equal the T8140's
+		 * (ECAM 0x1cb0000000/0x10000000, 64-bit window 0xbc0000000/0x20000000, 32-bit window 0xb80000000/0x40000000).
+		 * UNPROVEN: the driver takes one apple,piodma phandle, so port 2's PIODMA (apcie2-piodma, 0x18a030000,
+		 * IRQ 1589) is not described.
+		 */
+		piodma_radio: piodma@188030000 {
+			compatible = "apple,t8140-pcie-piodma";
+			reg = <0x1 0x88030000 0x0 0x4000>,
+			      <0x1 0x88034000 0x0 0x4000>,
+			      <0x1 0x88038000 0x0 0x4000>;
+			reg-names = "engine", "irq-aggregator", "fabric";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1573 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&pcie0_dart 17>;
+			apple,iova-address-bits = <36>;
+			apple,piodma-base-addresses = <0x1c 0xb0000000>,
+						      <0xb 0xc0000000>,
+						      <0xb 0x80000000>;
+			apple,piodma-aperture-sizes = <0x0 0x10000000>,
+						      <0x0 0x20000000>,
+						      <0x0 0x40000000>;
+		};
+
+		pcie0: pcie@1cb0000000 {
+			compatible = "apple,t8152-pcie", "apple,t8140-pcie", "apple,t6020-pcie";
+			device_type = "pci";
+
+			reg = <0x1c 0xb0000000 0x0 0x10000000>, /* ECAM */
+			      <0x1 0x8c000000 0x0 0x4000>,      /* RC */
+			      <0x1 0x88028000 0x0 0x8000>,      /* port 0 */
+			      <0x1 0x89028000 0x0 0x8000>,      /* port 1 (not populated) */
+			      <0x1 0x8a028000 0x0 0x8000>,      /* port 2 */
+			      <0x1 0x8f020000 0x0 0x4000>,      /* port 0 PHY: the T8140's phy0 offset (base + 0x7020000) */
+			      <0x1 0x8f024000 0x0 0x4000>,      /* UNPROVEN: port 1 PHY, +0x4000 stride as T6030 */
+			      <0x1 0x8f028000 0x0 0x4000>;      /* UNPROVEN: port 2 PHY, +0x4000 stride as T6030 */
+			reg-names = "config", "rc", "port0", "port1", "port2", "phy0", "phy1", "phy2";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1571 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1579 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1587 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1566 IRQ_TYPE_LEVEL_HIGH>;
+
+			msi-controller;
+			msi-parent = <&pcie0>;
+			msi-ranges = <&aic AIC_IRQ 1879 IRQ_TYPE_EDGE_RISING 32>;
+
+			/*
+			 * Bus 1 is port 0 (Centauri control, alpha, beta = functions 0, 1, 2 -> SIDs 1, 2, 3);
+			 * bus 2 is port 2 (lan0 -> SID 1 of its own DART).
+			 */
+			iommu-map = <0x100 &pcie0_dart 1 1>,
+				    <0x101 &pcie0_dart 2 1>,
+				    <0x102 &pcie0_dart 3 1>,
+				    <0x200 &pcie2_dart 1 1>;
+			iommu-map-mask = <0xffff>;
+			dma-coherent;
+			apple,valid-functions = <0x7>;
+			apple,endpoint-iova-address-bits = <32>;
+			apple,piodma = <&piodma_radio>;
+
+			bus-range = <0 2>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+
+			port00: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				bus-range = <1 1>;
+				reset-gpios = <&pinctrl_ap 3 GPIO_ACTIVE_LOW>;
+				/*
+				 * ADT function-reset = pKW8("pcIO", 0x800000, 0x130000): SMC pin 0x13 (19) on J873
+				 * (gpio-macsmc.c). UNPROVEN: the write has not been tried on a J873.
+				 */
+				pwren-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+				maximum-link-speed = <3>; /* ADT pci-bridge0 maximum-link-speed */
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+						<0 0 0 2 &port00 0 0 0 1>,
+						<0 0 0 3 &port00 0 0 0 2>,
+						<0 0 0 4 &port00 0 0 0 3>;
+
+				/* PCI 106b:1901 (alpha, function 1), Wi-Fi. The MAC is filled by the loader from /chosen mac-address-wifi0. */
+				wifi0: wifi@0,1 {
+					compatible = "pci106b,1901";
+					reg = <0x10100 0x0 0x0 0x0 0x0>;
+					local-mac-address = [00 00 00 00 00 00];
+				};
+
+				/* PCI 106b:1903 (beta, function 2), Bluetooth. Address filled by the loader from /chosen mac-address-bluetooth0. */
+				bluetooth0: bluetooth@0,2 {
+					compatible = "pci106b,1903";
+					reg = <0x10200 0x0 0x0 0x0 0x0>;
+					local-bd-address = [00 00 00 00 00 00];
+				};
+			};
+
+			/* Port 1 is not populated on this board. */
+			port01: pci@1,0 {
+				device_type = "pci";
+				reg = <0x800 0x0 0x0 0x0 0x0>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				status = "disabled";
+			};
+
+			port02: pci@2,0 {
+				device_type = "pci";
+				reg = <0x1000 0x0 0x0 0x0 0x0>;
+				bus-range = <2 2>;
+				reset-gpios = <&pinctrl_ap 5 GPIO_ACTIVE_LOW>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+						<0 0 0 2 &port02 0 0 0 1>,
+						<0 0 0 3 &port02 0 0 0 2>,
+						<0 0 0 4 &port02 0 0 0 3>;
+
+				/* lan0, a built-in function. The chip is read from its PCI IDs once it enumerates; the MAC comes from /chosen mac-address-ethernet0. */
+				ethernet0: ethernet@0,0 {
+					reg = <0x20000 0x0 0x0 0x0 0x0>;
+					local-mac-address = [00 00 00 00 00 00];
+				};
+			};
+		};
+	};
+};
+
+&m6_smc {
+	/* SMC GPIO provider: port 0's reg_on is an SMC "pcIO" write, not a GPIO of gpio0. */
+	smc_gpio: gpio {
+		compatible = "apple,smc-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+};
