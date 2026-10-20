@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8152 (M6) Mac mini J873: SPMI Type-C controller (hpm3, back-right port).
+ *
+ * Source: M6 ADT (m6-experiment-adt-20261019). /arm-io/nub-spmi-a0/hpm3
+ * compatible "usbc,sn201202x,spmi" (same ACE3 part as t8122, see
+ * t8122-usbpd-spmi.dtsi), port-number 4, rid 3, port-location "back-right",
+ * acio-parent = acio3 (phandle 162), dock = port-usb-c-4.
+ * usb-drd3 / atc-phy3 carry the same port-number 4 and acio-parent 162, so the
+ * controller side is label dwc3_3 / atcphy3 (usb-drd3, atc-phy3 in the ADT).
+ *
+ * Offline only: never booted on M6 hardware.
+ *
+ * Needs: ps_nub_spmi_a0 from t8152-j873-pmgr.dtsi, aic from t8152-j873.dts.
+ *
+ * No connector port graph yet: usbdrd3 (t8152-j873-usb2.dtsi) is a fixed USB2
+ * host without usb-role-switch, and its binding has no ports. The HPM3 role
+ * graph (usb-role-switch on usbdrd3 plus endpoints) is a later step.
+ */
+
+#include <dt-bindings/spmi/spmi.h>
+
+/ {
+	soc {
+		/*
+		 * ADT /arm-io/nub-spmi-a0: reg[0] bus 0x108908000 -> phys
+		 * 0x308908000 (+0x200000000, first /arm-io range). Linux maps 0x100.
+		 * ADT interrupts[1] = 682 with interrupt-parent[1] = aic (phandle 194);
+		 * the other ADT entries are SPMI-internal (parent = the controller).
+		 */
+		nub_spmi_a0: spmi@308908000 {
+			compatible = "apple,t8152-spmi", "apple,t8103-spmi";
+			reg = <0x3 0x08908000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 682 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_nub_spmi_a0>;
+		};
+	};
+};
+
+&nub_spmi_a0 {
+	/*
+	 * ADT hpm3: reg word0 = 0x8; interrupts 63/69/71 with interrupt-type
+	 * 0/2/3 (irq/sleep/wake). The "select" line is not in the ADT; 65 =
+	 * irq + 2 follows the hpm0 (11/13) and hpm1 (37/39) pattern and the
+	 * identical t8122 hpm5@8 node.
+	 */
+	hpm3: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			<65 IRQ_TYPE_EDGE_RISING>,
+			<69 IRQ_TYPE_EDGE_RISING>,
+			<71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec3: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back-right";
+			power-role = "dual";
+			/* first keyboard path: host only. "dual" once role switching is wanted. */
+			data-role = "host";
+		};
+	};
+};
