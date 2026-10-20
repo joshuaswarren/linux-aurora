@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873/T8152 display (DCP + DARTs), DISABLED placeholders for a later apple-drm port.
+ * First-boot display is the simple-framebuffer that m1n1/U-Boot fill into
+ * /chosen/framebuffer (kboot.c dt_set_fb); nothing here probes.
+ *
+ * Addresses: live M6 ADT, phys = bus + 0x200000000 (/arm-io range 0 -> 0x200000000).
+ *  /arm-io/dart-dcp   reg[0] 0x86340000  -> 0x286340000 +0x20000, sid 23, exclave-sid 24, IRQ 884
+ *  /arm-io/dart-disp0 reg[0] 0x86300000  -> 0x286300000 +0xc000, reg[1] 0x86314000 -> 0x286314000 +0x4000,
+ *                     streams 0 and 16, IRQ 884
+ *  /arm-io/dcp        reg[0] 0x86e00000 -> 0x286e00000 +0x74000 (ASC coproc), reg[1] 0x86850000 +0x4000,
+ *                     reg[2] 0x116020000 -> 0x316020000 +0x10000 (msgbox bank), reg[3] 0x86e0c000 +0x3c008;
+ *                     msgbox-mailbox-num 5, using-postoffice, using-alias => aperture reg[2] + (2*5+0)*0x80
+ *                     = 0x316020500; IRQs [304, 264, 224]; iommu-parent = dart-dcp sid 23.
+ *  /arm-io/disp0 'disp0,t8152' regs 0x284000000+0xd14000, 0x286240000+0x10000, 0x2863ac000+0x4000,
+ *                0x286800000+0x7f4000, 0x302800000+0x1d4000; IRQs 875 878 877 876 883 873 887 882.
+ * Unverified: disp-N naming/order against apple-drm, the mailbox IRQ role split, and the locked Gen3 DART
+ * binding (apple-dart.c has locked-root import but no t8152 display compatible).
+ * No power-domains: the display chain is virtual-flagged in the ADT (see m6-hdmi-pmgr-chain.md).
+ */
+
+/ {
+	soc {
+		dcp_mbox: mailbox@316020500 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x3 0x16020500 0x0 0x80>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 264 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		dcp_dart: iommu@286340000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x2 0x86340000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 884 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		disp0_dart: iommu@286300000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x2 0x86300000 0x0 0xc000>,
+			      <0x2 0x86314000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 884 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		dcp: dcp@286e00000 {
+			compatible = "apple,t8152-dcp", "apple,dcp";
+			mboxes = <&dcp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&dcp_dart 23>;
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4";
+			reg = <0x2 0x86e00000 0x0 0x74000>,
+			      <0x2 0x84000000 0x0 0xd14000>,
+			      <0x2 0x86240000 0x0 0x10000>,
+			      <0x2 0x863ac000 0x0 0x4000>,
+			      <0x2 0x86800000 0x0 0x7f4000>,
+			      <0x3 0x02800000 0x0 0x1d4000>;
+			#address-cells = <2>;
+			#size-cells = <2>;
+			status = "disabled";
+
+			disp0_piodma: piodma {
+				iommus = <&disp0_dart 16>;
+			};
+		};
+	};
+};
