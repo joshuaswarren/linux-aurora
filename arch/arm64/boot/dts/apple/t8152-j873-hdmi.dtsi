@@ -272,3 +272,42 @@
 		0x1c64 0x2c00000 0x800000
 	>;
 };
+
+/* The DCP reads the PMC idle register in the PMC window when the firmware
+ * acknowledges pmgrConfigDispPerfState (as on T8140, register 0x3028aa140,
+ * inside disp0 reg[4]). Keep the PMC power state on. */
+&pmgr0 {
+	ps_pmc: power-controller@1400 {
+		compatible = "apple,t8152-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1400 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmc";
+		apple,always-on;
+	};
+};
+
+/ {
+	soc {
+		display0: display-subsystem {
+			compatible = "apple,display-subsystem";
+			iommus = <&disp0_dart 0>;
+		};
+	};
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&dcp {
+	status = "okay";
+};
