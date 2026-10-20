@@ -113,6 +113,7 @@ dtb-$(CONFIG_ARCH_APPLE) += t8122-j613.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8122-j615.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8140-j700.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8152-j873.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8152-j873-hdmi.dtb
 
 # J700 media diagnostics require a qualified AVE firmware handoff.
 dtb-$(CONFIG_ARCH_APPLE) += t8140-j700-encoding.dtb

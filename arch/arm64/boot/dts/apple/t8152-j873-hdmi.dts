@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g Mac mini (M6) with the HDMI DPTX PHY, its power domains and the converter power pins.
+ * The first-boot t8152-j873.dts stays unchanged; this adds the HDMI description on top.
+ */
+
+#include "t8152-j873.dts"
+#include "t8152-j873-hdmi.dtsi"
