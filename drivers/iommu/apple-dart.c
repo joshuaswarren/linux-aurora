@@ -272,6 +272,14 @@ struct apple_dart {
 	u32 tunneled : 1;
 	u32 power_retained : 1;
 	struct apple_tunable *tunables;
+	/*
+	 * Gen3 static topology: no DART MMIO at probe. Topology comes from fixed
+	 * values; tunables, parameter read, lock check, reset and the fault IRQ
+	 * wait for the first runtime resume (first consumer).
+	 */
+	u32 static_topo : 1;
+	u32 hw_ready : 1;
+	u32 irq_requested : 1;
 	/* Gen3 (T8152): shared TLBI doorbell and per-instance route register */
 	void __iomem *tlbi;
 	u16 version;
@@ -331,11 +339,12 @@ static inline u32 apple_dart_readl(struct apple_dart *dart, u32 offset)
  *  1: do not apply the ADT tunables
  *  2: do not run hw_reset (no TTBR/TCR/stream writes at probe)
  *  4: skip only the TLB doorbell at the end of hw_reset (shared aperture, probe time)
+ *  8: static topology for every Gen3 DART (same as the apple,static-topology property)
  * A locked DART never gets tunables or a reset, whatever N is.
  */
 static unsigned int gen3_skip;
 module_param(gen3_skip, uint, 0444);
-MODULE_PARM_DESC(gen3_skip, "T8152 Gen3 DART probe bisect: 1 no tunables, 2 no reset, 4 no probe TLBI");
+MODULE_PARM_DESC(gen3_skip, "T8152 Gen3 DART probe bisect: 1 no tunables, 2 no reset, 4 no probe TLBI, 8 static topology (no MMIO at probe)");
 
 static void apple_dart_apply_tunables(struct apple_dart *dart)
 {
@@ -2152,6 +2161,10 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 	irqreturn_t ret;
 	struct apple_dart *dart = dev;
 
+	/* Static topology: no MMIO, and no resume, before the first consumer. */
+	if (dart->static_topo && !dart->hw_ready)
+		return IRQ_NONE;
+
 	WARN_ON(pm_runtime_get_sync(dart->dev) < 0);
 	ret = dart->hw->irq_handler(irq, dev);
 	pm_runtime_put(dart->dev);
@@ -2247,10 +2260,97 @@ static int apple_dart_pmp_admit(struct apple_dart *dart)
 
 static const struct apple_dart_hw apple_dart_hw_t8152;
 
+static void apple_dart_read_params(struct apple_dart *dart)
+{
+	u32 dart_params[4];
+
+	dart_params[0] = apple_dart_readl(dart, DART_PARAMS1);
+	dart_params[1] = apple_dart_readl(dart, DART_PARAMS2);
+	dart->pgsize = 1 << FIELD_GET(DART_PARAMS1_PAGE_SHIFT, dart_params[0]);
+	dart->supports_bypass = dart_params[1] & DART_PARAMS2_BYPASS_SUPPORT;
+
+	switch (dart->hw->type) {
+	case DART_T8020:
+	case DART_T6000:
+		dart->ias = 32;
+		dart->oas = dart->hw->oas;
+		dart->num_streams = dart->hw->max_sid_count;
+		break;
+
+	case DART_T8110:
+		dart_params[2] = apple_dart_readl(dart, DART_T8110_PARAMS3);
+		dart->ias = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, dart_params[2]);
+		dart->oas = FIELD_GET(DART_T8110_PARAMS3_PA_WIDTH, dart_params[2]);
+		dart_params[3] = apple_dart_readl(dart, DART_T8110_PARAMS4);
+		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS,
+					      dart_params[3]);
+		dart->four_level = dart->ias > 36;
+		dart->version = dart_params[2] & GENMASK(15, 0);
+		break;
+	}
+}
+
+/*
+ * Gen3 static topology, no MMIO. ADT: page-size 16384 (m1n1 also expects page shift 14
+ * and version 0x300), sid-count 16 for the USB DARTs (optional apple,num-streams). The
+ * address widths are placeholders wide enough for probe-time window checks; the
+ * first resume re-reads the real PARAMS and re-validates.
+ */
+static void apple_dart_set_static_params(struct apple_dart *dart)
+{
+	u32 n = 16;
+
+	of_property_read_u32(dart->dev->of_node, "apple,num-streams", &n);
+	dart->pgsize = SZ_16K;
+	dart->supports_bypass = false;
+	dart->ias = 42;
+	dart->oas = 42;
+	dart->num_streams = n;
+	dart->four_level = true;
+	dart->version = 0x0300;
+}
+
+/*
+ * First use of a static-topology Gen3 DART: everything probe skipped, in the safe order.
+ * Runs from the runtime-resume callback, which is irq-safe here: no sleeping calls. The
+ * fault IRQ is requested at probe (no MMIO) and ignored until hw_ready.
+ */
+static int apple_dart_gen3_late_init(struct apple_dart *dart)
+{
+	struct device *dev = dart->dev;
+	int ret;
+
+	apple_dart_read_params(dart);
+	if (dart->num_streams > DART_MAX_STREAMS)
+		return dev_err_probe(dev, -EINVAL, "too many streams (%d)\n", dart->num_streams);
+	if (of_property_present(dev->of_node, "apple,dma-range")) {
+		if ((dart->dma_min ^ dart->dma_max) & ~DMA_BIT_MASK(dart->ias))
+			return dev_err_probe(dev, -EINVAL, "DMA range does not fit ias=%d\n", dart->ias);
+	} else {
+		dart->dma_max = DMA_BIT_MASK(dart->ias);
+	}
+
+	/* Read the lock before any write. A locked root needs the locked-TTBR path. */
+	if (apple_dart_is_locked(dart))
+		return dev_err_probe(dev, -EOPNOTSUPP,
+				     "locked Gen3 DART is not supported in static-topology mode\n");
+	if (!(gen3_skip & 1))
+		apple_dart_apply_tunables(dart);
+	if (!(gen3_skip & 2)) {
+		ret = apple_dart_hw_reset(dart);
+		if (ret)
+			return ret;
+	}
+	dart->hw_ready = true;
+	dev_info(dev, "Gen3 DART initialised on first use: pagesize %#x, %d streams, AS %d -> %d\n",
+		 dart->pgsize, dart->num_streams, dart->ias, dart->oas);
+	return 0;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, enabled_count;
-	u32 dart_params[4], sid;
+	u32 sid;
 	struct device_node *pd_np;
 	struct resource *res;
 	struct apple_dart *dart;
@@ -2268,6 +2368,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->hw = of_device_get_match_data(dev);
 	dart->pmp_sid6_only = of_device_is_compatible(dev->of_node,
 						     "apple,t8152-pmp-dart");
+	dart->static_topo = dart->hw->gen3 &&
+		((gen3_skip & 8) ||
+		 of_property_read_bool(dev->of_node, "apple,static-topology"));
 	dart->force_available =
 		dart->pmp_sid6_only ||
 		of_property_read_bool(dev->of_node, "apple,force-available");
@@ -2355,7 +2458,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 			 dart->tunables->sz);
 		apple_dart_apply_tunables(dart);
 		dev_info(dev, "firmware PCIe-C DART tunables applied\n");
-	} else if (dart->hw == &apple_dart_hw_t8152) {
+	} else if (dart->hw == &apple_dart_hw_t8152 && !dart->static_topo) {
 		/*
 		 * Firmware (SPTM) owns a locked Gen3 DART: its protection and tunables are
 		 * already set and the 0x20c group sits in the write-protect block, so decide
@@ -2390,30 +2493,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 		goto params_done;
 	}
 
-	dart_params[0] = apple_dart_readl(dart, DART_PARAMS1);
-	dart_params[1] = apple_dart_readl(dart, DART_PARAMS2);
-	dart->pgsize = 1 << FIELD_GET(DART_PARAMS1_PAGE_SHIFT, dart_params[0]);
-	dart->supports_bypass = dart_params[1] & DART_PARAMS2_BYPASS_SUPPORT;
-
-	switch (dart->hw->type) {
-	case DART_T8020:
-	case DART_T6000:
-		dart->ias = 32;
-		dart->oas = dart->hw->oas;
-		dart->num_streams = dart->hw->max_sid_count;
-		break;
-
-	case DART_T8110:
-		dart_params[2] = apple_dart_readl(dart, DART_T8110_PARAMS3);
-		dart->ias = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, dart_params[2]);
-		dart->oas = FIELD_GET(DART_T8110_PARAMS3_PA_WIDTH, dart_params[2]);
-		dart_params[3] = apple_dart_readl(dart, DART_T8110_PARAMS4);
-		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS,
-					      dart_params[3]);
-		dart->four_level = dart->ias > 36;
-		dart->version = dart_params[2] & GENMASK(15, 0);
-		break;
-	}
+	if (dart->static_topo)
+		apple_dart_set_static_params(dart);
+	else
+		apple_dart_read_params(dart);
 
 params_done:
 	dart->dma_min = 0;
@@ -2514,7 +2597,7 @@ params_done:
 		goto err_clk_disable;
 	}
 
-	dart->locked = apple_dart_is_locked(dart);
+	dart->locked = !dart->static_topo && apple_dart_is_locked(dart);
 	if (dart->pmp_sid6_only) {
 		ret = apple_dart_pmp_admit(dart);
 		if (ret)
@@ -2540,13 +2623,16 @@ params_done:
 	if (tunneled)
 		dart->locked = false;
 	else
-		dart->locked = apple_dart_is_locked(dart);
-	if (!dart->locked && !(dart->hw->gen3 && (gen3_skip & 2))) {
+		dart->locked = !dart->static_topo && apple_dart_is_locked(dart);
+	if (!dart->locked && !dart->static_topo &&
+	    !(dart->hw->gen3 && (gen3_skip & 2))) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
 	}
 
+	if (dart->static_topo)
+		dev_info(dev, "Gen3 DART static topology: no MMIO until first use\n");
 	if (!dart->pmp_sid6_only) {
 		if (dart->locked)
 			apple_dart_drain_stale_exceptions(dart);
@@ -2554,6 +2640,7 @@ params_done:
 				  "apple-dart fault handler", dart);
 		if (ret)
 			goto err_clk_disable;
+		dart->irq_requested = true;
 	}
 
 	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL, "apple-dart.%s",
@@ -2578,7 +2665,7 @@ params_done:
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
-	if (!dart->pmp_sid6_only)
+	if (dart->irq_requested)
 		free_irq(dart->irq, dart);
 err_clk_disable:
 	pm_runtime_put(dev);
@@ -2591,10 +2678,10 @@ static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
-	if (!dart->locked)
+	if (!dart->locked && (!dart->static_topo || dart->hw_ready))
 		apple_dart_hw_reset(dart);
 
-	if (!dart->pmp_sid6_only)
+	if (dart->irq_requested)
 		free_irq(dart->irq, dart);
 
 	iommu_device_unregister(&dart->iommu);
@@ -2741,6 +2828,10 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 
+	/* A static-topology DART untouched so far has no state and must not be read. */
+	if (dart->static_topo && !dart->hw_ready)
+		return 0;
+
 	/* The tunneled DART has no state to save when its domain stays on. */
 	if (dart->power_retained)
 		return 0;
@@ -2766,6 +2857,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 	int ret;
+
+	/* First resume of a static-topology DART: do everything probe skipped. */
+	if (dart->static_topo && !dart->hw_ready)
+		return apple_dart_gen3_late_init(dart);
 
 	/*
 	 * PCIe-C DARTs on an apple,always-on domain retain their translation
