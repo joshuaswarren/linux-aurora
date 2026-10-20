@@ -4,15 +4,18 @@
 $id: http://devicetree.org/schemas/usb/apple,t8152-dwc3.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8152 USB2 host-only controller
+title: Apple T8152 USB2-only controller
 
 maintainers:
   - Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
 
 description: |
-  This USB2-only profile supports host mode, not gadget or OTG mode.
-  The controller starts at probe with or without a physical hub child node.
-  The dr_mode and maximum-speed properties must select host and high-speed.
+  This USB2-only profile starts a fixed role at probe, with or without a
+  physical hub child node: host mode, or — for a debug-cable port — fixed
+  peripheral (gadget) mode selected with dr_mode. The controller never
+  switches roles at runtime.
+  The dr_mode and maximum-speed properties must select host or peripheral and
+  high-speed.
   Firmware supplies device-specific calibration records as offset, clear-mask,
   set-value triples. Offsets are relative to each native register bank, not
   the combined Linux window. The core window ends at 0xcd00. The Apple window
@@ -62,7 +65,7 @@ properties:
       - const: usb2-phy
 
   dr_mode:
-    const: host
+    enum: [ host, peripheral ]
 
   maximum-speed:
     const: high-speed
@@ -72,6 +75,7 @@ properties:
 
   '#size-cells':
     const: 0
+
 
 patternProperties:
   '^hub@[1-9a-f][0-9a-f]?$':

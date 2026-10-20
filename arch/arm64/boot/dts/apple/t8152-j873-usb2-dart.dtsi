@@ -20,6 +20,7 @@
 					<0x308 0x3ffffffc 0x10000000>,
 					<0x310 0x3ffffffc 0x3ffffffc>,
 					<0x4600 0x00000002 0x00000002>;
+			status = "disabled";
 		};
 
 		usb3_dart1: iommu@413040000 {
@@ -39,6 +40,7 @@
 					<0x308 0x3ffffffc 0x10000000>,
 					<0x310 0x3ffffffc 0x3ffffffc>,
 					<0x4600 0x00000002 0x00000002>;
+			status = "disabled";
 		};
 	};
 };

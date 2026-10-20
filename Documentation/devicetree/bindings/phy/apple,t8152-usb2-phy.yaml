@@ -4,15 +4,16 @@
 $id: http://devicetree.org/schemas/phy/apple,t8152-usb2-phy.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8152 fixed-host USB2 PHY
+title: Apple T8152 USB2 PHY
 
 maintainers:
   - Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
 
 description: |
-  The USB2 and eUSB2 register banks support a fixed host connection independently
-  of the ATC USB3 and USB4 lanes. Firmware supplies device-specific calibration.
-  Both independent USB power domains must stay active while the PHY runs.
+  The USB2 and eUSB2 register banks support a fixed host or fixed peripheral
+  connection independently of the ATC USB3 and USB4 lanes. Firmware supplies
+  device-specific calibration. Both independent USB power domains must stay
+  active while the PHY runs.
 
 $defs:
   tunable:
@@ -55,11 +56,17 @@ properties:
 
   apple,tunable-usb2phy-dflt:
     $ref: '#/$defs/tunable'
-    description: Default calibration, applied before the host calibration.
+    description: Default calibration, applied before the role calibration.
 
   apple,tunable-usb2phy-host:
     $ref: '#/$defs/tunable'
     description: Host calibration, applied before the PHY leaves reset.
+
+  apple,tunable-usb2phy-dev:
+    $ref: '#/$defs/tunable'
+    description: |
+      Device calibration from the native tunable_USB2PHY_DEV list, applied
+      before the PHY leaves reset in peripheral mode.
 
 required:
   - compatible
@@ -69,6 +76,10 @@ required:
   - power-domains
   - power-domain-names
   - apple,tunable-usb2phy-dflt
-  - apple,tunable-usb2phy-host
+oneOf:
+  - required:
+      - apple,tunable-usb2phy-host
+  - required:
+      - apple,tunable-usb2phy-dev
 
 additionalProperties: false
