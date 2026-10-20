@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873/T8152 ANS2 NVMe storage. All addresses, IRQs and properties come from
+ * the live M6 ADT (m6-experiment-adt-20261019.bin):
+ *   /arm-io/ans: reg[0] 0x121600000+0x74000 (ascwrap coproc), reg[1]
+ *   0x121050000+0x4000 (msgbox bank), reg[3] 0x125cc0000+0x60000 (nvme window);
+ *   interrupts [302, 262, 222, 1349] with nvme-interrupt-idx = 3;
+ *   msgbox-mailbox-num = 3, msgbox-using-postoffice = true;
+ *   nvme-queue-entries = 64.
+ *   /arm-io/sart-ans: compatible "sart,coastguard", reg 0x125c50000+0xc000.
+ * The v8 mailbox takes the final mailbox aperture address in reg, like the
+ * t8152 SMC node: mailbox 3 with postoffice gives (2*3+0)*0x80 = 0x300 inside
+ * the msgbox bank. If the first probe fails, the alias-bank alternative is
+ * 0x121060300 (+0x10000) - one bounded iteration.
+ * The nvmmu reg repeats the nvme window: the T8152 NVMMU registers are
+ * aliased inside it (measured, ANS-v8), and the in-tree apple_nvme_t8152_hw
+ * expects a separate "nvmmu" reg - the same window satisfies both layouts.
+ * No power-domains or resets: the bring-up DT has no PMGR, and the driver
+ * skips them when absent (pd_count <= 1; empty reset array is a no-op).
+ */
+
+/ {
+	soc {
+		ans_mbox: mailbox@121050300 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x1 0x21050300 0x0 0x80>;
+			interrupt-parent = <&aic>;
+			/* ADT order [recv, send, ...]: 302 = recv-not-empty, 262 = send-empty. */
+			interrupts = <AIC_IRQ 262 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		sart: sart@125c50000 {
+			compatible = "sart,coastguard";
+			reg = <0x1 0x25c50000 0x0 0xc000>;
+		};
+
+		nvme: nvme@125cc0000 {
+			compatible = "apple,t8152-nvme-ans2";
+			reg = <0x1 0x25cc0000 0x0 0x60000>,
+			      <0x1 0x21600000 0x0 0x74000>,
+			      <0x1 0x25cc0000 0x0 0x60000>;
+			reg-names = "nvme", "ans", "nvmmu";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1349 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&sart>;
+		};
+	};
+};
