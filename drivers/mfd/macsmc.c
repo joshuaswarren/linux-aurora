@@ -57,9 +57,16 @@ static const struct mfd_cell apple_smc_devs[] = {
 static const struct mfd_cell apple_smc_low_gpio_dev =
 	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
 
-/* Initial T8152 support is read-only telemetry. Firmware retains fan control. */
-static const struct mfd_cell apple_smc_telemetry_devs[] = {
+/*
+ * T8152: telemetry (firmware retains fan control), the pcIO/gPxx GPIOs, and
+ * reboot/poweroff and RTC through the PMU NVMEM cells. Input, power and
+ * notifications are still not enabled.
+ */
+static const struct mfd_cell apple_smc_t8152_devs[] = {
+	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
+	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
@@ -478,13 +485,15 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
-	/* T8152's key-read interface is qualified; notifications, GPIO and power
-	 * functions are not. The board DT exposes temperature and fan inputs only.
+	/*
+	 * T8152's key-read interface is qualified; notifications are not, so
+	 * NTAP stays off and only the cells above are added. Each cell binds
+	 * only if the board DT has its node.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
 		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
-					    apple_smc_telemetry_devs,
-					    ARRAY_SIZE(apple_smc_telemetry_devs),
+					    apple_smc_t8152_devs,
+					    ARRAY_SIZE(apple_smc_t8152_devs),
 					    NULL, 0, NULL);
 
 	/* Enable notifications */
