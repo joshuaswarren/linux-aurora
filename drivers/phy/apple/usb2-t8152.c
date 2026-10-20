@@ -23,12 +23,20 @@
 #define USB2_SIDDQ		BIT(3)
 #define USB2_REFCLK_GATE		BIT(29)
 #define USB2_PHYCLOCK_GATE	BIT(30)
+/*
+ * Device-mode value of the misc-tune register from m1n1 src/usb.c
+ * usb_phy_bringup(), the role-agnostic USB2 device console setup. The word
+ * leaves the same refclk/APB gate bits clear that the host path clears below.
+ */
+#define USB2_DEVICE_MISCTUNE	0x008c0813
 
 struct apple_usb2 {
 	void __iomem *usb2;
 	void __iomem *eusb2;
 	struct apple_tunable *dflt;
 	struct apple_tunable *host;
+	struct apple_tunable *dev;
+	enum phy_mode mode;
 };
 
 static void apple_usb2_update(void __iomem *reg, u32 clear, u32 set)
@@ -41,7 +49,15 @@ static int apple_usb2_power_on(struct phy *phy)
 	struct apple_usb2 *usb = phy_get_drvdata(phy);
 
 	apple_tunable_apply(usb->usb2, usb->dflt);
-	apple_tunable_apply(usb->usb2, usb->host);
+	if (usb->mode == PHY_MODE_USB_DEVICE) {
+		if (!usb->dev)
+			return -EINVAL;
+		apple_tunable_apply(usb->usb2, usb->dev);
+	} else {
+		if (!usb->host)
+			return -EINVAL;
+		apple_tunable_apply(usb->usb2, usb->host);
+	}
 	apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(2));
 	apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(3));
 	msleep(10);
@@ -51,8 +67,12 @@ static int apple_usb2_power_on(struct phy *phy)
 	apple_usb2_update(usb->usb2 + USB2_RESET, USB2_PORT_RESET, 0);
 	apple_usb2_update(usb->eusb2, 0, BIT(0) | BIT(3));
 	apple_usb2_update(usb->usb2 + USB2_RESET, 0, USB2_APB_RESET_N);
-	apple_usb2_update(usb->usb2 + USB2_CLOCK, USB2_REFCLK_GATE, 0);
-	apple_usb2_update(usb->usb2 + USB2_CLOCK, USB2_PHYCLOCK_GATE, 0);
+	if (usb->mode == PHY_MODE_USB_DEVICE)
+		writel(USB2_DEVICE_MISCTUNE, usb->usb2 + USB2_CLOCK);
+	else {
+		apple_usb2_update(usb->usb2 + USB2_CLOCK, USB2_REFCLK_GATE, 0);
+		apple_usb2_update(usb->usb2 + USB2_CLOCK, USB2_PHYCLOCK_GATE, 0);
+	}
 	udelay(30);
 	msleep(5);
 	apple_usb2_update(usb->usb2 + USB2_CONTROL, USB2_MODE, USB2_RUN);
@@ -77,9 +97,26 @@ static int apple_usb2_power_off(struct phy *phy)
 	return 0;
 }
 
+static int apple_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	struct apple_usb2 *usb = phy_get_drvdata(phy);
+
+	(void)submode;
+	if (mode != PHY_MODE_USB_HOST && mode != PHY_MODE_USB_DEVICE)
+		return -EINVAL;
+	if (mode == PHY_MODE_USB_DEVICE && !usb->dev)
+		return -EINVAL;
+	if (mode == PHY_MODE_USB_HOST && !usb->host)
+		return -EINVAL;
+	usb->mode = mode;
+
+	return 0;
+}
+
 static const struct phy_ops apple_usb2_ops = {
 	.power_on = apple_usb2_power_on,
 	.power_off = apple_usb2_power_off,
+	.set_mode = apple_usb2_set_mode,
 	.owner = THIS_MODULE,
 };
 
@@ -119,8 +156,22 @@ static int apple_usb2_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(usb->dflt), "Invalid default tunables\n");
 	usb->host = devm_apple_tunable_parse(dev, dev->of_node,
 					   "apple,tunable-usb2phy-host", res);
-	if (IS_ERR(usb->host))
-		return dev_err_probe(dev, PTR_ERR(usb->host), "Invalid host tunables\n");
+	if (IS_ERR(usb->host)) {
+		if (PTR_ERR(usb->host) != -ENOENT)
+			return dev_err_probe(dev, PTR_ERR(usb->host), "Invalid host tunables\n");
+		usb->host = NULL;
+	}
+	usb->dev = devm_apple_tunable_parse(dev, dev->of_node,
+					  "apple,tunable-usb2phy-dev", res);
+	if (IS_ERR(usb->dev)) {
+		if (PTR_ERR(usb->dev) != -ENOENT)
+			return dev_err_probe(dev, PTR_ERR(usb->dev), "Invalid device tunables\n");
+		usb->dev = NULL;
+	}
+	if (!usb->host && !usb->dev)
+		return dev_err_probe(dev, -EINVAL, "No USB2 role calibration\n");
+	/* Default to the role whose calibration the board actually supplies. */
+	usb->mode = usb->host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE;
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "eusb2");
 	usb->eusb2 = devm_ioremap_resource(dev, res);
@@ -163,5 +214,5 @@ static struct platform_driver apple_usb2_driver = {
 };
 module_platform_driver(apple_usb2_driver);
 
-MODULE_DESCRIPTION("Apple T8152 fixed-host USB2 PHY");
+MODULE_DESCRIPTION("Apple T8152 USB2 PHY");
 MODULE_LICENSE("Dual MIT/GPL");

@@ -14,6 +14,7 @@
 			#phy-cells = <0>;
 			power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_usb>;
 			power-domain-names = "usb-aon", "usb";
+			status = "disabled";
 		};
 
 		usbdrd3: usb@412430000 {
@@ -33,6 +34,7 @@
 			phy-names = "usb2-phy";
 			dr_mode = "host";
 			maximum-speed = "high-speed";
+			status = "disabled";
 		};
 	};
 };
