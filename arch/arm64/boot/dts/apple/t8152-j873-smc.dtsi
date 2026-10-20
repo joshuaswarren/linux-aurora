@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8152 (M6) Mac mini J873: SMC GPIO / reboot / RTC and the PMU
+ * (woodcote) NVMEM cells they use.
+ *
+ * Sources: M6 ADT (m6-experiment-adt-20261019) and the 26A434 kernelcache
+ * (AppleSMC, AppleSPMIPMU). Offline only: never booted on M6 hardware.
+ *
+ * Extends the &m6_smc node of t8152-j873.dts (mailbox + hwmon). Needs
+ * ps_nub_spmi0 from t8152-j873-pmgr.dtsi and aic from t8152-j873.dts.
+ *
+ * Reboot / poweroff: macsmc-reboot writes SMC key MBSE = 'rest' / 'offw'
+ * (AppleSMCPMU::handleSystemPowerStateChange does the same) and then
+ * 'phra' (restart) / 'off1' (poweroff) (AppleDialogSPMIPMU::_handlePEHaltRestart
+ * and ::_shutdownGated). ADT pmu-main has info-has_phra = 1.
+ *
+ * There is deliberately no shutdown_flag cell (PMU 0xf80f bit 3): without it a
+ * poweroff request behaves like a restart (see macsmc-reboot.c), so the machine
+ * always comes back. Add the cell only once poweroff is wanted.
+ */
+
+#include <dt-bindings/spmi/spmi.h>
+
+/ {
+	soc {
+		/*
+		 * ADT /arm-io/nub-spmi0: reg[0] bus 0x108714000 -> phys 0x308714000 (+0x200000000).
+		 * ADT interrupts[1] = 675 with interrupt-parent[1] = aic (phandle 194); same
+		 * shape as nub-spmi-a0 (682). The AIC choice is INFERRED, see
+		 * t8152-j873-usbpd-spmi.dtsi.
+		 */
+		nub_spmi0: spmi@308714000 {
+			compatible = "apple,t8152-spmi", "apple,t8103-spmi";
+			reg = <0x3 0x08714000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 675 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_nub_spmi0>;
+
+			/*
+			 * ADT nub-spmi0/pmu-main: compatible "pmu,spmi","pmu,woodcote",
+			 * reg word0 = 0xe.
+			 *
+			 * NVMEM layout. ADT info-* values:
+			 *   info-clock_offset = (0x2100, 6)   RTC offset, 6 bytes (the kext
+			 *     rejects any other count, AppleDialogSPMIPMURTC::_readConfiguration)
+			 *   info-leg_scrpad   = 0xf800        boot keys: SPMI address =
+			 *     leg_scrpad + key (AppleDialogSPMIPMU::_readBootKey)
+			 * The boot key numbers (1 = boot_stage, 2 = error/panic counts, 0xf bit 3 =
+			 * shutdown flag, not wired) are the ones t8103/t8122/t8140 use; the kext reads keys 1
+			 * and 2 in _updateBootProperties. Key 0xf is INFERRED.
+			 */
+			pmic@e {
+				compatible = "apple,woodcote-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					boot_stage: boot-stage@f801 {
+						reg = <0xf801 0x1>;
+					};
+
+					boot_error_count: boot-error-count@f802,0 {
+						reg = <0xf802 0x1>;
+						bits = <0 4>;
+					};
+
+					panic_count: panic-count@f802,4 {
+						reg = <0xf802 0x1>;
+						bits = <4 4>;
+					};
+
+					rtc_offset: rtc-offset@2100 {
+						reg = <0x2100 0x6>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&m6_smc {
+	/*
+	 * pcIO pins used by ADT platform functions (see gpio-macsmc.c, j873 table):
+	 *   15 hdmi_pwr_en     20 dp2hdmi_pwr_en     19 pci-bridge0 (Wi-Fi/BT) reset
+	 */
+	smc_gpio: gpio {
+		compatible = "apple,smc-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+
+	smc_reboot: reboot {
+		compatible = "apple,smc-reboot";
+		nvmem-cells = <&boot_stage>, <&boot_error_count>, <&panic_count>;
+		nvmem-cell-names = "boot_stage", "boot_error_count", "panic_count";
+	};
+
+	rtc {
+		compatible = "apple,smc-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
+	};
+};

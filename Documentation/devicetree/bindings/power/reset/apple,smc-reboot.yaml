@@ -19,18 +19,30 @@ properties:
     const: apple,smc-reboot
 
   nvmem-cells:
-    items:
-      - description: Flag indicating shutdown (as opposed to reboot)
-      - description: Stage at which the boot process stopped (0x30 for normal boot)
-      - description: Counter for boot errors
-      - description: Counter for system panics
+    oneOf:
+      - items:
+          - description: Flag indicating shutdown (as opposed to reboot)
+          - description: Stage at which the boot process stopped (0x30 for normal boot)
+          - description: Counter for boot errors
+          - description: Counter for system panics
+      - items:
+          - description: Stage at which the boot process stopped (0x30 for normal boot)
+          - description: Counter for boot errors
+          - description: Counter for system panics
 
   nvmem-cell-names:
-    items:
-      - const: shutdown_flag
-      - const: boot_stage
-      - const: boot_error_count
-      - const: panic_count
+    oneOf:
+      - items:
+          - const: shutdown_flag
+          - const: boot_stage
+          - const: boot_error_count
+          - const: panic_count
+      - items:
+          - const: boot_stage
+          - const: boot_error_count
+          - const: panic_count
+    description:
+      Without shutdown_flag a poweroff request ends up as a restart.
 
 required:
   - compatible
