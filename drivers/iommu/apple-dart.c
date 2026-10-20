@@ -164,6 +164,9 @@
 
 /* T8152 Gen3: low nibble selects the TLBI route for this DART instance */
 #define DART_GEN3_ROUTE 0x4604
+/* AppleGen3DART _DART_ERR_SID_AXI_ID/_AXI_USER: 2 and 8 words per SID record */
+#define DART_GEN3_ERR_SID_AXI_ID(sid) (DART_T8110_ERR_SID(sid) + 0x18)
+#define DART_GEN3_ERR_SID_AXI_USER(sid) (DART_T8110_ERR_SID(sid) + 0x20)
 #define DART_T8110_ENABLE_STREAMS  0xc00
 #define DART_T8110_DISABLE_STREAMS 0xc20
 
@@ -198,6 +201,7 @@ struct apple_dart_hw {
 	enum dart_type type;
 	irqreturn_t (*irq_handler)(int irq, void *dev);
 	int (*invalidate_tlb)(struct apple_dart_stream_map *stream_map);
+	bool gen3;
 
 	u32 oas;
 	enum io_pgtable_fmt fmt;
@@ -976,7 +980,8 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 				   dart->hw->error);
 	}
 
-	if (dart->hw->type == DART_T8110)
+	/* Gen3: 0x104 is not in AppleGen3DART's register capture list; leave it alone. */
+	if (dart->hw->type == DART_T8110 && !dart->hw->gen3)
 		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
 
 	return dart->hw->invalidate_tlb(&stream_map);
@@ -2024,7 +2029,7 @@ static bool apple_dart_t8110_v2_block_pending(u16 version, u32 block_error)
 	       (block_error & DART_T8110_BLOCK_ERROR_MASK);
 }
 
-static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
+static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev, bool gen3)
 {
 	struct apple_dart *dart = dev;
 	irqreturn_t ret = IRQ_NONE;
@@ -2068,6 +2073,16 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 						    "write" : "read",
 						    apple_dart_t8110_v2_fault_name(status),
 						    addr, status);
+			if (gen3)
+				dev_err_ratelimited(dart->dev,
+					"  SID:%u AXI_ID %#x/%#x AXI_USER %#x/%#x raw+4 %#x raw+10 %#x\n",
+					sid,
+					readl(dart->regs + DART_GEN3_ERR_SID_AXI_ID(sid)),
+					readl(dart->regs + DART_GEN3_ERR_SID_AXI_ID(sid) + 4),
+					readl(dart->regs + DART_GEN3_ERR_SID_AXI_USER(sid)),
+					readl(dart->regs + DART_GEN3_ERR_SID_AXI_USER(sid) + 4),
+					readl(dart->regs + DART_T8110_ERR_SID(sid) + 0x4),
+					readl(dart->regs + DART_T8110_ERR_SID(sid) + 0x10));
 		}
 
 		/*
@@ -2084,7 +2099,8 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 		readl(dart->regs + DART_T8110_EXCEPTION(0));
 	}
 
-	if (dart->version >= 0x0203) {
+	/* Gen3: 0x704 is not in AppleGen3DART's register capture list; do not touch it. */
+	if (!gen3 && dart->version >= 0x0203) {
 		block_error = readl(dart->regs + DART_T8110_BLOCK_ERROR);
 		if (apple_dart_t8110_v2_block_pending(dart->version, block_error)) {
 			dev_err_ratelimited(dart->dev,
@@ -2106,9 +2122,14 @@ static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
 	struct apple_dart *dart = dev;
 
 	if (dart->version >= 0x0202)
-		return apple_dart_t8110_v2_irq(irq, dev);
+		return apple_dart_t8110_v2_irq(irq, dev, false);
 
 	return apple_dart_t8110_legacy_irq(irq, dev);
+}
+
+static irqreturn_t apple_dart_gen3_irq(int irq, void *dev)
+{
+	return apple_dart_t8110_v2_irq(irq, dev, true);
 }
 
 static irqreturn_t apple_dart_irq(int irq, void *dev)
@@ -2665,8 +2686,9 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 
 static const struct apple_dart_hw apple_dart_hw_t8152 = {
 	.type = DART_T8110,
-	.irq_handler = apple_dart_t8110_irq,
+	.irq_handler = apple_dart_gen3_irq,
 	.invalidate_tlb = apple_dart_gen3_hw_invalidate_tlb,
+	.gen3 = true,
 	.fmt = APPLE_DART2,
 	.max_sid_count = 256,
 
