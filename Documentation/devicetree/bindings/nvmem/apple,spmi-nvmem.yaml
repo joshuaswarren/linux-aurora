@@ -22,6 +22,7 @@ properties:
           - apple,maverick-pmic
           - apple,sera-pmic
           - apple,stowe-pmic
+          - apple,woodcote-pmic
       - const: apple,spmi-nvmem
 
   reg:
