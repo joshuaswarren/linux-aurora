@@ -9,7 +9,7 @@
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/thermal/thermal.h>
 / {
-	compatible = "apple,j873", "apple,t8152", "apple,arm-platform";
+	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
 	model = "Apple Mac mini (M6, J873)";
 	aurora,minimal-boot;
 	#address-cells = <2>;
