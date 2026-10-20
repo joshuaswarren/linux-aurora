@@ -104,9 +104,9 @@
 			      <0x3 0x88028000 0x0 0x8000>,      /* port 0 */
 			      <0x3 0x89028000 0x0 0x8000>,      /* port 1 (not populated) */
 			      <0x3 0x8a028000 0x0 0x8000>,      /* port 2 */
-			      <0x3 0x8f020000 0x0 0x4000>,      /* port 0 PHY: the T8140's phy0 offset (base + 0x7020000) */
-			      <0x3 0x8f024000 0x0 0x4000>,      /* UNPROVEN: port 1 PHY, +0x4000 stride as T6030 */
-			      <0x3 0x8f028000 0x0 0x4000>;      /* UNPROVEN: port 2 PHY, +0x4000 stride as T6030 */
+			      <0x3 0x8f010000 0x0 0x4000>,      /* port 0 PHY lane window: ADT reg[12] (PHYBASE + 0x10000) */
+			      <0x3 0x8f014000 0x0 0x4000>,      /* port 1 PHY lane window: ADT reg[18] (+0x4000 stride) */
+			      <0x3 0x8f018000 0x0 0x4000>;      /* port 2 PHY lane window: ADT reg[24] (+0x4000 stride) */
 			reg-names = "config", "rc", "port0", "port1", "port2", "phy0", "phy1", "phy2";
 
 			interrupt-parent = <&aic>;
