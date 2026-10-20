@@ -162,6 +162,8 @@
 #define DART_T8110_DIAG_LOCK 0x210
 #define DART_T8110_DIAG_LOCK_ON_ERR BIT(1)
 
+/* T8152 Gen3: low nibble selects the TLBI route for this DART instance */
+#define DART_GEN3_ROUTE 0x4604
 #define DART_T8110_ENABLE_STREAMS  0xc00
 #define DART_T8110_DISABLE_STREAMS 0xc20
 
@@ -266,6 +268,8 @@ struct apple_dart {
 	u32 tunneled : 1;
 	u32 power_retained : 1;
 	struct apple_tunable *tunables;
+	/* Gen3 (T8152): shared TLBI doorbell and per-instance route register */
+	void __iomem *tlbi;
 	u16 version;
 
 	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
@@ -771,6 +775,36 @@ apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
 	return apple_dart_t8110_hw_tlb_command_range(
 		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID, false, 0, 0);
+}
+
+/*
+ * Gen3 (T8152) DARTs do not take TLB invalidates through TLB_CMD. Apple's SPTM
+ * (gen3dart_write_tlbi_cmd_payload) stores a 128-bit payload to a TLBI
+ * aperture, then issues TLBI VALE1OS. Layout as used by m1n1 (accepted on
+ * DCP SID 23 without an exception): lo = BIT(60) | route << 56 | sid << 48.
+ * ponytail: one flush-SID doorbell per stream, no range invalidate.
+ */
+static int apple_dart_gen3_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	u64 route = readl(dart->regs + DART_GEN3_ROUTE) & 0xf;
+	unsigned long flags;
+	int sid;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		u64 lo = BIT_ULL(60) | route << 56 | (u64)sid << 48;
+		u64 hi = 0;
+
+		dma_wmb();
+		asm volatile("stp %0, %1, [%2]\n"
+			     "dsb ish\n"
+			     ".inst 0xd50881bf\n" /* tlbi vale1os, xzr */
+			     "dsb osh\n"
+			     :: "r"(lo), "r"(hi), "r"(dart->tlbi) : "memory");
+	}
+	spin_unlock_irqrestore(&dart->lock, flags);
+	return 0;
 }
 
 static const char *apple_dart_t8110_v2_fault_name(u32 exception);
@@ -2175,6 +2209,8 @@ static int apple_dart_pmp_admit(struct apple_dart *dart)
 	return 0;
 }
 
+static const struct apple_dart_hw apple_dart_hw_t8152;
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, enabled_count;
@@ -2233,12 +2269,22 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dev_err(dev, "MMIO region too small (%pr)\n", res);
 		return -EINVAL;
 	}
-	if (tunneled) {
+	if (tunneled || dart->hw == &apple_dart_hw_t8152) {
 		dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
 							  "apple,tunable", res);
 		if (IS_ERR(dart->tunables))
 			return dev_err_probe(dev, PTR_ERR(dart->tunables),
-					     "failed to parse PCIe-C DART tunables\n");
+					     "failed to parse DART tunables\n");
+	}
+	if (dart->hw == &apple_dart_hw_t8152) {
+		/* TLBI doorbell: reg[1], shared by every Gen3 DART (no mem region claim) */
+		struct resource *tr = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+
+		if (!tr || resource_size(tr) < 16)
+			return dev_err_probe(dev, -EINVAL, "Gen3 DART needs a 16-byte TLBI reg[1]\n");
+		dart->tlbi = devm_ioremap(dev, tr->start, resource_size(tr));
+		if (!dart->tlbi)
+			return -ENOMEM;
 	}
 
 	if (dart->pmp_sid6_only) {
@@ -2273,6 +2319,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 			 dart->tunables->sz);
 		apple_dart_apply_tunables(dart);
 		dev_info(dev, "firmware PCIe-C DART tunables applied\n");
+	} else if (dart->hw == &apple_dart_hw_t8152) {
+		apple_dart_apply_tunables(dart);
 	}
 
 	/*
@@ -2615,6 +2663,32 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 	.ttbr_count = 1,
 };
 
+static const struct apple_dart_hw apple_dart_hw_t8152 = {
+	.type = DART_T8110,
+	.irq_handler = apple_dart_t8110_irq,
+	.invalidate_tlb = apple_dart_gen3_hw_invalidate_tlb,
+	.fmt = APPLE_DART2,
+	.max_sid_count = 256,
+
+	.enable_streams = DART_T8110_ENABLE_STREAMS,
+	.lock = DART_T8110_PROTECT,
+	.lock_bit = DART_T8110_PROTECT_TTBR_TCR,
+
+	.error = DART_T8110_ERROR,
+
+	.tcr = DART_T8110_TCR,
+	.tcr_enabled = DART_T8110_TCR_TRANSLATE_ENABLE,
+	.tcr_disabled = 0,
+	.tcr_bypass = DART_T8110_TCR_BYPASS_DAPF | DART_T8110_TCR_BYPASS_DART,
+	.tcr_4level = DART_T8110_TCR_FOUR_LEVEL,
+
+	.ttbr = DART_T8110_TTBR,
+	.ttbr_valid = DART_T8110_TTBR_VALID,
+	.ttbr_addr_field_shift = DART_T8110_TTBR_ADDR_FIELD_SHIFT,
+	.ttbr_shift = DART_T8110_TTBR_SHIFT,
+	.ttbr_count = 1,
+};
+
 static __maybe_unused int apple_dart_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
@@ -2682,6 +2756,7 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
+	{ .compatible = "apple,t8152-dart", .data = &apple_dart_hw_t8152 },
 	{ .compatible = "apple,t6000-dart", .data = &apple_dart_hw_t6000 },
 	{},
 };
