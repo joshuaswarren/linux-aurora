@@ -1,28 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/*
- * Apple T8152 (M6) usb-drd2 Gen3 DARTs: /arm-io/dart-usb2 (dart-id 13, "dart,gen3").
- * The ADT lists two DARTBLK instances (0x383020000, 0x383040000); like t8122 each is
- * its own node and the consumer lists both: iommus = <&usb2_dart0 1>, <&usb2_dart1 1>
- * (/arm-io/usb-drd2 iommu-parent = mapper-usb2, reg = SID 1).
- *
- * reg[1] is the shared 16-byte TLBI doorbell: dart-tlbi-aperture (bus 0 -> 0x200000000)
- * + tlbi-aperture-offset 0x200. Power: ADT has no clock-gates on dart-usb2; the only
- * usb2 PMGR devices with a PS register are ATC2_USB (0x101a0) and ATC2_USB_AON
- * (0x10180), see t8152-j873-pmgr.dtsi. Following t600x/t8122, the DART uses ps_atc2_usb.
- *
- * Needs the ps_atc2_usb label from t8152-j873-pmgr.dtsi. Not included by any board dts.
- */
+/* usb-drd3: two DARTBLK instances, SID 1, shared TLBI aperture offset 0x280. */
 
 / {
 	soc {
-		usb2_dart0: iommu@383020000 {
+		usb3_dart0: iommu@413020000 {
 			compatible = "apple,t8152-dart";
-			reg = <0x3 0x83020000 0x0 0xc000>,
-			      <0x2 0x00000200 0x0 0x10>;
+			reg = <0x4 0x13020000 0x0 0xc000>,
+			      <0x2 0x00000280 0x0 0x10>;
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc2_usb>;
+			power-domains = <&ps_atc3_usb>;
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			/* ADT dart-tunables-instance-0 as (offset, mask, value) */
 			apple,tunable = <0x20c 0x80000121 0x80000121>,
@@ -34,14 +22,14 @@
 					<0x4600 0x00000002 0x00000002>;
 		};
 
-		usb2_dart1: iommu@383040000 {
+		usb3_dart1: iommu@413040000 {
 			compatible = "apple,t8152-dart";
-			reg = <0x3 0x83040000 0x0 0xc000>,
-			      <0x2 0x00000200 0x0 0x10>;
+			reg = <0x4 0x13040000 0x0 0xc000>,
+			      <0x2 0x00000280 0x0 0x10>;
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
-			power-domains = <&ps_atc2_usb>;
+			power-domains = <&ps_atc3_usb>;
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			/* ADT dart-tunables-instance-1: byte-identical to instance 0 */
 			apple,tunable = <0x20c 0x80000121 0x80000121>,
