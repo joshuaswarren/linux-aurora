@@ -232,4 +232,6 @@
 #include "t8152-j873-pmp.dtsi"
 #include "t8152-j873-ans.dtsi"
 #include "t8152-j873-pmgr.dtsi"
+#include "t8152-j873-usb2-dart.dtsi"
+#include "t8152-j873-usb2.dtsi"
 #include "t8152-j873-display.dtsi"
