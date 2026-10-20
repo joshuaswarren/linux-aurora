@@ -1,0 +1,64 @@
+/arm-io ranges (bus -> parent, size):
+  0x0 -> 0x200000000  0x400000000
+  0x400000000 -> 0x400000000  0x501c000  (identity)
+  0x408000000 -> 0x408000000  0x501c000  (identity)
+  0x380000000 -> 0x380000000  0x501c000  (identity)
+  0x410000000 -> 0x410000000  0x501c000  (identity)
+  0x800000000 -> 0x800000000  0x200000000  (identity)
+  0xc00000000 -> 0xc00000000  0x200000000  (identity)
+  0x1000000000 -> 0x1000000000  0x200000000  (identity)
+  0x1400000000 -> 0x1400000000  0x200000000  (identity)
+  0xa00000000 -> 0xa00000000  0x80000000  (identity)
+  0xe00000000 -> 0xe00000000  0x80000000  (identity)
+  0x1200000000 -> 0x1200000000  0x80000000  (identity)
+  0x1600000000 -> 0x1600000000  0x80000000  (identity)
+  0x1c50000000 -> 0x1c50000000  0x10000000  (identity)
+  0x1c60000000 -> 0x1c60000000  0x10000000  (identity)
+  0x1c70000000 -> 0x1c70000000  0x10000000  (identity)
+  0x1c80000000 -> 0x1c80000000  0x10000000  (identity)
+  0x1cb0000000 -> 0x1cb0000000  0x10000000  (identity)
+  0xbc0000000 -> 0xbc0000000  0x20000000  (identity)
+  0xb80000000 -> 0xb80000000  0x40000000  (identity)
+  0xac0000000 -> 0xac0000000  0x20000000  (identity)
+  0xa80000000 -> 0xa80000000  0x40000000  (identity)
+method check against t8152-j873.dts:
+  /arm-io/aic                reg[0] bus 0x101000000 -> phys 0x301000000 size 0x1cc000
+  /arm-io/smc                reg[0] bus 0x10c600000 -> phys 0x30c600000 size 0x74000
+APCIe:
+  /arm-io/gpio0              reg[0] bus 0x11a000000 -> phys 0x31a000000 size 0x100000
+  /arm-io/dart-apcie0        reg[0] bus 0x188000000 -> phys 0x388000000 size 0x20000
+  /arm-io/dart-apcie2        reg[0] bus 0x18a000000 -> phys 0x38a000000 size 0x20000
+  /arm-io/apcie0-piodma      reg[0] bus 0x188030000 -> phys 0x388030000 size 0x4000
+  /arm-io/apcie0-piodma      reg[1] bus 0x188034000 -> phys 0x388034000 size 0x4000
+  /arm-io/apcie0-piodma      reg[2] bus 0x188038000 -> phys 0x388038000 size 0x4000
+  /arm-io/apcie2-piodma      reg[0] bus 0x18a030000 -> phys 0x38a030000 size 0x4000
+  /arm-io/apcie2-piodma      reg[1] bus 0x18a034000 -> phys 0x38a034000 size 0x4000
+  /arm-io/apcie2-piodma      reg[2] bus 0x18a038000 -> phys 0x38a038000 size 0x4000
+  /arm-io/apcie              reg[0] bus 0x1cb0000000 -> phys 0x1cb0000000 size 0x10000000
+  /arm-io/apcie              reg[1] bus 0x18c000000 -> phys 0x38c000000 size 0x4000
+  /arm-io/apcie              reg[2] bus 0x18f000000 -> phys 0x38f000000 size 0x800000
+  /arm-io/apcie              reg[3] bus 0x18f020000 -> phys 0x38f020000 size 0x4000
+  /arm-io/apcie              reg[4] bus 0x18f800000 -> phys 0x38f800000 size 0x1c4000
+  /arm-io/apcie              reg[5] bus 0x18e000000 -> phys 0x38e000000 size 0x1000000
+  /arm-io/apcie              reg[6] bus 0x18d028000 -> phys 0x38d028000 size 0x4000
+  /arm-io/apcie              reg[7] bus 0x18d990400 -> phys 0x38d990400 size 0x4000
+  /arm-io/apcie              reg[8] bus 0x18d990000 -> phys 0x38d990000 size 0x4000
+  /arm-io/apcie              reg[9] bus 0x18d020000 -> phys 0x38d020000 size 0x4000
+  /arm-io/apcie              reg[10] bus 0x188028000 -> phys 0x388028000 size 0x8000
+  /arm-io/apcie              reg[11] bus 0x18803c000 -> phys 0x38803c000 size 0x4000
+  /arm-io/apcie              reg[12] bus 0x18f010000 -> phys 0x38f010000 size 0x4000
+  /arm-io/apcie              reg[13] bus 0x188024000 -> phys 0x388024000 size 0x4000
+  /arm-io/apcie              reg[14] bus 0x188048000 -> phys 0x388048000 size 0x4000
+  /arm-io/apcie              reg[15] bus 0x188044000 -> phys 0x388044000 size 0x4000
+  /arm-io/apcie              reg[16] bus 0x189028000 -> phys 0x389028000 size 0x8000
+  /arm-io/apcie              reg[17] bus 0x18903c000 -> phys 0x38903c000 size 0x4000
+  /arm-io/apcie              reg[18] bus 0x18f014000 -> phys 0x38f014000 size 0x4000
+  /arm-io/apcie              reg[19] bus 0x189024000 -> phys 0x389024000 size 0x4000
+  /arm-io/apcie              reg[20] bus 0x189048000 -> phys 0x389048000 size 0x4000
+  /arm-io/apcie              reg[21] bus 0x189044000 -> phys 0x389044000 size 0x4000
+  /arm-io/apcie              reg[22] bus 0x18a028000 -> phys 0x38a028000 size 0x8000
+  /arm-io/apcie              reg[23] bus 0x18a03c000 -> phys 0x38a03c000 size 0x4000
+  /arm-io/apcie              reg[24] bus 0x18f018000 -> phys 0x38f018000 size 0x4000
+  /arm-io/apcie              reg[25] bus 0x18a024000 -> phys 0x38a024000 size 0x4000
+  /arm-io/apcie              reg[26] bus 0x18a048000 -> phys 0x38a048000 size 0x4000
+  /arm-io/apcie              reg[27] bus 0x18a044000 -> phys 0x38a044000 size 0x4000

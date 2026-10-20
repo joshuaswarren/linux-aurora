@@ -7,14 +7,19 @@
  * Nothing in this file has run on a J873. UNPROVEN items are marked "UNPROVEN" and listed in
  * tools/aurora/j873/radio/README.md. Opt-in: only t8152-j873-radio.dts includes it.
  *
- * ADT facts (apcie = apcie,t8152, 3 ports declared, #ports = 3, ports 0 and 2 present):
- *   regs   [0] ECAM 0x1cb0000000, [1] RC 0x18c000000, [10] port0 0x188028000, [16] port1 0x189028000, [22] port2 0x18a028000
- *          (28 entries = 10 shared + 3 ports x 6; the T8140 has 7 shared)
+ * ADDRESSES ARE PHYSICAL. The ADT stores /arm-io children in bus addresses; /arm-io's first range maps bus 0..0x400000000 to
+ * parent 0x200000000, so every address below 0x400000000 below gains +0x200000000 (aic 0x101000000 -> 0x301000000 and
+ * smc 0x10c600000 -> 0x30c600000 are the nodes t8152-j873.dts already uses). ECAM 0x1cb0000000 and the PCI windows 0xbc0000000 and
+ * 0xb80000000 are identity ranges and do not change. Receipt: tools/aurora/j873/radio/adt-translate.out (script adt-translate.py).
+ *
+ * ADT facts (apcie = apcie,t8152, 3 ports declared, #ports = 3, ports 0 and 2 present). Bus address -> physical:
+ *   regs   [0] ECAM 0x1cb0000000, [1] RC bus 0x18c000000 -> 0x38c000000, [10] port0 0x388028000, [16] port1 0x389028000,
+ *          [22] port2 0x38a028000 (28 entries = 10 shared + 3 ports x 6; the T8140 has 7 shared)
  *   irqs   apcie 1571 1579 1587 (ports 0,1,2) and 1566 (not used by the driver); dart-apcie0 1572, dart-apcie2 1588;
  *          apcie0-piodma 1573, apcie2-piodma 1589; msi-vector-offset 1879, 96 vectors (ports share one window)
- *   dart   dart-apcie0 0x188000000 (control/alpha/beta/piodma streams, sid-count 19), dart-apcie2 0x18a000000
- *   gpio   gpio0 0x11a000000 (gpio,t8101, 224 pins, 7 interrupt groups 433..439); port0 PERST 3, CLKREQ 0;
- *          port2 PERST 5, CLKREQ 2; port0 reset/reg_on = pKW8("pcIO", 0x800000, 0x130000) on the SMC
+ *   dart   dart-apcie0 0x388000000 (control/alpha/beta/piodma streams, sid-count 19), dart-apcie2 0x38a000000
+ *   gpio   gpio0 0x31a000000 (gpio,t8101, 224 pins, 7 interrupt groups 433..439; the Neo's pinctrl is at the same physical address);
+ *          port0 PERST 3, CLKREQ 0; port2 PERST 5, CLKREQ 2; port0 reg_on = pKW8("pcIO", 0x800000, 0x130000) on the SMC
  *   power  power-gates/clock-gates/service-gates are all None: the ADT has no PMGR power domain for the APCIe, so none is attached
  */
 #include <dt-bindings/gpio/gpio.h>
@@ -27,9 +32,9 @@
 	};
 
 	soc {
-		pinctrl_ap: pinctrl@11a000000 {
+		pinctrl_ap: pinctrl@31a000000 {
 			compatible = "apple,t8152-pinctrl", "apple,t8103-pinctrl";
-			reg = <0x1 0x1a000000 0x0 0x100000>;
+			reg = <0x3 0x1a000000 0x0 0x100000>;
 
 			gpio-controller;
 			#gpio-cells = <2>;
@@ -49,18 +54,18 @@
 		};
 
 		/* Port 0 stream owner: control, alpha and beta use SIDs 1, 2 and 3 (slot == SID), the PIODMA stream is 17. */
-		pcie0_dart: iommu@188000000 {
+		pcie0_dart: iommu@388000000 {
 			compatible = "apple,t8152-dart", "apple,t8110-dart";
-			reg = <0x1 0x88000000 0x0 0x20000>;
+			reg = <0x3 0x88000000 0x0 0x20000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1572 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
 		/* Port 2 (Ethernet) stream owner. */
-		pcie2_dart: iommu@18a000000 {
+		pcie2_dart: iommu@38a000000 {
 			compatible = "apple,t8152-dart", "apple,t8110-dart";
-			reg = <0x1 0x8a000000 0x0 0x20000>;
+			reg = <0x3 0x8a000000 0x0 0x20000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1588 IRQ_TYPE_LEVEL_HIGH>;
@@ -69,14 +74,14 @@
 		/*
 		 * Port 0 PIODMA. The window values are the ECAM and the two bus ranges of the ADT; they equal the T8140's
 		 * (ECAM 0x1cb0000000/0x10000000, 64-bit window 0xbc0000000/0x20000000, 32-bit window 0xb80000000/0x40000000).
-		 * UNPROVEN: the driver takes one apple,piodma phandle, so port 2's PIODMA (apcie2-piodma, 0x18a030000,
-		 * IRQ 1589) is not described.
+		 * UNPROVEN: the driver takes one apple,piodma phandle, so port 2's PIODMA (apcie2-piodma, bus 0x18a030000,
+		 * IRQ 1589, physical 0x38a030000) is not described.
 		 */
-		piodma_radio: piodma@188030000 {
+		piodma_radio: piodma@388030000 {
 			compatible = "apple,t8140-pcie-piodma";
-			reg = <0x1 0x88030000 0x0 0x4000>,
-			      <0x1 0x88034000 0x0 0x4000>,
-			      <0x1 0x88038000 0x0 0x4000>;
+			reg = <0x3 0x88030000 0x0 0x4000>,
+			      <0x3 0x88034000 0x0 0x4000>,
+			      <0x3 0x88038000 0x0 0x4000>;
 			reg-names = "engine", "irq-aggregator", "fabric";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1573 IRQ_TYPE_LEVEL_HIGH>;
@@ -95,13 +100,13 @@
 			device_type = "pci";
 
 			reg = <0x1c 0xb0000000 0x0 0x10000000>, /* ECAM */
-			      <0x1 0x8c000000 0x0 0x4000>,      /* RC */
-			      <0x1 0x88028000 0x0 0x8000>,      /* port 0 */
-			      <0x1 0x89028000 0x0 0x8000>,      /* port 1 (not populated) */
-			      <0x1 0x8a028000 0x0 0x8000>,      /* port 2 */
-			      <0x1 0x8f020000 0x0 0x4000>,      /* port 0 PHY: the T8140's phy0 offset (base + 0x7020000) */
-			      <0x1 0x8f024000 0x0 0x4000>,      /* UNPROVEN: port 1 PHY, +0x4000 stride as T6030 */
-			      <0x1 0x8f028000 0x0 0x4000>;      /* UNPROVEN: port 2 PHY, +0x4000 stride as T6030 */
+			      <0x3 0x8c000000 0x0 0x4000>,      /* RC */
+			      <0x3 0x88028000 0x0 0x8000>,      /* port 0 */
+			      <0x3 0x89028000 0x0 0x8000>,      /* port 1 (not populated) */
+			      <0x3 0x8a028000 0x0 0x8000>,      /* port 2 */
+			      <0x3 0x8f020000 0x0 0x4000>,      /* port 0 PHY: the T8140's phy0 offset (base + 0x7020000) */
+			      <0x3 0x8f024000 0x0 0x4000>,      /* UNPROVEN: port 1 PHY, +0x4000 stride as T6030 */
+			      <0x3 0x8f028000 0x0 0x4000>;      /* UNPROVEN: port 2 PHY, +0x4000 stride as T6030 */
 			reg-names = "config", "rc", "port0", "port1", "port2", "phy0", "phy1", "phy2";
 
 			interrupt-parent = <&aic>;
