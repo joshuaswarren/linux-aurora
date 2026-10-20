@@ -335,7 +335,8 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 		if (of_machine_is_compatible("apple,j700")) {
 			smcgp->pcio = macsmc_j700_pcio;
 			smcgp->npcio = ARRAY_SIZE(macsmc_j700_pcio);
-		} else if (of_machine_is_compatible("apple,j873g")) {
+		} else if (of_machine_is_compatible("apple,j873g") ||
+			   of_machine_is_compatible("apple,j873")) {
 			smcgp->pcio = macsmc_j873_pcio;
 			smcgp->npcio = ARRAY_SIZE(macsmc_j873_pcio);
 		}
