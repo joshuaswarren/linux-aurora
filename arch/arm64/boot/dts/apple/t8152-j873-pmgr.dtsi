@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * PMGR power domains for the Apple T8152 (M6), generated from the live ADT
- * (/arm-io/pmgr-child) by dcp-dma-fix/gen-t8152-pmgr.py. Real (non-virtual) devices only;
- * virtual ADT devices have no PS register of their own (ANS, DPTX_PHY, ATC*_CIO_USB, ...)
- * and are managed by firmware. Every domain is apple,always-on: Linux only keeps them ACTIVE.
+ * (/arm-io/pmgr-child) by dcp-dma-fix/gen-t8152-pmgr.py. Real (non-virtual) devices only.
+ * The ADT "virtual" flag does not mean there is no PS register: m1n1 writes the register of
+ * any named device, and the DPTX/DP/AUX devices that HDMI needs are virtual in the ADT.
+ * Those are in t8152-j873-hdmi.dtsi. ANS, ATC*_CIO_USB and the other virtual devices are not
+ * described here yet. Every domain is apple,always-on: Linux only keeps them ACTIVE.
  */
 
 / {
