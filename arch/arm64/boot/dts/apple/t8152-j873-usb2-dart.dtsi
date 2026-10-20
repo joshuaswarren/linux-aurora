@@ -10,6 +10,9 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			/* no DART MMIO at probe: ADT dart,gen3 manual-availability, see apple-dart.c */
+			apple,static-topology;
+			apple,num-streams = <16>;
 			power-domains = <&ps_atc3_usb>;
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			/* ADT dart-tunables-instance-0 as (offset, mask, value) */
@@ -30,6 +33,9 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			/* no DART MMIO at probe: ADT dart,gen3 manual-availability, see apple-dart.c */
+			apple,static-topology;
+			apple,num-streams = <16>;
 			power-domains = <&ps_atc3_usb>;
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			/* ADT dart-tunables-instance-1: byte-identical to instance 0 */
