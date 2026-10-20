@@ -297,12 +297,8 @@ static void dwc3_apple_t8152_apply_tunables(struct dwc3_apple *appledwc,
 		apple_tunable_apply(base + offset, appledwc->tunables[i]);
 	}
 
-	if (device) {
-		writel(T8152_PIPE_MUX_CTRL_DUMMY, pipe + T8152_PIPE_MUX_CTRL);
-		writel(T8152_PIPE_AON_GEN_DWC3_RESET_N, pipe + T8152_PIPE_AON_GEN);
-		writel(T8152_PIPE_NONSELECTED_DEVICE, pipe + T8152_PIPE_NONSELECTED_OVERRIDE);
+	if (device)
 		return;
-	}
 
 	writel(readl(pipe + 0x20) | BIT(15), pipe + 0x20);
 	value = dwc3_readl(&appledwc->dwc, 0xc680);
@@ -427,6 +423,14 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
 		return ret;
+	}
+
+	if (appledwc->t8152_usb2 && state == DWC3_APPLE_DEVICE) {
+		void __iomem *pipe = appledwc->tunable_regs[2];
+
+		writel(T8152_PIPE_MUX_CTRL_DUMMY, pipe + T8152_PIPE_MUX_CTRL);
+		writel(T8152_PIPE_AON_GEN_DWC3_RESET_N, pipe + T8152_PIPE_AON_GEN);
+		writel(T8152_PIPE_NONSELECTED_DEVICE, pipe + T8152_PIPE_NONSELECTED_OVERRIDE);
 	}
 
 	ret = dwc3_apple_core_init(appledwc);
