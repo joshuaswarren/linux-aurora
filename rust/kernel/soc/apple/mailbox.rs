@@ -20,6 +20,7 @@ use crate::{
 };
 
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 
 /// 96-bit message. What it means is up to the upper layer
 pub type Message = bindings::apple_mbox_msg;
