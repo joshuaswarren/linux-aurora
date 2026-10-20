@@ -1,25 +1,47 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J873g (Mac mini, M6/T8152) HDMI: DPTX PHY, power domains, converter power pins and the DCP port 0
- * description. Included by t8152-j873-hdmi.dts only; the first-boot t8152-j873.dts does not use it.
+ * J873g (Mac mini, M6/T8152) HDMI: DPTX PHY, power domains, converter power pins, HPD and the
+ * DCP port 0 description. Included by t8152-j873-hdmi.dts only; the first-boot t8152-j873.dts
+ * does not use it.
  *
  * Addresses are from the live M6 ADT, phys = bus + 0x200000000 (/arm-io range 0).
  *  /arm-io/dptx-phy  reg[0] 0x11a740000 +0x10000 ("dptx", AppleDPTXPort Block::1)
  *                    reg[1] 0x11a700000 +0x4000  ("core", Block::0: source select 0x10, group enables 0x48)
  *                    port-number 1 is the ADT's name for the DCP remote port; the HDMI link only trains on
  *                    remote port 0, which is what a DCP with apple,dcp-index = <0> uses.
- *  The six PMGR devices below are "virtual" in the ADT but have a PS register that must be written:
+ *  The PMGR devices generated below are "virtual" in the ADT but have a PS register that must be written:
  *  DPTX_PHY id 167 0x3007016c0, DP 206 0x300714200, GLOBAL_AUX_CTRL0/1 0x300700460/0x300700480,
- *  DPEXT0 0x300700de0, DPEXT1 0x300700a80. The ADT clock-gates/power-gates <5> of the PHY node
- *  resolve to ECPU_4 (a CPU core) and are not the PHY's domain.
+ *  DPEXT0 0x300700de0, DPEXT1 0x300700a80, AOP_FILTER 222 0x308284000, AOP_GPIO 223 0x308284020
+ *  (parent AOP_FILTER). The ADT clock-gates/power-gates <5> of the PHY node resolve to ECPU_4
+ *  (a CPU core) and are not the PHY's domain.
  *  HDMI converter power: /arm-io/dp2hdmi-gpio0 function-hdmi_pwr_en pKW8("pcIO", 0x800000, 0xf0000) and
  *  function-dp2hdmi_pwr_en pKW8("pcIO", 0, 0x140000), pins 15 and 20 of the SMC GPIO (gpio-macsmc.c).
- *  HPD is function-hdmi_hpd: AOP GPIO phandle 203, pin 41. No AOP GPIO node exists for T8152 yet.
  *
- * What the DCP driver still needs before dcp, the DARTs and the mailbox can be enabled (they stay
- * disabled in t8152-j873-display.dtsi): T8152 hardware data in drivers/gpu/drm/apple/dcp.c, the
- * "apple,bw-scratch" and "apple,iomfb-surfaces" values (no ADT source known), and the AOP GPIO for
- * "hdmi-hpd-gpios".
+ * HPD: function-hdmi_hpd of /arm-io/dp2hdmi-gpio0 is {phandle 203, pin 41, flags 0x100}. Phandle 203 is
+ * /arm-io/aop-gpio (gpio,t8101, reg 0x110824000 +0x4000, 77 pins, AIC IRQs 573..579); pin 41 is the
+ * register at 0x3108240a4. The block sits in the AOP power island, so the node depends on AOP_GPIO.
+ * It uses apple,t8152-pinctrl, which reads and writes only the 77 pin registers (the unlisted slots
+ * of an AOP register block can fault on read, as on T8140).
+ *
+ * DCP bandwidth registers. The DCP asks the AP for the "bandwidth scratch" and "doorbell" registers
+ * (callback D003, rt_bandwidth_setup_ap). macOS takes them from the PMC. DISP0 has
+ * function-bw_req_interrupt0 = BIRQ(43), and bwr-agent maps DISP_INT (device 43) to BWR agent 0.
+ * The boost agent DISP_DCP is agent 0 in boost-agent. In the 26A434 kernelcache the T8152PMC vtable
+ * (0xfffffe000836e150) has the BWR agent offset 0x20000 + agent * 0x4000 (0xfffffe000a055538) and
+ * the boost agent offset 0xa4000 + agent * 0x4000 (0xfffffe000a055548). The T8142 DT
+ * (t8142-j813-display.dts) uses the same formulas.
+ * The PMC window base is ASSUMED to be 0x302800000: it is pmgr-child reg[46] and disp0 reg[4]
+ * (+0x1d4000), and on T8140 macOS answered D003 with window base + 0x20000 as scratch. I did not
+ * resolve the PMC base in the kernelcache. Scratch is 0x302820000 and doorbell is 0x3028a4000.
+ * The dcp "reg" list is the ADT's: coproc, disp0 reg[0..4] and /arm-io/dcp reg[1] (0x286850000) as
+ * iop-vbar, which makes the scratch and doorbell disp registers 5 and 6.
+ *
+ * apple,iomfb-surfaces: INFERRED, not captured on the M6. The default order is the M1/M2 legacy {2, 1}.
+ * The T8140 J700 DT uses <0> because the iBoot and macOS captures both use IOMFB surface slot 0 on
+ * the same 26.x DCP firmware generation (the M6 firmware is 26A428). Check the first swap.
+ *
+ * Still missing for apple-drm: T8152 hardware data in drivers/gpu/drm/apple/dcp.c. The dcp, DART and
+ * mailbox nodes stay disabled in t8152-j873-display.dtsi.
  */
 
 #include <dt-bindings/gpio/gpio.h>
@@ -33,6 +55,12 @@
 };
 
 / {
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
 	soc {
 		dptx_phy: phy@31a700000 {
 			compatible = "apple,t8152-dptx-phy";
@@ -45,15 +73,59 @@
 			#phy-cells = <0>;
 			status = "disabled";
 		};
+
+		pinctrl_aop: pinctrl@310824000 {
+			compatible = "apple,t8152-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x3 0x10824000 0x0 0x4000>;
+			power-domains = <&ps_aop_gpio>;
+
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_aop 0 0 77>;
+			apple,npins = <77>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 573 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 574 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 575 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 576 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 578 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 579 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		pmgr_dcp: power-management@302820000 {
+			reg = <0x3 0x02820000 0x0 0x8>,
+			      <0x3 0x028a4000 0x0 0x4>;
+			reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+			#apple,bw-scratch-cells = <3>;
+			#apple,bw-doorbell-cells = <2>;
+		};
 	};
 };
 
 &dcp {
+	reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+	reg = <0x2 0x86e00000 0x0 0x74000>,
+	      <0x2 0x84000000 0x0 0xd14000>,
+	      <0x2 0x86240000 0x0 0x10000>,
+	      <0x2 0x863ac000 0x0 0x4000>,
+	      <0x2 0x86800000 0x0 0x7f4000>,
+	      <0x3 0x02800000 0x0 0x1d4000>,
+	      <0x2 0x86850000 0x0 0x4000>;
+	clocks = <&clkref>;
+	apple,bw-scratch = <&pmgr_dcp 0 5 0>;
+	apple,bw-doorbell = <&pmgr_dcp 1 6>;
+	apple,iomfb-surfaces = <0>;
 	apple,connector-type = "HDMI-A";
 	apple,dcp-index = <0>;
 	apple,dptx-phy = <4>;
 	phys = <&dptx_phy>;
 	phy-names = "dp-phy";
+	hdmi-hpd-gpios = <&pinctrl_aop 41 GPIO_ACTIVE_HIGH>;
 	hdmi-pwren-gpios = <&m6_smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	dp2hdmi-pwren-gpios = <&m6_smc_gpio 20 GPIO_ACTIVE_HIGH>;
 };
@@ -68,6 +140,10 @@
 };
 
 &dptx_phy {
+	status = "okay";
+};
+
+&pinctrl_aop {
 	status = "okay";
 };
 
@@ -124,6 +200,28 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dpext1";
+		apple,always-on;
+	};
+};
+
+/* AOP_GPIO is the PS device of /arm-io/aop-gpio; its parent is AOP_FILTER. */
+&pmgr1 {
+	ps_aop_filter: power-controller@4000 {
+		compatible = "apple,t8152-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_filter";
+		apple,always-on;
+	};
+
+	ps_aop_gpio: power-controller@4020 {
+		compatible = "apple,t8152-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_gpio";
+		power-domains = <&ps_aop_filter>;
 		apple,always-on;
 	};
 };
