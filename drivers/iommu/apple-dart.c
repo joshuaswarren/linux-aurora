@@ -326,6 +326,17 @@ static inline u32 apple_dart_readl(struct apple_dart *dart, u32 offset)
 	return value;
 }
 
+/*
+ * T8152 Gen3 probe bisect knob (boot with apple_dart.gen3_skip=N). Default 0.
+ *  1: do not apply the ADT tunables
+ *  2: do not run hw_reset (no TTBR/TCR/stream writes at probe)
+ *  4: skip only the TLB doorbell at the end of hw_reset (shared aperture, probe time)
+ * A locked DART never gets tunables or a reset, whatever N is.
+ */
+static unsigned int gen3_skip;
+module_param(gen3_skip, uint, 0444);
+MODULE_PARM_DESC(gen3_skip, "T8152 Gen3 DART probe bisect: 1 no tunables, 2 no reset, 4 no probe TLBI");
+
 static void apple_dart_apply_tunables(struct apple_dart *dart)
 {
 	size_t i;
@@ -983,6 +994,10 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	/* Gen3: 0x104 is not in AppleGen3DART's register capture list; leave it alone. */
 	if (dart->hw->type == DART_T8110 && !dart->hw->gen3)
 		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
+
+	/* Gen3: attach and unmap flush; the probe-time doorbell write is optional. */
+	if (dart->hw->gen3 && (gen3_skip & 4))
+		return 0;
 
 	return dart->hw->invalidate_tlb(&stream_map);
 }
@@ -2341,7 +2356,17 @@ static int apple_dart_probe(struct platform_device *pdev)
 		apple_dart_apply_tunables(dart);
 		dev_info(dev, "firmware PCIe-C DART tunables applied\n");
 	} else if (dart->hw == &apple_dart_hw_t8152) {
-		apple_dart_apply_tunables(dart);
+		/*
+		 * Firmware (SPTM) owns a locked Gen3 DART: its protection and tunables are
+		 * already set and the 0x20c group sits in the write-protect block, so decide
+		 * lock state with a read before any write.
+		 */
+		if (apple_dart_is_locked(dart))
+			dev_info(dev, "Gen3 DART is locked: not applying tunables\n");
+		else if (gen3_skip & 1)
+			dev_info(dev, "gen3_skip: tunables skipped\n");
+		else
+			apple_dart_apply_tunables(dart);
 	}
 
 	/*
@@ -2516,7 +2541,7 @@ params_done:
 		dart->locked = false;
 	else
 		dart->locked = apple_dart_is_locked(dart);
-	if (!dart->locked) {
+	if (!dart->locked && !(dart->hw->gen3 && (gen3_skip & 2))) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
