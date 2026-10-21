@@ -280,6 +280,8 @@ struct apple_dart {
 	u32 static_topo : 1;
 	u32 hw_ready : 1;
 	u32 irq_requested : 1;
+	/* Serialises the first-use init: resume, attach and the fault IRQ can all reach it. */
+	spinlock_t late_lock;
 	/* Gen3 (T8152): shared TLBI doorbell and per-instance route register */
 	void __iomem *tlbi;
 	u16 version;
@@ -443,6 +445,8 @@ struct apple_dart_master_cfg {
 	     stream_map = &(base)->stream_maps[++i])
 
 static struct platform_driver apple_dart_driver;
+static int apple_dart_cfg_ensure_ready(struct apple_dart_master_cfg *cfg);
+static int apple_dart_gen3_ensure_ready(struct apple_dart *dart);
 static const struct iommu_ops apple_dart_iommu_ops;
 
 static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
@@ -1467,6 +1471,9 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
+	ret = apple_dart_cfg_ensure_ready(cfg);
+	if (ret)
+		goto err;
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
 	if (ret)
 		goto err;
@@ -1511,6 +1518,12 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
+	if (apple_dart_cfg_ensure_ready(cfg)) {
+		for_each_stream_map(i, cfg, stream_map)
+			pm_runtime_put(stream_map->dart->dev);
+		return -ENODEV;
+	}
+
 	for_each_stream_map(i, cfg, stream_map)
 		apple_dart_hw_enable_bypass(stream_map);
 
@@ -1542,6 +1555,12 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
+	if (apple_dart_cfg_ensure_ready(cfg)) {
+		for_each_stream_map(i, cfg, stream_map)
+			pm_runtime_put(stream_map->dart->dev);
+		return -ENODEV;
+	}
+
 	for_each_stream_map(i, cfg, stream_map)
 		apple_dart_hw_disable_dma(stream_map);
 
@@ -1568,10 +1587,16 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 	if (!dev_iommu_fwspec_get(dev) || !cfg)
 		return ERR_PTR(-ENODEV);
 
-	for_each_stream_map(i, cfg, stream_map)
+	for_each_stream_map(i, cfg, stream_map) {
 		device_link_add(dev, stream_map->dart->dev,
 			DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER |
 			DL_FLAG_RPM_ACTIVE);
+		if (stream_map->dart->static_topo)
+			dev_info(dev, "uses static-topology DART %s, sids %*pbl, hw_ready %d, rpm status %d\n",
+				 dev_name(stream_map->dart->dev), stream_map->dart->num_streams,
+				 stream_map->sidmap, stream_map->dart->hw_ready,
+				 stream_map->dart->dev->power.runtime_status);
+	}
 
 	return &cfg->stream_maps[0].dart->iommu;
 }
@@ -2161,9 +2186,17 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 	irqreturn_t ret;
 	struct apple_dart *dart = dev;
 
-	/* Static topology: no MMIO, and no resume, before the first consumer. */
-	if (dart->static_topo && !dart->hw_ready)
-		return IRQ_NONE;
+	/*
+	 * Static topology: no MMIO before the first consumer. A powered (runtime-active) DART that
+	 * still raises a fault was never initialised: do the first-use init here, which also
+	 * clears the pending error, rather than leave a level IRQ nobody claims.
+	 */
+	if (dart->static_topo && !dart->hw_ready) {
+		if (!pm_runtime_active(dart->dev) || apple_dart_gen3_ensure_ready(dart))
+			return IRQ_NONE;
+		dev_warn_ratelimited(dart->dev, "fault before first-use init; initialised from the IRQ path\n");
+		return IRQ_HANDLED;
+	}
 
 	WARN_ON(pm_runtime_get_sync(dart->dev) < 0);
 	ret = dart->hw->irq_handler(irq, dev);
@@ -2347,6 +2380,44 @@ static int apple_dart_gen3_late_init(struct apple_dart *dart)
 	return 0;
 }
 
+/*
+ * Run the first-use init exactly once from whichever path gets there first: runtime
+ * resume, a consumer attach, or a fault IRQ on a powered but never initialised DART.
+ * The caller guarantees the DART is powered. Safe in atomic context.
+ */
+static int apple_dart_gen3_ensure_ready(struct apple_dart *dart)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&dart->late_lock, flags);
+	if (!dart->hw_ready)
+		ret = apple_dart_gen3_late_init(dart);
+	spin_unlock_irqrestore(&dart->late_lock, flags);
+	return ret;
+}
+
+/* Every DART in a consumer's iommus list must be initialised before it is programmed. */
+static int apple_dart_cfg_ensure_ready(struct apple_dart_master_cfg *cfg)
+{
+	struct apple_dart_stream_map *stream_map;
+	int i, ret;
+
+	for_each_stream_map(i, cfg, stream_map) {
+		struct apple_dart *dart = stream_map->dart;
+
+		if (!dart->static_topo || dart->hw_ready)
+			continue;
+		dev_warn(dart->dev,
+			 "first-use init was not run by runtime resume (rpm status %d); initialising from attach\n",
+			 dart->dev->power.runtime_status);
+		ret = apple_dart_gen3_ensure_ready(dart);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, enabled_count;
@@ -2384,6 +2455,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 	}
 	spin_lock_init(&dart->lock);
+	spin_lock_init(&dart->late_lock);
 	platform_set_drvdata(pdev, dart);
 
 	/*
@@ -2860,7 +2932,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 
 	/* First resume of a static-topology DART: do everything probe skipped. */
 	if (dart->static_topo && !dart->hw_ready)
-		return apple_dart_gen3_late_init(dart);
+		return apple_dart_gen3_ensure_ready(dart);
 
 	/*
 	 * PCIe-C DARTs on an apple,always-on domain retain their translation
