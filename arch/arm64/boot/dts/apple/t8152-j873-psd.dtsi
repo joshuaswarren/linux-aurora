@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8152 (M6) J873: PSD service slot power domains for the four ATC USB ports.
+ *
+ * PSD base 0x303a10000 = ADT /arm-io/pmgr-child reg-groups group 0x1d (map 449 -> reg[52]
+ * 0x303000000, offset 0xa10000). Slot windows are 0x100 bytes at base + (slot << 8); the slot of
+ * ATCn_USB is the sixth u16 of its ADT `service` record (174..177 -> 71..74).
+ *
+ * Needs ps_atc<n>_usb_aon and ps_atc<n>_usb from t8152-j873-pmgr.dtsi. USB DARTs, the dwc3
+ * controller and the PHY consumers list psd_atc<n>_usb in power-domains so that the PMGR
+ * domains are powered first, then the slot request is acknowledged, before any DART or
+ * controller register is touched.
+ */
+
+/ {
+	soc {
+		/* ADT service 174 ATC0_USB -> PSD slot 71; parents ATC0_USB_AON and ATC0_USB (real PMGR1 PS). */
+		psd_atc0_usb: power-controller@303a14700 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a14700 0x0 0x100>;
+			#power-domain-cells = <0>;
+			power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_usb>;
+			label = "psd_atc0_usb";
+		};
+
+		/* ADT service 175 ATC1_USB -> PSD slot 72; parents ATC1_USB_AON and ATC1_USB (real PMGR1 PS). */
+		psd_atc1_usb: power-controller@303a14800 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a14800 0x0 0x100>;
+			#power-domain-cells = <0>;
+			power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_usb>;
+			label = "psd_atc1_usb";
+		};
+
+		/* ADT service 176 ATC2_USB -> PSD slot 73; parents ATC2_USB_AON and ATC2_USB (real PMGR1 PS). */
+		psd_atc2_usb: power-controller@303a14900 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a14900 0x0 0x100>;
+			#power-domain-cells = <0>;
+			power-domains = <&ps_atc2_usb_aon>, <&ps_atc2_usb>;
+			label = "psd_atc2_usb";
+		};
+
+		/* ADT service 177 ATC3_USB -> PSD slot 74; parents ATC3_USB_AON and ATC3_USB (real PMGR1 PS). */
+		psd_atc3_usb: power-controller@303a14a00 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a14a00 0x0 0x100>;
+			#power-domain-cells = <0>;
+			power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_usb>;
+			label = "psd_atc3_usb";
+		};
+	};
+};
