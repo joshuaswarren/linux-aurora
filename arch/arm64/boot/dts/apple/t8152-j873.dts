@@ -237,6 +237,7 @@
 #include "t8152-j873-usb2.dtsi"
 #include "t8152-j873-usb0-dart.dtsi"
 #include "t8152-j873-usb0.dtsi"
+#include "t8152-j873-drd2.dtsi"
 #include "t8152-j873-display.dtsi"
 #include "t8152-j873-usbpd-spmi.dtsi"
 #include "t8152-j873-smc.dtsi"
