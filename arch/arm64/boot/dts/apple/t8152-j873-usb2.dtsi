@@ -28,7 +28,7 @@
 			reg-names = "dwc3-core", "dwc3-apple", "pipe-handler",
 				    "pwr-ctrl", "bulk-fabric", "ausbc-debug";
 			interrupts = <AIC_IRQ 1834 IRQ_TYPE_LEVEL_HIGH>;
-			iommus = <&usb3_dart0 1>, <&usb3_dart1 1>;
+			iommus = <&usb3_dart0 0>, <&usb3_dart0 1>, <&usb3_dart1 0>, <&usb3_dart1 1>;
 			power-domains = <&psd_atc3_usb>;
 			phys = <&usb2phy3>;
 			phy-names = "usb2-phy";
