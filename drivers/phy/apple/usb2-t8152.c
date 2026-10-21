@@ -14,7 +14,6 @@
 #define USB2_RESET		0x04
 #define USB2_VBUS		0x08
 #define USB2_VBUS_FORCE		GENMASK(3, 0)
-#define USB2_HOST_MODE		GENMASK(14, 12)
 #define USB2_CLOCK		0x1c
 #define USB2_MODE		GENMASK(2, 0)
 #define USB2_RUN		2
@@ -49,20 +48,26 @@ static void apple_usb2_update(void __iomem *reg, u32 clear, u32 set)
 static int apple_usb2_power_on(struct phy *phy)
 {
 	struct apple_usb2 *usb = phy_get_drvdata(phy);
+	struct device *dev = phy->dev.parent;
+	bool device = usb->mode == PHY_MODE_USB_DEVICE;
 
+	if (device)
+		dev_info(dev, "USB2 pre-change SIG=0x%08x CTL=0x%08x MISCTUNE=0x%08x USBCTL=0x%08x\n",
+			 readl(usb->usb2 + USB2_VBUS), readl(usb->usb2 + USB2_RESET),
+			 readl(usb->usb2 + USB2_CLOCK), readl(usb->usb2 + USB2_CONTROL));
 	apple_tunable_apply(usb->usb2, usb->dflt);
-	if (usb->mode == PHY_MODE_USB_DEVICE) {
+	if (device) {
 		if (!usb->dev)
 			return -EINVAL;
 		apple_tunable_apply(usb->usb2, usb->dev);
+		dev_info(dev, "USB2 SIG write bits 3:0 (no 14:12 clear)\n");
+		apple_usb2_update(usb->usb2 + USB2_VBUS, 0, USB2_VBUS_FORCE);
+		dev_info(dev, "USB2 SIG now 0x%08x\n",
+			 readl(usb->usb2 + USB2_VBUS));
 	} else {
 		if (!usb->host)
 			return -EINVAL;
 		apple_tunable_apply(usb->usb2, usb->host);
-	}
-	if (usb->mode == PHY_MODE_USB_DEVICE) {
-		apple_usb2_update(usb->usb2 + USB2_VBUS, USB2_HOST_MODE, USB2_VBUS_FORCE);
-	} else {
 		apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(2));
 		apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(3));
 	}
@@ -73,15 +78,22 @@ static int apple_usb2_power_on(struct phy *phy)
 	apple_usb2_update(usb->usb2 + USB2_RESET, USB2_PORT_RESET, 0);
 	apple_usb2_update(usb->eusb2, 0, BIT(0) | BIT(3));
 	apple_usb2_update(usb->usb2 + USB2_RESET, 0, USB2_APB_RESET_N);
-	if (usb->mode == PHY_MODE_USB_DEVICE)
+	if (device) {
+		dev_info(dev, "USB2 write MISCTUNE 0x%08x\n", USB2_DEVICE_MISCTUNE);
 		writel(USB2_DEVICE_MISCTUNE, usb->usb2 + USB2_CLOCK);
-	else {
+	} else {
 		apple_usb2_update(usb->usb2 + USB2_CLOCK, USB2_REFCLK_GATE, 0);
 		apple_usb2_update(usb->usb2 + USB2_CLOCK, USB2_PHYCLOCK_GATE, 0);
 	}
 	udelay(30);
 	msleep(5);
+	if (device)
+		dev_info(dev, "USB2 write USBCTL RUN\n");
 	apple_usb2_update(usb->usb2 + USB2_CONTROL, USB2_MODE, USB2_RUN);
+	if (device)
+		dev_info(dev, "USB2 post-change SIG=0x%08x CTL=0x%08x MISCTUNE=0x%08x USBCTL=0x%08x\n",
+			 readl(usb->usb2 + USB2_VBUS), readl(usb->usb2 + USB2_RESET),
+			 readl(usb->usb2 + USB2_CLOCK), readl(usb->usb2 + USB2_CONTROL));
 
 	return 0;
 }
