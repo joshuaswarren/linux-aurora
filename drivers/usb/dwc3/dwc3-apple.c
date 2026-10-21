@@ -433,7 +433,22 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		writel(T8152_PIPE_NONSELECTED_DEVICE, pipe + T8152_PIPE_NONSELECTED_OVERRIDE);
 	}
 
+	if (appledwc->t8152_usb2) {
+		ret = phy_init(appledwc->usb2_phy);
+		if (ret)
+			return ret;
+		ret = phy_power_on(appledwc->usb2_phy);
+		if (ret) {
+			phy_exit(appledwc->usb2_phy);
+			return ret;
+		}
+	}
+
 	ret = dwc3_apple_core_init(appledwc);
+	if (appledwc->t8152_usb2) {
+		phy_power_off(appledwc->usb2_phy);
+		phy_exit(appledwc->usb2_phy);
+	}
 	if (ret) {
 		ret_reset = reset_control_assert(appledwc->reset);
 		if (ret_reset)
