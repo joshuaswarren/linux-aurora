@@ -65,8 +65,15 @@
 			/* ADT dart,gen3 manual-availability 1: no DART MMIO at probe (apple-dart.c, w7Y 0009); sid-count 19 */
 			apple,static-topology;
 			apple,num-streams = <19>;
-			/* ADT dart-tunables-instance-0 as (offset, mask, value) */
-			apple,tunable = <0x20c 0x80000121 0x80000121>;
+			/* ADT dart-tunables-instance-0 (all 8 records) as (offset, mask, value); 0x308/0x310 bound the page-table fetch */
+			apple,tunable = <0x20c 0x80000121 0x80000121>,
+					<0x220 0x00000f0f 0x00000f0f>,
+					<0x224 0x0000ffff 0x00000909>,
+					<0x260 0x00000007 0x00000004>,
+					<0x300 0x00001f31 0x00000001>,
+					<0x308 0x3ffffffc 0x10000000>,
+					<0x310 0x3ffffffc 0x3ffffffc>,
+					<0x4600 0x00000002 0x00000002>;
 		};
 
 		/* Port 2 (Ethernet) stream owner. */
@@ -79,7 +86,14 @@
 			interrupts = <AIC_IRQ 1588 IRQ_TYPE_LEVEL_HIGH>;
 			apple,static-topology;
 			apple,num-streams = <19>;
-			apple,tunable = <0x20c 0x80000121 0x80000121>;
+			apple,tunable = <0x20c 0x80000121 0x80000121>,
+					<0x220 0x00000f0f 0x00000f0f>,
+					<0x224 0x0000ffff 0x00000909>,
+					<0x260 0x00000007 0x00000004>,
+					<0x300 0x00001f31 0x00000001>,
+					<0x308 0x3ffffffc 0x10000000>,
+					<0x310 0x3ffffffc 0x3ffffffc>,
+					<0x4600 0x00000002 0x00000002>;
 		};
 
 		/*
