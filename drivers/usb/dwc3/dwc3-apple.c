@@ -425,12 +425,21 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		return ret;
 	}
 
-	if (appledwc->t8152_usb2 && state == DWC3_APPLE_DEVICE) {
+	if (appledwc->t8152_usb2) {
 		void __iomem *pipe = appledwc->tunable_regs[2];
 
-		writel(T8152_PIPE_MUX_CTRL_DUMMY, pipe + T8152_PIPE_MUX_CTRL);
+		if (state == DWC3_APPLE_DEVICE) {
+			writel(T8152_PIPE_MUX_CTRL_DUMMY, pipe + T8152_PIPE_MUX_CTRL);
+			writel(T8152_PIPE_NONSELECTED_DEVICE, pipe + T8152_PIPE_NONSELECTED_OVERRIDE);
+		}
+		/*
+		 * The AON block gates every DWC3 core register with its reset.
+		 * dwc3_core_probe() reads GSNPSID/GHWPARAMS first, so the reset
+		 * must be released here for the host role too, not only for the
+		 * peripheral (verified on port 1; port 2 returned garbage on the
+		 * first hardware run without this).
+		 */
 		writel(T8152_PIPE_AON_GEN_DWC3_RESET_N, pipe + T8152_PIPE_AON_GEN);
-		writel(T8152_PIPE_NONSELECTED_DEVICE, pipe + T8152_PIPE_NONSELECTED_OVERRIDE);
 	}
 
 	if (appledwc->t8152_usb2) {
