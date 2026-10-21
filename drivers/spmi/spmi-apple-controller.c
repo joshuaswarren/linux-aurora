@@ -31,31 +31,37 @@
 #define SPMI_ACT_REG 0xa4
 
 /*
- * FIFO registers per controller generation. Gen 1 (ADT has no "gen"): status 0, cmd 4, reply 8.
- * Gen 4 (T8152 and newer, ADT gen = 4): status 0x200, cmd 0x210, reply 0x220, RX empty BIT(30),
- * layout as in m1n1 src/spmi.c regs_gen4. The gen 4 interrupt registers are not known, so gen 4
- * runs polled and registers no interrupt domain.
+ * Registers per controller generation. Gen 1 (ADT has no "gen"): status 0, cmd 4, reply 8, IRQ mask 0x20,
+ * IRQ status/ack 0x60. Gen 4 (T8152 and newer, ADT gen = 4): status 0x200, cmd 0x210, reply 0x220, RX empty
+ * BIT(30) (layout as in m1n1 src/spmi.c regs_gen4), IRQ mask 0x400, IRQ status/ack 0x600. The IRQ banks are
+ * the same nine u32 banks as gen 1 (288 IRQs, write-1-to-clear ack); the gen 4 offsets come from the register
+ * tables of the macOS AppleSPMI driver.
+ *
+ * Gen 4 keeps the FIFO polled: its notify interrupt stays masked, so only peripheral IRQs are delivered.
  */
 struct apple_spmi_hw {
 	u32 status;
 	u32 cmd;
 	u32 rsp;
 	u32 rx_empty;
+	u32 irq_mask;
+	u32 irq_ack;
 	bool has_irq;
+	bool notify_fifo;
 };
 
 static const struct apple_spmi_hw apple_spmi_gen1_hw = {
-	.status = 0, .cmd = 0x4, .rsp = 0x8, .rx_empty = BIT(24), .has_irq = true,
+	.status = 0, .cmd = 0x4, .rsp = 0x8, .rx_empty = BIT(24),
+	.irq_mask = 0x20, .irq_ack = 0x60, .has_irq = true, .notify_fifo = true,
 };
 
 #define SPMI_GEN4_MIN_SIZE 0x1000
 
 static const struct apple_spmi_hw apple_spmi_gen4_hw = {
 	.status = 0x200, .cmd = 0x210, .rsp = 0x220, .rx_empty = BIT(30),
+	.irq_mask = 0x400, .irq_ack = 0x600, .has_irq = true,
 };
 
-#define SPMI_IRQ_MASK_BASE 0x20
-#define SPMI_IRQ_ACK_BASE 0x60
 #define SPMI_NUM_PERIPHERAL_IRQS 256
 #define SPMI_NUM_IRQS (SPMI_NUM_PERIPHERAL_IRQS + 32)
 
@@ -91,21 +97,21 @@ struct apple_spmi {
 
 static void apple_spmi_irq_ack_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_ACK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_ack + (irq / 32) * 4;
 
 	writel(BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_mask_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_MASK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask + (irq / 32) * 4;
 
 	writel(readl(reg) & ~BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_unmask_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_MASK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask + (irq / 32) * 4;
 
 	writel(readl(reg) | BIT(irq % 32), reg);
 }
@@ -187,7 +193,7 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	guard(mutex)(&spmi->fifo_lock);
 
 	if (spmi->prev_fail) {
-		if (spmi->hw->has_irq) {
+		if (spmi->hw->notify_fifo) {
 			writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + spmi->hw->rsp);
 			apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
 		} else {
@@ -393,15 +399,15 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	unsigned long val, offset, bit;
 
 	chained_irq_enter(chip, desc);
-	val = readl(spmi->regs + SPMI_IRQ_ACK_BASE + (SPMI_IRQ_NOTIFY / 32) * 4);
-	if (val & BIT(SPMI_IRQ_NOTIFY % 32)) {
+	val = readl(spmi->regs + spmi->hw->irq_ack + (SPMI_IRQ_NOTIFY / 32) * 4);
+	if (spmi->notify_irq && (val & BIT(SPMI_IRQ_NOTIFY % 32))) {
 		apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
 		complete(&spmi->fifo_rx);
 		handled = true;
 	}
 
 	for (offset = 0; offset < SPMI_NUM_PERIPHERAL_IRQS / 8; offset += sizeof(val)) {
-		val = readq(spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+		val = readq(spmi->regs + spmi->hw->irq_ack + offset);
 		/**
 		 * because of other masters in the bus, we're going to get a multitude of
 		 * interrupts we're not interested in. irq_resolve_mapping isn't very
@@ -441,21 +447,22 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
 	for (size_t offset = 0; offset < SPMI_NUM_IRQS / 8; offset += 4) {
-		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
-		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
+		writel(U32_MAX, spmi->regs + spmi->hw->irq_ack + offset);
 	}
 
 	spmi->irqd = devm_irq_domain_instantiate(&pdev->dev, &info);
 	if (IS_ERR(spmi->irqd))
 		return PTR_ERR(spmi->irqd);
 
-	spmi->notify_irq = true;
+	spmi->notify_irq = spmi->hw->notify_fifo;
 	ret = devm_add_action(&pdev->dev, remove_chained_handler, (void *)(uintptr_t)spmi->irq);
 	if (ret)
 		return ret;
 
 	irq_set_chained_handler_and_data(spmi->irq, apple_spmi_irq_handler, spmi);
-	apple_spmi_irq_unmask_raw(spmi, SPMI_IRQ_NOTIFY);
+	if (spmi->notify_irq)
+		apple_spmi_irq_unmask_raw(spmi, SPMI_IRQ_NOTIFY);
 
 	return 0;
 }
