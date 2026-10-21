@@ -16,7 +16,7 @@
 			      <4 0x02448000 0 0x4000>;
 			reg-names = "usb2", "eusb2";
 			#phy-cells = <0>;
-			power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_usb>;
+			power-domains = <&ps_atc0_usb_aon>, <&psd_atc0_usb>;
 			power-domain-names = "usb-aon", "usb";
 		};
 
@@ -32,7 +32,7 @@
 				    "pwr-ctrl", "bulk-fabric", "ausbc-debug";
 			interrupts = <AIC_IRQ 1621 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&usb0_dart0 1>, <&usb0_dart1 1>;
-			power-domains = <&ps_atc0_usb>;
+			power-domains = <&psd_atc0_usb>;
 			phys = <&usb2phy0>;
 			phy-names = "usb2-phy";
 			dr_mode = "peripheral";
