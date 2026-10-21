@@ -44,6 +44,13 @@ properties:
   mboxes:
     maxItems: 1
 
+  apple,smc-notifications:
+    type: boolean
+    description:
+      T8152 only. Enable SMC notifications and the power button / lid input
+      driver. Off by default because the T8152 notification traffic is not
+      qualified yet.
+
   gpio:
     $ref: /schemas/gpio/apple,smc-gpio.yaml
 
