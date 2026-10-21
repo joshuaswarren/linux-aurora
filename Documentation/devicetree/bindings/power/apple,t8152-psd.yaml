@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,t8152-psd.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152 PSD service slot power domain
+
+maintainers:
+  - Joshua Warren <joshua@joshuawarren.com>
+
+allOf:
+  - $ref: power-domain.yaml#
+
+description: |
+  The T8152 (M6) power state director (PSD) gates some blocks, among them the
+  ATC USB controllers and their DARTs, behind a per-port service slot. Each
+  slot has a 0x100 byte register window at the PSD base plus (slot << 8) with
+  the status (0x80), request (0x90), diagnostic (0xa0) and valid (0xbc)
+  registers. A consumer must power the parent PMGR domains (for ATC USB:
+  ATCn_USB_AON and ATCn_USB) first, then request state 0 (P0 RUN_MAX) and wait
+  for the acknowledge. This node models that as a power domain: the PMGR
+  domains are its parents (power-domains), powering it on writes the request.
+  Power-off requests state 6 (P6 RAIL_GATE).
+
+properties:
+  compatible:
+    const: apple,t8152-psd
+
+  reg:
+    maxItems: 1
+
+  "#power-domain-cells":
+    const: 0
+
+  power-domains:
+    description: Parent PMGR power domains, powered before the slot request.
+    minItems: 1
+    maxItems: 4
+
+  label:
+    description: Name of the power domain.
+
+  apple,psd-timeout-ms:
+    description: Acknowledge timeout in milliseconds (default 1000).
+
+required:
+  - compatible
+  - reg
+  - "#power-domain-cells"
+  - power-domains
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      ps_usb_aon: power-controller-aon {
+        #power-domain-cells = <0>;
+      };
+
+      ps_usb: power-controller-usb {
+        #power-domain-cells = <0>;
+      };
+
+      power-controller@303a14700 {
+        compatible = "apple,t8152-psd";
+        reg = <0x3 0x03a14700 0x0 0x100>;
+        #power-domain-cells = <0>;
+        power-domains = <&ps_usb_aon>, <&ps_usb>;
+        label = "psd_atc0_usb";
+      };
+    };
