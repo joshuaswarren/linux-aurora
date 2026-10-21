@@ -46,13 +46,8 @@
 
 #include <dt-bindings/gpio/gpio.h>
 
-&m6_smc {
-	m6_smc_gpio: gpio {
-		compatible = "apple,smc-gpio";
-		gpio-controller;
-		#gpio-cells = <2>;
-	};
-};
+/* The SMC gpio child comes from t8152-j873-smc.dtsi (smc_gpio); the DCP does
+ * not reference it (see the pwren note at the dcp node). */
 
 / {
 	clkref: clock-ref {
@@ -126,8 +121,10 @@
 	phys = <&dptx_phy>;
 	phy-names = "dp-phy";
 	hdmi-hpd-gpios = <&pinctrl_aop 41 GPIO_ACTIVE_HIGH>;
-	hdmi-pwren-gpios = <&m6_smc_gpio 15 GPIO_ACTIVE_HIGH>;
-	dp2hdmi-pwren-gpios = <&m6_smc_gpio 20 GPIO_ACTIVE_HIGH>;
+	/* No hdmi-pwren/dp2hdmi-pwren GPIOs: macsmc registers only telemetry
+	 * children on t8152, so the SMC gpio chip never instantiates and the
+	 * DCP probe would defer for ever. m1n1 has already asserted both
+	 * converter power pins, so they stay high for the whole session. */
 };
 
 /* DCP DART stream 23 and display DART stream 0/16 IOVA window: vm-base 1 TiB, vm-size 64 GiB. */
