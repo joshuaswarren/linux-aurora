@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8152 (M6) J873: GPU power through PSD service slots 3, 82 and 81.
+ *
+ * ADT: sgx power-gates/clock-gates/service-gates [3], gfx-asc [81], gfx1-asc [82], all PSD slots
+ * (< 170): the GPU has no PMGR power state, only these three PSD services (slot names in AppleT8152PMGR:
+ * 3 GPU_CLUSTER, 81 GPU_ASC0, 82 GPU_ASC1). Slot windows are 0x100 bytes at 0x303a10000 + (slot << 8).
+ *
+ * Native request order and states (J873, native 26A428, drivers/gpu/drm/asahi regs.rs): sgx 3 -> state 0,
+ * then gfx1-asc 82 -> state 2, then gfx-asc 81 -> state 2. One group domain does all three in that order
+ * when the gpu node attaches, and puts them back to state 6 in reverse when it detaches.
+ *
+ * Not included by any board file by default: attaching the gpu device writes the three PSD request
+ * registers at its probe, whether or not the driver then refuses to start the GPU.
+ */
+
+/ {
+	soc {
+		psd_gpu: power-controller@303a10300 {
+			compatible = "apple,t8152-psd-group";
+			reg = <0x3 0x03a10300 0x0 0x100>,	/* slot 3  GPU_CLUSTER (sgx) */
+			      <0x3 0x03a15200 0x0 0x100>,	/* slot 82 GPU_ASC1 (gfx1-asc) */
+			      <0x3 0x03a15100 0x0 0x100>;	/* slot 81 GPU_ASC0 (gfx-asc) */
+			apple,psd-states = <0 2 2>;
+			#power-domain-cells = <0>;
+			label = "psd_gpu";
+		};
+	};
+};
+
+&gpu {
+	power-domains = <&psd_gpu>;
+};
