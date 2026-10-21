@@ -13,6 +13,8 @@
 #define USB2_CONTROL		0x00
 #define USB2_RESET		0x04
 #define USB2_VBUS		0x08
+#define USB2_VBUS_FORCE		GENMASK(3, 0)
+#define USB2_HOST_MODE		GENMASK(14, 12)
 #define USB2_CLOCK		0x1c
 #define USB2_MODE		GENMASK(2, 0)
 #define USB2_RUN		2
@@ -58,8 +60,12 @@ static int apple_usb2_power_on(struct phy *phy)
 			return -EINVAL;
 		apple_tunable_apply(usb->usb2, usb->host);
 	}
-	apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(2));
-	apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(3));
+	if (usb->mode == PHY_MODE_USB_DEVICE) {
+		apple_usb2_update(usb->usb2 + USB2_VBUS, USB2_HOST_MODE, USB2_VBUS_FORCE);
+	} else {
+		apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(2));
+		apple_usb2_update(usb->usb2 + USB2_VBUS, 0, BIT(3));
+	}
 	msleep(10);
 	apple_usb2_update(usb->usb2 + USB2_RESET, USB2_SIDDQ, 0);
 	udelay(10);
