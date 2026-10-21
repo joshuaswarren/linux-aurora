@@ -48,6 +48,8 @@ static const struct apple_spmi_hw apple_spmi_gen1_hw = {
 	.status = 0, .cmd = 0x4, .rsp = 0x8, .rx_empty = BIT(24), .has_irq = true,
 };
 
+#define SPMI_GEN4_MIN_SIZE 0x1000
+
 static const struct apple_spmi_hw apple_spmi_gen4_hw = {
 	.status = 0x200, .cmd = 0x210, .rsp = 0x220, .rx_empty = BIT(30),
 };
@@ -462,6 +464,7 @@ static int apple_spmi_probe(struct platform_device *pdev)
 {
 	struct apple_spmi *spmi;
 	struct spmi_controller *ctrl;
+	struct resource *res;
 	int ret;
 
 	ctrl = devm_spmi_controller_alloc(&pdev->dev, sizeof(*spmi));
@@ -474,9 +477,21 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	init_completion(&spmi->fifo_rx);
 	platform_set_drvdata(pdev, spmi);
 
-	spmi->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(spmi->regs))
-		return PTR_ERR(spmi->regs);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return -ENODEV;
+	if (spmi->hw == &apple_spmi_gen4_hw && resource_size(res) < SPMI_GEN4_MIN_SIZE) {
+		/* DTBs from before gen 4 support describe only 0x100 bytes, the FIFO is at 0x200 */
+		dev_warn(&pdev->dev, "reg too small for gen 4 (%pa), mapping %#x\n",
+			 &res->start, SPMI_GEN4_MIN_SIZE);
+		spmi->regs = devm_ioremap(&pdev->dev, res->start, SPMI_GEN4_MIN_SIZE);
+		if (!spmi->regs)
+			return -ENOMEM;
+	} else {
+		spmi->regs = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(spmi->regs))
+			return PTR_ERR(spmi->regs);
+	}
 
 	ctrl->dev.of_node = pdev->dev.of_node;
 
