@@ -20,6 +20,16 @@
  *
  * Ack as in getPsdAck: valid bit 0 set and (status & 7) == requested state.
  *
+ * Slot groups: the GPU is three slots (3 GPU_CLUSTER, 82 GPU_ASC1, 81 GPU_ASC0) that must come up
+ * together, in that native order, with different active states (0, 2, 2). A node with compatible
+ * "apple,t8152-psd-group" lists one reg window per slot and apple,psd-states with each slot's
+ * active state; power_on requests the slots in reg order, power_off requests state 6 in reverse.
+ * Native order and states: J873 GPU power-on reproduced from native 26A428 (drivers/gpu/drm/asahi
+ * regs.rs T8152PsdService::active_state).
+ *
+ * The STATUS read clears the acknowledge (J873 hardware), so a request polls VALID first and reads
+ * STATUS only once VALID is set.
+ *
  * Lifetime: this domain sleeps in power_on (usleep_range polling), so it is not IRQ-safe.
  * The platform bus powers a consumer's single power domain on at attach time, before its
  * probe runs, which issues the request in process context. A consumer that marks its
@@ -50,58 +60,87 @@
 #define APPLE_PSD_P6_RAIL_GATE	6
 
 #define APPLE_PSD_DEFAULT_TIMEOUT_MS	1000	/* ADT pmgr-child psd-timeout-ms */
+#define APPLE_PSD_MAX_SLOTS		3
 
 struct apple_psd {
 	struct device *dev;
-	void __iomem *regs;
+	void __iomem *regs[APPLE_PSD_MAX_SLOTS];
+	u32 active[APPLE_PSD_MAX_SLOTS];
+	unsigned int nslots;
 	struct generic_pm_domain genpd;
 	unsigned int timeout_ms;
 };
 
 #define to_apple_psd(d) container_of(d, struct apple_psd, genpd)
 
-static int apple_psd_request(struct apple_psd *psd, u32 state)
+static int apple_psd_request(struct apple_psd *psd, unsigned int slot, u32 state)
 {
+	void __iomem *regs = psd->regs[slot];
 	unsigned long timeout = jiffies + msecs_to_jiffies(psd->timeout_ms);
-	u32 valid, status;
+	u32 valid = 0, status = 0;
 
-	writel(state, psd->regs + APPLE_PSD_REQUEST);
+	writel(state, regs + APPLE_PSD_REQUEST);
 
 	for (;;) {
-		valid = readl(psd->regs + APPLE_PSD_VALID);
-		status = readl(psd->regs + APPLE_PSD_STATUS);
-		if ((valid & APPLE_PSD_VALID_BIT) &&
-		    FIELD_GET(APPLE_PSD_STATE, status) == state)
-			return 0;
+		valid = readl(regs + APPLE_PSD_VALID);
+		if (valid & APPLE_PSD_VALID_BIT) {
+			/* Reading STATUS clears the acknowledge, so only after VALID. */
+			status = readl(regs + APPLE_PSD_STATUS);
+			if (FIELD_GET(APPLE_PSD_STATE, status) == state)
+				return 0;
+		}
 		if (time_after(jiffies, timeout))
 			break;
 		usleep_range(50, 200);
 	}
 
 	dev_err(psd->dev,
-		"PSD request %u not acknowledged: valid %#x status %#x diag %#x\n", state,
-		valid, status, readl(psd->regs + APPLE_PSD_DIAG));
+		"PSD slot %u request %u not acknowledged: valid %#x status %#x diag %#x\n", slot,
+		state, valid, status, readl(regs + APPLE_PSD_DIAG));
 	return -ETIMEDOUT;
 }
 
 static int apple_psd_power_on(struct generic_pm_domain *genpd)
 {
-	return apple_psd_request(to_apple_psd(genpd), APPLE_PSD_P0_RUN_MAX);
+	struct apple_psd *psd = to_apple_psd(genpd);
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < psd->nslots; i++) {
+		ret = apple_psd_request(psd, i, psd->active[i]);
+		if (ret)
+			goto undo;
+	}
+	return 0;
+
+undo:
+	/* Best effort: put the slots already brought up back to idle, newest first. */
+	while (i--)
+		apple_psd_request(psd, i, APPLE_PSD_P6_RAIL_GATE);
+	return ret;
 }
 
 static int apple_psd_power_off(struct generic_pm_domain *genpd)
 {
-	return apple_psd_request(to_apple_psd(genpd), APPLE_PSD_P6_RAIL_GATE);
+	struct apple_psd *psd = to_apple_psd(genpd);
+	int i, ret, first = 0;
+
+	for (i = psd->nslots - 1; i >= 0; i--) {
+		ret = apple_psd_request(psd, i, APPLE_PSD_P6_RAIL_GATE);
+		if (ret && !first)
+			first = ret;
+	}
+	return first;
 }
 
 static int apple_psd_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
-	struct of_phandle_iterator it;
 	struct apple_psd *psd;
 	const char *name;
 	u32 status, valid;
+	unsigned int i;
 	int ret;
 
 	psd = devm_kzalloc(dev, sizeof(*psd), GFP_KERNEL);
@@ -111,9 +150,30 @@ static int apple_psd_probe(struct platform_device *pdev)
 	psd->timeout_ms = APPLE_PSD_DEFAULT_TIMEOUT_MS;
 	of_property_read_u32(node, "apple,psd-timeout-ms", &psd->timeout_ms);
 
-	psd->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(psd->regs))
-		return PTR_ERR(psd->regs);
+	for (i = 0; i < APPLE_PSD_MAX_SLOTS; i++) {
+		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+
+		if (!res)
+			break;
+		psd->regs[i] = devm_ioremap_resource(dev, res);
+		if (IS_ERR(psd->regs[i]))
+			return PTR_ERR(psd->regs[i]);
+		psd->nslots++;
+	}
+	if (!psd->nslots)
+		return dev_err_probe(dev, -EINVAL, "no register window\n");
+
+	/* Per-slot active state, in reg order; default 0 (P0 RUN_MAX). */
+	if (of_property_present(node, "apple,psd-states")) {
+		ret = of_property_read_u32_array(node, "apple,psd-states", psd->active,
+						 psd->nslots);
+		if (ret)
+			return dev_err_probe(dev, ret, "apple,psd-states needs one cell per reg\n");
+		for (i = 0; i < psd->nslots; i++)
+			if (psd->active[i] >= APPLE_PSD_P6_RAIL_GATE)
+				return dev_err_probe(dev, -EINVAL, "bad PSD active state %u\n",
+						     psd->active[i]);
+	}
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret)
@@ -128,8 +188,8 @@ static int apple_psd_probe(struct platform_device *pdev)
 	 * power_on then issues the request (idempotent if the slot already runs P0).
 	 * A status read is safe (proven on hardware); no write happens at probe.
 	 */
-	status = readl(psd->regs + APPLE_PSD_STATUS);
-	valid = readl(psd->regs + APPLE_PSD_VALID);
+	status = readl(psd->regs[0] + APPLE_PSD_STATUS);
+	valid = readl(psd->regs[0] + APPLE_PSD_VALID);
 
 	ret = pm_genpd_init(&psd->genpd, NULL, true);
 	if (ret)
@@ -142,27 +202,31 @@ static int apple_psd_probe(struct platform_device *pdev)
 	}
 
 	/* The PMGR parents are brought up before power_on runs. */
-	of_for_each_phandle(&it, ret, node, "power-domains", "#power-domain-cells", -1) {
+	for (i = 0; ; i++) {
 		struct of_phandle_args parent, child;
 
-		parent.np = it.node;
-		parent.args_count = of_phandle_iterator_args(&it, parent.args, MAX_PHANDLE_ARGS);
+		ret = of_parse_phandle_with_args(node, "power-domains", "#power-domain-cells", i,
+						 &parent);
+		if (ret == -ENOENT)
+			break;	/* no (more) parents */
+		if (ret)
+			goto err_unlink;
 		child.np = node;
 		child.args_count = 0;
 		ret = of_genpd_add_subdomain(&parent, &child);
-		if (ret < 0) {
-			if (ret != -EPROBE_DEFER)
-				dev_err(dev, "failed to add parent domain %s: %d\n", it.node->name, ret);
-			of_node_put(parent.np);
+		if (ret < 0 && ret != -EPROBE_DEFER)
+			dev_err(dev, "failed to add parent domain %pOFn: %d\n", parent.np, ret);
+		of_node_put(parent.np);
+		if (ret < 0)
 			goto err_unlink;
-		}
 	}
+	ret = 0;
 
 	/* Parent domains are handled through the genpd hierarchy, not as a device. */
 	pm_genpd_remove_device(dev);
 
-	dev_info(dev, "PSD slot domain %s (status %#x valid %#x at probe, starting off)\n", name,
-		 status, valid);
+	dev_info(dev, "PSD slot domain %s, %u slot(s) (status %#x valid %#x at probe, starting off)\n",
+		 name, psd->nslots, status, valid);
 	return 0;
 
 err_unlink:
@@ -175,6 +239,7 @@ err_remove:
 
 static const struct of_device_id apple_psd_of_match[] = {
 	{ .compatible = "apple,t8152-psd" },
+	{ .compatible = "apple,t8152-psd-group" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_psd_of_match);

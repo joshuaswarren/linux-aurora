@@ -23,23 +23,41 @@ description: |
   domains are its parents (power-domains), powering it on writes the request.
   Power-off requests state 6 (P6 RAIL_GATE).
 
+  A "apple,t8152-psd-group" node covers several slots that are brought up
+  together (the GPU: slots 3, 82 and 81): one reg window per slot, requested
+  in reg order with the active state given by apple,psd-states, and put back
+  to state 6 in reverse order.
+
 properties:
   compatible:
-    const: apple,t8152-psd
+    enum:
+      - apple,t8152-psd
+      - apple,t8152-psd-group
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 3
 
   "#power-domain-cells":
     const: 0
 
   power-domains:
-    description: Parent PMGR power domains, powered before the slot request.
+    description:
+      Parent PMGR power domains, powered before the slot request. Absent when
+      the block has no PMGR power state (the GPU slots).
     minItems: 1
     maxItems: 4
 
   label:
     description: Name of the power domain.
+
+  apple,psd-states:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 3
+    description:
+      Active PSD state requested for each reg window, in reg order (default
+      0, P0 RUN_MAX). Each value is 0 to 5.
 
   apple,psd-timeout-ms:
     description: Acknowledge timeout in milliseconds (default 1000).
@@ -48,7 +66,6 @@ required:
   - compatible
   - reg
   - "#power-domain-cells"
-  - power-domains
 
 unevaluatedProperties: false
 
@@ -72,5 +89,20 @@ examples:
         #power-domain-cells = <0>;
         power-domains = <&ps_usb_aon>, <&ps_usb>;
         label = "psd_atc0_usb";
+      };
+    };
+  - |
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      power-controller@303a10300 {
+        compatible = "apple,t8152-psd-group";
+        reg = <0x3 0x03a10300 0x0 0x100>,
+              <0x3 0x03a15200 0x0 0x100>,
+              <0x3 0x03a15100 0x0 0x100>;
+        apple,psd-states = <0 2 2>;
+        #power-domain-cells = <0>;
+        label = "psd_gpu";
       };
     };
