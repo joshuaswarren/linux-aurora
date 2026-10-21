@@ -31,7 +31,7 @@
 		 */
 		nub_spmi0: spmi@308714000 {
 			compatible = "apple,t8152-spmi", "apple,t8103-spmi";
-			reg = <0x3 0x08714000 0x0 0x100>;
+			reg = <0x3 0x08714000 0x0 0x4000>;
 			#address-cells = <2>;
 			#size-cells = <0>;
 			#interrupt-cells = <2>;
