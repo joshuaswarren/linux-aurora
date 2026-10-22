@@ -2276,6 +2276,8 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
+        // T8152 (J873): INFERRED to boot like the T8140 (setup port, EPIC v4): same firmware code base (w7Y FW-NOTES).
+        (of::DeviceId::new(c_str!("apple,t8152-aop")), &HW_CFG_T8140),
     ]
 );
 
