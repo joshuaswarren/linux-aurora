@@ -288,6 +288,7 @@
 #include "t8152-j873-qspi.dtsi"
 
 #include "t8152-peripherals.dtsi"
+#include "t8152-j873g-peripherals.dtsi"
 
 /* Retain the register view published by this board's live hardware capture. */
 &dwc3_0_dart {
