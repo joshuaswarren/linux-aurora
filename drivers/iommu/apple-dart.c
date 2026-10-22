@@ -903,10 +903,39 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 			 drained);
 }
 
+/* Bits of the 32-stream word that belong to Linux on a shared (owned-streams) DART. */
+static u32 apple_dart_owned_word(struct apple_dart *dart, unsigned int word)
+{
+	u32 mask = 0;
+	unsigned int bit;
+
+	for (bit = 0; bit < 32; bit++)
+		if (word * 32 + bit < dart->num_streams &&
+		    test_bit(word * 32 + bit, dart->owned))
+			mask |= BIT(bit);
+	return mask;
+}
+
 static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
 {
 	if (dart->pmp_sid6_only)
 		return;
+
+	/*
+	 * Shared DART: ENABLE_STREAMS is a plain bitmap that firmware set up for the other
+	 * streams (AOP, MTP, the PMP and the secure SIDs). Writing only our bits would
+	 * switch every one of them off, so read-modify-write and only ever add ours.
+	 */
+	if (dart->has_owned) {
+		for (int word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
+			u32 ours = apple_dart_owned_word(dart, word);
+			u32 reg = dart->hw->enable_streams + 4 * word;
+
+			if (ours)
+				apple_dart_writel(dart, apple_dart_readl(dart, reg) | ours, reg);
+		}
+		return;
+	}
 
 	for (int word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
 		u32 mask = U32_MAX;
@@ -2112,8 +2141,13 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev, bool gen3)
 	 */
 	for (i = 0; i < words && i < 8; i++) {
 		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
-		unsigned long bits = pending;
+		unsigned long bits;
 		unsigned int bit;
+
+		/* Shared DART: a latched exception of firmware's streams is not ours to ack. */
+		if (dart->has_owned)
+			pending &= apple_dart_owned_word(dart, i);
+		bits = pending;
 
 		if (!pending)
 			continue;
