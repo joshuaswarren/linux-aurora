@@ -30,6 +30,7 @@ properties:
           - apple,t6000-dart
           - apple,t8152-dart
           - apple,t8152-sbr-dart
+          - apple,t8152-sbr-dart-inherited
       - items:
           - enum:
               - apple,t6000-dart
@@ -60,6 +61,15 @@ properties:
   apple,num-streams:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Stream count assumed by apple,static-topology (default 16).
+
+  apple,inherited-roots:
+    type: boolean
+    description: |
+      apple,t8152-dart and apple,t8152-sbr-dart. Treat the DART as locked even though its PROTECT lock bit is
+      clear: iBoot left the listed streams translating with page-table roots that hold firmware mappings, so
+      the DART is never reset, TCR/TTBR are never written, and every consumer publishes into the vacant slots
+      of the inherited root (the path used for locked DARTs). With apple,owned-streams, the listed streams are
+      the ones consumers may reference.
 
   apple,owned-streams:
     $ref: /schemas/types.yaml#/definitions/uint32-array

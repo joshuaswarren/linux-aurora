@@ -2744,7 +2744,8 @@ params_done:
 		ret = enabled_count;
 		goto err_clk_disable;
 	}
-	if (of_device_is_compatible(dev->of_node, "apple,t8152-sbr-dart") && !dart->has_owned) {
+	if ((of_device_is_compatible(dev->of_node, "apple,t8152-sbr-dart") ||
+	     of_device_is_compatible(dev->of_node, "apple,t8152-sbr-dart-inherited")) && !dart->has_owned) {
 		/* The shared SBR DART must never be reset as a whole: firmware streams live in it. */
 		dev_err(dev, "apple,t8152-sbr-dart needs apple,owned-streams\n");
 		ret = -EINVAL;
@@ -2777,7 +2778,9 @@ params_done:
 	if (tunneled)
 		dart->locked = false;
 	else
-		dart->locked = !dart->static_topo && apple_dart_is_locked(dart);
+		dart->locked = !dart->static_topo && (apple_dart_is_locked(dart) ||
+			of_property_read_bool(dev->of_node, "apple,inherited-roots") ||
+			of_device_is_compatible(dev->of_node, "apple,t8152-sbr-dart-inherited"));
 	if (!dart->locked && !dart->static_topo &&
 	    !(dart->hw->gen3 && (gen3_skip & 2))) {
 		ret = apple_dart_hw_reset(dart);
@@ -3058,6 +3061,7 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
 	{ .compatible = "apple,t8152-dart", .data = &apple_dart_hw_t8152 },
 	{ .compatible = "apple,t8152-sbr-dart", .data = &apple_dart_hw_t8152 },
+	{ .compatible = "apple,t8152-sbr-dart-inherited", .data = &apple_dart_hw_t8152 },
 	{ .compatible = "apple,t6000-dart", .data = &apple_dart_hw_t6000 },
 	{},
 };
