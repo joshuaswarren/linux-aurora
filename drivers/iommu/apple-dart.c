@@ -269,6 +269,13 @@ struct apple_dart {
 	u32 pmp_sid6_only : 1;
 	u32 has_static_enabled : 1;
 	DECLARE_BITMAP(static_enabled, DART_MAX_STREAMS);
+	/*
+	 * Shared DART (the T8152 SBR): only these streams belong to Linux. Reset, enable,
+	 * suspend/resume and consumer xlate never touch another stream, whose translation
+	 * firmware and coprocessors (AOP, MTP, PMP) still use.
+	 */
+	u32 has_owned : 1;
+	DECLARE_BITMAP(owned, DART_MAX_STREAMS);
 	u32 tunneled : 1;
 	u32 power_retained : 1;
 	struct apple_tunable *tunables;
@@ -982,7 +989,10 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
-	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
+	if (dart->has_owned)
+		bitmap_copy(stream_map.sidmap, dart->owned, DART_MAX_STREAMS);
+	else
+		bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
@@ -1721,6 +1731,8 @@ static int apple_dart_of_xlate(struct device *dev,
 		return -EINVAL;
 	sid = args->args[0];
 	if (sid >= dart->num_streams)
+		return -EINVAL;
+	if (dart->has_owned && !test_bit(sid, dart->owned))
 		return -EINVAL;
 	if (dart->pmp_sid6_only &&
 	    (sid != 6 || !of_device_is_compatible(dev->of_node,
@@ -2538,6 +2550,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		 */
 		if (apple_dart_is_locked(dart))
 			dev_info(dev, "Gen3 DART is locked: not applying tunables\n");
+		else if (of_property_present(dev->of_node, "apple,owned-streams"))
+			dev_info(dev, "shared Gen3 DART: tunables left as firmware set them\n");
 		else if (gen3_skip & 1)
 			dev_info(dev, "gen3_skip: tunables skipped\n");
 		else
@@ -2663,6 +2677,28 @@ params_done:
 				goto err_clk_disable;
 			}
 			set_bit(sid, dart->static_enabled);
+		}
+	} else if (enabled_count != -EINVAL) {
+		ret = enabled_count;
+		goto err_clk_disable;
+	}
+
+	enabled_count = of_property_count_u32_elems(dev->of_node, "apple,owned-streams");
+	if (enabled_count > 0) {
+		for (int i = 0; i < enabled_count; i++) {
+			ret = of_property_read_u32_index(dev->of_node, "apple,owned-streams",
+							 i, &sid);
+			if (ret || sid >= dart->num_streams) {
+				ret = ret ?: -ERANGE;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->owned);
+		}
+		dart->has_owned = true;
+		/* Enable only our streams; the others are already set up. */
+		if (!dart->has_static_enabled) {
+			bitmap_copy(dart->static_enabled, dart->owned, DART_MAX_STREAMS);
+			dart->has_static_enabled = true;
 		}
 	} else if (enabled_count != -EINVAL) {
 		ret = enabled_count;
@@ -2913,6 +2949,8 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 		return 0;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (dart->has_owned && !test_bit(sid, dart->owned))
+			continue;
 		dart->save_tcr[sid] = apple_dart_readl(dart,
 						       DART_TCR(dart, sid));
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
@@ -2953,6 +2991,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	}
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (dart->has_owned && !test_bit(sid, dart->owned))
+			continue;
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 			apple_dart_writel(dart, dart->save_ttbr[sid][idx],
 					   DART_TTBR(dart, sid, idx));

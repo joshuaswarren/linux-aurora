@@ -60,6 +60,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Stream count assumed by apple,static-topology (default 16).
 
+  apple,owned-streams:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: |
+      apple,t8152-dart only. The DART is shared with firmware and coprocessors
+      (the T8152 SBR DART): only these stream ids belong to the OS. Reset,
+      stream enable, suspend/resume and consumer iommus entries never touch
+      another stream, and the DART tunables are left as firmware set them.
+
   clocks:
     description:
       Reference to the gate clock phandle if required for this IOMMU.
