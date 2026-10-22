@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873 (Mac mini M6) SMC power sensors, from the 2068-key list captured on the live machine
+ * (receipts/2026-10-21-m6-desktop/smc-keys-1640Z.txt, idle desktop).
+ *
+ * Only keys whose meaning is cross-checked are listed:
+ *  - VD0R 12.561 V x ID0R 0.418 A = 5.25 W, and PDTR reads 5.246 W: AC (DC-in) input voltage, current
+ *    and power. Same key names and meanings as hwmon-common.dtsi on the M1/M2 minis.
+ *  - PHPC 1.78 W (same name as the laptops' "Heatpipe Power"; PPSM reads the same value, not listed).
+ * Left out on purpose:
+ *  - PSTR (Total System Power) and PMVR (3.8 V rail power) exist but read 0.0 here, so they would only
+ *    report a false zero.
+ *  - PMVC/VMVC/IMVC read 24.5 W / 3.81 V / 6.44 A: the power exceeds the AC input, so it cannot be a
+ *    measurement of the same kind (maybe a limit); meaning unknown.
+ *  - the ~75 other nonzero P, V and I rail keys (VP0b, IP0b, ...): rail names are not established.
+ * Temperatures are in t8152-j873-thermal-sensors.dtsi (125 typed float channels). Fan control keys
+ * (F0Tg target, F0md mode) are not listed: firmware keeps the fan automatic and the hwmon driver would
+ * otherwise expose a writable control.
+ */
+&m6_smc_hwmon {
+	power-PDTR {
+		apple,key-id = "PDTR";
+		label = "AC Input Power";
+	};
+	voltage-VD0R {
+		apple,key-id = "VD0R";
+		label = "AC Input Voltage";
+	};
+	current-ID0R {
+		apple,key-id = "ID0R";
+		label = "AC Input Current";
+	};
+	power-PHPC {
+		apple,key-id = "PHPC";
+		label = "Heatpipe Power";
+	};
+};
