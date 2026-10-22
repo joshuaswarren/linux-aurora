@@ -39,6 +39,7 @@ properties:
               - apple,t8112-nvme-ans2
               - apple,t6000-nvme-ans2
           - const: apple,nvme-ans2
+      - const: apple,t8152-nvme-ans2
 
   reg:
     minItems: 2
@@ -192,6 +193,22 @@ allOf:
     else:
       properties:
         apple,sleep-wake-delay-ms: false
+      required:
+        - resets
+        - power-domains
+        - power-domain-names
+
+  # T8152 also has no reset line and no PMGR power domains: the ANS is a
+  # virtual PMGR device there. It joins T6050 in the exemption below.
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              anyOf:
+                - const: apple,t6050-nvme-ans2
+                - const: apple,t8152-nvme-ans2
+    then:
       required:
         - resets
         - power-domains
