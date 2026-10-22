@@ -19,7 +19,11 @@ description: |
   the PMGR MMIO region it is represented as a sub-node of the PMGR
   syscon with reg used as an offset into it.
 
-  In both cases the reset id is the CIO port index on the die.
+  On t8152 the request and done registers are two adjacent words in the PMGR
+  region and, as on t600x, are a sub-node of the PMGR syscon; reg is the offset
+  of the request register and the reset id is the CIO cluster index.
+
+  In all cases the reset id is the CIO port index on the die.
 
 properties:
   compatible:
@@ -27,6 +31,7 @@ properties:
       - enum:
           - apple,t8103-cio-reset
           - apple,t6000-cio-reset
+          - apple,t8152-cio-reset
       - items:
           - const: apple,t8112-cio-reset
           - const: apple,t8103-cio-reset
