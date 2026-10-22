@@ -86,3 +86,14 @@ config PHY_APPLE_T6050_DP
 	  Fixed HDMI bridges and Type-C USB host/DisplayPort alternate mode.
 	  One owner coordinates the shared PHY, firmware, PIPE and USB2 state.
 	  Requires named register banks, power domains and firmware tunables.
+
+config PHY_APPLE_T8152_USB2
+	tristate "Apple T8152 fixed-host USB2 PHY"
+	default ARCH_APPLE
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on PM
+	select GENERIC_PHY
+	select APPLE_TUNABLE
+	help
+	  Enable the USB2-only PHY for fixed host ports on Apple T8152.
+	  This does not configure the USB3 or USB4 lanes.
