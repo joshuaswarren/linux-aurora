@@ -29,6 +29,7 @@ properties:
           - apple,t8110-dart
           - apple,t6000-dart
           - apple,t8152-dart
+          - apple,t8152-sbr-dart
       - items:
           - enum:
               - apple,t6000-dart
@@ -63,7 +64,7 @@ properties:
   apple,owned-streams:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description: |
-      apple,t8152-dart only. The DART is shared with firmware and coprocessors
+      apple,t8152-dart and apple,t8152-sbr-dart (which requires it). The DART is shared with firmware and coprocessors
       (the T8152 SBR DART): only these stream ids belong to the OS. Reset,
       stream enable, suspend/resume and consumer iommus entries never touch
       another stream, and the DART tunables are left as firmware set them.

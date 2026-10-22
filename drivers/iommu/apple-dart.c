@@ -850,6 +850,9 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 
 	if (dart->hw->type != DART_T8110 || dart->version < 0x0202)
 		return;
+	/* Shared DART: the latched exceptions of the other streams are not ours to acknowledge. */
+	if (dart->has_owned)
+		return;
 
 	for (i = 0; i < DIV_ROUND_UP(dart->num_streams, 32) && i < 8; i++) {
 		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
@@ -918,6 +921,9 @@ static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
 					mask |= BIT(bit);
 			}
 		}
+		/* Shared DART: never write a word that holds none of our streams. */
+		if (dart->has_owned && !mask)
+			continue;
 		apple_dart_writel(dart, mask,
 				   dart->hw->enable_streams + 4 * word);
 	}
@@ -2704,6 +2710,12 @@ params_done:
 		ret = enabled_count;
 		goto err_clk_disable;
 	}
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-sbr-dart") && !dart->has_owned) {
+		/* The shared SBR DART must never be reset as a whole: firmware streams live in it. */
+		dev_err(dev, "apple,t8152-sbr-dart needs apple,owned-streams\n");
+		ret = -EINVAL;
+		goto err_clk_disable;
+	}
 
 	dart->locked = !dart->static_topo && apple_dart_is_locked(dart);
 	if (dart->pmp_sid6_only) {
@@ -3011,6 +3023,7 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
 	{ .compatible = "apple,t8152-dart", .data = &apple_dart_hw_t8152 },
+	{ .compatible = "apple,t8152-sbr-dart", .data = &apple_dart_hw_t8152 },
 	{ .compatible = "apple,t6000-dart", .data = &apple_dart_hw_t6000 },
 	{},
 };
