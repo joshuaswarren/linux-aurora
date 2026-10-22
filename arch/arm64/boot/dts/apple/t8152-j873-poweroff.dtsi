@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873: make poweroff a real power-off. NOT included by the board file by default (experiment).
+ *
+ * macsmc-reboot writes SMC MBSE = 'offw' then 'off1' for poweroff, but the PMU only stays off if the
+ * boot-key flag (PMU key 0xf, SPMI address leg_scrpad 0xf800 + 0xf = 0xf80f) is set; without the
+ * shutdown_flag cell the request is carried out as a restart (observed on the J873).
+ *
+ * Bit 3 is the Asahi convention on t8103, t8122 and t8140 (boot key 0xf bit 3). The macOS decode
+ * (AppleDialogSPMIPMU::_shutdownGated on the M6: read key 0xf, mask 0x27 which CLEARS bit 3, then OR 0x10
+ * or 0x90) points at bit 4 instead. Bit 3 is the first thing to try; if the machine still restarts, change
+ * the cell to bits = <4 1> (unit name shutdown-flag@f80f,4) and retry. A failed attempt only restarts the
+ * machine; the cell is written 1 at poweroff and 0 at restart.
+ * After a successful poweroff the mini needs a physical power-on.
+ */
+&{/soc/spmi@308714000/pmic@e/nvmem-layout} {
+	shutdown_flag: shutdown-flag@f80f,3 {
+		reg = <0xf80f 0x1>;
+		bits = <3 1>;
+	};
+};
+
+&smc_reboot {
+	nvmem-cells = <&shutdown_flag>, <&boot_stage>, <&boot_error_count>, <&panic_count>;
+	nvmem-cell-names = "shutdown_flag", "boot_stage", "boot_error_count", "panic_count";
+};
