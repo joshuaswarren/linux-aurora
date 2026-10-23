@@ -67,7 +67,15 @@
  */
 #define REG_CHAN_BASE_LEGACY(ch)	(0x8000 + (ch) * 0x200)
 #define REG_CHAN_BASE_EVOLVED(ch)	(((ch) & 1 ? 0xc000 : 0x8000) + ((ch) / 2) * 0x200)
-#define REG_CHAN_BASE(ad, ch)		((ad)->evolved_layout ? \
+/*
+ * T8152 has no channel blocks at 0x8000/0xc000: every channel owns a 16 KiB
+ * aperture, the TX ones from 0x40000 and the RX ones from 0x80000, with the
+ * per-channel register layout of the other variants inside.  The FIFO ports
+ * stay at 0x10000.
+ */
+#define REG_CHAN_BASE_APERTURE(ch)	(((ch) & 1 ? 0x80000 : 0x40000) + ((ch) / 2) * 0x4000)
+#define REG_CHAN_BASE(ad, ch)		((ad)->chan_aperture ? REG_CHAN_BASE_APERTURE(ch) : \
+					 (ad)->evolved_layout ? \
 					 REG_CHAN_BASE_EVOLVED(ch) : REG_CHAN_BASE_LEGACY(ch))
 
 #define REG_CHAN_CTL(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x00)
@@ -152,6 +160,7 @@ struct admac_data {
 
 	bool set_unk28;
 	bool evolved_layout;
+	bool chan_aperture;
 	int irq;
 	int irq_index;
 	int nchannels;
@@ -175,6 +184,7 @@ struct admac_tx {
 struct admac_hw {
 	bool set_unk28;
 	bool evolved_layout;
+	bool chan_aperture;
 };
 
 static int admac_alloc_sram_carveout(struct admac_data *ad,
@@ -907,6 +917,7 @@ static int admac_probe(struct platform_device *pdev)
 	ad->nchannels = nchannels;
 	ad->set_unk28 = hw->set_unk28;
 	ad->evolved_layout = hw->evolved_layout;
+	ad->chan_aperture = hw->chan_aperture;
 	mutex_init(&ad->cache_alloc_lock);
 
 	/*
@@ -1038,6 +1049,7 @@ static const struct admac_hw admac_t8152_hw = {
 	/* macOS writes no global 0x28/0x2c value on this SoC */
 	.set_unk28 = false,
 	.evolved_layout = true,
+	.chan_aperture = true,
 };
 
 static const struct of_device_id admac_of_match[] = {
