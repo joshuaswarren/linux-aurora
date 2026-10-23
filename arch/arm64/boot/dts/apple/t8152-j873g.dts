@@ -250,6 +250,7 @@
 
 #include "t8152-j873g-peripherals.dtsi"
 #include "t8152-j873-pmgr.dtsi"
+#include "t8152-j873-qspi.dtsi"
 #include "t8152-j873-usb2-dart.dtsi"
 #include "t8152-j873-usb2.dtsi"
 #include "t8152-j873-usb0-dart.dtsi"
