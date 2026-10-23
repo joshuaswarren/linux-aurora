@@ -1251,7 +1251,14 @@ static void apple_nhi_ring_configure(struct tb_ring *ring, u32 flags, u32 e2e_fl
 		options += APPLE_CIO_NHI_RXRING_DESC_BASE;
 
 		sof_eof_mask = ring->sof_mask << 16 | ring->eof_mask;
-		writel(sof_eof_mask, options + 4);
+		/*
+		 * T8152 has no PDF range (the ACIO+0xdb0000 block of the M1/M2 DT
+		 * aborts on a read) and macOS never writes RX options + 4 there:
+		 * without a "pdf" range only the ring options are programmed. Type 7
+		 * keeps the masks in the receive ring registers.
+		 */
+		if (anhi->pdf_base || (anhi->acio && anhi->acio->type7))
+			writel(sof_eof_mask, options + 4);
 		if (anhi->pdf_base)
 			writel(sof_eof_mask,
 			       anhi->pdf_base + ring->hop * APPLE_CIO_NHI_PDF_STRIDE);
@@ -2052,9 +2059,13 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	}
 	apple_tunable_apply(anhi->nhi_base, tunable);
 
-	/* Type 7 keeps the PDF masks in the receive ring registers only. */
-	if (!acio->type7) {
-		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pdf");
+	/*
+	 * The M1/M2 DTs carry a "pdf" range; type 7 keeps the PDF masks in the
+	 * receive ring registers only, and T8152 has no "pdf" range at all
+	 * (see apple_nhi_ring_configure).
+	 */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pdf");
+	if (res && !acio->type7) {
 		anhi->pdf_base = devm_ioremap_resource(&pdev->dev, res);
 		if (IS_ERR(anhi->pdf_base)) {
 			ret = dev_err_probe(&pdev->dev, PTR_ERR(anhi->pdf_base),
