@@ -1809,6 +1809,25 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.primary_bclk_ratio = 125,
 };
 
+/*
+ * J873 (Mac mini, T8152): AOP-fed like the J700, but the speaker amplifier is
+ * an SN012776 on the AP's I2C bus and needs no software gain. The speakers
+ * stay disabled until the speaker path is verified on hardware (the amplifier
+ * model and the speaker count are not confirmed); the jack works first. The
+ * front-end DAIs are those of the AOP audio component, which keeps the
+ * T8140 names. The serial link format is the macaudio default until the
+ * firmware's stream-format property has been read on this machine.
+ */
+struct macaudio_platform_cfg macaudio_j873_cfg = {
+	.enable_speakers = false,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -1898,6 +1917,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
+	/* j873    AID?    sn012776    15      1x 1W    (AOP-fed, speakers disabled) */
+	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
