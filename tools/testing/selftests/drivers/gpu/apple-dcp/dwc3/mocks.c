@@ -103,6 +103,9 @@ struct dwc3_apple {
 	/* J714s only: the start after a sleep waits for its Type-C PHY; never set here. */
 	bool sleep_phy_wait, sleep_phy_pending;
 	bool dt_dis_u3_susphy;
+	bool fixed_hub, core_active, core_exit_pending, reset_pending;
+	bool t8152_usb2, fixed_peripheral;
+	void *tunable_regs[6];
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 	/* The PM sleep epoch (dwc3_apple_pm_notify()); the fixtures stay IDLE. */
 	int sleep_pm_lock;
