@@ -3098,6 +3098,30 @@ static int apple_dart_cfg_ensure_ready(struct apple_dart_master_cfg *cfg)
 	return 0;
 }
 
+/*
+ * A DART of a PCIe-C tunnel sits in the container node of its tunneled root complex:
+ * a sibling with a PCIe-C compatible marks it. The legacy container name is kept as a
+ * second test so that no existing device tree changes its behaviour.
+ */
+static bool apple_dart_is_tunneled(struct device_node *np)
+{
+	struct device_node *parent = of_get_parent(np);
+	struct device_node *child;
+	bool tunneled;
+
+	if (!parent)
+		return false;
+
+	tunneled = of_node_name_prefix(parent, "usb4-pcie-tunnel-");
+	for_each_child_of_node(parent, child) {
+		if (of_device_is_compatible(child, "apple,t8103-pciec") ||
+		    of_device_is_compatible(child, "apple,t6000-pciec"))
+			tunneled = true;
+	}
+	of_node_put(parent);
+	return tunneled;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -3107,9 +3131,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	struct apple_dart *dart;
 	struct device *dev = &pdev->dev;
 	u64 dma_range[2];
-	bool tunneled = dev->of_node->parent &&
-			 of_node_name_prefix(dev->of_node->parent,
-					     "usb4-pcie-tunnel-");
+	bool tunneled = apple_dart_is_tunneled(dev->of_node);
 
 	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
 	if (!dart)
