@@ -620,6 +620,9 @@ struct SndSocT8140AopData {
     /// [`SndSocT8140AopData::lpai_run_get`].
     #[pin]
     lpai_run: Mutex<LpaiRun>,
+    /// The T8152 speaker's thermal limiter, see [`spk_thermal`].
+    #[pin]
+    spkr_thermal: SpinLock<SpkThermal>,
 }
 
 const SPKR_START_WORK: u64 = 0;
@@ -2320,7 +2323,7 @@ unsafe extern "C" fn asoc_pcm_hw_params(
 /// Called by ASoC on this driver's registered component, with live
 /// arguments belonging to one of its links.
 unsafe extern "C" fn asoc_pcm_prepare(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> i32 {
     // SAFETY: ASoC hands its ops a live substream whose private data is the
@@ -2340,6 +2343,12 @@ unsafe extern "C" fn asoc_pcm_prepare(
         // SAFETY: the managed buffer is dma_bytes long and no DMA runs before
         // trigger START.
         unsafe { ptr::write_bytes(area, 0, bytes) };
+    }
+    // SAFETY: ASoC calls this op on a component whose descriptor/context stays live.
+    let data = unsafe { component_data(component) };
+    if !data.has_lpai {
+        // The speaker cooled while no stream ran.
+        data.spkr_thermal.lock().cool_idle();
     }
     0
 }
@@ -2369,6 +2378,177 @@ fn spkr_f32_bits(sample: i32, gain_q31: u32) -> u32 {
     let scaled = (i64::from(sample) * i64::from(gain_q31)) >> 31; // |scaled| < SPKR_CEILING_Q31
     f32_bits_of_q31(scaled as i32)
 }
+
+/// Feed-forward thermal limiter of the T8152 speaker.
+///
+/// The J873 has no speaker tap: the AOP offers no sense stream, so there is
+/// nothing a daemon could measure.  The vendor protects this speaker with a
+/// thermal model driven by the signal itself, and so does this limiter, in the
+/// copy path where no stream can bypass it.  The vendor's numbers for the
+/// speaker (one type-A speaker for all channels): amplifier sensitivity
+/// 11.9 V per full scale, voice-coil resistance 4.6 ohm, coil 40 C/W with a
+/// time constant of 3.4 s, magnet 60 C/W with 210 s, ambient 50 C, limit
+/// 140 C.  The thermal part is the two-filter model of the Linux speaker
+/// daemon: the power of every word (x * 11.9 V)^2 / 4.6 ohm, with x the word
+/// after the limiter gain in units of the I2S full scale, heats the magnet
+/// towards ambient + 60 C/W * P and the coil towards the magnet + 40 C/W * P;
+/// the gain falls from 0 dB to the sustained level (a full-scale square wave
+/// at 98 % of (140 - 50) / (40 + 60) = 0.9 W, -15.43 dB) over the last 20 C
+/// below the limit.  Beyond the vendor, the attack is immediate (one block of
+/// 128 words) and the release follows the vendor's 20 s, and the amplifier is
+/// assumed at the voltage of the full 11.9 V per full scale.  All of it is
+/// fixed point: no floating point exists in the kernel.  `CEILING` is a hard
+/// amplitude ceiling in the first audible tests (-20 dB below the sustained
+/// level), taken out only by a rebuild.
+mod spk_thermal {
+    // Temperatures are Q40 degrees C, gains Q30, the power in units of
+    // (I2S full scale)^2 * 2^32.
+    const KCQ: i64 = 315236;
+    const KMQ: i64 = 472854;
+    const AC: i64 = 26317;
+    const AM: i64 = 426;
+    const T_AMB_Q: i64 = 54975581388800;
+    const LO_Q: i64 = 131941395333120;
+    const WIN_Q: i64 = 21990232555520;
+    const HYST_Q: i64 = 5497558138880;
+    const REL: i64 = 572586;
+    /// 10^(-15.43 dB * k / 64 / 20) in Q30, rounded down.
+    const GTAB: [i64; 65] = [
+        1073741824, 1044350352, 1015763411, 987958979, 960915636, 934612548, 909029454, 884146644,
+        859944950, 836405728, 813510843, 791242658, 769584020, 748518241, 728029096, 708100798,
+        688717996, 669865759, 651529563, 633695283, 616349179, 599477889, 583068416, 567108119,
+        551584701, 536486206, 521801000, 507517772, 493625518, 480113536, 466971416, 454189035,
+        441756545, 429664369, 417903192, 406463952, 395337838, 384516279, 373990937, 363753705,
+        353796697, 344112240, 334692876, 325531348, 316620597, 307953760, 299524160, 291325303,
+        283350873, 275594726, 268050888, 260713546, 253577050, 246635900, 239884750, 233318399,
+        226931788, 220719998, 214678242, 208801867, 203086346, 197527275, 192120373, 186861473,
+        181746525,
+    ];
+    /// Start state: the coil just below the start of the limiting window (the
+    /// driver cannot know how warm the speaker is).
+    const T_START_COIL_Q: i64 = 130841883705344;
+    const T_START_MAGNET_Q: i64 = 100495362778726;
+    /// The hard amplitude ceiling of the first audible tests: -20 dB below the
+    /// sustained level (a worst-case power of about 9 mW).
+    pub(super) const CEILING_M20_Q30: i64 = 18174652;
+    /// No ceiling (unit tests, later steps).
+    #[allow(dead_code)]
+    pub(super) const CEILING_0DB_Q30: i64 = 1073741824;
+    /// 10 ms steps of the idle cooling: 1 - exp(-0.01 s / tau) in Q32.
+    const AC10: i64 = 12613698;
+    const AM10: i64 = 204517;
+    const ONE: i64 = 1 << 30;
+
+    fn gain_for_reduction(r16: i64) -> i64 {
+        let k = (r16 >> 10) as usize;
+        let f = r16 & 1023;
+        if k >= 64 {
+            return GTAB[64];
+        }
+        GTAB[k] + (((GTAB[k + 1] - GTAB[k]) * f) >> 10)
+    }
+
+    pub(super) struct SpkThermal {
+        t_coil: i64,
+        t_magnet: i64,
+        hyst_coil: i64,
+        hyst_magnet: i64,
+        gain: i64,
+        ceiling: i64,
+        last: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+    }
+
+    impl SpkThermal {
+        pub(super) fn new(ceiling: i64) -> Self {
+            Self {
+                t_coil: T_START_COIL_Q,
+                t_magnet: T_START_MAGNET_Q,
+                hyst_coil: T_START_COIL_Q,
+                hyst_magnet: T_START_MAGNET_Q,
+                gain: ONE,
+                ceiling,
+                last: None,
+            }
+        }
+
+        /// Limit one block of words (the I2S full scale is 2^30), in place, and
+        /// advance the model by the block.
+        pub(super) fn block(&mut self, words: &mut [i32]) {
+            let g = (self.gain * self.ceiling) >> 30;
+            let (mut tc, mut tm) = (self.t_coil, self.t_magnet);
+            for w in words.iter_mut() {
+                let y = (i64::from(*w) * g) >> 30;
+                let yq = y >> 14;
+                let pfs = yq * yq;
+                let tgt_c = tm + pfs * KCQ;
+                let tgt_m = T_AMB_Q + pfs * KMQ;
+                tc += (((tgt_c - tc) >> 12) * AC) >> 20;
+                tm += (((tgt_m - tm) >> 12) * AM) >> 20;
+                *w = y as i32;
+            }
+            self.t_coil = tc;
+            self.t_magnet = tm;
+            self.hyst_coil = self.hyst_coil.max(tc).min(tc + HYST_Q);
+            self.hyst_magnet = self.hyst_magnet.max(tm).min(tm + HYST_Q);
+            let temp = self.hyst_coil.max(self.hyst_magnet);
+            let r16 = if temp <= LO_Q {
+                0
+            } else {
+                core::cmp::min(65536, ((temp - LO_Q) >> 20) * 65536 / (WIN_Q >> 20))
+            };
+            let target = gain_for_reduction(r16);
+            if target < self.gain {
+                self.gain = target;
+            } else {
+                self.gain += ((target - self.gain) * REL) >> 32;
+            }
+            self.last = Some(kernel::time::Instant::now());
+        }
+
+        /// Let the speaker cool for the time since the last block: the same
+        /// filters with no power, in steps of 10 ms (at most 20 minutes).
+        pub(super) fn cool_idle(&mut self) {
+            let Some(last) = self.last.take() else {
+                return;
+            };
+            let ms = core::cmp::min(last.elapsed().as_millis(), 20 * 60 * 1000);
+            self.cool(ms as u64);
+        }
+
+        pub(super) fn cool(&mut self, ms: u64) {
+            let (mut tc, mut tm) = (self.t_coil, self.t_magnet);
+            for _ in 0..ms / 10 {
+                tc += (((tm - tc) >> 12) * AC10) >> 20;
+                tm += (((T_AMB_Q - tm) >> 12) * AM10) >> 20;
+            }
+            self.t_coil = tc;
+            self.t_magnet = tm;
+            self.hyst_coil = tc;
+            self.hyst_magnet = tm;
+        }
+
+        /// Unit tests: start from a given state.
+        #[allow(dead_code)]
+        pub(super) fn cool_from(&mut self, coil: i64, magnet: i64, ms: u64) {
+            self.t_coil = coil;
+            self.t_magnet = magnet;
+            self.cool(ms);
+        }
+
+        #[allow(dead_code)]
+        pub(super) fn state(&self) -> (i64, i64, i64, i64, i64) {
+            (
+                self.t_coil,
+                self.t_magnet,
+                self.hyst_coil,
+                self.hyst_magnet,
+                self.gain,
+            )
+        }
+    }
+}
+
+use spk_thermal::SpkThermal;
 
 /// Copy between userspace and the front-end buffers.  The speaker front-end
 /// converts and limits; the jack front-ends copy verbatim (their buffers are
@@ -2442,10 +2622,26 @@ unsafe extern "C" fn asoc_pcm_copy(
         if iov.copy_from_iter(&mut chunk[..n]) != n {
             return EFAULT.to_errno();
         }
-        for (i, word) in chunk[..n].chunks_exact(4).enumerate() {
-            let sample = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-            let bits = spkr_f32_bits(sample, gain);
-            dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&bits.to_le_bytes());
+        if data.has_lpai {
+            for (i, word) in chunk[..n].chunks_exact(4).enumerate() {
+                let sample = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                let bits = spkr_f32_bits(sample, gain);
+                dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&bits.to_le_bytes());
+            }
+        } else {
+            // T8152: every word goes through the thermal limiter, the one
+            // protection this speaker has.
+            let mut words = [0i32; 128];
+            let count = n / 4;
+            for (w, word) in words.iter_mut().zip(chunk[..n].chunks_exact(4)) {
+                let sample = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                *w = ((i64::from(sample) * i64::from(gain)) >> 31) as i32;
+            }
+            data.spkr_thermal.lock().block(&mut words[..count]);
+            for (i, w) in words[..count].iter().enumerate() {
+                let bits = f32_bits_of_q31(*w);
+                dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&bits.to_le_bytes());
+            }
         }
         off += n;
     }
@@ -3426,6 +3622,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                     users: 0,
                     running: false,
                 }),
+                spkr_thermal <- new_spinlock!(SpkThermal::new(spk_thermal::CEILING_M20_Q30)),
             }),
             GFP_KERNEL,
         )?;
@@ -3767,5 +3964,97 @@ mod lid_tests {
         // grabbed: the lid closes unseen; on release the bitmap reads closed
         assert!(switch.record(&lid, true));
         assert!(lid.mic_cut());
+    }
+}
+
+#[kunit_tests(snd_soc_t8140_aop_audio_thermal)]
+mod thermal_tests {
+    use super::spk_thermal::{SpkThermal, CEILING_0DB_Q30, CEILING_M20_Q30};
+
+    /// The 100 Hz square wave at the I2S full scale, 240 words per half period.
+    fn square(i: usize) -> i32 {
+        if (i / 240) % 2 == 0 {
+            0x4000_0000
+        } else {
+            -0x4000_0000
+        }
+    }
+
+    fn run_square(l: &mut SpkThermal, blocks: usize) -> i32 {
+        let mut words = [0i32; 128];
+        let mut peak = 0i32;
+        for b in 0..blocks {
+            for (k, w) in words.iter_mut().enumerate() {
+                *w = square(b * 128 + k);
+            }
+            l.block(&mut words);
+            for w in words.iter() {
+                peak = peak.max(w.abs());
+            }
+        }
+        peak
+    }
+
+    /// The same numbers as the host model of the J873 speaker limiter (ten
+    /// seconds of a full-scale square wave, then two seconds of silence).
+    #[test]
+    fn ten_seconds_of_full_scale_square_match_the_host_model() {
+        let mut l = SpkThermal::new(CEILING_0DB_Q30);
+        let peak = run_square(&mut l, 3750);
+        assert_eq!(peak, 1_073_741_824);
+        assert_eq!(
+            l.state(),
+            (
+                152358436004836,
+                102381555896261,
+                152358436004836,
+                102381555896261,
+                206396213
+            )
+        );
+        let silence = [0i32; 128];
+        for _ in 0..750 {
+            let mut w = silence;
+            l.block(&mut w);
+        }
+        assert_eq!(
+            l.state(),
+            (
+                130024328395229,
+                101932305864922,
+                135521886534109,
+                102381555896261,
+                226457860
+            )
+        );
+    }
+
+    #[test]
+    fn the_coil_stays_below_the_limit_with_a_full_scale_square() {
+        let mut l = SpkThermal::new(CEILING_0DB_Q30);
+        run_square(&mut l, 3750 * 6);
+        // 140 C in Q40
+        assert!(l.state().0 < 140i64 << 40);
+    }
+
+    #[test]
+    fn idle_cooling_matches_the_host_model() {
+        let mut l = SpkThermal::new(CEILING_0DB_Q30);
+        l.cool_from(
+            139i64 << 40,
+            (50i64 << 40) + (((139i64 - 50) * 60 << 40) / 100),
+            60_000,
+        );
+        assert_eq!(l.state().0, 99824966751432);
+        assert_eq!(l.state().1, 99097783336276);
+    }
+
+    #[test]
+    fn the_first_audible_ceiling_is_20_db_below_the_sustained_level() {
+        let mut l = SpkThermal::new(CEILING_M20_Q30);
+        let mut w = [0x4000_0000i32; 128];
+        l.block(&mut w);
+        assert_eq!(w[0], 18174652);
+        assert_eq!(w[127], 18174652);
     }
 }
