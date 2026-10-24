@@ -106,6 +106,9 @@
 	};
 };
 
-#include "spi1-nvram.dtsi"
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
+
+/* No spi1-nvram.dtsi: the 27.0.1 j575dap ADT has no SPI-NOR at
+ * 0x391104000 (the laptop keyboard/NVRAM bus), and t6032.dtsi deletes the
+ * inherited node. The boot chain keeps its environment on the ESP. */
