@@ -61,6 +61,24 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Stream count assumed by apple,static-topology (default 16).
 
+  apple,inherited-roots:
+    type: boolean
+    description: |
+      apple,t8152-dart only. Treat the DART as locked even though its PROTECT
+      lock bit is clear: the bootloader left the listed streams translating
+      with page-table roots that hold firmware mappings, so the DART is never
+      reset, TCR/TTBR are never written, and consumers publish into the vacant
+      slots of the inherited roots (the path used for locked DARTs).
+
+  apple,owned-streams:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: |
+      apple,t8152-dart only. The DART is shared with firmware and
+      coprocessors (the T8152 SBR DART): only these stream ids belong to the
+      OS. Consumer iommus entries never reference another stream, latched
+      exceptions of other streams are not acknowledged, and the DART tunables
+      are left as firmware set them.
+
   clocks:
     description:
       Reference to the gate clock phandle if required for this IOMMU.

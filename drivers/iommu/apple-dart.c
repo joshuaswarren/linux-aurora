@@ -295,6 +295,13 @@ struct apple_dart {
 	u32 four_level : 1;
 	u32 locked : 1;
 	u32 force_available : 1;
+	/*
+	 * A DART shared with firmware (the T8152 SBR DART): only the owned
+	 * streams belong to Linux; the others still translate for firmware and
+	 * coprocessors and are never acknowledged or referenced.
+	 */
+	u32 has_owned : 1;
+	DECLARE_BITMAP(owned, DART_MAX_STREAMS);
 	u32 tunneled : 1;
 	u32 per_stream : 1;
 	u32 power_retained : 1;
@@ -1307,6 +1314,22 @@ static int apple_dart_gen3_hw_invalidate_tlb(struct apple_dart_stream_map *strea
 
 static const char *apple_dart_t8110_v2_fault_name(u32 exception);
 
+/* The bits of exception word @word that belong to streams Linux owns. */
+static u32 apple_dart_owned_mask(struct apple_dart *dart, unsigned int word)
+{
+	unsigned int bit;
+	u32 own = 0;
+
+	if (!dart->has_owned)
+		return U32_MAX;
+
+	for (bit = 0; bit < 32; bit++)
+		if (test_bit(word * 32 + bit, dart->owned))
+			own |= BIT(bit);
+
+	return own;
+}
+
 static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 {
 	unsigned int i, drained = 0;
@@ -1316,8 +1339,12 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 
 	for (i = 0; i < DIV_ROUND_UP(dart->num_streams, 32) && i < 8; i++) {
 		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
-		unsigned long bits = pending;
+		unsigned long bits;
 		unsigned int bit;
+
+		/* Shared DART: the latched exceptions of other streams are not ours. */
+		pending &= apple_dart_owned_mask(dart, i);
+		bits = pending;
 
 		if (!pending)
 			continue;
@@ -2321,6 +2348,8 @@ static int apple_dart_of_xlate(struct device *dev,
 		return i;
 
 	sid = args->args[0];
+	if (dart->has_owned && !test_bit(sid, dart->owned))
+		return -EINVAL;
 
 	if (!cfg) {
 		cfg = kzalloc_obj(*cfg);
@@ -2813,8 +2842,15 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev, bool gen3)
 	 */
 	for (i = 0; i < words && i < 8; i++) {
 		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
-		unsigned long bits = pending;
+		unsigned long bits;
 		unsigned int bit;
+
+		/*
+		 * Shared DART: neither report nor acknowledge the exceptions of
+		 * streams that belong to firmware.
+		 */
+		pending &= apple_dart_owned_mask(dart, i);
+		bits = pending;
 
 		if (!pending)
 			continue;
@@ -3100,7 +3136,7 @@ static int apple_dart_cfg_ensure_ready(struct apple_dart_master_cfg *cfg)
 
 static int apple_dart_probe(struct platform_device *pdev)
 {
-	int ret;
+	int ret, count;
 	u32 sid;
 	struct device_node *pd_np;
 	struct resource *res;
@@ -3225,6 +3261,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 		 */
 		if (apple_dart_is_locked(dart))
 			dev_info(dev, "Gen3 DART is locked: not applying tunables\n");
+		else if (of_property_read_bool(dev->of_node, "apple,inherited-roots") ||
+			 of_property_present(dev->of_node, "apple,owned-streams"))
+			dev_info(dev, "shared Gen3 DART: tunables left as firmware set them\n");
 		else
 			apple_dart_apply_tunables(dart);
 	}
@@ -3349,6 +3388,24 @@ params_done:
 	if (ret)
 		goto err_clk_disable;
 
+	count = of_property_count_u32_elems(dev->of_node, "apple,owned-streams");
+	if (count > 0) {
+		for (int i = 0; i < count; i++) {
+			ret = of_property_read_u32_index(dev->of_node,
+							 "apple,owned-streams",
+							 i, &sid);
+			if (ret || sid >= dart->num_streams) {
+				ret = ret ?: -ERANGE;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->owned);
+		}
+		dart->has_owned = true;
+	} else if (count != -EINVAL) {
+		ret = count;
+		goto err_clk_disable;
+	}
+
 	/*
 	 * A hot-plug PCIe-C DART has no retained/locked translation context.
 	 * A DART the bootloader leaves locked is one that hardware we do not drive
@@ -3360,7 +3417,9 @@ params_done:
 	if (tunneled)
 		dart->locked = false;
 	else
-		dart->locked = !dart->static_topo && apple_dart_is_locked(dart);
+		dart->locked = !dart->static_topo &&
+			       (apple_dart_is_locked(dart) ||
+				of_property_read_bool(dev->of_node, "apple,inherited-roots"));
 	if (dart->hw->gen3 && dart->locked && !dart->force_available) {
 		dev_info(dev, "locked DART: holding it available for its lifetime\n");
 		dart->force_available = 1;
