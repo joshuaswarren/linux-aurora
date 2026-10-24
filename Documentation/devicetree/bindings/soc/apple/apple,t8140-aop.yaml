@@ -77,12 +77,15 @@ allOf:
           minItems: 2
         mbox-names:
           minItems: 2
+      required:
+        - power-domains
     else:
       properties:
         mboxes:
           maxItems: 1
         mbox-names:
           maxItems: 1
+        power-domains: false
 
 required:
   - compatible
@@ -92,6 +95,5 @@ required:
   - mbox-names
   - iommus
   - apple,dma-range
-  - power-domains
 
 additionalProperties: false
