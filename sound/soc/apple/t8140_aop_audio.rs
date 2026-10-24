@@ -556,7 +556,14 @@ struct SndSocT8140AopData {
     dev: ARef<device::Device>,
     adata: Arc<dyn AOP>,
     service: EPICService,
-    ring: Arc<SourceRing>,
+    /// The low-power microphone's source ring; `None` on machines without lpai.
+    ring: Option<Arc<SourceRing>>,
+    /// The machine has the lpai microphone, whose run state also raises the
+    /// gated audio fabric, and PMGR serializer leaves the AP must power
+    /// (T8140). On T8152 neither exists: the firmware powers its own fabric
+    /// and the serializers, and lpai, hpai and tap attach with
+    /// kIOReturnNoDevice.
+    has_lpai: bool,
     ring_bytes: Atomic<u32>,
     sequence: Atomic<u32>,
     /// The low-power microphone PCM holds a reference on `lpai_run`.
@@ -903,6 +910,9 @@ impl SndSocT8140AopData {
     /// power up fails the stream; recovering a domain from that state is the
     /// power-domain driver's business, not a consumer's.
     fn power_up(&self, name: &str, pds: &[&Option<PowerDomain>], attempts: u32) -> Result<()> {
+        if !self.has_lpai {
+            return Ok(());
+        }
         for (i, slot) in pds.iter().enumerate() {
             let Some(pd) = slot else {
                 dev_err!(self.dev, "{}: power domain not attached\n", name);
@@ -944,9 +954,55 @@ impl SndSocT8140AopData {
     fn service_startup(&self, svc: &Service, pds: &[&Option<PowerDomain>]) -> Result<()> {
         self.attach_device(svc.dev_id, svc.name)?;
         self.service_set_power(svc, SPKR_POWER_STATE_PW0)?;
+        if !self.has_lpai {
+            self.log_service_props(svc, "pw0");
+        }
         self.power_up_raising(svc.name, pds)?;
         svc.running.store(false, Relaxed);
         Ok(())
+    }
+
+    /// T8152 bring-up diagnostics: log what the firmware reports for a
+    /// service (properties 200, 300, 301 and 302) so that the stream format
+    /// and the serializer state can be read from the log. Read-only.
+    fn log_service_props(&self, svc: &Service, when: &str) {
+        for modifier in [
+            PROP_POWER_STATE,
+            PROP_CHANNEL_CONTROL,
+            PROP_STREAM_FORMAT,
+            PROP_RING_GEOMETRY,
+        ] {
+            let msg = AudioGetDeviceProp::new(svc.dev_id, modifier);
+            // SAFETY: the message is a plain packed firmware record.
+            let bytes = unsafe {
+                slice::from_raw_parts(
+                    ptr::from_ref(&msg).cast::<u8>(),
+                    mem::size_of::<AudioGetDeviceProp>(),
+                )
+            };
+            match self
+                .adata
+                .epic_call_ret(&self.service, EPIC_SUBTYPE_WRAPPED_CALL, bytes, 64)
+            {
+                Ok((ret, data)) => dev_dbg!(
+                    self.dev,
+                    "{} {}: property {} retcode {:#x} data {:02x?}\n",
+                    svc.name,
+                    when,
+                    modifier,
+                    ret,
+                    &data[..]
+                ),
+                Err(e) => dev_dbg!(
+                    self.dev,
+                    "{} {}: property {} call failed: {:?}\n",
+                    svc.name,
+                    when,
+                    modifier,
+                    e
+                ),
+            }
+        }
     }
 
     /// [`Self::power_up`] with the fabric raised first.
@@ -967,6 +1023,9 @@ impl SndSocT8140AopData {
     /// microphone is attached for the firmware's lifetime, so hold it in
     /// `runn` around `f`, once its first report has arrived.
     fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        if !self.has_lpai {
+            return f();
+        }
         self.lpai_run_get()?;
         let mut polls = 0;
         while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
@@ -994,6 +1053,9 @@ impl SndSocT8140AopData {
         }
         self.service_set_power(svc, SPKR_POWER_STATE_PWRD)?;
         svc.running.store(true, Relaxed);
+        if !self.has_lpai {
+            self.log_service_props(svc, "pwrd");
+        }
         Ok(())
     }
 
@@ -1039,14 +1101,23 @@ impl SndSocT8140AopData {
     // data after the copy-time gain, it senses no current or voltage. ----
 
     fn sense_startup(&self) -> Result<()> {
+        if !self.has_lpai {
+            return Ok(());
+        }
         self.service_startup(&self.tap, &[&self.pd_mca0])
     }
 
     fn sense_prepare(&self) -> Result<()> {
+        if !self.has_lpai {
+            return Ok(());
+        }
         self.service_run(&self.tap)
     }
 
     fn sense_shutdown(&self) {
+        if !self.has_lpai {
+            return;
+        }
         self.service_shutdown(&self.tap, &[&self.pd_mca0])
     }
 
@@ -1138,6 +1209,17 @@ impl SndSocT8140AopData {
     /// Output mute (property 700) is independent of the amplifier's SD_MODE;
     /// the amplifier stays off across a failure here.
     fn spkr_set_mute(&self, muted: bool) -> Result<()> {
+        if !self.has_lpai {
+            // T8152: the firmware answers every property above 302 with
+            // 0xe00002f0 (unsupported), the mute request included (measured on
+            // an M6 Mac mini); the amplifier is muted through its own codec.
+            dev_dbg!(
+                self.dev,
+                "speaker mute {} not requested on this firmware\n",
+                muted
+            );
+            return Ok(());
+        }
         let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(
             AUDIO_DEV_SPKR,
             PROP_OUTPUT_MUTE,
@@ -1340,7 +1422,7 @@ impl ReportListener for SndSocT8140AopData {
         let dma_area = unsafe { (*(*st.substream).runtime).dma_area };
         let buffer_bytes = st.buffer_bytes;
         let new_ptr = copy_span(
-            &self.ring,
+            self.ring.as_ref().ok_or(ENODEV)?,
             dma_area,
             buffer_bytes,
             ring_bytes,
@@ -2725,6 +2807,24 @@ fn pcm_stream(
     }
 }
 
+fn pcm_stream_range(
+    name: &'static core::ffi::CStr,
+    formats: u64,
+    channels_min: u32,
+    channels_max: u32,
+) -> bindings::snd_soc_pcm_stream {
+    bindings::snd_soc_pcm_stream {
+        stream_name: name.as_char_ptr(),
+        formats,
+        rates: bindings::SNDRV_PCM_RATE_48000,
+        rate_min: 48000,
+        rate_max: 48000,
+        channels_min,
+        channels_max,
+        ..Default::default()
+    }
+}
+
 /// The AOP-configured serializers take 24-bit samples from the low bits
 /// of each 32-bit DMA word: S24_LE.
 const OUT_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
@@ -2737,7 +2837,10 @@ const S32_FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE;
 /// renumbers every DAI after it and silently repoints the existing links.
 const DAI_COUNT: usize = 2 + FE_COUNT;
 
-fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
+// `mono_speaker`: T8152, whose speaker serializer takes one 32-bit word per
+// 48 kHz frame (measured: the DMA drains 192000 bytes per second whatever the
+// stream), so the speaker front-end must also accept one channel.
+fn dai_drivers(ops: &DaiOps, mono_speaker: bool) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
     [
         bindings::snd_soc_dai_driver {
             name: c"cout".as_char_ptr(),
@@ -2762,7 +2865,12 @@ fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
             id: FE_DAI_ID_BASE + 1,
             ops: &ops.fe,
             // the speaker front-end: S32 in, converted through the ceiling
-            playback: pcm_stream(c"PCM1 TX", S32_FORMATS, 2),
+            playback: pcm_stream_range(
+                c"PCM1 TX",
+                S32_FORMATS,
+                if mono_speaker { 1 } else { 2 },
+                2,
+            ),
             ..Default::default()
         },
         bindings::snd_soc_dai_driver {
@@ -2780,7 +2888,12 @@ fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
             name: c"spkr".as_char_ptr(),
             id: BE_DAI_ID_SPKR,
             ops: &ops.spkr,
-            playback: pcm_stream(c"SPKR TX", S32_FORMATS, 2),
+            playback: pcm_stream_range(
+                c"SPKR TX",
+                S32_FORMATS,
+                if mono_speaker { 1 } else { 2 },
+                2,
+            ),
             capture: pcm_stream(c"SPKR RX", S32_FORMATS, 2),
             ..Default::default()
         },
@@ -2806,7 +2919,7 @@ const _: () = assert!(mem::offset_of!(AsocContext, component) == 0);
 impl AsocContext {
     fn new(data: Arc<SndSocT8140AopData>) -> Result<KBox<Self>> {
         let ops = KBox::new(DaiOps::new(), GFP_KERNEL)?;
-        let dais = KBox::new(Opaque::new(dai_drivers(&ops)), GFP_KERNEL)?;
+        let dais = KBox::new(Opaque::new(dai_drivers(&ops, !data.has_lpai)), GFP_KERNEL)?;
         let volume = KBox::new(
             Opaque::new(bindings::soc_mixer_control {
                 min: 0,
@@ -2931,89 +3044,91 @@ impl SndSocT8140AopDriver {
             closed: AtomicFlag::new(false),
         };
 
-        // The low-power microphone: its ring is reported to us by the
-        // firmware for the AOP's lifetime.
-        data.attach_device(AUDIO_DEV_LPAI, "lpai")?;
-        data.set_channel_control()?;
-        data.read_geometry()?;
-        let listener: Arc<dyn ReportListener> = data.clone();
-        data.adata
-            .add_report_listener(data.service, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
+        if data.has_lpai {
+            // The low-power microphone: its ring is reported to us by the
+            // firmware for the AOP's lifetime.
+            data.attach_device(AUDIO_DEV_LPAI, "lpai")?;
+            data.set_channel_control()?;
+            data.read_geometry()?;
+            let listener: Arc<dyn ReportListener> = data.clone();
+            data.adata
+                .add_report_listener(data.service, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
 
-        // SAFETY: FFI call with the live device and the module; `this.card` receives the new card.
-        let ret = unsafe {
-            bindings::snd_card_new(
-                data.dev.as_raw(),
-                -1,
-                ptr::null(),
-                THIS_MODULE.as_ptr(),
-                0,
-                &mut this.card,
-            )
-        };
-        if ret < 0 {
-            dev_err!(data.dev, "unable to allocate the sound card\n");
-            return Err(Error::from_errno(ret));
-        }
-        // Named like the other AOP audio cards: Apple<chassis><interface>.
-        let chassis = fwnode
-            .property_read::<CString>(c_str!("apple,chassis-name"))
-            .required_by(&data.dev)?;
-        let machine_kind = fwnode
-            .property_read::<CString>(c_str!("apple,machine-kind"))
-            .required_by(&data.dev)?;
-        let id_str = CString::try_from_fmt(fmt!("Apple{}AOP", *chassis))?;
-        let shortname = CString::try_from_fmt(fmt!("{} {} AOP", *machine_kind, *chassis))?;
-        let longname = CString::try_from_fmt(fmt!("{} {} AOP Audio", *machine_kind, *chassis))?;
-        // SAFETY: `card` was created by `snd_card_new` above and is not
-        // registered yet, so nothing else accesses it.
-        let card = unsafe { &mut *this.card };
-        let named = copy_str(&mut card.driver, c"t8140-aop-audio".to_bytes_with_nul())
-            .and_then(|()| copy_str(&mut card.id, id_str.to_bytes_with_nul()))
-            .and_then(|()| copy_str(&mut card.shortname, shortname.to_bytes_with_nul()))
-            .and_then(|()| copy_str(&mut card.longname, longname.to_bytes_with_nul()));
-        if let Err(e) = named {
-            dev_err!(
-                data.dev,
-                "apple,chassis-name or apple,machine-kind too long for the card names\n"
-            );
-            return Err(e);
-        }
+            // SAFETY: FFI call with the live device and the module; `this.card` receives the new card.
+            let ret = unsafe {
+                bindings::snd_card_new(
+                    data.dev.as_raw(),
+                    -1,
+                    ptr::null(),
+                    THIS_MODULE.as_ptr(),
+                    0,
+                    &mut this.card,
+                )
+            };
+            if ret < 0 {
+                dev_err!(data.dev, "unable to allocate the sound card\n");
+                return Err(Error::from_errno(ret));
+            }
+            // Named like the other AOP audio cards: Apple<chassis><interface>.
+            let chassis = fwnode
+                .property_read::<CString>(c_str!("apple,chassis-name"))
+                .required_by(&data.dev)?;
+            let machine_kind = fwnode
+                .property_read::<CString>(c_str!("apple,machine-kind"))
+                .required_by(&data.dev)?;
+            let id_str = CString::try_from_fmt(fmt!("Apple{}AOP", *chassis))?;
+            let shortname = CString::try_from_fmt(fmt!("{} {} AOP", *machine_kind, *chassis))?;
+            let longname = CString::try_from_fmt(fmt!("{} {} AOP Audio", *machine_kind, *chassis))?;
+            // SAFETY: `card` was created by `snd_card_new` above and is not
+            // registered yet, so nothing else accesses it.
+            let card = unsafe { &mut *this.card };
+            let named = copy_str(&mut card.driver, c"t8140-aop-audio".to_bytes_with_nul())
+                .and_then(|()| copy_str(&mut card.id, id_str.to_bytes_with_nul()))
+                .and_then(|()| copy_str(&mut card.shortname, shortname.to_bytes_with_nul()))
+                .and_then(|()| copy_str(&mut card.longname, longname.to_bytes_with_nul()));
+            if let Err(e) = named {
+                dev_err!(
+                    data.dev,
+                    "apple,chassis-name or apple,machine-kind too long for the card names\n"
+                );
+                return Err(e);
+            }
 
-        this.new_pcm(0, c"lpai", c"Low-Power Microphone", &Self::LPAI_OPS)?;
-        this.new_pcm(1, c"hpai", c"High-Quality Microphone", &Self::HPAI_OPS)?;
+            this.new_pcm(0, c"lpai", c"Low-Power Microphone", &Self::LPAI_OPS)?;
+            this.new_pcm(1, c"hpai", c"High-Quality Microphone", &Self::HPAI_OPS)?;
 
-        // Both microphones' jack: unplugged while a lid is closed.
-        let mut jack = ptr::null_mut();
-        // SAFETY: `card` was created by `snd_card_new` above and is not registered yet; the jack
-        // becomes one of its devices and is freed with it.
-        let ret = unsafe {
-            bindings::snd_jack_new(
-                this.card,
-                c"Internal Mic".as_char_ptr(),
-                bindings::snd_jack_types_SND_JACK_MICROPHONE as i32,
-                &mut jack,
-                true,
-                // No input device of its own: the lid it follows already
-                // is one, and the control is what userspace reads.
-                true,
-            )
-        };
-        if ret < 0 {
-            dev_err!(data.dev, "unable to create the microphone jack\n");
-            return Err(Error::from_errno(ret));
-        }
-        data.mic_jack.store(jack, Relaxed);
-        this.register_lid_handler()?;
-        // The state as the card is registered, from the only reporter.
-        data.as_arc_borrow().queue_jack_report();
-        data.flush_jack_report();
+            // Both microphones' jack: unplugged while a lid is closed.
+            let mut jack = ptr::null_mut();
+            // SAFETY: `card` was created by `snd_card_new` above and is not registered yet; the jack
+            // becomes one of its devices and is freed with it.
+            let ret = unsafe {
+                bindings::snd_jack_new(
+                    this.card,
+                    c"Internal Mic".as_char_ptr(),
+                    bindings::snd_jack_types_SND_JACK_MICROPHONE as i32,
+                    &mut jack,
+                    true,
+                    // No input device of its own: the lid it follows already
+                    // is one, and the control is what userspace reads.
+                    true,
+                )
+            };
+            if ret < 0 {
+                dev_err!(data.dev, "unable to create the microphone jack\n");
+                return Err(Error::from_errno(ret));
+            }
+            data.mic_jack.store(jack, Relaxed);
+            this.register_lid_handler()?;
+            // The state as the card is registered, from the only reporter.
+            data.as_arc_borrow().queue_jack_report();
+            data.flush_jack_report();
 
-        // SAFETY: `card` was created by `snd_card_new` above and is not registered yet.
-        let ret = unsafe { bindings::snd_card_register(this.card) };
-        if ret < 0 {
-            dev_err!(data.dev, "unable to register the sound card\n");
-            return Err(Error::from_errno(ret));
+            // SAFETY: `card` was created by `snd_card_new` above and is not registered yet.
+            let ret = unsafe { bindings::snd_card_register(this.card) };
+            if ret < 0 {
+                dev_err!(data.dev, "unable to register the sound card\n");
+                return Err(Error::from_errno(ret));
+            }
         }
 
         // The ASoC side: the jack (cout) and speaker back-ends, the
@@ -3195,23 +3310,29 @@ unsafe extern "C" fn hpai_pcm_hw_params(
     }
 }
 
+// The match data says whether the machine has the lpai microphone, its source
+// ring and the AP-powered serializer leaves (T8140), or not (T8152).
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
     <SndSocT8140AopDriver as platform::Driver>::IdInfo,
-    [(of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ())]
+    [
+        (of::DeviceId::new(c_str!("apple,t8140-aop-audio")), true),
+        (of::DeviceId::new(c_str!("apple,t8152-aop-audio")), false),
+    ]
 );
 
 impl platform::Driver for SndSocT8140AopDriver {
-    type IdInfo = ();
+    type IdInfo = bool;
     type Data<'bound> = SndSocT8140AopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
+        info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        let has_lpai = *info.ok_or(ENODEV)?;
         let dev = ARef::<device::Device>::from(pdev.as_ref());
         // SAFETY: this is a service device the AOP core registered, being
         // probed here; the lookup defers the probe until the core has
@@ -3230,18 +3351,28 @@ impl platform::Driver for SndSocT8140AopDriver {
         // owned by the AOP driver because the firmware binds it once per boot.
         // SAFETY: no DMA is in flight on this device yet.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
-        let ring = adata.source_ring(pdev.as_ref(), RING_BYTES)?;
+        let ring = if has_lpai {
+            Some(adata.source_ring(pdev.as_ref(), RING_BYTES)?)
+        } else {
+            None
+        };
 
         // The serializer leaves.  A missing one only disables the paths that
-        // need it; those fail to open with ENODEV.
+        // need it; those fail to open with ENODEV.  T8152 has none: the
+        // firmware powers its own serializers.
         let mut pds: [Option<PowerDomain>; 5] = [None, None, None, None, None];
-        for (slot, (name, dt_name)) in pds.iter_mut().zip([
-            ("mca1", c"mca1"),
-            ("mca0", c"mca0"),
-            ("tx0", c"tx0"),
-            ("leap mca", c"mca"),
-            ("rx0", c"rx0"),
-        ]) {
+        let leaves: &[(&'static str, &'static core::ffi::CStr)] = if has_lpai {
+            &[
+                ("mca1", c"mca1"),
+                ("mca0", c"mca0"),
+                ("tx0", c"tx0"),
+                ("leap mca", c"mca"),
+                ("rx0", c"rx0"),
+            ]
+        } else {
+            &[]
+        };
+        for (slot, (name, dt_name)) in pds.iter_mut().zip(leaves.iter().copied()) {
             match PowerDomain::attach(&dev, name, dt_name) {
                 Ok(Some(pd)) => *slot = Some(pd),
                 Ok(None) => dev_warn!(dev, "no {} power domain\n", name),
@@ -3257,6 +3388,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 adata,
                 service: svc,
                 ring,
+                has_lpai,
                 ring_bytes: Atomic::new(0),
                 sequence: Atomic::new(0),
                 powered: AtomicFlag::new(false),
