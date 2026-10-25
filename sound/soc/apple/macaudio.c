@@ -108,6 +108,8 @@ struct macaudio_platform_cfg {
 	const char *fe_dai_names[MACAUDIO_NUM_FE_LINKS];
 	unsigned int dai_fmt;
 	unsigned int primary_bclk_ratio;
+	/* DAI format of the speaker amplifier's link only (0: as the others). */
+	unsigned int spk_dai_fmt;
 };
 
 static const char *volume_control_names[] = {
@@ -830,6 +832,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 				goto err_free;
 
 			link_props->is_speakers = speakers;
+			if (speakers && ma->cfg->spk_dai_fmt)
+				link->dai_fmt = ma->cfg->spk_dai_fmt;
 			link_props->is_headphones = !speakers;
 
 			link_props->codecs = devm_kcalloc(dev, ncodecs_per_cpu,
@@ -1515,6 +1519,12 @@ struct macaudio_platform_cfg macaudio_j873_cfg = {
 	.amp_gain = 15,
 	.safe_vol = -20,
 	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
+	/*
+	 * The amplifier must sample on the rising bit-clock edge here: with
+	 * the default format (falling edge) it stays in software shutdown.
+	 */
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
 };
 
 static int macaudio_fixup_controls(struct snd_soc_card *card)
