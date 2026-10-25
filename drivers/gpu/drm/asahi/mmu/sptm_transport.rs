@@ -191,6 +191,9 @@ impl Transport {
             // drop unregisters and drains callbacks before releasing the client.
             let status = unsafe { bindings::register_reboot_notifier(
                 core::ptr::addr_of_mut!(reboot.notifier)) };
+            if status == kernel::error::code::ENOTSUPP.to_errno() {
+                crate::g17::unsupported(file!(), line!());
+            }
             if status != 0 { return Err(Error::from_errno(status)); }
             transport.reboot = Some(reboot);
             for kind in 0..2 {

@@ -218,6 +218,11 @@ impl recovery::Queues for Service<'_> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         failure
     }
+    fn has_active_source_consumers(&self) -> bool {
+        self.firmware.queues.compute.iter().flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.has_active_source_consumers())
+    }
     fn render_scheduler_active(&self) -> bool {
         self.firmware.queues.render_scheduler_active() || !self.firmware.queues.teardown.is_empty()
     }
@@ -357,20 +362,18 @@ impl Firmware {
 
 impl crate::g17::Shared {
     /// The single event work item owns this preallocated collector until all
-    /// callbacks are finished. Shutdown can detach Firmware during an off-lock
-    /// boundary; the collector itself still owns every deferred completion.
+    /// callbacks are finished. Its independent slot lock never spans service or
+    /// callbacks. Shutdown can detach Firmware during an off-lock boundary;
+    /// the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             self.stop_queues();
             return;
         }
         let mut deferred = {
-            let mut state = self.state.lock();
-            let Some(firmware) = (*state).as_deref_mut() else {
-                return;
-            };
-            let Some(deferred) = firmware.queues.worker_deferred.take() else {
-                drop(state);
+            let mut slot = self.worker_deferred.lock();
+            let Some(deferred) = slot.take() else {
+                drop(slot);
                 self.lose_device_quietly();
                 return;
             };
@@ -379,8 +382,9 @@ impl crate::g17::Shared {
         let result = self.runtime_event_turn(&mut deferred);
         deferred.finish();
         self.queue_feed();
-        if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
-            firmware.queues.worker_deferred = Some(deferred);
+        {
+            let mut slot = self.worker_deferred.lock();
+            *slot = Some(deferred);
         }
         if let Err(error) = result {
             dev_err!(self.dev.as_ref(), "GPU event service failed: {:?}\n", error);
@@ -473,6 +477,7 @@ impl crate::g17::Shared {
             || firmware.compute_growth_pending()
             || firmware.queues.replay_outer_wait.is_some()
             || firmware.queues.replay_consumer_wait.is_some()
+            || firmware.queues.replay_source_wait
             || firmware.queues.render.replay_polling()
             || firmware.queues.teardown.polling(now)
             || firmware.compute_exit_polling(now)
@@ -501,11 +506,41 @@ impl crate::g17::Shared {
             // records that arrived while it was consuming the same ring.
             self.queue_events();
         }
+        // Read under the existing mutex; print only after releasing it.
+        let policy_sample = sample_m5_policy(&firmware.init);
         let grow_ready = firmware.render_grow_ready();
         drop(state);
+        if let Some((time_ns, words)) = policy_sample {
+            pr_info!("asahi: m5 policy telemetry1 t={} {:08x?}\n", time_ns, words);
+        }
         if grow_ready {
             self.queue_grow();
         }
         Ok(())
     }
+}
+
+/// Diagnostic only: one bounded, read-only sample per second of firmware events.
+/// Words are independently atomic, not a firmware-transaction snapshot. No extra
+/// timer, GPU wakeup, frequency request, power write, or controller change is made.
+fn sample_m5_policy(init: &crate::g17::initdata::InitData) -> Option<(u64, [u32; 16])> {
+    use core::sync::atomic::{fence, AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    const WORDS: [usize; 16] = [
+        0x02c, 0x030, 0x040, 0x044, 0x048, 0x080, 0x084, 0x088,
+        0x0ac, 0x0b0, 0xad4, 0xb9c, 0xba4, 0xbd4, 0xa18, 0xad0,
+    ];
+    let now = crate::g17::now_ns();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1_000_000_000
+        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return None;
+    }
+    fence(Ordering::Acquire);
+    let mut values = [0u32; 16];
+    for (value, offset) in values.iter_mut().zip(WORDS) {
+        *value = init.m5_policy_telemetry_word(offset).ok()?;
+    }
+    Some((now, values))
 }

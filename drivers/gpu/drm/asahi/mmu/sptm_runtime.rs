@@ -7,11 +7,59 @@ use super::*;
 use crate::g17::context::identity::WorkStates;
 use kernel::platform;
 
+/// Read-only snapshots use the existing client's transport and serialization.
+/// These are vote/pending words, not measured clock rates. Nothing polls them
+/// unless a debugfs reader explicitly requests a snapshot.
+pub(super) struct PlatformStatus {
+    transport: Arc<sptm_transport::Transport>,
+}
+
+impl kernel::debugfs::Writer for PlatformStatus {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let mut operations = match KVec::with_capacity(20, GFP_KERNEL) {
+            Ok(operations) => operations,
+            Err(error) => return writeln!(f, "allocation_error={:?}", error),
+        };
+        // Op 16 has a provider-side, ADT-validated, read-only whitelist. No
+        // caller-supplied address, write operation, or second client exists.
+        for (kind, count) in [(1, 9), (2, 4), (5, 3), (6, 4)] {
+            for index in 0..count {
+                if operations.push(sptm::Operation::new(16, [kind, index, 0, 0, 0]), GFP_KERNEL).is_err() {
+                    return writeln!(f, "allocation_error");
+                }
+            }
+        }
+        // SAFETY: ktime_get is a read-only clock query with no preconditions.
+        let begin = unsafe { kernel::bindings::ktime_get() };
+        let (completed, result) = self.transport.submit_receipts(&mut operations);
+        // SAFETY: As above.
+        let end = unsafe { kernel::bindings::ktime_get() };
+        writeln!(f, "begin_ns={} end_ns={} completed={} requested={} result={:?}",
+                 begin, end, completed, operations.len(), result)?;
+        writeln!(f, "scope=vote_words_not_clocks independent_reads=true")?;
+        for operation in operations.iter().take(completed) {
+            writeln!(f, "kind={} index={} address={:#x} word={:#x} aux0={:#x} aux1={:#x} status={:#x}",
+                     operation.args[0], operation.args[1], operation.args[2],
+                     operation.args[3], operation.args[4], operation.args[5], operation.result)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) type PlatformStatusHandle = Pin<KBox<kernel::debugfs::Scope<PlatformStatus>>>;
+
+fn platform_status(transport: Arc<sptm_transport::Transport>) -> Result<PlatformStatusHandle> {
+    KBox::pin_init(kernel::debugfs::Scope::dir(
+        PlatformStatus { transport }, c"m5-platform-votes", |data, dir| {
+            dir.read_only_file(c"status", data);
+        }), GFP_KERNEL)
+}
+
 struct Contexts {
     used: u64,
     generations: [u64; UAT_NUM_CTX],
     /// Published commands naming each identity that have not yet retired
-    /// exactly (native context ID manager reference counts).
+    /// exactly (as the native context ID manager counts references).
     pins: [u32; UAT_NUM_CTX],
     /// The VM each identity is bound to. Only VMs with live queues appear.
     owners: [Option<Vm>; UAT_NUM_CTX],
@@ -577,6 +625,15 @@ impl Uat {
             return Err(EINVAL);
         }
         let transport = Arc::new(sptm_transport::Transport::new(pdev)?, GFP_KERNEL)?;
+        let platform_status = if *crate::module_parameters::m5_platform_probe.value() != 0 {
+            match platform_status(transport.clone()) {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    dev_warn!(dev.as_ref(), "Platform vote snapshot unavailable: {:?}\n", error);
+                    None
+                }
+            }
+        } else { None };
         let state = Arc::pin_init(try_pin_init!(UatState {
             transport,
             available: crate::g17::availability::Availability::new()?,
@@ -595,6 +652,7 @@ impl Uat {
         let kernel_lower_vm = Vm::new_sptm(dev, inner.clone(), &state, geometry,
             geometry.user_range(), false, 1)?;
         Ok(Self {
+            platform_status,
             dev: dev.into(), geometry, inner, kernel_vm, kernel_lower_vm,
             slots: slotalloc::SlotAllocator::new(UAT_USER_CTX as u32, (),
                 |_inner, _slot| Some(SlotInner()), c_str!("Uat::SlotAllocator"),

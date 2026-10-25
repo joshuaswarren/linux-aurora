@@ -22,6 +22,16 @@ const PB: u64 = BASE + 0x15e_0000;
 const UMA: u64 = BASE + 0x15e_8000;
 
 impl InitData {
+    /// Diagnostic-only read of an aligned word within the existing policy allocation.
+    /// Callers hold the device state mutex, retaining this mapping for the entire sample.
+    pub(crate) fn m5_policy_telemetry_word(&self, offset: usize) -> Result<u32> {
+        if !self.m5 || offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > m::M5_POLICY_SIZE) {
+            return Err(EINVAL);
+        }
+        let at = m::M5_SHARED_LAYOUT.policy.checked_add(offset).ok_or(EINVAL)?;
+        Ok(self.object(self.bundle)?.word(at)?.load(Ordering::Relaxed))
+    }
+
     pub(crate) fn note_m5_submission_history(&self) -> Result {
         if !self.m5 { return Err(EINVAL); }
         let private = self.object(self.cluster)?;

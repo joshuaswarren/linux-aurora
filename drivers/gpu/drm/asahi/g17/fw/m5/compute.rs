@@ -367,6 +367,16 @@ impl Descriptor {
     /// Fill the entire prefix; no address or register becomes visible before
     /// validation completes. The owner publishes only after this returns.
     pub(crate) fn write(&mut self, args: &DescriptorArgs) -> Result {
+        self.populate::<true>(args)
+    }
+
+    /// Populate a prefix already cleared by `KernelObject::initialize`.
+    /// The caller must provide all-zero storage so reserved bytes stay zero.
+    pub(crate) fn write_zeroed(&mut self, args: &DescriptorArgs) -> Result {
+        self.populate::<false>(args)
+    }
+
+    fn populate<const CLEAR: bool>(&mut self, args: &DescriptorArgs) -> Result {
         if args.cdm_end_va < args.registers.cdm_va || args.qid >= 128 {
             return Err(EINVAL);
         }
@@ -376,7 +386,9 @@ impl Descriptor {
         let alternate_va = offset_va(args.descriptor_va, 0x760)?;
         // Also validate the kick's encodable addresses before mutating storage.
         bindings(args.descriptor_va, args.registers.scratch, args.registers.matrix_ops)?;
-        super::super::clear(self);
+        if CLEAR {
+            super::super::clear(self);
+        }
         self.tag = 3;
         self.submit_sequence = args.submit_sequence;
         self.context_id = args.registers.context_id.into();

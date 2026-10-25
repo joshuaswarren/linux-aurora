@@ -17,6 +17,11 @@ pub(crate) fn trace_context(id: u16) -> bool {
     DUMP_CONTEXTS.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0
 }
 
+/// Advertised while compressed single-layer D32 MSAA admission is enabled.
+pub(crate) fn depth_msaa_compression_enabled() -> bool {
+    enabled() && *crate::module_parameters::m5_depth_msaa_compression.value() == 1
+}
+
 pub(crate) fn validate(pass: &RenderPass) -> Result {
     // HAL300 carries the sample stride in eight bits. The 64-byte limit
     // belonged to the first qualified profile, not the M5 imageblock.
@@ -37,7 +42,8 @@ pub(crate) fn validate(pass: &RenderPass) -> Result {
     let plain_zls = pass.zls_control == 0
         || (pass.zls_control & 0x154 == 0
             && pass.depth.compression_va == 0 && pass.stencil.compression_va == 0);
-    let multisample = (plain_zls || layered_compressed_zls(pass))
+    let multisample = (plain_zls || layered_compressed_zls(pass)
+        || (depth_msaa_compression_enabled() && single_layer_compressed_depth_zls(pass)))
         && matches!(pass.samples_log2, 1..=3)
         && matches!((pass.utile_width, pass.utile_height),
                     (32, 32) | (32, 16) | (16, 16))
@@ -48,7 +54,7 @@ pub(crate) fn validate(pass: &RenderPass) -> Result {
             * u32::from(pass.utile_height) << pass.samples_log2) <= 65536;
     if !enabled() || !(single_sample || multisample)
         || (pass.zls_control != 0 && pass.depth.va == 0 && pass.stencil.va == 0) {
-        return Err(ENOTSUPP);
+        return Err(crate::g17::unsupported(file!(), line!()));
     }
     Ok(())
 }
@@ -87,6 +93,26 @@ fn layered_compressed_zls(pass: &RenderPass) -> bool {
         && (s_compressed || pass.stencil.compression_va == 0)
 }
 
+/// Single-layer D32 depth compression, with optional plain S8.
+/// The existing layered path remains separate. Both depth compression bits
+/// are required because partial rendering forces depth load and store even
+/// when one of those operations is disabled in the final render pass.
+fn single_layer_compressed_depth_zls(pass: &RenderPass) -> bool {
+    const Z_LOAD: u64 = 1 << 15;
+    const S_LOAD: u64 = 1 << 14;
+    const Z_STORE: u64 = 1 << 19;
+    const S_STORE: u64 = 1 << 18;
+    const Z_COMPRESS: u64 = (1 << 2) | (1 << 6);
+    const KNOWN: u64 = Z_LOAD | S_LOAD | Z_STORE | S_STORE | Z_COMPRESS;
+    pass.layers == 1
+        && matches!(pass.samples_log2, 1 | 2)
+        && pass.zls_control & !KNOWN == 0
+        && pass.zls_control & Z_COMPRESS == Z_COMPRESS
+        && pass.depth.va != 0 && pass.depth.compression_va != 0
+        && pass.stencil.compression_va == 0
+        && (pass.zls_control & (S_LOAD | S_STORE) == 0 || pass.stencil.va != 0)
+}
+
 pub(crate) fn parameter_geometry(blocks: usize) -> Result<super::buffer::BlockGeometry> {
     let mut info = core::mem::MaybeUninit::<kernel::bindings::sysinfo>::zeroed();
     // SAFETY: The complete sysinfo is initialized and writable.
@@ -122,7 +148,7 @@ pub(crate) fn controls(pass: &RenderPass) -> Result<regs::M5RenderControls> {
     Ok(regs::M5RenderControls {
         fragment_event_control: regs::fragment_event_control(true, 1),
         ta: stage(0x4054b), fragment: stage(0x104054b),
-        // Native code chooses this word from descriptor+12a4.
+        // Native 8bc09fc..0a78 chooses this word from descriptor+12a4.
         // Mode 2 is a private command-policy discriminator, not a default.
         ta_tile_control: if *crate::module_parameters::m5_ta_policy_test.value() == 2 {
             0x14c08a60

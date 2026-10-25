@@ -22,6 +22,7 @@ impl Firmware {
             return Ok(());
         }
         self.queues.replay_consumer_wait = None;
+        self.queues.replay_source_wait = false;
         let commands = self
             .queues
             .compute
@@ -60,6 +61,25 @@ impl Firmware {
                     break;
                 };
                 let owner = queue.owner();
+                let generation = self.recovery.generation();
+                // A source from the previous epoch must be republished first.
+                // Keep this FIFO head untouched and visit other physical
+                // queues; the normal delayed poll retries the consumer later.
+                let mut source_pending = false;
+                let mut source_error = None;
+                for dependency in &packet.sources {
+                    let observed = dependency.check().and_then(|()|
+                        dependency.source.snapshot(generation));
+                    match observed {
+                        Ok(crate::g17::sync_source::Snapshot::Pending) => source_pending = true,
+                        Ok(_) => {},
+                        Err(error) => { source_error = Some(error); break; },
+                    }
+                }
+                if source_pending && source_error.is_none() {
+                    self.queues.replay_source_wait = true;
+                    break;
+                }
                 // A render consumer named this command through a firmware
                 // dependency. Republish only while no render of the owner has
                 // executed since this recovery (none consumed the dead token),
@@ -70,7 +90,6 @@ impl Firmware {
                 let parked_prefix = owner.is_some_and(|owner| {
                     self.queues.render.owner_parked_through(owner, packet.order.wait_through[0])
                 });
-                let generation = self.recovery.generation();
                 let (executed, live) = if packet.completion.has_firmware_consumer() {
                     owner.map_or((true, false), |owner| self.queues.render.owner_render_state(owner, generation))
                 } else {
@@ -87,7 +106,7 @@ impl Firmware {
                 } else {
                     0
                 };
-                if must_wait && waited < CONSUMER_WAIT_NS {
+                if source_error.is_none() && must_wait && waited < CONSUMER_WAIT_NS {
                     self.queues.replay_consumer_wait = Some(now);
                     return Ok(());
                 }
@@ -110,7 +129,7 @@ impl Firmware {
                     packet.context.policy().priority(),
                     crate::g17::fw::queue::DataMaster::Compute,
                 )?;
-                if !outer_ready {
+                if !outer_ready && source_error.is_none() {
                     let now = super::now_ns();
                     let since = *self.queues.replay_outer_wait.get_or_insert(now);
                     if now.saturating_sub(since) < super::WORK_RING_WAIT_NS {
@@ -122,23 +141,60 @@ impl Firmware {
                     self.queues.replay_outer_wait = None;
                 }
 
-                let result = if let Some(error) = consumer {
+                let mut source_deferred = false;
+                let result = if let Some(error) = source_error {
+                    Err(error)
+                } else if let Some(error) = consumer {
                     Err(error)
                 } else if !outer_ready {
                     // This replay has no live firmware ownership. Persistent
                     // backpressure uses the existing failed-replay retirement.
                     Err(EBUSY)
                 } else { (|| {
-                    self.queues.compute[index]
-                        .as_mut()
-                        .and_then(|entry| entry.queue.as_deref_mut())
-                        .ok_or(EIO)?
-                        .prepare_replay(&packet)?;
+                    if packet.sources.is_empty() {
+                        self.queues.compute[index]
+                            .as_mut()
+                            .and_then(|entry| entry.queue.as_deref_mut())
+                            .ok_or(EIO)?
+                            .prepare_replay(&packet)?;
+                    }
                     let owner = owner.ok_or(EIO)?;
                     packet.check_dependencies()?;
-                    let dependencies = self.queues.render_prefix(owner, &packet)?;
-                    self.publish_compute(owner, packet.clone(), dependencies.as_slice(), deferred)
+                    let mut dependencies = self.queues.render_prefix(owner, &packet)?;
+                    let holds = if packet.sources.is_empty() { None } else {
+                        match self.queues.resolve_sources(&packet, generation, &mut dependencies) {
+                            Ok(holds) => Some(holds),
+                            Err(error) if error == EAGAIN => {
+                                source_deferred = true;
+                                return Ok(());
+                            },
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    // Source resolution and binding holds precede any replay
+                    // state change. Quiet rollback stays under the device lock.
+                    if !packet.sources.is_empty() {
+                        self.queues.compute[index]
+                            .as_mut()
+                            .and_then(|entry| entry.queue.as_deref_mut())
+                            .ok_or(EIO)?
+                            .prepare_replay(&packet)?;
+                        // The previous publication is already physically
+                        // retired. Only this attempt may transfer new holds.
+                        packet.reset_publication_for_replay();
+                    }
+                    let result = self.publish_compute(owner, packet.clone(), dependencies.as_slice(), deferred);
+                    if let Some(holds) = holds {
+                        if packet.is_published() {
+                            packet.completion.retain_source_holds(holds.into_holds());
+                        }
+                    }
+                    result
                 })() };
+                if source_deferred {
+                    self.queues.replay_source_wait = true;
+                    break;
+                }
                 let recovery_wait = matches!(result, Err(EAGAIN) | Err(EBUSY))
                     && (self.recovery.pending()
                         || recovery::Memory::recovery_state(&self.init)? != 0);

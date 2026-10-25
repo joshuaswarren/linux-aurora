@@ -31,7 +31,7 @@ impl PageTable {
 
     pub(super) fn visit_runs(&self, range: Range<u64>, visit: impl FnMut(u64, u64, u8) -> Result) -> Result<bool> {
         match self {
-            Self::Direct(_) => { let _ = (range, visit); Err(ENOTSUPP) }
+            Self::Direct(_) => { let _ = (range, visit); Err(crate::g17::unsupported(file!(), line!())) }
             #[cfg(CONFIG_ARM64)]
             Self::Sptm(table) => table.visit_runs(range, visit),
         }
@@ -76,7 +76,7 @@ impl PageTable {
         tile: &kernel::sync::Arc<super::sptm_pgtable::SparseTile>, prot: Prot) -> Result
     {
         match self {
-            Self::Direct(_) => Err(ENOTSUPP),
+            Self::Direct(_) => Err(crate::g17::unsupported(file!(), line!())),
             Self::Sptm(table) => table.map_tiled(range, tile, prot),
         }
     }
@@ -135,7 +135,7 @@ impl PageTable {
             // No atomic permission-change service is available yet. In
             // particular, do not emulate it with an unmap of live firmware.
             #[cfg(CONFIG_ARM64)]
-            Self::Sptm(_) => Err(ENOTSUPP),
+            Self::Sptm(_) => Err(crate::g17::unsupported(file!(), line!())),
         }
     }
 
@@ -144,7 +144,7 @@ impl PageTable {
             Self::Direct(table) => table.leaf_entry(address),
             // A shadow is not a hardware PTE readback.
             #[cfg(CONFIG_ARM64)]
-            Self::Sptm(_) => Err(ENOTSUPP),
+            Self::Sptm(_) => Err(crate::g17::unsupported(file!(), line!())),
         }
     }
 
@@ -153,7 +153,7 @@ impl PageTable {
         match self {
             Self::Direct(table) => table.dump_pages(range),
             #[cfg(CONFIG_ARM64)]
-            Self::Sptm(_) => Err(ENOTSUPP),
+            Self::Sptm(_) => Err(crate::g17::unsupported(file!(), line!())),
         }
     }
 }

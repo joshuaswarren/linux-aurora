@@ -68,6 +68,8 @@ pub(crate) const DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: u64 = 1 << 13;
 /// retain the running kernel's Rust UAPI crate and its exact link metadata.
 /// Host fixtures compare these values with both public headers.
 pub(crate) const DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: u64 = 1 << 14;
+/// D32 2x/4x ZLS admission; no compressed stencil or resolve bits.
+pub(crate) const DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION: u64 = 1 << 23;
 pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 = 1 << 21;
 /// UAPI DRM_ASAHI_RENDER_PROGRAM_TASK (bit 3), only with
 /// DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object program is an API task stage.

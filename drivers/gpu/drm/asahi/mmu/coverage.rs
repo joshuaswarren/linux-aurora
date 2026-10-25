@@ -178,26 +178,32 @@ impl CoverageCache {
             self.intervals.clear();
         }
         let (mut s, mut e) = (start, end);
-        let mut out = KVec::with_capacity(self.intervals.len() + 1, GFP_KERNEL)?;
-        let mut placed = false;
-        for &(is, ie, ia) in self.intervals.iter() {
-            if ie < s || (ie == s && ia != access) {
-                out.push((is, ie, ia), GFP_KERNEL)?;
-            } else if is > e || (is == e && ia != access) {
-                if !placed {
-                    out.push((s, e, access), GFP_KERNEL)?;
-                    placed = true;
-                }
-                out.push((is, ie, ia), GFP_KERNEL)?;
-            } else if ia == access {
+        let first = self.intervals.partition_point(|&(_is, ie, ia)| {
+            ie < s || (ie == s && ia != access)
+        });
+        let mut last = first;
+        while last < self.intervals.len() {
+            let (is, ie, ia) = self.intervals[last];
+            if is > e || (is == e && ia != access) {
+                break;
+            }
+            if ia == access {
                 s = s.min(is);
                 e = e.max(ie);
             }
+            last += 1;
         }
-        if !placed {
-            out.push((s, e, access), GFP_KERNEL)?;
+
+        let len = self.intervals.len();
+        if first == last {
+            // Grow only when adding a disjoint interval exhausts capacity.
+            self.intervals.push((s, e, access), GFP_KERNEL)?;
+            self.intervals.copy_within(first..len, first + 1);
+        } else {
+            self.intervals.copy_within(last..len, first + 1);
+            self.intervals.truncate(len - (last - first) + 1);
         }
-        self.intervals = out;
+        self.intervals[first] = (s, e, access);
         Ok(())
     }
 

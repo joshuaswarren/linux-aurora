@@ -77,6 +77,8 @@ pub(super) trait Queues {
     /// Copy every retained queue's live producer to its recovery target, then
     /// issue a full barrier. A failed graph must not skip subsequent queues.
     fn publish_recovery_targets(&self) -> Option<Error>;
+    /// Active converted consumers require every recovery target to be copied.
+    fn has_active_source_consumers(&self) -> bool { false }
     fn oldest_spared(&self, qid: u8) -> Option<bool>;
     fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>));
     /// Classify every in-flight completion; return QIDs of render slots with spared work.
@@ -229,6 +231,14 @@ pub(super) fn service<H: Host>(
     if host.host_recovery()? != 0 {
         return Err(EIO);
     }
+    // A converted consumer may depend on a producer cancelled by this restart.
+    // Do not resume that dependency graph without a proven cancellation order.
+    // The caller's event failure path stops the processors and keeps M5-owned
+    // storage retained; this is not an engine-retirement witness.
+    if host.has_active_source_consumers() {
+        pr_err!("GPU recovery with active cross-queue consumers requires stop containment\n");
+        return Err(EIO);
+    }
     host.recovery_mut().accepted = host.recovery().accepted.wrapping_add(1);
     if request.generation == 0 && !host.render_scheduler_active() {
         host.clear_timestamps()?;
@@ -236,6 +246,11 @@ pub(super) fn service<H: Host>(
     let mut sources = host.fault_sources()?;
     pr_err!("AGX firmware recovery fault sources: {:?}\n", sources);
     let target_error = host.publish_recovery_targets();
+    // Firmware is still halted and publication remains closed. Do not resume
+    // a converted consumer when any target failed to join this cancellation.
+    if host.has_active_source_consumers() {
+        if let Some(error) = target_error { return Err(error); }
+    }
     host.transition(1, 2)?;
     let mut recovered = false;
     for _ in 0..RECOVERY_POLLS {

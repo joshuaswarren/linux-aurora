@@ -54,7 +54,8 @@ impl super::super::Backend {
             let physical = &self.shared.physical_available;
             let mut observed = physical.observe();
             let mut outer_wait = None;
-            let result = self.ensure_render(packet, slot, true, Some(&mut observed)).and_then(|()| {
+            let mut pair_loan = false;
+            let result = self.ensure_render(packet, slot, true, Some(&mut observed), &mut pair_loan).and_then(|()| {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                 if firmware.recovery.pending()

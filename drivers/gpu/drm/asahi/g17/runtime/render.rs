@@ -141,8 +141,6 @@ struct Entry {
     pending_owner_closed: bool,
     borrowed_active: bool,
     borrowed_dependencies: Option<crate::g17::queue::render::Dependencies>,
-    /// The event worker has the pair on an observation loan (take/return_render_observation).
-    observing: bool,
     event_masks: [u64; 2],
     closed: bool,
     /// The pair was taken from a live, idle owner (admission lending): its
@@ -232,13 +230,6 @@ impl RenderState {
                 .push_within_capacity(retired)
                 .map_err(|_| EIO)?;
         }
-    }
-
-    /// The pair of `slot` is on an observation loan. Read under the device mutex: the loan's
-    /// return clears it and then notifies Shared::changed, so a waiter that checks this and
-    /// sleeps on that condition variable with the mutex held cannot miss the return.
-    pub(in crate::g17::runtime) fn observing(&self, slot: u8) -> bool {
-        self.entry(slot).is_ok_and(|entry| entry.observing)
     }
 
     fn entry(&self, slot: u8) -> Result<&Entry> {
@@ -388,7 +379,6 @@ impl Registry {
                 pending_owner_closed: false,
                 borrowed_active: false,
                 borrowed_dependencies: None,
-                observing: false,
                 event_masks: [0; 2],
                 closed: false,
                 lent_live: false,

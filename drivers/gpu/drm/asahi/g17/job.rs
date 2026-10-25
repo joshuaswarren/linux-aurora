@@ -107,6 +107,8 @@ pub(crate) struct Packet {
     pub(crate) footprint: Option<Arc<super::hazard::Footprint>>,
     inputs: KVec<Fence>,
     firmware: KVec<Fence>,
+    pub(crate) sources: KVec<super::sync_source::Dependency>,
+    source_inputs: KVec<Fence>,
     publication: AtomicU8,
     cancelled: AtomicBool,
     early: AtomicI32,
@@ -127,6 +129,8 @@ impl Packet {
         completion: Arc<Completion>,
         inputs: KVec<Fence>,
         firmware: KVec<Fence>,
+        sources: KVec<super::sync_source::Dependency>,
+        source_inputs: KVec<Fence>,
     ) -> Result<Arc<Self>> {
         let footprint = match &command {
             Validated::Render { attachments, .. } => {
@@ -145,6 +149,8 @@ impl Packet {
                 footprint,
                 inputs,
                 firmware,
+                sources,
+                source_inputs,
                 publication: AtomicU8::new(0),
                 cancelled: AtomicBool::new(false),
                 early: AtomicI32::new(0),
@@ -265,6 +271,13 @@ impl Packet {
         for fence in &self.firmware {
             check_status(fence)?;
         }
+        for dependency in &self.sources { dependency.check()?; }
+        self.check_source_inputs()?;
+        Ok(())
+    }
+
+    pub(crate) fn check_source_inputs(&self) -> Result {
+        for original in &self.source_inputs { check_status(original)?; }
         Ok(())
     }
 
@@ -286,6 +299,13 @@ impl Packet {
     pub(crate) fn begin_publication(&self) -> bool {
         self.publication
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    /// Return an owned, still invisible attempt to the scheduler. Cancellation
+    /// keeps its independent flag, so a racing cancel cannot be forgotten.
+    pub(crate) fn retry_unpublished(&self) -> bool {
+        self.publication
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
     pub(crate) fn mark_published(&self) {
@@ -354,6 +374,7 @@ pub(crate) trait Backend: Send + Sync {
     /// Complete architecture-specific validation before accepting any command
     /// from this ioctl. No device mutex or firmware publication is involved.
     fn prepare_command(&self, _command: &mut Validated) -> Result { Ok(()) }
+    fn firmware_compute_sources(&self) -> bool { false }
     /// Device detector retained by render completions after queue teardown.
     fn feed(&self) -> Option<Arc<super::feed::Feed>> {
         None
@@ -509,7 +530,7 @@ impl<B: Backend> Scheduler<B> {
         };
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
-        if packet.engine() == Engine::Render && !(early && self.backend.try_early(&packet)) {
+        if !(early && self.backend.try_early(&packet)) {
             self.backend.count_backlog(&packet);
         }
         job.push();

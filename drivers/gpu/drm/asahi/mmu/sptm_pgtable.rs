@@ -215,7 +215,7 @@ fn protection(value: Prot) -> Result<Protection> {
         else if value == prot::PROT_FW_SHARED_RO { Protection::FirmwareReadOnly }
         else if value == prot::PROT_FW_MMIO_RW { Protection::FirmwareMmioReadWrite }
         else if value == prot::PROT_FW_MMIO_RO { Protection::FirmwareMmioReadOnly }
-        else { return Err(ENOTSUPP); })
+        else { return Err(crate::g17::unsupported(file!(), line!())); })
 }
 
 pub(super) struct PageTable {
@@ -252,7 +252,17 @@ impl PageTable {
         if self.validate_range(range.clone()).is_err() { return Ok(false); }
         let mut at = range.start;
         while at < range.end {
-            let Some((start, run)) = self.run_at(at) else { return Ok(false); };
+            // Keep the located node: looking its key up again repeats the
+            // same tree search for every run in a coverage proof.
+            let lower = self.runs.cursor_lower_bound(&at);
+            let last = if lower.is_none() { self.runs.cursor_back() } else { None };
+            let found = match lower.as_ref() {
+                Some(cursor) if *cursor.current().0 == at => Some(cursor.current()),
+                Some(cursor) => cursor.peek_prev(),
+                None => last.as_ref().map(|cursor| cursor.current()),
+            };
+            let Some((&start, run)) = found else { return Ok(false); };
+            if at >= run.end { return Ok(false); }
             let access = u8::from(run.prot.allows_gpu(true, false))
                 | (u8::from(run.prot.allows_gpu(false, true)) << 1);
             visit(start, run.end, access)?;

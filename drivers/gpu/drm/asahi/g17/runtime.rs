@@ -35,6 +35,20 @@ const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
 /// A physical compute queue frees when another owner's queue goes idle.
 const COMPUTE_QUEUE_WAIT_NS: u64 = 30_000_000_000;
 
+/// Before visibility, rollback occurs under the publication lock and cannot
+/// invoke availability callbacks. Visible work transfers these to Completion.
+struct PendingSourceHolds(KVec<super::source_hold::SourceHold>);
+impl Drop for PendingSourceHolds {
+    fn drop(&mut self) {
+        for hold in self.0.drain(..) { hold.drop_quiet(); }
+    }
+}
+impl PendingSourceHolds {
+    fn into_holds(mut self) -> KVec<super::source_hold::SourceHold> {
+        core::mem::replace(&mut self.0, KVec::new())
+    }
+}
+
 /// A reservation remains identifiable while its backing is built without the
 /// device mutex. Failed construction returns the slot, never its host identity.
 #[derive(Clone, Copy)]
@@ -98,12 +112,46 @@ pub(super) struct Registry {
     /// A compute replay with a render consumer waits (since this time, ns)
     /// until the owner's renders are parked for replay or idle.
     replay_consumer_wait: Option<u64>,
+    /// A replay is awaiting a source's publication in the current epoch.
+    replay_source_wait: bool,
     pub(super) observations: compute::retirement::Batch,
-    worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
 }
 
 impl Registry {
+    fn resolve_sources(&self, packet: &Arc<super::job::Packet>, epoch: u64,
+        dependencies: &mut super::dependency::Frontier) -> Result<PendingSourceHolds>
+    {
+        use super::sync_source::Snapshot;
+        packet.check_source_inputs()?;
+        let mut holds = PendingSourceHolds(KVec::with_capacity(packet.sources.len(), GFP_KERNEL)?);
+        for dependency in &packet.sources {
+            // snapshot checks the source error and VM status in one critical section.
+            match dependency.source.snapshot(epoch)? {
+                Snapshot::Complete => {},
+                Snapshot::Pending => return Err(EAGAIN),
+                Snapshot::Published(token) => {
+                    if packet.completion.source().as_ref().is_some_and(|source|
+                        Arc::ptr_eq(source, &dependency.source)) { return Err(EINVAL); }
+                    let queue = self.compute.iter().flatten()
+                        .filter_map(|entry| entry.queue.as_deref())
+                        .find(|queue| queue.qid() == token.qid).ok_or(EAGAIN)?;
+                    let hold = match queue.hold_source(&dependency.source, token) {
+                        Ok(hold) => hold,
+                        Err(error) if error == EAGAIN && matches!(dependency.source.snapshot(epoch)?, Snapshot::Complete) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    holds.0.push_within_capacity(hold).map_err(|error| {
+                        error.0.drop_quiet(); ENOMEM
+                    })?;
+                    dependencies.insert(token.sequence,
+                        super::fw::kick::KickDependency::new(token.qid, token.kick).ok_or(EINVAL)?)?;
+                }
+            }
+        }
+        Ok(holds)
+    }
+
     /// Initialize inside the firmware allocation instead of staging the whole
     /// registry on the probe stack. No additional allocation is required.
     pub(super) fn new(
@@ -145,8 +193,8 @@ impl Registry {
             compute_pressure_until: 0,
             replay_outer_wait: None,
             replay_consumer_wait: None,
+            replay_source_wait: false,
             observations: compute::retirement::Batch::new()?,
-            worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
         })
     }
@@ -239,7 +287,7 @@ impl Registry {
             .filter(|(slot, entry)| prepared[*slot].load(Ordering::Acquire) == 0
                 && entry.as_ref().is_some_and(|entry| entry.growth.is_none()))
             .filter_map(|(_, entry)| entry.as_mut().and_then(|entry| entry.queue.as_deref_mut()))
-            .filter(|queue| queue.reusable())
+            .filter(|queue| !queue.source_held() && queue.reusable())
         {
             if queue.pool_vacant() {
                 vacant.get_or_insert(queue.qid());
@@ -280,7 +328,8 @@ impl Registry {
                 && entry.as_ref().is_some_and(|entry| entry.growth.is_none()))
             .filter_map(|(_, entry)| entry.as_mut().and_then(|entry| entry.queue.as_deref_mut()))
             .filter(|queue| {
-                queue.idle_owned() && queue.owner() != Some(requester) && queue.pool_fits(required)
+                !queue.source_held() && queue.idle_owned()
+                    && queue.owner() != Some(requester) && queue.pool_fits(required)
             })
             .min_by_key(|queue| queue.released_at())
         else {
@@ -531,11 +580,17 @@ pub(super) struct Backend {
     pub(super) context: Arc<Context>,
     owner: u64,
     backlog: core::sync::atomic::AtomicU32,
+    compute_backlog: core::sync::atomic::AtomicU32,
     /// vmfix6d attribution: the last site that returned EBUSY to this queue's
     /// render publication (render::submit::Site), reported by capacity waits.
     busy_site: core::sync::atomic::AtomicU32,
     /// vmfix6d A: a render publication of this queue is in progress.
     publishing: core::sync::atomic::AtomicBool,
+}
+
+enum ComputePublication {
+    SourcePending,
+    Attempted(Result),
 }
 
 impl Backend {
@@ -602,6 +657,7 @@ impl Backend {
                     context,
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
+                    compute_backlog: core::sync::atomic::AtomicU32::new(0),
                     busy_site: core::sync::atomic::AtomicU32::new(0),
                     publishing: core::sync::atomic::AtomicBool::new(false),
                 },
@@ -800,6 +856,9 @@ impl Backend {
             super::command::Validated::Compute { plan, .. } => plan.map(|plan| plan.geometry),
             _ => return Err(EINVAL),
         };
+        if self.try_prepare_resident_compute(packet, preparation, required)? {
+            return Ok(None);
+        }
         loop {
             if packet.cancel_requested() { return Err(ECANCELED); }
             if packet.completion.status().get() != 0 { return Err(EIO); }
@@ -846,6 +905,62 @@ impl Backend {
                 return Ok(Some(wait));
             }
         }
+    }
+
+    /// Reserve a resident M5 queue and its outer credits in one transaction.
+    /// Misses retain the existing preparation/wait path. In particular, a
+    /// newly acquired physical claim stays with Preparation until the caller
+    /// can release it outside the device mutex.
+    fn try_prepare_resident_compute(&self, packet: &Arc<super::job::Packet>,
+        preparation: &mut super::job::Preparation,
+        required: Option<super::fw::m5::pool::PoolGeometry>) -> Result<bool>
+    {
+        if !matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm) {
+            return Ok(false);
+        }
+        if packet.cancel_requested() { return Err(ECANCELED); }
+        if packet.completion.status().get() != 0 { return Err(EIO); }
+        let lease = match self.shared.preparations.try_enter() {
+            Ok(lease) => lease,
+            Err(error) if matches!(error, EBUSY | EAGAIN) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut state = self.shared.state.lock();
+        let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+        if !lease.is_current() || self.shared.crashed.load(Ordering::Acquire)
+            || firmware.recovery.pending()
+            || super::recovery::Memory::recovery_state(&firmware.init)? != 0
+        {
+            return Ok(false);
+        }
+        self.prepare_resident_compute_locked(firmware, packet, preparation, required)
+    }
+
+    /// The caller holds the device mutex and a current preparation lease.
+    /// Claims stay in Preparation so every release can occur after unlocking.
+    fn prepare_resident_compute_locked(&self, firmware: &mut super::Firmware,
+        packet: &Arc<super::job::Packet>, preparation: &mut super::job::Preparation,
+        required: Option<super::fw::m5::pool::PoolGeometry>) -> Result<bool>
+    {
+        let Some(queue) = firmware.queues.compute(self.owner) else {
+            return Ok(false);
+        };
+        if !queue.pool_fits(required) { return Ok(false); }
+        let slots = queue.outer_slots();
+        match firmware.queues.claim_compute(self.owner, &self.context, &preparation.compute) {
+            Ok(Some(claim)) => preparation.compute = Some(claim),
+            Ok(None) => {},
+            Err(error) if error == EBUSY => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        if preparation.outer.is_none() {
+            match firmware.init.reserve_outer(packet.context.policy().priority(), slots) {
+                Ok(claim) => preparation.outer = Some(claim),
+                Err(error) if matches!(error, EBUSY | EAGAIN) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
     }
 
     /// The physical claim remains held while checking the shared outer ring.
@@ -1056,7 +1171,8 @@ impl Backend {
                     self.compute_scheduler(&alloc, &lease, nonblocking, observed.as_deref_mut())?;
                 }
                 let queue = compute::Queue::new(&alloc, &objects, backing, self.owner, self.context.clone(),
-                    matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm))?;
+                    matches!(self.shared.firmware_profile, super::FirmwareProfile::M5Sptm),
+                    self.shared.physical_available.clone())?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
             let (mut built, build_error) = match built {
@@ -1127,13 +1243,13 @@ impl DeferredBatch {
     };
 
     /// Reused by the sole event work item; no allocation on a completion pass.
-    fn worker() -> Result<Self> {
+    pub(super) fn worker() -> Result<Self> {
         Self::with_capacity(2 * QIDS * Self::DEPTH, QIDS)
     }
     /// One publication can quarantine only its selected physical queue/pair.
     /// VM-wide settlement is a separate transaction before publishing its error.
     fn publication() -> Result<Self> {
-        Self::with_capacity(2 * Self::DEPTH, 0)
+        Self::with_capacity(2 * Self::DEPTH + 1, 0)
     }
     fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
         Ok(Self {
@@ -1170,12 +1286,13 @@ impl DeferredBatch {
             drop(vacated);
         }
     }
-    /// A recovery pass can fail and retire each retained command at most once.
-    /// Reserve before changing queues, plus a full publication for its caller.
+    /// A replay can publish its source and later fail and retire in this same
+    /// transaction. Reserve all three events before changing queues, plus a
+    /// full publication and source event for the caller.
     /// Healthy submissions keep the small publication collector unchanged.
     fn reserve_replays(&mut self, commands: usize) -> Result {
         self.values
-            .reserve(2 * commands + 2 * Self::DEPTH, GFP_KERNEL)?;
+            .reserve(3 * commands + 2 * Self::DEPTH + 1, GFP_KERNEL)?;
         Ok(())
     }
     pub(super) fn push(&mut self, value: super::completion::Deferred) -> Result {
@@ -1194,11 +1311,20 @@ impl DeferredBatch {
         // succeeds; failure fences and rejected events are not retirement.
         if let Some(
             Deferred::Retired(completion, _)
+            | Deferred::RetiredCompute(completion, _, _)
             | Deferred::Drained(completion, _)
             | Deferred::Release(completion),
         ) = self.values.last()
         {
             completion.note_retirement_queued();
+        }
+        match self.values.last() {
+            Some(Deferred::RetiredCompute(completion, _, _))
+            | Some(Deferred::Retired(completion, Ok(_)))
+            | Some(Deferred::Drained(completion, Ok(_))) => {
+                if let Some(source) = completion.source() { source.note_successful_retirement(); }
+            }
+            _ => {},
         }
         Ok(())
     }
@@ -1572,12 +1698,43 @@ impl Backend {
         Err(EBUSY)
     }
 
+    /// Resolve and retain firmware sources in the same device transaction as publication.
+    fn publish_compute_locked(&self, firmware: &mut super::Firmware,
+        packet: &Arc<super::job::Packet>, deferred: &mut DeferredBatch,
+        outer: &mut Option<super::initdata::OuterClaim>) -> Result<ComputePublication>
+    {
+        firmware.replay_compute(deferred)?;
+        let mut dependencies = firmware.queues.render_prefix(self.owner, packet)?;
+        let mut source_holds = Some(match firmware.queues.resolve_sources(
+            packet, firmware.recovery.generation(), &mut dependencies)
+        {
+            Ok(holds) => holds,
+            Err(error) if error == EAGAIN => return Ok(ComputePublication::SourcePending),
+            Err(error) => return Err(error),
+        });
+        let result = {
+            let _scope = outer.as_mut().map(|claim| firmware.init.outer_scope(claim)).transpose()?;
+            firmware.publish_compute(
+                self.owner,
+                packet.clone(),
+                dependencies.as_slice(),
+                deferred,
+            )
+        };
+        if packet.is_published() {
+            packet.completion.retain_source_holds(source_holds.take().ok_or(EIO)?.into_holds());
+        }
+        drop(source_holds);
+        Ok(ComputePublication::Attempted(result))
+    }
+
     /// Called after taking this packet's publication claim. All waits and work
     /// state allocation precede the device mutex; only the checked epoch commits.
     fn compute_packet(
         &self,
         packet: &Arc<super::job::Packet>,
         deferred: &mut DeferredBatch,
+        nonblocking: bool,
     ) -> Result {
         packet.check_dependencies()?;
         // Never acquire Packet::preparation while holding Shared::state.
@@ -1594,12 +1751,14 @@ impl Backend {
             if packet.completion.status().get() != 0 {
                 return Err(EIO);
             }
-            let lease = self.shared.preparations.enter(false)?;
+            let lease = if nonblocking { self.shared.preparations.try_enter()? }
+                        else { self.shared.preparations.enter(false)? };
             if packet.completion.work_state()?.word() == u32::MAX { return Err(EINVAL); }
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {
                 drop(state);
+                if nonblocking { return Err(EAGAIN); }
                 continue;
             }
             if packet.cancel_requested() {
@@ -1614,6 +1773,7 @@ impl Backend {
             }
             let recovery_state = super::recovery::Memory::recovery_state(&firmware.init)?;
             if firmware.recovery.pending() || recovery_state != 0 {
+                if nonblocking { return Err(EAGAIN); }
                 if recovery_polls == RECOVERY_SETTLE_POLLS {
                     return Err(EBUSY);
                 }
@@ -1624,22 +1784,23 @@ impl Backend {
                 kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
                 continue;
             }
-            firmware.replay_compute(deferred)?;
-            let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
-            let result = {
-                let _scope = outer.as_mut().map(|claim| firmware.init.outer_scope(claim)).transpose()?;
-                firmware.publish_compute(
-                    self.owner,
-                    packet.clone(),
-                    dependencies.as_slice(),
-                    deferred,
-                )
+            let result = match self.publish_compute_locked(firmware, packet, deferred, &mut outer)? {
+                ComputePublication::Attempted(result) => result,
+                ComputePublication::SourcePending if !nonblocking => {
+                    drop(state);
+                    drop(lease);
+                    self.shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                    continue;
+                }
+                ComputePublication::SourcePending => return Err(EAGAIN),
             };
             if matches!(result, Err(EBUSY) | Err(EAGAIN))
                 && !packet.is_published()
                 && (firmware.recovery.pending()
                     || super::recovery::Memory::recovery_state(&firmware.init)? != 0)
             {
+                if nonblocking { return result; }
                 if recovery_polls == RECOVERY_SETTLE_POLLS {
                     return Err(EBUSY);
                 }
@@ -1651,6 +1812,7 @@ impl Backend {
                 continue;
             }
             if matches!(result, Err(ENOENT)) && !packet.is_published() {
+                if nonblocking { return result; }
                 // This owner's idle queue was reassigned after its submission
                 // was accepted: bind a queue again (bounded inside), then retry.
                 // Under QID pressure an idle queue can be reassigned again
@@ -1665,6 +1827,7 @@ impl Backend {
                 continue;
             }
             if matches!(result, Err(EAGAIN)) && !packet.is_published() {
+                if nonblocking { return result; }
                 let now = now_ns();
                 let since = *outer_wait.get_or_insert(now);
                 if now.saturating_sub(since) >= COMPUTE_QUEUE_WAIT_NS {

@@ -43,7 +43,6 @@ impl crate::g17::Firmware {
             entry.borrowed_active = pair.published_in_flight();
             entry.borrowed_dependencies = Some(pair.dependency_snapshot());
             entry.preparing = Some(packet);
-            entry.observing = true;
             return Ok(Some((slot, entry.pair.take().ok_or(EIO)?)));
         }
         Ok(None)
@@ -62,7 +61,6 @@ impl crate::g17::Firmware {
         entry.pair = pair.take();
         entry.borrowed_dependencies = None;
         entry.preparing = None;
-        entry.observing = false;
         Ok(())
     }
 
@@ -139,9 +137,7 @@ impl crate::g17::Shared {
                 remaining = crate::hw::t8140::queues::RENDER_DEPTH;
                 retries = 0;
             }
-            // One loan covers every render that is already complete, so a publisher
-            // waiting for this pair sees a single short loan, not one per render.
-            let observed = pair.observe_completed();
+            let observed = pair.observe_front();
             let mut pair = Some(pair);
             let mut state = self.state.lock();
             // Return installed ownership before examining read errors or epoch.
@@ -179,26 +175,11 @@ impl crate::g17::Shared {
             let result = (|| {
                 let state = crate::g17::recovery::Memory::recovery_state(&firmware.init)?;
                 let progressed = match observed {
-                    Ok(run) => {
-                        // In order, each against the then-current front ticket; stop at
-                        // the first that does not retire (incomplete or stamps not visible).
-                        let mut any = false;
-                        for observed in run.into_iter() {
-                            let step = firmware.with_render(slot, |pair, host| {
-                                if !pair.is_front(&observed) {
-                                    return Ok(false);
-                                }
-                                pair.retire_observed(observed, state, host, &mut |event| {
-                                    deferred.push(event)
-                                })
-                            })?;
-                            if !step {
-                                break;
-                            }
-                            any = true;
-                        }
-                        any
-                    }
+                    Ok(observed) => firmware.with_render(slot, |pair, host| {
+                        pair.retire_observed(observed, state, host, &mut |event| {
+                            deferred.push(event)
+                        })
+                    })?,
                     Err(error) if error == EAGAIN => false,
                     Err(error) => return Err(error),
                 };

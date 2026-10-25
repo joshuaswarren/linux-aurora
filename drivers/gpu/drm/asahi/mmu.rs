@@ -663,7 +663,7 @@ impl VmInner {
 
     #[cfg(not(CONFIG_ARM64))]
     fn map_sparse_tile(&mut self, _range: Range<u64>, _prot: Prot) -> Result {
-        Err(ENOTSUPP)
+        Err(crate::g17::unsupported(file!(), line!()))
     }
 
     /// Remove hardware leaves for one complete user GPUVA without allocating.
@@ -755,7 +755,7 @@ impl VmInner {
 
     /// Returns the translation table base for this Vm
     fn ttb(&self) -> Result<u64> {
-        self.page_table.direct_root().ok_or(ENOTSUPP)
+        self.page_table.direct_root().ok_or_else(|| crate::g17::unsupported(file!(), line!()))
     }
 
     /// Invalidate a VA range of this Vm's address space in the TLB of one ASID.
@@ -1656,7 +1656,7 @@ impl UatInner {
         match &self.backend {
             UatBackend::Direct(inner) => Ok(inner.shared.lock()),
             #[cfg(CONFIG_ARM64)]
-            UatBackend::Sptm(_) => Err(ENOTSUPP),
+            UatBackend::Sptm(_) => Err(crate::g17::unsupported(file!(), line!())),
         }
     }
 
@@ -1665,13 +1665,16 @@ impl UatInner {
         match &self.backend {
             UatBackend::Direct(inner) => Ok(inner.handoff_flush[slot as usize].lock()),
             #[cfg(CONFIG_ARM64)]
-            UatBackend::Sptm(_) => Err(ENOTSUPP),
+            UatBackend::Sptm(_) => Err(crate::g17::unsupported(file!(), line!())),
         }
     }
 }
 
 /// Top-level UAT manager object
 pub(crate) struct Uat {
+    // Remove the debugfs entry and join its readers before releasing UAT state.
+    #[cfg(CONFIG_ARM64)]
+    platform_status: Option<sptm_runtime::PlatformStatusHandle>,
     dev: driver::AsahiDevRef,
     geometry: UatGeometry,
 
@@ -2016,7 +2019,7 @@ impl Vm {
 
     /// Get the translation table base for this Vm
     fn ttb(&self) -> Result<u64> {
-        self.binding.lock().ttb.ok_or(ENOTSUPP)
+        self.binding.lock().ttb.ok_or_else(|| crate::g17::unsupported(file!(), line!()))
     }
 
     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
@@ -2691,7 +2694,7 @@ impl Uat {
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
         let mut binding = vm.binding.lock();
 
-        let root = binding.ttb.ok_or(ENOTSUPP)?;
+        let root = binding.ttb.ok_or_else(|| crate::g17::unsupported(file!(), line!()))?;
         if binding.binding.is_none() {
             assert_eq!(binding.active_users, 0);
 
@@ -3038,6 +3041,8 @@ impl Uat {
         let ttb0 = kernel_lower_vm.ttb()?;
 
         let uat = Self {
+            #[cfg(CONFIG_ARM64)]
+            platform_status: None,
             dev: dev.into(),
             geometry,
             kernel_vm,

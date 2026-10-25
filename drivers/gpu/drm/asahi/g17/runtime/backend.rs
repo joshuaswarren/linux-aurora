@@ -2,7 +2,7 @@
 
 //! Scheduler callbacks and the off-lock fence boundary of a logical queue.
 
-use super::{Backend, DeferredBatch};
+use super::{Backend, ComputePublication, DeferredBatch};
 use crate::g17::{
     completion::Deferred,
     job::{self, Engine, Packet},
@@ -13,8 +13,179 @@ use kernel::{dma_fence::Fence, drm::sched, prelude::*, sync::Arc};
 impl Backend {
     pub(super) fn release_backlog(&self, packet: &Packet) {
         if packet.take_backlog() {
-            self.backlog.fetch_sub(1, Ordering::AcqRel);
+            self.backlog_for(packet.engine()).fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    fn backlog_for(&self, engine: Engine) -> &core::sync::atomic::AtomicU32 {
+        match engine {
+            Engine::Render => &self.backlog,
+            Engine::Compute => &self.compute_backlog,
+        }
+    }
+
+    /// Prepare only a resident compute queue. A miss leaves the scheduler to
+    /// handle identities, growth, recovery and capacity without an ioctl wait.
+    fn try_prepare_compute_early(&self, packet: &Arc<Packet>) -> bool {
+        let required = match &packet.command {
+            crate::g17::command::Validated::Compute { plan, .. } => plan.map(|p| p.geometry),
+            _ => return false,
+        };
+        let mut preparation = packet.preparation.lock();
+        let had_pin = packet.has_pin();
+        let had_compute = preparation.compute.is_some();
+        let had_outer = preparation.outer.is_some();
+        let prepared = (|| -> Result<bool> {
+            if packet.cancel_requested() || packet.completion.status().get() != 0 {
+                return Ok(false);
+            }
+            if packet.prepare_pins()?.is_some() { return Ok(false); }
+            preparation.work_state = Some(packet.completion.work_state()?.claim()?);
+            self.try_prepare_resident_compute(packet, &mut preparation, required)
+        })();
+        if matches!(prepared, Ok(true)) {
+            preparation.ready = true;
+            return true;
+        }
+        // These claims never became firmware-visible. As in scheduler prepare,
+        // release them outside Shared::state, preserving pre-existing claims.
+        if !had_outer { drop(preparation.outer.take()); }
+        if !had_compute { drop(preparation.compute.take()); }
+        drop(preparation.work_state.take());
+        if !had_pin { packet.unpin_retired(); }
+        false
+    }
+
+    fn try_compute_early(&self, packet: &Arc<Packet>) -> bool {
+        if !matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm)
+            || self.compute_backlog.load(Ordering::Acquire) != 0
+            || packet.has_dependencies()
+            || !self.try_prepare_compute_early(packet)
+        {
+            return false;
+        }
+        let mut deferred = match DeferredBatch::publication() {
+            Ok(batch) => batch,
+            Err(_) => {
+                self.release_early_compute_preparation(packet, false);
+                packet.unpin_retired();
+                return false;
+            }
+        };
+        let began = {
+            let _preparation = packet.preparation.lock();
+            packet.begin_publication()
+        };
+        let mut result = if !began { Err(ECANCELED) }
+            else if packet.completion.status().get() != 0 { Err(EIO) }
+            else { self.compute_packet(packet, &mut deferred, true) };
+        let retry = began && !packet.is_published()
+            && matches!(result, Err(EBUSY) | Err(EAGAIN) | Err(ENOENT));
+        self.release_early_compute_preparation(packet, result.is_ok() || packet.is_published());
+        if retry {
+            packet.unpin_retired();
+            let preparation = packet.preparation.lock();
+            let reset = packet.retry_unpublished();
+            drop(preparation);
+            if reset {
+                deferred.finish();
+                return false;
+            }
+            result = Err(EIO);
+        }
+        let result = self.finish_publication(packet, result, &mut deferred).map(|_| ());
+        packet.set_early_result(result);
+        true
+    }
+
+    fn release_early_compute_preparation(&self, packet: &Arc<Packet>, commit: bool) {
+        let mut preparation = packet.preparation.lock();
+        preparation.ready = false;
+        drop(preparation.outer.take());
+        if let Some(claim) = preparation.work_state.take() {
+            if commit { claim.commit(); }
+        }
+        drop(preparation.compute.take());
+    }
+
+    /// Scheduler dependencies and host pins precede this bounded resident attempt.
+    /// A miss restores invisible claims before the ordinary preparation path runs.
+    fn try_publish_resident_compute(
+        &self,
+        packet: &Arc<Packet>,
+        preparation: &mut job::Preparation,
+        deferred: &mut DeferredBatch,
+    ) -> Result<Option<Result>> {
+        if !matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm) {
+            return Ok(None);
+        }
+        let required = match &packet.command {
+            crate::g17::command::Validated::Compute { plan, .. } => plan.map(|p| p.geometry),
+            _ => return Ok(None),
+        };
+        let had_compute = preparation.compute.is_some();
+        let had_outer = preparation.outer.is_some();
+        let result = (|| -> Result<Option<Result>> {
+            if packet.cancel_requested() { return Err(ECANCELED); }
+            if packet.completion.status().get() != 0 { return Err(EIO); }
+            // Match compute_packet's final dependency and work-state checks,
+            // before taking Shared or beginning a publication attempt.
+            packet.check_dependencies()?;
+            let work_word = packet.completion.work_state()?.word();
+            if work_word == u32::MAX { return Err(EINVAL); }
+            let lease = match self.shared.preparations.try_enter() {
+                Ok(lease) => lease,
+                Err(error) if matches!(error, EBUSY | EAGAIN) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            if !lease.is_current() || self.shared.crashed.load(Ordering::Acquire)
+                || firmware.recovery.pending()
+                || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
+            {
+                return Ok(None);
+            }
+            if !self.prepare_resident_compute_locked(firmware, packet, preparation, required)? {
+                return Ok(None);
+            }
+            if !packet.begin_publication() { return Err(ECANCELED); }
+            let result = (|| -> Result {
+                if packet.completion.status().get() != 0 { return Err(EIO); }
+                if preparation.outer.is_none() { return Err(EINVAL); }
+                if !lease.is_current() { return Err(EAGAIN); }
+                if packet.cancel_requested() { return Err(ECANCELED); }
+                if self.shared.crashed.load(Ordering::Acquire) { return Err(EIO); }
+                if firmware.recovery.pending()
+                    || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
+                {
+                    return Err(EAGAIN);
+                }
+                match self.publish_compute_locked(
+                    firmware, packet, deferred, &mut preparation.outer)?
+                {
+                    ComputePublication::SourcePending => Err(EAGAIN),
+                    ComputePublication::Attempted(result) => result,
+                }
+            })();
+            Ok(Some(result))
+        })();
+        // Release Shared and its lease before this attempt's preparation
+        // claims return credits or notify waiters. Cancellation retains its flag.
+        let result = match result {
+            Ok(Some(Err(error))) if !packet.is_published()
+                && matches!(error, EBUSY | EAGAIN | ENOENT) =>
+            {
+                if packet.retry_unpublished() { Ok(None) }
+                else { Ok(Some(Err(EIO))) }
+            }
+            other => other,
+        };
+        if matches!(result, Ok(None)) {
+            if !had_outer { drop(preparation.outer.take()); }
+            if !had_compute { drop(preparation.compute.take()); }
+        }
+        result
     }
 
     fn stop_after_error(&self) {
@@ -33,6 +204,12 @@ impl Backend {
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU publication failed: owner={} pid={} published={} error={:?}\n",
                 self.owner, packet.context.owner_pid(), packet.is_published(), error);
+            match &packet.command {
+                crate::g17::command::Validated::Compute { sampler_count, sampler_heap_va, .. } =>
+                    pr_warn!("M5 publication origin: compute sampler_count={} heap={:#x}\n", sampler_count, sampler_heap_va),
+                crate::g17::command::Validated::Render { pass, .. } =>
+                    pr_warn!("M5 publication origin: render {}x{} layers={} samples={} sample_bytes={} utile={}x{} zls={:#x} depth={:#x}/{:#x} stencil={:#x}/{:#x}\n", pass.width, pass.height, pass.layers, 1u32 << pass.samples_log2, pass.sample_size, pass.utile_width, pass.utile_height, pass.zls_control, pass.depth.va, pass.depth.compression_va, pass.stencil.va, pass.stencil.compression_va),
+            }
             if [EIO, ETIMEDOUT, ENODEV].contains(&error) || packet.completion.status().get() != 0 {
                 <Self as job::Backend>::fail_vm(self, error);
             }
@@ -81,6 +258,10 @@ impl Backend {
 }
 
 impl job::Backend for Backend {
+    fn firmware_compute_sources(&self) -> bool {
+        matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm)
+            && *crate::module_parameters::m5_cross_queue_fw_wait.value() & 3 != 0
+    }
     fn max_tile_buffer_bytes(&self) -> u64 {
         if matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm) {
             crate::g17::command::M5_MAX_TILE_BUFFER
@@ -168,6 +349,13 @@ impl job::Backend for Backend {
     /// Firmware kick parents order the same engine. Explicit cross-engine and
     /// input dependencies were already attached to the DRM scheduled job.
     fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence> {
+        let mut resident_deferred = if packet.early_result().is_none()
+            && packet.engine() == Engine::Compute
+            && matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm)
+        {
+            DeferredBatch::publication().ok()
+        } else { None };
+        let mut resident_result = None;
         let mut preparation = packet.preparation.lock();
         let stop_observed = self.shared.admission_stop.observe();
         // The scheduler has consumed dependencies before this callback. Early
@@ -198,6 +386,14 @@ impl job::Backend for Backend {
                     Err(error) => return Err(error),
                 }
             }
+            if let Some(deferred) = resident_deferred.as_mut() {
+                if let Some(result) = self.try_publish_resident_compute(
+                    packet, &mut preparation, deferred)?
+                {
+                    resident_result = Some(result);
+                    return Ok(None);
+                }
+            }
             self.prepare_physical(packet, &mut preparation)
         })().and_then(|wait| {
             if let Some(mut wait) = wait {
@@ -205,7 +401,22 @@ impl job::Backend for Backend {
                 Ok(Some(wait))
             } else { Ok(None) }
         });
-        match result {
+        if let Some(result) = resident_result {
+            preparation.ready = false;
+            drop(preparation.outer.take());
+            if let Some(claim) = preparation.work_state.take() {
+                if result.is_ok() || packet.is_published() { claim.commit(); }
+            }
+            drop(preparation.compute.take());
+            drop(preparation);
+            self.release_backlog(packet);
+            let result = self.finish_publication(
+                packet, result, resident_deferred.as_mut().expect("resident collector"))
+                .map(|_| ());
+            packet.set_early_result(result);
+            return None;
+        }
+        let wait = match result {
             Ok(None) => { preparation.ready = true; None }
             Ok(Some(wait)) => {
                 // These claims never reached firmware. An aggregate node with
@@ -230,7 +441,10 @@ impl job::Backend for Backend {
                 packet.completion.fail_unpublished(error);
                 None
             }
-        }
+        };
+        drop(preparation);
+        if let Some(deferred) = resident_deferred.as_mut() { deferred.finish(); }
+        wait
     }
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {
@@ -271,7 +485,7 @@ impl job::Backend for Backend {
             Err(error)
         } else {
             match packet.engine() {
-                Engine::Compute => self.compute_packet(&packet, &mut deferred),
+                Engine::Compute => self.compute_packet(&packet, &mut deferred, false),
                 Engine::Render => self.render_packet(&packet, &mut deferred),
             }
         };
@@ -351,11 +565,14 @@ impl job::Backend for Backend {
     }
 
     fn try_early(&self, packet: &Arc<Packet>) -> bool {
-        self.try_render_early(packet)
+        match packet.engine() {
+            Engine::Render => self.try_render_early(packet),
+            Engine::Compute => self.try_compute_early(packet),
+        }
     }
 
     fn count_backlog(&self, packet: &Packet) {
         packet.count_backlog();
-        self.backlog.fetch_add(1, Ordering::AcqRel);
+        self.backlog_for(packet.engine()).fetch_add(1, Ordering::AcqRel);
     }
 }

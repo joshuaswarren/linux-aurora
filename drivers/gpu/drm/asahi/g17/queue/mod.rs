@@ -193,9 +193,9 @@ impl<B: Backend> Queue<B> {
             aggregate.member(),
             guard,
             destinations,
-            engine == Engine::Compute,
+            engine,
             host_predecessors.clone().next().is_some(),
-            if engine == Engine::Render { self.backend.feed() } else { None },
+            self.backend.feed(),
         ).map_err(|error| {
             dev_info!(self.dev.as_ref(), "G17 completion allocation failed: {:?}\n", error); error
         })?;
@@ -241,6 +241,12 @@ impl<B: Backend> Queue<B> {
         let mut checked_inputs =
             KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut sources = KVec::new();
+        let mut source_inputs = KVec::new();
+        let can_convert_inputs = self.backend.firmware_compute_sources()
+            && *crate::module_parameters::m5_cross_queue_fw_wait.value() & 2 != 0
+            && engine == Engine::Compute && count == 0 && timestamp_count == 0
+            && failure_count == 0 && !completion.has_timestamps();
         for fence in failures.into_iter().flatten() {
             checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             dependencies.push(fence.clone(), GFP_KERNEL)?;
@@ -268,12 +274,30 @@ impl<B: Backend> Queue<B> {
         // either order and must each consume an input's error status before running.
         for sync in inputs {
             if let Some(fence) = &sync.fence {
+                if can_convert_inputs {
+                    if let Ok(Some(found)) = super::sync_source::collect(fence, &self.context) {
+                        let extra = found.iter().filter(|source| !sources.iter().any(
+                            |known: &super::sync_source::Dependency| Arc::ptr_eq(&known.source, source))).count();
+                        if sources.len() + extra <= 31 {
+                            // Token dedup must not discard an independent
+                            // wrapper's later error status.
+                            source_inputs.push(fence.clone(), GFP_KERNEL)?;
+                            for source in found {
+                                if sources.iter().any(|known: &super::sync_source::Dependency|
+                                    Arc::ptr_eq(&known.source, &source)) { continue; }
+                                let ready = source.ready_fence();
+                                if job::fence_status(&ready) <= 0 { dependencies.push(ready, GFP_KERNEL)?; }
+                                sources.push(super::sync_source::Dependency::new(source), GFP_KERNEL)?;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 dependencies.push(fence.clone(), GFP_KERNEL)?;
                 checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             }
         }
-        let early = engine == Engine::Render
-            && dependencies.is_empty()
+        let early = dependencies.is_empty()
             && self.frontiers[index].len() < EARLY_DEPTH;
         let packet = Packet::new(
             id,
@@ -283,6 +307,8 @@ impl<B: Backend> Queue<B> {
             completion,
             checked_inputs,
             firmware,
+            sources,
+            source_inputs,
         )?;
         let scheduler = match engine {
             Engine::Render => &mut self.render,
@@ -325,7 +351,7 @@ impl<B: Backend> Queue<B> {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
-            if !self.backend.supports_engine(engine) { return Err(ENOTSUPP); }
+            if !self.backend.supports_engine(engine) { return Err(crate::g17::unsupported(file!(), line!())); }
             self.backend.prepare_command(&mut payload)?;
             let order = Order::new(
                 base,
@@ -375,7 +401,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
         )?;
         let result = (|| {
             if !self.backend.supports_submission() {
-                return Err(ENOTSUPP);
+                return Err(crate::g17::unsupported(file!(), line!()));
             }
             if self.context.status().get() != 0 {
                 return Err(EIO);
@@ -383,8 +409,15 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             let (pending, guards) = self.prepare_submission(bytes, objects).map_err(|error| {
                 dev_info!(self.dev.as_ref(), "G17 submission validation failed: {:?}\n", error); error
             })?;
+            let export_source = self.backend.firmware_compute_sources() && pending.len() == 1
+                && matches!(&pending[0].0, Validated::Compute { .. })
+                && !pending[0].2.has_host_outputs();
             let mut guards = guards.into_iter();
-            let aggregate = outputs.publish(self.context.clone())?;
+            let aggregate = if export_source {
+                outputs.publish_source(self.context.clone(), &self.fences)?
+            } else {
+                outputs.publish(self.context.clone())?
+            };
             for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(

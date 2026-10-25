@@ -365,7 +365,7 @@ impl Memory {
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let vm = context.vm();
         let m5 = alloc.uat.is_sptm();
-        if m5 != layout.is_m5() { return Err(ENOTSUPP); }
+        if m5 != layout.is_m5() { return Err(crate::g17::unsupported(file!(), line!())); }
         let mut graph = Graph::new(alloc, pool, &context, qids)?;
         let mut target = target::Target::new(alloc.dev, vm, layout)?;
         target.prepare(ordinal, layout)?;

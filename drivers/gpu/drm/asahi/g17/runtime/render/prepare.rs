@@ -26,9 +26,9 @@ struct BuildResources {
 }
 impl BuildResources {
     fn new(firmware: &crate::g17::Firmware) -> Result<Self> {
-        let metrics = firmware._pm_metrics.as_ref().ok_or(ENOTSUPP)?.clone();
+        let metrics = firmware._pm_metrics.as_ref().ok_or_else(|| crate::g17::unsupported(file!(), line!()))?.clone();
         let client = if firmware.uat.is_sptm() { metrics.gpu_va() } else {
-            crate::hw::t8140::CONFIG.pm_metrics.as_ref().ok_or(ENOTSUPP)?.va
+            crate::hw::t8140::CONFIG.pm_metrics.as_ref().ok_or_else(|| crate::g17::unsupported(file!(), line!()))?.va
         };
         Ok(Self {
             uat: firmware.uat.clone(),
@@ -204,7 +204,7 @@ impl super::super::Backend {
     }
 
     fn build_render_pair(&self, slot: u8, first: &Arc<Packet>, optional: bool,
-        nonblocking: bool, mut observed: Option<&mut u64>) -> Result {
+        nonblocking: bool, mut observed: Option<&mut u64>, pair_loan: &mut bool) -> Result {
         let lease = if nonblocking { self.shared.preparations.try_enter()? } else { self.shared.preparations.enter(false)? };
         let dev = self.shared.drm()?;
         let pool_claim = if matches!(self.shared.firmware_profile, crate::g17::FirmwareProfile::M5Sptm) {
@@ -253,6 +253,7 @@ impl super::super::Backend {
                         return Err(self.busy(Site::BuildPending));
                     }
                     if entry.constructing || entry.preparing.is_some() || entry.growing {
+                        *pair_loan = entry.pair.is_none() && entry.preparing.is_some();
                         return Err(self.busy(Site::BuildBusy));
                     }
                     if entry.parked.is_some() {
@@ -838,8 +839,11 @@ impl super::super::Backend {
     }
 
     pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8, nonblocking: bool,
-        mut observed: Option<&mut u64>) -> Result {
-        self.build_render_pair(slot, packet, false, nonblocking, observed.as_deref_mut())?;
+        mut observed: Option<&mut u64>, pair_loan: &mut bool) -> Result {
+        // This stack-owned result belongs only to the selected pair's attempt.
+        // Diagnostic busy_site may be written by another backend caller.
+        *pair_loan = false;
+        self.build_render_pair(slot, packet, false, nonblocking, observed.as_deref_mut(), pair_loan)?;
         let sibling = {
             let state = self.shared.state.lock();
             (*state)
@@ -852,7 +856,9 @@ impl super::super::Backend {
         if let Some(sibling) = sibling {
             // An optional sibling may be borrowed or waiting for recovery.
             // The selected pair is revalidated by prepare_render before publication.
-            match self.build_render_pair(sibling.slot(), packet, true, nonblocking, observed.as_deref_mut()) {
+            // Its refusal must not change the selected pair's wait reason.
+            let mut sibling_loan = false;
+            match self.build_render_pair(sibling.slot(), packet, true, nonblocking, observed.as_deref_mut(), &mut sibling_loan) {
                 Err(error)
                     if error == EBUSY
                         || error == EAGAIN
@@ -870,7 +876,9 @@ impl super::super::Backend {
         packet: &Arc<Packet>,
         deferred: &mut super::super::DeferredBatch,
         outer: Option<&mut crate::g17::initdata::outer_credit::OuterClaim>,
+        pair_loan: &mut bool,
     ) -> Result {
+        *pair_loan = false;
         let lease = self.shared.preparations.enter(false)?;
         let dev = self.shared.drm()?;
         let (uat, mut pair, addresses, growth_target) = {
@@ -879,13 +887,13 @@ impl super::super::Backend {
             if !lease.is_current() {
                 return Err(EAGAIN);
             }
-            let qids = firmware
-                .queues
-                .render
-                .entry(slot)?
-                .pair
+            let entry = firmware.queues.render.entry(slot)?;
+            let qids = entry.pair
                 .as_ref()
-                .ok_or_else(|| self.busy(Site::PrepareNoPair))?
+                .ok_or_else(|| {
+                    *pair_loan = entry.preparing.is_some();
+                    self.busy(Site::PrepareNoPair)
+                })?
                 .qids();
             let addresses = RenderAddresses {
                 stamps: [

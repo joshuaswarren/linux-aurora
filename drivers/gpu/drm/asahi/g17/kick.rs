@@ -368,6 +368,13 @@ impl PreparedKick<'_> {
         self.queue.prepare_install()
     }
 
+    /// Copy the checked entry fields for an opt-in publication trace.
+    /// These are constructor values, not reads of firmware-owned storage.
+    pub(crate) fn trace_dependencies(&self) -> (u64, u64, u64, [u64; KICK_DEPENDENCIES]) {
+        (self.entry.header, self.entry.dependency_control,
+            self.entry.dependency_types, self.entry.dependencies)
+    }
+
     /// Writes and fences the complete entry, then advances host state. The
     /// caller invokes this between the queue configuration and announcement.
     pub(crate) fn commit(self) -> KickTimestamp {

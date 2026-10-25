@@ -62,6 +62,10 @@ module! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
     params: {
+        m5_cross_queue_fw_wait: u32 {
+            default: 0,
+            description: "Experimental same-VM compute firmware dependencies; default off",
+        },
         m5_matrix_submit_test: u32 {
             default: 0,
             description: "Diagnostic native M5 matrix submission controls; default0 unchanged,1 enabled",
@@ -126,6 +130,14 @@ module! {
             default: 0x200,
             description: "M5 mesh rendering buffer bound to API task (object-stage) render kicks only, in 64 KiB chunks (native TA register 0x1ca48 control 0x200); 0 disables the binding and the task feature",
         },
+        m5_thermal_governor: u32 {
+            default: 0,
+            description: "M5 thermal diagnostic flags: bit 0 enables the host GPU power budget controller, bit 1 logs one-second sensor and limiter samples; default 0 preserves the existing policy",
+        },
+        m5_thermal_target_mc: u32 {
+            default: 90000,
+            description: "M5 GPU power budget governor target for the SoC hotspot temperature computed by the SMC, in milli-degrees C (70000..104000)",
+        },
         m5_render_lend_test: u32 {
             default: 0,
             description: "Diagnostic only (vmfix6b qualification): lend idle live owners' render pairs before fresh or released pairs, even when fresh pairs can be built; default off",
@@ -141,6 +153,10 @@ module! {
         m5_render_collect_poison: u32 {
             default: 0,
             description: "Diagnostic only (vmfix6e qualification): keep eagerly collected render graphs out of reuse, filled with a poison pattern, their client pool mappings removed and their PB descriptor pointed at an unmapped address, so a late firmware reference faults; default off",
+        },
+        m5_depth_msaa_compression: u32 {
+            default: 1,
+            description: "Enable single-layer D32 compressed 2x/4x ZLS admission",
         },
         m5_render_submit_test: u32 {
             default: 0,

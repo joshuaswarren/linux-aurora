@@ -12,7 +12,7 @@ use crate::g17::{
 use core::sync::atomic::Ordering;
 use kernel::{
     prelude::*,
-    sync::Arc,
+    sync::{Arc, CondVarTimeoutResult},
     time::{delay::fsleep, Delta},
 };
 
@@ -23,11 +23,6 @@ const MAX_RENDER_RELOCATIONS: u32 = 64;
 /// many polls (short waits behave as before), then sleeps on the device
 /// change condition in one-jiffy slices.
 const FAST_POLLS: u32 = 8;
-/// A publisher refused because its pair is on the event worker's observation loan retries as
-/// soon as the loan ends, up to this many times per packet, instead of sleeping a poll period.
-const LOAN_RETRIES_MAX: u32 = 32;
-/// Safety bound of one wait for an observation loan (a loan lasts microseconds).
-const LOAN_WAIT_NS: u64 = 2_000_000;
 /// Work-state nodes are freed off-lock by completion: bounded short retries
 /// before the progress watch takes over (unchanged first-attempt latency).
 const STATE_FAST_DELAY_US: i64 = 1000;
@@ -47,6 +42,8 @@ pub(super) enum Wait {
     Channel,
     /// No buffer identity, metrics slot or retired-binding room (vmfix6d D).
     Capacity,
+    /// This attempt found its installed pair borrowed off-lock.
+    PairLoan,
 }
 impl Wait {
     fn name(self) -> &'static str {
@@ -55,6 +52,7 @@ impl Wait {
             Wait::Lend => "lend",
             Wait::Build => "build",
             Wait::Prepare => "prepare",
+            Wait::PairLoan => "pair-loan",
             Wait::Channel => "channel",
             Wait::Capacity => "capacity",
         }
@@ -142,7 +140,6 @@ impl Backend {
         let mut relocations = 0u32;
         let mut recovery_polls = 0;
         let mut state_delay = 20i64;
-        let mut loan_retries = 0u32;
         // vmfix6d B: one progress watch for all of this packet's waits.
         let mut watch: Option<Watch> = None;
         loop {
@@ -159,7 +156,6 @@ impl Backend {
             // Sampled before the attempt: a change notified after this point
             // never lets the wait below sleep through it.
             let generation = progress::changes();
-            self.busy_site.store(Site::None as u32, Ordering::Relaxed);
             let work_state = {
                 let preparation = self.shared.preparations.enter(interruptible)?;
                 let result = if prepared.is_some() {
@@ -187,7 +183,8 @@ impl Backend {
                 }
                 result => {
                     result?;
-                    match self.ensure_render(packet, slot, false, None) {
+                    let mut pair_loan = false;
+                    match self.ensure_render(packet, slot, false, None, &mut pair_loan) {
                         Err(error) if error == EAGAIN => continue,
                         Err(error) if error == super::LEND_PENDING => Wait::Lend,
                         Err(error) if error == ENOSPC && !packet.is_published() && {
@@ -222,10 +219,12 @@ impl Backend {
                         Err(error) if error == RENDER_CAPACITY_PENDING && !packet.is_published() => {
                             Wait::Capacity
                         }
-                        Err(error) if error == EBUSY => Wait::Build,
+                        Err(error) if error == EBUSY => {
+                            if pair_loan { Wait::PairLoan } else { Wait::Build }
+                        }
                         result => {
                             result?;
-                            match self.prepare_render(slot, packet, deferred, outer.as_mut()) {
+                            match self.prepare_render(slot, packet, deferred, outer.as_mut(), &mut pair_loan) {
                                 Err(error)
                                     if !packet.is_published()
                                         && error == crate::g17::context::RENDER_CHANNEL_PENDING =>
@@ -263,7 +262,7 @@ impl Backend {
                                     if error == EAGAIN {
                                         continue;
                                     }
-                                    Wait::Prepare
+                                    if pair_loan { Wait::PairLoan } else { Wait::Prepare }
                                 }
                                 result => return result,
                             }
@@ -271,40 +270,8 @@ impl Backend {
                     }
                 }
             };
-            // The pair was on the event worker's observation loan (it retires completed renders
-            // off the device mutex): wait for that loan to end and retry, instead of sleeping a
-            // fixed poll period (fsleep(200 us), about 275 us, in render_wait()).
-            let site = self.busy_site.load(Ordering::Relaxed);
-            if (site == Site::BuildBusy as u32 || site == Site::PrepareNoPair as u32)
-                && loan_retries < LOAN_RETRIES_MAX
-            {
-                loan_retries += 1;
-                self.wait_observation_loan(slot, interruptible);
-                continue;
-            }
             self.render_wait(&mut watch, blocked, slot, packet, interruptible, generation)?;
         }
-    }
-
-    /// Wait, bounded by LOAN_WAIT_NS, while `slot`'s pair is on an observation loan. The loan's
-    /// return clears RenderState::observing() and notifies Shared::changed with the device mutex
-    /// held, and this checks the flag and sleeps on that condition variable with the same mutex
-    /// held, so the return cannot be missed. Returns at once when the loan already ended.
-    fn wait_observation_loan(&self, slot: u8, interruptible: bool) {
-        let start = crate::g17::now_ns();
-        let mut state = self.shared.state.lock();
-        loop {
-            let on_loan = (*state).as_deref().is_some_and(|firmware| firmware.queues.render.observing(slot));
-            if !on_loan || crate::g17::now_ns().saturating_sub(start) >= LOAN_WAIT_NS {
-                break;
-            }
-            let _ = if interruptible {
-                self.shared.changed.wait_interruptible_timeout(&mut state, 1)
-            } else {
-                self.shared.changed.wait_timeout(&mut state, 1)
-            };
-        }
-        drop(state);
     }
 
     /// vmfix6d B: one poll of a progress-bounded render wait. Called with no
@@ -356,6 +323,9 @@ impl Backend {
             // event worker; make sure it runs.
             self.shared.queue_events();
         }
+        if kind == Wait::PairLoan {
+            return self.wait_render_pair(slot, packet, interruptible);
+        }
         if !interruptible {
             // The submitting thread (early path) polls without sleeping
             // interruptibly, backing off to 1.6 ms.
@@ -378,6 +348,42 @@ impl Backend {
         let _ = self.shared.changed.wait_interruptible_timeout(&mut state, 1);
         drop(state);
         Ok(())
+    }
+
+    /// Pair restoration and this predicate share the device mutex. A return
+    /// before the check skips the sleep; a later return wakes the queued wait.
+    /// Unrelated notifications recheck only this predicate, never preparation.
+    fn wait_render_pair(&self, slot: u8, packet: &Arc<Packet>, interruptible: bool) -> Result {
+        // Unrelated notifications must not renew this helper's time budget.
+        // Use the configured kernel tick, not a userspace HZ macro.
+        let deadline = crate::g17::now_ns().saturating_add(u64::from(kernel::bindings::TICK_NSEC));
+        let mut state = self.shared.state.lock();
+        let mut remaining = 1;
+        loop {
+            let Some(firmware) = (*state).as_deref() else { return Ok(()); };
+            let entry = firmware.queues.render.entry(slot)?;
+            if entry.closed || entry.pending_error.is_some() || entry.pending_timeout
+                || self.shared.crashed.load(Ordering::Acquire)
+                || packet.cancel_requested() || packet.completion.status().get() != 0
+                || entry.pair.is_some() || entry.preparing.is_none()
+            {
+                return Ok(());
+            }
+            if crate::g17::now_ns() >= deadline {
+                return Ok(());
+            }
+            // The early submitter must retain its uninterruptible wait: a
+            // pending signal cannot turn a borrowed pair into a busy retry.
+            let result = if interruptible {
+                self.shared.changed.wait_interruptible_timeout(&mut state, remaining)
+            } else {
+                self.shared.changed.wait_timeout(&mut state, remaining)
+            };
+            match result {
+                CondVarTimeoutResult::Woken { jiffies } if jiffies != 0 => remaining = jiffies,
+                _ => return Ok(()),
+            }
+        }
     }
 
     /// vmfix6d B: hash of the state this wait depends on (device mutex).

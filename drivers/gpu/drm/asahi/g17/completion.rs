@@ -9,6 +9,7 @@
 use super::{
     context::{Context, WorkStateLease},
     fence::{self, CompletionFence, Member},
+    job::Engine,
     object::{CpuMap, KernelObject},
     recovery::Class,
     status::VmStatus,
@@ -70,6 +71,7 @@ impl Destination {
 pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destination>; 4]>>);
 
 impl Destinations {
+    pub(crate) fn has_host_outputs(&self) -> bool { self.0.is_some() }
     pub(crate) fn resolve(
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         timestamps: &[uapi::drm_asahi_timestamps],
@@ -193,6 +195,7 @@ impl M5ComputeTimestamps {
 
 #[pin_data]
 pub(crate) struct Completion {
+    engine: Engine,
     status: Arc<VmStatus>,
     output: HostOutput,
     // Present only when this command's public result may wait for a render
@@ -206,6 +209,8 @@ pub(crate) struct Completion {
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
     #[pin]
     render: Mutex<Option<super::queue::admission::RenderLease>>,
+    #[pin]
+    source_holds: Mutex<Option<KVec<super::source_hold::SourceHold>>>,
     signalled: AtomicBool,
     retirement_queued: AtomicBool,
     accepted: AtomicBool,
@@ -217,6 +222,29 @@ pub(crate) struct Completion {
 }
 
 impl Completion {
+    pub(crate) fn source(&self) -> Option<Arc<super::sync_source::Source>> {
+        self.output.output().member.source()
+    }
+    pub(crate) fn is_source(&self, source: &Arc<super::sync_source::Source>) -> bool {
+        self.output.output().member.is_source(source)
+    }
+    /// Called with publication serialized. Existing holds survive replay;
+    /// redundant temporary holds must not invoke callbacks under that lock.
+    pub(crate) fn retain_source_holds(&self, holds: KVec<super::source_hold::SourceHold>) {
+        if holds.is_empty() { return; }
+        let mut incoming = Some(holds);
+        {
+            let mut retained = self.source_holds.lock();
+            if retained.is_none() { *retained = incoming.take(); }
+        }
+        if let Some(holds) = incoming {
+            for hold in holds { hold.drop_quiet(); }
+        }
+    }
+    fn release_source_holds(&self) {
+        let holds = self.source_holds.lock().take();
+        drop(holds);
+    }
     pub(crate) fn new(
         dev: &AsahiDevice,
         contexts: &FenceContexts,
@@ -224,12 +252,12 @@ impl Completion {
         member: Member,
         vm_job: mmu::VmJobGuard,
         destinations: Destinations,
-        compute: bool,
+        engine: Engine,
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
-        let ordered = !compute
+        let ordered = engine == Engine::Render
             && (host_predecessors || destinations.iter().any(Option::is_some));
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
@@ -242,13 +270,14 @@ impl Completion {
         } else {
             HostOutput::Immediate(output)
         };
-        let compute = if compute && !context.is_sptm() {
+        let compute = if engine == Engine::Compute && !context.is_sptm() {
             Some(ComputeTimestamps::new(dev, context.vm())?)
         } else {
             None
         };
         Arc::pin_init(
             pin_init!(Self {
+                engine,
                 status: context.status().clone(),
                 output,
                 terminal,
@@ -257,6 +286,7 @@ impl Completion {
                 feed,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
+                source_holds <- new_mutex!(None, "G17 compute dependency holds"),
                 signalled: AtomicBool::new(false),
                 retirement_queued: AtomicBool::new(false),
                 accepted: AtomicBool::new(false),
@@ -484,6 +514,7 @@ impl Completion {
     /// An exact whole-pair drain or processor stop allows rehabilitation. The
     /// VM pin goes first; the still-held lease excludes reuse until both settle.
     pub(crate) fn release_after_retirement(&self) {
+        self.release_source_holds();
         drop(self.vm_job.lock().take());
         let lease = self.render.lock().take();
         if let Some(lease) = lease.as_ref() {
@@ -493,6 +524,7 @@ impl Completion {
     }
 
     fn release_healthy(&self) {
+        self.release_source_holds();
         drop(self.render.lock().take());
         drop(self.vm_job.lock().take());
     }
@@ -501,11 +533,23 @@ impl Completion {
     /// before waking userspace. A failure fence alone never establishes this.
     #[track_caller]
     pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
+        self.complete_with_compute(result, None);
+    }
+
+    /// Compute feedback is separate from public timestamps, which may contain
+    /// a synthesized retirement envelope when the execution record is absent.
+    fn complete_with_compute(&self, result: Result<[u64; 4]>, compute: Option<[u64; 2]>) {
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
         }
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
-            feed.note_render_pass(ticks[2], ticks[3]);
+            let execution = match self.engine {
+                Engine::Render => Some([ticks[2], ticks[3]]),
+                Engine::Compute => compute,
+            };
+            if let Some([start, end]) = execution {
+                feed.note_pass(start, end);
+            }
         }
         // Exact retirement: forward progress for capacity waits (vmfix6d).
         super::progress::note_retirement();
@@ -560,7 +604,10 @@ impl Completion {
 /// Runtime queues establish the ownership witness before constructing `Retired`
 /// or `Release`; `FailedOwned` leaves their physical and VM ownership intact.
 pub(crate) enum Deferred {
+    SourceReady(Arc<super::sync_source::Source>),
     Retired(Arc<Completion>, Result<[u64; 4]>),
+    /// Only the optional interval comes from an exact compute execution record.
+    RetiredCompute(Arc<Completion>, [u64; 4], Option<[u64; 2]>),
     Drained(Arc<Completion>, Result<[u64; 4]>),
     FailedOwned(Arc<Completion>, Error),
     Unpublished(Arc<Completion>, Error),
@@ -570,6 +617,11 @@ pub(crate) enum Deferred {
 impl Deferred {
     pub(crate) fn finish(self) {
         match self {
+            Self::SourceReady(source) => source.signal_ready(),
+            Self::RetiredCompute(completion, ticks, execution) => {
+                completion.complete_with_compute(Ok(ticks), execution);
+                completion.release_after_retirement();
+            }
             Self::Retired(completion, result) => {
                 completion.complete(result);
                 // An earlier failure may already have signalled this fence while

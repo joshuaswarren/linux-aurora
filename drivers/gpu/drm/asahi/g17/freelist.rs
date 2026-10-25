@@ -1147,6 +1147,11 @@ impl Lease {
         self.phase = LeasePhase::ReleaseSent(cursor);
         Ok(())
     }
+    /// Only sent releases and inherited release witnesses consume cursors.
+    pub(crate) fn needs_release_observation(&self) -> bool {
+        self.previous_release.is_some() || matches!(self.phase, LeasePhase::ReleaseSent(_))
+    }
+
     /// Observes all older release records passed by one consumer snapshot.
     pub(crate) fn observe_releases(&mut self, consumer: u32, producer: u32) -> Result {
         if let Some(cursor) = self.previous_release {

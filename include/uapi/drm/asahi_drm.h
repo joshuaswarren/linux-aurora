@@ -315,6 +315,8 @@ enum drm_asahi_feature {
 
 	/** @DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: Per-render external shader writes. */
 	DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES = (1UL) << 14,
+	/** @DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION: D32 2x/4x ZLS admission. */
+	DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION = (1UL) << 23,
 
 };
 

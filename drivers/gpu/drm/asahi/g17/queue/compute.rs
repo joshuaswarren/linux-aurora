@@ -15,7 +15,7 @@ use crate::g17::{
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
 };
 use crate::{hw::t8140::dynamic, mmu};
-use core::sync::atomic::{fence, AtomicU32, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
 use kernel::{prelude::*, sync::Arc};
 use retirement::{Cursors, RECORD_SLOTS};
 
@@ -552,6 +552,12 @@ pub(crate) enum PoolPhase {
 
 pub(crate) struct Queue {
     owner: Option<u64>,
+    /// Diagnostic budget belongs to one physical queue binding, not its shared VM.
+    entry_traces: u32,
+    /// Separate from publication preparation slots: readers only prevent
+    /// owner/priority reconfiguration and do not consume execution capacity.
+    source_readers: Arc<AtomicUsize>,
+    source_available: Arc<crate::g17::availability::Availability>,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
@@ -612,6 +618,7 @@ impl Queue {
         owner: u64,
         context: Arc<Context>,
         m5: bool,
+        source_available: Arc<crate::g17::availability::Availability>,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let mut graph = Graph::new(alloc, objects, &context, m5).map_err(|error| {
@@ -622,9 +629,13 @@ impl Queue {
         let binding = graph.bind(context.clone(), kick_alias, pool_alias).map_err(|error| {
             dev_info!(alloc.dev.as_ref(), "G17 compute client aliases failed: {:?}\n", error); error
         })?;
+        let source_readers = Arc::new(AtomicUsize::new(0), GFP_KERNEL)?;
         context.mark_published();
         Ok(Self {
             owner: Some(owner),
+            entry_traces: 0,
+            source_readers,
+            source_available,
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
             growing: false,
@@ -667,6 +678,48 @@ impl Queue {
     }
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
+    }
+
+    /// Includes partially published retained commands without a final ticket.
+    pub(crate) fn has_active_source_consumers(&self) -> bool {
+        self.active.iter().any(|active| !active.packet.sources.is_empty())
+    }
+
+    pub(crate) fn source_held(&self) -> bool {
+        self.source_readers.load(Ordering::Acquire) != 0
+    }
+
+    /// Called under the device mutex after current-epoch source resolution.
+    pub(crate) fn hold_source(&self, source: &Arc<crate::g17::sync_source::Source>,
+        token: crate::g17::sync_source::Token) -> Result<crate::g17::source_hold::SourceHold>
+    {
+        use crate::g17::sync_source::Snapshot;
+        if !self.graph.m5 || !self.installed || self.released || self.quarantined
+            || self.exit.is_some() || self.owner != Some(token.owner) || self.qid() != token.qid
+        { return Err(EAGAIN); }
+        let current = match source.snapshot(token.epoch)? {
+            Snapshot::Published(current) => current,
+            _ => return Err(EAGAIN),
+        };
+        if current.owner != token.owner || current.sequence != token.sequence
+            || current.context != token.context || current.qid != token.qid
+            || current.kick != token.kick || current.epoch != token.epoch
+            || current.ordinal != token.ordinal
+        { return Err(EAGAIN); }
+        let active = self.active.iter().find(|active| {
+            active.packet.completion.is_source(source)
+                && active.ticket.is_some_and(|ticket| ticket.owner == token.owner
+                    && ticket.submission == token.sequence && ticket.context_id == token.context
+                    && ticket.qid == token.qid && ticket.kick == token.kick.get()
+                    && ticket.epoch == token.epoch && ticket.ordinal == token.ordinal)
+        }).ok_or(EAGAIN)?;
+        let ticket = active.ticket.ok_or(EAGAIN)?;
+        self.valid_ticket(active, &ticket)?;
+        if !active.packet.context.is_current() || active.packet.completion.signalled()
+            || self.binding.as_ref().is_none_or(|binding|
+                !Arc::ptr_eq(&binding.context, &active.packet.context))
+        { return Err(EAGAIN); }
+        crate::g17::source_hold::SourceHold::new(&self.source_readers, &self.source_available)
     }
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
@@ -1067,9 +1120,10 @@ impl Queue {
                         }
                     }
                     self.retire_pending = true;
-                    defer(Deferred::Retired(
+                    defer(Deferred::RetiredCompute(
                         front.packet.completion.clone(),
-                        Ok([timestamps[0], timestamps[1], 0, 0]),
+                        [timestamps[0], timestamps[1], 0, 0],
+                        front.observed.map(|record| record.timestamps),
                     ))?;
                     self.retire_pending = false;
                     self.submitted = submitted;
@@ -1346,6 +1400,7 @@ impl Queue {
     }
     pub(crate) fn reusable(&self) -> bool {
         self.installed
+            && !self.source_held()
             && self.configuration.is_none()
             // A pool release in flight must be witnessed before any successor.
             && !matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
@@ -1406,6 +1461,7 @@ impl Queue {
         }
         context.mark_published();
         self.owner = Some(owner);
+        self.entry_traces = 0;
         self.released = false;
         self.retirement_ready = false;
         self.retired_by_teardown = false;
@@ -1483,7 +1539,7 @@ impl Queue {
     /// ring is reset to empty at the firmware's consumer cursor; the USC pool and
     /// descriptor ring are vacated and re-armed fresh before the next owner binds.
     pub(crate) fn recycle_killed(&mut self) -> Result<bool> {
-        if self.configuration.is_some() || !self.installed
+        if self.source_held() || self.configuration.is_some() || !self.installed
             || !self.exit.as_ref().is_some_and(|exit| exit.released())
             || self.active.len != 0
             || self.replays.len != 0
@@ -1512,7 +1568,7 @@ impl Queue {
     /// item ring restarts at the firmware consumer and the USC pool/ring are
     /// vacated and re-armed before any successor binds.
     pub(crate) fn recycle_failed(&mut self, recovery_state: u32) -> Result<bool> {
-        if self.configuration.is_some() || recovery_state != 0
+        if self.source_held() || self.configuration.is_some() || recovery_state != 0
             || !self.installed
             || !self.quarantined
             || self.spared_quarantine
@@ -1570,6 +1626,7 @@ impl Queue {
     /// closed (release_owner + the normal bind_owner rebinding).
     pub(crate) fn idle_owned(&self) -> bool {
         self.installed
+            && !self.source_held()
             && self.configuration.is_none()
             && self.owner.is_some()
             && !self.released
@@ -2006,7 +2063,7 @@ impl Queue {
         } else { crate::g17::fw::m5::compute::ScratchRequest::NONE };
         if !self.graph.m5 && (*requested_matrix_ops || *cdm_auxiliary_allocation != 0 || intersection.enabled()) { return Err(EINVAL); }
         if self.graph.m5 {
-            if *sampler_count != 0 { return Err(ENOTSUPP); }
+            if *sampler_count != 0 { return Err(crate::g17::unsupported(file!(), line!())); }
             if plan.is_some_and(|plan| !self.pool.fits(Some(plan.geometry))) { return Err(EINVAL); }
             self.install_m5(&packet, host)?;
         }
@@ -2146,6 +2203,7 @@ impl Queue {
         self.retirement_ready = false;
         let mut visible = false;
         let mut accounted = false;
+        let mut entry_trace = None;
         let result = (|| -> Result {
             work.add_submitted_kicks(1)?;
             accounted = true;
@@ -2153,7 +2211,7 @@ impl Queue {
             let offset = kick_timestamp.slot() % DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
             if self.graph.m5 {
                 object.initialize::<crate::g17::fw::m5::compute::Descriptor>(offset,
-                    |descriptor| descriptor.write(&m5_args))?;
+                    |descriptor| descriptor.write_zeroed(&m5_args))?;
             } else {
                 object.initialize::<ComputeDescriptor>(offset, |descriptor| descriptor.write(&args))?;
             }
@@ -2267,6 +2325,9 @@ impl Queue {
             if first {
                 prepared_kick.prepare_install()?;
             }
+            if self.graph.m5 && *crate::module_parameters::m5_cross_queue_fw_wait.value() & 4 != 0 {
+                entry_trace = Some(prepared_kick.trace_dependencies());
+            }
             prepared_kick.commit();
             self.submitted = self.submitted.checked_add(1).ok_or(EOVERFLOW)?;
             let announce_va = if self.graph.m5 {
@@ -2337,7 +2398,20 @@ impl Queue {
             }
             fence(Ordering::SeqCst);
             if !self.graph.m5 { host.notify((0x83 << 48) | 0x10)?; }
-            host.note_submission()
+            host.note_submission()?;
+            if let Some(source) = packet.completion.source() {
+                source.published(crate::g17::sync_source::Token {
+                    owner: self.owner.ok_or(EIO)?,
+                    sequence: packet.order.sequence,
+                    context: packet.context.id(),
+                    qid,
+                    kick: kick_timestamp,
+                    epoch,
+                    ordinal,
+                })?;
+                defer(Deferred::SourceReady(source))?;
+            }
+            Ok(())
         })();
         if let Err(error) = result {
             if !visible {
@@ -2353,6 +2427,18 @@ impl Queue {
             }
             self.terminal = self.quarantine(error, defer)?.map(|status| (status, error));
             return Err(error);
+        }
+        if let Some((header, control, types, words)) = entry_trace {
+            static ENTRY_TRACES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if self.entry_traces < 16
+                || (self.entry_traces < 20 && kick_timestamp.get() & 0xff == 0)
+            {
+                self.entry_traces += 1;
+                let index = ENTRY_TRACES.fetch_add(1, Ordering::Relaxed);
+                pr_info!("M5 compute entry trace {} owner={:?} sequence={} context={} qid={} kick={:#x} epoch={} header={:#x} control={:#x} types={:#x} dependencies={:x?}\n",
+                    index + 1, self.owner, packet.order.sequence, packet.context.id(),
+                    qid, kick_timestamp.get(), epoch, header, control, types, words);
+            }
         }
         Ok(())
     }
@@ -2419,6 +2505,11 @@ impl Queue {
         host: &mut impl Host,
     ) -> Result<(u64, BindingAddresses)> {
         if self.growing || self.pool_phase != PoolPhase::Populated { return Err(EAGAIN); }
+        // An outstanding consumer must not observe this physical queue's
+        // 40-bit progress counter wrap past its retained dependency token.
+        if self.source_held() && self.kick.timestamp().get() == 0 {
+            return Err(EAGAIN);
+        }
         let (epoch, state) = host.epoch()?;
         if state != 0 {
             return Err(EBUSY);

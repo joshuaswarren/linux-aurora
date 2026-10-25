@@ -30,6 +30,17 @@ macro_rules! enospc_site {
     }};
 }
 
+/// Error-only diagnostic: identify unsupported-operation origins without
+/// changing command validation, resource ownership or scheduling policy.
+pub(crate) fn unsupported(site: &str, line: u32) -> kernel::error::Error {
+    static COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 32 {
+        kernel::pr_warn!("M5 ENOTSUPP origin: {}:{} (occurrence {})\n", site, line, n + 1);
+    }
+    kernel::error::code::ENOTSUPP
+}
+
 mod buffer;
 mod channel;
 mod command;
@@ -51,11 +62,15 @@ mod job;
 mod kick;
 mod object;
 mod power;
+mod thermal;
 mod preparation;
 mod progress;
 mod qos;
 mod queue;
 mod recovery;
+mod sync_source;
+mod source_hold;
+mod source_array;
 mod runtime;
 mod timeout_trace;
 pub(crate) mod status;
@@ -329,14 +344,14 @@ impl rtkit::Operations for RoleOps {
         iova: usize,
         size: usize,
     ) -> Result<CrashLog> {
-        let buffer = data.crash_log.as_ref().ok_or(ENOTSUPP)?;
+        let buffer = data.crash_log.as_ref().ok_or_else(|| crate::g17::unsupported(file!(), line!()))?;
         if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != buffer.va || size > buffer.size
         {
             return Err(EINVAL);
         }
         Ok(CrashLog {
             iova,
-            map: data.crash_map.as_ref().ok_or(ENOTSUPP)?.clone(),
+            map: data.crash_map.as_ref().ok_or_else(|| crate::g17::unsupported(file!(), line!()))?.clone(),
         })
     }
 }
@@ -497,6 +512,8 @@ struct Firmware {
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
+    /// M5: host GPU power budget governor (Region C 0x88).
+    governor: thermal::Governor,
     registration_power_release_pending: bool,
     queues: runtime::Registry,
     pool: Arc<object::Pool>,
@@ -593,7 +610,42 @@ impl Firmware {
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
+        if self.uat.is_sptm() && thermal::requested() && self.governor.note_activity(now_ns()) {
+            self.primary.state.shared.queue_governor();
+        }
         self.apply_effort(power::FULL_EFFORT)
+    }
+
+    /// One governor step with the hotspot temperature reading; returns whether to run again.
+    fn governor_tick(&mut self, temp_mc: Option<i32>) -> bool {
+        let now = now_ns();
+        // Effort remains asserted until submitted work retires. A long job
+        // must not look idle merely because it has no subsequent submission.
+        if self.effort.applied() != 0 && thermal::requested() {
+            self.governor.note_activity(now);
+        }
+        let Ok(current) = self.init.m5_power_budget() else { return false; };
+        self.governor.set_maximum(current);
+        let power = self.init.m5_gpu_power_mw().unwrap_or(0);
+        let clamped = self.init.m5_firmware_clamped().unwrap_or(false);
+        let (publish, again) = self.governor.tick(temp_mc, power, clamped, now);
+        if let Some(budget) = publish {
+            if self.init.publish_m5_power_budget(budget).is_err() {
+                return false;
+            }
+        }
+        if thermal::tracing() {
+            pr_info!("asahi: M5 thermal sample temp_mc={:?} power_mw={} budget_mw={} clamped={}\n",
+                temp_mc, power, publish.unwrap_or(current), clamped);
+        }
+        again
+    }
+
+    /// Restore the calibrated maximum budget (shutdown).
+    fn governor_restore(&mut self) {
+        if let Some(budget) = self.governor.restore() {
+            let _ = self.init.publish_m5_power_budget(budget);
+        }
     }
 
     fn apply_effort(&mut self, effort: u32) -> Result {
@@ -667,6 +719,7 @@ const IDLE_WORK: u64 = 2;
 const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
+const GOVERNOR_WORK: u64 = 6;
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -692,10 +745,17 @@ struct Shared {
     preparations: Arc<preparation::Gate>,
     #[pin]
     work: Work<Shared, EVENT_WORK>,
+    /// Empty reusable collector, borrowed only by the serialized event work item.
+    /// The slot lock never nests with the device mutex or completion callbacks.
+    #[pin]
+    worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
     #[pin]
     poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
     idle: DelayedWork<Shared, IDLE_WORK>,
+    #[pin]
+    governor: DelayedWork<Shared, GOVERNOR_WORK>,
+    governor_armed: AtomicBool,
     #[pin]
     grow: Work<Shared, GROW_WORK>,
     #[pin]
@@ -723,6 +783,9 @@ impl_has_delayed_work! {
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, IDLE_WORK> for Shared { self.idle }
+}
+impl_has_delayed_work! {
+    impl HasDelayedWork<Shared, GOVERNOR_WORK> for Shared { self.governor }
 }
 impl_has_work! {
     impl HasWork<Shared, GROW_WORK> for Shared { self.grow }
@@ -778,6 +841,24 @@ impl WorkItem<IDLE_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
         this.queue_events();
+    }
+}
+impl WorkItem<GOVERNOR_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.governor_armed.store(false, Ordering::Release);
+        // Sensor reads may sleep: take them before the device lock.
+        let temp = thermal::hotspot_temperature_mc();
+        let again = {
+            let mut state = this.state.lock();
+            match (*state).as_deref_mut() {
+                Some(firmware) => firmware.governor_tick(temp),
+                None => false,
+            }
+        };
+        if again {
+            this.queue_governor();
+        }
     }
 }
 
@@ -852,6 +933,13 @@ impl Shared {
     fn queue_poll(self: &Arc<Self>) {
         let _ = workqueue::system_highpri()
             .enqueue_delayed::<Arc<Self>, POLL_WORK>(self.clone(), msecs_to_jiffies(1));
+    }
+
+    fn queue_governor(self: &Arc<Self>) {
+        if !self.governor_armed.swap(true, Ordering::AcqRel) {
+            let _ = workqueue::system_unbound().enqueue_delayed::<Arc<Self>, GOVERNOR_WORK>(
+                self.clone(), msecs_to_jiffies(thermal::PERIOD_MS));
+        }
     }
 
     fn queue_idle(self: &Arc<Self>, delay_ns: u64) {
@@ -981,7 +1069,8 @@ impl Gpu {
         let preparations = preparation::Gate::new(physical_available.clone())?;
         let admission_stop = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
-        let feed = feed::Feed::new()?;
+        let feed = feed::Feed::new(m5)?;
+        let worker_deferred = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -999,8 +1088,11 @@ impl Gpu {
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
                 work <- new_work!("g17::Shared::work"),
+                worker_deferred <- new_mutex!(Some(worker_deferred), "g17::Shared::worker_deferred"),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
+                governor <- new_delayed_work!("g17::Shared::governor"),
+                governor_armed: AtomicBool::new(false),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
@@ -1099,6 +1191,7 @@ impl Gpu {
                 rings: channel::Rings::new(),
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                governor: thermal::Governor::new(),
                 registration_power_release_pending: false,
                 queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags,
                     Arc::new(buffer::MetricsIds::new(), GFP_KERNEL)?),
@@ -1158,7 +1251,7 @@ impl Gpu {
         let firmware = KBox::try_init(kernel::try_init!(Firmware {
             secondary, primary, bridge: Bridge { regs, enabled: false },
             rings: channel::Rings::new(), recovery: recovery::State::new(),
-            effort: power::Effort::new(), registration_power_release_pending: false,
+            effort: power::Effort::new(), governor: thermal::Governor::new(), registration_power_release_pending: false,
             queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags, metrics_ids),
             pool: object::Pool::new()?,
             render_ids: freelist::RenderIds::new()?,
@@ -1234,6 +1327,10 @@ impl Gpu {
         self.shared.stop_queues();
         self.shared.disable_timer(&self.shared.poll);
         self.shared.disable_timer(&self.shared.idle);
+        self.shared.disable_timer(&self.shared.governor);
+        if let Some(firmware) = (*self.shared.state.lock()).as_deref_mut() {
+            firmware.governor_restore();
+        }
         self.shared.disable_work(&self.shared.grow);
         self.shared.disable_work(&self.shared.reclaim_work);
         self.shared.disable_work(&self.shared.work);
@@ -1286,6 +1383,9 @@ impl gpu::Gpu for Gpu {
                 | crate::file::DRM_ASAHI_FEATURE_SPARSE_TILES
                 | crate::file::DRM_ASAHI_FEATURE_COMPUTE_MATRIX
                 | crate::file::DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES;
+            if m5_render_submission::depth_msaa_compression_enabled() {
+                params.features |= crate::file::DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
+            }
             if *crate::module_parameters::m5_mesh_storage_chunks.value() != 0 {
                 params.features |= crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
             }
@@ -1342,9 +1442,9 @@ impl gpu::Gpu for Gpu {
         if matches!(self.cfg.firmware, FirmwareProfile::M5Sptm) {
             return Ok(vm);
         }
-        let mappings = firmware.init.user_aliases(&vm, firmware._pm_metrics.as_ref().ok_or(ENOTSUPP)?)?;
+        let mappings = firmware.init.user_aliases(&vm, firmware._pm_metrics.as_ref().ok_or_else(|| crate::g17::unsupported(file!(), line!()))?)?;
         let ranges =
-            hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.as_ref().ok_or(ENOTSUPP)?.va).ok_or(EINVAL)?;
+            hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.as_ref().ok_or_else(|| crate::g17::unsupported(file!(), line!()))?.va).ok_or(EINVAL)?;
         let mut reserved = KVec::with_capacity(ranges.len(), GFP_KERNEL)?;
         for range in ranges {
             reserved.push(range, GFP_KERNEL)?;

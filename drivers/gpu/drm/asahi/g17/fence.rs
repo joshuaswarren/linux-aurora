@@ -7,7 +7,7 @@
 
 use super::context::{Context, WorkStateLease};
 use crate::file::SyncItem;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use kernel::{
     bindings, c_str,
     dma_fence::{Fence, FenceContexts, FenceObject, FenceOps, RawDmaFence, UserFence},
@@ -18,6 +18,80 @@ use kernel::{
 };
 
 pub(crate) struct CompletionFence;
+
+pub(crate) struct ExportFence {
+    source: Arc<super::sync_source::Source>,
+}
+
+static EXPORT_OPS: AtomicUsize = AtomicUsize::new(0);
+
+#[vtable]
+impl FenceOps for ExportFence {
+    fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr { c_str!("asahi") }
+    fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
+        c_str!("g17-compute-source")
+    }
+}
+
+fn exported(contexts: &FenceContexts, source: Arc<super::sync_source::Source>) -> Result<UserFence<ExportFence>> {
+    let fence = contexts.new_fence(0, ExportFence { source })?;
+    // SAFETY: This is an owned, initialized fence which has not been published.
+    let ops = unsafe {
+        (*fence.raw()).context = bindings::dma_fence_context_alloc(1);
+        (*fence.raw()).ops as usize
+    };
+    match EXPORT_OPS.compare_exchange(0, ops, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {},
+        Err(previous) if previous == ops => {},
+        Err(_) => return Err(EIO),
+    }
+    Ok(fence.into())
+}
+
+/// The exact registered vtable, rather than a driver/timeline name, identifies
+/// our payload. The retained input fence owns the object during this clone.
+pub(crate) fn exported_source(fence: &Fence) -> Option<Arc<super::sync_source::Source>> {
+    // SAFETY: The owned Fence retains its object for the complete lookup.
+    unsafe { exported_source_raw(fence.raw()) }
+}
+
+/// The caller retains a reference to this fence or its owning chain node.
+pub(super) unsafe fn exported_source_raw(raw: *mut bindings::dma_fence) -> Option<Arc<super::sync_source::Source>> {
+    let expected = EXPORT_OPS.load(Ordering::Acquire);
+    if expected == 0 { return None; }
+    // SAFETY: Fence owns a live dma_fence. FenceObject is repr(C) with that
+    // fence as its first field. Only ExportFence allocations use this vtable;
+    // its distinctive callback and nontrivial payload drop prevent aliasing a
+    // different fence payload. No cast is made before the exact identity check.
+    unsafe {
+        if (*raw).ops as usize != expected { return None; }
+        let object = &*(raw as *const FenceObject<ExportFence>);
+        Some(object.source.clone())
+    }
+}
+
+enum AggregateFence {
+    Plain(UserFence<CompletionFence>),
+    Export(UserFence<ExportFence>),
+}
+
+impl AggregateFence {
+    fn fence(&self) -> Fence {
+        match self {
+            Self::Plain(fence) => Fence::from_fence(fence),
+            Self::Export(fence) => Fence::from_fence(fence),
+        }
+    }
+    fn set_error(&self, error: Error) {
+        match self { Self::Plain(fence) => fence.set_error(error), Self::Export(fence) => fence.set_error(error) }
+    }
+    fn signal(&self) {
+        match self { Self::Plain(fence) => fence.signal(), Self::Export(fence) => fence.signal() }
+    }
+    fn source(&self) -> Option<&Arc<super::sync_source::Source>> {
+        match self { Self::Plain(_) => None, Self::Export(fence) => Some(&fence.source) }
+    }
+}
 
 #[vtable]
 impl FenceOps for CompletionFence {
@@ -52,7 +126,7 @@ pub(crate) fn allocation_failure(contexts: &FenceContexts) -> Result<Fence> {
 /// The initial member keeps the aggregate unsignalled until enqueue finishes.
 #[pin_data]
 pub(crate) struct Submission {
-    fence: UserFence<CompletionFence>,
+    fence: AggregateFence,
     /// Successful retirement drops only this bookkeeping owner; runtime owners
     /// and failed submissions keep their work-state allocation.
     #[pin]
@@ -62,7 +136,7 @@ pub(crate) struct Submission {
 }
 
 impl Submission {
-    fn new(fence: UserFence<CompletionFence>, context: Arc<Context>) -> Result<Arc<Self>> {
+    fn new(fence: AggregateFence, context: Arc<Context>) -> Result<Arc<Self>> {
         let work_state = Arc::pin_init(WorkStateLease::deferred(context), GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self {
@@ -76,7 +150,7 @@ impl Submission {
     }
 
     pub(crate) fn fence(&self) -> Fence {
-        Fence::from_fence(&self.fence)
+        self.fence.fence()
     }
 
     /// Add one command before enqueue ends. The parser bounds the count to 64.
@@ -99,6 +173,9 @@ impl Submission {
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             let error = self.error.load(Ordering::Acquire);
+            if let Some(source) = self.fence.source() {
+                source.complete(if error == 0 { Ok(()) } else { Err(Error::from_errno(error)) });
+            }
             if error != 0 {
                 // Failure-path diagnostic: the ioctl's out-syncobj fence
                 // signals with this error (first 8, then powers of two).
@@ -137,6 +214,12 @@ pub(crate) struct Member {
 }
 
 impl Member {
+    pub(crate) fn source(&self) -> Option<Arc<super::sync_source::Source>> {
+        self.submission.fence.source().cloned()
+    }
+    pub(crate) fn is_source(&self, source: &Arc<super::sync_source::Source>) -> bool {
+        self.submission.fence.source().is_some_and(|known| Arc::ptr_eq(known, source))
+    }
     pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
         self.submission
             .work_state
@@ -214,7 +297,20 @@ impl Outputs {
 
     /// Publish the actual aggregate before enqueueing any command.
     pub(crate) fn publish(&mut self, context: Arc<Context>) -> Result<Arc<Submission>> {
-        let submission = Submission::new(self.fallback.clone(), context)?;
+        self.publish_fence(context, AggregateFence::Plain(self.fallback.clone()))
+    }
+
+    pub(crate) fn publish_source(&mut self, context: Arc<Context>, contexts: &FenceContexts) -> Result<Arc<Submission>> {
+        // The fallback is private until publication succeeds. Exported outputs
+        // use their distinct aggregate fence; this private fence becomes ready
+        // at hardware publication. On failure Outputs still publishes its error.
+        let source = super::sync_source::Source::new(self.fallback.clone(), context.clone())?;
+        let fence = AggregateFence::Export(exported(contexts, source)?);
+        self.publish_fence(context, fence)
+    }
+
+    fn publish_fence(&mut self, context: Arc<Context>, fence: AggregateFence) -> Result<Arc<Submission>> {
+        let submission = Submission::new(fence, context)?;
         install(self.syncs.drain(self.input_count..), &submission.fence());
         self.submission = Some(submission.clone());
         Ok(submission)

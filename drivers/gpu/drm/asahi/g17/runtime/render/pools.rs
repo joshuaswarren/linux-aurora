@@ -194,9 +194,15 @@ impl Pools {
 
     pub(super) fn observe(&mut self, init: &InitData) -> Result {
         fence(Ordering::Acquire);
-        let consumer = init.control_consumer()?.load(Ordering::Relaxed);
-        let producer = init.control_producer()?.load(Ordering::Relaxed);
-        for lease in self.leases.iter_mut().flatten() {
+        // Retain both checked-view errors even when no lease needs the values.
+        let consumer = init.control_consumer()?;
+        let producer = init.control_producer()?;
+        let mut leases = self.leases.iter_mut().flatten()
+            .filter(|lease| lease.needs_release_observation()).peekable();
+        if leases.peek().is_none() { return Ok(()); }
+        let consumer = consumer.load(Ordering::Relaxed);
+        let producer = producer.load(Ordering::Relaxed);
+        for lease in leases {
             lease.observe_releases(consumer, producer)?;
         }
         Ok(())
