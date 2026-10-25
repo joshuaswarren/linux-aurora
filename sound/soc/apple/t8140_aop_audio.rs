@@ -2638,9 +2638,10 @@ unsafe extern "C" fn asoc_pcm_copy(
                 *w = ((i64::from(sample) * i64::from(gain)) >> 31) as i32;
             }
             data.spkr_thermal.lock().block(&mut words[..count]);
+            // The amplifier takes plain 32-bit PCM from the AOP link (there is
+            // no LEAP on this machine to consume float32 words).
             for (i, w) in words[..count].iter().enumerate() {
-                let bits = f32_bits_of_q31(*w);
-                dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&bits.to_le_bytes());
+                dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
             }
         }
         off += n;
