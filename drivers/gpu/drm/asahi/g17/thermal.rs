@@ -21,9 +21,13 @@
 //! minutes without one raises it again by 1 C. It publishes the budget like the effort input, only when it changes, and
 //! restores the calibrated maximum on release, when the GPU goes idle, when no sensor can be read
 //! and at shutdown. Below the engage temperature nothing is written.
+//!
+//! Diagnostic only: /sys/kernel/debug/m5-gpu-policy/governor turns the governor on or off at
+//! runtime or returns it to the module parameters, and overrides its target.
 
 use core::ffi::{c_char, c_int, c_void, CStr};
-use kernel::{bindings, prelude::*};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use kernel::{bindings, debugfs, fmt, prelude::*, uaccess::UserSliceReader};
 
 extern "C" {
     fn thermal_zone_get_zone_by_name(name: *const c_char) -> *mut c_void;
@@ -105,8 +109,17 @@ const GPU_SLACK_PERCENT: i64 = 70;
 const CPU_HEAT_MARGIN_MC: i32 = 2000;
 const CPU_HEAT_FLOOR_SLACK_MW: i64 = 1000;
 
+/// Diagnostic only: runtime override of the control bit (0 = parameter, 1 = off, 2 = on) and of
+/// the target in milli-C (0 = parameter).
+static MODE: AtomicU32 = AtomicU32::new(0);
+static TARGET_OVERRIDE_MC: AtomicI32 = AtomicI32::new(0);
+
 fn enabled() -> bool {
-    *crate::module_parameters::m5_thermal_governor.value() & 1 != 0
+    match MODE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => *crate::module_parameters::m5_thermal_governor.value() & 1 != 0,
+    }
 }
 fn cpu_balance_enabled() -> bool {
     *crate::module_parameters::m5_thermal_governor.value() & 4 != 0
@@ -121,6 +134,10 @@ pub(super) fn requested() -> bool {
     enabled() || tracing()
 }
 fn target_mc() -> i32 {
+    let target = TARGET_OVERRIDE_MC.load(Ordering::Relaxed);
+    if target != 0 {
+        return target;
+    }
     let parameter = *crate::module_parameters::m5_thermal_target_mc.value();
     i32::try_from(parameter).unwrap_or(90_000).clamp(70_000, 104_000)
 }
@@ -697,4 +714,52 @@ impl Governor {
         let again = (!idle && requested()) || self.budget_mw != self.maximum_mw;
         (publish, again)
     }
+}
+
+/// Governor control: write "on", "off" or "param" (use the module parameters), or
+/// "target <milli-C>" (0 = parameter); read for the mode and the effective target.
+pub(crate) struct Control;
+impl debugfs::Writer for Control {
+    fn write(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "enabled={} target_mc={} mode={} target_override_mc={}", enabled(), target_mc(),
+                 MODE.load(Ordering::Relaxed), TARGET_OVERRIDE_MC.load(Ordering::Relaxed))
+    }
+}
+impl debugfs::Reader for Control {
+    fn read_from_slice(&self, reader: &mut UserSliceReader) -> Result {
+        let mut bytes = [0u8; 32];
+        let n = reader.len();
+        if n == 0 || n > bytes.len() {
+            return Err(EINVAL);
+        }
+        reader.read_slice(&mut bytes[..n])?;
+        let text = core::str::from_utf8(&bytes[..n]).map_err(|_| EINVAL)?.trim();
+        let mut fields = text.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some("param"), None) => MODE.store(0, Ordering::Relaxed),
+            (Some("off"), None) => MODE.store(1, Ordering::Relaxed),
+            (Some("on"), None) => MODE.store(2, Ordering::Relaxed),
+            (Some("target"), Some(value)) => {
+                let value = value.parse::<i32>().map_err(|_| EINVAL)?;
+                if value != 0 && !(70_000..=104_000).contains(&value) {
+                    return Err(EINVAL);
+                }
+                TARGET_OVERRIDE_MC.store(value, Ordering::Relaxed);
+            }
+            _ => return Err(EINVAL),
+        }
+        pr_info!("asahi: M5 governor control: {}\n", text);
+        Ok(())
+    }
+}
+
+pub(crate) struct Files {
+    governor: Control,
+}
+pub(crate) type Handle = core::pin::Pin<KBox<debugfs::Scope<Files>>>;
+pub(crate) fn open() -> Result<Handle> {
+    KBox::pin_init(debugfs::Scope::dir(Files { governor: Control }, c"m5-gpu-policy",
+        |data, dir| {
+            dir.read_write_file(c"governor", &data.governor);
+        }), GFP_KERNEL)
 }

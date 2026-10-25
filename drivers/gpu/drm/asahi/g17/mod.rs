@@ -514,6 +514,7 @@ struct Firmware {
     effort: power::Effort,
     /// M5: host GPU power budget governor (Region C 0x88).
     governor: thermal::Governor,
+    _governor_control: Option<thermal::Handle>,
     registration_power_release_pending: bool,
     queues: runtime::Registry,
     pool: Arc<object::Pool>,
@@ -1211,6 +1212,7 @@ impl Gpu {
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 governor: thermal::Governor::new(),
+                _governor_control: thermal::open().ok(),
                 registration_power_release_pending: false,
                 queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags,
                     Arc::new(buffer::MetricsIds::new(), GFP_KERNEL)?),
@@ -1270,7 +1272,8 @@ impl Gpu {
         let firmware = KBox::try_init(kernel::try_init!(Firmware {
             secondary, primary, bridge: Bridge { regs, enabled: false },
             rings: channel::Rings::new(), recovery: recovery::State::new(),
-            effort: power::Effort::new(), governor: thermal::Governor::new(), registration_power_release_pending: false,
+            effort: power::Effort::new(), governor: thermal::Governor::new(), _governor_control: thermal::open().ok(),
+            registration_power_release_pending: false,
             queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags, metrics_ids),
             pool: object::Pool::new()?,
             render_ids: freelist::RenderIds::new()?,
