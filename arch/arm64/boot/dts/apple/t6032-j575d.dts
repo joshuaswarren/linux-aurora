@@ -113,8 +113,8 @@
  * xHCI (ASM3142). The pwren numbers are the SMC gPxx key of the ADT
  * function-reg_on, function-sd_pwr_en and function-power_enable
  * properties read as hex; the ADT has no power function for port02. The ADT
- * has no PCI IDs, so the WLAN, Bluetooth and SD reader child nodes are not
- * written here.
+ * gives the PCI id only for the SD reader, so the WLAN and Bluetooth child
+ * nodes are not written here.
  */
 &port00 {
 	/* WLAN */
@@ -127,6 +127,13 @@
 	bus-range = <2 2>;
 	pwren-gpios = <&smc_gpio 25 GPIO_ACTIVE_HIGH>;
 	status = "okay";
+	/* The ADT gives the id (pci17a0,9755); the card-detect and write-protect polarity is the M2 Ultra Studio's */
+	sdhci0: mmc@0,0 {
+		compatible = "pci17a0,9755";
+		reg = <0x20000 0x0 0x0 0x0 0x0>;
+		cd-inverted;
+		wp-inverted;
+	};
 };
 
 &port02 {
