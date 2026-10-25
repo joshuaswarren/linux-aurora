@@ -29,10 +29,11 @@ const DBIAS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_IN
 const FEW_PRIMITIVES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
 const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 const STAGE_PREFIXES: u32 = crate::file::DRM_ASAHI_RENDER_STAGE_PREFIXES;
+const WHOLE_ATTACHMENTS: u32 = crate::file::DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
 const SHADER_WRITES: u32 = crate::file::DRM_ASAHI_RENDER_SHADER_WRITES;
 const RENDER_FLAGS: u32 =
     PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS | SHADER_WRITES
-        | STAGE_PREFIXES;
+        | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -474,6 +475,7 @@ impl Payload {
                     few_primitives: cmd.flags & FEW_PRIMITIVES != 0,
                     fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
                     stage_prefixes: cmd.flags & STAGE_PREFIXES != 0,
+                    whole_attachments: cmd.flags & WHOLE_ATTACHMENTS != 0,
                     shader_writes_memory: cmd.flags & SHADER_WRITES != 0,
                     occlusion_query_va: cmd.isp_oclqry_base,
                     sampler_heap_va: cmd.sampler_heap,

@@ -1412,7 +1412,8 @@ impl gpu::Gpu for Gpu {
                 | crate::file::DRM_ASAHI_FEATURE_SPARSE_TILES
                 | crate::file::DRM_ASAHI_FEATURE_COMPUTE_MATRIX
                 | crate::file::DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES
-                | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES;
+                | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES
+                | crate::file::DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS;
             if m5_render_submission::depth_msaa_compression_enabled() {
                 params.features |= crate::file::DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
             }

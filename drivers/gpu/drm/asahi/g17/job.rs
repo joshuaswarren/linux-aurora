@@ -150,8 +150,8 @@ impl Packet {
         source_inputs: KVec<Fence>,
     ) -> Result<Arc<Self>> {
         let footprint = match &command {
-            Validated::Render { attachments, .. } => {
-                context.vm().render_footprint(&attachments[1])?
+            Validated::Render { attachments, pass, .. } => {
+                context.vm().render_footprint(&attachments[1], pass.whole_attachments)?
             }
             Validated::Compute { .. } => None,
         };

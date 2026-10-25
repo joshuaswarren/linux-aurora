@@ -77,6 +77,13 @@ pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES: u64 = 1 << 25;
 /// The command is a struct drm_asahi_cmd_render_with_stage_prefixes: its tiling half waits
 /// only on the render and compute prefixes of the tail, its fragment half on the whole ones.
 pub(crate) const DRM_ASAHI_RENDER_STAGE_PREFIXES: u32 = 1 << 23;
+/// Renders may declare that they write whole attachments only
+/// (DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS).
+pub(crate) const DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS: u64 = 1 << 27;
+/// The render area covers every attachment's full extent, so its tile stores
+/// write no pixel outside it: an overlap with another such render without an
+/// ordering dependency is the application's own race.
+pub(crate) const DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS: u32 = 1 << 24;
 /// UAPI DRM_ASAHI_RENDER_PROGRAM_TASK (bit 3), only with
 /// DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object program is an API task stage.
 pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = 1 << 3;

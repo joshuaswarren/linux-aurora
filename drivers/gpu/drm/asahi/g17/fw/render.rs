@@ -187,6 +187,8 @@ pub(crate) struct RenderPass {
     /// Host-only: the tiling kick waits on its own render and compute prefixes
     /// (`Order::tiling_wait_through`), the fragment kick on the whole ones.
     pub(crate) stage_prefixes: bool,
+    /// Host-only: the render writes whole attachments (hazard ordering).
+    pub(crate) whole_attachments: bool,
     /// Per-command native shader write class; distinct from render-target outputs.
     pub(crate) shader_writes_memory: bool,
     /// GPU address of the occlusion-query results, or zero.
