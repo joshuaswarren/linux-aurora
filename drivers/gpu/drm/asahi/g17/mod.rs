@@ -879,7 +879,7 @@ impl WorkItem<GOVERNOR_WORK> for Shared {
             }
         };
         // Frequency QoS updates and SMC accesses may sleep: outside the device lock.
-        this.actuators.lock().apply(advice, want_fans, now_ns());
+        this.actuators.lock().apply(advice, want_fans, temp, now_ns());
         if again {
             this.queue_governor();
         }
