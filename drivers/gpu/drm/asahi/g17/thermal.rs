@@ -28,6 +28,8 @@ use kernel::{bindings, prelude::*};
 extern "C" {
     fn thermal_zone_get_zone_by_name(name: *const c_char) -> *mut c_void;
     fn thermal_zone_get_temp(zone: *mut c_void, temp: *mut c_int) -> c_int;
+    fn apple_smc_read(smc: *mut c_void, key: u32, buf: *mut c_void, size: usize) -> c_int;
+    fn apple_smc_write(smc: *mut c_void, key: u32, buf: *const c_void, size: usize) -> c_int;
 }
 
 /// SoC hotspot temperature computed by the SMC (registered as a thermal zone by the SMC driver):
@@ -108,6 +110,9 @@ fn enabled() -> bool {
 }
 fn cpu_balance_enabled() -> bool {
     *crate::module_parameters::m5_thermal_governor.value() & 4 != 0
+}
+fn fan_boost_enabled() -> bool {
+    *crate::module_parameters::m5_thermal_governor.value() & 8 != 0
 }
 pub(super) fn tracing() -> bool {
     *crate::module_parameters::m5_thermal_governor.value() & 2 != 0
@@ -193,6 +198,130 @@ pub(crate) fn hotspot_temperature_mc() -> Option<i32> {
         J714_GPU_DIE_ZONES.iter().filter_map(|name| zone_temperature_mc(&provider, name)).max()
             .map(|temp| temp + GPU_DIE_TO_HOTSPOT_MC)
     })
+}
+
+/// Keeps the fans boosted at least this long once boosted, so a short release or idle period
+/// (a loading screen) does not cycle them.
+const FAN_HOLD_NS: u64 = 30_000_000_000;
+
+fn smc_key(name: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*name)
+}
+
+/// Runs `f` with the SMC core of the sensor provider, under the provider lock (which serializes
+/// with its unbinding).
+fn with_smc<T>(f: impl FnOnce(*mut c_void) -> Option<T>) -> Option<T> {
+    let provider = SensorProvider::acquire()?;
+    // SAFETY: the provider lock keeps the device bound; the SMC core is its parent, whose driver
+    // data is the core's state for as long as a child is bound.
+    let smc = unsafe {
+        let parent = (*provider.0).parent;
+        if parent.is_null() { return None; }
+        (*parent).driver_data
+    };
+    if smc.is_null() { None } else { f(smc) }
+}
+
+/// Fan boost: while the governor limits the GPU, every fan runs at its hardware maximum instead of
+/// the SMC's automatic curve, which settles near two thirds of the maximum at the governor's
+/// target; the native performance controller raises the fans under sustained load the same way.
+/// Released (automatic mode) when the governor releases or the GPU goes idle, after a hold.
+pub(crate) struct FanBoost {
+    boosted: bool,
+    since_ns: u64,
+}
+
+impl FanBoost {
+    const fn new() -> Self {
+        Self { boosted: false, since_ns: 0 }
+    }
+
+    fn set(&mut self, boost: bool) -> bool {
+        with_smc(|smc| {
+            let mut count = 0u8;
+            // SAFETY: smc is the bound SMC core; the buffers are valid for their sizes.
+            if unsafe { apple_smc_read(smc, smc_key(b"FNum"), (&raw mut count).cast(), 1) } < 0 {
+                return None;
+            }
+            let mut ok = count != 0;
+            for fan in 0..count.min(4) {
+                let digit = b'0' + fan;
+                let mode = u8::from(boost);
+                let mut maximum = [0u8; 4];
+                // SAFETY: as above.
+                unsafe {
+                    if boost
+                        && apple_smc_read(smc, smc_key(&[b'F', digit, b'M', b'x']), maximum.as_mut_ptr().cast(), 4) < 0
+                    {
+                        ok = false;
+                        continue;
+                    }
+                    ok &= apple_smc_write(smc, smc_key(&[b'F', digit, b'm', b'd']), (&raw const mode).cast(), 1) >= 0;
+                    if boost {
+                        ok &= apple_smc_write(smc, smc_key(&[b'F', digit, b'T', b'g']), maximum.as_ptr().cast(), 4) >= 0;
+                    }
+                }
+            }
+            Some(ok)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Applies one governor step's request. Called from the governor work without driver locks:
+    /// SMC accesses sleep.
+    fn apply(&mut self, want: bool, now_ns: u64) {
+        let want = want && fan_boost_enabled();
+        if want {
+            self.since_ns = now_ns;
+        }
+        if want && !self.boosted {
+            self.boosted = self.set(true);
+        } else if !want && self.boosted
+            && (!fan_boost_enabled() || now_ns.saturating_sub(self.since_ns) >= FAN_HOLD_NS)
+        {
+            if self.set(false) {
+                self.boosted = false;
+            }
+        }
+    }
+
+    pub(crate) fn release(&mut self) {
+        if self.boosted && self.set(false) {
+            self.boosted = false;
+        }
+    }
+
+    pub(crate) fn boosted(&self) -> bool {
+        self.boosted
+    }
+}
+
+impl Drop for FanBoost {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// The host's thermal actuators besides the GPU budget, applied outside the device lock.
+pub(crate) struct Actuators {
+    pub(crate) cpu: CpuCeiling,
+    pub(crate) fans: FanBoost,
+}
+
+impl Actuators {
+    pub(crate) const fn new() -> Self {
+        Self { cpu: CpuCeiling::new(), fans: FanBoost::new() }
+    }
+
+    pub(crate) fn apply(&mut self, advice: CpuAdvice, fans: bool, now_ns: u64) {
+        self.cpu.apply(advice, now_ns);
+        self.fans.apply(fans, now_ns);
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.cpu.release();
+        self.fans.release();
+    }
 }
 
 /// What the CPU ceiling should do after a governor step.
@@ -476,6 +605,12 @@ impl Governor {
         } else {
             CpuAdvice::Hold
         }
+    }
+
+    /// Whether the fans should be boosted: while the controller governs a busy GPU.
+    pub(crate) fn fans_wanted(&self, now_ns: u64) -> bool {
+        self.maximum_mw != 0 && self.active
+            && now_ns.saturating_sub(self.last_activity_ns) < IDLE_RESTORE_NS
     }
 
     /// One control step with the hotspot temperature, the GPU's current draw (mW) and whether the
