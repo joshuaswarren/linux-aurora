@@ -16,6 +16,7 @@
 	model = "Apple Mac Studio (M3 Ultra, 2025)";
 
 	aliases {
+		ethernet0 = &ethernet0;
 		serial0 = &serial0;
 	};
 
@@ -104,6 +105,58 @@
 			};
 		};
 	};
+};
+
+/*
+ * PCIe devices, from the 27.0.1 ADT of a retail unit: port00 WLAN and
+ * Bluetooth, port01 SD card reader, port02 10 Gbit Ethernet, port03 USB
+ * xHCI (ASM3142). The pwren numbers are the SMC gPxx key of the ADT
+ * function-reg_on, function-sd_pwr_en and function-power_enable
+ * properties read as hex; the ADT has no power function for port02. The ADT
+ * has no PCI IDs, so the WLAN, Bluetooth and SD reader child nodes are not
+ * written here.
+ */
+&port00 {
+	/* WLAN */
+	bus-range = <1 1>;
+	pwren-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+};
+
+&port01 {
+	/* SD card reader */
+	bus-range = <2 2>;
+	pwren-gpios = <&smc_gpio 25 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&port02 {
+	/* 10 Gbit Ethernet */
+	bus-range = <3 3>;
+	status = "okay";
+	ethernet0: ethernet@0,0 {
+		reg = <0x30000 0x0 0x0 0x0 0x0>;
+		/* To be filled by the loader */
+		local-mac-address = [00 10 18 00 00 00];
+	};
+};
+
+&port03 {
+	/* USB xHCI */
+	bus-range = <4 4>;
+	pwren-gpios = <&smc_gpio 22 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&pcie0_dart_1 {
+	status = "okay";
+};
+
+&pcie0_dart_2 {
+	status = "okay";
+};
+
+&pcie0_dart_3 {
+	status = "okay";
 };
 
 #include "hwmon-common.dtsi"
