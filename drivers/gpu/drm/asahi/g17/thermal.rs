@@ -98,6 +98,10 @@ const CPU_DWELL_NS: u64 = 2_000_000_000;
 /// the lower share (it then waits for the CPU).
 const GPU_BOUND_PERCENT: i64 = 90;
 const GPU_SLACK_PERCENT: i64 = 70;
+/// The CPU's own heat: the hotspot this far above the target while the GPU budget is within the
+/// slack of its floor.
+const CPU_HEAT_MARGIN_MC: i32 = 2000;
+const CPU_HEAT_FLOOR_SLACK_MW: i64 = 1000;
 
 fn enabled() -> bool {
     *crate::module_parameters::m5_thermal_governor.value() & 1 != 0
@@ -441,7 +445,9 @@ impl Governor {
 
     /// How the CPU ceiling should follow the last step, from the GPU's draw (mW) against the
     /// budget it was given. While governing, a GPU that draws its whole budget below its ceiling
-    /// is limited by heat the CPU shares; one that leaves headroom waits for the CPU.
+    /// is limited by heat the CPU shares; one that leaves headroom waits for the CPU. When the
+    /// hotspot stays above the target with the GPU budget at its floor, the heat is the CPU's
+    /// and only the CPU can keep the firmware from clamping the GPU.
     pub(crate) fn cpu_advice(&self, power_mw: u32, now_ns: u64) -> CpuAdvice {
         if self.maximum_mw == 0 || now_ns.saturating_sub(self.last_activity_ns) >= IDLE_RESTORE_NS {
             return CpuAdvice::Release;
@@ -453,10 +459,20 @@ impl Governor {
         }
         let budget = i64::from(self.budget_mw);
         let power = i64::from(power_mw);
-        if budget >= self.ceiling_mw || power * 100 < budget * GPU_SLACK_PERCENT {
-            CpuAdvice::Raise
-        } else if power * 100 >= budget * GPU_BOUND_PERCENT {
+        let target = target_mc() - self.target_offset_mc;
+        let temp = self.last_temp_mc.unwrap_or(target);
+        if temp >= target + CPU_HEAT_MARGIN_MC
+            && budget <= FLOOR_MW.min(self.ceiling_mw) + CPU_HEAT_FLOOR_SLACK_MW
+        {
             CpuAdvice::Lower
+        } else if budget < self.ceiling_mw && power * 100 >= budget * GPU_BOUND_PERCENT {
+            CpuAdvice::Lower
+        } else if budget >= self.ceiling_mw
+            || (power * 100 < budget * GPU_SLACK_PERCENT && temp < target)
+        {
+            // A GPU waiting for the CPU gets it back only below the target: above it, the
+            // controller is still taking heat out.
+            CpuAdvice::Raise
         } else {
             CpuAdvice::Hold
         }
