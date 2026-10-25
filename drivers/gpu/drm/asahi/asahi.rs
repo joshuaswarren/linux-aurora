@@ -132,7 +132,7 @@ module! {
         },
         m5_thermal_governor: u32 {
             default: 0,
-            description: "M5 thermal diagnostic flags: bit 0 enables the host GPU power budget controller, bit 1 logs one-second sensor and limiter samples; default 0 preserves the existing policy",
+            description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 1 logs one-second sensor and limiter samples, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound; default 0 preserves the existing policy",
         },
         m5_thermal_target_mc: u32 {
             default: 90000,

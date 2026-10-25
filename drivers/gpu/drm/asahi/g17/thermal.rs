@@ -23,7 +23,7 @@
 //! and at shutdown. Below the engage temperature nothing is written.
 
 use core::ffi::{c_char, c_int, c_void, CStr};
-use kernel::bindings;
+use kernel::{bindings, prelude::*};
 
 extern "C" {
     fn thermal_zone_get_zone_by_name(name: *const c_char) -> *mut c_void;
@@ -88,8 +88,22 @@ const CLAMP_TARGET_RECOVER_NS: u64 = 600_000_000_000;
 /// Budget changes smaller than this are not published.
 const STEP_MW: i64 = 250;
 
+/// CPU ceiling: one step lowers every cpufreq policy's maximum by this share of its hardware
+/// maximum, down to the floor share.
+const CPU_STEP_PERCENT: u32 = 4;
+const CPU_FLOOR_PERCENT: u32 = 60;
+/// Minimum time between CPU ceiling steps; the hotspot and the GPU draw follow within it.
+const CPU_DWELL_NS: u64 = 2_000_000_000;
+/// The GPU uses its budget when it draws at least this share of it, and leaves headroom below
+/// the lower share (it then waits for the CPU).
+const GPU_BOUND_PERCENT: i64 = 90;
+const GPU_SLACK_PERCENT: i64 = 70;
+
 fn enabled() -> bool {
     *crate::module_parameters::m5_thermal_governor.value() & 1 != 0
+}
+fn cpu_balance_enabled() -> bool {
+    *crate::module_parameters::m5_thermal_governor.value() & 4 != 0
 }
 pub(super) fn tracing() -> bool {
     *crate::module_parameters::m5_thermal_governor.value() & 2 != 0
@@ -177,6 +191,168 @@ pub(crate) fn hotspot_temperature_mc() -> Option<i32> {
     })
 }
 
+/// What the CPU ceiling should do after a governor step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CpuAdvice {
+    /// Keep the current ceiling.
+    Hold,
+    /// The GPU draws its whole thermally limited budget: give it the CPU's share of the heat.
+    Lower,
+    /// The GPU is not limited by its budget (or waits for the CPU): give the CPU a step back.
+    Raise,
+    /// Not governing: drop the ceiling.
+    Release,
+}
+
+/// One cpufreq policy's maximum-frequency request.
+struct CpuRequest {
+    policy: *mut bindings::cpufreq_policy,
+    request: KBox<bindings::freq_qos_request>,
+    max_khz: u32,
+}
+
+// SAFETY: the policy reference and the request are only used from the governor work, under the
+// ceiling's lock.
+unsafe impl Send for CpuRequest {}
+
+/// Shares the SoC's heat between the CPU and the GPU while the governor limits the GPU, as the
+/// native performance controller does: when the GPU is budget-bound it lowers the maximum
+/// frequency of every CPU cluster one step at a time, and gives the steps back once the GPU no
+/// longer uses its budget (it then waits for the CPU) or is no longer limited. The requests are
+/// ordinary frequency QoS maxima, combined with any other limit on the policies.
+pub(crate) struct CpuCeiling {
+    requests: KVec<CpuRequest>,
+    level: u32,
+    last_change_ns: u64,
+}
+
+impl CpuCeiling {
+    pub(crate) const fn new() -> Self {
+        Self { requests: KVec::new(), level: 0, last_change_ns: 0 }
+    }
+
+    pub(crate) fn level(&self) -> u32 {
+        self.level
+    }
+
+    fn max_level() -> u32 {
+        (100 - CPU_FLOOR_PERCENT) / CPU_STEP_PERCENT
+    }
+
+    fn limit_khz(max_khz: u32, level: u32) -> i32 {
+        let share = 100 - level.min(Self::max_level()) * CPU_STEP_PERCENT;
+        (u64::from(max_khz) * u64::from(share) / 100).min(i32::MAX as u64) as i32
+    }
+
+    /// Takes a request on every policy (each policy once, through its first CPU).
+    fn acquire(&mut self) -> bool {
+        if !self.requests.is_empty() {
+            return true;
+        }
+        // SAFETY: nr_cpu_ids is set once during early boot.
+        let cpus = unsafe { bindings::nr_cpu_ids };
+        for cpu in 0..cpus {
+            // SAFETY: cpufreq_cpu_get accepts any CPU number and returns a counted reference or
+            // null.
+            let policy = unsafe { bindings::cpufreq_cpu_get(cpu) };
+            if policy.is_null() {
+                continue;
+            }
+            // SAFETY: the reference keeps the policy alive.
+            let (first, max_khz) = unsafe { ((*policy).cpu, (*policy).cpuinfo.max_freq) };
+            let request = if first == cpu && max_khz != 0 {
+                // The zeroed (default) request is the unused state freq_qos_add_request expects.
+                KBox::new(bindings::freq_qos_request::default(), GFP_KERNEL).ok()
+            } else {
+                None
+            };
+            let Some(mut request) = request.filter(|_| self.requests.reserve(1, GFP_KERNEL).is_ok())
+            else {
+                // SAFETY: drops the reference taken above.
+                unsafe { bindings::cpufreq_cpu_put(policy) };
+                continue;
+            };
+            // SAFETY: the policy outlives the request (the reference is held until removal) and
+            // the request is in its unused state, at a stable address in its box.
+            let added = unsafe {
+                bindings::freq_qos_add_request(
+                    &raw mut (*policy).constraints,
+                    &mut *request,
+                    bindings::freq_qos_req_type_FREQ_QOS_MAX,
+                    Self::limit_khz(max_khz, 0),
+                )
+            };
+            if added < 0 {
+                // SAFETY: drops the reference taken above.
+                unsafe { bindings::cpufreq_cpu_put(policy) };
+                continue;
+            }
+            // Capacity was reserved above, so this cannot fail.
+            let _ = self.requests.push(CpuRequest { policy, request, max_khz }, GFP_KERNEL);
+        }
+        !self.requests.is_empty()
+    }
+
+    /// Removes every request and the policy references.
+    pub(crate) fn release(&mut self) {
+        for mut entry in self.requests.drain_all() {
+            // SAFETY: the request was added in acquire and the policy reference is still held.
+            unsafe {
+                bindings::freq_qos_remove_request(&mut *entry.request);
+                bindings::cpufreq_cpu_put(entry.policy);
+            }
+        }
+        self.level = 0;
+    }
+
+    fn publish(&mut self) {
+        for entry in self.requests.iter_mut() {
+            let limit = Self::limit_khz(entry.max_khz, self.level);
+            // SAFETY: the request was added in acquire and stays valid until release.
+            unsafe { bindings::freq_qos_update_request(&mut *entry.request, limit) };
+        }
+    }
+
+    /// Applies one governor step's advice. Called from the governor work without driver locks:
+    /// frequency QoS updates may sleep.
+    pub(crate) fn apply(&mut self, advice: CpuAdvice, now_ns: u64) {
+        if !cpu_balance_enabled() || advice == CpuAdvice::Release {
+            if !self.requests.is_empty() {
+                self.release();
+            }
+            return;
+        }
+        if now_ns.saturating_sub(self.last_change_ns) < CPU_DWELL_NS {
+            return;
+        }
+        match advice {
+            CpuAdvice::Lower if self.level < Self::max_level() => {
+                if !self.acquire() {
+                    return;
+                }
+                self.level += 1;
+            }
+            CpuAdvice::Raise if self.level > 0 => {
+                self.level -= 1;
+                if self.level == 0 {
+                    self.release();
+                    self.last_change_ns = now_ns;
+                    return;
+                }
+            }
+            _ => return,
+        }
+        self.last_change_ns = now_ns;
+        self.publish();
+    }
+}
+
+impl Drop for CpuCeiling {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub(crate) struct Governor {
     maximum_mw: u32,
     budget_mw: u32,
@@ -261,6 +437,29 @@ impl Governor {
             self.target_offset_ns = now_ns;
         }
         self.was_clamped = clamped;
+    }
+
+    /// How the CPU ceiling should follow the last step, from the GPU's draw (mW) against the
+    /// budget it was given. While governing, a GPU that draws its whole budget below its ceiling
+    /// is limited by heat the CPU shares; one that leaves headroom waits for the CPU.
+    pub(crate) fn cpu_advice(&self, power_mw: u32, now_ns: u64) -> CpuAdvice {
+        if self.maximum_mw == 0 || now_ns.saturating_sub(self.last_activity_ns) >= IDLE_RESTORE_NS {
+            return CpuAdvice::Release;
+        }
+        if !self.active {
+            // Released by the controller: hand the steps back one at a time, so the CPU's heat
+            // returns gradually and does not re-engage the governor at once.
+            return CpuAdvice::Raise;
+        }
+        let budget = i64::from(self.budget_mw);
+        let power = i64::from(power_mw);
+        if budget >= self.ceiling_mw || power * 100 < budget * GPU_SLACK_PERCENT {
+            CpuAdvice::Raise
+        } else if power * 100 >= budget * GPU_BOUND_PERCENT {
+            CpuAdvice::Lower
+        } else {
+            CpuAdvice::Hold
+        }
     }
 
     /// One control step with the hotspot temperature, the GPU's current draw (mW) and whether the

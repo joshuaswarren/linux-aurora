@@ -616,29 +616,33 @@ impl Firmware {
         self.apply_effort(power::FULL_EFFORT)
     }
 
-    /// One governor step with the hotspot temperature reading; returns whether to run again.
-    fn governor_tick(&mut self, temp_mc: Option<i32>) -> bool {
+    /// One governor step with the hotspot temperature reading; returns whether to run again and
+    /// what the CPU ceiling should do (applied by the caller without the device lock).
+    fn governor_tick(&mut self, temp_mc: Option<i32>, cpu_level: u32) -> (bool, thermal::CpuAdvice) {
         let now = now_ns();
         // Effort remains asserted until submitted work retires. A long job
         // must not look idle merely because it has no subsequent submission.
         if self.effort.applied() != 0 && thermal::requested() {
             self.governor.note_activity(now);
         }
-        let Ok(current) = self.init.m5_power_budget() else { return false; };
+        let Ok(current) = self.init.m5_power_budget() else {
+            return (false, thermal::CpuAdvice::Release);
+        };
         self.governor.set_maximum(current);
         let power = self.init.m5_gpu_power_mw().unwrap_or(0);
         let clamped = self.init.m5_firmware_clamped().unwrap_or(false);
         let (publish, again) = self.governor.tick(temp_mc, power, clamped, now);
         if let Some(budget) = publish {
             if self.init.publish_m5_power_budget(budget).is_err() {
-                return false;
+                return (false, thermal::CpuAdvice::Release);
             }
         }
+        let advice = self.governor.cpu_advice(power, now);
         if thermal::tracing() {
-            pr_info!("asahi: M5 thermal sample temp_mc={:?} power_mw={} budget_mw={} clamped={}\n",
-                temp_mc, power, publish.unwrap_or(current), clamped);
+            pr_info!("asahi: M5 thermal sample temp_mc={:?} power_mw={} budget_mw={} clamped={} cpu_level={} cpu={:?}\n",
+                temp_mc, power, publish.unwrap_or(current), clamped, cpu_level, advice);
         }
-        again
+        (again, advice)
     }
 
     /// Restore the calibrated maximum budget (shutdown).
@@ -770,6 +774,10 @@ struct Shared {
     /// The device lock. `None` before boot completes and after detachment.
     #[pin]
     state: Mutex<Option<KBox<Firmware>>>,
+    /// M5: CPU frequency ceiling the thermal governor shares the SoC's heat with. Never taken
+    /// with `state` held.
+    #[pin]
+    cpu_ceiling: Mutex<thermal::CpuCeiling>,
     #[pin]
     changed: CondVar,
 }
@@ -849,13 +857,16 @@ impl WorkItem<GOVERNOR_WORK> for Shared {
         this.governor_armed.store(false, Ordering::Release);
         // Sensor reads may sleep: take them before the device lock.
         let temp = thermal::hotspot_temperature_mc();
-        let again = {
+        let cpu_level = this.cpu_ceiling.lock().level();
+        let (again, advice) = {
             let mut state = this.state.lock();
             match (*state).as_deref_mut() {
-                Some(firmware) => firmware.governor_tick(temp),
-                None => false,
+                Some(firmware) => firmware.governor_tick(temp, cpu_level),
+                None => (false, thermal::CpuAdvice::Release),
             }
         };
+        // Frequency QoS updates may sleep: outside the device lock.
+        this.cpu_ceiling.lock().apply(advice, now_ns());
         if again {
             this.queue_governor();
         }
@@ -1098,6 +1109,7 @@ impl Gpu {
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
+                cpu_ceiling <- new_mutex!(thermal::CpuCeiling::new(), "g17::Shared::cpu_ceiling"),
                 changed <- new_condvar!("g17::Shared::changed"),
             }),
             GFP_KERNEL,
@@ -1331,6 +1343,7 @@ impl Gpu {
         if let Some(firmware) = (*self.shared.state.lock()).as_deref_mut() {
             firmware.governor_restore();
         }
+        self.shared.cpu_ceiling.lock().release();
         self.shared.disable_work(&self.shared.grow);
         self.shared.disable_work(&self.shared.reclaim_work);
         self.shared.disable_work(&self.shared.work);
