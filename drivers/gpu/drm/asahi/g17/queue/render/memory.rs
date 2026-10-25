@@ -101,6 +101,10 @@ pub(in crate::g17) struct Graph {
 impl Graph {
     pub(super) fn is_m5(&self) -> bool { self.m5 }
 
+    /// Out of line: inlined, its temporaries stay reserved in `Memory::new`'s frame while the
+    /// rest of the pair (`buffer::Manager::new` and its allocations) is built below it, which
+    /// overflowed the submit ioctl's kernel stack.
+    #[inline(never)]
     pub(in crate::g17) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,

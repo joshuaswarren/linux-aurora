@@ -634,7 +634,9 @@ pub(crate) struct Manager {
     layout: layout::Layout,
     tvb: Tvb,
     metrics: MetricsLease,
-    scenes: Scenes,
+    /// Boxed: the per-scene owner table would otherwise make every `Manager` value large, and
+    /// one is built and moved through the frames of the submit path that creates a pair.
+    scenes: KBox<Scenes>,
     page_list_client: u64,
     scratch: u64,
     buffer_id: u8,
@@ -695,7 +697,7 @@ impl Manager {
                 generation: args.generation,
             }, graph.bytes_mut())?;
         fence(Ordering::SeqCst);
-        let mut scenes = Scenes::with_slots(layout.scratch_slots)?;
+        let mut scenes = KBox::new(Scenes::with_slots(layout.scratch_slots)?, GFP_KERNEL)?;
         scenes.commit(args.first_ordinal, fw::FIRST_SCENE)?;
         let page_list_client = page_list.iova();
         Ok(Self {
