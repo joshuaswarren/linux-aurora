@@ -1504,20 +1504,22 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 
 /*
  * J873 (Mac mini, T8152): AOP-fed like the J700, but the speaker amplifier is
- * an SN012776 on the AP's I2C bus and needs no software gain. The speakers
- * stay disabled until the speaker path is verified on hardware (the amplifier
- * model and the speaker count are not confirmed); the jack works first. The
- * front-end DAIs are those of the AOP audio component, which keeps the
- * T8140 names. The serial link format is the macaudio default until the
- * firmware's stream-format property has been read on this machine.
+ * an SN012776 on the AP's I2C bus and needs no software gain. The speaker
+ * is protected by the limiter in the AOP audio component (a ceiling, a
+ * fixed high-pass and a thermal model of the speaker in the copy path),
+ * not by a user-space daemon: the machine has no sense stream for one, so
+ * there is no volume lock to hand over (safe_vol = 0). The front-end DAIs
+ * are those of the AOP audio component, which keeps the T8140 names. The
+ * serial link format of the speaker is set below; the jack keeps the
+ * default.
  */
 struct macaudio_platform_cfg macaudio_j873_cfg = {
-	.enable_speakers = false,
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_1W,
 	.stereo = false,
 	.amp_gain = 15,
-	.safe_vol = -20,
+	.safe_vol = 0,
 	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
 	/*
 	 * The amplifier must sample on the rising bit-clock edge here: with

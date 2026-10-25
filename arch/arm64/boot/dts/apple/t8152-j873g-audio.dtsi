@@ -124,8 +124,9 @@
 		};
 
 		/*
-		 * The speaker stays disabled by the card driver until a
-		 * speaker-safety profile exists for this machine.
+		 * The speaker is protected by the limiter of the AOP audio
+		 * component (ceiling, high-pass and a thermal model), not by a
+		 * user-space daemon: the machine has no sense stream for one.
 		 */
 		dai-link@1 {
 			reg = <1>;
