@@ -2431,8 +2431,15 @@ mod spk_thermal {
     const T_START_COIL_Q: i64 = 130841883705344;
     const T_START_MAGNET_Q: i64 = 100495362778726;
     /// The hard amplitude ceiling of the first audible tests: -20 dB below the
-    /// sustained level (a worst-case power of about 9 mW).
+    /// sustained level (a worst-case power of about 9 mW); kept for the unit
+    /// tests of the model.
+    #[allow(dead_code)]
     pub(super) const CEILING_M20_Q30: i64 = 18174652;
+    /// The ceiling of the speaker path: 0.078 of full scale (0.93 V peak and
+    /// about 94 mW for a sine at an amplifier gain of 15, by this model), 6 dB
+    /// below the level at which the vendor's own driver plays a 440 Hz tone at
+    /// its maximum volume, measured with one microphone at one place.
+    pub(super) const CEILING_Q30: i64 = 83_800_000;
     /// No ceiling (unit tests, later steps).
     #[allow(dead_code)]
     pub(super) const CEILING_0DB_Q30: i64 = 1073741824;
@@ -3690,7 +3697,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                     users: 0,
                     running: false,
                 }),
-                spkr_thermal <- new_spinlock!(SpkThermal::new(spk_thermal::CEILING_M20_Q30)),
+                spkr_thermal <- new_spinlock!(SpkThermal::new(spk_thermal::CEILING_Q30)),
             }),
             GFP_KERNEL,
         )?;
@@ -4037,7 +4044,7 @@ mod lid_tests {
 
 #[kunit_tests(snd_soc_t8140_aop_audio_thermal)]
 mod thermal_tests {
-    use super::spk_thermal::{Highpass, SpkThermal, CEILING_0DB_Q30, CEILING_M20_Q30};
+    use super::spk_thermal::{Highpass, SpkThermal, CEILING_0DB_Q30, CEILING_M20_Q30, CEILING_Q30};
 
     /// The 100 Hz square wave at the I2S full scale, 240 words per half period.
     fn square(i: usize) -> i32 {
@@ -4176,6 +4183,17 @@ mod thermal_tests {
         run_square(&mut l, 3750 * 6);
         // 140 C in Q40
         assert!(l.state().0 < 140i64 << 40);
+    }
+
+    /// At the speaker ceiling a full-scale square wave stays far below the
+    /// sustained power (0.19 W against 0.9 W at 11.9 V per full scale): the
+    /// thermal gain never moves, the ceiling is a pure peak limit.
+    #[test]
+    fn the_speaker_ceiling_is_a_peak_limit_below_the_sustained_level() {
+        let mut l = SpkThermal::new(CEILING_Q30);
+        let peak = run_square(&mut l, 3750 * 3);
+        assert_eq!(i64::from(peak), CEILING_Q30);
+        assert_eq!(l.state().4, 1 << 30);
     }
 
     #[test]
