@@ -204,6 +204,53 @@ def dt_cells(val):
     return out
 
 
+def adt_irqs(node):
+    """(all_irqs, valid_irqs) of an ADT node, as (die, irq) pairs. The ADT
+    encodes die 1 by adding 0x1000 to the AIC number. 'interrupts-valid' is
+    a bitmask over the 'interrupts' entries; entries whose bit is clear are
+    marked invalid by the firmware (sgx entry 5, IRQ 1249). Without the
+    property every entry counts as valid."""
+    pr = node["props"]
+    raw = pr.get("interrupts")
+    if raw is None:
+        return [], []
+    all_irqs = [(1 if n >= 0x1000 else 0, n - 0x1000 if n >= 0x1000 else n)
+                for n in (int.from_bytes(raw[i:i + 4], "little")
+                          for i in range(0, len(raw), 4))]
+    mask = pr.get("interrupts-valid")
+    if mask is None:
+        return all_irqs, list(all_irqs)
+    m = int.from_bytes(mask, "little")
+    valid = [irq for i, irq in enumerate(all_irqs) if m & (1 << i)]
+    return all_irqs, valid
+
+
+def adt_irq_tables(root, names):
+    io = adt_find(root, "arm-io")
+    out = {}
+    for n in io["kids"]:
+        if adt_name(n) in names:
+            out[adt_name(n)] = adt_irqs(n)
+    return out
+
+
+def dt_irqs(node):
+    """(die, irq) pairs of a DT node: 4-cell `interrupts` specs
+    (<AIC_IRQ die irq type>) and 5-cell `interrupts-extended` specs
+    (<&aic AIC_IRQ die irq type>). Every interrupt-parent here is the AIC,
+    so the fixed grouping is safe for this board; nodes whose
+    interrupts-extended has irregular (<0> filler) specs are skipped, as
+    the spec length is then not derivable (e.g. the ADMAC channel list)."""
+    out = []
+    c = dt_cells(node.props.get("interrupts", ""))
+    if len(c) % 4 == 0:
+        out += [(c[i + 1], c[i + 2]) for i in range(0, len(c), 4)]
+    c = dt_cells(node.props.get("interrupts-extended", ""))
+    if c and len(c) % 5 == 0:
+        out += [(c[i + 2], c[i + 3]) for i in range(0, len(c), 5)]
+    return out
+
+
 def dt_strings(val):
     return re.findall(r'"([^"]*)"', val or "")
 
@@ -409,6 +456,23 @@ REQUIRED_PS.append(("soc@2200000000", "power-management@2a0280000", 0x158, "ps_a
 REQUIRED_PS.append(("soc@200000000", "power-management@408e80000", 0x110, "ps_gfx"))
 REQUIRED_PS.append(("soc@2200000000", "power-management@408e80000", 0x110, "ps_gfx_die1"))
 
+# ADT nodes whose interrupts the DT deliberately does not carry on the node
+# that covers their registers. Each display pipe (dispextN) shares its
+# register windows with dcpextN, which carries no interrupts of its own:
+# the ADT pipe interrupts are carried by the mailbox and DART nodes, and
+# those are checked against their own ADT nodes (dart-dcpextN, dart-
+# dispextN, dcpextN).
+IRQ_COVERAGE_EXEMPT = {f"dispext{i}" for i in range(8)}
+
+# Individual (die, irq) values the DT carries deliberately although no ADT
+# device lists them, each with its reason:
+#   (0, 1321): the DT models the T6031 four-cluster audio block in one mca
+#     node; the 27.0.1 j575dap ADT lists three MCA instances (mca0-2, irqs
+#     1318-1320) and has no fourth instance.
+DT_IRQ_ALLOW = {
+    (0, 1321),
+}
+
 # nodes that must carry status = "disabled"
 MUST_BE_DISABLED = (
     ["gpu", "mbox@40a408000"]
@@ -439,6 +503,16 @@ def main():
     root, _ = adt_parse(open(adt_path, "rb").read())
     awindows = adt_windows(root)
     gated = adt_gated_nodes(root, set(REQUIRED))
+    airqs = adt_irq_tables(root, set(REQUIRED))
+    # every /arm-io node with registers: windows + full irq set, for the
+    # per-DT-node subset rule
+    io = adt_find(root, "arm-io")
+    io_rng = adt_ranges(io)
+    adt_all = []
+    for n in io["kids"]:
+        wins = [(adt_translate(io_rng, a), s) for a, s in adt_reg(n) if s]
+        if wins:
+            adt_all.append((adt_name(n), wins, adt_irqs(n)[0]))
 
     for dtb in dtbs:
         print(f"== {dtb} ==")
@@ -503,7 +577,43 @@ def main():
                   if got == off else
                   f"{label}: {pmgr}/power-controller@{off:x} has reg offset {got:#x}, ADT says {off:#x}")
 
-        # 5. disabled gates
+        # 5. interrupts: every DT interrupt must appear in the ADT irq set
+        # of a node its windows overlap (order differences like the
+        # gfx-asc mailbox reorder are handled by set comparison), and
+        # every required ADT node with valid interrupts must see at least
+        # one of them carried by a DT node (IRQ_COVERAGE_EXEMPT excepted).
+        matched_irqs = {name: [] for name in REQUIRED}
+        for path, node, wins in dtnodes:
+            if not wins:
+                continue
+            dirs = dt_irqs(node)
+            if not dirs:
+                continue
+            union = set()
+            names = set()
+            for name, aw, airq in adt_all:
+                if any(overlap(w, aw2) for w in wins for aw2 in aw):
+                    union |= set(airq)
+                    names.add(name)
+            bad = [i for i in dirs if i not in union and i not in DT_IRQ_ALLOW]
+            check(not bad, f"{path}: irqs {[f'{d}:{n}' for d, n in dirs]} within the ADT ({', '.join(sorted(names))})"
+                  if not bad else
+                  f"{path}: irq(s) {bad} not in the ADT interrupt set of the overlapped node(s)")
+            for name in names:
+                if name in matched_irqs:
+                    matched_irqs[name] += dirs
+        for name in REQUIRED:
+            if name in IRQ_COVERAGE_EXEMPT:
+                continue
+            valid = airqs.get(name, ([], []))[1]
+            if not valid:
+                continue
+            carried = [i for i in matched_irqs[name] if i in valid]
+            check(carried, f"{name}: ADT interrupts {valid} carried by the DT"
+                  if carried else
+                  f"{name}: ADT interrupts {valid} carried by no DT node")
+
+        # 6. disabled gates
         for path, node, wins in dtnodes:
             base = node.name.split("@")[0]
             if base in MUST_BE_DISABLED or node.name in MUST_BE_DISABLED:

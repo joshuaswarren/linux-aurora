@@ -927,7 +927,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x3 0x5304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5143 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1047 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext0_cpu_die1>;
@@ -938,7 +938,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x3 0x530c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5143 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1047 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext0_cpu_die1>;
@@ -950,10 +950,10 @@
 		reg = <0x3 0x6c08000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		/* ADT list (n+1,n,n+3,n+2) reordered to mailbox order. */
-		interrupts = <AIC_IRQ 1 5164 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5165 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5166 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5167 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1068 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1069 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1070 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1071 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_dispext0_cpu_die1>;
@@ -991,7 +991,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x4 0x49304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5143 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1047 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext1_cpu_die1>;
@@ -1002,7 +1002,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x4 0x4930c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5179 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1083 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext1_cpu_die1>;
@@ -1014,10 +1014,10 @@
 		reg = <0x4 0x4ac08000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		/* ADT list (n+1,n,n+3,n+2) reordered to mailbox order. */
-		interrupts = <AIC_IRQ 1 5200 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5201 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5202 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5203 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1104 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1105 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1106 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1107 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_dispext1_cpu_die1>;
@@ -1055,7 +1055,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x4 0x4d304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5215 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1119 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext2_cpu_die1>;
@@ -1066,7 +1066,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x4 0x4d30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5215 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1119 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext2_cpu_die1>;
@@ -1078,10 +1078,10 @@
 		reg = <0x4 0x4ec08000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		/* ADT list (n+1,n,n+3,n+2) reordered to mailbox order. */
-		interrupts = <AIC_IRQ 1 5236 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5237 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5238 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5239 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1140 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1141 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1142 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1143 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_dispext2_cpu_die1>;
@@ -1119,7 +1119,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x2 0xc9304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5251 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1155 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext3_cpu_die1>;
@@ -1130,7 +1130,7 @@
 		compatible = "apple,t6032-dart", "apple,t8110-dart";
 		reg = <0x2 0xc930c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5143 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1047 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext3_cpu_die1>;
@@ -1142,10 +1142,10 @@
 		reg = <0x2 0xcac08000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		/* ADT list (n+1,n,n+3,n+2) reordered to mailbox order. */
-		interrupts = <AIC_IRQ 1 5272 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5273 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5274 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5275 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 1176 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1177 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1178 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 1179 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_dispext3_cpu_die1>;
@@ -1247,7 +1247,7 @@
 		compatible = "apple,t6031-dart", "apple,t8110-dart";
 		reg = <0x3 0xc9800000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5080 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 984 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
@@ -1257,7 +1257,7 @@
 		compatible = "apple,t6031-dart", "apple,t8110-dart";
 		reg = <0x3 0xc9810000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5080 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 984 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
@@ -1267,7 +1267,7 @@
 		compatible = "apple,t6031-dart", "apple,t8110-dart";
 		reg = <0x3 0xc9820000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5080 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 984 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
@@ -1285,11 +1285,11 @@
 		      <0x4 0x04000000 0x0 0x2000000>,
 		      <0x2 0xa02dc000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 5061 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5060 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5063 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5062 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1 5079 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1 965 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 964 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 967 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 966 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 983 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys_die1>, <&ps_ane_mpm_die1>,
 				<&ps_ane_cpu_die1>, <&ps_ane_td_die1>,
 				<&ps_ane_base_die1>;
