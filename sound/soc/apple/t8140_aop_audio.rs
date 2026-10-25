@@ -2638,10 +2638,13 @@ unsafe extern "C" fn asoc_pcm_copy(
                 *w = ((i64::from(sample) * i64::from(gain)) >> 31) as i32;
             }
             data.spkr_thermal.lock().block(&mut words[..count]);
-            // The amplifier takes plain 32-bit PCM from the AOP link (there is
-            // no LEAP on this machine to consume float32 words).
+            // The amplifier takes plain PCM from the AOP link (there is no
+            // LEAP on this machine to consume float32 words), but only the
+            // low 24 bits of each word: measured, a word beyond 2^23 wraps.
+            // The limiter's full scale, 2^30, is therefore 2^23 on the wire.
             for (i, w) in words[..count].iter().enumerate() {
-                dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                let w24 = *w >> 7;
+                dst[off + i * 4..off + i * 4 + 4].copy_from_slice(&w24.to_le_bytes());
             }
         }
         off += n;
