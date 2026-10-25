@@ -120,6 +120,7 @@ impl Output {
             }
             Err(error) => self.fence.set_error(error),
         }
+        super::lat::note(super::lat::FENCE_SIGNAL, 0);
         self.fence.signal();
         self.member.complete(result.map(|_| ()));
     }

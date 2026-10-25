@@ -1221,6 +1221,17 @@ impl File {
         data: &mut uapi::drm_asahi_submit,
         file: &DrmFile,
     ) -> Result<u32> {
+        crate::g17::lat::note(crate::g17::lat::SUBMIT_ENTER, 0);
+        let result = Self::submit_inner(device, data, file);
+        crate::g17::lat::note(crate::g17::lat::SUBMIT_EXIT, 0);
+        result
+    }
+
+    fn submit_inner(
+        device: &AsahiDevice,
+        data: &mut uapi::drm_asahi_submit,
+        file: &DrmFile,
+    ) -> Result<u32> {
         debug::update_debug_flags();
 
         if data.flags != 0 || data.pad != 0 {

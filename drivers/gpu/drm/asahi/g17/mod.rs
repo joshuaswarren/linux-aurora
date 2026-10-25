@@ -63,6 +63,7 @@ mod kick;
 mod object;
 mod power;
 mod thermal;
+pub(crate) mod lat;
 mod preparation;
 mod progress;
 mod qos;
@@ -330,6 +331,7 @@ impl rtkit::Operations for RoleOps {
         if !is_events_message(ep, msg) {
             return false;
         }
+        lat::note(lat::EVENT_MESSAGE, 0);
         data.shared.queue_events();
         true
     }
@@ -515,6 +517,7 @@ struct Firmware {
     /// M5: host GPU power budget governor (Region C 0x88).
     governor: thermal::Governor,
     _governor_control: Option<thermal::Handle>,
+    _latency_control: Option<lat::Handle>,
     registration_power_release_pending: bool,
     queues: runtime::Registry,
     pool: Arc<object::Pool>,
@@ -885,6 +888,7 @@ impl WorkItem<EVENT_WORK> for Shared {
     type Pointer = Arc<Shared>;
 
     fn run(this: Arc<Shared>) {
+        lat::note(lat::EVENT_WORKER, 0);
         this.run_runtime_events();
     }
 }
@@ -1212,7 +1216,7 @@ impl Gpu {
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 governor: thermal::Governor::new(),
-                _governor_control: thermal::open().ok(),
+                _governor_control: thermal::open().ok(), _latency_control: lat::open().ok(),
                 registration_power_release_pending: false,
                 queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags,
                     Arc::new(buffer::MetricsIds::new(), GFP_KERNEL)?),
@@ -1272,7 +1276,7 @@ impl Gpu {
         let firmware = KBox::try_init(kernel::try_init!(Firmware {
             secondary, primary, bridge: Bridge { regs, enabled: false },
             rings: channel::Rings::new(), recovery: recovery::State::new(),
-            effort: power::Effort::new(), governor: thermal::Governor::new(), _governor_control: thermal::open().ok(),
+            effort: power::Effort::new(), governor: thermal::Governor::new(), _governor_control: thermal::open().ok(), _latency_control: lat::open().ok(),
             registration_power_release_pending: false,
             queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags, metrics_ids),
             pool: object::Pool::new()?,

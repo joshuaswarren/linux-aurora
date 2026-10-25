@@ -1417,6 +1417,7 @@ impl compute::Host for ComputeHost<'_> {
         super::Firmware::apply_shared_effort(self.init, self.effort, super::power::FULL_EFFORT)
     }
     fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
+        super::lat::note(super::lat::KICK, 0);
         self.regs.submit_m5_work(submission)
     }
 }
