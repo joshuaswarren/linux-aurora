@@ -1672,6 +1672,13 @@ impl Pair {
             };
             let ordinal = front.ticket.ordinal;
             let context_update = front.context_update;
+            crate::g17::lat::note(
+                crate::g17::lat::RENDER_TAG,
+                u64::from(qids[0]) << 48 | (Arc::as_ptr(&front.packet.context) as u64 & 0xffff_ffff_ffff),
+            );
+            for (slot, ticks) in timestamps.iter().enumerate() {
+                crate::g17::lat::note(crate::g17::lat::RENDER_STAGE + slot as u64, *ticks);
+            }
             self.note_retirement(ordinal, context_update);
             let front = self.active.front_mut().ok_or(EIO)?;
             if !front.flist_completed {

@@ -17,6 +17,10 @@ pub(crate) const FENCE_SIGNAL: u64 = 6;
 /// Compute retirement: the firmware's start and end ticks of the command (args).
 pub(crate) const GPU_START: u64 = 7;
 pub(crate) const GPU_END: u64 = 8;
+/// Render retirement: a tag (tiling qid << 48 | context address bits), then
+/// the firmware's four stage ticks of the render, in slot order.
+pub(crate) const RENDER_TAG: u64 = 9;
+pub(crate) const RENDER_STAGE: u64 = 10;
 
 const CAPACITY: usize = 65536;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
