@@ -347,7 +347,9 @@ impl rtkit::Operations for RoleOps {
         size: usize,
     ) -> Result<CrashLog> {
         let buffer = data.crash_log.as_ref().ok_or_else(|| crate::g17::unsupported(file!(), line!()))?;
-        if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != buffer.va || size > buffer.size
+        // M5 buffers sit above the 40 address bits the Neo firmware's requests are masked to.
+        let iova64 = iova as u64;
+        if (iova64 != buffer.va && iova64 & RTKIT_BUFFER_ADDR_MASK != buffer.va) || size > buffer.size
         {
             return Err(EINVAL);
         }
