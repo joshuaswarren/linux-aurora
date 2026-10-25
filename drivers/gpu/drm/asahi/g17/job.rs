@@ -15,7 +15,8 @@ use kernel::{
 };
 
 pub(super) const TIMEOUT_MS: kernel::time::Msecs = 2000;
-const RENDER_CREDITS: u32 = 32;
+const RENDER_CREDITS: u32 = crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u32
+    * crate::hw::t8140::queues::RENDER_DEPTH as u32;
 const COMPUTE_CREDITS: u32 = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

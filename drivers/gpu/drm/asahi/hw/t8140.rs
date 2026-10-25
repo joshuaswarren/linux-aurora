@@ -393,7 +393,10 @@ pub(crate) mod scheduling {
 pub(crate) mod queues {
     pub(crate) const RENDER_SLOTS: usize = 64;
     pub(crate) const RENDER_PAIRS_PER_OWNER: usize = 2;
-    pub(crate) const RENDER_DEPTH: u8 = 16;
+    /// Renders an owner may have in flight on each of its pairs: a pair holds 32 descriptor,
+    /// configuration and timestamp records. Completion is only visible once a pair drains, so a
+    /// shallow window idles the GPU between drains.
+    pub(crate) const RENDER_DEPTH: u8 = 32;
     pub(crate) const COMPUTE_DEPTH: usize = 16;
 }
 
