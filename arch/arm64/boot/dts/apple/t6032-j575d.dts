@@ -127,7 +127,10 @@
 	bus-range = <2 2>;
 	pwren-gpios = <&smc_gpio 25 GPIO_ACTIVE_HIGH>;
 	status = "okay";
-	/* The ADT gives the id (pci17a0,9755); the card-detect and write-protect polarity is the M2 Ultra Studio's */
+	/*
+	 * The ADT gives both polarity properties as 1. The inverted flags below
+	 * are copied from the M2 Ultra Studio; their mapping to 1 is unverified.
+	 */
 	sdhci0: mmc@0,0 {
 		compatible = "pci17a0,9755";
 		reg = <0x20000 0x0 0x0 0x0 0x0>;
