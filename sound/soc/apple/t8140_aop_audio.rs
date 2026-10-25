@@ -2348,7 +2348,9 @@ unsafe extern "C" fn asoc_pcm_prepare(
     let data = unsafe { component_data(component) };
     if !data.has_lpai {
         // The speaker cooled while no stream ran.
-        data.spkr_thermal.lock().cool_idle();
+        let mut thermal = data.spkr_thermal.lock();
+        thermal.cool_idle();
+        thermal.reset_highpass();
     }
     0
 }
@@ -2448,6 +2450,49 @@ mod spk_thermal {
         GTAB[k] + (((GTAB[k + 1] - GTAB[k]) * f) >> 10)
     }
 
+    // Fixed high-pass of the speaker path: 2nd-order Butterworth, 100 Hz at
+    // 48 kHz, direct form I, Q28 coefficients, 64-bit state.  The speaker
+    // cone moves far more at low frequencies for the same voltage and the
+    // power model of the limiter has no excursion term; below 100 Hz the
+    // speaker radiates almost nothing anyway.  The output is held to the
+    // input's full scale (a step through a high-pass overshoots by up to
+    // 2x), so the ceiling stays a true peak ceiling.  |x| <= 2^31 and the
+    // coefficients are below 2^29: the sum of five products stays below
+    // 2^63 (the state, below 2.5 full scales, keeps it under 2^61).
+    const HP_B0: i64 = 265_962_279;
+    const HP_B1: i64 = -531_924_558;
+    const HP_B2: i64 = 265_962_279;
+    const HP_A1: i64 = -531_901_772;
+    const HP_A2: i64 = 263_511_889;
+    const HP_SHIFT: u32 = 28;
+    const HP_LIMIT: i64 = 1 << 30;
+
+    #[derive(Default)]
+    pub(super) struct Highpass {
+        x1: i64,
+        x2: i64,
+        y1: i64,
+        y2: i64,
+    }
+
+    impl Highpass {
+        pub(super) fn step(&mut self, x: i32) -> i32 {
+            let x = i64::from(x);
+            let acc = HP_B0 * x + HP_B1 * self.x1 + HP_B2 * self.x2
+                - HP_A1 * self.y1
+                - HP_A2 * self.y2;
+            // The feedback keeps the unclamped value: feeding the clamped one
+            // back would latch a nearly full-scale sine into sustained
+            // clipping.  The state stays below 2.5 full scales.
+            let y = (acc + (1 << (HP_SHIFT - 1))) >> HP_SHIFT;
+            self.x2 = self.x1;
+            self.x1 = x;
+            self.y2 = self.y1;
+            self.y1 = y;
+            y.clamp(-HP_LIMIT, HP_LIMIT) as i32
+        }
+    }
+
     pub(super) struct SpkThermal {
         t_coil: i64,
         t_magnet: i64,
@@ -2455,6 +2500,7 @@ mod spk_thermal {
         hyst_magnet: i64,
         gain: i64,
         ceiling: i64,
+        hp: Highpass,
         last: Option<kernel::time::Instant<kernel::time::Monotonic>>,
     }
 
@@ -2467,6 +2513,7 @@ mod spk_thermal {
                 hyst_magnet: T_START_MAGNET_Q,
                 gain: ONE,
                 ceiling,
+                hp: Highpass::default(),
                 last: None,
             }
         }
@@ -2503,6 +2550,19 @@ mod spk_thermal {
                 self.gain += ((target - self.gain) * REL) >> 32;
             }
             self.last = Some(kernel::time::Instant::now());
+        }
+
+        /// Filter one block of words in place with the speaker path's high-pass
+        /// (before `block`; the filter state carries over from block to block).
+        pub(super) fn highpass(&mut self, words: &mut [i32]) {
+            for w in words.iter_mut() {
+                *w = self.hp.step(*w);
+            }
+        }
+
+        /// Start the high-pass from rest (a new stream).
+        pub(super) fn reset_highpass(&mut self) {
+            self.hp = Highpass::default();
         }
 
         /// Let the speaker cool for the time since the last block: the same
@@ -2637,7 +2697,11 @@ unsafe extern "C" fn asoc_pcm_copy(
                 let sample = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
                 *w = ((i64::from(sample) * i64::from(gain)) >> 31) as i32;
             }
-            data.spkr_thermal.lock().block(&mut words[..count]);
+            {
+                let mut thermal = data.spkr_thermal.lock();
+                thermal.highpass(&mut words[..count]);
+                thermal.block(&mut words[..count]);
+            }
             // The amplifier takes plain PCM from the AOP link (there is no
             // LEAP on this machine to consume float32 words), but only the
             // low 24 bits of each word: measured, a word beyond 2^23 wraps.
@@ -3973,7 +4037,7 @@ mod lid_tests {
 
 #[kunit_tests(snd_soc_t8140_aop_audio_thermal)]
 mod thermal_tests {
-    use super::spk_thermal::{SpkThermal, CEILING_0DB_Q30, CEILING_M20_Q30};
+    use super::spk_thermal::{Highpass, SpkThermal, CEILING_0DB_Q30, CEILING_M20_Q30};
 
     /// The 100 Hz square wave at the I2S full scale, 240 words per half period.
     fn square(i: usize) -> i32 {
@@ -4031,6 +4095,79 @@ mod thermal_tests {
                 226457860
             )
         );
+    }
+
+    /// Peak of the high-pass output for a sine of peak 2^28 made by an integer
+    /// oscillator (`next = 2 cos(w) cur - prev`, Q30): `c2` is 2 cos(w) and
+    /// `s1` the first sample; the peak is taken over the last two periods
+    /// after the start-up has died out.
+    fn highpass_peak(c2: i64, s1: i64, period: usize) -> i64 {
+        let mut hp = Highpass::default();
+        let (mut prev, mut cur) = (0i64, s1);
+        let mut peak = 0i64;
+        for n in 0..8000usize {
+            let y = i64::from(hp.step(prev as i32));
+            if n >= 8000 - 2 * period {
+                peak = peak.max(y.abs());
+            }
+            let next = ((c2 * cur) >> 30) - prev;
+            prev = cur;
+            cur = next;
+        }
+        peak
+    }
+
+    /// Amplitude relative to the input peak 2^28, in 1/10000: the ideal
+    /// Butterworth magnitudes are 0.2425, 0.7071, 0.9701 and 0.9987.
+    fn highpass_gain(c2: i64, s1: i64, period: usize) -> i64 {
+        highpass_peak(c2, s1, period) * 10_000 / (1 << 28)
+    }
+
+    #[test]
+    fn the_highpass_follows_a_100_hz_butterworth() {
+        // 50, 100, 200 and 440 Hz at 48 kHz
+        assert!((highpass_gain(2_147_437_652, 1_756_893, 960) - 2_425).abs() <= 100);
+        assert!((highpass_gain(2_147_299_668, 3_513_712, 480) - 7_071).abs() <= 100);
+        assert!((highpass_gain(2_146_747_759, 7_026_821, 240) - 9_701).abs() <= 100);
+        assert!((highpass_gain(2_143_922_726, 15_452_226, 109) - 9_987).abs() <= 100);
+    }
+
+    #[test]
+    fn the_highpass_blocks_a_constant_and_holds_full_scale() {
+        let mut hp = Highpass::default();
+        let mut last = 0i32;
+        for _ in 0..300_000 {
+            last = hp.step(1 << 20);
+        }
+        assert!(i64::from(last).abs() < 1 << 15);
+        // a full-scale square wave at 120 Hz: the overshoot is held to full scale
+        let mut hp = Highpass::default();
+        let mut peak = 0i32;
+        for i in 0..40_000usize {
+            let x = if (i / 200) % 2 == 0 { 1 << 30 } else { -(1 << 30) };
+            peak = peak.max(hp.step(x).abs());
+        }
+        assert_eq!(peak, 1 << 30);
+    }
+
+    /// A full-scale 440 Hz sine (peak 2^30, integer oscillator) through the
+    /// high-pass: its linear peak is 0.9987 of full scale, so no sample may
+    /// sit on the clamp (a clamped feedback latched it into clipping).
+    #[test]
+    fn a_full_scale_sine_does_not_latch_the_highpass_into_clipping() {
+        let mut hp = Highpass::default();
+        let (mut prev, mut cur) = (0i64, 61_808_904i64);
+        let mut clamped = 0;
+        for n in 0..48_000usize {
+            let y = hp.step(prev as i32);
+            if n >= 48_000 - 3_000 && y.abs() == 1 << 30 {
+                clamped += 1;
+            }
+            let next = ((2_143_922_726i64 * cur) >> 30) - prev;
+            prev = cur;
+            cur = next;
+        }
+        assert_eq!(clamped, 0);
     }
 
     #[test]
