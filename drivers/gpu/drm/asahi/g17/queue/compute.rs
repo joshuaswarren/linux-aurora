@@ -2386,7 +2386,9 @@ impl Queue {
                     previous.publication = Some((packet.order.sequence, epoch));
                 }
             }
-            if notify_activation || self.graph.m5 {
+            let notify_every_kick = self.graph.m5
+                && *crate::module_parameters::m5_kick_notify.value() == 0;
+            if notify_activation || notify_every_kick {
                 fence(Ordering::SeqCst);
                 // Pipe 2 (compute) in bits 1:0, priority class in bits 3:2.
                 host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;

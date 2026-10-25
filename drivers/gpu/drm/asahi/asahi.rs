@@ -62,6 +62,10 @@ module! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
     params: {
+        m5_kick_notify: u32 {
+            default: 0,
+            description: "Diagnostic: 1 = M5 compute kicks notify the firmware only on queue activation",
+        },
         m5_cross_queue_fw_wait: u32 {
             default: 0,
             description: "Experimental same-VM compute firmware dependencies; default off",
