@@ -16,6 +16,7 @@ on:
       - "arch/arm64/boot/dts/apple/t6031*"
       - "arch/arm64/boot/dts/apple/t603x*"
       - ".github/scripts/adt-dt-check-t6032.py"
+      - ".github/scripts/adt-dt-check-t6032-mutation.sh"
       - ".github/workflows/t6032-adt-dt-check.yml"
   push:
     paths:
@@ -23,6 +24,7 @@ on:
       - "arch/arm64/boot/dts/apple/t6031*"
       - "arch/arm64/boot/dts/apple/t603x*"
       - ".github/scripts/adt-dt-check-t6032.py"
+      - ".github/scripts/adt-dt-check-t6032-mutation.sh"
       - ".github/workflows/t6032-adt-dt-check.yml"
   workflow_dispatch:
 
@@ -35,7 +37,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison
+          sudo apt-get install -y gcc-aarch64-linux-gnu flex bison device-tree-compiler
           pip install pyliblzfse
 
       - name: Build t6032-j575d.dtb
@@ -47,4 +49,8 @@ jobs:
       - name: Check the DTB against the 27.0.1 j575dap ADT
         run: |
           python3 .github/scripts/adt-dt-check-t6032.py --fetch-ipsw \
+            build/arch/arm64/boot/dts/apple/t6032-j575d.dtb
+
+      - name: A gated node switched on must fail the check
+        run: bash .github/scripts/adt-dt-check-t6032-mutation.sh \
             build/arch/arm64/boot/dts/apple/t6032-j575d.dtb

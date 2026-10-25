@@ -17,9 +17,16 @@ cannot silently regress:
   - every DT SoC node with registers must overlap an ADT node, except the
     die-1 cpufreq and pmgr mirrors (hardware mirrors at the die stride that
     the ADT expresses inside the pmgr register-window list, not as nodes);
-  - the power states the new nodes reference must exist at the ADT address
-    (bank + offset) in both dies;
-  - the GPU, ANE and display nodes must stay disabled.
+  - the power states the new nodes reference must exist in the DT at the
+    bank + offset listed in REQUIRED_PS (those offsets were read from the ADT
+    pmgr by hand; the script does not read them from the ADT), in both dies;
+  - the GPU, ANE and display nodes must stay disabled: a DT node is such a
+    gated node when its first register window starts where a window of a gated
+    ADT node starts (a DART: any window), so the test needs no DT labels, and
+    fewer matching DT nodes than gated ADT nodes is a failure.
+
+Expected, not a checker failure: dtc warns simple_bus_reg for the die-1 ANE
+node ane@23c9400000 (its reg is 0x3c9400000, the die-local address).
 
 Usage:
     adt-dt-check-t6032.py ADT DTB [DTB...]
@@ -439,7 +446,7 @@ DENIED = [
 # power states the new nodes reference: (soc, pmgr node, offset, what for)
 REQUIRED_PS = []
 for soc in ("soc@200000000", "soc@2200000000"):
-    sfx = "_die1" if soc.endswith("2000000000") else ""
+    sfx = "_die1" if soc.endswith("2200000000") else ""
     for i in range(4):
         off = {0: 0x4A8, 1: 0x4F8, 2: 0x508, 3: 0x488}[i]
         REQUIRED_PS.append((soc, "power-management@292800000", off,
@@ -473,16 +480,12 @@ DT_IRQ_ALLOW = {
     (0, 1321),
 }
 
-# nodes that must carry status = "disabled"
-MUST_BE_DISABLED = (
-    ["gpu", "mbox@40a408000"]
-    + [f"ane{d}" for d in (0, 1)]
-    + [f"ane{d}_dart{i}" for d in (0, 1) for i in range(3)]
-    + [f"dcpext{i}" for i in range(8)]
-    + [f"dcpext{i}_mbox" for i in range(8)]
-    + [f"dcpext{i}_dart" for i in range(8)]
-    + [f"dispext{i}_dart" for i in range(8)]
-)
+# ADT nodes the DT must keep disabled: GPU and its ASC, both ANE engines and
+# their DARTs, the eight external display pipes with their DARTs. The DT
+# nodes are found by register window, not by name or label.
+GATED_ADT = (["sgx", "gfx-asc", "ane0", "ane1", "dart-ane0", "dart-ane1"]
+             + [f"{p}{i}" for i in range(8) for p in ("dcpext", "dart-dcpext", "dart-dispext")])
+
 
 def main():
     args = sys.argv[1:]
@@ -553,7 +556,7 @@ def main():
                 continue
             check(False, f"{path} ({hex(wins[0][0])}): no ADT node overlaps it")
 
-        # 4. power states exist at the ADT address
+        # 4. power states exist in the DT at the REQUIRED_PS offsets
         psidx = {}
         stack = [("", tree)]
         while stack:
@@ -613,13 +616,21 @@ def main():
                   if carried else
                   f"{name}: ADT interrupts {valid} carried by no DT node")
 
-        # 6. disabled gates
+        # 6. disabled gates: a DT node whose first window starts where a
+        # window of a gated ADT node starts must be disabled (DARTs: any window)
+        gw = adt_gated_nodes(root, set(GATED_ADT))
+        starts = {ws[0][0] for ws in gw.values() if ws}
+        starts |= {a for n, ws in gw.items() if n.startswith("dart-") for a, _ in ws}
+        hit = 0
         for path, node, wins in dtnodes:
-            base = node.name.split("@")[0]
-            if base in MUST_BE_DISABLED or node.name in MUST_BE_DISABLED:
+            if wins and wins[0][0] in starts:
+                hit += 1
                 st = dt_strings(node.props.get("status", ""))
                 check(st == ["disabled"], f"{path}: disabled"
                       if st == ["disabled"] else f"{path}: status is {st or 'okay'}, must be disabled")
+        check(hit >= len(gw), f"{hit} DT nodes match the {len(gw)} gated ADT nodes"
+              if hit >= len(gw) else
+              f"only {hit} DT nodes match the {len(gw)} gated ADT nodes: a gated node is missing or moved")
 
     if failures:
         print(f"{len(failures)} check(s) failed")
