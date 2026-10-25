@@ -1105,6 +1105,8 @@ impl Queue {
             oldest = false;
             match result {
                 Ok(Some(timestamps)) => {
+                    crate::g17::lat::note(crate::g17::lat::GPU_START, timestamps[0]);
+                    crate::g17::lat::note(crate::g17::lat::GPU_END, timestamps[1]);
                     let submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     if front.qos_pending {
                         complete_qos(self.qos_owner())?;

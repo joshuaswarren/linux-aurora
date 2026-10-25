@@ -14,6 +14,9 @@ pub(crate) const KICK: u64 = 3;
 pub(crate) const EVENT_MESSAGE: u64 = 4;
 pub(crate) const EVENT_WORKER: u64 = 5;
 pub(crate) const FENCE_SIGNAL: u64 = 6;
+/// Compute retirement: the firmware's start and end ticks of the command (args).
+pub(crate) const GPU_START: u64 = 7;
+pub(crate) const GPU_END: u64 = 8;
 
 const CAPACITY: usize = 65536;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
