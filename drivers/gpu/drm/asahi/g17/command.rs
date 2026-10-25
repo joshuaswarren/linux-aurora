@@ -28,9 +28,11 @@ const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPE
 const DBIAS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
 const FEW_PRIMITIVES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
 const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+const STAGE_PREFIXES: u32 = crate::file::DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const SHADER_WRITES: u32 = crate::file::DRM_ASAHI_RENDER_SHADER_WRITES;
 const RENDER_FLAGS: u32 =
-    PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS | SHADER_WRITES;
+    PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS | SHADER_WRITES
+        | STAGE_PREFIXES;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -78,10 +80,52 @@ impl Attachments {
     }
 }
 
+/// A render command and the optional stage-prefix tail
+/// (struct drm_asahi_cmd_render_with_stage_prefixes). Without DRM_ASAHI_RENDER_STAGE_PREFIXES
+/// the tail is absent or zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RenderPayload {
+    pub(crate) legacy: uapi::drm_asahi_cmd_render,
+    ta_cdm_barrier: u16,
+    reserved0: u16,
+    reserved1: u32,
+    ta_prior_cdm: u64,
+    ta_vdm_barrier: u16,
+    reserved2: u16,
+    reserved3: u32,
+    ta_prior_vdm: u64,
+}
+// SAFETY: the UAPI command and the integer tail accept every bit pattern.
+unsafe impl AnyBitPattern for RenderPayload {}
+kernel::static_assert!(
+    size_of::<RenderPayload>() == size_of::<uapi::drm_asahi_cmd_render>() + 32
+);
+
+fn render_payload(bytes: &[u8]) -> Result<RenderPayload> {
+    let cmd: RenderPayload = payload(bytes)?;
+    let staged = cmd.legacy.flags & STAGE_PREFIXES != 0;
+    if cmd.reserved0 != 0
+        || cmd.reserved1 != 0
+        || cmd.reserved2 != 0
+        || cmd.reserved3 != 0
+        || (staged
+            && (bytes.len() != size_of::<RenderPayload>() || cmd.legacy.flags & FRAGMENT_BARRIERS != 0))
+        || (!staged
+            && (cmd.ta_cdm_barrier != 0
+                || cmd.ta_prior_cdm != 0
+                || cmd.ta_vdm_barrier != 0
+                || cmd.ta_prior_vdm != 0))
+    {
+        return Err(EINVAL);
+    }
+    Ok(cmd)
+}
+
 // Commands stay inline in the submission plan, avoiding an allocation per render pass.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
-    Render(uapi::drm_asahi_cmd_render, [Attachments; 2], Option<Arc<Programs>>),
+    Render(RenderPayload, [Attachments; 2], Option<Arc<Programs>>),
     Compute(uapi::drm_asahi_cmd_compute, Attachments, Option<Arc<ComputePrograms>>),
 }
 
@@ -135,7 +179,7 @@ impl<'a> Parser<'a> {
                         == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER
                     {
                         self.counts[0] += 1;
-                        Payload::Render(payload(bytes)?, [self.attachments[0], self.attachments[1]],
+                        Payload::Render(render_payload(bytes)?, [self.attachments[0], self.attachments[1]],
                             self.render_resources.clone())
                     } else {
                         self.counts[1] += 1;
@@ -331,8 +375,20 @@ pub(crate) enum Validated {
 impl Payload {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
-            Self::Render(cmd, ..) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Render(cmd, ..) => [cmd.legacy.prior_vdm, cmd.legacy.prior_cdm],
             Self::Compute(cmd, ..) => [cmd.prior_vdm, cmd.prior_cdm],
+        }
+    }
+
+    /// The tiling half's own render and compute prefixes (barrier, exact prior), if the
+    /// command carries them.
+    pub(crate) fn tiling_prefixes(&self) -> Option<([u16; 2], [u64; 2])> {
+        match self {
+            Self::Render(cmd, ..) if cmd.legacy.flags & STAGE_PREFIXES != 0 => Some((
+                [cmd.ta_vdm_barrier, cmd.ta_cdm_barrier],
+                [cmd.ta_prior_vdm, cmd.ta_prior_cdm],
+            )),
+            _ => None,
         }
     }
 
@@ -344,6 +400,7 @@ impl Payload {
     ) -> Result<Validated> {
         match self {
             Self::Render(cmd, attachments, resources) => {
+                let cmd = &cmd.legacy;
                 if cmd.flags & !RENDER_FLAGS != 0
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -416,6 +473,7 @@ impl Payload {
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
                     few_primitives: cmd.flags & FEW_PRIMITIVES != 0,
                     fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
+                    stage_prefixes: cmd.flags & STAGE_PREFIXES != 0,
                     shader_writes_memory: cmd.flags & SHADER_WRITES != 0,
                     occlusion_query_va: cmd.isp_oclqry_base,
                     sampler_heap_va: cmd.sampler_heap,

@@ -184,6 +184,9 @@ pub(crate) struct RenderPass {
     pub(crate) few_primitives: bool,
     /// Host-only: the resolved barriers order the fragment kick, not the tiling kick.
     pub(crate) fragment_barriers: bool,
+    /// Host-only: the tiling kick waits on its own render and compute prefixes
+    /// (`Order::tiling_wait_through`), the fragment kick on the whole ones.
+    pub(crate) stage_prefixes: bool,
     /// Per-command native shader write class; distinct from render-target outputs.
     pub(crate) shader_writes_memory: bool,
     /// GPU address of the occlusion-query results, or zero.

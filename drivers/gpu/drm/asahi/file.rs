@@ -71,6 +71,12 @@ pub(crate) const DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: u64 = 1 << 14;
 /// D32 2x/4x ZLS admission; no compressed stencil or resolve bits.
 pub(crate) const DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION: u64 = 1 << 23;
 pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 = 1 << 21;
+/// Renders may carry separate tiling prefixes of both subqueues
+/// (DRM_ASAHI_RENDER_STAGE_PREFIXES, struct drm_asahi_cmd_render_with_stage_prefixes).
+pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES: u64 = 1 << 25;
+/// The command is a struct drm_asahi_cmd_render_with_stage_prefixes: its tiling half waits
+/// only on the render and compute prefixes of the tail, its fragment half on the whole ones.
+pub(crate) const DRM_ASAHI_RENDER_STAGE_PREFIXES: u32 = 1 << 23;
 /// UAPI DRM_ASAHI_RENDER_PROGRAM_TASK (bit 3), only with
 /// DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object program is an API task stage.
 pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = 1 << 3;

@@ -353,13 +353,16 @@ impl<B: Backend> Queue<B> {
             };
             if !self.backend.supports_engine(engine) { return Err(crate::g17::unsupported(file!(), line!())); }
             self.backend.prepare_command(&mut payload)?;
-            let order = Order::new(
+            let mut order = Order::new(
                 base,
                 preceding,
                 command.barriers,
                 command.payload.prior(),
                 engine,
             )?;
+            if let Some((barriers, prior)) = command.payload.tiling_prefixes() {
+                order.narrow_tiling(&Order::new(base, preceding, barriers, prior, engine)?)?;
+            }
             preceding[engine.index()] += 1;
             let destinations = match &payload {
                 Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps)?,

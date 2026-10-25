@@ -516,9 +516,22 @@ impl Registry {
                 .ok_or(EOVERFLOW)? = *dependency;
             dependencies.render_count += 1;
         }
-        if dependencies.render_count != 0
-            && matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
-                if pass.fragment_barriers)
+        let staged = matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
+            if pass.stage_prefixes);
+        if staged {
+            let tiling = self.render_prefix_at(owner, packet, packet.order.tiling_wait_through[0])?;
+            for dependency in tiling.as_slice() {
+                *dependencies
+                    .render_tiling
+                    .get_mut(dependencies.render_tiling_count)
+                    .ok_or(EOVERFLOW)? = *dependency;
+                dependencies.render_tiling_count += 1;
+            }
+        }
+        if staged
+            || (dependencies.render_count != 0
+                && matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
+                    if pass.fragment_barriers))
         {
             let tiling = self.tiling_prefix(owner, packet)?;
             for dependency in tiling.as_slice() {
@@ -533,9 +546,20 @@ impl Registry {
             dependencies.compute = queue.dependency(
                 owner,
                 packet.completion.status(),
-                packet.order.wait_through[1],
+                packet.order.tiling_wait_through[1],
                 state,
             )?;
+            if packet.order.tiling_wait_through[1] != packet.order.wait_through[1] {
+                let whole = queue.dependency(
+                    owner,
+                    packet.completion.status(),
+                    packet.order.wait_through[1],
+                    state,
+                )?;
+                if whole != dependencies.compute {
+                    dependencies.fragment_compute = whole;
+                }
+            }
         }
         Ok(dependencies)
     }

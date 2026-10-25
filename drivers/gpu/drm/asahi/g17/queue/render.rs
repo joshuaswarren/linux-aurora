@@ -40,23 +40,32 @@ use retirement::{Ticket, Tracker};
 /// are built: the covered earlier renders (their fragment completions) and the
 /// covered compute completion. Which kick waits for the render prefix is the
 /// command's choice (`RenderPass::fragment_barriers`); compute always orders
-/// the tiling kick, since compute output may feed vertex work.
+/// the tiling kick, since compute output may feed vertex work. A stage-prefix
+/// command (`RenderPass::stage_prefixes`) also names the earlier renders its
+/// tiling half waits for (`render_tiling`, whole-render completions) and, when
+/// its fragment half waits on later compute work, that compute completion.
 #[derive(Copy, Clone)]
 pub(crate) struct RenderDependencies {
     pub(crate) render: [KickDependency; 2],
     pub(crate) render_count: usize,
+    pub(crate) render_tiling: [KickDependency; 2],
+    pub(crate) render_tiling_count: usize,
     pub(crate) tiling: [KickDependency; 2],
     pub(crate) tiling_count: usize,
     pub(crate) compute: Option<KickDependency>,
+    pub(crate) fragment_compute: Option<KickDependency>,
 }
 
 impl RenderDependencies {
     pub(crate) const EMPTY: Self = Self {
         render: [KickDependency::ZERO; 2],
         render_count: 0,
+        render_tiling: [KickDependency::ZERO; 2],
+        render_tiling_count: 0,
         tiling: [KickDependency::ZERO; 2],
         tiling_count: 0,
         compute: None,
+        fragment_compute: None,
     };
     pub(crate) fn render(&self) -> &[KickDependency] {
         &self.render[..self.render_count]
@@ -760,28 +769,37 @@ impl Pair {
 /// Kick barriers of one render. The fragment kick always waits for its own tiling kick;
 /// with the fragment-barriers flag the resolved prefix orders the fragment kick too and the
 /// tiling kick preserves the TA prefix across physical pairs. Otherwise the render prefix
-/// orders the tiling kick. A compute dependency always orders the tiling kick.
+/// orders the tiling kick. A compute dependency always orders the tiling kick. With stage
+/// prefixes the fragment kick takes the whole prefixes and the tiling kick its own earlier
+/// renders (whole completions), the TA prefix across pairs and its own compute prefix.
 struct RenderBarriers {
-    tiling: [KickDependency; 3],
+    tiling: [KickDependency; 5],
     tiling_count: usize,
-    fragment: [KickDependency; 3],
+    fragment: [KickDependency; 4],
     fragment_count: usize,
-    tiling_types: [u8; 4],
-    fragment_types: [u8; 4],
+    tiling_types: [u8; 6],
+    fragment_types: [u8; 5],
 }
 
 fn render_barriers(
     fragment_stage: bool,
+    stage_prefixes: bool,
     dependencies: &RenderDependencies,
     own_tiling: KickDependency,
 ) -> RenderBarriers {
-    let mut tiling_barriers = [KickDependency::ZERO; 3];
+    let fragment_stage = fragment_stage || stage_prefixes;
+    let mut tiling_barriers = [KickDependency::ZERO; 5];
     let mut tiling_count = 0;
-    let mut fragment_barriers = [own_tiling; 3];
+    let mut fragment_barriers = [own_tiling; 4];
     let mut fragment_count = 1;
-    let mut tiling_types = [1; 4];
-    let mut fragment_types = [3; 4];
+    let mut tiling_types = [1; 6];
+    let mut fragment_types = [3; 5];
     fragment_types[0] = 1;
+    for dependency in &dependencies.render_tiling[..dependencies.render_tiling_count] {
+        tiling_barriers[tiling_count] = *dependency;
+        tiling_types[tiling_count] = 2;
+        tiling_count += 1;
+    }
     for dependency in dependencies.render() {
         if fragment_stage {
             fragment_barriers[fragment_count] = *dependency;
@@ -809,6 +827,28 @@ fn render_barriers(
         tiling_barriers[tiling_count] = compute;
         tiling_types[tiling_count] = 2;
         tiling_count += 1;
+    }
+    if let Some(compute) = dependencies.fragment_compute {
+        fragment_barriers[fragment_count] = compute;
+        fragment_types[fragment_count] = 2;
+        fragment_count += 1;
+    }
+    if stage_prefixes {
+        // Only identical words of the same class are interchangeable.
+        let mut kept = 0;
+        for read in 0..tiling_count {
+            if (0..kept).any(|i| {
+                tiling_barriers[i].word() == tiling_barriers[read].word()
+                    && tiling_types[i] == tiling_types[read]
+            }) {
+                continue;
+            }
+            tiling_barriers[kept] = tiling_barriers[read];
+            tiling_types[kept] = tiling_types[read];
+            kept += 1;
+        }
+        tiling_count = kept;
+        tiling_types[kept] = 1;
     }
     RenderBarriers {
         tiling: tiling_barriers,
@@ -1009,7 +1049,7 @@ impl Pair {
             return Err(EINVAL);
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
-        let barriers = render_barriers(pass.fragment_barriers, dependencies, own_tiling);
+        let barriers = render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling);
         let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
         let barrier_types = [
             &barriers.tiling_types[..barriers.tiling_count + 1],
