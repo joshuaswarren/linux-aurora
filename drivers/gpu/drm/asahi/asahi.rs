@@ -108,6 +108,7 @@ mod object;
 mod pgtable;
 mod queue;
 mod regs;
+mod stats;
 mod slotalloc;
 mod uat;
 mod util;

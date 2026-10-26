@@ -82,6 +82,7 @@ use crate::{
     mmu,
     queue,
     regs,
+    stats::StatsSnapshot,
     workqueue, //
 };
 
@@ -257,6 +258,9 @@ pub(crate) struct GpuManager {
     event_manager: Arc<event::EventManager>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
+    /// Last raw firmware statistics of this device, exported read-only
+    /// through `crate::stats`.
+    stats: Arc<Mutex<StatsSnapshot>>,
     #[allow(clippy::vec_box)]
     #[pin]
     garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
@@ -330,6 +334,8 @@ pub(crate) trait GpuManager: Send + Sync {
         bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<mmu::KernelMapping>;
+    /// Last raw firmware statistics of this device.
+    fn stats_snapshot(&self) -> &Arc<Mutex<StatsSnapshot>>;
 }
 
 /// Private generic trait for functions that don't need to escape this module.
@@ -728,6 +734,9 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
+        // Per-device raw statistics snapshot, shared with the debugfs export.
+        let stats = Arc::pin_init(new_mutex!(StatsSnapshot::default(), "asahi_stats"), GFP_KERNEL)?;
+        let stats_clone = stats.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -739,7 +748,7 @@ impl GpuManager::ver {
                 )?,
                 fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
                 ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(dev, alloc_ref)?,
+                stats: channel::StatsChannel::ver::new(dev, alloc_ref, stats_clone)?,
             }),
             GFP_KERNEL,
         )?;
@@ -771,6 +780,7 @@ impl GpuManager::ver {
                 pipes,
                 buffer_mgr,
                 ids: Default::default(),
+                stats,
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
             }),
             GFP_KERNEL,
@@ -1629,6 +1639,10 @@ impl GpuManager for GpuManager::ver {
             mmu::PROT_FW_SHARED_RW,
             false,
         )
+    }
+
+    fn stats_snapshot(&self) -> &Arc<Mutex<StatsSnapshot>> {
+        &self.stats
     }
 }
 

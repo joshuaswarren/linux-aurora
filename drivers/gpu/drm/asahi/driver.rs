@@ -1838,6 +1838,7 @@ impl platform::Driver for AsahiDriver {
                 return Err(ENODEV);
             }
         };
+        let legacy_stats = legacy_gpu.stats_snapshot().clone();
         let gpu: Arc<dyn drm_gpu::DrmGpu> =
             Arc::new(drm_gpu::LegacyDrmGpu::new(legacy_gpu), GFP_KERNEL)?;
 
@@ -1864,6 +1865,10 @@ impl platform::Driver for AsahiDriver {
         (*drm).gpu.init()?;
 
         drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
+
+        // The DRM core created this card's debugfs directory when the device
+        // was registered; publish the raw firmware statistics in it.
+        crate::stats::register(&drm, &legacy_stats);
 
         Ok(Self {
             runtime: AsahiRuntime::Legacy(drm),

@@ -23,12 +23,16 @@ use crate::{
     buffer,
     event,
     gpu,
-    mem, //
+    mem,
+    stats::StatsSnapshot, //
 };
 use kernel::{
     c_str,
     prelude::*,
-    sync::Arc,
+    sync::{
+        Arc,
+        Mutex, //
+    },
     time::{
         delay::fsleep,
         Delta,
@@ -584,11 +588,14 @@ impl KTraceChannel {
 }
 
 /// Statistics channel, reporting power-related statistics to the driver.
-/// Not really implemented other than debug logs yet...
+/// The raw samples are kept in a per-device snapshot, exported read-only
+/// through `crate::stats`.
 #[versions(AGX)]
 pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
+    /// Last raw sample of every statistics kind, shared with the export.
+    stats: Arc<Mutex<StatsSnapshot>>,
 }
 
 #[versions(AGX)]
@@ -597,10 +604,12 @@ impl StatsChannel::ver {
     pub(crate) fn new(
         dev: &AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
+        stats: Arc<Mutex<StatsSnapshot>>,
     ) -> Result<StatsChannel::ver> {
         Ok(StatsChannel::ver {
             dev: dev.into(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
+            stats,
         })
     }
 
@@ -620,12 +629,89 @@ impl StatsChannel::ver {
                     // accessing the enum view is valid.
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
+                    self.record(msg);
                 }
                 _ => {
                     // SAFETY: The raw view is always valid for all bit patterns.
                     pr_warn!("Unknown stats message: {:?}\n", unsafe { msg.raw });
                 }
             }
+        }
+    }
+
+    /// Record one statistics message in the per-device snapshot.
+    ///
+    /// The firmware words are stored exactly as they arrived: no unit is
+    /// assumed, nothing is scaled and no metric is derived from them.
+    fn record(&mut self, msg: StatsMsg::ver) {
+        let stamp = crate::stats::monotonic_ns();
+        let mut snap = self.stats.lock();
+        snap.note_message();
+        match msg {
+            StatsMsg::ver::Power { power, .. } => snap.set_power(power.0, stamp),
+            StatsMsg::ver::PowerOn { off_time, .. } => snap.set_power_on(off_time.0, stamp),
+            StatsMsg::ver::PowerOff { on_time, .. } => snap.set_power_off(on_time.0, stamp),
+            StatsMsg::ver::Utilization {
+                timestamp,
+                util1,
+                util2,
+                util3,
+                util4,
+            } => snap.set_utilization(timestamp.0, [util1, util2, util3, util4], stamp),
+            StatsMsg::ver::AvgPower {
+                active_cs,
+                unk2,
+                unk3,
+                unk4,
+                avg_power,
+            } => snap.set_avg_power(active_cs.0, [unk2, unk3, unk4], avg_power, stamp),
+            StatsMsg::ver::Temperature {
+                raw_value,
+                scale,
+                tmin,
+                tmax,
+                ..
+            } => snap.set_temperature(raw_value, scale, tmin, tmax, stamp),
+            StatsMsg::ver::PowerState {
+                timestamp,
+                last_busy_ts,
+                active,
+                poweroff,
+                unk1,
+                pstate,
+                unk2,
+                unk3,
+            } => snap.set_power_state(
+                timestamp.0,
+                last_busy_ts.0,
+                active,
+                poweroff,
+                unk1,
+                pstate,
+                unk2,
+                unk3,
+                stamp,
+            ),
+            StatsMsg::ver::FwBusy { timestamp, busy } => {
+                snap.set_fw_busy(timestamp.0, busy, stamp)
+            }
+            StatsMsg::ver::PState {
+                ps_min,
+                unk1,
+                ps_max,
+                unk2,
+                ..
+            } => snap.set_pstate(ps_min, unk1, ps_max, unk2, stamp),
+            StatsMsg::ver::TempSensor {
+                sensor_id,
+                raw_value,
+                scale,
+                tmin,
+                tmax,
+                ..
+            } => snap.set_temp_sensor(sensor_id, raw_value, scale, tmin, tmax, stamp),
+            // The remaining tags are not decoded by the driver.
+            _ => {}
         }
     }
 }
