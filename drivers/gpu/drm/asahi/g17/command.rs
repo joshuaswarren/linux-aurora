@@ -359,6 +359,9 @@ pub(crate) enum Validated {
     },
     Compute {
         matrix_ops: bool,
+        /// The command may copy or reset queries, so it must follow the host's
+        /// timestamp publication for earlier commands.
+        query_access: bool,
         resources: Option<Arc<ComputePrograms>>,
         plan: Option<super::render_resources::Plan>,
         scratch: ScratchRequest,
@@ -526,7 +529,11 @@ impl Payload {
                 })
             }
             Self::Compute(cmd, attachments, resources) => {
-                if cmd.flags & !crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX != 0 || cmd.reserved != 0
+                if cmd.flags
+                    & !(crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX
+                        | crate::file::DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS)
+                    != 0
+                    || cmd.reserved != 0
                     || cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
@@ -553,6 +560,7 @@ impl Payload {
                 }
                 Ok(Validated::Compute {
                     matrix_ops: cmd.flags & crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX != 0,
+                    query_access: cmd.flags & crate::file::DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS == 0,
                     resources: resources.clone(), plan: None,
                     scratch: ScratchRequest::new(cmd.scs_layout)?,
                     cdm_auxiliary_allocation: cmd.cdm_auxiliary_allocation,

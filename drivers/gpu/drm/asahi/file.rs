@@ -88,6 +88,11 @@ pub(crate) const DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS: u32 = 1 << 24;
 /// DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object program is an API task stage.
 pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = 1 << 3;
 pub(crate) const DRM_ASAHI_COMPUTE_USES_MATRIX: u32 = 1 << 1;
+/// The compute command neither copies nor resets queries, so it cannot observe
+/// timestamps the host publishes after earlier commands complete
+/// (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS, feature bit 28).
+pub(crate) const DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: u32 = 1 << 3;
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS: u64 = 1 << 28;
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
