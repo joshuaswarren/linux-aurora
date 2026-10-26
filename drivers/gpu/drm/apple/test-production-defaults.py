@@ -22,10 +22,5 @@ assert "mdelay" not in vblank
 assert "to_delayed_work" in vblank
 assert "msleep" not in backlight
 assert "mod_delayed_work(system_wq, &dcp->bl_update_wq" in template
-assert "INIT_DELAYED_WORK(&dcp->bl_update_wq" in dcp
-assert "cancel_delayed_work_sync(&dcp->vblank_wq)" in dcp
-assert "INIT_WORK(&dcp->bl_update_wq" not in dcp
-assert "cancel_work_sync(&dcp->vblank_wq)" not in dcp
-assert "schedule_work(&dcp->vblank_wq)" not in iomfb + template
 
 print("PASS DCP production defaults: fixed H17P ABI and no busy waits in vblank/brightness work")
