@@ -82,6 +82,10 @@ impl Footprint {
 pub(crate) enum Plan {
     Any,
     Pair(u8),
+    /// Publish on the pair, after the owner's renders through the sequence:
+    /// the conflicting renders on the owner's other pair complete their
+    /// fragment work first through a firmware dependency (Packet::hazard_through).
+    After(u8, u64),
     Wait,
 }
 
@@ -103,7 +107,9 @@ pub(crate) fn plan<'a>(
     footprint: &Footprint,
     live: impl IntoIterator<Item = Live<'a>>,
 ) -> Plan {
-    let mut selected = None;
+    // The newest unordered conflict on each of at most two of the owner's
+    // pairs: the pair FIFO orders a render after everything on its own pair.
+    let mut conflicts: [Option<(u8, u64)>; 2] = [None; 2];
     for entry in live {
         if entry.quarantined || !footprint.overlaps(entry.footprint) {
             continue;
@@ -120,11 +126,20 @@ pub(crate) fn plan<'a>(
         if Order::contains(prefix, entry.sequence) {
             continue;
         }
-        match selected {
-            None => selected = Some(slot),
-            Some(prior) if prior == slot => {}
-            Some(_) => return Plan::Wait,
+        match conflicts.iter_mut().find(|c| c.is_none_or(|(s, _)| s == slot)) {
+            Some(c) => *c = Some((slot, c.map_or(entry.sequence, |(_, q)| q.max(entry.sequence)))),
+            None => return Plan::Wait,
         }
     }
-    selected.map_or(Plan::Any, Plan::Pair)
+    match conflicts {
+        [None, _] => Plan::Any,
+        [Some((slot, _)), None] => Plan::Pair(slot),
+        // Join the pair of the newer conflict and order the fragment work
+        // after the older one, as an application barrier on it would. Tile
+        // loads and stores happen only in fragment work.
+        [Some(a), Some(b)] => {
+            let (join, other) = if a.1 >= b.1 { (a, b) } else { (b, a) };
+            Plan::After(join.0, other.1)
+        }
+    }
 }

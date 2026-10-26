@@ -15,7 +15,7 @@ use crate::g17::{
     progress::{self, Step, Watch},
 };
 use crate::{g17::context::MAX_QUEUES, hw::t8140::queues as cfg};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kernel::{
     new_condvar, new_mutex,
     prelude::*,
@@ -28,6 +28,7 @@ pub(crate) struct Request<'a> {
     footprint: &'a Arc<Footprint>,
     sequence: u64,
     prefix: Option<u64>,
+    hazard_through: &'a AtomicU64,
 }
 
 impl<'a> Request<'a> {
@@ -36,7 +37,16 @@ impl<'a> Request<'a> {
             footprint,
             sequence: packet.order.sequence,
             prefix: packet.order.wait_through[0],
+            hazard_through: &packet.hazard_through,
         })
+    }
+
+    /// The plan the packet was admitted with orders it after conflicting
+    /// renders on another pair: raise its fragment prefix before publication.
+    fn admitted(request: Option<Self>, plan: Plan) {
+        if let (Some(request), Plan::After(_, through)) = (request, plan) {
+            request.hazard_through.fetch_max(through, Ordering::AcqRel);
+        }
     }
 }
 
@@ -409,7 +419,7 @@ impl State {
         match plan {
             Plan::Any => self.acquire(owner),
             Plan::Wait => None,
-            Plan::Pair(slot) => {
+            Plan::Pair(slot) | Plan::After(slot, _) => {
                 let index = usize::from(slot);
                 if self.owners.get(index) != Some(&owner)
                     || (self.quarantined | self.kill_hold | self.recall | !self.usable())
@@ -652,6 +662,7 @@ impl Pool {
                 state.plan(owner, request, ticket)
             };
             if let Some(slot) = state.pick(owner, plan) {
+                Request::admitted(request, plan);
                 state.forget_waiter(ticket.take());
                 let record =
                     request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -756,6 +767,7 @@ impl Pool {
         let Some(slot) = state.pick(owner, plan) else {
             return Ok(None);
         };
+        Request::admitted(request, plan);
         let record = request.and_then(|request| state.record(owner, Some(slot), 0, request));
         Ok(Some(RenderLease {
             pool: self.clone(),
@@ -783,6 +795,7 @@ impl Pool {
         }
         let plan = state.plan(owner, request, None);
         let Some(slot) = state.pick(owner, plan) else { return Ok(None); };
+        Request::admitted(request, plan);
         let record = match request {
             Some(request) => match state.record(owner, Some(slot), 0, request) {
                 Some(record) => Some(record),
@@ -916,6 +929,7 @@ impl Pool {
                             state.plan(owner, request, None)
                         };
                         if let Some(slot) = state.pick(owner, plan) {
+                            Request::admitted(request, plan);
                             let record = request
                                 .and_then(|request| state.record(owner, Some(slot), 0, request));
                             return Ok(RenderLease {

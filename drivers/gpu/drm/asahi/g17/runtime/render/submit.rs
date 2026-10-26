@@ -508,7 +508,14 @@ impl Registry {
         state: u32,
     ) -> Result<crate::g17::queue::render::RenderDependencies> {
         let mut dependencies = crate::g17::queue::render::RenderDependencies::EMPTY;
-        let frontier = self.render_prefix(owner, packet)?;
+        // Render admission may have ordered the fragment work after
+        // conflicting renders on another pair (hazard::Plan::After).
+        let hazard = packet.hazard_through.load(core::sync::atomic::Ordering::Acquire);
+        let prefix = match (packet.order.wait_through[0], hazard) {
+            (prefix, 0) => prefix,
+            (prefix, hazard) => Some(prefix.map_or(hazard, |prefix| prefix.max(hazard))),
+        };
+        let frontier = self.render_prefix_at(owner, packet, prefix)?;
         for dependency in frontier.as_slice() {
             *dependencies
                 .render

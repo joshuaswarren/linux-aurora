@@ -122,6 +122,9 @@ pub(crate) struct Packet {
     pub(crate) order: Order,
     pub(crate) completion: Arc<Completion>,
     pub(crate) footprint: Option<Arc<super::hazard::Footprint>>,
+    /// Render admission raised the fragment prefix through this sequence (0:
+    /// not raised) to order an attachment conflict (hazard::Plan::After).
+    pub(crate) hazard_through: AtomicU64,
     inputs: KVec<Fence>,
     firmware: KVec<Fence>,
     pub(crate) sources: KVec<super::sync_source::Dependency>,
@@ -164,6 +167,7 @@ impl Packet {
                 order,
                 completion,
                 footprint,
+                hazard_through: AtomicU64::new(0),
                 inputs,
                 firmware,
                 sources,
