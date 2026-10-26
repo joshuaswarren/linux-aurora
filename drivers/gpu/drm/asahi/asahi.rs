@@ -67,8 +67,8 @@ module! {
             description: "Diagnostic: 1 = M5 compute kicks notify the firmware only on queue activation",
         },
         m5_cross_queue_fw_wait: u32 {
-            default: 0,
-            description: "Experimental same-VM compute firmware dependencies; default off",
+            default: 2,
+            description: "Same-VM compute waits on other queues: 2 = firmware dependencies (default), 0 = host waits",
         },
         m5_matrix_submit_test: u32 {
             default: 0,
