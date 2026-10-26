@@ -1539,7 +1539,7 @@ impl super::Firmware {
         }
         if requested {
             self.init
-                .scan_compute_completions(|record| registry.observations.fold(record))?;
+                .scan_compute_completions(None, |record| registry.observations.fold(record))?;
         }
         let mut observed = None;
         for queue in registry
@@ -1575,8 +1575,19 @@ impl super::Firmware {
             requested |= queue.request_observations(&mut registry.observations, masks)?;
         }
         if requested {
-            self.init
-                .scan_compute_completions(|record| registry.observations.fold(record))?;
+            // Resume the ordered ring where the previous pass left off. A
+            // finished command whose record that pass missed falls back to
+            // the whole ring, which is also the only mode during recovery.
+            let resume = !self.recovery.pending() && state == 0;
+            self.init.scan_compute_completions(resume.then_some(&mut self.compute_scan),
+                |record| registry.observations.fold(record))?;
+            if resume && registry.compute.iter().flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| queue.finished_unobserved(&registry.observations, masks))
+            {
+                self.init.scan_compute_completions(None,
+                    |record| registry.observations.fold(record))?;
+            }
         }
         let view = qos::View::new(self.init.qos()?)?;
         for queue in registry

@@ -299,7 +299,7 @@ impl Compute {
         };
         self.observations.clear();
         self.observations.request(&ticket)?;
-        firmware.init.scan_compute_completions(|record| self.observations.fold(record))?;
+        firmware.init.scan_compute_completions(None, |record| self.observations.fold(record))?;
         let observed = self.observations.take(&ticket)?.ok_or(ENODATA)?;
         let words = self.descriptor.read_words::<4>(0xf2c)?;
         let descriptor_times = [u64::from(words[0]) | (u64::from(words[1]) << 32),

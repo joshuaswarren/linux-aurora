@@ -259,6 +259,14 @@ impl Batch {
         request.observed = Some(Observation { timestamps });
         Ok(())
     }
+    /// Whether this pass has an observation for `ticket`, without taking it.
+    pub(crate) fn observed(&self, ticket: &Ticket) -> bool {
+        let Some(&(start, count)) = self.slots.get(ticket.qid as usize) else {
+            return false;
+        };
+        self.requests.get(start..start + count).is_some_and(|requests| requests.iter().any(
+            |r| r.descriptor == ticket.descriptor && r.kick == ticket.kick && r.observed.is_some()))
+    }
     pub(crate) fn take(&mut self, ticket: &Ticket) -> Result<Option<Observation>> {
         let &(start, count) = self.slots.get(ticket.qid as usize).ok_or(EINVAL)?;
         let request = self

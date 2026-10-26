@@ -936,6 +936,19 @@ impl Queue {
         }
         Ok(requested)
     }
+    /// A requested command the queue stamp already covers, but which this
+    /// pass found no record for.
+    pub(crate) fn finished_unobserved(&self, batch: &Batch, masks: Option<[u64; 2]>) -> bool {
+        if self.quarantined || !self.selected(masks) {
+            return false;
+        }
+        let Ok(stamp) = self.graph.stamp() else {
+            return true;
+        };
+        self.active.iter().map_while(|active| active.ticket.map(|ticket| (active, ticket)))
+            .any(|(active, ticket)| active.observed.is_none()
+                && retirement::stamp_covers(stamp, ticket.kick) && !batch.observed(&ticket))
+    }
     pub(crate) fn latch_observations(
         &mut self,
         batch: &mut Batch,

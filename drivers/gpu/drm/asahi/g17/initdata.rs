@@ -48,6 +48,23 @@ impl ComputeCompletion<'_> {
     }
 }
 
+/// Resume position of the shared compute completion ring scan.
+#[derive(Default)]
+pub(crate) struct CompletionCursor {
+    next: usize,
+    /// Newest end timestamp seen, in GPU ticks.
+    newest: u64,
+}
+
+impl CompletionCursor {
+    const BACKOFF: usize = 16;
+    const STALE_RUN: usize = 8;
+    /// 2 ms at 24 MHz. The ring holds 2048 records, so a record this much
+    /// older than the newest one was written before the previous pass.
+    const STALE_TICKS: u64 = 48_000;
+    const TIME_MASK: u64 = 0x003f_ffff_ffff_ffff;
+}
+
 /// Unpublished device-wide compute backing, prepared without the device mutex. The cache
 /// identity belongs to this allocation, not to any one physical queue or client VM.
 pub(super) struct ComputeShared {
@@ -790,17 +807,54 @@ impl InitData {
 
     /// Snapshot the shared compute completion ring once per service transaction. The queue
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
+    ///
+    /// With a cursor, the pass resumes where the previous one found its
+    /// newest record instead of visiting the whole ring.
     pub(super) fn scan_compute_completions(
         &self,
+        cursor: Option<&mut CompletionCursor>,
         mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
     ) -> Result {
         let object = self.object(self.completion_rings[0])?;
         let slots = (abi::COMPLETION_RING_SIZE / 0x40).min(0x800);
         let words = object.atomic_dwords(0, slots * 8)?;
         fence(Ordering::Acquire);
-        for words in words.chunks_exact(8) {
+        let Some(cursor) = cursor else {
+            for words in words.chunks_exact(8) {
+                record(ComputeCompletion { words })?;
+            }
+            return Ok(());
+        };
+        // The firmware fills the ring in order. Start a little before the
+        // newest record of the previous pass and stop after a run of records
+        // that ended well before it: those were written before that pass.
+        let floor = cursor.newest.saturating_sub(CompletionCursor::STALE_TICKS);
+        let start = (cursor.next + slots - CompletionCursor::BACKOFF) % slots;
+        let mut newest = cursor.newest;
+        let mut newest_index = None;
+        let mut stale = 0;
+        for step in 0..slots {
+            let index = (start + step) % slots;
+            let words = words.get(index * 8..index * 8 + 8).ok_or(EINVAL)?;
+            let end = words[5].load(Ordering::Relaxed) & CompletionCursor::TIME_MASK;
+            if cursor.newest != 0 && (end == 0 || end < floor) {
+                stale += 1;
+                if stale >= CompletionCursor::STALE_RUN && step >= CompletionCursor::BACKOFF {
+                    break;
+                }
+            } else {
+                stale = 0;
+                if end > newest {
+                    newest = end;
+                    newest_index = Some(index);
+                }
+            }
             record(ComputeCompletion { words })?;
         }
+        if let Some(index) = newest_index {
+            cursor.next = (index + 1) % slots;
+        }
+        cursor.newest = newest;
         Ok(())
     }
 
