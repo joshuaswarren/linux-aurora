@@ -14,5 +14,6 @@ assert "cancel_work_sync(&dcp->vblank_wq)" not in dcp
 assert "schedule_work(&dcp->vblank_wq)" not in iomfb + template
 assert "warned_busy" not in iomfb
 assert "dev_err_ratelimited(dcp->dev," in iomfb
+assert "dcp_send_modeset" not in template
 
 print("PASS DCP delayed-work API: typed initialization, scheduling, and synchronous cancellation")

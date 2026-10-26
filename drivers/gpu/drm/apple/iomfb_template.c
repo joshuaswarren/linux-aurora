@@ -2504,8 +2504,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * already running at its native 2408x1506, so skip the modeset and let
 	 * that timing stand.
 	 */
-	if (!dcp_send_modeset &&
-	    dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		dev_info(dcp->dev, "inheriting the bootloader's display mode\n");
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
