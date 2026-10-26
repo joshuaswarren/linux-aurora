@@ -986,26 +986,20 @@ static void dcp_dispatch_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		schedule_delayed_work(&dcp->vblank_wq, 0);
 		return;
 	}
-	if (dcp_channel_busy(&dcp->ch_cmd))
-	{
-		if (!dcp->ch_cmd.warned_busy) {
-			u8 d = dcp->ch_cmd.depth;
+	if (dcp_channel_busy(&dcp->ch_cmd)) {
+		u8 d = dcp->ch_cmd.depth;
 
-			dev_err(dcp->dev,
-				"unexpected busy command channel: depth %u, oldest outstanding %.4s pushed %u ms ago\n",
-				d, d ? dcp->ch_cmd.tag[d - 1] : "----",
-				d ? jiffies_to_msecs(jiffies -
-						     dcp->ch_cmd.pushed_at[d - 1])
-				  : 0);
-			dcp->ch_cmd.warned_busy = true;
-		}
+		dev_err_ratelimited(dcp->dev,
+			"unexpected busy command channel: depth %u, oldest outstanding %.4s pushed %u ms ago\n",
+			d, d ? dcp->ch_cmd.tag[d - 1] : "----",
+			d ? jiffies_to_msecs(jiffies -
+					     dcp->ch_cmd.pushed_at[d - 1])
+			  : 0);
 		/* HACK: issue a delayed vblank event to avoid timeouts in
 		 * drm_atomic_helper_wait_for_vblanks().
 		 */
 		schedule_delayed_work(&dcp->vblank_wq, 0);
 		return;
-	} else if (dcp->ch_cmd.warned_busy) {
-		dcp->ch_cmd.warned_busy = false;
 	}
 
 	switch (dcp->fw_compat) {
