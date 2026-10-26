@@ -70,6 +70,9 @@ pub(crate) const DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: u64 = 1 << 13;
 pub(crate) const DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: u64 = 1 << 14;
 /// D32 2x/4x ZLS admission; no compressed stencil or resolve bits.
 pub(crate) const DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION: u64 = 1 << 23;
+/// UAPI DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION (bit 26): single-layer
+/// 2x/4x ZLS admission in native's compressed form, stencil included.
+pub(crate) const DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION: u64 = 1 << 26;
 pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 = 1 << 21;
 /// Renders may carry separate tiling prefixes of both subqueues
 /// (DRM_ASAHI_RENDER_STAGE_PREFIXES, struct drm_asahi_cmd_render_with_stage_prefixes).

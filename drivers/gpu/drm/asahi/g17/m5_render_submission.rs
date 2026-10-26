@@ -17,7 +17,8 @@ pub(crate) fn trace_context(id: u16) -> bool {
     DUMP_CONTEXTS.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0
 }
 
-/// Advertised while compressed single-layer D32 MSAA admission is enabled.
+/// Advertised while compressed single-layer MSAA ZLS admission is enabled:
+/// D32 depth with optional plain stencil, and native's compressed Z/S form.
 pub(crate) fn depth_msaa_compression_enabled() -> bool {
     enabled() && *crate::module_parameters::m5_depth_msaa_compression.value() == 1
 }
@@ -38,12 +39,15 @@ pub(crate) fn validate(pass: &RenderPass) -> Result {
     // render-layers-2-depth-msaa4-store / -stencil-store 3D commands: ZLS
     // control 0x80044 / 0xc0154, every enabled Z/S load or store compressed,
     // a compression address per compressed plane, depth stride word 0x1 and
-    // stencil stride 0x7c000 as supplied by userspace).
+    // stencil stride 0x7c000 as supplied by userspace). Native emits the same
+    // form (control 0xc0154, compressed stencil) for single-layer 4x MSAA
+    // depth/stencil passes; that case is admitted only with the opt-in.
     let plain_zls = pass.zls_control == 0
         || (pass.zls_control & 0x154 == 0
             && pass.depth.compression_va == 0 && pass.stencil.compression_va == 0);
     let multisample = (plain_zls || layered_compressed_zls(pass)
-        || (depth_msaa_compression_enabled() && single_layer_compressed_depth_zls(pass)))
+        || (depth_msaa_compression_enabled() && (single_layer_compressed_depth_zls(pass)
+            || single_layer_native_compressed_zls(pass))))
         && matches!(pass.samples_log2, 1..=3)
         && matches!((pass.utile_width, pass.utile_height),
                     (32, 32) | (32, 16) | (16, 16))
@@ -59,12 +63,24 @@ pub(crate) fn validate(pass: &RenderPass) -> Result {
     Ok(())
 }
 
-/// Layered multisample depth/stencil in native's form: each enabled load or
+/// Layered multisample depth/stencil in native's compressed form.
+fn layered_compressed_zls(pass: &RenderPass) -> bool {
+    pass.layers > 1 && native_compressed_zls(pass)
+}
+
+/// Single-layer 2x/4x depth/stencil in native's compressed form. Native emits
+/// ZLS control 0xc0154 with compressed stencil for single-layer 4x MSAA
+/// depth/stencil passes as well, the same form as the layered one.
+fn single_layer_native_compressed_zls(pass: &RenderPass) -> bool {
+    pass.layers == 1 && matches!(pass.samples_log2, 1 | 2) && native_compressed_zls(pass)
+}
+
+/// Multisample depth/stencil in native's compressed form: each enabled load or
 /// store of a plane is compressed (ZLS bits: Z load 15 / compress 2, S load 14
 /// / compress 4, Z store 19 / compress 6, S store 18 / compress 8; the depth
 /// format bits 25:26 are allowed), a plane
 /// with any compression has a compression address, and no other ZLS bits.
-fn layered_compressed_zls(pass: &RenderPass) -> bool {
+fn native_compressed_zls(pass: &RenderPass) -> bool {
     const Z_LOAD: u64 = 1 << 15;
     const S_LOAD: u64 = 1 << 14;
     const Z_STORE: u64 = 1 << 19;
@@ -80,8 +96,7 @@ fn layered_compressed_zls(pass: &RenderPass) -> bool {
     let control = pass.zls_control;
     let z_compressed = control & (Z_LOAD_COMPRESS | Z_STORE_COMPRESS) != 0;
     let s_compressed = control & (S_LOAD_COMPRESS | S_STORE_COMPRESS) != 0;
-    pass.layers > 1
-        && control != 0
+    control != 0
         && control & !KNOWN == 0
         && (control & Z_LOAD == 0 || control & Z_LOAD_COMPRESS != 0)
         && (control & S_LOAD == 0 || control & S_LOAD_COMPRESS != 0)
@@ -94,7 +109,7 @@ fn layered_compressed_zls(pass: &RenderPass) -> bool {
 }
 
 /// Single-layer D32 depth compression, with optional plain S8.
-/// The existing layered path remains separate. Both depth compression bits
+/// Native's compressed Z/S form is checked separately. Both depth compression bits
 /// are required because partial rendering forces depth load and store even
 /// when one of those operations is disabled in the final render pass.
 fn single_layer_compressed_depth_zls(pass: &RenderPass) -> bool {

@@ -1420,7 +1420,8 @@ impl gpu::Gpu for Gpu {
                 | crate::file::DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS
                 | crate::file::DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
             if m5_render_submission::depth_msaa_compression_enabled() {
-                params.features |= crate::file::DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
+                params.features |= crate::file::DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION
+                    | crate::file::DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION;
             }
             if *crate::module_parameters::m5_mesh_storage_chunks.value() != 0 {
                 params.features |= crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
