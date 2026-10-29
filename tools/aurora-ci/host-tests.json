@@ -589,6 +589,14 @@
    ]
   },
   {
+   "name": "tools/asahi/mtp-dt-from-adt-tests.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/asahi/mtp-dt-from-adt-tests.py"
+   ]
+  },
+  {
    "name": "tools/asahi/mt7932-association-events-tests.py",
    "group": "tools",
    "argv": [
