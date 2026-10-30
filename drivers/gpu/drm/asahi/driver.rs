@@ -1017,6 +1017,11 @@ fn probe_t8152(
     }
     if stage == g18_live_boot::STAGE_DRM {
         if *crate::module_parameters::g18_admit_compute.value() > 1 {return Err(EINVAL);}
+        let stream_bytes = *crate::module_parameters::g18_compute_stream_bytes.value();
+        if crate::g18_compute_stream::limit_from_param(stream_bytes).is_none() {
+            dev_err!(pdev.as_ref(), "G18G: g18_compute_stream_bytes={} needs 48 to 4096; refused before MMIO\n", stream_bytes);
+            return Err(EINVAL);
+        }
         return probe_t8152_drm(pdev, soc, stage);
     }
     let probe = prepare_t8152_device(pdev, soc, stage)?;
@@ -1035,6 +1040,7 @@ fn probe_t8152_drm(
     let (owner, runtime) = g18_live_boot::start_drm(pdev, probe)?;
     let config = crate::g18_drm::G18DrmConfig {
         admit_compute: *crate::module_parameters::g18_admit_compute.value() != 0,
+        compute_stream_bytes: u64::from(*crate::module_parameters::g18_compute_stream_bytes.value()),
         admit_msaa4: *crate::module_parameters::g18_admit_msaa4.value() != 0,
         admit_graphics_scratch:
             *crate::module_parameters::g18_admit_graphics_scratch.value() != 0,

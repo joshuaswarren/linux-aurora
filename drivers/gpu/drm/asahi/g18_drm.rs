@@ -28,9 +28,6 @@ use crate::{alloc, drm_gpu::{DrmGpu, DrmGpuParams}, file, g17_uapi,
     gem, gpu, hw, m5_vm, mmu, queue};
 
 const USER_END: u64 = (1 << 42) - 2 * mmu::UAT_PGSZ as u64;
-/// Compute stream bytes admitted: one direct dispatch plus terminator, the
-/// M5 profile (`m5_drm.rs:16-20`). Only reachable with `admit_compute`.
-const G18_COMPUTE_STREAM_BYTES: u64 = 48;
 /// `DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE`: the dispatch binds texture or image
 /// state, so the command takes the native texture compute mode (d62a,
 /// `g18_application_compute_resources.rs`). The only compute flag G18 admits.
@@ -110,8 +107,11 @@ pub(crate) fn map_timestamp_buffer_in(uat: &mmu::Uat, mut bo: gem::ObjectRef,
 /// Adapter options fixed at registration.
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct G18DrmConfig {
-    /// Admit compute commands (module parameter `g18_admit_compute`, default 0).
+    /// Admit compute commands (module parameter `g18_admit_compute`, default 1).
     pub(crate) admit_compute: bool,
+    /// Largest compute control stream admitted, in bytes (module parameter
+    /// `g18_compute_stream_bytes`, default 48). Zero, the `Default` value, means the 48 byte base profile.
+    pub(crate) compute_stream_bytes: u64,
     /// Admit exactly the native 4x MSAA render set (module parameter
     /// `g18_admit_msaa4`, default 0; msaa163). Off refuses every
     /// multisampled render as before.
@@ -546,12 +546,14 @@ impl G18Queue {
         }
         let stream_bytes = payload.control_stream_end.saturating_sub(payload.control_stream_base);
         let g18_flags = G18_COMPUTE_TEXTURE_STATE | g17_uapi::COMPUTE_G18_RESOURCES;
+        let limit = crate::g18_compute_stream::effective_limit(self.config.compute_stream_bytes);
         // ADD3 and every flag outside the G18 contract remain refused.
         if payload.flags & !g18_flags != 0 || payload.sampler_heap != 0
-            || payload.sampler_count != 0 || stream_bytes > G18_COMPUTE_STREAM_BYTES {
-            pr_err!("G18 compute admission rejected flags={:#x} sampler_heap={:#x} samplers={} stream_bytes={} (profile admits one dispatch, {})\n",
-                payload.flags, payload.sampler_heap, payload.sampler_count, stream_bytes,
-                G18_COMPUTE_STREAM_BYTES);
+            || payload.sampler_count != 0 || !crate::g18_compute_stream::admits(stream_bytes, limit) {
+            // The default keeps the log text of the single-dispatch profile word for word.
+            let profile = if limit == crate::g18_compute_stream::BASE_STREAM_BYTES { "one dispatch," } else { "streams up to" };
+            pr_err!("G18 compute admission rejected flags={:#x} sampler_heap={:#x} samplers={} stream_bytes={} (profile admits {} {})\n",
+                payload.flags, payload.sampler_heap, payload.sampler_count, stream_bytes, profile, limit);
             return Err(ENOTSUPP);
         }
         let resource_descriptor = if payload.flags & g17_uapi::COMPUTE_G18_RESOURCES != 0 {

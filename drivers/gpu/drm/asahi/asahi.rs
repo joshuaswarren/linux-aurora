@@ -66,6 +66,7 @@ mod g18_compute;
 mod g18_compute_inputs;
 mod g18_compute_metadata;
 mod g18_compute_plan;
+mod g18_compute_stream;
 mod g18_graphics_scratch;
 mod g18_compute_memory;
 mod g18_compute_state;
@@ -172,6 +173,10 @@ kernel::prelude::module! {
         g18_admit_compute: u32 {
             default: 1,
             description: "G18 DRM adapter: 1 admits single-dispatch compute commands (K1). 0 refuses them",
+        },
+        g18_compute_stream_bytes: u32 {
+            default: 48,
+            description: "G18 DRM adapter: largest compute control stream admitted, in bytes (48 to 4096; 48 is the single-dispatch profile and the default). Wider streams are admission only: what the firmware does with them is proven on hardware. Anything outside 48..4096 refuses to bind",
         },
         g18_admit_msaa4: u32 {
             default: 1,
