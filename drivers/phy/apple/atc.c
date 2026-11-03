@@ -513,7 +513,6 @@ enum atcphy_lane_mode {
 #define USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL BIT(2)
 #define USB2PHY_SIG_VBUSVLDEXT_FORCE_EN BIT(3)
 #define USB2PHY_SIG_HOST (7 << 12)
-#define USB2PHY_HOST_MASK(a) ((a)->legacy_fixed_usb2 ? GENMASK(6, 4) : USB2PHY_SIG_HOST)
 
 #define USB2PHY_MISCTUNE 0x1c
 #define USB2PHY_MISCTUNE_APBCLK_GATE_OFF BIT(29)
@@ -634,7 +633,6 @@ struct atcphy_hw {
  * @dev: Device pointer
  * @tunables: Firmware-provided tunable parameters
  * @tunables.axi2af: AXI to AF interface tunables
- * @tunables.usb2phy_reg_dflt: T8130 eUSB2 PHY register defaults
  * @tunables.common: Common tunables for all lanes
  * @tunables.lane_usb3: USB3 lane-specific tunables
  * @tunables.lane_dp: DisplayPort lane-specific tunables
@@ -679,7 +677,6 @@ struct apple_atcphy {
 
 	struct {
 		struct apple_tunable *axi2af;
-		struct apple_tunable *usb2phy_reg_dflt;
 		struct apple_tunable *common[2];
 		struct apple_tunable *dp_common[2];
 		struct apple_tunable *dp_lpdptx;
@@ -1344,10 +1341,6 @@ static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 {
 	int ret;
-
-	/* This profile never switches the live dummy backend. */
-	if (atcphy->legacy_fixed_usb2)
-		return atcphy_dummy_is_ready(atcphy) ? 0 : -EIO;
 
 	ret = atcphy_pipehandler_check(atcphy);
 	if (ret)
@@ -2493,10 +2486,6 @@ static int atcphy_power_off(struct apple_atcphy *atcphy)
 
 static void atcphy_usb2_power_on(struct apple_atcphy *atcphy)
 {
-	struct apple_tunable *tunable = atcphy->tunables.usb2phy_reg_dflt;
-	bool verified = true;
-	size_t i;
-
 	set32(atcphy->regs.usb2phy + USB2PHY_SIG,
 	      USB2PHY_SIG_VBUSDET_FORCE_VAL | USB2PHY_SIG_VBUSDET_FORCE_EN |
 		      USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL | USB2PHY_SIG_VBUSVLDEXT_FORCE_EN);
@@ -2579,9 +2568,6 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
-	if (atcphy->legacy_fixed_usb2 && mode != APPLE_ATCPHY_MODE_USB2 &&
-	    mode != APPLE_ATCPHY_MODE_OFF)
-		return -EOPNOTSUPP;
 
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
 		ret = atcphy_power_off(atcphy);
@@ -2705,10 +2691,10 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
-		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_HOST_MASK(atcphy));
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
 		break;
 	case PHY_MODE_USB_DEVICE:
-		clear32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_HOST_MASK(atcphy));
+		clear32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
 		break;
 	default:
 		return -EINVAL;
@@ -2767,7 +2753,6 @@ static int atcphy_usb3_power_off(struct phy *phy)
 static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
-	enum atcphy_pipehandler_state target;
 
 	guard(mutex)(&atcphy->lock);
 
@@ -2885,8 +2870,6 @@ static struct phy *atcphy_xlate(struct device *dev, const struct of_phandle_args
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 
-	if (atcphy->legacy_fixed_usb2 && args->args[0] == PHY_TYPE_DP)
-		return ERR_PTR(-EOPNOTSUPP);
 	switch (args->args[0]) {
 	case PHY_TYPE_USB2:
 		return atcphy->phys.usb2;
@@ -2910,8 +2893,6 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
-		if (atcphy->legacy_fixed_usb2 && i == 2)
-			continue;
 		*phys[i].phy = devm_phy_create(atcphy->dev, NULL, phys[i].ops);
 		if (IS_ERR(*phys[i].phy))
 			return PTR_ERR(*phys[i].phy);
@@ -3138,23 +3119,9 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	}
 
 	/*
-	 * A live PIPE mux blocks the reconfigure below: atcphy_configure() cannot
-	 * move the lanes while the pipehandler still points at USB3, and the
-	 * hardware falls back to USB2-only -- which is exactly what the comment
-	 * that used to live here predicted, and exactly what a DP-Alt dock then
-	 * reports by enumerating a USB Billboard device instead of a display.
-	 *
-	 * Measured on J700, 2026-09-22, with a DisplayLink UD-ULTC4K on the rear
-	 * connector: the CD321x asked for a mode change, this function warned
-	 * that pipehandler_up was set, atcphy_configure() ran anyway, the link
-	 * came up USB2-only and the dock published a Billboard.  DP was never
-	 * entered and the external DCP stayed at nr_modes:0.
-	 *
-	 * Every mode whose pipehandler_state is not USB3 -- DP among them --
-	 * needs the PIPE back on the dummy backend first.
-	 * atcphy_dwc3_reset_assert() already does precisely this before a reset;
-	 * warning about the same condition here and continuing regardless was
-	 * the bug.  Both callers hold atcphy->lock.
+	 * If the pipehandler is still/already up here there's a bug somewhere so make sure to
+	 * complain loudly. We can still try to switch modes and hope for the best though,
+	 * in the worst case the hardware will fall back to USB2-only.
 	 */
 	WARN_ON_ONCE(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY);
 	return atcphy_configure(atcphy, target_mode);
@@ -3191,8 +3158,6 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 		struct resource *res;
 	} tunables[] = {
 		{ "apple,tunable-axi2af", &atcphy->tunables.axi2af, atcphy->res.axi2af },
-		{ "apple,tunable-usb2phy-reg-dflt", &atcphy->tunables.usb2phy_reg_dflt,
-		  atcphy->res.usb2phy_reg },
 		{ "apple,tunable-common-a", &atcphy->tunables.common[0], atcphy->res.core },
 		{ "apple,tunable-common-b", &atcphy->tunables.common[1], atcphy->res.core },
 		{ "apple,tunable-lane0-usb", &atcphy->tunables.lane_usb3[0], atcphy->res.core },
@@ -3422,11 +3387,6 @@ power_off:
 	return ret;
 }
 
-static void atcphy_repeater_exit(void *data)
-{
-	phy_exit(data);
-}
-
 static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
@@ -3443,19 +3403,6 @@ static int atcphy_probe(struct platform_device *pdev)
 
 	atcphy->dev = dev;
 	atcphy->np = dev->of_node;
-	atcphy->legacy_fixed_usb2 = of_machine_is_compatible("apple,j700") &&
-		atcphy->hw->has_usb2phy_reg &&
-		device_property_read_bool(dev, "apple,usb2-fixed-host");
-	atcphy->force_usb2_on = device_property_read_bool(dev, "apple,force-usb2-on");
-	atcphy->force_usb2_host_preinit = device_property_read_bool(
-		dev, "apple,force-usb2-host-preinit");
-	atcphy->force_usb2_pipe_dummy = device_property_read_bool(
-		dev, "apple,force-usb2-pipe-dummy");
-	if (atcphy->legacy_fixed_usb2) {
-		atcphy->force_usb2_on = true;
-		atcphy->force_usb2_host_preinit = true;
-		atcphy->force_usb2_pipe_dummy = true;
-	}
 	mutex_init(&atcphy->lock);
 	platform_set_drvdata(pdev, atcphy);
 
@@ -3466,18 +3413,6 @@ static int atcphy_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (atcphy->legacy_fixed_usb2) {
-		atcphy->repeater = devm_phy_get(dev, "usb2-repeater");
-		if (IS_ERR(atcphy->repeater))
-			return dev_err_probe(dev, PTR_ERR(atcphy->repeater),
-					     "USB2 repeater unavailable\n");
-		ret = phy_init(atcphy->repeater);
-		if (ret)
-			return ret;
-		ret = devm_add_action_or_reset(dev, atcphy_repeater_exit, atcphy->repeater);
-		if (ret)
-			return ret;
-	}
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->fixed_usb2 = atcphy_usb2_behind_fixed_hub(atcphy);

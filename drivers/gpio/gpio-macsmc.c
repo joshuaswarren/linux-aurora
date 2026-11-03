@@ -345,9 +345,6 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	dev_info(smcgp->dev, "First GPIO key: %p4ch\n", &key);
-	if (smcgp->j700_pcio_pin8)
-		dev_info(smcgp->dev,
-			 "J700_SMC_PCIO_GPIO_ARMED: pin=8 key=pcIO template=0x0008000000800000 source=function-reg_on\n");
 
 	if (device_is_compatible(&pdev->dev, "apple,smc-low-gpio"))
 		smcgp->gc.label = "macsmc-pmu-low-gpio";

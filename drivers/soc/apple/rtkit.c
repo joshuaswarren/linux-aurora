@@ -7,9 +7,6 @@
 #include "rtkit-internal.h"
 #include <linux/of.h>
 
-static_assert(APPLE_RTKIT_EPMAP_SNAPSHOT_WORDS * 64 ==
-	      APPLE_RTKIT_MAX_ENDPOINTS);
-
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
 	APPLE_RTKIT_PWR_STATE_SLEEP = 0x01, /* sleeping, can be restarted */
@@ -121,39 +118,14 @@ static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 	return ret;
 }
 
-static void apple_rtkit_epmap_only_abort(struct apple_rtkit *rtk, int error)
-{
-	if (!rtk->epmap_only || rtk->epmap_finished)
-		return;
-
-	rtk->boot_result = error;
-	rtk->epmap_finished = true;
-	complete_all(&rtk->epmap_completion);
-}
-
 static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 {
 	u64 reply;
-	int ret;
 
 	int min_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MINVER, msg);
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
 	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
 
-	if (rtk->epmap_only) {
-		if (rtk->hello_seen || rtk->epmap_finished) {
-			apple_rtkit_epmap_only_abort(rtk, -EPROTO);
-			return;
-		}
-
-		rtk->raw_hello = msg;
-		rtk->hello_min_version = min_ver;
-		rtk->hello_max_version = max_ver;
-		rtk->hello_seen = true;
-	}
-
-	if (rtk->ops->protocol_version)
-		want_ver = rtk->ops->protocol_version;
 	dev_dbg(rtk->dev, "RTKit: Min ver %d, max ver %d\n", min_ver, max_ver);
 
 	if (min_ver > APPLE_RTKIT_MAX_SUPPORTED_VERSION) {
@@ -167,11 +139,6 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 			max_ver);
 		goto abort_boot;
 	}
-	if (want_ver < min_ver || want_ver > max_ver) {
-		dev_err(rtk->dev, "RTKit: required protocol %d outside remote range %d..%d\n",
-			want_ver, min_ver, max_ver);
-		goto abort_boot;
-	}
 
 	dev_info(rtk->dev, "RTKit: Initializing (protocol version %d)\n",
 		 want_ver);
@@ -179,37 +146,14 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, want_ver);
 	reply |= FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MAXVER, want_ver);
-	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY,
-					 reply);
-	if (ret && rtk->epmap_only)
-		apple_rtkit_epmap_only_abort(rtk, ret);
+	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY, reply);
 
 	return;
 
 abort_boot:
-	if (rtk->epmap_only) {
-		apple_rtkit_epmap_only_abort(rtk, -EINVAL);
-	} else {
-		rtk->boot_result = -EINVAL;
-		complete_all(&rtk->epmap_completion);
-	}
+	rtk->boot_result = -EINVAL;
+	complete_all(&rtk->epmap_completion);
 }
-
-/* The endpoint bitmap is the firmware's own inventory of what it exposes, and
- * it is otherwise only visible through dev_dbg.  Publishing it matters because
- * an endpoint the firmware advertises and Linux never starts is invisible: on
- * the J700 the ambient light sensor lives behind exactly such an endpoint.
- */
-static int apple_rtkit_endpoints_show(struct seq_file *s, void *unused)
-{
-	struct apple_rtkit *rtk = s->private;
-	int ep;
-
-	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS)
-		seq_printf(s, "0x%02x\n", ep);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(apple_rtkit_endpoints);
 
 static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 {
@@ -217,15 +161,6 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	u64 reply;
 	unsigned long bitmap = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BITMAP, msg);
 	u32 base = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BASE, msg);
-
-	if (rtk->epmap_only) {
-		if (!rtk->hello_seen || rtk->epmap_finished ||
-		    (rtk->epmap_bases_seen & BIT(base))) {
-			apple_rtkit_epmap_only_abort(rtk, -EPROTO);
-			return;
-		}
-		rtk->epmap_bases_seen |= BIT(base);
-	}
 
 	dev_dbg(rtk->dev,
 		"RTKit: received endpoint bitmap 0x%lx with base 0x%x\n",
@@ -235,33 +170,6 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		ep = 32 * base + i;
 		dev_dbg(rtk->dev, "RTKit: Discovered endpoint 0x%02x\n", ep);
 		set_bit(ep, rtk->endpoints);
-		if (rtk->epmap_only)
-			set_bit(ep, rtk->discovery_endpoints);
-	}
-
-	if (!rtk->endpoints_dentry) {
-		char name[64];
-
-		snprintf(name, sizeof(name), "%s-endpoints", dev_name(rtk->dev));
-		rtk->endpoints_dentry = debugfs_create_file(name, 0400, NULL, rtk,
-							    &apple_rtkit_endpoints_fops);
-	}
-
-	/*
-	 * G17P sends its firmware-owned crash buffer request as soon as EP1 is
-	 * started.  Start EP1 before acknowledging the EPMAP fragment that
-	 * advertises it, matching the ordering required by this firmware.
-	 */
-	if (rtk->firmware_owned_crashlog &&
-	    test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints) &&
-	    !rtk->crashlog_endpoint_started) {
-		ret = apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
-		if (ret) {
-			rtk->boot_result = ret;
-			complete_all(&rtk->epmap_completion);
-			return;
-		}
-		rtk->crashlog_endpoint_started = true;
 	}
 
 	/* G17P can request its crash DVA immediately after EP1 starts. */
@@ -283,22 +191,10 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	else
 		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
 
-	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY,
-					 reply);
-	if (ret && rtk->epmap_only) {
-		apple_rtkit_epmap_only_abort(rtk, ret);
-		return;
-	}
+	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
 
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
-
-	if (rtk->epmap_only) {
-		rtk->boot_result = 0;
-		rtk->epmap_finished = true;
-		complete_all(&rtk->epmap_completion);
-		return;
-	}
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		switch (ep) {
@@ -539,68 +435,6 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 						 len, DMA_FROM_DEVICE);
 }
 
-/*
- * Dump the crash buffer if it already carries a crash log.  Returns true
- * when it did (the coprocessor is then marked crashed and the client told).
- */
-static bool apple_rtkit_crashlog_dump_if_present(struct apple_rtkit *rtk)
-{
-	u8 probe[0x20];
-	u8 *bfr __free(kfree) = NULL;
-
-	if (rtk->crashed || rtk->crashlog_buffer.size < sizeof(probe) ||
-	    (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem))
-		return false;
-	apple_rtkit_memcpy(rtk, probe, &rtk->crashlog_buffer, 0, sizeof(probe));
-	if (!apple_rtkit_crashlog_present(probe, sizeof(probe)))
-		return false;
-
-	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
-	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_KERNEL);
-	if (bfr) {
-		apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0,
-				   rtk->crashlog_buffer.size);
-		apple_rtkit_crashlog_dump(rtk, bfr, rtk->crashlog_buffer.size);
-	} else {
-		dev_err(rtk->dev,
-			"RTKit: Couldn't allocate crashlog shadow buffer\n");
-	}
-
-	rtk->crashed = true;
-	if (rtk->ops->crashed)
-		rtk->ops->crashed(rtk->cookie, bfr, bfr ? rtk->crashlog_buffer.size : 0);
-	return true;
-}
-
-/*
- * A loader-booted coprocessor (the J700's DCP) requests its crash buffer only
- * once it is already crashing, and the log lands in that buffer a little
- * after the request -- with no second message on some firmwares.  Look again
- * a few times after the request so the panic is never lost.
- */
-static void apple_rtkit_crashlog_probe_work(struct work_struct *work)
-{
-	struct apple_rtkit *rtk =
-		container_of(to_delayed_work(work), struct apple_rtkit, crashlog_probe);
-	static const unsigned int retry_ms[] = { 250, 1000, 5000, 30000, 60000, 120000 };
-	unsigned int attempt = rtk->crashlog_probe_attempt;
-
-	if (READ_ONCE(rtk->shutting_down))
-		return;
-	if (apple_rtkit_crashlog_dump_if_present(rtk)) {
-		dev_err(rtk->dev,
-			"RTKit: crash log found %u ms after the buffer request\n",
-			rtk->crashlog_probe_elapsed_ms);
-		return;
-	}
-	if (attempt >= ARRAY_SIZE(retry_ms))
-		return;
-	rtk->crashlog_probe_elapsed_ms += retry_ms[attempt];
-	rtk->crashlog_probe_attempt = attempt + 1;
-	queue_delayed_work(rtk->wq, &rtk->crashlog_probe,
-			   msecs_to_jiffies(retry_ms[attempt]));
-}
-
 static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
@@ -831,20 +665,6 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
 						 APPLE_RTKIT_EP_OSLOG, msg);
-		/* Publish the buffer read-only.  Nothing here parses the oslog
-		 * entry format; the point is that the firmware's own text is
-		 * otherwise unreachable from Linux. */
-		if (!rtk->oslog_dentry && rtk->oslog_buffer.buffer &&
-		    rtk->oslog_buffer.size) {
-			rtk->oslog_blob.data = rtk->oslog_buffer.buffer;
-			rtk->oslog_blob.size = rtk->oslog_buffer.size;
-			rtk->oslog_dentry = debugfs_create_blob(
-				dev_name(rtk->dev), 0400, NULL,
-				&rtk->oslog_blob);
-			dev_info(rtk->dev,
-				 "RTKit: oslog buffer %zu bytes at debugfs %s\n",
-				 rtk->oslog_buffer.size, dev_name(rtk->dev));
-		}
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
@@ -911,7 +731,7 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 	default:
 		dev_warn(rtk->dev,
 			 "RTKit: message to unknown endpoint %02x: %llx\n",
-				 rtk_work->ep, rtk_work->msg);
+			 rtk_work->ep, rtk_work->msg);
 	}
 
 out:
@@ -934,26 +754,11 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 * afterwards.
 	 */
 	dma_rmb();
-	if (READ_ONCE(rtk->shutting_down))
-		return;
 
 	if (!test_bit(ep, rtk->endpoints))
 		dev_warn(rtk->dev,
 			 "RTKit: Message to undiscovered endpoint 0x%02x\n",
 			 ep);
-
-	/*
-	 * Passive discovery owns endpoint zero only.  Never queue a crashlog,
-	 * syslog, or application callback from this mode: doing so could allocate
-	 * shared memory or acknowledge a protocol that has not been admitted.
-	 */
-	if (rtk->epmap_only && ep != APPLE_RTKIT_EP_MGMT) {
-		dev_err(rtk->dev,
-			"RTKit: discovery-only client received endpoint 0x%02x traffic\n",
-			ep);
-		apple_rtkit_epmap_only_abort(rtk, -EPROTO);
-		return;
-	}
 
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
 	    rtk->ops->recv_message_early &&
@@ -983,18 +788,6 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 		dev_warn(rtk->dev,
 			 "RTKit: Device is crashed, cannot send message\n");
 		return -EINVAL;
-	}
-
-	if (rtk->epmap_only) {
-		u8 type = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, message);
-
-		if (ep != APPLE_RTKIT_EP_MGMT ||
-		    (type != APPLE_RTKIT_MGMT_HELLO_REPLY &&
-		     type != APPLE_RTKIT_MGMT_EPMAP_REPLY)) {
-			dev_warn(rtk->dev,
-				 "RTKit: discovery-only client refused endpoint/power side effect\n");
-			return -EPERM;
-		}
 	}
 
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
@@ -1030,9 +823,6 @@ EXPORT_SYMBOL_GPL(apple_rtkit_has_endpoint);
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;
-
-	if (rtk->epmap_only)
-		return -EPERM;
 
 	if (!test_bit(endpoint, rtk->endpoints))
 		return -EINVAL;
@@ -1143,6 +933,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->cookie = cookie;
 	rtk->ops = ops;
 	rtk->firmware_owned_crashlog = firmware_owned_crashlog;
+	rtk->t8152_pmp = of_device_is_compatible(dev->of_node, "apple,t8152-pmp-v2");
 	rtk->adopted = adopted;
 
 	init_completion(&rtk->epmap_completion);
@@ -1151,7 +942,6 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	init_completion(&rtk->iop_idle_completion);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
-	bitmap_zero(rtk->discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	if (mbox_name)
@@ -1249,10 +1039,6 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
-	debugfs_remove(rtk->oslog_dentry);
-	rtk->oslog_dentry = NULL;
-	debugfs_remove(rtk->endpoints_dentry);
-	rtk->endpoints_dentry = NULL;
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
@@ -1269,7 +1055,6 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	WRITE_ONCE(rtk->awaiting_iop_idle, false);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
-	bitmap_zero(rtk->discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	reinit_completion(&rtk->epmap_completion);
@@ -1277,14 +1062,6 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
 	rtk->crashed = false;
-	rtk->boot_result = 0;
-	rtk->raw_hello = 0;
-	rtk->hello_min_version = 0;
-	rtk->hello_max_version = 0;
-	rtk->epmap_bases_seen = 0;
-	rtk->hello_seen = false;
-	rtk->epmap_finished = false;
-	rtk->crashlog_endpoint_started = false;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 
@@ -1307,9 +1084,6 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 {
 	u64 msg;
 	int ret;
-
-	if (rtk->epmap_only)
-		return -EPERM;
 
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
@@ -1334,9 +1108,6 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	u64 msg;
 	int ret;
 
-	if (rtk->epmap_only)
-		return -EPERM;
-
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, state);
@@ -1357,9 +1128,6 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 {
 	int ret;
-
-	if (rtk->epmap_only)
-		return -EOPNOTSUPP;
 
 	if (apple_rtkit_is_running(rtk))
 		return 0;
@@ -1504,13 +1272,10 @@ int apple_rtkit_poweroff_adopted(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poweroff_adopted);
 
-int apple_rtkit_wake(struct apple_rtkit *rtk)
+static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 {
 	u64 msg;
 	int ret;
-
-	if (rtk->epmap_only)
-		return -EPERM;
 
 	if (apple_rtkit_is_running(rtk))
 		return -EINVAL;
@@ -1548,10 +1313,6 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
-	debugfs_remove(rtk->oslog_dentry);
-	rtk->oslog_dentry = NULL;
-	debugfs_remove(rtk->endpoints_dentry);
-	rtk->endpoints_dentry = NULL;
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);

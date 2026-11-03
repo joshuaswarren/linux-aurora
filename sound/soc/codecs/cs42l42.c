@@ -15,7 +15,6 @@
 #include <linux/init.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
-#include <linux/jiffies.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
@@ -866,34 +865,6 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 					      CS42L42_ASP_5050_MASK |
 					      (CS42L42_ASP_FSD_1_0 <<
 						CS42L42_ASP_FSD_SHIFT));
-		cs42l42->dsp_a = false;
-		break;
-	case SND_SOC_DAIFMT_DSP_A:
-		/*
-		 * Pulse mode, frame starts on the rising edge of LRCLK; the
-		 * channels sit back to back (hw_params places channel 2 at the
-		 * slot width).  The T8140 AOP runs the CS42L83 jack link this
-		 * way: a 125-SCLK frame pulse with two 32-bit slots.
-		 *
-		 * The data follows the frame pulse by half an SCLK, not the
-		 * whole one DSP-A nominally implies.  With FSD = 1.0 the codec
-		 * sampled every slot one bit late: the sample arrived doubled
-		 * and everything above half scale wrapped -- measured on the
-		 * J700 jack through a line-in (60 Hz sines: THD -60 dB up to
-		 * -12 dBFS, then the fundamental fell and THD reached +6 dB
-		 * from -6 dBFS up, 1800 discontinuities in three seconds), which
-		 * the listener heard as static riding on the bass at high
-		 * volume.  FSD = 0.5 gives THD -60 dB all the way to -1 dBFS.
-		 */
-		snd_soc_component_update_bits(component,
-					      CS42L42_ASP_FRM_CFG,
-					      CS42L42_ASP_STP_MASK |
-					      CS42L42_ASP_5050_MASK |
-					      CS42L42_ASP_FSD_MASK,
-					      CS42L42_ASP_STP_MASK |
-					      (CS42L42_ASP_FSD_0_5 <<
-						CS42L42_ASP_FSD_SHIFT));
-		cs42l42->dsp_a = true;
 		break;
 	case SND_SOC_DAIFMT_DSP_A:
 		/*
@@ -931,15 +902,6 @@ static int cs42l42_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		asp_cfg_val |= CS42L42_ASP_LCPOL_INV << CS42L42_ASP_LCPOL_SHIFT;
 		break;
 	}
-
-	/*
-	 * DSP-A on the T8140 AOP link: the receiving serializer samples SDOUT
-	 * on the edge the codec would drive it, so drive SDOUT on the other
-	 * edge (the SCPOL field has one bit per direction: bit 0 SDIN, bit 1
-	 * SDOUT).
-	 */
-	if (cs42l42->dsp_a)
-		asp_cfg_val &= ~(BIT(1) << CS42L42_ASP_SCPOL_SHIFT);
 
 	snd_soc_component_update_bits(component, CS42L42_ASP_CLK_CFG, CS42L42_ASP_MODE_MASK |
 								      CS42L42_ASP_SCPOL_MASK |
@@ -2061,8 +2023,7 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	mutex_lock(&cs42l42->irq_lock);
 	if (cs42l42->suspended || !cs42l42->init_done) {
 		mutex_unlock(&cs42l42->irq_lock);
-		if (use_runtime_pm)
-			pm_runtime_put_autosuspend(cs42l42->dev);
+		pm_runtime_put_autosuspend(cs42l42->dev);
 		return IRQ_NONE;
 	}
 
@@ -2083,8 +2044,6 @@ irqreturn_t cs42l42_irq_thread(int irq, void *data)
 		stickies[i] = stickies[i] & (~masks[i]) &
 				irq_params_table[i].mask;
 	}
-
-	result = IRQ_HANDLED;
 
 	/* Read tip sense status before handling type detect */
 	current_plug_status = (stickies[11] &

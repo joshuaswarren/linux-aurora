@@ -71,34 +71,6 @@ static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
-static bool piodma_config = true;
-module_param(piodma_config, bool, 0644);
-MODULE_PARM_DESC(piodma_config,
-		 "use PIODMA for downstream PCI configuration accesses");
-static bool piodma_config_writes;
-module_param(piodma_config_writes, bool, 0644);
-MODULE_PARM_DESC(piodma_config_writes,
-		 "use PIODMA for downstream PCI configuration writes");
-static int piodma_config_read_limit = 1;
-module_param(piodma_config_read_limit, int, 0644);
-MODULE_PARM_DESC(piodma_config_read_limit,
-		 "maximum downstream PIODMA config reads; negative is unlimited");
-
-static uint sunrise_power_off_ms = 2;
-module_param(sunrise_power_off_ms, uint, 0644);
-MODULE_PARM_DESC(sunrise_power_off_ms,
-		 "J700 RegOn low interval in milliseconds (default: Apple 2 ms)");
-
-static uint sunrise_power_on_ms = 150;
-module_param(sunrise_power_on_ms, uint, 0644);
-MODULE_PARM_DESC(sunrise_power_on_ms,
-		 "J700 RegOn high settle in milliseconds (default: Apple 150 ms)");
-
-static uint sunrise_link_retries;
-module_param(sunrise_link_retries, uint, 0644);
-MODULE_PARM_DESC(sunrise_link_retries,
-		 "bounded J700 RegOn/PERST link-recovery attempts (default: 0)");
-
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
 #define   CORE_RC_PHYIF_CTL_RUN		BIT(0)
@@ -282,7 +254,6 @@ static const struct hw_info t8140_hw = {
 };
 
 struct apple_pcie {
-	bool legacy_handoff;
 	struct mutex		lock;
 	struct device		*dev;
 	void __iomem            *base;
@@ -1391,8 +1362,6 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	/* Use the first reg entry to work out the port index */
 	port->idx = idx >> 11;
-	if (pcie->legacy_handoff && port->idx != 0)
-		return -EOPNOTSUPP;
 	port->pcie = pcie;
 	port->np = of_node_get(np);
 
@@ -1506,18 +1475,11 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (ret)
 		goto err_teardown;
 
-	if (pcie->legacy_handoff) {
-		/* Retain mappings for firmware-owned functions. */
-		for (i = 0; i < pcie->hw->max_rid2sid; i++)
-			if (readl_relaxed(port_rid2sid_addr(port, i)) & PORT_RID2SID_VALID)
-				__set_bit(i, port->sid_map);
-	} else {
-		/* Reset all RID/SID mappings, and check for RAZ/WI registers */
-		for (i = 0; i < pcie->hw->max_rid2sid; i++) {
-			if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
-				break;
-			apple_pcie_rid2sid_write(port, i, 0);
-		}
+	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
+	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
+		if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
+			break;
+		apple_pcie_rid2sid_write(port, i, 0);
 	}
 
 	dev_dbg(pcie->dev, "%pOF: %d RID/SID mapping entries\n", np, i);
@@ -1842,9 +1804,9 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
 	struct resource *res;
+	struct of_phandle_args args = {};
 	u32 sid, rid = pci_dev_id(pdev);
 	struct apple_pcie_port *port;
-	struct of_phandle_args iommu_spec = {};
 	int idx, err;
 
 	/*
@@ -1864,14 +1826,14 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	dev_dbg(&pdev->dev, "added to bus %s, index %d\n",
 		pci_name(pdev->bus->self), port->idx);
 
-	err = of_map_iommu_id(port->pcie->dev->of_node, rid, &iommu_spec);
+	err = of_map_id(port->pcie->dev->of_node, rid, "iommu-map",
+			"iommu-map-mask", NULL, NULL, &args);
 	if (err)
 		return err;
+	sid = args.args[0];
 	if (!FIELD_FIT(PORT_RID2SID_SID, sid))
 		return -ERANGE;
 
-	of_node_put(iommu_spec.np);
-	sid = iommu_spec.args[0];
 	mutex_lock(&port->pcie->lock);
 
 	if (port->pcie->hw->rid2sid_index_is_sid) {

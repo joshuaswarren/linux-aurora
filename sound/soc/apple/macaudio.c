@@ -82,13 +82,6 @@ enum macaudio_spkr_config {
 	SPKR_2W1T,	/* 2 woofers + 1 tweeter / ch */
 };
 
-/*
- * Three front-end links on every machine, plus an optional fourth for a
- * machine whose platform config names a fourth CPU DAI.
- */
-#define MACAUDIO_BASE_FE_LINKS	3
-#define MACAUDIO_MAX_FE_LINKS	4
-
 struct macaudio_platform_cfg {
 	bool enable_speakers;
 	enum macaudio_amp_type amp;
@@ -253,19 +246,6 @@ static struct snd_soc_dai_link macaudio_fe_links[] = {
 					SND_SOC_DAIFMT_IB_IF),
 		SND_SOC_DAILINK_REG(sense),
 	},
-	/*
-	 * Optional fourth front end, present only on machines whose platform
-	 * config names a fourth CPU DAI (J700's high-quality microphone array).
-	 * Not a DPCM front end: the array is a PDM part inside the AOP with no
-	 * codec and no serializer of ours, so there is no back end to route to
-	 * and the CPU DAI owns the firmware service itself.
-	 */
-	{
-		.name = "HQ Mic",
-		.stream_name = "HQ Mic",
-		.capture_only = 1,
-		SND_SOC_DAILINK_REG(hqmic),
-	},
 };
 
 static_assert(ARRAY_SIZE(macaudio_fe_links) == MACAUDIO_NUM_FE_LINKS);
@@ -298,9 +278,6 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
 	},
 	{
 		.is_sense = 1,
-	},
-	{
-		/* HQ Mic FE: nothing special, and only linked in when named */
 	}
 };
 
@@ -667,16 +644,6 @@ static int macaudio_get_codec_idle_props(struct device_node *np,
 	return 0;
 }
 
-/*
- * Front-end links for this machine: the optional fourth only where the
- * platform config named a fourth CPU DAI for it.
- */
-static int macaudio_num_fe_links(struct macaudio_snd_data *ma)
-{
-	return ma->cfg->fe_dai_names[MACAUDIO_BASE_FE_LINKS] ?
-		MACAUDIO_MAX_FE_LINKS : MACAUDIO_BASE_FE_LINKS;
-}
-
 static int macaudio_parse_of(struct macaudio_snd_data *ma)
 {
 	struct device_node *codec = NULL;
@@ -701,7 +668,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 	card->long_name = card->name;
 
 	/* Populate links, start with the fixed number of FE links */
-	num_links = macaudio_num_fe_links(ma);
+	num_links = ARRAY_SIZE(macaudio_fe_links);
 
 	/* Now add together the (dynamic) number of BE links */
 	for_each_available_child_of_node(dev->of_node, np) {
@@ -738,7 +705,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 	link = card->dai_link;
 	link_props = ma->link_props;
 
-	for (i = 0; i < macaudio_num_fe_links(ma); i++) {
+	for (i = 0; i < ARRAY_SIZE(macaudio_fe_links); i++) {
 		ret = macaudio_copy_link(dev, link, &macaudio_fe_links[i]);
 		if (ret)
 			goto err_free;
@@ -760,7 +727,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		card->dai_link[i].id = i;
 
 	/* We might disable the speakers, so count again */
-	num_links = macaudio_num_fe_links(ma);
+	num_links = ARRAY_SIZE(macaudio_fe_links);
 
 	/* Fill in the BEs */
 	for_each_available_child_of_node(dev->of_node, np) {
@@ -898,12 +865,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		num_links += num_bes;
 	}
 
-	for (i = 0; i < macaudio_num_fe_links(ma); i++)
+	for (i = 0; i < ARRAY_SIZE(macaudio_fe_links); i++)
 		card->dai_link[i].platforms->of_node = platform;
 
 	/* Skip the speaker sense PCM link if this amp has no sense (or no speakers) */
 	if (!ma->has_sense) {
-		for (i = 0; i < macaudio_num_fe_links(ma); i++) {
+		for (i = 0; i < ARRAY_SIZE(macaudio_fe_links); i++) {
 			if (ma->link_props[i].is_sense) {
 				memmove(&card->dai_link[i], &card->dai_link[i + 1],
 					(num_links - i - 1) * sizeof (struct snd_soc_dai_link));
@@ -1033,22 +1000,12 @@ static int macaudio_fe_startup(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		return ret;
 
-	/*
-	 * A front end with no serial bus of its own (the J700 microphone array
-	 * is a PDM part inside the AOP, reached over DMA) has no bclk-derived
-	 * rate ceiling.  Guard the division: arm64 UDIV by zero is defined to
-	 * yield 0 rather than trap, so a zero bclk_ratio would silently pin the
-	 * rate to [0,0] here and fail every open of that PCM with -EINVAL,
-	 * several steps later inside snd_pcm_hw_constraints_complete().
-	 */
-	if (props->bclk_ratio) {
-		max_rate = MACAUDIO_MAX_BCLK_FREQ / props->bclk_ratio;
-		ret = snd_pcm_hw_constraint_minmax(substream->runtime,
-						   SNDRV_PCM_HW_PARAM_RATE,
-						   0, max_rate);
-		if (ret < 0)
-			return ret;
-	}
+	max_rate = MACAUDIO_MAX_BCLK_FREQ / props->bclk_ratio;
+	ret = snd_pcm_hw_constraint_minmax(substream->runtime,
+					   SNDRV_PCM_HW_PARAM_RATE,
+					   0, max_rate);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
@@ -1298,16 +1255,6 @@ static int macaudio_fe_init(struct snd_soc_pcm_runtime *rtd)
 
 	if (props->is_sense)
 		return snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_cpu(rtd, 0), 0, 0xffff, 16, 16);
-
-	/*
-	 * A front end with no serial bus of its own has no slots to divide:
-	 * the J700 microphone array is a PDM part inside the AOP, reached over
-	 * DMA, and never crosses an I2S wire we clock.  Asking for zero slots
-	 * would return -ENOTSUPP from snd_soc_dai_set_tdm_slot(), which only
-	 * clears its initial error inside "if (slots)", and fail the card.
-	 */
-	if (!nslots)
-		return 0;
 
 	return snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_cpu(rtd, 0), (1 << nslots) - 1,
 					(1 << nslots) - 1, nslots, MACAUDIO_SLOTWIDTH);
@@ -1939,8 +1886,6 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j457    AID7    ssm3515     15      2× 1W+1T Compat: apple,j456-macaudio */
 	/* j473    AID12   sn012776    20      1× 1W */
 	{ .compatible = "apple,j473-macaudio", .data = &macaudio_j37x_j47x_cfg },
-	/* j700    AID44   max98360a   -       2× 1W (AOP-fed, no sense) */
-	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j474    AID26   sn012776    20      1× 1W    Compat: apple,j473-macaudio */
 	/* j475    AID25   sn012776    20      1× 1W    Compat: apple,j375-macaudio */
 	/* j493    AID18   sn012776    15      2× 2W */
@@ -2019,18 +1964,10 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 			link->ops = &macaudio_be_ops;
 			link->init = macaudio_be_init;
 			link->exit = macaudio_be_exit;
-		} else if (link->dynamic) {
+		} else {
 			link->ops = &macaudio_fe_ops;
 			link->init = macaudio_fe_init;
 		}
-		/*
-		 * A plain link -- neither a DPCM front end nor a back end --
-		 * gets neither set.  macaudio_fe_hw_params() insists on a
-		 * back end to route to ("no audio route configured by the
-		 * user") and there is none: the J700 microphone array is a
-		 * PDM part inside the AOP whose CPU DAI owns the firmware
-		 * service directly, with no codec to link to.
-		 */
 	}
 
 	INIT_WORK(&data->lock_update_work, macaudio_vlimit_update_work);
