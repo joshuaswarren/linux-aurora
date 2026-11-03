@@ -61,7 +61,6 @@
 #include "dma-fence.c"
 #include "dma-mapping.c"
 #include "dma-resv.c"
-#endif
 #include "drm.c"
 #include "drm_gpuvm.c"
 #include "drm_syncobj.c"
