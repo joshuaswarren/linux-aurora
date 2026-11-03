@@ -23,7 +23,6 @@ use crate::{
 };
 
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
 use core::ptr;
 use macros::vtable;
 
@@ -201,7 +200,6 @@ unsafe extern "C" fn shmem_destroy_callback<T: Operations>(
 
 impl<T: Operations> RtKit<T> {
     const VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
-        protocol_version: 0,
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
         recv_message_early: Some(recv_message_early_callback::<T>),
@@ -306,26 +304,6 @@ impl<T: Operations> RtKit<T> {
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
-    }
-
-    /// Wait for a passive HELLO/EPMAP exchange and return its exact snapshot.
-    pub fn discover_epmap(self: Pin<&mut Self>) -> Result<EpmapSnapshot> {
-        // SAFETY: `rtk` is valid per the type invariant and was constructed in
-        // discovery-only mode; the C API rejects any other mode.
-        to_result(unsafe { bindings::apple_rtkit_discover_epmap(self.rtk) })?;
-
-        let mut raw = MaybeUninit::<bindings::apple_rtkit_epmap_snapshot>::uninit();
-        // SAFETY: a successful discovery initialized the C snapshot.
-        to_result(unsafe { bindings::apple_rtkit_get_epmap_snapshot(self.rtk, raw.as_mut_ptr()) })?;
-        // SAFETY: the successful getter initialized every field.
-        let raw = unsafe { raw.assume_init() };
-
-        Ok(EpmapSnapshot {
-            raw_hello: raw.raw_hello,
-            hello_min_version: raw.hello_min_version,
-            hello_max_version: raw.hello_max_version,
-            endpoints: raw.endpoints,
-        })
     }
 
     /// Starts a non-system endpoint.

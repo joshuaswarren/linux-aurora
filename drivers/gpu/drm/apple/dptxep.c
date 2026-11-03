@@ -601,7 +601,6 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct dptxport_apcall_get_support *reply = reply_;
-	struct apple_dcp *dcp = service->ep->dcp;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;

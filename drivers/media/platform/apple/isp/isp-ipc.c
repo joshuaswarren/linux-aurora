@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
-#include <linux/module.h>
-
 #include "isp-iommu.h"
 #include "isp-ipc.h"
 #include "isp-regs.h"
@@ -199,10 +197,6 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 
 	return 0;
 }
-
-static bool fwlog;
-module_param(fwlog, bool, 0644);
-MODULE_PARM_DESC(fwlog, "Copy the ISP firmware's terminal output to the kernel log");
 
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {

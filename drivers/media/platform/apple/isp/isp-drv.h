@@ -303,12 +303,6 @@ struct apple_isp {
 
 	struct iommu_domain *domain;
 	unsigned long shift;
-	/*
-	 * Firmware-reported IOVAs carry the DART vm-base (bit 40 on t8140)
-	 * while our tables live at the low addresses: mask before comparing
-	 * or translating anything the firmware hands back.
-	 */
-	u64 fw_iova_mask;
 	struct drm_mm iovad; /* TODO iova.c can't allocate bottom-up */
 	u64 iova_size; /* size of the iovad range */
 	u64 fw_iova_mask; /* see isp_fw_iova() */

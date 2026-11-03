@@ -379,7 +379,6 @@ static int apple_isp_probe(struct platform_device *pdev)
 
 	isp->dev = dev;
 	isp->hw = of_device_get_match_data(dev);
-	isp->fw_persistent = isp->hw->gen == ISP_GEN_T8140;
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
 

@@ -28,7 +28,7 @@ static_assert(offsetof(struct dc_swap_complete_resp_h17p, swap_id) == 0);
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
-	IOMFB_METHOD("A025", dcpep_setup_video_limits), /* boot chain: 14th call inside D121, right before flush_supports_power; (0,0) */
+	IOMFB_METHOD_H17("A025", "A029", dcpep_setup_video_limits), /* (0,0) */
 	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched), /* issued from inside callback D206 */
 	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched), /* issued from inside callback D207 */
 	IOMFB_METHOD("A385", dcpep_set_create_dfb), /* first call inside D121; (0,0) */
@@ -51,18 +51,20 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	 * The default-framebuffer block macOS runs inside D121, straight after
 	 * A446 and before A025.  Sizes are the traced wire sizes.
 	 */
-	IOMFB_METHOD("A035", dcpep_get_dfb_compression_info), /* (0x8, 0x8) */
-	IOMFB_METHOD("A034", dcpep_get_dfb_info),             /* (0x2c, 0x2c) */
+	IOMFB_METHOD_H17("A035", "A039", dcpep_get_dfb_compression_info), /* (0x8, 0x8) */
+	IOMFB_METHOD_H17("A034", "A038", dcpep_get_dfb_info), /* (0x2c, 0x2c) */
 	IOMFB_METHOD("A103", dcpep_get_dfb_layout),           /* (0xc, 0x8) */
 	IOMFB_METHOD("A445", dcpep_get_dfb_state),            /* (0x4, 0x8) */
 	IOMFB_METHOD("A104", dcpep_set_dfb_dimensions),       /* (0x8, 0) w,h */
 	IOMFB_METHOD("A105", dcpep_commit_dfb_info),          /* (0, 0) */
-	IOMFB_METHOD("A033", dcpep_dfb_query),                /* (0, 0x4) */
+	IOMFB_METHOD_H17("A033", "A037", dcpep_dfb_query),    /* (0, 0x4) */
 	IOMFB_METHOD("A380", dcpep_dfb_ready_query),          /* (0, 0x4) */
 	IOMFB_METHOD("A353", dcpep_pipe_query_353),           /* (0, 0x8) */
 	IOMFB_METHOD("A352", dcpep_pipe_set_352),             /* (0x8, 0x4) {prop, value}: runtime property */
 	IOMFB_METHOD("A415", dcpep_pipe_cfg_415),             /* (0xc, 0xc) zeros */
-	IOMFB_METHOD("A031", dcpep_pipe_cfg_031),             /* (0x6c, 0) zeros */
+	/* H17G 25G76 UPPipeAP_H17GSCD::update_notify_clients_dcp builds
+	 * tag0x41303335 (A035), input0x6c, output0. */
+	IOMFB_METHOD_H17("A031", "A035", dcpep_pipe_cfg_031), /* (0x6c, 0) */
 	IOMFB_METHOD("A414", dcpep_pipe_cfg_414),             /* (0x8, 0x8) zeros */
 	IOMFB_METHOD("A478", dcpep_pipe_query_478),           /* (0, 0x4) */
 	IOMFB_METHOD("A474", dcpep_pipe_query_474),           /* (0, 0x4) */
@@ -115,14 +117,15 @@ static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 	u64 clock_request = DCP_H17P_DISP0_REG_BASE + 0x68000;
 	u64 scratch = DCP_H17P_DISP0_REG_BASE + 0x20000;
 
-	/*
-	 * DCPEXT has four display apertures, so its BWR/boost descriptors
-	 * are indices 4/5. Use those same resources for D003: firmware forms
-	 * a CPU pointer by adding (scratch - descriptor physical base) to
-	 * the mapped descriptor. Returning DISP0's address here made that
-	 * subtraction wrap and crashed firmware when power-off cleared BWR.
+	/* The T8142 DT contains the native PMC resources. The fallback above
+	 * is specific to the incomplete legacy T8140 binding.
 	 */
-	if (of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext")) {
+	if (!dcp->hw.legacy_pmc_binding) {
+		scratch = dcp->disp_bw_scratch_res.start +
+			  dcp->disp_bw_scratch_offset;
+		clock_request = dcp->disp_bw_doorbell_res.start +
+				dcp->disp_bw_doorbell_offset;
+	} else if (of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext")) {
 		scratch = dcp->disp_bw_scratch_res.start +
 			  dcp->disp_bw_scratch_offset;
 		clock_request = dcp->disp_bw_doorbell_res.start;

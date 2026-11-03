@@ -216,13 +216,25 @@ enum dcp_iomfb_method_profile {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
+	enum dcp_iomfb_method_profile iomfb_method_profile;
 	bool adopt_running_coprocessor;
 	/*
 	 * Attach to an existing RTKit session instead of restarting it.  This
-	 * requires the endpoint map to be recovered before the DCP services are
-	 * started; no current platform enables it.
+	 * uses explicit START_EP messages for the selected DCP services when
+	 * the bootloader already consumed endpoint discovery.
 	 */
 	bool adopt_live_session;
+	enum dcp_firmware_version firmware_compat;
+	/* T8140's legacy DT omits the native H17 PMC window. */
+	bool legacy_pmc_binding;
+};
+
+#define DCP_CALLBACK_TRACE_COUNT 16
+struct dcp_callback_trace {
+	char tag[4];
+	u32 in_len;
+	u32 out_len;
+	u8 input[16];
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -250,11 +262,6 @@ struct apple_dcp {
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
-	/* Locked firmware entry point supplied by iBoot. */
-	void __iomem *iop_vbar_reg;
-	bool fresh_boot_cpu_started;
-	bool adopted_session;
-	bool adopted_session_module_pinned;
 
 	/* DCP has crashed */
 	bool crashed;
@@ -315,6 +322,10 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
+	/* Atomic flushes waiting for the single-flight command channel. */
+	struct list_head pending_flushes;
+	/* Serializes the queue with command-channel dispatch. */
+	struct mutex pending_flush_lock;
 	/*
 	 * H17P: the last swap that put a surface on the panel, as built by
 	 * iomfb_flush() before the wire fix-up.  Re-presenting it is how a
@@ -382,14 +393,6 @@ struct apple_dcp {
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct delayed_work vblank_wq;
-
-	/* Names a command the firmware has stopped answering */
-	struct delayed_work stall_wq;
-	bool warned_stall;
-	bool dumped_crashlog;
-	/* the DCP crashlog region, so a stall can read the fresh record */
-	void *crashlog_buf;
-	size_t crashlog_size;
 
 	/* Names a command the firmware has stopped answering */
 	struct delayed_work stall_wq;
@@ -479,8 +482,6 @@ struct apple_dcp {
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
-void iomfb_link_timeout_snapshot(struct apple_dcp *dcp);
-void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);

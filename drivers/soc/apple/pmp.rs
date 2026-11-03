@@ -481,15 +481,19 @@ struct PmpDriver(Arc<PmpData>);
 
 /// Per-SoC configuration.
 struct PmpHwConfig {
+    /// Use the separately qualified T8152 firmware protocol.
+    t8152: bool,
     /// DMA mask to set before the firmware allocates anything, or `None` to
     /// keep the default.
     dma_mask: Option<DmaMask>,
 }
 
-const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig { dma_mask: None };
+const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig { dma_mask: None, t8152: false };
+const HW_CFG_T8152: PmpHwConfig = PmpHwConfig { dma_mask: None, t8152: true };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
 const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
+    t8152: false,
     dma_mask: Some(DmaMask::new::<42>()),
 };
 
@@ -499,6 +503,7 @@ kernel::of_device_table!(
     <PmpDriver as platform::Driver>::IdInfo,
     [
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
+        (of::DeviceId::new(c"apple,t8152-pmp-v2"), &HW_CFG_T8152),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]
 );
@@ -511,18 +516,23 @@ impl platform::Driver for PmpDriver {
     // handshake, including on the older profile; preserve ownership until reboot.
     const SUPPRESS_BIND_ATTRS: bool = true;
 
-    fn probe(
-        pdev: &platform::Device<Core>,
-        info: Option<&Self::IdInfo>,
-    ) -> impl PinInit<Self, Error> {
-        let dev: ARef<device::Device> = pdev.as_ref().into();
-        let cfg = info.ok_or(ENODEV)?;
+    fn probe(pdev: &platform::Device<Core>, info: Option<&&'static PmpHwConfig>) -> impl PinInit<Self, Error> {
+        // Allocate the platform driver's storage before starting firmware. An
+        // allocation failure after CPU_RUN must not release the device's devres.
+        pin_init::pin_init_scope(move || Ok(Self::probe_inner(pdev, info)))
+    }
+}
+
+impl PmpDriver {
+    fn probe_inner(pdev: &platform::Device<Core>, info: Option<&&'static PmpHwConfig>) -> Result<Self> {
+        let cfg = *info.ok_or(ENODEV)?;
+        let t8152 = cfg.t8152;
         if let Some(mask) = cfg.dma_mask {
-            // SAFETY: No DMA allocations or mappings exist for this device
-            // yet.
+            // SAFETY: No DMA allocations or mappings exist yet.
             unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
-        let data = PmpData::new(pdev)?;
+        let dev: ARef<device::Device> = pdev.as_ref().into();
+        let data = PmpData::new(pdev, t8152)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")

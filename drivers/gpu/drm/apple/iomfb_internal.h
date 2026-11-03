@@ -11,8 +11,7 @@ struct apple_dcp;
 typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 
 
-extern u32 dcp_clamshell_state;
-extern bool dcp_send_modeset;
+#define DCP_CLAMSHELL_STATE 1U
 
 #define DCP_THUNK_VOID(func, handle)                                         \
 	static void func(struct apple_dcp *dcp, bool oob, dcp_callback_t cb, \
@@ -103,15 +102,11 @@ extern bool dcp_send_modeset;
 	}
 
 extern bool dcp_defer_client_open;
-extern bool dcp_park_display;
 
 /* Call a DCP function given by a tag */
 void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
 		     void *cookie);
-
-bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
-				  void *in);
 
 /* Parse a callback tag "D123" into the ID 123. Returns -EINVAL on failure. */
 int dcp_parse_tag(char tag[4]);

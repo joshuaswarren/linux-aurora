@@ -265,6 +265,7 @@ static int isp_enable_irq(struct apple_isp *isp)
 		isp_err(isp, "failed to request IRQ#%u (%d)\n", isp->irq, err);
 		return err;
 	}
+
 	isp_dbg(isp, "about to enable interrupts...\n");
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0xf);

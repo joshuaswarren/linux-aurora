@@ -9,18 +9,14 @@
  */
 
 #include <linux/of.h>
-#include <linux/delay.h>
-#include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/reset.h>
-#include <linux/workqueue.h>
 
 #include "glue.h"
-#include "io.h"
 
 /*
  * This platform requires a very specific sequence of operations to bring up dwc3 and its USB3 PHY:
@@ -90,22 +86,6 @@ enum dwc3_apple_state {
 	DWC3_APPLE_SUSPENDED, /* Fixed-hub host asleep: core exited, xhci still registered */
 };
 
-#define DWC3_APPLE_MAX_ROLE_INPUTS 2
-
-struct dwc3_apple;
-
-/*
- * A fixed USB2 hub can fan one DWC3 controller out to several Type-C port
- * managers.  Give each HPM its own role-switch endpoint so a request from one
- * connector cannot overwrite the state of the other connector.
- */
-struct dwc3_apple_role_input {
-	struct dwc3_apple *appledwc;
-	struct usb_role_switch *role_sw;
-	enum usb_role role;
-	u32 index;
-};
-
 /**
  * struct dwc3_apple - Apple-specific DWC3 USB controller
  * @dwc: Core DWC3 structure
@@ -126,8 +106,6 @@ struct dwc3_apple {
 	struct device *dev;
 	struct resource *mmio_resource;
 	void __iomem *apple_regs;
-	void __iomem *dwc3_reset_regs;
-	void __iomem *xhci_regs;
 
 	struct reset_control *reset;
 	struct phy *usb2_phy;
@@ -138,13 +116,6 @@ struct dwc3_apple {
 	struct mutex lock;
 
 	enum dwc3_apple_state state;
-	/* state to restore in resume, captured by suspend */
-	enum dwc3_apple_state pm_state;
-	/* suspend left the core powered because something below can wake us */
-	bool pm_kept_powered;
-	/* Whether we armed the xHCI interrupt as a wake source; see suspend. */
-	bool pm_wake_irq_armed;
-	int pm_wake_irq;
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -172,86 +143,6 @@ struct dwc3_apple {
 #define APPLE_DWC3_CIO_PM_LC_TIMER_VALUE 0xa
 #define APPLE_DWC3_CIO_PM_ENTRY_TIMER GENMASK(7, 0)
 #define APPLE_DWC3_CIO_PM_ENTRY_TIMER_VALUE 0x10
-
-/* PIPE handler reset bits used by the ATC reset controller. */
-#define APPLE_DWC3_PIPEHANDLER_AON_GEN 0x1c
-#define APPLE_DWC3_FORCE_CLAMP_EN BIT(4)
-#define APPLE_DWC3_RESET_N BIT(0)
-
-#define XHCI_CAPLENGTH_MASK GENMASK(7, 0)
-#define XHCI_HCSPARAMS1 0x4
-#define XHCI_USBCMD 0x0
-#define XHCI_USBSTS 0x4
-#define XHCI_PORTSC_BASE 0x400
-#define XHCI_PORTSC_STRIDE 0x10
-
-static void dwc3_apple_dump_usb2_state(struct dwc3_apple *appledwc,
-				      const char *phase)
-{
-	u32 cap, hcs1, op_base, portsc;
-	u32 gusb2, gusb3, gctl;
-	unsigned int max_ports, port;
-
-	if (!appledwc->xhci_regs || !appledwc->dwc.regs)
-		return;
-
-	cap = readl(appledwc->xhci_regs);
-	hcs1 = readl(appledwc->xhci_regs + XHCI_HCSPARAMS1);
-	op_base = cap & XHCI_CAPLENGTH_MASK;
-	max_ports = (hcs1 >> 24) & 0xff;
-
-	gusb2 = dwc3_readl(&appledwc->dwc, DWC3_GUSB2PHYCFG(0));
-	gusb3 = dwc3_readl(&appledwc->dwc, DWC3_GUSB3PIPECTL(0));
-	gctl = dwc3_readl(&appledwc->dwc, DWC3_GCTL);
-
-	dev_info(appledwc->dev,
-		 "J700_USB2_CORE_STATE: phase=%s GUSB2PHYCFG=%08x SUSPHY2=%u GUSB3PIPECTL=%08x SUSPHY3=%u GCTL=%08x USBCMD=%08x USBSTS=%08x ports=%u\n",
-		 phase, gusb2, !!(gusb2 & DWC3_GUSB2PHYCFG_SUSPHY),
-		 gusb3, !!(gusb3 & DWC3_GUSB3PIPECTL_SUSPHY), gctl,
-		 readl(appledwc->xhci_regs + op_base + XHCI_USBCMD),
-		 readl(appledwc->xhci_regs + op_base + XHCI_USBSTS),
-		 max_ports);
-
-	for (port = 0; port < min(max_ports, 4U); port++) {
-		portsc = readl(appledwc->xhci_regs + op_base +
-			       XHCI_PORTSC_BASE + port * XHCI_PORTSC_STRIDE);
-		dev_info(appledwc->dev,
-			 "J700_USB2_ROOT_PORT: phase=%s port=%u PORTSC=%08x CCS=%u PED=%u PLS=%u PP=%u SPEED=%u CSC=%u PEC=%u PRC=%u PLC=%u\n",
-			 phase, port + 1, portsc, !!(portsc & BIT(0)),
-			 !!(portsc & BIT(1)), (portsc >> 5) & 0xf,
-			 !!(portsc & BIT(9)), (portsc >> 10) & 0xf,
-			 !!(portsc & BIT(17)), !!(portsc & BIT(18)),
-			 !!(portsc & BIT(21)), !!(portsc & BIT(22)));
-	}
-}
-
-static int dwc3_apple_reset_assert(struct dwc3_apple *appledwc)
-{
-	u32 value;
-
-	if (appledwc->reset)
-		return reset_control_assert(appledwc->reset);
-
-	value = readl(appledwc->dwc3_reset_regs + APPLE_DWC3_PIPEHANDLER_AON_GEN);
-	value &= ~APPLE_DWC3_RESET_N;
-	value |= APPLE_DWC3_FORCE_CLAMP_EN;
-	writel(value, appledwc->dwc3_reset_regs + APPLE_DWC3_PIPEHANDLER_AON_GEN);
-	return 0;
-}
-
-static int dwc3_apple_reset_deassert(struct dwc3_apple *appledwc)
-{
-	u32 value;
-
-	if (appledwc->reset)
-		return reset_control_deassert(appledwc->reset);
-
-	value = readl(appledwc->dwc3_reset_regs + APPLE_DWC3_PIPEHANDLER_AON_GEN);
-	value &= ~APPLE_DWC3_FORCE_CLAMP_EN;
-	value |= APPLE_DWC3_RESET_N;
-	writel(value, appledwc->dwc3_reset_regs + APPLE_DWC3_PIPEHANDLER_AON_GEN);
-	return 0;
-}
 
 static inline void dwc3_apple_writel(struct dwc3_apple *appledwc, u32 offset, u32 value)
 {
@@ -400,7 +291,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	if (ret)
 		dev_warn(appledwc->dev, "Failed to set the USB2 PHY mode, err=%d\n", ret);
 
-	ret = dwc3_apple_reset_deassert(appledwc);
+	ret = reset_control_deassert(appledwc->reset);
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
 		return ret;
@@ -418,8 +309,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	 * Now that the core is initialized and already went through dwc3_core_soft_reset we can
 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
 	 */
-	if (!appledwc->legacy_fixed_usb2)
-		dwc3_apple_setup_cio(appledwc);
+	dwc3_apple_setup_cio(appledwc);
 
 	return 0;
 }
@@ -539,7 +429,7 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 	dwc3_core_exit(&appledwc->dwc);
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 
-	ret = dwc3_apple_reset_assert(appledwc);
+	ret = reset_control_assert(appledwc->reset);
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to assert reset, err=%d\n", ret);
 		return ret;
@@ -548,11 +438,9 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 	return 0;
 }
 
-static void dwc3_apple_usb2_retry_work(struct work_struct *work)
+static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role role)
 {
-	struct dwc3_apple *appledwc =
-		container_of(to_delayed_work(work), struct dwc3_apple,
-			     usb2_retry_work);
+	struct dwc3_apple *appledwc = usb_role_switch_get_drvdata(sw);
 	int ret;
 
 	guard(mutex)(&appledwc->lock);
@@ -622,200 +510,6 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
 	}
 }
 
-static int dwc3_apple_role_input_set(struct usb_role_switch *sw,
-				      enum usb_role role)
-{
-	struct dwc3_apple_role_input *input =
-		usb_role_switch_get_drvdata(sw);
-	struct dwc3_apple *appledwc = input->appledwc;
-	enum usb_role old_role;
-	int ret = 0;
-
-	guard(mutex)(&appledwc->lock);
-
-	old_role = input->role;
-	input->role = role;
-
-	/*
-	 * The VL122 is the controller's permanent USB2 peer.  HPM roles describe
-	 * downstream connectors, so NONE or DEVICE on either input must never
-	 * tear down the shared host.  Preserve the per-input state for hotplug
-	 * diagnostics while presenting the only valid aggregate: HOST.
-	 */
-	if (appledwc->state != DWC3_APPLE_HOST) {
-		ret = dwc3_apple_exit(appledwc);
-		if (!ret)
-			ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
-	}
-
-	/*
-	 * Only the rear/DFU-side connector (input 0) owns the direct ATC lanes.
-	 * CD321x calls its Type-C mux before this role-switch endpoint, including
-	 * for same-role mode changes. Re-issue the aggregate host mode here so
-	 * the live DWC PIPE follows USB3 <-> dummy transitions without tearing
-	 * down the fixed USB2 hub and its downstream devices.
-	 */
-	if (!ret && input->index == 0 &&
-	    appledwc->dwc.usb3_generic_phy[0]) {
-		int pipe_ret;
-
-		pipe_ret = phy_set_mode(appledwc->dwc.usb3_generic_phy[0],
-					PHY_MODE_USB_HOST);
-		if (pipe_ret)
-			dev_warn(appledwc->dev,
-				 "J700_USB3_PIPE_SYNC_FAIL: requested=%d err=%d\n",
-				 role, pipe_ret);
-		else
-			dev_info(appledwc->dev,
-				 "J700_USB3_PIPE_SYNC_PASS: requested=%d aggregate=host\n",
-				 role);
-	}
-
-	/*
-	 * CD321x resets the stateful eUSB2 repeater out-of-band when a cable is
-	 * connected.  The fixed-hub policy deliberately keeps DWC3/xHCI alive,
-	 * so it must still perform Apple's matching 5-ms USB2 PHY port reset or
-	 * xHCI can retain the disconnect state without delivering a new connect
-	 * event.  Apply it to every real NONE -> HOST transition, including the
-	 * connected-at-boot notification: the qualified fixed-hub DT deliberately
-	 * has no apple,j700-usb2-retry-reset property, so usb2_retry_done is not a
-	 * valid readiness gate for this independent hotplug synchronization.
-	 */
-	if (!ret && appledwc->usb2_hub_always_on &&
-	    old_role == USB_ROLE_NONE &&
-	    role == USB_ROLE_HOST && appledwc->dwc.usb2_generic_phy[0]) {
-		dwc3_apple_dump_usb2_state(appledwc, "hotplug-pre-reset");
-		ret = phy_reset(appledwc->dwc.usb2_generic_phy[0]);
-		dwc3_apple_dump_usb2_state(appledwc, "hotplug-post-reset");
-		if (ret)
-			dev_err(appledwc->dev,
-				"J700_USB2_HOTPLUG_RESET_FAIL: input=%u old=%d requested=%d err=%d\n",
-				input->index, old_role, role, ret);
-		else
-			dev_info(appledwc->dev,
-				 "J700_USB2_HOTPLUG_RESET_PASS: input=%u old=%d requested=%d pulse_ms=5\n",
-				 input->index, old_role, role);
-	}
-
-	dev_info(appledwc->dev,
-		 "J700_USB2_FAKE_MUX_INPUT: input=%u old=%d requested=%d aggregate=%d roles=%d/%d state=%d ret=%d\n",
-		 input->index, old_role, role, USB_ROLE_HOST,
-		 appledwc->role_inputs[0].role,
-		 appledwc->role_inputs[1].role, appledwc->state, ret);
-
-	/*
-	 * A connected-at-boot HPM event is the best available indication that
-	 * the slow fixed hub can now be observed.  Keep the one-time delayed
-	 * DWC3 retry armed, but never reset an already enumerated hub for later
-	 * downstream hotplug events.
-	 */
-	if (!ret && old_role != role && appledwc->usb2_retry_reset &&
-	    !appledwc->usb2_retry_done)
-		mod_delayed_work(system_wq, &appledwc->usb2_retry_work,
-				 msecs_to_jiffies(5000));
-
-	return ret;
-}
-
-static enum usb_role
-dwc3_apple_role_input_get(struct usb_role_switch *sw)
-{
-	struct dwc3_apple_role_input *input =
-		usb_role_switch_get_drvdata(sw);
-	struct dwc3_apple *appledwc = input->appledwc;
-	enum usb_role role;
-
-	guard(mutex)(&appledwc->lock);
-	role = input->role;
-
-	return role;
-}
-
-static void dwc3_apple_remove_role_inputs(struct dwc3_apple *appledwc)
-{
-	while (appledwc->num_role_inputs) {
-		struct dwc3_apple_role_input *input =
-			&appledwc->role_inputs[--appledwc->num_role_inputs];
-
-		usb_role_switch_unregister(input->role_sw);
-		input->role_sw = NULL;
-	}
-}
-
-static int dwc3_apple_setup_role_inputs(struct dwc3_apple *appledwc)
-{
-	struct fwnode_handle *inputs, *child = NULL;
-	struct usb_role_switch_desc desc = { };
-	int ret = 0;
-
-	if (!appledwc->usb2_hub_always_on)
-		return 0;
-
-	inputs = device_get_named_child_node(appledwc->dev,
-					     "usb2-role-inputs");
-	if (!inputs)
-		return dev_err_probe(appledwc->dev, -EINVAL,
-				     "Missing fixed-hub role inputs\n");
-
-	while ((child = fwnode_get_next_child_node(inputs, child))) {
-		struct dwc3_apple_role_input *input;
-		const char *name;
-		u32 index;
-
-		if (!fwnode_property_present(child, "usb-role-switch"))
-			continue;
-		if (appledwc->num_role_inputs >= DWC3_APPLE_MAX_ROLE_INPUTS) {
-			ret = -E2BIG;
-			break;
-		}
-
-		input = &appledwc->role_inputs[appledwc->num_role_inputs];
-		index = appledwc->num_role_inputs;
-		fwnode_property_read_u32(child, "reg", &index);
-		input->appledwc = appledwc;
-		input->index = index;
-		input->role = USB_ROLE_NONE;
-
-		name = devm_kasprintf(appledwc->dev, GFP_KERNEL,
-				       "%s-usb2-input%u",
-				       dev_name(appledwc->dev), index);
-		if (!name) {
-			ret = -ENOMEM;
-			break;
-		}
-
-		desc.fwnode = child;
-		desc.set = dwc3_apple_role_input_set;
-		desc.get = dwc3_apple_role_input_get;
-		desc.driver_data = input;
-		desc.name = name;
-		input->role_sw = usb_role_switch_register(appledwc->dev,
-							 &desc);
-		if (IS_ERR(input->role_sw)) {
-			ret = PTR_ERR(input->role_sw);
-			input->role_sw = NULL;
-			break;
-		}
-
-		appledwc->num_role_inputs++;
-	}
-	fwnode_handle_put(child);
-	fwnode_handle_put(inputs);
-
-	if (!ret && appledwc->num_role_inputs != DWC3_APPLE_MAX_ROLE_INPUTS)
-		ret = -EINVAL;
-	if (ret) {
-		dwc3_apple_remove_role_inputs(appledwc);
-		return dev_err_probe(appledwc->dev, ret,
-				     "Failed to register fixed-hub role inputs\n");
-	}
-
-	dev_info(appledwc->dev,
-		 "J700_USB2_FAKE_MUX_READY: inputs=%u aggregate=host hub=always-on\n",
-		 appledwc->num_role_inputs);
-	return 0;
-}
-
 static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 {
 	struct usb_role_switch_desc dwc3_role_switch = { NULL };
@@ -852,42 +546,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	mutex_init(&appledwc->lock);
-	INIT_DELAYED_WORK(&appledwc->usb2_retry_work,
-			  dwc3_apple_usb2_retry_work);
-	appledwc->force_usb2_host = device_property_read_bool(dev, "apple,force-usb2-host");
-	appledwc->usb2_hub_always_on = device_property_read_bool(
-		dev, "apple,usb2-hub-always-on");
-	if (appledwc->legacy_fixed_usb2) {
-		appledwc->force_usb2_host = true;
-		appledwc->usb2_hub_always_on = true;
-	}
-	appledwc->usb2_retry_reset =
-		device_property_read_bool(dev, "apple,j700-usb2-retry-reset");
 
-	/*
-	 * Declare this controller wakeup-capable before the dwc3 core probes.
-	 *
-	 * dwc3 core latches dwc->sys_wakeup = device_may_wakeup(dwc->sysdev)
-	 * once, and dwc3_host_init() only propagates wakeup to the xHCI child
-	 * when that flag is set.  Without it the child never becomes a wakeup
-	 * device, its interrupt is never armed with enable_irq_wake(), and
-	 * s2idle has nothing that can end it: /sys/kernel/irq/<xhci>/wakeup
-	 * reads "disabled" and a Wake-on-LAN magic packet to a USB Ethernet
-	 * adapter is simply ignored -- measured on J700, where the machine
-	 * suspended correctly and then had to be recovered with a VDM reset.
-	 *
-	 * The core probe is deferred here until the first cable event, so this
-	 * has to happen in the glue probe rather than alongside it.
-	 */
-	device_init_wakeup(dev, true);
-
-	appledwc->reset = devm_reset_control_get_optional_exclusive(dev, NULL);
+	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(appledwc->reset))
 		return dev_err_probe(&pdev->dev, PTR_ERR(appledwc->reset),
 				     "Failed to get reset control\n");
-	if (!appledwc->reset) {
-		if (!appledwc->force_usb2_host && !appledwc->usb2_hub_always_on)
-			return dev_err_probe(dev, -ENODEV, "Missing reset control\n");
 
 	appledwc->usb2_phy = devm_phy_get(dev, "usb2-phy");
 	if (IS_ERR(appledwc->usb2_phy))
@@ -905,35 +568,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	/*
-	 * J700 routes the external USB-C connectors through an onboard VIA hub.
-	 * iBoot can leave the hub in reset across handoff, so pulse its dedicated
-	 * active-low reset before the host controller starts enumerating devices.
-	 */
-	appledwc->hub_reset_gpio = devm_gpiod_get_optional(dev, "hub-reset",
-							 GPIOD_OUT_HIGH);
-	if (IS_ERR(appledwc->hub_reset_gpio))
-		return dev_err_probe(dev, PTR_ERR(appledwc->hub_reset_gpio),
-				     "Failed to acquire onboard hub reset GPIO\n");
-	if (appledwc->hub_reset_gpio) {
-		usleep_range(100, 200);
-		gpiod_set_value_cansleep(appledwc->hub_reset_gpio, 0);
-		/* The VL122 is not ready in time for an immediate DWC3 reset. */
-		msleep(5000);
-		dev_info(dev, "pulsed onboard USB hub reset; 5s settle complete\n");
-	}
-
 	appledwc->mmio_resource = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dwc3-core");
 	if (!appledwc->mmio_resource) {
 		dev_err(dev, "Failed to get DWC3 MMIO\n");
 		return -EINVAL;
 	}
-	appledwc->xhci_regs = devm_ioremap(dev, appledwc->mmio_resource->start,
-					   min_t(resource_size_t,
-						 resource_size(appledwc->mmio_resource),
-						 0x1000));
-	if (!appledwc->xhci_regs)
-		return dev_err_probe(dev, -ENOMEM, "Failed to map xHCI diagnostics\n");
 
 	appledwc->apple_regs = devm_platform_ioremap_resource_byname(pdev, "dwc3-apple");
 	if (IS_ERR(appledwc->apple_regs))
@@ -951,26 +590,6 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
-	ret = dwc3_apple_setup_role_inputs(appledwc);
-	if (ret) {
-		usb_role_switch_unregister(appledwc->role_sw);
-		return ret;
-	}
-
-	if (appledwc->force_usb2_host || appledwc->usb2_hub_always_on) {
-		ret = dwc3_usb_role_switch_set(appledwc->role_sw, USB_ROLE_HOST);
-		if (ret) {
-			dwc3_apple_remove_role_inputs(appledwc);
-			usb_role_switch_unregister(appledwc->role_sw);
-			return dev_err_probe(dev, ret, "Failed to force USB2 host mode\n");
-		}
-		if (appledwc->usb2_hub_always_on)
-			dev_info(dev,
-				 "J700_USB2_HUB_ALWAYS_ON: shared USB2 host initialized independently of HPM cable state\n");
-		else
-			dev_info(dev,
-				 "USB2-only host mode active; ATC/SuperSpeed disabled\n");
-	}
 
 	if (!appledwc->fixed_hub)
 		return 0;
@@ -998,10 +617,8 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	struct dwc3 *dwc = platform_get_drvdata(pdev);
 	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
 
-	cancel_delayed_work_sync(&appledwc->usb2_retry_work);
 	guard(mutex)(&appledwc->lock);
 
-	dwc3_apple_remove_role_inputs(appledwc);
 	usb_role_switch_unregister(appledwc->role_sw);
 
 	/*

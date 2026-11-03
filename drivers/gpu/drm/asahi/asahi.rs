@@ -27,6 +27,7 @@ mod g17_completion;
 mod g17_config;
 mod g17_compute;
 mod g17_drm;
+mod m5_drm;
 mod g17_dep_stats;
 mod gem_stats;
 mod g17_dvfs_parity;
@@ -61,6 +62,31 @@ mod g17_rtkit;
 mod g17_submission;
 mod g17_trace_capture;
 mod g17_uapi;
+mod g18_compute;
+mod g18_compute_inputs;
+mod g18_compute_metadata;
+mod g18_compute_plan;
+mod g18_compute_memory;
+mod g18_compute_state;
+mod g18_compute_payload;
+mod g18_compute_triangle;
+mod g18_graphics_payload;
+mod g18_address_map;
+mod g18_render;
+mod g18_application;
+mod g18_drm;
+mod g18_application_runtime;
+mod g18_render_command;
+mod g18_render_assembly;
+mod g18_render_stage;
+mod g18_render_passthrough;
+mod g18_render_policy;
+mod g18_render_pixels;
+mod g18_parameter_buffer;
+use g17_resources::g18_graphics_queues;
+mod g18_scheduler;
+mod g18_live_boot;
+mod g18_uma;
 mod gem;
 mod gpu;
 mod hw;
@@ -260,7 +286,10 @@ kernel::prelude::module! {
         // set on the insmod command line. Looking for one in sysfs and not
         // finding it does not mean the build lacks it; check
         // `strings asahi.ko | grep parmtype=` instead. This cost a hardware
-        // cycle once already.
+        // cycle once already. The exceptions are registered outside this
+        // block: the 0644 g18_app_* application-compute knobs
+        // (g18_application_compute_resources.rs) ARE in sysfs and are read
+        // at every compute submission.
         g17p_vm_probe_va: u64 {
             default: 0,
             description: "Diagnostic GPU virtual address to inspect; 0 disables the probe",

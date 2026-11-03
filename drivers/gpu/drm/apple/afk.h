@@ -219,7 +219,6 @@ struct afk_ringbuffer {
 	u32 rptr;
 	void *buf;
 	size_t bufsz;
-	u32 block_size;
 };
 
 static inline __le32 *afk_rb_field(struct afk_ringbuffer *bfr, unsigned int idx)
@@ -253,7 +252,6 @@ struct apple_dcp_afkep {
 
 	spinlock_t lock;
 	u16 qe_seq;
-	u8 rx_log_count;
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
@@ -269,7 +267,6 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 int afk_start(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
-void afk_log_tx_state(struct apple_dcp_afkep *ep, const char *phase);
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		  enum epic_type etype, enum epic_category ecat, u8 stype,
 		  const void *payload, size_t payload_len);

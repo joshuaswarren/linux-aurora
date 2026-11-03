@@ -120,18 +120,6 @@ int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base)
 	return CISP_SEND_IN(isp, args);
 }
 
-int isp_cmd_set_dsid_clr_multi_bc_reg_base(struct apple_isp *isp,
-					   u64 dsid_clr_base, u32 dsid_clr_range)
-{
-	struct cmd_set_dsid_clr_multi_bc_reg_base args = {
-		.opcode = CISP_OPCODE(CISP_CMD_SET_DSID_CLR_MULTI_BC_REG_BASE),
-		.count = 1,
-		.dsid_clr_range = dsid_clr_range,
-		.dsid_clr_base = dsid_clr_base,
-	};
-	return CISP_SEND_IN(isp, args);
-}
-
 int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
 				   u64 dsid_clr_base3, u32 dsid_clr_range0,

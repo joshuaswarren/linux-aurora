@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Actual host count publisher plus saved B1 AArch64 retirement predicate."""
 from pathlib import Path
-import hashlib,subprocess,tempfile,re
+import subprocess,tempfile,re
 p=Path(__file__).resolve().parents[1]
 s=(p/'g17_resources.rs').read_text();start=s.index('    pub(crate) fn publish_compute_submitted_count(');end=s.index('\n    /// Zero the completion stamp',start);method=s[start:end]
 mock=r'''

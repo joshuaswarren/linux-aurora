@@ -386,7 +386,7 @@
 			#performance-domain-cells = <0>;
 		};
 
-		i2c0: i2c@235010000 {
+		i2c0: i2c@2a1010000 {
 			compatible = "apple,t8122-i2c", "apple,t8103-i2c";
 			reg = <0x2 0xa1010000 0x0 0x4000>;
 			clocks = <&clkref>;

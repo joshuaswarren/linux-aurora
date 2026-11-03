@@ -244,6 +244,9 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
     pub(crate) layers: u16,
+    /// Sample count: 1, 2 or 4. Defaults to 1, so every existing parameter
+    /// vector keeps its exact register program.
+    pub(crate) samples: u8,
     pub(crate) utile_width: u8,
     pub(crate) utile_height: u8,
     pub(crate) utile_config: u64,
@@ -327,6 +330,30 @@ pub(crate) struct G17pRenderParameters {
 }
 
 impl G17pRenderParameters {
+    /// Apply the witnessed multisample register triple for a sample count.
+    ///
+    /// Captured constants, not derived: from Apple's own renders on this part
+    /// (logs/m5-msaa-native-hv-20260915-101837) at one, two and four samples,
+    /// with a same-mode control in a second oracle process establishing the
+    /// noise floor. `multisample_control` is the sample POSITION table --
+    /// 0x88 is the centre (8,8), 0x44cc is (4,4),(12,12), and 0xeaa26e26
+    /// unpacks to (14,10),(10,2),(6,14),(2,6), the rotated-grid 4x pattern in
+    /// 1/16 pixel units. `utile_config`'s low nibble is log2(samples);
+    /// `tib_blocks` is samples << 16, zero at one sample.
+    pub(crate) fn set_samples(&mut self, samples: u8) -> bool {
+        let (multisample_control, utile_config, tib_blocks) = match samples {
+            1 => (0x88, 0xa000, 0),
+            2 => (0x44cc, 0xa001, 0x2_0000),
+            4 => (0xeaa2_6e26, 0x6002, 0x4_0000),
+            _ => return false,
+        };
+        self.samples = samples;
+        self.multisample_control = multisample_control;
+        self.utile_config = utile_config;
+        self.tib_blocks = tib_blocks;
+        true
+    }
+
     pub(crate) const fn source_rsrc8() -> Self {
         Self {
             width: 64,
@@ -372,6 +399,7 @@ impl G17pRenderParameters {
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
             layers: 1,
+            samples: 1,
             utile_width: 32,
             utile_height: 32,
             utile_config: 0xa000,
@@ -442,6 +470,15 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
     }
     let utiles_per_tile_x = TILE_WIDTH / utile_width as u64;
     let utiles_per_tile_y = TILE_HEIGHT / utile_height as u64;
+    // Four samples split the utile in Y. Measured against Apple's own
+    // four-sample render: size1 0x14 -> 0x28, size3 0x20 -> 0x40 and
+    // macro_size 0x40004 -> 0x40008, where only the y term moves. All three
+    // follow from doubling this one term; two samples do not split.
+    let utiles_per_tile_y = if parameters.samples == 4 {
+        utiles_per_tile_y * 2
+    } else {
+        utiles_per_tile_y
+    };
     let utiles_per_tile = utiles_per_tile_x * utiles_per_tile_y;
     let mtile_x1 = align((tiles_x + MACRO_TILES_X - 1) / MACRO_TILES_X, 4);
     let mtile_y1 = align((tiles_y + MACRO_TILES_Y - 1) / MACRO_TILES_Y, 4);
@@ -596,7 +633,12 @@ fn build_ta_registers_for_work_key(
         RegisterWrite::new(0x1c8f8, 0x8860),
         RegisterWrite::new(0x1c0b1, g.size1),
         RegisterWrite::new(0x1c850, g.size1),
-        RegisterWrite::new(0x10131, p.multisample_control),
+        // Silicon holds 0x10131 at 0x88 at ONE, TWO and FOUR samples while
+        // 0x10139 carries the real sample position table (all five captures in
+        // logs/m5-msaa-native-hv-20260915-101837). Driving this from
+        // multisample_control would write the position table here, which
+        // Apple never does.
+        RegisterWrite::new(0x10131, 0x88),
         RegisterWrite::new(0x10121, p.ppp_control),
         RegisterWrite::new(0x10129, g.pixels),
         RegisterWrite::new(0x101b9, g.screen),
@@ -864,7 +906,7 @@ pub(crate) const fn g17p_render_lifecycle_pair(
     ))
 }
 
-fn partial_store_registers(
+pub(crate) fn partial_store_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_STORE_REGISTER_COUNT] {
     [
@@ -887,7 +929,7 @@ fn partial_store_registers(
     ]
 }
 
-fn partial_resume_registers(
+pub(crate) fn partial_resume_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_RESUME_REGISTER_COUNT] {
     [
@@ -917,7 +959,7 @@ fn partial_resume_registers(
     ]
 }
 
-fn partial_load_registers(
+pub(crate) fn partial_load_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_LOAD_REGISTER_COUNT] {
     [
@@ -1139,16 +1181,34 @@ pub(crate) fn build_ta_descriptor(
     if raw.len() < TA_DESCRIPTOR_SIZE {
         return Err(RenderBuildError::BufferTooSmall);
     }
-    raw[..TA_DESCRIPTOR_SIZE].fill(0);
     let registers = build_ta_registers_for_work_key(
         parameters,
         render_work_key(metadata.context_id, metadata.command_buffer_state_word),
     )?;
+    build_ta_descriptor_base(parameters, objects, metadata, &registers, raw)?;
+    apply_g17p_ta_oracle(raw);
+    Ok(())
+}
+
+pub(crate) fn build_ta_descriptor_base(
+    parameters: &G17pRenderParameters,
+    objects: RenderDescriptorObjects,
+    metadata: RenderDescriptorMetadata,
+    registers: &[RegisterWrite],
+    raw: &mut [u8],
+) -> Result<(), RenderBuildError> {
+    if raw.len() < TA_DESCRIPTOR_SIZE {
+        return Err(RenderBuildError::BufferTooSmall);
+    }
+    if registers.is_empty() || registers.len() > (0x660 - 0x60) / REGISTER_BYTES {
+        return Err(RenderBuildError::BufferTooSmall);
+    }
+    raw[..TA_DESCRIPTOR_SIZE].fill(0);
     write_common_descriptor(
         RenderDescriptorKind::Tiling,
         objects,
         metadata,
-        &registers,
+        registers,
         raw,
     );
 
@@ -1166,7 +1226,11 @@ pub(crate) fn build_ta_descriptor(
     } else {
         parameters.sampler_count + 1
     };
-    put_u32(raw, 0x0768, 0x036c_0049);
+    put_u32(
+        raw,
+        0x0768,
+        (((registers.len() * REGISTER_BYTES) as u32) << 16) | registers.len() as u32,
+    );
     put_u64(raw, 0x0780, parameters.tpc);
     // Native copies RTMemory's geometry-derived TPC size beside its pointer
     // on every submission (25G83 88fd970..974), independent of queue lifetime.
@@ -1193,7 +1257,6 @@ pub(crate) fn build_ta_descriptor(
     // are deliberately unaligned in the native 0x9c0-byte command layout.
     put_u32(raw, 0x086e, (parameters.lifecycle >> 32) as u32);
     put_u64(raw, 0x08ce, parameters.lifecycle as u32 as u64);
-    apply_g17p_ta_oracle(raw);
     Ok(())
 }
 
@@ -1215,7 +1278,15 @@ pub(crate) fn build_cold_opening_ta_descriptor(
     metadata.ta_hardware_buffer_id = ta_hardware_buffer_id;
     build_ta_descriptor(parameters, objects, metadata, raw)?;
     put_u8(raw, 0x93e, 0xd0);
-    put_u8(raw, 0x93f, if parameters.native_pm_bytes { 0x87 } else { 0x91 });
+    put_u8(
+        raw,
+        0x93f,
+        if parameters.native_pm_bytes {
+            0x87
+        } else {
+            0x91
+        },
+    );
     Ok(())
 }
 
@@ -1234,6 +1305,13 @@ fn put_embedded_registers(
     encode_registers(raw, program_offset, registers);
 }
 
+pub(crate) struct G17pFragmentRegisters<'a> {
+    pub(crate) main: &'a [RegisterWrite],
+    pub(crate) store: &'a [RegisterWrite],
+    pub(crate) resume: &'a [RegisterWrite],
+    pub(crate) load: &'a [RegisterWrite],
+}
+
 pub(crate) fn build_fragment_descriptor(
     parameters: &G17pRenderParameters,
     objects: RenderDescriptorObjects,
@@ -1243,18 +1321,55 @@ pub(crate) fn build_fragment_descriptor(
     if raw.len() < FRAGMENT_DESCRIPTOR_SIZE {
         return Err(RenderBuildError::BufferTooSmall);
     }
-    raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);
-    let geometry = geometry(parameters)?;
     let registers = build_fragment_registers_for_work_key(
         parameters,
         render_work_key(metadata.context_id, metadata.command_buffer_state_word),
     )?;
-    let register_count = FRAGMENT_REGISTER_COUNT;
+    let store = partial_store_registers(parameters);
+    let resume = partial_resume_registers(parameters);
+    let load = partial_load_registers(parameters);
+    build_fragment_descriptor_base(
+        parameters,
+        objects,
+        metadata,
+        G17pFragmentRegisters {
+            main: &registers,
+            store: &store,
+            resume: &resume,
+            load: &load,
+        },
+        raw,
+    )?;
+    apply_g17p_fragment_oracle(raw);
+    Ok(())
+}
+
+pub(crate) fn build_fragment_descriptor_base(
+    parameters: &G17pRenderParameters,
+    objects: RenderDescriptorObjects,
+    metadata: RenderDescriptorMetadata,
+    programs: G17pFragmentRegisters<'_>,
+    raw: &mut [u8],
+) -> Result<(), RenderBuildError> {
+    if raw.len() < FRAGMENT_DESCRIPTOR_SIZE {
+        return Err(RenderBuildError::BufferTooSmall);
+    }
+    if programs.main.is_empty()
+        || programs.main.len() > (0x6a0 - 0xa0) / REGISTER_BYTES
+        || programs.store.len() > (0xec0 - 0x7c0) / REGISTER_BYTES
+        || programs.resume.len() > (0x15e0 - 0xee0) / REGISTER_BYTES
+        || programs.load.len() > (0x1d00 - 0x1600) / REGISTER_BYTES
+    {
+        return Err(RenderBuildError::BufferTooSmall);
+    }
+    raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);
+    let geometry = geometry(parameters)?;
+    let register_count = programs.main.len();
     write_common_descriptor(
         RenderDescriptorKind::Fragment,
         objects,
         metadata,
-        &registers[..register_count],
+        programs.main,
         raw,
     );
 
@@ -1287,9 +1402,9 @@ pub(crate) fn build_fragment_descriptor(
         0x07a8,
         (((register_count * REGISTER_BYTES) as u32) << 16) | register_count as u32,
     );
-    put_embedded_registers(raw, 0x0ec8, 0x07c0, &partial_store_registers(parameters));
-    put_embedded_registers(raw, 0x15e8, 0x0ee0, &partial_resume_registers(parameters));
-    put_embedded_registers(raw, 0x1d08, 0x1600, &partial_load_registers(parameters));
+    put_embedded_registers(raw, 0x0ec8, 0x07c0, programs.store);
+    put_embedded_registers(raw, 0x15e8, 0x0ee0, programs.resume);
+    put_embedded_registers(raw, 0x1d08, 0x1600, programs.load);
 
     put_u64(raw, 0x1d20, parameters.depth_bias_array);
     put_u64(raw, 0x1d30, parameters.scissor_array);
@@ -1311,47 +1426,6 @@ pub(crate) fn build_fragment_descriptor(
     put_u64(raw, 0x1f9c, parameters.partial_store_pipeline);
     put_u32(raw, 0x1fa8, parameters.depth_clear_value_bits);
     put_u64(raw, 0x1fac, (parameters.tib_blocks << 33) | 0x300);
-    // ORACLE BISECT. Native's 3D command record (recs3.txt, 0x2240 stride, so
-    // this is the record itself and not the next one) differs from ours in 73
-    // of 1096 qwords; all but a dozen are allocation addresses. These are the
-    // STRUCTURAL ones -- values we leave zero or set differently, that are not
-    // pointers -- gathered behind one bitmask so they can be bisected without a
-    // rebuild each time. The fragment executes on DM0 and writes NO pixels, so
-    // one of these is a candidate for the missing store.
-    {
-        let oracle = crate::g17_config::FRAG_ORACLE;
-        if oracle & 0x01 != 0 {
-            put_u64(raw, 0x158, 0x7007);
-        }
-        if oracle & 0x02 != 0 {
-            put_u64(raw, 0x488, 1);
-        }
-        if oracle & 0x04 != 0 {
-            // native 0x8000005300000000 against our 0x0000005300000000
-            let mut cur = [0u8; 8];
-            cur.copy_from_slice(&raw[0x21c8..0x21d0]);
-            put_u64(raw, 0x21c8, u64::from_le_bytes(cur) | (1u64 << 63));
-        }
-        if oracle & 0x08 != 0 {
-            put_u64(raw, 0x78, 0x40);
-        }
-        if oracle & 0x10 != 0 {
-            put_u64(raw, 0x458, 3);
-            put_u64(raw, 0x470, 0x500);
-        }
-        if oracle & 0x20 != 0 {
-            put_u64(raw, 0x1f48, 0x0000_0100_0000_0100);
-        }
-        if oracle & 0x40 != 0 {
-            // fields native leaves ZERO and we populate
-            put_u64(raw, 0x1d0, 0);
-            put_u64(raw, 0x1f0, 0);
-            put_u64(raw, 0x1f8, 0);
-        }
-        if oracle & 0x80 != 0 {
-            put_u32(raw, 0x1d8 + 4, 0x3f80_0000);
-        }
-    }
     // Native copies isMemorylessRender through the UMD render record +0x240,
     // parsed record +0x1b8, and host descriptor +0x8bf into this byte. It is
     // not a TIB-size predicate: native's memoryless policy also selects the
@@ -1399,6 +1473,43 @@ pub(crate) fn build_fragment_descriptor(
     put_u8(raw, 0x220c, 1);
     put_u8(raw, 0x222d, g17p_frg_hwdsid_mode());
     Ok(())
+}
+
+fn apply_g17p_fragment_oracle(raw: &mut [u8]) {
+    // Neo diagnostic overrides stay outside the shared encoder so M5
+    // register programs and geometry never inherit these substitutions.
+    let oracle = crate::g17_config::FRAG_ORACLE;
+    if oracle & 0x01 != 0 {
+        put_u64(raw, 0x158, 0x7007);
+    }
+    if oracle & 0x02 != 0 {
+        put_u64(raw, 0x488, 1);
+    }
+    if oracle & 0x04 != 0 {
+        // native 0x8000005300000000 against our 0x0000005300000000
+        let mut cur = [0u8; 8];
+        cur.copy_from_slice(&raw[0x21c8..0x21d0]);
+        put_u64(raw, 0x21c8, u64::from_le_bytes(cur) | (1u64 << 63));
+    }
+    if oracle & 0x08 != 0 {
+        put_u64(raw, 0x78, 0x40);
+    }
+    if oracle & 0x10 != 0 {
+        put_u64(raw, 0x458, 3);
+        put_u64(raw, 0x470, 0x500);
+    }
+    if oracle & 0x20 != 0 {
+        put_u64(raw, 0x1f48, 0x0000_0100_0000_0100);
+    }
+    if oracle & 0x40 != 0 {
+        // fields native leaves ZERO and we populate
+        put_u64(raw, 0x1d0, 0);
+        put_u64(raw, 0x1f0, 0);
+        put_u64(raw, 0x1f8, 0);
+    }
+    if oracle & 0x80 != 0 {
+        put_u32(raw, 0x1d8 + 4, 0x3f80_0000);
+    }
 }
 
 /// FRG +0x222d mode byte: Linux has always written 1; all 160 native light

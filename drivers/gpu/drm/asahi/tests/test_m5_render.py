@@ -8,12 +8,10 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = r'''
 #![allow(dead_code, non_upper_case_globals)]
-mod module_parameters {
-    pub struct Param(u32);
-    impl Param { pub fn value(&self) -> &u32 { &self.0 } }
-    pub static g17p_ta_oracle: Param = Param(ORACLE_MASK);
-    pub static g17p_frag_oracle: Param = Param(ORACLE_MASK);
-    pub static g17p_render_ta_qid_field: Param = Param(1);
+mod g17_config {
+    pub const TA_ORACLE: u32 = ORACLE_MASK;
+    pub const FRAG_ORACLE: u32 = ORACLE_MASK;
+    pub const RENDER_TA_QID_FIELD: u32 = 1;
 }
 mod g17_submission {
     pub const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u32 = 0;

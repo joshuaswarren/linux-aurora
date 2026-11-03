@@ -340,7 +340,7 @@ static bool mca_fe_clocks_in_use(struct mca_cluster *cl)
 	struct mca_cluster *be_cl;
 	int stream, i;
 
-	guard(mutex)(&mca->port_mutex);
+	mutex_lock(&mca->port_mutex);
 	for (i = 0; i < mca->nclusters; i++) {
 		be_cl = &mca->clusters[i];
 
@@ -349,10 +349,12 @@ static bool mca_fe_clocks_in_use(struct mca_cluster *cl)
 
 		for_each_pcm_streams(stream) {
 			if (be_cl->clocks_in_use[stream]) {
+				mutex_unlock(&mca->port_mutex);
 				return true;
 			}
 		}
 	}
+	mutex_unlock(&mca->port_mutex);
 	return false;
 }
 

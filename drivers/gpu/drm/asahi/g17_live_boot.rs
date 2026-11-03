@@ -21,6 +21,9 @@
 
 #![allow(dead_code)]
 
+#[path = "m5_live_boot.rs"]
+pub(crate) mod m5;
+
 use core::{
     ffi::{c_int, c_uint},
     mem::MaybeUninit,
@@ -286,6 +289,18 @@ struct G17PAscwrapV6Lifecycle {
 }
 
 impl G17PMailboxProvider {
+    fn cpu_state(&self) -> Result<(u32, u32)> {
+        let mut control = 0;
+        let mut status = 0;
+        // SAFETY: the provider remains linked and owns the wrapper mapping;
+        // both output pointers refer to writable stack storage.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_cpu_state(
+                self.mbox, &mut control, &mut status)
+        })?;
+        Ok((control, status))
+    }
+
     fn get(dev: &kernel::device::Device, index: usize) -> Result<Self> {
         // SAFETY: `dev` is live and apple_mbox_get() establishes a device link
         // to keep the resolved provider alive for this consumer.

@@ -270,6 +270,7 @@ int main(int argc, char **argv)
 		.usc_exec_base = USC_BASE,
 	};
 	struct mapped_bo code, shader, cdm, input_a, input_b, output;
+	struct mapped_bo usc_resource;
 	struct add3_cmdbuf commands = {0};
 	struct drm_asahi_submit submit = {0};
 	float *a, *b, *result;
@@ -297,11 +298,31 @@ int main(int argc, char **argv)
 	do_ioctl(fd, DRM_IOCTL_ASAHI_QUEUE_CREATE, &queue, "QUEUE_CREATE");
 
 	code = create_and_bind(fd, vm.vm_id, USC_BASE, GPU_PAGE_SIZE);
+	/*
+	 * add3_shader[6:8] == 0x007c selects a USC resource at
+	 * usc_exec_base + 0x7c * 0x2000 == USC_BASE + 0xF8000. Under m1n1 that
+	 * offset was covered by the RESOURCE object; the driver moved that
+	 * allocation to the dynamic low range, so nothing backs it any more and
+	 * the GPU dereferences an unmapped address on the first kick.
+	 */
+	usc_resource = create_and_bind(fd, vm.vm_id, USC_BASE + 0xF8000,
+				       0xC000);
 	shader = create_and_bind(fd, vm.vm_id, SHADER_VA, GPU_PAGE_SIZE);
 	cdm = create_and_bind(fd, vm.vm_id, CDM_VA, GPU_PAGE_SIZE);
 	input_a = create_and_bind(fd, vm.vm_id, INPUT_A_VA, GPU_PAGE_SIZE);
 	input_b = create_and_bind(fd, vm.vm_id, INPUT_B_VA, GPU_PAGE_SIZE);
 	output = create_and_bind(fd, vm.vm_id, OUTPUT_VA, GPU_PAGE_SIZE);
+	{
+		/*
+		 * m1n1 backed this offset with the RESOURCE object, which
+		 * carried the operand addresses at +0x14a0. Reproduce that
+		 * layout so the USC resource fetch finds real pointers.
+		 */
+		uint64_t *res = (uint64_t *)((uint8_t *)usc_resource.map + 0x14a0);
+		res[0] = INPUT_A_VA;
+		res[1] = INPUT_B_VA;
+		res[2] = OUTPUT_VA;
+	}
 	build_add3_code_image(code.map);
 	memcpy(shader.map, add3_shader, sizeof(add3_shader));
 	memcpy(cdm.map, add3_cdm, sizeof(add3_cdm));

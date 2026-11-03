@@ -9,13 +9,10 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
-#include <linux/io.h>
 #include <linux/kref.h>
 #include <linux/module.h>
-#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/ratelimit.h>
-#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 
@@ -31,29 +28,12 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
-#include "afk.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "parser.h"
 #include "trace.h"
-
-
-/*
- * A476 payload.  macOS sends 1 (dcp-calls.log line 1648); we sent 0 on the
- * theory that A476 is set_dcp_clamshellstate and 1 meant "lid shut".  That
- * attribution is unverified -- A476's shape (in 4, out 0) equally fits
- * set_has_frame_swap_function(bool) -- and the black panel it appeared to fix
- * was really the surf_iova misalignment, so the evidence for 0 was
- * coincidental.  Follow the capture.
- */
-u32 dcp_clamshell_state = 1;
-module_param_named(clamshell_state, dcp_clamshell_state, uint, 0644);
-
-bool dcp_send_modeset;   /* macOS never issues A413 */
-module_param_named(send_modeset, dcp_send_modeset, bool, 0644);
-
 
 
 /*
@@ -99,14 +79,10 @@ static void dcp_start_extra_eps(struct apple_dcp *dcp)
 		if (!(dcp_extra_eps & BIT(n)))
 			continue;
 		dev_info(dcp->dev, "starting extra endpoint %#04x\n", 0x20 + n);
-		apple_rtkit_start_ep(dcp->rtk, 0x20 + n);
+		dcp_start_rtkit_endpoint(dcp, 0x20 + n);
 	}
 }
 
-
-bool dcp_park_display = true;
-module_param_named(park_display, dcp_park_display, bool, 0644);
-MODULE_PARM_DESC(park_display, "H17P: power the display down after boot until a modeset");
 
 bool dcp_defer_client_open;
 module_param_named(defer_client_open, dcp_defer_client_open, bool, 0644);
@@ -195,6 +171,9 @@ MODULE_PARM_DESC(h17p_swap_poke, "hex off=val byte pokes into the fixed-up H17P 
 
 static int dcp_trace_budget;
 module_param_named(trace_rpc, dcp_trace_budget, int, 0644);
+static bool dcp_trace_calls;
+module_param_named(trace_calls, dcp_trace_calls, bool, 0644);
+MODULE_PARM_DESC(trace_calls, "Trace AP calls after the bounded RPC trace budget is consumed");
 MODULE_PARM_DESC(trace_rpc,
 		 "log the first N DCP RPC messages (0 = off; the vblank callback\n"
 		 "\t\t alone is 60/s, so anything non-zero fills the kernel ring)");
@@ -334,6 +313,13 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
 		     void *cookie)
 {
+	struct dcp_method_entry resolved = *call;
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
+	    call->tag_h17g[0])
+		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
+	call = &resolved;
+
 	enum dcp_context_id context = dcp_call_context(dcp, oob);
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
@@ -361,8 +347,12 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		memcpy(out_data, data, in_len);
 
 	trace_iomfb_push(dcp, call, context, offset, depth);
-	if (dcp_trace_budget > 0) {
-		dcp_trace_budget--;
+	/* Explicit AP tracing can outlast the callback/property trace budget.
+	 * Leave it disabled for normal desktop operation.
+	 */
+	if (dcp_trace_budget > 0 || dcp_trace_calls) {
+		if (dcp_trace_budget > 0)
+			dcp_trace_budget--;
 		dev_info(dcp->dev, "CALL %.4s ctx=%x off=%#x in=%u out=%u\n",
 			 call->tag, context, offset, in_len, out_len);
 	}
@@ -408,6 +398,30 @@ int dcp_parse_tag(char tag[4])
  * call then sits on the command channel forever -- every later push sees a busy
  * channel and the whole bring-up stalls with no clue which call did it.  Name it.
  */
+static void dcp_dump_callback_trace(struct apple_dcp *dcp)
+{
+	struct dcp_callback_trace records[DCP_CALLBACK_TRACE_COUNT];
+	unsigned long flags;
+	u32 count, first, i;
+
+	if (!dcp->hw.adopt_live_session)
+		return;
+	spin_lock_irqsave(&dcp->callback_trace_lock, flags);
+	count = dcp->callback_trace_count;
+	memcpy(records, dcp->callback_trace, sizeof(records));
+	spin_unlock_irqrestore(&dcp->callback_trace_lock, flags);
+	first = count > DCP_CALLBACK_TRACE_COUNT ? count - DCP_CALLBACK_TRACE_COUNT : 0;
+	dev_info(dcp->dev, "DCP callback history: %u received, last %u follow\n",
+		 count, count - first);
+	for (i = first; i < count; ++i) {
+		struct dcp_callback_trace *r = &records[i % DCP_CALLBACK_TRACE_COUNT];
+		dev_info(dcp->dev, "CB[%u] %c%c%c%c in=%u out=%u data=%*ph\n",
+			 i, r->tag[3], r->tag[2], r->tag[1], r->tag[0],
+			 r->in_len, r->out_len, min_t(u32, r->in_len, sizeof(r->input)),
+			 r->input);
+	}
+}
+
 void dcp_stall_check(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(to_delayed_work(work),
@@ -428,6 +442,16 @@ void dcp_stall_check(struct work_struct *work)
 			ch->tag[d - 1], d,
 			jiffies_to_msecs(jiffies - ch->pushed_at[d - 1]));
 		/* by now a fresh panic record has been written, if there is one */
+		if (dcp->hw.adopt_live_session) {
+			struct dcp_channel *nested = &dcp->ch_cb;
+			u8 depth = READ_ONCE(nested->depth);
+
+			if (depth && depth <= DCP_MAX_CALL_DEPTH)
+				dev_info(dcp->dev,
+					 "DCP nested callback channel: %.4s depth=%u\n",
+					 nested->tag[depth - 1], depth);
+		}
+		dcp_dump_callback_trace(dcp);
 		dcp_dump_crashlog(dcp);
 	}
 
@@ -562,6 +586,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		dev_info(dev, "CB %c%c%c%c ctx=%x in=%u out=%u %s\n",
 			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
 			 context, hdr->in_len, hdr->out_len, nm);
+		dev_info(dev, "CB input %*ph\n", min_t(u32, hdr->in_len, 32), ib);
 	}
 
 	in = data + sizeof(*hdr);
@@ -587,29 +612,6 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	if (tag == 408 && dcp->hw.adopt_live_session)
 		dev_info(dev, "D408 clock request in=%u out=%u data=%*ph\n",
 			 hdr->in_len, hdr->out_len, min_t(u32, hdr->in_len, 16), in);
-
-	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
-	    !dcp->cb_handlers[tag]) {
-		dev_warn(dev, "received unknown callback %c%c%c%c\n",
-			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
-		/*
-		 * Leaving a callback unanswered wedges the coprocessor: it
-		 * waits for the ack forever and the outer call never returns.
-		 * On H17P answer it with a zeroed output instead, so the
-		 * warning above names the tag we still have to implement
-		 * rather than costing a reboot to discover one tag at a time.
-		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
-			if (hdr->out_len)
-				memset(out, 0, hdr->out_len);
-			depth = dcp_push_depth(&ch->depth);
-			ch->output[depth] = out;
-			ch->end[depth] = offset +
-					 ALIGN(length, DCP_PACKET_ALIGNMENT);
-			dcp_ack(dcp, context);
-		}
-		return;
-	}
 
 	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
 	    !dcp->cb_handlers[tag]) {
@@ -712,7 +714,7 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	ch->output[ch->depth] = NULL;
 
 	if (cb)
-		cb(dcp, data + sizeof(*header) + header->in_len, cookie);
+		cb(dcp, out, cookie);
 
 	if (context == DCP_CONTEXT_CMD) {
 		mutex_lock(&dcp->pending_flush_lock);
@@ -965,10 +967,10 @@ void dcp_retain_unbound_fbs_pdev(struct platform_device *pdev, struct drm_crtc *
 	dcp_retain_unbound_fbs(platform_get_drvdata(pdev), crtc, state);
 }
 
-void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
+static void dcp_dispatch_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			       struct drm_atomic_state *state)
 {
-	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
 
 	/*
 	 * DCP does not complete swaps after a link loss.  A plane-only commit
@@ -1019,6 +1021,64 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
+	}
+}
+
+static void dcp_dispatch_pending_flushes(struct apple_dcp *dcp)
+{
+	struct apple_crtc_state *apple_state;
+	struct drm_atomic_state *state;
+
+again:
+	lockdep_assert_held(&dcp->pending_flush_lock);
+	if (dcp_channel_busy(&dcp->ch_cmd) ||
+	    list_empty(&dcp->pending_flushes))
+		return;
+
+	apple_state = list_first_entry(&dcp->pending_flushes,
+				       struct apple_crtc_state, pending_flush);
+	list_del_init(&apple_state->pending_flush);
+	state = apple_state->base.state;
+
+	dcp_dispatch_flush(dcp, apple_state->base.crtc, state);
+	drm_atomic_state_put(state);
+
+	if (!dcp_channel_busy(&dcp->ch_cmd))
+		goto again;
+}
+
+void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
+{
+	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct drm_crtc_state *base;
+	struct apple_crtc_state *apple_state;
+
+	base = drm_atomic_get_new_crtc_state(state, crtc);
+	apple_state = to_apple_crtc_state(base);
+	drm_atomic_state_get(state);
+
+	mutex_lock(&dcp->pending_flush_lock);
+	WARN_ON(!list_empty(&apple_state->pending_flush));
+	list_add_tail(&apple_state->pending_flush, &dcp->pending_flushes);
+	dcp_dispatch_pending_flushes(dcp);
+	mutex_unlock(&dcp->pending_flush_lock);
+}
+
+void dcp_flush_shutdown(struct apple_dcp *dcp)
+{
+	struct apple_crtc_state *apple_state, *tmp;
+	LIST_HEAD(pending);
+
+	mutex_lock(&dcp->pending_flush_lock);
+	list_splice_init(&dcp->pending_flushes, &pending);
+	mutex_unlock(&dcp->pending_flush_lock);
+
+	list_for_each_entry_safe(apple_state, tmp, &pending, pending_flush) {
+		struct drm_atomic_state *state = apple_state->base.state;
+
+		list_del_init(&apple_state->pending_flush);
+		drm_atomic_state_put(state);
 	}
 }
 
@@ -1090,6 +1150,7 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
+	int ret;
 
 	/*
 	 * macOS starts sixteen DCP endpoints; we started three.  Its StartEP
@@ -1100,8 +1161,12 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	 * on the AP side -- which is how 0x2d's absence used to produce DART
 	 * faults -- so bring the whole set up, in that order.
 	 */
-	apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
-	apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	ret = dcp_start_rtkit_endpoint(dcp, REMOTE_ALLOC_ENDPOINT);
+	if (ret)
+		return ret;
+	ret = dcp_start_rtkit_endpoint(dcp, IOMFB_ENDPOINT);
+	if (ret)
+		return ret;
 	dcp_start_extra_eps(dcp);
 
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
@@ -1119,8 +1184,6 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	/* We're going down */
 	dcp->active = false;
 	dcp->valid_mode = false;
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
-		cancel_work_sync(&dcp->link_service_match_work);
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -1135,12 +1198,5 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
-	}
-
-	if (dcp->shmem_inherited) {
-		iounmap((__force void __iomem *)dcp->shmem);
-		dcp->shmem = NULL;
-		dcp->shmem_iova = 0;
-		dcp->shmem_inherited = false;
 	}
 }

@@ -53,6 +53,46 @@ use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 #[cfg(not(test))]
 static G17P_MCACHE_PROBE_NEXT: AtomicU32 = AtomicU32::new(96);
 
+#[cfg(not(test))]
+#[path = "m5_resources.rs"]
+pub(crate) mod m5;
+
+#[cfg(not(test))]
+#[path = "g18_resources.rs"]
+pub(crate) mod g18;
+
+#[cfg(not(test))]
+#[path = "g18_pool_resources.rs"]
+pub(crate) mod g18_pool;
+
+#[cfg(not(test))]
+#[path = "g18_scheduler_resources.rs"]
+pub(crate) mod g18_scheduler;
+
+#[cfg(not(test))]
+#[path = "g18_compute_resources.rs"]
+pub(crate) mod g18_compute;
+
+#[cfg(not(test))]
+#[path = "g18_compute_payload_memory.rs"]
+pub(crate) mod g18_compute_payload;
+
+#[cfg(not(test))]
+#[path = "g18_graphics_memory.rs"]
+pub(crate) mod g18_graphics_memory;
+
+#[cfg(not(test))]
+#[path = "g18_graphics_job.rs"]
+pub(crate) mod g18_graphics_job;
+
+#[cfg(not(test))]
+#[path = "g18_graphics_queues.rs"]
+pub(crate) mod g18_graphics_queues;
+
+#[cfg(not(test))]
+#[path = "g18_queue_probe.rs"]
+pub(crate) mod g18_queue;
+
 // ---------------------------------------------------------------------------
 // v90: pooled firmware-cached command objects.
 //
@@ -3771,6 +3811,26 @@ fn new_g17p_render_target_memory(
 
 #[cfg(not(test))]
 impl MappedObject {
+    fn new_wc_in_range_with_guards(
+        dev: &AsahiDevice, vm: &mmu::Vm, range: Range<u64>, size: usize,
+        alignment: u64, prot: mmu::Prot, guard_pages: usize,
+    ) -> Result<Self> {
+        let mut object = gem::new_kernel_object_wc(dev, size)?;
+        object.vmap()?.memset(0);
+        let mapping = vm.map_in_range_with_guards(&object.gem, 0..object.size(),
+            alignment, range, prot, guard_pages)?;
+        let iova = mapping.iova();
+        Ok(Self { mapping: Some(mapping), object, iova, object_offset: 0,
+            logical_size: size, cpu_wc: true, fw_node: None, fw_pool: 0 })
+    }
+
+    fn map_alias_at_with_guards(&mut self, vm: &mmu::Vm, address: u64,
+        prot: mmu::Prot, guard_pages: usize) -> Result<mmu::KernelMapping> {
+        if self.object_offset != 0 { return Err(EINVAL); }
+        self.object.map_at_with_guards(vm, address, prot, guard_pages)
+    }
+
+
     fn new_wc_render_owned(
         dev: &AsahiDevice, vm: &mmu::Vm, pair: G17PRenderQueuePair,
         bootstrap_address: Option<u64>, size: usize, prot: mmu::Prot,
@@ -5286,6 +5346,25 @@ impl G17PRenderFlist {
             empty: read_u32(0x28)?,
             total_pages: read_u32(0x2c)?,
         })
+    }
+
+    fn store_uma_state(&self, state: g17_submission::G17PUmaPagePoolState) -> Result {
+        let vmap = self.control_shared.object.gem.vmap::<u8>()?;
+        for (offset, value) in [
+            (0x20, state.counter_a),
+            (0x24, state.counter_b),
+            (0x28, state.empty),
+            (0x2c, state.total_pages),
+        ] {
+            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                // SAFETY: these fields are within the retained control
+                // object. The caller has retired TA, 3D and FList references
+                // before transferring the physical pool slot to another owner.
+                unsafe { core::ptr::write_volatile(vmap.as_mut_ptr().add(offset + index), byte) };
+            }
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
     }
 }
 

@@ -13,20 +13,6 @@
 #include <linux/moduleparam.h>
 #include <asm/cpuidle.h>
 
-/* Keep the qualified arch idle fallback until CPU PM is validated on J700. */
-static bool neo_cpuidle;
-module_param_named(neo, neo_cpuidle, bool, 0644);
-MODULE_PARM_DESC(neo, "Allow experimental J700 cpuidle driver binding (default off)");
-
-static bool neo_cpu_pm;
-module_param_named(neo_cpu_pm, neo_cpu_pm, bool, 0644);
-MODULE_PARM_DESC(neo_cpu_pm, "Include CPU PM callbacks in J700 idle qualification");
-
-static int neo_cpu = -1;
-static cpumask_t neo_cpumask;
-module_param_named(neo_cpu, neo_cpu, int, 0644);
-MODULE_PARM_DESC(neo_cpu, "J700 CPU to register at bind time (-1 for all CPUs)");
-
 enum idle_state {
 	STATE_WFI,
 	STATE_PWRDOWN,
@@ -152,61 +138,6 @@ static struct cpuidle_driver apple_idle_driver = {
 	.state_count = STATE_COUNT,
 };
 
-static __cpuidle int apple_neo_enter_wfi(struct cpuidle_device *dev,
-				       struct cpuidle_driver *drv, int index)
-{
-	bool notify = READ_ONCE(neo_cpu_pm);
-	int ret;
-
-	/* Qualify CPU PM separately from the existing state-preserving WFI. */
-	if (notify) {
-		/* Notify context owners while RCU is still watching this CPU. */
-		ret = cpu_pm_enter();
-		if (ret)
-			return ret;
-	}
-
-	ct_cpuidle_enter();
-	/*
-	 * Use the same GPR/FPSIMD-preserving path as early boot. T8140 cannot
-	 * use apple_cpu_deep_wfi(): its CYC_OVRD register is locked.
-	 */
-	cpu_do_idle();
-	ct_cpuidle_exit();
-	if (notify)
-		cpu_pm_exit();
-
-	return index;
-}
-
-static struct cpuidle_driver apple_neo_idle_driver = {
-	.name = "apple_neo_idle",
-	.owner = THIS_MODULE,
-	.states = {
-		[0] = {
-			.enter = apple_enter_wfi,
-			.exit_latency = 1,
-			.target_residency = 1,
-			.power_usage = UINT_MAX,
-			.name = "WFI",
-			.desc = "Architectural state-preserving WFI",
-		},
-		[1] = {
-			.enter = apple_neo_enter_wfi,
-			.enter_s2idle = apple_neo_enter_wfi,
-			/* Initial governor estimates, not measured hardware limits. */
-			.exit_latency = 10,
-			.target_residency = 100,
-			.name = "WFI-test",
-			.desc = "Experimental WFI with optional CPU PM",
-			/* Enable per CPU through sysfs after reaching userspace. */
-			.flags = CPUIDLE_FLAG_RCU_IDLE | CPUIDLE_FLAG_OFF,
-		},
-	},
-	.safe_state_index = 0,
-	.state_count = 2,
-};
-
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
 	t8140_cpuidle = !!pdev->dev.of_node;
@@ -224,7 +155,6 @@ static struct platform_driver apple_cpuidle_driver = {
 		.of_match_table = apple_cpuidle_of_match,
 	},
 	.probe = apple_cpuidle_probe,
-	.remove = apple_cpuidle_remove,
 };
 
 static int __init apple_cpuidle_init(void)
@@ -239,8 +169,7 @@ static int __init apple_cpuidle_init(void)
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return 0;
 
-	if (!(of_machine_is_compatible("apple,j700") ||
-	      of_machine_is_compatible("apple,t8103") ||
+	if (!(of_machine_is_compatible("apple,t8103") ||
 	      of_machine_is_compatible("apple,t8112") ||
 	      of_machine_is_compatible("apple,t8122") ||
 	      of_machine_is_compatible("apple,t6000") ||

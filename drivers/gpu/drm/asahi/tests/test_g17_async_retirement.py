@@ -88,7 +88,7 @@ quarantine = item(r, '    pub(crate) fn quarantine_async_compute(')
 assert quarantine.index('self.service_async_compute_completions()') < quarantine.index('q.quarantined = true')
 source=r'''
 #![allow(dead_code,unused_variables)]
-use std::sync::{Arc,atomic::{AtomicU64,AtomicUsize,Ordering}};
+use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
 type Error=i32;type Result<T=()>=std::result::Result<T,Error>;
 const EIO:i32=5;const EINVAL:i32=22;const EAGAIN:i32=11;const ENODEV:i32=19;const EBUSY:i32=16;const ERANGE:i32=34;
 const ENODATA:i32=61;const ECANCELED:i32=125;const ENOSPC:i32=28;const EOVERFLOW:i32=75;
@@ -167,8 +167,7 @@ static G17P_MARK_ZERO_DURATION: core::sync::atomic::AtomicU32 =
 // assertions below read.
 // Probe parameter; 0 is the default and the behaviour these tests assert.
 mod module_parameters { pub struct P; impl P { pub fn value(&self)->&'static u32 { &0 } }
-  pub static g17p_quarantine_scope: P = P;
-  pub static g17p_quarantine_selftest: P = P; }
+  pub static g17p_quarantine_scope: P = P; }
 mod g17_live_boot { pub fn note_session_recovery_pending(pending:&mut bool,_pdev:Option<&()>,_reason:&'static str){ *pending = true; } }
 struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>,retired:AtomicUsize}
 impl Completion{fn recovery_spared(&self)->bool{false}fn complete(&self,r:Result<[u64;2]>){if self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst).is_ok() && r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}fn cancel_while_owned(&self){self.complete(Err(ECANCELED));}fn release_after_retirement(&self){self.retired.fetch_add(1,Ordering::SeqCst);}

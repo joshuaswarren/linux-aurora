@@ -83,28 +83,16 @@ static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 	p_off = nvmem_cell_read(rtc->rtc_offset, &len);
 	if (IS_ERR(p_off))
 		return PTR_ERR(p_off);
-	if (len < (rtc->offset_in_seconds ? RTC_OFFSET_SEC_BYTES : RTC_BYTES)) {
+	if (len < RTC_BYTES) {
 		kfree(p_off);
 		return -EIO;
 	}
 
-	memcpy(&off, p_off, rtc->offset_in_seconds ? RTC_OFFSET_SEC_BYTES : RTC_BYTES);
+	memcpy(&off, p_off, RTC_BYTES);
 	kfree(p_off);
 
-	/*
-	 * No offset has ever been stored: the raw counter is time since the SMC
-	 * first powered up, not wall-clock time (it reads as 1971). Report the
-	 * time as invalid so hctosys leaves the system clock alone instead of
-	 * setting it decades into the past.
-	 */
-	if (!off)
-		return -EINVAL;
-
-	if (rtc->offset_in_seconds)
-		now = (time64_t)(ctr >> RTC_SEC_SHIFT) + (s64)off;
-	else
-		/* Sign extend from 48 to 64 bits, then arithmetic shift right 15 bits to get seconds */
-		now = sign_extend64(ctr + off, RTC_BITS - 1) >> RTC_SEC_SHIFT;
+	/* Sign extend from 48 to 64 bits, then arithmetic shift right 15 bits to get seconds */
+	now = sign_extend64(ctr + off, RTC_BITS - 1) >> RTC_SEC_SHIFT;
 	rtc_time64_to_tm(now, tm);
 
 	return ret;
@@ -165,9 +153,6 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	if (IS_ERR(rtc->rtc_offset))
 		return dev_err_probe(&pdev->dev, PTR_ERR(rtc->rtc_offset),
 				     "Failed to get rtc_offset NVMEM cell\n");
-
-	rtc->offset_in_seconds = of_property_read_bool(pdev->dev.of_node,
-						       "apple,rtc-offset-seconds");
 
 	rtc->rtc_dev = devm_rtc_allocate_device(&pdev->dev);
 	if (IS_ERR(rtc->rtc_dev))

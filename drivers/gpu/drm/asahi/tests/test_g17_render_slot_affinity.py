@@ -92,7 +92,6 @@ impl CondVar{
 '''+state+r'''
 struct G17PQueueRegistry{lease:Mutex<G17PQueueLeaseState>,lease_free:CondVar,compute_faulted:AtomicU32}
 impl G17PQueueRegistry{
- fn compute_poison_is_device_wide(&self)->bool{true}
  fn new()->Arc<Self>{Arc::new(Self{
   lease:Mutex(std::sync::Mutex::new(G17PQueueLeaseState::default())),
   lease_free:CondVar(std::sync::Condvar::new()),

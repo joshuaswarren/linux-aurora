@@ -90,8 +90,6 @@ static bool afk_endpoint_has_v2_rx(struct apple_dcp_afkep *ep)
 
 
 #define BLOCK_SHIFT 6
-#define AFK_RING_BLOCK_COUNT 3
-#define AFK_RING_BLOCK_SIZE (1U << BLOCK_SHIFT)
 
 #define GETBUF_SIZE GENMASK(31, 16)
 #define GETBUF_TAG GENMASK(15, 0)
@@ -180,7 +178,9 @@ int afk_start(struct apple_dcp_afkep *ep)
 	int ret;
 
 	reinit_completion(&ep->started);
-	dcp_start_rtkit_endpoint(ep->dcp, ep->endpoint);
+	ret = dcp_start_rtkit_endpoint(ep->dcp, ep->endpoint);
+	if (ret)
+		return ret;
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
 	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));
@@ -232,7 +232,7 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	u32 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
 	u32 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(INITRB_TAG, message);
-	u32 bufsz, hdrsz, end;
+	u32 bufsz, hdrsz, end, block;
 
 	if (tag != ep->bfr_tag) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: expected tag 0x%x but got 0x%x\n",
@@ -262,24 +262,23 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	}
 
 	bfr->hdr = ep->bfr + base;
-	bufsz = le32_to_cpu(*(__le32 *)bfr->hdr);	/* first word of block 0 */
+	dma_rmb();
+	bufsz = le32_to_cpu(READ_ONCE(*(__le32 *)bfr->hdr));
 	hdrsz = size - bufsz;
+	block = hdrsz / AFK_RB_BLOCKS;
 	if (bufsz >= size || hdrsz % AFK_RB_BLOCKS ||
-	    hdrsz / AFK_RB_BLOCKS < AFK_RB_BLOCK_MIN) {
+	    block < AFK_RB_BLOCK_MIN || !is_power_of_2(block) ||
+	    !IS_ALIGNED(bufsz, block) || bufsz < 2 * block) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: ring bufsz %#x with size %#x gives no valid header (base %#x, msg %#llx)\n",
 			ep->endpoint, bufsz, size, base, message);
 		return;
 	}
-	bfr->block = hdrsz / AFK_RB_BLOCKS;
+	bfr->block = block;
 
 	bfr->buf = (u8 *)bfr->hdr + hdrsz;
 	bfr->bufsz = bufsz;
-	bfr->block_size = block_size;
 	bfr->ready = true;
-	dev_info(ep->dcp->dev,
-		 "AFK[ep:%02x]: ring ready block %#x header %#x data %#x\n",
-		 ep->endpoint, block_size, header_size, bufsz);
 
 	if (ep->rxbfr.ready && ep->txbfr.ready)
 		afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_START));
@@ -468,20 +467,12 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	strscpy(name, payload, sizeof(name));
 
 	/*
-	 * AFKEPV2 PublishReport keeps the fixed 32-byte name followed by an
-	 * inline binary OSSerialize dictionary. AppleFirmwareKit optionally
-	 * reads "name" or "interface-name" from that dictionary and otherwise
-	 * uses the fixed name; it does not require the legacy EPIC triplet.
+	 * in DCP firmware 13.2 DCP reports interface-name as name which starts
+	 * with "dispext%d" using -1 s ID for "dcp". In the 12.3 firmware
+	 * EPICProviderClass was used. If the init call has props parse them and
+	 * use EPICProviderClass to match the service.
 	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P) {
-		service_name = name;
-	} else if (props_size > 36) {
-		/*
-		 * In DCP firmware 13.2 DCP reports interface-name as name which
-		 * starts with "dispext%d" using -1 as the ID for "dcp". In the
-		 * 12.3 firmware EPICProviderClass was used. Parse the properties
-		 * and use EPICProviderClass to match the service.
-		 */
+	if (props_size > 36) {
 		int ret = parse(props, props_size, &ctx);
 		if (ret) {
 			dev_err(ep->dcp->dev,
@@ -1069,10 +1060,8 @@ too_small:
 static bool afk_recv(struct apple_dcp_afkep *ep)
 {
 	struct afk_qe *hdr;
-	bool log_entry;
-	u32 next_rptr, rptr, wptr;
+	u32 rptr, wptr;
 	u32 magic, size, channel, type;
-	u8 sequence;
 
 	if (!ep->rxbfr.ready) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: got RECV but not ready\n",
@@ -1168,10 +1157,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	 *       1. the tracer sees replies before the notifies from dcp
 	 *       2. the tracer tries to read buffers after they are unmapped.
 	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P)
-		afk_recv_handle_v2(ep, hdr->data, size);
-	else
-		afk_recv_handle(ep, channel, type, hdr->data, size);
+	afk_recv_handle(ep, channel, type, hdr->data, size);
 
 	return true;
 }
@@ -1209,12 +1195,6 @@ static void afk_receive_message_worker(struct work_struct *work_)
 		break;
 
 	case RBEP_RECV:
-		if (work->ep->endpoint == SYSTEM_ENDPOINT &&
-		    work->ep->rx_log_count < 16)
-			dev_info(work->ep->dcp->dev,
-				 "AFK[ep:%02x]: RECV raw %#llx doorbell wptr %#x\n",
-				 work->ep->endpoint, work->message,
-				 (u32)FIELD_GET(SEND_WPTR, work->message));
 		while (afk_recv(work->ep))
 			;
 		break;
@@ -1248,39 +1228,16 @@ int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 	return 0;
 }
 
-void afk_log_tx_state(struct apple_dcp_afkep *ep, const char *phase)
-{
-	unsigned long flags;
-	u32 rptr, wptr;
-
-	if (!ep || !ep->txbfr.ready)
-		return;
-
-	spin_lock_irqsave(&ep->lock, flags);
-	dma_rmb();
-	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
-	wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
-	dev_info(ep->dcp->dev,
-		 "AFK[ep:%02x]: TX state %s consumer %#x producer %#x services %u\n",
-		 ep->endpoint, phase, rptr, wptr, ep->num_channels);
-	spin_unlock_irqrestore(&ep->lock, flags);
-}
-
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		  enum epic_type etype, enum epic_category ecat, u8 stype,
 		  const void *payload, size_t payload_len)
 {
 	u32 rptr, wptr;
-	u32 old_wptr;
-	u64 doorbell;
-	struct afk_qe *hdr, *hdr2, *entry;
+	struct afk_qe *hdr, *hdr2;
 	struct epic_hdr *ehdr;
 	struct epic_sub_hdr *eshdr;
-	struct afk_v2_packet_hdr *v2_packet;
-	struct afk_v2_message_hdr *v2_message;
 	unsigned long flags;
 	size_t total_epic_size, total_size;
-	bool use_v2 = ep->dcp->fw_compat == DCP_FIRMWARE_H17P;
 	int ret;
 
 	spin_lock_irqsave(&ep->lock, flags);
@@ -1289,16 +1246,7 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	rptr = le32_to_cpu(*afk_rb_rptr(&ep->txbfr));
 	wptr = le32_to_cpu(*afk_rb_wptr(&ep->txbfr));
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
-	if (use_v2) {
-		if (channel > U16_MAX || payload_len > U32_MAX - sizeof(*v2_message)) {
-			ret = -E2BIG;
-			goto out;
-		}
-		total_epic_size = sizeof(*v2_packet) + sizeof(*v2_message) +
-				  payload_len;
-	} else {
-		total_epic_size = sizeof(*ehdr) + sizeof(*eshdr) + payload_len;
-	}
+	total_epic_size = sizeof(*ehdr) + sizeof(*eshdr) + payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
 
 	hdr = hdr2 = NULL;
@@ -1381,59 +1329,33 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	hdr->magic = cpu_to_le32(QE_MAGIC);
 	hdr->size = cpu_to_le32(total_epic_size);
-	hdr->channel = cpu_to_le32(use_v2 ? 0 : channel);
-	hdr->type = cpu_to_le32(use_v2 ? 0 : etype);
+	hdr->channel = cpu_to_le32(channel);
+	hdr->type = cpu_to_le32(etype);
 	if (hdr2)
 		memcpy(hdr2, hdr, sizeof(*hdr));
 
-	if (use_v2) {
-		v2_packet = ep->txbfr.buf + wptr;
-		memset(v2_packet, 0, sizeof(*v2_packet));
-		v2_packet->sequence = cpu_to_le16(ep->qe_seq++);
-		v2_packet->interface_id = cpu_to_le16(channel);
-		v2_packet->message_size =
-			cpu_to_le32(sizeof(*v2_message) + payload_len);
-		wptr += sizeof(*v2_packet);
+	ehdr = ep->txbfr.buf + wptr;
+	memset(ehdr, 0, sizeof(*ehdr));
+	ehdr->version = 2;
+	ehdr->seq = cpu_to_le16(ep->qe_seq++);
+	ehdr->timestamp = cpu_to_le64(0);
+	wptr += sizeof(*ehdr);
 
-		v2_message = ep->txbfr.buf + wptr;
-		memset(v2_message, 0, sizeof(*v2_message));
-		v2_message->id = cpu_to_le64(tag);
-		v2_message->opcode = stype;
-		if (ecat == EPIC_CAT_COMMAND)
-			v2_message->kind = AFK_V2_COMMAND;
-		else if (ecat == EPIC_CAT_REPLY)
-			v2_message->kind = AFK_V2_RESPONSE;
-		else {
-			v2_message->kind = AFK_V2_REPORT;
-			if (stype == AFK_V2_REPORT_OPEN)
-				v2_message->flags = 1;
-		}
-		wptr += sizeof(*v2_message);
-	} else {
-		ehdr = ep->txbfr.buf + wptr;
-		memset(ehdr, 0, sizeof(*ehdr));
-		ehdr->version = 2;
-		ehdr->seq = cpu_to_le16(ep->qe_seq++);
-		ehdr->timestamp = cpu_to_le64(0);
-		wptr += sizeof(*ehdr);
+	eshdr = ep->txbfr.buf + wptr;
+	memset(eshdr, 0, sizeof(*eshdr));
+	eshdr->length = cpu_to_le32(payload_len);
+	eshdr->version = 4;
+	eshdr->category = ecat;
+	eshdr->type = cpu_to_le16(stype);
+	eshdr->timestamp = cpu_to_le64(0);
+	eshdr->tag = cpu_to_le16(tag);
+	if (ecat == EPIC_CAT_REPLY)
+		eshdr->inline_len = cpu_to_le32(payload_len - 4);
+	else
+		eshdr->inline_len = cpu_to_le32(0);
+	wptr += sizeof(*eshdr);
 
-		eshdr = ep->txbfr.buf + wptr;
-		memset(eshdr, 0, sizeof(*eshdr));
-		eshdr->length = cpu_to_le32(payload_len);
-		eshdr->version = 4;
-		eshdr->category = ecat;
-		eshdr->type = cpu_to_le16(stype);
-		eshdr->timestamp = cpu_to_le64(0);
-		eshdr->tag = cpu_to_le16(tag);
-		if (ecat == EPIC_CAT_REPLY)
-			eshdr->inline_len = cpu_to_le32(payload_len - 4);
-		else
-			eshdr->inline_len = cpu_to_le32(0);
-		wptr += sizeof(*eshdr);
-	}
-
-	if (payload_len)
-		memcpy(ep->txbfr.buf + wptr, payload, payload_len);
+	memcpy(ep->txbfr.buf + wptr, payload, payload_len);
 	wptr += payload_len;
 	wptr = ALIGN(wptr, ep->txbfr.block);
 	if (wptr == ep->txbfr.bufsz)

@@ -935,15 +935,6 @@ impl File {
             batch.push_map(prepared)?;
             plans.push(PreparedGemBindOp::Map { op, bo }, GFP_KERNEL)?;
         }
-        if vm.driver_range_overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: map range {:#x}..{:#x} overlaps a device-owned VA\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
-        }
 
         crate::g17_mem_path::BIND_PREPARE.since(prepare_started);
         vm.reserve_deferred_user_unmaps(unmap_count)?;

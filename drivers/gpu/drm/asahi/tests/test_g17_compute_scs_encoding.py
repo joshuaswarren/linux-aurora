@@ -101,6 +101,8 @@ fn command(layout: u64) -> TranslatedComputeCommand {
             end: uapi::UapiTimestamp { handle: 0, offset: 0 },
         },
         scs_layout: layout,
+        g18_texture_state: false,
+        g18_resource_descriptor: None,
     }
 }
 

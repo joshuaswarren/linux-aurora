@@ -38,7 +38,6 @@ use kernel::{
     module_platform_driver,
     new_condvar,
     new_mutex,
-    new_spinlock,
     of,
     platform,
     prelude::*,
@@ -89,15 +88,6 @@ const BOOTARGS_SIZE: usize = 0x230;
 const CPU_CONTROL: usize = 0x44;
 const CPU_RUN: u32 = 0x1 << 4;
 const AFK_ENDPOINT_START: u8 = 0x20;
-/// 0x20..=0x2e.  This deliberately matches macOS, which was measured under the
-/// hypervisor on 2026-09-20 starting exactly 0x08 (oslog), 0x20, 0x21, 0x22,
-/// 0x23 and 0x2b on this AOP -- the same five AFK endpoints started here.
-///
-/// It is tempting to widen this: the J700 setup port sets up 0x30 and 0x32 too
-/// (see SETUP_ENDPOINTS), giving them ring buffers that nothing then listens
-/// on, and they looked like a candidate for the ambient light sensor's missing
-/// sample path.  The trace settles it -- macOS never starts them either -- so
-/// do not go there again without new evidence.
 const AFK_ENDPOINT_COUNT: u8 = 0xf;
 const AFK_OPC_GET_BUF: u64 = 0x89;
 const AFK_OPC_INIT: u64 = 0x80;
@@ -699,32 +689,6 @@ impl AFKEndpoint {
     ) -> Result<()> {
         let subtype = ehdr.subtype;
         if ehdr.category == EPIC_CATEGORY_REPORT {
-            // Unconditional: the question "does the AOP ever send a report at
-            // all, on any endpoint or channel?" has to be answerable without
-            // depending on a module parameter.  aop.report_trace could not be
-            // read back from /sys/module/aop/parameters on this build, so a
-            // silent log left it untestable.
-            //
-            // The first report on the endpoint answers that question; the ALS
-            // then streams one every 200 ms, and logging each wrapped the
-            // kernel ring every couple of minutes and destroyed every other
-            // driver's boot log.  Say it once and count the rest.
-            // QEHeader is repr(C, packed): bind the field to a local before
-            // formatting, or rustc rejects the unaligned reference (E0793).
-            let rep_ch = qhdr.channel;
-            let rep_ep = self.index;
-            let rep_len = data.len();
-            self.reports = self.reports.saturating_add(1);
-            if self.reports == 1 {
-                dev_info!(
-                    client.dev,
-                    "aop: EPIC report ep {:#04x} channel {:#x} subtype {:#06x} ({} bytes); further reports on this endpoint are not logged\n",
-                    rep_ep,
-                    rep_ch,
-                    subtype,
-                    rep_len
-                );
-            }
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
                 if data.len() < EPIC_ANNOUNCE_LEN {
                     return Err(EMSGSIZE);
@@ -856,7 +820,6 @@ impl AFKEndpoint {
         rtkit: Pin<&mut rtkit::RtKit<AopData>>,
         channel: u32,
         subtype: u16,
-        category: u8,
         data: &[u8],
         ret: Option<KVec<u8>>,
     ) -> Result<Arc<FutureValue<CallResult>>> {
@@ -890,7 +853,7 @@ impl AFKEndpoint {
             seq: self.seq,
             length: data.len() as u32,
             sub_version: 2,
-            category,
+            category: EPIC_CATEGORY_NOTIFY,
             subtype,
             tag,
             ..EPICHeader::default()
@@ -1354,7 +1317,6 @@ impl AopData {
                     report_listeners <- new_mutex!(KVec::new()),
                     source_ring <- new_mutex!(None),
                     subdevices <- new_mutex!(KVec::new()),
-                    source_ring <- new_mutex!(None),
                 }
             ),
             GFP_KERNEL,
@@ -1413,31 +1375,10 @@ impl AopData {
             channel,
             endpoint: ep.index,
         };
-        // Every announcement is logged, including the ones with no sub-device.
-        // On the J700 endpoint 0x20 announces SPUApp / SPUAppUntrusted /
-        // HibernationAppUntrusted and all three used to be dropped in silence,
-        // which hid the fact that the ambient light sensor is a CT817 HID
-        // device on the SPU (macOS: AppleSPUCT817 -> IOHIDEventService ->
-        // AppleSPUALSDriver::eventServiceCallback) rather than something the
-        // `als` EPIC service streams.
-        dev_info!(
-            self.dev,
-            "aop: service announce ep {:#04x} channel {:#x} name {}\n",
-            ep.index,
-            channel,
-            core::str::from_utf8(name).unwrap_or("<non-utf8>")
-        );
         let dev_name = match name {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
             b"als" => c_str!("als"),
-            // The SPU application endpoint.  On the J700 the ambient light
-            // sensor is a CT817 HID device reached through here, not through
-            // the `als` EPIC service (which answers property reads and then
-            // never reports).  Create the sub-devices so a driver can bind and
-            // claim the channel; HibernationAppUntrusted stays dropped.
-            b"SPUApp" => c_str!("spu"),
-            b"SPUAppUntrusted" => c_str!("spu-untrusted"),
             _ => {
                 return Ok(());
             }
@@ -1546,330 +1487,6 @@ impl AopData {
         aop_mmio.try_memcpy_toio(offset, &arg_bytes)
     }
 
-    /// One setup-port message, in interrupt context (the native host's
-    /// boot_step() and endpoint_request()).
-    fn setup_handle(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
-        if ep == SETUP_MGMT_EP {
-            let ty = (word >> 52) & 0xff;
-            match ty {
-                SETUP_TYPE_HELLO => {
-                    if word & 0xffffffff != SETUP_HELLO_VERSION {
-                        dev_warn!(
-                            self.dev,
-                            "setup port: HELLO version {:#x}",
-                            word & 0xffffffff
-                        );
-                    }
-                    st.send(
-                        SETUP_MGMT_EP,
-                        (SETUP_TYPE_HELLO_REPLY << 52) | SETUP_HELLO_VERSION,
-                    )
-                }
-                SETUP_TYPE_EPMAP => {
-                    // The firmware advertises its endpoint set here, and the
-                    // driver otherwise discards it and requests SETUP_ENDPOINTS
-                    // blindly.  RTKit packs a 32-bit bitmap plus a 3-bit base,
-                    // so the endpoint number is base * 32 + bit.  Log it: the
-                    // J700 map differs from the M1/M2 one this list was written
-                    // for, and a missing endpoint stalls firmware startup.
-                    let bitmap = (word & 0xffffffff) as u32;
-                    let base = ((word >> 32) & 0x7) as u8;
-                    for bit in 0..32u8 {
-                        if bitmap & (1u32 << bit) != 0 {
-                            dev_info!(
-                                self.dev,
-                                "setup port: firmware advertises endpoint {:#04x}\n",
-                                base * 32 + bit
-                            );
-                        }
-                    }
-                    st.send(SETUP_MGMT_EP, word)?;
-                    if word & SETUP_EPMAP_LAST != 0 {
-                        st.map_done = true;
-                    }
-                    Ok(())
-                }
-                SETUP_TYPE_AP_PWR => {
-                    st.ap_ready = (word & 0xffff) == SETUP_AP_PWR_ON;
-                    Ok(())
-                }
-                SETUP_TYPE_UNK3 => st.send(SETUP_MGMT_EP, SETUP_TYPE_UNK3_REPLY << 52),
-                SETUP_TYPE_PWR_ACK => Ok(()),
-                _ => Err(EIO),
-            }
-        } else if word >> 56 == SETUP_BUFFER_REQUEST {
-            self.setup_endpoint_request(st, ep, word)
-        } else if st.endpoint(ep).is_some() {
-            st.reply = Some(word);
-            Ok(())
-        } else {
-            Err(EIO)
-        }
-    }
-
-    /// The source-buffer bind: a 24-byte request in the endpoint's
-    /// host-to-AOP page, (3 << 60) | len on the endpoint, the firmware's
-    /// 0x2000000000000001, one status byte in the reply window, then
-    /// 4 << 60 to release it.
-    fn setup_bind_source(&self, iova: u64, size: u64) -> Result<()> {
-        let mut st = self.setup.lock();
-        let ep = st.endpoint(SETUP_SOURCE_EP).ok_or(ENXIO)?;
-        let tx_off = st.arena_offset(ep.tx_iova).ok_or(EIO)?;
-        let rx_off = st.arena_offset(ep.rx_iova).ok_or(EIO)?;
-        let mut req = [0u8; 24];
-        req[..8].copy_from_slice(&SETUP_SET_SOURCE_BUFFER.to_le_bytes());
-        req[8..16].copy_from_slice(&iova.to_le_bytes());
-        req[16..24].copy_from_slice(&size.to_le_bytes());
-        {
-            let arena = st.arena.as_mut().ok_or(ENXIO)?;
-            // SAFETY: the arena is a coherent allocation of
-            // SETUP_ARENA_PAGES pages and tx_off is a page inside it.
-            unsafe {
-                let buf = &mut arena.as_mut()[tx_off..tx_off + req.len()];
-                buf.copy_from_slice(&req);
-            }
-        }
-        mem_sync();
-        st.reply = None;
-        st.send(SETUP_SOURCE_EP, SETUP_REQUEST_TYPE | req.len() as u64)?;
-        let mut waited = 0i64;
-        while st.reply.is_none() {
-            let _ = self
-                .setup_cv
-                .wait_interruptible_timeout(&mut st, msecs_to_jiffies(100));
-            waited += 100;
-            if waited >= SETUP_REPLY_TIMEOUT_MS && st.reply.is_none() {
-                dev_err!(self.dev, "setup port: source bind timed out\n");
-                return Err(ETIMEDOUT);
-            }
-        }
-        let reply = st.reply.take().unwrap();
-        if reply != SETUP_REPLY_READY {
-            dev_err!(
-                self.dev,
-                "setup port: unexpected source bind reply {:#x}\n",
-                reply
-            );
-            return Err(EIO);
-        }
-        mem_sync();
-        let status = {
-            let arena = st.arena.as_ref().ok_or(ENXIO)?;
-            // SAFETY: rx_off is a page inside the arena.
-            unsafe { arena.as_ref()[rx_off] }
-        };
-        st.send(SETUP_SOURCE_EP, SETUP_REQUEST_DONE)?;
-        if status != 0 {
-            dev_err!(self.dev, "setup port: source bind status {:#x}\n", status);
-            return Err(EIO);
-        }
-        dev_info!(
-            self.dev,
-            "setup port: source ring {:#x} ({} bytes) bound\n",
-            iova,
-            size
-        );
-        Ok(())
-    }
-
-    /// Push the ALS calibration on setup-port endpoint 0x21.
-    ///
-    /// Without it the sensor answers every property correctly and accepts the
-    /// arming interval, and then reports nothing at all, because the trusted
-    /// side never powers the part.  With it the samples start immediately.
-    /// Measured on a cold AOP under m1n1 with no secure kernel present, which
-    /// is the point: the exclave is needed to learn these bytes, not to send
-    /// them.
-    fn setup_push_als_calibration(&self) -> Result<()> {
-        let mut st = self.setup.lock();
-        let ep = match st.endpoint(SETUP_ALS_EP) {
-            Some(ep) => ep,
-            None => {
-                dev_warn!(
-                    self.dev,
-                    "setup port: no endpoint {:#04x}; ALS uncalibrated\n",
-                    SETUP_ALS_EP
-                );
-                return Ok(());
-            }
-        };
-        let tx_off = st.arena_offset(ep.tx_iova).ok_or(EIO)?;
-        let rx_off = st.arena_offset(ep.rx_iova).ok_or(EIO)?;
-        {
-            let arena = st.arena.as_mut().ok_or(ENXIO)?;
-            // SAFETY: the arena is a coherent allocation of SETUP_ARENA_PAGES
-            // pages and tx_off is a page inside it.
-            unsafe {
-                let buf = &mut arena.as_mut()[tx_off..tx_off + SETUP_ALS_CALIBRATION.len()];
-                buf.copy_from_slice(&SETUP_ALS_CALIBRATION);
-            }
-        }
-        mem_sync();
-        st.reply = None;
-        st.send(
-            SETUP_ALS_EP,
-            SETUP_REQUEST_TYPE | SETUP_ALS_CALIBRATION.len() as u64,
-        )?;
-        let mut waited = 0i64;
-        while st.reply.is_none() {
-            let _ = self
-                .setup_cv
-                .wait_interruptible_timeout(&mut st, msecs_to_jiffies(100));
-            waited += 100;
-            if waited >= SETUP_REPLY_TIMEOUT_MS && st.reply.is_none() {
-                dev_err!(self.dev, "setup port: ALS calibration timed out\n");
-                return Err(ETIMEDOUT);
-            }
-        }
-        let reply = st.reply.take().unwrap();
-        if reply != SETUP_REPLY_READY && reply != SETUP_REPLY_READY_ALT {
-            dev_err!(
-                self.dev,
-                "setup port: unexpected ALS calibration reply {:#x}\n",
-                reply
-            );
-            return Err(EIO);
-        }
-        mem_sync();
-        let status = {
-            let arena = st.arena.as_ref().ok_or(ENXIO)?;
-            // SAFETY: rx_off is a page inside the arena.
-            unsafe { arena.as_ref()[rx_off] }
-        };
-        st.send(SETUP_ALS_EP, SETUP_REQUEST_DONE)?;
-        dev_info!(
-            self.dev,
-            "setup port: ALS calibration pushed (reply {:#x}, status {:#x})\n",
-            reply,
-            status
-        );
-        Ok(())
-    }
-
-    /// Endpoint buffer request: one host-to-AOP page and a reply window of
-    /// requested * 16 bytes, both handed out from the pre-mapped arena.
-    fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
-        let requested = (word & 0xffffffff) as usize;
-        let slot = SETUP_ENDPOINTS.iter().position(|e| *e == ep).ok_or(EIO)?;
-        if st.endpoints[slot].is_some() || (requested != 0x400 && requested != 0x1000) {
-            return Err(EIO);
-        }
-        let rx_pages = (requested * 16).div_ceil(SETUP_PAGE);
-        if st.next_page + 1 + rx_pages > SETUP_ARENA_PAGES {
-            return Err(ENOMEM);
-        }
-        let base = st.arena_iova();
-        let tx_iova = base + (st.next_page * SETUP_PAGE) as u64;
-        st.next_page += 1;
-        let rx_iova = base + (st.next_page * SETUP_PAGE) as u64;
-        st.next_page += rx_pages;
-        st.send(ep, SETUP_BUFFER_REQUEST_ACK)?;
-        st.send(ep, SetupState::shared_descriptor(tx_iova, 1, true))?;
-        st.send(ep, SetupState::shared_descriptor(rx_iova, rx_pages, false))?;
-        st.endpoints[slot] = Some(SetupEndpoint {
-            ep,
-            tx_iova,
-            rx_iova,
-        });
-        dev_info!(
-            self.dev,
-            "setup port: endpoint {:#x} tx {:#x} rx {:#x} ({} pages)\n",
-            ep,
-            tx_iova,
-            rx_iova,
-            rx_pages
-        );
-        Ok(())
-    }
-
-    /// After the primary port reports AP power ON: request the setup port's
-    /// AP power state and wait for its ack and the five endpoint buffers.
-    fn setup_finish_boot(&self) -> Result<()> {
-        let mut st = self.setup.lock();
-        if !st.map_done {
-            dev_warn!(
-                self.dev,
-                "setup port: EPMAP not complete before AP power request\n"
-            );
-        }
-        if !st.power_sent {
-            st.send(SETUP_MGMT_EP, (SETUP_TYPE_AP_PWR << 52) | SETUP_AP_PWR_INIT)?;
-            st.power_sent = true;
-        }
-        let mut waited = 0i64;
-        while !st.ready() && !st.failed {
-            let _ = self
-                .setup_cv
-                .wait_interruptible_timeout(&mut st, msecs_to_jiffies(100));
-            waited += 100;
-            if waited >= SETUP_BOOT_TIMEOUT_MS {
-                break;
-            }
-        }
-        let ready = st.ready();
-        let count = st.endpoint_count();
-        let ap_ready = st.ap_ready;
-        let failed = st.failed;
-        drop(st);
-        if !ready {
-            dev_err!(
-                self.dev,
-                "setup port: boot incomplete (ap_ready {} endpoints {}/{} failed {})\n",
-                ap_ready,
-                count,
-                SETUP_ENDPOINTS.len(),
-                failed
-            );
-            return Err(ETIMEDOUT);
-        }
-        dev_info!(self.dev, "setup port: dual-mailbox boot complete\n");
-        self.dump_setup_rings();
-        Ok(())
-    }
-
-    /// Endpoints 0x30 and 0x32 get setup-port tx/rx buffers and then nothing
-    /// runs on them: they are not started as AFK/EPIC endpoints.  macOS reaches
-    /// the SPU (and so the CT817 ambient light sensor) over a RemoteDataQueue
-    /// pair on an iop_ringbuffer, not over EPIC, so one of these is the likely
-    /// carrier.  An iop_ringbuffer is identifiable without any traffic: its
-    /// header word at ring+4 carries the protocol version in the high half, and
-    /// iop_ringbuffer_enqueue_msg_vec only emits the "AOP " magic when that is
-    /// 0x0007xxxx.  Dump the head of every setup buffer so the ring -- if there
-    /// is one -- names itself.
-    fn dump_setup_rings(&self) {
-        let st = self.setup.lock();
-        let Some(arena) = st.arena.as_ref() else {
-            return;
-        };
-        // SAFETY: the arena is a live coherent allocation of SETUP_ARENA_PAGES
-        // pages and every offset below is bounds-checked against it.
-        let bytes = unsafe { arena.as_ref() };
-        for slot in st.endpoints.iter().flatten() {
-            for (what, iova) in [("tx", slot.tx_iova), ("rx", slot.rx_iova)] {
-                let Some(off) = st.arena_offset(iova) else {
-                    continue;
-                };
-                if off + 64 > bytes.len() {
-                    continue;
-                }
-                let head = &bytes[off..off + 64];
-                let w0 = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-                let w1 = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
-                let ring = (w1 & 0xffff0000) == 0x0007_0000;
-                dev_info!(
-                    self.dev,
-                    "setup port: ep {:#x} {} head w0 {:#010x} w1 {:#010x}{} {:02x?}\n",
-                    slot.ep,
-                    what,
-                    w0,
-                    w1,
-                    if ring { " IOP_RINGBUFFER(v7)" } else { "" },
-                    head
-                );
-            }
-        }
-    }
-
     fn start_cpu(&self, asc_mmio: &RelaxedMmio<ASC_MMIO_SIZE>) -> Result<()> {
         let val = asc_mmio.read32(CPU_CONTROL);
         asc_mmio.write32(val | CPU_RUN, CPU_CONTROL);
@@ -1968,7 +1585,6 @@ impl AOP for AopData {
                 rtk.as_mut(),
                 svc.channel,
                 subtype,
-                EPIC_CATEGORY_NOTIFY,
                 msg_bytes,
                 Some(ret_buf),
             )?
@@ -1976,7 +1592,6 @@ impl AOP for AopData {
         let res = self.wait_call(ep_idx, svc, subtype, call)?;
         Ok((res.retcode, res.extra_data.ok_or(EIO)?))
     }
-
     fn add_fakehid_listener(
         &self,
         svc: EPICService,
