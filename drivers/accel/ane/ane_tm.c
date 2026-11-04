@@ -246,15 +246,12 @@ static int ane_tm_collect_events(struct ane_device *ane,
 	return *finished == 3 && (tm_read32(ane, TM_STATUS) & TM_IS_IDLE);
 }
 
-/* read_poll_timeout op: consult the DART latch before any engine access.
- * Returns 1 to end the poll when a fault is latched; the caller then
- * handles the fault without ever reading the wedged engine.
- */
+/* Stop polling on a DART fault before accessing the engine. */
 static int ane_tm_poll_step(struct ane_device *ane, struct ane_request *req,
 			    u32 *finished)
 {
 	if (ane_dart_faulted(ane, NULL, NULL))
-		return 1;
+		return -EIO;
 	return ane_tm_collect_events(ane, req, finished);
 }
 
@@ -295,10 +292,13 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 			err = status;
 		if (ane_dart_faulted(ane, &fault_iova, &fault_status)) {
 			faulted = true;
-			if (ane->scratch_pages >= ANE_DART_SCRATCH_MAX)
+			if (ane->scratch_pages >= ANE_DART_SCRATCH_MAX) {
+				err = -EIO;
 				break;
-			if (ane_dart_drain_fault(ane, fault_iova, scratch,
-						 &ane->scratch_pages))
+			}
+			err = ane_dart_drain_fault(ane, fault_iova, scratch,
+						   &ane->scratch_pages);
+			if (err)
 				break;
 			/* The retried transaction now completes; poll on. */
 			continue;
@@ -307,19 +307,9 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	}
 
 	if (faulted) {
-		/* The faulting program drained through the scratch pages
-		 * and the engine is idle again (the latch is clear or the
-		 * poll would still be running). Gate the queue with the
-		 * normal completion writes, hand the scratch pages back,
-		 * and fail this request. No partition power cycle, no
-		 * stream disable: the page tables were never changed by
-		 * the fault.
-		 */
+		/* Only a successful poll establishes completion after a drain. */
 		if (err || ane_dart_faulted(ane, NULL, NULL)) {
-			/* Drain failed or the drained program never reached
-			 * completion: the engine is not idle and access is
-			 * off the table. Retain scratch backing until reset.
-			 */
+			/* Completion is unknown; retain scratch until reboot. */
 			err = err ?: -EIO;
 			goto wedge;
 		}
@@ -362,17 +352,9 @@ wedge:
 			err, finished, req->qid, req->nid);
 	}
 
-	/* One bounded recovery attempt: stop the tm, power-cycle the engine
-	 * and return to accepting work. Only a failed reset preserves
-	 * resources until reboot.
-	 */
+	/* Retained scratch prevents recovery until reboot. */
 	if (ane_tm_recover(ane) < 0) {
-		if (ane->tm_retention)
-			dev_err(ane->dev,
-				"recovery failed; preserving resources until module reload or reboot (tm/tq file retained through the cycle: the latched task error parks the TM in place; rmmod+insmod restores service)\n");
-		else
-			dev_err(ane->dev,
-				"recovery failed; preserving resources until reboot\n");
+		dev_err(ane->dev, "recovery failed; preserving resources until reboot\n");
 	}
 	return err;
 }
@@ -583,6 +565,8 @@ int ane_tm_recover(struct ane_device *ane)
 	lockdep_assert_held(&ane->engine_lock);
 	if (!atomic_read(&ane->wedged))
 		return 0;
+	if (ane->scratch_pages)
+		return -EBUSY;
 
 	dev_err(ane->dev, "recovering: power-cycling engine partitions\n");
 

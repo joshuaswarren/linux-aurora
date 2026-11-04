@@ -824,15 +824,14 @@ static void ane_drm_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	struct ane_device *ane = drm->dev_private;
 
-	mutex_lock(&ane->engine_lock);
-	if (ane->removed) {
-		mutex_unlock(&ane->engine_lock);
+	if (pm_runtime_resume_and_get(ane->dev) < 0)
 		return;
-	}
-
-	ane_tm_recover(ane);
-
+	mutex_lock(&ane->engine_lock);
+	if (!ane->removed)
+		ane_tm_recover(ane);
 	mutex_unlock(&ane->engine_lock);
+	pm_runtime_mark_last_busy(ane->dev);
+	pm_runtime_put_autosuspend(ane->dev);
 }
 
 /*
@@ -911,11 +910,14 @@ static int ane_drm_release(struct inode *inode, struct file *file)
 {
 	struct drm_file *priv = file->private_data;
 	struct device *dev = get_device(priv->minor->dev->dev);
-	int err;
+	int err, pm_err;
 
-	pm_runtime_get_sync(dev);
+	pm_err = pm_runtime_resume_and_get(dev);
 	err = drm_release(inode, file);
-	pm_runtime_put_autosuspend(dev);
+	if (pm_err >= 0) {
+		pm_runtime_mark_last_busy(dev);
+		pm_runtime_put_autosuspend(dev);
+	}
 	put_device(dev);
 	return err;
 }

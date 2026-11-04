@@ -71,7 +71,7 @@ struct ane_device {
 	 * nodes (see ane_reclaim_preserved). Registered under engine_lock.
 	 */
 	struct list_head preserved_list;
-	/* Fault-drain DMA backing, retained until completion or a safe reset. */
+	/* Fault-drain DMA backing, retained until completion or reboot. */
 	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
 	int scratch_pages;
 	bool removed;
