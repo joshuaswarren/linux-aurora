@@ -828,6 +828,17 @@ found:
 	if (!total)
 		return 0;
 
+	/*
+	 * With pci=noiovbars the VF BARs are never sized and never become
+	 * resources, so a device that exposes huge SR-IOV BARs does not ask
+	 * for prefetchable window space the platform cannot give. SR-IOV
+	 * stays off for the device: is_physfn is never set, so
+	 * pci_enable_sriov() returns -ENOSYS and pci_sriov_get_totalvfs()
+	 * returns 0.
+	 */
+	if (pci_noiovbars)
+		return 0;
+
 	pci_read_config_dword(dev, pos + PCI_SRIOV_SUP_PGSIZE, &pgsz);
 	i = PAGE_SHIFT > 12 ? PAGE_SHIFT - 12 : 0;
 	pgsz &= ~((1 << i) - 1);
