@@ -488,8 +488,8 @@ int xe_guc_ads_init(struct xe_guc_ads *ads)
 
 	dev_info(xe->drm.dev,
 		 "xe np: ads bo mem_type=%u ggtt_addr=0x%llx size=%llu\n",
-		 ads->bo->ttm.resource->mem_type, xe_bo_ggtt_addr(ads->bo),
-		 xe_bo_size(ads->bo));
+		 ads->bo->ttm.resource->mem_type, (unsigned long long)xe_bo_ggtt_addr(ads->bo),
+		 (unsigned long long)xe_bo_size(ads->bo));
 
 	return 0;
 }

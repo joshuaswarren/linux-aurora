@@ -1278,8 +1278,8 @@ int xe_guc_pc_start(struct xe_guc_pc *pc)
 
 	dev_info(xe->drm.dev,
 		 "xe np: slpc bo mem_type=%u ggtt_addr=0x%llx size=%llu slpc_size=%u np_kernel_bo_sysmem=%d np_sysmem_wc=%d np_keep_vram_mask=0x%x\n",
-		 pc->bo->ttm.resource->mem_type, xe_bo_ggtt_addr(pc->bo),
-		 xe_bo_size(pc->bo), size, xe_modparam.np_kernel_bo_sysmem,
+		 pc->bo->ttm.resource->mem_type, (unsigned long long)xe_bo_ggtt_addr(pc->bo),
+		 (unsigned long long)xe_bo_size(pc->bo), size, xe_modparam.np_kernel_bo_sysmem,
 		 xe_modparam.np_sysmem_wc, xe_modparam.np_keep_vram_mask);
 
 	earlier = ktime_get();
