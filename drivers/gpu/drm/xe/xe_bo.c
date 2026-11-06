@@ -4,9 +4,12 @@
  */
 
 #include "xe_bo.h"
+#include "regs/xe_bars.h"
 
 #include <linux/dma-buf.h>
+#include <linux/dma-map-ops.h>
 #include <linux/nospec.h>
+#include <linux/pci.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_dumb_buffers.h>
@@ -28,6 +31,7 @@
 #include "xe_ggtt.h"
 #include "xe_map.h"
 #include "xe_migrate.h"
+#include "xe_module.h"
 #include "xe_pat.h"
 #include "xe_pm.h"
 #include "xe_preempt_fence.h"
@@ -607,6 +611,35 @@ static struct ttm_tt *xe_ttm_tt_create(struct ttm_buffer_object *ttm_bo,
 		xe_assert(xe, bo->cpu_caching == 0);
 		caching = ttm_uncached;
 	}
+	else if (xe_modparam.np_kernel_bo_sysmem &&
+		 xe_modparam.np_sysmem_wc &&
+		 (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+		  IORESOURCE_MEM_NONPOSTED) &&
+		 !dev_is_dma_coherent(xe->drm.dev) &&
+		 (bo->flags & XE_BO_FLAG_SYSTEM) &&
+		 !(bo->flags & XE_BO_FLAG_USER)) {
+		/*
+		 * Non-coherent DMA: write-combine CPU access to system
+		 * BOs (Normal-NC, memcpy-safe) instead of write-back;
+		 * stale linear-map lines are cleaned by the DMA map.
+		 */
+		xe_assert(xe, bo->cpu_caching == 0);
+		caching = ttm_write_combined;
+	}
+	else if (xe_modparam.np_user_sysmem_wc &&
+		 (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+		  IORESOURCE_MEM_NONPOSTED) &&
+		 !dev_is_dma_coherent(xe->drm.dev) &&
+		 (bo->flags & XE_BO_FLAG_SYSTEM) &&
+		 bo->cpu_caching == DRM_XE_GEM_CPU_CACHING_WC) {
+		/*
+		 * Non-coherent: honor a user WC request (or the forced
+		 * WC from the GEM create path) on dGPU too, where the
+		 * switch above is skipped and system pages would
+		 * otherwise always be CPU write-back.
+		 */
+		caching = ttm_write_combined;
+	}
 
 	if (ttm_bo->type != ttm_bo_type_sg)
 		page_flags |= TTM_TT_FLAG_EXTERNAL | TTM_TT_FLAG_EXTERNAL_MAPPABLE;
@@ -737,8 +770,14 @@ static int xe_ttm_io_mem_reserve(struct ttm_device *bdev,
 		mem->bus.offset += vram->io_start;
 		mem->bus.is_iomem = true;
 
+		if (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+		    IORESOURCE_MEM_NONPOSTED) {
+			mem->bus.is_nonposted = true;
+			mem->bus.caching = ttm_uncached;
+		}
 #if  !IS_ENABLED(CONFIG_X86)
-		mem->bus.caching = ttm_write_combined;
+		else
+			mem->bus.caching = ttm_write_combined;
 #endif
 		return 0;
 	} case XE_PL_STOLEN:
@@ -2056,6 +2095,19 @@ static vm_fault_t __xe_bo_cpu_fault(struct vm_fault *vmf, struct xe_device *xe, 
 {
 	vm_fault_t ret;
 
+	/*
+	 * egpu-b60: CPU faults on VRAM BOs would map Device-nGnRnE
+	 * pages through the BAR, which userspace cannot access with
+	 * ordinary stores. Fail the mapping cleanly instead.
+	 */
+	if (xe_modparam.np_user_no_cpu_vram &&
+	    (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+	     IORESOURCE_MEM_NONPOSTED) &&
+	    !dev_is_dma_coherent(xe->drm.dev) &&
+	    xe_bo_is_vram(bo) &&
+	    !(bo->flags & XE_BO_FLAG_NP_USER_VRAM))
+		return VM_FAULT_SIGBUS;
+
 	trace_xe_bo_cpu_fault(bo);
 
 	ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot,
@@ -2442,15 +2494,16 @@ struct xe_bo *xe_bo_init_locked(struct xe_device *xe, struct xe_bo *bo,
 		flags |= XE_BO_FLAG_INTERNAL_64K;
 		alignment = align >> PAGE_SHIFT;
 	} else {
-		aligned_size = ALIGN(size, SZ_4K);
+		aligned_size = PAGE_ALIGN(size);
 		flags &= ~XE_BO_FLAG_INTERNAL_64K;
-		alignment = SZ_4K >> PAGE_SHIFT;
+		alignment = 1;
 	}
 
 	if (type == ttm_bo_type_device && aligned_size != size) {
 		xe_bo_free(bo);
 		return ERR_PTR(-EINVAL);
 	}
+	size = aligned_size;
 
 	if (!bo) {
 		bo = xe_bo_alloc();
@@ -2603,6 +2656,28 @@ __xe_bo_create_locked(struct xe_device *xe,
 
 	if (vm)
 		xe_vm_assert_held(vm);
+
+	/*
+	 * On hosts where the VRAM BAR must be mapped non-posted (e.g.
+	 * behind the Apple USB4/PCIe tunnel), CPU stores into kernel BO
+	 * vmaps over that BAR fault the fabric. Route pinned,
+	 * CPU-accessed kernel BOs (LRC, HWSP, GuC ADS/log/ct, rings, ...)
+	 * to system memory. User BOs from the GEM create ioctl keep their
+	 * requested placement (they are neither PINNED nor
+	 * NEEDS_CPU_ACCESS at creation) and fixed-placement requests are
+	 * left untouched.
+	 */
+	if (!(start || end != ~0ULL) &&
+	    xe_modparam.np_kernel_bo_sysmem &&
+	    (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+	     IORESOURCE_MEM_NONPOSTED) &&
+	    (flags & XE_BO_FLAG_PINNED) &&
+	    (flags & XE_BO_FLAG_NEEDS_CPU_ACCESS) &&
+	    !(flags & XE_BO_FLAG_NP_KEEP_VRAM)) {
+		flags &= ~XE_BO_FLAG_VRAM_MASK;
+		flags |= XE_BO_FLAG_SYSTEM;
+	}
+	flags &= ~XE_BO_FLAG_NP_KEEP_VRAM;
 
 	if (start || end != ~0ULL) {
 		bo = xe_bo_alloc();
@@ -3370,6 +3445,15 @@ static int gem_create_user_ext_set_property(struct xe_device *xe,
 	if (XE_IOCTL_DBG(xe, err))
 		return -EFAULT;
 
+	if (ext.property == DRM_XE_GEM_CREATE_SET_PROPERTY_NP_KEEP_VRAM) {
+		if (XE_IOCTL_DBG(xe, ext.value > 1))
+			return -EINVAL;
+		/* Applied at creation time by the pre-scan in
+		 * xe_gem_create_ioctl().
+		 */
+		return 0;
+	}
+
 	if (XE_IOCTL_DBG(xe, ext.property >=
 			 ARRAY_SIZE(gem_create_set_property_funcs)) ||
 	    XE_IOCTL_DBG(xe, ext.pad) ||
@@ -3435,6 +3519,7 @@ int xe_gem_create_ioctl(struct drm_device *dev, void *data,
 	struct xe_vm *vm = NULL;
 	struct xe_bo *bo;
 	unsigned int bo_flags;
+	bool np_keep_vram = false;
 	u32 handle;
 	int err;
 
@@ -3484,6 +3569,57 @@ int xe_gem_create_ioctl(struct drm_device *dev, void *data,
 
 	bo_flags |= args->placement << (ffs(XE_BO_FLAG_SYSTEM) - 1);
 
+	/*
+	 * egpu-b60: opt-in (DRM_XE_GEM_CREATE_SET_PROPERTY_NP_KEEP_VRAM,
+	 * property 0x4e50, value 1): keep this user BO in VRAM. Walk the
+	 * extension chain up front because placement is decided at
+	 * creation; the post-create property walk accepts the property
+	 * and treats it as already applied.
+	 */
+	if (xe_modparam.np_keep_vram_ext &&
+	    (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+	     IORESOURCE_MEM_NONPOSTED) &&
+	    !dev_is_dma_coherent(xe->drm.dev)) {
+		u64 ext_ptr = args->extensions;
+		int cnt = 0;
+
+		while (ext_ptr && cnt++ < MAX_USER_EXTENSIONS) {
+			struct drm_xe_user_extension user_ext;
+			struct drm_xe_ext_set_property set_prop;
+
+			if (copy_from_user(&user_ext, u64_to_user_ptr(ext_ptr),
+					   sizeof(user_ext)))
+				break;
+			if (user_ext.name !=
+			    DRM_XE_GEM_CREATE_EXTENSION_SET_PROPERTY) {
+				ext_ptr = user_ext.next_extension;
+				continue;
+			}
+			if (copy_from_user(&set_prop, u64_to_user_ptr(ext_ptr),
+					   sizeof(set_prop)))
+				break;
+			if (set_prop.property ==
+			    DRM_XE_GEM_CREATE_SET_PROPERTY_NP_KEEP_VRAM &&
+			    set_prop.value == 1)
+				np_keep_vram = true;
+			ext_ptr = set_prop.base.next_extension;
+		}
+	}
+
+	if (np_keep_vram) {
+		if (XE_IOCTL_DBG(xe, !(bo_flags & XE_BO_FLAG_VRAM_MASK)))
+			return -EINVAL;
+		bo_flags |= XE_BO_FLAG_NP_USER_VRAM;
+	} else if (xe_modparam.np_user_no_cpu_vram &&
+	    (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+	     IORESOURCE_MEM_NONPOSTED) &&
+	    !dev_is_dma_coherent(xe->drm.dev) &&
+	    (args->flags & DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM)) {
+		bo_flags &= ~XE_BO_FLAG_VRAM_MASK;
+		bo_flags |= XE_BO_FLAG_SYSTEM;
+		args->flags &= ~DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM;
+	}
+
 	/* CCS formats need physical placement at a 64K alignment in VRAM. */
 	if ((bo_flags & XE_BO_FLAG_VRAM_MASK) &&
 	    (args->flags & DRM_XE_GEM_CREATE_FLAG_SCANOUT) &&
@@ -3501,6 +3637,19 @@ int xe_gem_create_ioctl(struct drm_device *dev, void *data,
 	if (XE_IOCTL_DBG(xe, !args->cpu_caching ||
 			 args->cpu_caching > DRM_XE_GEM_CPU_CACHING_WC))
 		return -EINVAL;
+
+	/*
+	 * On a non-coherent host with a non-posted BAR, user SYSTEM BOs
+	 * mapped write-back lose GPU/CPU coherency (no snoop); give them
+	 * write-combined CPU caching regardless of the requested WB.
+	 */
+	if (xe_modparam.np_user_sysmem_wc &&
+	    (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+	     IORESOURCE_MEM_NONPOSTED) &&
+	    !dev_is_dma_coherent(xe->drm.dev) &&
+	    (bo_flags & XE_BO_FLAG_SYSTEM) &&
+	    args->cpu_caching == DRM_XE_GEM_CPU_CACHING_WB)
+		args->cpu_caching = DRM_XE_GEM_CPU_CACHING_WC;
 
 	if (XE_IOCTL_DBG(xe, bo_flags & XE_BO_FLAG_VRAM_MASK &&
 			 args->cpu_caching != DRM_XE_GEM_CPU_CACHING_WC))

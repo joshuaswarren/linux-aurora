@@ -5,7 +5,9 @@
 
 #include "xe_query.h"
 
+#include <linux/dma-map-ops.h>
 #include <linux/nospec.h>
+#include <linux/pci.h>
 #include <linux/sched/clock.h>
 
 #include <drm/ttm/ttm_placement.h>
@@ -14,6 +16,7 @@
 
 #include "regs/xe_engine_regs.h"
 #include "regs/xe_gt_regs.h"
+#include "regs/xe_bars.h"
 #include "xe_bo.h"
 #include "xe_device.h"
 #include "xe_eu_stall.h"
@@ -299,6 +302,22 @@ static int query_mem_regions(struct xe_device *xe,
 
 			mem_regions->mem_regions[mem_regions->num_mem_regions].cpu_visible_size =
 				xe_ttm_vram_get_cpu_visible_size(man);
+
+			/*
+			 * egpu-b60: opt-in reporting change. Default keeps
+			 * the real visible window (256 MiB) so clients keep
+			 * a DEVICE_LOCAL|HOST_VISIBLE heap; the np gating of
+			 * CPU-mapped BOs happens at GEM create time.
+			 */
+			if (xe_modparam.np_hide_visible_vram &&
+			    (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+			     IORESOURCE_MEM_NONPOSTED) &&
+			    !dev_is_dma_coherent(xe->drm.dev)) {
+				mem_regions->mem_regions
+					[mem_regions->num_mem_regions].cpu_visible_used = 0;
+				mem_regions->mem_regions
+					[mem_regions->num_mem_regions].cpu_visible_size = 0;
+			}
 			mem_regions->num_mem_regions++;
 		}
 	}
@@ -351,8 +370,14 @@ static int query_config(struct xe_device *xe, struct drm_xe_device_query *query)
 		DRM_XE_QUERY_CONFIG_FLAG_HAS_DISABLE_STATE_CACHE_PERF_FIX;
 	config->info[DRM_XE_QUERY_CONFIG_FLAGS] |=
 		DRM_XE_QUERY_CONFIG_FLAG_HAS_PURGING_SUPPORT;
+	if (xe_modparam.np_keep_vram_ext &&
+	    (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+	     IORESOURCE_MEM_NONPOSTED) &&
+	    !dev_is_dma_coherent(xe->drm.dev))
+		config->info[DRM_XE_QUERY_CONFIG_FLAGS] |=
+			DRM_XE_QUERY_CONFIG_FLAG_NP_KEEP_VRAM_EXT;
 	config->info[DRM_XE_QUERY_CONFIG_MIN_ALIGNMENT] =
-		xe->info.vram_flags & XE_VRAM_FLAGS_NEED64K ? SZ_64K : SZ_4K;
+		xe->info.vram_flags & XE_VRAM_FLAGS_NEED64K ? SZ_64K : PAGE_SIZE;
 	config->info[DRM_XE_QUERY_CONFIG_VA_BITS] = xe->info.va_bits;
 	config->info[DRM_XE_QUERY_CONFIG_MAX_EXEC_QUEUE_PRIORITY] =
 		xe_exec_queue_device_get_max_priority(xe);
