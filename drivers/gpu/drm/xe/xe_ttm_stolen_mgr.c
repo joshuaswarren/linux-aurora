@@ -256,6 +256,11 @@ int xe_ttm_stolen_mgr_init(struct xe_device *xe)
 
 	xe->mem.stolen_mgr = mgr;
 
+	/* Register cleanup before the fallible map below so its error return unwinds the manager. */
+	ret = drmm_add_action_or_reset(&xe->drm, xe_ttm_stolen_mgr_fini, mgr);
+	if (ret)
+		return ret;
+
 	drm_dbg_kms(&xe->drm, "Initialized stolen memory support with %llu bytes\n",
 		    stolen_size);
 
@@ -270,7 +275,7 @@ int xe_ttm_stolen_mgr_init(struct xe_device *xe)
 		}
 	}
 
-	return drmm_add_action_or_reset(&xe->drm, xe_ttm_stolen_mgr_fini, mgr);
+	return 0;
 }
 
 u64 xe_ttm_stolen_io_offset(struct xe_bo *bo, u32 offset)
