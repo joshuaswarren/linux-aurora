@@ -10,6 +10,7 @@
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/sizes.h>
 #include <linux/wait_bit.h>
 
 #include <drm/drm_managed.h>
@@ -1256,7 +1257,7 @@ int xe_guc_pc_start(struct xe_guc_pc *pc)
 {
 	struct xe_device *xe = pc_to_xe(pc);
 	struct xe_gt *gt = pc_to_gt(pc);
-	u32 size = PAGE_ALIGN(sizeof(struct slpc_shared_data));
+	u32 size = ALIGN(sizeof(struct slpc_shared_data), SZ_4K);
 	ktime_t earlier;
 	int ret;
 
@@ -1274,6 +1275,12 @@ int xe_guc_pc_start(struct xe_guc_pc *pc)
 
 	xe_map_memset(xe, &pc->bo->vmap, 0, 0, size);
 	slpc_shared_data_write(pc, header.size, size);
+
+	dev_info(xe->drm.dev,
+		 "xe np: slpc bo mem_type=%u ggtt_addr=0x%llx size=%llu slpc_size=%u np_kernel_bo_sysmem=%d np_sysmem_wc=%d np_keep_vram_mask=0x%x\n",
+		 pc->bo->ttm.resource->mem_type, xe_bo_ggtt_addr(pc->bo),
+		 xe_bo_size(pc->bo), size, xe_modparam.np_kernel_bo_sysmem,
+		 xe_modparam.np_sysmem_wc, xe_modparam.np_keep_vram_mask);
 
 	earlier = ktime_get();
 	ret = pc_action_reset(pc);
@@ -1364,7 +1371,7 @@ int xe_guc_pc_init(struct xe_guc_pc *pc)
 	struct xe_tile *tile = gt_to_tile(gt);
 	struct xe_device *xe = gt_to_xe(gt);
 	struct xe_bo *bo;
-	u32 size = PAGE_ALIGN(sizeof(struct slpc_shared_data));
+	u32 size = ALIGN(sizeof(struct slpc_shared_data), SZ_4K);
 	int err;
 
 	if (xe->info.skip_guc_pc)
@@ -1378,7 +1385,9 @@ int xe_guc_pc_init(struct xe_guc_pc *pc)
 					  XE_BO_FLAG_VRAM_IF_DGFX(tile) |
 					  XE_BO_FLAG_GGTT |
 					  XE_BO_FLAG_GGTT_INVALIDATE |
-					  XE_BO_FLAG_PINNED_NORESTORE);
+					  XE_BO_FLAG_PINNED_NORESTORE |
+					  (xe_np_keep_vram(XE_NP_KEEP_SLPC) ?
+					   XE_BO_FLAG_NP_KEEP_VRAM : 0));
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
 

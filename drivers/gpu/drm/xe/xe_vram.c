@@ -4,6 +4,7 @@
  */
 
 #include <kunit/visibility.h>
+#include <linux/io.h>
 #include <linux/pci.h>
 
 #include <drm/drm_managed.h>
@@ -38,6 +39,22 @@ static bool resource_is_valid(struct pci_dev *pdev, int bar)
 	return true;
 }
 
+static void xe_np_unmap(void *mapping)
+{
+	iounmap((void __iomem __force *)mapping);
+}
+
+static void __iomem *xe_ioremap_np(struct pci_dev *pdev, resource_size_t offset,
+				   resource_size_t size)
+{
+	void __iomem *mapping = ioremap_np(offset, size);
+
+	if (mapping && devm_add_action_or_reset(&pdev->dev, xe_np_unmap, mapping))
+		return NULL;
+
+	return mapping;
+}
+
 static int determine_lmem_bar_size(struct xe_device *xe, struct xe_vram_region *lmem_bar)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
@@ -56,7 +73,14 @@ static int determine_lmem_bar_size(struct xe_device *xe, struct xe_vram_region *
 	lmem_bar->dpa_base = 0;
 
 	/* set up a map to the total memory area. */
-	lmem_bar->mapping = devm_ioremap_wc(&pdev->dev, lmem_bar->io_start, lmem_bar->io_size);
+	if (pci_resource_flags(pdev, LMEM_BAR) & IORESOURCE_MEM_NONPOSTED)
+		lmem_bar->mapping = xe_ioremap_np(pdev, lmem_bar->io_start, lmem_bar->io_size);
+	else
+		lmem_bar->mapping = devm_ioremap_wc(&pdev->dev, lmem_bar->io_start, lmem_bar->io_size);
+	if (!lmem_bar->mapping) {
+		drm_err(&xe->drm, "failed to map lmem bar\n");
+		return -ENOMEM;
+	}
 
 	return 0;
 }

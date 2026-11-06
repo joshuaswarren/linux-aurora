@@ -30,12 +30,58 @@ struct xe_modparam xe_modparam = {
 #endif
 	.wedged_mode =		XE_DEFAULT_WEDGED_MODE,
 	.svm_notifier_size =	XE_DEFAULT_SVM_NOTIFIER_SIZE,
+	.np_kernel_bo_sysmem =	true,
+	.np_sysmem_wc =		true,
+	.np_user_sysmem_wc =	true,
+	.np_user_no_cpu_vram =	true,
+	.np_hide_visible_vram =	false,
+	.np_keep_vram_ext =	true,
+	.np_keep_vram_mask =	0x7,
 	/* the rest are 0 by default */
 };
 
 module_param_named(svm_notifier_size, xe_modparam.svm_notifier_size, uint, 0600);
 MODULE_PARM_DESC(svm_notifier_size, "Set the svm notifier size in MiB, must be power of 2 "
 		 "[default=" __stringify(XE_DEFAULT_SVM_NOTIFIER_SIZE) "]");
+
+module_param_named(np_kernel_bo_sysmem, xe_modparam.np_kernel_bo_sysmem, bool, 0444);
+MODULE_PARM_DESC(np_kernel_bo_sysmem,
+		 "Keep pinned kernel BOs in system memory when the VRAM BAR is "
+		 "non-posted (default: true)");
+
+module_param_named(np_sysmem_wc, xe_modparam.np_sysmem_wc, bool, 0444);
+MODULE_PARM_DESC(np_sysmem_wc,
+		 "Use write-combined CPU mappings for kernel system BOs on "
+		 "non-coherent non-posted hosts (default: true)");
+
+module_param_named(np_user_sysmem_wc, xe_modparam.np_user_sysmem_wc, bool, 0444);
+MODULE_PARM_DESC(np_user_sysmem_wc,
+		 "Force write-combined CPU caching for user SYSTEM BOs on "
+		 "non-coherent non-posted hosts (default: true)");
+
+module_param_named(np_user_no_cpu_vram, xe_modparam.np_user_no_cpu_vram, bool, 0444);
+MODULE_PARM_DESC(np_user_no_cpu_vram,
+		 "Place user CPU-mapped BOs in system memory instead of the "
+		 "non-posted VRAM BAR and report cpu_visible_size 0 "
+		 "(default: true)");
+
+module_param_named(np_hide_visible_vram, xe_modparam.np_hide_visible_vram, bool, 0444);
+MODULE_PARM_DESC(np_hide_visible_vram,
+		 "Report cpu_visible_size/used as 0 in the mem-region query "
+		 "(default: false)");
+
+module_param_named(np_keep_vram_ext, xe_modparam.np_keep_vram_ext, bool, 0444);
+MODULE_PARM_DESC(np_keep_vram_ext,
+		 "Honor the DRM_XE_GEM_CREATE_SET_PROPERTY_NP_KEEP_VRAM "
+		 "create property on non-coherent non-posted hosts "
+		 "(default: true)");
+
+module_param_named(np_keep_vram_mask, xe_modparam.np_keep_vram_mask, uint, 0444);
+MODULE_PARM_DESC(np_keep_vram_mask,
+		 "Bitmask of BO classes kept in VRAM when the BAR is non-posted: "
+		 "bit0=SLPC, bit1=page tables, bit2=migrate VM (PT+batch pool), "
+		 "bit3=LRC, bit4=HWSP, bit5=GuC ADS/log/ct, bit6=other "
+		 "(default: 0x7)");
 
 #if IS_ENABLED(CONFIG_DRM_XE_DISPLAY)
 module_param_named(probe_display, xe_modparam.probe_display, bool, 0444);

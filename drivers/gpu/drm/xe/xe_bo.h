@@ -11,6 +11,7 @@
 
 #include <xen/xen.h>
 
+#include "xe_module.h"
 #include "xe_bo_types.h"
 #include "xe_ggtt.h"
 #include "xe_macros.h"
@@ -56,6 +57,12 @@
 #define XE_BO_FLAG_FORCE_USER_VRAM	BIT(25)
 #define XE_BO_FLAG_NO_COMPRESSION	BIT(26)
 #define XE_BO_FLAG_NEEDS_1G		BIT(27)
+
+/* egpu-b60: BO classes selected by xe.np_keep_vram_mask keep VRAM placement */
+#define XE_BO_FLAG_NP_KEEP_VRAM		BIT(27)
+
+/* egpu-b60: user BO pinned to VRAM via the NP_KEEP_VRAM create property */
+#define XE_BO_FLAG_NP_USER_VRAM		BIT(28)
 
 /* this one is trigger internally only */
 #define XE_BO_FLAG_INTERNAL_TEST	BIT(30)

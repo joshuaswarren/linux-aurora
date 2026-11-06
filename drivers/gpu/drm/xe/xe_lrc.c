@@ -1670,7 +1670,9 @@ static int xe_lrc_init(struct xe_lrc *lrc, struct xe_hw_engine *hwe, struct xe_v
 		lrc->flags |= XE_LRC_FLAG_INDIRECT_RING_STATE;
 
 	bo_flags = XE_BO_FLAG_VRAM_IF_DGFX(tile) | XE_BO_FLAG_GGTT |
-		   XE_BO_FLAG_GGTT_INVALIDATE;
+		   XE_BO_FLAG_GGTT_INVALIDATE |
+		   (xe_np_keep_vram(XE_NP_KEEP_LRC) ?
+		    XE_BO_FLAG_NP_KEEP_VRAM : 0);
 
 	if ((vm && vm->xef) || init_flags & XE_LRC_CREATE_USER_CTX) /* userspace */
 		bo_flags |= XE_BO_FLAG_PINNED_LATE_RESTORE | XE_BO_FLAG_FORCE_USER_VRAM;

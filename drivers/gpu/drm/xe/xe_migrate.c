@@ -227,7 +227,9 @@ static int xe_migrate_pt_bo_alloc(struct xe_tile *tile, struct xe_migrate *m,
 				  num_entries * XE_PAGE_SIZE,
 				  ttm_bo_type_kernel,
 				  XE_BO_FLAG_VRAM_IF_DGFX(tile) |
-				  XE_BO_FLAG_PAGETABLE, exec);
+				  XE_BO_FLAG_PAGETABLE |
+				  (xe_np_keep_vram(XE_NP_KEEP_MIGRATE) ?
+				   XE_BO_FLAG_NP_KEEP_VRAM : 0), exec);
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
 
@@ -657,7 +659,7 @@ static void emit_pte(struct xe_migrate *m,
 			u64 addr, flags = 0;
 			bool devmem = false;
 
-			addr = xe_res_dma(cur) & PAGE_MASK;
+			addr = ALIGN_DOWN(xe_res_dma(cur), XE_PAGE_SIZE);
 			if (is_vram) {
 				if (vm->flags & XE_VM_FLAG_64K) {
 					u64 va = cur_ofs * XE_PAGE_SIZE / 8;
@@ -678,7 +680,7 @@ static void emit_pte(struct xe_migrate *m,
 			bb->cs[bb->len++] = lower_32_bits(addr);
 			bb->cs[bb->len++] = upper_32_bits(addr);
 
-			xe_res_next(cur, min_t(u32, size, PAGE_SIZE));
+			xe_res_next(cur, min_t(u32, size, XE_PAGE_SIZE));
 			cur_ofs += 8;
 		}
 	}
@@ -1953,7 +1955,7 @@ __xe_migrate_update_pgtables(struct xe_migrate *m,
 					if (idx == chunk)
 						goto next_cmd;
 
-					xe_tile_assert(tile, xe_bo_size(pt_bo) == SZ_4K);
+					xe_tile_assert(tile, xe_bo_size(pt_bo) == PAGE_ALIGN(SZ_4K));
 
 					/* Map a PT at most once */
 					if (pt_bo->update_index < 0)

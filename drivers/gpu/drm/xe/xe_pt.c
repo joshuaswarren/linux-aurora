@@ -121,7 +121,9 @@ struct xe_pt *xe_pt_create(struct xe_vm *vm, struct xe_tile *tile,
 
 	bo_flags = XE_BO_FLAG_VRAM_IF_DGFX(tile) |
 		   XE_BO_FLAG_IGNORE_MIN_PAGE_SIZE |
-		   XE_BO_FLAG_NO_RESV_EVICT | XE_BO_FLAG_PAGETABLE;
+		   XE_BO_FLAG_NO_RESV_EVICT | XE_BO_FLAG_PAGETABLE |
+		   (xe_np_keep_vram(XE_NP_KEEP_PT) ?
+		    XE_BO_FLAG_NP_KEEP_VRAM : 0);
 	if (vm->xef) /* userspace */
 		bo_flags |= XE_BO_FLAG_PINNED_LATE_RESTORE | XE_BO_FLAG_FORCE_USER_VRAM;
 

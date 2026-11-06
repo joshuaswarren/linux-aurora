@@ -325,8 +325,8 @@ int xe_guc_ct_init_noalloc(struct xe_guc_ct *ct)
 	struct xe_gt *gt = ct_to_gt(ct);
 	int err;
 
-	xe_gt_assert(gt, !(guc_h2g_size() % PAGE_SIZE));
-	xe_gt_assert(gt, !(guc_g2h_size() % PAGE_SIZE));
+	xe_gt_assert(gt, !(guc_h2g_size() % XE_PAGE_SIZE));
+	xe_gt_assert(gt, !(guc_g2h_size() % XE_PAGE_SIZE));
 
 	err = drmm_mutex_init(&xe->drm, &ct->lock);
 	if (err)
@@ -376,7 +376,9 @@ int xe_guc_ct_init(struct xe_guc_ct *ct)
 					  XE_BO_FLAG_SYSTEM |
 					  XE_BO_FLAG_GGTT |
 					  XE_BO_FLAG_GGTT_INVALIDATE |
-					  XE_BO_FLAG_PINNED_NORESTORE);
+					  XE_BO_FLAG_PINNED_NORESTORE |
+					  (xe_np_keep_vram(XE_NP_KEEP_GUC) ?
+					   XE_BO_FLAG_NP_KEEP_VRAM : 0));
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
 
@@ -386,7 +388,9 @@ int xe_guc_ct_init(struct xe_guc_ct *ct)
 					  XE_BO_FLAG_SYSTEM |
 					  XE_BO_FLAG_GGTT |
 					  XE_BO_FLAG_GGTT_INVALIDATE |
-					  XE_BO_FLAG_PINNED_NORESTORE);
+					  XE_BO_FLAG_PINNED_NORESTORE |
+					  (xe_np_keep_vram(XE_NP_KEEP_GUC) ?
+					   XE_BO_FLAG_NP_KEEP_VRAM : 0));
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
 

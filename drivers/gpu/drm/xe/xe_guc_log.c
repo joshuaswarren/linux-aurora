@@ -631,7 +631,9 @@ int xe_guc_log_init(struct xe_guc_log *log)
 					  XE_BO_FLAG_SYSTEM |
 					  XE_BO_FLAG_GGTT |
 					  XE_BO_FLAG_GGTT_INVALIDATE |
-					  XE_BO_FLAG_PINNED_NORESTORE);
+					  XE_BO_FLAG_PINNED_NORESTORE |
+					  (xe_np_keep_vram(XE_NP_KEEP_GUC) ?
+					   XE_BO_FLAG_NP_KEEP_VRAM : 0));
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
 
