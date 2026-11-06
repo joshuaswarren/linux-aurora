@@ -413,6 +413,12 @@ struct drm_xe_query_mem_regions {
  *    - %DRM_XE_QUERY_CONFIG_FLAG_HAS_DISABLE_STATE_CACHE_PERF_FIX - Flag is set
  *      if a queue can be created with
  *      %DRM_XE_EXEC_QUEUE_SET_DISABLE_STATE_CACHE_PERF_FIX
+ *    - %DRM_XE_QUERY_CONFIG_FLAG_NP_KEEP_VRAM_EXT - provisional, driver-private.
+ *      Flag is set if the driver honours
+ *      %DRM_XE_GEM_CREATE_SET_PROPERTY_NP_KEEP_VRAM on this device: only on a
+ *      device whose VRAM BAR must be accessed non-posted and that is not DMA
+ *      coherent, and only if the driver parameter np_keep_vram_ext is on.
+ *      Never set elsewhere. The bit number may change.
  *  - %DRM_XE_QUERY_CONFIG_MIN_ALIGNMENT - Minimal memory alignment
  *    required by this device, typically SZ_4K or SZ_64K
  *  - %DRM_XE_QUERY_CONFIG_VA_BITS - Maximum bits of a virtual address
@@ -434,6 +440,7 @@ struct drm_xe_query_config {
 	#define DRM_XE_QUERY_CONFIG_FLAG_HAS_NO_COMPRESSION_HINT (1 << 3)
 	#define DRM_XE_QUERY_CONFIG_FLAG_HAS_DISABLE_STATE_CACHE_PERF_FIX	(1 << 4)
 	#define DRM_XE_QUERY_CONFIG_FLAG_HAS_PURGING_SUPPORT    (1 << 5)
+	#define DRM_XE_QUERY_CONFIG_FLAG_NP_KEEP_VRAM_EXT	(1 << 6)
 #define DRM_XE_QUERY_CONFIG_MIN_ALIGNMENT		2
 #define DRM_XE_QUERY_CONFIG_VA_BITS			3
 #define DRM_XE_QUERY_CONFIG_MAX_EXEC_QUEUE_PRIORITY	4
@@ -843,6 +850,12 @@ struct drm_xe_device_query {
 struct drm_xe_gem_create {
 #define DRM_XE_GEM_CREATE_EXTENSION_SET_PROPERTY	0
 #define   DRM_XE_GEM_CREATE_SET_PROPERTY_PXP_TYPE	0
+/*
+ * egpu-b60 (private): keep this user BO in VRAM even though the BAR is
+ * non-posted. The caller must use Device-safe CPU stores (the mapping is
+ * the non-posted BAR mapping).
+ */
+#define   DRM_XE_GEM_CREATE_SET_PROPERTY_NP_KEEP_VRAM	0x4e50
 	/** @extensions: Pointer to the first extension struct, if any */
 	__u64 extensions;
 
