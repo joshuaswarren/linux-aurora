@@ -4,6 +4,7 @@
  * Copyright (C) 2021-2022 Red Hat
  */
 
+#include <linux/io.h>
 #include <drm/drm_managed.h>
 
 #include <drm/ttm/ttm_device.h>
@@ -23,6 +24,22 @@
 #include "xe_ttm_stolen_mgr.h"
 #include "xe_vram.h"
 #include "xe_wa.h"
+
+static void xe_np_unmap(void *mapping)
+{
+	iounmap((void __iomem __force *)mapping);
+}
+
+static void __iomem *xe_ioremap_np(struct pci_dev *pdev, resource_size_t offset,
+				   resource_size_t size)
+{
+	void __iomem *mapping = ioremap_np(offset, size);
+
+	if (mapping && devm_add_action_or_reset(&pdev->dev, xe_np_unmap, mapping))
+		return NULL;
+
+	return mapping;
+}
 
 /**
  * xe_ttm_stolen_cpu_access_needs_ggtt() - If we can't directly CPU access
@@ -242,8 +259,16 @@ int xe_ttm_stolen_mgr_init(struct xe_device *xe)
 	drm_dbg_kms(&xe->drm, "Initialized stolen memory support with %llu bytes\n",
 		    stolen_size);
 
-	if (io_size)
-		mgr->mapping = devm_ioremap_wc(&pdev->dev, mgr->io_base, io_size);
+	if (io_size) {
+		if (pci_resource_flags(pdev, LMEM_BAR) & IORESOURCE_MEM_NONPOSTED)
+			mgr->mapping = xe_ioremap_np(pdev, mgr->io_base, io_size);
+		else
+			mgr->mapping = devm_ioremap_wc(&pdev->dev, mgr->io_base, io_size);
+		if (!mgr->mapping) {
+			drm_err(&xe->drm, "failed to map stolen io region\n");
+			return -ENOMEM;
+		}
+	}
 
 	return drmm_add_action_or_reset(&xe->drm, xe_ttm_stolen_mgr_fini, mgr);
 }
@@ -266,6 +291,8 @@ static int __xe_ttm_stolen_io_mem_reserve_bar2(struct xe_device *xe,
 					       struct xe_ttm_stolen_mgr *mgr,
 					       struct ttm_resource *mem)
 {
+	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+
 	if (!mgr->io_base)
 		return -EIO;
 
@@ -279,7 +306,12 @@ static int __xe_ttm_stolen_io_mem_reserve_bar2(struct xe_device *xe,
 
 	mem->bus.offset += mgr->io_base;
 	mem->bus.is_iomem = true;
-	mem->bus.caching = ttm_write_combined;
+	if (pci_resource_flags(pdev, LMEM_BAR) & IORESOURCE_MEM_NONPOSTED) {
+		mem->bus.is_nonposted = true;
+		mem->bus.caching = ttm_uncached;
+	} else {
+		mem->bus.caching = ttm_write_combined;
+	}
 
 	return 0;
 }
