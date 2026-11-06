@@ -147,6 +147,9 @@ static bool pcie_ats_disabled;
 /* If set, the PCI config space of each device is printed during boot. */
 bool pci_early_dump;
 
+/* If set, SR-IOV VF BARs are never sized; see pci=noiovbars in iov.c. */
+bool pci_noiovbars;
+
 bool pci_ats_disabled(void)
 {
 	return pcie_ats_disabled;
@@ -6780,6 +6783,8 @@ static int __init pci_setup(char *str)
 				pci_no_domains();
 			} else if (!strncmp(str, "noari", 5)) {
 				pcie_ari_disabled = true;
+			} else if (!strcmp(str, "noiovbars")) {
+				pci_noiovbars = true;
 			} else if (!strncmp(str, "notph", 5)) {
 				pci_no_tph();
 			} else if (!strncmp(str, "resource_alignment=", 19)) {
