@@ -813,7 +813,7 @@ static bool avd_h264_refs_valid(const struct avd_h264_run *run)
 
 /*
  * Slices one picture may hold. H.264 allows one slice per macroblock, so the
- * bound is the macroblock count of the NEGOTIATED coded size, counting both
+ * bound is the macroblock count of the NEGOTIATED DECODED size, counting both
  * fields of a frame. The SPS control geometry is not trusted: it does not
  * have to match the negotiated format.
  */
