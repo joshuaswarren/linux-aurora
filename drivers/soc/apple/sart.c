@@ -61,6 +61,27 @@
 #define APPLE_SART3_SIZE_MAX   GENMASK(29, 0)
 
 #define APPLE_SART3_FLAGS_ALLOW 0xff
+/* SARTv4 (CoastGuard) registers */
+#define APPLE_SART4_CONFIG(idx)	      (0x00 + 4 * (idx))
+#define APPLE_SART4_CONFIG_FLAGS      GENMASK(31, 24)
+#define APPLE_SART4_CONFIG_SIZE	      GENMASK(23, 0)
+#define APPLE_SART4_CONFIG_SIZE_SHIFT 12
+#define APPLE_SART4_CONFIG_SIZE_MAX   GENMASK(23, 0)
+
+#define APPLE_SART4_PADDR(idx)	(0x40 + 4 * (idx))
+#define APPLE_SART4_PADDR_SHIFT 12
+
+/*
+ * CoastGuard SARTv4 native flag semantics (verified from 26A434 kernelcache
+ * AppleSART `IOSARTMapper::_addRegion` 0xfffffe0009a2070c-0x714):
+ * Bits 30:29 = 0x60 (base allow flag)
+ * Bits 27:26 = access (0x0c for RW, 0x08 for RO)
+ * Bits 25:24 = access (0x03 for RW, 0x02 for RO)
+ * Bits 31, 28 = 0
+ * Combined allow flags (RW): 0x60 | 0x0c | 0x03 = 0x6f
+ */
+#define APPLE_SART4_FLAGS_ALLOW 0x6f
+
 
 struct apple_sart_ops {
 	void (*get_entry)(struct apple_sart *sart, int index, u8 *flags,
@@ -177,6 +198,41 @@ static struct apple_sart_ops sart_ops_v3 = {
 	.paddr_shift = APPLE_SART3_PADDR_SHIFT,
 	.size_max = APPLE_SART3_SIZE_MAX,
 };
+static void sart4_get_entry(struct apple_sart *sart, int index, u8 *flags,
+			    phys_addr_t *paddr, size_t *size)
+{
+	u32 cfg = readl(sart->regs + APPLE_SART4_CONFIG(index));
+	phys_addr_t paddr_ = readl(sart->regs + APPLE_SART4_PADDR(index));
+	size_t size_ = FIELD_GET(APPLE_SART4_CONFIG_SIZE, cfg);
+
+	*flags = FIELD_GET(APPLE_SART4_CONFIG_FLAGS, cfg);
+	*size = size_ << APPLE_SART4_CONFIG_SIZE_SHIFT;
+	*paddr = paddr_ << APPLE_SART4_PADDR_SHIFT;
+}
+
+static void sart4_set_entry(struct apple_sart *sart, int index, u8 flags,
+			    phys_addr_t paddr_shifted, size_t size_shifted)
+{
+	u32 cfg = 0;
+
+	if (flags) {
+		cfg = FIELD_PREP(APPLE_SART4_CONFIG_FLAGS, flags);
+		cfg |= FIELD_PREP(APPLE_SART4_CONFIG_SIZE, size_shifted);
+	}
+
+	writel(paddr_shifted, sart->regs + APPLE_SART4_PADDR(index));
+	writel(cfg, sart->regs + APPLE_SART4_CONFIG(index));
+}
+
+static struct apple_sart_ops sart_ops_v4 = {
+	.get_entry = sart4_get_entry,
+	.set_entry = sart4_set_entry,
+	.flags_allow = APPLE_SART4_FLAGS_ALLOW,
+	.size_shift = APPLE_SART4_CONFIG_SIZE_SHIFT,
+	.paddr_shift = APPLE_SART4_PADDR_SHIFT,
+	.size_max = APPLE_SART4_CONFIG_SIZE_MAX,
+};
+
 
 static int apple_sart_probe(struct platform_device *pdev)
 {
@@ -372,6 +428,14 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_sart_of_match[] = {
+	{
+		.compatible = "sart,coastguard",
+		.data = &sart_ops_v4,
+	},
+	{
+		.compatible = "apple,t8152-sart",
+		.data = &sart_ops_v4,
+	},
 	{
 		.compatible = "apple,t6000-sart",
 		.data = &sart_ops_v3,
