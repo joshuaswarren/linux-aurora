@@ -4,6 +4,8 @@
 //!
 //! C header: [`include/linux/soc/apple/mailbox.h`](../../../../include/linux/soc/apple/mailbox.h)
 
+use core::mem::MaybeUninit;
+
 use crate::{
     bindings,
     device,
