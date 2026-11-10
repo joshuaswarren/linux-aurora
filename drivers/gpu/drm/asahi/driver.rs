@@ -85,11 +85,13 @@ pub(crate) type AsahiRegData<'drm> = AsahiDrmRegistrationData<'drm>;
 /// each new ioctl, flag or feature bit, so userspace can tell what a kernel
 /// accepts without probing. The patch level marks fixes userspace may need to
 /// detect.
+// The DRM name is userspace ABI: every installed Mesa (agx_device.c,
+// hk_physical_device.c) selects the GPU by the name "asahi".
 const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
     major: 1,
     minor: 0,
     patchlevel: 0,
-    name: c"aurora",
+    name: c"asahi",
     desc: c"Aurora GPU for Apple AGX",
 };
 
