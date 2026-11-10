@@ -238,6 +238,8 @@ struct macaudio_snd_data {
 
 	const struct macaudio_platform_cfg *cfg;
 	bool has_speakers;
+	/* An SN012776 level came from the board table: the boot loader passed no ADT row */
+	bool amp_levels_table;
 	bool has_sense;
 	bool has_safety;
 	unsigned int max_channels;
@@ -2382,11 +2384,24 @@ static int macaudio_sn012776_level(struct device_node *amp)
 }
 
 /*
- * Speakers on SN012776 amps run only when every amp has its level from the
- * Mac; a boot loader that does not pass it leaves them off.
+ * An SN012776's level: its ADT row, or the board table's gain when the boot
+ * loader passed no rows (m1n1 builds that predate apple,speaker-config).
+ * An out-of-range row is never replaced.
+ */
+static int macaudio_sn012776_amp_level(struct device_node *amp, int table_level)
+{
+	int level = macaudio_sn012776_level(amp);
+
+	return (level == -ENOENT && table_level) ? table_level : level;
+}
+
+/*
+ * Speakers on SN012776 amps run only when every amp has a level, from the
+ * Mac or from the board table; *from_table tells which.
  */
 static bool macaudio_sn012776_levels_present(struct device *dev,
-					     struct device_node *codec)
+					     struct device_node *codec,
+					     int table_level, bool *from_table)
 {
 	struct of_phandle_args args;
 	int i, n, level;
@@ -2396,10 +2411,12 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 		if (of_parse_phandle_with_args(codec, "sound-dai",
 					       "#sound-dai-cells", i, &args))
 			return false;
-		level = macaudio_sn012776_level(args.np);
+		level = macaudio_sn012776_amp_level(args.np, table_level);
 		if (level < 0)
-			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
+			dev_err(dev, "%pOF: %s amp level\n", args.np,
 				level == -ENOENT ? "no" : "out-of-range");
+		else if (from_table && macaudio_sn012776_level(args.np) < 0)
+			*from_table = true;
 		of_node_put(args.np);
 		if (level < 0)
 			return false;
@@ -2411,7 +2428,7 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
  * Every SN012776's "Amp Gain Volume" ends at its own level; the lease fixes
  * it there (macaudio_spk_fix_amp_gains()).
  */
-static int macaudio_limit_sn012776_levels(struct snd_soc_card *card)
+static int macaudio_limit_sn012776_levels(struct snd_soc_card *card, int table_level)
 {
 	struct snd_soc_component *component;
 	char name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
@@ -2422,7 +2439,7 @@ static int macaudio_limit_sn012776_levels(struct snd_soc_card *card)
 
 		if (!np || !of_device_is_compatible(np, "ti,sn012776"))
 			continue;
-		level = macaudio_sn012776_level(np);
+		level = macaudio_sn012776_amp_level(np, table_level);
 		if (level < 0)
 			return dev_err_probe(card->dev, level, "%pOF: no amp level\n", np);
 		snprintf(name, sizeof(name), "%s%sAmp Gain Volume",
@@ -2641,7 +2658,9 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			if (ma->cfg->amp == AMP_SN012776) {
 				struct device_node *spk_codec = of_get_child_by_name(np, "codec");
 				bool levels = spk_codec &&
-					macaudio_sn012776_levels_present(card->dev, spk_codec);
+					macaudio_sn012776_levels_present(card->dev, spk_codec,
+									 ma->cfg->amp_gain,
+									 &ma->amp_levels_table);
 
 				of_node_put(spk_codec);
 				if (!levels) {
@@ -3610,13 +3629,15 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 			CHECK_CONCAT(macaudio_set_fixed_enum, "ASI1 Sel", "Left");
 
 		/*
-		 * Each amp's gain ends at its level from the Mac's ADT
-		 * (macaudio_limit_sn012776_levels()). The tweeters' playback
-		 * high-pass starts at the protection floor; the woofers keep
-		 * the corner the amps were given from the ADT.
+		 * Each amp's gain ends at its level (macaudio_limit_sn012776_levels()).
+		 * The tweeters' playback high-pass starts at the protection
+		 * floor; the woofers keep the corner the amps were given from
+		 * the ADT, or the 2 Hz of the board table when the boot loader
+		 * passed no ADT rows.
 		 */
 		CHECK_CONCAT(macaudio_set_fixed_enum, "HPF Corner Frequency",
-			     tweeter ? MACAUDIO_TWEETER_HPF_SAFE : NULL);
+			     tweeter ? MACAUDIO_TWEETER_HPF_SAFE :
+			     ma->amp_levels_table ? "2 Hz" : NULL);
 
 		CHECK_CONCAT(macaudio_set_fixed_enum, "OCE Handling", "Retry");
 		break;
@@ -3667,7 +3688,7 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 	macaudio_protect_sense(card);
 
 	if (ma->cfg->amp == AMP_SN012776) {
-		int ret = macaudio_limit_sn012776_levels(card);
+		int ret = macaudio_limit_sn012776_levels(card, ma->cfg->amp_gain);
 
 		if (ret)
 			return ret;
@@ -3960,11 +3981,11 @@ static const struct snd_soc_dapm_route macaudio_dapm_routes[] = {
 /*
  *	enable	amp		speakers	stereo	gain	safe_vol
  *
- * An SN012776's gain is not here: each amp's operating level comes from the
- * Mac's ADT, through the amp's apple,speaker-config.
+ * An SN012776's gain here is only the fallback for a boot loader that passes
+ * no ADT rows; with apple,speaker-config on the amp, the Mac's level wins.
  */
 struct macaudio_platform_cfg macaudio_j180_cfg = {
-	false,	AMP_SN012776,	SPKR_1W1T,	false,	0,	-20,
+	false,	AMP_SN012776,	SPKR_1W1T,	false,	10,	-20,
 };
 struct macaudio_platform_cfg macaudio_j274_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	false,	20,	-20,
@@ -4005,27 +4026,27 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 };
 
 struct macaudio_platform_cfg macaudio_j314_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
 
 /* Granted, the tweeters restore their DT corner (see tweeter_hpf_granted) */
 struct macaudio_platform_cfg macaudio_j316_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 	.tweeter_hpf_granted = true,
 };
 
 struct macaudio_platform_cfg macaudio_j37x_j47x_cfg = {
-	true,	AMP_SN012776,	SPKR_1W,	false,	0,	-20,
+	true,	AMP_SN012776,	SPKR_1W,	false,	20,	-20,
 };
 
 /* Granted, the tweeters restore their DT corner (see tweeter_hpf_granted) */
 struct macaudio_platform_cfg macaudio_j413_cfg = {
-	true,	AMP_SN012776,	SPKR_1W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_1W1T,	true,	15,	-20,
 	.tweeter_hpf_granted = true,
 };
 
 struct macaudio_platform_cfg macaudio_j415_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j45x_cfg = {
@@ -4033,7 +4054,7 @@ struct macaudio_platform_cfg macaudio_j45x_cfg = {
 };
 
 struct macaudio_platform_cfg macaudio_j493_cfg = {
-	true,	AMP_SN012776,	SPKR_2W,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W,	true,	15,	-20,
 };
 
 /*
