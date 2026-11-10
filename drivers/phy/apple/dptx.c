@@ -12,6 +12,7 @@
  */
 
 #include "dptx.h"
+#include "dptx-t8152.h"
 
 #include <asm/io.h>
 #include "linux/of.h"
@@ -21,6 +22,9 @@
 #include <linux/phy/phy.h>
 #include <linux/phy/phy-dp.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
+#include <linux/soc/apple/tunable.h>
 #include <linux/types.h>
 
 #define DPTX_MAX_LANES    4
@@ -31,6 +35,7 @@
 enum apple_dptx_type {
 	DPTX_PHY_T8112,
 	DPTX_PHY_T6020,
+	DPTX_PHY_T8152,
 };
 
 struct apple_dptx_phy_hw {
@@ -56,6 +61,11 @@ struct apple_dptx_phy {
 
 	// TODO: m1n1 port things to clean up
 	u32 active_lanes;
+
+	/* T8152 only */
+	struct apple_tunable *tunable;
+	struct dev_pm_domain_list *pd_list;
+	bool active;
 };
 
 
@@ -83,6 +93,14 @@ static int dptx_phy_set_active_lane_count(struct apple_dptx_phy *phy, u32 num_la
 	u32 l, ctrl;
 
 	dev_dbg(phy->dev, "set_active_lane_count(%u)\n", num_lanes);
+
+	if (phy->hw.type == DPTX_PHY_T8152) {
+		int ret = dptx_t8152_set_active_lanes(phy->regs.dptx, num_lanes);
+
+		if (!ret)
+			phy->active_lanes = num_lanes;
+		return ret;
+	}
 
 	if (num_lanes == 3 || num_lanes > DPTX_MAX_LANES)
 		return -1;
@@ -129,6 +147,24 @@ static int dptx_phy_activate(struct apple_dptx_phy *phy, u32 dcp_index)
 	u32 val_4408;
 
 	dev_dbg(phy->dev, "activate(dcp:%u)\n", dcp_index);
+
+	if (phy->hw.type == DPTX_PHY_T8152) {
+		if (phy->active)
+			return 0;
+		int ret = pm_runtime_resume_and_get(phy->dev);
+
+		if (ret < 0)
+			return ret;
+		ret = dptx_t8152_activate(phy->dev, phy->regs.dptx, phy->regs.core,
+					  dcp_index, phy->tunable);
+		if (ret) {
+			pm_runtime_put(phy->dev);
+			return ret;
+		}
+		phy->active_lanes = 0;
+		phy->active = true;
+		return 0;
+	}
 
 	// MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
 	// MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
@@ -318,6 +354,13 @@ static int dptx_phy_activate(struct apple_dptx_phy *phy, u32 dcp_index)
 
 static int dptx_phy_deactivate(struct apple_dptx_phy *phy)
 {
+	if (phy->hw.type == DPTX_PHY_T8152 && phy->active) {
+		dptx_t8152_deactivate(phy->regs.dptx);
+		phy->active_lanes = 0;
+		phy->active = false;
+		pm_runtime_put(phy->dev);
+	}
+
 	return 0;
 }
 
@@ -581,6 +624,17 @@ static int dptx_phy_configure(struct phy *phy, union phy_configure_opts *opts_)
 	}
 
 	if (opts->set_rate) {
+		if (dptx_phy->hw.type == DPTX_PHY_T8152) {
+			if (!opts->link_rate)
+				return 0;
+
+			mutex_lock(&dptx_phy->lock);
+			ret = dptx_t8152_set_link_rate(dptx_phy->dev, dptx_phy->regs.dptx,
+						       dptx_phy->regs.core, opts->link_rate);
+			mutex_unlock(&dptx_phy->lock);
+			return ret;
+		}
+
 		switch (opts->link_rate) {
 		case 1620:
 			link_rate = DPTX_PHY_LINK_RATE_RBR;
@@ -644,6 +698,29 @@ static int dptx_phy_probe(struct platform_device *pdev)
 	if (IS_ERR(dptx_phy->regs.dptx))
 		return PTR_ERR(dptx_phy->regs.dptx);
 
+	if (dptx_phy->hw.type == DPTX_PHY_T8152) {
+		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dptx");
+		int ret;
+
+		dptx_phy->tunable = devm_apple_tunable_parse(dev, dev->of_node,
+							     "apple,tunable-dptx", res);
+		if (IS_ERR(dptx_phy->tunable))
+			return dev_err_probe(dev, PTR_ERR(dptx_phy->tunable),
+					     "failed to parse apple,tunable-dptx\n");
+
+		/* The core attaches a single power domain itself. */
+		if (of_count_phandle_with_args(dev->of_node, "power-domains",
+					       "#power-domain-cells") > 1) {
+			ret = devm_pm_domain_attach_list(dev, NULL, &dptx_phy->pd_list);
+			if (ret < 0)
+				return dev_err_probe(dev, ret, "failed to attach power domains\n");
+		}
+
+		ret = devm_pm_runtime_enable(dev);
+		if (ret)
+			return ret;
+	}
+
 	/* create phy */
 	dptx_phy->phy_dp =
 		devm_phy_create(dptx_phy->dev, NULL, &apple_atc_dp_phy_ops);
@@ -667,9 +744,14 @@ static const struct apple_dptx_phy_hw apple_dptx_hw_t8112 = {
 	.type = DPTX_PHY_T8112,
 };
 
+static const struct apple_dptx_phy_hw apple_dptx_hw_t8152 = {
+	.type = DPTX_PHY_T8152,
+};
+
 static const struct of_device_id dptx_phy_match[] = {
 	{ .compatible = "apple,t6020-dptx-phy", .data = &apple_dptx_hw_t6020 },
 	{ .compatible = "apple,t8112-dptx-phy", .data = &apple_dptx_hw_t8112 },
+	{ .compatible = "apple,t8152-dptx-phy", .data = &apple_dptx_hw_t8152 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, dptx_phy_match);
