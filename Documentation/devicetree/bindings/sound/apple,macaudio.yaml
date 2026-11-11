@@ -48,6 +48,7 @@ properties:
               - apple,j713-macaudio
               - apple,j713-macaudio-jack
               - apple,j714-macaudio
+              - apple,k116-macaudio
               - apple,j715-macaudio
               - apple,j715-macaudio-jack
               - apple,j773-macaudio
