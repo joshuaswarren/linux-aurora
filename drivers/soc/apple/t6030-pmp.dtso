@@ -92,12 +92,17 @@
 				 * The ANE power vote. Starts off: no always-on, so
 				 * the PMP seed stays report@7 and report@10. The
 				 * consumer's attach powers it, so no parent here.
+				 * Explicit phandle like report@7-9: kbuild compiles
+				 * this dtbo without -@, so the entry must carry its
+				 * own phandle; of_resolve_phandles rebases it at
+				 * apply (resolver.c adds live_max+1).
 				 */
 				pmp_report_ane: report@5 {
 					compatible = "apple,t6000-pmp-v2-report-entry";
 					reg = <0x5>;
 					label = "pmp-ane-sys";
 					#power-domain-cells = <0>;
+					phandle = <0x103>;
 				};
 			};
 
