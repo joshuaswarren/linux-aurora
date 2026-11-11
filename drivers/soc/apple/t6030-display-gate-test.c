@@ -357,6 +357,35 @@ static void __init gt_expect_enabled(struct kunit *test)
 							      "apple,always-on"));
 }
 
+/*
+ * The ANE vote entry the T6030 overlay adds. It must exist and be available,
+ * carry reg 5, stay off the start seed, and hold a nonzero phandle: the
+ * resolver assigns it, so no literal is asserted. The start seed is the
+ * always-on entries' bits - exactly report@7 (bit 7) and report@10 (bit 16)
+ * - and report@5 adds none, mirroring apple_pmp_start_describe's walk.
+ */
+static void __init gt_expect_ane_report(struct kunit *test)
+{
+	struct device_node *report;
+	u32 reg = 0, phandle = 0, seed = 0;
+
+	report = gt_node(test, "/soc/pmp-report@3503c0000/report@5");
+	KUNIT_EXPECT_TRUE(test, of_device_is_available(report));
+	KUNIT_EXPECT_EQ(test, of_property_read_u32(report, "reg", &reg), 0);
+	KUNIT_EXPECT_EQ(test, reg, 5);
+	KUNIT_EXPECT_FALSE(test, of_property_read_bool(report, "apple,always-on"));
+	KUNIT_EXPECT_EQ(test, of_property_read_u32(report, "phandle", &phandle), 0);
+	KUNIT_EXPECT_NE(test, phandle, 0);
+
+	report = gt_node(test, "/soc/pmp-report@3503c0000");
+	for_each_available_child_of_node_scoped(report, child) {
+		if (of_property_read_bool(child, "apple,always-on") &&
+		    !of_property_read_u32(child, "reg", &reg))
+			seed |= BIT(reg);
+	}
+	KUNIT_EXPECT_EQ(test, seed, BIT(7) | BIT(16));
+}
+
 static int __init gt_apply_fixture(const struct gt_soc *s, int *id)
 {
 	if (gt_live_soc < 0) {
@@ -727,6 +756,7 @@ static void __init gate_t6030_default_on(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, gate_setup_t6031("0"), 0);
 	gt_run(test);
 	gt_expect_enabled(test);
+	gt_expect_ane_report(test);
 }
 
 static void __init gate_t6030_escape(struct kunit *test)
@@ -772,6 +802,7 @@ static void __init gate_t6030_enabled_again(struct kunit *test)
 {
 	gt_run(test);
 	gt_expect_enabled(test);
+	gt_expect_ane_report(test);
 }
 
 /* T8122: on by default, with the device tree's own PMP */
