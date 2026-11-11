@@ -29,7 +29,6 @@
 
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
-#define START_ATTEMPTS 3
 
 #define MAX_INTERFACES 16
 
@@ -850,27 +849,20 @@ static void dchid_stop(struct hid_device *hdev)
 static int dchid_open(struct hid_device *hdev)
 {
 	struct dchid_iface *iface = hdev->driver_data;
-	int attempt, ret;
+	int ret;
 
 	if (READ_ONCE(iface->dchid->stopping))
 		return -ESHUTDOWN;
 
-	for (attempt = 1; !completion_done(&iface->ready); attempt++) {
+	if (!completion_done(&iface->ready)) {
 		ret = dchid_start_interface(iface);
 		if (ret < 0)
 			return ret;
 
-		if (wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS)))
-			break;
-
-		/* No ready message: the next attempt, or the next open, starts it again. */
-		iface->starting = false;
-		if (attempt == START_ATTEMPTS) {
+		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
 			return -ETIMEDOUT;
 		}
-		dev_warn(iface->dchid->dev, "iface %s start timed out, starting it again\n",
-			 iface->name);
 	}
 
 	/* Pairs with the acquire in dchid_handle_report(); publishes iface->hid. */
