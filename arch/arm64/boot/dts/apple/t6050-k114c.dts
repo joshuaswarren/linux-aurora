@@ -301,3 +301,4 @@
 
 #include "t6050-j714c-pcie-tunables.dtsi"
 #include "t6050-k114c-pcie-tunables.dtsi"
+#include "t6050-k114c-isp.dtsi"
