@@ -343,7 +343,6 @@
 };
 
 &nub_gpio0 {
-	/delete-property/ interrupts;
 	status = "okay";
 
 	kiwi_clk24_pins: kiwi-clk24-pins {
