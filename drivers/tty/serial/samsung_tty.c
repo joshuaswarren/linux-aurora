@@ -2123,13 +2123,25 @@ static int __maybe_unused s3c24xx_serial_resume(struct device *dev)
 	}
 
 	if (port) {
-		clk_prepare_enable(ourport->clk);
-		if (!IS_ERR(ourport->baudclk))
-			clk_prepare_enable(ourport->baudclk);
-		s3c24xx_serial_resetport(port, s3c24xx_port_to_cfg(port));
-		if (!IS_ERR(ourport->baudclk))
-			clk_disable_unprepare(ourport->baudclk);
-		clk_disable_unprepare(ourport->clk);
+		/*
+		 * omarchy-m5: an unused port is runtime suspended, and its PM
+		 * domain may be off (genpd powers it down). On Apple SoCs a
+		 * register write to a powered-off UART is an external abort
+		 * (SError), so power the port for the reset. Without runtime PM
+		 * the device is active and this takes nothing but a reference.
+		 */
+		if (pm_runtime_resume_and_get(dev) < 0) {
+			dev_warn(dev, "cannot power the port, skipping its reset\n");
+		} else {
+			clk_prepare_enable(ourport->clk);
+			if (!IS_ERR(ourport->baudclk))
+				clk_prepare_enable(ourport->baudclk);
+			s3c24xx_serial_resetport(port, s3c24xx_port_to_cfg(port));
+			if (!IS_ERR(ourport->baudclk))
+				clk_disable_unprepare(ourport->baudclk);
+			clk_disable_unprepare(ourport->clk);
+			pm_runtime_put_sync(dev);
+		}
 
 		uart_resume_port(&s3c24xx_uart_drv, port);
 	}
