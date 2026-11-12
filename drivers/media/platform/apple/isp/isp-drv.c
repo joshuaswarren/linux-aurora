@@ -11,6 +11,7 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -525,12 +526,39 @@ isp_check_firmware_version(struct apple_isp *isp)
 	return compat;
 }
 
+/*
+ * The DCP presenting the software camera indicator (apple,camera-indicator).
+ * A device ref is held for the driver's lifetime and put in remove.
+ */
+static struct device *apple_isp_indicator_dcp(struct device *dev)
+{
+	struct device_node *np;
+	struct platform_device *dcp;
+
+	np = of_parse_phandle(dev->of_node, "apple,camera-indicator", 0);
+	if (!np)
+		return NULL;
+	dcp = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!dcp || !dcp->dev.driver) {
+		if (dcp)
+			put_device(&dcp->dev);
+		return ERR_PTR(-EPROBE_DEFER);
+	}
+	return &dcp->dev;
+}
+
 static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_isp *isp;
 	struct resource *res;
+	struct device *dcp;
 	int err;
+
+	dcp = apple_isp_indicator_dcp(dev);
+	if (IS_ERR(dcp))
+		return PTR_ERR(dcp);
 
 	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (err)
@@ -546,6 +574,9 @@ static int apple_isp_probe(struct platform_device *pdev)
 
 	isp->dev = dev;
 	isp->hw = of_device_get_match_data(dev);
+	isp->dcp = dcp;
+	if (dcp)
+		dev_notice(dev, "camera light is a software indicator presented by the DCP; it is not a privacy guarantee\n");
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
 
@@ -768,6 +799,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 	apple_isp_free_iommu(isp);
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
+	put_device(isp->dcp);
 	/* Freed now, or when the last open file is closed. */
 	v4l2_device_put(&isp->v4l2_dev);
 }

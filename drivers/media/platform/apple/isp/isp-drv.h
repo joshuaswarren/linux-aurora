@@ -399,6 +399,8 @@ struct apple_isp {
 	bool cil_lit;
 	/* The node says the light is not this driver's to drive (apple,no-light-gpio) */
 	bool no_light_gpio;
+	/* The DCP presenting the software camera indicator (apple,camera-indicator) */
+	struct device *dcp;
 	void __iomem *dapf;
 	struct hrtimer wdt_timer;
 	bool wdt_running;
@@ -557,6 +559,11 @@ static inline unsigned int isp_num_meta(struct apple_isp *isp)
 static inline bool apple_isp_light_gpio(const struct apple_isp *isp)
 {
 	return isp->hw->camera_light && !isp->no_light_gpio;
+}
+
+static inline bool apple_isp_camera_indicator(const struct apple_isp *isp)
+{
+	return !!isp->dcp;
 }
 
 #endif /* __ISP_DRV_H__ */

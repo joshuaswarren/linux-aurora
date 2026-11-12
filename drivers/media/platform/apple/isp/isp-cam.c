@@ -8,6 +8,7 @@
 #include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/unaligned.h>
+#include <linux/soc/apple/display.h>
 #include <kunit/static_stub.h>
 
 #include "isp-cam.h"
@@ -1179,6 +1180,9 @@ void apple_isp_stop_camera(struct apple_isp *isp)
  * whenever it captures, with the register sequence and rate observed on
  * the running hardware.
  */
+static int apple_isp_dcp_indicator_set(struct device *dcp, bool on);
+static bool apple_isp_dcp_indicator_lit(struct device *dcp);
+
 static void apple_isp_wdt_kick(struct apple_isp *isp)
 {
 	writel(0, isp->wdt + ISP_WDT_CLEAR);
@@ -1192,6 +1196,10 @@ static enum hrtimer_restart apple_isp_wdt_timer(struct hrtimer *timer)
 					     wdt_timer);
 
 	if (apple_isp_light_gpio(isp) && !isp->cil_lit)
+		return HRTIMER_NORESTART;
+	/* A lost indicator means no frame may pass: stop feeding. */
+	if (apple_isp_camera_indicator(isp) &&
+	    !apple_isp_dcp_indicator_lit(isp->dcp))
 		return HRTIMER_NORESTART;
 	apple_isp_wdt_kick(isp);
 	hrtimer_forward_now(timer, ns_to_ktime(ISP_WDT_PERIOD_NS));
@@ -1234,6 +1242,22 @@ void apple_isp_wdt_stop(struct apple_isp *isp)
 #define ISP_GPIO_CHECK		(ISP_GPIO_MODE | ISP_GPIO_DATA)
 
 /*
+ * The DCP contract functions are implemented by the DRM side. These wrappers
+ * are the seam the KUnit tests stub, and the only callers of the contract.
+ */
+static int apple_isp_dcp_indicator_set(struct device *dcp, bool on)
+{
+	KUNIT_STATIC_STUB_REDIRECT(apple_isp_dcp_indicator_set, dcp, on);
+	return apple_dcp_camera_indicator_set(dcp, on);
+}
+
+static bool apple_isp_dcp_indicator_lit(struct device *dcp)
+{
+	KUNIT_STATIC_STUB_REDIRECT(apple_isp_dcp_indicator_lit, dcp);
+	return apple_dcp_camera_indicator_lit(dcp);
+}
+
+/*
  * Light the camera light before the sensor may stream: drive its pin as an
  * output at the on level, with the input buffer on so the pin's level reads
  * back, and refuse to stream unless it does.
@@ -1263,6 +1287,11 @@ static int apple_isp_light_on(struct apple_isp *isp)
  */
 void apple_isp_light_off(struct apple_isp *isp)
 {
+	if (apple_isp_camera_indicator(isp)) {
+		apple_isp_wdt_stop(isp);
+		apple_isp_dcp_indicator_set(isp->dcp, false);
+		return;
+	}
 	if (!apple_isp_light_gpio(isp) || !isp->cil_lit)
 		return;
 	apple_isp_wdt_stop(isp);
@@ -1277,6 +1306,10 @@ void apple_isp_light_off(struct apple_isp *isp)
  */
 void apple_isp_light_force_off(struct apple_isp *isp)
 {
+	if (apple_isp_camera_indicator(isp)) {
+		apple_isp_light_off(isp);
+		return;
+	}
 	if (!apple_isp_light_gpio(isp))
 		return;
 	apple_isp_light_off(isp);
@@ -1284,17 +1317,23 @@ void apple_isp_light_force_off(struct apple_isp *isp)
 	       isp->cil);
 }
 
-static bool allow_unlit;
-module_param(allow_unlit, bool, 0644);
-MODULE_PARM_DESC(allow_unlit,
-		 "Stream on a node with apple,no-light-gpio (camera light not driven by Linux). Default off; set only with someone watching the light.");
-
 int apple_isp_start_capture(struct apple_isp *isp)
 {
 	int err;
 
-	if (isp->no_light_gpio && !allow_unlit) {
-		dev_err(isp->dev, "refusing to stream: the camera light is not driven by Linux; set apple_isp.allow_unlit=1 to override\n");
+	/*
+	 * The DCP indicator is software, not a privacy guarantee: stream only
+	 * once it is actually presented on the panel.
+	 */
+	if (apple_isp_camera_indicator(isp)) {
+		err = apple_isp_dcp_indicator_set(isp->dcp, true);
+		if (err) {
+			dev_err(isp->dev, "camera indicator failed to light (%d), not streaming\n",
+				err);
+			return -EPERM;
+		}
+	} else if (isp->no_light_gpio) {
+		dev_err(isp->dev, "refusing to stream: the camera light is not driven by Linux\n");
 		return -EPERM;
 	}
 

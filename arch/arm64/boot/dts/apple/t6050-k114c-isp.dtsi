@@ -58,6 +58,8 @@
 	 * stream.
 	 */
 	apple,no-light-gpio;
+	/* Software camera indicator presented by the DCP; not a privacy guarantee. */
+	apple,camera-indicator = <&dcp>;
 	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
 	memory-region-names = "text", "data", "heap";
 	status = "okay";
