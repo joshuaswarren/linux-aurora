@@ -481,6 +481,26 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 
 	fmt->version = args->version;
 
+	/*
+	 * Bring-up aid for a board whose sensor presets are not in its device
+	 * tree yet: log every configuration the firmware reports, before the
+	 * sensor whitelist can refuse the camera.
+	 */
+	dev_info(isp->dev, "ch %d: sensor version 0x%x, %u firmware configs\n",
+		 ch, args->version, args->num_presets);
+	for (u32 i = 0; i < args->num_presets && i < ISP_MAX_SENSOR_CONFIGS; i++) {
+		struct cmd_ch_camera_config_h17 cfg = {};
+
+		if (isp_cmd_ch_camera_config_get(isp, ch, i, &cfg))
+			break;
+		dev_info(isp->dev,
+			 "ch %d: config %u: in %ux%u out %ux%u (in2 %ux%u out2 %ux%u)\n",
+			 ch, i, cfg.config.in_width, cfg.config.in_height,
+			 cfg.config.out_width, cfg.config.out_height,
+			 cfg.config.in_width2, cfg.config.in_height2,
+			 cfg.config.out_width2, cfg.config.out_height2);
+	}
+
 	err = isp_ch_get_sensor_id(isp, ch);
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
