@@ -141,6 +141,59 @@
 	};
 
 	/*
+	 * SPI2 carries the Mesa fingerprint sensor (Touch ID). ADT /arm-io/spi2:
+	 * 0x305108000 (+ 0x4000), AIC interrupt 1369, pmgr SPI2 (parent SPI_P).
+	 * Disabled here; the board DT enables it with the sensor node.
+	 */
+	spi2: spi@505108000 {
+		compatible = "apple,t8140-spi", "apple,t8103-spi";
+		reg = <0x5 0x05108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1369 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_200m>;
+		power-domains = <&ps_spi2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		mesa: fingerprint@0 {
+			compatible = "apple,mesa-fingerprint";
+			reg = <0>;
+			spi-max-frequency = <8000000>;
+			spi-cpha;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * NUB GPIO controller (ADT /arm-io/nub-gpio0): 0x2881e4000, 61 pins, seven
+	 * interrupt groups 706..718 (even). The Mesa power switch is pin 21 on it
+	 * (function-mesa_pwr = nub-gpio0, 21, 257).
+	 */
+	pinctrl_nub: pinctrl@2881e4000 {
+		compatible = "apple,t8122-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x2 0x881e4000 0x0 0x4000>;
+		power-domains = <&ps_nub_gpio>;
+
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_nub 0 0 61>;
+		apple,npins = <61>;
+
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 706 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 708 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 710 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 712 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 714 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 716 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 718 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/*
 	 * I2C controllers. ADT /arm-io/i2c1..3: 0x305014000, 0x305018000,
 	 * 0x30501c000 (+ 0x4000 each), AIC interrupts 1376-1378, pmgr I2C1-3.
 	 * SCL/SDA are AP pins 60/61, 62/63 and 64/65; iBoot leaves them muxed

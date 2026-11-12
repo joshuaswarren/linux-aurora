@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * K114c apcie0 tunables that differ from the J714c's. t6050-k114c.dts includes
+ * t6050-j714c-pcie-tunables.dtsi first and this file after it, so the two
+ * properties below replace the J714c values; axi2af, pcieclkgen, phy and
+ * phy-ip-auspma are entry-for-entry identical on this machine (K114c ADT
+ * of 2026-11-10, ioreg gather).
+ *
+ * cio3pllcore: the ADT stores the offsets relative to the cio3pllcore window
+ * at pcieclkgen + 0x2200; the driver applies the property on the pcieclkgen
+ * window ("apple,tunable-cio3pllcore" tuned against "pcieclkgen"), so 0x2200
+ * is added, the same re-basing the J714c file uses. The offsets then equal
+ * the J714c's; one value differs (offset 0x224c: 0x94 here, 0x95 there).
+ * phy-ip-pll: three values differ from the J714c (the PLL trim).
+ * Entries are copied unchanged from the ADT as (offset, 4, mask, value).
+ */
+&pcie0 {
+	apple,tunable-cio3pllcore =
+			<0x2200 4 0xa0b 0xa01>,
+			<0x2224 4 0xc00 0x800>,
+			<0x2228 4 0xf00 0xb00>,
+			<0x2238 4 0x20 0x0>,
+			<0x224c 4 0xff 0x94>,
+			<0x22e8 4 0xe0000 0x20000>,
+			<0x2300 4 0xffffff 0xb40b4>;
+
+	apple,tunable-phy-ip-pll =
+			<0x180828 4 0xffff 0xb44>,
+			<0x180838 4 0x2 0x2>,
+			<0x180c1c 4 0x7e0 0x7c0>,
+			<0x180e10 4 0x3e0 0x1e0>,
+			<0x1820a4 4 0x3c3c000 0x1010000>,
+			<0x182200 4 0x8 0x8>,
+			<0x18221c 4 0x7c0 0x500>,
+			<0x182224 4 0xc00 0x800>,
+			<0x182228 4 0xf00 0xb00>,
+			<0x182230 4 0x3f 0x32>,
+			<0x18224c 4 0xfe7f 0x4412>,
+			<0x1822b0 4 0x700000 0x300000>,
+			<0x182338 4 0x1f00 0x1700>,
+			<0x183000 4 0x301fbf00 0x1e3400>,
+			<0x183004 4 0x1fffff 0x8d0e3>,
+			<0x183014 4 0xff0000ff 0x40000080>,
+			<0x183008 4 0x1fffff 0x15930a>,
+			<0x18300c 4 0x1fffff 0x1a2548>,
+			<0x183010 4 0x1fffff 0x1baaa8>;
+};
