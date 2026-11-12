@@ -7,6 +7,7 @@
 #include "dcp.h"
 
 #include "dcp-internal.h"
+#include "dcp-indicator.h"
 #include "iomfb_internal.h"
 
 #include "iomfb_plane.h"
@@ -234,6 +235,12 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	int ret;
 
 	new_plane_state = drm_atomic_get_new_plane_state(commit, plane);
+
+	if (!dcp_ind_plane_ok(to_apple_plane(plane)->indicator,
+			      new_plane_state->fb &&
+			      new_plane_state->fb == to_apple_plane(plane)->indicator_fb,
+			      !!new_plane_state->fb))
+		return -EINVAL;
 
 	if (!new_plane_state->crtc)
 		return 0;

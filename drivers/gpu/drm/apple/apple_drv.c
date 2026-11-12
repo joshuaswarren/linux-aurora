@@ -420,6 +420,7 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 
 	if (crtc_state->active_changed && !crtc_state->active) {
+		dcp_indicator_swap_failed(platform_get_drvdata(apple_crtc->dcp));
 		dcp_poweroff(apple_crtc->dcp);
 		if (apple_crtc->fabric_held) {
 			apple_crtc->fabric_held = false;
@@ -1151,6 +1152,26 @@ static int apple_probe_per_dcp(struct device *dev,
 			return ret;
 
 		zpos++;
+	}
+
+	if (dcp_data->camera_ind.has_surf) {
+		struct drm_plane *ind_plane;
+
+		ind_plane = apple_plane_init(drm, 1U << num, dcp_data->camera_ind.surf,
+					     supports_l10r, supports_xrgb2101010,
+					     dcp_data->hw.iomfb_method_profile ==
+						     DCP_IOMFB_METHODS_H17G,
+					     DRM_PLANE_TYPE_OVERLAY, false,
+					     supports_premultiplied);
+		if (IS_ERR(ind_plane))
+			return PTR_ERR(ind_plane);
+		ret = drm_plane_create_zpos_immutable_property(ind_plane, zpos++);
+		if (ret)
+			return ret;
+		/* Without its buffer the plane stays reserved and the camera stays off. */
+		ret = dcp_indicator_attach_plane(dcp_data, drm, ind_plane);
+		if (ret)
+			dev_err(dev, "camera indicator unavailable: %d\n", ret);
 	}
 
 	/*

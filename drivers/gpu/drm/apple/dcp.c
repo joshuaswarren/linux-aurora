@@ -1618,6 +1618,9 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 
+	if (!dcp_indicator_color_ok(dcp, crtc_state->color_mgmt_changed))
+		return -EBUSY;
+
 	/* External H17P does not program adaptive sync. */
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
@@ -6313,6 +6316,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
 	}
+	{
+		int ret_ind = dcp_indicator_probe(dcp);
+
+		if (ret_ind)
+			return ret_ind;
+	}
+
 	/* The J700 loader names surface zero rather than enabling it. */
 	if (of_machine_is_compatible("apple,j700") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp") &&

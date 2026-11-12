@@ -3293,6 +3293,8 @@ void iomfb_scanout_complete_h17p(struct apple_dcp *dcp)
 		scanout->request.swap.bg_color = previous->request.swap.bg_color;
 	dcp->iomfb.scanout = scanout;
 	dcp->iomfb.next_scanout = NULL;
+	if (dcp->camera_ind.has_surf)
+		dcp_indicator_swap_done(dcp, scanout->fb[dcp->camera_ind.surf]);
 	iomfb_scanout_release_h17p(previous);
 }
 
@@ -3341,6 +3343,7 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp)
 {
 	struct iomfb_transaction *transaction = dcp->iomfb.active;
 
+	dcp_indicator_swap_failed(dcp);
 	if (transaction && transaction->backlight_reserved) {
 		dcp_backlight_complete(dcp, transaction->backlight.sequence, false);
 		transaction->backlight_reserved = false;

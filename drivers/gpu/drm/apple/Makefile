@@ -31,7 +31,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_dropped_swap_test.o
 appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o j613_dcp_activate.o
 appledrm-y += iomfb_v27.o
 appledrm-y += epic/dpavservep.o
-appledrm-y += plane.o
+appledrm-y += plane.o dcp-indicator.o
 
 
 appledrm-$(CONFIG_TRACING) += trace.o

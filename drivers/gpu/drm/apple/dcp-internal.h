@@ -4,6 +4,7 @@
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
 
+#include "dcp-indicator.h"
 #include <drm/drm_mode.h>
 #include <linux/atomic.h>
 #include <linux/backlight.h>
@@ -368,7 +369,20 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 					       unsigned int count, u64 *generation);
 bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation);
 
+/* Kernel-owned software camera indicator; see dcp-indicator.c. */
+struct dcp_camera_indicator {
+	struct dcp_indicator state;
+	spinlock_t lock;
+	struct mutex ctl;
+	struct completion presented;
+	struct drm_plane *plane;
+	struct drm_framebuffer *fb;
+	u32 surf;
+	bool has_surf;
+};
+
 struct apple_dcp {
+	struct dcp_camera_indicator camera_ind;
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
@@ -1149,5 +1163,12 @@ void dcp_trace_panel_property(struct apple_dcp *dcp, int tag, const char *key,
 			      size_t key_len, const void *blob, size_t len);
 
 void dcp_panel_edid_receive(struct apple_dcp *dcp, const void *blob, size_t len);
+
+int dcp_indicator_probe(struct apple_dcp *dcp);
+int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
+			       struct drm_plane *plane);
+void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot_fb);
+void dcp_indicator_swap_failed(struct apple_dcp *dcp);
+bool dcp_indicator_color_ok(struct apple_dcp *dcp, bool color_mgmt_changed);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */
