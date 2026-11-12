@@ -3,7 +3,8 @@
  * K114c camera, draft. ADT isp0/dart-isp0 match J716c/J714c except sensor-type
  * (0xb9 here). The loader (aura) reserves the firmware text/data and the main
  * memory from the ADT isp0 segment-ranges at boot (alias "isp").
- * UNMEASURED on K114c: camera-light pin, presets, firmware segment sizes.
+ * Firmware segments (macOS ioreg, MEASURED): text 0x100011f4000 size 0xc1c000,
+ * data 0x1000292c000 size 0x13d0000, the J716c sizes. UNMEASURED: presets, light.
  */
 / {
 	aliases {
@@ -21,9 +22,8 @@
 	      <0x5 0x82924000 0 0x40>,
 	      <0x5 0x829241d0 0 0x20>,
 	      <0x5 0x82924464 0 0x10>,
-	      <0x5 0xc3b50000 0 0x8000>,
-	      <0x2 0xdc000234 0 0x4>;
-	reg-names = "coproc", "mbox", "gpio", "mbox2", "wdt", "cil";
+	      <0x5 0xc3b50000 0 0x8000>;
+	reg-names = "coproc", "mbox", "gpio", "mbox2", "wdt";
 	interrupts = <AIC_IRQ 0 513 IRQ_TYPE_LEVEL_HIGH>;
 	iommus = <&isp0_dart 0>, <&isp0_dart 12>,
 		 <&isp0_dart1 0>, <&isp0_dart1 12>,
@@ -36,12 +36,12 @@
 	apple,temporal-filter = <1>;
 	apple,cam-connections-scheme = <0x10>;
 	/*
-	 * UNMEASURED for K114c: the camera-light pin. The J714c ADT eic has
-	 * cil-gpio-offset 141 / cil-gpio-config 0x474002 (cil 2); the K114c ADT
-	 * eic has cil 1 and no cil-gpio-* properties. These are the J714c values.
+	 * The K114c ADT (macOS ioreg) has no camera-light GPIO: eic cil 1, mil 1,
+	 * no cil-gpio-offset/config (the J714c has pin 141). Linux does not drive
+	 * the light here. What lights it is UNMEASURED: watch the LED at the first
+	 * stream.
 	 */
-	apple,cil-config = <0x474002>;
-	apple,cil-active-high;
+	apple,no-light-gpio;
 	status = "disabled";
 	sensor-presets {
 		/* J714c IMX958 presets (omacom/linux-aurora#422); UNMEASURED on K114c. */
