@@ -2917,23 +2917,47 @@ int dwc3_pm_prepare(struct dwc3 *dwc)
 }
 EXPORT_SYMBOL_GPL(dwc3_pm_prepare);
 
+/*
+ * On Apple T6050 the generic dwc3 runs a controller the bootloader left
+ * initialised, with no PHY, reset or power-domain description. Its system
+ * suspend (dwc3_core_exit/init) resets the machine (J714s, found by aborting
+ * pm_test=devices at each device in turn), so leave it alone across sleep.
+ * Read-only at runtime so suspend and resume always take the same path.
+ */
+static bool t6050_skip_sleep = true;
+module_param(t6050_skip_sleep, bool, 0444);
+MODULE_PARM_DESC(t6050_skip_sleep, "On Apple T6050, skip the dwc3 system suspend/resume");
+
+static bool dwc3_plat_skip_sleep(void)
+{
+	return READ_ONCE(t6050_skip_sleep) && of_machine_is_compatible("apple,t6050");
+}
+
 static int dwc3_plat_suspend(struct device *dev)
 {
+	if (dwc3_plat_skip_sleep())
+		return 0;
 	return dwc3_pm_suspend(dev_get_drvdata(dev));
 }
 
 static int dwc3_plat_resume(struct device *dev)
 {
+	if (dwc3_plat_skip_sleep())
+		return 0;
 	return dwc3_pm_resume(dev_get_drvdata(dev));
 }
 
 static void dwc3_plat_complete(struct device *dev)
 {
+	if (dwc3_plat_skip_sleep())
+		return;
 	dwc3_pm_complete(dev_get_drvdata(dev));
 }
 
 static int dwc3_plat_prepare(struct device *dev)
 {
+	if (dwc3_plat_skip_sleep())
+		return 0;
 	return dwc3_pm_prepare(dev_get_drvdata(dev));
 }
 #else
