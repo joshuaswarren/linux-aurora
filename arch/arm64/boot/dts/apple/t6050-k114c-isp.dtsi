@@ -2,16 +2,32 @@
 /*
  * K114c camera, draft. ADT isp0/dart-isp0 match J716c/J714c except sensor-type
  * (0xb9 here). The loader (aura) reserves the firmware text/data and the main
- * memory from the ADT isp0 segment-ranges at boot (alias "isp").
+ * memory is placed statically below (no loader handoff).
  * Firmware segments (macOS ioreg, MEASURED): text 0x100011f4000 size 0xc1c000,
  * data 0x1000292c000 size 0x13d0000, the J716c sizes. UNMEASURED: presets, light.
  */
-/ {
-	aliases {
-		isp = &isp0;
-		isp-dart0 = &isp0_dart;
-		isp-dart1 = &isp0_dart1;
-		isp-dart2 = &isp0_dart2;
+/*
+ * Static firmware placement, MEASURED from the macOS ioreg isp0 segment-ranges
+ * (iBoot loads them; same iBoot as the boot set): text 0x100011f4000 size
+ * 0xc1c000, data 0x1000292c000 size 0x13d0000, main memory 32 MiB at IOVA
+ * 0x100_0000_0000. No "isp" alias: no loader change, the loader leaves the
+ * node as it is. The addresses move with iBoot; re-read them after an update.
+ */
+&{/reserved-memory} {
+	isp_fw_text: isp-firmware-text@100011f4000 {
+		reg = <0x100 0x011f4000 0x0 0xc1c000>;
+		iommu-addresses = <&isp0 0x100 0x0 0x0 0xc1c000>;
+		no-map;
+	};
+
+	isp_fw_data: isp-firmware-data@1000292c000 {
+		reg = <0x100 0x0292c000 0x0 0x13d0000>;
+		iommu-addresses = <&isp0 0x100 0xc1c000 0x0 0x13d0000>;
+		no-map;
+	};
+
+	isp_heap: isp-heap {
+		iommu-addresses = <&isp0 0x100 0x0 0x0 0x2000000>;
 	};
 };
 
@@ -42,7 +58,9 @@
 	 * stream.
 	 */
 	apple,no-light-gpio;
-	status = "disabled";
+	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+	memory-region-names = "text", "data", "heap";
+	status = "okay";
 	sensor-presets {
 		/* J714c IMX958 presets (omacom/linux-aurora#422); UNMEASURED on K114c. */
 		preset0 {
@@ -74,7 +92,7 @@
 	interrupts = <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>;
 	power-domains = <&ps_isp_sys>;
 	apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
-	status = "disabled";
+	status = "okay";
 };
 
 &isp0_dart1 {
@@ -85,7 +103,7 @@
 	interrupts = <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>;
 	power-domains = <&ps_isp_sys>;
 	apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
-	status = "disabled";
+	status = "okay";
 };
 
 &isp0_dart2 {
@@ -96,7 +114,7 @@
 	interrupts = <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>;
 	power-domains = <&ps_isp_sys>;
 	apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
-	status = "disabled";
+	status = "okay";
 };
 
 &pmgr1 {
