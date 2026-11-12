@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * K114c camera, draft. Copied from the J716c description: ADT isp0/dart-isp0
- * match J716c except sensor-type (0xb9 here, 0x75 there). UNMEASURED: the
- * sensor model and the preset (config-index/sizes are carried over from
- * J716c); the loader reserves firmware memory from the ADT at boot.
+ * K114c camera, draft. ADT isp0/dart-isp0 match J716c/J714c except sensor-type
+ * (0xb9 here). The loader (aura) reserves the firmware text/data and the main
+ * memory from the ADT isp0 segment-ranges at boot (alias "isp").
+ * UNMEASURED on K114c: camera-light pin, presets, firmware segment sizes.
  */
 / {
 	aliases {
@@ -21,24 +21,47 @@
 	      <0x5 0x82924000 0 0x40>,
 	      <0x5 0x829241d0 0 0x20>,
 	      <0x5 0x82924464 0 0x10>,
-	      <0x5 0xc3b50000 0 0x8000>;
-	reg-names = "coproc", "mbox", "gpio", "mbox2", "wdt";
+	      <0x5 0xc3b50000 0 0x8000>,
+	      <0x2 0xdc000234 0 0x4>;
+	reg-names = "coproc", "mbox", "gpio", "mbox2", "wdt", "cil";
 	interrupts = <AIC_IRQ 0 513 IRQ_TYPE_LEVEL_HIGH>;
 	iommus = <&isp0_dart 0>, <&isp0_dart 12>,
 		 <&isp0_dart1 0>, <&isp0_dart1 12>,
 		 <&isp0_dart2 0>, <&isp0_dart2 12>;
 	power-domains = <&ps_isp_sys>, <&ps_isp_cpu>, <&ps_isp_fe>,
-			<&ps_ispsens0>, <&ps_isp_dprx>, <&ps_isp_secure>,
-			<&ps_isp_be>, <&ps_isp_clr>;
-	apple,dart-vm-size = /bits/ 64 <0xde000000>;
+			<&ps_isp_dprx>, <&ps_isp_secure>, <&ps_isp_be>,
+			<&ps_isp_clr>, <&ps_ispsens0>;
+	apple,dart-vm-size = /bits/ 64 <0xde600000>;
 	apple,platform-id = <0xb9>;
+	apple,temporal-filter = <1>;
+	apple,cam-connections-scheme = <0x10>;
+	/*
+	 * UNMEASURED for K114c: the camera-light pin. The J714c ADT eic has
+	 * cil-gpio-offset 141 / cil-gpio-config 0x474002 (cil 2); the K114c ADT
+	 * eic has cil 1 and no cil-gpio-* properties. These are the J714c values.
+	 */
+	apple,cil-config = <0x474002>;
+	apple,cil-active-high;
 	status = "disabled";
 	sensor-presets {
+		/* J714c IMX958 presets (omacom/linux-aurora#422); UNMEASURED on K114c. */
 		preset0 {
-			apple,config-index = <5>;
-			apple,input-size = <1920 2160>;
+			apple,config-index = <6>;
+			apple,input-size = <3040 2880>;
 			apple,output-size = <1920 1080>;
-			apple,crop = <0 0 1920 1080>;
+			apple,crop = <320 765 2400 1350>;
+		};
+		preset1 {
+			apple,config-index = <7>;
+			apple,input-size = <3040 2880>;
+			apple,output-size = <1280 720>;
+			apple,crop = <320 765 2400 1350>;
+		};
+		preset2 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 2880>;
+			apple,output-size = <2560 1440>;
+			apple,crop = <240 720 2560 1440>;
 		};
 	};
 };
