@@ -251,7 +251,10 @@ impl EventManager {
         });
 
         for wq in owners {
-            wq.fail_all(error);
+            if wq.fail_all(error) {
+                // The pinned commands still point at this queue's ring; keep it until reboot.
+                core::mem::forget(wq);
+            }
         }
     }
 }

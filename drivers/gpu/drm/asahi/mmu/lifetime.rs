@@ -115,7 +115,8 @@ pub(crate) struct VmJobGuard {
 
 impl VmJobGuard {
     /// Blocks mapping commits until existing commits drain, before the error fence becomes visible.
-    /// May sleep; callers must run in sleepable context.
+    /// May sleep; callers must run in sleepable context. This runs in the crash callback with no
+    /// timeout, so the mapping-commit window must never wait on the firmware.
     pub(crate) fn quarantine(&self) {
         if let Some(lifetime) = self.vm.lifetime.as_ref() {
             let mut state = lifetime.state.lock();
@@ -360,7 +361,8 @@ impl Vm {
             .is_some_and(|lifetime| lifetime.state.lock().closed)
     }
 
-    /// Track accepted work on the legacy submission path.
+    /// Track accepted work on the legacy submission path. Called for every backend; a no-op where
+    /// tracking already exists (G15 and later attach it when they create the VM).
     pub(crate) fn with_job_lifetime(mut self) -> Result<Self> {
         if self.lifetime.is_none() {
             self.lifetime = Some(VmLifetime::new()?);
