@@ -1006,7 +1006,9 @@ pub(crate) trait WorkQueue {
 
     fn signal(&self) -> bool;
     fn mark_error(&self, value: event::EventValue, error: WorkError);
-    fn fail_all(&self, error: WorkError);
+    /// Fails all pending commands. Returns true when commands were left pinned: the caller
+    /// must then keep its reference to this queue, whose ring they still point at.
+    fn fail_all(&self, error: WorkError) -> bool;
 }
 
 #[versions(AGX)]
@@ -1164,7 +1166,7 @@ impl WorkQueue for WorkQueue::ver {
     }
 
     /// Mark all of this queue's work as having failed, and complete it.
-    fn fail_all(&self, error: WorkError) {
+    fn fail_all(&self, error: WorkError) -> bool {
         // If anything is marked completed, we can consider it successful
         // at this point, even if we didn't get the signal event yet.
         self.signal();
@@ -1177,7 +1179,7 @@ impl WorkQueue for WorkQueue::ver {
             if inner.pending_jobs > 0 || !inner.pending.is_empty() {
                 pr_crit!("WorkQueue: fail_all() called with no event and pending jobs.\n");
             }
-            return;
+            return false;
         }
 
         mod_pr_debug!(
@@ -1201,6 +1203,7 @@ impl WorkQueue for WorkQueue::ver {
         core::mem::drop(inner);
         core::mem::drop(held);
 
+        let pinned = !cmds.is_empty();
         for mut cmd in cmds {
             cmd.as_mut().inner_mut().quarantine_vm();
             cmd.as_mut().inner_mut().mark_error(error);
@@ -1208,6 +1211,7 @@ impl WorkQueue for WorkQueue::ver {
             // No confirmed GPU stop exists after a firmware crash; retain command resources until reboot.
             core::mem::forget(cmd);
         }
+        pinned
     }
 }
 
