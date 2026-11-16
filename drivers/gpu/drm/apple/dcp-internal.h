@@ -734,6 +734,8 @@ struct apple_dcp {
 	unsigned int swap_watchdog_retrains;
 	/* When the latest arm expires, in jiffies. */
 	unsigned long swap_watchdog_deadline;
+	/* Commits swapped in whose modeset phase has not finished. */
+	atomic_t modeset_commits;
 
 	/* List of referenced framebuffers pending a completed replacement swap.
 	 * The commit and RTKit work queues share it under this lock.

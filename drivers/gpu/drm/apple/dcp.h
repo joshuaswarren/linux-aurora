@@ -93,6 +93,7 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev);
 bool dcp_edr_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
+void dcp_commit_modeset_pending(struct platform_device *pdev, bool pending);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
 void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
 void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);

@@ -1298,6 +1298,10 @@ bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id)
  * mark the mode invalid so later commits do not wait for DCP, and let the
  * hotplug worker re-apply the active CRTC.  On H17P the dropped present is
  * also retired, so that the commands queued behind it can run.
+ * A userspace commit queued behind the stuck flip, or still in its modeset
+ * phase, sets the pipe up and powers it off itself.  Do not retrain beside
+ * it: complete the flip so that it goes on, and leave the retrain to the
+ * watchdog of the next swap.
  */
 VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 {
@@ -1339,6 +1343,11 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 		WRITE_ONCE(dcp->desktop->vrr_failed, true);
 		WRITE_ONCE(dcp->vrr_enabled, false);
 		dev_warn(dcp->dev, "adaptive swap timed out, restoring fixed refresh\n");
+	}
+	if (atomic_read(&dcp->modeset_commits)) {
+		dev_info(dcp->dev, "w88-wd: a commit is queued, no retrain this round\n");
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
 	}
 	dev_warn(dcp->dev, "swap not completed, retraining the display\n");
 	dcp_mode_invalidate(&dcp->mode_state);
@@ -4736,6 +4745,17 @@ void dcp_retain_framebuffer(struct platform_device *pdev,
 	mutex_lock(&dcp->swapped_out_fbs_lock);
 	list_add_tail(&entry->head, &dcp->swapped_out_fbs);
 	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+/* Counts the commits that still have a modeset phase to run; see dcp_swap_watchdog(). */
+void dcp_commit_modeset_pending(struct platform_device *pdev, bool pending)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (pending)
+		atomic_inc(&dcp->modeset_commits);
+	else
+		atomic_dec(&dcp->modeset_commits);
 }
 
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
