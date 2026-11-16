@@ -267,6 +267,28 @@ static void dropped_present_retired_test(struct kunit *test)
 }
 
 /*
+ * The docked resume: the watchdog fires while the userspace commit that
+ * restores the session is queued behind the stuck flip.  The commit powers
+ * the pipe off itself, so the watchdog retires the present and completes the
+ * flip, but leaves the mode and the hotplug worker alone.  Once no commit is
+ * queued, the watchdog of the next swap retrains as before.
+ */
+static void queued_commit_no_retrain_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_external(test);
+	struct apple_dcp *dcp = &t->dcp;
+
+	dcp_commit_modeset_pending(t->pdev, true);
+	dropped_test_retire(test, t, 0);
+	KUNIT_EXPECT_FALSE(test, dcp->present_state_h17p.pending);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dcp->mode_state.valid));
+
+	dcp_commit_modeset_pending(t->pdev, false);
+	dropped_test_retire(test, t, 1);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->mode_state.valid));
+}
+
+/*
  * The firmware might still read a dropped present: its framebuffers, and the
  * one it would have replaced, stay referenced until a later present
  * completes.  A late completion of the dropped present releases nothing.
@@ -546,6 +568,7 @@ static struct kunit_case dropped_swap_cases[] = {
 	KUNIT_CASE(desktop_present_completion_test),
 	KUNIT_CASE(takeover_adopt_watched_test),
 	KUNIT_CASE(dropped_present_retired_test),
+	KUNIT_CASE(queued_commit_no_retrain_test),
 	KUNIT_CASE(dropped_present_buffers_test),
 	KUNIT_CASE(completed_present_kept_test),
 	KUNIT_CASE(stop_deferred_test),

@@ -698,9 +698,21 @@ static void apple_fail_lost_flips(struct drm_atomic_commit *state)
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state);
 
+/* dcp_swap_watchdog() does not retrain beside a commit that has a modeset phase to run. */
+static void apple_commit_modeset_pending(struct drm_atomic_commit *state, bool pending)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
+		dcp_commit_modeset_pending(to_apple_crtc(crtc)->dcp, pending);
+}
+
 /* The helper's commit_tail() with the bounded fence wait. */
 static void apple_commit_tail(struct drm_atomic_commit *state)
 {
+	apple_commit_modeset_pending(state, true);
 	apple_wait_for_fences(state->dev, state, false);
 	drm_atomic_helper_wait_for_dependencies(state);
 	apple_atomic_commit_tail(state);
@@ -801,6 +813,7 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 
 	drm_atomic_helper_commit_modeset_disables(state->dev, state);
 	drm_atomic_helper_commit_modeset_enables(state->dev, state);
+	apple_commit_modeset_pending(state, false);
 	drm_atomic_helper_commit_planes(state->dev, state,
 					DRM_PLANE_COMMIT_ACTIVE_ONLY);
 	drm_atomic_helper_fake_vblank(state);
