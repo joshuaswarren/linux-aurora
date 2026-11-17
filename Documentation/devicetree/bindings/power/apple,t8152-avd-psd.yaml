@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,t8152-avd-psd.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152 AVD PSD power domain
+
+maintainers:
+  - Thomas Glanzmann <thomas@glanzmann.de>
+
+description:
+  PSD service 50 supplies the T8152 Kopsia video decoder and its Gen3 DART.
+  Its register bank contains separate power request, state and acknowledge
+  registers. Reading the state consumes the acknowledgement. The initial
+  implementation powers this domain on and retains it; power gating and
+  reset are not supported.
+
+allOf:
+  - $ref: power-domain.yaml#
+
+properties:
+  compatible:
+    const: apple,t8152-avd-psd
+
+  reg:
+    maxItems: 1
+
+  '#power-domain-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - '#power-domain-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        power-controller@303a13200 {
+            compatible = "apple,t8152-avd-psd";
+            reg = <0x3 0x03a13200 0x0 0x100>;
+            #power-domain-cells = <0>;
+        };
+    };
