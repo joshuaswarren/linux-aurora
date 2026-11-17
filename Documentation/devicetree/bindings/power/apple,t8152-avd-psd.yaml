@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/power/apple,t8152-avd-psd.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8152 AVD PSD power domain
+title: Apple T8152 PSD power domains
 
 maintainers:
   - Thomas Glanzmann <thomas@glanzmann.de>
@@ -16,12 +16,19 @@ description:
   implementation powers this domain on and retains it; power gating and
   reset are not supported.
 
+  The rear USB4 routers, their PCIe-C tunnels and the ATC common blocks
+  are PSD services as well (apple,t8152-cio-psd). They switch between
+  state 0 (on) and 6 (cold). A router reconfiguration only completes from
+  a cold domain, so these are powered off when their users stop.
+
 allOf:
   - $ref: power-domain.yaml#
 
 properties:
   compatible:
-    const: apple,t8152-avd-psd
+    enum:
+      - apple,t8152-avd-psd
+      - apple,t8152-cio-psd
 
   reg:
     maxItems: 1
