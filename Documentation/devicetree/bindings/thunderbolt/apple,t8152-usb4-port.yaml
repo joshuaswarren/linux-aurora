@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/thunderbolt/apple,t8152-usb4-port.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152 USB-C port in USB4 mode
+
+maintainers:
+  - Thomas Glanzmann <thomas@glanzmann.de>
+
+description:
+  A rear USB-C port of the J873g (M6 Mac mini) as seen by its USB4 router.
+  The port's ACE3 PD controller has no Type-C driver; the display driver
+  uses it for DisplayPort alternate mode. This node describes the ATC PHY,
+  its PMGR power states and PSD service, and the ADT tunables that put the
+  PHY into CIO mode, so that a USB4 cable reported by the PD controller can
+  be handed to the router's Thunderbolt switch. The ATC register blocks are
+  shared with the display driver and are mapped without being claimed.
+
+properties:
+  compatible:
+    const: apple,t8152-usb4-port
+
+  reg:
+    items:
+      - description: ATC PHY
+      - description: PMGR power states DP_0 (+0), DP_1 (+0x20), USB_AON (+0x100)
+      - description: PMGR2 PSD service of the ATC common block
+
+  reg-names:
+    items:
+      - const: phy
+      - const: ps
+      - const: psd
+
+  label:
+    description: Name of the connector on the chassis.
+
+  apple,usb-pd:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The port's PD controller on the SPMI bus.
+
+  apple,tunable-phy-pre:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: PHY register offset
+        - description: mask
+        - description: value
+    description:
+      ADT tunables applied once the PHY's register bus is up, before the
+      lanes are configured (atc-phyN tunable_ACIOPHY_CMN_DFLT and
+      tunable_CIOPLL_CORE_DFLT at their register blocks).
+
+  apple,tunable-phy-post:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: PHY register offset
+        - description: mask
+        - description: value
+    description:
+      ADT tunables applied after the crossbar is set to CIO mode
+      (tunable_ATC_FABRIC, tunable_ATC_COMMON_CFG and the CIO lane groups).
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: Link to the Thunderbolt switch of the port's USB4 router.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - apple,usb-pd
+  - apple,tunable-phy-pre
+  - apple,tunable-phy-post
+  - port
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        hpm3: usb-pd {
+        };
+
+        usb4-port@413000000 {
+            compatible = "apple,t8152-usb4-port";
+            reg = <0x4 0x13000000 0x0 0x84000>,
+                  <0x3 0x082900c0 0x0 0x104>,
+                  <0x3 0x03a13a00 0x0 0x100>;
+            reg-names = "phy", "ps", "psd";
+            label = "USB-C Back-right";
+            apple,usb-pd = <&hpm3>;
+            apple,tunable-phy-pre = <0x4000 0x1 0x1>;
+            apple,tunable-phy-post = <0x60000 0x2 0x2>;
+
+            port {
+                usb4_port3_sw: endpoint {
+                    remote-endpoint = <&usb4_port3_sw>;
+                };
+            };
+        };
+    };
