@@ -104,6 +104,11 @@ properties:
         const: apple,t8152-ans-mailbox
 
       - description:
+          T8152 ACIO mailbox of a rear USB4 router, a counted 0x80 window
+          in the router's post-office bank, polled by the host.
+        const: apple,t8152-cio-mailbox
+
+      - description:
           An older ASC mailbox interface found on T2 and A11 that is also
           used for the NVMe coprocessor and the system management
           controller.
@@ -169,6 +174,7 @@ allOf:
               enum:
                 - apple,secure-rtbuddy-proxy
                 - apple,t8152-ans-mailbox
+                - apple,t8152-cio-mailbox
     then:
       required:
         - interrupts
@@ -194,7 +200,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8152-ans-mailbox
+            enum:
+              - apple,t8152-ans-mailbox
+              - apple,t8152-cio-mailbox
     then:
       properties:
         interrupts: false
@@ -250,6 +258,7 @@ allOf:
                 - apple,t8140-aop-setup-mailbox
                 - apple,t8152-ans-mailbox
                 - apple,t8152-ascwrap-v8-mailbox
+                - apple,t8152-cio-mailbox
                 - apple,t8152-smc-mailbox
     then:
       properties:
