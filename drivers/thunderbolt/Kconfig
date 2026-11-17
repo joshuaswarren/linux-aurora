@@ -89,6 +89,19 @@ config USB4_APPLE_SOC
 	  To compile the driver as a module, choose M here. The module
 	  will be called thunderbolt_apple.
 
+config USB4_APPLE_T8152_PORT
+	tristate "Apple T8152 rear USB-C ports in USB4 mode"
+	depends on USB4_APPLE_SOC && SPMI
+	select APPLE_TUNABLE
+	help
+	  Say Y here to use USB4 devices on the rear USB-C ports of the
+	  Apple M6 Mac mini (J873g). The driver watches the ports' PD
+	  controllers for a USB4 cable, brings the ATC PHY up in CIO mode
+	  and starts the port's USB4 router.
+
+	  To compile the driver as a module, choose M here. The module
+	  will be called apple-t8152-usb4-port.
+
 config USB4_APPLE_DPIN_KUNIT_TEST
 	bool "Apple DP-IN lifecycle tests" if !KUNIT_ALL_TESTS
 	depends on USB4_APPLE_SOC && KUNIT=y
