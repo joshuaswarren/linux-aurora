@@ -683,11 +683,8 @@ impl File {
         let file_id = file.inner().id;
         let vm = gpu
             .new_vm_for_file(kernel_range.clone(), file_id)?
-<<<<<<< HEAD
-            .with_memory_client(file.inner().mem.clone());
-=======
+            .with_memory_client(file.inner().mem.clone())
             .with_job_lifetime()?;
->>>>>>> facf881b7a39 (drm: retain VM resources until GPU jobs retire)
         // G16 registers a retained backend owner before returning this VM. Any later
         // allocation can fail before file::Vm exists to run its normal close path.
         let failed_vm = ScopeGuard::new_with_data(
