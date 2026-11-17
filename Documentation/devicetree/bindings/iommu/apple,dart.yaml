@@ -34,6 +34,8 @@ properties:
           - apple,t6000-dart
           - apple,t8152-dart-gen3
           - apple,t8152-avd-dart
+          - apple,t8152-acio-dart
+          - apple,t8152-pciec-dart
       - items:
           - const: apple,t8140-ane-dart
           - const: apple,t8140-dart
@@ -363,6 +365,8 @@ allOf:
             enum:
               - apple,t8152-dart-gen3
               - apple,t8152-avd-dart
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
     then:
       description:
         The T8152 Gen3 DARTs in front of the display coprocessors and their
@@ -373,6 +377,8 @@ allOf:
         TLB invalidation aperture instead. The T8152 AVD instance uses the
         same invalidation aperture, but starts unlocked with inactive streams
         and is initialized by the operating system after its PSD domain is on.
+        So do the DARTs of the rear USB4 routers (ACIO NHI streams) and of
+        their PCIe-C tunnels, each at its own aperture slot.
       properties:
         reg:
           minItems: 2
@@ -398,6 +404,18 @@ allOf:
     then:
       required:
         - power-domains
+        - apple,dma-range
+        - apple,tunable
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
+    then:
+      required:
         - apple,dma-range
         - apple,tunable
 
