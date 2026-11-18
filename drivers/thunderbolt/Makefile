@@ -20,3 +20,5 @@ obj-$(CONFIG_USB4_STREAM) += thunderbolt_stream.o
 obj-$(CONFIG_USB4_APPLE_SOC) += thunderbolt_apple.o
 thunderbolt_apple-y := apple.o apple-dpin-state.o
 thunderbolt_apple-$(CONFIG_USB4_APPLE_DPIN_KUNIT_TEST) += apple-dpin-test.o
+obj-$(CONFIG_USB4_APPLE_T8152_PORT) += apple-t8152-usb4-port.o
+apple-t8152-usb4-port-y := apple-t8152-port.o

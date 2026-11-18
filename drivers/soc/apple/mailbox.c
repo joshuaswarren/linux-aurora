@@ -230,7 +230,8 @@ struct apple_mbox_hw {
 	/* No interrupts are described; receive and send are polled. */
 	bool rx_poll_required;
 	/* J873 post-office window a polled provider must sit at. */
-	u64 j873_window;
+	/* The J873 post-office windows this polled profile may own. */
+	u64 j873_windows[3];
 	/* Status word counts RX occupancy and free TX slots; paired transfers. */
 	bool counted_fifo;
 	bool ap_initializes_mailboxes;
@@ -1506,6 +1507,14 @@ static int apple_mbox_probe_ascwrap_v8(struct platform_device *pdev,
 	return 0;
 }
 
+static bool apple_mbox_j873_window(const struct apple_mbox_hw *hw, u64 start)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(hw->j873_windows); i++)
+		if (hw->j873_windows[i] && hw->j873_windows[i] == start)
+			return true;
+	return false;
+}
+
 static int apple_mbox_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -1598,7 +1607,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		 */
 		if (mbox->hw->rx_poll_required &&
 		    (!of_machine_is_compatible("apple,j873g") || !res ||
-		     res->start != mbox->hw->j873_window ||
+		     !apple_mbox_j873_window(mbox->hw, res->start) ||
 		     resource_size(res) != APPLE_ASCWRAP_V8_MBOX_SIZE))
 			return dev_err_probe(dev, -EINVAL,
 					     "post-office window does not match the J873 profile\n");
@@ -1988,7 +1997,23 @@ static const struct apple_mbox_hw apple_mbox_t8152_smc_hw = {
  */
 static const struct apple_mbox_hw apple_mbox_t8152_ans_hw = {
 	.rx_poll_required = true,
-	.j873_window = 0x316010300ULL,
+	.j873_windows = { 0x316010300ULL },
+	.counted_fifo = true,
+	.control_full = GENMASK(11, 8), /* free TX slots */
+	.control_empty = GENMASK(3, 0), /* RX occupancy */
+	.a2i_control = 0x20,
+	.a2i_send0 = 0x10,
+	.a2i_send1 = 0x18,
+	.i2a_control = 0x20,
+	.i2a_recv0 = 0x00,
+	.i2a_recv1 = 0x08,
+	.has_irq_controls = false,
+};
+
+/* The counted ACIO mailboxes of the rear USB4 routers (CIO0, CIO1, CIO3). */
+static const struct apple_mbox_hw apple_mbox_t8152_cio_hw = {
+	.rx_poll_required = true,
+	.j873_windows = { 0x401178080ULL, 0x409178080ULL, 0x411178080ULL },
 	.counted_fifo = true,
 	.control_full = GENMASK(11, 8), /* free TX slots */
 	.control_empty = GENMASK(3, 0), /* RX occupancy */
@@ -2002,6 +2027,7 @@ static const struct apple_mbox_hw apple_mbox_t8152_ans_hw = {
 };
 
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t8152-cio-mailbox", .data = &apple_mbox_t8152_cio_hw },
 	{ .compatible = "apple,t8152-smc-mailbox", .data = &apple_mbox_t8152_smc_hw },
 	/* The AOP's ASC wrapper mailbox has the SMC mailbox's counted FIFOs. */
 	{ .compatible = "apple,t8152-ascwrap-v8-mailbox", .data = &apple_mbox_t8152_smc_hw },
