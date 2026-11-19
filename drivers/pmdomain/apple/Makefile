@@ -2,6 +2,7 @@
 obj-$(CONFIG_APPLE_PMGR_PWRSTATE)	+= pmgr-pwrstate.o
 obj-$(CONFIG_APPLE_PMGR_PWRSTATE)	+= gfx-tvm.o
 obj-$(CONFIG_APPLE_T6041_CIO_RECONFIG) += t6041-cio-reconfig.o
+obj-$(CONFIG_APPLE_PMGR_PSD)	+= pmgr-psd.o
 obj-$(CONFIG_APPLE_PMP_REPORT)	+= pmp-report.o
 obj-$(CONFIG_APPLE_PMP_REPORT_KUNIT_TEST) += pmp-report-test.o
 obj-$(CONFIG_APPLE_PMP_DRAM_KUNIT_TEST) += pmp-dram-test.o
