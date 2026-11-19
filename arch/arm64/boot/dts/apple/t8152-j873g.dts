@@ -294,18 +294,21 @@
 &dwc3_0_dart {
 	reg = <0x4 0x3020000 0x0 0xc000>,
 	      <0x4 0x3040000 0x0 0xc000>;
+	power-domains = <&psd_atc0_usb>;
 };
 
 /* Retain the register view published by this board's live hardware capture. */
 &dwc3_1_dart {
 	reg = <0x4 0xb020000 0x0 0xc000>,
 	      <0x4 0xb040000 0x0 0xc000>;
+	power-domains = <&psd_atc1_usb>;
 };
 
 /* Retain the register view published by this board's live hardware capture. */
 &dwc3_3_dart {
 	reg = <0x4 0x13020000 0x0 0xc000>,
 	      <0x4 0x13040000 0x0 0xc000>;
+	power-domains = <&psd_atc3_usb>;
 };
 
 /* Retain the register view published by this board's live hardware capture. */
@@ -430,4 +433,5 @@
 &dwc3_2_dart {
 	reg = <0x3 0x83020000 0x0 0xc000>,
 	      <0x3 0x83040000 0x0 0xc000>;
+	power-domains = <&psd_atc2_usb>;
 };
