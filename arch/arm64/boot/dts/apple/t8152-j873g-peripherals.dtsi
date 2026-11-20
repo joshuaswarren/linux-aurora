@@ -70,5 +70,38 @@
 			#power-domain-cells = <0>;
 			label = "psd_atc3_usb";
 		};
+
+		/*
+		 * ANS NVMe storage: the coprocessor's post-office mailbox,
+		 * its SART address filter and the controller itself. The boot
+		 * loader leaves ANS powered, so no power domain is named.
+		 */
+		ans_mbox: mailbox@316010300 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x3 0x16010300 0x0 0x80>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 262 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		sart: sart@325c50000 {
+			compatible = "apple,t8152-sart";
+			reg = <0x3 0x25c50000 0x0 0xc000>;
+		};
+
+		nvme: nvme@325cc0000 {
+			compatible = "apple,t8152-nvme-ans2",
+				     "apple,t8132-nvme-ans2";
+			reg = <0x3 0x25cc0000 0x0 0x60000>,
+			      <0x3 0x21600000 0x0 0x74000>,
+			      <0x3 0x25cc0000 0x0 0x60000>;
+			reg-names = "nvme", "ans", "nvmmu";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1349 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&sart>;
+		};
 	};
 };
