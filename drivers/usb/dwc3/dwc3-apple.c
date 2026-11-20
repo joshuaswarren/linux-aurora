@@ -28,6 +28,7 @@
 #include <linux/suspend.h>
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
+#include <linux/usb/otg.h>
 #include <linux/usb/phy.h>
 #include <linux/workqueue.h>
 
@@ -175,6 +176,8 @@ struct dwc3_apple {
 	/* The root port the fixed hub sits on, its node's reg. */
 	u32 hub_port;
 	bool host_only;
+	/* T8152: no role switch ever fires; the node's dr_mode is the role forever. */
+	bool fixed_role;
 
 	struct mutex lock;
 
@@ -308,12 +311,22 @@ static inline void dwc3_apple_mask(struct dwc3_apple *appledwc, u32 offset, u32 
  * needs it.
  */
 #define DWC3_APPLE_T8140_PWRDNSCALE 0xd
+/* T8152 boots with 1560; the vendor driver writes 13, taking RxDetect-to-Polling
+ * under 90 ms on the front port. */
+#define DWC3_APPLE_T8152_PWRDNSCALE 0xd
 
 static void dwc3_apple_setup_hibernation(struct dwc3_apple *appledwc)
 {
 	struct dwc3 *dwc = &appledwc->dwc;
 	u32 reg;
 
+	if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8152-dwc3")) {
+		reg = dwc3_readl(dwc, DWC3_GCTL);
+		reg &= ~DWC3_GCTL_PWRDNSCALE_MASK;
+		reg |= DWC3_GCTL_PWRDNSCALE(DWC3_APPLE_T8152_PWRDNSCALE);
+		dwc3_writel(dwc, DWC3_GCTL, reg);
+		return;
+	}
 	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8140-dwc3"))
 		return;
 	reg = dwc3_readl(dwc, DWC3_GCTL);
@@ -1826,6 +1839,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct dwc3_apple *appledwc;
+	enum dwc3_apple_state state;
 	int ret;
 
 	appledwc = devm_kzalloc(&pdev->dev, sizeof(*appledwc), GFP_KERNEL);
@@ -1846,7 +1860,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->dwc.dev = dev;
 	platform_set_drvdata(pdev, &appledwc->dwc);
 
-	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
+	appledwc->fixed_role = of_device_is_compatible(dev->of_node, "apple,t8152-dwc3");
+	/* The T8152 nodes take no reset line: it is released with the pipe handler. */
+	appledwc->reset = appledwc->fixed_role ?
+		devm_reset_control_get_optional_exclusive(dev, NULL) :
+		devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(appledwc->reset))
 		return dev_err_probe(&pdev->dev, PTR_ERR(appledwc->reset),
 				     "Failed to get reset control\n");
@@ -1861,7 +1879,8 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * expose only USB2; a NULL PHY is a no-op.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
-	    of_device_is_compatible(dev->of_node, "apple,t6040-dwc3"))
+	    of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8152-dwc3"))
 		appledwc->usb3_phy = devm_phy_optional_get(dev, "usb3-phy");
 	else
 		appledwc->usb3_phy = devm_phy_get(dev, "usb3-phy");
@@ -1945,26 +1964,30 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
 	}
 
-	if (!appledwc->fixed_hub) {
+	if (!appledwc->fixed_hub && !appledwc->fixed_role) {
 		WRITE_ONCE(appledwc->sleep_pm_online, true);
 		return 0;
 	}
 
 	/*
-	 * The hub is the controller's permanent USB2 peer, and the PHY has kept
-	 * its USB2 path up for it since its own probe, so there is nothing to
-	 * wait for: bring the host up now.
+	 * The hub is the controller's permanent USB2 peer, and a T8152 port keeps
+	 * the role its dr_mode gives it forever: neither waits for a cable event,
+	 * and the PHY has kept the USB2 path up for them since its own probe, so
+	 * bring the core up now.
 	 */
+	state = DWC3_APPLE_HOST;
+	if (appledwc->fixed_role && usb_get_dr_mode(dev) == USB_DR_MODE_PERIPHERAL)
+		state = DWC3_APPLE_DEVICE;
 	scoped_guard(mutex, &appledwc->lock)
-		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+		ret = dwc3_apple_init(appledwc, state);
 	if (ret) {
 		/* A failed cleanup remains visible even when probe cannot be retried. */
 		if (appledwc->core_active || appledwc->reset_pending)
-			dev_err(dev, "Host startup left pending PHY/reset cleanup\n");
+			dev_err(dev, "Fixed-role startup left pending PHY/reset cleanup\n");
 		if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
 			dwc3_core_remove_no_shutdown(&appledwc->dwc);
 		usb_role_switch_unregister(appledwc->role_sw);
-		return dev_err_probe(dev, ret, "Failed to start host mode\n");
+		return dev_err_probe(dev, ret, "Failed to start the fixed role\n");
 	}
 
 	WRITE_ONCE(appledwc->sleep_pm_online, true);
