@@ -82,30 +82,123 @@
 		status = "disabled";
 	};
 
-	dwc3_0_dart: iommu@403020000 {
+	dwc3_0_dart_0: iommu@403020000 {
 		compatible = "apple,t8152-dart", "apple,t8110-dart";
-		reg = <0x4 0x3020000 0x0 0x20000>,
-		      <0x4 0x3040000 0x0 0x20000>;
+		reg = <0x4 0x03020000 0x0 0xc000>,
+		      <0x2 0x100 0x0 0x10>;
+		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1608 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
 		status = "disabled";
 	};
 
-	dwc3_1_dart: iommu@40b020000 {
+	dwc3_0_dart_1: iommu@403040000 {
 		compatible = "apple,t8152-dart", "apple,t8110-dart";
-		reg = <0x4 0xb020000 0x0 0x20000>,
-		      <0x4 0xb040000 0x0 0x20000>;
+		reg = <0x4 0x03040000 0x0 0xc000>,
+		      <0x2 0x100 0x0 0x10>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1608 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
+		status = "disabled";
+	};
+
+	dwc3_1_dart_0: iommu@40b020000 {
+		compatible = "apple,t8152-dart", "apple,t8110-dart";
+		reg = <0x4 0x0b020000 0x0 0xc000>,
+		      <0x2 0x180 0x0 0x10>;
+		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1679 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
 		status = "disabled";
 	};
 
-	dwc3_3_dart: iommu@413020000 {
+	dwc3_1_dart_1: iommu@40b040000 {
 		compatible = "apple,t8152-dart", "apple,t8110-dart";
-		reg = <0x4 0x13020000 0x0 0x20000>,
-		      <0x4 0x13040000 0x0 0x20000>;
+		reg = <0x4 0x0b040000 0x0 0xc000>,
+		      <0x2 0x180 0x0 0x10>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1679 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
+		status = "disabled";
+	};
+
+	dwc3_3_dart_0: iommu@413020000 {
+		compatible = "apple,t8152-dart", "apple,t8110-dart";
+		reg = <0x4 0x13020000 0x0 0xc000>,
+		      <0x2 0x280 0x0 0x10>;
+		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
+		status = "disabled";
+	};
+
+	dwc3_3_dart_1: iommu@413040000 {
+		compatible = "apple,t8152-dart", "apple,t8110-dart";
+		reg = <0x4 0x13040000 0x0 0xc000>,
+		      <0x2 0x280 0x0 0x10>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
 		status = "disabled";
 	};
 
@@ -169,7 +262,7 @@
 
 	dispext1_dart: iommu@502300000 {
 		compatible = "apple,t8152-dart", "apple,t8110-dart";
-		reg = <0x5 0x2300000 0x0 0xc000>,
+		reg = <0x5 0x02300000 0x0 0xc000>,
 		      <0x5 0x2314000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1098 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
@@ -658,12 +751,43 @@
 		status = "disabled";
 	};
 
-	dwc3_2_dart: iommu@383020000 {
+	dwc3_2_dart_0: iommu@383020000 {
 		compatible = "apple,t8152-dart", "apple,t8110-dart";
-		reg = <0x3 0x83020000 0x0 0x20000>,
-		      <0x3 0x83040000 0x0 0x20000>;
+		reg = <0x3 0x83020000 0x0 0xc000>,
+		      <0x2 0x200 0x0 0x10>;
+		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
+		status = "disabled";
+	};
+
+	dwc3_2_dart_1: iommu@383040000 {
+		compatible = "apple,t8152-dart", "apple,t8110-dart";
+		reg = <0x3 0x83040000 0x0 0xc000>,
+		      <0x2 0x200 0x0 0x10>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,static-topology;
+		apple,num-streams = <16>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,tunable = <0x20c 0x80000121 0x80000121>,
+				<0x220 0x00000f0f 0x00000f0f>,
+				<0x224 0x0000ffff 0x00000909>,
+				<0x300 0x00001f31 0x00000001>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x4600 0x00000002 0x00000002>;
 		status = "disabled";
 	};
 

@@ -290,25 +290,37 @@
 #include "t8152-peripherals.dtsi"
 #include "t8152-j873g-peripherals.dtsi"
 
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_0_dart {
-	reg = <0x4 0x3020000 0x0 0xc000>,
-	      <0x4 0x3040000 0x0 0xc000>;
+/* Per-instance DARTs for the port; the register view is in the SoC file. */
+&dwc3_0_dart_0 {
 	power-domains = <&psd_atc0_usb>;
+	status = "okay";
 };
 
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_1_dart {
-	reg = <0x4 0xb020000 0x0 0xc000>,
-	      <0x4 0xb040000 0x0 0xc000>;
+&dwc3_0_dart_1 {
+	power-domains = <&psd_atc0_usb>;
+	status = "okay";
+};
+
+/* Per-instance DARTs for the port; the register view is in the SoC file. */
+&dwc3_1_dart_0 {
 	power-domains = <&psd_atc1_usb>;
+	status = "okay";
 };
 
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_3_dart {
-	reg = <0x4 0x13020000 0x0 0xc000>,
-	      <0x4 0x13040000 0x0 0xc000>;
+&dwc3_1_dart_1 {
+	power-domains = <&psd_atc1_usb>;
+	status = "okay";
+};
+
+/* Per-instance DARTs for the port; the register view is in the SoC file. */
+&dwc3_3_dart_0 {
 	power-domains = <&psd_atc3_usb>;
+	status = "okay";
+};
+
+&dwc3_3_dart_1 {
+	power-domains = <&psd_atc3_usb>;
+	status = "okay";
 };
 
 /* Retain the register view published by this board's live hardware capture. */
@@ -429,9 +441,13 @@
 
 /* Unexposed chassis port instances remain described and disabled. */
 
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_2_dart {
-	reg = <0x3 0x83020000 0x0 0xc000>,
-	      <0x3 0x83040000 0x0 0xc000>;
+/* Per-instance DARTs for the port; the register view is in the SoC file. */
+&dwc3_2_dart_0 {
 	power-domains = <&psd_atc2_usb>;
+	status = "okay";
+};
+
+&dwc3_2_dart_1 {
+	power-domains = <&psd_atc2_usb>;
+	status = "okay";
 };

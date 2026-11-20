@@ -152,6 +152,92 @@
 			power-domains = <&ps_atc3_usb_aon>, <&psd_atc3_usb>;
 			power-domain-names = "usb-aon", "usb";
 		};
+
+		/*
+		 * The four DWC3 controllers, one per ATC port. Port 0 is the
+		 * debug-cable port and stays a fixed peripheral; the other
+		 * three are fixed hosts. Each maps two stream IDs on each of
+		 * its two DART instances. All are USB2-only for now.
+		 */
+		usbdrd0: usb@402430000 {
+			compatible = "apple,t8152-dwc3";
+			reg = <0x4 0x02430000 0x0 0xcd00>,
+			      <0x4 0x0243cd00 0x0 0x4b00>,
+			      <0x4 0x02414000 0x0 0x4000>,
+			      <0x4 0x02410000 0x0 0x4000>,
+			      <0x4 0x02444000 0x0 0x4000>,
+			      <0x4 0x02450000 0x0 0x4000>;
+			reg-names = "dwc3-core", "dwc3-apple", "pipe-handler",
+				    "pwr-ctrl", "bulk-fabric", "ausbc-debug";
+			interrupts = <AIC_IRQ 1621 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&dwc3_0_dart_0 0>, <&dwc3_0_dart_0 1>,
+				 <&dwc3_0_dart_1 0>, <&dwc3_0_dart_1 1>;
+			power-domains = <&psd_atc0_usb>;
+			phys = <&usb2phy0>;
+			phy-names = "usb2-phy";
+			dr_mode = "peripheral";
+			maximum-speed = "high-speed";
+		};
+
+		usbdrd1: usb@40a430000 {
+			compatible = "apple,t8152-dwc3";
+			reg = <0x4 0x0a430000 0x0 0xcd00>,
+			      <0x4 0x0a43cd00 0x0 0x4b00>,
+			      <0x4 0x0a414000 0x0 0x4000>,
+			      <0x4 0x0a410000 0x0 0x4000>,
+			      <0x4 0x0a444000 0x0 0x4000>,
+			      <0x4 0x0a450000 0x0 0x4000>;
+			reg-names = "dwc3-core", "dwc3-apple", "pipe-handler",
+				    "pwr-ctrl", "bulk-fabric", "ausbc-debug";
+			interrupts = <AIC_IRQ 1692 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&dwc3_1_dart_0 0>, <&dwc3_1_dart_0 1>,
+				 <&dwc3_1_dart_1 0>, <&dwc3_1_dart_1 1>;
+			power-domains = <&psd_atc1_usb>;
+			phys = <&usb2phy1>;
+			phy-names = "usb2-phy";
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+		};
+
+		usbdrd2: usb@382430000 {
+			compatible = "apple,t8152-dwc3";
+			reg = <0x3 0x82430000 0x0 0xcd00>,
+			      <0x3 0x8243cd00 0x0 0x4b00>,
+			      <0x3 0x82414000 0x0 0x4000>,
+			      <0x3 0x82410000 0x0 0x4000>,
+			      <0x3 0x82444000 0x0 0x4000>,
+			      <0x3 0x82450000 0x0 0x4000>;
+			reg-names = "dwc3-core", "dwc3-apple", "pipe-handler",
+				    "pwr-ctrl", "bulk-fabric", "ausbc-debug";
+			interrupts = <AIC_IRQ 1763 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&dwc3_2_dart_0 0>, <&dwc3_2_dart_0 1>,
+				 <&dwc3_2_dart_1 0>, <&dwc3_2_dart_1 1>;
+			power-domains = <&psd_atc2_usb>;
+			phys = <&usb2phy2>;
+			phy-names = "usb2-phy";
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+		};
+
+		usbdrd3: usb@412430000 {
+			compatible = "apple,t8152-dwc3";
+			reg = <0x4 0x12430000 0x0 0xcd00>,
+			      <0x4 0x1243cd00 0x0 0x4b00>,
+			      <0x4 0x12414000 0x0 0x4000>,
+			      <0x4 0x12410000 0x0 0x4000>,
+			      <0x4 0x12444000 0x0 0x4000>,
+			      <0x4 0x12450000 0x0 0x4000>;
+			reg-names = "dwc3-core", "dwc3-apple", "pipe-handler",
+				    "pwr-ctrl", "bulk-fabric", "ausbc-debug";
+			interrupts = <AIC_IRQ 1834 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&dwc3_3_dart_0 0>, <&dwc3_3_dart_0 1>,
+				 <&dwc3_3_dart_1 0>, <&dwc3_3_dart_1 1>;
+			power-domains = <&psd_atc3_usb>;
+			phys = <&usb2phy3>;
+			phy-names = "usb2-phy";
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+		};
 	};
 };
 
