@@ -2011,6 +2011,7 @@ static void dwc3_apple_shutdown(struct platform_device *pdev)
 }
 
 static const struct of_device_id dwc3_apple_of_match[] = {
+	{ .compatible = "apple,t8152-dwc3" },
 	{ .compatible = "apple,t8132-dwc3" },
 	{ .compatible = "apple,t8103-dwc3" },
 	{}
