@@ -47,6 +47,7 @@
 			compatible = "apple,t8152-psd";
 			reg = <0x3 0x03a14700 0x0 0x100>;
 			#power-domain-cells = <0>;
+			power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_usb>;
 			label = "psd_atc0_usb";
 		};
 
@@ -54,6 +55,7 @@
 			compatible = "apple,t8152-psd";
 			reg = <0x3 0x03a14800 0x0 0x100>;
 			#power-domain-cells = <0>;
+			power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_usb>;
 			label = "psd_atc1_usb";
 		};
 
@@ -61,6 +63,7 @@
 			compatible = "apple,t8152-psd";
 			reg = <0x3 0x03a14900 0x0 0x100>;
 			#power-domain-cells = <0>;
+			power-domains = <&ps_atc2_usb_aon>, <&ps_atc2_usb>;
 			label = "psd_atc2_usb";
 		};
 
@@ -68,6 +71,7 @@
 			compatible = "apple,t8152-psd";
 			reg = <0x3 0x03a14a00 0x0 0x100>;
 			#power-domain-cells = <0>;
+			power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_usb>;
 			label = "psd_atc3_usb";
 		};
 
@@ -103,5 +107,133 @@
 			mboxes = <&ans_mbox>;
 			apple,sart = <&sart>;
 		};
+
+		/*
+		 * The USB2 side of each ATC port: one PHY per DWC3 controller.
+		 * Each sits behind its port's always-on and PSD domains. The
+		 * SuperSpeed side of the ATC PHY is not described yet.
+		 */
+		usb2phy0: phy@402418000 {
+			compatible = "apple,t8152-usb2-phy";
+			reg = <0x4 0x02418000 0x0 0x4000>,
+			      <0x4 0x02448000 0x0 0x4000>;
+			reg-names = "usb2", "eusb2";
+			#phy-cells = <0>;
+			power-domains = <&ps_atc0_usb_aon>, <&psd_atc0_usb>;
+			power-domain-names = "usb-aon", "usb";
+		};
+
+		usb2phy1: phy@40a418000 {
+			compatible = "apple,t8152-usb2-phy";
+			reg = <0x4 0x0a418000 0x0 0x4000>,
+			      <0x4 0x0a448000 0x0 0x4000>;
+			reg-names = "usb2", "eusb2";
+			#phy-cells = <0>;
+			power-domains = <&ps_atc1_usb_aon>, <&psd_atc1_usb>;
+			power-domain-names = "usb-aon", "usb";
+		};
+
+		usb2phy2: phy@382418000 {
+			compatible = "apple,t8152-usb2-phy";
+			reg = <0x3 0x82418000 0x0 0x4000>,
+			      <0x3 0x82448000 0x0 0x4000>;
+			reg-names = "usb2", "eusb2";
+			#phy-cells = <0>;
+			power-domains = <&ps_atc2_usb_aon>, <&psd_atc2_usb>;
+			power-domain-names = "usb-aon", "usb";
+		};
+
+		usb2phy3: phy@412418000 {
+			compatible = "apple,t8152-usb2-phy";
+			reg = <0x4 0x12418000 0x0 0x4000>,
+			      <0x4 0x12448000 0x0 0x4000>;
+			reg-names = "usb2", "eusb2";
+			#phy-cells = <0>;
+			power-domains = <&ps_atc3_usb_aon>, <&psd_atc3_usb>;
+			power-domain-names = "usb-aon", "usb";
+		};
+	};
+};
+
+/* The ATC USB domains, one always-on and one main pair per port. */
+&pmgr {
+	ps_atc0_usb_aon: power-controller@10100 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x10100 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb_aon";
+		apple,always-on;
+	};
+
+	ps_atc0_usb: power-controller@10120 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x10120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb";
+		apple,always-on;
+	};
+
+	ps_atc1_usb_aon: power-controller@10140 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x10140 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_usb_aon";
+		apple,always-on;
+	};
+
+	ps_atc1_usb: power-controller@10160 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x10160 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_usb";
+		apple,always-on;
+	};
+
+	ps_atc2_usb_aon: power-controller@10180 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x10180 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_usb_aon";
+		apple,always-on;
+	};
+
+	ps_atc2_usb: power-controller@101a0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x101a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_usb";
+		apple,always-on;
+	};
+
+	ps_atc3_usb_aon: power-controller@101c0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x101c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3_usb_aon";
+		apple,always-on;
+	};
+
+	ps_atc3_usb: power-controller@101e0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x101e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3_usb";
+		apple,always-on;
 	};
 };
