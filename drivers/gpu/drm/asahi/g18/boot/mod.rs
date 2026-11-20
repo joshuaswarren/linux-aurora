@@ -71,7 +71,7 @@ use core::{
     ffi::c_void,
     mem::MaybeUninit,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use kernel::{
     bindings, c_str,
@@ -82,7 +82,7 @@ use kernel::{
     new_mutex, platform,
     prelude::*,
     soc::apple::rtkit,
-    sync::{aref::ARef, Arc, Mutex},
+    sync::{aref::ARef, Arc, Completion, Mutex},
     time::{delay::fsleep, Delta, Instant, Monotonic},
 };
 
@@ -887,11 +887,44 @@ struct G18RoleState {
     crashed: AtomicBool,
     crash_dumped: AtomicBool,
     messages: AtomicU32,
+    /// Verified firmware event notifications: EP_GFX_MESSAGES type 0x0042,
+    /// the family's ring-service kick (G15 `RING_SERVICE`, G16, M3).
+    events: AtomicU64,
+    /// One wake token per verified event.
+    arrived: Pin<KBox<Completion>>,
 }
 
 impl G18RoleState {
     fn crashed(&self) -> bool {
         self.crashed.load(Ordering::Acquire)
+    }
+
+    /// Count one verified firmware event and wake every waiter.
+    fn record_event(&self) {
+        self.events.fetch_add(1, Ordering::Release);
+        self.arrived.complete();
+    }
+
+    /// Verified events so far.
+    fn events(&self) -> u64 {
+        self.events.load(Ordering::Acquire)
+    }
+
+    /// Sleep until an event past `seen` lands or one jiffy elapses. The
+    /// one-jiffy bound is the fallback that replaces the polled interval:
+    /// the caller's predicate is authoritative on every return, so a wake
+    /// without an event costs one extra check and a busy event source is
+    /// capped by draining at most 64 stale tokens first.
+    fn wait_event_past(&self, seen: u64) {
+        for _ in 0..64 {
+            if !self.arrived.try_wait_for_completion() {
+                break;
+            }
+        }
+        if self.events() != seen {
+            return;
+        }
+        self.arrived.wait_for_completion_timeout(1);
     }
 
     /// Scan the role's `__DATA` for a `CLHE` crashlog and dump it. Firmware
@@ -1001,6 +1034,13 @@ impl rtkit::Operations for G18RtkitOps {
         message: u64,
     ) {
         let ordinal = data.messages.fetch_add(1, Ordering::Relaxed);
+        // EP_GFX_MESSAGES type 0x0042 is the ring-service event the family's
+        // firmware posts when its report rings want draining; it is what
+        // makes the wait loops' predicates move. Wake them here in interrupt
+        // context — the predicate recheck decides what the event means.
+        if endpoint == EP_GFX_MESSAGES && message >> 48 == 0x0042 {
+            data.record_event();
+        }
         if ordinal < MESSAGE_LOG_BUDGET || ordinal.is_power_of_two() {
             dev_info!(
                 data.dev.as_ref(),
@@ -1019,6 +1059,9 @@ impl rtkit::Operations for G18RtkitOps {
         crashlog: Option<&[u8]>,
     ) {
         data.crashed.store(true, Ordering::Release);
+        // A crashed role sends no further events; wake the waits so they
+        // reach their crashed predicate instead of sitting on the fallback.
+        data.record_event();
         dev_err!(
             data.dev.as_ref(),
             "G18 firmware crashed role={} host-crashlog={}\n",
@@ -1996,6 +2039,8 @@ fn prepare_firmware_session(pdev: &platform::Device<Core<'_>>, probe: T8152Probe
             crashed: AtomicBool::new(false),
             crash_dumped: AtomicBool::new(false),
             messages: AtomicU32::new(0),
+            events: AtomicU64::new(0),
+            arrived: KBox::pin_init(Completion::new(), GFP_KERNEL)?,
         }, GFP_KERNEL)?;
         let rtkit = rtkit::RtKit::<G18RtkitOps>::new_g17p(drm.as_ref().as_ref(), None, role.index(), state.clone())
             .map_err(|error| no_probe_defer(dev, role.name(), "RTKit mailbox", error))?;

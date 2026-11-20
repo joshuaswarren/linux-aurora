@@ -42,12 +42,6 @@ const JOB_WATCHDOG_MS: u32 = 10_000;
 /// the firmware consumed it.
 const RECOVERED_RETIRE_MS: u32 = 2000;
 
-/// Poll interval for a wait that has lasted `us`: fine while a job is
-/// likely to be about to retire, coarse once it has clearly not.
-pub(super) const fn poll_interval_us(us: i64) -> i64 {
-    if us < 2_000 { 20 } else if us < 50_000 { 200 } else { 1_000 }
-}
-
 /// Upper bounds, in microseconds, of the latency buckets; the last bucket is
 /// open-ended.
 const LATENCY_BOUNDS_US: [i64; 6] = [100, 300, 1_000, 3_000, 10_000, 100_000];
@@ -366,7 +360,8 @@ impl G18Session {
             }
             // Keep the report rings moving while the firmware works.
             self.drain()?;
-            fsleep(Delta::from_millis(1));
+            let seen = self.states[G18Role::Gfx.index()].events();
+            self.states[G18Role::Gfx.index()].wait_event_past(seen);
             word = self.recovery_word()?;
         }
         if word.state == to {
@@ -426,7 +421,8 @@ impl G18Session {
                 since = Instant::<Monotonic>::now();
                 reported = 0;
             }
-            fsleep(Delta::from_micros(poll_interval_us(us)));
+            let seen = self.states[G18Role::Gfx.index()].events();
+            self.states[G18Role::Gfx.index()].wait_event_past(seen);
         }
     }
 }

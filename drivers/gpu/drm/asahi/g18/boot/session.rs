@@ -36,7 +36,10 @@ impl ApplicationOwner {
         if self.failed.load(Ordering::Acquire) {return Err(Failure::Fatal(EIO));}
         let session=self.session.clone();let failed=self.failed.clone();
         let quarantined=self.quarantined.clone();
-        let ticket=Arc::new(AtomicI32::new(TICKET_RUNNING),GFP_KERNEL)?;let done=ticket.clone();
+        let ticket=Arc::pin_init(pin_init!(WorkerTicket {
+            result: AtomicI32::new(TICKET_RUNNING),
+            done <- Completion::new(),
+        }),GFP_KERNEL)?;let done=ticket.clone();
         kernel::workqueue::system_long().try_spawn(GFP_KERNEL,move || {
             let mut owner=session.lock();
             let result=if failed.load(Ordering::Acquire) {Err(Failure::Fatal(EIO))} else {
@@ -69,17 +72,22 @@ impl ApplicationOwner {
                 }
                 let _=owner.stop("application fault");
             }
-            done.store(match result {
+            done.result.store(match result {
                 Ok(())=>0,
                 Err(Failure::Fatal(error))=>error.to_errno(),
                 Err(Failure::Job(JobFailure::Recovered(_) | JobFailure::Unbound(..) | JobFailure::Released))=>JobOutcome::Recovered as i32,
                 Err(Failure::Job(JobFailure::Stranded(..) | JobFailure::Retained))=>JobOutcome::Stranded as i32,
             },Ordering::Release);
+            // The result is published before the wake, so any waiter that
+            // sees the completion sees the final value.
+            done.done.complete();
         })?;
         let waited=Instant::<Monotonic>::now();
         loop {
-            match ticket.load(Ordering::Acquire) {
-                TICKET_RUNNING => fsleep(Delta::from_micros(recovery::poll_interval_us(waited.elapsed().as_micros_ceil()))),
+            match ticket.result.load(Ordering::Acquire) {
+                // Bounded fallback: recheck after at most one jiffy even if
+                // the worker's wake is lost.
+                TICKET_RUNNING => { ticket.done.wait_for_completion_timeout(1); }
                 0 => {recovery::SUBMIT_LATENCY.record(waited.elapsed().as_micros_ceil());return Ok(())}
                 code if code==JobOutcome::Recovered as i32 => return Err(Failure::Job(JobFailure::Released)),
                 code if code==JobOutcome::Stranded as i32 => return Err(Failure::Job(JobFailure::Retained)),
@@ -99,6 +107,14 @@ impl ApplicationOwner {
             Err(Failure::Fatal(error)) => {if let Some(status)=vm.status(){status.record(error);}Err(error)}
         }
     }
+}
+
+/// One session-worker task's crossing back to its submitting thread.
+#[pin_data]
+struct WorkerTicket {
+    result: AtomicI32,
+    #[pin]
+    done: Completion,
 }
 
 /// Worker ticket values besides 0 and negative errnos.
@@ -200,7 +216,8 @@ impl G18Session {
                     self.check_faults("application binding")?;
                     if self.memory.as_mut().ok_or(EIO)?.compute_outer_counters()?==[outer_after;3]
                         && self.application_job.as_mut().ok_or(EIO)?.job.queues().stage_gate(phase,&pass)? {passed=true;break;}
-                    fsleep(Delta::from_millis(1));
+                    let seen=self.states[G18Role::Gfx.index()].events();
+                    self.states[G18Role::Gfx.index()].wait_event_past(seen);
                 }
                 if !passed {return Err(ETIMEDOUT.into());}
                 dev_info!(self.device(),"G18_APP_BIND_PASS phase={}\n",phase);

@@ -40,7 +40,8 @@ impl G18Session {
                             probe.pool_status(), pool, command.context_id)) {
                         passed = true; break;
                     }
-                    fsleep(Delta::from_millis(1));
+                    let seen = self.states[G18Role::Gfx.index()].events();
+                    self.states[G18Role::Gfx.index()].wait_event_past(seen);
                 }
                 if !passed { return Err(ETIMEDOUT.into()); }
                 dev_info!(self.device(), "G18_APP_COMPUTE_BIND_PASS phase={}\n", phase);
