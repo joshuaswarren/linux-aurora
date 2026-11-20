@@ -231,6 +231,10 @@ struct apple_nvme_hw {
 	u32 sleep_shn;
 	/* The ANS is never reset through PMGR here, so no reset is named. */
 	bool reset_optional;
+	/* Post-M4 register banks that must not be read back after writes. */
+	bool no_ioq_readback;
+	/* ANS register window uses the secure layout; see apple_nvme_reg(). */
+	bool secure_reg_layout;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -310,6 +314,30 @@ struct apple_nvme {
 	struct delayed_work flush_dwork;
 	struct blk_crypto_profile crypto_profile;
 };
+
+/*
+ * Map a legacy ANS register offset to the secure layout (the T8152 SPTM
+ * agrees with AppleANS3CGv2Controller): the admin-queue and I/O-queue
+ * register banks move up 0x4000 and LINEAR_SQ_CTRL 0x24908 becomes 0x2813c.
+ */
+static u32 apple_nvme_reg(const struct apple_nvme *anv, u32 off)
+{
+	if (!anv->hw->secure_reg_layout)
+		return off;
+	switch (off) {
+	case NVME_REG_AQA:
+	case NVME_REG_ASQ:
+	case NVME_REG_ACQ:
+	case APPLE_ANS_IOSQ_REGISTER:
+	case APPLE_ANS_IOCQ_REGISTER:
+	case APPLE_ANS_MAX_PEND_CMDS_CTRL:
+		return off + 0x4000;
+	case APPLE_ANS_LINEAR_SQ_CTRL:
+		return 0x2813c;
+	default:
+		return off;
+	}
+}
 
 /* Bit in recovery_flags: recovery_work owns the next controller stop. */
 #define APPLE_NVME_RECOVERY_PENDING 0
@@ -1976,12 +2004,13 @@ rtkit_ready:
 		 */
 		if (!anv->lsq_in_nvmmu) {
 			writel(APPLE_ANS_LINEAR_SQ_EN,
-			       anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+			       anv->mmio_nvme + apple_nvme_reg(anv, APPLE_ANS_LINEAR_SQ_CTRL));
 			if (anv->hw->needs_ioq_registers) {
 				u32 lsq_ctrl = readl(anv->mmio_nvme +
-						     APPLE_ANS_LINEAR_SQ_CTRL);
+						     apple_nvme_reg(anv, APPLE_ANS_LINEAR_SQ_CTRL));
 
-				if (!(lsq_ctrl & APPLE_ANS_LINEAR_SQ_EN)) {
+				if (!(lsq_ctrl & APPLE_ANS_LINEAR_SQ_EN) &&
+				    !anv->hw->no_ioq_readback) {
 					dev_err(anv->dev,
 						"failed to enable linear submission queues: LSQ_CTRL=0x%08x\n",
 						lsq_ctrl);
@@ -2002,9 +2031,9 @@ rtkit_ready:
 		if (anv->hw->needs_ioq_registers)
 			ioqa_depth--;
 		ioqa = ioqa_depth | (ioqa_depth << 16);
-		writel(ioqa, anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
-		if (anv->hw->needs_ioq_registers &&
-		    readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL) != ioqa) {
+		writel(ioqa, anv->mmio_nvme + apple_nvme_reg(anv, APPLE_ANS_MAX_PEND_CMDS_CTRL));
+		if (anv->hw->needs_ioq_registers && !anv->hw->no_ioq_readback &&
+		    readl(anv->mmio_nvme + apple_nvme_reg(anv, APPLE_ANS_MAX_PEND_CMDS_CTRL)) != ioqa) {
 			dev_err(anv->dev, "failed to program I/O queue aperture\n");
 			ret = -EIO;
 			goto out;
@@ -2018,11 +2047,11 @@ rtkit_ready:
 	/* Setup the admin queue */
 	aqa = APPLE_NVME_AQ_DEPTH - 1;
 	aqa |= aqa << 16;
-	writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
+	writel(aqa, anv->mmio_nvme + apple_nvme_reg(anv, NVME_REG_AQA));
 	apple_nvme_writeq(anv, anv->adminq.sq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ASQ);
+			  anv->mmio_nvme + apple_nvme_reg(anv, NVME_REG_ASQ));
 	apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ACQ);
+			  anv->mmio_nvme + apple_nvme_reg(anv, NVME_REG_ACQ));
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
@@ -2095,9 +2124,9 @@ rtkit_ready:
 		 * reports null I/O SQ and CQ addresses.
 		 */
 		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr,
-				  anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER);
+				  anv->mmio_nvme + apple_nvme_reg(anv, APPLE_ANS_IOCQ_REGISTER));
 		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr,
-				  anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER);
+				  anv->mmio_nvme + apple_nvme_reg(anv, APPLE_ANS_IOSQ_REGISTER));
 	}
 	nr_io_queues = 1;
 	if (anv->hw->has_queue_count) {
@@ -3349,6 +3378,25 @@ static const struct apple_nvme_hw apple_nvme_t6050_hw = {
 	.quirks = NVME_QUIRK_NO_APST | NVME_QUIRK_BROKEN_FUA,
 };
 
+/*
+ * T8152 (M6) ANS: the NVMMU registers sit in the 0x60000 "nvme" window
+ * (there is no separate NVMMU region; the T8140 non-secure alias does not
+ * exist and faults), the register window uses the secure layout, and the
+ * I/O queue registers must not be read back. ADT: nvme-secure-reg-layout,
+ * nvme-linear-sq, nvme-queue-entries = 64.
+ */
+static const struct apple_nvme_hw apple_nvme_t8152_hw = {
+	.has_lsq_nvmmu = true,
+	.has_queue_count = true,
+	.has_separate_nvmmu = false,
+	.needs_ioq_registers = true,
+	.no_ioq_readback = true,
+	.secure_reg_layout = true,
+	.reset_optional = true,
+	.max_queue_depth = 64,
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
 	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
@@ -3357,6 +3405,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
+	{ .compatible = "apple,t8152-nvme-ans2", .data = &apple_nvme_t8152_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };
