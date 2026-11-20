@@ -29,7 +29,9 @@ impl G18Session {
                 Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit)
                     .send_message(EP_GFX_INTERRUPTS, 0x0083_0000_0000_000a)?;
                 let mut passed = false;
-                for _ in 0..CONTROL_POLLS {
+                let deadline = Instant::<Monotonic>::now();
+                while deadline.elapsed().as_millis() < CONTROL_POLLS as i64 {
+                    let seen = self.states[G18Role::Gfx.index()].events();
                     self.check_faults("application compute binding")?;
                     let outer = self.memory.as_mut().ok_or(EIO)?.compute_outer_counters()?;
                     let probe = self.queue_probe.as_mut().ok_or(EIO)?;
@@ -40,7 +42,6 @@ impl G18Session {
                             probe.pool_status(), pool, command.context_id)) {
                         passed = true; break;
                     }
-                    let seen = self.states[G18Role::Gfx.index()].events();
                     self.states[G18Role::Gfx.index()].wait_event_past(seen);
                 }
                 if !passed { return Err(ETIMEDOUT.into()); }

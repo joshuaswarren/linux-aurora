@@ -354,13 +354,18 @@ impl G18Session {
     fn await_recovery_state(&mut self, label: &str, phase: &str, from: u32, to: u32, polls: u32)
         -> Result<G18RecoveryWord> {
         let mut word = self.recovery_word()?;
-        for _ in 0..polls {
-            if word.state == to || word.state != from || self.any_crashed() {
+        let started = Instant::<Monotonic>::now();
+        loop {
+            // Snapshot before the predicate: an event landing between the
+            // two reads then fails `events() == seen` and wakes at once
+            // instead of having its fresh token drained as stale.
+            let seen = self.states[G18Role::Gfx.index()].events();
+            if word.state == to || word.state != from || self.any_crashed()
+                || started.elapsed().as_millis() >= polls as i64 {
                 break;
             }
             // Keep the report rings moving while the firmware works.
             self.drain()?;
-            let seen = self.states[G18Role::Gfx.index()].events();
             self.states[G18Role::Gfx.index()].wait_event_past(seen);
             word = self.recovery_word()?;
         }
@@ -402,6 +407,9 @@ impl G18Session {
             if report {
                 reported = ms / period;
             }
+            // Snapshot before the predicate so a retirement between the
+            // two reads still misses the wait instead of being drained.
+            let seen = self.states[G18Role::Gfx.index()].events();
             if retired(self, ms, recovery.is_some(), report)? {
                 if recovery.is_none() && latency_report_due(JOB_LATENCY.record(us)) {
                     let (job, job_max) = JOB_LATENCY.snapshot();
@@ -421,7 +429,6 @@ impl G18Session {
                 since = Instant::<Monotonic>::now();
                 reported = 0;
             }
-            let seen = self.states[G18Role::Gfx.index()].events();
             self.states[G18Role::Gfx.index()].wait_event_past(seen);
         }
     }

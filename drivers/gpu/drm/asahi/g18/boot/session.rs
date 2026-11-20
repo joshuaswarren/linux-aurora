@@ -212,11 +212,12 @@ impl G18Session {
                 let outer_after=self.memory.as_mut().ok_or(EIO)?.publish_application_records(&records)?;
                 Pin::new(&mut self.roles[G18Role::Gfx.index()].rtkit).send_message(EP_GFX_INTERRUPTS,0x0083_0000_0000_000a)?;
                 let mut passed=false;
-                for _ in 0..CONTROL_POLLS {
+                let deadline=Instant::<Monotonic>::now();
+                while deadline.elapsed().as_millis()<CONTROL_POLLS as i64 {
+                    let seen=self.states[G18Role::Gfx.index()].events();
                     self.check_faults("application binding")?;
                     if self.memory.as_mut().ok_or(EIO)?.compute_outer_counters()?==[outer_after;3]
                         && self.application_job.as_mut().ok_or(EIO)?.job.queues().stage_gate(phase,&pass)? {passed=true;break;}
-                    let seen=self.states[G18Role::Gfx.index()].events();
                     self.states[G18Role::Gfx.index()].wait_event_past(seen);
                 }
                 if !passed {return Err(ETIMEDOUT.into());}

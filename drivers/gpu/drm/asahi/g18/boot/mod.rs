@@ -200,7 +200,7 @@ const INITDATA_ACK: u64 = 0x0009_0000_0000_0000;
 const IDLE_POLICY_WAKE: u64 = 0x0084_0000_0000_0011;
 
 const ACK_POLLS: u32 = 200; // x 10 ms
-const CONTROL_POLLS: u32 = 1000; // x 1 ms
+const CONTROL_POLLS: u32 = 1000; // ms deadline
 const SYSLOG_WINDOW_MS: u32 = 2000;
 const HEARTBEAT_MS: u32 = 60_000;
 const HEARTBEAT_STEP_MS: u32 = 100;
