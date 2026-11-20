@@ -28,6 +28,18 @@
 			reg = <0x3 0x700000 0x0 0x14000>;
 		};
 
+		/*
+		 * Second PMGR block: hosts the AOP and ATC USB power domains
+		 * (ADT /arm-io/pmgr1).
+		 */
+		pmgr1: power-management@308280000 {
+			compatible = "apple,t8152-pmgr", "apple,t8103-pmgr",
+				     "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x8280000 0x0 0x80000>;
+		};
+
 		qspi: spi@331118000 {
 			compatible = "apple,t8152-qspi", "apple,t8140-qspi";
 			/* One aperture; the command block starts at offset 0x800. */

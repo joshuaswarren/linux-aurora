@@ -264,7 +264,7 @@
 };
 
 /* The ATC USB domains, one always-on and one main pair per port. */
-&pmgr {
+&pmgr1 {
 	ps_aop_filter: power-controller@4000 {
 		compatible = "apple,t8152-pmgr-pwrstate",
 			     "apple,t8103-pmgr-pwrstate";
