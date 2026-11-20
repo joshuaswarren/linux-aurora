@@ -238,11 +238,54 @@
 			dr_mode = "host";
 			maximum-speed = "high-speed";
 		};
+
+		/* ADT /arm-io/aop-gpio; coprocessor/firmware ownership unqualified. */
+		pinctrl_aop: pinctrl@310824000 {
+			compatible = "apple,t8152-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x3 0x10824000 0x0 0x4000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_aop 0 0 77>;
+			apple,npins = <77>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 573 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 574 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 575 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 576 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 578 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 579 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_aop_gpio>;
+			status = "disabled";
+		};
 	};
 };
 
 /* The ATC USB domains, one always-on and one main pair per port. */
 &pmgr {
+	ps_aop_filter: power-controller@4000 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_filter";
+		apple,always-on;
+	};
+
+	ps_aop_gpio: power-controller@4020 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_gpio";
+		power-domains = <&ps_aop_filter>;
+		apple,always-on;
+	};
+
 	ps_atc0_usb_aon: power-controller@10100 {
 		compatible = "apple,t8152-pmgr-pwrstate",
 			     "apple,t8103-pmgr-pwrstate";
