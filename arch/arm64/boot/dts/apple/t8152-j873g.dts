@@ -451,3 +451,12 @@
 	power-domains = <&psd_atc2_usb>;
 	status = "okay";
 };
+
+/* The two APCIE PIODMA engines (ADT piodma@388030000 / piodma@38a030000). */
+&apcie0_piodma {
+	status = "okay";
+};
+
+&apcie2_piodma {
+	status = "okay";
+};
